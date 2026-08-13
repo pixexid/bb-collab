@@ -5,7 +5,7 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 // ponytail: keep exports bounded at 256 rows; add paged/file export before migration or cutover.
 export const MAX_EXPORT_ROWS = 256;
 export const MAX_EXPORT_BYTES = 512 * 1024;
@@ -27,6 +27,8 @@ export const TABLES = [
   "external_work_refs",
   "qualification_observations",
   "eligibility_projections",
+  "assignments",
+  "execution_attempts",
   "role_generations",
   "role_generation_heads",
 ] as const;
@@ -294,9 +296,162 @@ export const MIGRATIONS: string[] = [
     FOREIGN KEY (project_id, role_id, current_generation)
       REFERENCES role_generations(project_id, role_id, generation)
   )`,
+  `CREATE TABLE IF NOT EXISTS assignments (
+    project_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    assignment_kind TEXT NOT NULL CHECK (assignment_kind IN ('write', 'review', 'probe')),
+    lane_id TEXT NOT NULL,
+    role_requirement_id TEXT NOT NULL,
+    role_id TEXT NOT NULL,
+    role_generation INTEGER NOT NULL CHECK (role_generation > 0),
+    config_revision INTEGER NOT NULL,
+    governance_epoch INTEGER NOT NULL CHECK (governance_epoch > 0),
+    work_item_revision INTEGER NOT NULL CHECK (work_item_revision > 0),
+    repo_target_id TEXT NOT NULL,
+    branch_name TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    candidate_semantics TEXT NOT NULL CHECK (candidate_semantics IN ('base', 'frozen')),
+    candidate_sha TEXT,
+    bb_server_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    environment_path TEXT NOT NULL,
+    environment_mode TEXT NOT NULL CHECK (environment_mode = 'managed-worktree'),
+    frozen_brief_version INTEGER NOT NULL CHECK (frozen_brief_version = 1),
+    frozen_brief_digest TEXT NOT NULL,
+    requested_provider_id TEXT NOT NULL,
+    requested_model TEXT NOT NULL,
+    requested_reasoning_level TEXT NOT NULL,
+    requested_permission_mode TEXT NOT NULL CHECK (requested_permission_mode = 'full'),
+    requested_service_tier TEXT NOT NULL,
+    requested_visibility TEXT NOT NULL CHECK (requested_visibility = 'visible'),
+    requested_profile_digest TEXT NOT NULL,
+    dispatch_kind TEXT NOT NULL CHECK (dispatch_kind IN ('spawn', 'attach')),
+    attach_thread_id TEXT,
+    parent_assignment_id TEXT,
+    depth INTEGER NOT NULL CHECK (depth = 0),
+    deadline_at_ms INTEGER NOT NULL CHECK (deadline_at_ms >= 0),
+    assignment_digest TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    creation_event_sequence INTEGER NOT NULL CHECK (creation_event_sequence > 0),
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (project_id, assignment_id),
+    FOREIGN KEY (project_id, work_item_id)
+      REFERENCES work_items(project_id, work_item_id),
+    FOREIGN KEY (project_id, repo_target_id, config_revision)
+      REFERENCES repository_targets(project_id, repo_target_id, config_revision),
+    FOREIGN KEY (project_id, role_id, role_generation)
+      REFERENCES role_generations(project_id, role_id, generation),
+    FOREIGN KEY (project_id, parent_assignment_id)
+      REFERENCES assignments(project_id, assignment_id),
+    CHECK ((candidate_semantics = 'base' AND candidate_sha IS NULL) OR
+           (candidate_semantics = 'frozen' AND candidate_sha IS NOT NULL)),
+    CHECK ((dispatch_kind = 'spawn' AND attach_thread_id IS NULL) OR
+           (dispatch_kind = 'attach' AND attach_thread_id IS NOT NULL))
+  );
+  CREATE TABLE IF NOT EXISTS execution_attempts (
+    project_id TEXT NOT NULL,
+    execution_attempt_id TEXT NOT NULL,
+    assignment_id TEXT,
+    origin TEXT NOT NULL CHECK (origin IN ('assignment', 'role_holder', 'legacy_unresolved')),
+    assignment_digest TEXT,
+    lane_id TEXT,
+    assignment_kind TEXT CHECK (assignment_kind IS NULL OR assignment_kind IN ('write', 'review', 'probe')),
+    attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal > 0),
+    dispatch_kind TEXT CHECK (dispatch_kind IS NULL OR dispatch_kind IN ('spawn', 'attach')),
+    config_revision INTEGER NOT NULL,
+    governance_epoch INTEGER NOT NULL CHECK (governance_epoch > 0),
+    work_item_id TEXT,
+    repo_target_id TEXT,
+    role_id TEXT NOT NULL,
+    role_generation INTEGER NOT NULL CHECK (role_generation > 0),
+    state TEXT NOT NULL CHECK (state IN ('prepared', 'armed', 'content_delivered', 'running', 'done', 'blocked', 'failed', 'dispatch_unknown')),
+    bb_server_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    environment_path TEXT NOT NULL,
+    thread_id TEXT,
+    provider_thread_id TEXT,
+    native_request_id TEXT,
+    request_event_id TEXT,
+    request_event_seq INTEGER,
+    accepted_event_id TEXT,
+    accepted_event_seq INTEGER,
+    first_action_event_id TEXT,
+    first_action_event_seq INTEGER,
+    content_event_id TEXT,
+    content_event_seq INTEGER,
+    completion_event_id TEXT,
+    completion_event_seq INTEGER,
+    terminal_event_id TEXT,
+    terminal_event_seq INTEGER,
+    frozen_brief_digest TEXT,
+    content_receipt_digest TEXT,
+    actual_provider_id TEXT,
+    actual_model TEXT,
+    actual_reasoning_level TEXT,
+    actual_permission_mode TEXT,
+    actual_service_tier TEXT,
+    actual_visibility TEXT CHECK (actual_visibility IS NULL OR actual_visibility IN ('visible', 'hidden')),
+    actual_profile_digest TEXT,
+    branch_name TEXT,
+    base_sha TEXT,
+    candidate_sha TEXT,
+    environment_digest TEXT NOT NULL,
+    native_receipt_digest TEXT,
+    terminal_result TEXT CHECK (terminal_result IS NULL OR terminal_result IN ('DONE', 'BLOCKED')),
+    reported_outcome TEXT CHECK (reported_outcome IS NULL OR reported_outcome IN ('DONE', 'BLOCKED')),
+    terminal_report_digest TEXT,
+    conflicting_terminal_digest TEXT,
+    reason_code TEXT,
+    last_event_seq INTEGER,
+    created_at_ms INTEGER NOT NULL,
+    observed_at_ms INTEGER,
+    completed_at_ms INTEGER,
+    attempt_digest TEXT NOT NULL,
+    PRIMARY KEY (project_id, execution_attempt_id),
+    FOREIGN KEY (project_id, assignment_id)
+      REFERENCES assignments(project_id, assignment_id),
+    FOREIGN KEY (project_id, repo_target_id, config_revision)
+      REFERENCES repository_targets(project_id, repo_target_id, config_revision),
+    CHECK ((origin = 'assignment' AND assignment_id IS NOT NULL AND assignment_digest IS NOT NULL AND lane_id IS NOT NULL AND assignment_kind IS NOT NULL) OR
+           (origin != 'assignment' AND assignment_id IS NULL))
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_active_assignment
+    ON execution_attempts(project_id, assignment_digest)
+    WHERE origin = 'assignment' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown');
+  CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_active_writer_lane
+    ON execution_attempts(project_id, lane_id)
+    WHERE origin = 'assignment' AND assignment_kind = 'write'
+      AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown');
+  CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_native_request
+    ON execution_attempts(bb_server_id, thread_id, native_request_id)
+    WHERE thread_id IS NOT NULL AND native_request_id IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS execution_attempts_project_state
+    ON execution_attempts(project_id, state, assignment_kind, lane_id)`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
+export const CACHED_CONSUMERS = ["server.rpcContract", "server.collabCli", "src/test-support", "tests/server.test"] as const;
+
+export function cachedConsumerRolloutEvidence(observedSchemaVersion: number) {
+  const reread = observedSchemaVersion === SCHEMA_VERSION;
+  const evidence = {
+    names: [...CACHED_CONSUMERS],
+    oldSchemaVersion: 3,
+    newSchemaVersion: SCHEMA_VERSION,
+    observedSchemaVersion,
+    action: reread ? "reread" : "refused",
+    expected: CACHED_CONSUMERS.length,
+    attempted: CACHED_CONSUMERS.length,
+    verified: reread ? CACHED_CONSUMERS.length : 0,
+    schemaDigest,
+  };
+  return { ...evidence, rolloutReceiptDigest: sha256(canonicalJson(evidence)) };
+}
 
 const id = z.string().trim().min(1).max(256);
 const targetSchema = z
@@ -443,6 +598,80 @@ const roleContextRefSchema = z
     completionEventSeq: z.number().int().positive(),
   })
   .strict();
+const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
+const gitShaSchema = z.string().regex(/^[0-9a-f]{40,64}$/u);
+const assignmentEnvironmentSchema = z
+  .object({
+    bbServerId: id,
+    environmentId: id,
+    sourceId: id,
+    hostId: id,
+    path: id,
+    mode: z.literal("managed-worktree"),
+  })
+  .strict();
+const assignmentIntentSchema = z
+  .object({
+    assignmentId: id,
+    workItemId: id,
+    assignmentKind: z.enum(["write", "review", "probe"]),
+    laneId: id,
+    roleRequirementId: id,
+    roleId: roleIdSchema,
+    roleGeneration: z.number().int().positive(),
+    branchName: id,
+    baseSha: gitShaSchema,
+    candidateSemantics: z.enum(["base", "frozen"]),
+    candidateSha: gitShaSchema.nullable(),
+    environment: assignmentEnvironmentSchema,
+    frozenBriefVersion: z.literal(1),
+    frozenBriefDigest: digestSchema,
+    requestedProfile: executionProfileSchema,
+    dispatchKind: z.enum(["spawn", "attach"]),
+    attachThreadId: id.nullable(),
+    parentAssignmentId: id.nullable().default(null),
+    depth: z.literal(0),
+    deadlineAtMs: z.number().int().nonnegative(),
+  })
+  .strict()
+  .superRefine((assignment, ctx) => {
+    if ((assignment.candidateSemantics === "base") !== (assignment.candidateSha === null)) {
+      ctx.addIssue({ code: "custom", path: ["candidateSha"], message: "base intent has no candidate; frozen intent requires one" });
+    }
+    if ((assignment.dispatchKind === "attach") !== (assignment.attachThreadId !== null)) {
+      ctx.addIssue({ code: "custom", path: ["attachThreadId"], message: "attach requires one exact thread; spawn forbids one" });
+    }
+  });
+const terminalEvidenceSchema = z
+  .object({ kind: id, digest: digestSchema, ref: id })
+  .strict();
+const terminalReportSchema = z
+  .object({
+    receiptVersion: z.literal(1),
+    outcome: z.enum(["DONE", "BLOCKED"]),
+    projectId: id,
+    assignmentId: id,
+    executionAttemptId: id,
+    workItemId: id,
+    roleId: roleIdSchema,
+    roleGeneration: z.number().int().positive(),
+    repoTargetId: id,
+    environmentId: id,
+    threadId: id,
+    branchName: id,
+    baseSha: gitShaSchema,
+    candidateSha: gitShaSchema,
+    nativeReceiptDigest: digestSchema,
+    actualProfileDigest: digestSchema,
+    candidateObservationDigest: digestSchema,
+    reasonCode: id,
+    evidence: z.array(terminalEvidenceSchema).min(1).max(64),
+    reportedAtMs: z.number().int().nonnegative(),
+    receiptEventId: id,
+    receiptEventSeq: z.number().int().positive(),
+    receivedAtMs: z.number().int().nonnegative(),
+  })
+  .strict();
 
 export const applyRequestSchema = z
   .object({
@@ -457,6 +686,10 @@ export const applyRequestSchema = z
       "github_issue_projection",
       "qualification_observation_record",
       "role_generation_succession",
+      "assignment_prepare",
+      "assignment_dispatch",
+      "assignment_reconcile",
+      "assignment_terminal",
     ]),
     idempotencyKey: id,
     actorReceiptId: id.nullable().optional(),
@@ -492,6 +725,11 @@ export const applyRequestSchema = z
     reasonCode: id.optional(),
     fixtureContextDigest: id.optional(),
     declaredProfile: executionProfileSchema.optional(),
+    assignment: assignmentIntentSchema.optional(),
+    assignmentId: id.optional(),
+    executionAttemptId: id.optional(),
+    frozenBriefContent: z.string().max(256 * 1024).optional(),
+    terminalReport: terminalReportSchema.optional(),
   })
   .strict();
 
@@ -575,12 +813,84 @@ export interface RoleEventFact {
 }
 
 export interface RoleFactReader {
+  serverId(): string;
   thread(threadId: string): RoleThreadFact;
   events(threadId: string): RoleEventFact[];
   environment(environmentId: string): RoleEnvironmentFact;
   project(projectId: string): RoleProjectFact;
   host(hostId: string): RoleHostFact;
   version(): string;
+}
+
+export interface NativeAssignmentInput {
+  projectId: string;
+  assignmentId: string;
+  executionAttemptId: string;
+  assignmentKind: "write" | "review" | "probe";
+  dispatchKind: "spawn" | "attach";
+  attachThreadId: string | null;
+  repoTargetId: string;
+  branchName: string;
+  baseSha: string;
+  candidateSha: string | null;
+  environment: z.infer<typeof assignmentEnvironmentSchema>;
+  requestedProfile: ExecutionProfile;
+  frozenBriefContent: string;
+  frozenBriefDigest: string;
+}
+
+export interface NativeAssignmentEvidence {
+  disposition: "confirmed" | "refused" | "ambiguous";
+  reasonCode: string;
+  assignmentId?: string;
+  executionAttemptId?: string;
+  bbServerId?: string;
+  projectId?: string;
+  environmentId?: string;
+  sourceId?: string;
+  hostId?: string;
+  environmentPath?: string;
+  threadId?: string;
+  providerThreadId?: string;
+  nativeRequestId?: string;
+  requestEventId?: string;
+  requestEventSeq?: number;
+  acceptedEventId?: string;
+  acceptedEventSeq?: number;
+  firstActionEventId?: string;
+  firstActionEventSeq?: number;
+  contentEventId?: string;
+  contentEventSeq?: number;
+  contentDigest?: string;
+  actualProfile?: ExecutionProfile;
+  branchName?: string;
+  baseSha?: string;
+  candidateSha?: string | null;
+  lastEventSeq?: number;
+  observedAtMs?: number;
+}
+
+export interface NativeAssignmentInspection {
+  bbServerId: string;
+  projectId: string;
+  environmentId: string;
+  sourceId: string;
+  hostId: string;
+  environmentPath: string;
+  environmentMode: "managed-worktree";
+  branchName: string;
+  headSha: string;
+  baseSha: string;
+  candidateSha: string | null;
+  threadId: string | null;
+  threadProviderId: string | null;
+  threadVisibility: "visible" | "hidden" | null;
+}
+
+export interface NativeAssignmentAdapter {
+  inspect(input: { projectId: string; repoTargetId: string; assignment: z.infer<typeof assignmentIntentSchema> }): NativeAssignmentInspection;
+  dispatch(input: NativeAssignmentInput): NativeAssignmentEvidence;
+  reconcile(input: NativeAssignmentInput & { threadId: string | null; nativeRequestId: string | null }): NativeAssignmentEvidence;
 }
 
 interface ResolvedRoleContext {
@@ -598,6 +908,12 @@ interface ResolvedRoleContext {
   completionEventId: string;
   completionEventSeq: number;
   bbVersion: string;
+  bbServerId: string;
+  nativeRequestId: string;
+  acceptedEventId: string;
+  acceptedEventSeq: number;
+  startEventId: string;
+  startEventSeq: number;
 }
 
 function stringField(value: unknown): string | null {
@@ -612,7 +928,9 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
   let project: RoleProjectFact;
   let host: RoleHostFact;
   let bbVersion: string;
+  let bbServerId: string;
   try {
+    bbServerId = reader.serverId();
     thread = reader.thread(request.roleContext.threadId);
     events = reader.events(request.roleContext.threadId);
     if (!thread.environmentId) throw refusal("ROLE_CONTEXT_REQUIRED", "holder thread has no environment");
@@ -647,7 +965,7 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
   );
   if (sources.length !== 1) throw refusal("ROLE_CONTEXT_FOREIGN", "project source does not resolve uniquely by exact host and path");
   if (host.id !== environment.hostId || host.status !== "connected") throw refusal("ROLE_CONTEXT_UNKNOWN", "holder host is unavailable");
-  if (!stringField(bbVersion) || events.length === 0 || events.length > 256) {
+  if (!stringField(bbVersion) || !stringField(bbServerId) || events.length === 0 || events.length > 256) {
     throw refusal("ROLE_CONTEXT_UNKNOWN", "bounded BB version or event facts are unavailable");
   }
   for (let index = 1; index < events.length; index += 1) {
@@ -673,10 +991,12 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
     (event) => event.type === "turn/input/accepted" && event.data.clientRequestId === requestId,
   );
   if (accepted.length !== 1) throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "execution input correlation is missing or ambiguous");
-  const providerThreadId = stringField(accepted[0]!.data.providerThreadId);
+  const acceptedEvent = accepted[0]!;
+  const providerThreadId = stringField(acceptedEvent.data.providerThreadId);
   if (!providerThreadId) throw refusal("EXECUTION_PROFILE_UNKNOWN", "provider thread correlation is unavailable");
   const starts = events.filter((event) => event.type === "turn/started" && event.data.providerThreadId === providerThreadId);
   if (starts.length !== 1) throw refusal("EXECUTION_PROFILE_UNKNOWN", "correlated execution start is missing or ambiguous");
+  const startEvent = starts[0]!;
   const completions = events.filter((event) => event.type === "turn/completed" && event.data.providerThreadId === providerThreadId);
   if (completions.length !== 1) throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "correlated execution completion is missing or ambiguous");
   const completion = completions[0]!;
@@ -725,15 +1045,21 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
       requestId,
       requestEventId: requestEvent.id,
       requestEventSeq: requestEvent.seq,
+      acceptedEventId: acceptedEvent.id,
+      acceptedEventSeq: acceptedEvent.seq,
+      startEventId: startEvent.id,
+      startEventSeq: startEvent.seq,
       completionEventId: completion.id,
       completionEventSeq: completion.seq,
       source: executionSource,
     },
     bbVersion,
+    bbServerId,
     pluginSdkVersion: PLUGIN_SDK_VERSION,
   };
   const holderExecutionAttemptId = sha256(canonicalJson({
     projectId: request.projectId,
+    bbServerId,
     threadId: thread.id,
     environmentId: environment.id,
     providerThreadId,
@@ -758,6 +1084,12 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
     completionEventId: completion.id,
     completionEventSeq: completion.seq,
     bbVersion,
+    bbServerId,
+    nativeRequestId: requestId,
+    acceptedEventId: acceptedEvent.id,
+    acceptedEventSeq: acceptedEvent.seq,
+    startEventId: startEvent.id,
+    startEventSeq: startEvent.seq,
   };
 }
 
@@ -816,6 +1148,12 @@ export type FoundationCode =
   | "EXECUTION_PROFILE_UNKNOWN"
   | "EXECUTION_PROFILE_MISMATCH"
   | "EXECUTION_COMPLETION_AMBIGUOUS"
+  | "LANE_WRITER_EXISTS"
+  | "DISPATCH_UNKNOWN"
+  | "TERMINAL_REPORT_REQUIRED"
+  | "TERMINAL_REPORT_AMBIGUOUS"
+  | "ASSIGNMENT_HEAD_STALE"
+  | "EXECUTION_CONTEXT_FOREIGN"
   | "ROLE_UNQUALIFIED"
   | "CAPABILITY_UNKNOWN"
   | "QUALIFICATION_CONTEXT_FOREIGN"
@@ -971,6 +1309,10 @@ function validateConfig(value: unknown): string {
         const parsed = roleRequirementsSchema.safeParse(roleRequirements);
         if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
       }
+      const writingLaneCeiling = (bbCollab as Record<string, unknown>).writingLaneCeiling;
+      if (writingLaneCeiling !== undefined && (!Number.isInteger(writingLaneCeiling) || Number(writingLaneCeiling) < 0 || Number(writingLaneCeiling) > 2)) {
+        throw refusal("INVALID_INPUT", "writingLaneCeiling must be an integer from 0 through 2");
+      }
     }
   }
   const json = canonicalJson(value);
@@ -982,7 +1324,7 @@ function validateConfig(value: unknown): string {
 
 type GithubIssuesConfig = z.infer<typeof githubIssuesConfigSchema>;
 type WorkItemState = (typeof WORK_ITEM_STATES)[number];
-type ExecutionProfile = z.infer<typeof executionProfileSchema>;
+export type ExecutionProfile = z.infer<typeof executionProfileSchema>;
 type RoleRequirement = z.infer<typeof roleRequirementSchema>;
 
 function githubConfigFromJson(configJson: string): GithubIssuesConfig | null {
@@ -1005,6 +1347,12 @@ function roleRequirementsFromJson(configJson: string): RoleRequirement[] {
   const parsed = roleRequirementsSchema.safeParse(value);
   if (!parsed.success) throw refusal("INVALID_INPUT", "stored role requirements are invalid");
   return parsed.data;
+}
+
+function writingLaneCeilingFromJson(configJson: string): number {
+  const config = JSON.parse(configJson) as { extensions?: { bbCollab?: { writingLaneCeiling?: unknown } } };
+  const value = config.extensions?.bbCollab?.writingLaneCeiling;
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 2 ? value : 2;
 }
 
 function requireMappedTargets(configJson: string, targets: NonNullable<ApplyRequest["targets"]>): void {
@@ -1067,6 +1415,11 @@ function normalizeRequest(request: ApplyRequest): ApplyRequest {
     reasonCode: request.reasonCode ?? undefined,
     fixtureContextDigest: request.fixtureContextDigest ?? undefined,
     declaredProfile: request.declaredProfile ?? undefined,
+    assignment: request.assignment ?? undefined,
+    assignmentId: request.assignmentId ?? undefined,
+    executionAttemptId: request.executionAttemptId ?? undefined,
+    frozenBriefContent: request.frozenBriefContent ?? undefined,
+    terminalReport: request.terminalReport ?? undefined,
   };
 }
 
@@ -1722,8 +2075,8 @@ function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest): voi
   const head = asRow<{ current_generation: number }>(
     db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(request.projectId, actor.role_id),
   );
-  const generation = asRow<{ status: string; holder_execution_attempt_id: string }>(
-    db.prepare("SELECT status, holder_execution_attempt_id FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?").get(
+  const generation = asRow<{ status: string; holder_execution_attempt_id: string; holder_context_digest: string; holder_executed_profile_digest: string }>(
+    db.prepare("SELECT status, holder_execution_attempt_id, holder_context_digest, holder_executed_profile_digest FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?").get(
       request.projectId,
       actor.role_id,
       actor.role_generation,
@@ -1732,6 +2085,21 @@ function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest): voi
   if (!head || head.current_generation !== actor.role_generation) throw refusal("ROLE_GENERATION_STALE", "role actor is not the current generation");
   if (!generation || generation.status !== "active") throw refusal("ROLE_NOT_ACTIVE", "role actor is not active");
   if (generation.holder_execution_attempt_id !== actor.subject_id) throw refusal("ROLE_HOLDER_MISMATCH", "role actor does not bind the current holder context");
+  const attempt = asRow<{ origin: string; state: string; native_receipt_digest: string | null; actual_profile_digest: string | null }>(
+    db.prepare("SELECT origin, state, native_receipt_digest, actual_profile_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(
+      request.projectId,
+      generation.holder_execution_attempt_id,
+    ),
+  );
+  if (
+    !attempt ||
+    attempt.origin !== "role_holder" ||
+    attempt.state !== "done" ||
+    attempt.native_receipt_digest !== generation.holder_context_digest ||
+    attempt.actual_profile_digest !== generation.holder_executed_profile_digest
+  ) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "role holder has no complete canonical execution attempt");
+  }
 }
 
 function profileEquals(left: ExecutionProfile, right: ExecutionProfile): boolean {
@@ -1943,6 +2311,113 @@ interface EligibilityProjectionRow {
   derivation_digest: string;
 }
 
+function materializeRoleHolderAttempt(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  context: ResolvedRoleContext,
+  resolved: ResolvedRoleRequirement,
+  governanceEpoch: number,
+  roleGeneration: number,
+  holderContextDigest: string,
+): void {
+  const environment = context.baseContext.environment as { path: string; branchName: string | null };
+  const attemptEvidence = {
+    origin: "role_holder",
+    projectId: request.projectId,
+    executionAttemptId: context.holderExecutionAttemptId,
+    configRevision: resolved.configRevision,
+    governanceEpoch,
+    repoTargetId: resolved.requirement.repoTargetId,
+    roleId: resolved.requirement.roleId,
+    bbServerId: context.bbServerId,
+    threadId: context.threadId,
+    environmentId: context.environmentId,
+    sourceId: context.sourceId,
+    hostId: context.hostId,
+    providerThreadId: context.providerThreadId,
+    nativeRequestId: context.nativeRequestId,
+    requestEventId: context.requestEventId,
+    requestEventSeq: context.requestEventSeq,
+    acceptedEventId: context.acceptedEventId,
+    acceptedEventSeq: context.acceptedEventSeq,
+    startEventId: context.startEventId,
+    startEventSeq: context.startEventSeq,
+    completionEventId: context.completionEventId,
+    completionEventSeq: context.completionEventSeq,
+    actualProfileDigest: context.profileDigest,
+    holderContextDigest,
+  };
+  const attemptDigest = sha256(canonicalJson(attemptEvidence));
+  const existing = asRow<{ origin: string; state: string; attempt_digest: string; native_receipt_digest: string | null }>(
+    db.prepare("SELECT origin, state, attempt_digest, native_receipt_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(
+      request.projectId,
+      context.holderExecutionAttemptId,
+    ),
+  );
+  if (existing) {
+    if (existing.origin !== "role_holder" || existing.state !== "done" || existing.attempt_digest !== attemptDigest || existing.native_receipt_digest !== holderContextDigest) {
+      throw refusal("ROLE_HOLDER_MISMATCH", "canonical role-holder attempt conflicts with the exact holder facts");
+    }
+    return;
+  }
+  const createdAtMs = now();
+  db.prepare(
+    `INSERT INTO execution_attempts (
+      project_id, execution_attempt_id, assignment_id, origin, assignment_digest, lane_id,
+      assignment_kind, attempt_ordinal, dispatch_kind, config_revision, governance_epoch,
+      work_item_id, repo_target_id, role_id, role_generation, state, bb_server_id,
+      environment_id, source_id, host_id, environment_path, thread_id, provider_thread_id,
+      native_request_id, request_event_id, request_event_seq, accepted_event_id, accepted_event_seq,
+      first_action_event_id, first_action_event_seq, completion_event_id, completion_event_seq,
+      actual_provider_id, actual_model, actual_reasoning_level, actual_permission_mode,
+      actual_service_tier, actual_visibility, actual_profile_digest, branch_name,
+      environment_digest, native_receipt_digest, reason_code, last_event_seq,
+      created_at_ms, observed_at_ms, completed_at_ms, attempt_digest
+    ) VALUES (?, ?, NULL, 'role_holder', NULL, NULL, NULL, 1, NULL, ?, ?, NULL, ?, ?, ?,
+      'done', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+      'role_holder_observed', ?, ?, ?, ?, ?)`
+  ).run(
+    request.projectId,
+    context.holderExecutionAttemptId,
+    resolved.configRevision,
+    governanceEpoch,
+    resolved.requirement.repoTargetId,
+    resolved.requirement.roleId,
+    roleGeneration,
+    context.bbServerId,
+    context.environmentId,
+    context.sourceId,
+    context.hostId,
+    environment.path,
+    context.threadId,
+    context.providerThreadId,
+    context.nativeRequestId,
+    context.requestEventId,
+    context.requestEventSeq,
+    context.acceptedEventId,
+    context.acceptedEventSeq,
+    context.startEventId,
+    context.startEventSeq,
+    context.completionEventId,
+    context.completionEventSeq,
+    context.profile.providerId,
+    context.profile.model,
+    context.profile.reasoningLevel,
+    context.profile.permissionMode,
+    context.profile.serviceTier,
+    context.profile.visibility,
+    context.profileDigest,
+    environment.branchName,
+    sha256(canonicalJson(context.baseContext.environment)),
+    holderContextDigest,
+    context.completionEventSeq,
+    createdAtMs,
+    createdAtMs,
+    createdAtMs,
+    attemptDigest,
+  );
+}
+
 function applyRoleGenerationSuccession(
   db: SqliteDatabase,
   request: ApplyRequest,
@@ -2032,6 +2507,15 @@ function applyRoleGenerationSuccession(
     nextGeneration = request.expectedGeneration + 1;
   }
   const createdAtMs = now();
+  materializeRoleHolderAttempt(
+    db,
+    request,
+    context,
+    resolved,
+    governor.governance_epoch,
+    nextGeneration,
+    expectedContextDigest,
+  );
   db.prepare(
     `INSERT INTO role_generations (
       project_id, role_id, generation, role_requirement_id, config_revision, repo_target_id,
@@ -2811,6 +3295,773 @@ function applyGithubIssueProjection(
   }
 }
 
+type AssignmentIntent = z.infer<typeof assignmentIntentSchema>;
+type TerminalReport = z.infer<typeof terminalReportSchema>;
+
+interface AssignmentRow {
+  project_id: string;
+  assignment_id: string;
+  work_item_id: string;
+  assignment_kind: "write" | "review" | "probe";
+  lane_id: string;
+  role_requirement_id: string;
+  role_id: (typeof ROLE_IDS)[number];
+  role_generation: number;
+  config_revision: number;
+  governance_epoch: number;
+  work_item_revision: number;
+  repo_target_id: string;
+  branch_name: string;
+  base_sha: string;
+  candidate_semantics: "base" | "frozen";
+  candidate_sha: string | null;
+  bb_server_id: string;
+  environment_id: string;
+  source_id: string;
+  host_id: string;
+  environment_path: string;
+  frozen_brief_digest: string;
+  requested_provider_id: string;
+  requested_model: string;
+  requested_reasoning_level: string;
+  requested_permission_mode: string;
+  requested_service_tier: string;
+  requested_visibility: "visible";
+  requested_profile_digest: string;
+  dispatch_kind: "spawn" | "attach";
+  attach_thread_id: string | null;
+  deadline_at_ms: number;
+  assignment_digest: string;
+}
+
+interface ExecutionAttemptRow {
+  project_id: string;
+  execution_attempt_id: string;
+  assignment_id: string | null;
+  state: "prepared" | "armed" | "content_delivered" | "running" | "done" | "blocked" | "failed" | "dispatch_unknown";
+  thread_id: string | null;
+  native_request_id: string | null;
+  native_receipt_digest: string | null;
+  actual_profile_digest: string | null;
+  terminal_report_digest: string | null;
+  last_event_seq: number | null;
+}
+
+const ACTIVE_ASSIGNMENT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"] as const;
+const ACTIVE_ASSIGNMENT_SQL = "('prepared','armed','content_delivered','running','dispatch_unknown')";
+
+function requestedProfile(assignment: AssignmentRow): ExecutionProfile {
+  return {
+    providerId: assignment.requested_provider_id,
+    model: assignment.requested_model,
+    reasoningLevel: assignment.requested_reasoning_level,
+    permissionMode: assignment.requested_permission_mode,
+    serviceTier: assignment.requested_service_tier,
+    visibility: assignment.requested_visibility,
+  };
+}
+
+function assignmentEnvironmentDigest(assignment: Pick<AssignmentIntent, "environment" | "branchName" | "baseSha" | "candidateSha">): string {
+  return sha256(canonicalJson({
+    ...assignment.environment,
+    branchName: assignment.branchName,
+    baseSha: assignment.baseSha,
+    candidateSha: assignment.candidateSha,
+  }));
+}
+
+function immutableAssignmentDigest(
+  assignment: AssignmentIntent,
+  projectId: string,
+  configRevision: number,
+  governanceEpoch: number,
+  workItemRevision: number,
+  repoTargetId: string,
+): string {
+  const { assignmentId: _assignmentId, ...intent } = assignment;
+  return sha256(canonicalJson({ projectId, configRevision, governanceEpoch, workItemRevision, repoTargetId, intent }));
+}
+
+function assignmentRows(db: SqliteDatabase, request: ApplyRequest): { assignment: AssignmentRow; attempt: ExecutionAttemptRow } {
+  if (!request.assignmentId || !request.executionAttemptId) throw refusal("INVALID_INPUT", "assignment and execution attempt identities are required");
+  const assignment = asRow<AssignmentRow>(
+    db.prepare("SELECT * FROM assignments WHERE project_id = ? AND assignment_id = ?").get(request.projectId, request.assignmentId),
+  );
+  const attempt = asRow<ExecutionAttemptRow>(
+    db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(request.projectId, request.executionAttemptId),
+  );
+  if (!assignment || !attempt || attempt.assignment_id !== assignment.assignment_id) {
+    throw refusal("RESOURCE_UNKNOWN", "assignment or canonical execution attempt is unavailable");
+  }
+  return { assignment, attempt };
+}
+
+function requireCanonicalRoleGeneration(
+  db: SqliteDatabase,
+  projectId: string,
+  roleId: string,
+  roleGeneration: number,
+  roleRequirementId: string,
+): void {
+  const head = asRow<{ current_generation: number }>(
+    db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(projectId, roleId),
+  );
+  const generation = asRow<{ status: string; role_requirement_id: string; holder_execution_attempt_id: string }>(
+    db.prepare("SELECT status, role_requirement_id, holder_execution_attempt_id FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?").get(
+      projectId,
+      roleId,
+      roleGeneration,
+    ),
+  );
+  if (!head || head.current_generation !== roleGeneration) throw refusal("ROLE_GENERATION_STALE", "assignment role generation is not current");
+  if (!generation || generation.status !== "active") throw refusal("ROLE_NOT_ACTIVE", "assignment role generation is not active");
+  if (generation.role_requirement_id !== roleRequirementId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement does not match its generation");
+  const holder = asRow<{ origin: string; state: string; native_receipt_digest: string | null }>(
+    db.prepare("SELECT origin, state, native_receipt_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(
+      projectId,
+      generation.holder_execution_attempt_id,
+    ),
+  );
+  if (!holder || holder.origin !== "role_holder" || holder.state !== "done" || !holder.native_receipt_digest) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "assignment role holder has no complete canonical execution attempt");
+  }
+}
+
+function requireAssignmentActor(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  roleId: string,
+  roleGeneration: number,
+): void {
+  const actor = asRow<{ actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null }>(
+    db.prepare("SELECT actor_kind, subject_id, role_id, role_generation FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(
+      request.projectId,
+      request.actorReceiptId,
+    ),
+  );
+  const generation = asRow<{ holder_execution_attempt_id: string }>(
+    db.prepare("SELECT holder_execution_attempt_id FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?").get(
+      request.projectId,
+      roleId,
+      roleGeneration,
+    ),
+  );
+  if (
+    !actor || actor.actor_kind !== "role" || actor.role_id !== roleId || actor.role_generation !== roleGeneration ||
+    !generation || actor.subject_id !== generation.holder_execution_attempt_id
+  ) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "assignment actor is not the exact current role holder");
+  }
+}
+
+function revalidateAssignmentAuthority(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  assignment: AssignmentRow,
+): { actorReceiptId: string; governor: { governance_epoch: number; fence_token: string; state: string } } {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request);
+  requireAssignmentActor(db, request, assignment.role_id, assignment.role_generation);
+  if (configRevision !== assignment.config_revision || governor.governance_epoch !== assignment.governance_epoch) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "assignment config or governance head moved");
+  }
+  requireCanonicalRoleGeneration(db, request.projectId, assignment.role_id, assignment.role_generation, assignment.role_requirement_id);
+  const workItem = requireWorkItem(db, { ...request, workItemId: assignment.work_item_id, repoTargetId: assignment.repo_target_id, expectedResourceRevision: assignment.work_item_revision }, configRevision, assignment.work_item_revision);
+  if (workItem.resource_revision !== assignment.work_item_revision) throw refusal("ASSIGNMENT_HEAD_STALE", "assignment WorkItem revision moved");
+  const target = requireTarget(db, request.projectId, configRevision, assignment.repo_target_id) as { source_id: string; host_id: string; path: string };
+  if (target.source_id !== assignment.source_id || target.host_id !== assignment.host_id || target.path !== assignment.environment_path) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment environment no longer matches its exact target");
+  }
+  return { actorReceiptId, governor };
+}
+
+function preflightAssignmentPrepare(db: SqliteDatabase, request: ApplyRequest): void {
+  const assignment = request.assignment;
+  if (!assignment) throw refusal("INVALID_INPUT", "assignment_prepare requires immutable assignment intent");
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  requireActor(db, request);
+  requireRoleActorBinding(db, request);
+  requireAssignmentActor(db, request, assignment.roleId, assignment.roleGeneration);
+  if (assignment.requestedProfile.permissionMode !== "full" || assignment.requestedProfile.visibility !== "visible") {
+    throw refusal("EXECUTION_PROFILE_MISMATCH", "assignment requires explicit full permission and visible execution");
+  }
+  if (assignment.assignmentKind === "write" ? assignment.candidateSemantics !== "base" : assignment.candidateSemantics !== "frozen") {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "assignment candidate semantics do not match its kind");
+  }
+  if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "assignment requires one exact repository target");
+  const workItem = requireWorkItem(db, { ...request, workItemId: assignment.workItemId }, configRevision);
+  if (assignment.assignmentKind === "write" ? !["ready", "in_progress"].includes(workItem.lifecycle_state) : workItem.lifecycle_state !== "in_progress") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "WorkItem state does not permit this assignment kind");
+  }
+  const target = requireTarget(db, request.projectId, configRevision, request.repoTargetId) as { source_id: string; host_id: string; path: string };
+  if (target.source_id !== assignment.environment.sourceId || target.host_id !== assignment.environment.hostId || target.path !== assignment.environment.path) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment environment does not match the exact repository target");
+  }
+  requireCanonicalRoleGeneration(db, request.projectId, assignment.roleId, assignment.roleGeneration, assignment.roleRequirementId);
+  const requirement = roleRequirementsFromJson(storedConfigJson(db, request.projectId, configRevision))
+    .find((candidate) => candidate.roleRequirementId === assignment.roleRequirementId);
+  if (!requirement || requirement.roleId !== assignment.roleId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement is not configured");
+  if (requirement.repoTargetId !== null && requirement.repoTargetId !== request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "assignment role requirement targets another repository");
+  if (!profileEquals(requirement.executedProfile, assignment.requestedProfile)) throw refusal("EXECUTION_PROFILE_MISMATCH", "requested assignment profile does not match the role requirement");
+  const activeWriters = asRow<{ count: number }>(db.prepare(
+    `SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND origin = 'assignment'
+     AND assignment_kind = 'write' AND state IN ${ACTIVE_ASSIGNMENT_SQL}`,
+  ).get(request.projectId))?.count ?? 0;
+  const laneOccupied = db.prepare(
+    `SELECT 1 FROM execution_attempts WHERE project_id = ? AND lane_id = ? AND origin = 'assignment'
+     AND assignment_kind = 'write' AND state IN ${ACTIVE_ASSIGNMENT_SQL}`,
+  ).get(request.projectId, assignment.laneId);
+  const ceiling = writingLaneCeilingFromJson(storedConfigJson(db, request.projectId, configRevision));
+  if (assignment.assignmentKind === "write" && (laneOccupied || activeWriters >= ceiling)) {
+    throw refusal("LANE_WRITER_EXISTS", "writing lane or project writing ceiling is occupied", { expected: ceiling, attempted: activeWriters, verified: activeWriters });
+  }
+  const assignmentDigest = immutableAssignmentDigest(
+    assignment,
+    request.projectId,
+    configRevision,
+    governor.governance_epoch,
+    workItem.resource_revision,
+    request.repoTargetId,
+  );
+  if (db.prepare(`SELECT 1 FROM execution_attempts WHERE project_id = ? AND assignment_digest = ? AND state IN ${ACTIVE_ASSIGNMENT_SQL}`).get(request.projectId, assignmentDigest)) {
+    throw refusal("LANE_WRITER_EXISTS", "an unresolved attempt already owns this immutable assignment intent");
+  }
+  if (db.prepare("SELECT 1 FROM assignments WHERE project_id = ? AND assignment_id = ?").get(request.projectId, assignment.assignmentId)) {
+    throw refusal("IDEMPOTENCY_KEY_CONFLICT", "assignment identity is immutable and already exists");
+  }
+}
+
+function applyAssignmentPrepare(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+  inspection: NativeAssignmentInspection,
+): FoundationResult {
+  const assignment = request.assignment;
+  if (!assignment) throw refusal("INVALID_INPUT", "assignment_prepare requires immutable assignment intent");
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request);
+  requireAssignmentActor(db, request, assignment.roleId, assignment.roleGeneration);
+  if (assignment.requestedProfile.permissionMode !== "full" || assignment.requestedProfile.visibility !== "visible") {
+    throw refusal("EXECUTION_PROFILE_MISMATCH", "assignment requires explicit full permission and visible execution");
+  }
+  if (assignment.assignmentKind === "write" ? assignment.candidateSemantics !== "base" : assignment.candidateSemantics !== "frozen") {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "assignment candidate semantics do not match its kind");
+  }
+  if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "assignment requires one exact repository target");
+  if (
+    inspection.bbServerId !== assignment.environment.bbServerId ||
+    inspection.projectId !== request.projectId ||
+    inspection.environmentId !== assignment.environment.environmentId ||
+    inspection.sourceId !== assignment.environment.sourceId ||
+    inspection.hostId !== assignment.environment.hostId ||
+    inspection.environmentPath !== assignment.environment.path ||
+    inspection.environmentMode !== assignment.environment.mode ||
+    inspection.branchName !== assignment.branchName ||
+    inspection.baseSha !== assignment.baseSha ||
+    inspection.headSha !== (assignment.candidateSha ?? assignment.baseSha) ||
+    inspection.candidateSha !== assignment.candidateSha
+  ) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "typed BB/Git facts do not match the exact assignment environment and head");
+  }
+  if (
+    assignment.dispatchKind === "attach" &&
+    (inspection.threadId !== assignment.attachThreadId || inspection.threadProviderId !== assignment.requestedProfile.providerId || inspection.threadVisibility !== "visible")
+  ) {
+    throw refusal(inspection.threadVisibility === "hidden" ? "ROLE_CONTEXT_HIDDEN" : "EXECUTION_CONTEXT_FOREIGN", "attach thread does not match the exact visible assignment context");
+  }
+  if (assignment.dispatchKind === "spawn" && (inspection.threadId !== null || inspection.threadProviderId !== null || inspection.threadVisibility !== null)) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "spawn preparation cannot adopt an existing thread");
+  }
+  const workItem = requireWorkItem(
+    db,
+    { ...request, workItemId: assignment.workItemId, expectedResourceRevision: request.expectedResourceRevision },
+    configRevision,
+  );
+  if (assignment.assignmentKind === "write" && !["ready", "in_progress"].includes(workItem.lifecycle_state)) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "write assignment requires a ready or in-progress WorkItem");
+  }
+  if (assignment.assignmentKind !== "write" && workItem.lifecycle_state !== "in_progress") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "review and probe assignments require an in-progress WorkItem");
+  }
+  const target = requireTarget(db, request.projectId, configRevision, request.repoTargetId) as { source_id: string; host_id: string; path: string };
+  if (
+    target.source_id !== assignment.environment.sourceId ||
+    target.host_id !== assignment.environment.hostId ||
+    target.path !== assignment.environment.path
+  ) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment environment does not match the exact repository target");
+  }
+  requireCanonicalRoleGeneration(db, request.projectId, assignment.roleId, assignment.roleGeneration, assignment.roleRequirementId);
+  const requirements = roleRequirementsFromJson(storedConfigJson(db, request.projectId, configRevision));
+  const requirement = requirements.find((candidate) => candidate.roleRequirementId === assignment.roleRequirementId);
+  if (!requirement || requirement.roleId !== assignment.roleId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement is not configured");
+  if (requirement.repoTargetId !== null && requirement.repoTargetId !== request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "assignment role requirement targets another repository");
+  if (!profileEquals(requirement.executedProfile, assignment.requestedProfile)) throw refusal("EXECUTION_PROFILE_MISMATCH", "requested assignment profile does not match the role requirement");
+  const configJson = storedConfigJson(db, request.projectId, configRevision);
+  const ceiling = writingLaneCeilingFromJson(configJson);
+  const activeWriterRows = db.prepare(
+    `SELECT execution_attempt_id, lane_id FROM execution_attempts
+     WHERE project_id = ? AND origin = 'assignment' AND assignment_kind = 'write' AND state IN ${ACTIVE_ASSIGNMENT_SQL}
+     ORDER BY lane_id, execution_attempt_id`,
+  ).all(request.projectId) as Array<{ execution_attempt_id: string; lane_id: string }>;
+  const laneHolder = activeWriterRows.find((row) => row.lane_id === assignment.laneId);
+  if (assignment.assignmentKind === "write" && (laneHolder || activeWriterRows.length >= ceiling)) {
+    throw refusal("LANE_WRITER_EXISTS", "writing lane or project writing ceiling is occupied", {
+      expected: ceiling,
+      attempted: activeWriterRows.length,
+      verified: activeWriterRows.length,
+    });
+  }
+  const assignmentDigest = immutableAssignmentDigest(
+    assignment,
+    request.projectId,
+    configRevision,
+    governor.governance_epoch,
+    workItem.resource_revision,
+    request.repoTargetId,
+  );
+  const unresolvedIntent = asRow<{ execution_attempt_id: string }>(
+    db.prepare(`SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND assignment_digest = ? AND state IN ${ACTIVE_ASSIGNMENT_SQL}`).get(
+      request.projectId,
+      assignmentDigest,
+    ),
+  );
+  if (unresolvedIntent) throw refusal("LANE_WRITER_EXISTS", "an unresolved attempt already owns this immutable assignment intent");
+  if (db.prepare("SELECT 1 FROM assignments WHERE project_id = ? AND assignment_id = ?").get(request.projectId, assignment.assignmentId)) {
+    throw refusal("IDEMPOTENCY_KEY_CONFLICT", "assignment identity is immutable and already exists");
+  }
+  const executionAttemptId = sha256(canonicalJson({ projectId: request.projectId, assignmentDigest, attemptOrdinal: 1 }));
+  const profileDigest = sha256(canonicalJson(assignment.requestedProfile));
+  const environmentDigest = assignmentEnvironmentDigest(assignment);
+  const eventSequence = nextEventSequence(db, request.projectId);
+  const createdAtMs = now();
+  db.prepare(
+    `INSERT INTO assignments (
+      project_id, assignment_id, work_item_id, assignment_kind, lane_id, role_requirement_id,
+      role_id, role_generation, config_revision, governance_epoch, work_item_revision,
+      repo_target_id, branch_name, base_sha, candidate_semantics, candidate_sha, bb_server_id,
+      environment_id, source_id, host_id, environment_path, environment_mode,
+      frozen_brief_version, frozen_brief_digest, requested_provider_id, requested_model,
+      requested_reasoning_level, requested_permission_mode, requested_service_tier,
+      requested_visibility, requested_profile_digest, dispatch_kind, attach_thread_id,
+      parent_assignment_id, depth, deadline_at_ms, assignment_digest, idempotency_key,
+      creation_event_sequence, created_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'managed-worktree',
+      ?, ?, ?, ?, ?, ?, ?, 'visible', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`
+  ).run(
+    request.projectId, assignment.assignmentId, assignment.workItemId, assignment.assignmentKind,
+    assignment.laneId, assignment.roleRequirementId, assignment.roleId, assignment.roleGeneration,
+    configRevision, governor.governance_epoch, workItem.resource_revision, request.repoTargetId,
+    assignment.branchName, assignment.baseSha, assignment.candidateSemantics, assignment.candidateSha,
+    assignment.environment.bbServerId, assignment.environment.environmentId, assignment.environment.sourceId,
+    assignment.environment.hostId, assignment.environment.path, assignment.frozenBriefVersion,
+    assignment.frozenBriefDigest, assignment.requestedProfile.providerId, assignment.requestedProfile.model,
+    assignment.requestedProfile.reasoningLevel, assignment.requestedProfile.permissionMode,
+    assignment.requestedProfile.serviceTier, profileDigest, assignment.dispatchKind,
+    assignment.attachThreadId, assignment.parentAssignmentId, assignment.deadlineAtMs, assignmentDigest,
+    request.idempotencyKey, eventSequence, createdAtMs,
+  );
+  const attemptDigest = sha256(canonicalJson({ projectId: request.projectId, executionAttemptId, assignmentDigest, state: "prepared" }));
+  db.prepare(
+    `INSERT INTO execution_attempts (
+      project_id, execution_attempt_id, assignment_id, origin, assignment_digest, lane_id,
+      assignment_kind, attempt_ordinal, dispatch_kind, config_revision, governance_epoch,
+      work_item_id, repo_target_id, role_id, role_generation, state, bb_server_id,
+      environment_id, source_id, host_id, environment_path, thread_id, frozen_brief_digest,
+      branch_name, base_sha, candidate_sha, environment_digest, created_at_ms, attempt_digest
+    ) VALUES (?, ?, ?, 'assignment', ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    request.projectId, executionAttemptId, assignment.assignmentId, assignmentDigest, assignment.laneId,
+    assignment.assignmentKind, assignment.dispatchKind, configRevision, governor.governance_epoch,
+    assignment.workItemId, request.repoTargetId, assignment.roleId, assignment.roleGeneration,
+    assignment.environment.bbServerId, assignment.environment.environmentId, assignment.environment.sourceId,
+    assignment.environment.hostId, assignment.environment.path, assignment.attachThreadId,
+    assignment.frozenBriefDigest, assignment.branchName, assignment.baseSha, assignment.candidateSha,
+    environmentDigest, createdAtMs, attemptDigest,
+  );
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    { aggregateType: "assignment", aggregateId: assignment.assignmentId, aggregateRevision: 1, eventType: "assignment_prepared", event: { assignmentId: assignment.assignmentId, executionAttemptId, assignmentDigest, laneId: assignment.laneId, assignmentKind: assignment.assignmentKind } },
+    { expected: 2, attempted: 2, verified: 2 },
+    { currentConfigRevision: configRevision, currentGovernanceEpoch: governor.governance_epoch, currentResourceRevision: workItem.resource_revision, evidence: { assignmentId: assignment.assignmentId, executionAttemptId, assignmentDigest, requestedProfileDigest: profileDigest, environmentDigest, activeWriterCount: activeWriterRows.length + (assignment.assignmentKind === "write" ? 1 : 0), writingLaneCeiling: ceiling } },
+  );
+}
+
+function nativeAssignmentInput(assignment: AssignmentRow, attempt: ExecutionAttemptRow, frozenBriefContent: string): NativeAssignmentInput {
+  return {
+    projectId: assignment.project_id,
+    assignmentId: assignment.assignment_id,
+    executionAttemptId: attempt.execution_attempt_id,
+    assignmentKind: assignment.assignment_kind,
+    dispatchKind: assignment.dispatch_kind,
+    attachThreadId: assignment.attach_thread_id,
+    repoTargetId: assignment.repo_target_id,
+    branchName: assignment.branch_name,
+    baseSha: assignment.base_sha,
+    candidateSha: assignment.candidate_sha,
+    environment: {
+      bbServerId: assignment.bb_server_id,
+      environmentId: assignment.environment_id,
+      sourceId: assignment.source_id,
+      hostId: assignment.host_id,
+      path: assignment.environment_path,
+      mode: "managed-worktree",
+    },
+    requestedProfile: requestedProfile(assignment),
+    frozenBriefContent,
+    frozenBriefDigest: assignment.frozen_brief_digest,
+  };
+}
+
+function positiveNativeEvidence(
+  assignment: AssignmentRow,
+  attempt: ExecutionAttemptRow,
+  evidence: NativeAssignmentEvidence,
+): { profile: ExecutionProfile; profileDigest: string; nativeReceiptDigest: string; state: "content_delivered" | "running" } {
+  const requiredStrings = [
+    evidence.assignmentId,
+    evidence.executionAttemptId,
+    evidence.bbServerId,
+    evidence.projectId,
+    evidence.environmentId,
+    evidence.sourceId,
+    evidence.hostId,
+    evidence.environmentPath,
+    evidence.threadId,
+    evidence.providerThreadId,
+    evidence.nativeRequestId,
+    evidence.requestEventId,
+    evidence.acceptedEventId,
+    evidence.firstActionEventId,
+    evidence.contentEventId,
+    evidence.contentDigest,
+    evidence.branchName,
+    evidence.baseSha,
+  ];
+  if (requiredStrings.some((value) => !stringField(value)) || !evidence.actualProfile) {
+    throw refusal("DISPATCH_UNKNOWN", "native evidence lacks exact first-action, content, context, or profile facts");
+  }
+  if (
+    evidence.assignmentId !== assignment.assignment_id ||
+    evidence.executionAttemptId !== attempt.execution_attempt_id ||
+    evidence.bbServerId !== assignment.bb_server_id ||
+    evidence.projectId !== assignment.project_id ||
+    evidence.environmentId !== assignment.environment_id ||
+    evidence.sourceId !== assignment.source_id ||
+    evidence.hostId !== assignment.host_id ||
+    evidence.environmentPath !== assignment.environment_path ||
+    evidence.branchName !== assignment.branch_name ||
+    evidence.baseSha !== assignment.base_sha ||
+    evidence.candidateSha !== assignment.candidate_sha ||
+    (attempt.thread_id !== null && evidence.threadId !== attempt.thread_id) ||
+    (attempt.native_request_id !== null && evidence.nativeRequestId !== attempt.native_request_id)
+  ) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "native evidence belongs to another exact execution context");
+  }
+  if (evidence.contentDigest !== assignment.frozen_brief_digest) {
+    throw refusal("DISPATCH_UNKNOWN", "native content receipt does not bind the exact frozen brief");
+  }
+  if (!profileEquals(evidence.actualProfile, requestedProfile(assignment))) {
+    throw refusal("EXECUTION_PROFILE_MISMATCH", "actual execution profile does not match the requested profile");
+  }
+  if (
+    !evidence.requestEventSeq || !evidence.acceptedEventSeq || !evidence.firstActionEventSeq || !evidence.contentEventSeq ||
+    !(evidence.requestEventSeq < evidence.acceptedEventSeq && evidence.acceptedEventSeq <= evidence.firstActionEventSeq && evidence.firstActionEventSeq <= evidence.contentEventSeq)
+  ) {
+    throw refusal("DISPATCH_UNKNOWN", "native event correlation is absent or ambiguously ordered");
+  }
+  const profileDigest = sha256(canonicalJson(evidence.actualProfile));
+  const nativeReceiptDigest = sha256(canonicalJson({
+    projectId: assignment.project_id,
+    assignmentId: assignment.assignment_id,
+    threadId: evidence.threadId,
+    providerThreadId: evidence.providerThreadId,
+    nativeRequestId: evidence.nativeRequestId,
+    requestEventId: evidence.requestEventId,
+    requestEventSeq: evidence.requestEventSeq,
+    acceptedEventId: evidence.acceptedEventId,
+    acceptedEventSeq: evidence.acceptedEventSeq,
+    firstActionEventId: evidence.firstActionEventId,
+    firstActionEventSeq: evidence.firstActionEventSeq,
+    contentEventId: evidence.contentEventId,
+    contentEventSeq: evidence.contentEventSeq,
+    contentDigest: evidence.contentDigest,
+    actualProfileDigest: profileDigest,
+  }));
+  return { profile: evidence.actualProfile, profileDigest, nativeReceiptDigest, state: "content_delivered" };
+}
+
+function recordNativeEvidence(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+  assignment: AssignmentRow,
+  attempt: ExecutionAttemptRow,
+  evidence: NativeAssignmentEvidence,
+  operation: "dispatch" | "reconcile",
+): FoundationResult {
+  return transaction(db, () => {
+    const replay = checkIdempotency(db, request, digest);
+    if (replay) return replay;
+    const current = assignmentRows(db, request);
+    if (current.attempt.state !== attempt.state || current.attempt.thread_id !== attempt.thread_id || current.attempt.native_request_id !== attempt.native_request_id) {
+      throw refusal("ASSIGNMENT_HEAD_STALE", "attempt state moved before native evidence was recorded");
+    }
+    const authority = revalidateAssignmentAuthority(db, request, current.assignment);
+    const observedAtMs = evidence.observedAtMs ?? now();
+    let positive: ReturnType<typeof positiveNativeEvidence> | null = null;
+    let outcome: FoundationCode = "DISPATCH_UNKNOWN";
+    let state: ExecutionAttemptRow["state"] = "dispatch_unknown";
+    let reasonCode = evidence.reasonCode || "dispatch_unknown";
+    const observedProfile = evidence.actualProfile ?? null;
+    const observedProfileDigest = observedProfile ? sha256(canonicalJson(observedProfile)) : null;
+    try {
+      if (evidence.disposition === "confirmed") {
+        positive = positiveNativeEvidence(current.assignment, current.attempt, evidence);
+        outcome = "OK";
+        state = positive.state;
+      } else if (evidence.disposition === "refused") {
+        state = "failed";
+        outcome = "EXECUTION_PROFILE_UNKNOWN";
+      }
+    } catch (error) {
+      if (error instanceof Refusal && ["EXECUTION_PROFILE_MISMATCH", "EXECUTION_CONTEXT_FOREIGN"].includes(error.data.code)) {
+        reasonCode = error.data.code;
+        outcome = error.data.code;
+      }
+      state = "dispatch_unknown";
+    }
+    const terminalDeadlineReason = observedAtMs > current.assignment.deadline_at_ms ? "assignment_deadline_exceeded" : reasonCode;
+    const updated = db.prepare(
+      `UPDATE execution_attempts SET state = ?, thread_id = COALESCE(thread_id, ?),
+       provider_thread_id = COALESCE(provider_thread_id, ?), native_request_id = COALESCE(native_request_id, ?),
+       request_event_id = COALESCE(request_event_id, ?), request_event_seq = COALESCE(request_event_seq, ?),
+       accepted_event_id = COALESCE(accepted_event_id, ?), accepted_event_seq = COALESCE(accepted_event_seq, ?),
+       first_action_event_id = COALESCE(first_action_event_id, ?), first_action_event_seq = COALESCE(first_action_event_seq, ?),
+       content_event_id = COALESCE(content_event_id, ?), content_event_seq = COALESCE(content_event_seq, ?),
+       content_receipt_digest = COALESCE(content_receipt_digest, ?),
+       actual_provider_id = COALESCE(actual_provider_id, ?), actual_model = COALESCE(actual_model, ?),
+       actual_reasoning_level = COALESCE(actual_reasoning_level, ?), actual_permission_mode = COALESCE(actual_permission_mode, ?),
+       actual_service_tier = COALESCE(actual_service_tier, ?), actual_visibility = COALESCE(actual_visibility, ?),
+       actual_profile_digest = COALESCE(actual_profile_digest, ?), native_receipt_digest = COALESCE(native_receipt_digest, ?),
+       reason_code = ?, last_event_seq = ?, observed_at_ms = ?
+       WHERE project_id = ? AND execution_attempt_id = ? AND state = ?
+         AND thread_id IS ? AND native_request_id IS ?`,
+    ).run(
+      state, evidence.threadId ?? null, evidence.providerThreadId ?? null, evidence.nativeRequestId ?? null,
+      evidence.requestEventId ?? null, evidence.requestEventSeq ?? null, evidence.acceptedEventId ?? null,
+      evidence.acceptedEventSeq ?? null, evidence.firstActionEventId ?? null, evidence.firstActionEventSeq ?? null,
+      evidence.contentEventId ?? null, evidence.contentEventSeq ?? null, evidence.contentDigest ?? null,
+      (positive?.profile ?? observedProfile)?.providerId ?? null, (positive?.profile ?? observedProfile)?.model ?? null,
+      (positive?.profile ?? observedProfile)?.reasoningLevel ?? null, (positive?.profile ?? observedProfile)?.permissionMode ?? null,
+      (positive?.profile ?? observedProfile)?.serviceTier ?? null, (positive?.profile ?? observedProfile)?.visibility ?? null,
+      positive?.profileDigest ?? observedProfileDigest, positive?.nativeReceiptDigest ?? null, terminalDeadlineReason,
+      evidence.lastEventSeq ?? evidence.contentEventSeq ?? null, observedAtMs, request.projectId,
+      current.attempt.execution_attempt_id, current.attempt.state, current.attempt.thread_id, current.attempt.native_request_id,
+    );
+    if (updated.changes !== 1) throw refusal("ASSIGNMENT_HEAD_STALE", "attempt native-evidence compare-and-swap failed");
+    return commitMutation(
+      db,
+      request,
+      digest,
+      authority.actorReceiptId,
+      { aggregateType: "execution_attempt", aggregateId: current.attempt.execution_attempt_id, aggregateRevision: 2, eventType: state === "dispatch_unknown" ? "assignment_dispatch_unknown" : state === "failed" ? "assignment_dispatch_failed" : "assignment_content_delivered", event: { assignmentId: current.assignment.assignment_id, executionAttemptId: current.attempt.execution_attempt_id, operation, state, reasonCode: terminalDeadlineReason, nativeRequestId: evidence.nativeRequestId ?? null, threadId: evidence.threadId ?? null, lastEventSeq: evidence.lastEventSeq ?? null } },
+      { expected: 1, attempted: 1, verified: outcome === "OK" ? 1 : 0 },
+      { currentConfigRevision: current.assignment.config_revision, currentGovernanceEpoch: authority.governor.governance_epoch, evidence: { assignmentId: current.assignment.assignment_id, executionAttemptId: current.attempt.execution_attempt_id, state, reasonCode: terminalDeadlineReason, nativeReceiptDigest: positive?.nativeReceiptDigest ?? null, actualProfileDigest: positive?.profileDigest ?? observedProfileDigest, threadId: evidence.threadId ?? null, nativeRequestId: evidence.nativeRequestId ?? null, lastEventSeq: evidence.lastEventSeq ?? null } },
+      outcome,
+    );
+  });
+}
+
+function applyAssignmentNative(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+  adapter: NativeAssignmentAdapter | null,
+  operation: "dispatch" | "reconcile",
+): FoundationResult {
+  try {
+    const replay = checkIdempotency(db, request, digest);
+    if (replay) return replay;
+    const { assignment, attempt } = transaction(db, () => {
+      const replayInTransaction = checkIdempotency(db, request, digest);
+      if (replayInTransaction) throw refusal("IDEMPOTENCY_KEY_CONFLICT", "assignment operation was concurrently committed");
+      const rows = assignmentRows(db, request);
+      revalidateAssignmentAuthority(db, request, rows.assignment);
+      if (operation === "dispatch" && rows.attempt.state !== "prepared") {
+        throw refusal(rows.attempt.state === "dispatch_unknown" ? "DISPATCH_UNKNOWN" : "ASSIGNMENT_HEAD_STALE", "assignment attempt is not dispatchable");
+      }
+      if (operation === "reconcile" && rows.attempt.state !== "dispatch_unknown") {
+        throw refusal("ASSIGNMENT_HEAD_STALE", "only an ambiguous dispatch may be reconciled");
+      }
+      return rows;
+    });
+    if (!adapter) return result("DISPATCH_UNKNOWN", request.projectId, 1, 0, 0, { message: "native assignment adapter is unavailable" });
+    const frozenBriefContent = request.frozenBriefContent;
+    if (!frozenBriefContent || sha256(frozenBriefContent) !== assignment.frozen_brief_digest) {
+      return result("ASSIGNMENT_HEAD_STALE", request.projectId, 1, 0, 0, { message: "exact frozen brief content does not match immutable intent" });
+    }
+    const input = nativeAssignmentInput(assignment, attempt, frozenBriefContent);
+    let evidence: NativeAssignmentEvidence;
+    try {
+      evidence = operation === "dispatch"
+        ? adapter.dispatch(input)
+        : adapter.reconcile({ ...input, threadId: attempt.thread_id, nativeRequestId: attempt.native_request_id });
+    } catch {
+      evidence = { disposition: "ambiguous", reasonCode: "native_transport_ambiguous", threadId: attempt.thread_id ?? undefined, nativeRequestId: attempt.native_request_id ?? undefined };
+    }
+    return recordNativeEvidence(db, request, digest, assignment, attempt, evidence, operation);
+  } catch (error) {
+    if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal assignment mutation error" });
+  }
+}
+
+function terminalCorrelationMatches(assignment: AssignmentRow, attempt: ExecutionAttemptRow, report: TerminalReport): boolean {
+  return (
+    report.projectId === assignment.project_id &&
+    report.assignmentId === assignment.assignment_id &&
+    report.executionAttemptId === attempt.execution_attempt_id &&
+    report.workItemId === assignment.work_item_id &&
+    report.roleId === assignment.role_id &&
+    report.roleGeneration === assignment.role_generation &&
+    report.repoTargetId === assignment.repo_target_id &&
+    report.environmentId === assignment.environment_id &&
+    report.threadId === attempt.thread_id &&
+    report.branchName === assignment.branch_name &&
+    report.baseSha === assignment.base_sha &&
+    report.nativeReceiptDigest === attempt.native_receipt_digest &&
+    report.actualProfileDigest === attempt.actual_profile_digest &&
+    (assignment.candidate_semantics === "base" || report.candidateSha === assignment.candidate_sha) &&
+    report.receiptEventSeq > (attempt.last_event_seq ?? 0) &&
+    report.reportedAtMs <= report.receivedAtMs
+  );
+}
+
+function applyAssignmentTerminal(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
+  const report = request.terminalReport;
+  if (!report) throw refusal("TERMINAL_REPORT_REQUIRED", "assignment terminal mutation requires one exact versioned report");
+  const { assignment, attempt } = assignmentRows(db, request);
+  const reportDigest = sha256(canonicalJson(report));
+  if (attempt.terminal_report_digest) {
+    if (attempt.terminal_report_digest === reportDigest) {
+      const original = asRow<{ outcome_json: string }>(
+        db.prepare("SELECT outcome_json FROM mutation_receipts WHERE project_id = ? AND operation_class = 'assignment_terminal' AND json_extract(outcome_json, '$.evidence.terminalReportDigest') = ? ORDER BY created_at_ms LIMIT 1").get(
+          request.projectId,
+          reportDigest,
+        ),
+      );
+      if (original) return JSON.parse(original.outcome_json) as FoundationResult;
+    }
+    const authority = revalidateAssignmentAuthority(db, request, assignment);
+    db.prepare(
+      `UPDATE execution_attempts SET state = 'running', terminal_result = NULL,
+       conflicting_terminal_digest = ?, reason_code = 'terminal_report_ambiguous'
+       WHERE project_id = ? AND execution_attempt_id = ?`,
+    ).run(reportDigest, request.projectId, attempt.execution_attempt_id);
+    return commitMutation(
+      db,
+      request,
+      digest,
+      authority.actorReceiptId,
+      { aggregateType: "execution_attempt", aggregateId: attempt.execution_attempt_id, aggregateRevision: 4, eventType: "assignment_terminal_ambiguous", event: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, terminalReportDigest: attempt.terminal_report_digest, conflictingTerminalDigest: reportDigest } },
+      { expected: 1, attempted: 1, verified: 0 },
+      { message: "terminal evidence conflicts with the retained report", currentConfigRevision: assignment.config_revision, currentGovernanceEpoch: authority.governor.governance_epoch, evidence: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, terminalReportDigest: attempt.terminal_report_digest, conflictingTerminalDigest: reportDigest } },
+      "TERMINAL_REPORT_AMBIGUOUS",
+    );
+  }
+  if (attempt.state === "dispatch_unknown") throw refusal("DISPATCH_UNKNOWN", "ambiguous dispatch must be reconciled before terminal evidence");
+  if (!attempt.native_receipt_digest || !attempt.actual_profile_digest || !attempt.thread_id || !terminalCorrelationMatches(assignment, attempt, report)) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "terminal report does not match the exact assignment, native receipt, or executed profile");
+  }
+  if (report.candidateObservationDigest !== sha256(canonicalJson({ branchName: report.branchName, baseSha: report.baseSha, candidateSha: report.candidateSha }))) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "terminal candidate observation digest is invalid");
+  }
+  const authority = revalidateAssignmentAuthority(db, request, assignment);
+  const late = report.receivedAtMs > assignment.deadline_at_ms;
+  const state = late || report.outcome === "BLOCKED" ? "blocked" : "done";
+  const terminalResult = late ? "BLOCKED" : report.outcome;
+  const reasonCode = late ? "terminal_report_late" : report.reasonCode;
+  const updated = db.prepare(
+    `UPDATE execution_attempts SET state = ?, terminal_result = ?, reported_outcome = ?, terminal_report_digest = ?,
+     terminal_event_id = ?, terminal_event_seq = ?, candidate_sha = ?, reason_code = ?,
+     completed_at_ms = ?, observed_at_ms = ?, last_event_seq = ?
+     WHERE project_id = ? AND execution_attempt_id = ? AND state IN ('armed', 'content_delivered', 'running', 'failed')
+       AND terminal_report_digest IS NULL`,
+  ).run(
+    state,
+    terminalResult,
+    report.outcome,
+    reportDigest,
+    report.receiptEventId,
+    report.receiptEventSeq,
+    report.candidateSha,
+    reasonCode,
+    report.receivedAtMs,
+    report.receivedAtMs,
+    report.receiptEventSeq,
+    request.projectId,
+    attempt.execution_attempt_id,
+  );
+  if (updated.changes !== 1) throw refusal("ASSIGNMENT_HEAD_STALE", "terminal attempt compare-and-swap failed");
+  return commitMutation(
+    db,
+    request,
+    digest,
+    authority.actorReceiptId,
+    { aggregateType: "execution_attempt", aggregateId: attempt.execution_attempt_id, aggregateRevision: 3, eventType: "assignment_terminal_reported", event: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, state, terminalResult, reportedOutcome: report.outcome, terminalReportDigest: reportDigest, reasonCode } },
+    { expected: 1, attempted: 1, verified: 1 },
+    { currentConfigRevision: assignment.config_revision, currentGovernanceEpoch: authority.governor.governance_epoch, evidence: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, state, terminalResult, reportedOutcome: report.outcome, terminalReportDigest: reportDigest, reasonCode, deadlineAtMs: assignment.deadline_at_ms, receivedAtMs: report.receivedAtMs } },
+  );
+}
+
+function applyAssignmentMutation(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+  adapter: NativeAssignmentAdapter | null,
+): FoundationResult {
+  if (request.operationClass === "assignment_dispatch" || request.operationClass === "assignment_reconcile") {
+    return applyAssignmentNative(db, request, digest, adapter, request.operationClass === "assignment_dispatch" ? "dispatch" : "reconcile");
+  }
+  try {
+    let inspection: NativeAssignmentInspection | null = null;
+    if (request.operationClass === "assignment_prepare") {
+      const replay = checkIdempotency(db, request, digest);
+      if (replay) return replay;
+      if (!request.assignment || !request.repoTargetId || !adapter) {
+        throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment preparation requires one native BB fact adapter and exact target");
+      }
+      transaction(db, () => preflightAssignmentPrepare(db, request));
+      try {
+        inspection = adapter.inspect({ projectId: request.projectId, repoTargetId: request.repoTargetId, assignment: request.assignment });
+      } catch {
+        throw refusal("EXECUTION_CONTEXT_FOREIGN", "exact native BB/Git assignment facts are unavailable");
+      }
+    }
+    return transaction(db, () => {
+      const replay = checkIdempotency(db, request, digest);
+      if (replay) return replay;
+      return request.operationClass === "assignment_prepare"
+        ? applyAssignmentPrepare(db, request, digest, inspection!)
+        : applyAssignmentTerminal(db, request, digest);
+    });
+  } catch (error) {
+    if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
+    if (isConstraintError(error)) return unavailableResult(request.projectId, "canonical assignment mutation could not be committed unambiguously");
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal assignment mutation error" });
+  }
+}
+
 function isConstraintError(error: unknown): boolean {
   return error instanceof Error && /constraint|unique|busy|locked/iu.test(error.message);
 }
@@ -2824,6 +4075,7 @@ export function applyFixtureMutation(
   input: unknown,
   githubAdapter: GitHubIssueAdapter | null = null,
   roleFactReader: RoleFactReader | null = null,
+  nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
 ): FoundationResult {
   let request: ApplyRequest;
   try {
@@ -2840,6 +4092,9 @@ export function applyFixtureMutation(
     }
     if (request.operationClass === "qualification_observation_record" || request.operationClass === "role_generation_succession") {
       return applyRoleMutation(db, request, digest, roleFactReader);
+    }
+    if (["assignment_prepare", "assignment_dispatch", "assignment_reconcile", "assignment_terminal"].includes(request.operationClass)) {
+      return applyAssignmentMutation(db, request, digest, nativeAssignmentAdapter);
     }
     return transaction(db, () => {
       const replay = checkIdempotency(db, request, digest);
@@ -2862,6 +4117,11 @@ export function applyFixtureMutation(
         case "qualification_observation_record":
         case "role_generation_succession":
           throw refusal("INTERNAL_ERROR", "role fact operations must not run inside the canonical transaction");
+        case "assignment_prepare":
+        case "assignment_dispatch":
+        case "assignment_reconcile":
+        case "assignment_terminal":
+          throw refusal("INTERNAL_ERROR", "assignment operations must use the assignment resolver");
       }
     });
   } catch (error) {
@@ -2893,6 +4153,8 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     external_work_refs: "work_item_id, provider",
     qualification_observations: "qualification_id",
     eligibility_projections: "role_requirement_id, profile_digest",
+    assignments: "assignment_id",
+    execution_attempts: "execution_attempt_id",
     role_generations: "role_id, generation",
     role_generation_heads: "role_id",
   };
@@ -3053,11 +4315,15 @@ export async function doctor(
     const roleGenerationHeads = db.prepare(
       `SELECT role_generation_heads.role_id, role_generation_heads.current_generation,
               role_generations.status, role_generations.qualification_id,
-              role_generations.holder_execution_attempt_id
+              role_generations.holder_execution_attempt_id,
+              execution_attempts.state AS holder_attempt_state,
+              execution_attempts.native_receipt_digest AS holder_native_receipt_digest
        FROM role_generation_heads
        JOIN role_generations ON role_generations.project_id = role_generation_heads.project_id
          AND role_generations.role_id = role_generation_heads.role_id
          AND role_generations.generation = role_generation_heads.current_generation
+       LEFT JOIN execution_attempts ON execution_attempts.project_id = role_generations.project_id
+         AND execution_attempts.execution_attempt_id = role_generations.holder_execution_attempt_id
        WHERE role_generation_heads.project_id = ? ORDER BY role_generation_heads.role_id`,
     ).all(projectId) as Array<Record<string, unknown>>;
     const observationCount = asRow<{ count: number }>(
@@ -3083,6 +4349,39 @@ export async function doctor(
     const schemaState = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (" + TABLES.map(() => "?").join(",") + ") ORDER BY name")
       .all(...TABLES) as Array<{ name: string }>;
+    const configJson = storedConfigJson(db, projectId, configHead.config_revision);
+    const writingLaneCeiling = writingLaneCeilingFromJson(configJson);
+    const assignmentAttempts = db.prepare(
+      `SELECT assignments.assignment_id, assignments.assignment_kind, assignments.lane_id,
+              assignments.repo_target_id, assignments.branch_name, assignments.base_sha,
+              assignments.candidate_sha, assignments.environment_id, assignments.deadline_at_ms,
+              assignments.requested_provider_id, assignments.requested_model,
+              assignments.requested_reasoning_level, assignments.requested_permission_mode,
+              assignments.requested_service_tier, assignments.requested_visibility,
+              assignments.requested_profile_digest, execution_attempts.execution_attempt_id,
+              execution_attempts.state, execution_attempts.thread_id, execution_attempts.native_request_id,
+              execution_attempts.actual_provider_id, execution_attempts.actual_model,
+              execution_attempts.actual_reasoning_level, execution_attempts.actual_permission_mode,
+              execution_attempts.actual_service_tier, execution_attempts.actual_visibility,
+              execution_attempts.actual_profile_digest, execution_attempts.native_receipt_digest,
+              execution_attempts.terminal_result, execution_attempts.reported_outcome,
+              execution_attempts.terminal_report_digest, execution_attempts.conflicting_terminal_digest,
+              execution_attempts.reason_code, execution_attempts.last_event_seq
+       FROM assignments JOIN execution_attempts
+         ON execution_attempts.project_id = assignments.project_id
+        AND execution_attempts.assignment_id = assignments.assignment_id
+       WHERE assignments.project_id = ? ORDER BY assignments.assignment_id, execution_attempts.execution_attempt_id`,
+    ).all(projectId) as Array<Record<string, unknown>>;
+    const activeWriters = assignmentAttempts.filter(
+      (row) => row.assignment_kind === "write" && (ACTIVE_ASSIGNMENT_STATES as readonly unknown[]).includes(row.state),
+    );
+    const unresolvedAttempts = assignmentAttempts.filter(
+      (row) => row.state === "dispatch_unknown" || row.conflicting_terminal_digest !== null || row.terminal_report_digest === null,
+    );
+    const unresolvedRoleHolders = roleGenerationHeads
+      .filter((row) => row.holder_attempt_state !== "done" || !row.holder_native_receipt_digest)
+      .map((row) => ({ roleId: row.role_id, generation: row.current_generation, holderExecutionAttemptId: row.holder_execution_attempt_id, reason: "ROLE_HOLDER_UNRESOLVED" }));
+    const cachedConsumers = cachedConsumerRolloutEvidence(SCHEMA_VERSION);
     const expected = targets.length + 1;
     return result("OK", projectId, expected, expected, expected, {
       currentConfigRevision: configHead.config_revision,
@@ -3095,14 +4394,19 @@ export async function doctor(
         targets: targetEvidence,
         governorshipHead: governor ?? null,
         roleGenerationHeads,
+        unresolvedRoleHolders,
         qualificationObservationCount: observationCount,
         eligibility,
-        cachedConsumers: {
-          names: ["server.rpcContract", "server.collabCli", "src/test-support", "tests/server.test"],
-          expected: 0,
-          attempted: 0,
-          verified: 0,
+        assignments: assignmentAttempts,
+        capacity: {
+          writingLaneCeiling,
+          activeWriterCount: activeWriters.length,
+          activeWriterLaneIds: activeWriters.map((row) => row.lane_id),
+          duplicateLaneIds: [...new Set(activeWriters.map((row) => row.lane_id).filter((laneId, index, all) => all.indexOf(laneId) !== index))],
+          ceilingViolated: activeWriters.length > writingLaneCeiling,
         },
+        unresolvedAttempts,
+        cachedConsumers,
         schema: { version: SCHEMA_VERSION, migrationStatementIds: MIGRATIONS.map((_, index) => index), digest: schemaDigest, tables: schemaState.map((row) => row.name) },
       },
     });

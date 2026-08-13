@@ -14,6 +14,7 @@ import {
   PLUGIN_ID,
   SCHEMA_VERSION,
   applyFixtureMutation,
+  cachedConsumerRolloutEvidence,
   canonicalJson,
   databaseIsReady,
   doctor,
@@ -24,6 +25,7 @@ import {
 import {
   applyWithFixtureReceipt,
   DeterministicGitHubIssueAdapter,
+  DeterministicNativeAssignmentAdapter,
   DeterministicRoleFactReader,
   seedFixtureDecision,
   seedVerifiedFixtureReceipt,
@@ -51,6 +53,10 @@ const ROLE_PROFILE = {
   visibility: "visible" as const,
 };
 const ROLE_PROFILE_DIGEST = sha256(canonicalJson(ROLE_PROFILE));
+const BASE_SHA = "a".repeat(40);
+const CANDIDATE_SHA = "b".repeat(40);
+const FROZEN_BRIEF = "# Frozen assignment\nImplement the exact bounded change.";
+const FROZEN_BRIEF_DIGEST = sha256(FROZEN_BRIEF);
 
 function roleConfig() {
   const config = structuredClone(bootstrapRequest().config) as {
@@ -380,6 +386,102 @@ function directDatabase() {
   return { db, path, directory };
 }
 
+async function assignmentFixture(options: { writingLaneCeiling?: number } = {}) {
+  const host = await loadedHost();
+  const config = roleConfig();
+  if (options.writingLaneCeiling !== undefined) {
+    (config.extensions.bbCollab as Record<string, unknown>).writingLaneCeiling = options.writingLaneCeiling;
+  }
+  const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config });
+  expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+  expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+  expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+  const succession = applyWithFixtureReceipt(db, successionRequest(fenceToken), null, roleReader());
+  expect(succession.outcome).toBe("OK");
+  const holderExecutionAttemptId = (succession.evidence as { holderExecutionAttemptId: string }).holderExecutionAttemptId;
+  seedVerifiedFixtureReceipt(db, {
+    projectId: PROJECT_ID,
+    receiptId: "role-actor-assignment",
+    actorKind: "role",
+    subjectId: holderExecutionAttemptId,
+    roleId: "project-orchestrator",
+    roleGeneration: 1,
+  });
+  return { host, db, fenceToken, holderExecutionAttemptId };
+}
+
+function assignmentPrepareRequest(
+  fenceToken: string,
+  assignmentId = "assignment-1",
+  overrides: Partial<ApplyRequest> = {},
+): ApplyRequest {
+  return {
+    projectId: PROJECT_ID,
+    operationClass: "assignment_prepare",
+    idempotencyKey: `prepare-${assignmentId}`,
+    actorReceiptId: "role-actor-assignment",
+    expectedConfigRevision: 1,
+    expectedGovernanceEpoch: 1,
+    expectedFenceToken: fenceToken,
+    repoTargetId: TARGET_ID,
+    expectedResourceRevision: 2,
+    assignment: {
+      assignmentId,
+      workItemId: WORK_ITEM_ID,
+      assignmentKind: "write",
+      laneId: "lane-main",
+      roleRequirementId: "orchestrator-v1",
+      roleId: "project-orchestrator",
+      roleGeneration: 1,
+      branchName: `bb/${assignmentId}`,
+      baseSha: BASE_SHA,
+      candidateSemantics: "base",
+      candidateSha: null,
+      environment: {
+        bbServerId: "bb-server-test",
+        environmentId: `environment-${assignmentId}`,
+        sourceId: "source-main",
+        hostId: "host-main",
+        path: "/workspace/project",
+        mode: "managed-worktree",
+      },
+      frozenBriefVersion: 1,
+      frozenBriefDigest: FROZEN_BRIEF_DIGEST,
+      requestedProfile: ROLE_PROFILE,
+      dispatchKind: "spawn",
+      attachThreadId: null,
+      parentAssignmentId: null,
+      depth: 0,
+      deadlineAtMs: Date.now() + 60_000,
+    },
+    ...overrides,
+  };
+}
+
+function assignmentPhaseRequest(
+  fenceToken: string,
+  operationClass: "assignment_dispatch" | "assignment_reconcile" | "assignment_terminal",
+  assignmentId: string,
+  executionAttemptId: string,
+  overrides: Partial<ApplyRequest> = {},
+): ApplyRequest {
+  return {
+    projectId: PROJECT_ID,
+    operationClass,
+    idempotencyKey: `${operationClass}-${assignmentId}`,
+    actorReceiptId: "role-actor-assignment",
+    expectedConfigRevision: 1,
+    expectedGovernanceEpoch: 1,
+    expectedFenceToken: fenceToken,
+    repoTargetId: TARGET_ID,
+    expectedResourceRevision: 2,
+    assignmentId,
+    executionAttemptId,
+    frozenBriefContent: FROZEN_BRIEF,
+    ...overrides,
+  };
+}
+
 describe("bb-collab plugin boundary", () => {
   it("loads one CLI/RPC seam and refuses production apply before any write", async () => {
     const host = await loadedHost();
@@ -423,7 +525,7 @@ describe("bb-collab plugin boundary", () => {
     expect(first).toMatchObject({ outcome: "OK", expected: 8, attempted: 8, verified: 8 });
     expect((first as { export: { manifest: { schemaVersion: number } } }).export.manifest.schemaVersion).toBe(SCHEMA_VERSION);
     expect((first as { export: { manifest: { migrationStatementIds: number[]; schemaDigest: string } } }).export.manifest.migrationStatementIds).toEqual(
-      Array.from({ length: 16 }, (_, index) => index),
+      Array.from({ length: MIGRATIONS.length }, (_, index) => index),
     );
     expect((first as { export: { checksums: Record<string, string> } }).export.checksums).toHaveProperty("records.ndjson");
   });
@@ -1307,7 +1409,7 @@ describe("bb-collab plugin boundary", () => {
         qualificationObservationCount: 1,
         roleGenerationHeads: [{ role_id: "project-orchestrator", current_generation: 1, status: "active" }],
         eligibility: [{ roleRequirementId: "orchestrator-v1", effectiveStatus: "eligible" }],
-        cachedConsumers: { expected: 0, attempted: 0, verified: 0 },
+        cachedConsumers: { expected: 4, attempted: 4, verified: 4 },
       },
     });
     const beforeProductionRefusal = exportFoundation(db, PROJECT_ID);
@@ -1515,6 +1617,7 @@ describe("bb-collab plugin boundary", () => {
       expect(failed).not.toHaveProperty("mutationReceipt");
       expect(failed).not.toHaveProperty("eventSequence");
       expect(facts.readCalls).toEqual([
+        "server.id",
         `thread:${ROLE_THREAD_ID}`,
         `events:${ROLE_THREAD_ID}`,
         `environment:${ROLE_ENVIRONMENT_ID}`,
@@ -1612,6 +1715,334 @@ describe("bb-collab plugin boundary", () => {
       predecessorGeneration: 1,
     }), null, roleReader()).outcome).toBe("ELIGIBILITY_STALE");
     expect(staleDb.prepare("SELECT generation, status FROM role_generations").all()).toEqual([{ generation: 1, status: "active" }]);
+  });
+
+  it("migrates v3 role evidence to v4 without manufacturing a canonical holder attempt", async () => {
+    const fixture = await assignmentFixture();
+    const { db, host } = fixture;
+    const holder = db.prepare("SELECT holder_execution_attempt_id FROM role_generations WHERE role_id = 'project-orchestrator'").get() as { holder_execution_attempt_id: string };
+    expect(db.prepare("SELECT origin, state FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toEqual({ origin: "role_holder", state: "done" });
+
+    db.pragma("foreign_keys = OFF");
+    db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
+    db.pragma("foreign_keys = ON");
+    db.exec(MIGRATIONS.at(-1)!);
+    expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
+    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
+      outcome: "OK",
+      evidence: { unresolvedRoleHolders: [{ reason: "ROLE_HOLDER_UNRESOLVED", holderExecutionAttemptId: holder.holder_execution_attempt_id }] },
+    });
+    seedVerifiedFixtureReceipt(db, {
+      projectId: PROJECT_ID,
+      receiptId: "legacy-role-actor",
+      actorKind: "role",
+      subjectId: holder.holder_execution_attempt_id,
+      roleId: "project-orchestrator",
+      roleGeneration: 1,
+    });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fixture.fenceToken, {
+      idempotencyKey: "legacy-holder-refusal",
+      actorReceiptId: "legacy-role-actor",
+      qualificationId: "legacy-holder-refusal",
+    }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
+    expect(cachedConsumerRolloutEvidence(3)).toMatchObject({ action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(4)).toMatchObject({ action: "reread", expected: 4, attempted: 4, verified: 4 });
+  });
+
+  it("reserves before native dispatch and accepts one exact terminal report", async () => {
+    const { db, fenceToken } = await assignmentFixture();
+    const adapter = new DeterministicNativeAssignmentAdapter();
+    const prepare = assignmentPrepareRequest(fenceToken);
+    const prepared = applyWithFixtureReceipt(db, prepare, null, null, adapter);
+    expect(prepared).toMatchObject({ outcome: "OK", evidence: { assignmentId: "assignment-1", writingLaneCeiling: 2, activeWriterCount: 1 } });
+    expect(applyWithFixtureReceipt(db, prepare, null, null, adapter)).toEqual(prepared);
+    expect(adapter.inspectCalls).toHaveLength(1);
+    expect(adapter.dispatchCalls).toHaveLength(0);
+    const executionAttemptId = (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+    expect(db.prepare("SELECT state FROM execution_attempts WHERE execution_attempt_id = ?").get(executionAttemptId)).toEqual({ state: "prepared" });
+
+    const dispatch = assignmentPhaseRequest(fenceToken, "assignment_dispatch", "assignment-1", executionAttemptId);
+    expect(applyWithFixtureReceipt(db, { ...dispatch, idempotencyKey: "dispatch-wrong-brief", frozenBriefContent: `${FROZEN_BRIEF}\nwrong` }, null, null, adapter).outcome).toBe("ASSIGNMENT_HEAD_STALE");
+    expect(adapter.dispatchCalls).toHaveLength(0);
+    const delivered = applyWithFixtureReceipt(db, dispatch, null, null, adapter);
+    expect(delivered).toMatchObject({ outcome: "OK", evidence: { state: "content_delivered", actualProfileDigest: ROLE_PROFILE_DIGEST } });
+    expect(adapter.dispatchCalls).toHaveLength(1);
+    const native = delivered.evidence as { nativeReceiptDigest: string; actualProfileDigest: string; threadId: string };
+    const terminalReport = {
+      receiptVersion: 1 as const,
+      outcome: "DONE" as const,
+      projectId: PROJECT_ID,
+      assignmentId: "assignment-1",
+      executionAttemptId,
+      workItemId: WORK_ITEM_ID,
+      roleId: "project-orchestrator" as const,
+      roleGeneration: 1,
+      repoTargetId: TARGET_ID,
+      environmentId: "environment-assignment-1",
+      threadId: native.threadId,
+      branchName: "bb/assignment-1",
+      baseSha: BASE_SHA,
+      candidateSha: CANDIDATE_SHA,
+      nativeReceiptDigest: native.nativeReceiptDigest,
+      actualProfileDigest: native.actualProfileDigest,
+      candidateObservationDigest: sha256(canonicalJson({ branchName: "bb/assignment-1", baseSha: BASE_SHA, candidateSha: CANDIDATE_SHA })),
+      reasonCode: "writer_done",
+      evidence: [{ kind: "test", digest: sha256("tests"), ref: "fixture" }],
+      reportedAtMs: Date.now(),
+      receiptEventId: "terminal-event-1",
+      receiptEventSeq: 10,
+      receivedAtMs: Date.now(),
+    };
+    const terminal = assignmentPhaseRequest(fenceToken, "assignment_terminal", "assignment-1", executionAttemptId, {
+      idempotencyKey: "terminal-assignment-1",
+      terminalReport,
+    });
+    const done = applyWithFixtureReceipt(db, terminal, null, null, adapter);
+    expect(done).toMatchObject({ outcome: "OK", evidence: { state: "done", terminalResult: "DONE" } });
+    expect(applyWithFixtureReceipt(db, { ...terminal, idempotencyKey: "terminal-identical-replay" }, null, null, adapter)).toEqual(done);
+    expect(db.prepare("SELECT state, terminal_result FROM execution_attempts WHERE execution_attempt_id = ?").get(executionAttemptId)).toEqual({ state: "done", terminal_result: "DONE" });
+
+    const conflict = applyWithFixtureReceipt(db, {
+      ...terminal,
+      idempotencyKey: "terminal-conflict",
+      terminalReport: { ...terminalReport, outcome: "BLOCKED", reasonCode: "conflicting" },
+    }, null, null, adapter);
+    expect(conflict.outcome).toBe("TERMINAL_REPORT_AMBIGUOUS");
+    expect(db.prepare("SELECT state, terminal_result, conflicting_terminal_digest FROM execution_attempts WHERE execution_attempt_id = ?").get(executionAttemptId)).toMatchObject({ state: "running", terminal_result: null, conflicting_terminal_digest: expect.any(String) });
+  });
+
+  it("treats queued or incomplete content evidence as durable dispatch ambiguity and never retries", async () => {
+    const { db, fenceToken } = await assignmentFixture();
+    const adapter = new DeterministicNativeAssignmentAdapter();
+    const prepared = applyWithFixtureReceipt(db, assignmentPrepareRequest(fenceToken), null, null, adapter);
+    const executionAttemptId = (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+    adapter.nextEvidence = { disposition: "confirmed", reasonCode: "queued_only", contentEventId: undefined, contentEventSeq: undefined, contentDigest: undefined };
+    const dispatch = assignmentPhaseRequest(fenceToken, "assignment_dispatch", "assignment-1", executionAttemptId);
+    expect(applyWithFixtureReceipt(db, dispatch, null, null, adapter).outcome).toBe("DISPATCH_UNKNOWN");
+    expect(adapter.dispatchCalls).toHaveLength(1);
+    expect(applyWithFixtureReceipt(db, dispatch, null, null, adapter).outcome).toBe("DISPATCH_UNKNOWN");
+    expect(applyWithFixtureReceipt(db, { ...dispatch, idempotencyKey: "dispatch-new-key" }, null, null, adapter).outcome).toBe("DISPATCH_UNKNOWN");
+    expect(adapter.dispatchCalls).toHaveLength(1);
+    expect(db.prepare("SELECT state FROM execution_attempts WHERE execution_attempt_id = ?").get(executionAttemptId)).toEqual({ state: "dispatch_unknown" });
+
+    const reconcile = assignmentPhaseRequest(fenceToken, "assignment_reconcile", "assignment-1", executionAttemptId);
+    adapter.nextEvidence = { threadId: "foreign-thread" };
+    expect(applyWithFixtureReceipt(db, reconcile, null, null, adapter).outcome).toBe("EXECUTION_CONTEXT_FOREIGN");
+    expect(applyWithFixtureReceipt(db, { ...reconcile, idempotencyKey: "reconcile-exact-native-identity" }, null, null, adapter).outcome).toBe("OK");
+    expect(adapter.reconcileCalls).toHaveLength(2);
+    expect(db.prepare("SELECT state FROM execution_attempts WHERE execution_attempt_id = ?").get(executionAttemptId)).toEqual({ state: "content_delivered" });
+  });
+
+  it("retains actual profile mismatch and refuses a hidden attach before send", async () => {
+    const { db, fenceToken } = await assignmentFixture();
+    const mismatchAdapter = new DeterministicNativeAssignmentAdapter();
+    const prepared = applyWithFixtureReceipt(db, assignmentPrepareRequest(fenceToken), null, null, mismatchAdapter);
+    const executionAttemptId = (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+    mismatchAdapter.nextEvidence = { actualProfile: { ...ROLE_PROFILE, model: "fallback-model" } };
+    const mismatch = applyWithFixtureReceipt(
+      db,
+      assignmentPhaseRequest(fenceToken, "assignment_dispatch", "assignment-1", executionAttemptId),
+      null,
+      null,
+      mismatchAdapter,
+    );
+    expect(mismatch).toMatchObject({ outcome: "EXECUTION_PROFILE_MISMATCH", evidence: { state: "dispatch_unknown", actualProfileDigest: expect.any(String) } });
+    expect((mismatch.evidence as { actualProfileDigest: string }).actualProfileDigest).not.toBe(ROLE_PROFILE_DIGEST);
+
+    const second = await assignmentFixture();
+    const attachAdapter = new DeterministicNativeAssignmentAdapter();
+    attachAdapter.nextInspection = { threadVisibility: "hidden" };
+    const attach = assignmentPrepareRequest(second.fenceToken, "attach-1", {
+      assignment: {
+        ...assignmentPrepareRequest(second.fenceToken).assignment!,
+        assignmentId: "attach-1",
+        branchName: "bb/attach-1",
+        dispatchKind: "attach",
+        attachThreadId: "thread-existing",
+        environment: { ...assignmentPrepareRequest(second.fenceToken).assignment!.environment, environmentId: "environment-attach-1" },
+      },
+    });
+    expect(applyWithFixtureReceipt(second.db, attach, null, null, attachAdapter).outcome).toBe("ROLE_CONTEXT_HIDDEN");
+    expect(attachAdapter.dispatchCalls).toHaveLength(0);
+    expect(second.db.prepare("SELECT COUNT(*) AS count FROM assignments").get()).toEqual({ count: 0 });
+
+    const visible = applyWithFixtureReceipt(second.db, { ...attach, idempotencyKey: "prepare-attach-visible" }, null, null, attachAdapter);
+    expect(visible.outcome).toBe("OK");
+    const attachAttemptId = (visible.evidence as { executionAttemptId: string }).executionAttemptId;
+    expect(applyWithFixtureReceipt(second.db, assignmentPhaseRequest(second.fenceToken, "assignment_dispatch", "attach-1", attachAttemptId), null, null, attachAdapter).outcome).toBe("OK");
+    expect(attachAdapter.dispatchCalls[0]).toMatchObject({ dispatchKind: "attach", attachThreadId: "thread-existing" });
+  });
+
+  it("retains a late DONE report as blocked terminal evidence", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(100);
+    try {
+      const { db, fenceToken } = await assignmentFixture();
+      const adapter = new DeterministicNativeAssignmentAdapter();
+      const prepare = assignmentPrepareRequest(fenceToken, "late-1", {
+        assignment: { ...assignmentPrepareRequest(fenceToken).assignment!, assignmentId: "late-1", branchName: "bb/late-1", deadlineAtMs: 200, environment: { ...assignmentPrepareRequest(fenceToken).assignment!.environment, environmentId: "environment-late-1" } },
+      });
+      const prepared = applyWithFixtureReceipt(db, prepare, null, null, adapter);
+      const executionAttemptId = (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+      const delivered = applyWithFixtureReceipt(db, assignmentPhaseRequest(fenceToken, "assignment_dispatch", "late-1", executionAttemptId), null, null, adapter);
+      const native = delivered.evidence as { nativeReceiptDigest: string; actualProfileDigest: string; threadId: string };
+      clock.mockReturnValue(300);
+      const report = {
+        receiptVersion: 1 as const,
+        outcome: "DONE" as const,
+        projectId: PROJECT_ID,
+        assignmentId: "late-1",
+        executionAttemptId,
+        workItemId: WORK_ITEM_ID,
+        roleId: "project-orchestrator" as const,
+        roleGeneration: 1,
+        repoTargetId: TARGET_ID,
+        environmentId: "environment-late-1",
+        threadId: native.threadId,
+        branchName: "bb/late-1",
+        baseSha: BASE_SHA,
+        candidateSha: CANDIDATE_SHA,
+        nativeReceiptDigest: native.nativeReceiptDigest,
+        actualProfileDigest: native.actualProfileDigest,
+        candidateObservationDigest: sha256(canonicalJson({ branchName: "bb/late-1", baseSha: BASE_SHA, candidateSha: CANDIDATE_SHA })),
+        reasonCode: "writer_done",
+        evidence: [{ kind: "test", digest: sha256("late"), ref: "fixture" }],
+        reportedAtMs: 300,
+        receiptEventId: "terminal-late",
+        receiptEventSeq: 10,
+        receivedAtMs: 300,
+      };
+      expect(applyWithFixtureReceipt(db, assignmentPhaseRequest(fenceToken, "assignment_terminal", "late-1", executionAttemptId, { terminalReport: report }), null, null, adapter)).toMatchObject({
+        outcome: "OK",
+        evidence: { state: "blocked", terminalResult: "BLOCKED", reportedOutcome: "DONE", reasonCode: "terminal_report_late" },
+      });
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("revalidates role generation before dispatch and terminal without failover", async () => {
+    const { db, fenceToken } = await assignmentFixture();
+    const adapter = new DeterministicNativeAssignmentAdapter();
+    const prepared = applyWithFixtureReceipt(db, assignmentPrepareRequest(fenceToken), null, null, adapter);
+    const executionAttemptId = (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, { idempotencyKey: "qualification-successor", qualificationId: "qualification-successor" }), null, roleReader()).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, { idempotencyKey: "succession-successor", qualificationId: "qualification-successor", expectedGeneration: 1, predecessorGeneration: 1 }), null, roleReader()).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, assignmentPhaseRequest(fenceToken, "assignment_dispatch", "assignment-1", executionAttemptId), null, null, adapter).outcome).toBe("ROLE_GENERATION_STALE");
+    expect(adapter.dispatchCalls).toHaveLength(0);
+    expect(db.prepare("SELECT state FROM execution_attempts WHERE execution_attempt_id = ?").get(executionAttemptId)).toEqual({ state: "prepared" });
+  });
+
+  it("refuses stale or foreign assignment admission before any native side effect", async () => {
+    const cases: Array<[string, Partial<ApplyRequest>, string]> = [
+      ["stale-config", { expectedConfigRevision: 0 }, "PROJECT_CONFIG_STALE"],
+      ["stale-governor", { expectedGovernanceEpoch: 9 }, "GOVERNOR_EPOCH_STALE"],
+      ["stale-work-item", { expectedResourceRevision: 1 }, "WORK_ITEM_REVISION_STALE"],
+      ["foreign-target", { repoTargetId: "foreign-target" }, "REPO_TARGET_FOREIGN"],
+      ["stale-role", { assignment: { ...assignmentPrepareRequest("unused").assignment!, roleGeneration: 2 } }, "ROLE_HOLDER_MISMATCH"],
+      ["profile", { assignment: { ...assignmentPrepareRequest("unused").assignment!, requestedProfile: { ...ROLE_PROFILE, permissionMode: "auto" } } }, "EXECUTION_PROFILE_MISMATCH"],
+      ["candidate", { assignment: { ...assignmentPrepareRequest("unused").assignment!, candidateSemantics: "frozen", candidateSha: CANDIDATE_SHA } }, "ASSIGNMENT_HEAD_STALE"],
+      ["environment", { assignment: { ...assignmentPrepareRequest("unused").assignment!, environment: { ...assignmentPrepareRequest("unused").assignment!.environment, path: "/foreign" } } }, "EXECUTION_CONTEXT_FOREIGN"],
+    ];
+    for (const [name, overrides, outcome] of cases) {
+      const { db, fenceToken } = await assignmentFixture();
+      const adapter = new DeterministicNativeAssignmentAdapter();
+      const request = assignmentPrepareRequest(fenceToken, `negative-${name}`, {
+        ...overrides,
+        idempotencyKey: `negative-${name}`,
+        assignment: overrides.assignment
+          ? { ...overrides.assignment, assignmentId: `negative-${name}`, branchName: `bb/negative-${name}`, environment: { ...overrides.assignment.environment, environmentId: `environment-negative-${name}` } }
+          : { ...assignmentPrepareRequest(fenceToken).assignment!, assignmentId: `negative-${name}`, branchName: `bb/negative-${name}`, environment: { ...assignmentPrepareRequest(fenceToken).assignment!.environment, environmentId: `environment-negative-${name}` } },
+      });
+      expect(applyWithFixtureReceipt(db, request, null, null, adapter).outcome, name).toBe(outcome);
+      expect(adapter.dispatchCalls, name).toHaveLength(0);
+      expect(db.prepare("SELECT COUNT(*) AS count FROM assignments").get(), name).toEqual({ count: 0 });
+      expect(db.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = ?").get(request.idempotencyKey), name).toBeUndefined();
+    }
+
+    for (const inspection of [{ baseSha: "c".repeat(40) }, { branchName: "bb/foreign" }, { candidateSha: CANDIDATE_SHA }]) {
+      const { db, fenceToken } = await assignmentFixture();
+      const adapter = new DeterministicNativeAssignmentAdapter();
+      adapter.nextInspection = inspection;
+      expect(applyWithFixtureReceipt(db, assignmentPrepareRequest(fenceToken), null, null, adapter).outcome).toBe("EXECUTION_CONTEXT_FOREIGN");
+      expect(adapter.dispatchCalls).toHaveLength(0);
+      expect(db.prepare("SELECT COUNT(*) AS count FROM assignments").get()).toEqual({ count: 0 });
+    }
+  });
+
+  it("serializes writer lanes and the lower project ceiling while read-only assignments do not count", async () => {
+    const { db: firstDb, path, directory } = directDatabase();
+    const secondDb = new Database(path);
+    let reopenedDb: Database.Database | null = null;
+    databaseIsReady(secondDb);
+    try {
+      seedVerifiedFixtureReceipt(firstDb, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
+      const config = roleConfig();
+      (config.extensions.bbCollab as Record<string, unknown>).writingLaneCeiling = 1;
+      const bootstrapped = applyFixtureMutation(firstDb, bootstrapRequest(PROJECT_ID, { config }));
+      const fenceToken = (bootstrapped.evidence as { fenceToken: string }).fenceToken;
+      expect(applyWithFixtureReceipt(firstDb, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(firstDb, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(firstDb, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(firstDb, qualificationRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+      const succession = applyWithFixtureReceipt(firstDb, successionRequest(fenceToken), null, roleReader());
+      const holderExecutionAttemptId = (succession.evidence as { holderExecutionAttemptId: string }).holderExecutionAttemptId;
+      seedVerifiedFixtureReceipt(firstDb, { projectId: PROJECT_ID, receiptId: "role-actor-assignment", actorKind: "role", subjectId: holderExecutionAttemptId, roleId: "project-orchestrator", roleGeneration: 1 });
+      const adapter = new DeterministicNativeAssignmentAdapter();
+      const readOnly = assignmentPrepareRequest(fenceToken, "review-1", {
+        expectedResourceRevision: 3,
+        assignment: {
+          ...assignmentPrepareRequest(fenceToken).assignment!,
+          assignmentId: "review-1",
+          assignmentKind: "review",
+          laneId: "review-lane",
+          branchName: "bb/review-1",
+          candidateSemantics: "frozen",
+          candidateSha: CANDIDATE_SHA,
+          environment: { ...assignmentPrepareRequest(fenceToken).assignment!.environment, environmentId: "environment-review-1" },
+        },
+      });
+      expect(applyWithFixtureReceipt(firstDb, readOnly, null, null, adapter).outcome).toBe("OK");
+      const firstWrite = assignmentPrepareRequest(fenceToken, "writer-1", {
+        expectedResourceRevision: 3,
+        assignment: { ...assignmentPrepareRequest(fenceToken).assignment!, assignmentId: "writer-1", branchName: "bb/writer-1", environment: { ...assignmentPrepareRequest(fenceToken).assignment!.environment, environmentId: "environment-writer-1" } },
+      });
+      const preparedWrite = applyWithFixtureReceipt(firstDb, firstWrite, null, null, adapter);
+      expect(preparedWrite.outcome).toBe("OK");
+      const beforeLoserEvents = (firstDb.prepare("SELECT COUNT(*) AS count FROM state_events").get() as { count: number }).count;
+      const loser = assignmentPrepareRequest(fenceToken, "writer-2", {
+        idempotencyKey: "prepare-writer-2",
+        expectedResourceRevision: 3,
+        assignment: { ...assignmentPrepareRequest(fenceToken).assignment!, assignmentId: "writer-2", laneId: "lane-second", branchName: "bb/writer-2", environment: { ...assignmentPrepareRequest(fenceToken).assignment!.environment, environmentId: "environment-writer-2" } },
+      });
+      expect(applyWithFixtureReceipt(secondDb, loser, null, null, adapter).outcome).toBe("LANE_WRITER_EXISTS");
+      expect(firstDb.prepare("SELECT COUNT(*) AS count FROM assignments").get()).toEqual({ count: 2 });
+      expect(firstDb.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'assignment' AND assignment_kind = 'write'").get()).toEqual({ count: 1 });
+      expect(firstDb.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE idempotency_key = 'prepare-writer-2'").get()).toEqual({ count: 0 });
+      expect(firstDb.prepare("SELECT COUNT(*) AS count FROM state_events").get()).toEqual({ count: beforeLoserEvents });
+
+      const executionAttemptId = (preparedWrite.evidence as { executionAttemptId: string }).executionAttemptId;
+      adapter.nextEvidence = { disposition: "ambiguous", reasonCode: "native_transport_ambiguous" };
+      const dispatch = assignmentPhaseRequest(fenceToken, "assignment_dispatch", "writer-1", executionAttemptId);
+      const ambiguous = applyWithFixtureReceipt(firstDb, dispatch, null, null, adapter);
+      expect(ambiguous.outcome).toBe("DISPATCH_UNKNOWN");
+      const beforeReopen = exportFoundation(firstDb, PROJECT_ID);
+
+      secondDb.close();
+      firstDb.close();
+      reopenedDb = new Database(path);
+      databaseIsReady(reopenedDb);
+      const retryAdapter = new DeterministicNativeAssignmentAdapter();
+      expect(applyWithFixtureReceipt(reopenedDb, dispatch, null, null, retryAdapter)).toEqual(ambiguous);
+      expect(applyWithFixtureReceipt(reopenedDb, { ...dispatch, idempotencyKey: "dispatch-writer-1-new-key" }, null, null, retryAdapter).outcome).toBe("DISPATCH_UNKNOWN");
+      expect(retryAdapter.dispatchCalls).toHaveLength(0);
+      expect(exportFoundation(reopenedDb, PROJECT_ID)).toEqual(beforeReopen);
+    } finally {
+      reopenedDb?.close();
+      if (secondDb.open) secondDb.close();
+      if (firstDb.open) firstDb.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("uses one read-only default and non-zero refusal exits for CLI input", async () => {
