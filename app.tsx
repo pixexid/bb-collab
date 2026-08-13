@@ -1,9 +1,220 @@
-import { useCallback, useEffect, useState } from "react";
-import { definePluginApp, useRpc } from "@bb/plugin-sdk/app";
-import type { PluginComposerThreadRowStatus, PluginPendingInteractionProps, PluginRpcResult } from "@bb/plugin-sdk/app";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { definePluginApp, experimental_useSidebarThreadActions, experimental_useSidebarThreads, useRpc } from "@bb/plugin-sdk/app";
+import type {
+  PluginComposerThreadRowStatus,
+  PluginPendingInteractionProps,
+  PluginRpcResult,
+  PluginSidebarProject,
+  PluginSidebarThread,
+  PluginThreadListProps,
+} from "@bb/plugin-sdk/app";
 import { rpcContract } from "./server";
 
 type Lane = PluginRpcResult<typeof rpcContract["lanes"]>[number];
+type ThreadStates = PluginRpcResult<typeof rpcContract["threadStates"]>;
+type ThreadModels = PluginRpcResult<typeof rpcContract["threadModels"]>;
+
+const MAX_VISIBLE_THREADS = 5;
+
+function threadTitle(thread: PluginSidebarThread): string {
+  return thread.title ?? thread.titleFallback ?? "Untitled thread";
+}
+
+function projectAvatar(name: string): string {
+  const initials = name
+    .split(/\s+/u)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0])
+    .join("")
+    .toUpperCase();
+  return initials || "?";
+}
+
+function indicatorClasses(thread: PluginSidebarThread): string {
+  if (thread.indicator === "unread-error") return "border-l-destructive text-destructive";
+  if (thread.hasPendingInteraction || thread.indicator === "waiting-for-input") return "border-l-primary text-primary animate-pulse";
+  if (thread.indicator !== "none") return "border-l-primary text-primary";
+  return "border-l-border";
+}
+
+function matchesSearch(thread: PluginSidebarThread, project: PluginSidebarProject, searchQuery: string): boolean {
+  const query = searchQuery.trim().toLocaleLowerCase();
+  if (!query) return true;
+  return [threadTitle(thread), thread.providerId, project.name, thread.environment?.branchName ?? ""]
+    .some((value) => value.toLocaleLowerCase().includes(query));
+}
+
+function sortRecent(a: PluginSidebarThread, b: PluginSidebarThread): number {
+  return b.updatedAt - a.updatedAt || b.createdAt - a.createdAt || a.id.localeCompare(b.id);
+}
+
+export function groupThreads(
+  projects: readonly PluginSidebarProject[],
+  threads: readonly PluginSidebarThread[],
+  searchQuery = "",
+) {
+  const projectById = new Map(projects.map((project) => [project.id, project]));
+  const groups = new Map<string, { project: PluginSidebarProject; threads: PluginSidebarThread[] }>();
+  for (const thread of threads) {
+    const project = projectById.get(thread.projectId) ?? { id: thread.projectId, name: thread.projectId, isPersonal: false };
+    if (!matchesSearch(thread, project, searchQuery)) continue;
+    const group = groups.get(project.id) ?? { project, threads: [] };
+    group.threads.push(thread);
+    groups.set(project.id, group);
+  }
+  return [...groups.values()].map((group) => ({ ...group, threads: group.threads.sort(sortRecent) }));
+}
+
+function ThreadRow({
+  thread,
+  model,
+  active,
+  customState,
+  onNavigate,
+  onToggleState,
+}: {
+  thread: PluginSidebarThread;
+  model: string | null;
+  active: boolean;
+  customState: string | undefined;
+  onNavigate: () => void;
+  onToggleState: () => void;
+}) {
+  const actions = experimental_useSidebarThreadActions();
+  const title = threadTitle(thread);
+  const pendingLabel = thread.hasPendingInteraction ? "Pending interaction" : thread.indicatorLabel;
+  return (
+    <div
+      className={`group flex items-start gap-2 border-l-2 px-3 py-2 text-left text-sm hover:bg-muted/50 ${indicatorClasses(thread)} ${active ? "bg-muted" : ""}`}
+      role="button"
+      tabIndex={0}
+      aria-current={active ? "page" : undefined}
+      onClick={() => {
+        actions.open(thread.id);
+        onNavigate();
+      }}
+      onKeyDown={(event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        actions.open(thread.id);
+        onNavigate();
+      }}
+    >
+      <span className="mt-1 w-2 shrink-0 text-center" aria-label={pendingLabel ?? undefined}>
+        {thread.hasPendingInteraction || thread.indicator !== "none" ? "●" : "·"}
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate font-medium text-foreground">{title}</span>
+        <span className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+          <span className="max-w-[12rem] truncate rounded bg-muted px-1.5 py-0.5" title={`Provider: ${thread.providerId}; model: ${model ?? "unavailable"}`}>{thread.providerId}/{model ?? "unavailable"}</span>
+          {thread.environment?.branchName ? <span className="truncate">{thread.environment.branchName}</span> : null}
+          {customState ? <span className="truncate rounded bg-muted px-1.5 py-0.5">{customState}</span> : null}
+        </span>
+      </span>
+      <button
+        type="button"
+        className="shrink-0 rounded px-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+        aria-label={customState ? "Clear custom state" : "Set custom state"}
+        onClick={(event) => {
+          event.stopPropagation();
+          onToggleState();
+        }}
+      >
+        {customState ? "✓" : "+"}
+      </button>
+    </div>
+  );
+}
+
+export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: PluginThreadListProps) {
+  const sidebar = experimental_useSidebarThreads();
+  const rpc = useRpc<typeof rpcContract>();
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
+  const [customStates, setCustomStates] = useState<ThreadStates>({});
+  const [threadModels, setThreadModels] = useState<ThreadModels>({});
+  const threadIds = useMemo(() => sidebar.threads.map((thread) => thread.id), [sidebar.threads]);
+  const threadIdsKey = threadIds.join("\u0000");
+
+  useEffect(() => {
+    let mounted = true;
+    void rpc.call("threadStates", { threadIds }).then((states) => {
+      if (mounted) setCustomStates(states);
+    }).catch(() => {
+      if (mounted) setCustomStates({});
+    });
+    void rpc.call("threadModels", { threadIds }).then((models) => {
+      if (mounted) setThreadModels(models);
+    }).catch(() => {
+      if (mounted) setThreadModels(Object.fromEntries(threadIds.map((threadId) => [threadId, null])));
+    });
+    return () => {
+      mounted = false;
+    };
+  }, [rpc, threadIdsKey]);
+
+  const groups = groupThreads(sidebar.projects, sidebar.threads, searchQuery);
+  if (sidebar.status === "loading") return <p className="p-3 text-sm text-muted-foreground">Loading threads…</p>;
+  if (sidebar.status === "error") return <p className="p-3 text-sm text-destructive">Unable to load threads.</p>;
+  if (groups.length === 0) return <p className="p-3 text-sm text-muted-foreground">No matching threads.</p>;
+
+  const toggleCustomState = (threadId: string) => {
+    const next = customStates[threadId] ? null : "tracked";
+    void rpc.call("setThreadState", { threadId, state: next }).then(({ state }) => {
+      setCustomStates((current) => {
+        const updated = { ...current };
+        if (state === null) delete updated[threadId];
+        else updated[threadId] = state;
+        return updated;
+      });
+    }).catch(() => undefined);
+  };
+
+  return (
+    <div className="h-full overflow-y-auto">
+      {groups.map(({ project, threads }) => {
+        const expanded = expandedProjects.has(project.id);
+        const visibleThreads = expanded ? threads : threads.slice(0, MAX_VISIBLE_THREADS);
+        return (
+          <section key={project.id} aria-labelledby={`project-${project.id}`}>
+            <div className="flex items-center gap-2 px-3 py-2 text-xs font-semibold text-muted-foreground">
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-muted text-foreground" aria-hidden="true">{projectAvatar(project.name)}</span>
+              <span id={`project-${project.id}`} className="truncate">{project.name}</span>
+              <span className="ml-auto tabular-nums">{threads.length}</span>
+            </div>
+            <div>
+              {visibleThreads.map((thread) => (
+                <ThreadRow
+                  key={thread.id}
+                  thread={thread}
+                  model={threadModels[thread.id] ?? null}
+                  active={thread.id === activeThreadId}
+                  customState={customStates[thread.id]}
+                  onNavigate={onNavigate}
+                  onToggleState={() => toggleCustomState(thread.id)}
+                />
+              ))}
+              {threads.length > MAX_VISIBLE_THREADS ? (
+                <button
+                  type="button"
+                  className="w-full px-3 py-2 text-left text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+                  onClick={() => setExpandedProjects((current) => {
+                    const updated = new Set(current);
+                    if (expanded) updated.delete(project.id);
+                    else updated.add(project.id);
+                    return updated;
+                  })}
+                >
+                  {expanded ? "Show less" : `Show more (${threads.length - MAX_VISIBLE_THREADS})`}
+                </button>
+              ) : null}
+            </div>
+          </section>
+        );
+      })}
+    </div>
+  );
+}
 
 function OperatorReceiptForm({ interaction, submit, cancel }: PluginPendingInteractionProps) {
   const payload = interaction.payload as {
@@ -146,6 +357,12 @@ function mountLanePulse({ signal, setStatus }: { signal: AbortSignal; setStatus:
 }
 
 export default definePluginApp((app) => {
+  app.slots.experimental_threadList({
+    id: "bb-collab-threads",
+    title: "bb-collab thread list",
+    description: "Group threads by project with durable bb-collab state.",
+    component: SidebarThreadList,
+  });
   app.slots.pendingInteraction({ id: "operator-receipt", component: OperatorReceiptForm });
   app.slots.navPanel({
     id: "lanes",

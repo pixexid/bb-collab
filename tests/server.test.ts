@@ -1182,7 +1182,7 @@ describe("bb-collab plugin boundary", () => {
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "OPERATOR_AUTH_REQUIRED" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules).toEqual([]);
-    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "doctor", "export", "lanes", "operatorReceipt"]);
+    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "doctor", "export", "lanes", "operatorReceipt", "setThreadState", "threadModels", "threadStates"]);
   });
 
   it("proves fixture bootstrap, read-only doctor, deterministic export, and exact BB fact reads", async () => {
