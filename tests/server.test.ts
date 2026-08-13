@@ -1485,6 +1485,55 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
+  it("rolls back successor authority when the late mutation receipt insert fails", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "late-failure-qualification",
+      qualificationId: "late-failure-qualification",
+    }), null, roleReader()).outcome).toBe("OK");
+    const request = successionRequest(fenceToken, {
+      idempotencyKey: "late-receipt-failure",
+      qualificationId: "late-failure-qualification",
+      expectedGeneration: 1,
+      predecessorGeneration: 1,
+    });
+    const before = exportFoundation(db, PROJECT_ID);
+    const facts = roleReader();
+    db.exec(`CREATE TEMP TRIGGER fail_late_role_receipt
+      BEFORE INSERT ON mutation_receipts
+      WHEN NEW.operation_class = 'role_generation_succession'
+        AND NEW.idempotency_key = 'late-receipt-failure'
+      BEGIN
+        SELECT RAISE(ABORT, 'late role receipt failure');
+      END`);
+    try {
+      const failed = applyWithFixtureReceipt(db, request, null, facts);
+      expect(failed).toMatchObject({ outcome: "INTERNAL_ERROR", expected: 1, attempted: 0, verified: 0 });
+      expect(failed).not.toHaveProperty("mutationReceipt");
+      expect(failed).not.toHaveProperty("eventSequence");
+      expect(facts.readCalls).toEqual([
+        `thread:${ROLE_THREAD_ID}`,
+        `events:${ROLE_THREAD_ID}`,
+        `environment:${ROLE_ENVIRONMENT_ID}`,
+        `project:${PROJECT_ID}`,
+        "host:host-main",
+        "system.version",
+      ]);
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+      expect(db.prepare("SELECT generation, status, retired_at_ms FROM role_generations ORDER BY generation").all()).toEqual([
+        { generation: 1, status: "active", retired_at_ms: null },
+      ]);
+      expect(db.prepare("SELECT current_generation FROM role_generation_heads").get()).toEqual({ current_generation: 1 });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE idempotency_key = 'late-receipt-failure'").get()).toEqual({ count: 0 });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE idempotency_key = 'late-receipt-failure'").get()).toEqual({ count: 0 });
+    } finally {
+      db.exec("DROP TRIGGER fail_late_role_receipt");
+    }
+  });
+
   it("accepts only a verified current role actor bound to the holder execution reference", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
