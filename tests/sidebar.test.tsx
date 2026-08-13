@@ -229,6 +229,8 @@ describe("replacement thread list", () => {
     // Motion is emphasis only: every animated cue opts out under reduced motion.
     for (const kind of ["running", "pending"]) expect(shapeOf(kind)).toContain("motion-reduce:animate-none");
     expect(rendered.container.querySelector('[data-sidebar-thread-signal="running"]')!.getAttribute("aria-label")).toBe("Thread is working");
+    // The indicator label is its own state, not part of the row link's name.
+    expect(rendered.getByRole("link", { name: "running" })).toBeTruthy();
   });
 
   it("keeps rows and project headers at the native compact height", async () => {
@@ -242,6 +244,20 @@ describe("replacement thread list", () => {
     expect(row.className).toContain("transition-colors");
     expect(row.className).toContain("motion-reduce:transition-none");
     expect(rendered.getByText("Project A").parentElement!.className).toContain("h-6");
+  });
+
+  it("cross-fades the row actions instead of reflowing the row on hover", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [thread("thread-1", "project-a", 1)] },
+      rpc: rpcHandlers(),
+    });
+    const trigger = rendered.getByRole("button", { name: "Thread actions" });
+    const meta = trigger.parentElement!.firstElementChild!;
+    // A row that reflows on hover moves whatever the pointer was aiming at.
+    expect(trigger.className).toContain("absolute");
+    expect(meta.className).toContain("group-hover/row:opacity-0");
+    expect(meta.className).not.toContain("hidden");
   });
 
   it("keeps parent threads nested with independently collapsible children", async () => {
@@ -349,6 +365,47 @@ describe("replacement thread list", () => {
       method: "reorderPinned",
       input: { threadId: "pinned-1", previousThreadId: "pinned-2", nextThreadId: null },
     }));
+  });
+
+  it("scopes pinned neighbours to the row's own project group", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: {
+        status: "ready",
+        projects: [project("project-a", "Project A"), project("project-b", "Project B")],
+        threads: [
+          { ...thread("b-pinned", "project-b", 4), isPinned: true },
+          { ...thread("a-pinned-1", "project-a", 3), isPinned: true },
+          { ...thread("a-pinned-2", "project-a", 2), isPinned: true },
+        ],
+      },
+      rpc: rpcHandlers(),
+    });
+    fireEvent.pointerDown(rendered.container.querySelector('[data-sidebar-thread-id="a-pinned-2"]')!, { button: 0 });
+    fireEvent.pointerUp(rendered.container.querySelector('[data-sidebar-thread-id="a-pinned-1"]')!, { button: 0 });
+    // Not "b-pinned": a neighbour from another group is one the user never saw.
+    await waitFor(() => expect(rendered.inspection.rpcCalls).toContainEqual({
+      method: "reorderPinned",
+      input: { threadId: "a-pinned-2", previousThreadId: null, nextThreadId: "a-pinned-1" },
+    }));
+  });
+
+  it("ignores a pinned drag that crosses project groups", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: {
+        status: "ready",
+        projects: [project("project-a", "Project A"), project("project-b", "Project B")],
+        threads: [
+          { ...thread("a-pinned", "project-a", 2), isPinned: true },
+          { ...thread("b-pinned", "project-b", 1), isPinned: true },
+        ],
+      },
+      rpc: rpcHandlers(),
+    });
+    fireEvent.pointerDown(rendered.container.querySelector('[data-sidebar-thread-id="a-pinned"]')!, { button: 0 });
+    fireEvent.pointerUp(rendered.container.querySelector('[data-sidebar-thread-id="b-pinned"]')!, { button: 0 });
+    expect(rendered.inspection.rpcCalls.filter((call) => call.method === "reorderPinned")).toEqual([]);
   });
 
   it("does not reorder from a plain click or from an unpinned row", async () => {

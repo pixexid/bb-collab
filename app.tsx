@@ -221,7 +221,7 @@ function ThreadRow({
   };
   return (
     <div
-      className={`group relative flex h-7 items-center gap-1.5 rounded-md border-l-2 pr-1 text-left text-sm transition-colors duration-150 select-none hover:bg-muted/50 motion-reduce:transition-none ${indicatorClasses(thread)} ${active ? "bg-muted" : ""}`}
+      className={`group/row relative flex h-7 items-center gap-1.5 rounded-md border-l-2 pr-1 text-left text-sm transition-colors duration-150 select-none hover:bg-muted/50 motion-reduce:transition-none ${indicatorClasses(thread)} ${active ? "bg-muted" : ""}`}
       style={{ paddingLeft: `${8 + depth * 16}px` }}
       onPointerDown={(event) => { if (thread.isPinned && event.button === 0) onPinnedDragStart(thread.id); }}
       onPointerEnter={() => onPinnedDragOver(thread.id)}
@@ -231,9 +231,12 @@ function ThreadRow({
         <input autoFocus className="min-w-0 flex-1 rounded border border-border bg-background px-1 text-sm text-foreground" aria-label={`Rename ${title}`} value={renameValue} onChange={(event) => setRenameValue(event.target.value)} onBlur={finishRename} onKeyDown={(event) => { if (event.key === "Enter") finishRename(); if (event.key === "Escape") setRenaming(false); }} />
       ) : (
         <span className="flex min-w-0 flex-1 items-center gap-1.5">
+          {/* Outside the link: the host's indicator label is its own accessible
+              state, not part of the link's name. */}
+          <ThreadSignalIcon thread={thread} />
           <a
             href="#"
-            className="flex min-w-0 items-center gap-1.5 rounded-md outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            className="min-w-0 truncate rounded-md text-foreground outline-none focus-visible:ring-2 focus-visible:ring-primary"
             aria-current={active ? "page" : undefined}
             data-sidebar-thread-shortcut-target=""
             data-sidebar-thread-id={thread.id}
@@ -241,27 +244,31 @@ function ThreadRow({
             title={thread.environment?.branchName ? `${title} — ${thread.environment.branchName}` : title}
             onClick={(event) => { event.preventDefault(); actions.open(thread.id); onNavigate(); }}
           >
-            <ThreadSignalIcon thread={thread} />
-            <span className="min-w-0 truncate text-foreground">{title}</span>
+            {title}
           </a>
           {hasChildren ? <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded text-xs leading-none text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none" aria-label={`${collapsed ? "Expand" : "Collapse"} ${title} children`} aria-expanded={!collapsed} onClick={onToggleChildren}>{collapsed ? "›" : "⌄"}</button> : null}
         </span>
       )}
-      <span className="flex min-w-0 shrink items-center gap-1 text-[11px] text-muted-foreground group-hover:hidden group-focus-within:hidden">
-        {customState ? <span className="shrink-0 truncate rounded bg-muted px-1 leading-4" data-custom-thread-state="">{customState}</span> : null}
-        <span className="max-w-[9rem] truncate" title={`Provider: ${thread.providerId}; model: ${model ?? "unavailable"}`}>{thread.providerId}/{model ?? "unavailable"}</span>
+      {/* Meta and actions share one slot and only cross-fade: hovering a row
+          must not reflow it, or whatever you were aiming at moves. Capped so
+          the title keeps the majority of the row. */}
+      <span className="relative flex min-w-5 max-w-[45%] shrink items-center justify-end">
+        <span className={`flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground transition-opacity duration-150 group-focus-within/row:opacity-0 group-hover/row:opacity-0 motion-reduce:transition-none ${menuOpen ? "opacity-0" : ""}`}>
+          {customState ? <span className="min-w-0 truncate rounded bg-muted px-1 leading-4" data-custom-thread-state="">{customState}</span> : null}
+          <span className="min-w-0 truncate" title={`Provider: ${thread.providerId}; model: ${model ?? "unavailable"}`}>{thread.providerId}/{model ?? "unavailable"}</span>
+        </span>
+        <button
+          ref={triggerRef}
+          type="button"
+          className={`absolute right-0 z-10 inline-flex size-5 shrink-0 items-center justify-center rounded text-xs leading-none text-muted-foreground transition-opacity duration-150 hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary group-hover/row:opacity-100 motion-reduce:transition-none ${menuOpen ? "opacity-100" : "opacity-0"}`}
+          aria-label="Thread actions"
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          onClick={() => setMenuOpen((open) => !open)}
+        >
+          ⋯
+        </button>
       </span>
-      <button
-        ref={triggerRef}
-        type="button"
-        className={`inline-flex size-5 shrink-0 items-center justify-center rounded text-xs leading-none text-muted-foreground transition-opacity duration-150 hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary group-hover:opacity-100 motion-reduce:transition-none ${menuOpen ? "opacity-100" : "opacity-0"}`}
-        aria-label="Thread actions"
-        aria-haspopup="menu"
-        aria-expanded={menuOpen}
-        onClick={() => setMenuOpen((open) => !open)}
-      >
-        ⋯
-      </button>
       {menuOpen ? <div
         ref={menuRef}
         role="menu"
@@ -343,7 +350,15 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   // downward drag a no-op.
   const reorderPinned = (draggedId: string, targetId: string) => {
     if (!draggedId || !targetId || draggedId === targetId) return;
-    const order = sidebar.threads.filter((thread) => thread.isPinned).map((thread) => thread.id);
+    const byId = new Map(sidebar.threads.map((thread) => [thread.id, thread]));
+    const dragged = byId.get(draggedId);
+    const target = byId.get(targetId);
+    if (!dragged?.isPinned || !target?.isPinned) return;
+    // Pinned rows are only ever adjacent inside one project group, so the
+    // neighbours handed to the host come from that group. A global pinned list
+    // names neighbours the user never saw next to the row.
+    if (dragged.projectId !== target.projectId) return;
+    const order = sidebar.threads.filter((thread) => thread.isPinned && thread.projectId === dragged.projectId).map((thread) => thread.id);
     const from = order.indexOf(draggedId);
     const to = order.indexOf(targetId);
     if (from < 0 || to < 0) return;
