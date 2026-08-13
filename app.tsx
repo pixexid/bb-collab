@@ -12,6 +12,7 @@ import { rpcContract } from "./server";
 
 type Lane = PluginRpcResult<typeof rpcContract["lanes"]>[number];
 type ThreadStates = PluginRpcResult<typeof rpcContract["threadStates"]>;
+type ThreadModels = PluginRpcResult<typeof rpcContract["threadModels"]>;
 
 const MAX_VISIBLE_THREADS = 5;
 
@@ -67,12 +68,14 @@ export function groupThreads(
 
 function ThreadRow({
   thread,
+  model,
   active,
   customState,
   onNavigate,
   onToggleState,
 }: {
   thread: PluginSidebarThread;
+  model: string | null;
   active: boolean;
   customState: string | undefined;
   onNavigate: () => void;
@@ -104,7 +107,7 @@ function ThreadRow({
       <span className="min-w-0 flex-1">
         <span className="block truncate font-medium text-foreground">{title}</span>
         <span className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
-          <span className="max-w-[8rem] truncate rounded bg-muted px-1.5 py-0.5" title={`Provider: ${thread.providerId}`}>{thread.providerId}</span>
+          <span className="max-w-[12rem] truncate rounded bg-muted px-1.5 py-0.5" title={`Provider: ${thread.providerId}; model: ${model ?? "unavailable"}`}>{thread.providerId}/{model ?? "unavailable"}</span>
           {thread.environment?.branchName ? <span className="truncate">{thread.environment.branchName}</span> : null}
           {customState ? <span className="truncate rounded bg-muted px-1.5 py-0.5">{customState}</span> : null}
         </span>
@@ -129,6 +132,7 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   const rpc = useRpc<typeof rpcContract>();
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
   const [customStates, setCustomStates] = useState<ThreadStates>({});
+  const [threadModels, setThreadModels] = useState<ThreadModels>({});
   const threadIds = useMemo(() => sidebar.threads.map((thread) => thread.id), [sidebar.threads]);
   const threadIdsKey = threadIds.join("\u0000");
 
@@ -138,6 +142,11 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
       if (mounted) setCustomStates(states);
     }).catch(() => {
       if (mounted) setCustomStates({});
+    });
+    void rpc.call("threadModels", { threadIds }).then((models) => {
+      if (mounted) setThreadModels(models);
+    }).catch(() => {
+      if (mounted) setThreadModels(Object.fromEntries(threadIds.map((threadId) => [threadId, null])));
     });
     return () => {
       mounted = false;
@@ -178,6 +187,7 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
                 <ThreadRow
                   key={thread.id}
                   thread={thread}
+                  model={threadModels[thread.id] ?? null}
                   active={thread.id === activeThreadId}
                   customState={customStates[thread.id]}
                   onNavigate={onNavigate}

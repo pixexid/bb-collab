@@ -59,10 +59,11 @@ async function registration() {
   return app.threadLists[0]!;
 }
 
-function rpcHandlers(states: Record<string, string> = {}) {
+function rpcHandlers(states: Record<string, string> = {}, models: Record<string, string | null> = {}) {
   return {
     lanes: async () => [],
     threadStates: async () => states,
+    threadModels: async () => models,
     setThreadState: async (input: { threadId: string; state: string | null }) => ({ state: input.state }),
     doctor: async () => ({}) as never,
     export: async () => ({}) as never,
@@ -116,16 +117,40 @@ describe("replacement thread list", () => {
     const onNavigate = vi.fn();
     const rendered = renderSlot(list, props({ onNavigate }), {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [thread("thread-1", "project-a", 1)] },
-      rpc: rpcHandlers({ "thread-1": "review" }),
+      rpc: rpcHandlers({ "thread-1": "review" }, { "thread-1": "gpt-5.6" }),
     });
 
     await waitFor(() => expect(rendered.getByText("review")).toBeTruthy());
+    expect(rendered.getByText("codex/gpt-5.6")).toBeTruthy();
     fireEvent.click(rendered.getByText("thread-1"));
     expect(rendered.inspection.sidebarActionCalls).toContainEqual({ method: "open", threadId: "thread-1" });
     expect(onNavigate).toHaveBeenCalledTimes(1);
     expect(rendered.queryByRole("textbox")).toBeNull();
     expect(rendered.queryByText("New thread")).toBeNull();
     expect(rendered.queryByText("Footer")).toBeNull();
+  });
+
+  it("reads the native model by thread id and falls back safely when unavailable", async () => {
+    const host = createFakePluginHost({
+      pluginId: "bb-collab",
+      sdk: {
+        threads: {
+          defaultExecutionOptions: async ({ threadId }) => {
+            if (threadId === "broken") throw new Error("unavailable");
+            if (threadId === "missing") return null;
+            return { model: "gpt-5.6", serviceTier: "default", reasoningLevel: "high", permissionMode: "full", source: "client/thread/start" };
+          },
+        },
+      },
+    });
+    await plugin(host.bb);
+
+    await expect(host.harness.callRpc("threadModels", { threadIds: ["known", "missing", "broken"] })).resolves.toEqual({
+      known: "gpt-5.6",
+      missing: null,
+      broken: null,
+    });
+    expect(host.harness.inspection.sdk.callsTo("threads.defaultExecutionOptions")).toHaveLength(3);
   });
 
   it("stores custom state by thread id in plugin KV", async () => {

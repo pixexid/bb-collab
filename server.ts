@@ -146,6 +146,10 @@ export const rpcContract = defineRpcContract({
     input: z.object({ threadIds: z.array(sidebarThreadIdSchema).max(256) }).strict(),
     output: z.record(z.string(), sidebarThreadStateSchema),
   },
+  threadModels: {
+    input: z.object({ threadIds: z.array(sidebarThreadIdSchema).max(256) }).strict(),
+    output: z.record(z.string(), z.string().nullable()),
+  },
   setThreadState: {
     input: z.object({ threadId: sidebarThreadIdSchema, state: sidebarThreadStateSchema.nullable() }).strict(),
     output: z.object({ state: sidebarThreadStateSchema.nullable() }).strict(),
@@ -310,6 +314,17 @@ export default async function plugin(bb: BbPluginApi) {
         return parsed.success ? ([threadId, parsed.data] as const) : null;
       }));
       return Object.fromEntries(entries.filter((entry): entry is readonly [string, string] => entry !== null));
+    },
+    async threadModels(input) {
+      const entries = await Promise.all(input.threadIds.map(async (threadId) => {
+        try {
+          const options = await bb.sdk.threads.defaultExecutionOptions({ threadId });
+          return [threadId, options?.model ?? null] as const;
+        } catch {
+          return [threadId, null] as const;
+        }
+      }));
+      return Object.fromEntries(entries);
     },
     async setThreadState(input) {
       if (input.state === null) await bb.storage.kv.delete(sidebarThreadStateKey(input.threadId));
