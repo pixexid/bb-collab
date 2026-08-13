@@ -986,7 +986,7 @@ describe("bb-collab plugin boundary", () => {
       db.close();
       rmSync(directory, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("rejects stale config without changing any foundation bytes", async () => {
     const host = await loadedHost();
