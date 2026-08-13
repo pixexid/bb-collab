@@ -543,6 +543,74 @@ function assignmentTerminalReport(
   };
 }
 
+function decisionCreateRequest(
+  fenceToken: string,
+  decisionId = "decision-v5",
+  overrides: Partial<ApplyRequest> = {},
+): ApplyRequest {
+  return {
+    projectId: PROJECT_ID,
+    operationClass: "decision_create",
+    idempotencyKey: `create-${decisionId}`,
+    actorReceiptId: "role-actor-assignment",
+    expectedConfigRevision: 1,
+    expectedGovernanceEpoch: 1,
+    expectedFenceToken: fenceToken,
+    repoTargetId: TARGET_ID,
+    decision: {
+      decisionId,
+      repoTargetId: TARGET_ID,
+      scope: { operation: "assignment" },
+      decisionClass: "assignment_admission",
+      options: { mode: "exact" },
+      resourceRevision: 1,
+    },
+    ...overrides,
+  };
+}
+
+function decisionDispositionRequest(
+  fenceToken: string,
+  decisionId = "decision-v5",
+  expectedResourceRevision = 1,
+  overrides: Partial<ApplyRequest> = {},
+): ApplyRequest {
+  return {
+    projectId: PROJECT_ID,
+    operationClass: "decision_disposition",
+    idempotencyKey: `disposition-${decisionId}-${expectedResourceRevision}`,
+    actorReceiptId: "role-actor-assignment",
+    expectedConfigRevision: 1,
+    expectedGovernanceEpoch: 1,
+    expectedFenceToken: fenceToken,
+    repoTargetId: TARGET_ID,
+    decisionId,
+    disposition: "adopted",
+    expectedResourceRevision,
+    reason: { mechanism: "fixture" },
+    ...overrides,
+  };
+}
+
+function decisionArtifact(
+  evidenceId: string,
+  overrides: Partial<NonNullable<ApplyRequest["decisionEvidence"]>[number]> = {},
+): NonNullable<ApplyRequest["decisionEvidence"]>[number] {
+  return {
+    evidenceId,
+    evidenceKind: "advisory_read",
+    sourceKind: "helper",
+    sourceRef: `fixture:${evidenceId}`,
+    executionAttemptId: null,
+    contentDigest: sha256(`content:${evidenceId}`),
+    redactedJson: canonicalJson({ summary: evidenceId }),
+    durableRefJson: canonicalJson({ ref: `fixture:${evidenceId}` }),
+    relationKind: "advisory_read",
+    relation: { purpose: "condition" },
+    ...overrides,
+  };
+}
+
 describe("bb-collab plugin boundary", () => {
   it("loads one CLI/RPC seam and refuses production apply before any write", async () => {
     const host = await loadedHost();
@@ -819,18 +887,32 @@ describe("bb-collab plugin boundary", () => {
   it("keeps disposition history append-only and rejects stale resource revisions", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, {
+      config: roleConfig(),
       decision: {
         decisionId: "decision-1",
         repoTargetId: TARGET_ID,
         scope: { operation: "review" },
+        decisionClass: "assignment_admission",
+        options: {},
         resourceRevision: 1,
       },
+    });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+    const succession = applyWithFixtureReceipt(db, successionRequest(fenceToken), null, roleReader());
+    const holderExecutionAttemptId = (succession.evidence as { holderExecutionAttemptId: string }).holderExecutionAttemptId;
+    seedVerifiedFixtureReceipt(db, {
+      projectId: PROJECT_ID,
+      receiptId: "role-actor-decision",
+      actorKind: "role",
+      subjectId: holderExecutionAttemptId,
+      roleId: "project-orchestrator",
+      roleGeneration: 1,
     });
     const first = applyWithFixtureReceipt(db, {
       projectId: PROJECT_ID,
       operationClass: "decision_disposition",
       idempotencyKey: "disposition-1",
-      actorReceiptId: RECEIPT_ID,
+      actorReceiptId: "role-actor-decision",
       expectedConfigRevision: 1,
       expectedGovernanceEpoch: 1,
       expectedFenceToken: fenceToken,
@@ -845,7 +927,7 @@ describe("bb-collab plugin boundary", () => {
       projectId: PROJECT_ID,
       operationClass: "decision_disposition",
       idempotencyKey: "disposition-stale",
-      actorReceiptId: RECEIPT_ID,
+      actorReceiptId: "role-actor-decision",
       expectedConfigRevision: 1,
       expectedGovernanceEpoch: 1,
       expectedFenceToken: fenceToken,
@@ -857,6 +939,459 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(stale.outcome).toBe("RESOURCE_REVISION_STALE");
     expect(db.prepare("SELECT disposition_sequence FROM decision_dispositions").all()).toEqual([{ disposition_sequence: 1 }]);
+  });
+
+  it("creates immutable typed Decisions and keeps helper, Pro, legacy, and fixture receipts evidence-only", async () => {
+    const { db, fenceToken } = await assignmentFixture();
+    const create = decisionCreateRequest(fenceToken);
+    const created = applyWithFixtureReceipt(db, create);
+    expect(created).toMatchObject({ outcome: "OK", currentResourceRevision: 1 });
+    expect(applyWithFixtureReceipt(db, create)).toEqual(created);
+
+    const beforeDrift = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "decision-v5", {
+      idempotencyKey: "create-decision-v5-drift",
+      decision: { ...create.decision!, options: { mode: "different" } },
+    })).outcome).toBe("DECISION_IDENTITY_CONFLICT");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeDrift);
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "decision-class-unknown", {
+      idempotencyKey: "create-decision-class-unknown",
+      decision: { ...create.decision!, decisionId: "decision-class-unknown", decisionClass: "unknown_class" },
+    })).outcome).toBe("DECISION_CLASS_UNKNOWN");
+
+    for (const actorKind of ["fixture", "helper", "pro", "legacy"] as const) {
+      const receiptId = `decision-${actorKind}`;
+      seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId, actorKind });
+      const before = exportFoundation(db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 1, {
+        idempotencyKey: `disposition-${actorKind}`,
+        actorReceiptId: receiptId,
+      })).outcome).toBe("ACTOR_RECEIPT_UNVERIFIED");
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    }
+
+    const helper = decisionArtifact("evidence-helper");
+    const pro = decisionArtifact("evidence-pro", { sourceKind: "pro" });
+    const disposition = decisionDispositionRequest(fenceToken, "decision-v5", 1, {
+      conditions: [{ kind: "evidence_required", evidenceIds: [helper.evidenceId, pro.evidenceId] }],
+      decisionEvidence: [helper, pro],
+    });
+    const adopted = applyWithFixtureReceipt(db, disposition);
+    expect(adopted).toMatchObject({ outcome: "OK", currentResourceRevision: 2, evidence: { evidenceIds: [helper.evidenceId, pro.evidenceId] } });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM evidence_artifacts").get()).toEqual({ count: 2 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM decision_evidence").get()).toEqual({ count: 2 });
+    expect((db.prepare("PRAGMA table_info(evidence_artifacts)").all() as Array<{ name: string }>).map((row) => row.name)).not.toContain("actor_receipt_id");
+    expect((db.prepare("PRAGMA table_info(decision_evidence)").all() as Array<{ name: string }>).map((row) => row.name)).not.toContain("actor_receipt_id");
+
+    const legacy = decisionArtifact("evidence-legacy", {
+      evidenceKind: "legacy_claim",
+      sourceKind: "legacy_claim",
+      sourceRef: "legacy:accepted_by",
+      redactedJson: canonicalJson({ accepted_by: "legacy-harness-name", unresolved: true }),
+      relationKind: "legacy_claim",
+      relation: { authorityEffect: "none" },
+    });
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 2, {
+      idempotencyKey: "disposition-reuse-artifact",
+      disposition: "rejected",
+      decisionEvidence: [helper, legacy],
+    })).outcome).toBe("OK");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM evidence_artifacts").get()).toEqual({ count: 3 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM decision_evidence").get()).toEqual({ count: 4 });
+    expect(db.prepare("SELECT evidence_kind, source_kind, redacted_json FROM evidence_artifacts WHERE evidence_id = ?").get(legacy.evidenceId)).toEqual({
+      evidence_kind: "legacy_claim",
+      source_kind: "legacy_claim",
+      redacted_json: legacy.redactedJson,
+    });
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "decision-reuse", {
+      idempotencyKey: "create-decision-reuse",
+      decision: { ...create.decision!, decisionId: "decision-reuse" },
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-reuse", 1, {
+      idempotencyKey: "disposition-cross-decision-reuse",
+      disposition: "rejected",
+      decisionEvidence: [helper],
+    })).outcome).toBe("OK");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM evidence_artifacts").get()).toEqual({ count: 3 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM decision_evidence").get()).toEqual({ count: 5 });
+
+    const beforeConflict = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 3, {
+      idempotencyKey: "disposition-evidence-conflict",
+      disposition: "rejected",
+      decisionEvidence: [{ ...helper, contentDigest: sha256("different") }],
+    })).outcome).toBe("EVIDENCE_IDENTITY_CONFLICT");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeConflict);
+    expect(applyWithFixtureReceipt(db, { ...disposition, reason: { mechanism: "changed" } }).outcome).toBe("IDEMPOTENCY_KEY_CONFLICT");
+  });
+
+  it("requires the current qualified role holder for Decision authority", async () => {
+    const { db, fenceToken, holderExecutionAttemptId } = await assignmentFixture();
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken)).outcome).toBe("OK");
+    seedVerifiedFixtureReceipt(db, {
+      projectId: PROJECT_ID,
+      receiptId: "role-wrong-generation",
+      actorKind: "role",
+      subjectId: holderExecutionAttemptId,
+      roleId: "project-orchestrator",
+      roleGeneration: 2,
+    });
+    seedVerifiedFixtureReceipt(db, {
+      projectId: PROJECT_ID,
+      receiptId: "role-wrong-holder",
+      actorKind: "role",
+      subjectId: "foreign-holder",
+      roleId: "project-orchestrator",
+      roleGeneration: 1,
+    });
+    for (const [receiptId, outcome] of [["role-wrong-generation", "ROLE_GENERATION_STALE"], ["role-wrong-holder", "ROLE_HOLDER_MISMATCH"]]) {
+      const before = exportFoundation(db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 1, {
+        idempotencyKey: `disposition-${receiptId}`,
+        actorReceiptId: receiptId,
+      })).outcome).toBe(outcome);
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    }
+    db.prepare("UPDATE eligibility_projections SET effective_status = 'ineligible' WHERE role_requirement_id = 'orchestrator-v1'").run();
+    const beforeUnqualified = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 1, {
+      idempotencyKey: "disposition-unqualified-role",
+    })).outcome).toBe("ROLE_UNQUALIFIED");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeUnqualified);
+    db.prepare("UPDATE eligibility_projections SET effective_status = 'eligible' WHERE role_requirement_id = 'orchestrator-v1'").run();
+    db.prepare("UPDATE role_generations SET status = 'retired' WHERE role_id = 'project-orchestrator' AND generation = 1").run();
+    const beforeRetired = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 1, {
+      idempotencyKey: "disposition-retired-role",
+    })).outcome).toBe("ROLE_NOT_ACTIVE");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRetired);
+  });
+
+  it("admits a current qualified independent reviewer only for review adjudication", async () => {
+    const { db, fenceToken } = await assignmentFixture();
+    const reviewerContext = {
+      threadId: "thread-reviewer",
+      requestEventId: "event-reviewer-request",
+      requestEventSeq: 1,
+      completionEventId: "event-reviewer-completion",
+      completionEventSeq: 4,
+    };
+    const reviewerReader = () => roleReader((facts) => {
+      facts.thread.id = reviewerContext.threadId;
+      facts.thread.environmentId = "environment-reviewer";
+      facts.environment.id = "environment-reviewer";
+      facts.events[0]!.id = reviewerContext.requestEventId;
+      facts.events[3]!.id = reviewerContext.completionEventId;
+    });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "qualification-reviewer",
+      repoTargetId: TARGET_ID,
+      roleId: "independent-reviewer",
+      roleRequirementId: "reviewer-v1",
+      qualificationId: "qualification-reviewer",
+      roleContext: reviewerContext,
+    }), null, reviewerReader()).outcome).toBe("OK");
+    const succession = applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      idempotencyKey: "succession-reviewer",
+      repoTargetId: TARGET_ID,
+      roleId: "independent-reviewer",
+      roleRequirementId: "reviewer-v1",
+      qualificationId: "qualification-reviewer",
+      roleContext: reviewerContext,
+    }), null, reviewerReader());
+    expect(succession.outcome).toBe("OK");
+    const holderExecutionAttemptId = (succession.evidence as { holderExecutionAttemptId: string }).holderExecutionAttemptId;
+    seedVerifiedFixtureReceipt(db, {
+      projectId: PROJECT_ID,
+      receiptId: "role-actor-reviewer",
+      actorKind: "role",
+      subjectId: holderExecutionAttemptId,
+      roleId: "independent-reviewer",
+      roleGeneration: 1,
+    });
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "review-decision", {
+      idempotencyKey: "create-review-decision",
+      actorReceiptId: "role-actor-reviewer",
+      decision: {
+        ...decisionCreateRequest(fenceToken).decision!,
+        decisionId: "review-decision",
+        decisionClass: "review_adjudication",
+        scope: { candidateSha: CANDIDATE_SHA },
+      },
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "review-decision", 1, {
+      idempotencyKey: "adopt-review-decision",
+      actorReceiptId: "role-actor-reviewer",
+    })).outcome).toBe("OK");
+  });
+
+  it("derives holds and validates supersede and revert references without editing history", async () => {
+    const { db, fenceToken } = await assignmentFixture();
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 1, {
+      disposition: "proposed",
+      holdAction: "set",
+      holdCode: "operator-review",
+    })).outcome).toBe("OK");
+    const held = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 2, {
+      idempotencyKey: "adopt-while-held",
+    })).outcome).toBe("DECISION_DISPOSITION_INVALID");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(held);
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 2, {
+      idempotencyKey: "clear-hold",
+      disposition: "rejected",
+      holdAction: "clear",
+      holdCode: "operator-review",
+      holdReferenceSequence: 1,
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 3, {
+      idempotencyKey: "adopt-after-clear",
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 4, {
+      idempotencyKey: "supersede-adoption",
+      disposition: "superseded",
+      supersedesDispositionSequence: 3,
+    })).outcome).toBe("OK");
+    const beforeRepeatedSupersede = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 5, {
+      idempotencyKey: "repeat-supersede",
+      disposition: "superseded",
+      supersedesDispositionSequence: 3,
+    })).outcome).toBe("DECISION_REFERENCE_INVALID");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRepeatedSupersede);
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 5, {
+      idempotencyKey: "adopt-for-revert",
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 6, {
+      idempotencyKey: "revoke-exact",
+      disposition: "revoked",
+      revertsDispositionSequence: 5,
+    })).outcome).toBe("OK");
+    const beforeRepeatedRevert = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 7, {
+      idempotencyKey: "repeat-revert",
+      disposition: "revoked",
+      revertsDispositionSequence: 5,
+    })).outcome).toBe("DECISION_REFERENCE_INVALID");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRepeatedRevert);
+    expect(db.prepare("SELECT disposition_sequence, disposition FROM decision_dispositions ORDER BY disposition_sequence").all()).toEqual([
+      { disposition_sequence: 1, disposition: "proposed" },
+      { disposition_sequence: 2, disposition: "rejected" },
+      { disposition_sequence: 3, disposition: "adopted" },
+      { disposition_sequence: 4, disposition: "superseded" },
+      { disposition_sequence: 5, disposition: "adopted" },
+      { disposition_sequence: 6, disposition: "revoked" },
+    ]);
+  });
+
+  it("refuses malformed, raw, secret-like, oversized, and unsatisfied Decision evidence", async () => {
+    const { db, fenceToken } = await assignmentFixture();
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken)).outcome).toBe("OK");
+    const base = decisionArtifact("bad-evidence");
+    const cases: Array<[string, NonNullable<ApplyRequest["decisionEvidence"]>[number], string]> = [
+      ["malformed", { ...base, redactedJson: "{" }, "MALFORMED_JSON"],
+      ["noncanonical", { ...base, redactedJson: "{\"z\":1,\"a\":2}" }, "EVIDENCE_REDACTION_INVALID"],
+      ["secret", { ...base, redactedJson: canonicalJson({ apiToken: "hidden" }) }, "EVIDENCE_REDACTION_INVALID"],
+      ["raw", { ...base, redactedJson: canonicalJson({ rawOutput: "worker bytes" }) }, "EVIDENCE_REDACTION_INVALID"],
+      ["oversized", { ...base, redactedJson: canonicalJson({ summary: "x".repeat(17 * 1024) }) }, "EVIDENCE_REDACTION_INVALID"],
+    ];
+    for (const [name, evidence, outcome] of cases) {
+      const before = exportFoundation(db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 1, {
+        idempotencyKey: `bad-evidence-${name}`,
+        decisionEvidence: [evidence],
+      })).outcome, name).toBe(outcome);
+      expect(exportFoundation(db, PROJECT_ID), name).toEqual(before);
+    }
+    const beforeMissing = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 1, {
+      idempotencyKey: "missing-condition-evidence",
+      conditions: [{ kind: "evidence_required", evidenceIds: ["missing"] }],
+    })).outcome).toBe("EVIDENCE_REQUIRED");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeMissing);
+  });
+
+  it("binds delegated Decision evidence only to one exact successful terminal Assignment attempt", async () => {
+    const { db, fenceToken } = await assignmentFixture();
+    const adapter = new DeterministicNativeAssignmentAdapter();
+    const prepared = applyWithFixtureReceipt(db, assignmentPrepareRequest(fenceToken), null, null, adapter);
+    const executionAttemptId = (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+    const delivered = applyWithFixtureReceipt(
+      db,
+      assignmentPhaseRequest(fenceToken, "assignment_dispatch", "assignment-1", executionAttemptId),
+      null,
+      null,
+      adapter,
+    );
+    const native = delivered.evidence as { nativeReceiptDigest: string; actualProfileDigest: string; threadId: string };
+    const terminal = applyWithFixtureReceipt(
+      db,
+      assignmentPhaseRequest(fenceToken, "assignment_terminal", "assignment-1", executionAttemptId, {
+        terminalReport: assignmentTerminalReport("assignment-1", executionAttemptId, native),
+      }),
+      null,
+      null,
+      adapter,
+    );
+    const terminalDigest = (terminal.evidence as { terminalReportDigest: string }).terminalReportDigest;
+    expect(terminal.outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken)).outcome).toBe("OK");
+    const delegated = decisionArtifact("delegated-done", {
+      evidenceKind: "delegated_action_receipt",
+      sourceKind: "delegated_action",
+      sourceRef: `execution:${executionAttemptId}`,
+      assignmentId: "assignment-1",
+      executionAttemptId,
+      contentDigest: terminalDigest,
+      redactedJson: canonicalJson({ outcome: "DONE" }),
+      durableRefJson: canonicalJson({ assignmentId: "assignment-1", executionAttemptId }),
+      relationKind: "delegated_action_receipt",
+      terminalReportDigest: terminalDigest,
+      actualProfileDigest: native.actualProfileDigest,
+      nativeReceiptDigest: native.nativeReceiptDigest,
+    });
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 1, {
+      conditions: [{ kind: "evidence_required", evidenceIds: [delegated.evidenceId] }],
+      decisionEvidence: [delegated],
+    })).outcome).toBe("OK");
+    expect(db.prepare("SELECT evidence_id, disposition_sequence FROM decision_evidence").all()).toEqual([
+      { evidence_id: delegated.evidenceId, disposition_sequence: 1 },
+    ]);
+
+    const negativeCases: Array<[string, Partial<typeof delegated>, string]> = [
+      ["assignment", { assignmentId: "foreign-assignment" }, "EXECUTION_CONTEXT_FOREIGN"],
+      ["terminal", { contentDigest: sha256("wrong"), terminalReportDigest: sha256("wrong") }, "EXECUTION_CONTEXT_FOREIGN"],
+      ["profile", { actualProfileDigest: sha256("wrong") }, "EXECUTION_PROFILE_MISMATCH"],
+      ["native", { nativeReceiptDigest: sha256("wrong") }, "EXECUTION_CONTEXT_FOREIGN"],
+    ];
+    for (const [name, override, outcome] of negativeCases) {
+      const before = exportFoundation(db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 2, {
+        idempotencyKey: `delegated-negative-${name}`,
+        disposition: "rejected",
+        decisionEvidence: [{ ...delegated, evidenceId: `delegated-${name}`, ...override }],
+      })).outcome, name).toBe(outcome);
+      expect(exportFoundation(db, PROJECT_ID), name).toEqual(before);
+    }
+
+    for (const [name, column, value, outcome] of [
+      ["dispatch", "state", "dispatch_unknown", "DISPATCH_UNKNOWN"],
+      ["blocked", "state", "blocked", "TERMINAL_REPORT_REQUIRED"],
+      ["failed", "state", "failed", "TERMINAL_REPORT_REQUIRED"],
+      ["nonterminal", "state", "running", "TERMINAL_REPORT_REQUIRED"],
+      ["conflict", "conflicting_terminal_digest", sha256("conflict"), "TERMINAL_REPORT_AMBIGUOUS"],
+    ] as const) {
+      const original = (db.prepare(`SELECT ${column} AS value FROM execution_attempts WHERE execution_attempt_id = ?`).get(executionAttemptId) as { value: unknown }).value;
+      db.prepare(`UPDATE execution_attempts SET ${column} = ? WHERE execution_attempt_id = ?`).run(value, executionAttemptId);
+      const before = exportFoundation(db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 2, {
+        idempotencyKey: `delegated-state-${name}`,
+        disposition: "rejected",
+        decisionEvidence: [{ ...delegated, evidenceId: `delegated-state-${name}` }],
+      })).outcome, name).toBe(outcome);
+      expect(exportFoundation(db, PROJECT_ID), name).toEqual(before);
+      db.prepare(`UPDATE execution_attempts SET ${column} = ? WHERE execution_attempt_id = ?`).run(original, executionAttemptId);
+    }
+  });
+
+  it("rolls back Decision revision, disposition, artifacts, relations, event, and receipt after a late SQLite failure", async () => {
+    const { db, fenceToken } = await assignmentFixture();
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken)).outcome).toBe("OK");
+    db.exec(`CREATE TEMP TRIGGER fail_decision_receipt
+      BEFORE INSERT ON mutation_receipts
+      WHEN NEW.operation_class = 'decision_disposition'
+      BEGIN SELECT RAISE(ABORT, 'injected late constraint'); END`);
+    const before = exportFoundation(db, PROJECT_ID);
+    const failed = applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 1, {
+      decisionEvidence: [decisionArtifact("rollback-evidence")],
+    }));
+    expect(failed.outcome).toBe("CANONICAL_STORE_UNAVAILABLE");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    expect(db.prepare("SELECT current_resource_revision FROM decisions WHERE decision_id = 'decision-v5'").get()).toEqual({ current_resource_revision: 1 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM decision_dispositions WHERE decision_id = 'decision-v5'").get()).toEqual({ count: 0 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM evidence_artifacts").get()).toEqual({ count: 0 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM decision_evidence").get()).toEqual({ count: 0 });
+    db.exec("DROP TRIGGER fail_decision_receipt");
+  });
+
+  it("migrates v4 to v5 without manufacturing typed authority for existing Decision rows", () => {
+    const db = new Database(":memory:");
+    databaseIsReady(db);
+    try {
+      for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement);
+      seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
+      const bootstrap = applyFixtureMutation(db, bootstrapRequest());
+      const fenceToken = (bootstrap.evidence as { fenceToken: string }).fenceToken;
+      const scopeJson = canonicalJson({ legacy: true });
+      db.prepare(
+        `INSERT INTO decisions
+          (decision_id, project_id, config_revision, repo_target_id, scope_json, scope_digest, current_resource_revision)
+         VALUES ('legacy-decision', ?, 1, ?, ?, ?, 1)`,
+      ).run(PROJECT_ID, TARGET_ID, scopeJson, sha256(scopeJson));
+      db.exec(MIGRATIONS.at(-1)!);
+      expect(db.prepare("SELECT decision_class, options_json, decision_identity_digest FROM decisions WHERE decision_id = 'legacy-decision'").get()).toEqual({
+        decision_class: null,
+        options_json: null,
+        decision_identity_digest: null,
+      });
+      const before = exportFoundation(db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "legacy-decision", 1, {
+        actorReceiptId: RECEIPT_ID,
+        idempotencyKey: "legacy-decision-refusal",
+      })).outcome).toBe("DECISION_IDENTITY_CONFLICT");
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+      expect((before.export?.manifest.tableCounts ?? {})).toMatchObject({ evidence_artifacts: 0, decision_evidence: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("reports deterministic v5 Decision and evidence integrity without adopting or repairing state", async () => {
+    const { host, db, fenceToken } = await assignmentFixture();
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 1, {
+      disposition: "proposed",
+      holdAction: "set",
+      holdCode: "review",
+      decisionEvidence: [decisionArtifact("doctor-evidence")],
+    })).outcome).toBe("OK");
+    const legacyScope = canonicalJson({ legacy: true });
+    db.prepare(
+      `INSERT INTO decisions
+        (decision_id, project_id, config_revision, repo_target_id, scope_json, scope_digest, current_resource_revision)
+       VALUES ('doctor-legacy', ?, 1, ?, ?, ?, 1)`,
+    ).run(PROJECT_ID, TARGET_ID, legacyScope, sha256(legacyScope));
+    const before = exportFoundation(db, PROJECT_ID);
+    const changesBefore = db.prepare("SELECT total_changes() AS count").get();
+    const first = await host.harness.callRpc("doctor", { projectId: PROJECT_ID });
+    const second = await host.harness.callRpc("doctor", { projectId: PROJECT_ID });
+    expect(second).toEqual(first);
+    expect(db.prepare("SELECT total_changes() AS count").get()).toEqual(changesBefore);
+    expect(first).toMatchObject({
+      outcome: "OK",
+      evidence: {
+        decisionIntegrity: {
+          unresolvedDecisions: [{ decisionId: "doctor-legacy", reason: "DECISION_IDENTITY_CONFLICT" }],
+          issues: [],
+          derivedHolds: [{ decisionId: "decision-v5", holdCode: "review", setterSequence: 1 }],
+          artifactCount: 1,
+          relationCount: 1,
+        },
+        cachedConsumers: { oldSchemaVersion: 4, newSchemaVersion: 5, expected: 4, attempted: 4, verified: 4 },
+        schema: { version: 5 },
+      },
+    });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+
+    db.prepare("UPDATE evidence_artifacts SET redacted_digest = ? WHERE evidence_id = 'doctor-evidence'").run(sha256("tampered"));
+    const corruptedBefore = exportFoundation(db, PROJECT_ID);
+    const corrupted = await host.harness.callRpc("doctor", { projectId: PROJECT_ID });
+    expect(corrupted).toMatchObject({
+      outcome: "OK",
+      evidence: { decisionIntegrity: { issues: expect.arrayContaining([{ evidenceId: "doctor-evidence", reason: "evidence_artifact_digest_invalid" }]) } },
+    });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(corruptedBefore);
   });
 
   it("reopens the real SQLite file and recovers the committed idempotent receipt", () => {
@@ -1787,7 +2322,7 @@ describe("bb-collab plugin boundary", () => {
     db.pragma("foreign_keys = OFF");
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
-    db.exec(MIGRATIONS.at(-1)!);
+    db.exec(MIGRATIONS.at(-2)!);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -1807,8 +2342,8 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(3)).toMatchObject({ action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(4)).toMatchObject({ action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(4)).toMatchObject({ oldSchemaVersion: 4, newSchemaVersion: 5, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(5)).toMatchObject({ oldSchemaVersion: 4, newSchemaVersion: 5, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {
