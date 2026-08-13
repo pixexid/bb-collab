@@ -65,7 +65,9 @@ async function registration() {
   return app.threadLists[0]!;
 }
 
-function rpcHandlers(states: Record<string, string> = {}, models: Record<string, string | null> = {}) {
+type ThreadExecution = { model: string; reasoning: string };
+
+function rpcHandlers(states: Record<string, string> = {}, models: Record<string, ThreadExecution | null> = {}) {
   return {
     lanes: async () => [],
     threadStates: async () => states,
@@ -208,7 +210,7 @@ describe("replacement thread list", () => {
     expect(threadSignal({ ...thread("pending", "p", 1), hasPendingInteraction: true, indicatorLabel: "Thread needs user input" })).toEqual({ kind: "pending", label: "Thread needs user input" });
   });
 
-  it("gives each signal a distinct shape that survives reduced motion", async () => {
+  it("signals state through colour alone on one native-sized dot", async () => {
     const list = await registration();
     const rendered = renderSlot(list, props(), {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [
@@ -219,18 +221,120 @@ describe("replacement thread list", () => {
       ] },
       rpc: rpcHandlers(),
     });
-    const shapeOf = (kind: string) => rendered.container.querySelector(`[data-sidebar-thread-signal="${kind}"] > span`)!.className;
+    const dotOf = (kind: string) => rendered.container.querySelector(`[data-sidebar-thread-signal="${kind}"]`)! as HTMLElement;
 
-    expect(shapeOf("running")).toContain("animate-spin");
-    expect(shapeOf("running")).toContain("border-primary");
-    expect(shapeOf("pending")).toContain("bg-primary");
-    expect(shapeOf("attention")).toContain("bg-destructive");
-    expect(shapeOf("idle")).toContain("bg-muted-foreground/40");
-    // Motion is emphasis only: every animated cue opts out under reduced motion.
-    for (const kind of ["running", "pending"]) expect(shapeOf(kind)).toContain("motion-reduce:animate-none");
-    expect(rendered.container.querySelector('[data-sidebar-thread-signal="running"]')!.getAttribute("aria-label")).toBe("Thread is working");
+    expect(dotOf("running").className).toContain("bg-primary");
+    expect(dotOf("pending").className).toContain("bg-primary");
+    expect(dotOf("attention").className).toContain("bg-destructive");
+    expect(dotOf("idle").className).toContain("bg-muted-foreground/40");
+    // Colour is the only feedback dimension: identical geometry, no motion, and
+    // nothing nested beside it.
+    for (const kind of ["running", "pending", "attention", "idle"]) {
+      expect(dotOf(kind).className).toContain("size-1.5");
+      expect(dotOf(kind).className).not.toMatch(/animate-|size-2|size-3|border-2/u);
+      expect(dotOf(kind).childElementCount).toBe(0);
+    }
+    expect(dotOf("running").getAttribute("aria-label")).toBe("Thread is working");
     // The indicator label is its own state, not part of the row link's name.
     expect(rendered.getByRole("link", { name: "running" })).toBeTruthy();
+  });
+
+  it("puts no ornament or spacer in front of the row title", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [
+        { ...thread("running", "project-a", 1), indicator: "workflow", indicatorLabel: "Thread is working" },
+      ] },
+      rpc: rpcHandlers(),
+    });
+    const anchor = rendered.container.querySelector<HTMLAnchorElement>('[data-sidebar-thread-id="running"]')!;
+    // The title leads the row: no icon, no dot and no placeholder box holding
+    // the space one used to occupy.
+    expect(anchor.previousElementSibling).toBeNull();
+    expect(anchor.parentElement!.firstElementChild).toBe(anchor);
+    // The state dot lives after the title, at the native right edge.
+    const dot = rendered.container.querySelector('[data-sidebar-thread-signal]')!;
+    expect(anchor.compareDocumentPosition(dot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("maps host model and reasoning facts to short badge text with safe fallbacks", async () => {
+    const { shortModelName, reasoningLetter, executionBadgeLabel } = await import("../app");
+
+    expect(shortModelName("gpt-5.6-luna")).toBe("Luna");
+    expect(shortModelName("gpt-5.6-sol")).toBe("Sol");
+    expect(shortModelName("claude-opus-5[1m]")).toBe("Opus");
+    expect(shortModelName("kimi-k3")).toBe("Kimi");
+    expect(shortModelName("claude-fable-5")).toBe("Fable");
+    expect(shortModelName("claude-sonnet-5")).toBe("Sonnet");
+    expect(shortModelName("gpt-5.5")).toBe("GPT");
+    // Unknown families still read as the host's own first word, never a guess.
+    expect(shortModelName("mistral-large-2")).toBe("Mistral");
+    expect(shortModelName("openai/o9-preview")).toBe("O9");
+    expect(shortModelName(null)).toBe("—");
+
+    expect(["low", "medium", "high", "xhigh", "max"].map(reasoningLetter)).toEqual(["L", "M", "H", "X", "MAX"]);
+    // Never invent a level the host did not supply, and never letter one that
+    // has no letter.
+    expect(reasoningLetter(null)).toBe("–");
+    expect(reasoningLetter("none")).toBe("–");
+    expect(reasoningLetter("ultracode")).toBe("–");
+    expect(executionBadgeLabel("codex", null)).toBe("codex · model unavailable · reasoning unavailable");
+    expect(executionBadgeLabel("codex", { model: "gpt-5.6-luna", reasoning: "high" })).toBe("codex · model gpt-5.6-luna · reasoning high");
+  });
+
+  it("renders the execution badge as a bundled monochrome mark plus short text", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [thread("thread-1", "project-a", 1)] },
+      rpc: rpcHandlers({}, { "thread-1": { model: "gpt-5.6-luna", reasoning: "high" } }),
+    });
+
+    const badge = await waitFor(() => rendered.getByRole("img", { name: "codex · model gpt-5.6-luna · reasoning high" }));
+    expect(badge.textContent).toBe("Luna·H");
+    // No long provider/model text survives in the row.
+    expect(rendered.queryByText("codex/gpt-5.6-luna")).toBeNull();
+
+    const mark = badge.querySelector("svg")!;
+    expect(mark.getAttribute("data-provider-mark")).toBe("codex");
+    expect(mark.getAttribute("stroke")).toBe("currentColor");
+    expect(mark.getAttribute("aria-hidden")).toBe("true");
+    // Theme token only: nothing hard-codes a colour or reaches off-device.
+    expect(mark.outerHTML).not.toMatch(/https?:|url\(|#[0-9a-f]{3,6}\b|rgb\(/iu);
+    expect(rendered.container.querySelector("img, image, use")).toBeNull();
+  });
+
+  it("falls back to a generic mark for a provider it ships no mark for", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: {
+        status: "ready",
+        projects: [project("project-a", "Project A")],
+        threads: [{ ...thread("thread-1", "project-a", 1), providerId: "claude-code" }, { ...thread("thread-2", "project-a", 2), providerId: "some-new-provider" }],
+      },
+      rpc: rpcHandlers(),
+    });
+
+    const marks = Array.from(rendered.container.querySelectorAll("svg[data-provider-mark]"));
+    expect(marks.map((mark) => mark.getAttribute("data-provider-mark"))).toEqual(["somenewprovider", "claudecode"]);
+    expect(marks.every((mark) => mark.querySelector("path")!.getAttribute("d"))).toBeTruthy();
+  });
+
+  it("gives the project counter the same typography as the project name", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [thread("thread-1", "project-a", 1)] },
+      rpc: rpcHandlers(),
+    });
+    const name = rendered.getByText("Project A");
+    const counter = rendered.container.querySelector<HTMLElement>("[data-project-thread-count]")!;
+    expect(counter.textContent).toBe("1");
+    // Both inherit the header's type: neither carries a size, weight, colour or
+    // numeral utility the other lacks.
+    expect(counter.parentElement).toBe(name.parentElement);
+    const typography = /^(text-|font-|leading-|tracking-|tabular-|slashed-|lining-|oldstyle-|proportional-)/u;
+    const typeClassesOf = (element: HTMLElement) => element.className.split(/\s+/u).filter((token) => typography.test(token));
+    expect(typeClassesOf(counter)).toEqual(typeClassesOf(name));
+    expect(typeClassesOf(counter)).toEqual([]);
   });
 
   it("keeps rows and project headers at the native compact height", async () => {
@@ -430,11 +534,11 @@ describe("replacement thread list", () => {
     const onNavigate = vi.fn();
     const rendered = renderSlot(list, props({ onNavigate }), {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [thread("thread-1", "project-a", 1)] },
-      rpc: rpcHandlers({ "thread-1": "review" }, { "thread-1": "gpt-5.6" }),
+      rpc: rpcHandlers({ "thread-1": "review" }, { "thread-1": { model: "gpt-5.6", reasoning: "medium" } }),
     });
 
     await waitFor(() => expect(rendered.getByText("review")).toBeTruthy());
-    expect(rendered.getByText("codex/gpt-5.6")).toBeTruthy();
+    expect(rendered.getByText("GPT·M")).toBeTruthy();
     fireEvent.click(rendered.getByText("thread-1"));
     expect(rendered.inspection.sidebarActionCalls).toContainEqual({ method: "open", threadId: "thread-1" });
     expect(onNavigate).toHaveBeenCalledTimes(1);
@@ -443,7 +547,7 @@ describe("replacement thread list", () => {
     expect(rendered.queryByText("Footer")).toBeNull();
   });
 
-  it("reads the native model by thread id and falls back safely when unavailable", async () => {
+  it("reads the native model and reasoning by thread id and falls back safely when unavailable", async () => {
     const host = createFakePluginHost({
       pluginId: "bb-collab",
       sdk: {
@@ -459,7 +563,7 @@ describe("replacement thread list", () => {
     await plugin(host.bb);
 
     await expect(host.harness.callRpc("threadModels", { threadIds: ["known", "missing", "broken"] })).resolves.toEqual({
-      known: "gpt-5.6",
+      known: { model: "gpt-5.6", reasoning: "high" },
       missing: null,
       broken: null,
     });

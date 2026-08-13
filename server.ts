@@ -136,6 +136,10 @@ const laneListSchema = z.array(laneViewSchema);
 const sidebarThreadIdSchema = z.string().trim().min(1).max(256);
 const sidebarThreadStateSchema = z.string().trim().min(1).max(64);
 const sidebarThreadStateKey = (threadId: string) => `sidebar.thread-state:${threadId}`;
+const sidebarReasoningLevelSchema = z.enum(["none", "low", "medium", "high", "xhigh", "ultracode", "max", "ultra"]);
+const sidebarThreadExecutionSchema = z
+  .object({ model: z.string(), reasoning: sidebarReasoningLevelSchema })
+  .strict();
 const sidebarCollapseKindSchema = z.enum(["project", "thread"]);
 const sidebarCollapseKey = (kind: "project" | "thread", id: string) => `sidebar.collapse:${kind}:${id}`;
 
@@ -150,7 +154,7 @@ export const rpcContract = defineRpcContract({
   },
   threadModels: {
     input: z.object({ threadIds: z.array(sidebarThreadIdSchema).max(256) }).strict(),
-    output: z.record(z.string(), z.string().nullable()),
+    output: z.record(z.string(), sidebarThreadExecutionSchema.nullable()),
   },
   setThreadState: {
     input: z.object({ threadId: sidebarThreadIdSchema, state: sidebarThreadStateSchema.nullable() }).strict(),
@@ -343,7 +347,9 @@ export default async function plugin(bb: BbPluginApi) {
       const entries = await Promise.all(input.threadIds.map(async (threadId) => {
         try {
           const options = await bb.sdk.threads.defaultExecutionOptions({ threadId });
-          return [threadId, options?.model ?? null] as const;
+          // Model and reasoning are only ever the host's resolved facts; an
+          // absent option set stays absent rather than becoming a default.
+          return [threadId, options ? { model: options.model, reasoning: options.reasoningLevel } : null] as const;
         } catch {
           return [threadId, null] as const;
         }

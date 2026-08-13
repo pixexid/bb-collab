@@ -15687,6 +15687,8 @@ var laneListSchema = external_exports.array(laneViewSchema);
 var sidebarThreadIdSchema = external_exports.string().trim().min(1).max(256);
 var sidebarThreadStateSchema = external_exports.string().trim().min(1).max(64);
 var sidebarThreadStateKey = (threadId) => `sidebar.thread-state:${threadId}`;
+var sidebarReasoningLevelSchema = external_exports.enum(["none", "low", "medium", "high", "xhigh", "ultracode", "max", "ultra"]);
+var sidebarThreadExecutionSchema = external_exports.object({ model: external_exports.string(), reasoning: sidebarReasoningLevelSchema }).strict();
 var sidebarCollapseKindSchema = external_exports.enum(["project", "thread"]);
 var sidebarCollapseKey = (kind, id2) => `sidebar.collapse:${kind}:${id2}`;
 var rpcContract = defineRpcContract({
@@ -15700,7 +15702,7 @@ var rpcContract = defineRpcContract({
   },
   threadModels: {
     input: external_exports.object({ threadIds: external_exports.array(sidebarThreadIdSchema).max(256) }).strict(),
-    output: external_exports.record(external_exports.string(), external_exports.string().nullable())
+    output: external_exports.record(external_exports.string(), sidebarThreadExecutionSchema.nullable())
   },
   setThreadState: {
     input: external_exports.object({ threadId: sidebarThreadIdSchema, state: sidebarThreadStateSchema.nullable() }).strict(),
@@ -15873,7 +15875,7 @@ async function plugin(bb) {
       const entries = await Promise.all(input.threadIds.map(async (threadId) => {
         try {
           const options = await bb.sdk.threads.defaultExecutionOptions({ threadId });
-          return [threadId, options?.model ?? null];
+          return [threadId, options ? { model: options.model, reasoning: options.reasoningLevel } : null];
         } catch {
           return [threadId, null];
         }
