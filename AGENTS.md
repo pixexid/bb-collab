@@ -3,7 +3,7 @@
 CONTRACT_VERSION: 2
 
 This repository contains the founding contract and the implemented foundation
-through schema v6: a single SQLite store with migrations, resolver,
+through schema v7: a single SQLite store with migrations, resolver,
 state-event and mutation-receipt, deterministic export, and read-only doctor
 seams, plus WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
 Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
@@ -56,9 +56,9 @@ Changing version text alone is not a migration. A zero-work result is not a
 successful apply unless zero expected work, zero attempted work and zero
 verified work are all proven.
 
-Contract v2/schema v6 requires all four cached consumers to reread the
+Contract v2/schema v7 requires all four cached consumers to reread the
 MigrationRun operation, export/evidence, and refusal contract or refuse schema
-v5.
+v6.
 
 ## Delegation and lane obligations
 

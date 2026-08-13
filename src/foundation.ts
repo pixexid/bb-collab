@@ -6,7 +6,7 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 export const CONTRACT_VERSION = 2;
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 // ponytail: keep exports bounded at 256 rows; add paged/file export before migration or cutover.
 export const MAX_EXPORT_ROWS = 256;
 export const MAX_EXPORT_BYTES = 512 * 1024;
@@ -21,6 +21,7 @@ export const TABLES = [
   "project_governorship_heads",
   "migration_runs",
   "actor_receipts",
+  "operator_receipts",
   "decisions",
   "decision_dispositions",
   "evidence_artifacts",
@@ -525,6 +526,32 @@ export const MIGRATIONS: string[] = [
   CREATE UNIQUE INDEX IF NOT EXISTS migration_runs_one_open
     ON migration_runs(source_system, project_id)
     WHERE state NOT IN ('retired', 'rolled_back')`,
+  `CREATE TABLE IF NOT EXISTS operator_receipts (
+    project_id TEXT NOT NULL,
+    receipt_id TEXT NOT NULL UNIQUE,
+    receipt_type TEXT NOT NULL CHECK (receipt_type = 'operator_confirmation'),
+    mutation_class TEXT NOT NULL CHECK (mutation_class IN (
+      'bootstrap', 'config_revision', 'governor_claim', 'decision_create',
+      'decision_disposition', 'work_item_create', 'work_item_transition',
+      'github_issue_projection', 'qualification_observation_record',
+      'role_generation_succession', 'assignment_prepare', 'assignment_dispatch',
+      'assignment_reconcile', 'assignment_terminal', 'migration_prepare',
+      'migration_step'
+    )),
+    candidate_head TEXT NOT NULL CHECK (
+      length(candidate_head) BETWEEN 40 AND 64
+      AND candidate_head NOT GLOB '*[^0-9a-f]*'
+    ),
+    binding_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status = 'interim'),
+    retirement_condition TEXT NOT NULL CHECK (retirement_condition = 'host-issued receipt get-bb/bb#1541'),
+    caller_thread_id TEXT NOT NULL,
+    caller_plugin_id TEXT NOT NULL,
+    requested_from_background INTEGER NOT NULL CHECK (requested_from_background IN (0, 1)),
+    receipt_digest TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (project_id, receipt_id)
+  )`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -534,7 +561,7 @@ export function cachedConsumerRolloutEvidence(observedSchemaVersion: number) {
   const reread = observedSchemaVersion === SCHEMA_VERSION;
   const evidence = {
     names: [...CACHED_CONSUMERS],
-    oldSchemaVersion: 5,
+    oldSchemaVersion: 6,
     newSchemaVersion: SCHEMA_VERSION,
     observedSchemaVersion,
     action: reread ? "reread" : "refused",
@@ -947,6 +974,59 @@ const roleContextRefSchema = z
   })
   .strict();
 const gitShaSchema = z.string().regex(/^[0-9a-f]{40,64}$/u);
+export const OPERATOR_RECEIPT_RETIREMENT_CONDITION = "host-issued receipt get-bb/bb#1541" as const;
+export const CANONICAL_MUTATION_CLASSES = [
+  "bootstrap",
+  "config_revision",
+  "governor_claim",
+  "decision_create",
+  "decision_disposition",
+  "work_item_create",
+  "work_item_transition",
+  "github_issue_projection",
+  "qualification_observation_record",
+  "role_generation_succession",
+  "assignment_prepare",
+  "assignment_dispatch",
+  "assignment_reconcile",
+  "assignment_terminal",
+  "migration_prepare",
+  "migration_step",
+] as const;
+const operatorMutationClassSchema = z.enum(CANONICAL_MUTATION_CLASSES);
+export const operatorReceiptRequestSchema = z.object({
+  projectId: id,
+  mutationClass: operatorMutationClassSchema,
+  candidateHead: gitShaSchema,
+  callerThreadId: id,
+  requestedFromBackground: z.boolean(),
+}).strict();
+export const operatorReceiptConfirmationSchema = z.object({
+  confirmed: z.boolean(),
+  projectId: id,
+  mutationClass: operatorMutationClassSchema,
+  candidateHead: gitShaSchema,
+}).strict();
+
+export type OperatorReceiptRequest = z.infer<typeof operatorReceiptRequestSchema>;
+export type OperatorReceiptConfirmation = z.infer<typeof operatorReceiptConfirmationSchema>;
+
+export interface OperatorReceipt {
+  receiptId: string;
+  projectId: string;
+  receiptType: "operator_confirmation";
+  mutationClass: OperatorReceiptRequest["mutationClass"];
+  candidateHead: string;
+  bindingDigest: string;
+  status: "interim";
+  retirementCondition: typeof OPERATOR_RECEIPT_RETIREMENT_CONDITION;
+  callerThreadId: string;
+  callerPluginId: string;
+  requestedFromBackground: boolean;
+  receiptDigest: string;
+  createdAtMs: number;
+}
+
 const assignmentEnvironmentSchema = z
   .object({
     bbServerId: id,
@@ -1023,24 +1103,7 @@ const terminalReportSchema = z
 export const applyRequestSchema = z
   .object({
     projectId: id,
-    operationClass: z.enum([
-      "bootstrap",
-      "config_revision",
-      "governor_claim",
-      "decision_create",
-      "decision_disposition",
-      "work_item_create",
-      "work_item_transition",
-      "github_issue_projection",
-      "qualification_observation_record",
-      "role_generation_succession",
-      "assignment_prepare",
-      "assignment_dispatch",
-      "assignment_reconcile",
-      "assignment_terminal",
-      "migration_prepare",
-      "migration_step",
-    ]),
+    operationClass: z.enum(CANONICAL_MUTATION_CLASSES),
     idempotencyKey: id,
     actorReceiptId: id.nullable().optional(),
     expectedConfigRevision: z.number().int().nonnegative().nullable().optional(),
@@ -1599,7 +1662,9 @@ export type FoundationCode =
   | "EXPORT_BOUNDED"
   | "SOURCE_FREEZE_UNPROVEN"
   | "IMPORT_EQUIVALENCE_FAILED"
-  | "MIGRATION_FIX_FORWARD_REQUIRED";
+  | "MIGRATION_FIX_FORWARD_REQUIRED"
+  | "OPERATOR_RECEIPT_CANCELLED"
+  | "OPERATOR_RECEIPT_STALE";
 
 export interface MutationReceipt {
   projectId: string;
@@ -1625,6 +1690,7 @@ export interface FoundationResult {
   expectedResourceRevision?: number;
   mutationReceipt?: MutationReceipt;
   eventSequence?: number;
+  operatorReceipt?: OperatorReceipt;
   evidence?: unknown;
   export?: ExportPayload;
 }
@@ -1952,6 +2018,71 @@ function result(
   return Object.fromEntries(
     Object.entries({ outcome, subject, expected, attempted, verified, ...extra }).filter(([, value]) => value !== undefined),
   ) as unknown as FoundationResult;
+}
+
+export function operatorReceiptBindingDigest(input: Pick<OperatorReceiptRequest, "projectId" | "mutationClass" | "candidateHead">): string {
+  return sha256(canonicalJson({
+    projectId: input.projectId,
+    mutationClass: input.mutationClass,
+    candidateHead: input.candidateHead,
+  }));
+}
+
+export function persistInterimOperatorReceipt(
+  db: SqliteDatabase,
+  input: OperatorReceiptRequest & { callerPluginId: string },
+  createdAtMs = now(),
+): OperatorReceipt {
+  const receiptId = `operator-${randomBytes(16).toString("hex")}`;
+  const bindingDigest = operatorReceiptBindingDigest(input);
+  const receiptDigest = sha256(canonicalJson({
+    receiptId,
+    projectId: input.projectId,
+    receiptType: "operator_confirmation",
+    mutationClass: input.mutationClass,
+    candidateHead: input.candidateHead,
+    bindingDigest,
+    status: "interim",
+    retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
+    callerThreadId: input.callerThreadId,
+    callerPluginId: input.callerPluginId,
+    requestedFromBackground: input.requestedFromBackground,
+    createdAtMs,
+  }));
+  db.prepare(
+    `INSERT INTO operator_receipts (
+      project_id, receipt_id, receipt_type, mutation_class, candidate_head,
+      binding_digest, status, retirement_condition, caller_thread_id,
+      caller_plugin_id, requested_from_background, receipt_digest, created_at_ms
+    ) VALUES (?, ?, 'operator_confirmation', ?, ?, ?, 'interim', ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    input.projectId,
+    receiptId,
+    input.mutationClass,
+    input.candidateHead,
+    bindingDigest,
+    OPERATOR_RECEIPT_RETIREMENT_CONDITION,
+    input.callerThreadId,
+    input.callerPluginId,
+    input.requestedFromBackground ? 1 : 0,
+    receiptDigest,
+    createdAtMs,
+  );
+  return {
+    receiptId,
+    projectId: input.projectId,
+    receiptType: "operator_confirmation",
+    mutationClass: input.mutationClass,
+    candidateHead: input.candidateHead,
+    bindingDigest,
+    status: "interim",
+    retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
+    callerThreadId: input.callerThreadId,
+    callerPluginId: input.callerPluginId,
+    requestedFromBackground: input.requestedFromBackground,
+    receiptDigest,
+    createdAtMs,
+  };
 }
 
 function refusalResult(subject: string, data: RefusalData, expected = 1, attempted = 0, verified = 0): FoundationResult {
@@ -6472,6 +6603,7 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     project_governorship_heads: "project_id",
     migration_runs: "migration_id",
     actor_receipts: "receipt_id",
+    operator_receipts: "receipt_id",
     decisions: "decision_id",
     decision_dispositions: "decision_dispositions.decision_id, decision_dispositions.disposition_sequence",
     evidence_artifacts: "evidence_id",

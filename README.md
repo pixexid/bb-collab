@@ -5,7 +5,7 @@ BB-native project governance, work lifecycle, and collaboration runtime.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through schema v5: a
+The repository now contains the implemented foundation through schema v7: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
