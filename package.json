@@ -13,6 +13,7 @@
       "icon": "Database"
     },
     "server": "./server.ts",
+    "app": "./app.tsx",
     "skills": []
   },
   "scripts": {

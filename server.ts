@@ -1,6 +1,14 @@
 import { defineRpcContract, type BbPluginApi, type PluginCliContext } from "@bb/plugin-sdk";
 import { z } from "zod";
 import {
+  SUPERVISOR_THREAD_ID,
+  createLaneWatcher,
+  openLaneViews,
+  readLaneStates,
+  subscribeToThreadChanges,
+  threadEventStatus,
+} from "./src/awareness.js";
+import {
   BB_VERSION_RANGE,
   MIGRATIONS,
   PLUGIN_ID,
@@ -85,7 +93,30 @@ export const foundationResultSchema = z
   })
   .strict();
 
+const laneViewSchema = z
+  .object({
+    projectId: projectIdSchema,
+    laneId: projectIdSchema,
+    assignmentId: projectIdSchema,
+    assignmentKind: z.enum(["write", "review", "probe"]),
+    workItemId: projectIdSchema,
+    threadId: projectIdSchema.nullable(),
+    executionAttemptId: projectIdSchema,
+    attemptState: z.string(),
+    workerStatus: z.enum(["active", "idle", "error", "starting", "stopping"]).nullable(),
+    waitingOn: z.string().nullable(),
+    ageMs: z.number().int().nonnegative(),
+    tone: z.enum(["default", "running", "success", "error"]),
+  })
+  .strict();
+
+const laneListSchema = z.array(laneViewSchema);
+
 export const rpcContract = defineRpcContract({
+  lanes: {
+    input: z.object({}).strict(),
+    output: laneListSchema,
+  },
   doctor: {
     input: z.object({ projectId: projectIdSchema }).strict(),
     output: foundationResultSchema,
@@ -181,7 +212,51 @@ export default async function plugin(bb: BbPluginApi) {
     db = null;
   }
 
+  const watcher = createLaneWatcher({
+    readLanes: () => (db ? readLaneStates(db) : []),
+    steer: async (lane) => {
+      await bb.sdk.threads.send({
+        threadId: SUPERVISOR_THREAD_ID,
+        mode: "steer",
+        input: [
+          {
+            type: "text",
+            text: `Lane ${lane.laneId} is open while worker ${lane.threadId ?? "unknown"} is idle without a terminal receipt. Reconcile assignment ${lane.assignmentId}.`,
+            mentions: [],
+          },
+        ],
+      });
+    },
+  });
+
+  const observe = (payload: Parameters<typeof threadEventStatus>[0]) => {
+    const { id, status } = threadEventStatus(payload);
+    return watcher.observe(id, status);
+  };
+  bb.events.on("thread.active", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
+  bb.events.on("thread.idle", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
+  bb.events.on("thread.failed", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
+  const unsubscribe = subscribeToThreadChanges(bb.sdk, (threadId, status) => watcher.observe(threadId, status));
+  bb.onDispose(unsubscribe);
+  bb.background.service("lane-watcher", {
+    start(signal) {
+      return new Promise<void>((resolve) => {
+        if (signal.aborted) return resolve();
+        signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+    },
+  });
+
+  bb.http.route("GET", "/lanes", () =>
+    new Response(JSON.stringify(db ? openLaneViews(db) : []), {
+      headers: { "content-type": "application/json" },
+    }),
+  );
+
   bb.rpc.register(rpcContract, {
+    lanes() {
+      return db ? openLaneViews(db) : [];
+    },
     async doctor(input) {
       return doctor(db, bb.sdk, input.projectId);
     },
