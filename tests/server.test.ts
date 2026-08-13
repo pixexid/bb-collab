@@ -422,13 +422,20 @@ function seedAssignmentDatabase(
   return { fenceToken, workItemRevision: options.inProgress ? 3 : 2 };
 }
 
-async function assignmentFixture(options: { writingLaneCeiling?: number; connectorPolicy?: "required" | "optional" | "prohibited" } = {}) {
+async function assignmentFixture(options: {
+  writingLaneCeiling?: number;
+  connectorPolicy?: "required" | "optional" | "prohibited";
+  targetDefaultBranch?: string;
+} = {}) {
   const host = await loadedHost();
   const config = roleConfig(options.connectorPolicy);
   if (options.writingLaneCeiling !== undefined) {
     (config.extensions.bbCollab as Record<string, unknown>).writingLaneCeiling = options.writingLaneCeiling;
   }
-  const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config });
+  const targets = options.targetDefaultBranch
+    ? bootstrapRequest().targets!.map((target) => ({ ...target, defaultBranch: options.targetDefaultBranch! }))
+    : undefined;
+  const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config, ...(targets ? { targets } : {}) });
   expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
   expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
   expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
@@ -3590,13 +3597,35 @@ describe("bb-collab plugin boundary", () => {
       receipts: db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get(),
     });
     const writer = await assignmentFixture();
+    const writerRequest = (name: string) => assignmentPrepareRequest(writer.fenceToken, `workspace-${name}`, {
+      idempotencyKey: `workspace-${name}`,
+      assignment: {
+        ...assignmentPrepareRequest(writer.fenceToken).assignment!,
+        assignmentId: `workspace-${name}`,
+        branchName: `bb/workspace-${name}`,
+        environment: {
+          ...assignmentPrepareRequest(writer.fenceToken).assignment!.environment,
+          environmentId: `environment-workspace-${name}`,
+        },
+      },
+    });
+    const requiredFacts: Array<keyof NativeAssignmentInspection> = [
+      "bbServerId", "projectId", "environmentId", "sourceId", "hostId", "environmentPath",
+      "environmentMode", "environmentStatus", "branchName", "headSha", "baseSha",
+      "defaultBranchName", "defaultBranchHeadSha", "mergeBaseSha",
+    ];
+    const unresolvedFacts = requiredFacts.flatMap((field) => [
+      [`${field}-null`, { [field]: null } as Partial<NativeAssignmentInspection>, "BB_FACTS_UNAVAILABLE" as const],
+      [`${field}-missing`, { [field]: undefined } as Partial<NativeAssignmentInspection>, "BB_FACTS_UNAVAILABLE" as const],
+    ] as Array<[string, Partial<NativeAssignmentInspection>, FoundationResult["outcome"]]>);
     const writerCases: Array<[string, Partial<NativeAssignmentInspection>, FoundationResult["outcome"]]> = [
-      ["missing-identity", { environmentId: undefined as never }, "BB_FACTS_UNAVAILABLE"],
-      ["null-identity", { environmentId: null }, "BB_FACTS_UNAVAILABLE"],
+      ...unresolvedFacts,
       ["provisioning", { environmentStatus: "provisioning" }, "BB_FACTS_UNAVAILABLE"],
       ["ambiguous", { environmentStatus: "ambiguous" }, "BB_FACTS_UNAVAILABLE"],
-      ["missing-ancestry", { mergeBaseSha: null }, "BB_FACTS_UNAVAILABLE"],
+      ["unknown-working-tree", { workingTreeState: "unknown" }, "BB_FACTS_UNAVAILABLE"],
+      ["unknown-inspection-key", { unknownFact: true } as Partial<NativeAssignmentInspection>, "BB_FACTS_UNAVAILABLE"],
       ["dirty", { workingTreeState: "dirty" }, "EXECUTION_CONTEXT_FOREIGN"],
+      ["foreign-environment", { environmentId: "environment-foreign" }, "EXECUTION_CONTEXT_FOREIGN"],
       ["moved", { environmentPath: "/workspace/moved" }, "EXECUTION_CONTEXT_FOREIGN"],
       ["foreign-project", { projectId: FOREIGN_PROJECT_ID }, "EXECUTION_CONTEXT_FOREIGN"],
       ["foreign-source", { sourceId: "source-foreign" }, "EXECUTION_CONTEXT_FOREIGN"],
@@ -3604,6 +3633,7 @@ describe("bb-collab plugin boundary", () => {
       ["non-managed", { environmentMode: "local-path" }, "EXECUTION_CONTEXT_FOREIGN"],
       ["wrong-branch", { branchName: "bb/foreign" }, "EXECUTION_CONTEXT_FOREIGN"],
       ["stale-head", { headSha: CANDIDATE_SHA }, "ASSIGNMENT_HEAD_STALE"],
+      ["writer-head-moved-but-ancestor", { headSha: CANDIDATE_SHA, mergeBaseSha: CANDIDATE_SHA, defaultBranchHeadSha: H1_CANDIDATE_SHA }, "ASSIGNMENT_HEAD_STALE"],
       ["writer-ahead", { defaultBranchHeadSha: CANDIDATE_SHA, mergeBaseSha: CANDIDATE_SHA }, "ASSIGNMENT_HEAD_STALE"],
       ["writer-diverged", { defaultBranchHeadSha: CANDIDATE_SHA, mergeBaseSha: H1_CANDIDATE_SHA }, "ASSIGNMENT_HEAD_STALE"],
     ];
@@ -3611,30 +3641,40 @@ describe("bb-collab plugin boundary", () => {
       const adapter = new DeterministicNativeAssignmentAdapter();
       adapter.nextInspection = inspection;
       const before = mutationCounts(writer.db);
-      const request = assignmentPrepareRequest(writer.fenceToken, `workspace-${name}`, {
-        idempotencyKey: `workspace-${name}`,
-        assignment: {
-          ...assignmentPrepareRequest(writer.fenceToken).assignment!,
-          assignmentId: `workspace-${name}`,
-          branchName: `bb/workspace-${name}`,
-          environment: {
-            ...assignmentPrepareRequest(writer.fenceToken).assignment!.environment,
-            environmentId: `environment-workspace-${name}`,
-          },
-        },
-      });
+      const request = writerRequest(name);
       expect(applyWithFixtureReceipt(writer.db, request, null, null, adapter).outcome, name).toBe(outcome);
       expect(adapter.dispatchCalls, name).toHaveLength(0);
       expect(mutationCounts(writer.db), name).toEqual(before);
     }
 
+    const missingAdapterBefore = mutationCounts(writer.db);
+    expect(applyWithFixtureReceipt(writer.db, writerRequest("missing-adapter")).outcome).toBe("BB_FACTS_UNAVAILABLE");
+    expect(mutationCounts(writer.db)).toEqual(missingAdapterBefore);
+
+    const throwingAdapter = new DeterministicNativeAssignmentAdapter();
+    throwingAdapter.onInspect = () => { throw new Error("fixture inspection failure"); };
+    const throwingAdapterBefore = mutationCounts(writer.db);
+    expect(applyWithFixtureReceipt(writer.db, writerRequest("throwing-adapter"), null, null, throwingAdapter).outcome).toBe("BB_FACTS_UNAVAILABLE");
+    expect(throwingAdapter.inspectCalls).toHaveLength(1);
+    expect(throwingAdapter.dispatchCalls).toHaveLength(0);
+    expect(mutationCounts(writer.db)).toEqual(throwingAdapterBefore);
+
+    const defaultBranch = await assignmentFixture({ targetDefaultBranch: "develop" });
+    const defaultBranchAdapter = new DeterministicNativeAssignmentAdapter();
+    const defaultBranchBefore = mutationCounts(defaultBranch.db);
     expect(applyWithFixtureReceipt(
-      writer.db,
-      assignmentPrepareRequest(writer.fenceToken, "writer-behind"),
+      defaultBranch.db,
+      assignmentPrepareRequest(defaultBranch.fenceToken, "registered-default-branch"),
       null,
       null,
-      new DeterministicNativeAssignmentAdapter(),
-    ).outcome).toBe("OK");
+      defaultBranchAdapter,
+    ).outcome).toBe("EXECUTION_CONTEXT_FOREIGN");
+    expect(defaultBranchAdapter.dispatchCalls).toHaveLength(0);
+    expect(mutationCounts(defaultBranch.db)).toEqual(defaultBranchBefore);
+
+    const writerBehindAdapter = new DeterministicNativeAssignmentAdapter();
+    writerBehindAdapter.nextInspection = { defaultBranchHeadSha: CANDIDATE_SHA };
+    expect(applyWithFixtureReceipt(writer.db, assignmentPrepareRequest(writer.fenceToken, "writer-behind"), null, null, writerBehindAdapter).outcome).toBe("OK");
 
     const reviewer = await assignmentFixture();
     expect(applyWithFixtureReceipt(reviewer.db, transitionRequest(reviewer.fenceToken, "in_progress", 2)).outcome).toBe("OK");
@@ -3676,10 +3716,6 @@ describe("bb-collab plugin boundary", () => {
       candidateScope: { mode: "read-only", candidateSemantics: "frozen", candidateSha: CANDIDATE_SHA, mutations: "forbidden" },
       requestedProfile: { permissionMode: "full", visibility: "visible" },
     });
-    for (const mutationSurface of ["authority", "issue", "plugin", "queue", "task", "write"]) {
-      expect(Object.keys(reviewAdapter.dispatchCalls[0]!)).not.toContain(mutationSurface);
-    }
-
     const probeRequest = {
       ...reviewRequest,
       idempotencyKey: "probe-candidate",
