@@ -9,6 +9,7 @@ The controlling decision is
 [founding gist](https://gist.github.com/pixexid/77c7ac47afc27a63a147159195ba56b7).
 The llm-collab source fence is
 [f988d9711d3778f751e4ec0e32ebbf7b0893c80f](https://github.com/pixexid/llm-collab/tree/f988d9711d3778f751e4ec0e32ebbf7b0893c80f).
+The complete 40-issue disposition is in the [migration ledger](llm-collab-migration-ledger.md).
 
 ## Import boundary
 
@@ -67,6 +68,9 @@ Legacy data is imported as facts and evidence:
 | 13. Onboarding and conformance | Add | Read-only doctor plus explicit idempotent apply/verify validates exact BB/plugin, project, targets, dependencies, projections, workers, worktrees, roles, review/release surfaces and connector evidence. Zero work is not success without expected/attempted/verified proof. |
 
 ## Issue disposition ledger
+
+The detailed [migration ledger](llm-collab-migration-ledger.md) reconciles
+every currently open source issue exactly once.
 
 The ledger migrates the surviving requirement, evidence or probe. It does not
 copy an issue body or its implementation assumptions.

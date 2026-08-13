@@ -4,6 +4,8 @@ The roadmap is dependency-ordered. Each step has an observable exit
 condition; a later step must not smuggle authority into an earlier one.
 [ADR 0001](adr/0001-founding-contract.md) is the governing contract and
 [the import manifest](import-manifest.md) is the surviving issue ledger.
+The detailed 40-issue source disposition is in the
+[llm-collab migration ledger](llm-collab-migration-ledger.md).
 
 ## Founding documentation
 
@@ -86,6 +88,19 @@ condition; a later step must not smuggle authority into an earlier one.
    custom transport, automated subagents, BB Tasks projection, broader
    qualification campaigns, dashboards, multi-server availability or reverse
    migration only when the first-adopter evidence shows a concrete gap.
+
+## Immediate migration holds
+
+The next cutover chain is [bb-collab #5 operator receipt](https://github.com/pixexid/bb-collab/issues/5)
+backed by [get-bb/bb #1541 operator receipt](https://github.com/get-bb/bb/issues/1541),
+[#29 MigrationRun and one-governor cutover](https://github.com/pixexid/bb-collab/issues/29),
+[#30 native managed-worktree and candidate attach](https://github.com/pixexid/bb-collab/issues/30),
+and [#31 adversarial conformance and first adopter](https://github.com/pixexid/bb-collab/issues/31).
+[get-bb/bb #1543](https://github.com/get-bb/bb/issues/1543) is a separate native
+GitHub state-change wake continuation, not cutover authority.
+
+P4 plugin profile, P5 renewable leases, P6 capacity/failover, and P7 optional
+transport remain named post-v1 holds; they are not issue-spam prerequisites.
 
 ## Executable adoption target
 
