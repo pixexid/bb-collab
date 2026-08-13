@@ -12,6 +12,7 @@ import {
   MAX_EXPORT_ROWS,
   MIGRATIONS,
   PLUGIN_ID,
+  SCHEMA_VERSION,
   applyFixtureMutation,
   canonicalJson,
   databaseIsReady,
@@ -23,6 +24,7 @@ import {
 import {
   applyWithFixtureReceipt,
   DeterministicGitHubIssueAdapter,
+  DeterministicRoleFactReader,
   seedFixtureDecision,
   seedVerifiedFixtureReceipt,
 } from "../src/test-support.js";
@@ -36,6 +38,143 @@ const WORK_ITEM_ID = "work-item-1";
 const GITHUB_OWNER = "example";
 const GITHUB_REPO = "project";
 const CONNECTOR_HOST = "github.test";
+const ROLE_THREAD_ID = "thread-holder";
+const ROLE_ENVIRONMENT_ID = "environment-holder";
+const ROLE_REQUEST_EVENT_ID = "event-request";
+const ROLE_COMPLETION_EVENT_ID = "event-completion";
+const ROLE_PROFILE = {
+  providerId: "codex",
+  model: "gpt-5.6-sol",
+  reasoningLevel: "high",
+  permissionMode: "full",
+  serviceTier: "default",
+  visibility: "visible" as const,
+};
+const ROLE_PROFILE_DIGEST = sha256(canonicalJson(ROLE_PROFILE));
+
+function roleConfig() {
+  const config = structuredClone(bootstrapRequest().config) as {
+    extensions: { bbCollab: Record<string, unknown> };
+  };
+  config.extensions.bbCollab.roleRequirements = [
+    { roleRequirementId: "orchestrator-v1", roleId: "project-orchestrator", repoTargetId: null, executedProfile: ROLE_PROFILE },
+    { roleRequirementId: "reviewer-v1", roleId: "independent-reviewer", repoTargetId: TARGET_ID, executedProfile: ROLE_PROFILE },
+  ];
+  return config;
+}
+
+function roleReader(
+  mutate?: (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => void,
+) {
+  const facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0] = {
+    thread: {
+      id: ROLE_THREAD_ID,
+      projectId: PROJECT_ID,
+      environmentId: ROLE_ENVIRONMENT_ID,
+      providerId: ROLE_PROFILE.providerId,
+      status: "idle",
+      visibility: "visible",
+    },
+    events: [
+      {
+        id: ROLE_REQUEST_EVENT_ID,
+        seq: 1,
+        type: "client/turn/requested",
+        data: {
+          requestId: "request-1",
+          execution: {
+            model: ROLE_PROFILE.model,
+            reasoningLevel: ROLE_PROFILE.reasoningLevel,
+            permissionMode: ROLE_PROFILE.permissionMode,
+            serviceTier: ROLE_PROFILE.serviceTier,
+            source: "client/turn/requested",
+          },
+        },
+      },
+      { id: "event-accepted", seq: 2, type: "turn/input/accepted", data: { clientRequestId: "request-1", providerThreadId: "provider-thread-1" } },
+      { id: "event-started", seq: 3, type: "turn/started", data: { providerThreadId: "provider-thread-1" } },
+      { id: ROLE_COMPLETION_EVENT_ID, seq: 4, type: "turn/completed", data: { providerThreadId: "provider-thread-1", status: "completed" } },
+    ],
+    environment: {
+      id: ROLE_ENVIRONMENT_ID,
+      projectId: PROJECT_ID,
+      hostId: "host-main",
+      path: "/workspace/project",
+      managed: true,
+      isGitRepo: true,
+      isWorktree: true,
+      workspaceProvisionType: "managed-worktree",
+      branchName: "bb/role-holder",
+      baseBranch: "main",
+      defaultBranch: "main",
+      mergeBaseBranch: null,
+      status: "ready",
+    },
+    project: projectFacts(),
+    host: { id: "host-main", status: "connected", maxPermissionMode: "full" },
+    version: "0.37.0",
+  };
+  mutate?.(facts);
+  return new DeterministicRoleFactReader(facts);
+}
+
+function qualificationRequest(fenceToken: string, overrides: Partial<ApplyRequest> = {}): ApplyRequest {
+  return {
+    projectId: PROJECT_ID,
+    operationClass: "qualification_observation_record",
+    idempotencyKey: "qualification-1",
+    actorReceiptId: RECEIPT_ID,
+    expectedConfigRevision: 1,
+    expectedGovernanceEpoch: 1,
+    expectedFenceToken: fenceToken,
+    repoTargetId: null,
+    roleId: "project-orchestrator",
+    roleRequirementId: "orchestrator-v1",
+    qualificationId: "qualification-1",
+    roleContext: {
+      threadId: ROLE_THREAD_ID,
+      requestEventId: ROLE_REQUEST_EVENT_ID,
+      requestEventSeq: 1,
+      completionEventId: ROLE_COMPLETION_EVENT_ID,
+      completionEventSeq: 4,
+    },
+    qualificationOutcome: "qualified",
+    observedAtMs: 100,
+    expiresAtMs: 9_999_999_999_999,
+    reasonCode: "fixture_passed",
+    fixtureContextDigest: "fixture-v1",
+    declaredProfile: ROLE_PROFILE,
+    ...overrides,
+  };
+}
+
+function successionRequest(fenceToken: string, overrides: Partial<ApplyRequest> = {}): ApplyRequest {
+  return {
+    projectId: PROJECT_ID,
+    operationClass: "role_generation_succession",
+    idempotencyKey: "succession-1",
+    actorReceiptId: RECEIPT_ID,
+    expectedConfigRevision: 1,
+    expectedGovernanceEpoch: 1,
+    expectedFenceToken: fenceToken,
+    repoTargetId: null,
+    roleId: "project-orchestrator",
+    roleRequirementId: "orchestrator-v1",
+    qualificationId: "qualification-1",
+    expectedGeneration: null,
+    predecessorGeneration: null,
+    profileDigest: ROLE_PROFILE_DIGEST,
+    fixtureContextDigest: "fixture-v1",
+    roleContext: {
+      threadId: ROLE_THREAD_ID,
+      requestEventId: ROLE_REQUEST_EVENT_ID,
+      requestEventSeq: 1,
+      completionEventId: ROLE_COMPLETION_EVENT_ID,
+      completionEventSeq: 4,
+    },
+    ...overrides,
+  };
+}
 
 function projectFacts(projectId = PROJECT_ID) {
   return {
@@ -282,9 +421,9 @@ describe("bb-collab plugin boundary", () => {
     const second = await host.harness.callRpc("export", { projectId: PROJECT_ID });
     expect(second).toEqual(first);
     expect(first).toMatchObject({ outcome: "OK", expected: 8, attempted: 8, verified: 8 });
-    expect((first as { export: { manifest: { schemaVersion: number } } }).export.manifest.schemaVersion).toBe(2);
+    expect((first as { export: { manifest: { schemaVersion: number } } }).export.manifest.schemaVersion).toBe(SCHEMA_VERSION);
     expect((first as { export: { manifest: { migrationStatementIds: number[]; schemaDigest: string } } }).export.manifest.migrationStatementIds).toEqual(
-      Array.from({ length: 12 }, (_, index) => index),
+      Array.from({ length: 16 }, (_, index) => index),
     );
     expect((first as { export: { checksums: Record<string, string> } }).export.checksums).toHaveProperty("records.ndjson");
   });
@@ -1125,6 +1264,354 @@ describe("bb-collab plugin boundary", () => {
     extensions.bbCollab.githubIssues.repositoryMappings.push({ repoTargetId: TARGET_ID, owner: "other", repo: "other", connectorHost: CONNECTOR_HOST });
     expect(applyWithFixtureReceipt(db, bootstrapRequest(PROJECT_ID, { config: { ...base, extensions } })).outcome).toBe("INVALID_INPUT");
     expect(db.prepare("SELECT COUNT(*) AS count FROM project_config_revisions").get()).toEqual({ count: 0 });
+  });
+
+  it("records immutable qualification and activates one exact first orchestrator generation", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    const facts = roleReader();
+    const qualified = applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, facts);
+    expect(qualified).toMatchObject({ outcome: "OK", expected: 1, attempted: 1, verified: 1 });
+    const activated = applyWithFixtureReceipt(db, successionRequest(fenceToken), null, facts);
+    expect(activated).toMatchObject({ outcome: "OK", currentResourceRevision: 1 });
+    expect(db.prepare("SELECT role_id, generation, status, predecessor_generation FROM role_generations").get()).toEqual({
+      role_id: "project-orchestrator",
+      generation: 1,
+      status: "active",
+      predecessor_generation: null,
+    });
+    expect(db.prepare("SELECT role_id, current_generation FROM role_generation_heads").get()).toEqual({
+      role_id: "project-orchestrator",
+      current_generation: 1,
+    });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM qualification_observations").get()).toEqual({ count: 1 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE aggregate_type IN ('qualification_observation', 'role_generation')").get()).toEqual({ count: 2 });
+    const firstExport = exportFoundation(db, PROJECT_ID);
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(firstExport);
+    expect((firstExport.export?.manifest.tableCounts ?? {})).toMatchObject({
+      qualification_observations: 1,
+      eligibility_projections: 1,
+      role_generations: 1,
+      role_generation_heads: 1,
+    });
+    const rawFacts = roleReader((value) => {
+      value.thread.visibility = "hidden";
+      value.events[3]!.data.status = "failed";
+    });
+    expect(rawFacts.facts.thread.visibility).toBe("hidden");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(firstExport);
+    const doctorResult = await host.harness.callRpc("doctor", { projectId: PROJECT_ID });
+    expect(doctorResult).toMatchObject({
+      outcome: "OK",
+      evidence: {
+        qualificationObservationCount: 1,
+        roleGenerationHeads: [{ role_id: "project-orchestrator", current_generation: 1, status: "active" }],
+        eligibility: [{ roleRequirementId: "orchestrator-v1", effectiveStatus: "eligible" }],
+        cachedConsumers: { expected: 0, attempted: 0, verified: 0 },
+      },
+    });
+    const beforeProductionRefusal = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", successionRequest(fenceToken, { idempotencyKey: "production-role" }))).toMatchObject({
+      outcome: "OPERATOR_AUTH_REQUIRED",
+      expected: 1,
+      attempted: 0,
+      verified: 0,
+    });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeProductionRefusal);
+  });
+
+  it("requires exact target binding for the independent reviewer", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    const facts = roleReader();
+    const reviewerQualification = qualificationRequest(fenceToken, {
+      idempotencyKey: "reviewer-qualification",
+      repoTargetId: TARGET_ID,
+      roleId: "independent-reviewer",
+      roleRequirementId: "reviewer-v1",
+      qualificationId: "reviewer-qualification",
+    });
+    const before = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, { ...reviewerQualification, idempotencyKey: "reviewer-missing-target", repoTargetId: null }, null, facts).outcome).toBe("REPO_TARGET_REQUIRED");
+    expect(applyWithFixtureReceipt(db, { ...reviewerQualification, idempotencyKey: "reviewer-foreign-target", repoTargetId: SECOND_TARGET_ID }, null, facts).outcome).toBe("REPO_TARGET_FOREIGN");
+    const wrongTargetContext = roleReader((value) => {
+      value.environment.path = "/workspace/other";
+      value.project.sources[0]!.path = "/workspace/other";
+    });
+    expect(applyWithFixtureReceipt(db, { ...reviewerQualification, idempotencyKey: "reviewer-wrong-context", qualificationId: "reviewer-wrong-context" }, null, wrongTargetContext).outcome).toBe("ROLE_CONTEXT_FOREIGN");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    expect(applyWithFixtureReceipt(db, reviewerQualification, null, facts).outcome).toBe("OK");
+    const reviewerSuccession = successionRequest(fenceToken, {
+      idempotencyKey: "reviewer-succession",
+      repoTargetId: TARGET_ID,
+      roleId: "independent-reviewer",
+      roleRequirementId: "reviewer-v1",
+      qualificationId: "reviewer-qualification",
+    });
+    expect(applyWithFixtureReceipt(db, reviewerSuccession, null, facts).outcome).toBe("OK");
+    expect(db.prepare("SELECT repo_target_id, status FROM role_generations WHERE role_id = 'independent-reviewer'").get()).toEqual({
+      repo_target_id: TARGET_ID,
+      status: "active",
+    });
+  });
+
+  it("decides replay and conflict before role fact access and does not cache transient unknown facts", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    const request = qualificationRequest(fenceToken);
+    const firstReader = roleReader();
+    const committed = applyWithFixtureReceipt(db, request, null, firstReader);
+    expect(committed.outcome).toBe("OK");
+    const reads = firstReader.readCalls.length;
+    expect(applyWithFixtureReceipt(db, request, null, null)).toEqual(committed);
+    expect(applyWithFixtureReceipt(db, { ...request, reasonCode: "conflicting-reuse" }, null, null).outcome).toBe("IDEMPOTENCY_KEY_CONFLICT");
+    expect(firstReader.readCalls).toHaveLength(reads);
+
+    const transient = qualificationRequest(fenceToken, { idempotencyKey: "transient-context", qualificationId: "transient-context" });
+    const unavailable = roleReader((facts) => { facts.thread.id = "other-thread"; });
+    expect(applyWithFixtureReceipt(db, transient, null, unavailable).outcome).toBe("ROLE_CONTEXT_UNKNOWN");
+    expect(db.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = 'transient-context'").get()).toBeUndefined();
+    expect(applyWithFixtureReceipt(db, transient, null, roleReader()).outcome).toBe("OK");
+  });
+
+  it("keeps failed declared-profile evidence immutable and replaces only current eligibility", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    const mismatch = qualificationRequest(fenceToken, {
+      idempotencyKey: "qualification-mismatch",
+      qualificationId: "qualification-mismatch",
+      declaredProfile: { ...ROLE_PROFILE, model: "declared-only-model" },
+    });
+    expect(applyWithFixtureReceipt(db, mismatch, null, roleReader())).toMatchObject({
+      outcome: "EXECUTION_PROFILE_MISMATCH",
+      attempted: 1,
+      verified: 1,
+      evidence: { effectiveStatus: "ineligible", reasonCode: "execution_profile_mismatch" },
+    });
+    expect(db.prepare("SELECT outcome FROM qualification_observations WHERE qualification_id = 'qualification-mismatch'").get()).toEqual({ outcome: "unqualified" });
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      idempotencyKey: "mismatch-succession",
+      qualificationId: "qualification-mismatch",
+    }), null, roleReader()).outcome).toBe("ROLE_UNQUALIFIED");
+
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "qualification-2",
+      qualificationId: "qualification-2",
+      reasonCode: "replacement_passed",
+    }), null, roleReader()).outcome).toBe("OK");
+    expect(db.prepare("SELECT qualification_id, outcome FROM qualification_observations ORDER BY qualification_id").all()).toEqual([
+      { qualification_id: "qualification-1", outcome: "qualified" },
+      { qualification_id: "qualification-2", outcome: "qualified" },
+      { qualification_id: "qualification-mismatch", outcome: "unqualified" },
+    ]);
+    expect(db.prepare("SELECT current_qualification_id FROM eligibility_projections").get()).toEqual({ current_qualification_id: "qualification-2" });
+  });
+
+  it("refuses hidden, foreign, missing, ambiguous, and incomplete BB holder contexts without mutation", async () => {
+    const cases: Array<[string, (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => void, string, Partial<ApplyRequest>?]> = [
+      ["hidden", (facts) => { facts.thread.visibility = "hidden"; }, "ROLE_CONTEXT_HIDDEN"],
+      ["foreign-thread", (facts) => { facts.thread.projectId = FOREIGN_PROJECT_ID; }, "ROLE_CONTEXT_FOREIGN"],
+      ["missing-environment", (facts) => { facts.thread.environmentId = null; }, "ROLE_CONTEXT_REQUIRED"],
+      ["foreign-environment", (facts) => { facts.environment.projectId = FOREIGN_PROJECT_ID; }, "ROLE_CONTEXT_FOREIGN"],
+      ["source-mismatch", (facts) => { facts.project.sources[0]!.path = "/other"; }, "ROLE_CONTEXT_FOREIGN"],
+      ["ambiguous-source", (facts) => { facts.project.sources.push({ ...facts.project.sources[0]!, id: "source-duplicate" }); }, "ROLE_CONTEXT_FOREIGN"],
+      ["host-unavailable", (facts) => { facts.host.status = "disconnected"; }, "ROLE_CONTEXT_UNKNOWN"],
+      ["missing-start", (facts) => { facts.events = facts.events.filter((event) => event.type !== "turn/started"); }, "EXECUTION_PROFILE_UNKNOWN"],
+      ["failed-completion", (facts) => { facts.events[3]!.data.status = "failed"; }, "EXECUTION_PROFILE_UNKNOWN"],
+      ["duplicate-completion", (facts) => { facts.events.push({ id: "completion-2", seq: 5, type: "turn/completed", data: { providerThreadId: "provider-thread-1", status: "completed" } }); }, "EXECUTION_COMPLETION_AMBIGUOUS"],
+      ["model-fallback", (facts) => {
+        facts.events[3]!.seq = 5;
+        facts.events.splice(3, 0, { id: "fallback", seq: 4, type: "provider/modelFallback", data: { providerThreadId: "provider-thread-1" } });
+      }, "EXECUTION_PROFILE_UNKNOWN", { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 5 } }],
+    ];
+    for (const [name, mutate, outcome, requestOverride] of cases) {
+      const host = await loadedHost();
+      const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+      const before = exportFoundation(db, PROJECT_ID);
+      const result = applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+        idempotencyKey: `context-${name}`,
+        qualificationId: `context-${name}`,
+        ...requestOverride,
+      }), null, roleReader(mutate));
+      expect(result.outcome, name).toBe(outcome);
+      expect(exportFoundation(db, PROJECT_ID), name).toEqual(before);
+    }
+  });
+
+  it("serializes role-head contenders and preserves exact state after reopen", () => {
+    const { db: firstDb, path, directory } = directDatabase();
+    const secondDb = new Database(path);
+    databaseIsReady(secondDb);
+    try {
+      seedVerifiedFixtureReceipt(firstDb, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
+      const bootstrapped = applyFixtureMutation(firstDb, bootstrapRequest(PROJECT_ID, { config: roleConfig() }));
+      const fenceToken = (bootstrapped.evidence as { fenceToken: string }).fenceToken;
+      expect(applyWithFixtureReceipt(firstDb, qualificationRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(firstDb, successionRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(firstDb, qualificationRequest(fenceToken, {
+        idempotencyKey: "qualification-2",
+        qualificationId: "qualification-2",
+      }), null, roleReader()).outcome).toBe("OK");
+      const successor = successionRequest(fenceToken, {
+        idempotencyKey: "succession-2",
+        qualificationId: "qualification-2",
+        expectedGeneration: 1,
+        predecessorGeneration: 1,
+      });
+      const winner = applyWithFixtureReceipt(firstDb, successor, null, roleReader());
+      const loser = applyWithFixtureReceipt(secondDb, { ...successor, idempotencyKey: "succession-loser" }, null, roleReader());
+      expect(winner).toMatchObject({ outcome: "OK", currentResourceRevision: 2 });
+      expect(loser).toMatchObject({ outcome: "ROLE_GENERATION_STALE", currentResourceRevision: 2, expectedResourceRevision: 1 });
+      expect(firstDb.prepare("SELECT generation, status FROM role_generations ORDER BY generation").all()).toEqual([
+        { generation: 1, status: "retired" },
+        { generation: 2, status: "active" },
+      ]);
+      expect(firstDb.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE idempotency_key = 'succession-loser'").get()).toEqual({ count: 0 });
+      const beforeReopen = exportFoundation(firstDb, PROJECT_ID);
+      firstDb.close();
+      const reopened = new Database(path);
+      databaseIsReady(reopened);
+      try {
+        expect(applyWithFixtureReceipt(reopened, successor, null, null)).toEqual(winner);
+        expect(exportFoundation(reopened, PROJECT_ID)).toEqual(beforeReopen);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      secondDb.close();
+      if (firstDb.open) firstDb.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back successor authority when the late mutation receipt insert fails", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "late-failure-qualification",
+      qualificationId: "late-failure-qualification",
+    }), null, roleReader()).outcome).toBe("OK");
+    const request = successionRequest(fenceToken, {
+      idempotencyKey: "late-receipt-failure",
+      qualificationId: "late-failure-qualification",
+      expectedGeneration: 1,
+      predecessorGeneration: 1,
+    });
+    const before = exportFoundation(db, PROJECT_ID);
+    const facts = roleReader();
+    db.exec(`CREATE TEMP TRIGGER fail_late_role_receipt
+      BEFORE INSERT ON mutation_receipts
+      WHEN NEW.operation_class = 'role_generation_succession'
+        AND NEW.idempotency_key = 'late-receipt-failure'
+      BEGIN
+        SELECT RAISE(ABORT, 'late role receipt failure');
+      END`);
+    try {
+      const failed = applyWithFixtureReceipt(db, request, null, facts);
+      expect(failed).toMatchObject({ outcome: "INTERNAL_ERROR", expected: 1, attempted: 0, verified: 0 });
+      expect(failed).not.toHaveProperty("mutationReceipt");
+      expect(failed).not.toHaveProperty("eventSequence");
+      expect(facts.readCalls).toEqual([
+        `thread:${ROLE_THREAD_ID}`,
+        `events:${ROLE_THREAD_ID}`,
+        `environment:${ROLE_ENVIRONMENT_ID}`,
+        `project:${PROJECT_ID}`,
+        "host:host-main",
+        "system.version",
+      ]);
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+      expect(db.prepare("SELECT generation, status, retired_at_ms FROM role_generations ORDER BY generation").all()).toEqual([
+        { generation: 1, status: "active", retired_at_ms: null },
+      ]);
+      expect(db.prepare("SELECT current_generation FROM role_generation_heads").get()).toEqual({ current_generation: 1 });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE idempotency_key = 'late-receipt-failure'").get()).toEqual({ count: 0 });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE idempotency_key = 'late-receipt-failure'").get()).toEqual({ count: 0 });
+    } finally {
+      db.exec("DROP TRIGGER fail_late_role_receipt");
+    }
+  });
+
+  it("accepts only a verified current role actor bound to the holder execution reference", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+    const first = applyWithFixtureReceipt(db, successionRequest(fenceToken), null, roleReader());
+    const holderExecutionAttemptId = (first.evidence as { holderExecutionAttemptId: string }).holderExecutionAttemptId;
+    seedVerifiedFixtureReceipt(db, {
+      projectId: PROJECT_ID,
+      receiptId: "role-actor-current",
+      actorKind: "role",
+      subjectId: holderExecutionAttemptId,
+      roleId: "project-orchestrator",
+      roleGeneration: 1,
+    });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "role-actor-qualification",
+      actorReceiptId: "role-actor-current",
+      qualificationId: "role-actor-qualification",
+    }), null, roleReader()).outcome).toBe("OK");
+    seedVerifiedFixtureReceipt(db, {
+      projectId: PROJECT_ID,
+      receiptId: "role-actor-wrong-holder",
+      actorKind: "role",
+      subjectId: "wrong-holder",
+      roleId: "project-orchestrator",
+      roleGeneration: 1,
+    });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "wrong-holder-qualification",
+      actorReceiptId: "role-actor-wrong-holder",
+      qualificationId: "wrong-holder-qualification",
+    }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
+    expect(db.prepare("SELECT 1 FROM qualification_observations WHERE qualification_id = 'wrong-holder-qualification'").get()).toBeUndefined();
+  });
+
+  it("derives expiry and config staleness at read time without automatic role mutation", async () => {
+    const expiryHost = await loadedHost();
+    const { db: expiryDb, fenceToken: expiryFence } = seedAndBootstrap(expiryHost, PROJECT_ID, { config: roleConfig() });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(100);
+    try {
+      expect(applyWithFixtureReceipt(expiryDb, qualificationRequest(expiryFence, { observedAtMs: 50, expiresAtMs: 200 }), null, roleReader()).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(expiryDb, successionRequest(expiryFence), null, roleReader()).outcome).toBe("OK");
+      clock.mockReturnValue(300);
+      expect(applyWithFixtureReceipt(expiryDb, successionRequest(expiryFence, {
+        idempotencyKey: "expired-successor",
+        expectedGeneration: 1,
+        predecessorGeneration: 1,
+      }), null, roleReader()).outcome).toBe("ELIGIBILITY_EXPIRED");
+      expect(expiryDb.prepare("SELECT generation, status FROM role_generations").all()).toEqual([{ generation: 1, status: "active" }]);
+      expect(await expiryHost.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
+        evidence: { eligibility: [{ effectiveStatus: "expired", reasonCode: "eligibility_expired" }] },
+      });
+    } finally {
+      clock.mockRestore();
+    }
+
+    const staleHost = await loadedHost();
+    const { db: staleDb, fenceToken: staleFence } = seedAndBootstrap(staleHost, PROJECT_ID, { config: roleConfig() });
+    expect(applyWithFixtureReceipt(staleDb, qualificationRequest(staleFence), null, roleReader()).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(staleDb, successionRequest(staleFence), null, roleReader()).outcome).toBe("OK");
+    const config2 = roleConfig();
+    (config2 as Record<string, unknown>).note = "new immutable revision";
+    expect(applyWithFixtureReceipt(staleDb, {
+      ...bootstrapRequest(PROJECT_ID, { config: config2 }),
+      operationClass: "config_revision",
+      idempotencyKey: "role-config-2",
+      expectedConfigRevision: 1,
+      configRevision: 2,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: staleFence,
+    }).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(staleDb, successionRequest(staleFence, {
+      idempotencyKey: "stale-successor",
+      expectedConfigRevision: 2,
+      expectedGeneration: 1,
+      predecessorGeneration: 1,
+    }), null, roleReader()).outcome).toBe("ELIGIBILITY_STALE");
+    expect(staleDb.prepare("SELECT generation, status FROM role_generations").all()).toEqual([{ generation: 1, status: "active" }]);
   });
 
   it("uses one read-only default and non-zero refusal exits for CLI input", async () => {

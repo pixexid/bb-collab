@@ -9,6 +9,12 @@ import {
   type GitHubIssueAdapter,
   type GitHubIssueMutation,
   type GitHubIssueSnapshot,
+  type RoleEnvironmentFact,
+  type RoleEventFact,
+  type RoleFactReader,
+  type RoleHostFact,
+  type RoleProjectFact,
+  type RoleThreadFact,
   type SqliteDatabase,
 } from "./foundation.js";
 
@@ -145,10 +151,61 @@ export class DeterministicGitHubIssueAdapter implements GitHubIssueAdapter {
   }
 }
 
+export class DeterministicRoleFactReader implements RoleFactReader {
+  readonly readCalls: string[] = [];
+
+  constructor(
+    readonly facts: {
+      thread: RoleThreadFact;
+      events: RoleEventFact[];
+      environment: RoleEnvironmentFact;
+      project: RoleProjectFact;
+      host: RoleHostFact;
+      version: string;
+    },
+  ) {}
+
+  thread(threadId: string): RoleThreadFact {
+    this.readCalls.push(`thread:${threadId}`);
+    if (this.facts.thread.id !== threadId) throw new Error("unknown thread");
+    return structuredClone(this.facts.thread);
+  }
+
+  events(threadId: string): RoleEventFact[] {
+    this.readCalls.push(`events:${threadId}`);
+    if (this.facts.thread.id !== threadId) throw new Error("unknown thread");
+    return structuredClone(this.facts.events);
+  }
+
+  environment(environmentId: string): RoleEnvironmentFact {
+    this.readCalls.push(`environment:${environmentId}`);
+    if (this.facts.environment.id !== environmentId) throw new Error("unknown environment");
+    return structuredClone(this.facts.environment);
+  }
+
+  project(projectId: string): RoleProjectFact {
+    this.readCalls.push(`project:${projectId}`);
+    if (this.facts.project.id !== projectId) throw new Error("unknown project");
+    return structuredClone(this.facts.project);
+  }
+
+  host(hostId: string): RoleHostFact {
+    this.readCalls.push(`host:${hostId}`);
+    if (this.facts.host.id !== hostId) throw new Error("unknown host");
+    return structuredClone(this.facts.host);
+  }
+
+  version(): string {
+    this.readCalls.push("system.version");
+    return this.facts.version;
+  }
+}
+
 export function applyWithFixtureReceipt(
   db: Database.Database,
   request: ApplyRequest,
   githubAdapter: GitHubIssueAdapter | null = null,
+  roleFactReader: RoleFactReader | null = null,
 ): FoundationResult {
-  return applyFixtureMutation(db, request, githubAdapter);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader);
 }

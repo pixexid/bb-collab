@@ -5,7 +5,7 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 // ponytail: keep exports bounded at 256 rows; add paged/file export before migration or cutover.
 export const MAX_EXPORT_ROWS = 256;
 export const MAX_EXPORT_BYTES = 512 * 1024;
@@ -25,6 +25,10 @@ export const TABLES = [
   "state_events",
   "work_items",
   "external_work_refs",
+  "qualification_observations",
+  "eligibility_projections",
+  "role_generations",
+  "role_generation_heads",
 ] as const;
 
 export const MIGRATIONS: string[] = [
@@ -193,6 +197,103 @@ export const MIGRATIONS: string[] = [
   CREATE UNIQUE INDEX IF NOT EXISTS external_work_refs_issue_identity
     ON external_work_refs(provider, owner, repo, issue_number)
     WHERE issue_number IS NOT NULL`,
+  `CREATE TABLE IF NOT EXISTS qualification_observations (
+    project_id TEXT NOT NULL,
+    qualification_id TEXT NOT NULL,
+    role_requirement_id TEXT NOT NULL,
+    config_revision INTEGER NOT NULL,
+    repo_target_id TEXT,
+    role_requirement_digest TEXT NOT NULL,
+    executed_profile_digest TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    reasoning_level TEXT NOT NULL,
+    permission_mode TEXT NOT NULL,
+    service_tier TEXT NOT NULL,
+    visibility TEXT NOT NULL CHECK (visibility IN ('visible', 'hidden')),
+    thread_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    provider_thread_id TEXT NOT NULL,
+    request_event_id TEXT NOT NULL,
+    request_event_seq INTEGER NOT NULL CHECK (request_event_seq > 0),
+    completion_event_id TEXT NOT NULL,
+    completion_event_seq INTEGER NOT NULL CHECK (completion_event_seq > 0),
+    bb_version TEXT NOT NULL,
+    plugin_sdk_version TEXT NOT NULL,
+    qualification_context_digest TEXT NOT NULL,
+    fixture_context_digest TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('qualified', 'unqualified', 'unknown')),
+    observed_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER,
+    evidence_digest TEXT NOT NULL,
+    observation_digest TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    PRIMARY KEY (project_id, qualification_id),
+    FOREIGN KEY (project_id, config_revision)
+      REFERENCES project_config_revisions(project_id, config_revision),
+    FOREIGN KEY (project_id, repo_target_id, config_revision)
+      REFERENCES repository_targets(project_id, repo_target_id, config_revision)
+  )`,
+  `CREATE TABLE IF NOT EXISTS eligibility_projections (
+    project_id TEXT NOT NULL,
+    role_requirement_id TEXT NOT NULL,
+    profile_digest TEXT NOT NULL,
+    current_qualification_id TEXT NOT NULL,
+    effective_status TEXT NOT NULL
+      CHECK (effective_status IN ('eligible', 'ineligible', 'unknown')),
+    qualification_context_digest TEXT NOT NULL,
+    config_revision INTEGER NOT NULL,
+    role_requirement_digest TEXT NOT NULL,
+    derived_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER,
+    derivation_digest TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    PRIMARY KEY (project_id, role_requirement_id, profile_digest),
+    FOREIGN KEY (project_id, current_qualification_id)
+      REFERENCES qualification_observations(project_id, qualification_id),
+    FOREIGN KEY (project_id, config_revision)
+      REFERENCES project_config_revisions(project_id, config_revision)
+  )`,
+  `CREATE TABLE IF NOT EXISTS role_generations (
+    project_id TEXT NOT NULL,
+    role_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    role_requirement_id TEXT NOT NULL,
+    config_revision INTEGER NOT NULL,
+    repo_target_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'draining', 'retired', 'invalidated')),
+    predecessor_generation INTEGER,
+    holder_execution_attempt_id TEXT NOT NULL,
+    holder_context_digest TEXT NOT NULL,
+    holder_executed_profile_digest TEXT NOT NULL,
+    qualification_id TEXT NOT NULL,
+    eligibility_derivation_digest TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    activated_at_ms INTEGER NOT NULL,
+    retired_at_ms INTEGER,
+    PRIMARY KEY (project_id, role_id, generation),
+    FOREIGN KEY (project_id, config_revision)
+      REFERENCES project_config_revisions(project_id, config_revision),
+    FOREIGN KEY (project_id, repo_target_id, config_revision)
+      REFERENCES repository_targets(project_id, repo_target_id, config_revision),
+    FOREIGN KEY (project_id, qualification_id)
+      REFERENCES qualification_observations(project_id, qualification_id),
+    FOREIGN KEY (project_id, role_id, predecessor_generation)
+      REFERENCES role_generations(project_id, role_id, generation),
+    CHECK ((generation = 1 AND predecessor_generation IS NULL) OR
+           (generation > 1 AND predecessor_generation = generation - 1))
+  )`,
+  `CREATE TABLE IF NOT EXISTS role_generation_heads (
+    project_id TEXT NOT NULL,
+    role_id TEXT NOT NULL,
+    current_generation INTEGER NOT NULL CHECK (current_generation > 0),
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (project_id, role_id),
+    FOREIGN KEY (project_id, role_id, current_generation)
+      REFERENCES role_generations(project_id, role_id, generation)
+  )`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -288,6 +389,61 @@ const githubIssuesConfigSchema = z
     }
   });
 
+export const ROLE_IDS = ["project-orchestrator", "independent-reviewer"] as const;
+const roleIdSchema = z.enum(ROLE_IDS);
+const executionProfileSchema = z
+  .object({
+    providerId: id,
+    model: id,
+    reasoningLevel: id,
+    permissionMode: id,
+    serviceTier: id,
+    visibility: z.enum(["visible", "hidden"]),
+  })
+  .strict();
+const roleRequirementSchema = z
+  .object({
+    roleRequirementId: id,
+    roleId: roleIdSchema,
+    repoTargetId: id.nullable(),
+    executedProfile: executionProfileSchema,
+  })
+  .strict()
+  .superRefine((requirement, ctx) => {
+    if (requirement.roleId === "project-orchestrator" && requirement.repoTargetId !== null) {
+      ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "project-orchestrator must be project-scoped" });
+    }
+    if (requirement.roleId === "independent-reviewer" && requirement.repoTargetId === null) {
+      ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "independent-reviewer requires an exact repository target" });
+    }
+    if (requirement.executedProfile.visibility !== "visible") {
+      ctx.addIssue({ code: "custom", path: ["executedProfile", "visibility"], message: "active role holders must be visible" });
+    }
+  });
+const roleRequirementsSchema = z.array(roleRequirementSchema).max(2).superRefine((requirements, ctx) => {
+  const requirementIds = new Set<string>();
+  const roleIds = new Set<string>();
+  requirements.forEach((requirement, index) => {
+    if (requirementIds.has(requirement.roleRequirementId)) {
+      ctx.addIssue({ code: "custom", path: [index, "roleRequirementId"], message: "duplicate role requirement" });
+    }
+    if (roleIds.has(requirement.roleId)) {
+      ctx.addIssue({ code: "custom", path: [index, "roleId"], message: "duplicate logical role" });
+    }
+    requirementIds.add(requirement.roleRequirementId);
+    roleIds.add(requirement.roleId);
+  });
+});
+const roleContextRefSchema = z
+  .object({
+    threadId: id,
+    requestEventId: id,
+    requestEventSeq: z.number().int().positive(),
+    completionEventId: id,
+    completionEventSeq: z.number().int().positive(),
+  })
+  .strict();
+
 export const applyRequestSchema = z
   .object({
     projectId: id,
@@ -299,6 +455,8 @@ export const applyRequestSchema = z
       "work_item_create",
       "work_item_transition",
       "github_issue_projection",
+      "qualification_observation_record",
+      "role_generation_succession",
     ]),
     idempotencyKey: id,
     actorReceiptId: id.nullable().optional(),
@@ -321,6 +479,19 @@ export const applyRequestSchema = z
     workItemId: id.optional(),
     lifecycleState: workItemStateSchema.optional(),
     projectionKind: z.literal("github_issue").optional(),
+    roleId: roleIdSchema.optional(),
+    roleRequirementId: id.optional(),
+    qualificationId: id.optional(),
+    expectedGeneration: z.number().int().positive().nullable().optional(),
+    predecessorGeneration: z.number().int().positive().nullable().optional(),
+    profileDigest: id.optional(),
+    roleContext: roleContextRefSchema.optional(),
+    qualificationOutcome: z.enum(["qualified", "unqualified", "unknown"]).optional(),
+    observedAtMs: z.number().int().nonnegative().optional(),
+    expiresAtMs: z.number().int().nonnegative().nullable().optional(),
+    reasonCode: id.optional(),
+    fixtureContextDigest: id.optional(),
+    declaredProfile: executionProfileSchema.optional(),
   })
   .strict();
 
@@ -355,6 +526,239 @@ export interface GitHubIssueAdapter {
   available: boolean;
   read(owner: string, repo: string, issueNumber: number): GitHubIssueSnapshot | null;
   mutate(input: GitHubIssueMutation): GitHubIssueSnapshot;
+}
+
+export interface RoleThreadFact {
+  id: string;
+  projectId: string;
+  environmentId: string | null;
+  providerId: string;
+  status: string;
+  visibility: "visible" | "hidden";
+}
+
+export interface RoleEnvironmentFact {
+  id: string;
+  projectId: string;
+  hostId: string;
+  path: string | null;
+  managed: boolean;
+  isGitRepo: boolean;
+  isWorktree: boolean;
+  workspaceProvisionType: string;
+  branchName: string | null;
+  baseBranch: string | null;
+  defaultBranch: string | null;
+  mergeBaseBranch: string | null;
+  status: string;
+}
+
+export interface RoleProjectFact {
+  id: string;
+  kind: string;
+  name: string;
+  gitRemoteUrl: string | null;
+  sources: Array<{ id: string; projectId: string; hostId: string; path: string }>;
+}
+
+export interface RoleHostFact {
+  id: string;
+  status: string;
+  maxPermissionMode: string;
+}
+
+export interface RoleEventFact {
+  id: string;
+  seq: number;
+  type: string;
+  data: Record<string, unknown>;
+}
+
+export interface RoleFactReader {
+  thread(threadId: string): RoleThreadFact;
+  events(threadId: string): RoleEventFact[];
+  environment(environmentId: string): RoleEnvironmentFact;
+  project(projectId: string): RoleProjectFact;
+  host(hostId: string): RoleHostFact;
+  version(): string;
+}
+
+interface ResolvedRoleContext {
+  profile: ExecutionProfile;
+  profileDigest: string;
+  baseContext: Record<string, unknown>;
+  holderExecutionAttemptId: string;
+  threadId: string;
+  environmentId: string;
+  sourceId: string;
+  hostId: string;
+  providerThreadId: string;
+  requestEventId: string;
+  requestEventSeq: number;
+  completionEventId: string;
+  completionEventSeq: number;
+  bbVersion: string;
+}
+
+function stringField(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 && value.length <= 256 ? value : null;
+}
+
+function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest): ResolvedRoleContext {
+  if (!reader || !request.roleContext) throw refusal("ROLE_CONTEXT_REQUIRED", "exact BB role context facts are required");
+  let thread: RoleThreadFact;
+  let events: RoleEventFact[];
+  let environment: RoleEnvironmentFact;
+  let project: RoleProjectFact;
+  let host: RoleHostFact;
+  let bbVersion: string;
+  try {
+    thread = reader.thread(request.roleContext.threadId);
+    events = reader.events(request.roleContext.threadId);
+    if (!thread.environmentId) throw refusal("ROLE_CONTEXT_REQUIRED", "holder thread has no environment");
+    environment = reader.environment(thread.environmentId);
+    project = reader.project(request.projectId);
+    host = reader.host(environment.hostId);
+    bbVersion = reader.version();
+  } catch (error) {
+    if (error instanceof Refusal) throw error;
+    throw refusal("ROLE_CONTEXT_UNKNOWN", "one or more exact BB context facts are unavailable");
+  }
+  if (thread.id !== request.roleContext.threadId || thread.projectId !== request.projectId || project.id !== request.projectId) {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "thread or project context belongs to another project");
+  }
+  if (thread.visibility !== "visible") throw refusal("ROLE_CONTEXT_HIDDEN", "hidden threads cannot hold active roles");
+  if (!new Set(["active", "idle"]).has(thread.status)) throw refusal("ROLE_CONTEXT_UNKNOWN", "holder thread is not in a usable execution state");
+  if (!thread.environmentId || environment.id !== thread.environmentId || environment.projectId !== request.projectId) {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "environment context does not match the holder thread and project");
+  }
+  if (
+    environment.status !== "ready" ||
+    !environment.path ||
+    !environment.managed ||
+    !environment.isGitRepo ||
+    !environment.isWorktree ||
+    environment.workspaceProvisionType !== "managed-worktree"
+  ) {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "holder environment is not an exact ready managed worktree");
+  }
+  const sources = project.sources.filter(
+    (source) => source.projectId === request.projectId && source.hostId === environment.hostId && source.path === environment.path,
+  );
+  if (sources.length !== 1) throw refusal("ROLE_CONTEXT_FOREIGN", "project source does not resolve uniquely by exact host and path");
+  if (host.id !== environment.hostId || host.status !== "connected") throw refusal("ROLE_CONTEXT_UNKNOWN", "holder host is unavailable");
+  if (!stringField(bbVersion) || events.length === 0 || events.length > 256) {
+    throw refusal("ROLE_CONTEXT_UNKNOWN", "bounded BB version or event facts are unavailable");
+  }
+  for (let index = 1; index < events.length; index += 1) {
+    if (events[index]!.seq <= events[index - 1]!.seq) throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "BB event ordering is ambiguous");
+  }
+  const requestEvents = events.filter(
+    (event) => event.id === request.roleContext!.requestEventId && event.seq === request.roleContext!.requestEventSeq && event.type === "client/turn/requested",
+  );
+  if (requestEvents.length !== 1) throw refusal("EXECUTION_PROFILE_UNKNOWN", "the exact execution-bearing request event is unavailable");
+  const requestEvent = requestEvents[0]!;
+  const execution = requestEvent.data.execution as Record<string, unknown> | undefined;
+  const requestId = stringField(requestEvent.data.requestId);
+  if (!execution || !requestId) throw refusal("EXECUTION_PROFILE_UNKNOWN", "execution request correlation is incomplete");
+  const model = stringField(execution.model);
+  const reasoningLevel = stringField(execution.reasoningLevel);
+  const permissionMode = stringField(execution.permissionMode);
+  const serviceTier = stringField(execution.serviceTier);
+  const executionSource = stringField(execution.source);
+  if (!model || !reasoningLevel || !permissionMode || !serviceTier || !executionSource) {
+    throw refusal("EXECUTION_PROFILE_UNKNOWN", "execution profile fields are incomplete");
+  }
+  const accepted = events.filter(
+    (event) => event.type === "turn/input/accepted" && event.data.clientRequestId === requestId,
+  );
+  if (accepted.length !== 1) throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "execution input correlation is missing or ambiguous");
+  const providerThreadId = stringField(accepted[0]!.data.providerThreadId);
+  if (!providerThreadId) throw refusal("EXECUTION_PROFILE_UNKNOWN", "provider thread correlation is unavailable");
+  const starts = events.filter((event) => event.type === "turn/started" && event.data.providerThreadId === providerThreadId);
+  if (starts.length !== 1) throw refusal("EXECUTION_PROFILE_UNKNOWN", "correlated execution start is missing or ambiguous");
+  const completions = events.filter((event) => event.type === "turn/completed" && event.data.providerThreadId === providerThreadId);
+  if (completions.length !== 1) throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "correlated execution completion is missing or ambiguous");
+  const completion = completions[0]!;
+  if (completion.id !== request.roleContext.completionEventId || completion.seq !== request.roleContext.completionEventSeq) {
+    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion does not match the exact requested correlation");
+  }
+  if (completion.data.status !== "completed") throw refusal("EXECUTION_PROFILE_UNKNOWN", "execution did not complete successfully");
+  if (events.some((event) => event.type === "provider/modelFallback" && event.data.providerThreadId === providerThreadId)) {
+    throw refusal("EXECUTION_PROFILE_UNKNOWN", "model fallback has no final unambiguous executed profile");
+  }
+  const profile: ExecutionProfile = {
+    providerId: thread.providerId,
+    model,
+    reasoningLevel,
+    permissionMode,
+    serviceTier,
+    visibility: thread.visibility,
+  };
+  const permissionRank: Record<string, number> = { "accept-edits": 0, auto: 1, full: 2 };
+  if ((permissionRank[profile.permissionMode] ?? 99) > (permissionRank[host.maxPermissionMode] ?? -1)) {
+    throw refusal("EXECUTION_PROFILE_MISMATCH", "executed permission exceeds the host permission ceiling");
+  }
+  const source = sources[0]!;
+  const baseContext = {
+    project: { id: project.id, kind: project.kind, gitRemoteUrl: project.gitRemoteUrl },
+    thread: { id: thread.id, projectId: thread.projectId, providerId: thread.providerId, status: thread.status, visibility: thread.visibility },
+    environment: {
+      id: environment.id,
+      projectId: environment.projectId,
+      hostId: environment.hostId,
+      path: environment.path,
+      managed: environment.managed,
+      isGitRepo: environment.isGitRepo,
+      isWorktree: environment.isWorktree,
+      workspaceProvisionType: environment.workspaceProvisionType,
+      branchName: environment.branchName,
+      baseBranch: environment.baseBranch,
+      defaultBranch: environment.defaultBranch,
+      mergeBaseBranch: environment.mergeBaseBranch,
+      status: environment.status,
+    },
+    source: { id: source.id, projectId: source.projectId, hostId: source.hostId, path: source.path },
+    host: { id: host.id, status: host.status, maxPermissionMode: host.maxPermissionMode },
+    execution: {
+      providerThreadId,
+      requestId,
+      requestEventId: requestEvent.id,
+      requestEventSeq: requestEvent.seq,
+      completionEventId: completion.id,
+      completionEventSeq: completion.seq,
+      source: executionSource,
+    },
+    bbVersion,
+    pluginSdkVersion: PLUGIN_SDK_VERSION,
+  };
+  const holderExecutionAttemptId = sha256(canonicalJson({
+    projectId: request.projectId,
+    threadId: thread.id,
+    environmentId: environment.id,
+    providerThreadId,
+    requestId,
+    requestEventId: requestEvent.id,
+    requestEventSeq: requestEvent.seq,
+    completionEventId: completion.id,
+    completionEventSeq: completion.seq,
+  }));
+  return {
+    profile,
+    profileDigest: sha256(canonicalJson(profile)),
+    baseContext,
+    holderExecutionAttemptId,
+    threadId: thread.id,
+    environmentId: environment.id,
+    sourceId: source.id,
+    hostId: host.id,
+    providerThreadId,
+    requestEventId: requestEvent.id,
+    requestEventSeq: requestEvent.seq,
+    completionEventId: completion.id,
+    completionEventSeq: completion.seq,
+    bbVersion,
+  };
 }
 
 export class GitHubIssueAdapterError extends Error {
@@ -399,6 +803,24 @@ export type FoundationCode =
   | "EXTERNAL_CAPABILITY_REQUIRED"
   | "EXTERNAL_RESPONSE_INVALID"
   | "EXTERNAL_DELIVERY_AMBIGUOUS"
+  | "ROLE_REQUIREMENT_UNKNOWN"
+  | "ROLE_HEAD_UNAVAILABLE"
+  | "ROLE_GENERATION_STALE"
+  | "ROLE_PREDECESSOR_MISMATCH"
+  | "ROLE_NOT_ACTIVE"
+  | "ROLE_CONTEXT_REQUIRED"
+  | "ROLE_CONTEXT_UNKNOWN"
+  | "ROLE_CONTEXT_FOREIGN"
+  | "ROLE_CONTEXT_HIDDEN"
+  | "ROLE_HOLDER_MISMATCH"
+  | "EXECUTION_PROFILE_UNKNOWN"
+  | "EXECUTION_PROFILE_MISMATCH"
+  | "EXECUTION_COMPLETION_AMBIGUOUS"
+  | "ROLE_UNQUALIFIED"
+  | "CAPABILITY_UNKNOWN"
+  | "QUALIFICATION_CONTEXT_FOREIGN"
+  | "ELIGIBILITY_EXPIRED"
+  | "ELIGIBILITY_STALE"
   | "IDEMPOTENCY_KEY_CONFLICT"
   | "CANONICAL_STORE_UNAVAILABLE"
   | "INTERNAL_ERROR"
@@ -544,6 +966,11 @@ function validateConfig(value: unknown): string {
         const parsed = githubIssuesConfigSchema.safeParse(githubIssues);
         if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
       }
+      const roleRequirements = (bbCollab as Record<string, unknown>).roleRequirements;
+      if (roleRequirements !== undefined) {
+        const parsed = roleRequirementsSchema.safeParse(roleRequirements);
+        if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
+      }
     }
   }
   const json = canonicalJson(value);
@@ -555,6 +982,8 @@ function validateConfig(value: unknown): string {
 
 type GithubIssuesConfig = z.infer<typeof githubIssuesConfigSchema>;
 type WorkItemState = (typeof WORK_ITEM_STATES)[number];
+type ExecutionProfile = z.infer<typeof executionProfileSchema>;
+type RoleRequirement = z.infer<typeof roleRequirementSchema>;
 
 function githubConfigFromJson(configJson: string): GithubIssuesConfig | null {
   const config = JSON.parse(configJson) as {
@@ -567,12 +996,25 @@ function githubConfigFromJson(configJson: string): GithubIssuesConfig | null {
   return parsed.data;
 }
 
+function roleRequirementsFromJson(configJson: string): RoleRequirement[] {
+  const config = JSON.parse(configJson) as {
+    extensions?: { bbCollab?: { roleRequirements?: unknown } };
+  };
+  const value = config.extensions?.bbCollab?.roleRequirements;
+  if (value === undefined) return [];
+  const parsed = roleRequirementsSchema.safeParse(value);
+  if (!parsed.success) throw refusal("INVALID_INPUT", "stored role requirements are invalid");
+  return parsed.data;
+}
+
 function requireMappedTargets(configJson: string, targets: NonNullable<ApplyRequest["targets"]>): void {
   const github = githubConfigFromJson(configJson);
-  if (!github) return;
   const targetIds = new Set(targets.map((target) => target.repoTargetId));
-  if (github.repositoryMappings.some((mapping) => !targetIds.has(mapping.repoTargetId))) {
+  if (github?.repositoryMappings.some((mapping) => !targetIds.has(mapping.repoTargetId))) {
     throw refusal("REPO_TARGET_FOREIGN", "GitHub repository mapping names a target outside the config revision");
+  }
+  if (roleRequirementsFromJson(configJson).some((requirement) => requirement.repoTargetId && !targetIds.has(requirement.repoTargetId))) {
+    throw refusal("REPO_TARGET_FOREIGN", "role requirement names a target outside the config revision");
   }
 }
 
@@ -612,6 +1054,19 @@ function normalizeRequest(request: ApplyRequest): ApplyRequest {
     workItemId: request.workItemId ?? undefined,
     lifecycleState: request.lifecycleState ?? undefined,
     projectionKind: request.projectionKind ?? undefined,
+    roleId: request.roleId ?? undefined,
+    roleRequirementId: request.roleRequirementId ?? undefined,
+    qualificationId: request.qualificationId ?? undefined,
+    expectedGeneration: request.expectedGeneration ?? null,
+    predecessorGeneration: request.predecessorGeneration ?? null,
+    profileDigest: request.profileDigest ?? undefined,
+    roleContext: request.roleContext ?? undefined,
+    qualificationOutcome: request.qualificationOutcome ?? undefined,
+    observedAtMs: request.observedAtMs ?? undefined,
+    expiresAtMs: request.expiresAtMs ?? null,
+    reasonCode: request.reasonCode ?? undefined,
+    fixtureContextDigest: request.fixtureContextDigest ?? undefined,
+    declaredProfile: request.declaredProfile ?? undefined,
   };
 }
 
@@ -1211,6 +1666,467 @@ function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, dig
       evidence: { dispositionSequence: sequence },
     },
   );
+}
+
+interface ResolvedRoleRequirement {
+  requirement: RoleRequirement;
+  digest: string;
+  configRevision: number;
+}
+
+function requireRoleRequirement(db: SqliteDatabase, request: ApplyRequest, configRevision: number): ResolvedRoleRequirement {
+  if (!request.roleRequirementId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "role requirement identity is required");
+  const requirements = roleRequirementsFromJson(storedConfigJson(db, request.projectId, configRevision));
+  const matches = requirements.filter((candidate) => candidate.roleRequirementId === request.roleRequirementId);
+  if (matches.length !== 1) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "role requirement is not uniquely configured");
+  const requirement = matches[0]!;
+  if (request.roleId && request.roleId !== requirement.roleId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "logical role does not match its requirement");
+  if (requirement.repoTargetId === null) {
+    if (request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "project-scoped role cannot accept a repository target");
+  } else {
+    if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "target-scoped role requires its exact repository target");
+    if (request.repoTargetId !== requirement.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "role requirement target does not match the exact repository target");
+    requireTarget(db, request.projectId, configRevision, request.repoTargetId);
+  }
+  return { requirement, digest: sha256(canonicalJson(requirement)), configRevision };
+}
+
+function requireRoleTargetContext(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  resolved: ResolvedRoleRequirement,
+  context: ResolvedRoleContext,
+): void {
+  if (resolved.requirement.repoTargetId === null) return;
+  const target = requireTarget(db, request.projectId, resolved.configRevision, resolved.requirement.repoTargetId) as {
+    source_id: string;
+    host_id: string;
+    path: string;
+  };
+  const environment = context.baseContext.environment as { path?: unknown };
+  if (target.source_id !== context.sourceId || target.host_id !== context.hostId || target.path !== environment.path) {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "holder context does not match the exact repository target source, host, and path");
+  }
+}
+
+function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest): void {
+  if (!request.actorReceiptId) return;
+  const actor = asRow<{ actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null }>(
+    db.prepare("SELECT actor_kind, subject_id, role_id, role_generation FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(
+      request.projectId,
+      request.actorReceiptId,
+    ),
+  );
+  if (!actor || actor.actor_kind !== "role") return;
+  if (!actor.role_id || actor.role_generation === null) throw refusal("ROLE_HOLDER_MISMATCH", "role actor receipt has no exact generation");
+  const head = asRow<{ current_generation: number }>(
+    db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(request.projectId, actor.role_id),
+  );
+  const generation = asRow<{ status: string; holder_execution_attempt_id: string }>(
+    db.prepare("SELECT status, holder_execution_attempt_id FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?").get(
+      request.projectId,
+      actor.role_id,
+      actor.role_generation,
+    ),
+  );
+  if (!head || head.current_generation !== actor.role_generation) throw refusal("ROLE_GENERATION_STALE", "role actor is not the current generation");
+  if (!generation || generation.status !== "active") throw refusal("ROLE_NOT_ACTIVE", "role actor is not active");
+  if (generation.holder_execution_attempt_id !== actor.subject_id) throw refusal("ROLE_HOLDER_MISMATCH", "role actor does not bind the current holder context");
+}
+
+function profileEquals(left: ExecutionProfile, right: ExecutionProfile): boolean {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+function qualificationContextDigest(
+  context: ResolvedRoleContext,
+  resolved: ResolvedRoleRequirement,
+  request: ApplyRequest,
+): string {
+  return sha256(canonicalJson({
+    ...context.baseContext,
+    configRevision: resolved.configRevision,
+    roleId: resolved.requirement.roleId,
+    roleRequirementId: resolved.requirement.roleRequirementId,
+    roleRequirementDigest: resolved.digest,
+    repoTargetId: resolved.requirement.repoTargetId,
+    fixtureContextDigest: request.fixtureContextDigest,
+  }));
+}
+
+function applyQualificationObservation(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+  context: ResolvedRoleContext,
+): FoundationResult {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request);
+  const resolved = requireRoleRequirement(db, request, configRevision);
+  requireRoleTargetContext(db, request, resolved, context);
+  const qualificationId = request.qualificationId;
+  const requestedOutcome = request.qualificationOutcome;
+  const observedAtMs = request.observedAtMs;
+  const fixtureContextDigest = request.fixtureContextDigest;
+  const expiresAtMs = request.expiresAtMs ?? null;
+  if (!qualificationId || !requestedOutcome || observedAtMs === undefined || !fixtureContextDigest || !request.reasonCode) {
+    throw refusal("INVALID_INPUT", "qualification recording requires exact observation, outcome, time, fixture, and reason fields");
+  }
+  if (expiresAtMs !== null && expiresAtMs <= observedAtMs) {
+    throw refusal("INVALID_INPUT", "qualification expiry must be later than observation time");
+  }
+  if (db.prepare("SELECT 1 FROM qualification_observations WHERE project_id = ? AND qualification_id = ?").get(request.projectId, qualificationId)) {
+    throw refusal("IDEMPOTENCY_KEY_CONFLICT", "qualification identity is immutable and already exists");
+  }
+  const contextDigest = qualificationContextDigest(context, resolved, request);
+  const requiredMatch = profileEquals(context.profile, resolved.requirement.executedProfile);
+  const declaredMatch = request.declaredProfile === undefined || profileEquals(context.profile, request.declaredProfile);
+  const mismatch = !requiredMatch || !declaredMatch;
+  const observationOutcome = mismatch ? "unqualified" : requestedOutcome;
+  const effectiveStatus = observationOutcome === "qualified" ? "eligible" : observationOutcome === "unqualified" ? "ineligible" : "unknown";
+  const reasonCode = mismatch ? "execution_profile_mismatch" : request.reasonCode;
+  const evidenceDigest = sha256(canonicalJson({
+    executedProfileDigest: context.profileDigest,
+    qualificationContextDigest: contextDigest,
+    fixtureContextDigest,
+    outcome: observationOutcome,
+    reasonCode,
+  }));
+  const observation = {
+    projectId: request.projectId,
+    qualificationId,
+    roleRequirementId: resolved.requirement.roleRequirementId,
+    configRevision,
+    repoTargetId: resolved.requirement.repoTargetId,
+    roleRequirementDigest: resolved.digest,
+    executedProfileDigest: context.profileDigest,
+    qualificationContextDigest: contextDigest,
+    fixtureContextDigest,
+    outcome: observationOutcome,
+    observedAtMs,
+    expiresAtMs,
+    evidenceDigest,
+    reasonCode,
+  };
+  const observationDigest = sha256(canonicalJson(observation));
+  db.prepare(
+    `INSERT INTO qualification_observations (
+      project_id, qualification_id, role_requirement_id, config_revision, repo_target_id,
+      role_requirement_digest, executed_profile_digest, provider_id, model, reasoning_level,
+      permission_mode, service_tier, visibility, thread_id, environment_id, source_id, host_id,
+      provider_thread_id, request_event_id, request_event_seq, completion_event_id, completion_event_seq,
+      bb_version, plugin_sdk_version, qualification_context_digest, fixture_context_digest, outcome,
+      observed_at_ms, expires_at_ms, evidence_digest, observation_digest, reason_code
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    request.projectId,
+    qualificationId,
+    resolved.requirement.roleRequirementId,
+    configRevision,
+    resolved.requirement.repoTargetId,
+    resolved.digest,
+    context.profileDigest,
+    context.profile.providerId,
+    context.profile.model,
+    context.profile.reasoningLevel,
+    context.profile.permissionMode,
+    context.profile.serviceTier,
+    context.profile.visibility,
+    context.threadId,
+    context.environmentId,
+    context.sourceId,
+    context.hostId,
+    context.providerThreadId,
+    context.requestEventId,
+    context.requestEventSeq,
+    context.completionEventId,
+    context.completionEventSeq,
+    context.bbVersion,
+    PLUGIN_SDK_VERSION,
+    contextDigest,
+    fixtureContextDigest,
+    observationOutcome,
+    observedAtMs,
+    expiresAtMs,
+    evidenceDigest,
+    observationDigest,
+    reasonCode,
+  );
+  const derivedAtMs = now();
+  const derivationDigest = sha256(canonicalJson({
+    qualificationId,
+    profileDigest: context.profileDigest,
+    effectiveStatus,
+    contextDigest,
+    configRevision,
+    roleRequirementDigest: resolved.digest,
+    derivedAtMs,
+    expiresAtMs,
+    reasonCode,
+  }));
+  db.prepare(
+    `INSERT INTO eligibility_projections (
+      project_id, role_requirement_id, profile_digest, current_qualification_id,
+      effective_status, qualification_context_digest, config_revision, role_requirement_digest,
+      derived_at_ms, expires_at_ms, derivation_digest, reason_code
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(project_id, role_requirement_id, profile_digest) DO UPDATE SET
+      current_qualification_id = excluded.current_qualification_id,
+      effective_status = excluded.effective_status,
+      qualification_context_digest = excluded.qualification_context_digest,
+      config_revision = excluded.config_revision,
+      role_requirement_digest = excluded.role_requirement_digest,
+      derived_at_ms = excluded.derived_at_ms,
+      expires_at_ms = excluded.expires_at_ms,
+      derivation_digest = excluded.derivation_digest,
+      reason_code = excluded.reason_code`,
+  ).run(
+    request.projectId,
+    resolved.requirement.roleRequirementId,
+    context.profileDigest,
+    qualificationId,
+    effectiveStatus,
+    contextDigest,
+    configRevision,
+    resolved.digest,
+    derivedAtMs,
+    expiresAtMs,
+    derivationDigest,
+    reasonCode,
+  );
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "qualification_observation",
+      aggregateId: qualificationId,
+      aggregateRevision: 1,
+      eventType: "qualification_observation_recorded",
+      event: { qualificationId, roleRequirementId: resolved.requirement.roleRequirementId, profileDigest: context.profileDigest, outcome: observationOutcome },
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    {
+      currentConfigRevision: configRevision,
+      currentGovernanceEpoch: governor.governance_epoch,
+      evidence: { qualificationId, roleRequirementId: resolved.requirement.roleRequirementId, profileDigest: context.profileDigest, effectiveStatus, observationDigest, derivationDigest, reasonCode },
+    },
+    mismatch ? "EXECUTION_PROFILE_MISMATCH" : "OK",
+  );
+}
+
+interface QualificationObservationRow {
+  qualification_id: string;
+  role_requirement_id: string;
+  config_revision: number;
+  repo_target_id: string | null;
+  role_requirement_digest: string;
+  executed_profile_digest: string;
+  qualification_context_digest: string;
+  fixture_context_digest: string;
+  outcome: "qualified" | "unqualified" | "unknown";
+  expires_at_ms: number | null;
+  bb_version: string;
+  plugin_sdk_version: string;
+}
+
+interface EligibilityProjectionRow {
+  current_qualification_id: string;
+  effective_status: "eligible" | "ineligible" | "unknown";
+  qualification_context_digest: string;
+  config_revision: number;
+  role_requirement_digest: string;
+  expires_at_ms: number | null;
+  derivation_digest: string;
+}
+
+function applyRoleGenerationSuccession(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+  context: ResolvedRoleContext,
+): FoundationResult {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request);
+  if (!request.roleId || !request.qualificationId || !request.profileDigest || !request.fixtureContextDigest) {
+    throw refusal("INVALID_INPUT", "role succession requires role, qualification, profile, and fixture context identities");
+  }
+  const resolved = requireRoleRequirement(db, request, configRevision);
+  requireRoleTargetContext(db, request, resolved, context);
+  if (!profileEquals(context.profile, resolved.requirement.executedProfile) || request.profileDigest !== context.profileDigest) {
+    throw refusal("EXECUTION_PROFILE_MISMATCH", "holder executed profile does not match the role requirement");
+  }
+  const expectedContextDigest = qualificationContextDigest(context, resolved, request);
+  const observation = asRow<QualificationObservationRow>(
+    db.prepare("SELECT * FROM qualification_observations WHERE project_id = ? AND qualification_id = ?").get(request.projectId, request.qualificationId),
+  );
+  if (!observation) throw refusal("ROLE_UNQUALIFIED", "qualification observation is not known");
+  const projection = asRow<EligibilityProjectionRow>(
+    db.prepare("SELECT * FROM eligibility_projections WHERE project_id = ? AND role_requirement_id = ? AND profile_digest = ?").get(
+      request.projectId,
+      resolved.requirement.roleRequirementId,
+      request.profileDigest,
+    ),
+  );
+  if (!projection) throw refusal("CAPABILITY_UNKNOWN", "current eligibility projection is unavailable");
+  if (
+    observation.config_revision !== configRevision ||
+    projection.config_revision !== configRevision ||
+    observation.role_requirement_digest !== resolved.digest ||
+    projection.role_requirement_digest !== resolved.digest ||
+    observation.bb_version !== context.bbVersion ||
+    observation.plugin_sdk_version !== PLUGIN_SDK_VERSION
+  ) {
+    throw refusal("ELIGIBILITY_STALE", "qualification or runtime evidence is stale");
+  }
+  if (
+    observation.role_requirement_id !== resolved.requirement.roleRequirementId ||
+    observation.repo_target_id !== resolved.requirement.repoTargetId ||
+    observation.executed_profile_digest !== request.profileDigest ||
+    observation.qualification_context_digest !== expectedContextDigest ||
+    observation.fixture_context_digest !== request.fixtureContextDigest ||
+    projection.current_qualification_id !== observation.qualification_id ||
+    projection.qualification_context_digest !== expectedContextDigest
+  ) {
+    throw refusal("QUALIFICATION_CONTEXT_FOREIGN", "qualification does not match the exact holder context");
+  }
+  const effectiveAtMs = now();
+  if ((observation.expires_at_ms !== null && observation.expires_at_ms <= effectiveAtMs) || (projection.expires_at_ms !== null && projection.expires_at_ms <= effectiveAtMs)) {
+    throw refusal("ELIGIBILITY_EXPIRED", "qualification eligibility has expired");
+  }
+  if (observation.outcome === "unknown" || projection.effective_status === "unknown") throw refusal("CAPABILITY_UNKNOWN", "qualification outcome is unknown");
+  if (observation.outcome !== "qualified" || projection.effective_status !== "eligible") throw refusal("ROLE_UNQUALIFIED", "qualification is not eligible");
+  const head = asRow<{ current_generation: number }>(
+    db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(request.projectId, request.roleId),
+  );
+  const first = request.expectedGeneration === null && request.predecessorGeneration === null;
+  let nextGeneration: number;
+  if (first) {
+    if (head) throw refusal("ROLE_GENERATION_STALE", "first generation requires no current role head", { currentResourceRevision: head.current_generation });
+    nextGeneration = 1;
+  } else {
+    if (request.expectedGeneration === null || request.predecessorGeneration === null) {
+      throw refusal("ROLE_PREDECESSOR_MISMATCH", "successor requires matching expected and predecessor generations");
+    }
+    if (!head) throw refusal("ROLE_HEAD_UNAVAILABLE", "successor requires a current role head");
+    if (head.current_generation !== request.expectedGeneration) {
+      throw refusal("ROLE_GENERATION_STALE", "role head generation is stale", {
+        currentResourceRevision: head.current_generation,
+        expectedResourceRevision: request.expectedGeneration,
+      });
+    }
+    if (request.predecessorGeneration !== request.expectedGeneration) throw refusal("ROLE_PREDECESSOR_MISMATCH", "predecessor does not match the expected current generation");
+    const predecessor = asRow<{ status: string }>(
+      db.prepare("SELECT status FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?").get(
+        request.projectId,
+        request.roleId,
+        request.predecessorGeneration,
+      ),
+    );
+    if (!predecessor || !["active", "draining"].includes(predecessor.status)) throw refusal("ROLE_NOT_ACTIVE", "predecessor is not current and active or draining");
+    nextGeneration = request.expectedGeneration + 1;
+  }
+  const createdAtMs = now();
+  db.prepare(
+    `INSERT INTO role_generations (
+      project_id, role_id, generation, role_requirement_id, config_revision, repo_target_id,
+      status, predecessor_generation, holder_execution_attempt_id, holder_context_digest,
+      holder_executed_profile_digest, qualification_id, eligibility_derivation_digest,
+      created_at_ms, activated_at_ms, retired_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+  ).run(
+    request.projectId,
+    request.roleId,
+    nextGeneration,
+    resolved.requirement.roleRequirementId,
+    configRevision,
+    resolved.requirement.repoTargetId,
+    request.predecessorGeneration,
+    context.holderExecutionAttemptId,
+    expectedContextDigest,
+    context.profileDigest,
+    request.qualificationId,
+    projection.derivation_digest,
+    createdAtMs,
+    createdAtMs,
+  );
+  if (first) {
+    db.prepare("INSERT INTO role_generation_heads (project_id, role_id, current_generation, updated_at_ms) VALUES (?, ?, 1, ?)").run(
+      request.projectId,
+      request.roleId,
+      createdAtMs,
+    );
+  } else {
+    const retired = db.prepare(
+      `UPDATE role_generations SET status = 'retired', retired_at_ms = ?
+       WHERE project_id = ? AND role_id = ? AND generation = ? AND status IN ('active', 'draining')`,
+    ).run(createdAtMs, request.projectId, request.roleId, request.predecessorGeneration);
+    if (retired.changes !== 1) throw refusal("ROLE_NOT_ACTIVE", "predecessor retirement compare-and-swap failed");
+    const advanced = db.prepare(
+      `UPDATE role_generation_heads SET current_generation = ?, updated_at_ms = ?
+       WHERE project_id = ? AND role_id = ? AND current_generation = ?`,
+    ).run(nextGeneration, createdAtMs, request.projectId, request.roleId, request.expectedGeneration);
+    if (advanced.changes !== 1) throw refusal("ROLE_GENERATION_STALE", "role head compare-and-swap failed");
+  }
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "role_generation",
+      aggregateId: request.roleId,
+      aggregateRevision: nextGeneration,
+      eventType: "role_generation_succeeded",
+      event: { roleId: request.roleId, generation: nextGeneration, predecessorGeneration: request.predecessorGeneration, qualificationId: request.qualificationId },
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    {
+      currentConfigRevision: configRevision,
+      currentGovernanceEpoch: governor.governance_epoch,
+      currentResourceRevision: nextGeneration,
+      expectedResourceRevision: request.expectedGeneration ?? undefined,
+      evidence: {
+        roleId: request.roleId,
+        generation: nextGeneration,
+        predecessorGeneration: request.predecessorGeneration,
+        holderExecutionAttemptId: context.holderExecutionAttemptId,
+        holderContextDigest: expectedContextDigest,
+        executedProfileDigest: context.profileDigest,
+        qualificationId: request.qualificationId,
+        eligibilityDerivationDigest: projection.derivation_digest,
+      },
+    },
+  );
+}
+
+function applyRoleMutation(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+  reader: RoleFactReader | null,
+): FoundationResult {
+  try {
+    const replay = checkIdempotency(db, request, digest);
+    if (replay) return replay;
+    const context = resolveRoleContext(reader, request);
+    return transaction(db, () => {
+      const replayInTransaction = checkIdempotency(db, request, digest);
+      if (replayInTransaction) return replayInTransaction;
+      return request.operationClass === "qualification_observation_record"
+        ? applyQualificationObservation(db, request, digest, context)
+        : applyRoleGenerationSuccession(db, request, digest, context);
+    });
+  } catch (error) {
+    if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
+    if (isConstraintError(error)) return unavailableResult(request.projectId, "canonical role mutation could not be committed unambiguously");
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+  }
 }
 
 interface WorkItemRow {
@@ -1907,6 +2823,7 @@ export function applyFixtureMutation(
   db: SqliteDatabase | null,
   input: unknown,
   githubAdapter: GitHubIssueAdapter | null = null,
+  roleFactReader: RoleFactReader | null = null,
 ): FoundationResult {
   let request: ApplyRequest;
   try {
@@ -1920,6 +2837,9 @@ export function applyFixtureMutation(
     const digest = requestDigest(request);
     if (request.operationClass === "github_issue_projection") {
       return applyGithubIssueProjection(db, request, digest, githubAdapter);
+    }
+    if (request.operationClass === "qualification_observation_record" || request.operationClass === "role_generation_succession") {
+      return applyRoleMutation(db, request, digest, roleFactReader);
     }
     return transaction(db, () => {
       const replay = checkIdempotency(db, request, digest);
@@ -1939,6 +2859,9 @@ export function applyFixtureMutation(
           return applyWorkItemTransition(db, request, digest);
         case "github_issue_projection":
           throw refusal("INTERNAL_ERROR", "projection must not run inside the canonical transaction");
+        case "qualification_observation_record":
+        case "role_generation_succession":
+          throw refusal("INTERNAL_ERROR", "role fact operations must not run inside the canonical transaction");
       }
     });
   } catch (error) {
@@ -1968,6 +2891,10 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     state_events: "event_sequence",
     work_items: "work_item_id",
     external_work_refs: "work_item_id, provider",
+    qualification_observations: "qualification_id",
+    eligibility_projections: "role_requirement_id, profile_digest",
+    role_generations: "role_id, generation",
+    role_generation_heads: "role_id",
   };
   const query =
     table === "decision_dispositions"
@@ -2123,6 +3050,36 @@ export async function doctor(
     const governor = asRow<Record<string, unknown>>(
       db.prepare("SELECT * FROM project_governorship_heads WHERE project_id = ?").get(projectId),
     );
+    const roleGenerationHeads = db.prepare(
+      `SELECT role_generation_heads.role_id, role_generation_heads.current_generation,
+              role_generations.status, role_generations.qualification_id,
+              role_generations.holder_execution_attempt_id
+       FROM role_generation_heads
+       JOIN role_generations ON role_generations.project_id = role_generation_heads.project_id
+         AND role_generations.role_id = role_generation_heads.role_id
+         AND role_generations.generation = role_generation_heads.current_generation
+       WHERE role_generation_heads.project_id = ? ORDER BY role_generation_heads.role_id`,
+    ).all(projectId) as Array<Record<string, unknown>>;
+    const observationCount = asRow<{ count: number }>(
+      db.prepare("SELECT COUNT(*) AS count FROM qualification_observations WHERE project_id = ?").get(projectId),
+    )?.count ?? 0;
+    const configuredRequirements = roleRequirementsFromJson(storedConfigJson(db, projectId, configHead.config_revision));
+    const eligibility = (db.prepare(
+      `SELECT role_requirement_id, profile_digest, current_qualification_id, effective_status,
+              config_revision, role_requirement_digest, expires_at_ms, reason_code
+       FROM eligibility_projections WHERE project_id = ? ORDER BY role_requirement_id, profile_digest`,
+    ).all(projectId) as Array<Record<string, unknown>>).map((row) => {
+      const requirement = configuredRequirements.find((candidate) => candidate.roleRequirementId === row.role_requirement_id);
+      const stale = row.config_revision !== configHead.config_revision || !requirement || sha256(canonicalJson(requirement)) !== row.role_requirement_digest;
+      const expired = typeof row.expires_at_ms === "number" && row.expires_at_ms <= now();
+      return {
+        roleRequirementId: row.role_requirement_id,
+        profileDigest: row.profile_digest,
+        currentQualificationId: row.current_qualification_id,
+        effectiveStatus: stale ? "stale" : expired ? "expired" : row.effective_status,
+        reasonCode: stale ? "requirement_or_config_stale" : expired ? "eligibility_expired" : row.reason_code,
+      };
+    });
     const schemaState = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (" + TABLES.map(() => "?").join(",") + ") ORDER BY name")
       .all(...TABLES) as Array<{ name: string }>;
@@ -2137,6 +3094,15 @@ export async function doctor(
         project: { id: project.id, kind: project.kind, name: project.name, gitRemoteUrl: project.gitRemoteUrl },
         targets: targetEvidence,
         governorshipHead: governor ?? null,
+        roleGenerationHeads,
+        qualificationObservationCount: observationCount,
+        eligibility,
+        cachedConsumers: {
+          names: ["server.rpcContract", "server.collabCli", "src/test-support", "tests/server.test"],
+          expected: 0,
+          attempted: 0,
+          verified: 0,
+        },
         schema: { version: SCHEMA_VERSION, migrationStatementIds: MIGRATIONS.map((_, index) => index), digest: schemaDigest, tables: schemaState.map((row) => row.name) },
       },
     });
