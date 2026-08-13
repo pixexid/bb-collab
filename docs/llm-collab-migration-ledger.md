@@ -23,9 +23,8 @@ was created, edited, closed, or transitioned.
   - import manifest blob `b9f5f0a399da5705ed1c2aa610fd9e214834c98d`;
   - roadmap blob `76fcadb38a6094eb5be5ec73f8d9a9fc4b31461c`;
   - `AGENTS.md` blob `56df822ab67aeac9ce6d8dfd96d9f9a0d092f994`.
-- Current bb-collab issue-only ledger: 14 issues, one open (#5) and 13
-  closed (#1, #3, #4, #7, #8, #10, #13, #15, #17, #18, #21, #22, #23).
-  Pull requests are not counted as issues.
+- The bb-collab issue ledger was read live at the audit fence; #28-31 were
+  created after the audit and are linked below. Pull requests are excluded.
 
 The governing rule is distill-and-migrate: carry surviving invariants, typed
 evidence, and probes into the one bb-collab authority; do not fork or bulk-copy
