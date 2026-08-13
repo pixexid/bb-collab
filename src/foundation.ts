@@ -255,7 +255,7 @@ const githubIssueConventionSchema = z
     managedLabels: z
       .object({
         names: z.array(id).max(128),
-        byLifecycle: z.record(workItemStateSchema, z.array(id).max(128)).optional(),
+        byLifecycle: z.partialRecord(workItemStateSchema, z.array(id).max(128)).optional(),
       })
       .strict()
       .optional(),
@@ -819,22 +819,20 @@ function nextEventSequence(db: SqliteDatabase, projectId: string): number {
   return row?.next_sequence ?? 1;
 }
 
-function commitMutation(
+interface StateEventInput {
+  aggregateType: string;
+  aggregateId: string;
+  aggregateRevision: number;
+  eventType: string;
+  event: unknown;
+}
+
+function appendStateEvent(
   db: SqliteDatabase,
   request: ApplyRequest,
-  digest: string,
   actorReceiptId: string,
-  event: {
-    aggregateType: string;
-    aggregateId: string;
-    aggregateRevision: number;
-    eventType: string;
-    event: unknown;
-  },
-  counts: { expected: number; attempted: number; verified: number },
-  extra: Omit<FoundationResult, "outcome" | "subject" | "expected" | "attempted" | "verified" | "eventSequence" | "mutationReceipt"> = {},
-  outcome: FoundationCode = "OK",
-): FoundationResult {
+  event: StateEventInput,
+): { eventSequence: number; createdAtMs: number } {
   const eventSequence = nextEventSequence(db, request.projectId);
   const createdAtMs = now();
   db.prepare(
@@ -854,6 +852,20 @@ function commitMutation(
     canonicalJson(event.event),
     createdAtMs,
   );
+  return { eventSequence, createdAtMs };
+}
+
+function commitMutation(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+  actorReceiptId: string,
+  event: StateEventInput,
+  counts: { expected: number; attempted: number; verified: number },
+  extra: Omit<FoundationResult, "outcome" | "subject" | "expected" | "attempted" | "verified" | "eventSequence" | "mutationReceipt"> = {},
+  outcome: FoundationCode = "OK",
+): FoundationResult {
+  const { eventSequence, createdAtMs } = appendStateEvent(db, request, actorReceiptId, event);
   const mutationReceipt: MutationReceipt = {
     projectId: request.projectId,
     idempotencyKey: request.idempotencyKey,
@@ -1448,6 +1460,30 @@ function externalRef(db: SqliteDatabase, projectId: string, workItemId: string):
   );
 }
 
+const EXTERNAL_REF_CAS_WHERE = `project_id = ? AND work_item_id = ? AND provider = 'github'
+  AND owner = ? AND repo = ? AND issue_number IS ? AND projection_state = ?
+  AND attempted_resource_revision = ? AND projected_resource_revision IS ?
+  AND desired_digest = ? AND observed_external_revision IS ? AND observed_external_digest IS ?
+  AND last_idempotency_key = ? AND last_request_digest = ?`;
+
+function externalRefCasArgs(ref: ExternalWorkRefRow): unknown[] {
+  return [
+    ref.project_id,
+    ref.work_item_id,
+    ref.owner,
+    ref.repo,
+    ref.issue_number,
+    ref.projection_state,
+    ref.attempted_resource_revision,
+    ref.projected_resource_revision,
+    ref.desired_digest,
+    ref.observed_external_revision,
+    ref.observed_external_digest,
+    ref.last_idempotency_key,
+    ref.last_request_digest,
+  ];
+}
+
 interface ProjectionContext {
   actorReceiptId: string;
   configRevision: number;
@@ -1457,7 +1493,27 @@ interface ProjectionContext {
   mapping: z.infer<typeof githubMappingSchema>;
   desired: DesiredProjection;
   ref: ExternalWorkRefRow;
-  createdReservation: boolean;
+}
+
+function revalidateProjectionContext(db: SqliteDatabase, request: ApplyRequest, context: ProjectionContext) {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  const workItem = requireWorkItem(db, request, configRevision);
+  const { mapping } = requireGithubMapping(db, request.projectId, configRevision, workItem.repo_target_id);
+  if (
+    configRevision !== context.configRevision ||
+    governor.governance_epoch !== context.governanceEpoch ||
+    actorReceiptId !== context.actorReceiptId ||
+    workItem.work_item_id !== context.workItem.work_item_id ||
+    mapping.repoTargetId !== context.mapping.repoTargetId ||
+    mapping.owner !== context.mapping.owner ||
+    mapping.repo !== context.mapping.repo ||
+    mapping.connectorHost !== context.mapping.connectorHost
+  ) {
+    throw refusal("EXTERNAL_TARGET_MISMATCH", "projection authority context changed before local mutation");
+  }
+  return { configRevision, governor, actorReceiptId, workItem, mapping };
 }
 
 function prepareProjection(
@@ -1513,6 +1569,19 @@ function prepareProjection(
         createdAtMs,
         createdAtMs,
       );
+      appendStateEvent(db, request, actorReceiptId, {
+        aggregateType: "external_work_ref",
+        aggregateId: workItem.work_item_id,
+        aggregateRevision: workItem.resource_revision,
+        eventType: "github_issue_projection_reserved",
+        event: {
+          workItemId: workItem.work_item_id,
+          provider: "github",
+          from: null,
+          to: "pending",
+          desiredDigest: desired.digest,
+        },
+      });
       ref = externalRef(db, request.projectId, workItem.work_item_id)!;
     }
     return {
@@ -1524,7 +1593,6 @@ function prepareProjection(
       mapping,
       desired,
       ref,
-      createdReservation: ref.projection_state === "pending",
     };
   });
 }
@@ -1538,29 +1606,34 @@ function reserveExistingProjection(
   return transaction(db, () => {
     const replay = checkIdempotency(db, request, digest);
     if (replay) throw refusal("IDEMPOTENCY_KEY_CONFLICT", "projection was concurrently finalized");
-    const configRevision = requireConfig(db, request);
-    requireGovernor(db, request);
-    requireActor(db, request);
-    requireWorkItem(db, request, configRevision);
-    const ref = externalRef(db, request.projectId, context.workItem.work_item_id);
-    if (!ref || ref.projection_state !== "current" || ref.issue_number !== context.ref.issue_number || ref.observed_external_digest !== context.ref.observed_external_digest) {
-      throw refusal("EXTERNAL_REF_CONFLICT", "external ref changed before projection reservation");
-    }
+    revalidateProjectionContext(db, request, context);
     const updated = db.prepare(
       `UPDATE external_work_refs SET projection_state = 'pending', attempted_resource_revision = ?,
        desired_digest = ?, last_idempotency_key = ?, last_request_digest = ?, updated_at_ms = ?
-       WHERE project_id = ? AND work_item_id = ? AND provider = 'github' AND projection_state = 'current'`,
+       WHERE ${EXTERNAL_REF_CAS_WHERE}`,
     ).run(
       context.workItem.resource_revision,
       context.desired.digest,
       request.idempotencyKey,
       digest,
       now(),
-      request.projectId,
-      context.workItem.work_item_id,
+      ...externalRefCasArgs(context.ref),
     );
     if (updated.changes !== 1) throw refusal("EXTERNAL_REF_CONFLICT", "external ref reservation lost its compare-and-swap race");
-    return { ...context, ref: externalRef(db, request.projectId, context.workItem.work_item_id)!, createdReservation: true };
+    appendStateEvent(db, request, context.actorReceiptId, {
+      aggregateType: "external_work_ref",
+      aggregateId: context.workItem.work_item_id,
+      aggregateRevision: context.workItem.resource_revision,
+      eventType: "github_issue_projection_reserved",
+      event: {
+        workItemId: context.workItem.work_item_id,
+        provider: "github",
+        from: context.ref.projection_state,
+        to: "pending",
+        desiredDigest: context.desired.digest,
+      },
+    });
+    return { ...context, ref: externalRef(db, request.projectId, context.workItem.work_item_id)! };
   });
 }
 
@@ -1577,12 +1650,11 @@ function recordProjectionState(
   return transaction(db, () => {
     const replay = checkIdempotency(db, request, digest);
     if (replay) return replay;
-    const ref = externalRef(db, request.projectId, context.workItem.work_item_id);
-    if (!ref) throw refusal("EXTERNAL_REF_REQUIRED", "external ref reservation is missing");
-    db.prepare(
+    const authority = revalidateProjectionContext(db, request, context);
+    const updated = db.prepare(
       `UPDATE external_work_refs SET projection_state = ?, attempted_resource_revision = ?, desired_digest = ?,
        last_idempotency_key = ?, last_request_digest = ?, updated_at_ms = ?
-       WHERE project_id = ? AND work_item_id = ? AND provider = 'github'`,
+       WHERE ${EXTERNAL_REF_CAS_WHERE}`,
     ).run(
       state,
       context.workItem.resource_revision,
@@ -1590,14 +1662,14 @@ function recordProjectionState(
       request.idempotencyKey,
       digest,
       now(),
-      request.projectId,
-      context.workItem.work_item_id,
+      ...externalRefCasArgs(context.ref),
     );
+    if (updated.changes !== 1) throw refusal("EXTERNAL_REF_CONFLICT", "external ref state changed before projection outcome was recorded");
     return commitMutation(
       db,
       request,
       digest,
-      context.actorReceiptId,
+      authority.actorReceiptId,
       {
         aggregateType: "external_work_ref",
         aggregateId: context.workItem.work_item_id,
@@ -1608,9 +1680,9 @@ function recordProjectionState(
       counts,
       {
         message,
-        currentConfigRevision: context.configRevision,
-        currentGovernanceEpoch: context.governanceEpoch,
-        currentResourceRevision: context.workItem.resource_revision,
+        currentConfigRevision: authority.configRevision,
+        currentGovernanceEpoch: authority.governor.governance_epoch,
+        currentResourceRevision: authority.workItem.resource_revision,
         expectedResourceRevision: request.expectedResourceRevision ?? undefined,
         evidence: { projectionState: state, desiredDigest: context.desired.digest },
       },
@@ -1631,19 +1703,24 @@ function finalizeProjection(
   return transaction(db, () => {
     const replay = checkIdempotency(db, request, digest);
     if (replay) return replay;
-    const configRevision = requireConfig(db, request);
-    const governor = requireGovernor(db, request);
-    const actorReceiptId = requireActor(db, request);
-    const workItem = requireWorkItem(db, request, configRevision);
-    const { mapping } = requireGithubMapping(db, request.projectId, configRevision, workItem.repo_target_id);
-    if (mapping.owner !== context.mapping.owner || mapping.repo !== context.mapping.repo || mapping.connectorHost !== adapter.connectorHost) {
+    const authority = revalidateProjectionContext(db, request, context);
+    if (authority.mapping.connectorHost !== adapter.connectorHost) {
       throw refusal("EXTERNAL_TARGET_MISMATCH", "GitHub mapping changed before projection finalization");
     }
-    const ref = externalRef(db, request.projectId, workItem.work_item_id);
-    if (!ref || ref.owner !== snapshot.owner || ref.repo !== snapshot.repo || (ref.issue_number !== null && ref.issue_number !== snapshot.issueNumber)) {
+    if (
+      context.ref.owner !== snapshot.owner ||
+      context.ref.repo !== snapshot.repo ||
+      (context.ref.issue_number !== null && context.ref.issue_number !== snapshot.issueNumber)
+    ) {
       throw refusal("EXTERNAL_REF_CONFLICT", "external identity changed before projection finalization");
     }
-    if (mutationKind !== "verify" && (ref.projection_state !== "pending" || ref.last_idempotency_key !== request.idempotencyKey || ref.last_request_digest !== digest)) {
+    if (
+      (mutationKind === "verify" && context.ref.projection_state !== "current") ||
+      (mutationKind !== "verify" &&
+        (context.ref.projection_state !== "pending" ||
+          context.ref.last_idempotency_key !== request.idempotencyKey ||
+          context.ref.last_request_digest !== digest))
+    ) {
       throw refusal("EXTERNAL_REF_CONFLICT", "external reservation changed before projection finalization");
     }
     const observed = observedDigest(snapshot, context.desired);
@@ -1652,38 +1729,37 @@ function finalizeProjection(
       `UPDATE external_work_refs SET issue_number = ?, projection_state = 'current', attempted_resource_revision = ?,
        projected_resource_revision = ?, desired_digest = ?, observed_external_revision = ?,
        observed_external_digest = ?, last_idempotency_key = ?, last_request_digest = ?, updated_at_ms = ?
-       WHERE project_id = ? AND work_item_id = ? AND provider = 'github'`,
+       WHERE ${EXTERNAL_REF_CAS_WHERE}`,
     ).run(
       snapshot.issueNumber,
-      workItem.resource_revision,
-      workItem.resource_revision,
+      authority.workItem.resource_revision,
+      authority.workItem.resource_revision,
       context.desired.digest,
       snapshot.externalRevision,
       observed,
       request.idempotencyKey,
       digest,
       now(),
-      request.projectId,
-      workItem.work_item_id,
+      ...externalRefCasArgs(context.ref),
     );
     if (updated.changes !== 1) throw refusal("EXTERNAL_REF_CONFLICT", "external ref finalization lost its compare-and-swap race");
     return commitMutation(
       db,
       request,
       digest,
-      actorReceiptId,
+      authority.actorReceiptId,
       {
         aggregateType: "external_work_ref",
-        aggregateId: workItem.work_item_id,
-        aggregateRevision: workItem.resource_revision,
+        aggregateId: authority.workItem.work_item_id,
+        aggregateRevision: authority.workItem.resource_revision,
         eventType: "github_issue_projected",
-        event: { workItemId: workItem.work_item_id, owner: snapshot.owner, repo: snapshot.repo, issueNumber: snapshot.issueNumber, mutationKind },
+        event: { workItemId: authority.workItem.work_item_id, owner: snapshot.owner, repo: snapshot.repo, issueNumber: snapshot.issueNumber, mutationKind },
       },
       { expected: 1, attempted: 1, verified: 1 },
       {
-        currentConfigRevision: configRevision,
-        currentGovernanceEpoch: governor.governance_epoch,
-        currentResourceRevision: workItem.resource_revision,
+        currentConfigRevision: authority.configRevision,
+        currentGovernanceEpoch: authority.governor.governance_epoch,
+        currentResourceRevision: authority.workItem.resource_revision,
         expectedResourceRevision: request.expectedResourceRevision ?? undefined,
         evidence: {
           provider: "github",
@@ -1706,6 +1782,13 @@ function applyGithubIssueProjection(
   digest: string,
   adapter: GitHubIssueAdapter | null,
 ): FoundationResult {
+  try {
+    const replay = checkIdempotency(db, request, digest);
+    if (replay) return replay;
+  } catch (error) {
+    if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+  }
   if (!adapter) return result("EXTERNAL_CAPABILITY_REQUIRED", request.projectId, 1, 0, 0, { message: "a GitHub Issues adapter capability is required" });
   if (!adapter.available) return result("EXTERNAL_UNAVAILABLE", request.projectId, 1, 0, 0, { message: "the GitHub Issues adapter is unavailable" });
   let context: ProjectionContext;

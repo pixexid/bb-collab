@@ -807,12 +807,17 @@ describe("bb-collab plugin boundary", () => {
     expect(db.prepare("SELECT lifecycle_state FROM work_items").get()).toEqual({ lifecycle_state: "proposed" });
 
     const reads = adapter.readCalls.length;
-    expect(applyWithFixtureReceipt(db, request, adapter)).toEqual(projected);
+    expect(applyWithFixtureReceipt(db, request, null)).toEqual(projected);
+    const unavailable = new DeterministicGitHubIssueAdapter();
+    unavailable.available = false;
+    expect(applyWithFixtureReceipt(db, request, unavailable)).toEqual(projected);
+    expect(unavailable.mutationCalls).toHaveLength(0);
+    expect(unavailable.readCalls).toHaveLength(0);
     expect(adapter.mutationCalls).toHaveLength(1);
     expect(adapter.readCalls).toHaveLength(reads);
     const conflictRequest = { ...request, workItemId: "different-work-item" };
-    const conflict = applyWithFixtureReceipt(db, conflictRequest, adapter);
-    expect(conflict).toEqual(applyWithFixtureReceipt(db, conflictRequest, adapter));
+    const conflict = applyWithFixtureReceipt(db, conflictRequest, null);
+    expect(conflict).toEqual(applyWithFixtureReceipt(db, conflictRequest, unavailable));
     expect(conflict.outcome).toBe("IDEMPOTENCY_KEY_CONFLICT");
     expect(adapter.mutationCalls).toHaveLength(1);
 
@@ -879,10 +884,21 @@ describe("bb-collab plugin boundary", () => {
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
     const adapter = new DeterministicGitHubIssueAdapter();
     expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("OK");
+    const original = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)!;
     adapter.remove(GITHUB_OWNER, GITHUB_REPO, 1);
-    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, { idempotencyKey: "missing-external" }), adapter).outcome).toBe("EXTERNAL_NOT_FOUND");
+    const missingRequest = projectionRequest(fenceToken, 1, { idempotencyKey: "missing-external" });
+    expect(applyWithFixtureReceipt(db, missingRequest, adapter).outcome).toBe("EXTERNAL_NOT_FOUND");
+    expect(db.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = 'missing-external'").get()).toBeUndefined();
     expect(adapter.mutationCalls).toHaveLength(1);
     expect(db.prepare("SELECT lifecycle_state FROM work_items").get()).toEqual({ lifecycle_state: "proposed" });
+
+    adapter.put(original);
+    expect(applyWithFixtureReceipt(db, missingRequest, adapter).outcome).toBe("OK");
+    const unavailableRequest = projectionRequest(fenceToken, 1, { idempotencyKey: "unavailable-external" });
+    adapter.readOutcomes.push("unavailable");
+    expect(applyWithFixtureReceipt(db, unavailableRequest, adapter).outcome).toBe("EXTERNAL_UNAVAILABLE");
+    expect(db.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = 'unavailable-external'").get()).toBeUndefined();
+    expect(applyWithFixtureReceipt(db, unavailableRequest, adapter).outcome).toBe("OK");
 
     adapter.put({
       owner: GITHUB_OWNER,
@@ -928,9 +944,31 @@ describe("bb-collab plugin boundary", () => {
       expect(applyFixtureMutation(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
       const adapter = new DeterministicGitHubIssueAdapter();
       adapter.nextMutationOutcome = "wrong_identity";
+      const mutate = adapter.mutate.bind(adapter);
+      let reservationInsideMutation: unknown;
+      adapter.mutate = (input) => {
+        reservationInsideMutation = db.prepare(
+          `SELECT state_events.event_type, state_events.actor_receipt_id, actor_receipts.verification_state,
+                  external_work_refs.projection_state
+           FROM state_events
+           JOIN actor_receipts ON actor_receipts.project_id = state_events.project_id
+             AND actor_receipts.receipt_id = state_events.actor_receipt_id
+           JOIN external_work_refs ON external_work_refs.project_id = state_events.project_id
+             AND external_work_refs.work_item_id = state_events.aggregate_id
+           WHERE state_events.event_type = 'github_issue_projection_reserved'
+           ORDER BY state_events.event_sequence DESC LIMIT 1`,
+        ).get();
+        return mutate(input);
+      };
       const request = projectionRequest(fenceToken, 1);
       const ambiguous = applyFixtureMutation(db, request, adapter);
       expect(ambiguous).toMatchObject({ outcome: "EXTERNAL_DELIVERY_AMBIGUOUS", attempted: 1, verified: 0 });
+      expect(reservationInsideMutation).toEqual({
+        event_type: "github_issue_projection_reserved",
+        actor_receipt_id: RECEIPT_ID,
+        verification_state: "verified",
+        projection_state: "pending",
+      });
       expect(adapter.mutationCalls).toHaveLength(1);
       expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "delivery_ambiguous" });
       const before = exportFoundation(db, PROJECT_ID);
@@ -939,6 +977,9 @@ describe("bb-collab plugin boundary", () => {
       const reopened = new Database(path);
       databaseIsReady(reopened);
       try {
+        expect(reopened.prepare(
+          "SELECT event_type, actor_receipt_id FROM state_events WHERE event_type = 'github_issue_projection_reserved'",
+        ).get()).toEqual({ event_type: "github_issue_projection_reserved", actor_receipt_id: RECEIPT_ID });
         const retryAdapter = new DeterministicGitHubIssueAdapter();
         expect(applyFixtureMutation(reopened, request, retryAdapter)).toEqual(ambiguous);
         expect(applyFixtureMutation(reopened, { ...request, idempotencyKey: "new-key-after-ambiguity" }, retryAdapter).outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
@@ -966,6 +1007,12 @@ describe("bb-collab plugin boundary", () => {
     const ambiguous = applyWithFixtureReceipt(db, request, adapter);
     expect(ambiguous.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
     expect(adapter.mutationCalls).toHaveLength(2);
+    expect(db.prepare(
+      "SELECT event_type, actor_receipt_id FROM state_events WHERE event_type = 'github_issue_projection_reserved' ORDER BY event_sequence",
+    ).all()).toEqual([
+      { event_type: "github_issue_projection_reserved", actor_receipt_id: RECEIPT_ID },
+      { event_type: "github_issue_projection_reserved", actor_receipt_id: RECEIPT_ID },
+    ]);
     expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "delivery_ambiguous" });
     const calls = adapter.mutationCalls.length;
     expect(applyWithFixtureReceipt(db, request, adapter)).toEqual(ambiguous);
@@ -988,7 +1035,83 @@ describe("bb-collab plugin boundary", () => {
     expect(adapter.mutationCalls).toHaveLength(1);
     expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items").get()).toEqual({ lifecycle_state: "ready", resource_revision: 2 });
     expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE aggregate_type = 'work_item'").get()).toEqual({ count: 2 });
-    expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "delivery_ambiguous" });
+    expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "pending" });
+  });
+
+  it("never overwrites a newer reservation or finalized ref with stale projection context", async () => {
+    const driftHost = await loadedHost();
+    const { db: driftDb, fenceToken: driftFence } = seedAndBootstrap(driftHost);
+    expect(applyWithFixtureReceipt(driftDb, workItemCreateRequest(driftFence)).outcome).toBe("OK");
+    const driftAdapter = new DeterministicGitHubIssueAdapter();
+    expect(applyWithFixtureReceipt(driftDb, projectionRequest(driftFence, 1), driftAdapter).outcome).toBe("OK");
+    const drifted = driftAdapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)!;
+    driftAdapter.put({ ...drifted, state: "closed", externalRevision: "manual-close" });
+    const read = driftAdapter.read.bind(driftAdapter);
+    driftAdapter.read = (owner, repo, issueNumber) => {
+      const snapshot = read(owner, repo, issueNumber);
+      driftDb.prepare(
+        `UPDATE external_work_refs SET projection_state = 'pending', desired_digest = 'newer-desired',
+         last_idempotency_key = 'newer-reservation', last_request_digest = 'newer-request'
+         WHERE project_id = ? AND work_item_id = ?`,
+      ).run(PROJECT_ID, WORK_ITEM_ID);
+      return snapshot;
+    };
+    expect(applyWithFixtureReceipt(driftDb, projectionRequest(driftFence, 1, { idempotencyKey: "stale-drift" }), driftAdapter).outcome).toBe("EXTERNAL_DIVERGED");
+    expect(driftDb.prepare("SELECT projection_state, desired_digest, last_idempotency_key FROM external_work_refs").get()).toEqual({
+      projection_state: "pending",
+      desired_digest: "newer-desired",
+      last_idempotency_key: "newer-reservation",
+    });
+    expect(driftDb.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = 'stale-drift'").get()).toBeUndefined();
+
+    const finalizeHost = await loadedHost();
+    const { db: finalizeDb, fenceToken: finalizeFence } = seedAndBootstrap(finalizeHost);
+    expect(applyWithFixtureReceipt(finalizeDb, workItemCreateRequest(finalizeFence)).outcome).toBe("OK");
+    const finalizeAdapter = new DeterministicGitHubIssueAdapter();
+    const mutate = finalizeAdapter.mutate.bind(finalizeAdapter);
+    finalizeAdapter.mutate = (input) => {
+      const snapshot = mutate(input);
+      finalizeDb.prepare(
+        `UPDATE external_work_refs SET issue_number = ?, projection_state = 'current',
+         projected_resource_revision = 1, desired_digest = 'newer-finalized',
+         observed_external_revision = 'newer-revision', observed_external_digest = 'newer-observed',
+         last_idempotency_key = 'newer-finalization', last_request_digest = 'newer-request'
+         WHERE project_id = ? AND work_item_id = ?`,
+      ).run(snapshot.issueNumber, PROJECT_ID, WORK_ITEM_ID);
+      return snapshot;
+    };
+    expect(applyWithFixtureReceipt(finalizeDb, projectionRequest(finalizeFence, 1), finalizeAdapter).outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(finalizeDb.prepare("SELECT projection_state, desired_digest, last_idempotency_key FROM external_work_refs").get()).toEqual({
+      projection_state: "current",
+      desired_digest: "newer-finalized",
+      last_idempotency_key: "newer-finalization",
+    });
+    expect(finalizeDb.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = 'project-github-1'").get()).toBeUndefined();
+  });
+
+  it("accepts partial lifecycle-label maps and rejects unknown or undeclared labels", async () => {
+    const partialHost = await loadedHost();
+    const partialDb = partialHost.bb.storage.database();
+    seedVerifiedFixtureReceipt(partialDb, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
+    const partialConfig = structuredClone(bootstrapRequest().config) as {
+      extensions: { bbCollab: { githubIssues: { issue: { managedLabels: { byLifecycle: Record<string, string[]> } } } } };
+    };
+    partialConfig.extensions.bbCollab.githubIssues.issue.managedLabels.byLifecycle = { ready: ["work-ready"] };
+    expect(applyWithFixtureReceipt(partialDb, bootstrapRequest(PROJECT_ID, { config: partialConfig })).outcome).toBe("OK");
+
+    const invalidLifecycleLabels: Array<[string, Record<string, string[]>]> = [
+      ["unknown", { parked: ["work-ready"] }],
+      ["undeclared", { ready: ["not-declared"] }],
+    ];
+    for (const [name, byLifecycle] of invalidLifecycleLabels) {
+      const host = await loadedHost();
+      const db = host.bb.storage.database();
+      seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
+      const config = structuredClone(bootstrapRequest().config) as typeof partialConfig;
+      config.extensions.bbCollab.githubIssues.issue.managedLabels.byLifecycle = byLifecycle;
+      expect(applyWithFixtureReceipt(db, bootstrapRequest(PROJECT_ID, { idempotencyKey: `labels-${name}`, config })).outcome).toBe("INVALID_INPUT");
+      expect(db.prepare("SELECT COUNT(*) AS count FROM project_config_revisions").get()).toEqual({ count: 0 });
+    }
   });
 
   it("rejects malformed or duplicate namespaced GitHub mappings before bootstrap mutation", async () => {
