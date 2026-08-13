@@ -5,9 +5,14 @@ BB-native project governance, work lifecycle, and collaboration runtime.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-This repository currently contains founding documentation only: no plugin,
-package, database schema, adapter, workflow, CI, release automation or task
-authority has been scaffolded.
+The repository now contains the implemented foundation through schema v5: a
+single SQLite store with migrations, resolver, state-event and
+mutation-receipt, deterministic export, and read-only doctor seams, plus
+WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
+Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
+foundations. Production RPC/CLI apply remain unconditionally
+`OPERATOR_AUTH_REQUIRED`; the plugin has not been installed, reloaded, or
+activated against live project authority.
 
 The founding decision is an **adopt with amendments** disposition of the
 operator-backed review. bb-collab is a public BB-native successor to
