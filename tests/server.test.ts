@@ -435,6 +435,48 @@ async function assignmentFixture(options: { writingLaneCeiling?: number } = {}) 
   return { host, db, fenceToken, holderExecutionAttemptId };
 }
 
+function activateReviewer(db: Database.Database, fenceToken: string) {
+  const roleContext = {
+    threadId: "thread-reviewer",
+    requestEventId: "event-reviewer-request",
+    requestEventSeq: 1,
+    completionEventId: "event-reviewer-completion",
+    completionEventSeq: 4,
+  };
+  const facts = () => roleReader((input) => {
+    input.thread.id = roleContext.threadId;
+    input.thread.environmentId = "environment-reviewer";
+    input.environment.id = "environment-reviewer";
+    input.events[0]!.id = roleContext.requestEventId;
+    input.events[3]!.id = roleContext.completionEventId;
+  });
+  expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+    idempotencyKey: "qualification-reviewer",
+    repoTargetId: TARGET_ID,
+    roleId: "independent-reviewer",
+    roleRequirementId: "reviewer-v1",
+    qualificationId: "qualification-reviewer",
+    roleContext,
+  }), null, facts()).outcome).toBe("OK");
+  const succession = applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+    idempotencyKey: "succession-reviewer",
+    repoTargetId: TARGET_ID,
+    roleId: "independent-reviewer",
+    roleRequirementId: "reviewer-v1",
+    qualificationId: "qualification-reviewer",
+    roleContext,
+  }), null, facts());
+  expect(succession.outcome).toBe("OK");
+  seedVerifiedFixtureReceipt(db, {
+    projectId: PROJECT_ID,
+    receiptId: "role-actor-reviewer",
+    actorKind: "role",
+    subjectId: (succession.evidence as { holderExecutionAttemptId: string }).holderExecutionAttemptId,
+    roleId: "independent-reviewer",
+    roleGeneration: 1,
+  });
+}
+
 function assignmentPrepareRequest(
   fenceToken: string,
   assignmentId = "assignment-1",
@@ -1067,50 +1109,11 @@ describe("bb-collab plugin boundary", () => {
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRetired);
   });
 
-  it("admits a current qualified independent reviewer only for review adjudication", async () => {
+  it("keeps review Decision authority with the project orchestrator and the reviewer evidence-only", async () => {
     const { db, fenceToken } = await assignmentFixture();
-    const reviewerContext = {
-      threadId: "thread-reviewer",
-      requestEventId: "event-reviewer-request",
-      requestEventSeq: 1,
-      completionEventId: "event-reviewer-completion",
-      completionEventSeq: 4,
-    };
-    const reviewerReader = () => roleReader((facts) => {
-      facts.thread.id = reviewerContext.threadId;
-      facts.thread.environmentId = "environment-reviewer";
-      facts.environment.id = "environment-reviewer";
-      facts.events[0]!.id = reviewerContext.requestEventId;
-      facts.events[3]!.id = reviewerContext.completionEventId;
-    });
-    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
-      idempotencyKey: "qualification-reviewer",
-      repoTargetId: TARGET_ID,
-      roleId: "independent-reviewer",
-      roleRequirementId: "reviewer-v1",
-      qualificationId: "qualification-reviewer",
-      roleContext: reviewerContext,
-    }), null, reviewerReader()).outcome).toBe("OK");
-    const succession = applyWithFixtureReceipt(db, successionRequest(fenceToken, {
-      idempotencyKey: "succession-reviewer",
-      repoTargetId: TARGET_ID,
-      roleId: "independent-reviewer",
-      roleRequirementId: "reviewer-v1",
-      qualificationId: "qualification-reviewer",
-      roleContext: reviewerContext,
-    }), null, reviewerReader());
-    expect(succession.outcome).toBe("OK");
-    const holderExecutionAttemptId = (succession.evidence as { holderExecutionAttemptId: string }).holderExecutionAttemptId;
-    seedVerifiedFixtureReceipt(db, {
-      projectId: PROJECT_ID,
-      receiptId: "role-actor-reviewer",
-      actorKind: "role",
-      subjectId: holderExecutionAttemptId,
-      roleId: "independent-reviewer",
-      roleGeneration: 1,
-    });
-    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "review-decision", {
-      idempotencyKey: "create-review-decision",
+    activateReviewer(db, fenceToken);
+    const create = decisionCreateRequest(fenceToken, "review-decision", {
+      idempotencyKey: "create-review-decision-reviewer",
       actorReceiptId: "role-actor-reviewer",
       decision: {
         ...decisionCreateRequest(fenceToken).decision!,
@@ -1118,10 +1121,26 @@ describe("bb-collab plugin boundary", () => {
         decisionClass: "review_adjudication",
         scope: { candidateSha: CANDIDATE_SHA },
       },
-    })).outcome).toBe("OK");
+    });
+    const beforeReviewerCreate = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, create).outcome).toBe("ROLE_HOLDER_MISMATCH");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeReviewerCreate);
+
+    expect(applyWithFixtureReceipt(db, {
+      ...create,
+      idempotencyKey: "create-review-decision-orchestrator",
+      actorReceiptId: "role-actor-assignment",
+    }).outcome).toBe("OK");
+    const beforeReviewerDisposition = exportFoundation(db, PROJECT_ID);
     expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "review-decision", 1, {
-      idempotencyKey: "adopt-review-decision",
+      idempotencyKey: "reject-review-decision-reviewer",
       actorReceiptId: "role-actor-reviewer",
+      disposition: "rejected",
+    })).outcome).toBe("ROLE_HOLDER_MISMATCH");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeReviewerDisposition);
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "review-decision", 1, {
+      idempotencyKey: "reject-review-decision-orchestrator",
+      disposition: "rejected",
     })).outcome).toBe("OK");
   });
 
@@ -1293,6 +1312,129 @@ describe("bb-collab plugin boundary", () => {
       expect(exportFoundation(db, PROJECT_ID), name).toEqual(before);
       db.prepare(`UPDATE execution_attempts SET ${column} = ? WHERE execution_attempt_id = ?`).run(original, executionAttemptId);
     }
+  });
+
+  it("requires exact terminal review Assignment evidence for review adjudication", async () => {
+    const { db, fenceToken } = await assignmentFixture();
+    activateReviewer(db, fenceToken);
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "review-evidence-decision", {
+      decision: {
+        ...decisionCreateRequest(fenceToken).decision!,
+        decisionId: "review-evidence-decision",
+        decisionClass: "review_adjudication",
+        scope: { candidateSha: CANDIDATE_SHA },
+      },
+    })).outcome).toBe("OK");
+
+    const completeAssignment = (assignmentKind: "write" | "review" | "probe", assignmentId: string) => {
+      const adapter = new DeterministicNativeAssignmentAdapter();
+      const template = assignmentPrepareRequest(fenceToken, assignmentId);
+      const prepared = applyWithFixtureReceipt(db, {
+        ...template,
+        actorReceiptId: "role-actor-reviewer",
+        expectedResourceRevision: 3,
+        assignment: {
+          ...template.assignment!,
+          assignmentKind,
+          laneId: `lane-${assignmentId}`,
+          roleRequirementId: "reviewer-v1",
+          roleId: "independent-reviewer",
+          candidateSemantics: assignmentKind === "write" ? "base" : "frozen",
+          candidateSha: assignmentKind === "write" ? null : CANDIDATE_SHA,
+        },
+      }, null, null, adapter);
+      expect(prepared.outcome).toBe("OK");
+      const executionAttemptId = (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+      const delivered = applyWithFixtureReceipt(db, assignmentPhaseRequest(
+        fenceToken,
+        "assignment_dispatch",
+        assignmentId,
+        executionAttemptId,
+        { actorReceiptId: "role-actor-reviewer", expectedResourceRevision: 3 },
+      ), null, null, adapter);
+      expect(delivered.outcome).toBe("OK");
+      const native = delivered.evidence as { nativeReceiptDigest: string; actualProfileDigest: string; threadId: string };
+      const terminal = applyWithFixtureReceipt(db, assignmentPhaseRequest(
+        fenceToken,
+        "assignment_terminal",
+        assignmentId,
+        executionAttemptId,
+        {
+          actorReceiptId: "role-actor-reviewer",
+          expectedResourceRevision: 3,
+          terminalReport: assignmentTerminalReport(assignmentId, executionAttemptId, native, {
+            roleId: "independent-reviewer",
+            reasonCode: `${assignmentKind}_done`,
+          }),
+        },
+      ), null, null, adapter);
+      expect(terminal.outcome).toBe("OK");
+      const terminalReportDigest = (terminal.evidence as { terminalReportDigest: string }).terminalReportDigest;
+      return {
+        executionAttemptId,
+        evidence: decisionArtifact(`delegated-${assignmentId}`, {
+          evidenceKind: "delegated_action_receipt",
+          sourceKind: "delegated_action",
+          sourceRef: `execution:${executionAttemptId}`,
+          assignmentId,
+          executionAttemptId,
+          contentDigest: terminalReportDigest,
+          redactedJson: canonicalJson({ outcome: "DONE" }),
+          durableRefJson: canonicalJson({ assignmentId, executionAttemptId }),
+          relationKind: "delegated_action_receipt",
+          terminalReportDigest,
+          actualProfileDigest: native.actualProfileDigest,
+          nativeReceiptDigest: native.nativeReceiptDigest,
+        }),
+      };
+    };
+
+    const review = completeAssignment("review", "review-assignment");
+    const write = completeAssignment("write", "write-assignment");
+    const probe = completeAssignment("probe", "probe-assignment");
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "review-evidence-decision", 1, {
+      conditions: [{ kind: "evidence_required", evidenceIds: [review.evidence.evidenceId] }],
+      decisionEvidence: [review.evidence],
+    })).outcome).toBe("OK");
+
+    const expectRefusal = (name: string, evidence: typeof review.evidence, outcome: string) => {
+      const before = exportFoundation(db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "review-evidence-decision", 2, {
+        idempotencyKey: `review-evidence-${name}`,
+        disposition: "rejected",
+        decisionEvidence: [evidence],
+      })).outcome, name).toBe(outcome);
+      expect(exportFoundation(db, PROJECT_ID), name).toEqual(before);
+    };
+
+    expectRefusal("write", write.evidence, "EXECUTION_CONTEXT_FOREIGN");
+    expectRefusal("probe", probe.evidence, "EXECUTION_CONTEXT_FOREIGN");
+    expectRefusal("missing", {
+      ...review.evidence,
+      evidenceId: "delegated-missing",
+      sourceRef: "execution:missing-execution",
+      assignmentId: "missing-assignment",
+      executionAttemptId: "missing-execution",
+    }, "RESOURCE_UNKNOWN");
+    expectRefusal("foreign", {
+      ...review.evidence,
+      evidenceId: "delegated-foreign",
+      assignmentId: "foreign-assignment",
+    }, "EXECUTION_CONTEXT_FOREIGN");
+
+    db.prepare("UPDATE execution_attempts SET state = 'running' WHERE execution_attempt_id = ?").run(review.executionAttemptId);
+    expectRefusal("nonterminal", { ...review.evidence, evidenceId: "delegated-nonterminal" }, "TERMINAL_REPORT_REQUIRED");
+    db.prepare("UPDATE execution_attempts SET state = 'done' WHERE execution_attempt_id = ?").run(review.executionAttemptId);
+    db.prepare("UPDATE execution_attempts SET conflicting_terminal_digest = ? WHERE execution_attempt_id = ?").run(sha256("conflict"), review.executionAttemptId);
+    expectRefusal("ambiguous", { ...review.evidence, evidenceId: "delegated-ambiguous" }, "TERMINAL_REPORT_AMBIGUOUS");
+    db.prepare("UPDATE execution_attempts SET conflicting_terminal_digest = NULL WHERE execution_attempt_id = ?").run(review.executionAttemptId);
+    expectRefusal("digest", {
+      ...review.evidence,
+      evidenceId: "delegated-digest",
+      contentDigest: sha256("wrong"),
+      terminalReportDigest: sha256("wrong"),
+    }, "EXECUTION_CONTEXT_FOREIGN");
   });
 
   it("rolls back Decision revision, disposition, artifacts, relations, event, and receipt after a late SQLite failure", async () => {

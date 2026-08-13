@@ -2192,11 +2192,7 @@ function requireDecisionActor(db: SqliteDatabase, request: ApplyRequest, decisio
   }
   if (actor.actor_kind === "operator") return actorReceiptId;
   requireRoleActorBinding(db, request);
-  const requiredRole = decisionClass === "review_adjudication"
-    ? "independent-reviewer"
-    : decisionClass === "operator_only"
-      ? null
-      : "project-orchestrator";
+  const requiredRole = decisionClass === "operator_only" ? null : "project-orchestrator";
   if (!requiredRole || actor.role_id !== requiredRole) {
     throw refusal("ROLE_HOLDER_MISMATCH", "decision class is not authorized by this current role");
   }
@@ -2276,6 +2272,7 @@ function validateDelegatedDecisionEvidence(
   db: SqliteDatabase,
   request: ApplyRequest,
   governorEpoch: number,
+  decisionClass: string,
   evidence: DecisionEvidenceInput,
 ): void {
   if (!evidence.executionAttemptId) throw refusal("EVIDENCE_REQUIRED", "delegated evidence requires an execution attempt");
@@ -2296,6 +2293,9 @@ function validateDelegatedDecisionEvidence(
   );
   if (!assignment || attempt.assignment_digest !== assignment.assignment_digest) {
     throw refusal("EXECUTION_CONTEXT_FOREIGN", "delegated attempt does not bind its immutable Assignment");
+  }
+  if (decisionClass === "review_adjudication" && (assignment.assignment_kind !== "review" || attempt.assignment_kind !== "review")) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "review adjudication requires an exact review Assignment attempt");
   }
   const configRevision = currentConfig(db, request.projectId)?.config_revision;
   if (
@@ -2350,6 +2350,7 @@ function prepareDecisionEvidence(
   db: SqliteDatabase,
   request: ApplyRequest,
   governorEpoch: number,
+  decisionClass: string,
 ): PreparedDecisionEvidence[] {
   const inputs = request.decisionEvidence ?? [];
   if (new Set(inputs.map((item) => item.evidenceId)).size !== inputs.length) {
@@ -2369,7 +2370,7 @@ function prepareDecisionEvidence(
     const durable = parseCanonicalEvidenceJson(input.durableRefJson, "evidence durable reference");
     const relationJson = boundedCanonicalObject(input.relation ?? {}, "evidence relation");
     assertRedactedEvidence(JSON.parse(relationJson), "evidence relation");
-    if (delegated) validateDelegatedDecisionEvidence(db, request, governorEpoch, input);
+    if (delegated) validateDelegatedDecisionEvidence(db, request, governorEpoch, decisionClass, input);
     const redactedDigest = sha256(redacted.json);
     const artifactIdentityDigest = sha256(canonicalJson({
       projectId: request.projectId,
@@ -2480,7 +2481,7 @@ function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, dig
       throw refusal("DECISION_REFERENCE_INVALID", "hold clear must name one active earlier setter for the same code");
     }
   }
-  const preparedEvidence = prepareDecisionEvidence(db, request, governor.governance_epoch);
+  const preparedEvidence = prepareDecisionEvidence(db, request, governor.governance_epoch, decision.decision_class);
   const evidenceIds = new Set(preparedEvidence.map((item) => item.input.evidenceId));
   const conditions = request.conditions ?? [];
   for (const condition of conditions) {
