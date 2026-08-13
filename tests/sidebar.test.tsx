@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
 
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { installTestPluginRuntime, loadPluginApp, renderSlot } from "@bb/plugin-sdk/testing/app";
@@ -74,6 +76,13 @@ function rpcHandlers(states: Record<string, string> = {}, models: Record<string,
 
 describe("replacement thread list", () => {
   afterEach(() => cleanup());
+
+  it("keeps path-install app packaging independent from server imports", async () => {
+    const appSource = readFileSync(resolve("app.tsx"), "utf8");
+    expect(appSource).toMatch(/import\s+type\s+\{\s*rpcContract\s*\}\s+from\s+["']\.\/server["']/);
+    expect(appSource).not.toMatch(/import\s+\{[^}]*rpcContract[^}]*\}\s+from\s+["']\.\/server["']/);
+    await loadedApp();
+  });
 
   it("keeps the Lane 1 content-script fallback registered", async () => {
     const app = await loadedApp();
