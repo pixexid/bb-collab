@@ -5,7 +5,7 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 // ponytail: keep exports bounded at 256 rows; add paged/file export before migration or cutover.
 export const MAX_EXPORT_ROWS = 256;
 export const MAX_EXPORT_BYTES = 512 * 1024;
@@ -21,6 +21,8 @@ export const TABLES = [
   "actor_receipts",
   "decisions",
   "decision_dispositions",
+  "evidence_artifacts",
+  "decision_evidence",
   "mutation_receipts",
   "state_events",
   "work_items",
@@ -432,6 +434,53 @@ export const MIGRATIONS: string[] = [
     WHERE thread_id IS NOT NULL AND native_request_id IS NOT NULL;
   CREATE INDEX IF NOT EXISTS execution_attempts_project_state
     ON execution_attempts(project_id, state, assignment_kind, lane_id)`,
+  `ALTER TABLE decisions ADD COLUMN decision_class TEXT;
+  ALTER TABLE decisions ADD COLUMN options_json TEXT;
+  ALTER TABLE decisions ADD COLUMN decision_identity_digest TEXT;
+  ALTER TABLE decision_dispositions ADD COLUMN conditions_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(conditions_json));
+  ALTER TABLE decision_dispositions ADD COLUMN hold_action TEXT NOT NULL DEFAULT 'none' CHECK (hold_action IN ('none', 'set', 'clear'));
+  ALTER TABLE decision_dispositions ADD COLUMN hold_code TEXT;
+  ALTER TABLE decision_dispositions ADD COLUMN hold_reference_sequence INTEGER;
+  ALTER TABLE decision_dispositions ADD COLUMN supersedes_disposition_sequence INTEGER;
+  ALTER TABLE decision_dispositions ADD COLUMN reverts_disposition_sequence INTEGER;
+  CREATE TABLE IF NOT EXISTS evidence_artifacts (
+    project_id TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    evidence_kind TEXT NOT NULL CHECK (evidence_kind IN
+      ('advisory_read', 'delegated_action_receipt', 'legacy_claim', 'connector', 'test', 'export', 'release', 'review_ready')),
+    source_kind TEXT NOT NULL CHECK (source_kind IN
+      ('helper', 'pro', 'legacy_claim', 'delegated_action', 'connector', 'test', 'export', 'release', 'review_ready')),
+    source_ref TEXT NOT NULL,
+    execution_attempt_id TEXT,
+    content_digest TEXT NOT NULL,
+    redacted_json TEXT NOT NULL CHECK (json_valid(redacted_json)),
+    redacted_digest TEXT NOT NULL,
+    durable_ref_json TEXT NOT NULL CHECK (json_valid(durable_ref_json)),
+    artifact_identity_digest TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (project_id, evidence_id),
+    FOREIGN KEY (project_id, execution_attempt_id)
+      REFERENCES execution_attempts(project_id, execution_attempt_id),
+    CHECK ((evidence_kind = 'delegated_action_receipt' AND source_kind = 'delegated_action' AND execution_attempt_id IS NOT NULL) OR
+           (evidence_kind != 'delegated_action_receipt' AND source_kind != 'delegated_action' AND execution_attempt_id IS NULL))
+  );
+  CREATE TABLE IF NOT EXISTS decision_evidence (
+    project_id TEXT NOT NULL,
+    decision_id TEXT NOT NULL,
+    evidence_sequence INTEGER NOT NULL CHECK (evidence_sequence > 0),
+    evidence_id TEXT NOT NULL,
+    disposition_sequence INTEGER NOT NULL CHECK (disposition_sequence > 0),
+    relation_kind TEXT NOT NULL CHECK (relation_kind IN
+      ('advisory_read', 'delegated_action_receipt', 'legacy_claim', 'supporting')),
+    relation_json TEXT NOT NULL CHECK (json_valid(relation_json)),
+    created_at_ms INTEGER NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    PRIMARY KEY (project_id, decision_id, evidence_sequence),
+    FOREIGN KEY (decision_id, disposition_sequence)
+      REFERENCES decision_dispositions(decision_id, disposition_sequence),
+    FOREIGN KEY (project_id, evidence_id)
+      REFERENCES evidence_artifacts(project_id, evidence_id)
+  )`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -441,7 +490,7 @@ export function cachedConsumerRolloutEvidence(observedSchemaVersion: number) {
   const reread = observedSchemaVersion === SCHEMA_VERSION;
   const evidence = {
     names: [...CACHED_CONSUMERS],
-    oldSchemaVersion: 3,
+    oldSchemaVersion: 4,
     newSchemaVersion: SCHEMA_VERSION,
     observedSchemaVersion,
     action: reread ? "reread" : "refused",
@@ -477,12 +526,66 @@ const targetCollectionSchema = z.array(targetSchema).superRefine((targets, ctx) 
     seen.add(target.repoTargetId);
   }
 });
+const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
 const decisionSchema = z
   .object({
     decisionId: id,
     repoTargetId: id.nullable(),
     scope: z.unknown(),
+    decisionClass: id.optional(),
+    options: z.unknown().optional(),
     resourceRevision: z.number().int().positive().default(1),
+  })
+  .strict();
+
+export const DECISION_CLASSES = [
+  "assignment_admission",
+  "role_succession",
+  "review_adjudication",
+  "legacy_adoption",
+  "operator_only",
+] as const;
+const decisionConditionSchema = z
+  .object({
+    kind: z.literal("evidence_required"),
+    evidenceIds: z.array(id).min(1).max(32),
+  })
+  .strict();
+const decisionEvidenceSchema = z
+  .object({
+    evidenceId: id,
+    evidenceKind: z.enum([
+      "advisory_read",
+      "delegated_action_receipt",
+      "legacy_claim",
+      "connector",
+      "test",
+      "export",
+      "release",
+      "review_ready",
+    ]),
+    sourceKind: z.enum([
+      "helper",
+      "pro",
+      "legacy_claim",
+      "delegated_action",
+      "connector",
+      "test",
+      "export",
+      "release",
+      "review_ready",
+    ]),
+    sourceRef: id,
+    assignmentId: id.optional(),
+    executionAttemptId: id.nullable().default(null),
+    contentDigest: digestSchema,
+    redactedJson: z.string(),
+    durableRefJson: z.string(),
+    relationKind: z.enum(["advisory_read", "delegated_action_receipt", "legacy_claim", "supporting"]),
+    relation: z.unknown().optional(),
+    terminalReportDigest: digestSchema.optional(),
+    actualProfileDigest: digestSchema.optional(),
+    nativeReceiptDigest: digestSchema.optional(),
   })
   .strict();
 
@@ -598,7 +701,6 @@ const roleContextRefSchema = z
     completionEventSeq: z.number().int().positive(),
   })
   .strict();
-const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
 const gitShaSchema = z.string().regex(/^[0-9a-f]{40,64}$/u);
 const assignmentEnvironmentSchema = z
   .object({
@@ -680,6 +782,7 @@ export const applyRequestSchema = z
       "bootstrap",
       "config_revision",
       "governor_claim",
+      "decision_create",
       "decision_disposition",
       "work_item_create",
       "work_item_transition",
@@ -708,6 +811,13 @@ export const applyRequestSchema = z
       .enum(["proposed", "adopted", "rejected", "superseded", "revoked"])
       .optional(),
     reason: z.unknown().optional(),
+    conditions: z.array(decisionConditionSchema).max(32).optional(),
+    holdAction: z.enum(["none", "set", "clear"]).optional(),
+    holdCode: id.nullable().optional(),
+    holdReferenceSequence: z.number().int().positive().nullable().optional(),
+    supersedesDispositionSequence: z.number().int().positive().nullable().optional(),
+    revertsDispositionSequence: z.number().int().positive().nullable().optional(),
+    decisionEvidence: z.array(decisionEvidenceSchema).max(64).optional(),
     workItem: workItemInputSchema.optional(),
     workItemId: id.optional(),
     lifecycleState: workItemStateSchema.optional(),
@@ -734,6 +844,7 @@ export const applyRequestSchema = z
   .strict();
 
 export type ApplyRequest = z.infer<typeof applyRequestSchema>;
+type DecisionEvidenceInput = z.infer<typeof decisionEvidenceSchema>;
 export type SqliteDatabase = Database.Database;
 
 export interface GitHubIssueSnapshot {
@@ -1125,6 +1236,13 @@ export type FoundationCode =
   | "ACTOR_RECEIPT_FOREIGN"
   | "ACTOR_RECEIPT_UNKNOWN"
   | "ACTOR_RECEIPT_UNVERIFIED"
+  | "DECISION_IDENTITY_CONFLICT"
+  | "DECISION_CLASS_UNKNOWN"
+  | "DECISION_DISPOSITION_INVALID"
+  | "DECISION_REFERENCE_INVALID"
+  | "EVIDENCE_REQUIRED"
+  | "EVIDENCE_REDACTION_INVALID"
+  | "EVIDENCE_IDENTITY_CONFLICT"
   | "RESOURCE_UNKNOWN"
   | "RESOURCE_REVISION_STALE"
   | "WORK_ITEM_UNKNOWN"
@@ -1388,6 +1506,48 @@ function assertNoSecretValues(value: unknown, path = "config"): void {
   }
 }
 
+function boundedCanonicalObject(value: unknown, label: string, maxBytes = 16 * 1024): string {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw refusal("MALFORMED_JSON", `${label} must be a JSON object`);
+  }
+  const json = canonicalJson(value);
+  if (Buffer.byteLength(json, "utf8") > maxBytes) throw refusal("MALFORMED_JSON", `${label} exceeds ${maxBytes} bytes`);
+  return json;
+}
+
+function assertRedactedEvidence(value: unknown, path: string): void {
+  if (Array.isArray(value)) {
+    value.forEach((child, index) => assertRedactedEvidence(child, `${path}[${index}]`));
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, child] of Object.entries(value)) {
+    if (/(?:secret|password|token|api[-_]?key|private[-_]?key|raw|payload|transcript|(?:^|_)output|(?:^|_)body|bytes?)/iu.test(key)) {
+      throw refusal("EVIDENCE_REDACTION_INVALID", `evidence contains forbidden raw or secret-like field ${path}.${key}`);
+    }
+    assertRedactedEvidence(child, `${path}.${key}`);
+  }
+}
+
+function parseCanonicalEvidenceJson(text: string, label: string): { value: Record<string, unknown>; json: string } {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw refusal("MALFORMED_JSON", `${label} is not valid JSON`);
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw refusal("MALFORMED_JSON", `${label} must be a JSON object`);
+  }
+  const json = canonicalJson(value);
+  if (Buffer.byteLength(json, "utf8") > 16 * 1024) {
+    throw refusal("EVIDENCE_REDACTION_INVALID", `${label} exceeds 16384 bytes`);
+  }
+  if (json !== text) throw refusal("EVIDENCE_REDACTION_INVALID", `${label} must be canonical JSON`);
+  assertRedactedEvidence(value, label);
+  return { value: value as Record<string, unknown>, json };
+}
+
 function normalizeRequest(request: ApplyRequest): ApplyRequest {
   return {
     ...request,
@@ -1405,6 +1565,13 @@ function normalizeRequest(request: ApplyRequest): ApplyRequest {
     decisionId: request.decisionId ?? undefined,
     disposition: request.disposition ?? undefined,
     reason: request.reason ?? undefined,
+    conditions: request.conditions ?? undefined,
+    holdAction: request.holdAction ?? undefined,
+    holdCode: request.holdCode ?? null,
+    holdReferenceSequence: request.holdReferenceSequence ?? null,
+    supersedesDispositionSequence: request.supersedesDispositionSequence ?? null,
+    revertsDispositionSequence: request.revertsDispositionSequence ?? null,
+    decisionEvidence: request.decisionEvidence ?? undefined,
     workItem: request.workItem ?? undefined,
     workItemId: request.workItemId ?? undefined,
     lifecycleState: request.lifecycleState ?? undefined,
@@ -1780,21 +1947,26 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
   ).run(request.projectId, fenceToken, createdAtMs);
   if (request.decision) {
     const decision = request.decision;
+    if (decision.resourceRevision !== 1) throw refusal("DECISION_IDENTITY_CONFLICT", "new decisions begin at resource revision 1");
     if (decision.repoTargetId !== null && !targets.some((target) => target.repoTargetId === decision.repoTargetId)) {
       throw refusal("REPO_TARGET_FOREIGN", "decision target does not match bootstrap target");
     }
-    const scopeJson = canonicalJson(decision.scope);
+    const identity = decisionIdentity(request.projectId, 1, decision);
     db.prepare(
       `INSERT INTO decisions
-        (decision_id, project_id, config_revision, repo_target_id, scope_json, scope_digest, current_resource_revision)
-       VALUES (?, ?, 1, ?, ?, ?, ?)`,
+        (decision_id, project_id, config_revision, repo_target_id, scope_json, scope_digest,
+         current_resource_revision, decision_class, options_json, decision_identity_digest)
+       VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       decision.decisionId,
       request.projectId,
       decision.repoTargetId,
-      scopeJson,
-      sha256(scopeJson),
+      identity.scopeJson,
+      sha256(identity.scopeJson),
       decision.resourceRevision,
+      identity.decisionClass,
+      identity.optionsJson,
+      identity.identityDigest,
     );
   }
   return commitMutation(
@@ -1954,21 +2126,306 @@ function applyGovernorClaim(db: SqliteDatabase, request: ApplyRequest, digest: s
   );
 }
 
+interface DecisionRow {
+  decision_id: string;
+  project_id: string;
+  config_revision: number;
+  repo_target_id: string | null;
+  scope_json: string;
+  scope_digest: string;
+  decision_class: string | null;
+  options_json: string | null;
+  decision_identity_digest: string | null;
+  current_resource_revision: number;
+}
+
+function decisionIdentity(
+  projectId: string,
+  configRevision: number,
+  decision: NonNullable<ApplyRequest["decision"]>,
+): { scopeJson: string; optionsJson: string; decisionClass: (typeof DECISION_CLASSES)[number]; identityDigest: string } {
+  if (!decision.decisionClass || !(DECISION_CLASSES as readonly string[]).includes(decision.decisionClass)) {
+    throw refusal("DECISION_CLASS_UNKNOWN", "decision class is not in the bounded v5 class set");
+  }
+  if (decision.options === undefined) throw refusal("DECISION_IDENTITY_CONFLICT", "typed decision options are required");
+  const scopeJson = boundedCanonicalObject(decision.scope, "decision scope");
+  const optionsJson = boundedCanonicalObject(decision.options, "decision options");
+  const identityDigest = sha256(canonicalJson({
+    projectId,
+    configRevision,
+    repoTargetId: decision.repoTargetId,
+    scope: JSON.parse(scopeJson),
+    decisionClass: decision.decisionClass,
+    options: JSON.parse(optionsJson),
+  }));
+  return {
+    scopeJson,
+    optionsJson,
+    decisionClass: decision.decisionClass as (typeof DECISION_CLASSES)[number],
+    identityDigest,
+  };
+}
+
+function storedDecisionIdentityDigest(decision: DecisionRow): string | null {
+  if (!decision.decision_class || !decision.options_json) return null;
+  try {
+    return sha256(canonicalJson({
+      projectId: decision.project_id,
+      configRevision: decision.config_revision,
+      repoTargetId: decision.repo_target_id,
+      scope: JSON.parse(decision.scope_json),
+      decisionClass: decision.decision_class,
+      options: JSON.parse(decision.options_json),
+    }));
+  } catch {
+    return null;
+  }
+}
+
+function requireDecisionActor(db: SqliteDatabase, request: ApplyRequest, decisionClass: string): string {
+  const actorReceiptId = requireActor(db, request);
+  const actor = asRow<{ actor_kind: string; role_id: string | null }>(
+    db.prepare("SELECT actor_kind, role_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(request.projectId, actorReceiptId),
+  );
+  if (!actor || !["role", "operator"].includes(actor.actor_kind)) {
+    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "decision authority requires a role or operator actor receipt");
+  }
+  if (actor.actor_kind === "operator") return actorReceiptId;
+  requireRoleActorBinding(db, request);
+  const requiredRole = decisionClass === "review_adjudication"
+    ? "independent-reviewer"
+    : decisionClass === "operator_only"
+      ? null
+      : "project-orchestrator";
+  if (!requiredRole || actor.role_id !== requiredRole) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "decision class is not authorized by this current role");
+  }
+  return actorReceiptId;
+}
+
+function applyDecisionCreate(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
+  const currentRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const decision = request.decision;
+  if (!decision) throw refusal("INVALID_INPUT", "decision_create requires immutable decision identity");
+  if (decision.resourceRevision !== 1) throw refusal("DECISION_IDENTITY_CONFLICT", "new decisions begin at resource revision 1");
+  if (decision.repoTargetId === null) {
+    if (request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "project-scoped decision cannot accept a repository target");
+  } else {
+    if (request.repoTargetId !== decision.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "decision target does not match the exact request target");
+    requireTarget(db, request.projectId, currentRevision, decision.repoTargetId);
+  }
+  const identity = decisionIdentity(request.projectId, currentRevision, decision);
+  const actorReceiptId = requireDecisionActor(db, request, identity.decisionClass);
+  const existing = asRow<DecisionRow>(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decision.decisionId));
+  if (existing) {
+    if (existing.project_id !== request.projectId || existing.decision_identity_digest !== identity.identityDigest) {
+      throw refusal("DECISION_IDENTITY_CONFLICT", "decision id is already bound to another immutable identity");
+    }
+    throw refusal("DECISION_IDENTITY_CONFLICT", "decision identity already exists under another idempotency request");
+  }
+  db.prepare(
+    `INSERT INTO decisions
+      (decision_id, project_id, config_revision, repo_target_id, scope_json, scope_digest,
+       current_resource_revision, decision_class, options_json, decision_identity_digest)
+     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+  ).run(
+    decision.decisionId,
+    request.projectId,
+    currentRevision,
+    decision.repoTargetId,
+    identity.scopeJson,
+    sha256(identity.scopeJson),
+    identity.decisionClass,
+    identity.optionsJson,
+    identity.identityDigest,
+  );
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "decision",
+      aggregateId: decision.decisionId,
+      aggregateRevision: 1,
+      eventType: "decision_created",
+      event: { decisionId: decision.decisionId, decisionClass: identity.decisionClass, decisionIdentityDigest: identity.identityDigest },
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    {
+      currentConfigRevision: currentRevision,
+      currentGovernanceEpoch: governor.governance_epoch,
+      currentResourceRevision: 1,
+      evidence: { decisionId: decision.decisionId, decisionClass: identity.decisionClass, decisionIdentityDigest: identity.identityDigest },
+    },
+  );
+}
+
+interface PreparedDecisionEvidence {
+  input: DecisionEvidenceInput;
+  redactedJson: string;
+  redactedDigest: string;
+  durableRefJson: string;
+  relationJson: string;
+  artifactIdentityDigest: string;
+  exists: boolean;
+}
+
+function validateDelegatedDecisionEvidence(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  governorEpoch: number,
+  evidence: DecisionEvidenceInput,
+): void {
+  if (!evidence.executionAttemptId) throw refusal("EVIDENCE_REQUIRED", "delegated evidence requires an execution attempt");
+  const attempt = asRow<Record<string, string | number | null>>(
+    db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(request.projectId, evidence.executionAttemptId),
+  );
+  if (!attempt) throw refusal("RESOURCE_UNKNOWN", "delegated execution attempt is not known in this project");
+  if (attempt.state === "dispatch_unknown") throw refusal("DISPATCH_UNKNOWN", "delegated execution remains dispatch-ambiguous");
+  if (attempt.conflicting_terminal_digest !== null) throw refusal("TERMINAL_REPORT_AMBIGUOUS", "delegated terminal evidence is conflicting");
+  if (attempt.origin !== "assignment" || !attempt.assignment_id) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "evidence does not name an assignment-origin execution attempt");
+  }
+  if (evidence.assignmentId && evidence.assignmentId !== attempt.assignment_id) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "evidence assignment identity does not match the execution attempt");
+  }
+  const assignment = asRow<Record<string, string | number | null>>(
+    db.prepare("SELECT * FROM assignments WHERE project_id = ? AND assignment_id = ?").get(request.projectId, attempt.assignment_id),
+  );
+  if (!assignment || attempt.assignment_digest !== assignment.assignment_digest) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "delegated attempt does not bind its immutable Assignment");
+  }
+  const configRevision = currentConfig(db, request.projectId)?.config_revision;
+  if (
+    configRevision !== assignment.config_revision || assignment.config_revision !== attempt.config_revision ||
+    governorEpoch !== assignment.governance_epoch || assignment.governance_epoch !== attempt.governance_epoch
+  ) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "delegated assignment config or governorship is stale");
+  }
+  const workItem = asRow<{ resource_revision: number; repo_target_id: string }>(
+    db.prepare("SELECT resource_revision, repo_target_id FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, assignment.work_item_id),
+  );
+  if (!workItem || workItem.resource_revision !== assignment.work_item_revision) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "delegated Assignment WorkItem revision is stale");
+  }
+  const target = asRow<{ source_id: string; host_id: string; path: string }>(
+    db.prepare("SELECT source_id, host_id, path FROM repository_targets WHERE project_id = ? AND repo_target_id = ? AND config_revision = ?").get(
+      request.projectId,
+      assignment.repo_target_id,
+      assignment.config_revision,
+    ),
+  );
+  if (
+    !target || workItem.repo_target_id !== assignment.repo_target_id || attempt.repo_target_id !== assignment.repo_target_id ||
+    target.source_id !== assignment.source_id || target.host_id !== assignment.host_id || target.path !== assignment.environment_path ||
+    attempt.environment_id !== assignment.environment_id || attempt.source_id !== assignment.source_id ||
+    attempt.host_id !== assignment.host_id || attempt.environment_path !== assignment.environment_path ||
+    attempt.branch_name !== assignment.branch_name || attempt.base_sha !== assignment.base_sha ||
+    attempt.frozen_brief_digest !== assignment.frozen_brief_digest || attempt.content_receipt_digest !== assignment.frozen_brief_digest ||
+    attempt.role_id !== assignment.role_id || attempt.role_generation !== assignment.role_generation
+  ) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "delegated attempt no longer matches its exact Assignment context");
+  }
+  if (assignment.candidate_semantics === "frozen" && attempt.candidate_sha !== assignment.candidate_sha) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "delegated frozen candidate does not match its Assignment");
+  }
+  if (attempt.state !== "done" || attempt.terminal_result !== "DONE" || attempt.reported_outcome !== "DONE" ||
+      !attempt.terminal_report_digest || !attempt.terminal_event_id || !attempt.native_receipt_digest || !attempt.actual_profile_digest) {
+    throw refusal("TERMINAL_REPORT_REQUIRED", "delegated evidence is not one exact successful terminal attempt");
+  }
+  if (evidence.contentDigest !== attempt.terminal_report_digest || evidence.terminalReportDigest !== attempt.terminal_report_digest) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "delegated terminal digest does not match canonical evidence");
+  }
+  if (evidence.actualProfileDigest !== attempt.actual_profile_digest) {
+    throw refusal("EXECUTION_PROFILE_MISMATCH", "delegated actual profile digest does not match canonical evidence");
+  }
+  if (evidence.nativeReceiptDigest !== attempt.native_receipt_digest) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "delegated native receipt digest does not match canonical evidence");
+  }
+}
+
+function prepareDecisionEvidence(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  governorEpoch: number,
+): PreparedDecisionEvidence[] {
+  const inputs = request.decisionEvidence ?? [];
+  if (new Set(inputs.map((item) => item.evidenceId)).size !== inputs.length) {
+    throw refusal("EVIDENCE_IDENTITY_CONFLICT", "one disposition cannot repeat an evidence identity");
+  }
+  return inputs.map((input) => {
+    const delegated = input.evidenceKind === "delegated_action_receipt";
+    const validPair = delegated
+      ? input.sourceKind === "delegated_action" && input.relationKind === "delegated_action_receipt" && input.executionAttemptId !== null
+      : input.evidenceKind === "advisory_read"
+        ? ["helper", "pro"].includes(input.sourceKind) && input.relationKind === "advisory_read" && input.executionAttemptId === null
+        : input.evidenceKind === "legacy_claim"
+          ? input.sourceKind === "legacy_claim" && input.relationKind === "legacy_claim" && input.executionAttemptId === null
+          : input.sourceKind === input.evidenceKind && input.relationKind === "supporting" && input.executionAttemptId === null;
+    if (!validPair) throw refusal("EVIDENCE_REDACTION_INVALID", "evidence kind, source, relation, and execution binding are inconsistent");
+    const redacted = parseCanonicalEvidenceJson(input.redactedJson, "evidence redacted metadata");
+    const durable = parseCanonicalEvidenceJson(input.durableRefJson, "evidence durable reference");
+    const relationJson = boundedCanonicalObject(input.relation ?? {}, "evidence relation");
+    assertRedactedEvidence(JSON.parse(relationJson), "evidence relation");
+    if (delegated) validateDelegatedDecisionEvidence(db, request, governorEpoch, input);
+    const redactedDigest = sha256(redacted.json);
+    const artifactIdentityDigest = sha256(canonicalJson({
+      projectId: request.projectId,
+      evidenceId: input.evidenceId,
+      evidenceKind: input.evidenceKind,
+      sourceKind: input.sourceKind,
+      sourceRef: input.sourceRef,
+      executionAttemptId: input.executionAttemptId,
+      contentDigest: input.contentDigest,
+      redactedDigest,
+      durableRef: durable.value,
+    }));
+    const existing = asRow<{ artifact_identity_digest: string }>(
+      db.prepare("SELECT artifact_identity_digest FROM evidence_artifacts WHERE project_id = ? AND evidence_id = ?").get(request.projectId, input.evidenceId),
+    );
+    if (existing && existing.artifact_identity_digest !== artifactIdentityDigest) {
+      throw refusal("EVIDENCE_IDENTITY_CONFLICT", "evidence id is already bound to another immutable digest bundle");
+    }
+    return {
+      input,
+      redactedJson: redacted.json,
+      redactedDigest,
+      durableRefJson: durable.json,
+      relationJson,
+      artifactIdentityDigest,
+      exists: Boolean(existing),
+    };
+  });
+}
+
+function dispositionReference(
+  db: SqliteDatabase,
+  decisionId: string,
+  sequence: number | null | undefined,
+): Record<string, unknown> | null {
+  if (sequence === null || sequence === undefined) return null;
+  return asRow<Record<string, unknown>>(
+    db.prepare("SELECT * FROM decision_dispositions WHERE decision_id = ? AND disposition_sequence = ?").get(decisionId, sequence),
+  ) ?? null;
+}
+
 function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
   const currentRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
-  const actorReceiptId = requireActor(db, request);
   const decisionId = request.decisionId;
   if (!decisionId || !request.disposition) throw refusal("INVALID_INPUT", "decision disposition requires decisionId and disposition");
-  const decision = asRow<{
-    decision_id: string;
-    project_id: string;
-    config_revision: number;
-    repo_target_id: string | null;
-    current_resource_revision: number;
-  }>(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decisionId));
-  if (!decision) throw refusal("RESOURCE_UNKNOWN", "decision is not known");
-  if (decision.project_id !== request.projectId) throw refusal("RESOURCE_UNKNOWN", "decision belongs to another project");
+  const decision = asRow<DecisionRow>(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decisionId));
+  if (!decision || decision.project_id !== request.projectId) throw refusal("RESOURCE_UNKNOWN", "decision is not known in this project");
+  if (
+    !decision.decision_class || !(DECISION_CLASSES as readonly string[]).includes(decision.decision_class) ||
+    !decision.options_json || !decision.decision_identity_digest ||
+    storedDecisionIdentityDigest(decision) !== decision.decision_identity_digest
+  ) {
+    throw refusal("DECISION_IDENTITY_CONFLICT", "decision has no valid immutable typed identity");
+  }
+  const actorReceiptId = requireDecisionActor(db, request, decision.decision_class);
   if (decision.config_revision !== currentRevision) {
     throw refusal("PROJECT_CONFIG_STALE", "decision is bound to a stale config revision", {
       currentConfigRevision: currentRevision,
@@ -1989,29 +2446,142 @@ function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, dig
       expectedResourceRevision: expectedResourceRevision ?? undefined,
     });
   }
+  const sequence = asRow<{ next_sequence: number }>(
+    db.prepare("SELECT COALESCE(MAX(disposition_sequence), 0) + 1 AS next_sequence FROM decision_dispositions WHERE decision_id = ?").get(decisionId),
+  )?.next_sequence ?? 1;
+  const supersedes = request.supersedesDispositionSequence ?? null;
+  const reverts = request.revertsDispositionSequence ?? null;
+  if ((request.disposition === "superseded") !== (supersedes !== null) || (request.disposition === "revoked") !== (reverts !== null)) {
+    throw refusal("DECISION_DISPOSITION_INVALID", "superseded and revoked dispositions require exactly their matching prior reference");
+  }
+  for (const [kind, reference] of [["supersedes", supersedes], ["reverts", reverts]] as const) {
+    if (reference === null) continue;
+    if (reference >= sequence || !dispositionReference(db, decisionId, reference)) {
+      throw refusal("DECISION_REFERENCE_INVALID", `${kind} must name an earlier disposition on the same decision`);
+    }
+    if (db.prepare(`SELECT 1 FROM decision_dispositions WHERE decision_id = ? AND ${kind}_disposition_sequence = ?`).get(decisionId, reference)) {
+      throw refusal("DECISION_REFERENCE_INVALID", `${kind} target was already consumed`);
+    }
+  }
+  const holdAction = request.holdAction ?? "none";
+  const holdCode = request.holdCode ?? null;
+  const holdReference = request.holdReferenceSequence ?? null;
+  if (
+    (holdAction === "none" && (holdCode !== null || holdReference !== null)) ||
+    (holdAction === "set" && (holdCode === null || holdReference !== null)) ||
+    (holdAction === "clear" && (holdCode === null || holdReference === null))
+  ) {
+    throw refusal("DECISION_REFERENCE_INVALID", "hold set/clear fields are inconsistent");
+  }
+  if (holdAction === "clear") {
+    const setter = dispositionReference(db, decisionId, holdReference);
+    if (!setter || setter.hold_action !== "set" || setter.hold_code !== holdCode || holdReference! >= sequence ||
+        db.prepare("SELECT 1 FROM decision_dispositions WHERE decision_id = ? AND hold_action = 'clear' AND hold_reference_sequence = ?").get(decisionId, holdReference)) {
+      throw refusal("DECISION_REFERENCE_INVALID", "hold clear must name one active earlier setter for the same code");
+    }
+  }
+  const preparedEvidence = prepareDecisionEvidence(db, request, governor.governance_epoch);
+  const evidenceIds = new Set(preparedEvidence.map((item) => item.input.evidenceId));
+  const conditions = request.conditions ?? [];
+  for (const condition of conditions) {
+    if (condition.evidenceIds.some((evidenceId) => !evidenceIds.has(evidenceId))) {
+      throw refusal("EVIDENCE_REQUIRED", "every typed condition must name evidence bound to this exact disposition");
+    }
+  }
+  if (request.disposition === "adopted") {
+    const activeHolds = db.prepare(
+      `SELECT setter.disposition_sequence FROM decision_dispositions setter
+       WHERE setter.decision_id = ? AND setter.hold_action = 'set'
+         AND NOT EXISTS (
+           SELECT 1 FROM decision_dispositions clearer
+           WHERE clearer.decision_id = setter.decision_id AND clearer.hold_action = 'clear'
+             AND clearer.hold_reference_sequence = setter.disposition_sequence
+         )`,
+    ).all(decisionId) as Array<{ disposition_sequence: number }>;
+    const remaining = activeHolds.filter((row) => !(holdAction === "clear" && row.disposition_sequence === holdReference));
+    if (holdAction === "set" || remaining.length > 0) throw refusal("DECISION_DISPOSITION_INVALID", "active Decision holds block adoption");
+  }
+  const reasonJson = boundedCanonicalObject(request.reason ?? {}, "decision reason");
+  assertRedactedEvidence(JSON.parse(reasonJson), "decision reason");
+  const conditionsJson = canonicalJson(conditions);
+  if (Buffer.byteLength(conditionsJson, "utf8") > 16 * 1024) throw refusal("EVIDENCE_REDACTION_INVALID", "decision conditions exceed 16 KiB");
   const nextRevision = decision.current_resource_revision + 1;
-  const update = db
-    .prepare(
-      `UPDATE decisions SET current_resource_revision = ?
-       WHERE decision_id = ? AND project_id = ? AND current_resource_revision = ?`,
-    )
-    .run(nextRevision, decisionId, request.projectId, expectedResourceRevision);
+  const update = db.prepare(
+    `UPDATE decisions SET current_resource_revision = ?
+     WHERE decision_id = ? AND project_id = ? AND current_resource_revision = ?`,
+  ).run(nextRevision, decisionId, request.projectId, expectedResourceRevision);
   if (update.changes !== 1) {
     throw refusal("RESOURCE_REVISION_STALE", "decision compare-and-swap failed", {
       currentResourceRevision: decision.current_resource_revision,
       expectedResourceRevision,
     });
   }
-  const sequenceRow = asRow<{ next_sequence: number }>(
-    db.prepare("SELECT COALESCE(MAX(disposition_sequence), 0) + 1 AS next_sequence FROM decision_dispositions WHERE decision_id = ?").get(decisionId),
-  );
-  const sequence = sequenceRow?.next_sequence ?? 1;
-  const reasonJson = canonicalJson(request.reason ?? {});
+  const createdAtMs = now();
   db.prepare(
     `INSERT INTO decision_dispositions
-      (decision_id, disposition_sequence, disposition, actor_receipt_id, reason_json, created_at_ms, idempotency_key)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run(decisionId, sequence, request.disposition, actorReceiptId, reasonJson, now(), request.idempotencyKey);
+      (decision_id, disposition_sequence, disposition, actor_receipt_id, reason_json, created_at_ms, idempotency_key,
+       conditions_json, hold_action, hold_code, hold_reference_sequence,
+       supersedes_disposition_sequence, reverts_disposition_sequence)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    decisionId,
+    sequence,
+    request.disposition,
+    actorReceiptId,
+    reasonJson,
+    createdAtMs,
+    request.idempotencyKey,
+    conditionsJson,
+    holdAction,
+    holdCode,
+    holdReference,
+    supersedes,
+    reverts,
+  );
+  const insertArtifact = db.prepare(
+    `INSERT INTO evidence_artifacts
+      (project_id, evidence_id, evidence_kind, source_kind, source_ref, execution_attempt_id,
+       content_digest, redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest, created_at_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const insertRelation = db.prepare(
+    `INSERT INTO decision_evidence
+      (project_id, decision_id, evidence_sequence, evidence_id, disposition_sequence,
+       relation_kind, relation_json, created_at_ms, idempotency_key)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  let evidenceSequence = asRow<{ next_sequence: number }>(db.prepare(
+    "SELECT COALESCE(MAX(evidence_sequence), 0) + 1 AS next_sequence FROM decision_evidence WHERE project_id = ? AND decision_id = ?",
+  ).get(request.projectId, decisionId))?.next_sequence ?? 1;
+  for (const prepared of preparedEvidence) {
+    if (!prepared.exists) {
+      insertArtifact.run(
+        request.projectId,
+        prepared.input.evidenceId,
+        prepared.input.evidenceKind,
+        prepared.input.sourceKind,
+        prepared.input.sourceRef,
+        prepared.input.executionAttemptId,
+        prepared.input.contentDigest,
+        prepared.redactedJson,
+        prepared.redactedDigest,
+        prepared.durableRefJson,
+        prepared.artifactIdentityDigest,
+        createdAtMs,
+      );
+    }
+    insertRelation.run(
+      request.projectId,
+      decisionId,
+      evidenceSequence++,
+      prepared.input.evidenceId,
+      sequence,
+      prepared.input.relationKind,
+      prepared.relationJson,
+      createdAtMs,
+      request.idempotencyKey,
+    );
+  }
   return commitMutation(
     db,
     request,
@@ -2022,15 +2592,20 @@ function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, dig
       aggregateId: decisionId,
       aggregateRevision: nextRevision,
       eventType: "decision_disposition_appended",
-      event: { decisionId, dispositionSequence: sequence, disposition: request.disposition },
+      event: {
+        decisionId,
+        dispositionSequence: sequence,
+        disposition: request.disposition,
+        evidenceIds: preparedEvidence.map((item) => item.input.evidenceId),
+      },
     },
-    { expected: 1, attempted: 1, verified: 1 },
+    { expected: preparedEvidence.length + 1, attempted: preparedEvidence.length + 1, verified: preparedEvidence.length + 1 },
     {
       currentConfigRevision: currentRevision,
       currentGovernanceEpoch: governor.governance_epoch,
       currentResourceRevision: nextRevision,
       expectedResourceRevision,
-      evidence: { dispositionSequence: sequence },
+      evidence: { dispositionSequence: sequence, evidenceIds: preparedEvidence.map((item) => item.input.evidenceId) },
     },
   );
 }
@@ -2089,8 +2664,20 @@ function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest): voi
   const head = asRow<{ current_generation: number }>(
     db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(request.projectId, actor.role_id),
   );
-  const generation = asRow<{ status: string; holder_execution_attempt_id: string; holder_context_digest: string; holder_executed_profile_digest: string }>(
-    db.prepare("SELECT status, holder_execution_attempt_id, holder_context_digest, holder_executed_profile_digest FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?").get(
+  const generation = asRow<{
+    status: string;
+    role_requirement_id: string;
+    config_revision: number;
+    holder_execution_attempt_id: string;
+    holder_context_digest: string;
+    holder_executed_profile_digest: string;
+    qualification_id: string;
+    eligibility_derivation_digest: string;
+  }>(
+    db.prepare(`SELECT status, role_requirement_id, config_revision, holder_execution_attempt_id,
+                       holder_context_digest, holder_executed_profile_digest, qualification_id,
+                       eligibility_derivation_digest
+                FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?`).get(
       request.projectId,
       actor.role_id,
       actor.role_generation,
@@ -2113,6 +2700,25 @@ function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest): voi
     attempt.actual_profile_digest !== generation.holder_executed_profile_digest
   ) {
     throw refusal("ROLE_HOLDER_MISMATCH", "role holder has no complete canonical execution attempt");
+  }
+  const eligibility = asRow<{
+    current_qualification_id: string;
+    effective_status: string;
+    config_revision: number;
+    expires_at_ms: number | null;
+    derivation_digest: string;
+  }>(db.prepare(
+    `SELECT current_qualification_id, effective_status, config_revision, expires_at_ms, derivation_digest
+     FROM eligibility_projections
+     WHERE project_id = ? AND role_requirement_id = ? AND profile_digest = ?`,
+  ).get(request.projectId, generation.role_requirement_id, generation.holder_executed_profile_digest));
+  if (
+    !eligibility || eligibility.current_qualification_id !== generation.qualification_id ||
+    eligibility.effective_status !== "eligible" || eligibility.config_revision !== generation.config_revision ||
+    eligibility.derivation_digest !== generation.eligibility_derivation_digest ||
+    (eligibility.expires_at_ms !== null && eligibility.expires_at_ms <= now())
+  ) {
+    throw refusal("ROLE_UNQUALIFIED", "role actor no longer has current eligible qualification evidence");
   }
 }
 
@@ -4329,6 +4935,8 @@ export function applyFixtureMutation(
           return applyConfigRevision(db, request, digest);
         case "governor_claim":
           return applyGovernorClaim(db, request, digest);
+        case "decision_create":
+          return applyDecisionCreate(db, request, digest);
         case "decision_disposition":
           return applyDecisionDisposition(db, request, digest);
         case "work_item_create":
@@ -4369,7 +4977,9 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     project_governorship_heads: "project_id",
     actor_receipts: "receipt_id",
     decisions: "decision_id",
-    decision_dispositions: "decision_id, disposition_sequence",
+    decision_dispositions: "decision_dispositions.decision_id, decision_dispositions.disposition_sequence",
+    evidence_artifacts: "evidence_id",
+    decision_evidence: "decision_evidence.decision_id, decision_evidence.evidence_sequence",
     mutation_receipts: "idempotency_key",
     state_events: "event_sequence",
     work_items: "work_item_id",
@@ -4382,9 +4992,9 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     role_generation_heads: "role_id",
   };
   const query =
-    table === "decision_dispositions"
-      ? `SELECT decision_dispositions.* FROM decision_dispositions
-         JOIN decisions ON decisions.decision_id = decision_dispositions.decision_id
+    table === "decision_dispositions" || table === "decision_evidence"
+      ? `SELECT ${table}.* FROM ${table}
+         JOIN decisions ON decisions.decision_id = ${table}.decision_id
          WHERE decisions.project_id = ? ORDER BY ${orderBy[table]}`
       : `SELECT * FROM ${table} WHERE project_id = ? ORDER BY ${orderBy[table]}`;
   return db.prepare(query).all(projectId) as Record<string, unknown>[];
@@ -4462,6 +5072,168 @@ function versionAtLeast037(version: string): boolean {
   if (!match) return false;
   const tuple = [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)];
   return tuple[0] > 0 || (tuple[0] === 0 && tuple[1] >= 37);
+}
+
+function decisionDoctorEvidence(db: SqliteDatabase, projectId: string): {
+  unresolvedDecisions: Array<{ decisionId: string; reason: string }>;
+  issues: Array<{ decisionId?: string; evidenceId?: string; reason: string }>;
+  derivedHolds: Array<{ decisionId: string; holdCode: string; setterSequence: number }>;
+  artifactCount: number;
+  relationCount: number;
+} {
+  const decisions = db.prepare("SELECT * FROM decisions WHERE project_id = ? ORDER BY decision_id").all(projectId) as DecisionRow[];
+  const artifacts = db.prepare("SELECT * FROM evidence_artifacts WHERE project_id = ? ORDER BY evidence_id").all(projectId) as Array<Record<string, string | number | null>>;
+  const unresolvedDecisions: Array<{ decisionId: string; reason: string }> = [];
+  const issues: Array<{ decisionId?: string; evidenceId?: string; reason: string }> = [];
+  const derivedHolds: Array<{ decisionId: string; holdCode: string; setterSequence: number }> = [];
+  let relationCount = 0;
+  for (const decision of decisions) {
+    if (
+      !(DECISION_CLASSES as readonly string[]).includes(decision.decision_class ?? "") ||
+      !decision.options_json || !decision.decision_identity_digest ||
+      decision.scope_digest !== sha256(decision.scope_json) ||
+      storedDecisionIdentityDigest(decision) !== decision.decision_identity_digest
+    ) {
+      unresolvedDecisions.push({ decisionId: decision.decision_id, reason: "DECISION_IDENTITY_CONFLICT" });
+    }
+    const dispositions = db.prepare(
+      "SELECT * FROM decision_dispositions WHERE decision_id = ? ORDER BY disposition_sequence",
+    ).all(decision.decision_id) as Array<Record<string, string | number | null>>;
+    const seenReverts = new Set<number>();
+    const seenSupersedes = new Set<number>();
+    const activeHolds = new Map<number, string>();
+    for (const [index, disposition] of dispositions.entries()) {
+      const sequence = Number(disposition.disposition_sequence);
+      if (sequence !== index + 1) issues.push({ decisionId: decision.decision_id, reason: "disposition_sequence_not_contiguous" });
+      const actor = asRow<{ actor_kind: string; project_id: string; verification_state: string; receipt_digest: string; subject_id: string; role_id: string | null; role_generation: number | null }>(
+        db.prepare("SELECT * FROM actor_receipts WHERE receipt_id = ?").get(disposition.actor_receipt_id),
+      );
+      if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || !["role", "operator"].includes(actor.actor_kind)) {
+        issues.push({ decisionId: decision.decision_id, reason: "decision_actor_invalid" });
+      } else {
+        const receiptDigest = sha256(canonicalJson({
+          projectId: actor.project_id,
+          receiptId: disposition.actor_receipt_id,
+          actorKind: actor.actor_kind,
+          subjectId: actor.subject_id,
+          roleId: actor.role_id,
+          roleGeneration: actor.role_generation,
+          verificationState: actor.verification_state,
+        }));
+        if (receiptDigest !== actor.receipt_digest) issues.push({ decisionId: decision.decision_id, reason: "decision_actor_digest_invalid" });
+        if (actor.actor_kind === "role") {
+          const role = asRow<{ current_generation: number; status: string; holder_execution_attempt_id: string; holder_context_digest: string; holder_executed_profile_digest: string; qualification_id: string; eligibility_derivation_digest: string; role_requirement_id: string }>(db.prepare(
+            `SELECT role_generation_heads.current_generation, role_generations.status,
+                    role_generations.holder_execution_attempt_id, role_generations.holder_context_digest,
+                    role_generations.holder_executed_profile_digest, role_generations.qualification_id,
+                    role_generations.eligibility_derivation_digest, role_generations.role_requirement_id
+             FROM role_generation_heads JOIN role_generations
+               ON role_generations.project_id = role_generation_heads.project_id
+              AND role_generations.role_id = role_generation_heads.role_id
+              AND role_generations.generation = role_generation_heads.current_generation
+             WHERE role_generation_heads.project_id = ? AND role_generation_heads.role_id = ?`,
+          ).get(projectId, actor.role_id));
+          const holder = role && asRow<{ state: string; origin: string; native_receipt_digest: string | null; actual_profile_digest: string | null }>(
+            db.prepare("SELECT state, origin, native_receipt_digest, actual_profile_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, role.holder_execution_attempt_id),
+          );
+          const eligibility = role && asRow<{ current_qualification_id: string; effective_status: string; expires_at_ms: number | null; derivation_digest: string }>(db.prepare(
+            "SELECT current_qualification_id, effective_status, expires_at_ms, derivation_digest FROM eligibility_projections WHERE project_id = ? AND role_requirement_id = ? AND profile_digest = ?",
+          ).get(projectId, role.role_requirement_id, role.holder_executed_profile_digest));
+          if (
+            !role || actor.role_generation !== role.current_generation || role.status !== "active" || actor.subject_id !== role.holder_execution_attempt_id ||
+            !holder || holder.origin !== "role_holder" || holder.state !== "done" || holder.native_receipt_digest !== role.holder_context_digest ||
+            holder.actual_profile_digest !== role.holder_executed_profile_digest || !eligibility ||
+            eligibility.current_qualification_id !== role.qualification_id || eligibility.effective_status !== "eligible" ||
+            eligibility.derivation_digest !== role.eligibility_derivation_digest ||
+            (eligibility.expires_at_ms !== null && eligibility.expires_at_ms <= now())
+          ) {
+            issues.push({ decisionId: decision.decision_id, reason: "decision_role_binding_invalid" });
+          }
+        }
+      }
+      try {
+        const conditions = JSON.parse(String(disposition.conditions_json));
+        if (canonicalJson(conditions) !== disposition.conditions_json || !Array.isArray(conditions)) throw new Error("invalid");
+      } catch {
+        issues.push({ decisionId: decision.decision_id, reason: "decision_conditions_invalid" });
+      }
+      for (const [kind, value, seen] of [
+        ["supersedes", disposition.supersedes_disposition_sequence, seenSupersedes],
+        ["reverts", disposition.reverts_disposition_sequence, seenReverts],
+      ] as const) {
+        if (value === null) continue;
+        const reference = Number(value);
+        if (reference >= sequence || reference < 1 || reference > dispositions.length || seen.has(reference)) {
+          issues.push({ decisionId: decision.decision_id, reason: `${kind}_reference_invalid` });
+        }
+        seen.add(reference);
+      }
+      if (disposition.hold_action === "set" && typeof disposition.hold_code === "string") activeHolds.set(sequence, disposition.hold_code);
+      if (disposition.hold_action === "clear") {
+        const reference = Number(disposition.hold_reference_sequence);
+        if (!activeHolds.has(reference) || activeHolds.get(reference) !== disposition.hold_code) {
+          issues.push({ decisionId: decision.decision_id, reason: "hold_reference_invalid" });
+        } else {
+          activeHolds.delete(reference);
+        }
+      }
+    }
+    for (const [setterSequence, holdCode] of activeHolds) derivedHolds.push({ decisionId: decision.decision_id, holdCode, setterSequence });
+    const relations = db.prepare(
+      "SELECT * FROM decision_evidence WHERE project_id = ? AND decision_id = ? ORDER BY evidence_sequence",
+    ).all(projectId, decision.decision_id) as Array<Record<string, string | number | null>>;
+    relationCount += relations.length;
+    for (const [index, relation] of relations.entries()) {
+      if (Number(relation.evidence_sequence) !== index + 1) issues.push({ decisionId: decision.decision_id, reason: "evidence_sequence_not_contiguous" });
+      if (!dispositions.some((row) => row.disposition_sequence === relation.disposition_sequence)) {
+        issues.push({ decisionId: decision.decision_id, evidenceId: String(relation.evidence_id), reason: "evidence_disposition_unknown" });
+      }
+      if (!artifacts.some((artifact) => artifact.evidence_id === relation.evidence_id)) {
+        issues.push({ decisionId: decision.decision_id, evidenceId: String(relation.evidence_id), reason: "evidence_artifact_unknown" });
+      }
+    }
+  }
+  for (const artifact of artifacts) {
+    const evidenceId = String(artifact.evidence_id);
+    try {
+      const redacted = JSON.parse(String(artifact.redacted_json));
+      const durableRef = JSON.parse(String(artifact.durable_ref_json));
+      assertRedactedEvidence(redacted, "evidence redacted metadata");
+      assertRedactedEvidence(durableRef, "evidence durable reference");
+      const expectedIdentity = sha256(canonicalJson({
+        projectId,
+        evidenceId,
+        evidenceKind: artifact.evidence_kind,
+        sourceKind: artifact.source_kind,
+        sourceRef: artifact.source_ref,
+        executionAttemptId: artifact.execution_attempt_id,
+        contentDigest: artifact.content_digest,
+        redactedDigest: sha256(canonicalJson(redacted)),
+        durableRef,
+      }));
+      if (
+        canonicalJson(redacted) !== artifact.redacted_json || canonicalJson(durableRef) !== artifact.durable_ref_json ||
+        sha256(canonicalJson(redacted)) !== artifact.redacted_digest || expectedIdentity !== artifact.artifact_identity_digest
+      ) {
+        issues.push({ evidenceId, reason: "evidence_artifact_digest_invalid" });
+      }
+    } catch {
+      issues.push({ evidenceId, reason: "evidence_artifact_redaction_invalid" });
+    }
+    if (artifact.evidence_kind === "delegated_action_receipt") {
+      const attempt = asRow<{ state: string; terminal_result: string | null; reported_outcome: string | null; terminal_report_digest: string | null; native_receipt_digest: string | null; actual_profile_digest: string | null; conflicting_terminal_digest: string | null }>(
+        db.prepare("SELECT state, terminal_result, reported_outcome, terminal_report_digest, native_receipt_digest, actual_profile_digest, conflicting_terminal_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, artifact.execution_attempt_id),
+      );
+      if (
+        !attempt || attempt.state !== "done" || attempt.terminal_result !== "DONE" || attempt.reported_outcome !== "DONE" ||
+        attempt.terminal_report_digest !== artifact.content_digest || !attempt.native_receipt_digest || !attempt.actual_profile_digest ||
+        attempt.conflicting_terminal_digest !== null
+      ) {
+        issues.push({ evidenceId, reason: "delegated_evidence_binding_invalid" });
+      }
+    }
+  }
+  return { unresolvedDecisions, issues, derivedHolds, artifactCount: artifacts.length, relationCount };
 }
 
 export async function doctor(
@@ -4606,6 +5378,7 @@ export async function doctor(
     const unresolvedRoleHolders = roleGenerationHeads
       .filter((row) => row.holder_attempt_state !== "done" || !row.holder_native_receipt_digest)
       .map((row) => ({ roleId: row.role_id, generation: row.current_generation, holderExecutionAttemptId: row.holder_execution_attempt_id, reason: "ROLE_HOLDER_UNRESOLVED" }));
+    const decisionIntegrity = decisionDoctorEvidence(db, projectId);
     const cachedConsumers = cachedConsumerRolloutEvidence(SCHEMA_VERSION);
     const expected = targets.length + 1;
     return result("OK", projectId, expected, expected, expected, {
@@ -4631,6 +5404,7 @@ export async function doctor(
           ceilingViolated: activeWriters.length > writingLaneCeiling,
         },
         unresolvedAttempts,
+        decisionIntegrity,
         cachedConsumers,
         schema: { version: SCHEMA_VERSION, migrationStatementIds: MIGRATIONS.map((_, index) => index), digest: schemaDigest, tables: schemaState.map((row) => row.name) },
       },

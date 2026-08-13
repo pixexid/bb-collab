@@ -71,15 +71,28 @@ export function seedFixtureDecision(
     configRevision?: number;
     repoTargetId?: string | null;
     scope?: unknown;
+    decisionClass?: "assignment_admission" | "role_succession" | "review_adjudication" | "legacy_adoption" | "operator_only";
+    options?: Record<string, unknown>;
     resourceRevision?: number;
   },
 ): void {
   const scopeJson = canonicalJson(input.scope ?? { fixture: true });
+  const decisionClass = input.decisionClass ?? "assignment_admission";
+  const optionsJson = canonicalJson(input.options ?? {});
+  const identityDigest = sha256(canonicalJson({
+    projectId: input.projectId,
+    configRevision: input.configRevision ?? 1,
+    repoTargetId: input.repoTargetId ?? null,
+    scope: JSON.parse(scopeJson),
+    decisionClass,
+    options: JSON.parse(optionsJson),
+  }));
   db.prepare(
     `INSERT INTO decisions
       (decision_id, project_id, config_revision, repo_target_id, scope_json,
-       scope_digest, current_resource_revision)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       scope_digest, current_resource_revision, decision_class, options_json,
+       decision_identity_digest)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     input.decisionId,
     input.projectId,
@@ -88,6 +101,9 @@ export function seedFixtureDecision(
     scopeJson,
     sha256(scopeJson),
     input.resourceRevision ?? 1,
+    decisionClass,
+    optionsJson,
+    identityDigest,
   );
 }
 
