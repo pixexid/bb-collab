@@ -1041,6 +1041,9 @@ export interface NativeAssignmentInput {
   branchName: string;
   baseSha: string;
   candidateSha: string | null;
+  candidateScope:
+    | { mode: "write"; candidateSemantics: "base"; candidateSha: null }
+    | { mode: "read-only"; candidateSemantics: "frozen"; candidateSha: string; mutations: "forbidden" };
   environment: z.infer<typeof assignmentEnvironmentSchema>;
   requestedProfile: ExecutionProfile;
   executionInputSources: {
@@ -1086,17 +1089,22 @@ export interface NativeAssignmentEvidence {
 }
 
 export interface NativeAssignmentInspection {
-  bbServerId: string;
-  projectId: string;
-  environmentId: string;
-  sourceId: string;
-  hostId: string;
-  environmentPath: string;
-  environmentMode: "managed-worktree";
-  branchName: string;
-  headSha: string;
-  baseSha: string;
+  bbServerId: string | null;
+  projectId: string | null;
+  environmentId: string | null;
+  sourceId: string | null;
+  hostId: string | null;
+  environmentPath: string | null;
+  environmentMode: string | null;
+  environmentStatus: string | null;
+  workingTreeState: "clean" | "dirty" | "unknown";
+  branchName: string | null;
+  headSha: string | null;
+  baseSha: string | null;
   candidateSha: string | null;
+  defaultBranchName: string | null;
+  defaultBranchHeadSha: string | null;
+  mergeBaseSha: string | null;
   threadId: string | null;
   threadProviderId: string | null;
   threadVisibility: "visible" | "hidden" | null;
@@ -4927,6 +4935,78 @@ function preflightAssignmentPrepare(db: SqliteDatabase, request: ApplyRequest): 
   }
 }
 
+function requireNativeAssignmentWorkspace(
+  request: ApplyRequest,
+  assignment: AssignmentIntent,
+  rawInspection: NativeAssignmentInspection,
+  target: { source_id: string; host_id: string; path: string; default_branch: string },
+): NativeAssignmentInspection {
+  const parsed = z.object({
+    bbServerId: id.nullable(),
+    projectId: id.nullable(),
+    environmentId: id.nullable(),
+    sourceId: id.nullable(),
+    hostId: id.nullable(),
+    environmentPath: id.nullable(),
+    environmentMode: id.nullable(),
+    environmentStatus: id.nullable(),
+    workingTreeState: z.enum(["clean", "dirty", "unknown"]),
+    branchName: id.nullable(),
+    headSha: gitShaSchema.nullable(),
+    baseSha: gitShaSchema.nullable(),
+    candidateSha: gitShaSchema.nullable(),
+    defaultBranchName: id.nullable(),
+    defaultBranchHeadSha: gitShaSchema.nullable(),
+    mergeBaseSha: gitShaSchema.nullable(),
+    threadId: id.nullable(),
+    threadProviderId: id.nullable(),
+    threadVisibility: z.enum(["visible", "hidden"]).nullable(),
+  }).strict().safeParse(rawInspection);
+  if (!parsed.success) throw refusal("BB_FACTS_UNAVAILABLE", "exact native BB/Git assignment facts are unavailable");
+  const inspection = parsed.data;
+  if (
+    !inspection.bbServerId || !inspection.projectId || !inspection.environmentId ||
+    !inspection.sourceId || !inspection.hostId || !inspection.environmentPath ||
+    !inspection.environmentMode || !inspection.environmentStatus || !inspection.branchName ||
+    !inspection.headSha || !inspection.baseSha || !inspection.defaultBranchName ||
+    !inspection.defaultBranchHeadSha || !inspection.mergeBaseSha ||
+    inspection.environmentStatus !== "ready" || inspection.workingTreeState === "unknown"
+  ) {
+    throw refusal("BB_FACTS_UNAVAILABLE", "native environment identity, readiness, cleanliness, or ancestry is unresolved");
+  }
+  if (
+    inspection.bbServerId !== assignment.environment.bbServerId ||
+    inspection.projectId !== request.projectId ||
+    inspection.environmentId !== assignment.environment.environmentId ||
+    inspection.sourceId !== assignment.environment.sourceId ||
+    inspection.hostId !== assignment.environment.hostId ||
+    inspection.environmentPath !== assignment.environment.path ||
+    inspection.environmentMode !== "managed-worktree" ||
+    inspection.workingTreeState !== "clean" ||
+    inspection.branchName !== assignment.branchName ||
+    inspection.defaultBranchName !== target.default_branch ||
+    target.source_id !== assignment.environment.sourceId ||
+    target.host_id !== assignment.environment.hostId ||
+    target.path !== assignment.environment.path
+  ) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "native environment is dirty, moved, foreign, or not the exact managed worktree target");
+  }
+  if (inspection.baseSha !== assignment.baseSha || inspection.candidateSha !== assignment.candidateSha) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "native branch base or candidate does not match the immutable assignment");
+  }
+  if (assignment.assignmentKind === "write") {
+    if (inspection.headSha !== assignment.baseSha || inspection.mergeBaseSha !== inspection.headSha) {
+      throw refusal("ASSIGNMENT_HEAD_STALE", "writer head is stale, ahead of, or not an ancestor of the current default branch");
+    }
+  } else if (
+    inspection.headSha !== assignment.candidateSha ||
+    inspection.mergeBaseSha !== inspection.defaultBranchHeadSha
+  ) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "frozen candidate is not the exact clean head descended from the current default branch");
+  }
+  return inspection;
+}
+
 function applyAssignmentPrepare(
   db: SqliteDatabase,
   request: ApplyRequest,
@@ -4947,21 +5027,13 @@ function applyAssignmentPrepare(
     throw refusal("ASSIGNMENT_HEAD_STALE", "assignment candidate semantics do not match its kind");
   }
   if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "assignment requires one exact repository target");
-  if (
-    inspection.bbServerId !== assignment.environment.bbServerId ||
-    inspection.projectId !== request.projectId ||
-    inspection.environmentId !== assignment.environment.environmentId ||
-    inspection.sourceId !== assignment.environment.sourceId ||
-    inspection.hostId !== assignment.environment.hostId ||
-    inspection.environmentPath !== assignment.environment.path ||
-    inspection.environmentMode !== assignment.environment.mode ||
-    inspection.branchName !== assignment.branchName ||
-    inspection.baseSha !== assignment.baseSha ||
-    inspection.headSha !== (assignment.candidateSha ?? assignment.baseSha) ||
-    inspection.candidateSha !== assignment.candidateSha
-  ) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "typed BB/Git facts do not match the exact assignment environment and head");
-  }
+  const target = requireTarget(db, request.projectId, configRevision, request.repoTargetId) as {
+    source_id: string;
+    host_id: string;
+    path: string;
+    default_branch: string;
+  };
+  inspection = requireNativeAssignmentWorkspace(request, assignment, inspection, target);
   if (
     assignment.dispatchKind === "attach" &&
     (inspection.threadId !== assignment.attachThreadId || inspection.threadProviderId !== assignment.requestedProfile.providerId || inspection.threadVisibility !== "visible")
@@ -4981,14 +5053,6 @@ function applyAssignmentPrepare(
   }
   if (assignment.assignmentKind !== "write" && workItem.lifecycle_state !== "in_progress") {
     throw refusal("WORK_ITEM_STATE_INVALID", "review and probe assignments require an in-progress WorkItem");
-  }
-  const target = requireTarget(db, request.projectId, configRevision, request.repoTargetId) as { source_id: string; host_id: string; path: string };
-  if (
-    target.source_id !== assignment.environment.sourceId ||
-    target.host_id !== assignment.environment.hostId ||
-    target.path !== assignment.environment.path
-  ) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment environment does not match the exact repository target");
   }
   requireCanonicalRoleGeneration(db, request.projectId, assignment.roleId, assignment.roleGeneration, assignment.roleRequirementId);
   const requirements = roleRequirementsFromJson(storedConfigJson(db, request.projectId, configRevision));
@@ -5103,6 +5167,9 @@ export function explicitExecutionInputSources(serviceTier?: string): NativeAssig
 }
 
 function nativeAssignmentInput(assignment: AssignmentRow, attempt: ExecutionAttemptRow, frozenBriefContent: string): NativeAssignmentInput {
+  const candidateScope: NativeAssignmentInput["candidateScope"] = assignment.assignment_kind === "write"
+    ? { mode: "write", candidateSemantics: "base", candidateSha: null }
+    : { mode: "read-only", candidateSemantics: "frozen", candidateSha: assignment.candidate_sha!, mutations: "forbidden" };
   return {
     projectId: assignment.project_id,
     assignmentId: assignment.assignment_id,
@@ -5114,6 +5181,7 @@ function nativeAssignmentInput(assignment: AssignmentRow, attempt: ExecutionAtte
     branchName: assignment.branch_name,
     baseSha: assignment.base_sha,
     candidateSha: assignment.candidate_sha,
+    candidateScope,
     environment: {
       bbServerId: assignment.bb_server_id,
       environmentId: assignment.environment_id,
@@ -5594,14 +5662,15 @@ function applyAssignmentMutation(
     if (request.operationClass === "assignment_prepare") {
       const replay = checkIdempotency(db, request, digest);
       if (replay) return replay;
-      if (!request.assignment || !request.repoTargetId || !adapter) {
-        throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment preparation requires one native BB fact adapter and exact target");
+      if (!request.assignment || !request.repoTargetId) {
+        throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment preparation requires immutable intent and one exact target");
       }
+      if (!adapter) throw refusal("BB_FACTS_UNAVAILABLE", "assignment preparation requires one native BB fact adapter");
       transaction(db, () => preflightAssignmentPrepare(db, request));
       try {
         inspection = adapter.inspect({ projectId: request.projectId, repoTargetId: request.repoTargetId, assignment: request.assignment });
       } catch {
-        throw refusal("EXECUTION_CONTEXT_FOREIGN", "exact native BB/Git assignment facts are unavailable");
+        throw refusal("BB_FACTS_UNAVAILABLE", "exact native BB/Git assignment facts are unavailable");
       }
     }
     return transaction(db, () => {

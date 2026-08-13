@@ -23,6 +23,7 @@ import {
   sha256,
   type ApplyRequest,
   type FoundationResult,
+  type NativeAssignmentInspection,
 } from "../src/foundation.js";
 import {
   applyWithFixtureReceipt,
@@ -3212,6 +3213,11 @@ describe("bb-collab plugin boundary", () => {
       reasoningLevel: "explicit",
       permissionMode: "explicit",
     });
+    expect(adapter.dispatchCalls[0]).toMatchObject({
+      candidateSha: null,
+      candidateScope: { mode: "write", candidateSemantics: "base", candidateSha: null },
+      requestedProfile: { providerId: "codex", model: "gpt-5.6-sol", reasoningLevel: "high", permissionMode: "full", visibility: "visible" },
+    });
     expect(explicitExecutionInputSources()).toEqual({ providerId: "explicit", model: "explicit", reasoningLevel: "explicit", permissionMode: "explicit" });
     const native = delivered.evidence as { nativeReceiptDigest: string; actualProfileDigest: string; threadId: string };
     const terminalReport = {
@@ -3562,14 +3568,187 @@ describe("bb-collab plugin boundary", () => {
       expect(db.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = ?").get(request.idempotencyKey), name).toBeUndefined();
     }
 
-    for (const inspection of [{ baseSha: "c".repeat(40) }, { branchName: "bb/foreign" }, { candidateSha: CANDIDATE_SHA }]) {
+    for (const [inspection, outcome] of [
+      [{ baseSha: "c".repeat(40) }, "ASSIGNMENT_HEAD_STALE"],
+      [{ branchName: "bb/foreign" }, "EXECUTION_CONTEXT_FOREIGN"],
+      [{ candidateSha: CANDIDATE_SHA }, "ASSIGNMENT_HEAD_STALE"],
+    ] as Array<[Partial<NativeAssignmentInspection>, FoundationResult["outcome"]]>) {
       const { db, fenceToken } = await assignmentFixture();
       const adapter = new DeterministicNativeAssignmentAdapter();
       adapter.nextInspection = inspection;
-      expect(applyWithFixtureReceipt(db, assignmentPrepareRequest(fenceToken), null, null, adapter).outcome).toBe("EXECUTION_CONTEXT_FOREIGN");
+      expect(applyWithFixtureReceipt(db, assignmentPrepareRequest(fenceToken), null, null, adapter).outcome).toBe(outcome);
       expect(adapter.dispatchCalls).toHaveLength(0);
       expect(db.prepare("SELECT COUNT(*) AS count FROM assignments").get()).toEqual({ count: 0 });
     }
+  });
+
+  it("seals assignment preparation to resolved clean workspace ancestry and structural candidate scope", async () => {
+    const mutationCounts = (db: Database.Database) => ({
+      assignments: db.prepare("SELECT COUNT(*) AS count FROM assignments").get(),
+      attempts: db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'assignment'").get(),
+      events: db.prepare("SELECT COUNT(*) AS count FROM state_events").get(),
+      receipts: db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get(),
+    });
+    const writer = await assignmentFixture();
+    const writerCases: Array<[string, Partial<NativeAssignmentInspection>, FoundationResult["outcome"]]> = [
+      ["missing-identity", { environmentId: undefined as never }, "BB_FACTS_UNAVAILABLE"],
+      ["null-identity", { environmentId: null }, "BB_FACTS_UNAVAILABLE"],
+      ["provisioning", { environmentStatus: "provisioning" }, "BB_FACTS_UNAVAILABLE"],
+      ["ambiguous", { environmentStatus: "ambiguous" }, "BB_FACTS_UNAVAILABLE"],
+      ["missing-ancestry", { mergeBaseSha: null }, "BB_FACTS_UNAVAILABLE"],
+      ["dirty", { workingTreeState: "dirty" }, "EXECUTION_CONTEXT_FOREIGN"],
+      ["moved", { environmentPath: "/workspace/moved" }, "EXECUTION_CONTEXT_FOREIGN"],
+      ["foreign-project", { projectId: FOREIGN_PROJECT_ID }, "EXECUTION_CONTEXT_FOREIGN"],
+      ["foreign-source", { sourceId: "source-foreign" }, "EXECUTION_CONTEXT_FOREIGN"],
+      ["foreign-host", { hostId: "host-foreign" }, "EXECUTION_CONTEXT_FOREIGN"],
+      ["non-managed", { environmentMode: "local-path" }, "EXECUTION_CONTEXT_FOREIGN"],
+      ["wrong-branch", { branchName: "bb/foreign" }, "EXECUTION_CONTEXT_FOREIGN"],
+      ["stale-head", { headSha: CANDIDATE_SHA }, "ASSIGNMENT_HEAD_STALE"],
+      ["writer-ahead", { defaultBranchHeadSha: CANDIDATE_SHA, mergeBaseSha: CANDIDATE_SHA }, "ASSIGNMENT_HEAD_STALE"],
+      ["writer-diverged", { defaultBranchHeadSha: CANDIDATE_SHA, mergeBaseSha: H1_CANDIDATE_SHA }, "ASSIGNMENT_HEAD_STALE"],
+    ];
+    for (const [name, inspection, outcome] of writerCases) {
+      const adapter = new DeterministicNativeAssignmentAdapter();
+      adapter.nextInspection = inspection;
+      const before = mutationCounts(writer.db);
+      const request = assignmentPrepareRequest(writer.fenceToken, `workspace-${name}`, {
+        idempotencyKey: `workspace-${name}`,
+        assignment: {
+          ...assignmentPrepareRequest(writer.fenceToken).assignment!,
+          assignmentId: `workspace-${name}`,
+          branchName: `bb/workspace-${name}`,
+          environment: {
+            ...assignmentPrepareRequest(writer.fenceToken).assignment!.environment,
+            environmentId: `environment-workspace-${name}`,
+          },
+        },
+      });
+      expect(applyWithFixtureReceipt(writer.db, request, null, null, adapter).outcome, name).toBe(outcome);
+      expect(adapter.dispatchCalls, name).toHaveLength(0);
+      expect(mutationCounts(writer.db), name).toEqual(before);
+    }
+
+    expect(applyWithFixtureReceipt(
+      writer.db,
+      assignmentPrepareRequest(writer.fenceToken, "writer-behind"),
+      null,
+      null,
+      new DeterministicNativeAssignmentAdapter(),
+    ).outcome).toBe("OK");
+
+    const reviewer = await assignmentFixture();
+    expect(applyWithFixtureReceipt(reviewer.db, transitionRequest(reviewer.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    activateReviewer(reviewer.db, reviewer.fenceToken);
+    const reviewRequest = assignmentPrepareRequest(reviewer.fenceToken, "review-candidate", {
+      actorReceiptId: "role-actor-reviewer",
+      expectedResourceRevision: 3,
+      assignment: {
+        ...assignmentPrepareRequest(reviewer.fenceToken).assignment!,
+        assignmentId: "review-candidate",
+        assignmentKind: "review",
+        laneId: "review-candidate",
+        roleRequirementId: "reviewer-v1",
+        roleId: "independent-reviewer",
+        roleGeneration: 2,
+        branchName: "bb/review-candidate",
+        candidateSemantics: "frozen",
+        candidateSha: CANDIDATE_SHA,
+        environment: {
+          ...assignmentPrepareRequest(reviewer.fenceToken).assignment!.environment,
+          environmentId: "environment-review-candidate",
+        },
+      },
+    });
+    const reviewAdapter = new DeterministicNativeAssignmentAdapter();
+    const prepared = applyWithFixtureReceipt(reviewer.db, reviewRequest, null, null, reviewAdapter);
+    expect(prepared.outcome).toBe("OK");
+    const executionAttemptId = (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+    expect(applyWithFixtureReceipt(reviewer.db, assignmentPhaseRequest(
+      reviewer.fenceToken,
+      "assignment_dispatch",
+      "review-candidate",
+      executionAttemptId,
+      { actorReceiptId: "role-actor-reviewer", expectedResourceRevision: 3 },
+    ), null, null, reviewAdapter).outcome).toBe("OK");
+    expect(reviewAdapter.dispatchCalls[0]).toMatchObject({
+      assignmentKind: "review",
+      candidateSha: CANDIDATE_SHA,
+      candidateScope: { mode: "read-only", candidateSemantics: "frozen", candidateSha: CANDIDATE_SHA, mutations: "forbidden" },
+      requestedProfile: { permissionMode: "full", visibility: "visible" },
+    });
+    for (const mutationSurface of ["authority", "issue", "plugin", "queue", "task", "write"]) {
+      expect(Object.keys(reviewAdapter.dispatchCalls[0]!)).not.toContain(mutationSurface);
+    }
+
+    const probeRequest = {
+      ...reviewRequest,
+      idempotencyKey: "probe-candidate",
+      assignment: {
+        ...reviewRequest.assignment!,
+        assignmentId: "probe-candidate",
+        assignmentKind: "probe" as const,
+        laneId: "probe-candidate",
+        branchName: "bb/probe-candidate",
+        environment: { ...reviewRequest.assignment!.environment, environmentId: "environment-probe-candidate" },
+      },
+    };
+    const probeAdapter = new DeterministicNativeAssignmentAdapter();
+    const probePrepared = applyWithFixtureReceipt(reviewer.db, probeRequest, null, null, probeAdapter);
+    expect(probePrepared.outcome).toBe("OK");
+    const probeAttemptId = (probePrepared.evidence as { executionAttemptId: string }).executionAttemptId;
+    expect(applyWithFixtureReceipt(reviewer.db, assignmentPhaseRequest(
+      reviewer.fenceToken,
+      "assignment_dispatch",
+      "probe-candidate",
+      probeAttemptId,
+      { actorReceiptId: "role-actor-reviewer", expectedResourceRevision: 3 },
+    ), null, null, probeAdapter).outcome).toBe("OK");
+    expect(probeAdapter.dispatchCalls[0]?.candidateScope).toEqual({
+      mode: "read-only",
+      candidateSemantics: "frozen",
+      candidateSha: CANDIDATE_SHA,
+      mutations: "forbidden",
+    });
+
+    for (const [name, inspection] of [
+      ["candidate-head-mismatch", { headSha: H1_CANDIDATE_SHA }],
+      ["candidate-non-descendant", { mergeBaseSha: H1_CANDIDATE_SHA }],
+    ] as Array<[string, Partial<NativeAssignmentInspection>]>) {
+      const fixture = await assignmentFixture();
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+      activateReviewer(fixture.db, fixture.fenceToken);
+      const adapter = new DeterministicNativeAssignmentAdapter();
+      adapter.nextInspection = inspection;
+      const before = mutationCounts(fixture.db);
+      const request = {
+        ...reviewRequest,
+        idempotencyKey: name,
+        expectedFenceToken: fixture.fenceToken,
+        assignment: {
+          ...reviewRequest.assignment!,
+          assignmentId: name,
+          branchName: `bb/${name}`,
+          environment: { ...reviewRequest.assignment!.environment, environmentId: `environment-${name}` },
+        },
+      };
+      expect(applyWithFixtureReceipt(fixture.db, request, null, null, adapter).outcome, name).toBe("ASSIGNMENT_HEAD_STALE");
+      expect(mutationCounts(fixture.db)).toEqual(before);
+    }
+
+    const relabeled = await assignmentFixture();
+    expect(applyWithFixtureReceipt(relabeled.db, transitionRequest(relabeled.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    const relabeledRequest = assignmentPrepareRequest(relabeled.fenceToken, "candidate-relabeled-write", {
+      expectedResourceRevision: 3,
+      assignment: {
+        ...assignmentPrepareRequest(relabeled.fenceToken).assignment!,
+        assignmentId: "candidate-relabeled-write",
+        candidateSemantics: "frozen",
+        candidateSha: CANDIDATE_SHA,
+      },
+    });
+    const beforeRelabeled = mutationCounts(relabeled.db);
+    expect(applyWithFixtureReceipt(relabeled.db, relabeledRequest, null, null, new DeterministicNativeAssignmentAdapter()).outcome).toBe("ASSIGNMENT_HEAD_STALE");
+    expect(mutationCounts(relabeled.db)).toEqual(beforeRelabeled);
   });
 
   it("serializes writer lanes and the lower project ceiling while read-only assignments do not count", async () => {
