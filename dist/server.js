@@ -15687,6 +15687,8 @@ var laneListSchema = external_exports.array(laneViewSchema);
 var sidebarThreadIdSchema = external_exports.string().trim().min(1).max(256);
 var sidebarThreadStateSchema = external_exports.string().trim().min(1).max(64);
 var sidebarThreadStateKey = (threadId) => `sidebar.thread-state:${threadId}`;
+var sidebarCollapseKindSchema = external_exports.enum(["project", "thread"]);
+var sidebarCollapseKey = (kind, id2) => `sidebar.collapse:${kind}:${id2}`;
 var rpcContract = defineRpcContract({
   lanes: {
     input: external_exports.object({}).strict(),
@@ -15703,6 +15705,28 @@ var rpcContract = defineRpcContract({
   setThreadState: {
     input: external_exports.object({ threadId: sidebarThreadIdSchema, state: sidebarThreadStateSchema.nullable() }).strict(),
     output: external_exports.object({ state: sidebarThreadStateSchema.nullable() }).strict()
+  },
+  sidebarCollapseState: {
+    input: external_exports.object({
+      projectIds: external_exports.array(sidebarThreadIdSchema).max(256),
+      threadIds: external_exports.array(sidebarThreadIdSchema).max(256)
+    }).strict(),
+    output: external_exports.object({
+      projects: external_exports.record(external_exports.string(), external_exports.boolean()),
+      threads: external_exports.record(external_exports.string(), external_exports.boolean())
+    }).strict()
+  },
+  setSidebarCollapse: {
+    input: external_exports.object({ kind: sidebarCollapseKindSchema, id: sidebarThreadIdSchema, collapsed: external_exports.boolean() }).strict(),
+    output: external_exports.object({ kind: sidebarCollapseKindSchema, id: sidebarThreadIdSchema, collapsed: external_exports.boolean() }).strict()
+  },
+  reorderPinned: {
+    input: external_exports.object({
+      threadId: sidebarThreadIdSchema,
+      previousThreadId: sidebarThreadIdSchema.nullable(),
+      nextThreadId: sidebarThreadIdSchema.nullable()
+    }).strict(),
+    output: external_exports.object({ ok: external_exports.literal(true) }).strict()
   },
   doctor: {
     input: external_exports.object({ projectId: projectIdSchema }).strict(),
@@ -15860,6 +15884,29 @@ async function plugin(bb) {
       if (input.state === null) await bb.storage.kv.delete(sidebarThreadStateKey(input.threadId));
       else await bb.storage.kv.set(sidebarThreadStateKey(input.threadId), input.state);
       return { state: input.state };
+    },
+    async sidebarCollapseState(input) {
+      const read = async (kind, ids) => {
+        const entries = await Promise.all(ids.map(async (id2) => {
+          const value = await bb.storage.kv.get(sidebarCollapseKey(kind, id2));
+          return value === true ? [id2, true] : null;
+        }));
+        return Object.fromEntries(entries.filter((entry) => entry !== null));
+      };
+      return {
+        projects: await read("project", input.projectIds),
+        threads: await read("thread", input.threadIds)
+      };
+    },
+    async setSidebarCollapse(input) {
+      const key = sidebarCollapseKey(input.kind, input.id);
+      if (input.collapsed) await bb.storage.kv.set(key, true);
+      else await bb.storage.kv.delete(key);
+      return input;
+    },
+    async reorderPinned(input) {
+      await bb.sdk.threads.reorderPinned(input);
+      return { ok: true };
     },
     async doctor(input) {
       return doctor(db, bb.sdk, input.projectId);

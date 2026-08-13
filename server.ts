@@ -136,6 +136,8 @@ const laneListSchema = z.array(laneViewSchema);
 const sidebarThreadIdSchema = z.string().trim().min(1).max(256);
 const sidebarThreadStateSchema = z.string().trim().min(1).max(64);
 const sidebarThreadStateKey = (threadId: string) => `sidebar.thread-state:${threadId}`;
+const sidebarCollapseKindSchema = z.enum(["project", "thread"]);
+const sidebarCollapseKey = (kind: "project" | "thread", id: string) => `sidebar.collapse:${kind}:${id}`;
 
 export const rpcContract = defineRpcContract({
   lanes: {
@@ -153,6 +155,28 @@ export const rpcContract = defineRpcContract({
   setThreadState: {
     input: z.object({ threadId: sidebarThreadIdSchema, state: sidebarThreadStateSchema.nullable() }).strict(),
     output: z.object({ state: sidebarThreadStateSchema.nullable() }).strict(),
+  },
+  sidebarCollapseState: {
+    input: z.object({
+      projectIds: z.array(sidebarThreadIdSchema).max(256),
+      threadIds: z.array(sidebarThreadIdSchema).max(256),
+    }).strict(),
+    output: z.object({
+      projects: z.record(z.string(), z.boolean()),
+      threads: z.record(z.string(), z.boolean()),
+    }).strict(),
+  },
+  setSidebarCollapse: {
+    input: z.object({ kind: sidebarCollapseKindSchema, id: sidebarThreadIdSchema, collapsed: z.boolean() }).strict(),
+    output: z.object({ kind: sidebarCollapseKindSchema, id: sidebarThreadIdSchema, collapsed: z.boolean() }).strict(),
+  },
+  reorderPinned: {
+    input: z.object({
+      threadId: sidebarThreadIdSchema,
+      previousThreadId: sidebarThreadIdSchema.nullable(),
+      nextThreadId: sidebarThreadIdSchema.nullable(),
+    }).strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
   },
   doctor: {
     input: z.object({ projectId: projectIdSchema }).strict(),
@@ -330,6 +354,29 @@ export default async function plugin(bb: BbPluginApi) {
       if (input.state === null) await bb.storage.kv.delete(sidebarThreadStateKey(input.threadId));
       else await bb.storage.kv.set(sidebarThreadStateKey(input.threadId), input.state);
       return { state: input.state };
+    },
+    async sidebarCollapseState(input) {
+      const read = async (kind: "project" | "thread", ids: readonly string[]) => {
+        const entries = await Promise.all(ids.map(async (id) => {
+          const value = await bb.storage.kv.get<unknown>(sidebarCollapseKey(kind, id));
+          return value === true ? ([id, true] as const) : null;
+        }));
+        return Object.fromEntries(entries.filter((entry): entry is readonly [string, true] => entry !== null));
+      };
+      return {
+        projects: await read("project", input.projectIds),
+        threads: await read("thread", input.threadIds),
+      };
+    },
+    async setSidebarCollapse(input) {
+      const key = sidebarCollapseKey(input.kind, input.id);
+      if (input.collapsed) await bb.storage.kv.set(key, true);
+      else await bb.storage.kv.delete(key);
+      return input;
+    },
+    async reorderPinned(input) {
+      await bb.sdk.threads.reorderPinned(input);
+      return { ok: true as const };
     },
     async doctor(input) {
       return doctor(db, bb.sdk, input.projectId);
