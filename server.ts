@@ -18,6 +18,10 @@ import {
   doctor,
   exportFoundation,
   operatorAuthRequired,
+  operatorReceiptConfirmationSchema,
+  operatorReceiptRequestSchema,
+  OPERATOR_RECEIPT_RETIREMENT_CONDITION,
+  persistInterimOperatorReceipt,
   parseApplyRequest,
   type FoundationResult,
   type SqliteDatabase,
@@ -87,6 +91,24 @@ export const foundationResultSchema = z
     currentResourceRevision: z.number().int().positive().optional(),
     expectedResourceRevision: z.number().int().positive().optional(),
     mutationReceipt: mutationReceiptSchema.optional(),
+    operatorReceipt: z
+      .object({
+        receiptId: z.string(),
+        projectId: projectIdSchema,
+        receiptType: z.literal("operator_confirmation"),
+        mutationClass: z.string(),
+        candidateHead: z.string(),
+        bindingDigest: z.string(),
+        status: z.literal("interim"),
+        retirementCondition: z.literal(OPERATOR_RECEIPT_RETIREMENT_CONDITION),
+        callerThreadId: z.string(),
+        callerPluginId: z.string(),
+        requestedFromBackground: z.boolean(),
+        receiptDigest: z.string(),
+        createdAtMs: z.number().int().nonnegative(),
+      })
+      .strict()
+      .optional(),
     eventSequence: z.number().int().positive().optional(),
     evidence: z.unknown().optional(),
     export: exportSchema.optional(),
@@ -129,6 +151,10 @@ export const rpcContract = defineRpcContract({
     input: applyRequestSchema,
     output: foundationResultSchema,
   },
+  operatorReceipt: {
+    input: operatorReceiptRequestSchema,
+    output: foundationResultSchema,
+  },
 });
 
 function jsonResult(result: FoundationResult): string {
@@ -151,6 +177,15 @@ function invalidCli(message: string) {
     verified: 0,
     message,
   });
+}
+
+function operatorReceiptResult(
+  projectId: string,
+  outcome: FoundationResult["outcome"],
+  message: string,
+  extra: Pick<FoundationResult, "operatorReceipt"> = {},
+): FoundationResult {
+  return { outcome, subject: projectId, expected: 1, attempted: extra.operatorReceipt ? 1 : 0, verified: extra.operatorReceipt ? 1 : 0, message, ...extra };
 }
 
 function parseFlag(args: string[], name: string): string | null {
@@ -265,6 +300,41 @@ export default async function plugin(bb: BbPluginApi) {
     },
     async apply(input) {
       return operatorAuthRequired(input.projectId);
+    },
+    async operatorReceipt(input) {
+      if (!db) return operatorReceiptResult(input.projectId, "CANONICAL_STORE_UNAVAILABLE", "canonical SQLite store is unavailable");
+      const interaction = await bb.ui.requestInput({
+        threadId: input.callerThreadId,
+        rendererId: "operator-receipt",
+        title: "Confirm operator receipt",
+        payload: {
+          kind: "operator_receipt_confirmation",
+          projectId: input.projectId,
+          mutationClass: input.mutationClass,
+          candidateHead: input.candidateHead,
+          retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
+          requestedFromBackground: input.requestedFromBackground,
+        },
+      });
+      if (interaction.outcome === "cancelled") {
+        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_CANCELLED", `operator confirmation cancelled: ${interaction.reason}`);
+      }
+      const confirmation = operatorReceiptConfirmationSchema.safeParse(interaction.value);
+      if (!confirmation.success) return operatorReceiptResult(input.projectId, "INVALID_INPUT", "operator confirmation form result is invalid");
+      if (!confirmation.data.confirmed) return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_CANCELLED", "operator confirmation was not accepted");
+      if (
+        confirmation.data.projectId !== input.projectId ||
+        confirmation.data.mutationClass !== input.mutationClass ||
+        confirmation.data.candidateHead !== input.candidateHead
+      ) {
+        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_STALE", "operator confirmation binding is stale");
+      }
+      try {
+        const receipt = persistInterimOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId });
+        return operatorReceiptResult(input.projectId, "OK", "interim operator receipt persisted", { operatorReceipt: receipt });
+      } catch {
+        return operatorReceiptResult(input.projectId, "INTERNAL_ERROR", "interim operator receipt was not persisted");
+      }
     },
   });
 

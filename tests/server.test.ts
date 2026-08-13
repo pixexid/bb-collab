@@ -1182,7 +1182,7 @@ describe("bb-collab plugin boundary", () => {
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "OPERATOR_AUTH_REQUIRED" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules).toEqual([]);
-    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "doctor", "export", "lanes"]);
+    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "doctor", "export", "lanes", "operatorReceipt"]);
   });
 
   it("proves fixture bootstrap, read-only doctor, deterministic export, and exact BB fact reads", async () => {
@@ -1245,13 +1245,14 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("appends only the v6 MigrationRun table and two indexes and rolls every cached consumer forward", () => {
-    expect(SCHEMA_VERSION).toBe(6);
+  it("appends only the v7 interim operator receipt table and rolls every cached consumer forward", () => {
+    expect(SCHEMA_VERSION).toBe(7);
     expect(CONTRACT_VERSION).toBe(2);
-    expect(MIGRATIONS).toHaveLength(19);
-    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("9469e48a59bcd8113a04b1524ab10fc12f92936c96c821cba5491f3faa407502");
-    expect(MIGRATIONS.at(-1)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
+    expect(MIGRATIONS).toHaveLength(20);
+    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("9469e48a59bcd8113a04b1524ab10fc12f92936c96c821cba5491f3faa407502");
+    expect(MIGRATIONS.at(-2)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
     expect(MIGRATIONS.at(-1)?.match(/CREATE TABLE/gu)).toHaveLength(1);
+    expect(MIGRATIONS.at(-1)).toContain("operator_receipts");
     expect(TABLES).toContain("migration_runs");
     expect(MIGRATION_STATES).toEqual([
       "prepared", "frozen", "exported", "imported", "equivalent", "target_active", "exercised", "retired", "rolled_back", "fix_forward_required",
@@ -1259,8 +1260,8 @@ describe("bb-collab plugin boundary", () => {
     expect(MIGRATION_STEPS).toEqual([
       "record_inventory", "record_quiescence", "freeze", "record_export", "record_import", "record_equivalence", "activate", "record_exercise", "retire", "rollback", "mark_fix_forward_required",
     ]);
-    expect(cachedConsumerRolloutEvidence(5)).toMatchObject({ oldSchemaVersion: 5, newSchemaVersion: 6, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(6)).toMatchObject({ oldSchemaVersion: 5, newSchemaVersion: 6, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(6)).toMatchObject({ oldSchemaVersion: 6, newSchemaVersion: 7, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(7)).toMatchObject({ oldSchemaVersion: 6, newSchemaVersion: 7, action: "reread", expected: 4, attempted: 4, verified: 4 });
 
     const { db, directory } = directDatabase();
     try {
@@ -2784,8 +2785,8 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 5, newSchemaVersion: 6, expected: 4, attempted: 4, verified: 4 },
-        schema: { version: 6 },
+        cachedConsumers: { oldSchemaVersion: 6, newSchemaVersion: 7, expected: 4, attempted: 4, verified: 4 },
+        schema: { version: 7 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -3728,7 +3729,7 @@ describe("bb-collab plugin boundary", () => {
     db.pragma("foreign_keys = OFF");
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
-    db.exec(MIGRATIONS.at(-3)!);
+    db.exec(MIGRATIONS.at(-4)!);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -3748,8 +3749,8 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(5)).toMatchObject({ oldSchemaVersion: 5, newSchemaVersion: 6, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(6)).toMatchObject({ oldSchemaVersion: 5, newSchemaVersion: 6, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(6)).toMatchObject({ oldSchemaVersion: 6, newSchemaVersion: 7, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(7)).toMatchObject({ oldSchemaVersion: 6, newSchemaVersion: 7, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {
