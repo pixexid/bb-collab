@@ -6,8 +6,11 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 export const SCHEMA_VERSION = 1;
+// ponytail: keep exports bounded at 256 rows; add paged/file export before migration or cutover.
 export const MAX_EXPORT_ROWS = 256;
 export const MAX_EXPORT_BYTES = 512 * 1024;
+/** Deferred until a later cutover operation; issue #3 has no sanctioned freeze transition. */
+export const DEFERRED_ISSUE_3_OUTCOMES = ["PROJECT_FROZEN"] as const;
 
 export const TABLES = [
   "project_config_revisions",
@@ -159,6 +162,19 @@ const targetSchema = z
     defaultBranch: id,
   })
   .strict();
+const targetCollectionSchema = z.array(targetSchema).superRefine((targets, ctx) => {
+  const seen = new Set<string>();
+  for (const [index, target] of targets.entries()) {
+    if (seen.has(target.repoTargetId)) {
+      ctx.addIssue({
+        code: "custom",
+        path: [index, "repoTargetId"],
+        message: `duplicate repoTargetId ${target.repoTargetId}`,
+      });
+    }
+    seen.add(target.repoTargetId);
+  }
+});
 const decisionSchema = z
   .object({
     decisionId: id,
@@ -182,7 +198,7 @@ export const applyRequestSchema = z
     expectedResourceRevision: z.number().int().positive().nullable().optional(),
     runtimeId: id.optional(),
     config: z.unknown().optional(),
-    target: targetSchema.optional(),
+    targets: targetCollectionSchema.optional(),
     decision: decisionSchema.optional(),
     decisionId: id.optional(),
     disposition: z
@@ -217,6 +233,7 @@ export type FoundationCode =
   | "RESOURCE_REVISION_STALE"
   | "IDEMPOTENCY_KEY_CONFLICT"
   | "CANONICAL_STORE_UNAVAILABLE"
+  | "INTERNAL_ERROR"
   | "OPERATOR_AUTH_REQUIRED"
   | "CONFIG_SECRET_FORBIDDEN"
   | "MALFORMED_JSON"
@@ -349,6 +366,7 @@ function validateConfig(value: unknown): string {
 }
 
 function assertNoSecretValues(value: unknown, path = "config"): void {
+  // Structural key rejection cannot classify arbitrary string values reliably; callers and project schemas must pass references only.
   if (Array.isArray(value)) {
     value.forEach((item, index) => assertNoSecretValues(item, `${path}[${index}]`));
     return;
@@ -374,7 +392,7 @@ function normalizeRequest(request: ApplyRequest): ApplyRequest {
     expectedResourceRevision: request.expectedResourceRevision ?? null,
     runtimeId: request.runtimeId ?? undefined,
     config: request.config ?? undefined,
-    target: request.target ?? undefined,
+    targets: request.targets ?? undefined,
     decision: request.decision ?? undefined,
     decisionId: request.decisionId ?? undefined,
     disposition: request.disposition ?? undefined,
@@ -497,6 +515,7 @@ function requireGovernor(db: SqliteDatabase, request: ApplyRequest): { governanc
   const head = asRow<{ governance_epoch: number; fence_token: string; state: string }>(
     db.prepare("SELECT governance_epoch, fence_token, state FROM project_governorship_heads WHERE project_id = ?").get(request.projectId),
   );
+  // Issue #3 only reports this on an incomplete/corrupt state; no sanctioned path creates it.
   if (!head) throw refusal("GOVERNOR_UNAVAILABLE", "project has no current governorship head");
   if (
     request.expectedGovernanceEpoch !== head.governance_epoch ||
@@ -507,11 +526,12 @@ function requireGovernor(db: SqliteDatabase, request: ApplyRequest): { governanc
       expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? undefined,
     });
   }
+  // Deferred ceiling: issue #3 has no sanctioned freeze/cutover operation; PROJECT_FROZEN is reserved for that later slice.
   if (head.state !== "target_active") throw refusal("PROJECT_FROZEN", "project governorship is not writable");
   return head;
 }
 
-function targetDigest(target: NonNullable<ApplyRequest["target"]>): string {
+function targetDigest(target: NonNullable<ApplyRequest["targets"]>[number]): string {
   return sha256(
     canonicalJson({
       repoTargetId: target.repoTargetId,
@@ -522,6 +542,17 @@ function targetDigest(target: NonNullable<ApplyRequest["target"]>): string {
       defaultBranch: target.defaultBranch,
     }),
   );
+}
+
+function requireTargetCollection(request: ApplyRequest, operation: string): NonNullable<ApplyRequest["targets"]> {
+  const targets = request.targets;
+  if (!targets || targets.length === 0) {
+    throw refusal("REPO_TARGET_REQUIRED", `${operation} requires one or more exact repository targets`);
+  }
+  if (request.repoTargetId && !targets.some((target) => target.repoTargetId === request.repoTargetId)) {
+    throw refusal("REPO_TARGET_FOREIGN", "repository target selector is not present in the target collection");
+  }
+  return targets;
 }
 
 function requireTarget(
@@ -652,16 +683,12 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
   const actorReceiptId = requireActor(db, request);
   const config = request.config === undefined ? undefined : validateConfig(request.config);
   if (!config) throw refusal("INVALID_INPUT", "bootstrap requires a config object");
-  if (!request.target) throw refusal("REPO_TARGET_REQUIRED", "bootstrap requires an exact repository target");
+  const targets = requireTargetCollection(request, "bootstrap");
   const existingConfig = currentConfig(db, request.projectId);
   const existingGovernor = db
     .prepare("SELECT 1 FROM project_governorship_heads WHERE project_id = ?")
     .get(request.projectId);
   if (existingConfig || existingGovernor) throw refusal("GOVERNOR_CAS_FAILED", "bootstrap head already exists");
-  const target = request.target;
-  if (request.repoTargetId && request.repoTargetId !== target.repoTargetId) {
-    throw refusal("REPO_TARGET_FOREIGN", "request target id does not match target payload");
-  }
   const createdAtMs = now();
   db.prepare(
     `INSERT INTO project_config_revisions
@@ -672,20 +699,23 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
     request.projectId,
     createdAtMs,
   );
-  db.prepare(
+  const insertTarget = db.prepare(
     `INSERT INTO repository_targets
       (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest)
      VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    request.projectId,
-    target.repoTargetId,
-    target.sourceId,
-    target.hostId,
-    target.path,
-    target.remoteUrl,
-    target.defaultBranch,
-    targetDigest(target),
   );
+  for (const target of targets) {
+    insertTarget.run(
+      request.projectId,
+      target.repoTargetId,
+      target.sourceId,
+      target.hostId,
+      target.path,
+      target.remoteUrl,
+      target.defaultBranch,
+      targetDigest(target),
+    );
+  }
   const fenceToken = newFenceToken();
   db.prepare(
     `INSERT INTO project_governorships
@@ -699,7 +729,7 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
   ).run(request.projectId, fenceToken, createdAtMs);
   if (request.decision) {
     const decision = request.decision;
-    if (decision.repoTargetId !== null && decision.repoTargetId !== target.repoTargetId) {
+    if (decision.repoTargetId !== null && !targets.some((target) => target.repoTargetId === decision.repoTargetId)) {
       throw refusal("REPO_TARGET_FOREIGN", "decision target does not match bootstrap target");
     }
     const scopeJson = canonicalJson(decision.scope);
@@ -726,13 +756,17 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
       aggregateId: request.projectId,
       aggregateRevision: 1,
       eventType: "foundation_bootstrapped",
-      event: { configRevision: 1, repoTargetId: target.repoTargetId, governanceEpoch: 1 },
+      event: { configRevision: 1, repoTargetIds: targets.map((target) => target.repoTargetId), governanceEpoch: 1 },
     },
-    { expected: 3, attempted: 3, verified: 3 },
+    { expected: targets.length + 2, attempted: targets.length + 2, verified: targets.length + 2 },
     {
       currentConfigRevision: 1,
       currentGovernanceEpoch: 1,
-      evidence: { configDigest: sha256(config), targetDigest: targetDigest(target), fenceToken },
+      evidence: {
+        configDigest: sha256(config),
+        targetDigests: targets.map((target) => ({ repoTargetId: target.repoTargetId, digest: targetDigest(target) })),
+        fenceToken,
+      },
     },
   );
 }
@@ -741,11 +775,12 @@ function applyConfigRevision(db: SqliteDatabase, request: ApplyRequest, digest: 
   const currentRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
-  if (!request.config || !request.target) {
+  if (!request.config || !request.targets) {
     requireTarget(db, request.projectId, currentRevision, request.repoTargetId);
-    throw refusal("INVALID_INPUT", "config revision requires config and target");
+    throw refusal("INVALID_INPUT", "config revision requires config and target collection");
   }
   const configJson = validateConfig(request.config);
+  const targets = requireTargetCollection(request, "config revision");
   const nextRevision = currentRevision + 1;
   if (request.configRevision !== null && request.configRevision !== nextRevision) {
     throw refusal("PROJECT_CONFIG_STALE", "new config revision is not the next immutable revision", {
@@ -753,31 +788,30 @@ function applyConfigRevision(db: SqliteDatabase, request: ApplyRequest, digest: 
       expectedConfigRevision: nextRevision,
     });
   }
-  const target = request.target;
-  if (request.repoTargetId && request.repoTargetId !== target.repoTargetId) {
-    throw refusal("REPO_TARGET_FOREIGN", "request target id does not match target payload");
-  }
   const createdAtMs = now();
   db.prepare(
     `INSERT INTO project_config_revisions
       (project_id, config_revision, canonical_config_json, config_digest, created_at_ms)
      VALUES (?, ?, ?, ?, ?)`,
   ).run(request.projectId, nextRevision, configJson, sha256(configJson), createdAtMs);
-  db.prepare(
+  const insertTarget = db.prepare(
     `INSERT INTO repository_targets
       (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    request.projectId,
-    target.repoTargetId,
-    nextRevision,
-    target.sourceId,
-    target.hostId,
-    target.path,
-    target.remoteUrl,
-    target.defaultBranch,
-    targetDigest(target),
   );
+  for (const target of targets) {
+    insertTarget.run(
+      request.projectId,
+      target.repoTargetId,
+      nextRevision,
+      target.sourceId,
+      target.hostId,
+      target.path,
+      target.remoteUrl,
+      target.defaultBranch,
+      targetDigest(target),
+    );
+  }
   const headUpdate = db
     .prepare(
       "UPDATE project_config_heads SET config_revision = ?, updated_at_ms = ? WHERE project_id = ? AND config_revision = ?",
@@ -799,9 +833,9 @@ function applyConfigRevision(db: SqliteDatabase, request: ApplyRequest, digest: 
       aggregateId: request.projectId,
       aggregateRevision: nextRevision,
       eventType: "config_revision_appended",
-      event: { configRevision: nextRevision, repoTargetId: target.repoTargetId, previousGovernorEpoch: governor.governance_epoch },
+      event: { configRevision: nextRevision, repoTargetIds: targets.map((target) => target.repoTargetId), previousGovernorEpoch: governor.governance_epoch },
     },
-    { expected: 2, attempted: 2, verified: 2 },
+    { expected: targets.length + 1, attempted: targets.length + 1, verified: targets.length + 1 },
     { currentConfigRevision: nextRevision, currentGovernanceEpoch: governor.governance_epoch },
   );
 }
@@ -812,6 +846,7 @@ function applyGovernorClaim(db: SqliteDatabase, request: ApplyRequest, digest: s
     db.prepare("SELECT governance_epoch, fence_token, state FROM project_governorship_heads WHERE project_id = ?").get(request.projectId),
   );
   if (!currentHead) throw refusal("GOVERNOR_UNAVAILABLE", "project has no current governorship head");
+  // Deferred ceiling: issue #3 cannot transition a governorship to frozen; later cutover owns PROJECT_FROZEN.
   if (currentHead.state !== "target_active") throw refusal("PROJECT_FROZEN", "project governorship is not writable");
   const expectedEpoch = request.expectedGovernanceEpoch;
   const expectedToken = request.expectedFenceToken;
@@ -965,8 +1000,8 @@ export function applyFixtureMutation(db: SqliteDatabase | null, input: unknown):
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  const digest = requestDigest(request);
   try {
+    const digest = requestDigest(request);
     return transaction(db, () => {
       const replay = checkIdempotency(db, request, digest);
       if (replay) return replay;
@@ -984,7 +1019,7 @@ export function applyFixtureMutation(db: SqliteDatabase | null, input: unknown):
   } catch (error) {
     if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
     if (isConstraintError(error)) return result("CANONICAL_STORE_UNAVAILABLE", request.projectId, 1, 0, 0, { message: String(error) });
-    return result("CANONICAL_STORE_UNAVAILABLE", request.projectId, 1, 0, 0, { message: String(error) });
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
   }
 }
 
