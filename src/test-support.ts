@@ -9,6 +9,10 @@ import {
   type GitHubIssueAdapter,
   type GitHubIssueMutation,
   type GitHubIssueSnapshot,
+  type NativeAssignmentAdapter,
+  type NativeAssignmentEvidence,
+  type NativeAssignmentInput,
+  type NativeAssignmentInspection,
   type RoleEnvironmentFact,
   type RoleEventFact,
   type RoleFactReader,
@@ -165,6 +169,11 @@ export class DeterministicRoleFactReader implements RoleFactReader {
     },
   ) {}
 
+  serverId(): string {
+    this.readCalls.push("server.id");
+    return "bb-server-test";
+  }
+
   thread(threadId: string): RoleThreadFact {
     this.readCalls.push(`thread:${threadId}`);
     if (this.facts.thread.id !== threadId) throw new Error("unknown thread");
@@ -201,11 +210,93 @@ export class DeterministicRoleFactReader implements RoleFactReader {
   }
 }
 
+export class DeterministicNativeAssignmentAdapter implements NativeAssignmentAdapter {
+  readonly inspectCalls: Array<{ projectId: string; repoTargetId: string; assignment: ApplyRequest["assignment"] }> = [];
+  readonly dispatchCalls: NativeAssignmentInput[] = [];
+  readonly reconcileCalls: Array<NativeAssignmentInput & { threadId: string | null; nativeRequestId: string | null }> = [];
+  nextEvidence: Partial<NativeAssignmentEvidence> | null = null;
+  nextInspection: Partial<NativeAssignmentInspection> | null = null;
+  onInspect: ((input: { projectId: string; repoTargetId: string; assignment: NonNullable<ApplyRequest["assignment"]> }) => void) | null = null;
+  onDispatch: ((input: NativeAssignmentInput) => void) | null = null;
+
+  inspect(input: { projectId: string; repoTargetId: string; assignment: NonNullable<ApplyRequest["assignment"]> }): NativeAssignmentInspection {
+    this.inspectCalls.push(structuredClone(input));
+    this.onInspect?.(input);
+    const override = this.nextInspection;
+    this.nextInspection = null;
+    return {
+      bbServerId: input.assignment.environment.bbServerId,
+      projectId: input.projectId,
+      environmentId: input.assignment.environment.environmentId,
+      sourceId: input.assignment.environment.sourceId,
+      hostId: input.assignment.environment.hostId,
+      environmentPath: input.assignment.environment.path,
+      environmentMode: input.assignment.environment.mode,
+      branchName: input.assignment.branchName,
+      headSha: input.assignment.candidateSha ?? input.assignment.baseSha,
+      baseSha: input.assignment.baseSha,
+      candidateSha: input.assignment.candidateSha,
+      threadId: input.assignment.attachThreadId,
+      threadProviderId: input.assignment.attachThreadId ? input.assignment.requestedProfile.providerId : null,
+      threadVisibility: input.assignment.attachThreadId ? input.assignment.requestedProfile.visibility : null,
+      ...override,
+    };
+  }
+
+  private evidence(input: NativeAssignmentInput): NativeAssignmentEvidence {
+    const override = this.nextEvidence;
+    this.nextEvidence = null;
+    return {
+      disposition: "confirmed",
+      reasonCode: "exact_content_receipt",
+      assignmentId: input.assignmentId,
+      executionAttemptId: input.executionAttemptId,
+      bbServerId: input.environment.bbServerId,
+      projectId: input.projectId,
+      environmentId: input.environment.environmentId,
+      sourceId: input.environment.sourceId,
+      hostId: input.environment.hostId,
+      environmentPath: input.environment.path,
+      threadId: input.attachThreadId ?? `thread-${input.assignmentId}`,
+      providerThreadId: `provider-${input.executionAttemptId}`,
+      nativeRequestId: `request-${input.executionAttemptId}`,
+      requestEventId: `request-event-${input.executionAttemptId}`,
+      requestEventSeq: 1,
+      acceptedEventId: `accepted-event-${input.executionAttemptId}`,
+      acceptedEventSeq: 2,
+      firstActionEventId: `first-action-${input.executionAttemptId}`,
+      firstActionEventSeq: 3,
+      contentEventId: `content-event-${input.executionAttemptId}`,
+      contentEventSeq: 4,
+      contentDigest: input.frozenBriefDigest,
+      actualProfile: structuredClone(input.requestedProfile),
+      branchName: input.branchName,
+      baseSha: input.baseSha,
+      candidateSha: input.candidateSha,
+      lastEventSeq: 4,
+      observedAtMs: Date.now(),
+      ...override,
+    };
+  }
+
+  dispatch(input: NativeAssignmentInput): NativeAssignmentEvidence {
+    this.dispatchCalls.push(structuredClone(input));
+    this.onDispatch?.(input);
+    return this.evidence(input);
+  }
+
+  reconcile(input: NativeAssignmentInput & { threadId: string | null; nativeRequestId: string | null }): NativeAssignmentEvidence {
+    this.reconcileCalls.push(structuredClone(input));
+    return this.evidence(input);
+  }
+}
+
 export function applyWithFixtureReceipt(
   db: Database.Database,
   request: ApplyRequest,
   githubAdapter: GitHubIssueAdapter | null = null,
   roleFactReader: RoleFactReader | null = null,
+  nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
 ): FoundationResult {
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter);
 }
