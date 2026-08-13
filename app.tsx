@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { definePluginApp, experimental_useSidebarThreadActions, experimental_useSidebarThreads, useRpc } from "@bb/plugin-sdk/app";
 import type {
   PluginComposerThreadRowStatus,
@@ -77,6 +77,15 @@ function sortRecent(a: PluginSidebarThread, b: PluginSidebarThread): number {
   return b.updatedAt - a.updatedAt || b.createdAt - a.createdAt || a.id.localeCompare(b.id);
 }
 
+function sortSidebarThreads(threads: PluginSidebarThread[]): PluginSidebarThread[] {
+  const inputIndex = new Map(threads.map((thread, index) => [thread.id, index]));
+  return threads.sort((a, b) => {
+    if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+    if (a.isPinned) return inputIndex.get(a.id)! - inputIndex.get(b.id)!;
+    return sortRecent(a, b);
+  });
+}
+
 export function groupThreads(
   projects: readonly PluginSidebarProject[],
   threads: readonly PluginSidebarThread[],
@@ -91,7 +100,7 @@ export function groupThreads(
     group.threads.push(thread);
     groups.set(project.id, group);
   }
-  return [...groups.values()].map((group) => ({ ...group, threads: group.threads.sort(sortRecent) }));
+  return [...groups.values()].map((group) => ({ ...group, threads: sortSidebarThreads(group.threads) }));
 }
 
 type ThreadTreeNode = { thread: PluginSidebarThread; children: ThreadTreeNode[] };
@@ -105,7 +114,12 @@ export function buildThreadTree(threads: readonly PluginSidebarThread[]): Thread
     else roots.push(node);
   }
   const sort = (items: ThreadTreeNode[]) => {
-    items.sort((a, b) => sortRecent(a.thread, b.thread));
+    const inputIndex = new Map(items.map((item, index) => [item.thread.id, index]));
+    items.sort((a, b) => {
+      if (a.thread.isPinned !== b.thread.isPinned) return a.thread.isPinned ? -1 : 1;
+      if (a.thread.isPinned) return inputIndex.get(a.thread.id)! - inputIndex.get(b.thread.id)!;
+      return sortRecent(a.thread, b.thread);
+    });
     items.forEach((item) => sort(item.children));
   };
   sort(roots);
@@ -126,7 +140,10 @@ function ThreadRow({
   hasChildren,
   onToggleChildren,
   onDrop,
+  onDragEnter,
+  onDragEnd,
   onDragStart,
+  onPointerEnd,
   onNavigate,
 }: {
   thread: PluginSidebarThread;
@@ -138,7 +155,10 @@ function ThreadRow({
   hasChildren: boolean;
   onToggleChildren: () => void;
   onDrop: (threadId: string) => void;
+  onDragEnter: (threadId: string) => void;
+  onDragEnd: (threadId: string) => void;
   onDragStart: (threadId: string) => void;
+  onPointerEnd: (threadId: string) => void;
   onNavigate: () => void;
 }) {
   const actions = experimental_useSidebarThreadActions();
@@ -163,7 +183,7 @@ function ThreadRow({
     run();
   };
   return (
-    <div className={`group relative flex items-start gap-1 border-l-2 py-1.5 pr-2 text-left text-sm hover:bg-muted/50 ${indicatorClasses(thread)}`} style={{ paddingLeft: `${8 + depth * 16}px` }} onDrop={(event) => { event.preventDefault(); onDrop(event.dataTransfer?.getData("text/plain") ?? ""); }} onDragOver={(event) => event.preventDefault()}>
+    <div className={`group relative flex items-start gap-1 border-l-2 py-1.5 pr-2 text-left text-sm hover:bg-muted/50 ${indicatorClasses(thread)}`} style={{ paddingLeft: `${8 + depth * 16}px` }} onDrop={(event) => { event.preventDefault(); onDrop(event.dataTransfer?.getData("text/plain") ?? ""); }} onDragEnter={() => onDragEnter(thread.id)} onDragOver={(event) => event.preventDefault()} onPointerUp={() => onPointerEnd(thread.id)} onMouseUp={() => onPointerEnd(thread.id)}>
       {hasChildren ? <button type="button" className="mt-1 h-6 w-6 shrink-0 rounded text-muted-foreground hover:bg-muted hover:text-foreground" aria-label={`${collapsed ? "Expand" : "Collapse"} ${title} children`} aria-expanded={!collapsed} onClick={onToggleChildren}>{collapsed ? "›" : "⌄"}</button> : <span className="w-6 shrink-0" aria-hidden="true" />}
       {renaming ? (
         <input autoFocus className="min-w-0 flex-1 rounded border border-border bg-background px-1 text-sm text-foreground" aria-label={`Rename ${title}`} value={renameValue} onChange={(event) => setRenameValue(event.target.value)} onBlur={finishRename} onKeyDown={(event) => { if (event.key === "Enter") finishRename(); if (event.key === "Escape") setRenaming(false); }} />
@@ -175,7 +195,10 @@ function ThreadRow({
           data-sidebar-thread-shortcut-target=""
           data-sidebar-thread-id={thread.id}
           draggable={thread.isPinned}
+          onPointerDown={(event) => { if (thread.isPinned && event.button === 0) onDragStart(thread.id); }}
+          onMouseDown={(event) => { if (thread.isPinned && event.button === 0) onDragStart(thread.id); }}
           onDragStart={(event) => { if (!thread.isPinned) return; event.dataTransfer?.setData("text/plain", thread.id); event.dataTransfer?.setDragImage(event.currentTarget, 0, 0); onDragStart(thread.id); }}
+          onDragEnd={() => onDragEnd(thread.id)}
           onClick={(event) => { event.preventDefault(); actions.open(thread.id); onNavigate(); }}
         >
           <span className={`mt-1 w-4 shrink-0 text-center ${signal.kind === "attention" ? "text-primary" : signal.kind === "pending" ? "text-primary animate-pulse" : signal.kind === "running" ? "text-primary animate-spin" : "text-muted-foreground"}`} aria-label={signal.label} title={signal.label} data-sidebar-thread-signal={signal.kind} data-active-count={activityCount}>{signal.glyph}</span>
@@ -208,7 +231,8 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set());
   const [collapsedThreads, setCollapsedThreads] = useState<Set<string>>(() => new Set());
-  const [draggingThreadId, setDraggingThreadId] = useState<string | null>(null);
+  const draggingThreadId = useRef<string | null>(null);
+  const dragTargetId = useRef<string | null>(null);
   const [customStates, setCustomStates] = useState<ThreadStates>({});
   const [threadModels, setThreadModels] = useState<ThreadModels>({});
   const threadIds = useMemo(() => sidebar.threads.map((thread) => thread.id), [sidebar.threads]);
@@ -267,11 +291,17 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     if (insertionIndex < 0) return;
     void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: remaining[insertionIndex - 1] ?? null, nextThreadId: remaining[insertionIndex] ?? null }).catch(() => undefined);
   };
+  const startPinnedDrag = (threadId: string) => { draggingThreadId.current = threadId; dragTargetId.current = null; };
+  const finishPinnedDrag = (targetId = dragTargetId.current ?? "", draggedId = draggingThreadId.current ?? "") => {
+    draggingThreadId.current = null;
+    dragTargetId.current = null;
+    reorderPinned(draggedId, targetId);
+  };
 
   const renderNode = (node: ThreadTreeNode, model: string | null, depth: number): ReactNode => {
     const childrenCollapsed = collapsedThreads.has(node.thread.id);
     return <div key={node.thread.id}>
-      <ThreadRow thread={node.thread} model={model} active={node.thread.id === activeThreadId} customState={customStates[node.thread.id]} depth={depth} collapsed={childrenCollapsed} hasChildren={node.children.length > 0} onToggleChildren={() => toggleThread(node.thread.id)} onDrop={(draggedId) => reorderPinned(draggedId || draggingThreadId || "", node.thread.id)} onDragStart={setDraggingThreadId} onNavigate={onNavigate} />
+      <ThreadRow thread={node.thread} model={model} active={node.thread.id === activeThreadId} customState={customStates[node.thread.id]} depth={depth} collapsed={childrenCollapsed} hasChildren={node.children.length > 0} onToggleChildren={() => toggleThread(node.thread.id)} onDrop={(draggedId) => finishPinnedDrag(node.thread.id, draggedId || undefined)} onDragEnter={(threadId) => { dragTargetId.current = threadId; }} onDragEnd={(threadId) => finishPinnedDrag(undefined, threadId)} onDragStart={startPinnedDrag} onPointerEnd={finishPinnedDrag} onNavigate={onNavigate} />
       {!childrenCollapsed ? node.children.map((child) => renderNode(child, threadModels[child.thread.id] ?? null, depth + 1)) : null}
     </div>;
   };

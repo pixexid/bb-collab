@@ -113,6 +113,20 @@ describe("replacement thread list", () => {
     expect(rendered.getByRole("button", { name: "Show more (1)" })).toBeTruthy();
   });
 
+  it("preserves host order for pinned rows even when updatedAt disagrees", async () => {
+    const list = await registration();
+    const hostOrder = [
+      { ...thread("pinned-first", "project-a", 1), isPinned: true },
+      { ...thread("pinned-second", "project-a", 2), isPinned: true },
+    ];
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: hostOrder },
+      rpc: rpcHandlers(),
+    });
+
+    expect(Array.from(rendered.container.querySelectorAll<HTMLElement>("[data-sidebar-thread-id]")).map((row) => row.dataset.sidebarThreadId)).toEqual(["pinned-first", "pinned-second"]);
+  });
+
   it("expands one project without changing other project groups", async () => {
     const list = await registration();
     const threads = Array.from({ length: 6 }, (_, index) => thread(`project-a-${index + 1}`, "project-a", index + 1));
@@ -212,6 +226,62 @@ describe("replacement thread list", () => {
     const transfer = { setData: vi.fn(), getData: () => "pinned-1", setDragImage: vi.fn(), effectAllowed: "none" };
     fireEvent.dragStart(rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!, { dataTransfer: transfer });
     fireEvent.drop(rendered.container.querySelector('[data-sidebar-thread-id="pinned-2"]')!, { dataTransfer: transfer });
+    await waitFor(() => expect(rendered.inspection.rpcCalls).toContainEqual({
+      method: "reorderPinned",
+      input: { threadId: "pinned-1", previousThreadId: null, nextThreadId: "pinned-2" },
+    }));
+  });
+
+  it("keeps the pointer drag fallback on the same typed reorder path", async () => {
+    const list = await registration();
+    const first = { ...thread("pinned-1", "project-a", 2), isPinned: true };
+    const second = { ...thread("pinned-2", "project-a", 1), isPinned: true };
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [first, second] },
+      rpc: rpcHandlers(),
+    });
+    const firstRow = rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!;
+    const secondRow = rendered.container.querySelector('[data-sidebar-thread-id="pinned-2"]')!;
+    fireEvent.pointerDown(firstRow, { button: 0 });
+    fireEvent.pointerUp(secondRow, { button: 0 });
+    await waitFor(() => expect(rendered.inspection.rpcCalls).toContainEqual({
+      method: "reorderPinned",
+      input: { threadId: "pinned-1", previousThreadId: null, nextThreadId: "pinned-2" },
+    }));
+  });
+
+  it("keeps the mouse drag fallback on the same typed reorder path", async () => {
+    const list = await registration();
+    const first = { ...thread("pinned-1", "project-a", 2), isPinned: true };
+    const second = { ...thread("pinned-2", "project-a", 1), isPinned: true };
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [first, second] },
+      rpc: rpcHandlers(),
+    });
+    const firstRow = rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!;
+    const secondRow = rendered.container.querySelector('[data-sidebar-thread-id="pinned-2"]')!;
+    fireEvent.mouseDown(firstRow, { button: 0 });
+    fireEvent.mouseUp(secondRow, { button: 0 });
+    await waitFor(() => expect(rendered.inspection.rpcCalls).toContainEqual({
+      method: "reorderPinned",
+      input: { threadId: "pinned-1", previousThreadId: null, nextThreadId: "pinned-2" },
+    }));
+  });
+
+  it("commits native dragend after dragenter when drop is unavailable", async () => {
+    const list = await registration();
+    const first = { ...thread("pinned-1", "project-a", 2), isPinned: true };
+    const second = { ...thread("pinned-2", "project-a", 1), isPinned: true };
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [first, second] },
+      rpc: rpcHandlers(),
+    });
+    const firstRow = rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!;
+    const secondRow = rendered.container.querySelector('[data-sidebar-thread-id="pinned-2"]')!;
+    const transfer = { setData: vi.fn(), getData: () => "pinned-1", setDragImage: vi.fn(), effectAllowed: "none" };
+    fireEvent.dragStart(firstRow, { dataTransfer: transfer });
+    fireEvent.dragEnter(secondRow);
+    fireEvent.dragEnd(firstRow);
     await waitFor(() => expect(rendered.inspection.rpcCalls).toContainEqual({
       method: "reorderPinned",
       input: { threadId: "pinned-1", previousThreadId: null, nextThreadId: "pinned-2" },
