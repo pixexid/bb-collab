@@ -2,6 +2,14 @@
 
 BB-native project governance, work lifecycle, and collaboration runtime.
 
+## Sidebar thread list
+
+The optional `bb-collab thread list` provider groups live threads by stable
+project identity and keeps custom per-thread state in plugin storage. Select it
+in Settings > Appearance > Sidebar. The built-in list remains the default and
+retains the Lane 1 thread-row pulse fallback; the host continues to render
+new-thread, search, navigation rows, and the footer.
+
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.

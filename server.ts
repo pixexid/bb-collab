@@ -133,11 +133,22 @@ const laneViewSchema = z
   .strict();
 
 const laneListSchema = z.array(laneViewSchema);
+const sidebarThreadIdSchema = z.string().trim().min(1).max(256);
+const sidebarThreadStateSchema = z.string().trim().min(1).max(64);
+const sidebarThreadStateKey = (threadId: string) => `sidebar.thread-state:${threadId}`;
 
 export const rpcContract = defineRpcContract({
   lanes: {
     input: z.object({}).strict(),
     output: laneListSchema,
+  },
+  threadStates: {
+    input: z.object({ threadIds: z.array(sidebarThreadIdSchema).max(256) }).strict(),
+    output: z.record(z.string(), sidebarThreadStateSchema),
+  },
+  setThreadState: {
+    input: z.object({ threadId: sidebarThreadIdSchema, state: sidebarThreadStateSchema.nullable() }).strict(),
+    output: z.object({ state: sidebarThreadStateSchema.nullable() }).strict(),
   },
   doctor: {
     input: z.object({ projectId: projectIdSchema }).strict(),
@@ -291,6 +302,19 @@ export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(rpcContract, {
     lanes() {
       return db ? openLaneViews(db) : [];
+    },
+    async threadStates(input) {
+      const entries = await Promise.all(input.threadIds.map(async (threadId) => {
+        const value = await bb.storage.kv.get<unknown>(sidebarThreadStateKey(threadId));
+        const parsed = sidebarThreadStateSchema.safeParse(value);
+        return parsed.success ? ([threadId, parsed.data] as const) : null;
+      }));
+      return Object.fromEntries(entries.filter((entry): entry is readonly [string, string] => entry !== null));
+    },
+    async setThreadState(input) {
+      if (input.state === null) await bb.storage.kv.delete(sidebarThreadStateKey(input.threadId));
+      else await bb.storage.kv.set(sidebarThreadStateKey(input.threadId), input.state);
+      return { state: input.state };
     },
     async doctor(input) {
       return doctor(db, bb.sdk, input.projectId);
