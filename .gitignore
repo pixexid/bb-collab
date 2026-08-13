@@ -1,3 +1,7 @@
 node_modules/
 dist/
+!dist/
+dist/*
+!dist/server.js
+!dist/server.meta.json
 npm-debug.log*
