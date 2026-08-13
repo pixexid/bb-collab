@@ -12,12 +12,12 @@
     "branding": {
       "icon": "Database"
     },
-    "server": "./server.ts",
+    "server": "./dist/server.js",
     "app": "./app.tsx",
     "skills": []
   },
   "scripts": {
-    "build": "bb plugin build",
+    "build": "node scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "verify": "npm run typecheck && npm test && npm run build"
