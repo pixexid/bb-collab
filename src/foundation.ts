@@ -2671,12 +2671,11 @@ function validateMigrationExport(payload: NonNullable<ApplyRequest["migrationSte
     throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture artifact index is not sorted and unique");
   }
   for (const artifact of payload.artifactIndex) {
+    const redacted = parseCanonicalEvidenceJson(artifact.redactedJson, "migration artifact redacted metadata");
+    const durable = parseCanonicalEvidenceJson(artifact.durableRefJson, "migration artifact durable reference");
     try {
-      const durableRef = JSON.parse(artifact.durableRefJson);
       if (
-        canonicalJson(JSON.parse(artifact.redactedJson)) !== artifact.redactedJson ||
-        canonicalJson(durableRef) !== artifact.durableRefJson ||
-        sha256(artifact.redactedJson) !== artifact.redactedDigest ||
+        sha256(redacted.json) !== artifact.redactedDigest ||
         sha256(canonicalJson({
           projectId,
           evidenceId: artifact.evidenceId,
@@ -2686,7 +2685,7 @@ function validateMigrationExport(payload: NonNullable<ApplyRequest["migrationSte
           executionAttemptId: artifact.executionAttemptId,
           contentDigest: artifact.contentDigest,
           redactedDigest: artifact.redactedDigest,
-          durableRef,
+          durableRef: durable.value,
         })) !== artifact.artifactIdentityDigest
       ) throw new Error("digest mismatch");
     } catch {

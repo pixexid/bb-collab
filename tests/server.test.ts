@@ -526,6 +526,39 @@ function fixtureExport(db: Database.Database): ExportPayload {
   return exported.export!;
 }
 
+function resealArtifactExport(payload: ExportPayload, mutate: (artifact: ExportPayload["artifactIndex"][number]) => void): ExportPayload {
+  const resealed = structuredClone(payload);
+  mutate(resealed.artifactIndex[0]!);
+  for (const artifact of resealed.artifactIndex) {
+    const redacted = JSON.parse(artifact.redactedJson);
+    const durableRef = JSON.parse(artifact.durableRefJson);
+    artifact.redactedJson = canonicalJson(redacted);
+    artifact.durableRefJson = canonicalJson(durableRef);
+    artifact.redactedDigest = sha256(artifact.redactedJson);
+    artifact.artifactIdentityDigest = sha256(canonicalJson({
+      projectId: PROJECT_ID,
+      evidenceId: artifact.evidenceId,
+      evidenceKind: artifact.evidenceKind,
+      sourceKind: artifact.sourceKind,
+      sourceRef: artifact.sourceRef,
+      executionAttemptId: artifact.executionAttemptId,
+      contentDigest: artifact.contentDigest,
+      redactedDigest: artifact.redactedDigest,
+      durableRef: JSON.parse(artifact.durableRefJson),
+    }));
+  }
+  resealed.manifest.artifactIndexDigest = sha256(canonicalJson(resealed.artifactIndex));
+  const rootInput = { ...resealed.manifest };
+  delete (rootInput as Partial<ExportPayload["manifest"]>).exportRootDigest;
+  resealed.manifest.exportRootDigest = sha256(canonicalJson(rootInput));
+  resealed.checksums = {
+    "artifact-index.json": resealed.manifest.artifactIndexDigest,
+    "manifest.json": sha256(canonicalJson(resealed.manifest)),
+    "records.ndjson": resealed.manifest.recordsDigest,
+  };
+  return resealed;
+}
+
 function recordMigrationExport(db: Database.Database) {
   const exported = fixtureExport(db);
   const ceiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
@@ -570,7 +603,7 @@ function activateMigration(db: Database.Database) {
 
 function seedEvidenceArtifact(db: Database.Database, evidenceId: string, payloadBytes = 0) {
   const redactedJson = canonicalJson({ evidenceId, redacted: true });
-  const durableRefJson = canonicalJson({ kind: "fixture", ref: evidenceId, payload: "x".repeat(payloadBytes) });
+  const durableRefJson = canonicalJson({ kind: "fixture", ref: evidenceId, fixtureContent: "x".repeat(payloadBytes) });
   const artifact = {
     projectId: PROJECT_ID,
     evidenceId,
@@ -1336,6 +1369,25 @@ describe("bb-collab plugin boundary", () => {
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
     expect(firstExport.manifest).toMatchObject({ contractVersion: 2, contractDigest });
+    const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
+    const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
+    const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
+      artifact.redactedJson = canonicalJson({ secret: "fixture-secret" });
+    });
+    expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_export", {
+      sourceEventCeiling: artifactImportCeiling,
+      sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
+      export: secretMetadata,
+    }, { idempotencyKey: "record-export-secret-metadata" }))).toMatchObject({ outcome: "EVIDENCE_REDACTION_INVALID" });
+    const oversizedMetadata = resealArtifactExport(firstExport, (artifact) => {
+      artifact.durableRefJson = canonicalJson({ metadata: "x".repeat(17 * 1024) });
+    });
+    expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_export", {
+      sourceEventCeiling: artifactImportCeiling,
+      sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
+      export: oversizedMetadata,
+    }, { idempotencyKey: "record-export-oversized-metadata" }))).toMatchObject({ outcome: "EVIDENCE_REDACTION_INVALID" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeArtifactImportGuards);
     const invalidTransition = migrationStepRequest(db, "record_import", { proofDigest: sha256("invalid"), export: firstExport, importRootDigest: sha256("invalid") });
     expect(applyWithFixtureReceipt(db, invalidTransition).outcome).toBe("INVALID_INPUT");
 
