@@ -1,0 +1,41 @@
+{
+  "name": "bb-plugin-bb-collab",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "bb": ">=0.37.0",
+    "bbPluginSdk": "^0.4.1"
+  },
+  "bb": {
+    "name": "bb-collab",
+    "description": "BB-native project governance storage and conformance boundary.",
+    "branding": {
+      "icon": "Database"
+    },
+    "server": "./server.ts",
+    "skills": []
+  },
+  "scripts": {
+    "build": "bb plugin build",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "verify": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@bb/plugin-sdk": "file:vendor/bb-plugin-sdk-0.4.1.tgz",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "better-sqlite3": "^12.0.0",
+    "cron-parser": "^5.5.0",
+    "hono": "4.13.1",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.1"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true
+  }
+}
