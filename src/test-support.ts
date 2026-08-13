@@ -13,6 +13,8 @@ import {
   type NativeAssignmentEvidence,
   type NativeAssignmentInput,
   type NativeAssignmentInspection,
+  type ReviewFactReader,
+  type ReviewFacts,
   type RoleEnvironmentFact,
   type RoleEventFact,
   type RoleFactReader,
@@ -307,12 +309,26 @@ export class DeterministicNativeAssignmentAdapter implements NativeAssignmentAda
   }
 }
 
+export class DeterministicReviewFactReader implements ReviewFactReader {
+  readonly readCalls: Parameters<ReviewFactReader["read"]>[0][] = [];
+  facts: ReviewFacts | null = null;
+  onRead: ((input: Parameters<ReviewFactReader["read"]>[0]) => void) | null = null;
+
+  read(input: Parameters<ReviewFactReader["read"]>[0]): ReviewFacts {
+    this.readCalls.push(structuredClone(input));
+    this.onRead?.(input);
+    if (!this.facts) throw new Error("review facts unavailable");
+    return structuredClone(this.facts);
+  }
+}
+
 export function applyWithFixtureReceipt(
   db: Database.Database,
   request: ApplyRequest,
   githubAdapter: GitHubIssueAdapter | null = null,
   roleFactReader: RoleFactReader | null = null,
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
+  reviewFactReader: ReviewFactReader | null = null,
 ): FoundationResult {
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader);
 }

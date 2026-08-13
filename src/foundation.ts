@@ -527,6 +527,102 @@ const targetCollectionSchema = z.array(targetSchema).superRefine((targets, ctx) 
   }
 });
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
+const sortedIdSetSchema = z
+  .array(id)
+  .min(1)
+  .max(64)
+  .refine((values) => new Set(values).size === values.length && canonicalJson(values) === canonicalJson([...values].sort()), {
+    message: "values must be sorted and duplicate-free",
+  });
+const reviewTargetSchema = z
+  .object({
+    workItemId: id,
+    repoTargetId: id,
+    configRevision: z.number().int().positive(),
+    baseSha: z.string().regex(/^[0-9a-f]{40,64}$/u),
+    h0CandidateSha: z.string().regex(/^[0-9a-f]{40,64}$/u),
+    h0TreeDigest: digestSchema,
+    tierAEntries: sortedIdSetSchema,
+  })
+  .strict();
+const reviewScopeSchema = z
+  .object({ targets: z.array(reviewTargetSchema).min(1).max(32) })
+  .strict()
+  .superRefine((scope, ctx) => {
+    const keys = scope.targets.map((target) => `${target.workItemId}\u0000${target.repoTargetId}`);
+    if (new Set(scope.targets.map((target) => target.workItemId)).size !== scope.targets.length) {
+      ctx.addIssue({ code: "custom", path: ["targets"], message: "one WorkItem cannot span multiple review targets" });
+    }
+    if (canonicalJson(keys) !== canonicalJson([...keys].sort())) {
+      ctx.addIssue({ code: "custom", path: ["targets"], message: "review targets must be canonically sorted" });
+    }
+  });
+const connectorPolicySchema = z.enum(["required", "optional", "prohibited"]);
+const reviewConnectorSchema = z
+  .object({ repoTargetId: id, connectorId: id, policy: connectorPolicySchema })
+  .strict();
+const reviewConnectorsSchema = z
+  .array(reviewConnectorSchema)
+  .min(1)
+  .max(128)
+  .superRefine((connectors, ctx) => {
+    const keys = connectors.map((connector) => `${connector.repoTargetId}\u0000${connector.connectorId}`);
+    if (new Set(keys).size !== keys.length) {
+      ctx.addIssue({ code: "custom", message: "review connector mappings must be duplicate-free" });
+    }
+    if (canonicalJson(keys) !== canonicalJson([...keys].sort())) {
+      ctx.addIssue({ code: "custom", message: "review connector mappings must be canonically sorted" });
+    }
+  });
+const reviewOptionsSchema = z
+  .object({ connectors: reviewConnectorsSchema })
+  .strict();
+const gitIdentitySchema = z.object({ name: id, email: id }).strict();
+const connectorReviewRelationSchema = z
+  .object({
+    relationRole: z.literal("connector_h0"),
+    workItemId: id,
+    repoTargetId: id,
+    h0CandidateSha: z.string().regex(/^[0-9a-f]{40,64}$/u),
+    h0TreeDigest: digestSchema,
+    connectorId: id,
+    state: z.enum(["available", "absent", "degraded", "unknown"]),
+    terminal: z.boolean(),
+  })
+  .strict();
+const finalReviewRelationSchema = z
+  .object({
+    relationRole: z.literal("final_review"),
+    workItemId: id,
+    repoTargetId: id,
+    configRevision: z.number().int().positive(),
+    baseSha: z.string().regex(/^[0-9a-f]{40,64}$/u),
+    candidateSha: z.string().regex(/^[0-9a-f]{40,64}$/u),
+    treeDigest: digestSchema,
+    changedFiles: sortedIdSetSchema,
+    tierAEntries: sortedIdSetSchema,
+    writeAssignmentId: id,
+    writeExecutionAttemptId: id,
+    authors: z.array(gitIdentitySchema).min(1).max(64),
+    committers: z.array(gitIdentitySchema).min(1).max(64),
+  })
+  .strict();
+const amendmentReviewRelationSchema = z
+  .object({
+    relationRole: z.literal("amendment_scope"),
+    workItemId: id,
+    repoTargetId: id,
+    baseSha: z.string().regex(/^[0-9a-f]{40,64}$/u),
+    h0AssignmentId: id,
+    h0CandidateSha: z.string().regex(/^[0-9a-f]{40,64}$/u),
+    h0TreeDigest: digestSchema,
+    h1AssignmentId: id,
+    h1CandidateSha: z.string().regex(/^[0-9a-f]{40,64}$/u),
+    h1TreeDigest: digestSchema,
+    allowedChangedFiles: sortedIdSetSchema,
+    actualChangedFiles: sortedIdSetSchema,
+  })
+  .strict();
 const decisionSchema = z
   .object({
     decisionId: id,
@@ -646,6 +742,7 @@ const githubIssuesConfigSchema = z
       }
     }
   });
+const reviewPolicySchema = z.object({ connectors: reviewConnectorsSchema }).strict();
 
 export const ROLE_IDS = ["project-orchestrator", "independent-reviewer"] as const;
 const roleIdSchema = z.enum(ROLE_IDS);
@@ -1005,6 +1102,49 @@ export interface NativeAssignmentInspection {
   threadVisibility: "visible" | "hidden" | null;
 }
 
+export interface ReviewFacts {
+  projectId: string;
+  workItemId: string;
+  repoTargetId: string;
+  writeAssignmentId: string;
+  writeExecutionAttemptId: string;
+  branchName: string;
+  baseSha: string;
+  candidateSha: string;
+  treeDigest: string;
+  changedFiles: string[];
+  authors: Array<{ name: string; email: string }>;
+  committers: Array<{ name: string; email: string }>;
+}
+
+const reviewFactsSchema = z.object({
+  projectId: id,
+  workItemId: id,
+  repoTargetId: id,
+  writeAssignmentId: id,
+  writeExecutionAttemptId: id,
+  branchName: id,
+  baseSha: z.string().regex(/^[0-9a-f]{40,64}$/u),
+  candidateSha: z.string().regex(/^[0-9a-f]{40,64}$/u),
+  treeDigest: digestSchema,
+  changedFiles: sortedIdSetSchema,
+  authors: z.array(gitIdentitySchema).min(1).max(64),
+  committers: z.array(gitIdentitySchema).min(1).max(64),
+}).strict();
+
+export interface ReviewFactReader {
+  read(input: {
+    projectId: string;
+    workItemId: string;
+    repoTargetId: string;
+    writeAssignmentId: string;
+    writeExecutionAttemptId: string;
+    branchName: string;
+    baseSha: string;
+    candidateSha: string;
+  }): ReviewFacts;
+}
+
 export interface NativeAssignmentAdapter {
   inspect(input: { projectId: string; repoTargetId: string; assignment: z.infer<typeof assignmentIntentSchema> }): NativeAssignmentInspection;
   dispatch(input: NativeAssignmentInput): NativeAssignmentEvidence;
@@ -1278,6 +1418,8 @@ export type FoundationCode =
   | "TERMINAL_REPORT_REQUIRED"
   | "TERMINAL_REPORT_AMBIGUOUS"
   | "ASSIGNMENT_HEAD_STALE"
+  | "REVIEW_AMENDMENT_CAP"
+  | "REVIEW_SCOPE_MISMATCH"
   | "EXECUTION_CONTEXT_FOREIGN"
   | "ROLE_UNQUALIFIED"
   | "CAPABILITY_UNKNOWN"
@@ -1438,6 +1580,11 @@ function validateConfig(value: unknown): string {
       if (writingLaneCeiling !== undefined && (!Number.isInteger(writingLaneCeiling) || Number(writingLaneCeiling) < 0 || Number(writingLaneCeiling) > 2)) {
         throw refusal("INVALID_INPUT", "writingLaneCeiling must be an integer from 0 through 2");
       }
+      const reviewPolicy = (bbCollab as Record<string, unknown>).reviewPolicy;
+      if (reviewPolicy !== undefined) {
+        const parsed = reviewPolicySchema.safeParse(reviewPolicy);
+        if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
+      }
     }
   }
   const json = canonicalJson(value);
@@ -1480,6 +1627,15 @@ function writingLaneCeilingFromJson(configJson: string): number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 2 ? value : 2;
 }
 
+function reviewPolicyFromJson(configJson: string): z.infer<typeof reviewPolicySchema> | null {
+  const config = JSON.parse(configJson) as { extensions?: { bbCollab?: { reviewPolicy?: unknown } } };
+  const value = config.extensions?.bbCollab?.reviewPolicy;
+  if (value === undefined) return null;
+  const parsed = reviewPolicySchema.safeParse(value);
+  if (!parsed.success) throw refusal("INVALID_INPUT", "stored review policy is invalid");
+  return parsed.data;
+}
+
 function requireMappedTargets(configJson: string, targets: NonNullable<ApplyRequest["targets"]>): void {
   const github = githubConfigFromJson(configJson);
   const targetIds = new Set(targets.map((target) => target.repoTargetId));
@@ -1488,6 +1644,9 @@ function requireMappedTargets(configJson: string, targets: NonNullable<ApplyRequ
   }
   if (roleRequirementsFromJson(configJson).some((requirement) => requirement.repoTargetId && !targetIds.has(requirement.repoTargetId))) {
     throw refusal("REPO_TARGET_FOREIGN", "role requirement names a target outside the config revision");
+  }
+  if (reviewPolicyFromJson(configJson)?.connectors.some((connector) => !targetIds.has(connector.repoTargetId))) {
+    throw refusal("REPO_TARGET_FOREIGN", "review connector mapping names a target outside the config revision");
   }
 }
 
@@ -1952,6 +2111,9 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
       throw refusal("REPO_TARGET_FOREIGN", "decision target does not match bootstrap target");
     }
     const identity = decisionIdentity(request.projectId, 1, decision);
+    if (identity.decisionClass === "review_adjudication") {
+      throw refusal("WORK_ITEM_UNKNOWN", "review Decisions require an existing exact WorkItem and cannot be bootstrapped");
+    }
     db.prepare(
       `INSERT INTO decisions
         (decision_id, project_id, config_revision, repo_target_id, scope_json, scope_digest,
@@ -2139,6 +2301,24 @@ interface DecisionRow {
   current_resource_revision: number;
 }
 
+type ReviewTarget = z.infer<typeof reviewTargetSchema>;
+type ReviewOptions = z.infer<typeof reviewOptionsSchema>;
+
+function parseReviewIdentity(
+  scopeJson: string,
+  optionsJson: string,
+  configRevision: number,
+): { scope: z.infer<typeof reviewScopeSchema>; options: ReviewOptions } {
+  const scope = reviewScopeSchema.safeParse(JSON.parse(scopeJson));
+  const options = reviewOptionsSchema.safeParse(JSON.parse(optionsJson));
+  if (!scope.success) throw refusal("DECISION_IDENTITY_CONFLICT", scope.error.message);
+  if (!options.success) throw refusal("DECISION_IDENTITY_CONFLICT", options.error.message);
+  if (scope.data.targets.some((target) => target.configRevision !== configRevision)) {
+    throw refusal("PROJECT_CONFIG_STALE", "review target scope must bind the Decision config revision");
+  }
+  return { scope: scope.data, options: options.data };
+}
+
 function decisionIdentity(
   projectId: string,
   configRevision: number,
@@ -2150,6 +2330,7 @@ function decisionIdentity(
   if (decision.options === undefined) throw refusal("DECISION_IDENTITY_CONFLICT", "typed decision options are required");
   const scopeJson = boundedCanonicalObject(decision.scope, "decision scope");
   const optionsJson = boundedCanonicalObject(decision.options, "decision options");
+  if (decision.decisionClass === "review_adjudication") parseReviewIdentity(scopeJson, optionsJson, configRevision);
   const identityDigest = sha256(canonicalJson({
     projectId,
     configRevision,
@@ -2164,6 +2345,43 @@ function decisionIdentity(
     decisionClass: decision.decisionClass as (typeof DECISION_CLASSES)[number],
     identityDigest,
   };
+}
+
+function validateReviewDecisionCreate(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  decision: NonNullable<ApplyRequest["decision"]>,
+  identity: ReturnType<typeof decisionIdentity>,
+  configRevision: number,
+): void {
+  if (identity.decisionClass !== "review_adjudication") return;
+  const review = parseReviewIdentity(identity.scopeJson, identity.optionsJson, configRevision);
+  const policy = reviewPolicyFromJson(storedConfigJson(db, request.projectId, configRevision));
+  const targetIds = [...new Set(review.scope.targets.map((target) => target.repoTargetId))];
+  if (!policy || review.options.connectors.length !== targetIds.length) {
+    throw refusal("PROJECT_CONFIG_STALE", "review Decision must freeze one connector mapping per exact target");
+  }
+  for (const targetId of targetIds) {
+    const options = review.options.connectors.filter((connector) => connector.repoTargetId === targetId);
+    if (options.length !== 1 || !policy.connectors.some((connector) => canonicalJson(connector) === canonicalJson(options[0]))) {
+      throw refusal("PROJECT_CONFIG_STALE", "review connector mapping must equal the immutable config revision");
+    }
+  }
+  if (decision.repoTargetId !== null) {
+    if (review.scope.targets.length !== 1 || review.scope.targets[0]!.repoTargetId !== decision.repoTargetId) {
+      throw refusal("REPO_TARGET_FOREIGN", "target-scoped review Decision must contain only its exact target");
+    }
+  }
+  for (const target of review.scope.targets) {
+    requireTarget(db, request.projectId, configRevision, target.repoTargetId);
+    const workItem = asRow<WorkItemRow>(
+      db.prepare("SELECT * FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, target.workItemId),
+    );
+    if (!workItem) throw refusal("WORK_ITEM_UNKNOWN", "review Decision WorkItem is not known");
+    if (workItem.config_revision !== configRevision || workItem.repo_target_id !== target.repoTargetId) {
+      throw refusal("WORK_ITEM_FOREIGN", "review Decision WorkItem does not match its exact config and target");
+    }
+  }
 }
 
 function storedDecisionIdentityDigest(decision: DecisionRow): string | null {
@@ -2212,6 +2430,7 @@ function applyDecisionCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
     requireTarget(db, request.projectId, currentRevision, decision.repoTargetId);
   }
   const identity = decisionIdentity(request.projectId, currentRevision, decision);
+  validateReviewDecisionCreate(db, request, decision, identity, currentRevision);
   const actorReceiptId = requireDecisionActor(db, request, identity.decisionClass);
   const existing = asRow<DecisionRow>(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decision.decisionId));
   if (existing) {
@@ -2410,6 +2629,388 @@ function dispositionReference(
   return asRow<Record<string, unknown>>(
     db.prepare("SELECT * FROM decision_dispositions WHERE decision_id = ? AND disposition_sequence = ?").get(decisionId, sequence),
   ) ?? null;
+}
+
+interface ReviewRelationRecord {
+  evidenceId: string;
+  evidenceKind: string;
+  sourceKind: string;
+  relationKind: string;
+  assignmentId: string | null;
+  executionAttemptId: string | null;
+  relation: unknown;
+  current: boolean;
+}
+
+interface PreparedReviewInspection {
+  assignment: AssignmentRow;
+  attempt: ExecutionAttemptRow;
+  writer: AssignmentRow;
+  writerAttempt: ExecutionAttemptRow;
+  target: ReviewTarget;
+  relation: z.infer<typeof finalReviewRelationSchema>;
+  expectedCandidateSha: string;
+  expectedTreeDigest: string;
+}
+
+function reviewRelationRecords(db: SqliteDatabase, request: ApplyRequest, decisionId: string): ReviewRelationRecord[] {
+  const stored = db.prepare(
+    `SELECT decision_evidence.evidence_id, decision_evidence.relation_kind,
+            decision_evidence.relation_json, evidence_artifacts.evidence_kind,
+            evidence_artifacts.source_kind, evidence_artifacts.execution_attempt_id,
+            execution_attempts.assignment_id
+     FROM decision_evidence JOIN evidence_artifacts
+       ON evidence_artifacts.project_id = decision_evidence.project_id
+      AND evidence_artifacts.evidence_id = decision_evidence.evidence_id
+     LEFT JOIN execution_attempts
+       ON execution_attempts.project_id = evidence_artifacts.project_id
+      AND execution_attempts.execution_attempt_id = evidence_artifacts.execution_attempt_id
+     WHERE decision_evidence.project_id = ? AND decision_evidence.decision_id = ?
+     ORDER BY decision_evidence.evidence_sequence`,
+  ).all(request.projectId, decisionId) as Array<Record<string, string | null>>;
+  const prior = stored.map((row) => ({
+    evidenceId: row.evidence_id!,
+    evidenceKind: row.evidence_kind!,
+    sourceKind: row.source_kind!,
+    relationKind: row.relation_kind!,
+    assignmentId: row.assignment_id ?? null,
+    executionAttemptId: row.execution_attempt_id ?? null,
+    relation: JSON.parse(row.relation_json!),
+    current: false,
+  }));
+  const current = (request.decisionEvidence ?? []).map((evidence) => ({
+    evidenceId: evidence.evidenceId,
+    evidenceKind: evidence.evidenceKind,
+    sourceKind: evidence.sourceKind,
+    relationKind: evidence.relationKind,
+    assignmentId: evidence.assignmentId ?? null,
+    executionAttemptId: evidence.executionAttemptId,
+    relation: evidence.relation ?? {},
+    current: true,
+  }));
+  return [...prior, ...current];
+}
+
+function reviewTargetKey(target: Pick<ReviewTarget, "workItemId" | "repoTargetId">): string {
+  return `${target.workItemId}\u0000${target.repoTargetId}`;
+}
+
+function requireReviewAssignment(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  assignmentId: string | null,
+  executionAttemptId: string | null,
+): { assignment: AssignmentRow; attempt: ExecutionAttemptRow } {
+  if (!assignmentId || !executionAttemptId) throw refusal("EVIDENCE_REQUIRED", "final review evidence requires exact Assignment and attempt identities");
+  return assignmentRows(db, { ...request, assignmentId, executionAttemptId });
+}
+
+function requireSuccessfulWrite(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  target: ReviewTarget,
+  assignmentId: string,
+  executionAttemptId: string,
+  candidateSha: string,
+): { assignment: AssignmentRow; attempt: ExecutionAttemptRow } {
+  const rows = assignmentRows(db, { ...request, assignmentId, executionAttemptId });
+  if (
+    rows.assignment.assignment_kind !== "write" || rows.attempt.assignment_kind !== "write" ||
+    rows.assignment.work_item_id !== target.workItemId || rows.assignment.repo_target_id !== target.repoTargetId ||
+    rows.assignment.config_revision !== target.configRevision || rows.assignment.base_sha !== target.baseSha ||
+    rows.attempt.branch_name !== rows.assignment.branch_name || rows.attempt.base_sha !== target.baseSha ||
+    rows.attempt.candidate_sha !== candidateSha || rows.attempt.state !== "done" ||
+    rows.attempt.terminal_result !== "DONE" || rows.attempt.reported_outcome !== "DONE"
+  ) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "write facts do not bind the exact successful base-to-candidate Assignment range");
+  }
+  return rows;
+}
+
+function validateAmendmentRelation(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  target: ReviewTarget,
+  amendment: z.infer<typeof amendmentReviewRelationSchema>,
+): void {
+  if (
+    amendment.workItemId !== target.workItemId || amendment.repoTargetId !== target.repoTargetId ||
+    amendment.baseSha !== target.baseSha || amendment.h0CandidateSha !== target.h0CandidateSha ||
+    amendment.h0TreeDigest !== target.h0TreeDigest || amendment.h1CandidateSha === target.h0CandidateSha ||
+    amendment.h1TreeDigest === target.h0TreeDigest
+  ) {
+    throw refusal("REVIEW_SCOPE_MISMATCH", "review amendment does not preserve the exact H0 scope and base");
+  }
+  if (amendment.actualChangedFiles.some((file) => !amendment.allowedChangedFiles.includes(file))) {
+    throw refusal("REVIEW_SCOPE_MISMATCH", "review amendment changes files outside the adopted findings scope");
+  }
+  const exactReview = (assignmentId: string, candidateSha: string): AssignmentRow => {
+    const assignment = asRow<AssignmentRow>(db.prepare(
+      "SELECT * FROM assignments WHERE project_id = ? AND assignment_id = ?",
+    ).get(request.projectId, assignmentId));
+    const attempt = asRow<ExecutionAttemptRow>(db.prepare(
+      `SELECT * FROM execution_attempts
+       WHERE project_id = ? AND assignment_id = ? AND candidate_sha = ?
+         AND state = 'done' AND terminal_result = 'DONE' AND reported_outcome = 'DONE'`,
+    ).get(request.projectId, assignmentId, candidateSha));
+    if (
+      !assignment || !attempt || assignment.assignment_kind !== "review" || assignment.candidate_semantics !== "frozen" ||
+      assignment.work_item_id !== target.workItemId || assignment.repo_target_id !== target.repoTargetId ||
+      assignment.config_revision !== target.configRevision || assignment.base_sha !== target.baseSha ||
+      assignment.candidate_sha !== candidateSha || attempt.assignment_id !== assignment.assignment_id
+    ) {
+      throw refusal("ASSIGNMENT_HEAD_STALE", "review amendment does not bind exact successful H0 and H1 review Assignments");
+    }
+    return assignment;
+  };
+  const h0 = exactReview(amendment.h0AssignmentId, amendment.h0CandidateSha);
+  const h1 = exactReview(amendment.h1AssignmentId, amendment.h1CandidateSha);
+  if (h0.governance_epoch !== h1.governance_epoch || h0.work_item_revision !== h1.work_item_revision) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "review amendment changed governorship or WorkItem revision");
+  }
+}
+
+function preflightReviewDisposition(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  factsByWriter: ReadonlyMap<string, ReviewFacts> | null,
+): PreparedReviewInspection[] {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const decisionId = request.decisionId;
+  if (!decisionId || !request.disposition) throw refusal("INVALID_INPUT", "decision disposition requires decisionId and disposition");
+  const decision = asRow<DecisionRow>(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decisionId));
+  if (!decision || decision.project_id !== request.projectId || decision.decision_class !== "review_adjudication" || !decision.options_json) {
+    throw refusal("RESOURCE_UNKNOWN", "review Decision is not known in this project");
+  }
+  requireDecisionActor(db, request, "review_adjudication");
+  if (decision.config_revision !== configRevision) throw refusal("PROJECT_CONFIG_STALE", "review Decision config revision is stale");
+  if (request.expectedResourceRevision !== decision.current_resource_revision) {
+    throw refusal("RESOURCE_REVISION_STALE", "review Decision resource revision is stale", {
+      currentResourceRevision: decision.current_resource_revision,
+      expectedResourceRevision: request.expectedResourceRevision ?? undefined,
+    });
+  }
+  if (decision.repo_target_id) {
+    if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "review Decision requires its exact target");
+    if (request.repoTargetId !== decision.repo_target_id) throw refusal("REPO_TARGET_FOREIGN", "review Decision target is foreign");
+  } else if (request.repoTargetId) {
+    throw refusal("REPO_TARGET_FOREIGN", "project-scoped review Decision cannot infer one request target");
+  }
+  const review = parseReviewIdentity(decision.scope_json, decision.options_json, configRevision);
+  const policy = reviewPolicyFromJson(storedConfigJson(db, request.projectId, configRevision));
+  if (!policy || review.options.connectors.length !== new Set(review.scope.targets.map((target) => target.repoTargetId)).size || review.options.connectors.some((option) =>
+    !policy.connectors.some((connector) => canonicalJson(connector) === canonicalJson(option))
+  )) {
+    throw refusal("PROJECT_CONFIG_STALE", "review Decision connector mappings no longer match their config revision");
+  }
+  for (const target of review.scope.targets) {
+    requireTarget(db, request.projectId, configRevision, target.repoTargetId);
+    const workItem = asRow<WorkItemRow>(db.prepare("SELECT * FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, target.workItemId));
+    if (!workItem || workItem.config_revision !== configRevision || workItem.repo_target_id !== target.repoTargetId) {
+      throw refusal("WORK_ITEM_FOREIGN", "review scope WorkItem does not match the exact current target");
+    }
+  }
+  if (request.disposition !== "adopted") return [];
+
+  const relations = reviewRelationRecords(db, request, decisionId);
+  const suppliedConnectorRecords = relations.filter((record) => record.current && record.evidenceKind === "connector");
+  if (suppliedConnectorRecords.some((record) => {
+    const relation = connectorReviewRelationSchema.safeParse(record.relation);
+    const option = relation.success
+      ? review.options.connectors.find((connector) => connector.repoTargetId === relation.data.repoTargetId && connector.connectorId === relation.data.connectorId)
+      : undefined;
+    return !option || option.policy === "prohibited";
+  })) {
+    throw refusal("INVALID_INPUT", "prohibited or unmapped connector material is not accepted");
+  }
+  const connectorRecords = relations.filter((record) => record.evidenceKind === "connector");
+  const connectors = connectorRecords.map((record) => {
+    if (record.evidenceKind !== "connector" || record.sourceKind !== "connector" || record.relationKind !== "supporting") {
+      throw refusal("INVALID_INPUT", "connector evidence kind and relation are inconsistent");
+    }
+    const parsed = connectorReviewRelationSchema.safeParse(record.relation);
+    if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
+    const target = review.scope.targets.find((candidate) => reviewTargetKey(candidate) === reviewTargetKey(parsed.data));
+    const option = review.options.connectors.find((connector) =>
+      connector.repoTargetId === parsed.data.repoTargetId && connector.connectorId === parsed.data.connectorId
+    );
+    if (
+      !target || !option || option.policy === "prohibited" || parsed.data.h0CandidateSha !== target.h0CandidateSha ||
+      parsed.data.h0TreeDigest !== target.h0TreeDigest
+    ) {
+      throw refusal("INVALID_INPUT", "connector evidence is not bound to the exact H0 target and configured identity");
+    }
+    return { record, relation: parsed.data, target };
+  });
+  for (const target of review.scope.targets) {
+    const matches = connectors.filter((candidate) => reviewTargetKey(candidate.target) === reviewTargetKey(target));
+    if (matches.length > 1) throw refusal("INVALID_INPUT", "review generation permits only one connector pass per target");
+    const option = review.options.connectors.find((connector) => connector.repoTargetId === target.repoTargetId)!;
+    if (option.policy === "required" && (matches.length !== 1 || matches[0]!.relation.state !== "available" || !matches[0]!.relation.terminal)) {
+      throw refusal("EXTERNAL_CAPABILITY_REQUIRED", "required connector lacks exact available terminal H0 evidence");
+    }
+  }
+
+  const amendmentRecords = relations.filter((record) => (record.relation as { relationRole?: unknown }).relationRole === "amendment_scope");
+  if (amendmentRecords.length > 1) {
+    throw refusal("REVIEW_AMENDMENT_CAP", "review Decision already consumed its one bounded amendment");
+  }
+  const amendmentByTarget = new Map<string, z.infer<typeof amendmentReviewRelationSchema>>();
+  for (const record of amendmentRecords) {
+    if (record.evidenceKind !== "review_ready" || record.sourceKind !== "review_ready" || record.relationKind !== "supporting") {
+      throw refusal("EVIDENCE_REDACTION_INVALID", "amendment scope requires review_ready supporting evidence");
+    }
+    const parsed = amendmentReviewRelationSchema.safeParse(record.relation);
+    if (!parsed.success) throw refusal("REVIEW_SCOPE_MISMATCH", parsed.error.message);
+    const target = review.scope.targets.find((candidate) => reviewTargetKey(candidate) === reviewTargetKey(parsed.data));
+    if (!target || amendmentByTarget.has(reviewTargetKey(target))) throw refusal("REVIEW_AMENDMENT_CAP", "review target has more than one amendment relation");
+    validateAmendmentRelation(db, request, target, parsed.data);
+    amendmentByTarget.set(reviewTargetKey(target), parsed.data);
+  }
+
+  const finalRecords = relations.filter((record) => record.current && (record.relation as { relationRole?: unknown }).relationRole === "final_review");
+  const requiredEvidence = new Set((request.conditions ?? []).flatMap((condition) => condition.evidenceIds));
+  const prepared: PreparedReviewInspection[] = [];
+  for (const target of review.scope.targets) {
+    const matches = finalRecords.filter((record) => {
+      const parsed = finalReviewRelationSchema.safeParse(record.relation);
+      return parsed.success && reviewTargetKey(parsed.data) === reviewTargetKey(target);
+    });
+    if (matches.length !== 1) throw refusal("EVIDENCE_REQUIRED", "adopted review requires one exact final review receipt per target");
+    const record = matches[0]!;
+    if (
+      record.evidenceKind !== "delegated_action_receipt" || record.sourceKind !== "delegated_action" ||
+      record.relationKind !== "delegated_action_receipt" || !requiredEvidence.has(record.evidenceId)
+    ) {
+      throw refusal("EVIDENCE_REQUIRED", "final review receipt must be a typed required delegated condition");
+    }
+    const relation = finalReviewRelationSchema.parse(record.relation);
+    const amendment = amendmentByTarget.get(reviewTargetKey(target)) ?? null;
+    const expectedCandidateSha = amendment?.h1CandidateSha ?? target.h0CandidateSha;
+    const expectedTreeDigest = amendment?.h1TreeDigest ?? target.h0TreeDigest;
+    if (
+      relation.configRevision !== target.configRevision || relation.baseSha !== target.baseSha ||
+      relation.candidateSha !== expectedCandidateSha || relation.treeDigest !== expectedTreeDigest ||
+      canonicalJson(relation.tierAEntries) !== canonicalJson(target.tierAEntries) ||
+      (amendment && canonicalJson(relation.changedFiles) !== canonicalJson(amendment.actualChangedFiles))
+    ) {
+      throw refusal("REVIEW_SCOPE_MISMATCH", "final review relation does not match the exact frozen target and amendment scope");
+    }
+    const evidenceInput = (request.decisionEvidence ?? []).find((evidence) => evidence.evidenceId === record.evidenceId)!;
+    validateDelegatedDecisionEvidence(db, request, governor.governance_epoch, "review_adjudication", evidenceInput);
+    const rows = requireReviewAssignment(db, request, record.assignmentId, record.executionAttemptId);
+    if (
+      rows.assignment.assignment_kind !== "review" || rows.assignment.role_id !== "independent-reviewer" ||
+      rows.assignment.candidate_semantics !== "frozen" || rows.assignment.work_item_id !== target.workItemId ||
+      rows.assignment.repo_target_id !== target.repoTargetId || rows.assignment.config_revision !== target.configRevision ||
+      rows.assignment.base_sha !== target.baseSha || rows.assignment.candidate_sha !== expectedCandidateSha ||
+      rows.assignment.requested_permission_mode !== "full" || rows.assignment.requested_visibility !== "visible" ||
+      rows.attempt.actual_permission_mode !== "full" || rows.attempt.actual_visibility !== "visible"
+    ) {
+      throw refusal("ASSIGNMENT_HEAD_STALE", "final review Assignment is not the exact visible/full frozen target");
+    }
+    requireCanonicalRoleGeneration(db, request.projectId, rows.assignment.role_id, rows.assignment.role_generation, rows.assignment.role_requirement_id);
+    if (amendment && rows.assignment.assignment_id !== amendment.h1AssignmentId) {
+      throw refusal("REVIEW_SCOPE_MISMATCH", "final review does not bind the exact H1 review Assignment");
+    }
+    const writer = requireSuccessfulWrite(
+      db, request, target, relation.writeAssignmentId, relation.writeExecutionAttemptId, expectedCandidateSha,
+    );
+    const writers = db.prepare(
+      `SELECT assignments.assignment_id, assignments.lane_id, assignments.role_id, assignments.role_generation,
+              execution_attempts.execution_attempt_id
+       FROM assignments JOIN execution_attempts
+         ON execution_attempts.project_id = assignments.project_id
+        AND execution_attempts.assignment_id = assignments.assignment_id
+       WHERE assignments.project_id = ? AND assignments.work_item_id = ?
+         AND assignments.repo_target_id = ? AND assignments.assignment_kind = 'write'`,
+    ).all(request.projectId, target.workItemId, target.repoTargetId) as Array<{
+      assignment_id: string; lane_id: string; role_id: string; role_generation: number; execution_attempt_id: string;
+    }>;
+    if (writers.length === 0) throw refusal("EVIDENCE_REQUIRED", "review target has no exact recorded write Assignment");
+    if (writers.some((candidate) =>
+      candidate.assignment_id === rows.assignment.assignment_id || candidate.execution_attempt_id === rows.attempt.execution_attempt_id ||
+      candidate.lane_id === rows.assignment.lane_id || candidate.role_id === rows.assignment.role_id ||
+      candidate.role_generation === rows.assignment.role_generation
+    )) {
+      throw refusal("ROLE_HOLDER_MISMATCH", "review Assignment is not structurally independent from every write Assignment");
+    }
+    prepared.push({ assignment: rows.assignment, attempt: rows.attempt, writer: writer.assignment, writerAttempt: writer.attempt, target, relation, expectedCandidateSha, expectedTreeDigest });
+  }
+  if (!factsByWriter) return prepared;
+
+  for (const item of prepared) {
+    const parsedFacts = reviewFactsSchema.safeParse(factsByWriter.get(item.writer.assignment_id));
+    if (!parsedFacts.success) throw refusal("BB_FACTS_UNAVAILABLE", "bounded exact review tree, diff, and authorship facts are unavailable");
+    const facts = parsedFacts.data;
+    if (
+      facts.projectId !== request.projectId ||
+      facts.workItemId !== item.target.workItemId || facts.repoTargetId !== item.target.repoTargetId ||
+      facts.writeAssignmentId !== item.writer.assignment_id || facts.writeExecutionAttemptId !== item.writerAttempt.execution_attempt_id ||
+      facts.branchName !== item.writer.branch_name ||
+      facts.baseSha !== item.target.baseSha || facts.candidateSha !== item.expectedCandidateSha ||
+      facts.treeDigest !== item.expectedTreeDigest || canonicalJson(facts.changedFiles) !== canonicalJson(item.relation.changedFiles) ||
+      canonicalJson(facts.authors) !== canonicalJson(item.relation.authors) ||
+      canonicalJson(facts.committers) !== canonicalJson(item.relation.committers) ||
+      !sortedIdSetSchema.safeParse(facts.changedFiles).success || facts.authors.length === 0 || facts.committers.length === 0
+    ) {
+      throw refusal("ASSIGNMENT_HEAD_STALE", "bounded review facts do not match the exact writer range, tree, diff, and Git evidence");
+    }
+  }
+  return prepared;
+}
+
+function applyDecisionMutation(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+  reader: ReviewFactReader | null,
+): FoundationResult {
+  try {
+    const replay = checkIdempotency(db, request, digest);
+    if (replay) return replay;
+    const decision = request.decisionId
+      ? asRow<DecisionRow>(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(request.decisionId))
+      : undefined;
+    if (decision?.decision_class !== "review_adjudication" || request.disposition !== "adopted") {
+      return transaction(db, () => {
+        const replayInTransaction = checkIdempotency(db, request, digest);
+        return replayInTransaction ?? applyDecisionDisposition(db, request, digest);
+      });
+    }
+    const prepared = preflightReviewDisposition(db, request, null);
+    if (!reader) throw refusal("BB_FACTS_UNAVAILABLE", "review adjudication requires the bounded exact review fact reader");
+    const facts = new Map<string, ReviewFacts>();
+    for (const item of prepared) {
+      let value: ReviewFacts;
+      try {
+        value = reader.read({
+          projectId: request.projectId,
+          workItemId: item.target.workItemId,
+          repoTargetId: item.target.repoTargetId,
+          writeAssignmentId: item.writer.assignment_id,
+          writeExecutionAttemptId: item.writerAttempt.execution_attempt_id,
+          branchName: item.writer.branch_name,
+          baseSha: item.target.baseSha,
+          candidateSha: item.expectedCandidateSha,
+        });
+      } catch {
+        throw refusal("BB_FACTS_UNAVAILABLE", "bounded exact review facts are unavailable");
+      }
+      facts.set(item.writer.assignment_id, value);
+    }
+    return transaction(db, () => {
+      const replayInTransaction = checkIdempotency(db, request, digest);
+      if (replayInTransaction) return replayInTransaction;
+      preflightReviewDisposition(db, request, facts);
+      return applyDecisionDisposition(db, request, digest);
+    });
+  } catch (error) {
+    if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
+    if (isConstraintError(error)) return unavailableResult(request.projectId, "canonical review disposition could not be committed unambiguously");
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal decision mutation error" });
+  }
 }
 
 function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
@@ -3959,6 +4560,9 @@ interface ExecutionAttemptRow {
   project_id: string;
   execution_attempt_id: string;
   assignment_id: string | null;
+  assignment_kind: "write" | "review" | "probe" | null;
+  branch_name: string | null;
+  base_sha: string | null;
   state: "prepared" | "armed" | "content_delivered" | "running" | "done" | "blocked" | "failed" | "dispatch_unknown";
   thread_id: string | null;
   provider_thread_id: string | null;
@@ -4906,6 +5510,7 @@ export function applyFixtureMutation(
   githubAdapter: GitHubIssueAdapter | null = null,
   roleFactReader: RoleFactReader | null = null,
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
+  reviewFactReader: ReviewFactReader | null = null,
 ): FoundationResult {
   let request: ApplyRequest;
   try {
@@ -4926,6 +5531,9 @@ export function applyFixtureMutation(
     if (["assignment_prepare", "assignment_dispatch", "assignment_reconcile", "assignment_terminal"].includes(request.operationClass)) {
       return applyAssignmentMutation(db, request, digest, nativeAssignmentAdapter);
     }
+    if (request.operationClass === "decision_disposition") {
+      return applyDecisionMutation(db, request, digest, reviewFactReader);
+    }
     return transaction(db, () => {
       const replay = checkIdempotency(db, request, digest);
       if (replay) return replay;
@@ -4939,7 +5547,7 @@ export function applyFixtureMutation(
         case "decision_create":
           return applyDecisionCreate(db, request, digest);
         case "decision_disposition":
-          return applyDecisionDisposition(db, request, digest);
+          throw refusal("INTERNAL_ERROR", "decision disposition must use the Decision resolver");
         case "work_item_create":
           return applyWorkItemCreate(db, request, digest);
         case "work_item_transition":
