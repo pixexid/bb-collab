@@ -113,15 +113,16 @@ Every current open llm-collab issue is listed exactly once.
 
 ## Proposed bb-collab roadmap issues for missing BB-native work
 
-These are proposals only; no issue was created. They exclude work already
-represented by the current bb-collab ledger and exclude legacy llm-collab
-maintenance. They are ordered by dependency.
+P1-P3 are live bb-collab issues #29, #30, and #31. P4-P7 remain unfiled
+post-v1 proposals. They exclude work already represented by the current
+bb-collab ledger and exclude legacy llm-collab maintenance. They are ordered
+by dependency.
 
-### P1 — Complete MigrationRun and one-governor cutover proof for one project
+### P1 — [#29](https://github.com/pixexid/bb-collab/issues/29) Complete MigrationRun and one-governor cutover proof for one project
 
 **Dependencies:** existing #3, #7, #10, #13, #15, #17, #22, #23; upstream
 bb-collab #5 must provide the non-forgeable operator receipt before privileged
-activation.
+activation. This is live issue [#29](https://github.com/pixexid/bb-collab/issues/29).
 
 **Paste-ready body:**
 
@@ -154,10 +155,11 @@ queue/ledger, manual database edit, production mutation without the BB-host
 operator receipt, or generic reverse migration promise.
 ```
 
-### P2 — Activate one sanctioned BB-native managed-worktree and candidate-attach path
+### P2 — [#30](https://github.com/pixexid/bb-collab/issues/30) Activate one sanctioned BB-native managed-worktree and candidate-attach path
 
 **Dependencies:** existing #13 and exact target/config seams; #5 for governed
-activation; distilled source requirements #718, #800, and #812.
+activation; distilled source requirements #718, #800, and #812. This is live
+issue [#30](https://github.com/pixexid/bb-collab/issues/30).
 
 **Paste-ready body:**
 
@@ -191,9 +193,11 @@ Do not port bb_spawn.py wholesale, create a second transport, or grant a
 read-only candidate attachment any write/task/queue/authority capability.
 ```
 
-### P3 — Finish adversarial conformance doctor and first-adopter cutover gate
+### P3 — [#31](https://github.com/pixexid/bb-collab/issues/31) Finish adversarial conformance doctor and first-adopter cutover gate
 
-**Dependencies:** P1 and P2, existing #4, #21, and #22.
+**Dependencies:** [#29](https://github.com/pixexid/bb-collab/issues/29) and
+[#30](https://github.com/pixexid/bb-collab/issues/30), existing #4, #21, and
+#22. This is live issue [#31](https://github.com/pixexid/bb-collab/issues/31).
 
 **Paste-ready body:**
 
@@ -338,10 +342,11 @@ mailbox implementation.
 
 ## Top dependency chain
 
-`bb-collab #5 operator receipt` → `P1 MigrationRun/shared one-governor
-cutover` → `P2 native managed-worktree/candidate attach` → `P3 adversarial
-doctor + first adopter` → `P5 leases` → `P6 capacity/failover`; `P4 plugin
-profile` is parallel after P3/#5, and `P7 transport` is parallel after P3/P5.
+`bb-collab #5 operator receipt` → `#29/P1 MigrationRun/shared one-governor
+cutover` → `#30/P2 native managed-worktree/candidate attach` → `#31/P3
+adversarial doctor + first adopter` → `P5 leases` → `P6 capacity/failover`;
+`P4 plugin profile` is parallel after P3/#5, and `P7 transport` is parallel
+after P3/P5.
 
 The current bb-collab main branch is not cut over: production apply remains
 `OPERATOR_AUTH_REQUIRED`, the plugin has not been installed/reloaded/activated

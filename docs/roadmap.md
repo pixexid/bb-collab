@@ -91,7 +91,8 @@ The detailed 40-issue source disposition is in the
 
 ## Immediate migration holds
 
-The next cutover chain is [#5 / get-bb/bb #1541 operator receipt](https://github.com/get-bb/bb/issues/1541),
+The next cutover chain is [bb-collab #5 operator receipt](https://github.com/pixexid/bb-collab/issues/5)
+backed by [get-bb/bb #1541 operator receipt](https://github.com/get-bb/bb/issues/1541),
 [#29 MigrationRun and one-governor cutover](https://github.com/pixexid/bb-collab/issues/29),
 [#30 native managed-worktree and candidate attach](https://github.com/pixexid/bb-collab/issues/30),
 and [#31 adversarial conformance and first adopter](https://github.com/pixexid/bb-collab/issues/31).
