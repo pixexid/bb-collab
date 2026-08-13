@@ -216,9 +216,12 @@ export class DeterministicNativeAssignmentAdapter implements NativeAssignmentAda
   readonly reconcileCalls: Array<NativeAssignmentInput & { threadId: string | null; nativeRequestId: string | null }> = [];
   nextEvidence: Partial<NativeAssignmentEvidence> | null = null;
   nextInspection: Partial<NativeAssignmentInspection> | null = null;
+  onInspect: ((input: { projectId: string; repoTargetId: string; assignment: NonNullable<ApplyRequest["assignment"]> }) => void) | null = null;
+  onDispatch: ((input: NativeAssignmentInput) => void) | null = null;
 
   inspect(input: { projectId: string; repoTargetId: string; assignment: NonNullable<ApplyRequest["assignment"]> }): NativeAssignmentInspection {
     this.inspectCalls.push(structuredClone(input));
+    this.onInspect?.(input);
     const override = this.nextInspection;
     this.nextInspection = null;
     return {
@@ -278,6 +281,7 @@ export class DeterministicNativeAssignmentAdapter implements NativeAssignmentAda
 
   dispatch(input: NativeAssignmentInput): NativeAssignmentEvidence {
     this.dispatchCalls.push(structuredClone(input));
+    this.onDispatch?.(input);
     return this.evidence(input);
   }
 

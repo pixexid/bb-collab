@@ -835,6 +835,13 @@ export interface NativeAssignmentInput {
   candidateSha: string | null;
   environment: z.infer<typeof assignmentEnvironmentSchema>;
   requestedProfile: ExecutionProfile;
+  executionInputSources: {
+    providerId: "explicit";
+    model: "explicit";
+    serviceTier?: "explicit";
+    reasoningLevel: "explicit";
+    permissionMode: "explicit";
+  };
   frozenBriefContent: string;
   frozenBriefDigest: string;
 }
@@ -1625,6 +1632,13 @@ function nextEventSequence(db: SqliteDatabase, projectId: string): number {
     db.prepare("SELECT COALESCE(MAX(event_sequence), 0) + 1 AS next_sequence FROM state_events WHERE project_id = ?").get(projectId),
   );
   return row?.next_sequence ?? 1;
+}
+
+function nextAggregateRevision(db: SqliteDatabase, projectId: string, aggregateType: string, aggregateId: string): number {
+  return asRow<{ next_revision: number }>(db.prepare(
+    `SELECT COALESCE(MAX(aggregate_revision), 0) + 1 AS next_revision
+     FROM state_events WHERE project_id = ? AND aggregate_type = ? AND aggregate_id = ?`,
+  ).get(projectId, aggregateType, aggregateId))?.next_revision ?? 1;
 }
 
 interface StateEventInput {
@@ -3340,12 +3354,47 @@ interface ExecutionAttemptRow {
   assignment_id: string | null;
   state: "prepared" | "armed" | "content_delivered" | "running" | "done" | "blocked" | "failed" | "dispatch_unknown";
   thread_id: string | null;
+  provider_thread_id: string | null;
   native_request_id: string | null;
+  request_event_id: string | null;
+  request_event_seq: number | null;
+  accepted_event_id: string | null;
+  accepted_event_seq: number | null;
+  first_action_event_id: string | null;
+  first_action_event_seq: number | null;
+  content_event_id: string | null;
+  content_event_seq: number | null;
+  content_receipt_digest: string | null;
+  actual_provider_id: string | null;
+  actual_model: string | null;
+  actual_reasoning_level: string | null;
+  actual_permission_mode: string | null;
+  actual_service_tier: string | null;
+  actual_visibility: "visible" | "hidden" | null;
   native_receipt_digest: string | null;
   actual_profile_digest: string | null;
+  candidate_sha: string | null;
+  terminal_result: "DONE" | "BLOCKED" | null;
+  reported_outcome: "DONE" | "BLOCKED" | null;
   terminal_report_digest: string | null;
+  conflicting_terminal_digest: string | null;
+  terminal_event_id: string | null;
+  terminal_event_seq: number | null;
+  completed_at_ms: number | null;
+  reason_code: string | null;
   last_event_seq: number | null;
 }
+
+const NATIVE_EVIDENCE_COLUMNS = [
+  "thread_id", "provider_thread_id", "native_request_id",
+  "request_event_id", "request_event_seq", "accepted_event_id", "accepted_event_seq",
+  "first_action_event_id", "first_action_event_seq", "content_event_id", "content_event_seq",
+  "content_receipt_digest", "actual_provider_id", "actual_model", "actual_reasoning_level",
+  "actual_permission_mode", "actual_service_tier", "actual_visibility", "actual_profile_digest",
+  "native_receipt_digest", "last_event_seq",
+] as const;
+type NativeEvidenceColumn = (typeof NATIVE_EVIDENCE_COLUMNS)[number];
+type NativeEvidenceSnapshot = Record<NativeEvidenceColumn, string | number | null>;
 
 const ACTIVE_ASSIGNMENT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"] as const;
 const ACTIVE_ASSIGNMENT_SQL = "('prepared','armed','content_delivered','running','dispatch_unknown')";
@@ -3477,6 +3526,14 @@ function revalidateAssignmentAuthority(
   return { actorReceiptId, governor };
 }
 
+function hasUnresolvedWriterTerminalConflict(db: SqliteDatabase, projectId: string): boolean {
+  return Boolean(db.prepare(
+    `SELECT 1 FROM execution_attempts
+     WHERE project_id = ? AND origin = 'assignment' AND assignment_kind = 'write'
+       AND conflicting_terminal_digest IS NOT NULL LIMIT 1`,
+  ).get(projectId));
+}
+
 function preflightAssignmentPrepare(db: SqliteDatabase, request: ApplyRequest): void {
   const assignment = request.assignment;
   if (!assignment) throw refusal("INVALID_INPUT", "assignment_prepare requires immutable assignment intent");
@@ -3506,6 +3563,9 @@ function preflightAssignmentPrepare(db: SqliteDatabase, request: ApplyRequest): 
   if (!requirement || requirement.roleId !== assignment.roleId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement is not configured");
   if (requirement.repoTargetId !== null && requirement.repoTargetId !== request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "assignment role requirement targets another repository");
   if (!profileEquals(requirement.executedProfile, assignment.requestedProfile)) throw refusal("EXECUTION_PROFILE_MISMATCH", "requested assignment profile does not match the role requirement");
+  if (assignment.assignmentKind === "write" && hasUnresolvedWriterTerminalConflict(db, request.projectId)) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "an unresolved terminal conflict blocks new writing admission");
+  }
   const activeWriters = asRow<{ count: number }>(db.prepare(
     `SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND origin = 'assignment'
      AND assignment_kind = 'write' AND state IN ${ACTIVE_ASSIGNMENT_SQL}`,
@@ -3603,6 +3663,9 @@ function applyAssignmentPrepare(
   if (!requirement || requirement.roleId !== assignment.roleId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement is not configured");
   if (requirement.repoTargetId !== null && requirement.repoTargetId !== request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "assignment role requirement targets another repository");
   if (!profileEquals(requirement.executedProfile, assignment.requestedProfile)) throw refusal("EXECUTION_PROFILE_MISMATCH", "requested assignment profile does not match the role requirement");
+  if (assignment.assignmentKind === "write" && hasUnresolvedWriterTerminalConflict(db, request.projectId)) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "an unresolved terminal conflict blocks new writing admission");
+  }
   const configJson = storedConfigJson(db, request.projectId, configRevision);
   const ceiling = writingLaneCeilingFromJson(configJson);
   const activeWriterRows = db.prepare(
@@ -3696,6 +3759,16 @@ function applyAssignmentPrepare(
   );
 }
 
+export function explicitExecutionInputSources(serviceTier?: string): NativeAssignmentInput["executionInputSources"] {
+  return {
+    providerId: "explicit",
+    model: "explicit",
+    reasoningLevel: "explicit",
+    permissionMode: "explicit",
+    ...(serviceTier ? { serviceTier: "explicit" as const } : {}),
+  };
+}
+
 function nativeAssignmentInput(assignment: AssignmentRow, attempt: ExecutionAttemptRow, frozenBriefContent: string): NativeAssignmentInput {
   return {
     projectId: assignment.project_id,
@@ -3717,9 +3790,28 @@ function nativeAssignmentInput(assignment: AssignmentRow, attempt: ExecutionAtte
       mode: "managed-worktree",
     },
     requestedProfile: requestedProfile(assignment),
+    executionInputSources: explicitExecutionInputSources(assignment.requested_service_tier || undefined),
     frozenBriefContent,
     frozenBriefDigest: assignment.frozen_brief_digest,
   };
+}
+
+function nativeContextMatches(assignment: AssignmentRow, attempt: ExecutionAttemptRow, evidence: NativeAssignmentEvidence): boolean {
+  return (
+    evidence.assignmentId === assignment.assignment_id &&
+    evidence.executionAttemptId === attempt.execution_attempt_id &&
+    evidence.bbServerId === assignment.bb_server_id &&
+    evidence.projectId === assignment.project_id &&
+    evidence.environmentId === assignment.environment_id &&
+    evidence.sourceId === assignment.source_id &&
+    evidence.hostId === assignment.host_id &&
+    evidence.environmentPath === assignment.environment_path &&
+    evidence.branchName === assignment.branch_name &&
+    evidence.baseSha === assignment.base_sha &&
+    evidence.candidateSha === assignment.candidate_sha &&
+    (attempt.thread_id === null || evidence.threadId === attempt.thread_id) &&
+    (attempt.native_request_id === null || evidence.nativeRequestId === attempt.native_request_id)
+  );
 }
 
 function positiveNativeEvidence(
@@ -3750,21 +3842,7 @@ function positiveNativeEvidence(
   if (requiredStrings.some((value) => !stringField(value)) || !evidence.actualProfile) {
     throw refusal("DISPATCH_UNKNOWN", "native evidence lacks exact first-action, content, context, or profile facts");
   }
-  if (
-    evidence.assignmentId !== assignment.assignment_id ||
-    evidence.executionAttemptId !== attempt.execution_attempt_id ||
-    evidence.bbServerId !== assignment.bb_server_id ||
-    evidence.projectId !== assignment.project_id ||
-    evidence.environmentId !== assignment.environment_id ||
-    evidence.sourceId !== assignment.source_id ||
-    evidence.hostId !== assignment.host_id ||
-    evidence.environmentPath !== assignment.environment_path ||
-    evidence.branchName !== assignment.branch_name ||
-    evidence.baseSha !== assignment.base_sha ||
-    evidence.candidateSha !== assignment.candidate_sha ||
-    (attempt.thread_id !== null && evidence.threadId !== attempt.thread_id) ||
-    (attempt.native_request_id !== null && evidence.nativeRequestId !== attempt.native_request_id)
-  ) {
+  if (!nativeContextMatches(assignment, attempt, evidence)) {
     throw refusal("EXECUTION_CONTEXT_FOREIGN", "native evidence belongs to another exact execution context");
   }
   if (evidence.contentDigest !== assignment.frozen_brief_digest) {
@@ -3800,6 +3878,78 @@ function positiveNativeEvidence(
   return { profile: evidence.actualProfile, profileDigest, nativeReceiptDigest, state: "content_delivered" };
 }
 
+function nativeEvidenceSnapshot(attempt: ExecutionAttemptRow): NativeEvidenceSnapshot {
+  return Object.fromEntries(NATIVE_EVIDENCE_COLUMNS.map((column) => [column, attempt[column]])) as NativeEvidenceSnapshot;
+}
+
+function incomingNativeEvidence(
+  evidence: NativeAssignmentEvidence,
+  positive: ReturnType<typeof positiveNativeEvidence> | null,
+): NativeEvidenceSnapshot {
+  const profile = positive?.profile ?? evidence.actualProfile ?? null;
+  return {
+    thread_id: evidence.threadId ?? null,
+    provider_thread_id: evidence.providerThreadId ?? null,
+    native_request_id: evidence.nativeRequestId ?? null,
+    request_event_id: evidence.requestEventId ?? null,
+    request_event_seq: evidence.requestEventSeq ?? null,
+    accepted_event_id: evidence.acceptedEventId ?? null,
+    accepted_event_seq: evidence.acceptedEventSeq ?? null,
+    first_action_event_id: evidence.firstActionEventId ?? null,
+    first_action_event_seq: evidence.firstActionEventSeq ?? null,
+    content_event_id: evidence.contentEventId ?? null,
+    content_event_seq: evidence.contentEventSeq ?? null,
+    content_receipt_digest: evidence.contentDigest ?? null,
+    actual_provider_id: profile?.providerId ?? null,
+    actual_model: profile?.model ?? null,
+    actual_reasoning_level: profile?.reasoningLevel ?? null,
+    actual_permission_mode: profile?.permissionMode ?? null,
+    actual_service_tier: profile?.serviceTier ?? null,
+    actual_visibility: profile?.visibility ?? null,
+    actual_profile_digest: positive?.profileDigest ?? (profile ? sha256(canonicalJson(profile)) : null),
+    native_receipt_digest: positive?.nativeReceiptDigest ?? null,
+    last_event_seq: evidence.lastEventSeq ?? evidence.contentEventSeq ?? null,
+  };
+}
+
+function mergeNativeEvidence(
+  retained: NativeEvidenceSnapshot,
+  incoming: NativeEvidenceSnapshot,
+): { merged: NativeEvidenceSnapshot; contradiction: boolean } {
+  let contradiction = false;
+  const merged = Object.fromEntries(NATIVE_EVIDENCE_COLUMNS.map((column) => {
+    const current = retained[column];
+    const next = incoming[column];
+    if (current !== null && next !== null && current !== next) contradiction = true;
+    return [column, current ?? next];
+  })) as NativeEvidenceSnapshot;
+  return { merged, contradiction };
+}
+
+function exactPreEffectRefusal(
+  assignment: AssignmentRow,
+  attempt: ExecutionAttemptRow,
+  evidence: NativeAssignmentEvidence,
+  operation: "dispatch" | "reconcile",
+  incoming: NativeEvidenceSnapshot,
+): boolean {
+  if (!nativeContextMatches(assignment, attempt, evidence)) return false;
+  const effectColumns: NativeEvidenceColumn[] = [
+    "accepted_event_id", "accepted_event_seq", "first_action_event_id", "first_action_event_seq",
+    "content_event_id", "content_event_seq", "content_receipt_digest", "actual_provider_id",
+    "actual_model", "actual_reasoning_level", "actual_permission_mode", "actual_service_tier",
+    "actual_visibility", "actual_profile_digest", "native_receipt_digest",
+  ];
+  if (effectColumns.some((column) => attempt[column] !== null || incoming[column] !== null)) return false;
+  if (operation === "dispatch") {
+    return NATIVE_EVIDENCE_COLUMNS.every((column) =>
+      (attempt[column] === null && incoming[column] === null) || incoming[column] === attempt[column]
+    );
+  }
+  if (!attempt.thread_id || !attempt.native_request_id) return false;
+  return NATIVE_EVIDENCE_COLUMNS.every((column) => attempt[column] === null || incoming[column] === attempt[column]);
+}
+
 function recordNativeEvidence(
   db: SqliteDatabase,
   request: ApplyRequest,
@@ -3813,7 +3963,9 @@ function recordNativeEvidence(
     const replay = checkIdempotency(db, request, digest);
     if (replay) return replay;
     const current = assignmentRows(db, request);
-    if (current.attempt.state !== attempt.state || current.attempt.thread_id !== attempt.thread_id || current.attempt.native_request_id !== attempt.native_request_id) {
+    const retained = nativeEvidenceSnapshot(attempt);
+    const currentRetained = nativeEvidenceSnapshot(current.attempt);
+    if (current.attempt.state !== attempt.state || canonicalJson(currentRetained) !== canonicalJson(retained)) {
       throw refusal("ASSIGNMENT_HEAD_STALE", "attempt state moved before native evidence was recorded");
     }
     const authority = revalidateAssignmentAuthority(db, request, current.assignment);
@@ -3822,61 +3974,70 @@ function recordNativeEvidence(
     let outcome: FoundationCode = "DISPATCH_UNKNOWN";
     let state: ExecutionAttemptRow["state"] = "dispatch_unknown";
     let reasonCode = evidence.reasonCode || "dispatch_unknown";
-    const observedProfile = evidence.actualProfile ?? null;
-    const observedProfileDigest = observedProfile ? sha256(canonicalJson(observedProfile)) : null;
+    let acceptIncoming = nativeContextMatches(current.assignment, current.attempt, evidence);
     try {
       if (evidence.disposition === "confirmed") {
         positive = positiveNativeEvidence(current.assignment, current.attempt, evidence);
         outcome = "OK";
         state = positive.state;
-      } else if (evidence.disposition === "refused") {
-        state = "failed";
-        outcome = "EXECUTION_PROFILE_UNKNOWN";
       }
     } catch (error) {
       if (error instanceof Refusal && ["EXECUTION_PROFILE_MISMATCH", "EXECUTION_CONTEXT_FOREIGN"].includes(error.data.code)) {
         reasonCode = error.data.code;
         outcome = error.data.code;
+        if (error.data.code === "EXECUTION_CONTEXT_FOREIGN") acceptIncoming = false;
       }
       state = "dispatch_unknown";
     }
-    const terminalDeadlineReason = observedAtMs > current.assignment.deadline_at_ms ? "assignment_deadline_exceeded" : reasonCode;
-    const updated = db.prepare(
-      `UPDATE execution_attempts SET state = ?, thread_id = COALESCE(thread_id, ?),
-       provider_thread_id = COALESCE(provider_thread_id, ?), native_request_id = COALESCE(native_request_id, ?),
-       request_event_id = COALESCE(request_event_id, ?), request_event_seq = COALESCE(request_event_seq, ?),
-       accepted_event_id = COALESCE(accepted_event_id, ?), accepted_event_seq = COALESCE(accepted_event_seq, ?),
-       first_action_event_id = COALESCE(first_action_event_id, ?), first_action_event_seq = COALESCE(first_action_event_seq, ?),
-       content_event_id = COALESCE(content_event_id, ?), content_event_seq = COALESCE(content_event_seq, ?),
-       content_receipt_digest = COALESCE(content_receipt_digest, ?),
-       actual_provider_id = COALESCE(actual_provider_id, ?), actual_model = COALESCE(actual_model, ?),
-       actual_reasoning_level = COALESCE(actual_reasoning_level, ?), actual_permission_mode = COALESCE(actual_permission_mode, ?),
-       actual_service_tier = COALESCE(actual_service_tier, ?), actual_visibility = COALESCE(actual_visibility, ?),
-       actual_profile_digest = COALESCE(actual_profile_digest, ?), native_receipt_digest = COALESCE(native_receipt_digest, ?),
-       reason_code = ?, last_event_seq = ?, observed_at_ms = ?
-       WHERE project_id = ? AND execution_attempt_id = ? AND state = ?
-         AND thread_id IS ? AND native_request_id IS ?`,
-    ).run(
-      state, evidence.threadId ?? null, evidence.providerThreadId ?? null, evidence.nativeRequestId ?? null,
-      evidence.requestEventId ?? null, evidence.requestEventSeq ?? null, evidence.acceptedEventId ?? null,
-      evidence.acceptedEventSeq ?? null, evidence.firstActionEventId ?? null, evidence.firstActionEventSeq ?? null,
-      evidence.contentEventId ?? null, evidence.contentEventSeq ?? null, evidence.contentDigest ?? null,
-      (positive?.profile ?? observedProfile)?.providerId ?? null, (positive?.profile ?? observedProfile)?.model ?? null,
-      (positive?.profile ?? observedProfile)?.reasoningLevel ?? null, (positive?.profile ?? observedProfile)?.permissionMode ?? null,
-      (positive?.profile ?? observedProfile)?.serviceTier ?? null, (positive?.profile ?? observedProfile)?.visibility ?? null,
-      positive?.profileDigest ?? observedProfileDigest, positive?.nativeReceiptDigest ?? null, terminalDeadlineReason,
-      evidence.lastEventSeq ?? evidence.contentEventSeq ?? null, observedAtMs, request.projectId,
-      current.attempt.execution_attempt_id, current.attempt.state, current.attempt.thread_id, current.attempt.native_request_id,
+    const incoming = incomingNativeEvidence(evidence, positive);
+    if (evidence.disposition === "refused") {
+      if (exactPreEffectRefusal(current.assignment, current.attempt, evidence, operation, incoming)) {
+        state = "failed";
+        outcome = "EXECUTION_PROFILE_UNKNOWN";
+      } else {
+        state = "dispatch_unknown";
+        outcome = acceptIncoming ? "DISPATCH_UNKNOWN" : "EXECUTION_CONTEXT_FOREIGN";
+        reasonCode = acceptIncoming ? "refusal_not_proven_pre_effect" : "EXECUTION_CONTEXT_FOREIGN";
+      }
+    }
+    const mergedResult = mergeNativeEvidence(retained, acceptIncoming ? incoming : retained);
+    const missingRetainedConfirmation = positive !== null && NATIVE_EVIDENCE_COLUMNS.some(
+      (column) => retained[column] !== null && incoming[column] !== retained[column],
     );
-    if (updated.changes !== 1) throw refusal("ASSIGNMENT_HEAD_STALE", "attempt native-evidence compare-and-swap failed");
+    const evidenceContradiction = mergedResult.contradiction || missingRetainedConfirmation;
+    const merged = evidenceContradiction ? retained : mergedResult.merged;
+    if (evidenceContradiction) {
+      positive = null;
+      state = "dispatch_unknown";
+      outcome = "DISPATCH_UNKNOWN";
+      reasonCode = "retained_native_evidence_contradiction";
+    }
+    const terminalDeadlineReason = observedAtMs > current.assignment.deadline_at_ms ? "assignment_deadline_exceeded" : reasonCode;
+    const setColumns = NATIVE_EVIDENCE_COLUMNS.map((column) => `${column} = ?`).join(", ");
+    const priorPredicate = NATIVE_EVIDENCE_COLUMNS.map((column) => `${column} IS ?`).join(" AND ");
+    const updated = db.prepare(
+      `UPDATE execution_attempts SET state = ?, ${setColumns}, reason_code = ?, observed_at_ms = ?
+       WHERE project_id = ? AND execution_attempt_id = ? AND state = ? AND ${priorPredicate}`,
+    ).run(
+      state,
+      ...NATIVE_EVIDENCE_COLUMNS.map((column) => merged[column]),
+      terminalDeadlineReason,
+      observedAtMs,
+      request.projectId,
+      current.attempt.execution_attempt_id,
+      current.attempt.state,
+      ...NATIVE_EVIDENCE_COLUMNS.map((column) => retained[column]),
+    );
+    if (updated.changes !== 1) throw refusal("DISPATCH_UNKNOWN", "attempt native-evidence compare-and-swap failed");
+    const aggregateRevision = nextAggregateRevision(db, request.projectId, "execution_attempt", current.attempt.execution_attempt_id);
     return commitMutation(
       db,
       request,
       digest,
       authority.actorReceiptId,
-      { aggregateType: "execution_attempt", aggregateId: current.attempt.execution_attempt_id, aggregateRevision: 2, eventType: state === "dispatch_unknown" ? "assignment_dispatch_unknown" : state === "failed" ? "assignment_dispatch_failed" : "assignment_content_delivered", event: { assignmentId: current.assignment.assignment_id, executionAttemptId: current.attempt.execution_attempt_id, operation, state, reasonCode: terminalDeadlineReason, nativeRequestId: evidence.nativeRequestId ?? null, threadId: evidence.threadId ?? null, lastEventSeq: evidence.lastEventSeq ?? null } },
+      { aggregateType: "execution_attempt", aggregateId: current.attempt.execution_attempt_id, aggregateRevision, eventType: state === "dispatch_unknown" ? "assignment_dispatch_unknown" : state === "failed" ? "assignment_dispatch_failed" : "assignment_content_delivered", event: { assignmentId: current.assignment.assignment_id, executionAttemptId: current.attempt.execution_attempt_id, operation, state, reasonCode: terminalDeadlineReason, nativeRequestId: merged.native_request_id, threadId: merged.thread_id, lastEventSeq: merged.last_event_seq } },
       { expected: 1, attempted: 1, verified: outcome === "OK" ? 1 : 0 },
-      { currentConfigRevision: current.assignment.config_revision, currentGovernanceEpoch: authority.governor.governance_epoch, evidence: { assignmentId: current.assignment.assignment_id, executionAttemptId: current.attempt.execution_attempt_id, state, reasonCode: terminalDeadlineReason, nativeReceiptDigest: positive?.nativeReceiptDigest ?? null, actualProfileDigest: positive?.profileDigest ?? observedProfileDigest, threadId: evidence.threadId ?? null, nativeRequestId: evidence.nativeRequestId ?? null, lastEventSeq: evidence.lastEventSeq ?? null } },
+      { currentConfigRevision: current.assignment.config_revision, currentGovernanceEpoch: authority.governor.governance_epoch, evidence: { assignmentId: current.assignment.assignment_id, executionAttemptId: current.attempt.execution_attempt_id, state, reasonCode: terminalDeadlineReason, nativeReceiptDigest: merged.native_receipt_digest, actualProfileDigest: merged.actual_profile_digest, threadId: merged.thread_id, nativeRequestId: merged.native_request_id, lastEventSeq: merged.last_event_seq } },
       outcome,
     );
   });
@@ -3889,29 +4050,64 @@ function applyAssignmentNative(
   adapter: NativeAssignmentAdapter | null,
   operation: "dispatch" | "reconcile",
 ): FoundationResult {
+  let possibleNativeEffect = false;
   try {
     const replay = checkIdempotency(db, request, digest);
     if (replay) return replay;
+    if (!adapter) return result("DISPATCH_UNKNOWN", request.projectId, 1, 0, 0, { message: "native assignment adapter is unavailable" });
+    const frozenBriefContent = request.frozenBriefContent;
     const { assignment, attempt } = transaction(db, () => {
       const replayInTransaction = checkIdempotency(db, request, digest);
       if (replayInTransaction) throw refusal("IDEMPOTENCY_KEY_CONFLICT", "assignment operation was concurrently committed");
       const rows = assignmentRows(db, request);
-      revalidateAssignmentAuthority(db, request, rows.assignment);
+      const authority = revalidateAssignmentAuthority(db, request, rows.assignment);
+      if (!frozenBriefContent || sha256(frozenBriefContent) !== rows.assignment.frozen_brief_digest) {
+        throw refusal("ASSIGNMENT_HEAD_STALE", "exact frozen brief content does not match immutable intent");
+      }
       if (operation === "dispatch" && rows.attempt.state !== "prepared") {
         throw refusal(rows.attempt.state === "dispatch_unknown" ? "DISPATCH_UNKNOWN" : "ASSIGNMENT_HEAD_STALE", "assignment attempt is not dispatchable");
       }
       if (operation === "reconcile" && rows.attempt.state !== "dispatch_unknown") {
         throw refusal("ASSIGNMENT_HEAD_STALE", "only an ambiguous dispatch may be reconciled");
       }
-      return rows;
+      if (operation === "reconcile") return rows;
+
+      const retained = nativeEvidenceSnapshot(rows.attempt);
+      const priorPredicate = NATIVE_EVIDENCE_COLUMNS.map((column) => `${column} IS ?`).join(" AND ");
+      const claimed = db.prepare(
+        `UPDATE execution_attempts SET state = 'dispatch_unknown', reason_code = 'dispatch_claimed', observed_at_ms = ?
+         WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND ${priorPredicate}`,
+      ).run(
+        now(),
+        request.projectId,
+        rows.attempt.execution_attempt_id,
+        ...NATIVE_EVIDENCE_COLUMNS.map((column) => retained[column]),
+      );
+      if (claimed.changes !== 1) throw refusal("DISPATCH_UNKNOWN", "dispatch claim compare-and-swap failed");
+      const claimIdentity = sha256(canonicalJson({
+        phase: "assignment_dispatch_claim",
+        projectId: request.projectId,
+        executionAttemptId: rows.attempt.execution_attempt_id,
+        requestDigest: digest,
+      }));
+      const claimRequest = { ...request, idempotencyKey: `assignment-dispatch-claim-${claimIdentity}` };
+      const claimDigest = sha256(canonicalJson({ claimIdentity, requestDigest: digest }));
+      const aggregateRevision = nextAggregateRevision(db, request.projectId, "execution_attempt", rows.attempt.execution_attempt_id);
+      commitMutation(
+        db,
+        claimRequest,
+        claimDigest,
+        authority.actorReceiptId,
+        { aggregateType: "execution_attempt", aggregateId: rows.attempt.execution_attempt_id, aggregateRevision, eventType: "assignment_dispatch_claimed", event: { assignmentId: rows.assignment.assignment_id, executionAttemptId: rows.attempt.execution_attempt_id, state: "dispatch_unknown", reasonCode: "dispatch_claimed" } },
+        { expected: 1, attempted: 1, verified: 1 },
+        { currentConfigRevision: rows.assignment.config_revision, currentGovernanceEpoch: authority.governor.governance_epoch, evidence: { assignmentId: rows.assignment.assignment_id, executionAttemptId: rows.attempt.execution_attempt_id, state: "dispatch_unknown", reasonCode: "dispatch_claimed" } },
+        "DISPATCH_UNKNOWN",
+      );
+      return assignmentRows(db, request);
     });
-    if (!adapter) return result("DISPATCH_UNKNOWN", request.projectId, 1, 0, 0, { message: "native assignment adapter is unavailable" });
-    const frozenBriefContent = request.frozenBriefContent;
-    if (!frozenBriefContent || sha256(frozenBriefContent) !== assignment.frozen_brief_digest) {
-      return result("ASSIGNMENT_HEAD_STALE", request.projectId, 1, 0, 0, { message: "exact frozen brief content does not match immutable intent" });
-    }
-    const input = nativeAssignmentInput(assignment, attempt, frozenBriefContent);
+    const input = nativeAssignmentInput(assignment, attempt, frozenBriefContent!);
     let evidence: NativeAssignmentEvidence;
+    possibleNativeEffect = true;
     try {
       evidence = operation === "dispatch"
         ? adapter.dispatch(input)
@@ -3921,6 +4117,7 @@ function applyAssignmentNative(
     }
     return recordNativeEvidence(db, request, digest, assignment, attempt, evidence, operation);
   } catch (error) {
+    if (possibleNativeEffect) return result("DISPATCH_UNKNOWN", request.projectId, 1, 1, 0, { message: "native effect may have occurred; durable dispatch claim remains unresolved" });
     if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
     return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal assignment mutation error" });
   }
@@ -3963,17 +4160,42 @@ function applyAssignmentTerminal(db: SqliteDatabase, request: ApplyRequest, dige
       if (original) return JSON.parse(original.outcome_json) as FoundationResult;
     }
     const authority = revalidateAssignmentAuthority(db, request, assignment);
-    db.prepare(
-      `UPDATE execution_attempts SET state = 'running', terminal_result = NULL,
-       conflicting_terminal_digest = ?, reason_code = 'terminal_report_ambiguous'
-       WHERE project_id = ? AND execution_attempt_id = ?`,
-    ).run(reportDigest, request.projectId, attempt.execution_attempt_id);
+    if (attempt.conflicting_terminal_digest !== null) {
+      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "a different terminal conflict is already retained");
+    }
+    const updated = db.prepare(
+      `UPDATE execution_attempts SET conflicting_terminal_digest = ?, reason_code = 'terminal_report_ambiguous'
+       WHERE project_id = ? AND execution_attempt_id = ? AND state IS ?
+         AND terminal_result IS ? AND reported_outcome IS ? AND terminal_report_digest IS ?
+         AND conflicting_terminal_digest IS ? AND terminal_event_id IS ? AND terminal_event_seq IS ?
+         AND candidate_sha IS ? AND native_receipt_digest IS ? AND actual_profile_digest IS ?
+         AND completed_at_ms IS ? AND reason_code IS ? AND last_event_seq IS ?`,
+    ).run(
+      reportDigest,
+      request.projectId,
+      attempt.execution_attempt_id,
+      attempt.state,
+      attempt.terminal_result,
+      attempt.reported_outcome,
+      attempt.terminal_report_digest,
+      attempt.conflicting_terminal_digest,
+      attempt.terminal_event_id,
+      attempt.terminal_event_seq,
+      attempt.candidate_sha,
+      attempt.native_receipt_digest,
+      attempt.actual_profile_digest,
+      attempt.completed_at_ms,
+      attempt.reason_code,
+      attempt.last_event_seq,
+    );
+    if (updated.changes !== 1) throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal conflict compare-and-swap failed");
+    const aggregateRevision = nextAggregateRevision(db, request.projectId, "execution_attempt", attempt.execution_attempt_id);
     return commitMutation(
       db,
       request,
       digest,
       authority.actorReceiptId,
-      { aggregateType: "execution_attempt", aggregateId: attempt.execution_attempt_id, aggregateRevision: 4, eventType: "assignment_terminal_ambiguous", event: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, terminalReportDigest: attempt.terminal_report_digest, conflictingTerminalDigest: reportDigest } },
+      { aggregateType: "execution_attempt", aggregateId: attempt.execution_attempt_id, aggregateRevision, eventType: "assignment_terminal_ambiguous", event: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, terminalReportDigest: attempt.terminal_report_digest, conflictingTerminalDigest: reportDigest } },
       { expected: 1, attempted: 1, verified: 0 },
       { message: "terminal evidence conflicts with the retained report", currentConfigRevision: assignment.config_revision, currentGovernanceEpoch: authority.governor.governance_epoch, evidence: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, terminalReportDigest: attempt.terminal_report_digest, conflictingTerminalDigest: reportDigest } },
       "TERMINAL_REPORT_AMBIGUOUS",
@@ -4013,12 +4235,13 @@ function applyAssignmentTerminal(db: SqliteDatabase, request: ApplyRequest, dige
     attempt.execution_attempt_id,
   );
   if (updated.changes !== 1) throw refusal("ASSIGNMENT_HEAD_STALE", "terminal attempt compare-and-swap failed");
+  const aggregateRevision = nextAggregateRevision(db, request.projectId, "execution_attempt", attempt.execution_attempt_id);
   return commitMutation(
     db,
     request,
     digest,
     authority.actorReceiptId,
-    { aggregateType: "execution_attempt", aggregateId: attempt.execution_attempt_id, aggregateRevision: 3, eventType: "assignment_terminal_reported", event: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, state, terminalResult, reportedOutcome: report.outcome, terminalReportDigest: reportDigest, reasonCode } },
+    { aggregateType: "execution_attempt", aggregateId: attempt.execution_attempt_id, aggregateRevision, eventType: "assignment_terminal_reported", event: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, state, terminalResult, reportedOutcome: report.outcome, terminalReportDigest: reportDigest, reasonCode } },
     { expected: 1, attempted: 1, verified: 1 },
     { currentConfigRevision: assignment.config_revision, currentGovernanceEpoch: authority.governor.governance_epoch, evidence: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, state, terminalResult, reportedOutcome: report.outcome, terminalReportDigest: reportDigest, reasonCode, deadlineAtMs: assignment.deadline_at_ms, receivedAtMs: report.receivedAtMs } },
   );
@@ -4373,7 +4596,9 @@ export async function doctor(
        WHERE assignments.project_id = ? ORDER BY assignments.assignment_id, execution_attempts.execution_attempt_id`,
     ).all(projectId) as Array<Record<string, unknown>>;
     const activeWriters = assignmentAttempts.filter(
-      (row) => row.assignment_kind === "write" && (ACTIVE_ASSIGNMENT_STATES as readonly unknown[]).includes(row.state),
+      (row) => row.assignment_kind === "write" && (
+        (ACTIVE_ASSIGNMENT_STATES as readonly unknown[]).includes(row.state) || row.conflicting_terminal_digest !== null
+      ),
     );
     const unresolvedAttempts = assignmentAttempts.filter(
       (row) => row.state === "dispatch_unknown" || row.conflicting_terminal_digest !== null || row.terminal_report_digest === null,
