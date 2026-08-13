@@ -8,7 +8,7 @@ import type {
   PluginSidebarThread,
   PluginThreadListProps,
 } from "@bb/plugin-sdk/app";
-import { rpcContract } from "./server";
+import type { rpcContract } from "./server";
 
 type Lane = PluginRpcResult<typeof rpcContract["lanes"]>[number];
 type ThreadStates = PluginRpcResult<typeof rpcContract["threadStates"]>;
