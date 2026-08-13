@@ -1963,6 +1963,70 @@ describe("bb-collab plugin boundary", () => {
     expect(fixture.reader.readCalls).toHaveLength(1);
   });
 
+  it("rejects an amendment with a stale referenced H0 Assignment without reads or writes", async () => {
+    const fixture = await preparedReview();
+    const h1Write = completeFixtureAssignment(fixture.db, fixture.fenceToken, { assignmentKind: "write", assignmentId: "write-amendment-stale-h0", candidateSha: H1_CANDIDATE_SHA });
+    const h1Review = completeFixtureAssignment(fixture.db, fixture.fenceToken, { assignmentKind: "review", assignmentId: "review-amendment-stale-h0", candidateSha: H1_CANDIDATE_SHA });
+    h1Review.evidence.relation = {
+      relationRole: "final_review",
+      workItemId: WORK_ITEM_ID,
+      repoTargetId: TARGET_ID,
+      configRevision: 1,
+      baseSha: BASE_SHA,
+      candidateSha: H1_CANDIDATE_SHA,
+      treeDigest: H1_TREE_DIGEST,
+      changedFiles: REVIEW_FILES,
+      tierAEntries: REVIEW_FILES,
+      writeAssignmentId: h1Write.assignmentId,
+      writeExecutionAttemptId: h1Write.executionAttemptId,
+      authors: REVIEW_AUTHORS,
+      committers: REVIEW_COMMITTERS,
+    };
+    fixture.reader.facts = {
+      ...fixture.reader.facts!,
+      writeAssignmentId: h1Write.assignmentId,
+      writeExecutionAttemptId: h1Write.executionAttemptId,
+      branchName: `bb/${h1Write.assignmentId}`,
+      candidateSha: H1_CANDIDATE_SHA,
+      treeDigest: H1_TREE_DIGEST,
+    };
+    const amendment = decisionArtifact("review-amendment-stale-h0", {
+      evidenceKind: "review_ready",
+      sourceKind: "review_ready",
+      sourceRef: "review-ready:stale-h0",
+      relationKind: "supporting",
+      relation: {
+        relationRole: "amendment_scope",
+        workItemId: WORK_ITEM_ID,
+        repoTargetId: TARGET_ID,
+        baseSha: BASE_SHA,
+        h0AssignmentId: fixture.review.assignmentId,
+        h0CandidateSha: CANDIDATE_SHA,
+        h0TreeDigest: H0_TREE_DIGEST,
+        h1AssignmentId: h1Review.assignmentId,
+        h1CandidateSha: H1_CANDIDATE_SHA,
+        h1TreeDigest: H1_TREE_DIGEST,
+        allowedChangedFiles: REVIEW_FILES,
+        actualChangedFiles: REVIEW_FILES,
+      },
+    });
+    fixture.db.prepare("UPDATE assignments SET assignment_digest = ? WHERE assignment_id = ?").run(sha256("corrupt-h0-amendment-reference"), fixture.review.assignmentId);
+    const request = decisionDispositionRequest(fixture.fenceToken, "review-evidence-decision", 1, {
+      idempotencyKey: "review-amendment-stale-h0",
+      conditions: [{ kind: "evidence_required", evidenceIds: [h1Review.evidence.evidenceId] }],
+      decisionEvidence: [amendment, h1Review.evidence],
+    });
+    const before = exportFoundation(fixture.db, PROJECT_ID);
+    const counts = Object.fromEntries(["evidence_artifacts", "decision_evidence", "state_events", "actor_receipts", "mutation_receipts"].map((table) => [table, (fixture.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count]));
+    expect(applyWithFixtureReceipt(fixture.db, request, null, null, null, fixture.reader).outcome).toBe("ASSIGNMENT_HEAD_STALE");
+    expect(fixture.reader.readCalls).toHaveLength(0);
+    expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+    for (const [table, count] of Object.entries(counts)) {
+      expect((fixture.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count, table).toBe(count);
+    }
+    expect(fixture.db.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = ?").get(request.idempotencyKey)).toBeUndefined();
+  });
+
   it("rejects changed-base and out-of-scope amendments without reading facts", async () => {
     const fixture = await preparedReview();
     const h1Write = completeFixtureAssignment(fixture.db, fixture.fenceToken, { assignmentKind: "write", assignmentId: "write-amendment", candidateSha: H1_CANDIDATE_SHA });
