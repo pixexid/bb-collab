@@ -1,2 +1,122 @@
 # bb-collab
-BB-native project governance, work lifecycle, and collaboration runtime
+
+BB-native project governance, work lifecycle, and collaboration runtime.
+
+## Founding status
+
+Issue 1 freezes the contract and v1 boundary before implementation begins.
+This repository currently contains founding documentation only: no plugin,
+package, database schema, adapter, workflow, CI, release automation or task
+authority has been scaffolded.
+
+The founding decision is an **adopt with amendments** disposition of the
+operator-backed review. bb-collab is a public BB-native successor to
+llm-collab: distill the surviving invariants; do not fork its history or
+implementation.
+
+- [Issue 1](https://github.com/pixexid/bb-collab/issues/1) is the acceptance
+  record.
+- [ADR 0001](docs/adr/0001-founding-contract.md) is the complete decision.
+- [Threat model](docs/threat-model.md) defines the trust and enforcement
+  ceiling.
+- [Import manifest](docs/import-manifest.md) records surviving clauses and
+  issue dispositions.
+- [Roadmap](docs/roadmap.md) gives the dependency order and adoption gate.
+
+Evidence is public and durable:
+[approved founding evidence gist](https://gist.github.com/pixexid/77c7ac47afc27a63a147159195ba56b7)
+and the
+[llm-collab source fence](https://github.com/pixexid/llm-collab/tree/f988d9711d3778f751e4ec0e32ebbf7b0893c80f).
+The attached adjudication and Pro verdict are provenance inputs, not
+independent authority stores. No license is inferred from the unlicensed
+predecessor.
+
+## Canonical boundary
+
+- The bb-collab plugin SQLite database owns canonical governance and work
+  state.
+- BB core owns native project, source, host, environment, thread, provider and
+  event facts.
+- GitHub Issues, BB Tasks, Markdown and project files are projection,
+  configuration or evidence surfaces only.
+
+The plugin governs sanctioned canonical mutations. It cannot physically veto
+raw BB, administrator, Git or filesystem activity; unmanaged activity gains no
+canonical authority merely by being observed.
+
+## v1 boundary
+
+The first release is complete only when it can provide:
+
+1. One BB plugin database with transactional storage, migrations, backup and
+   deterministic logical export.
+2. Immutable project-config revisions and exact stable repository targets.
+3. A read-only conformance doctor and explicit idempotent apply/verify mode.
+4. Project governorship with one compare-and-swap epoch/fence and one
+   versioned mutation resolver.
+5. A canonical WorkItem lifecycle and GitHub Issues as the first projection.
+6. Role generations, manual succession and the minimum qualification and
+   eligibility evidence needed for the orchestrator and reviewer roles.
+7. One sanctioned native BB assignment path with separate Assignment and
+   ExecutionAttempt records, exact executed-profile receipts, isolated
+   environments and terminal reports.
+8. Decisions, dispositions, evidence artifacts and operator holds, with
+   consults explicitly advisory.
+9. Exact-head review, release and environment-safety gates with
+   capability-aware connector handling.
+10. Deterministic source freeze, export, import, equivalence and one-governor
+    activation.
+11. One adversarial first-adopter conformance lane through routine closure.
+
+No task or spawn authority implementation starts before storage, exact target,
+conformance, governorship and resolver seams exist.
+
+## Explicit non-goals for v1
+
+- Automatic leases, heartbeat election, failover or provider-capacity routing.
+- A custom bus, inbox, ACK/dedupe transport or watcher fleet.
+- Automated subagent spawning, generalized delegation trees or depth greater
+  than one.
+- A generic workflow/fan-out engine, dashboard or plugin-profile control
+  plane.
+- BB Tasks, GitHub labels or GitHub Projects as canonical state.
+- Model-branded qualification projects, provider price/quota brokerage or
+  autonomous model selection.
+- Multi-server active-active authority.
+- Universal browser, database, deployment or product automation.
+- Full replay of legacy chats, inboxes, pointer wakes, watchers or mutable
+  task files.
+- Standing supervisors, cross-project peer authority, Fable-specific routing
+  or harness-named roles.
+- Invisible full-permission defaults.
+- A physical veto over raw BB, admin, Git or filesystem activity.
+- Generic post-write reverse migration without a lossless fixture-tested
+  adapter.
+
+## Repository layout
+
+| Path | Contract |
+| --- | --- |
+| [AGENTS.md](AGENTS.md) | Contract version, canonical boundary and worker/review obligations. |
+| [docs/adr/0001-founding-contract.md](docs/adr/0001-founding-contract.md) | Complete adjudicated schema, authority, failure and cutover decision. |
+| [docs/threat-model.md](docs/threat-model.md) | Trust boundaries, threats, controls and enforcement ceiling. |
+| [docs/import-manifest.md](docs/import-manifest.md) | Surviving llm-collab clauses, issue ledger and migration rules. |
+| [docs/roadmap.md](docs/roadmap.md) | Dependency-ordered implementation and adoption evidence. |
+
+## Dependency sequence
+
+Founding work proceeds in this order: contract and source evidence; plugin
+storage/export; project configuration and repository targets; conformance
+doctor/apply; project governorship and resolver; WorkItem and GitHub
+projection; role generations and qualification; assignment and execution;
+decision/disposition/evidence; review, release and environment safety;
+migration/cutover; adversarial fixtures; one quiet first-adopter lane.
+
+## Adoption target
+
+A standard one- or two-repository project must reach one routine closed lane in
+at most four operator hours, without shared code edits, manual database edits,
+manual label loops, watcher processes or one-off spawn exceptions. Doctor,
+explicit apply and post-apply doctor must converge idempotently, and wrong
+project, wrong repository, stale epoch and zero-work false-success fixtures
+must fail with typed reasons and no mutation.
