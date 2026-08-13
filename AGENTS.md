@@ -2,9 +2,14 @@
 
 CONTRACT_VERSION: 1
 
-This repository contains the founding contract for bb-collab, a BB-native
-project-governance and work-lifecycle plugin. The implementation does not
-exist yet. The complete decision is in
+This repository contains the founding contract and the implemented foundation
+through schema v5: a single SQLite store with migrations, resolver,
+state-event and mutation-receipt, deterministic export, and read-only doctor
+seams, plus WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
+Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
+foundations. Production RPC/CLI apply remain unconditionally
+`OPERATOR_AUTH_REQUIRED`; the plugin has not been installed, reloaded, or
+activated against live project authority. The complete decision is in
 [ADR 0001](docs/adr/0001-founding-contract.md); the threat boundary is in
 [the threat model](docs/threat-model.md); import and issue disposition are in
 [the import manifest](docs/import-manifest.md); and dependency order is in
