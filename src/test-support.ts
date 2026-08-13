@@ -2,9 +2,13 @@ import type Database from "better-sqlite3";
 import {
   applyFixtureMutation,
   canonicalJson,
+  GitHubIssueAdapterError,
   sha256,
   type ApplyRequest,
   type FoundationResult,
+  type GitHubIssueAdapter,
+  type GitHubIssueMutation,
+  type GitHubIssueSnapshot,
   type SqliteDatabase,
 } from "./foundation.js";
 
@@ -77,6 +81,74 @@ export function seedFixtureDecision(
   );
 }
 
-export function applyWithFixtureReceipt(db: Database.Database, request: ApplyRequest): FoundationResult {
-  return applyFixtureMutation(db, request);
+export class DeterministicGitHubIssueAdapter implements GitHubIssueAdapter {
+  readonly mutationCalls: GitHubIssueMutation[] = [];
+  readonly readCalls: Array<{ owner: string; repo: string; issueNumber: number }> = [];
+  readonly issues = new Map<string, GitHubIssueSnapshot>();
+  available = true;
+  nextIssueNumber = 1;
+  nextMutationOutcome: "normal" | "ambiguous" | "wrong_identity" = "normal";
+  readonly readOutcomes: Array<"normal" | "missing" | "invalid" | "unavailable"> = [];
+
+  constructor(readonly connectorHost = "github.test") {}
+
+  private key(owner: string, repo: string, issueNumber: number): string {
+    return `${owner}/${repo}#${issueNumber}`;
+  }
+
+  put(snapshot: GitHubIssueSnapshot): void {
+    this.issues.set(this.key(snapshot.owner, snapshot.repo, snapshot.issueNumber), structuredClone(snapshot));
+    this.nextIssueNumber = Math.max(this.nextIssueNumber, snapshot.issueNumber + 1);
+  }
+
+  remove(owner: string, repo: string, issueNumber: number): void {
+    this.issues.delete(this.key(owner, repo, issueNumber));
+  }
+
+  snapshot(owner: string, repo: string, issueNumber: number): GitHubIssueSnapshot | undefined {
+    const value = this.issues.get(this.key(owner, repo, issueNumber));
+    return value ? structuredClone(value) : undefined;
+  }
+
+  read(owner: string, repo: string, issueNumber: number): GitHubIssueSnapshot | null {
+    this.readCalls.push({ owner, repo, issueNumber });
+    const outcome = this.readOutcomes.shift() ?? "normal";
+    if (outcome === "unavailable") throw new GitHubIssueAdapterError("unavailable");
+    if (outcome === "missing") return null;
+    if (outcome === "invalid") return { owner } as never;
+    return this.snapshot(owner, repo, issueNumber) ?? null;
+  }
+
+  mutate(input: GitHubIssueMutation): GitHubIssueSnapshot {
+    this.mutationCalls.push(structuredClone(input));
+    const outcome = this.nextMutationOutcome;
+    this.nextMutationOutcome = "normal";
+    if (outcome === "ambiguous") throw new GitHubIssueAdapterError("ambiguous");
+    const issueNumber = input.kind === "create" ? this.nextIssueNumber++ : input.issueNumber!;
+    const previous = this.snapshot(input.owner, input.repo, issueNumber);
+    if (input.kind === "update" && !previous) throw new GitHubIssueAdapterError("ambiguous");
+    const labels = new Set(previous?.labels ?? []);
+    input.removeLabels.forEach((label) => labels.delete(label));
+    input.addLabels.forEach((label) => labels.add(label));
+    const snapshot: GitHubIssueSnapshot = {
+      owner: input.owner,
+      repo: input.repo,
+      issueNumber,
+      title: input.title,
+      body: input.body,
+      state: input.state,
+      labels: [...labels].sort(),
+      externalRevision: `fixture-${this.mutationCalls.length}`,
+    };
+    this.put(snapshot);
+    return outcome === "wrong_identity" ? { ...snapshot, repo: "wrong-repo" } : structuredClone(snapshot);
+  }
+}
+
+export function applyWithFixtureReceipt(
+  db: Database.Database,
+  request: ApplyRequest,
+  githubAdapter: GitHubIssueAdapter | null = null,
+): FoundationResult {
+  return applyFixtureMutation(db, request, githubAdapter);
 }
