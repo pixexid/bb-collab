@@ -13,6 +13,7 @@ import type { rpcContract } from "./server";
 type Lane = PluginRpcResult<typeof rpcContract["lanes"]>[number];
 type ThreadStates = PluginRpcResult<typeof rpcContract["threadStates"]>;
 type ThreadModels = PluginRpcResult<typeof rpcContract["threadModels"]>;
+type ThreadExecution = NonNullable<ThreadModels[string]>;
 type SidebarCollapseState = PluginRpcResult<typeof rpcContract["sidebarCollapseState"]>;
 
 const MAX_VISIBLE_THREADS = 5;
@@ -69,27 +70,107 @@ function indicatorClasses(thread: PluginSidebarThread): string {
   return "border-l-primary";
 }
 
-// Four shapes, not four colours: the state stays readable with reduced motion on
-// and at the 28px row height the native sidebar uses.
-function signalShapeClasses(thread: PluginSidebarThread, kind: SidebarThreadSignal): string {
-  if (kind === "running") return "size-2.5 animate-spin rounded-full border-2 border-primary border-t-transparent motion-reduce:animate-none";
-  if (kind === "pending") return "flex size-3.5 animate-pulse items-center justify-center rounded-full bg-primary text-[9px] font-bold leading-none text-primary-foreground motion-reduce:animate-none";
-  if (kind === "attention") return `size-2.5 rounded-full ${isError(thread) ? "bg-destructive" : "bg-primary"}`;
-  return "size-1.5 rounded-full bg-muted-foreground/40";
+// Colour is the only dimension: one native-sized dot at the native right edge,
+// never a shape, a size step or a motion cue.
+export function signalDotClasses(thread: PluginSidebarThread, kind: SidebarThreadSignal): string {
+  if (kind === "attention" && isError(thread)) return "bg-destructive";
+  if (kind === "idle") return "bg-muted-foreground/40";
+  return "bg-primary";
 }
 
-function ThreadSignalIcon({ thread }: { thread: PluginSidebarThread }) {
+function ThreadSignalDot({ thread }: { thread: PluginSidebarThread }) {
   const signal = threadSignal(thread);
   return (
     <span
-      className="flex w-3.5 shrink-0 items-center justify-center"
+      className={`size-1.5 shrink-0 rounded-full ${signalDotClasses(thread, signal.kind)}`}
       role="img"
       aria-label={signal.label}
       title={signal.label}
       data-sidebar-thread-signal={signal.kind}
-      data-active-count={activeCount(thread)}
+    />
+  );
+}
+
+// Minimal bundled marks, not trademark artwork: one currentColor path each, so
+// the badge inherits the row's theme token and fetches nothing.
+const PROVIDER_MARKS: Record<string, string> = {
+  codex: "M8 1.8 13.4 5v6L8 14.2 2.6 11V5z",
+  claudecode: "M8 2.2v11.6M3 5.1l10 5.8M13 5.1 3 10.9",
+  cursor: "M3.2 2.4 12.8 8l-4.4 1.2L6.6 13.6z",
+};
+const GENERIC_PROVIDER_MARK = "M8 2.6a5.4 5.4 0 1 0 0 10.8 5.4 5.4 0 0 0 0-10.8z";
+
+function providerMarkKey(providerId: string): string {
+  return providerId.toLocaleLowerCase().replace(/[^a-z0-9]/gu, "");
+}
+
+function ProviderMark({ providerId }: { providerId: string }) {
+  const key = providerMarkKey(providerId);
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      className="size-3 shrink-0"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.4}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable="false"
+      data-provider-mark={key}
     >
-      <span className={signalShapeClasses(thread, signal.kind)} aria-hidden="true">{signal.kind === "pending" ? "!" : null}</span>
+      <path d={PROVIDER_MARKS[key] ?? GENERIC_PROVIDER_MARK} />
+    </svg>
+  );
+}
+
+// Ordered: the family word is a suffix as often as a prefix, so the first hit
+// wins and the prefix entries stay last.
+const MODEL_SHORT_NAMES: readonly (readonly [string, string])[] = [
+  ["luna", "Luna"],
+  ["sol", "Sol"],
+  ["opus", "Opus"],
+  ["sonnet", "Sonnet"],
+  ["haiku", "Haiku"],
+  ["fable", "Fable"],
+  ["kimi", "Kimi"],
+  ["gemini", "Gemini"],
+  ["grok", "Grok"],
+  ["claude", "Claude"],
+  ["gpt", "GPT"],
+];
+const UNAVAILABLE_SHORT_NAME = "—";
+
+export function shortModelName(model: string | null): string {
+  if (!model) return UNAVAILABLE_SHORT_NAME;
+  const key = model.toLocaleLowerCase();
+  const known = MODEL_SHORT_NAMES.find(([needle]) => key.includes(needle));
+  if (known) return known[1];
+  // Fallback still names what the host reported — the id's own first word, never
+  // an invented family.
+  const family = key.split("/").at(-1)!.split(/[-_.:]/u).find(Boolean);
+  return family ? family[0].toUpperCase() + family.slice(1, 8) : UNAVAILABLE_SHORT_NAME;
+}
+
+const REASONING_LETTERS: Record<string, string> = { low: "L", medium: "M", high: "H", xhigh: "X", max: "MAX" };
+const UNAVAILABLE_REASONING_LETTER = "–";
+
+// Levels outside the operator's letter set keep the neutral mark; the exact SDK
+// level still reaches the badge's accessible name.
+export function reasoningLetter(reasoning: string | null): string {
+  return REASONING_LETTERS[reasoning ?? ""] ?? UNAVAILABLE_REASONING_LETTER;
+}
+
+export function executionBadgeLabel(providerId: string, execution: ThreadExecution | null): string {
+  return `${providerId} · model ${execution?.model ?? "unavailable"} · reasoning ${execution?.reasoning ?? "unavailable"}`;
+}
+
+function ExecutionBadge({ providerId, execution }: { providerId: string; execution: ThreadExecution | null }) {
+  const label = executionBadgeLabel(providerId, execution);
+  return (
+    <span className="flex min-w-0 items-center gap-1" role="img" aria-label={label} title={label} data-thread-execution-badge="">
+      <ProviderMark providerId={providerId} />
+      <span className="min-w-0 truncate">{shortModelName(execution?.model ?? null)}·{reasoningLetter(execution?.reasoning ?? null)}</span>
     </span>
   );
 }
@@ -162,7 +243,7 @@ const MENU_ITEM = "flex h-7 w-full shrink-0 items-center rounded px-2 text-left 
 
 function ThreadRow({
   thread,
-  model,
+  execution,
   active,
   customState,
   depth,
@@ -175,7 +256,7 @@ function ThreadRow({
   onNavigate,
 }: {
   thread: PluginSidebarThread;
-  model: string | null;
+  execution: ThreadExecution | null;
   active: boolean;
   customState: string | undefined;
   depth: number;
@@ -231,9 +312,6 @@ function ThreadRow({
         <input autoFocus className="min-w-0 flex-1 rounded border border-border bg-background px-1 text-sm text-foreground" aria-label={`Rename ${title}`} value={renameValue} onChange={(event) => setRenameValue(event.target.value)} onBlur={finishRename} onKeyDown={(event) => { if (event.key === "Enter") finishRename(); if (event.key === "Escape") setRenaming(false); }} />
       ) : (
         <span className="flex min-w-0 flex-1 items-center gap-1.5">
-          {/* Outside the link: the host's indicator label is its own accessible
-              state, not part of the link's name. */}
-          <ThreadSignalIcon thread={thread} />
           <a
             href="#"
             className="min-w-0 truncate rounded-md text-foreground outline-none focus-visible:ring-2 focus-visible:ring-primary"
@@ -255,7 +333,10 @@ function ThreadRow({
       <span className="relative flex min-w-5 max-w-[45%] shrink items-center justify-end">
         <span className={`flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground transition-opacity duration-150 group-focus-within/row:opacity-0 group-hover/row:opacity-0 motion-reduce:transition-none ${menuOpen ? "opacity-0" : ""}`}>
           {customState ? <span className="min-w-0 truncate rounded bg-muted px-1 leading-4" data-custom-thread-state="">{customState}</span> : null}
-          <span className="min-w-0 truncate" title={`Provider: ${thread.providerId}; model: ${model ?? "unavailable"}`}>{thread.providerId}/{model ?? "unavailable"}</span>
+          <ExecutionBadge providerId={thread.providerId} execution={execution} />
+          {/* The host's indicator label is its own accessible state, sitting where
+              the native list puts it rather than in front of the title. */}
+          <ThreadSignalDot thread={thread} />
         </span>
         <button
           ref={triggerRef}
@@ -390,10 +471,10 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     dragTargetId.current = null;
   };
 
-  const renderNode = (node: ThreadTreeNode, model: string | null, depth: number): ReactNode => {
+  const renderNode = (node: ThreadTreeNode, execution: ThreadExecution | null, depth: number): ReactNode => {
     const childrenCollapsed = collapsedThreads.has(node.thread.id);
     return <div key={node.thread.id} className="space-y-px">
-      <ThreadRow thread={node.thread} model={model} active={node.thread.id === activeThreadId} customState={customStates[node.thread.id]} depth={depth} collapsed={childrenCollapsed} hasChildren={node.children.length > 0} onToggleChildren={() => toggleThread(node.thread.id)} onPinnedDragStart={startPinnedDrag} onPinnedDragOver={trackPinnedDrag} onPinnedDragEnd={finishPinnedDrag} onNavigate={onNavigate} />
+      <ThreadRow thread={node.thread} execution={execution} active={node.thread.id === activeThreadId} customState={customStates[node.thread.id]} depth={depth} collapsed={childrenCollapsed} hasChildren={node.children.length > 0} onToggleChildren={() => toggleThread(node.thread.id)} onPinnedDragStart={startPinnedDrag} onPinnedDragOver={trackPinnedDrag} onPinnedDragEnd={finishPinnedDrag} onNavigate={onNavigate} />
       {!childrenCollapsed ? node.children.map((child) => renderNode(child, threadModels[child.thread.id] ?? null, depth + 1)) : null}
     </div>;
   };
@@ -410,7 +491,9 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
             <div className="flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-normal text-muted-foreground">
               <span className="flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground" aria-hidden="true">{projectAvatar(project.name)}</span>
               <span id={`project-${project.id}`} className="min-w-0 truncate">{project.name}</span>
-              <span className="ml-auto shrink-0 tabular-nums">{threads.length}</span>
+              {/* No type utilities of its own: the counter inherits the header's
+                  size, weight, colour and baseline so it never outweighs the name. */}
+              <span className="ml-auto shrink-0" data-project-thread-count="">{threads.length}</span>
               <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none" aria-label={`${collapsed ? "Expand" : "Collapse"} ${project.name} section`} aria-expanded={!collapsed} onClick={() => toggleProject(project.id)}>{collapsed ? "›" : "⌄"}</button>
             </div>
             {!collapsed ? <div className="mt-0.5 space-y-px">
