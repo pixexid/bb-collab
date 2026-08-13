@@ -520,6 +520,46 @@ function activateReviewer(db: Database.Database, fenceToken: string) {
   });
 }
 
+function advanceOrchestrator(db: Database.Database, fenceToken: string): string {
+  const roleContext = {
+    threadId: "thread-orchestrator-successor",
+    requestEventId: "event-orchestrator-successor-request",
+    requestEventSeq: 1,
+    completionEventId: "event-orchestrator-successor-completion",
+    completionEventSeq: 4,
+  };
+  const facts = () => roleReader((input) => {
+    input.thread.id = roleContext.threadId;
+    input.thread.environmentId = "environment-orchestrator-successor";
+    input.environment.id = "environment-orchestrator-successor";
+    input.events[0]!.id = roleContext.requestEventId;
+    input.events[3]!.id = roleContext.completionEventId;
+  });
+  expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+    idempotencyKey: "qualification-orchestrator-successor",
+    qualificationId: "qualification-orchestrator-successor",
+    roleContext,
+  }), null, facts()).outcome).toBe("OK");
+  const succession = applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+    idempotencyKey: "succession-orchestrator-successor",
+    qualificationId: "qualification-orchestrator-successor",
+    roleContext,
+    expectedGeneration: 1,
+    predecessorGeneration: 1,
+  }), null, facts());
+  expect(succession.outcome).toBe("OK");
+  const receiptId = "role-actor-orchestrator-successor";
+  seedVerifiedFixtureReceipt(db, {
+    projectId: PROJECT_ID,
+    receiptId,
+    actorKind: "role",
+    subjectId: (succession.evidence as { holderExecutionAttemptId: string }).holderExecutionAttemptId,
+    roleId: "project-orchestrator",
+    roleGeneration: 2,
+  });
+  return receiptId;
+}
+
 function assignmentPrepareRequest(
   fenceToken: string,
   assignmentId = "assignment-1",
@@ -1673,14 +1713,27 @@ describe("bb-collab plugin boundary", () => {
     expect(applyWithFixtureReceipt(optional.db, optional.request([connectorEvidence("absent", true)]), null, null, null, optional.reader).outcome).toBe("OK");
 
     const prohibited = await preparedReview("prohibited");
-    const before = exportFoundation(prohibited.db, PROJECT_ID);
     const eventCount = (prohibited.db.prepare("SELECT COUNT(*) AS count FROM state_events").get() as { count: number }).count;
     const receiptCount = (prohibited.db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get() as { count: number }).count;
-    expect(applyWithFixtureReceipt(prohibited.db, prohibited.request([connectorEvidence("available", true)]), null, null, null, prohibited.reader).outcome).toBe("INVALID_INPUT");
+    const artifactCount = (prohibited.db.prepare("SELECT COUNT(*) AS count FROM evidence_artifacts").get() as { count: number }).count;
+    for (const disposition of ["proposed", "rejected", "adopted"] as const) {
+      const before = exportFoundation(prohibited.db, PROJECT_ID);
+      const request = prohibited.request([connectorEvidence("available", true)], {
+        idempotencyKey: `review-prohibited-${disposition}`,
+        disposition,
+      });
+      expect(applyWithFixtureReceipt(prohibited.db, request, null, null, null, prohibited.reader).outcome, disposition).toBe("INVALID_INPUT");
+      expect(exportFoundation(prohibited.db, PROJECT_ID), disposition).toEqual(before);
+    }
     expect(prohibited.reader.readCalls).toHaveLength(0);
     expect(prohibited.db.prepare("SELECT COUNT(*) AS count FROM state_events").get()).toEqual({ count: eventCount });
     expect(prohibited.db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get()).toEqual({ count: receiptCount });
-    expect(exportFoundation(prohibited.db, PROJECT_ID)).toEqual(before);
+    expect(prohibited.db.prepare("SELECT COUNT(*) AS count FROM evidence_artifacts").get()).toEqual({ count: artifactCount });
+    expect(applyWithFixtureReceipt(prohibited.db, prohibited.request([], {
+      idempotencyKey: "review-prohibited-rejected",
+      disposition: "adopted",
+    }), null, null, null, prohibited.reader).outcome).toBe("OK");
+    expect(prohibited.reader.readCalls).toHaveLength(1);
     expect(String(applyFixtureMutation)).not.toContain("connectorAdapter");
 
     const prohibitedLocal = await preparedReview("prohibited");
@@ -1740,11 +1793,81 @@ describe("bb-collab plugin boundary", () => {
     expect(fixture.db.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = 'review-cas-race'").get()).toBeUndefined();
   });
 
+  it("revalidates every referenced Assignment against current authority, resource, intent, and target state", async () => {
+    const expectReferenceRefusal = (
+      fixture: Awaited<ReturnType<typeof preparedReview>>,
+      request: ApplyRequest,
+      outcome: string,
+    ) => {
+      const before = exportFoundation(fixture.db, PROJECT_ID);
+      expect(before.outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, request, null, null, null, fixture.reader).outcome).toBe(outcome);
+      expect(fixture.reader.readCalls).toHaveLength(0);
+      expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+      expect(fixture.db.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = ?").get(request.idempotencyKey)).toBeUndefined();
+    };
+
+    const governance = await preparedReview();
+    const claim = applyWithFixtureReceipt(governance.db, {
+      projectId: PROJECT_ID,
+      operationClass: "governor_claim",
+      idempotencyKey: "review-reference-governor-advance",
+      actorReceiptId: RECEIPT_ID,
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: governance.fenceToken,
+      runtimeId: "runtime-review-successor",
+    });
+    expect(claim.outcome).toBe("OK");
+    const successorFence = (claim.evidence as { fenceToken: string }).fenceToken;
+    expectReferenceRefusal(governance, governance.request([], {
+      idempotencyKey: "review-reference-governance-stale",
+      expectedGovernanceEpoch: 2,
+      expectedFenceToken: successorFence,
+    }), "ASSIGNMENT_HEAD_STALE");
+
+    const workItem = await preparedReview();
+    expect(applyWithFixtureReceipt(workItem.db, transitionRequest(workItem.fenceToken, "succeeded", 3)).outcome).toBe("OK");
+    expectReferenceRefusal(workItem, workItem.request([], { idempotencyKey: "review-reference-work-item-stale" }), "ASSIGNMENT_HEAD_STALE");
+
+    const role = await preparedReview();
+    const successorActorReceiptId = advanceOrchestrator(role.db, role.fenceToken);
+    expectReferenceRefusal(role, role.request([], {
+      idempotencyKey: "review-reference-role-stale",
+      actorReceiptId: successorActorReceiptId,
+    }), "ROLE_GENERATION_STALE");
+
+    const digest = await preparedReview();
+    digest.db.prepare("UPDATE assignments SET assignment_digest = ? WHERE assignment_id = ?").run(sha256("corrupt-assignment-digest"), digest.write.assignmentId);
+    expectReferenceRefusal(digest, digest.request([], { idempotencyKey: "review-reference-digest-corrupt" }), "ASSIGNMENT_HEAD_STALE");
+
+    const linkage = await preparedReview();
+    linkage.db.prepare("UPDATE execution_attempts SET assignment_digest = ? WHERE execution_attempt_id = ?").run(sha256("corrupt-attempt-linkage"), linkage.write.executionAttemptId);
+    expectReferenceRefusal(linkage, linkage.request([], { idempotencyKey: "review-reference-linkage-corrupt" }), "ASSIGNMENT_HEAD_STALE");
+
+    const intent = await preparedReview();
+    intent.db.prepare("UPDATE assignments SET requested_model = 'tampered-model' WHERE assignment_id = ?").run(intent.write.assignmentId);
+    expectReferenceRefusal(intent, intent.request([], { idempotencyKey: "review-reference-intent-corrupt" }), "ROLE_REQUIREMENT_UNKNOWN");
+
+    const target = await preparedReview();
+    const movedTarget = {
+      repoTargetId: TARGET_ID,
+      sourceId: "source-main",
+      hostId: "host-main",
+      path: "/workspace/moved",
+      remoteUrl: null,
+      defaultBranch: "main",
+    };
+    target.db.prepare("UPDATE repository_targets SET path = ?, target_digest = ? WHERE project_id = ? AND repo_target_id = ? AND config_revision = 1")
+      .run(movedTarget.path, sha256(canonicalJson(movedTarget)), PROJECT_ID, TARGET_ID);
+    expectReferenceRefusal(target, target.request([], { idempotencyKey: "review-reference-target-moved" }), "EXECUTION_CONTEXT_FOREIGN");
+  });
+
   it("rejects non-independent lane, role, generation, profile, and terminal facts before reading Git evidence", async () => {
     const fixture = await preparedReview();
     const mutations = [
-      ["lane", "UPDATE assignments SET lane_id = 'writer-write-assignment' WHERE assignment_id = 'review-assignment'", "UPDATE assignments SET lane_id = 'review-review-assignment' WHERE assignment_id = 'review-assignment'", "ROLE_HOLDER_MISMATCH"],
-      ["role", "UPDATE assignments SET role_id = 'project-orchestrator', role_generation = 1 WHERE assignment_id = 'review-assignment'; UPDATE execution_attempts SET role_id = 'project-orchestrator', role_generation = 1 WHERE execution_attempt_id = ?", "UPDATE assignments SET role_id = 'independent-reviewer', role_generation = 2 WHERE assignment_id = 'review-assignment'; UPDATE execution_attempts SET role_id = 'independent-reviewer', role_generation = 2 WHERE execution_attempt_id = ?", "ASSIGNMENT_HEAD_STALE"],
+      ["lane", "UPDATE assignments SET lane_id = 'writer-write-assignment' WHERE assignment_id = 'review-assignment'", "UPDATE assignments SET lane_id = 'review-review-assignment' WHERE assignment_id = 'review-assignment'", "ASSIGNMENT_HEAD_STALE"],
+      ["role", "UPDATE assignments SET role_id = 'project-orchestrator', role_generation = 1 WHERE assignment_id = 'review-assignment'; UPDATE execution_attempts SET role_id = 'project-orchestrator', role_generation = 1 WHERE execution_attempt_id = ?", "UPDATE assignments SET role_id = 'independent-reviewer', role_generation = 2 WHERE assignment_id = 'review-assignment'; UPDATE execution_attempts SET role_id = 'independent-reviewer', role_generation = 2 WHERE execution_attempt_id = ?", "ROLE_REQUIREMENT_UNKNOWN"],
       ["generation", "UPDATE assignments SET role_generation = 1 WHERE assignment_id = 'review-assignment'; UPDATE execution_attempts SET role_generation = 1 WHERE execution_attempt_id = ?", "UPDATE assignments SET role_generation = 2 WHERE assignment_id = 'review-assignment'; UPDATE execution_attempts SET role_generation = 2 WHERE execution_attempt_id = ?", "ROLE_GENERATION_STALE"],
       ["profile", "UPDATE execution_attempts SET actual_permission_mode = 'read' WHERE execution_attempt_id = ?", "UPDATE execution_attempts SET actual_permission_mode = 'full' WHERE execution_attempt_id = ?", "ASSIGNMENT_HEAD_STALE"],
       ["blocked", "UPDATE execution_attempts SET state = 'blocked' WHERE execution_attempt_id = ?", "UPDATE execution_attempts SET state = 'done' WHERE execution_attempt_id = ?", "TERMINAL_REPORT_REQUIRED"],
@@ -1867,6 +1990,66 @@ describe("bb-collab plugin boundary", () => {
       expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
     }
     expect(fixture.reader.readCalls).toHaveLength(0);
+  });
+
+  it("keeps the amendment changed-file subset guard mutation-discriminating", async () => {
+    const fixture = await preparedReview();
+    const h1Write = completeFixtureAssignment(fixture.db, fixture.fenceToken, { assignmentKind: "write", assignmentId: "write-amendment-subset", candidateSha: H1_CANDIDATE_SHA });
+    const h1Review = completeFixtureAssignment(fixture.db, fixture.fenceToken, { assignmentKind: "review", assignmentId: "review-amendment-subset", candidateSha: H1_CANDIDATE_SHA });
+    const actualChangedFiles = ["server.ts"];
+    h1Review.evidence.relation = {
+      relationRole: "final_review",
+      workItemId: WORK_ITEM_ID,
+      repoTargetId: TARGET_ID,
+      configRevision: 1,
+      baseSha: BASE_SHA,
+      candidateSha: H1_CANDIDATE_SHA,
+      treeDigest: H1_TREE_DIGEST,
+      changedFiles: actualChangedFiles,
+      tierAEntries: REVIEW_FILES,
+      writeAssignmentId: h1Write.assignmentId,
+      writeExecutionAttemptId: h1Write.executionAttemptId,
+      authors: REVIEW_AUTHORS,
+      committers: REVIEW_COMMITTERS,
+    };
+    fixture.reader.facts = {
+      ...fixture.reader.facts!,
+      writeAssignmentId: h1Write.assignmentId,
+      writeExecutionAttemptId: h1Write.executionAttemptId,
+      branchName: `bb/${h1Write.assignmentId}`,
+      candidateSha: H1_CANDIDATE_SHA,
+      treeDigest: H1_TREE_DIGEST,
+      changedFiles: actualChangedFiles,
+    };
+    const amendment = decisionArtifact("review-amendment-subset", {
+      evidenceKind: "review_ready",
+      sourceKind: "review_ready",
+      sourceRef: "review-ready:subset",
+      relationKind: "supporting",
+      relation: {
+        relationRole: "amendment_scope",
+        workItemId: WORK_ITEM_ID,
+        repoTargetId: TARGET_ID,
+        baseSha: BASE_SHA,
+        h0AssignmentId: fixture.review.assignmentId,
+        h0CandidateSha: CANDIDATE_SHA,
+        h0TreeDigest: H0_TREE_DIGEST,
+        h1AssignmentId: h1Review.assignmentId,
+        h1CandidateSha: H1_CANDIDATE_SHA,
+        h1TreeDigest: H1_TREE_DIGEST,
+        allowedChangedFiles: REVIEW_FILES,
+        actualChangedFiles,
+      },
+    });
+    const request = decisionDispositionRequest(fixture.fenceToken, "review-evidence-decision", 1, {
+      idempotencyKey: "review-amendment-subset",
+      conditions: [{ kind: "evidence_required", evidenceIds: [h1Review.evidence.evidenceId] }],
+      decisionEvidence: [amendment, h1Review.evidence],
+    });
+    const before = exportFoundation(fixture.db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(fixture.db, request, null, null, null, fixture.reader).outcome).toBe("REVIEW_SCOPE_MISMATCH");
+    expect(fixture.reader.readCalls).toHaveLength(0);
+    expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
   });
 
   it("rolls back review disposition artifacts, relations, events, and receipts after late SQLite failures", async () => {

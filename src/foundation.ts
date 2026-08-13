@@ -2724,6 +2724,7 @@ function requireSuccessfulWrite(
   ) {
     throw refusal("ASSIGNMENT_HEAD_STALE", "write facts do not bind the exact successful base-to-candidate Assignment range");
   }
+  revalidateAssignmentReference(db, request, rows.assignment, rows.attempt);
   return rows;
 }
 
@@ -2761,6 +2762,7 @@ function validateAmendmentRelation(
     ) {
       throw refusal("ASSIGNMENT_HEAD_STALE", "review amendment does not bind exact successful H0 and H1 review Assignments");
     }
+    revalidateAssignmentReference(db, request, assignment, attempt);
     return assignment;
   };
   const h0 = exactReview(amendment.h0AssignmentId, amendment.h0CandidateSha);
@@ -2811,8 +2813,6 @@ function preflightReviewDisposition(
       throw refusal("WORK_ITEM_FOREIGN", "review scope WorkItem does not match the exact current target");
     }
   }
-  if (request.disposition !== "adopted") return [];
-
   const relations = reviewRelationRecords(db, request, decisionId);
   const suppliedConnectorRecords = relations.filter((record) => record.current && record.evidenceKind === "connector");
   if (suppliedConnectorRecords.some((record) => {
@@ -2824,6 +2824,8 @@ function preflightReviewDisposition(
   })) {
     throw refusal("INVALID_INPUT", "prohibited or unmapped connector material is not accepted");
   }
+  if (request.disposition !== "adopted") return [];
+
   const connectorRecords = relations.filter((record) => record.evidenceKind === "connector");
   const connectors = connectorRecords.map((record) => {
     if (record.evidenceKind !== "connector" || record.sourceKind !== "connector" || record.relationKind !== "supporting") {
@@ -2900,6 +2902,7 @@ function preflightReviewDisposition(
     const evidenceInput = (request.decisionEvidence ?? []).find((evidence) => evidence.evidenceId === record.evidenceId)!;
     validateDelegatedDecisionEvidence(db, request, governor.governance_epoch, "review_adjudication", evidenceInput);
     const rows = requireReviewAssignment(db, request, record.assignmentId, record.executionAttemptId);
+    revalidateAssignmentReference(db, request, rows.assignment, rows.attempt);
     if (
       rows.assignment.assignment_kind !== "review" || rows.assignment.role_id !== "independent-reviewer" ||
       rows.assignment.candidate_semantics !== "frozen" || rows.assignment.work_item_id !== target.workItemId ||
@@ -2973,13 +2976,21 @@ function applyDecisionMutation(
     const decision = request.decisionId
       ? asRow<DecisionRow>(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(request.decisionId))
       : undefined;
-    if (decision?.decision_class !== "review_adjudication" || request.disposition !== "adopted") {
+    if (decision?.decision_class !== "review_adjudication") {
       return transaction(db, () => {
         const replayInTransaction = checkIdempotency(db, request, digest);
         return replayInTransaction ?? applyDecisionDisposition(db, request, digest);
       });
     }
     const prepared = preflightReviewDisposition(db, request, null);
+    if (request.disposition !== "adopted") {
+      return transaction(db, () => {
+        const replayInTransaction = checkIdempotency(db, request, digest);
+        if (replayInTransaction) return replayInTransaction;
+        preflightReviewDisposition(db, request, null);
+        return applyDecisionDisposition(db, request, digest);
+      });
+    }
     if (!reader) throw refusal("BB_FACTS_UNAVAILABLE", "review adjudication requires the bounded exact review fact reader");
     const facts = new Map<string, ReviewFacts>();
     for (const item of prepared) {
@@ -4542,6 +4553,8 @@ interface AssignmentRow {
   source_id: string;
   host_id: string;
   environment_path: string;
+  environment_mode: "managed-worktree";
+  frozen_brief_version: 1;
   frozen_brief_digest: string;
   requested_provider_id: string;
   requested_model: string;
@@ -4552,6 +4565,8 @@ interface AssignmentRow {
   requested_profile_digest: string;
   dispatch_kind: "spawn" | "attach";
   attach_thread_id: string | null;
+  parent_assignment_id: string | null;
+  depth: 0;
   deadline_at_ms: number;
   assignment_digest: string;
 }
@@ -4560,10 +4575,26 @@ interface ExecutionAttemptRow {
   project_id: string;
   execution_attempt_id: string;
   assignment_id: string | null;
+  origin: "assignment" | "role_holder" | "legacy_unresolved";
+  assignment_digest: string | null;
+  lane_id: string | null;
   assignment_kind: "write" | "review" | "probe" | null;
+  attempt_ordinal: number;
+  dispatch_kind: "spawn" | "attach" | null;
+  config_revision: number;
+  governance_epoch: number;
+  work_item_id: string | null;
+  repo_target_id: string | null;
+  role_id: string;
+  role_generation: number;
   branch_name: string | null;
   base_sha: string | null;
   state: "prepared" | "armed" | "content_delivered" | "running" | "done" | "blocked" | "failed" | "dispatch_unknown";
+  bb_server_id: string;
+  environment_id: string;
+  source_id: string;
+  host_id: string;
+  environment_path: string;
   thread_id: string | null;
   provider_thread_id: string | null;
   native_request_id: string | null;
@@ -4576,6 +4607,8 @@ interface ExecutionAttemptRow {
   content_event_id: string | null;
   content_event_seq: number | null;
   content_receipt_digest: string | null;
+  frozen_brief_digest: string | null;
+  environment_digest: string | null;
   actual_provider_id: string | null;
   actual_model: string | null;
   actual_reasoning_level: string | null;
@@ -4594,6 +4627,7 @@ interface ExecutionAttemptRow {
   completed_at_ms: number | null;
   reason_code: string | null;
   last_event_seq: number | null;
+  attempt_digest: string;
 }
 
 const NATIVE_EVIDENCE_COLUMNS = [
@@ -4642,6 +4676,38 @@ function immutableAssignmentDigest(
   return sha256(canonicalJson({ projectId, configRevision, governanceEpoch, workItemRevision, repoTargetId, intent }));
 }
 
+function storedAssignmentIntent(assignment: AssignmentRow): AssignmentIntent {
+  return {
+    assignmentId: assignment.assignment_id,
+    workItemId: assignment.work_item_id,
+    assignmentKind: assignment.assignment_kind,
+    laneId: assignment.lane_id,
+    roleRequirementId: assignment.role_requirement_id,
+    roleId: assignment.role_id,
+    roleGeneration: assignment.role_generation,
+    branchName: assignment.branch_name,
+    baseSha: assignment.base_sha,
+    candidateSemantics: assignment.candidate_semantics,
+    candidateSha: assignment.candidate_sha,
+    environment: {
+      bbServerId: assignment.bb_server_id,
+      environmentId: assignment.environment_id,
+      sourceId: assignment.source_id,
+      hostId: assignment.host_id,
+      path: assignment.environment_path,
+      mode: assignment.environment_mode,
+    },
+    frozenBriefVersion: assignment.frozen_brief_version,
+    frozenBriefDigest: assignment.frozen_brief_digest,
+    requestedProfile: requestedProfile(assignment),
+    dispatchKind: assignment.dispatch_kind,
+    attachThreadId: assignment.attach_thread_id,
+    parentAssignmentId: assignment.parent_assignment_id,
+    depth: assignment.depth,
+    deadlineAtMs: assignment.deadline_at_ms,
+  };
+}
+
 function assignmentRows(db: SqliteDatabase, request: ApplyRequest): { assignment: AssignmentRow; attempt: ExecutionAttemptRow } {
   if (!request.assignmentId || !request.executionAttemptId) throw refusal("INVALID_INPUT", "assignment and execution attempt identities are required");
   const assignment = asRow<AssignmentRow>(
@@ -4687,6 +4753,72 @@ function requireCanonicalRoleGeneration(
   }
 }
 
+function revalidateAssignmentReference(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  assignment: AssignmentRow,
+  attempt: ExecutionAttemptRow,
+): { governor: { governance_epoch: number; fence_token: string; state: string } } {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  if (configRevision !== assignment.config_revision || governor.governance_epoch !== assignment.governance_epoch) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "assignment config or governance head moved");
+  }
+  requireCanonicalRoleGeneration(db, request.projectId, assignment.role_id, assignment.role_generation, assignment.role_requirement_id);
+  const workItem = requireWorkItem(
+    db,
+    { ...request, workItemId: assignment.work_item_id, repoTargetId: assignment.repo_target_id, expectedResourceRevision: assignment.work_item_revision },
+    configRevision,
+    assignment.work_item_revision,
+  );
+  const target = requireTarget(db, request.projectId, configRevision, assignment.repo_target_id) as { source_id: string; host_id: string; path: string };
+  if (
+    workItem.repo_target_id !== assignment.repo_target_id || target.source_id !== assignment.source_id ||
+    target.host_id !== assignment.host_id || target.path !== assignment.environment_path
+  ) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment environment no longer matches its exact target");
+  }
+  const intent = storedAssignmentIntent(assignment);
+  const profileDigest = sha256(canonicalJson(intent.requestedProfile));
+  const assignmentDigest = immutableAssignmentDigest(
+    intent,
+    request.projectId,
+    assignment.config_revision,
+    assignment.governance_epoch,
+    assignment.work_item_revision,
+    assignment.repo_target_id,
+  );
+  const executionAttemptId = sha256(canonicalJson({ projectId: request.projectId, assignmentDigest, attemptOrdinal: 1 }));
+  const attemptDigest = sha256(canonicalJson({ projectId: request.projectId, executionAttemptId, assignmentDigest, state: "prepared" }));
+  const requirement = roleRequirementsFromJson(storedConfigJson(db, request.projectId, configRevision))
+    .find((candidate) => candidate.roleRequirementId === assignment.role_requirement_id);
+  if (
+    !requirement || requirement.roleId !== assignment.role_id ||
+    (requirement.repoTargetId !== null && requirement.repoTargetId !== assignment.repo_target_id) ||
+    !profileEquals(requirement.executedProfile, intent.requestedProfile)
+  ) {
+    throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement or executed profile is no longer canonical");
+  }
+  if (
+    assignment.assignment_digest !== assignmentDigest || assignment.requested_profile_digest !== profileDigest ||
+    attempt.execution_attempt_id !== executionAttemptId || attempt.attempt_digest !== attemptDigest ||
+    attempt.assignment_id !== assignment.assignment_id || attempt.origin !== "assignment" ||
+    attempt.assignment_digest !== assignmentDigest || attempt.attempt_ordinal !== 1 ||
+    attempt.lane_id !== assignment.lane_id || attempt.assignment_kind !== assignment.assignment_kind ||
+    attempt.dispatch_kind !== assignment.dispatch_kind || attempt.config_revision !== assignment.config_revision ||
+    attempt.governance_epoch !== assignment.governance_epoch || attempt.work_item_id !== assignment.work_item_id ||
+    attempt.repo_target_id !== assignment.repo_target_id || attempt.role_id !== assignment.role_id ||
+    attempt.role_generation !== assignment.role_generation || attempt.bb_server_id !== assignment.bb_server_id ||
+    attempt.environment_id !== assignment.environment_id || attempt.source_id !== assignment.source_id ||
+    attempt.host_id !== assignment.host_id || attempt.environment_path !== assignment.environment_path ||
+    attempt.frozen_brief_digest !== assignment.frozen_brief_digest || attempt.branch_name !== assignment.branch_name ||
+    attempt.base_sha !== assignment.base_sha || attempt.environment_digest !== assignmentEnvironmentDigest(intent)
+  ) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "assignment or execution attempt no longer matches its immutable stored intent");
+  }
+  return { governor };
+}
+
 function requireAssignmentActor(
   db: SqliteDatabase,
   request: ApplyRequest,
@@ -4718,22 +4850,12 @@ function revalidateAssignmentAuthority(
   db: SqliteDatabase,
   request: ApplyRequest,
   assignment: AssignmentRow,
+  attempt: ExecutionAttemptRow,
 ): { actorReceiptId: string; governor: { governance_epoch: number; fence_token: string; state: string } } {
-  const configRevision = requireConfig(db, request);
-  const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
   requireRoleActorBinding(db, request);
   requireAssignmentActor(db, request, assignment.role_id, assignment.role_generation);
-  if (configRevision !== assignment.config_revision || governor.governance_epoch !== assignment.governance_epoch) {
-    throw refusal("ASSIGNMENT_HEAD_STALE", "assignment config or governance head moved");
-  }
-  requireCanonicalRoleGeneration(db, request.projectId, assignment.role_id, assignment.role_generation, assignment.role_requirement_id);
-  const workItem = requireWorkItem(db, { ...request, workItemId: assignment.work_item_id, repoTargetId: assignment.repo_target_id, expectedResourceRevision: assignment.work_item_revision }, configRevision, assignment.work_item_revision);
-  if (workItem.resource_revision !== assignment.work_item_revision) throw refusal("ASSIGNMENT_HEAD_STALE", "assignment WorkItem revision moved");
-  const target = requireTarget(db, request.projectId, configRevision, assignment.repo_target_id) as { source_id: string; host_id: string; path: string };
-  if (target.source_id !== assignment.source_id || target.host_id !== assignment.host_id || target.path !== assignment.environment_path) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment environment no longer matches its exact target");
-  }
+  const { governor } = revalidateAssignmentReference(db, request, assignment, attempt);
   return { actorReceiptId, governor };
 }
 
@@ -5179,7 +5301,7 @@ function recordNativeEvidence(
     if (current.attempt.state !== attempt.state || canonicalJson(currentRetained) !== canonicalJson(retained)) {
       throw refusal("ASSIGNMENT_HEAD_STALE", "attempt state moved before native evidence was recorded");
     }
-    const authority = revalidateAssignmentAuthority(db, request, current.assignment);
+    const authority = revalidateAssignmentAuthority(db, request, current.assignment, current.attempt);
     const observedAtMs = evidence.observedAtMs ?? now();
     let positive: ReturnType<typeof positiveNativeEvidence> | null = null;
     let outcome: FoundationCode = "DISPATCH_UNKNOWN";
@@ -5271,7 +5393,7 @@ function applyAssignmentNative(
       const replayInTransaction = checkIdempotency(db, request, digest);
       if (replayInTransaction) throw refusal("IDEMPOTENCY_KEY_CONFLICT", "assignment operation was concurrently committed");
       const rows = assignmentRows(db, request);
-      const authority = revalidateAssignmentAuthority(db, request, rows.assignment);
+      const authority = revalidateAssignmentAuthority(db, request, rows.assignment, rows.attempt);
       if (!frozenBriefContent || sha256(frozenBriefContent) !== rows.assignment.frozen_brief_digest) {
         throw refusal("ASSIGNMENT_HEAD_STALE", "exact frozen brief content does not match immutable intent");
       }
@@ -5370,7 +5492,7 @@ function applyAssignmentTerminal(db: SqliteDatabase, request: ApplyRequest, dige
       );
       if (original) return JSON.parse(original.outcome_json) as FoundationResult;
     }
-    const authority = revalidateAssignmentAuthority(db, request, assignment);
+    const authority = revalidateAssignmentAuthority(db, request, assignment, attempt);
     if (attempt.conflicting_terminal_digest !== null) {
       throw refusal("TERMINAL_REPORT_AMBIGUOUS", "a different terminal conflict is already retained");
     }
@@ -5419,7 +5541,7 @@ function applyAssignmentTerminal(db: SqliteDatabase, request: ApplyRequest, dige
   if (report.candidateObservationDigest !== sha256(canonicalJson({ branchName: report.branchName, baseSha: report.baseSha, candidateSha: report.candidateSha }))) {
     throw refusal("ASSIGNMENT_HEAD_STALE", "terminal candidate observation digest is invalid");
   }
-  const authority = revalidateAssignmentAuthority(db, request, assignment);
+  const authority = revalidateAssignmentAuthority(db, request, assignment, attempt);
   const late = report.receivedAtMs > assignment.deadline_at_ms;
   const state = late || report.outcome === "BLOCKED" ? "blocked" : "done";
   const terminalResult = late ? "BLOCKED" : report.outcome;
