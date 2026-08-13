@@ -49,21 +49,49 @@ function activeCount(thread: PluginSidebarThread): number {
   return Object.values(thread.activity).reduce((total, count) => total + count, 0);
 }
 
-export function threadSignal(thread: PluginSidebarThread): { kind: SidebarThreadSignal; label: string; glyph: string } {
-  if (thread.hasPendingInteraction) return { kind: "pending", label: "Pending interaction", glyph: "!" };
-  if (ATTENTION_INDICATORS.has(thread.indicator)) return { kind: "attention", label: thread.indicatorLabel ?? "Needs attention", glyph: "!" };
+export function threadSignal(thread: PluginSidebarThread): { kind: SidebarThreadSignal; label: string } {
+  if (thread.hasPendingInteraction) return { kind: "pending", label: thread.indicatorLabel ?? "Pending interaction" };
+  if (ATTENTION_INDICATORS.has(thread.indicator)) return { kind: "attention", label: thread.indicatorLabel ?? "Needs attention" };
   if (activeCount(thread) > 0 || RUNNING_INDICATORS.has(thread.indicator)) {
-    return { kind: "running", label: thread.indicatorLabel ?? "Running", glyph: "◌" };
+    return { kind: "running", label: thread.indicatorLabel ?? "Running" };
   }
-  return { kind: "idle", label: thread.indicatorLabel ?? "Idle", glyph: "·" };
+  return { kind: "idle", label: thread.indicatorLabel ?? "Idle" };
+}
+
+function isError(thread: PluginSidebarThread): boolean {
+  return thread.indicator === "unread-error";
 }
 
 function indicatorClasses(thread: PluginSidebarThread): string {
   const signal = threadSignal(thread);
-  if (signal.kind === "attention" && thread.indicator === "unread-error") return "border-l-destructive";
-  if (signal.kind === "pending") return "border-l-primary";
-  if (signal.kind === "attention" || signal.kind === "running") return "border-l-primary";
-  return "border-l-border";
+  if (signal.kind === "idle") return "border-l-transparent";
+  if (signal.kind === "attention" && isError(thread)) return "border-l-destructive";
+  return "border-l-primary";
+}
+
+// Four shapes, not four colours: the state stays readable with reduced motion on
+// and at the 28px row height the native sidebar uses.
+function signalShapeClasses(thread: PluginSidebarThread, kind: SidebarThreadSignal): string {
+  if (kind === "running") return "size-2.5 animate-spin rounded-full border-2 border-primary border-t-transparent motion-reduce:animate-none";
+  if (kind === "pending") return "flex size-3.5 animate-pulse items-center justify-center rounded-full bg-primary text-[9px] font-bold leading-none text-primary-foreground motion-reduce:animate-none";
+  if (kind === "attention") return `size-2.5 rounded-full ${isError(thread) ? "bg-destructive" : "bg-primary"}`;
+  return "size-1.5 rounded-full bg-muted-foreground/40";
+}
+
+function ThreadSignalIcon({ thread }: { thread: PluginSidebarThread }) {
+  const signal = threadSignal(thread);
+  return (
+    <span
+      className="flex w-3.5 shrink-0 items-center justify-center"
+      role="img"
+      aria-label={signal.label}
+      title={signal.label}
+      data-sidebar-thread-signal={signal.kind}
+      data-active-count={activeCount(thread)}
+    >
+      <span className={signalShapeClasses(thread, signal.kind)} aria-hidden="true">{signal.kind === "pending" ? "!" : null}</span>
+    </span>
+  );
 }
 
 function matchesSearch(thread: PluginSidebarThread, project: PluginSidebarProject, searchQuery: string): boolean {
@@ -130,6 +158,8 @@ function collapseMap(values: Record<string, boolean>): Set<string> {
   return new Set(Object.entries(values).filter(([, collapsed]) => collapsed).map(([id]) => id));
 }
 
+const MENU_ITEM = "flex h-7 w-full shrink-0 items-center rounded px-2 text-left text-xs transition-colors duration-150 hover:bg-muted motion-reduce:transition-none";
+
 function ThreadRow({
   thread,
   model,
@@ -139,11 +169,9 @@ function ThreadRow({
   collapsed,
   hasChildren,
   onToggleChildren,
-  onDrop,
-  onDragEnter,
-  onDragEnd,
-  onDragStart,
-  onPointerEnd,
+  onPinnedDragStart,
+  onPinnedDragOver,
+  onPinnedDragEnd,
   onNavigate,
 }: {
   thread: PluginSidebarThread;
@@ -154,21 +182,29 @@ function ThreadRow({
   collapsed: boolean;
   hasChildren: boolean;
   onToggleChildren: () => void;
-  onDrop: (threadId: string) => void;
-  onDragEnter: (threadId: string) => void;
-  onDragEnd: (threadId: string) => void;
-  onDragStart: (threadId: string) => void;
-  onPointerEnd: (threadId: string) => void;
+  onPinnedDragStart: (threadId: string) => void;
+  onPinnedDragOver: (threadId: string) => void;
+  onPinnedDragEnd: (threadId: string) => void;
   onNavigate: () => void;
 }) {
   const actions = experimental_useSidebarThreadActions();
   const title = threadTitle(thread);
-  const signal = threadSignal(thread);
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(title);
-  const activityCount = activeCount(thread);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
   useEffect(() => setRenameValue(title), [title]);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const closeOnOutside = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (menuRef.current?.contains(target) || triggerRef.current?.contains(target)) return;
+      setMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutside);
+    return () => document.removeEventListener("pointerdown", closeOnOutside);
+  }, [menuOpen]);
   const finishRename = () => {
     const nextTitle = renameValue.trim();
     if (!nextTitle || nextTitle === title) {
@@ -180,46 +216,66 @@ function ThreadRow({
   };
   const menuAction = (run: () => void) => {
     setMenuOpen(false);
+    triggerRef.current?.focus();
     run();
   };
   return (
-    <div className={`group relative flex items-start gap-1 border-l-2 py-1.5 pr-2 text-left text-sm hover:bg-muted/50 ${indicatorClasses(thread)}`} style={{ paddingLeft: `${8 + depth * 16}px` }} onDrop={(event) => { event.preventDefault(); onDrop(event.dataTransfer?.getData("text/plain") ?? ""); }} onDragEnter={() => onDragEnter(thread.id)} onDragOver={(event) => event.preventDefault()} onPointerUp={() => onPointerEnd(thread.id)} onMouseUp={() => onPointerEnd(thread.id)}>
-      {hasChildren ? <button type="button" className="mt-1 h-6 w-6 shrink-0 rounded text-muted-foreground hover:bg-muted hover:text-foreground" aria-label={`${collapsed ? "Expand" : "Collapse"} ${title} children`} aria-expanded={!collapsed} onClick={onToggleChildren}>{collapsed ? "›" : "⌄"}</button> : <span className="w-6 shrink-0" aria-hidden="true" />}
+    <div
+      className={`group relative flex h-7 items-center gap-1.5 rounded-md border-l-2 pr-1 text-left text-sm transition-colors duration-150 select-none hover:bg-muted/50 motion-reduce:transition-none ${indicatorClasses(thread)} ${active ? "bg-muted" : ""}`}
+      style={{ paddingLeft: `${8 + depth * 16}px` }}
+      onPointerDown={(event) => { if (thread.isPinned && event.button === 0) onPinnedDragStart(thread.id); }}
+      onPointerEnter={() => onPinnedDragOver(thread.id)}
+      onPointerUp={() => onPinnedDragEnd(thread.id)}
+    >
       {renaming ? (
         <input autoFocus className="min-w-0 flex-1 rounded border border-border bg-background px-1 text-sm text-foreground" aria-label={`Rename ${title}`} value={renameValue} onChange={(event) => setRenameValue(event.target.value)} onBlur={finishRename} onKeyDown={(event) => { if (event.key === "Enter") finishRename(); if (event.key === "Escape") setRenaming(false); }} />
       ) : (
-        <a
-          href="#"
-          className={`flex min-w-0 flex-1 items-start gap-2 rounded px-1 py-1 ${active ? "bg-muted" : ""}`}
-          aria-current={active ? "page" : undefined}
-          data-sidebar-thread-shortcut-target=""
-          data-sidebar-thread-id={thread.id}
-          draggable={thread.isPinned}
-          onPointerDown={(event) => { if (thread.isPinned && event.button === 0) onDragStart(thread.id); }}
-          onMouseDown={(event) => { if (thread.isPinned && event.button === 0) onDragStart(thread.id); }}
-          onDragStart={(event) => { if (!thread.isPinned) return; event.dataTransfer?.setData("text/plain", thread.id); event.dataTransfer?.setDragImage(event.currentTarget, 0, 0); onDragStart(thread.id); }}
-          onDragEnd={() => onDragEnd(thread.id)}
-          onClick={(event) => { event.preventDefault(); actions.open(thread.id); onNavigate(); }}
-        >
-          <span className={`mt-1 w-4 shrink-0 text-center ${signal.kind === "attention" ? "text-primary" : signal.kind === "pending" ? "text-primary animate-pulse" : signal.kind === "running" ? "text-primary animate-spin" : "text-muted-foreground"}`} aria-label={signal.label} title={signal.label} data-sidebar-thread-signal={signal.kind} data-active-count={activityCount}>{signal.glyph}</span>
-          <span className="min-w-0 flex-1">
-            <span className="block truncate font-medium text-foreground">{title}</span>
-            <span className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
-              <span className="max-w-[12rem] truncate rounded bg-muted px-1.5 py-0.5" title={`Provider: ${thread.providerId}; model: ${model ?? "unavailable"}`}>{thread.providerId}/{model ?? "unavailable"}</span>
-              {thread.environment?.branchName ? <span className="truncate">{thread.environment.branchName}</span> : null}
-              {customState ? <span className="truncate rounded bg-muted px-1.5 py-0.5" data-custom-thread-state="">{customState}</span> : null}
-            </span>
-          </span>
-        </a>
+        <span className="flex min-w-0 flex-1 items-center gap-1.5">
+          <a
+            href="#"
+            className="flex min-w-0 items-center gap-1.5 rounded-md outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            aria-current={active ? "page" : undefined}
+            data-sidebar-thread-shortcut-target=""
+            data-sidebar-thread-id={thread.id}
+            draggable={false}
+            title={thread.environment?.branchName ? `${title} — ${thread.environment.branchName}` : title}
+            onClick={(event) => { event.preventDefault(); actions.open(thread.id); onNavigate(); }}
+          >
+            <ThreadSignalIcon thread={thread} />
+            <span className="min-w-0 truncate text-foreground">{title}</span>
+          </a>
+          {hasChildren ? <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded text-xs leading-none text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none" aria-label={`${collapsed ? "Expand" : "Collapse"} ${title} children`} aria-expanded={!collapsed} onClick={onToggleChildren}>{collapsed ? "›" : "⌄"}</button> : null}
+        </span>
       )}
-      <button type="button" className="mt-1 shrink-0 rounded px-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground" aria-label="Thread actions" aria-expanded={menuOpen} onClick={() => setMenuOpen((open) => !open)}>•••</button>
-      {menuOpen ? <div role="menu" aria-label={`${title} actions`} className="absolute right-2 top-8 z-10 min-w-40 rounded border border-border bg-background p-1 shadow-lg">
-        <button type="button" role="menuitem" className="block w-full rounded px-2 py-1 text-left text-xs hover:bg-muted" onClick={() => menuAction(() => actions.open(thread.id, { split: true }))}>Open in split</button>
-        <button type="button" role="menuitem" className="block w-full rounded px-2 py-1 text-left text-xs hover:bg-muted" onClick={() => menuAction(() => { void actions.setRead(thread.id, thread.isUnread).catch(() => undefined); })}>{thread.isUnread ? "Mark read" : "Mark unread"}</button>
-        <button type="button" role="menuitem" className="block w-full rounded px-2 py-1 text-left text-xs hover:bg-muted" onClick={() => menuAction(() => { void actions.setPinned(thread.id, !thread.isPinned).catch(() => undefined); })}>{thread.isPinned ? "Unpin" : "Pin"}</button>
-        <button type="button" role="menuitem" className="block w-full rounded px-2 py-1 text-left text-xs hover:bg-muted" onClick={() => menuAction(() => setRenaming(true))}>Rename</button>
-        <button type="button" role="menuitem" className="block w-full rounded px-2 py-1 text-left text-xs hover:bg-muted" onClick={() => menuAction(() => actions.archive(thread.id))}>Archive</button>
-        <button type="button" role="menuitem" className="block w-full rounded px-2 py-1 text-left text-xs text-destructive hover:bg-muted" onClick={() => menuAction(() => actions.requestDelete(thread.id))}>Delete</button>
+      <span className="flex min-w-0 shrink items-center gap-1 text-[11px] text-muted-foreground group-hover:hidden group-focus-within:hidden">
+        {customState ? <span className="shrink-0 truncate rounded bg-muted px-1 leading-4" data-custom-thread-state="">{customState}</span> : null}
+        <span className="max-w-[9rem] truncate" title={`Provider: ${thread.providerId}; model: ${model ?? "unavailable"}`}>{thread.providerId}/{model ?? "unavailable"}</span>
+      </span>
+      <button
+        ref={triggerRef}
+        type="button"
+        className={`inline-flex size-5 shrink-0 items-center justify-center rounded text-xs leading-none text-muted-foreground transition-opacity duration-150 hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary group-hover:opacity-100 motion-reduce:transition-none ${menuOpen ? "opacity-100" : "opacity-0"}`}
+        aria-label="Thread actions"
+        aria-haspopup="menu"
+        aria-expanded={menuOpen}
+        onClick={() => setMenuOpen((open) => !open)}
+      >
+        ⋯
+      </button>
+      {menuOpen ? <div
+        ref={menuRef}
+        role="menu"
+        aria-label={`${title} actions`}
+        className="absolute right-1 top-7 z-20 flex w-44 flex-col rounded-md border border-border bg-background p-1 shadow"
+        onKeyDown={(event) => { if (event.key === "Escape") { setMenuOpen(false); triggerRef.current?.focus(); } }}
+      >
+        <button autoFocus type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => actions.open(thread.id, { split: true }))}>Open in split</button>
+        <button type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => { void actions.setRead(thread.id, thread.isUnread).catch(() => undefined); })}>{thread.isUnread ? "Mark read" : "Mark unread"}</button>
+        <button type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => { void actions.setPinned(thread.id, !thread.isPinned).catch(() => undefined); })}>{thread.isPinned ? "Unpin" : "Pin"}</button>
+        <button type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => setRenaming(true))}>Rename</button>
+        <button type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => actions.archive(thread.id))}>Archive</button>
+        <span role="separator" className="my-1 border-t border-border" />
+        <button type="button" role="menuitem" className={`${MENU_ITEM} text-destructive`} onClick={() => menuAction(() => actions.requestDelete(thread.id))}>Delete</button>
       </div> : null}
     </div>
   );
@@ -282,32 +338,53 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     setCollapsedThreads((current) => { const next = new Set(current); if (collapsed) next.add(threadId); else next.delete(threadId); return next; });
     void rpc.call("setSidebarCollapse", { kind: "thread", id: threadId, collapsed }).catch(() => undefined);
   };
+  // Placement mirrors a sortable list: dragging down lands after the target,
+  // dragging up lands before it. Anchoring on the target alone made every
+  // downward drag a no-op.
   const reorderPinned = (draggedId: string, targetId: string) => {
-    if (!draggedId || draggedId === targetId) return;
+    if (!draggedId || !targetId || draggedId === targetId) return;
     const order = sidebar.threads.filter((thread) => thread.isPinned).map((thread) => thread.id);
-    if (!order.includes(draggedId) || !order.includes(targetId)) return;
+    const from = order.indexOf(draggedId);
+    const to = order.indexOf(targetId);
+    if (from < 0 || to < 0) return;
     const remaining = order.filter((id) => id !== draggedId);
-    const insertionIndex = remaining.indexOf(targetId);
-    if (insertionIndex < 0) return;
+    const insertionIndex = remaining.indexOf(targetId) + (from < to ? 1 : 0);
     void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: remaining[insertionIndex - 1] ?? null, nextThreadId: remaining[insertionIndex] ?? null }).catch(() => undefined);
   };
-  const startPinnedDrag = (threadId: string) => { draggingThreadId.current = threadId; dragTargetId.current = null; };
-  const finishPinnedDrag = (targetId = dragTargetId.current ?? "", draggedId = draggingThreadId.current ?? "") => {
-    draggingThreadId.current = null;
+  const startPinnedDrag = (threadId: string) => {
+    draggingThreadId.current = threadId;
     dragTargetId.current = null;
-    reorderPinned(draggedId, targetId);
+    // The row's own handler runs first. Reaching here with a source still armed
+    // means the release missed every row: commit to the last row crossed on a
+    // real release, discard on cancel, and never leave a stale source behind.
+    const settle = (event: Event) => {
+      if (event.type === "pointerup" && draggingThreadId.current) finishPinnedDrag("");
+      draggingThreadId.current = null;
+      dragTargetId.current = null;
+      window.removeEventListener("pointerup", settle);
+      window.removeEventListener("pointercancel", settle);
+    };
+    window.addEventListener("pointerup", settle);
+    window.addEventListener("pointercancel", settle);
+  };
+  const trackPinnedDrag = (threadId: string) => { if (draggingThreadId.current) dragTargetId.current = threadId; };
+  const finishPinnedDrag = (targetId: string) => {
+    const draggedId = draggingThreadId.current ?? "";
+    draggingThreadId.current = null;
+    reorderPinned(draggedId, targetId || dragTargetId.current || "");
+    dragTargetId.current = null;
   };
 
   const renderNode = (node: ThreadTreeNode, model: string | null, depth: number): ReactNode => {
     const childrenCollapsed = collapsedThreads.has(node.thread.id);
-    return <div key={node.thread.id}>
-      <ThreadRow thread={node.thread} model={model} active={node.thread.id === activeThreadId} customState={customStates[node.thread.id]} depth={depth} collapsed={childrenCollapsed} hasChildren={node.children.length > 0} onToggleChildren={() => toggleThread(node.thread.id)} onDrop={(draggedId) => finishPinnedDrag(node.thread.id, draggedId || undefined)} onDragEnter={(threadId) => { dragTargetId.current = threadId; }} onDragEnd={(threadId) => finishPinnedDrag(undefined, threadId)} onDragStart={startPinnedDrag} onPointerEnd={finishPinnedDrag} onNavigate={onNavigate} />
+    return <div key={node.thread.id} className="space-y-px">
+      <ThreadRow thread={node.thread} model={model} active={node.thread.id === activeThreadId} customState={customStates[node.thread.id]} depth={depth} collapsed={childrenCollapsed} hasChildren={node.children.length > 0} onToggleChildren={() => toggleThread(node.thread.id)} onPinnedDragStart={startPinnedDrag} onPinnedDragOver={trackPinnedDrag} onPinnedDragEnd={finishPinnedDrag} onNavigate={onNavigate} />
       {!childrenCollapsed ? node.children.map((child) => renderNode(child, threadModels[child.thread.id] ?? null, depth + 1)) : null}
     </div>;
   };
 
   return (
-    <div className="h-full overflow-y-auto">
+    <div className="h-full space-y-3 overflow-y-auto p-1">
       {groups.map(({ project, threads }) => {
         const tree = buildThreadTree(threads);
         const collapsed = collapsedProjects.has(project.id);
@@ -315,18 +392,18 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
         const visibleThreads = expanded ? tree : tree.slice(0, MAX_VISIBLE_THREADS);
         return (
           <section key={project.id} aria-labelledby={`project-${project.id}`}>
-            <div className="flex items-center gap-2 px-3 py-2 text-xs font-semibold text-muted-foreground">
-              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-muted text-foreground" aria-hidden="true">{projectAvatar(project.name)}</span>
-              <span id={`project-${project.id}`} className="truncate">{project.name}</span>
-              <span className="ml-auto tabular-nums">{threads.length}</span>
-              <button type="button" className="rounded px-1 hover:bg-muted hover:text-foreground" aria-label={`${collapsed ? "Expand" : "Collapse"} ${project.name} section`} aria-expanded={!collapsed} onClick={() => toggleProject(project.id)}>{collapsed ? "›" : "⌄"}</button>
+            <div className="flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-normal text-muted-foreground">
+              <span className="flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground" aria-hidden="true">{projectAvatar(project.name)}</span>
+              <span id={`project-${project.id}`} className="min-w-0 truncate">{project.name}</span>
+              <span className="ml-auto shrink-0 tabular-nums">{threads.length}</span>
+              <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none" aria-label={`${collapsed ? "Expand" : "Collapse"} ${project.name} section`} aria-expanded={!collapsed} onClick={() => toggleProject(project.id)}>{collapsed ? "›" : "⌄"}</button>
             </div>
-            {!collapsed ? <div>
+            {!collapsed ? <div className="mt-0.5 space-y-px">
               {visibleThreads.map((node) => renderNode(node, threadModels[node.thread.id] ?? null, 0))}
               {tree.length > MAX_VISIBLE_THREADS ? (
                 <button
                   type="button"
-                  className="w-full px-3 py-2 text-left text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+                  className="flex h-6 w-full items-center rounded-md pl-2 text-left text-xs text-muted-foreground transition-colors duration-150 hover:bg-muted/50 hover:text-foreground motion-reduce:transition-none"
                   onClick={() => setExpandedProjects((current) => {
                     const updated = new Set(current);
                     if (expanded) updated.delete(project.id);

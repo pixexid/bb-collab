@@ -164,12 +164,84 @@ describe("replacement thread list", () => {
     expect(rendered.inspection.sidebarActionCalls).toContainEqual({ method: "setRead", threadId: "thread-1", read: true });
   });
 
+  it("renders the row actions as a compact stacked dropdown that closes on Escape", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [thread("thread-1", "project-a", 1)] },
+      rpc: rpcHandlers(),
+    });
+    const trigger = rendered.getByRole("button", { name: "Thread actions" });
+    expect(trigger.getAttribute("aria-haspopup")).toBe("menu");
+    fireEvent.click(trigger);
+
+    const menu = rendered.getByRole("menu");
+    expect(menu.className).toContain("flex-col");
+    expect(menu.className).toContain("w-44");
+    expect(menu.className).toContain("absolute");
+    const items = rendered.getAllByRole("menuitem");
+    expect(items).toHaveLength(6);
+    expect(items.every((item) => item.className.includes("w-full") && item.className.includes("h-7"))).toBe(true);
+    expect(items.at(-1)!.className).toContain("text-destructive");
+    expect(rendered.getByRole("separator")).toBeTruthy();
+
+    fireEvent.keyDown(menu, { key: "Escape" });
+    expect(rendered.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("routes the destructive action through the host delete confirmation", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [thread("thread-1", "project-a", 1)] },
+      rpc: rpcHandlers(),
+    });
+    fireEvent.click(rendered.getByRole("button", { name: "Thread actions" }));
+    fireEvent.click(rendered.getByRole("menuitem", { name: "Delete" }));
+    expect(rendered.inspection.sidebarActionCalls).toContainEqual({ method: "requestDelete", threadId: "thread-1" });
+  });
+
   it("renders resolved running, attention, idle, and pending signals", async () => {
     const { threadSignal } = await import("../app");
-    expect(threadSignal({ ...thread("running", "p", 1), activity: { workflows: 1, backgroundAgents: 0, backgroundCommands: 0, planMode: 0, goals: 0 }, indicatorLabel: "Thread is working" })).toEqual({ kind: "running", label: "Thread is working", glyph: "◌" });
-    expect(threadSignal({ ...thread("attention", "p", 1), indicator: "unread-error", indicatorLabel: "Thread failed" }).kind).toBe("attention");
+    expect(threadSignal({ ...thread("running", "p", 1), activity: { workflows: 1, backgroundAgents: 0, backgroundCommands: 0, planMode: 0, goals: 0 }, indicatorLabel: "Thread is working" })).toEqual({ kind: "running", label: "Thread is working" });
+    expect(threadSignal({ ...thread("attention", "p", 1), indicator: "unread-error", indicatorLabel: "Thread failed" })).toEqual({ kind: "attention", label: "Thread failed" });
     expect(threadSignal(thread("idle", "p", 1)).kind).toBe("idle");
-    expect(threadSignal({ ...thread("pending", "p", 1), hasPendingInteraction: true }).kind).toBe("pending");
+    expect(threadSignal({ ...thread("pending", "p", 1), hasPendingInteraction: true, indicatorLabel: "Thread needs user input" })).toEqual({ kind: "pending", label: "Thread needs user input" });
+  });
+
+  it("gives each signal a distinct shape that survives reduced motion", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [
+        { ...thread("running", "project-a", 4), indicator: "workflow", indicatorLabel: "Thread is working" },
+        { ...thread("pending", "project-a", 3), hasPendingInteraction: true },
+        { ...thread("failed", "project-a", 2), indicator: "unread-error", indicatorLabel: "Thread failed" },
+        thread("idle", "project-a", 1),
+      ] },
+      rpc: rpcHandlers(),
+    });
+    const shapeOf = (kind: string) => rendered.container.querySelector(`[data-sidebar-thread-signal="${kind}"] > span`)!.className;
+
+    expect(shapeOf("running")).toContain("animate-spin");
+    expect(shapeOf("running")).toContain("border-primary");
+    expect(shapeOf("pending")).toContain("bg-primary");
+    expect(shapeOf("attention")).toContain("bg-destructive");
+    expect(shapeOf("idle")).toContain("bg-muted-foreground/40");
+    // Motion is emphasis only: every animated cue opts out under reduced motion.
+    for (const kind of ["running", "pending"]) expect(shapeOf(kind)).toContain("motion-reduce:animate-none");
+    expect(rendered.container.querySelector('[data-sidebar-thread-signal="running"]')!.getAttribute("aria-label")).toBe("Thread is working");
+  });
+
+  it("keeps rows and project headers at the native compact height", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [thread("thread-1", "project-a", 1)] },
+      rpc: rpcHandlers(),
+    });
+    const row = rendered.container.querySelector('[data-sidebar-thread-id="thread-1"]')!.closest("div")!;
+    expect(row.className).toContain("h-7");
+    expect(row.className).toContain("transition-colors");
+    expect(row.className).toContain("motion-reduce:transition-none");
+    expect(rendered.getByText("Project A").parentElement!.className).toContain("h-6");
   });
 
   it("keeps parent threads nested with independently collapsible children", async () => {
@@ -215,42 +287,54 @@ describe("replacement thread list", () => {
     expect(rendered.container.querySelector('[data-sidebar-thread-shortcut-target][data-sidebar-thread-id="thread-1"]')).toBeTruthy();
   });
 
-  it("sends typed pinned reorder args from a real row drag/drop", async () => {
+  it("leaves pinned rows undraggable so the pointer gesture is never swallowed", async () => {
     const list = await registration();
-    const first = { ...thread("pinned-1", "project-a", 2), isPinned: true };
-    const second = { ...thread("pinned-2", "project-a", 1), isPinned: true };
     const rendered = renderSlot(list, props(), {
-      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [first, second] },
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [{ ...thread("pinned-1", "project-a", 1), isPinned: true }] },
       rpc: rpcHandlers(),
     });
-    const transfer = { setData: vi.fn(), getData: () => "pinned-1", setDragImage: vi.fn(), effectAllowed: "none" };
-    fireEvent.dragStart(rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!, { dataTransfer: transfer });
-    fireEvent.drop(rendered.container.querySelector('[data-sidebar-thread-id="pinned-2"]')!, { dataTransfer: transfer });
+    // A draggable row anchor starts a native HTML5 drag on the first pointermove,
+    // which swallows the rest of the pointer stream and strands the reorder.
+    const anchor = rendered.container.querySelector<HTMLAnchorElement>('[data-sidebar-thread-id="pinned-1"]')!;
+    expect(anchor.draggable).toBe(false);
+    expect(anchor.getAttribute("draggable")).toBe("false");
+  });
+
+  it("sends typed pinned reorder args for a downward pointer drag", async () => {
+    const list = await registration();
+    const first = { ...thread("pinned-1", "project-a", 3), isPinned: true };
+    const second = { ...thread("pinned-2", "project-a", 2), isPinned: true };
+    const third = { ...thread("pinned-3", "project-a", 1), isPinned: true };
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [first, second, third] },
+      rpc: rpcHandlers(),
+    });
+    fireEvent.pointerDown(rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!, { button: 0 });
+    fireEvent.pointerUp(rendered.container.querySelector('[data-sidebar-thread-id="pinned-2"]')!, { button: 0 });
     await waitFor(() => expect(rendered.inspection.rpcCalls).toContainEqual({
       method: "reorderPinned",
-      input: { threadId: "pinned-1", previousThreadId: null, nextThreadId: "pinned-2" },
+      input: { threadId: "pinned-1", previousThreadId: "pinned-2", nextThreadId: "pinned-3" },
     }));
   });
 
-  it("keeps the pointer drag fallback on the same typed reorder path", async () => {
+  it("sends typed pinned reorder args for an upward pointer drag", async () => {
     const list = await registration();
-    const first = { ...thread("pinned-1", "project-a", 2), isPinned: true };
-    const second = { ...thread("pinned-2", "project-a", 1), isPinned: true };
+    const first = { ...thread("pinned-1", "project-a", 3), isPinned: true };
+    const second = { ...thread("pinned-2", "project-a", 2), isPinned: true };
+    const third = { ...thread("pinned-3", "project-a", 1), isPinned: true };
     const rendered = renderSlot(list, props(), {
-      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [first, second] },
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [first, second, third] },
       rpc: rpcHandlers(),
     });
-    const firstRow = rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!;
-    const secondRow = rendered.container.querySelector('[data-sidebar-thread-id="pinned-2"]')!;
-    fireEvent.pointerDown(firstRow, { button: 0 });
-    fireEvent.pointerUp(secondRow, { button: 0 });
+    fireEvent.pointerDown(rendered.container.querySelector('[data-sidebar-thread-id="pinned-3"]')!, { button: 0 });
+    fireEvent.pointerUp(rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!, { button: 0 });
     await waitFor(() => expect(rendered.inspection.rpcCalls).toContainEqual({
       method: "reorderPinned",
-      input: { threadId: "pinned-1", previousThreadId: null, nextThreadId: "pinned-2" },
+      input: { threadId: "pinned-3", previousThreadId: null, nextThreadId: "pinned-1" },
     }));
   });
 
-  it("keeps the mouse drag fallback on the same typed reorder path", async () => {
+  it("commits the row the pointer last crossed when the release misses a row", async () => {
     const list = await registration();
     const first = { ...thread("pinned-1", "project-a", 2), isPinned: true };
     const second = { ...thread("pinned-2", "project-a", 1), isPinned: true };
@@ -258,34 +342,30 @@ describe("replacement thread list", () => {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [first, second] },
       rpc: rpcHandlers(),
     });
-    const firstRow = rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!;
-    const secondRow = rendered.container.querySelector('[data-sidebar-thread-id="pinned-2"]')!;
-    fireEvent.mouseDown(firstRow, { button: 0 });
-    fireEvent.mouseUp(secondRow, { button: 0 });
+    fireEvent.pointerDown(rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!, { button: 0 });
+    fireEvent.pointerEnter(rendered.container.querySelector('[data-sidebar-thread-id="pinned-2"]')!.closest("div")!);
+    fireEvent.pointerUp(document.body, { button: 0 });
     await waitFor(() => expect(rendered.inspection.rpcCalls).toContainEqual({
       method: "reorderPinned",
-      input: { threadId: "pinned-1", previousThreadId: null, nextThreadId: "pinned-2" },
+      input: { threadId: "pinned-1", previousThreadId: "pinned-2", nextThreadId: null },
     }));
   });
 
-  it("commits native dragend after dragenter when drop is unavailable", async () => {
+  it("does not reorder from a plain click or from an unpinned row", async () => {
     const list = await registration();
-    const first = { ...thread("pinned-1", "project-a", 2), isPinned: true };
-    const second = { ...thread("pinned-2", "project-a", 1), isPinned: true };
+    const pinned = { ...thread("pinned-1", "project-a", 2), isPinned: true };
+    const loose = thread("loose-1", "project-a", 1);
     const rendered = renderSlot(list, props(), {
-      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [first, second] },
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [pinned, loose] },
       rpc: rpcHandlers(),
     });
-    const firstRow = rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!;
-    const secondRow = rendered.container.querySelector('[data-sidebar-thread-id="pinned-2"]')!;
-    const transfer = { setData: vi.fn(), getData: () => "pinned-1", setDragImage: vi.fn(), effectAllowed: "none" };
-    fireEvent.dragStart(firstRow, { dataTransfer: transfer });
-    fireEvent.dragEnter(secondRow);
-    fireEvent.dragEnd(firstRow);
-    await waitFor(() => expect(rendered.inspection.rpcCalls).toContainEqual({
-      method: "reorderPinned",
-      input: { threadId: "pinned-1", previousThreadId: null, nextThreadId: "pinned-2" },
-    }));
+    const pinnedRow = rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!;
+    const looseRow = rendered.container.querySelector('[data-sidebar-thread-id="loose-1"]')!;
+    fireEvent.pointerDown(pinnedRow, { button: 0 });
+    fireEvent.pointerUp(pinnedRow, { button: 0 });
+    fireEvent.pointerDown(looseRow, { button: 0 });
+    fireEvent.pointerUp(pinnedRow, { button: 0 });
+    expect(rendered.inspection.rpcCalls.filter((call) => call.method === "reorderPinned")).toEqual([]);
   });
 
   it("renders durable custom state and routes row navigation through host actions", async () => {
