@@ -5,7 +5,8 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const SCHEMA_VERSION = 5;
+export const CONTRACT_VERSION = 2;
+export const SCHEMA_VERSION = 6;
 // ponytail: keep exports bounded at 256 rows; add paged/file export before migration or cutover.
 export const MAX_EXPORT_ROWS = 256;
 export const MAX_EXPORT_BYTES = 512 * 1024;
@@ -18,6 +19,7 @@ export const TABLES = [
   "repository_targets",
   "project_governorships",
   "project_governorship_heads",
+  "migration_runs",
   "actor_receipts",
   "decisions",
   "decision_dispositions",
@@ -481,6 +483,48 @@ export const MIGRATIONS: string[] = [
     FOREIGN KEY (project_id, evidence_id)
       REFERENCES evidence_artifacts(project_id, evidence_id)
   )`,
+  `CREATE TABLE IF NOT EXISTS migration_runs (
+    migration_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    source_system TEXT NOT NULL DEFAULT 'llm-collab' CHECK (source_system = 'llm-collab'),
+    source_runtime_id TEXT NOT NULL,
+    target_runtime_id TEXT NOT NULL,
+    source_contract_digest TEXT NOT NULL,
+    source_schema_digest TEXT NOT NULL,
+    source_export_digest TEXT,
+    config_revision INTEGER NOT NULL CHECK (config_revision > 0),
+    decision_id TEXT NOT NULL,
+    decision_disposition_sequence INTEGER NOT NULL CHECK (decision_disposition_sequence > 0),
+    state TEXT NOT NULL CHECK (state IN
+      ('prepared', 'frozen', 'exported', 'imported', 'equivalent', 'target_active', 'exercised', 'retired', 'rolled_back', 'fix_forward_required')),
+    resource_revision INTEGER NOT NULL CHECK (resource_revision > 0),
+    source_event_ceiling INTEGER CHECK (source_event_ceiling IS NULL OR source_event_ceiling >= 0),
+    source_snapshot_digest TEXT NOT NULL,
+    source_governor_epoch INTEGER NOT NULL CHECK (source_governor_epoch > 0),
+    target_governor_epoch INTEGER NOT NULL CHECK (target_governor_epoch > 0),
+    mutator_inventory_digest TEXT,
+    quiescence_digest TEXT,
+    import_root_digest TEXT,
+    equivalence_digest TEXT,
+    recovery_digest TEXT,
+    retention_until_ms INTEGER NOT NULL CHECK (retention_until_ms >= 0),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    FOREIGN KEY (project_id, config_revision)
+      REFERENCES project_config_revisions(project_id, config_revision),
+    FOREIGN KEY (decision_id, decision_disposition_sequence)
+      REFERENCES decision_dispositions(decision_id, disposition_sequence),
+    FOREIGN KEY (project_id, source_governor_epoch)
+      REFERENCES project_governorships(project_id, governance_epoch),
+    FOREIGN KEY (project_id, target_governor_epoch)
+      REFERENCES project_governorships(project_id, governance_epoch)
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS migration_runs_final_export_identity
+    ON migration_runs(source_system, project_id, source_export_digest)
+    WHERE source_export_digest IS NOT NULL;
+  CREATE UNIQUE INDEX IF NOT EXISTS migration_runs_one_open
+    ON migration_runs(source_system, project_id)
+    WHERE state NOT IN ('retired', 'rolled_back')`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -490,7 +534,7 @@ export function cachedConsumerRolloutEvidence(observedSchemaVersion: number) {
   const reread = observedSchemaVersion === SCHEMA_VERSION;
   const evidence = {
     names: [...CACHED_CONSUMERS],
-    oldSchemaVersion: 4,
+    oldSchemaVersion: 5,
     newSchemaVersion: SCHEMA_VERSION,
     observedSchemaVersion,
     action: reread ? "reread" : "refused",
@@ -527,6 +571,110 @@ const targetCollectionSchema = z.array(targetSchema).superRefine((targets, ctx) 
   }
 });
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
+export const MIGRATION_STATES = [
+  "prepared",
+  "frozen",
+  "exported",
+  "imported",
+  "equivalent",
+  "target_active",
+  "exercised",
+  "retired",
+  "rolled_back",
+  "fix_forward_required",
+] as const;
+export const MIGRATION_STEPS = [
+  "record_inventory",
+  "record_quiescence",
+  "freeze",
+  "record_export",
+  "record_import",
+  "record_equivalence",
+  "activate",
+  "record_exercise",
+  "retire",
+  "rollback",
+  "mark_fix_forward_required",
+] as const;
+export const contractDigest = sha256(canonicalJson({
+  contractVersion: CONTRACT_VERSION,
+  operationClasses: ["migration_prepare", "migration_step"],
+  migrationStates: MIGRATION_STATES,
+  migrationSteps: MIGRATION_STEPS,
+}));
+const migrationArtifactSchema = z
+  .object({
+    evidenceId: id,
+    evidenceKind: id,
+    sourceKind: id,
+    sourceRef: id,
+    executionAttemptId: id.nullable(),
+    contentDigest: digestSchema,
+    redactedJson: z.string(),
+    redactedDigest: digestSchema,
+    durableRefJson: z.string(),
+    artifactIdentityDigest: digestSchema,
+  })
+  .strict();
+const migrationExportSchema = z
+  .object({
+    manifest: z
+      .object({
+        schemaVersion: z.number().int().positive(),
+        contractVersion: z.number().int().positive(),
+        pluginId: id,
+        projectId: id,
+        migrationStatementIds: z.array(z.number().int().nonnegative()),
+        schemaDigest: digestSchema,
+        contractDigest: digestSchema,
+        rowCount: z.number().int().nonnegative(),
+        tableCounts: z.record(z.string(), z.number().int().nonnegative()),
+        recordsDigest: digestSchema,
+        artifactIndexDigest: digestSchema,
+        exportRootDigest: digestSchema,
+      })
+      .strict(),
+    recordsNdjson: z.string().max(MAX_EXPORT_BYTES),
+    artifactIndex: z.array(migrationArtifactSchema).max(MAX_EXPORT_ROWS),
+    checksums: z.record(z.string(), digestSchema),
+  })
+  .strict();
+const migrationPrepareSchema = z
+  .object({
+    migrationId: id,
+    sourceSystem: z.literal("llm-collab"),
+    sourceRuntimeId: id,
+    targetRuntimeId: id,
+    sourceContractDigest: digestSchema,
+    sourceSchemaDigest: digestSchema,
+    sourceSnapshotDigest: digestSchema,
+    decisionId: id,
+    decisionDispositionSequence: z.number().int().positive(),
+    retentionUntilMs: z.number().int().nonnegative(),
+  })
+  .strict();
+const migrationStepSchema = z
+  .object({
+    migrationId: id,
+    step: z.enum(MIGRATION_STEPS),
+    proofDigest: digestSchema,
+    repositoryTargetsDigest: digestSchema,
+    sourceEventCeiling: z.number().int().nonnegative().optional(),
+    sourceSnapshotDigest: digestSchema.optional(),
+    export: migrationExportSchema.optional(),
+    importRootDigest: digestSchema.optional(),
+    equivalenceDigest: digestSchema.optional(),
+    recoveryDigest: digestSchema.optional(),
+    canaries: z
+      .object({
+        expected: z.number().int().positive(),
+        attempted: z.number().int().nonnegative(),
+        verified: z.number().int().nonnegative(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
 const sortedIdSetSchema = z
   .array(id)
   .min(1)
@@ -890,6 +1038,8 @@ export const applyRequestSchema = z
       "assignment_dispatch",
       "assignment_reconcile",
       "assignment_terminal",
+      "migration_prepare",
+      "migration_step",
     ]),
     idempotencyKey: id,
     actorReceiptId: id.nullable().optional(),
@@ -937,6 +1087,8 @@ export const applyRequestSchema = z
     executionAttemptId: id.optional(),
     frozenBriefContent: z.string().max(256 * 1024).optional(),
     terminalReport: terminalReportSchema.optional(),
+    migration: migrationPrepareSchema.optional(),
+    migrationStep: migrationStepSchema.optional(),
   })
   .strict();
 
@@ -1444,7 +1596,10 @@ export type FoundationCode =
   | "BB_VERSION_INCOMPATIBLE"
   | "BB_FACTS_UNAVAILABLE"
   | "HOST_UNAVAILABLE"
-  | "EXPORT_BOUNDED";
+  | "EXPORT_BOUNDED"
+  | "SOURCE_FREEZE_UNPROVEN"
+  | "IMPORT_EQUIVALENCE_FAILED"
+  | "MIGRATION_FIX_FORWARD_REQUIRED";
 
 export interface MutationReceipt {
   projectId: string;
@@ -1477,15 +1632,31 @@ export interface FoundationResult {
 export interface ExportPayload {
   manifest: {
     schemaVersion: number;
+    contractVersion: number;
     pluginId: string;
     projectId: string;
     migrationStatementIds: number[];
     schemaDigest: string;
+    contractDigest: string;
     rowCount: number;
     tableCounts: Record<string, number>;
     recordsDigest: string;
+    artifactIndexDigest: string;
+    exportRootDigest: string;
   };
   recordsNdjson: string;
+  artifactIndex: Array<{
+    evidenceId: string;
+    evidenceKind: string;
+    sourceKind: string;
+    sourceRef: string;
+    executionAttemptId: string | null;
+    contentDigest: string;
+    redactedJson: string;
+    redactedDigest: string;
+    durableRefJson: string;
+    artifactIdentityDigest: string;
+  }>;
   checksums: Record<string, string>;
 }
 
@@ -2293,6 +2464,526 @@ function applyGovernorClaim(db: SqliteDatabase, request: ApplyRequest, digest: s
     },
     { expected: 1, attempted: 1, verified: 1 },
     { currentConfigRevision: currentRevision, currentGovernanceEpoch: nextEpoch, evidence: { fenceToken: nextToken } },
+  );
+}
+
+interface MigrationRunRow {
+  migration_id: string;
+  project_id: string;
+  source_system: "llm-collab";
+  source_runtime_id: string;
+  target_runtime_id: string;
+  source_contract_digest: string;
+  source_schema_digest: string;
+  source_export_digest: string | null;
+  config_revision: number;
+  decision_id: string;
+  decision_disposition_sequence: number;
+  state: (typeof MIGRATION_STATES)[number];
+  resource_revision: number;
+  source_event_ceiling: number | null;
+  source_snapshot_digest: string;
+  source_governor_epoch: number;
+  target_governor_epoch: number;
+  mutator_inventory_digest: string | null;
+  quiescence_digest: string | null;
+  import_root_digest: string | null;
+  equivalence_digest: string | null;
+  recovery_digest: string | null;
+  retention_until_ms: number;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+function exactGovernor(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+): { governance_epoch: number; fence_token: string; state: "source_active" | "frozen" | "target_active" | "retired" } {
+  const head = asRow<{ governance_epoch: number; fence_token: string; state: "source_active" | "frozen" | "target_active" | "retired" }>(
+    db.prepare("SELECT governance_epoch, fence_token, state FROM project_governorship_heads WHERE project_id = ?").get(request.projectId),
+  );
+  if (!head) throw refusal("GOVERNOR_UNAVAILABLE", "project has no current governorship head");
+  if (request.expectedGovernanceEpoch !== head.governance_epoch || request.expectedFenceToken !== head.fence_token) {
+    throw refusal("GOVERNOR_EPOCH_STALE", "expected governorship epoch or fence token is stale", {
+      currentGovernanceEpoch: head.governance_epoch,
+      expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? undefined,
+    });
+  }
+  return head;
+}
+
+function migrationTargetDigest(db: SqliteDatabase, projectId: string, configRevision: number): string {
+  const targets = db.prepare(
+    `SELECT repo_target_id, source_id, host_id, path, remote_url, default_branch, target_digest
+     FROM repository_targets WHERE project_id = ? AND config_revision = ? ORDER BY repo_target_id`,
+  ).all(projectId, configRevision);
+  if (targets.length === 0) throw refusal("REPO_TARGET_REQUIRED", "migration requires exact configured repository targets");
+  return sha256(canonicalJson(targets));
+}
+
+function requireAdoptedMigrationDecision(
+  db: SqliteDatabase,
+  projectId: string,
+  configRevision: number,
+  decisionId: string,
+  dispositionSequence: number,
+): void {
+  const decision = asRow<{
+    decision_id: string; project_id: string; config_revision: number; repo_target_id: string | null; scope_json: string;
+    scope_digest: string; decision_class: string | null; options_json: string | null; decision_identity_digest: string | null;
+    current_resource_revision: number;
+  }>(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decisionId));
+  if (!decision || decision.project_id !== projectId) throw refusal("RESOURCE_UNKNOWN", "authorizing Decision is not known in this project");
+  if (decision.config_revision !== configRevision) throw refusal("PROJECT_CONFIG_STALE", "authorizing Decision config revision is stale");
+  if (
+    !decision.decision_class || !decision.options_json || !decision.decision_identity_digest ||
+    decision.scope_digest !== sha256(decision.scope_json) ||
+    storedDecisionIdentityDigest(decision) !== decision.decision_identity_digest
+  ) throw refusal("INVALID_INPUT", "authorizing Decision identity is invalid");
+  const disposition = asRow<{ disposition: string; actor_receipt_id: string; latest_sequence: number }>(db.prepare(
+    `SELECT decision_dispositions.disposition, decision_dispositions.actor_receipt_id,
+            (SELECT MAX(latest.disposition_sequence) FROM decision_dispositions AS latest
+             WHERE latest.decision_id = decision_dispositions.decision_id) AS latest_sequence
+     FROM decision_dispositions WHERE decision_id = ? AND disposition_sequence = ?`,
+  ).get(decisionId, dispositionSequence));
+  if (!disposition || disposition.disposition !== "adopted" || disposition.latest_sequence !== dispositionSequence) {
+    throw refusal("INVALID_INPUT", "migration requires the current adopted Decision disposition");
+  }
+  const actor = asRow<{
+    project_id: string; actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null;
+    verification_state: string; receipt_digest: string;
+  }>(db.prepare(
+    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, receipt_digest FROM actor_receipts WHERE receipt_id = ?",
+  ).get(disposition.actor_receipt_id));
+  if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || !["role", "operator"].includes(actor.actor_kind) ||
+      actor.receipt_digest !== sha256(canonicalJson({
+        projectId: actor.project_id,
+        receiptId: disposition.actor_receipt_id,
+        actorKind: actor.actor_kind,
+        subjectId: actor.subject_id,
+        roleId: actor.role_id,
+        roleGeneration: actor.role_generation,
+        verificationState: actor.verification_state,
+      }))) {
+    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "authorizing Decision actor receipt is not verified");
+  }
+}
+
+function rotateMigrationGovernor(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  actorReceiptId: string,
+  head: ReturnType<typeof exactGovernor>,
+  runtimeId: string,
+  state: "source_active" | "frozen" | "target_active",
+): { governanceEpoch: number; fenceToken: string } {
+  const governanceEpoch = head.governance_epoch + 1;
+  const fenceToken = newFenceToken();
+  try {
+    db.prepare(
+      `INSERT INTO project_governorships
+        (project_id, governance_epoch, runtime_id, state, fence_token, actor_receipt_id, predecessor_epoch, created_at_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(request.projectId, governanceEpoch, runtimeId, state, fenceToken, actorReceiptId, head.governance_epoch, now());
+  } catch (error) {
+    if (isConstraintError(error)) throw refusal("GOVERNOR_CAS_FAILED", "migration governorship rotation lost its compare-and-swap race");
+    throw error;
+  }
+  const updated = db.prepare(
+    `UPDATE project_governorship_heads SET governance_epoch = ?, fence_token = ?, state = ?, updated_at_ms = ?
+     WHERE project_id = ? AND governance_epoch = ? AND fence_token = ? AND state = ?`,
+  ).run(governanceEpoch, fenceToken, state, now(), request.projectId, head.governance_epoch, head.fence_token, head.state);
+  if (updated.changes !== 1) throw refusal("GOVERNOR_CAS_FAILED", "migration governorship head compare-and-swap failed");
+  return { governanceEpoch, fenceToken };
+}
+
+function migrationEvent(
+  step: "prepare" | (typeof MIGRATION_STEPS)[number],
+  priorState: MigrationRunRow["state"] | null,
+  next: MigrationRunRow,
+  stepProofDigest: string,
+) {
+  return {
+    step,
+    priorState,
+    newState: next.state,
+    priorRevision: next.resource_revision - 1,
+    newRevision: next.resource_revision,
+    sourceGovernorEpoch: next.source_governor_epoch,
+    targetGovernorEpoch: next.target_governor_epoch,
+    sourceContractDigest: next.source_contract_digest,
+    sourceSchemaDigest: next.source_schema_digest,
+    sourceExportDigest: next.source_export_digest,
+    sourceSnapshotDigest: next.source_snapshot_digest,
+    mutatorInventoryDigest: next.mutator_inventory_digest,
+    quiescenceDigest: next.quiescence_digest,
+    importRootDigest: next.import_root_digest,
+    equivalenceDigest: next.equivalence_digest,
+    recoveryDigest: next.recovery_digest,
+    stepProofDigest,
+  };
+}
+
+function validateMigrationExport(payload: NonNullable<ApplyRequest["migrationStep"]>["export"], projectId: string): ExportPayload {
+  if (!payload) throw refusal("IMPORT_EQUIVALENCE_FAILED", "migration step requires the deterministic fixture export");
+  const manifest = payload.manifest;
+  const expectedTables = Object.fromEntries(TABLES.map((table) => [table, manifest.tableCounts[table] ?? -1]));
+  if (
+    manifest.schemaVersion !== SCHEMA_VERSION || manifest.contractVersion !== CONTRACT_VERSION ||
+    manifest.pluginId !== PLUGIN_ID || manifest.projectId !== projectId ||
+    canonicalJson(manifest.migrationStatementIds) !== canonicalJson(MIGRATIONS.map((_, index) => index)) ||
+    manifest.schemaDigest !== schemaDigest || manifest.contractDigest !== contractDigest ||
+    Object.keys(manifest.tableCounts).sort().join("\0") !== [...TABLES].sort().join("\0") ||
+    Object.values(expectedTables).some((count) => count < 0)
+  ) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export identity does not match the exact runtime/schema/project contract");
+  }
+  const lines = payload.recordsNdjson === "" ? [] : payload.recordsNdjson.split("\n");
+  const counts = Object.fromEntries(TABLES.map((table) => [table, 0])) as Record<string, number>;
+  let lastTableIndex = -1;
+  for (const line of lines) {
+    let record: { table?: unknown; row?: unknown };
+    try {
+      record = JSON.parse(line) as { table?: unknown; row?: unknown };
+    } catch {
+      throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export contains malformed NDJSON");
+    }
+    if (canonicalJson(record) !== line || typeof record.table !== "string" || !TABLES.includes(record.table as (typeof TABLES)[number])) {
+      throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export records are not canonical or reference an unknown table");
+    }
+    const tableIndex = TABLES.indexOf(record.table as (typeof TABLES)[number]);
+    if (tableIndex < lastTableIndex) throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export table order is not canonical");
+    lastTableIndex = tableIndex;
+    const row = record.row as Record<string, unknown> | null;
+    if (!row || typeof row !== "object" || ("project_id" in row && row.project_id !== projectId)) {
+      throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export record references a foreign project");
+    }
+    counts[record.table] = (counts[record.table] ?? 0) + 1;
+  }
+  if (lines.length !== manifest.rowCount || canonicalJson(counts) !== canonicalJson(manifest.tableCounts)) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export counts do not match its records");
+  }
+  if (
+    canonicalJson(payload.artifactIndex.map((artifact) => artifact.evidenceId)) !==
+      canonicalJson(payload.artifactIndex.map((artifact) => artifact.evidenceId).sort()) ||
+    new Set(payload.artifactIndex.map((artifact) => artifact.evidenceId)).size !== payload.artifactIndex.length
+  ) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture artifact index is not sorted and unique");
+  }
+  for (const artifact of payload.artifactIndex) {
+    const redacted = parseCanonicalEvidenceJson(artifact.redactedJson, "migration artifact redacted metadata");
+    const durable = parseCanonicalEvidenceJson(artifact.durableRefJson, "migration artifact durable reference");
+    try {
+      if (
+        sha256(redacted.json) !== artifact.redactedDigest ||
+        sha256(canonicalJson({
+          projectId,
+          evidenceId: artifact.evidenceId,
+          evidenceKind: artifact.evidenceKind,
+          sourceKind: artifact.sourceKind,
+          sourceRef: artifact.sourceRef,
+          executionAttemptId: artifact.executionAttemptId,
+          contentDigest: artifact.contentDigest,
+          redactedDigest: artifact.redactedDigest,
+          durableRef: durable.value,
+        })) !== artifact.artifactIdentityDigest
+      ) throw new Error("digest mismatch");
+    } catch {
+      throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture artifact index contains invalid redacted or durable metadata");
+    }
+  }
+  const artifactIndexJson = canonicalJson(payload.artifactIndex);
+  const artifactIndexDigest = sha256(artifactIndexJson);
+  const recordsDigest = sha256(payload.recordsNdjson);
+  const rootInput = { ...manifest };
+  delete (rootInput as Partial<typeof manifest>).exportRootDigest;
+  const expectedChecksums = {
+    "artifact-index.json": artifactIndexDigest,
+    "manifest.json": sha256(canonicalJson(manifest)),
+    "records.ndjson": recordsDigest,
+  };
+  if (
+    payload.artifactIndex.length !== manifest.tableCounts.evidence_artifacts ||
+    recordsDigest !== manifest.recordsDigest || artifactIndexDigest !== manifest.artifactIndexDigest ||
+    sha256(canonicalJson(rootInput)) !== manifest.exportRootDigest ||
+    canonicalJson(payload.checksums) !== canonicalJson(expectedChecksums) ||
+    Buffer.byteLength(payload.recordsNdjson, "utf8") + Buffer.byteLength(artifactIndexJson, "utf8") > MAX_EXPORT_BYTES
+  ) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export hashes, roots, or bounds do not verify");
+  }
+  return payload as ExportPayload;
+}
+
+function applyMigrationPrepare(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
+  const configRevision = requireConfig(db, request);
+  if (request.configRevision !== configRevision) throw refusal("PROJECT_CONFIG_STALE", "migration prepare must bind the current config revision");
+  const head = exactGovernor(db, request);
+  if (head.state !== "target_active") throw refusal("PROJECT_FROZEN", "migration prepare requires the current writable target fixture head");
+  const actorReceiptId = requireActor(db, request);
+  const migration = request.migration;
+  if (!migration || request.migrationStep) throw refusal("INVALID_INPUT", "migration_prepare requires one immutable MigrationRun input");
+  if (migration.targetRuntimeId !== PLUGIN_ID || migration.retentionUntilMs <= now()) {
+    throw refusal("INVALID_INPUT", "migration prepare requires the exact target runtime and future retention");
+  }
+  requireAdoptedMigrationDecision(
+    db, request.projectId, configRevision, migration.decisionId, migration.decisionDispositionSequence,
+  );
+  if (db.prepare("SELECT 1 FROM migration_runs WHERE source_system = 'llm-collab' AND project_id = ? AND state NOT IN ('retired', 'rolled_back')").get(request.projectId)) {
+    throw refusal("INVALID_INPUT", "project already has an open MigrationRun");
+  }
+  const targetDigest = migrationTargetDigest(db, request.projectId, configRevision);
+  const governor = rotateMigrationGovernor(db, request, actorReceiptId, head, migration.sourceRuntimeId, "source_active");
+  const createdAtMs = now();
+  const run: MigrationRunRow = {
+    migration_id: migration.migrationId,
+    project_id: request.projectId,
+    source_system: migration.sourceSystem,
+    source_runtime_id: migration.sourceRuntimeId,
+    target_runtime_id: migration.targetRuntimeId,
+    source_contract_digest: migration.sourceContractDigest,
+    source_schema_digest: migration.sourceSchemaDigest,
+    source_export_digest: null,
+    config_revision: configRevision,
+    decision_id: migration.decisionId,
+    decision_disposition_sequence: migration.decisionDispositionSequence,
+    state: "prepared",
+    resource_revision: 1,
+    source_event_ceiling: null,
+    source_snapshot_digest: migration.sourceSnapshotDigest,
+    source_governor_epoch: governor.governanceEpoch,
+    target_governor_epoch: head.governance_epoch,
+    mutator_inventory_digest: null,
+    quiescence_digest: null,
+    import_root_digest: null,
+    equivalence_digest: null,
+    recovery_digest: null,
+    retention_until_ms: migration.retentionUntilMs,
+    created_at_ms: createdAtMs,
+    updated_at_ms: createdAtMs,
+  };
+  db.prepare(
+    `INSERT INTO migration_runs
+      (migration_id, project_id, source_system, source_runtime_id, target_runtime_id,
+       source_contract_digest, source_schema_digest, source_export_digest, config_revision,
+       decision_id, decision_disposition_sequence, state, resource_revision, source_event_ceiling,
+       source_snapshot_digest, source_governor_epoch, target_governor_epoch, mutator_inventory_digest,
+       quiescence_digest, import_root_digest, equivalence_digest, recovery_digest,
+       retention_until_ms, created_at_ms, updated_at_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)`,
+  ).run(
+    run.migration_id, run.project_id, run.source_system, run.source_runtime_id, run.target_runtime_id,
+    run.source_contract_digest, run.source_schema_digest, run.config_revision, run.decision_id,
+    run.decision_disposition_sequence, run.state, run.resource_revision, run.source_snapshot_digest,
+    run.source_governor_epoch, run.target_governor_epoch, run.retention_until_ms, run.created_at_ms, run.updated_at_ms,
+  );
+  return commitMutation(
+    db, request, digest, actorReceiptId,
+    { aggregateType: "migration_run", aggregateId: run.migration_id, aggregateRevision: 1, eventType: "migration_run_changed", event: migrationEvent("prepare", null, run, migration.sourceSnapshotDigest) },
+    { expected: 1, attempted: 1, verified: 1 },
+    { currentConfigRevision: configRevision, currentGovernanceEpoch: governor.governanceEpoch, currentResourceRevision: 1,
+      evidence: { migrationId: run.migration_id, state: run.state, resourceRevision: 1, fenceToken: governor.fenceToken, repositoryTargetsDigest: targetDigest } },
+  );
+}
+
+function requireCompleteCanaries(request: ApplyRequest): void {
+  const canaries = request.migrationStep?.canaries;
+  if (!canaries || canaries.attempted !== canaries.expected || canaries.verified !== canaries.expected) {
+    throw refusal("SOURCE_FREEZE_UNPROVEN", "source mutator canaries are incomplete", {
+      expected: canaries?.expected ?? 1,
+      attempted: canaries?.attempted ?? 0,
+      verified: canaries?.verified ?? 0,
+    });
+  }
+}
+
+function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
+  const configRevision = requireConfig(db, request);
+  const actorReceiptId = requireActor(db, request);
+  const step = request.migrationStep;
+  if (!step || request.migration) throw refusal("INVALID_INPUT", "migration_step requires one closed transition input");
+  const run = asRow<MigrationRunRow>(db.prepare("SELECT * FROM migration_runs WHERE project_id = ? AND migration_id = ?").get(request.projectId, step.migrationId));
+  if (!run) throw refusal("RESOURCE_UNKNOWN", "MigrationRun is not known in this project");
+  if (request.expectedResourceRevision !== run.resource_revision) {
+    throw refusal("RESOURCE_REVISION_STALE", "MigrationRun revision is stale", {
+      currentResourceRevision: run.resource_revision,
+      expectedResourceRevision: request.expectedResourceRevision ?? undefined,
+    });
+  }
+  if (request.configRevision !== configRevision || run.config_revision !== configRevision) {
+    throw refusal("PROJECT_CONFIG_STALE", "MigrationRun config revision is stale");
+  }
+  requireAdoptedMigrationDecision(db, request.projectId, configRevision, run.decision_id, run.decision_disposition_sequence);
+  const head = exactGovernor(db, request);
+  const repositoryTargetsDigest = migrationTargetDigest(db, request.projectId, configRevision);
+  if (step.repositoryTargetsDigest !== repositoryTargetsDigest) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "repository target identity changed or is foreign");
+  }
+  if (["record_import", "record_equivalence", "activate"].includes(step.step) && run.retention_until_ms <= now()) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "MigrationRun retention expired before equivalence/activation");
+  }
+  const next: MigrationRunRow = { ...run, resource_revision: run.resource_revision + 1, updated_at_ms: now() };
+  let eventStep: "prepare" | (typeof MIGRATION_STEPS)[number] = step.step;
+  let outcome: FoundationCode = "OK";
+  let nextFenceToken = head.fence_token;
+  const requireState = (...states: MigrationRunRow["state"][]) => {
+    if (!states.includes(run.state)) throw refusal("INVALID_INPUT", `${step.step} is invalid from ${run.state}`);
+  };
+  const requireGovernorState = (...states: typeof head.state[]) => {
+    if (!states.includes(head.state)) throw refusal("PROJECT_FROZEN", `${step.step} does not match the canonical governorship state`);
+  };
+
+  switch (step.step) {
+    case "record_inventory":
+      requireState("prepared");
+      requireGovernorState("source_active");
+      next.mutator_inventory_digest = step.proofDigest;
+      break;
+    case "record_quiescence":
+      requireState("prepared");
+      requireGovernorState("source_active");
+      next.quiescence_digest = step.proofDigest;
+      break;
+    case "freeze": {
+      requireState("prepared");
+      requireGovernorState("source_active");
+      if (!run.mutator_inventory_digest || !run.quiescence_digest) {
+        throw refusal("SOURCE_FREEZE_UNPROVEN", "inventory and quiescence proofs are required before freeze");
+      }
+      requireCompleteCanaries(request);
+      const governor = rotateMigrationGovernor(db, request, actorReceiptId, head, run.source_runtime_id, "frozen");
+      next.state = "frozen";
+      next.source_governor_epoch = governor.governanceEpoch;
+      nextFenceToken = governor.fenceToken;
+      break;
+    }
+    case "record_export": {
+      requireState("frozen");
+      requireGovernorState("frozen");
+      const exported = validateMigrationExport(step.export, request.projectId);
+      if (run.source_schema_digest !== exported.manifest.schemaDigest || run.source_contract_digest !== exported.manifest.contractDigest) {
+        throw refusal("IMPORT_EQUIVALENCE_FAILED", "source schema or contract digest does not match the fixture export");
+      }
+      const ceiling = step.sourceEventCeiling;
+      const currentCeiling = asRow<{ event_sequence: number }>(db.prepare("SELECT COALESCE(MAX(event_sequence), 0) AS event_sequence FROM state_events WHERE project_id = ?").get(request.projectId))?.event_sequence ?? 0;
+      if (ceiling === undefined || ceiling !== currentCeiling || step.sourceSnapshotDigest !== run.source_snapshot_digest) {
+        throw refusal("IMPORT_EQUIVALENCE_FAILED", "source event ceiling or snapshot digest is not exact");
+      }
+      if (db.prepare("SELECT 1 FROM migration_runs WHERE source_system = ? AND project_id = ? AND source_export_digest = ? AND migration_id <> ?").get(run.source_system, run.project_id, exported.manifest.exportRootDigest, run.migration_id)) {
+        throw refusal("INVALID_INPUT", "final source export identity already belongs to another MigrationRun");
+      }
+      next.state = "exported";
+      next.source_event_ceiling = ceiling;
+      next.source_export_digest = exported.manifest.exportRootDigest;
+      break;
+    }
+    case "record_import": {
+      requireState("exported");
+      requireGovernorState("frozen");
+      const exported = validateMigrationExport(step.export, request.projectId);
+      const expectedRoot = sha256(canonicalJson({
+        sourceExportDigest: run.source_export_digest,
+        targetRuntimeId: run.target_runtime_id,
+        configRevision,
+        repositoryTargetsDigest,
+      }));
+      if (exported.manifest.exportRootDigest !== run.source_export_digest || step.importRootDigest !== expectedRoot || step.proofDigest !== expectedRoot) {
+        throw refusal("IMPORT_EQUIVALENCE_FAILED", "import root does not bind the exact export/runtime/config/repository identity");
+      }
+      next.state = "imported";
+      next.import_root_digest = expectedRoot;
+      break;
+    }
+    case "record_equivalence": {
+      requireState("imported");
+      requireGovernorState("frozen");
+      const exported = validateMigrationExport(step.export, request.projectId);
+      const expectedDigest = sha256(canonicalJson({
+        sourceExportDigest: run.source_export_digest,
+        importRootDigest: run.import_root_digest,
+        sourceSnapshotDigest: run.source_snapshot_digest,
+        repositoryTargetsDigest,
+      }));
+      if (exported.manifest.exportRootDigest !== run.source_export_digest || step.equivalenceDigest !== expectedDigest || step.proofDigest !== expectedDigest) {
+        throw refusal("IMPORT_EQUIVALENCE_FAILED", "equivalence proof does not bind exact hashes and references");
+      }
+      next.state = "equivalent";
+      next.equivalence_digest = expectedDigest;
+      break;
+    }
+    case "activate": {
+      requireState("equivalent");
+      requireGovernorState("frozen");
+      const governor = rotateMigrationGovernor(db, request, actorReceiptId, head, run.target_runtime_id, "target_active");
+      next.state = "target_active";
+      next.target_governor_epoch = governor.governanceEpoch;
+      nextFenceToken = governor.fenceToken;
+      break;
+    }
+    case "record_exercise":
+      requireState("target_active");
+      requireGovernorState("target_active");
+      next.state = "exercised";
+      break;
+    case "retire":
+      requireState("exercised");
+      requireGovernorState("target_active");
+      next.state = "retired";
+      break;
+    case "rollback":
+      if (["target_active", "exercised"].includes(run.state)) {
+        requireGovernorState("target_active");
+        if (!step.recoveryDigest || step.recoveryDigest !== step.proofDigest) throw refusal("INVALID_INPUT", "fix-forward requires exact recovery evidence");
+        next.state = "fix_forward_required";
+        next.recovery_digest = step.recoveryDigest;
+        eventStep = "mark_fix_forward_required";
+        outcome = "MIGRATION_FIX_FORWARD_REQUIRED";
+      } else {
+        requireState("prepared", "frozen", "exported", "imported", "equivalent");
+        requireGovernorState("source_active", "frozen");
+        if (!step.recoveryDigest || step.recoveryDigest !== step.proofDigest) throw refusal("INVALID_INPUT", "rollback requires exact recovery evidence");
+        const governor = rotateMigrationGovernor(db, request, actorReceiptId, head, run.source_runtime_id, "source_active");
+        next.state = "rolled_back";
+        next.source_governor_epoch = governor.governanceEpoch;
+        next.recovery_digest = step.recoveryDigest;
+        nextFenceToken = governor.fenceToken;
+      }
+      break;
+    case "mark_fix_forward_required":
+      requireState("target_active", "exercised");
+      requireGovernorState("target_active");
+      if (!step.recoveryDigest || step.recoveryDigest !== step.proofDigest) throw refusal("INVALID_INPUT", "fix-forward requires exact recovery evidence");
+      next.state = "fix_forward_required";
+      next.recovery_digest = step.recoveryDigest;
+      outcome = "MIGRATION_FIX_FORWARD_REQUIRED";
+      break;
+  }
+
+  const updated = db.prepare(
+    `UPDATE migration_runs SET state = ?, resource_revision = ?, source_event_ceiling = ?, source_snapshot_digest = ?,
+       source_governor_epoch = ?, target_governor_epoch = ?, mutator_inventory_digest = ?, quiescence_digest = ?,
+       source_export_digest = ?, import_root_digest = ?, equivalence_digest = ?, recovery_digest = ?, updated_at_ms = ?
+     WHERE project_id = ? AND migration_id = ? AND resource_revision = ?`,
+  ).run(
+    next.state, next.resource_revision, next.source_event_ceiling, next.source_snapshot_digest,
+    next.source_governor_epoch, next.target_governor_epoch, next.mutator_inventory_digest, next.quiescence_digest,
+    next.source_export_digest, next.import_root_digest, next.equivalence_digest, next.recovery_digest, next.updated_at_ms,
+    request.projectId, next.migration_id, run.resource_revision,
+  );
+  if (updated.changes !== 1) throw refusal("RESOURCE_REVISION_STALE", "MigrationRun compare-and-swap failed", {
+    currentResourceRevision: run.resource_revision,
+    expectedResourceRevision: request.expectedResourceRevision ?? undefined,
+  });
+  const currentGovernanceEpoch = next.state === "retired" || next.state === "exercised" || next.state === "fix_forward_required"
+    ? head.governance_epoch
+    : next.state === "target_active" ? next.target_governor_epoch : next.source_governor_epoch;
+  return commitMutation(
+    db, request, digest, actorReceiptId,
+    { aggregateType: "migration_run", aggregateId: next.migration_id, aggregateRevision: next.resource_revision, eventType: "migration_run_changed", event: migrationEvent(eventStep, run.state, next, step.proofDigest) },
+    { expected: 1, attempted: 1, verified: 1 },
+    { currentConfigRevision: configRevision, currentGovernanceEpoch, currentResourceRevision: next.resource_revision,
+      evidence: { migrationId: next.migration_id, state: next.state, resourceRevision: next.resource_revision, fenceToken: nextFenceToken,
+        repositoryTargetsDigest, sourceExportDigest: next.source_export_digest } },
+    outcome,
   );
 }
 
@@ -5735,6 +6426,10 @@ export function applyFixtureMutation(
           return applyConfigRevision(db, request, digest);
         case "governor_claim":
           return applyGovernorClaim(db, request, digest);
+        case "migration_prepare":
+          return applyMigrationPrepare(db, request, digest);
+        case "migration_step":
+          return applyMigrationStep(db, request, digest);
         case "decision_create":
           return applyDecisionCreate(db, request, digest);
         case "decision_disposition":
@@ -5775,6 +6470,7 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     repository_targets: "repo_target_id, config_revision",
     project_governorships: "governance_epoch",
     project_governorship_heads: "project_id",
+    migration_runs: "migration_id",
     actor_receipts: "receipt_id",
     decisions: "decision_id",
     decision_dispositions: "decision_dispositions.decision_id, decision_dispositions.disposition_sequence",
@@ -5814,25 +6510,45 @@ export function exportFoundation(db: SqliteDatabase | null, projectId: string): 
     const recordsNdjson = TABLES.flatMap((table) =>
       rowsByTable[table].map((row) => canonicalJson({ table, row })),
     ).join("\n");
-    if (Buffer.byteLength(recordsNdjson, "utf8") > MAX_EXPORT_BYTES) {
+    const artifactIndex = rowsByTable.evidence_artifacts.map((row) => ({
+      evidenceId: String(row.evidence_id),
+      evidenceKind: String(row.evidence_kind),
+      sourceKind: String(row.source_kind),
+      sourceRef: String(row.source_ref),
+      executionAttemptId: row.execution_attempt_id === null ? null : String(row.execution_attempt_id),
+      contentDigest: String(row.content_digest),
+      redactedJson: String(row.redacted_json),
+      redactedDigest: String(row.redacted_digest),
+      durableRefJson: String(row.durable_ref_json),
+      artifactIdentityDigest: String(row.artifact_identity_digest),
+    }));
+    const artifactIndexJson = canonicalJson(artifactIndex);
+    if (Buffer.byteLength(recordsNdjson, "utf8") + Buffer.byteLength(artifactIndexJson, "utf8") > MAX_EXPORT_BYTES) {
       return result("EXPORT_BOUNDED", projectId, rowCount, rowCount, 0, { message: "export exceeds the bounded byte limit" });
     }
     const recordsDigest = sha256(recordsNdjson);
-    const manifest = {
+    const artifactIndexDigest = sha256(artifactIndexJson);
+    const manifestWithoutRoot = {
       schemaVersion: SCHEMA_VERSION,
+      contractVersion: CONTRACT_VERSION,
       pluginId: PLUGIN_ID,
       projectId,
       migrationStatementIds: MIGRATIONS.map((_, index) => index),
       schemaDigest,
+      contractDigest,
       rowCount,
       tableCounts,
       recordsDigest,
+      artifactIndexDigest,
     };
+    const manifest = { ...manifestWithoutRoot, exportRootDigest: sha256(canonicalJson(manifestWithoutRoot)) };
     const manifestJson = canonicalJson(manifest);
     const exportPayload: ExportPayload = {
       manifest,
       recordsNdjson,
+      artifactIndex,
       checksums: {
+        "artifact-index.json": artifactIndexDigest,
         "manifest.json": sha256(manifestJson),
         "records.ndjson": recordsDigest,
       },
@@ -6107,6 +6823,24 @@ export async function doctor(
     const governor = asRow<Record<string, unknown>>(
       db.prepare("SELECT * FROM project_governorship_heads WHERE project_id = ?").get(projectId),
     );
+    const migrationRuns = (db.prepare(
+      `SELECT migration_id, source_system, source_runtime_id, target_runtime_id, source_export_digest,
+              config_revision, decision_id, decision_disposition_sequence, state, resource_revision,
+              source_event_ceiling, source_snapshot_digest, source_governor_epoch, target_governor_epoch,
+              mutator_inventory_digest, quiescence_digest, import_root_digest, equivalence_digest,
+              recovery_digest, retention_until_ms, created_at_ms, updated_at_ms
+       FROM migration_runs WHERE project_id = ? ORDER BY migration_id`,
+    ).all(projectId) as Array<Record<string, string | number | null>>).map((run) => {
+      const state = String(run.state);
+      const unresolvedProof: string[] = [];
+      if (!run.mutator_inventory_digest) unresolvedProof.push("mutator_inventory");
+      if (!run.quiescence_digest) unresolvedProof.push("quiescence");
+      if (["exported", "imported", "equivalent", "target_active", "exercised", "retired", "fix_forward_required"].includes(String(run.state)) && !run.source_export_digest) unresolvedProof.push("source_export");
+      if (["imported", "equivalent", "target_active", "exercised", "retired", "fix_forward_required"].includes(String(run.state)) && !run.import_root_digest) unresolvedProof.push("import");
+      if (["equivalent", "target_active", "exercised", "retired", "fix_forward_required"].includes(String(run.state)) && !run.equivalence_digest) unresolvedProof.push("equivalence");
+      return { ...run, state, retentionExpired: Number(run.retention_until_ms) <= now(), unresolvedProof };
+    });
+    const activeMigrationRun = migrationRuns.find((run) => !["retired", "rolled_back"].includes(String(run.state))) ?? null;
     const roleGenerationHeads = db.prepare(
       `SELECT role_generation_heads.role_id, role_generation_heads.current_generation,
               role_generations.status, role_generations.qualification_id,
@@ -6191,6 +6925,8 @@ export async function doctor(
         project: { id: project.id, kind: project.kind, name: project.name, gitRemoteUrl: project.gitRemoteUrl },
         targets: targetEvidence,
         governorshipHead: governor ?? null,
+        migrationRuns,
+        activeMigrationRun,
         roleGenerationHeads,
         unresolvedRoleHolders,
         qualificationObservationCount: observationCount,

@@ -31,16 +31,36 @@ const exportSchema = z
     manifest: z
       .object({
         schemaVersion: z.number().int().positive(),
+        contractVersion: z.number().int().positive(),
         pluginId: z.string(),
         projectId: projectIdSchema,
         migrationStatementIds: z.array(z.number().int().nonnegative()),
         schemaDigest: z.string(),
+        contractDigest: z.string(),
         rowCount: z.number().int().nonnegative(),
         tableCounts: z.record(z.string(), z.number().int().nonnegative()),
         recordsDigest: z.string(),
+        artifactIndexDigest: z.string(),
+        exportRootDigest: z.string(),
       })
       .strict(),
     recordsNdjson: z.string(),
+    artifactIndex: z.array(
+      z
+        .object({
+          evidenceId: z.string(),
+          evidenceKind: z.string(),
+          sourceKind: z.string(),
+          sourceRef: z.string(),
+          executionAttemptId: z.string().nullable(),
+          contentDigest: z.string(),
+          redactedJson: z.string(),
+          redactedDigest: z.string(),
+          durableRefJson: z.string(),
+          artifactIdentityDigest: z.string(),
+        })
+        .strict(),
+    ),
     checksums: z.record(z.string(), z.string()),
   })
   .strict();

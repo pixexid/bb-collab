@@ -9,19 +9,26 @@ import { z } from "zod";
 import plugin from "../server.js";
 import {
   DEFERRED_ISSUE_3_OUTCOMES,
+  CONTRACT_VERSION,
   MAX_EXPORT_ROWS,
   MIGRATIONS,
+  MIGRATION_STATES,
+  MIGRATION_STEPS,
   PLUGIN_ID,
   SCHEMA_VERSION,
+  TABLES,
   applyFixtureMutation,
   cachedConsumerRolloutEvidence,
   canonicalJson,
+  contractDigest,
   databaseIsReady,
   doctor,
   explicitExecutionInputSources,
   exportFoundation,
+  schemaDigest,
   sha256,
   type ApplyRequest,
+  type ExportPayload,
   type FoundationResult,
   type NativeAssignmentInspection,
 } from "../src/foundation.js";
@@ -397,6 +404,232 @@ function directDatabase() {
   databaseIsReady(db);
   for (const statement of MIGRATIONS) db.exec(statement);
   return { db, path, directory };
+}
+
+const MIGRATION_ID = "migration-1";
+const MIGRATION_DECISION_ID = "migration-decision";
+const SOURCE_SNAPSHOT_DIGEST = sha256("source-snapshot");
+
+function currentGovernor(db: Database.Database) {
+  return db.prepare("SELECT governance_epoch, fence_token, state FROM project_governorship_heads WHERE project_id = ?").get(PROJECT_ID) as {
+    governance_epoch: number;
+    fence_token: string;
+    state: "source_active" | "frozen" | "target_active" | "retired";
+  };
+}
+
+function repositoryTargetsDigest(db: Database.Database) {
+  return sha256(canonicalJson(db.prepare(
+    `SELECT repo_target_id, source_id, host_id, path, remote_url, default_branch, target_digest
+     FROM repository_targets WHERE project_id = ? AND config_revision = 1 ORDER BY repo_target_id`,
+  ).all(PROJECT_ID)));
+}
+
+function seedMigrationAuthority(db: Database.Database) {
+  seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID, actorKind: "operator", subjectId: "fixture-operator" });
+  const bootstrap = applyWithFixtureReceipt(db, bootstrapRequest());
+  expect(bootstrap.outcome).toBe("OK");
+  seedFixtureDecision(db, {
+    projectId: PROJECT_ID,
+    decisionId: MIGRATION_DECISION_ID,
+    scope: { operation: "migration", projectId: PROJECT_ID },
+    decisionClass: "assignment_admission",
+    options: { sourceSystem: "llm-collab", targetRuntimeId: PLUGIN_ID },
+  });
+  db.prepare(
+    `INSERT INTO decision_dispositions
+      (decision_id, disposition_sequence, disposition, actor_receipt_id, reason_json, created_at_ms, idempotency_key)
+     VALUES (?, 1, 'adopted', ?, ?, 1, 'migration-decision-adopted')`,
+  ).run(MIGRATION_DECISION_ID, RECEIPT_ID, canonicalJson({ reason: "fixture cutover authorized" }));
+  return currentGovernor(db);
+}
+
+function migrationPrepareRequest(
+  governor: ReturnType<typeof currentGovernor>,
+  overrides: Partial<ApplyRequest> = {},
+): ApplyRequest {
+  return {
+    projectId: PROJECT_ID,
+    operationClass: "migration_prepare",
+    idempotencyKey: "migration-prepare",
+    actorReceiptId: RECEIPT_ID,
+    expectedConfigRevision: 1,
+    configRevision: 1,
+    expectedGovernanceEpoch: governor.governance_epoch,
+    expectedFenceToken: governor.fence_token,
+    expectedResourceRevision: null,
+    migration: {
+      migrationId: MIGRATION_ID,
+      sourceSystem: "llm-collab",
+      sourceRuntimeId: "llm-collab-runtime",
+      targetRuntimeId: PLUGIN_ID,
+      sourceContractDigest: contractDigest,
+      sourceSchemaDigest: schemaDigest,
+      sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
+      decisionId: MIGRATION_DECISION_ID,
+      decisionDispositionSequence: 1,
+      retentionUntilMs: 9_999_999_999_999,
+    },
+    ...overrides,
+  };
+}
+
+function migrationStepRequest(
+  db: Database.Database,
+  step: (typeof MIGRATION_STEPS)[number],
+  input: Partial<NonNullable<ApplyRequest["migrationStep"]>> = {},
+  overrides: Partial<ApplyRequest> = {},
+): ApplyRequest {
+  const governor = currentGovernor(db);
+  const run = db.prepare("SELECT resource_revision FROM migration_runs WHERE project_id = ? AND migration_id = ?").get(PROJECT_ID, MIGRATION_ID) as {
+    resource_revision: number;
+  };
+  return {
+    projectId: PROJECT_ID,
+    operationClass: "migration_step",
+    idempotencyKey: `migration-${step}-${run.resource_revision}`,
+    actorReceiptId: RECEIPT_ID,
+    expectedConfigRevision: 1,
+    configRevision: 1,
+    expectedGovernanceEpoch: governor.governance_epoch,
+    expectedFenceToken: governor.fence_token,
+    expectedResourceRevision: run.resource_revision,
+    migrationStep: {
+      migrationId: MIGRATION_ID,
+      step,
+      proofDigest: sha256(step),
+      repositoryTargetsDigest: repositoryTargetsDigest(db),
+      ...input,
+    },
+    ...overrides,
+  };
+}
+
+function prepareMigration(db: Database.Database) {
+  const prepare = applyWithFixtureReceipt(db, migrationPrepareRequest(seedMigrationAuthority(db)));
+  expect(prepare).toMatchObject({ outcome: "OK", currentResourceRevision: 1, evidence: { state: "prepared" } });
+  return prepare;
+}
+
+function freezeMigration(db: Database.Database) {
+  prepareMigration(db);
+  expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_inventory", { proofDigest: sha256("inventory") }))).toMatchObject({ outcome: "OK", currentResourceRevision: 2 });
+  expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_quiescence", { proofDigest: sha256("quiescence") }))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+  const freeze = applyWithFixtureReceipt(db, migrationStepRequest(db, "freeze", { canaries: { expected: 3, attempted: 3, verified: 3 } }));
+  expect(freeze).toMatchObject({ outcome: "OK", currentResourceRevision: 4, evidence: { state: "frozen" } });
+  return freeze;
+}
+
+function fixtureExport(db: Database.Database): ExportPayload {
+  const exported = exportFoundation(db, PROJECT_ID);
+  expect(exported.outcome).toBe("OK");
+  return exported.export!;
+}
+
+function resealArtifactExport(payload: ExportPayload, mutate: (artifact: ExportPayload["artifactIndex"][number]) => void): ExportPayload {
+  const resealed = structuredClone(payload);
+  mutate(resealed.artifactIndex[0]!);
+  for (const artifact of resealed.artifactIndex) {
+    const redacted = JSON.parse(artifact.redactedJson);
+    const durableRef = JSON.parse(artifact.durableRefJson);
+    artifact.redactedJson = canonicalJson(redacted);
+    artifact.durableRefJson = canonicalJson(durableRef);
+    artifact.redactedDigest = sha256(artifact.redactedJson);
+    artifact.artifactIdentityDigest = sha256(canonicalJson({
+      projectId: PROJECT_ID,
+      evidenceId: artifact.evidenceId,
+      evidenceKind: artifact.evidenceKind,
+      sourceKind: artifact.sourceKind,
+      sourceRef: artifact.sourceRef,
+      executionAttemptId: artifact.executionAttemptId,
+      contentDigest: artifact.contentDigest,
+      redactedDigest: artifact.redactedDigest,
+      durableRef: JSON.parse(artifact.durableRefJson),
+    }));
+  }
+  resealed.manifest.artifactIndexDigest = sha256(canonicalJson(resealed.artifactIndex));
+  const rootInput = { ...resealed.manifest };
+  delete (rootInput as Partial<ExportPayload["manifest"]>).exportRootDigest;
+  resealed.manifest.exportRootDigest = sha256(canonicalJson(rootInput));
+  resealed.checksums = {
+    "artifact-index.json": resealed.manifest.artifactIndexDigest,
+    "manifest.json": sha256(canonicalJson(resealed.manifest)),
+    "records.ndjson": resealed.manifest.recordsDigest,
+  };
+  return resealed;
+}
+
+function recordMigrationExport(db: Database.Database) {
+  const exported = fixtureExport(db);
+  const ceiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
+  const result = applyWithFixtureReceipt(db, migrationStepRequest(db, "record_export", {
+    sourceEventCeiling: ceiling,
+    sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
+    export: exported,
+  }));
+  expect(result).toMatchObject({ outcome: "OK", currentResourceRevision: 5, evidence: { state: "exported", sourceExportDigest: exported.manifest.exportRootDigest } });
+  return exported;
+}
+
+function activateMigration(db: Database.Database) {
+  freezeMigration(db);
+  const exported = recordMigrationExport(db);
+  const importRootDigest = sha256(canonicalJson({
+    sourceExportDigest: exported.manifest.exportRootDigest,
+    targetRuntimeId: PLUGIN_ID,
+    configRevision: 1,
+    repositoryTargetsDigest: repositoryTargetsDigest(db),
+  }));
+  expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_import", {
+    proofDigest: importRootDigest,
+    export: exported,
+    importRootDigest,
+  }))).toMatchObject({ outcome: "OK", currentResourceRevision: 6, evidence: { state: "imported" } });
+  const equivalenceDigest = sha256(canonicalJson({
+    sourceExportDigest: exported.manifest.exportRootDigest,
+    importRootDigest,
+    sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
+    repositoryTargetsDigest: repositoryTargetsDigest(db),
+  }));
+  expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_equivalence", {
+    proofDigest: equivalenceDigest,
+    export: exported,
+    equivalenceDigest,
+  }))).toMatchObject({ outcome: "OK", currentResourceRevision: 7, evidence: { state: "equivalent" } });
+  const activate = applyWithFixtureReceipt(db, migrationStepRequest(db, "activate"));
+  expect(activate).toMatchObject({ outcome: "OK", currentResourceRevision: 8, evidence: { state: "target_active" } });
+  return { exported, activate };
+}
+
+function seedEvidenceArtifact(db: Database.Database, evidenceId: string, payloadBytes = 0) {
+  const redactedJson = canonicalJson({ evidenceId, redacted: true });
+  const durableRefJson = canonicalJson({ kind: "fixture", ref: evidenceId, fixtureContent: "x".repeat(payloadBytes) });
+  const artifact = {
+    projectId: PROJECT_ID,
+    evidenceId,
+    evidenceKind: "test",
+    sourceKind: "test",
+    sourceRef: `fixture:${evidenceId}`,
+    executionAttemptId: null,
+    contentDigest: sha256(`content:${evidenceId}`),
+    redactedDigest: sha256(redactedJson),
+    durableRef: JSON.parse(durableRefJson),
+  };
+  db.prepare(
+    `INSERT INTO evidence_artifacts
+      (project_id, evidence_id, evidence_kind, source_kind, source_ref, execution_attempt_id,
+       content_digest, redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest, created_at_ms)
+     VALUES (?, ?, 'test', 'test', ?, NULL, ?, ?, ?, ?, ?, 1)`,
+  ).run(
+    PROJECT_ID,
+    evidenceId,
+    artifact.sourceRef,
+    artifact.contentDigest,
+    redactedJson,
+    artifact.redactedDigest,
+    durableRefJson,
+    sha256(canonicalJson(artifact)),
+  );
 }
 
 function seedAssignmentDatabase(
@@ -973,6 +1206,10 @@ describe("bb-collab plugin boundary", () => {
       Array.from({ length: MIGRATIONS.length }, (_, index) => index),
     );
     expect((first as { export: { checksums: Record<string, string> } }).export.checksums).toHaveProperty("records.ndjson");
+    expect((first as { export: ExportPayload }).export).toMatchObject({
+      artifactIndex: [],
+      checksums: { "artifact-index.json": sha256("[]") },
+    });
   });
 
   it("returns a deterministic bounded result past the export row ceiling", () => {
@@ -995,6 +1232,326 @@ describe("bb-collab plugin boundary", () => {
       rmSync(directory, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it("counts the derived artifact index against the existing export byte ceiling", () => {
+    const { db, directory } = directDatabase();
+    try {
+      seedMigrationAuthority(db);
+      seedEvidenceArtifact(db, "large-artifact", 270 * 1024);
+      expect(exportFoundation(db, PROJECT_ID)).toMatchObject({ outcome: "EXPORT_BOUNDED", verified: 0 });
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("appends only the v6 MigrationRun table and two indexes and rolls every cached consumer forward", () => {
+    expect(SCHEMA_VERSION).toBe(6);
+    expect(CONTRACT_VERSION).toBe(2);
+    expect(MIGRATIONS).toHaveLength(19);
+    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("9469e48a59bcd8113a04b1524ab10fc12f92936c96c821cba5491f3faa407502");
+    expect(MIGRATIONS.at(-1)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
+    expect(MIGRATIONS.at(-1)?.match(/CREATE TABLE/gu)).toHaveLength(1);
+    expect(TABLES).toContain("migration_runs");
+    expect(MIGRATION_STATES).toEqual([
+      "prepared", "frozen", "exported", "imported", "equivalent", "target_active", "exercised", "retired", "rolled_back", "fix_forward_required",
+    ]);
+    expect(MIGRATION_STEPS).toEqual([
+      "record_inventory", "record_quiescence", "freeze", "record_export", "record_import", "record_equivalence", "activate", "record_exercise", "retire", "rollback", "mark_fix_forward_required",
+    ]);
+    expect(cachedConsumerRolloutEvidence(5)).toMatchObject({ oldSchemaVersion: 5, newSchemaVersion: 6, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(6)).toMatchObject({ oldSchemaVersion: 5, newSchemaVersion: 6, action: "reread", expected: 4, attempted: 4, verified: 4 });
+
+    const { db, directory } = directDatabase();
+    try {
+      expect((db.prepare("PRAGMA table_info(migration_runs)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual([
+        "migration_id", "project_id", "source_system", "source_runtime_id", "target_runtime_id", "source_contract_digest", "source_schema_digest",
+        "source_export_digest", "config_revision", "decision_id", "decision_disposition_sequence", "state", "resource_revision", "source_event_ceiling",
+        "source_snapshot_digest", "source_governor_epoch", "target_governor_epoch", "mutator_inventory_digest", "quiescence_digest", "import_root_digest",
+        "equivalence_digest", "recovery_digest", "retention_until_ms", "created_at_ms", "updated_at_ms",
+      ]);
+      expect((db.prepare("PRAGMA index_list(migration_runs)").all() as Array<{ name: string; unique: number; partial: number }>).filter((row) => row.name.startsWith("migration_runs_"))).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: "migration_runs_final_export_identity", unique: 1, partial: 1 }),
+        expect.objectContaining({ name: "migration_runs_one_open", unique: 1, partial: 1 }),
+      ]));
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("prepares one sanctioned run, binds adopted authority, and enforces open/final identities", () => {
+    const { db, directory } = directDatabase();
+    try {
+      const governor = seedMigrationAuthority(db);
+      const beforeRefusal = exportFoundation(db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(db, migrationPrepareRequest(governor, {
+        idempotencyKey: "migration-unadopted",
+        migration: { ...migrationPrepareRequest(governor).migration!, decisionDispositionSequence: 2 },
+      })).outcome).toBe("INVALID_INPUT");
+      expect(applyWithFixtureReceipt(db, migrationPrepareRequest(governor, {
+        idempotencyKey: "migration-actor-missing",
+        actorReceiptId: null,
+      })).outcome).toBe("ACTOR_RECEIPT_REQUIRED");
+      seedVerifiedFixtureReceipt(db, { projectId: FOREIGN_PROJECT_ID, receiptId: "migration-foreign-actor" });
+      expect(applyWithFixtureReceipt(db, migrationPrepareRequest(governor, {
+        idempotencyKey: "migration-actor-foreign",
+        actorReceiptId: "migration-foreign-actor",
+      })).outcome).toBe("ACTOR_RECEIPT_FOREIGN");
+      expect(applyWithFixtureReceipt(db, migrationPrepareRequest(governor, {
+        idempotencyKey: "migration-config-stale",
+        expectedConfigRevision: 0,
+      })).outcome).toBe("PROJECT_CONFIG_STALE");
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
+
+      const request = migrationPrepareRequest(governor);
+      const prepared = applyWithFixtureReceipt(db, request);
+      expect(applyWithFixtureReceipt(db, request)).toEqual(prepared);
+      expect(applyWithFixtureReceipt(db, { ...request, migration: { ...request.migration!, sourceRuntimeId: "conflict" } }).outcome).toBe("IDEMPOTENCY_KEY_CONFLICT");
+      expect(db.prepare("SELECT state, resource_revision, source_export_digest, source_governor_epoch, target_governor_epoch FROM migration_runs").get()).toEqual({
+        state: "prepared", resource_revision: 1, source_export_digest: null, source_governor_epoch: 2, target_governor_epoch: 1,
+      });
+      expect(currentGovernor(db)).toMatchObject({ governance_epoch: 2, state: "source_active" });
+
+      expect(() => db.exec(`INSERT INTO migration_runs SELECT 'migration-open-2', project_id, source_system, source_runtime_id, target_runtime_id,
+        source_contract_digest, source_schema_digest, source_export_digest, config_revision, decision_id, decision_disposition_sequence, state,
+        resource_revision, source_event_ceiling, source_snapshot_digest, source_governor_epoch, target_governor_epoch, mutator_inventory_digest,
+        quiescence_digest, import_root_digest, equivalence_digest, recovery_digest, retention_until_ms, created_at_ms, updated_at_ms FROM migration_runs`)).toThrow();
+      const finalDigest = sha256("same-final-export");
+      db.prepare("UPDATE migration_runs SET state = 'retired', source_export_digest = ? WHERE migration_id = ?").run(finalDigest, MIGRATION_ID);
+      expect(() => db.exec(`INSERT INTO migration_runs SELECT 'migration-final-2', project_id, source_system, source_runtime_id, target_runtime_id,
+        source_contract_digest, source_schema_digest, source_export_digest, config_revision, decision_id, decision_disposition_sequence, 'rolled_back',
+        resource_revision, source_event_ceiling, source_snapshot_digest, source_governor_epoch, target_governor_epoch, mutator_inventory_digest,
+        quiescence_digest, import_root_digest, equivalence_digest, recovery_digest, retention_until_ms, created_at_ms, updated_at_ms FROM migration_runs`)).toThrow();
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("runs the closed lifecycle with exact replay/CAS, canonical export/import, and target-safe retirement", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    prepareMigration(db);
+    const inventory = migrationStepRequest(db, "record_inventory", { proofDigest: sha256("inventory") });
+    const recordedInventory = applyWithFixtureReceipt(db, inventory);
+    expect(applyWithFixtureReceipt(db, inventory)).toEqual(recordedInventory);
+    expect(applyWithFixtureReceipt(db, { ...inventory, migrationStep: { ...inventory.migrationStep!, proofDigest: sha256("inventory-conflict") } }).outcome).toBe("IDEMPOTENCY_KEY_CONFLICT");
+    expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_quiescence", { proofDigest: sha256("quiescence") }))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+
+    const beforeForeignTarget = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "freeze", {
+      repositoryTargetsDigest: sha256("foreign-targets"),
+      canaries: { expected: 3, attempted: 3, verified: 3 },
+    }, { idempotencyKey: "freeze-foreign-targets" }))).toMatchObject({ outcome: "IMPORT_EQUIVALENCE_FAILED" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeForeignTarget);
+
+    const beforeIncomplete = exportFoundation(db, PROJECT_ID);
+    const incomplete = migrationStepRequest(db, "freeze", { canaries: { expected: 3, attempted: 3, verified: 2 } });
+    expect(applyWithFixtureReceipt(db, incomplete)).toMatchObject({ outcome: "SOURCE_FREEZE_UNPROVEN", expected: 3, attempted: 3, verified: 2 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeIncomplete);
+    expect(db.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = ?").get(incomplete.idempotencyKey)).toBeUndefined();
+
+    const stale = migrationStepRequest(db, "freeze", { canaries: { expected: 3, attempted: 3, verified: 3 } }, { expectedResourceRevision: 2, idempotencyKey: "freeze-stale-revision" });
+    expect(applyWithFixtureReceipt(db, stale).outcome).toBe("RESOURCE_REVISION_STALE");
+    const wrongToken = migrationStepRequest(db, "freeze", { canaries: { expected: 3, attempted: 3, verified: 3 } }, { expectedFenceToken: "wrong", idempotencyKey: "freeze-wrong-token" });
+    expect(applyWithFixtureReceipt(db, wrongToken).outcome).toBe("GOVERNOR_EPOCH_STALE");
+    expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "freeze", { canaries: { expected: 3, attempted: 3, verified: 3 } }))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+
+    seedEvidenceArtifact(db, "evidence-z");
+    seedEvidenceArtifact(db, "evidence-a");
+    const firstExport = fixtureExport(db);
+    expect(fixtureExport(db)).toEqual(firstExport);
+    expect(firstExport.artifactIndex.map((artifact) => artifact.evidenceId)).toEqual(["evidence-a", "evidence-z"]);
+    expect(firstExport.checksums).toEqual({
+      "artifact-index.json": sha256(canonicalJson(firstExport.artifactIndex)),
+      "manifest.json": sha256(canonicalJson(firstExport.manifest)),
+      "records.ndjson": sha256(firstExport.recordsNdjson),
+    });
+    expect(firstExport.manifest).toMatchObject({ contractVersion: 2, contractDigest });
+    const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
+    const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
+    const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
+      artifact.redactedJson = canonicalJson({ secret: "fixture-secret" });
+    });
+    expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_export", {
+      sourceEventCeiling: artifactImportCeiling,
+      sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
+      export: secretMetadata,
+    }, { idempotencyKey: "record-export-secret-metadata" }))).toMatchObject({ outcome: "EVIDENCE_REDACTION_INVALID" });
+    const oversizedMetadata = resealArtifactExport(firstExport, (artifact) => {
+      artifact.durableRefJson = canonicalJson({ metadata: "x".repeat(17 * 1024) });
+    });
+    expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_export", {
+      sourceEventCeiling: artifactImportCeiling,
+      sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
+      export: oversizedMetadata,
+    }, { idempotencyKey: "record-export-oversized-metadata" }))).toMatchObject({ outcome: "EVIDENCE_REDACTION_INVALID" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeArtifactImportGuards);
+    const invalidTransition = migrationStepRequest(db, "record_import", { proofDigest: sha256("invalid"), export: firstExport, importRootDigest: sha256("invalid") });
+    expect(applyWithFixtureReceipt(db, invalidTransition).outcome).toBe("INVALID_INPUT");
+
+    const invalidReference = structuredClone(firstExport);
+    invalidReference.artifactIndex[0]!.durableRefJson = canonicalJson({ kind: "fixture", ref: "foreign-artifact" });
+    invalidReference.manifest.artifactIndexDigest = sha256(canonicalJson(invalidReference.artifactIndex));
+    const invalidRootInput = { ...invalidReference.manifest };
+    delete (invalidRootInput as Partial<ExportPayload["manifest"]>).exportRootDigest;
+    invalidReference.manifest.exportRootDigest = sha256(canonicalJson(invalidRootInput));
+    invalidReference.checksums = {
+      "artifact-index.json": invalidReference.manifest.artifactIndexDigest,
+      "manifest.json": sha256(canonicalJson(invalidReference.manifest)),
+      "records.ndjson": invalidReference.manifest.recordsDigest,
+    };
+    const beforeInvalidReference = exportFoundation(db, PROJECT_ID);
+    const invalidReferenceCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
+    expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_export", {
+      sourceEventCeiling: invalidReferenceCeiling,
+      sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
+      export: invalidReference,
+    }, { idempotencyKey: "record-export-invalid-reference" }))).toMatchObject({ outcome: "IMPORT_EQUIVALENCE_FAILED" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeInvalidReference);
+
+    const exported = recordMigrationExport(db);
+    const beforeInvalidImport = exportFoundation(db, PROJECT_ID);
+    const invalidExport = structuredClone(exported);
+    invalidExport.checksums["records.ndjson"] = sha256("tampered");
+    expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_import", {
+      proofDigest: sha256("invalid-import"), export: invalidExport, importRootDigest: sha256("invalid-import"),
+    }))).toMatchObject({ outcome: "IMPORT_EQUIVALENCE_FAILED" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeInvalidImport);
+
+    const importRootDigest = sha256(canonicalJson({
+      sourceExportDigest: exported.manifest.exportRootDigest, targetRuntimeId: PLUGIN_ID, configRevision: 1, repositoryTargetsDigest: repositoryTargetsDigest(db),
+    }));
+    expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_import", { proofDigest: importRootDigest, export: exported, importRootDigest }))).toMatchObject({ outcome: "OK", currentResourceRevision: 6 });
+    const wrongEquivalence = migrationStepRequest(db, "record_equivalence", { proofDigest: sha256("wrong-equivalence"), export: exported, equivalenceDigest: sha256("wrong-equivalence") });
+    const beforeWrongEquivalence = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, wrongEquivalence).outcome).toBe("IMPORT_EQUIVALENCE_FAILED");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeWrongEquivalence);
+    const equivalenceDigest = sha256(canonicalJson({
+      sourceExportDigest: exported.manifest.exportRootDigest, importRootDigest, sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST, repositoryTargetsDigest: repositoryTargetsDigest(db),
+    }));
+    expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_equivalence", { proofDigest: equivalenceDigest, export: exported, equivalenceDigest }))).toMatchObject({ outcome: "OK", currentResourceRevision: 7 });
+    expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "activate"))).toMatchObject({ outcome: "OK", currentResourceRevision: 8 });
+    expect(currentGovernor(db)).toMatchObject({ governance_epoch: 4, state: "target_active" });
+    expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_exercise"))).toMatchObject({ outcome: "OK", currentResourceRevision: 9 });
+    expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "retire"))).toMatchObject({ outcome: "OK", currentResourceRevision: 10 });
+    expect(currentGovernor(db)).toMatchObject({ governance_epoch: 4, state: "target_active" });
+    expect(db.prepare("SELECT state, resource_revision FROM migration_runs").get()).toEqual({ state: "retired", resource_revision: 10 });
+    expect(db.prepare("SELECT DISTINCT event_type FROM state_events WHERE aggregate_type = 'migration_run'").all()).toEqual([{ event_type: "migration_run_changed" }]);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE aggregate_type = 'migration_run'").get()).toEqual({ count: 10 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE operation_class IN ('migration_prepare', 'migration_step')").get()).toEqual({ count: 10 });
+  });
+
+  it("keeps pre-target rollback reversible and post-target recovery fix-forward only", () => {
+    const before = directDatabase();
+    try {
+      prepareMigration(before.db);
+      const recoveryDigest = sha256("pre-target-recovery");
+      expect(applyWithFixtureReceipt(before.db, migrationStepRequest(before.db, "rollback", { proofDigest: recoveryDigest, recoveryDigest }))).toMatchObject({
+        outcome: "OK", evidence: { state: "rolled_back" },
+      });
+      expect(currentGovernor(before.db)).toMatchObject({ state: "source_active", governance_epoch: 3 });
+    } finally {
+      before.db.close();
+      rmSync(before.directory, { recursive: true, force: true });
+    }
+
+    const after = directDatabase();
+    try {
+      activateMigration(after.db);
+      const targetHead = currentGovernor(after.db);
+      const recoveryDigest = sha256("post-target-recovery");
+      const rollback = migrationStepRequest(after.db, "rollback", { proofDigest: recoveryDigest, recoveryDigest });
+      const fixForward = applyWithFixtureReceipt(after.db, rollback);
+      expect(fixForward).toMatchObject({ outcome: "MIGRATION_FIX_FORWARD_REQUIRED", evidence: { state: "fix_forward_required" } });
+      expect(applyWithFixtureReceipt(after.db, rollback)).toEqual(fixForward);
+      expect(currentGovernor(after.db)).toEqual(targetHead);
+      expect(after.db.prepare("SELECT state, recovery_digest FROM migration_runs").get()).toEqual({ state: "fix_forward_required", recovery_digest: recoveryDigest });
+      expect(applyWithFixtureReceipt(after.db, migrationStepRequest(after.db, "rollback", { proofDigest: recoveryDigest, recoveryDigest })).outcome).toBe("INVALID_INPUT");
+    } finally {
+      after.db.close();
+      rmSync(after.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes prepare, freeze, and activate contenders across two real SQLite connections", () => {
+    const { db: firstDb, path, directory } = directDatabase();
+    const secondDb = new Database(path);
+    databaseIsReady(secondDb);
+    try {
+      const governor = seedMigrationAuthority(firstDb);
+      const prepareA = migrationPrepareRequest(governor, { idempotencyKey: "prepare-race-a" });
+      const prepareB = migrationPrepareRequest(governor, { idempotencyKey: "prepare-race-b", migration: { ...migrationPrepareRequest(governor).migration!, migrationId: "migration-race-b" } });
+      expect(applyWithFixtureReceipt(firstDb, prepareA).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(secondDb, prepareB).outcome).toBe("GOVERNOR_EPOCH_STALE");
+      expect(firstDb.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = 'prepare-race-b'").get()).toBeUndefined();
+
+      expect(applyWithFixtureReceipt(firstDb, migrationStepRequest(firstDb, "record_inventory", { proofDigest: sha256("inventory") })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(firstDb, migrationStepRequest(firstDb, "record_quiescence", { proofDigest: sha256("quiescence") })).outcome).toBe("OK");
+      const freezeA = migrationStepRequest(firstDb, "freeze", { canaries: { expected: 2, attempted: 2, verified: 2 } }, { idempotencyKey: "freeze-race-a" });
+      const freezeB = { ...freezeA, idempotencyKey: "freeze-race-b" };
+      const eventsBeforeFreeze = (firstDb.prepare("SELECT COUNT(*) AS count FROM state_events").get() as { count: number }).count;
+      expect(applyWithFixtureReceipt(firstDb, freezeA).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(secondDb, freezeB).outcome).toBe("RESOURCE_REVISION_STALE");
+      expect(firstDb.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = 'freeze-race-b'").get()).toBeUndefined();
+      expect(firstDb.prepare("SELECT COUNT(*) AS count FROM state_events").get()).toEqual({ count: eventsBeforeFreeze + 1 });
+
+      const exported = recordMigrationExport(firstDb);
+      const importRootDigest = sha256(canonicalJson({ sourceExportDigest: exported.manifest.exportRootDigest, targetRuntimeId: PLUGIN_ID, configRevision: 1, repositoryTargetsDigest: repositoryTargetsDigest(firstDb) }));
+      expect(applyWithFixtureReceipt(firstDb, migrationStepRequest(firstDb, "record_import", { proofDigest: importRootDigest, export: exported, importRootDigest })).outcome).toBe("OK");
+      const equivalenceDigest = sha256(canonicalJson({ sourceExportDigest: exported.manifest.exportRootDigest, importRootDigest, sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST, repositoryTargetsDigest: repositoryTargetsDigest(firstDb) }));
+      expect(applyWithFixtureReceipt(firstDb, migrationStepRequest(firstDb, "record_equivalence", { proofDigest: equivalenceDigest, export: exported, equivalenceDigest })).outcome).toBe("OK");
+      const activateA = migrationStepRequest(firstDb, "activate", {}, { idempotencyKey: "activate-race-a" });
+      const activateB = { ...activateA, idempotencyKey: "activate-race-b" };
+      const eventsBeforeActivate = (firstDb.prepare("SELECT COUNT(*) AS count FROM state_events").get() as { count: number }).count;
+      expect(applyWithFixtureReceipt(firstDb, activateA).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(secondDb, activateB).outcome).toBe("RESOURCE_REVISION_STALE");
+      expect(firstDb.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = 'activate-race-b'").get()).toBeUndefined();
+      expect(firstDb.prepare("SELECT COUNT(*) AS count FROM state_events").get()).toEqual({ count: eventsBeforeActivate + 1 });
+    } finally {
+      secondDb.close();
+      firstDb.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reopens byte-identical at prepared, frozen, and target-active fixture boundaries", () => {
+    for (const stage of ["prepared", "frozen", "target_active"] as const) {
+      const fixture = directDatabase();
+      let reopened: Database.Database | null = null;
+      try {
+        if (stage === "prepared") prepareMigration(fixture.db);
+        if (stage === "frozen") freezeMigration(fixture.db);
+        if (stage === "target_active") activateMigration(fixture.db);
+        const before = exportFoundation(fixture.db, PROJECT_ID);
+        fixture.db.close();
+        reopened = new Database(fixture.path);
+        databaseIsReady(reopened);
+        expect(reopened.prepare("SELECT state FROM migration_runs").get()).toEqual({ state: stage });
+        expect(exportFoundation(reopened, PROJECT_ID)).toEqual(before);
+      } finally {
+        reopened?.close();
+        if (fixture.db.open) fixture.db.close();
+        rmSync(fixture.directory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("doctor reports the active run, expired retention, and unresolved proof without writing", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    prepareMigration(db);
+    db.prepare("UPDATE migration_runs SET retention_until_ms = 0 WHERE migration_id = ?").run(MIGRATION_ID);
+    const changes = db.prepare("SELECT total_changes() AS count").get();
+    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
+      outcome: "OK",
+      evidence: {
+        activeMigrationRun: { migration_id: MIGRATION_ID, state: "prepared", retentionExpired: true, unresolvedProof: ["mutator_inventory", "quiescence"] },
+      },
+    });
+    expect(db.prepare("SELECT total_changes() AS count").get()).toEqual(changes);
+  });
 
   it("rejects stale config without changing any foundation bytes", async () => {
     const host = await loadedHost();
@@ -2227,8 +2784,8 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 4, newSchemaVersion: 5, expected: 4, attempted: 4, verified: 4 },
-        schema: { version: 5 },
+        cachedConsumers: { oldSchemaVersion: 5, newSchemaVersion: 6, expected: 4, attempted: 4, verified: 4 },
+        schema: { version: 6 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -3171,7 +3728,7 @@ describe("bb-collab plugin boundary", () => {
     db.pragma("foreign_keys = OFF");
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
-    db.exec(MIGRATIONS.at(-2)!);
+    db.exec(MIGRATIONS.at(-3)!);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -3191,8 +3748,8 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(4)).toMatchObject({ oldSchemaVersion: 4, newSchemaVersion: 5, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(5)).toMatchObject({ oldSchemaVersion: 4, newSchemaVersion: 5, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(5)).toMatchObject({ oldSchemaVersion: 5, newSchemaVersion: 6, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(6)).toMatchObject({ oldSchemaVersion: 5, newSchemaVersion: 6, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {
