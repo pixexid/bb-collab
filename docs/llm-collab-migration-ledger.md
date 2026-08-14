@@ -123,6 +123,13 @@ by dependency.
 bb-collab #5 must provide the non-forgeable operator receipt before privileged
 activation. This is live issue [#29](https://github.com/pixexid/bb-collab/issues/29).
 
+Ratified bounded exception: the frozen llm-collab fence
+`f988d9711d3778f751e4ec0e32ebbf7b0893c80f` at resource revision 4 on merged
+main `0686d34` has no canonical bb-collab rows. Its historical markdown/files
+are recorded as a sorted, hash-listed, `canonical: false`
+`sourceEvidenceManifest`; canonical import is exact zero work and the source
+CAS/event ceiling is not fabricated. This does not retire the source.
+
 **Paste-ready body:**
 
 ```markdown

@@ -41,6 +41,12 @@ create/adopted disposition, migration_prepare, and migration_step; role-based
 and review Decisions remain role-bound. The plugin has not been installed, reloaded, or activated against live
 project authority.
 
+The ratified evidence-only MigrationRun shape records the llm-collab fence
+`f988d9711d3778f751e4ec0e32ebbf7b0893c80f` at resource revision 4 and merged
+main `0686d34` as sorted, hashed, explicitly non-canonical source evidence.
+It proves canonical import zero-work and preserves the historical archive
+read-only; no source-CAS event ceiling or source retirement is fabricated.
+
 The founding decision is an **adopt with amendments** disposition of the
 operator-backed review. bb-collab is a public BB-native successor to
 llm-collab: distill the surviving invariants; do not fork its history or

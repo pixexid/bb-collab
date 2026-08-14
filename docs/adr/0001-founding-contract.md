@@ -403,6 +403,21 @@ Legacy import preserves facts, not implied authority:
   resume, release or close work;
 - emit no legacy authority field from a new write path.
 
+The ratified evidence-only cutover shape is bounded to the llm-collab source
+fence `f988d9711d3778f751e4ec0e32ebbf7b0893c80f`, resource revision 4 and
+merged main `0686d34`. When that source has no canonical bb-collab rows, the
+MigrationRun records a deterministic manifest of sorted historical file paths
+and SHA-256 digests with `canonical: false`; it is source evidence, never the
+target canonical export. `record_import` must prove canonical import
+`expected=0`, `attempted=0`, `verified=0`, and `record_equivalence` must use
+the exact disposition `no canonical state existed to migrate; historical
+archive preserved as evidence, read-only`.
+
+Source-CAS deviation: no source-side canonical bb-collab compare-and-swap
+event ceiling existed at this fence, so the evidence-only path records no
+fabricated source event ceiling and makes no source mutation or retirement
+claim. The source fence, revision and archive hashes remain read-only evidence.
+
 Before target mutation, rollback requires imported and target mutation
 sequences to match, unchanged source/export and external heads, no
 target-created canonical or projection mutation, and a successful new

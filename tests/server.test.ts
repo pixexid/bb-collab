@@ -11,6 +11,10 @@ import {
   DEFERRED_ISSUE_3_OUTCOMES,
   AUTHORIZED_APPROVER_ID,
   CONTRACT_VERSION,
+  EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION,
+  LLM_COLLAB_EVIDENCE_RESOURCE_REVISION,
+  LLM_COLLAB_MERGED_MAIN_SHA,
+  LLM_COLLAB_SOURCE_FENCE,
   MAX_EXPORT_ROWS,
   MIGRATIONS,
   MIGRATION_STATES,
@@ -414,6 +418,30 @@ function directDatabase() {
 const MIGRATION_ID = "migration-1";
 const MIGRATION_DECISION_ID = "migration-decision";
 const SOURCE_SNAPSHOT_DIGEST = sha256("source-snapshot");
+
+function sourceEvidenceManifest() {
+  const manifest = {
+    sourceSystem: "llm-collab" as const,
+    sourceFence: LLM_COLLAB_SOURCE_FENCE,
+    resourceRevision: LLM_COLLAB_EVIDENCE_RESOURCE_REVISION,
+    mergedMainSha: LLM_COLLAB_MERGED_MAIN_SHA,
+    canonical: false as const,
+    files: [
+      { path: "README.md", digest: sha256("README.md") },
+      { path: "docs/archive.md", digest: sha256("docs/archive.md") },
+    ],
+  };
+  return { ...manifest, manifestDigest: sha256(canonicalJson(manifest)) };
+}
+
+function nonMigrationRows(db: Database.Database) {
+  return Object.fromEntries(TABLES.filter((table) => !["migration_runs", "mutation_receipts", "state_events"].includes(table)).map((table) => [
+    table,
+    table === "decision_dispositions"
+      ? db.prepare("SELECT decision_dispositions.* FROM decision_dispositions JOIN decisions ON decisions.decision_id = decision_dispositions.decision_id WHERE decisions.project_id = ? ORDER BY decision_id, disposition_sequence").all(PROJECT_ID)
+      : db.prepare(`SELECT * FROM ${table} WHERE project_id = ? ORDER BY rowid`).all(PROJECT_ID),
+  ]));
+}
 
 function currentGovernor(db: Database.Database) {
   return db.prepare("SELECT governance_epoch, fence_token, state FROM project_governorship_heads WHERE project_id = ?").get(PROJECT_ID) as {
@@ -2245,6 +2273,93 @@ describe("bb-collab plugin boundary", () => {
     expect(db.prepare("SELECT DISTINCT event_type FROM state_events WHERE aggregate_type = 'migration_run'").all()).toEqual([{ event_type: "migration_run_changed" }]);
     expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE aggregate_type = 'migration_run'").get()).toEqual({ count: 10 });
     expect(db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE operation_class IN ('migration_prepare', 'migration_step')").get()).toEqual({ count: 10 });
+  });
+
+  it("records evidence-only source history with exact canonical zero-work", () => {
+    const { db, directory } = directDatabase();
+    try {
+      freezeMigration(db);
+      const beforeCanonicalRows = nonMigrationRows(db);
+      const manifest = sourceEvidenceManifest();
+      const exported = applyWithFixtureReceipt(db, migrationStepRequest(db, "record_export", {
+        sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
+        sourceEvidenceManifest: manifest,
+      }));
+      expect(exported).toMatchObject({ outcome: "OK", currentResourceRevision: 5, evidence: {
+        sourceExportKind: "non_canonical_source_evidence",
+        sourceEvidenceManifest: manifest,
+      } });
+      expect(db.prepare("SELECT source_event_ceiling, source_export_digest FROM migration_runs").get()).toEqual({
+        source_event_ceiling: null,
+        source_export_digest: manifest.manifestDigest,
+      });
+
+      const targetExport = fixtureExport(db);
+      const beforeMixed = exportFoundation(db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_import", {
+        sourceEvidenceManifest: manifest,
+        export: targetExport,
+        canonicalImport: { expected: 0, attempted: 0, verified: 0 },
+        importRootDigest: sha256("mixed-target-export"),
+      }, { idempotencyKey: "evidence-mixed-target-export" })).outcome).toBe("IMPORT_EQUIVALENCE_FAILED");
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeMixed);
+
+      const nonzero = migrationStepRequest(db, "record_import", {
+        sourceEvidenceManifest: manifest,
+        canonicalImport: { expected: 1, attempted: 1, verified: 1 },
+        importRootDigest: sha256("nonzero"),
+      }, { idempotencyKey: "evidence-nonzero-import" });
+      expect(applyWithFixtureReceipt(db, nonzero)).toMatchObject({ outcome: "IMPORT_EQUIVALENCE_FAILED", expected: 1, attempted: 1, verified: 1 });
+      expect(db.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = ?").get(nonzero.idempotencyKey)).toBeUndefined();
+
+      const canonicalImport = { expected: 0 as const, attempted: 0 as const, verified: 0 as const };
+      const importRootDigest = sha256(canonicalJson({
+        sourceExportDigest: manifest.manifestDigest,
+        sourceEvidenceManifestDigest: manifest.manifestDigest,
+        targetRuntimeId: PLUGIN_ID,
+        configRevision: 1,
+        repositoryTargetsDigest: repositoryTargetsDigest(db),
+        canonicalImport,
+      }));
+      const importedRequest = migrationStepRequest(db, "record_import", {
+        sourceEvidenceManifest: manifest,
+        canonicalImport,
+        importRootDigest,
+        proofDigest: importRootDigest,
+      });
+      const imported = applyWithFixtureReceipt(db, importedRequest);
+      expect(imported).toMatchObject({ outcome: "OK", expected: 0, attempted: 0, verified: 0, currentResourceRevision: 6 });
+      expect(applyWithFixtureReceipt(db, importedRequest)).toEqual(imported);
+
+      const equivalenceDigest = sha256(canonicalJson({
+        sourceExportDigest: manifest.manifestDigest,
+        sourceEvidenceManifestDigest: manifest.manifestDigest,
+        importRootDigest,
+        sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
+        repositoryTargetsDigest: repositoryTargetsDigest(db),
+        canonicalImport,
+        equivalenceDisposition: EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION,
+      }));
+      const equivalent = applyWithFixtureReceipt(db, migrationStepRequest(db, "record_equivalence", {
+        sourceEvidenceManifest: manifest,
+        canonicalImport,
+        equivalenceDigest,
+        proofDigest: equivalenceDigest,
+        equivalenceDisposition: EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION,
+      }));
+      expect(equivalent).toMatchObject({
+        outcome: "OK", expected: 0, attempted: 0, verified: 0, currentResourceRevision: 7,
+        evidence: { sourceExportKind: "non_canonical_source_evidence", canonicalImport, equivalenceDisposition: EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION },
+      });
+      expect(nonMigrationRows(db)).toEqual(beforeCanonicalRows);
+      expect(db.prepare("SELECT state, resource_revision FROM migration_runs").get()).toEqual({ state: "equivalent", resource_revision: 7 });
+      expect(db.prepare("SELECT event_json FROM state_events WHERE aggregate_type = 'migration_run' ORDER BY event_sequence DESC LIMIT 1").get()).toMatchObject({
+        event_json: expect.stringContaining(EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION),
+      });
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("keeps pre-target rollback reversible and post-target recovery fix-forward only", () => {

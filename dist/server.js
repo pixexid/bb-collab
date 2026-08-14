@@ -13892,6 +13892,10 @@ var CONTRACT_VERSION = 6;
 var SCHEMA_VERSION = 10;
 var AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab";
 var AUTHORIZED_APPROVER_PROJECT_ID = "proj_a8zzfsx36j";
+var LLM_COLLAB_SOURCE_FENCE = "f988d9711d3778f751e4ec0e32ebbf7b0893c80f";
+var LLM_COLLAB_MERGED_MAIN_SHA = "0686d34";
+var LLM_COLLAB_EVIDENCE_RESOURCE_REVISION = 4;
+var EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION = "no canonical state existed to migrate; historical archive preserved as evidence, read-only";
 var MAX_EXPORT_ROWS = 256;
 var MAX_EXPORT_BYTES = 512 * 1024;
 var TABLES = [
@@ -14609,6 +14613,19 @@ var migrationPrepareSchema = external_exports.object({
   decisionDispositionSequence: external_exports.number().int().positive(),
   retentionUntilMs: external_exports.number().int().nonnegative()
 }).strict();
+var sourceEvidenceManifestSchema = external_exports.object({
+  sourceSystem: external_exports.literal("llm-collab"),
+  sourceFence: external_exports.literal(LLM_COLLAB_SOURCE_FENCE),
+  resourceRevision: external_exports.literal(LLM_COLLAB_EVIDENCE_RESOURCE_REVISION),
+  mergedMainSha: external_exports.literal(LLM_COLLAB_MERGED_MAIN_SHA),
+  canonical: external_exports.literal(false),
+  files: external_exports.array(external_exports.object({ path: id, digest: digestSchema }).strict()).min(1).max(MAX_EXPORT_ROWS).superRefine((files, ctx) => {
+    const paths = files.map((file2) => file2.path);
+    if (new Set(paths).size !== paths.length) ctx.addIssue({ code: "custom", message: "source evidence files must be unique" });
+    if (canonicalJson(paths) !== canonicalJson([...paths].sort())) ctx.addIssue({ code: "custom", message: "source evidence files must be sorted" });
+  }),
+  manifestDigest: digestSchema
+}).strict();
 var migrationStepSchema = external_exports.object({
   migrationId: id,
   step: external_exports.enum(MIGRATION_STEPS),
@@ -14617,8 +14634,11 @@ var migrationStepSchema = external_exports.object({
   sourceEventCeiling: external_exports.number().int().nonnegative().optional(),
   sourceSnapshotDigest: digestSchema.optional(),
   export: migrationExportSchema.optional(),
+  sourceEvidenceManifest: sourceEvidenceManifestSchema.optional(),
+  canonicalImport: external_exports.object({ expected: external_exports.number().int().nonnegative(), attempted: external_exports.number().int().nonnegative(), verified: external_exports.number().int().nonnegative() }).strict().optional(),
   importRootDigest: digestSchema.optional(),
   equivalenceDigest: digestSchema.optional(),
+  equivalenceDisposition: external_exports.string().optional(),
   recoveryDigest: digestSchema.optional(),
   canaries: external_exports.object({
     expected: external_exports.number().int().positive(),
@@ -16241,7 +16261,7 @@ function rotateMigrationGovernor(db, request, actorReceiptId, head, runtimeId, s
   if (updated.changes !== 1) throw refusal("GOVERNOR_CAS_FAILED", "migration governorship head compare-and-swap failed");
   return { governanceEpoch, fenceToken };
 }
-function migrationEvent(step, priorState, next, stepProofDigest) {
+function migrationEvent(step, priorState, next, stepProofDigest, extra = {}) {
   return {
     step,
     priorState,
@@ -16259,8 +16279,44 @@ function migrationEvent(step, priorState, next, stepProofDigest) {
     importRootDigest: next.import_root_digest,
     equivalenceDigest: next.equivalence_digest,
     recoveryDigest: next.recovery_digest,
-    stepProofDigest
+    stepProofDigest,
+    ...extra
   };
+}
+function validateSourceEvidenceManifest(payload) {
+  const parsed = sourceEvidenceManifestSchema.safeParse(payload);
+  if (!parsed.success) throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence manifest identity is invalid");
+  const { manifestDigest, ...withoutDigest } = parsed.data;
+  if (sha256(canonicalJson(withoutDigest)) !== manifestDigest) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence manifest digest is not deterministic");
+  }
+  return parsed.data;
+}
+function requireZeroCanonicalImport(value) {
+  if (!value || value.expected !== 0 || value.attempted !== 0 || value.verified !== 0) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "evidence-only migration requires exact canonical import zero-work", {
+      expected: value?.expected ?? 0,
+      attempted: value?.attempted ?? 0,
+      verified: value?.verified ?? 0
+    });
+  }
+  return { expected: 0, attempted: 0, verified: 0 };
+}
+function recordedSourceEvidenceManifest(db, run) {
+  const event = asRow(db.prepare(
+    `SELECT event_json FROM state_events
+     WHERE project_id = ? AND aggregate_type = 'migration_run' AND aggregate_id = ? AND aggregate_revision = ?
+     ORDER BY event_sequence DESC LIMIT 1`
+  ).get(run.project_id, run.migration_id, run.resource_revision));
+  if (!event) return null;
+  let value;
+  try {
+    value = JSON.parse(event.event_json);
+  } catch {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "recorded MigrationRun evidence event is malformed");
+  }
+  if (!value || typeof value !== "object" || value.sourceExportKind !== "non_canonical_source_evidence") return null;
+  return validateSourceEvidenceManifest(value.sourceEvidenceManifest);
 }
 function validateMigrationExport(payload, projectId) {
   if (!payload) throw refusal("IMPORT_EQUIVALENCE_FAILED", "migration step requires the deterministic fixture export");
@@ -16465,6 +16521,8 @@ function applyMigrationStep(db, request, digest) {
   let eventStep = step.step;
   let outcome = "OK";
   let nextFenceToken = head.fence_token;
+  let eventExtra = {};
+  let mutationCounts = { expected: 1, attempted: 1, verified: 1 };
   const requireState = (...states) => {
     if (!states.includes(run.state)) throw refusal("INVALID_INPUT", `${step.step} is invalid from ${run.state}`);
   };
@@ -16498,6 +16556,26 @@ function applyMigrationStep(db, request, digest) {
     case "record_export": {
       requireState("frozen");
       requireGovernorState("frozen");
+      if (step.sourceEvidenceManifest && step.export) {
+        throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence cannot be supplied as the target canonical export");
+      }
+      if (step.sourceEvidenceManifest) {
+        const sourceEvidenceManifest = validateSourceEvidenceManifest(step.sourceEvidenceManifest);
+        if (run.resource_revision !== LLM_COLLAB_EVIDENCE_RESOURCE_REVISION || step.sourceEventCeiling !== void 0 || step.sourceSnapshotDigest !== run.source_snapshot_digest) {
+          throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence has no canonical source event ceiling to record");
+        }
+        if (db.prepare("SELECT 1 FROM migration_runs WHERE source_system = ? AND project_id = ? AND source_export_digest = ? AND migration_id <> ?").get(run.source_system, run.project_id, sourceEvidenceManifest.manifestDigest, run.migration_id)) {
+          throw refusal("INVALID_INPUT", "final source evidence identity already belongs to another MigrationRun");
+        }
+        next.state = "exported";
+        next.source_event_ceiling = null;
+        next.source_export_digest = sourceEvidenceManifest.manifestDigest;
+        eventExtra = {
+          sourceExportKind: "non_canonical_source_evidence",
+          sourceEvidenceManifest
+        };
+        break;
+      }
       const exported = validateMigrationExport(step.export, request.projectId);
       if (run.source_schema_digest !== exported.manifest.schemaDigest || run.source_contract_digest !== exported.manifest.contractDigest) {
         throw refusal("IMPORT_EQUIVALENCE_FAILED", "source schema or contract digest does not match the fixture export");
@@ -16513,11 +16591,42 @@ function applyMigrationStep(db, request, digest) {
       next.state = "exported";
       next.source_event_ceiling = ceiling;
       next.source_export_digest = exported.manifest.exportRootDigest;
+      eventExtra = { sourceExportKind: "canonical_fixture" };
       break;
     }
     case "record_import": {
       requireState("exported");
       requireGovernorState("frozen");
+      const recordedEvidence = recordedSourceEvidenceManifest(db, run);
+      if (recordedEvidence) {
+        if (step.export || !step.sourceEvidenceManifest) {
+          throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence cannot be supplied as the target canonical export");
+        }
+        const sourceEvidenceManifest = validateSourceEvidenceManifest(step.sourceEvidenceManifest);
+        if (sourceEvidenceManifest.manifestDigest !== recordedEvidence.manifestDigest) {
+          throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence manifest does not bind the recorded source identity");
+        }
+        const canonicalImport = requireZeroCanonicalImport(step.canonicalImport);
+        const expectedRoot2 = sha256(canonicalJson({
+          sourceExportDigest: run.source_export_digest,
+          sourceEvidenceManifestDigest: sourceEvidenceManifest.manifestDigest,
+          targetRuntimeId: run.target_runtime_id,
+          configRevision,
+          repositoryTargetsDigest,
+          canonicalImport
+        }));
+        if (step.importRootDigest !== expectedRoot2 || step.proofDigest !== expectedRoot2) {
+          throw refusal("IMPORT_EQUIVALENCE_FAILED", "evidence-only import root does not bind exact hashes and zero-work proof");
+        }
+        next.state = "imported";
+        next.import_root_digest = expectedRoot2;
+        eventExtra = { sourceExportKind: "non_canonical_source_evidence", sourceEvidenceManifest, canonicalImport };
+        mutationCounts = canonicalImport;
+        break;
+      }
+      if (step.sourceEvidenceManifest || step.canonicalImport) {
+        throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence is not a canonical fixture export");
+      }
       const exported = validateMigrationExport(step.export, request.projectId);
       const expectedRoot = sha256(canonicalJson({
         sourceExportDigest: run.source_export_digest,
@@ -16535,6 +16644,45 @@ function applyMigrationStep(db, request, digest) {
     case "record_equivalence": {
       requireState("imported");
       requireGovernorState("frozen");
+      const recordedEvidence = recordedSourceEvidenceManifest(db, run);
+      if (recordedEvidence) {
+        if (step.export || !step.sourceEvidenceManifest) {
+          throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence cannot be supplied as the target canonical export");
+        }
+        const sourceEvidenceManifest = validateSourceEvidenceManifest(step.sourceEvidenceManifest);
+        if (sourceEvidenceManifest.manifestDigest !== recordedEvidence.manifestDigest) {
+          throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence manifest does not bind the recorded source identity");
+        }
+        const canonicalImport = requireZeroCanonicalImport(step.canonicalImport);
+        if (step.equivalenceDisposition !== EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION) {
+          throw refusal("IMPORT_EQUIVALENCE_FAILED", "evidence-only equivalence requires the ratified disposition");
+        }
+        const expectedDigest2 = sha256(canonicalJson({
+          sourceExportDigest: run.source_export_digest,
+          sourceEvidenceManifestDigest: sourceEvidenceManifest.manifestDigest,
+          importRootDigest: run.import_root_digest,
+          sourceSnapshotDigest: run.source_snapshot_digest,
+          repositoryTargetsDigest,
+          canonicalImport,
+          equivalenceDisposition: EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION
+        }));
+        if (step.equivalenceDigest !== expectedDigest2 || step.proofDigest !== expectedDigest2) {
+          throw refusal("IMPORT_EQUIVALENCE_FAILED", "evidence-only equivalence proof does not bind exact hashes and disposition");
+        }
+        next.state = "equivalent";
+        next.equivalence_digest = expectedDigest2;
+        eventExtra = {
+          sourceExportKind: "non_canonical_source_evidence",
+          sourceEvidenceManifest,
+          canonicalImport,
+          equivalenceDisposition: EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION
+        };
+        mutationCounts = canonicalImport;
+        break;
+      }
+      if (step.sourceEvidenceManifest || step.canonicalImport || step.equivalenceDisposition) {
+        throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence is not a canonical fixture export");
+      }
       const exported = validateMigrationExport(step.export, request.projectId);
       const expectedDigest = sha256(canonicalJson({
         sourceExportDigest: run.source_export_digest,
@@ -16629,8 +16777,8 @@ function applyMigrationStep(db, request, digest) {
     request,
     digest,
     actorReceiptId,
-    { aggregateType: "migration_run", aggregateId: next.migration_id, aggregateRevision: next.resource_revision, eventType: "migration_run_changed", event: migrationEvent(eventStep, run.state, next, step.proofDigest) },
-    { expected: 1, attempted: 1, verified: 1 },
+    { aggregateType: "migration_run", aggregateId: next.migration_id, aggregateRevision: next.resource_revision, eventType: "migration_run_changed", event: migrationEvent(eventStep, run.state, next, step.proofDigest, eventExtra) },
+    mutationCounts,
     {
       currentConfigRevision: configRevision,
       currentGovernanceEpoch,
@@ -16641,7 +16789,8 @@ function applyMigrationStep(db, request, digest) {
         resourceRevision: next.resource_revision,
         fenceToken: nextFenceToken,
         repositoryTargetsDigest,
-        sourceExportDigest: next.source_export_digest
+        sourceExportDigest: next.source_export_digest,
+        ...eventExtra
       }
     },
     outcome
