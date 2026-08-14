@@ -11,8 +11,12 @@ foundations, with a fixture-only MigrationRun cutover contract. Production
 RPC/CLI apply require an exact one-request interim operator receipt bound to
 project, operation, candidate head, idempotency key, and request digest;
 missing, mismatched, consumed, malformed, stale, or retired receipts refuse
-before any write. The plugin has not been installed, reloaded, or activated
-against live project authority. The complete decision is in
+before any write. Interim receipts have no local expiry or revocation; they
+retire only on the host-issued `get-bb/bb#1541` condition, while stale means
+an exact binding mismatch. Reserve/finalize adapter operations are explicitly
+unsupported under this one-request seam and refuse before the adapter. The
+plugin has not been installed, reloaded, or activated against live project
+authority. The complete decision is in
 [ADR 0001](docs/adr/0001-founding-contract.md); the threat boundary is in
 [the threat model](docs/threat-model.md); import and issue disposition are in
 [the import manifest](docs/import-manifest.md); and dependency order is in

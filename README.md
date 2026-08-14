@@ -22,8 +22,11 @@ foundations. Production RPC/CLI apply require an exact one-request interim
 operator receipt bound to project, operation, exact candidate head,
 idempotency key, and request digest; it is consumed atomically and invalid,
 stale, retired, mismatched, or reused receipts refuse before any write. The
-plugin has not been installed, reloaded, or activated against live project
-authority.
+receipt has no local expiry or revocation: it retires only on the host-issued
+`get-bb/bb#1541` condition, and stale means an exact binding mismatch. Adapter
+reserve/finalize operations refuse before the adapter under this one-request
+seam. The plugin has not been installed, reloaded, or activated against live
+project authority.
 
 The founding decision is an **adopt with amendments** disposition of the
 operator-backed review. bb-collab is a public BB-native successor to

@@ -18,6 +18,7 @@ import {
   SCHEMA_VERSION,
   TABLES,
   applyFixtureMutation,
+  applyAuthorizedMutation,
   cachedConsumerRolloutEvidence,
   canonicalJson,
   contractDigest,
@@ -27,6 +28,7 @@ import {
   exportFoundation,
   persistInterimOperatorReceipt,
   operatorRequestDigest,
+  legacyRequestDigest,
   schemaDigest,
   sha256,
   type ApplyRequest,
@@ -1215,7 +1217,7 @@ describe("bb-collab plugin boundary", () => {
     expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: 1 });
     expect(db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: 1 });
     const beforeReuse = exportFoundation(db, PROJECT_ID);
-    expect(await host.harness.callRpc("apply", { ...request, idempotencyKey: "bootstrap-distinct", operatorReceiptId: receipt.receiptId })).toMatchObject({ outcome: "OPERATOR_RECEIPT_STALE" });
+    expect(await host.harness.callRpc("apply", { ...request, idempotencyKey: "bootstrap-distinct", operatorReceiptId: receipt.receiptId })).toMatchObject({ outcome: "OPERATOR_RECEIPT_REUSED" });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeReuse);
   });
 
@@ -1239,8 +1241,94 @@ describe("bb-collab plugin boundary", () => {
     expect(await host.harness.callRpc("apply", authorized)).toMatchObject({ outcome: "OK" });
     const beforeSecond = exportFoundation(db, PROJECT_ID);
     const second = migrationStepRequest(db, "record_quiescence", { proofDigest: sha256("quiescence") }, { operatorReceiptId: receipt.receiptId, candidateHead: CANDIDATE_SHA });
-    expect(await host.harness.callRpc("apply", second)).toMatchObject({ outcome: "OPERATOR_RECEIPT_STALE" });
+    expect(await host.harness.callRpc("apply", second)).toMatchObject({ outcome: "OPERATOR_RECEIPT_REUSED" });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeSecond);
+  });
+
+  it("replays a v7-era mutation receipt with its legacy digest", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
+    const request = bootstrapRequest();
+    const committed = applyFixtureMutation(db, request);
+    expect(committed.outcome).toBe("OK");
+    expect(legacyRequestDigest(request)).not.toBe(operatorRequestDigest(request));
+    db.prepare("UPDATE mutation_receipts SET request_digest = ? WHERE project_id = ? AND idempotency_key = ?").run(legacyRequestDigest(request), PROJECT_ID, request.idempotencyKey);
+    expect(applyFixtureMutation(db, request)).toEqual(committed);
+  });
+
+  it("refuses receipt-bound adapter reserve/finalize operations before any adapter call", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    const { fenceToken } = seedAssignmentDatabase(db);
+    const prepAdapter = new DeterministicNativeAssignmentAdapter();
+    const prepared = applyFixtureMutation(db, assignmentPrepareRequest(fenceToken), null, null, prepAdapter);
+    const executionAttemptId = (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+    const request = { ...assignmentPhaseRequest(fenceToken, "assignment_dispatch", "assignment-1", executionAttemptId), candidateHead: CANDIDATE_SHA };
+    const receipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: "assignment_dispatch",
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: operatorRequestDigest(request),
+      callerThreadId: "operator-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 1);
+    const before = exportFoundation(db, PROJECT_ID);
+    const adapter = new DeterministicNativeAssignmentAdapter();
+    expect(applyAuthorizedMutation(db, { ...request, operatorReceiptId: receipt.receiptId }, null, null, adapter)).toMatchObject({ outcome: "OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED" });
+    expect(adapter.dispatchCalls).toHaveLength(0);
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("refuses receipt-bound GitHub reserve/finalize before reservation or adapter mutation", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyFixtureMutation(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    const request = { ...projectionRequest(fenceToken, 1), candidateHead: CANDIDATE_SHA };
+    const receipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: "github_issue_projection",
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: operatorRequestDigest(request),
+      callerThreadId: "operator-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 1);
+    const before = exportFoundation(db, PROJECT_ID);
+    const adapter = new DeterministicGitHubIssueAdapter();
+    expect(applyAuthorizedMutation(db, { ...request, operatorReceiptId: receipt.receiptId }, adapter)).toMatchObject({ outcome: "OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED" });
+    expect(adapter.mutationCalls).toHaveLength(0);
+    expect(adapter.readCalls).toHaveLength(0);
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("fixture-only projection window cannot append after receipt consumption", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyFixtureMutation(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    const request = { ...projectionRequest(fenceToken, 1), candidateHead: CANDIDATE_SHA };
+    const receipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: "github_issue_projection",
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: operatorRequestDigest(request),
+      callerThreadId: "operator-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 1);
+    const beforeEvents = (db.prepare("SELECT COUNT(*) AS count FROM state_events").get() as { count: number }).count;
+    const beforeReceipts = (db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get() as { count: number }).count;
+    const adapter = new DeterministicGitHubIssueAdapter();
+    const result = applyFixtureMutation(db, { ...request, operatorReceiptId: receipt.receiptId }, adapter);
+    expect(result.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(adapter.mutationCalls).toHaveLength(1);
+    expect((db.prepare("SELECT COUNT(*) AS count FROM state_events").get() as { count: number }).count).toBe(beforeEvents + 1);
+    expect((db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get() as { count: number }).count).toBe(beforeReceipts);
+    expect(db.prepare("SELECT consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?").get(receipt.receiptId)).toEqual({ consumed_event_sequence: beforeEvents + 1 });
   });
 
   it("rejects every invalid receipt binding before any canonical write", async () => {
