@@ -18,12 +18,15 @@ import {
 const PROJECT_ID = "proj_operator_receipt";
 const MUTATION_CLASS = "decision_disposition" as const;
 const CANDIDATE_HEAD = "a".repeat(40);
+const REQUEST_DIGEST = "d".repeat(64);
 
 function request(overrides: Partial<OperatorReceiptRequest> = {}): OperatorReceiptRequest {
   return {
     projectId: PROJECT_ID,
     mutationClass: MUTATION_CLASS,
     candidateHead: CANDIDATE_HEAD,
+    idempotencyKey: "operator-request-1",
+    requestDigest: REQUEST_DIGEST,
     callerThreadId: "thread-caller",
     requestedFromBackground: false,
     ...overrides,
@@ -47,12 +50,22 @@ describe("interim operator receipts", () => {
     const host = await loadedHost();
     const input = request();
     const pending = await pendingRequest(host, input);
+    expect(host.harness.inspection.pendingInteractions[0].payload).toMatchObject({
+      projectId: input.projectId,
+      mutationClass: input.mutationClass,
+      candidateHead: input.candidateHead,
+      idempotencyKey: input.idempotencyKey,
+      requestDigest: input.requestDigest,
+      requestedFromBackground: input.requestedFromBackground,
+    });
 
     host.harness.behavior.submitInteraction(pending.id, {
       confirmed: true,
       projectId: input.projectId,
       mutationClass: input.mutationClass,
       candidateHead: input.candidateHead,
+      idempotencyKey: input.idempotencyKey,
+      requestDigest: input.requestDigest,
     });
 
     const result = await pending.result;
@@ -65,10 +78,12 @@ describe("interim operator receipts", () => {
       callerPluginId: "bb-collab",
     } });
     const db = host.bb.storage.database();
-    expect(db.prepare("SELECT project_id, mutation_class, candidate_head, status, retirement_condition FROM operator_receipts").get()).toEqual({
+    expect(db.prepare("SELECT project_id, mutation_class, candidate_head, idempotency_key, request_digest, status, retirement_condition FROM operator_receipts").get()).toEqual({
       project_id: PROJECT_ID,
       mutation_class: MUTATION_CLASS,
       candidate_head: CANDIDATE_HEAD,
+      idempotency_key: input.idempotencyKey,
+      request_digest: input.requestDigest,
       status: "interim",
       retirement_condition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
     });
@@ -87,8 +102,9 @@ describe("interim operator receipts", () => {
 
   it("refuses invalid form results without persisting", async () => {
     const host = await loadedHost();
-    const pending = await pendingRequest(host);
-    host.harness.behavior.submitInteraction(pending.id, { confirmed: true, projectId: PROJECT_ID, mutationClass: MUTATION_CLASS, candidateHead: "bad" });
+    const input = request();
+    const pending = await pendingRequest(host, input);
+    host.harness.behavior.submitInteraction(pending.id, { confirmed: true, projectId: PROJECT_ID, mutationClass: MUTATION_CLASS, candidateHead: "a".repeat(41), idempotencyKey: input.idempotencyKey, requestDigest: input.requestDigest });
 
     await expect(pending.result).resolves.toMatchObject({ outcome: "INVALID_INPUT" });
     expect(host.bb.storage.database().prepare("SELECT COUNT(*) AS count FROM operator_receipts").get()).toEqual({ count: 0 });
@@ -96,12 +112,15 @@ describe("interim operator receipts", () => {
 
   it("refuses a stale binding even when the submitted head is otherwise valid", async () => {
     const host = await loadedHost();
-    const pending = await pendingRequest(host);
+    const input = request();
+    const pending = await pendingRequest(host, input);
     host.harness.behavior.submitInteraction(pending.id, {
       confirmed: true,
       projectId: PROJECT_ID,
       mutationClass: MUTATION_CLASS,
       candidateHead: "b".repeat(40),
+      idempotencyKey: input.idempotencyKey,
+      requestDigest: input.requestDigest,
     });
 
     await expect(pending.result).resolves.toMatchObject({ outcome: "OPERATOR_RECEIPT_STALE" });
@@ -122,9 +141,11 @@ describe("interim operator receipts", () => {
 
       const second = new Database(path);
       databaseIsReady(second);
-      expect(second.prepare("SELECT status, requested_from_background, created_at_ms FROM operator_receipts WHERE receipt_id = ?").get(receipt.receiptId)).toEqual({
+      expect(second.prepare("SELECT status, requested_from_background, idempotency_key, request_digest, created_at_ms FROM operator_receipts WHERE receipt_id = ?").get(receipt.receiptId)).toEqual({
         status: "interim",
         requested_from_background: 1,
+        idempotency_key: input.idempotencyKey,
+        request_digest: input.requestDigest,
         created_at_ms: 123,
       });
       const exported = exportFoundation(second, PROJECT_ID);

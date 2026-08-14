@@ -146,6 +146,18 @@ The result is a machine-readable AuthorityContext containing resolved project,
 config, governorship, actor, repository, resource and evidence revisions.
 Refusals are typed; no wrapper may turn a refusal into success.
 
+The contract v3/schema v8 interim operator gate is a one-request grant bound to
+the exact project_id, operation class, lowercase 40-character candidate head,
+idempotency key and canonical normalized request digest. Consumption is an atomic
+compare-and-set in the same transaction as the first StateEvent; an already
+consumed receipt refuses, except that the original operatorReceiptId may return
+its already-committed idempotent result byte-for-byte. The receipt has no local
+TTL or revocation; it retires only on the host-issued `get-bb/bb#1541`
+condition, and stale means an exact binding mismatch. The
+`github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
+reserve/finalize adapter paths are unsupported by this one-request gate and
+refuse before their adapters. This is not live cutover or source retirement.
+
 ## 6. Roles, delegation and execution
 
 A logical role is a project-scoped seat such as project-orchestrator or

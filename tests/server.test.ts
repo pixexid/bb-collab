@@ -18,6 +18,7 @@ import {
   SCHEMA_VERSION,
   TABLES,
   applyFixtureMutation,
+  applyAuthorizedMutation,
   cachedConsumerRolloutEvidence,
   canonicalJson,
   contractDigest,
@@ -25,6 +26,8 @@ import {
   doctor,
   explicitExecutionInputSources,
   exportFoundation,
+  persistInterimOperatorReceipt,
+  operatorRequestDigest,
   schemaDigest,
   sha256,
   type ApplyRequest,
@@ -1168,7 +1171,7 @@ describe("bb-collab plugin boundary", () => {
     const before = exportFoundation(db, PROJECT_ID);
 
     const rpc = await host.harness.callRpc("apply", request);
-    expect(rpc).toMatchObject({ outcome: "OPERATOR_AUTH_REQUIRED", expected: 1, attempted: 0, verified: 0 });
+    expect(rpc).toMatchObject({ outcome: "OPERATOR_RECEIPT_REQUIRED", expected: 1, attempted: 0, verified: 0 });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
 
     const cli = await host.harness.runCli([
@@ -1179,10 +1182,255 @@ describe("bb-collab plugin boundary", () => {
       JSON.stringify(request),
     ]);
     expect(cli.exitCode).toBe(2);
-    expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "OPERATOR_AUTH_REQUIRED" });
+    expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "OPERATOR_RECEIPT_REQUIRED" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules).toEqual([]);
     expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "doctor", "export", "lanes", "operatorReceipt", "reorderPinned", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
+  });
+
+  it("authorizes exact interim receipts through the same RPC and CLI seam", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID, actorKind: "operator", subjectId: "operator-1" });
+    const request = { ...bootstrapRequest(), candidateHead: CANDIDATE_SHA };
+    const receipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: request.operationClass,
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: operatorRequestDigest(request),
+      callerThreadId: "operator-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 1);
+    const authorized = { ...request, operatorReceiptId: receipt.receiptId };
+
+    const rpc = await host.harness.callRpc("apply", authorized);
+    expect(rpc).toMatchObject({ outcome: "OK", mutationReceipt: { operationClass: "bootstrap", operatorReceiptId: receipt.receiptId } });
+    expect(db.prepare("SELECT operator_receipt_id FROM state_events WHERE project_id = ?").get(PROJECT_ID)).toEqual({ operator_receipt_id: receipt.receiptId });
+    expect(db.prepare("SELECT operator_receipt_id FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?").get(PROJECT_ID, request.idempotencyKey)).toEqual({ operator_receipt_id: receipt.receiptId });
+    expect(db.prepare("SELECT consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?").get(receipt.receiptId)).toEqual({ consumed_event_sequence: 1 });
+    const cli = await host.harness.runCli(["apply", "--project", PROJECT_ID, "--request", JSON.stringify(authorized)]);
+    expect(cli.exitCode).toBe(0);
+    expect(JSON.parse(cli.stdout)).toEqual(rpc);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: 1 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: 1 });
+    const fresh = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: request.operationClass,
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: operatorRequestDigest(request),
+      callerThreadId: "operator-thread-fresh",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 2);
+    const beforeFreshApply = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", { ...authorized, operatorReceiptId: fresh.receiptId })).toMatchObject({ outcome: "OPERATOR_RECEIPT_STALE" });
+    expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(fresh.receiptId)).toEqual({ consumed_at_ms: null });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeFreshApply);
+    const beforeReuse = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", { ...request, idempotencyKey: "bootstrap-distinct", operatorReceiptId: receipt.receiptId })).toMatchObject({ outcome: "OPERATOR_RECEIPT_REUSED" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeReuse);
+  });
+
+  it("cannot reuse one receipt for two migration steps", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    prepareMigration(db);
+    const first = migrationStepRequest(db, "record_inventory", { proofDigest: sha256("inventory") });
+    const authorizedRequest = { ...first, candidateHead: CANDIDATE_SHA };
+    const receipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: "migration_step",
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: first.idempotencyKey,
+      requestDigest: operatorRequestDigest(authorizedRequest),
+      callerThreadId: "operator-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 1);
+    const authorized = { ...authorizedRequest, operatorReceiptId: receipt.receiptId };
+    expect(await host.harness.callRpc("apply", authorized)).toMatchObject({ outcome: "OK" });
+    const beforeSecond = exportFoundation(db, PROJECT_ID);
+    const second = migrationStepRequest(db, "record_quiescence", { proofDigest: sha256("quiescence") }, { operatorReceiptId: receipt.receiptId, candidateHead: CANDIDATE_SHA });
+    expect(await host.harness.callRpc("apply", second)).toMatchObject({ outcome: "OPERATOR_RECEIPT_REUSED" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeSecond);
+  });
+
+  it("replays a v7 mutation receipt after the v8 ALTER with the base normalized digest", () => {
+    const db = new Database(":memory:");
+    databaseIsReady(db);
+    try {
+      for (const statement of MIGRATIONS.slice(0, -2)) db.exec(statement);
+      const request = bootstrapRequest();
+      const baseV7Digest = "1a9530eb42af63727dd3001bd7990edf147242a525da64578e5d240c75e80027";
+      const committed = { outcome: "OK", subject: PROJECT_ID, expected: 1, attempted: 1, verified: 1 };
+      seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
+      db.prepare(
+        `INSERT INTO state_events
+          (project_id, event_sequence, aggregate_type, aggregate_id, aggregate_revision,
+           event_type, actor_receipt_id, idempotency_key, event_json, created_at_ms)
+         VALUES (?, 1, 'project', ?, 1, 'bootstrapped', ?, ?, ?, 1)`,
+      ).run(PROJECT_ID, PROJECT_ID, RECEIPT_ID, request.idempotencyKey, canonicalJson({ fixture: true }));
+      db.prepare(
+        `INSERT INTO mutation_receipts
+          (project_id, idempotency_key, operation_class, request_digest,
+           outcome_json, committed_event_sequence, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, 1, 1)`,
+      ).run(PROJECT_ID, request.idempotencyKey, request.operationClass, baseV7Digest, canonicalJson(committed));
+      db.exec(MIGRATIONS.at(-2)!);
+      db.exec(MIGRATIONS.at(-1)!);
+
+      expect(operatorRequestDigest(request)).toBe(baseV7Digest);
+      expect(operatorRequestDigest({ ...request, expectedConfigRevision: undefined })).toBe(
+        operatorRequestDigest({ ...request, expectedConfigRevision: null }),
+      );
+      const before = db.prepare("SELECT COUNT(*) AS count FROM state_events").get();
+      expect(applyFixtureMutation(db, request)).toEqual(committed);
+      expect(db.prepare("SELECT COUNT(*) AS count FROM state_events").get()).toEqual(before);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("refuses receipt-bound adapter reserve/finalize operations before any adapter call", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    const { fenceToken } = seedAssignmentDatabase(db);
+    const prepAdapter = new DeterministicNativeAssignmentAdapter();
+    const prepared = applyFixtureMutation(db, assignmentPrepareRequest(fenceToken), null, null, prepAdapter);
+    const executionAttemptId = (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+    const request = { ...assignmentPhaseRequest(fenceToken, "assignment_dispatch", "assignment-1", executionAttemptId), candidateHead: CANDIDATE_SHA };
+    const receipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: "assignment_dispatch",
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: operatorRequestDigest(request),
+      callerThreadId: "operator-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 1);
+    const before = exportFoundation(db, PROJECT_ID);
+    const adapter = new DeterministicNativeAssignmentAdapter();
+    expect(applyAuthorizedMutation(db, { ...request, operatorReceiptId: receipt.receiptId }, null, null, adapter)).toMatchObject({ outcome: "OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED" });
+    expect(adapter.dispatchCalls).toHaveLength(0);
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("refuses receipt-bound assignment reconcile before a non-null adapter call", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    const { fenceToken } = seedAssignmentDatabase(db);
+    const prepAdapter = new DeterministicNativeAssignmentAdapter();
+    const prepared = applyFixtureMutation(db, assignmentPrepareRequest(fenceToken), null, null, prepAdapter);
+    const executionAttemptId = (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+    const dispatchAdapter = new DeterministicNativeAssignmentAdapter();
+    dispatchAdapter.nextEvidence = { disposition: "ambiguous", reasonCode: "request_outcome_unknown" };
+    expect(applyFixtureMutation(db, assignmentPhaseRequest(fenceToken, "assignment_dispatch", "assignment-1", executionAttemptId), null, null, dispatchAdapter).outcome).toBe("DISPATCH_UNKNOWN");
+    const request = { ...assignmentPhaseRequest(fenceToken, "assignment_reconcile", "assignment-1", executionAttemptId), candidateHead: CANDIDATE_SHA };
+    const receipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: "assignment_reconcile",
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: operatorRequestDigest(request),
+      callerThreadId: "operator-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 1);
+    const before = exportFoundation(db, PROJECT_ID);
+    const reconcileAdapter = new DeterministicNativeAssignmentAdapter();
+    expect(applyAuthorizedMutation(db, { ...request, operatorReceiptId: receipt.receiptId }, null, null, reconcileAdapter)).toMatchObject({ outcome: "OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED" });
+    expect(reconcileAdapter.reconcileCalls).toHaveLength(0);
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("refuses receipt-bound GitHub reserve/finalize before reservation or adapter mutation", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyFixtureMutation(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    const request = { ...projectionRequest(fenceToken, 1), candidateHead: CANDIDATE_SHA };
+    const receipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: "github_issue_projection",
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: operatorRequestDigest(request),
+      callerThreadId: "operator-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 1);
+    const before = exportFoundation(db, PROJECT_ID);
+    const adapter = new DeterministicGitHubIssueAdapter();
+    expect(applyAuthorizedMutation(db, { ...request, operatorReceiptId: receipt.receiptId }, adapter)).toMatchObject({ outcome: "OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED" });
+    expect(adapter.mutationCalls).toHaveLength(0);
+    expect(adapter.readCalls).toHaveLength(0);
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("fixture-only projection window cannot append after receipt consumption", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyFixtureMutation(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    const request = { ...projectionRequest(fenceToken, 1), candidateHead: CANDIDATE_SHA };
+    const receipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: "github_issue_projection",
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: operatorRequestDigest(request),
+      callerThreadId: "operator-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 1);
+    const beforeEvents = (db.prepare("SELECT COUNT(*) AS count FROM state_events").get() as { count: number }).count;
+    const beforeReceipts = (db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get() as { count: number }).count;
+    const adapter = new DeterministicGitHubIssueAdapter();
+    const result = applyFixtureMutation(db, { ...request, operatorReceiptId: receipt.receiptId }, adapter);
+    expect(result.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(adapter.mutationCalls).toHaveLength(1);
+    expect((db.prepare("SELECT COUNT(*) AS count FROM state_events").get() as { count: number }).count).toBe(beforeEvents + 1);
+    expect((db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get() as { count: number }).count).toBe(beforeReceipts);
+    expect(db.prepare("SELECT consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?").get(receipt.receiptId)).toEqual({ consumed_event_sequence: beforeEvents + 1 });
+  });
+
+  it("rejects every invalid receipt binding before any canonical write", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    const base = { ...bootstrapRequest(), candidateHead: CANDIDATE_SHA };
+    const before = exportFoundation(db, PROJECT_ID);
+    const receipt = (projectId: string, mutationClass: ApplyRequest["operationClass"], id: string) => persistInterimOperatorReceipt(db, {
+      projectId,
+      mutationClass,
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: base.idempotencyKey,
+      requestDigest: operatorRequestDigest(base),
+      callerThreadId: `thread-${id}`,
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 1);
+
+    expect((await host.harness.callRpc("apply", base) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_REQUIRED");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    const foreign = receipt(FOREIGN_PROJECT_ID, "bootstrap", "foreign");
+    expect((await host.harness.callRpc("apply", { ...base, operatorReceiptId: foreign.receiptId }) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_FOREIGN");
+    const stale = receipt(PROJECT_ID, "bootstrap", "stale");
+    expect((await host.harness.callRpc("apply", { ...base, operatorReceiptId: stale.receiptId, candidateHead: H1_CANDIDATE_SHA }) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_STALE");
+    const mismatched = receipt(PROJECT_ID, "config_revision", "mismatch");
+    expect((await host.harness.callRpc("apply", { ...base, operatorReceiptId: mismatched.receiptId }) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_STALE");
+    const malformed = receipt(PROJECT_ID, "bootstrap", "malformed");
+    db.prepare("UPDATE operator_receipts SET binding_digest = 'bad' WHERE receipt_id = ?").run(malformed.receiptId);
+    expect((await host.harness.callRpc("apply", { ...base, operatorReceiptId: malformed.receiptId }) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_INVALID");
+    const retired = receipt(PROJECT_ID, "bootstrap", "retired");
+    db.pragma("ignore_check_constraints = ON");
+    db.prepare("UPDATE operator_receipts SET status = 'retired' WHERE receipt_id = ?").run(retired.receiptId);
+    db.pragma("ignore_check_constraints = OFF");
+    const beforeInvalidApplications = exportFoundation(db, PROJECT_ID);
+    expect((await host.harness.callRpc("apply", { ...base, operatorReceiptId: retired.receiptId }) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_RETIRED");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeInvalidApplications);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: 0 });
   });
 
   it("proves fixture bootstrap, read-only doctor, deterministic export, and exact BB fact reads", async () => {
@@ -1245,14 +1493,15 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("appends only the v7 interim operator receipt table and rolls every cached consumer forward", () => {
-    expect(SCHEMA_VERSION).toBe(7);
-    expect(CONTRACT_VERSION).toBe(2);
-    expect(MIGRATIONS).toHaveLength(20);
-    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("9469e48a59bcd8113a04b1524ab10fc12f92936c96c821cba5491f3faa407502");
-    expect(MIGRATIONS.at(-2)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
-    expect(MIGRATIONS.at(-1)?.match(/CREATE TABLE/gu)).toHaveLength(1);
-    expect(MIGRATIONS.at(-1)).toContain("operator_receipts");
+  it("appends the v8 one-request receipt columns and rolls every cached consumer forward", () => {
+    expect(SCHEMA_VERSION).toBe(8);
+    expect(CONTRACT_VERSION).toBe(3);
+    expect(MIGRATIONS).toHaveLength(21);
+    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("97fd37424ea09eeb134998f57ae50f97e9b64c7e2fce877f1220e8194b05b774");
+    expect(MIGRATIONS.at(-3)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
+    expect(MIGRATIONS.at(-2)?.match(/CREATE TABLE/gu)).toHaveLength(1);
+    expect(MIGRATIONS.at(-2)).toContain("operator_receipts");
+    expect(MIGRATIONS.at(-1)).toContain("operator_receipt_id");
     expect(TABLES).toContain("migration_runs");
     expect(MIGRATION_STATES).toEqual([
       "prepared", "frozen", "exported", "imported", "equivalent", "target_active", "exercised", "retired", "rolled_back", "fix_forward_required",
@@ -1260,8 +1509,8 @@ describe("bb-collab plugin boundary", () => {
     expect(MIGRATION_STEPS).toEqual([
       "record_inventory", "record_quiescence", "freeze", "record_export", "record_import", "record_equivalence", "activate", "record_exercise", "retire", "rollback", "mark_fix_forward_required",
     ]);
-    expect(cachedConsumerRolloutEvidence(6)).toMatchObject({ oldSchemaVersion: 6, newSchemaVersion: 7, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(7)).toMatchObject({ oldSchemaVersion: 6, newSchemaVersion: 7, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(7)).toMatchObject({ oldSchemaVersion: 7, newSchemaVersion: 8, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(8)).toMatchObject({ oldSchemaVersion: 7, newSchemaVersion: 8, action: "reread", expected: 4, attempted: 4, verified: 4 });
 
     const { db, directory } = directDatabase();
     try {
@@ -1271,6 +1520,11 @@ describe("bb-collab plugin boundary", () => {
         "source_snapshot_digest", "source_governor_epoch", "target_governor_epoch", "mutator_inventory_digest", "quiescence_digest", "import_root_digest",
         "equivalence_digest", "recovery_digest", "retention_until_ms", "created_at_ms", "updated_at_ms",
       ]);
+      expect((db.prepare("PRAGMA table_info(operator_receipts)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual(expect.arrayContaining([
+        "idempotency_key", "request_digest", "consumed_at_ms", "consumed_event_sequence",
+      ]));
+      expect((db.prepare("PRAGMA table_info(state_events)").all() as Array<{ name: string }>).map((row) => row.name)).toContain("operator_receipt_id");
+      expect((db.prepare("PRAGMA table_info(mutation_receipts)").all() as Array<{ name: string }>).map((row) => row.name)).toContain("operator_receipt_id");
       expect((db.prepare("PRAGMA index_list(migration_runs)").all() as Array<{ name: string; unique: number; partial: number }>).filter((row) => row.name.startsWith("migration_runs_"))).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "migration_runs_final_export_identity", unique: 1, partial: 1 }),
         expect.objectContaining({ name: "migration_runs_one_open", unique: 1, partial: 1 }),
@@ -1369,7 +1623,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ contractVersion: 2, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ contractVersion: 3, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -2726,7 +2980,7 @@ describe("bb-collab plugin boundary", () => {
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-      for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement);
+      for (const statement of MIGRATIONS) db.exec(statement);
       seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
       const bootstrap = applyFixtureMutation(db, bootstrapRequest());
       const fenceToken = (bootstrap.evidence as { fenceToken: string }).fenceToken;
@@ -2736,7 +2990,6 @@ describe("bb-collab plugin boundary", () => {
           (decision_id, project_id, config_revision, repo_target_id, scope_json, scope_digest, current_resource_revision)
          VALUES ('legacy-decision', ?, 1, ?, ?, ?, 1)`,
       ).run(PROJECT_ID, TARGET_ID, scopeJson, sha256(scopeJson));
-      db.exec(MIGRATIONS.at(-1)!);
       expect(db.prepare("SELECT decision_class, options_json, decision_identity_digest FROM decisions WHERE decision_id = 'legacy-decision'").get()).toEqual({
         decision_class: null,
         options_json: null,
@@ -2785,8 +3038,8 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 6, newSchemaVersion: 7, expected: 4, attempted: 4, verified: 4 },
-        schema: { version: 7 },
+        cachedConsumers: { oldSchemaVersion: 7, newSchemaVersion: 8, expected: 4, attempted: 4, verified: 4 },
+        schema: { version: 8 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -3417,7 +3670,7 @@ describe("bb-collab plugin boundary", () => {
     });
     const beforeProductionRefusal = exportFoundation(db, PROJECT_ID);
     expect(await host.harness.callRpc("apply", successionRequest(fenceToken, { idempotencyKey: "production-role" }))).toMatchObject({
-      outcome: "OPERATOR_AUTH_REQUIRED",
+      outcome: "OPERATOR_RECEIPT_REQUIRED",
       expected: 1,
       attempted: 0,
       verified: 0,
@@ -3729,7 +3982,7 @@ describe("bb-collab plugin boundary", () => {
     db.pragma("foreign_keys = OFF");
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
-    db.exec(MIGRATIONS.at(-4)!);
+    db.exec(MIGRATIONS.at(-5)!);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -3749,8 +4002,8 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(6)).toMatchObject({ oldSchemaVersion: 6, newSchemaVersion: 7, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(7)).toMatchObject({ oldSchemaVersion: 6, newSchemaVersion: 7, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(7)).toMatchObject({ oldSchemaVersion: 7, newSchemaVersion: 8, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(8)).toMatchObject({ oldSchemaVersion: 7, newSchemaVersion: 8, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {

@@ -13,11 +13,11 @@ import {
   MIGRATIONS,
   PLUGIN_ID,
   PLUGIN_SDK_VERSION,
+  applyAuthorizedMutation,
   applyRequestSchema,
   databaseIsReady,
   doctor,
   exportFoundation,
-  operatorAuthRequired,
   operatorReceiptConfirmationSchema,
   operatorReceiptRequestSchema,
   OPERATOR_RECEIPT_RETIREMENT_CONDITION,
@@ -34,6 +34,7 @@ const mutationReceiptSchema = z
     idempotencyKey: z.string(),
     operationClass: z.string(),
     requestDigest: z.string(),
+    operatorReceiptId: z.string().nullable(),
     committedEventSequence: z.number().int().positive(),
     createdAtMs: z.number().int().nonnegative(),
   })
@@ -104,6 +105,8 @@ export const foundationResultSchema = z
         callerThreadId: z.string(),
         callerPluginId: z.string(),
         requestedFromBackground: z.boolean(),
+        idempotencyKey: z.string(),
+        requestDigest: z.string(),
         receiptDigest: z.string(),
         createdAtMs: z.number().int().nonnegative(),
       })
@@ -266,9 +269,10 @@ async function runCli(
     const requestJson = parseFlag(args, "--request");
     if (!requestJson) return invalidCli("--request JSON is required");
     try {
-      const request = parseApplyRequest(JSON.parse(requestJson));
+      const rawRequest = JSON.parse(requestJson);
+      const request = parseApplyRequest(rawRequest);
       if (request.projectId !== projectId) return invalidCli("--project does not match request.projectId");
-      return cliResult(operatorAuthRequired(projectId));
+      return cliResult(applyAuthorizedMutation(db, rawRequest));
     } catch (error) {
       return invalidCli(error instanceof Error ? error.message : String(error));
     }
@@ -391,7 +395,7 @@ export default async function plugin(bb: BbPluginApi) {
       return exportFoundation(db, input.projectId);
     },
     async apply(input) {
-      return operatorAuthRequired(input.projectId);
+      return applyAuthorizedMutation(db, input);
     },
     async operatorReceipt(input) {
       if (!db) return operatorReceiptResult(input.projectId, "CANONICAL_STORE_UNAVAILABLE", "canonical SQLite store is unavailable");
@@ -404,6 +408,8 @@ export default async function plugin(bb: BbPluginApi) {
           projectId: input.projectId,
           mutationClass: input.mutationClass,
           candidateHead: input.candidateHead,
+          idempotencyKey: input.idempotencyKey,
+          requestDigest: input.requestDigest,
           retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
           requestedFromBackground: input.requestedFromBackground,
         },
@@ -417,7 +423,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (
         confirmation.data.projectId !== input.projectId ||
         confirmation.data.mutationClass !== input.mutationClass ||
-        confirmation.data.candidateHead !== input.candidateHead
+        confirmation.data.candidateHead !== input.candidateHead ||
+        confirmation.data.idempotencyKey !== input.idempotencyKey ||
+        confirmation.data.requestDigest !== input.requestDigest
       ) {
         return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_STALE", "operator confirmation binding is stale");
       }
@@ -438,7 +446,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "export", summary: "Deterministic bounded foundation export", usage: "bb collab export --project PROJECT_ID" },
       {
         name: "apply",
-        summary: "Explicit foundation apply (operator authentication required)",
+        summary: "Explicit foundation apply (exact one-request receipt required)",
         usage: "bb collab apply --project PROJECT_ID --request JSON",
       },
     ],
