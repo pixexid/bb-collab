@@ -71,7 +71,7 @@ infrastructure, but they must not create duplicate authority concepts.
 | ExecutionAttempt | execution_attempt_id | One dispatch attempt under an Assignment, including BB server, thread, environment, host, native correlation IDs, actual profile, lifecycle and terminal evidence. Native references are unique in their BB server scope. |
 | Decision | decision_id | Immutable project, scope, class and options identity. A consult does not become an authority decision merely by existing. |
 | DecisionDisposition | decision_id, disposition_sequence | Append-only proposed, adopted, rejected, superseded or revoked disposition, with typed actor, conditions, reason and revert. Current state is derived. |
-| AuthorizedApprover | project_id, approver_id, authorizing_decision_id, authorizing_disposition_sequence | Durable active/revoked registry row for `orchestrator:bb-collab`, linked to the exact adopted `operator_only` Decision disposition and the six ratified derived mutation classes. |
+| AuthorizedApprover | project_id, approver_id, authorizing_decision_id, authorizing_disposition_sequence | Durable active/revoked registry row for `orchestrator:bb-collab`, linked to the exact adopted `operator_only` Decision disposition and the eight ratified derived mutation classes. |
 | QualificationObservation | qualification_id | Immutable fixture-bound capability result for an exact executed-profile digest and observed BB/runtime/fixture context. |
 | EligibilityProjection | project_id, role_requirement_id, profile_digest | Rebuildable current eligibility with observation references, expiry and requalification trigger. |
 | EvidenceArtifact | evidence_id, content_digest where appropriate | Content-addressed review, test, consult, release, export, receipt or legacy artifact with durable location metadata. |
@@ -147,7 +147,7 @@ The result is a machine-readable AuthorityContext containing resolved project,
 config, governorship, actor, repository, resource and evidence revisions.
 Refusals are typed; no wrapper may turn a refusal into success.
 
-The contract v7/schema v10 interim operator gate is a one-request grant bound to
+The contract v8/schema v10 interim operator gate is a one-request grant bound to
 the exact project_id, operation class, lowercase 40-character candidate head,
 idempotency key and canonical normalized request digest. Consumption is an atomic
 compare-and-set in the same transaction as the first StateEvent; an already
@@ -158,8 +158,8 @@ condition, and stale means an exact binding mismatch. The
 `github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
 reserve/finalize adapter paths are unsupported by this one-request gate and
 refuse before their adapters. For `bootstrap`, `decision_create`,
-`decision_disposition`, `work_item_create`, `migration_prepare`, and
-`migration_step`, a confirmed
+`decision_disposition`, `work_item_create`, `qualification_observation_record`,
+`role_generation_succession`, `migration_prepare`, and `migration_step`, a confirmed
 operator receipt is atomically paired with a verified actor receipt whose `actor_kind` is
 `plugin`, whose `subject_id` is `bb-collab`, and whose durable
 `operator_receipt_id` points to that exact authorizing receipt. The derived
@@ -172,7 +172,7 @@ the `operator_only` Decision class and its `adopted` disposition; role-based and
 review Decisions remain role-bound. After the one-time adopted authorizing
 `operator_only` Decision registers `approverId=orchestrator:bb-collab`, the
 `approverAttestation` RPC validates the active registry row, exact authorizing
-Decision/disposition, caller plugin, six-class allowlist and exact request
+Decision/disposition, caller plugin, eight-class allowlist and exact request
 binding, then atomically issues a fresh receipt plus the same verified plugin
 actor without `requestInput`. A later operator revocation or change marks the
 registry unusable; both registry and interim receipt retain the upstream
@@ -479,8 +479,8 @@ The following remain unresolved until the named proof or operator decision:
 - General operator actor authentication. Do not infer identity from a display
   name, checkout possession or thread ID. The narrow exception is the
   explicitly ratified `plugin/bb-collab` derived actor for the bounded
-  bootstrap, operator-only Decision, and migration mutation classes, which is
-  issued by an active exact authorized-approver attestation and remains bound
+  bootstrap, operator-only Decision, work-item, role, and migration mutation
+  classes, which is issued by an active exact authorized-approver attestation and remains bound
   to its exact operator receipt; other operator actors still wait for a proven
   BB-native authenticated subject/receipt or a separately explicit decision.
 - Connector policy per repository. Set required, optional or prohibited only
