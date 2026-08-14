@@ -1,9 +1,9 @@
 # bb-collab repository contract
 
-CONTRACT_VERSION: 5
+CONTRACT_VERSION: 6
 
 This repository contains the founding contract and the implemented foundation
-through contract v5/schema v9: a single SQLite store with migrations, resolver,
+through contract v6/schema v10: a single SQLite store with migrations, resolver,
 state-event and mutation-receipt, deterministic export, and read-only doctor
 seams, plus WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
 Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
@@ -69,11 +69,13 @@ Changing version text alone is not a migration. A zero-work result is not a
 successful apply unless zero expected work, zero attempted work and zero
 verified work are all proven.
 
-Contract v5/schema v9 requires all four cached consumers to reread the
-one-request receipt, mutation/export/evidence, and refusal contract or refuse
-contract v4/schema v8. The verified plugin actor receipt is allowed only for
-bootstrap, operator_only Decision create/adopted disposition, migration_prepare,
-and migration_step; it remains bound to the exact operator receipt.
+Contract v6/schema v10 requires all four cached consumers to reread the
+one-request receipt, authorized-approver registry/attestation,
+mutation/export/evidence, and refusal contract or refuse contract v5/schema v9.
+An adopted operator_only Decision registers approverId=orchestrator:bb-collab
+with the exact five derived mutation classes. Attestation has no requestInput
+interaction and atomically creates the same exact-bound receipt plus verified
+plugin actor; operator revocation/change marks the registry unusable.
 
 ## Delegation and lane obligations
 

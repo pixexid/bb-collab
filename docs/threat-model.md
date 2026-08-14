@@ -19,20 +19,24 @@ worker.
 | GitHub, BB Tasks and Markdown | External projections or evidence | They may not activate work, satisfy a gate or close a WorkItem independently. |
 | Operator/admin/raw BB activity | Unmanaged activity on a full-trust host | It may be detected as evidence or discrepancy, but it acquires no canonical authority by observation. |
 
-The v5/schema v9 operator gate is a separate host/UI confirmation boundary:
-an interim receipt binds one exact project, operation class, lowercase
-40-character candidate head, idempotency key and canonical normalized request digest.
-The first committed StateEvent consumes it atomically; reuse, a different
-receipt for an already-committed idempotency key, or any binding mismatch
-refuses before a write. It has no local TTL or revocation and retires only on
-the host-issued `get-bb/bb#1541` condition. `github_issue_projection`,
+The v6/schema v10 operator gate has a host/UI confirmation boundary only for
+authorizing or revoking the approver. An adopted `operator_only` Decision
+registers `approverId=orchestrator:bb-collab` for the exact project and adopted
+disposition, with the five ratified derived mutation classes. The
+`approverAttestation` RPC validates that active registry row, exact Decision
+and disposition, caller plugin, class and request binding, then atomically
+issues a fresh interim receipt plus verified plugin actor with no pending UI
+interaction. Revocation or change marks the registry revoked and attestation
+fails closed. The receipt binds one exact project, operation class, lowercase
+40-character candidate head, idempotency key and canonical normalized request
+digest. Both the registry and interim receipt retain the upstream host-issued
+`get-bb/bb#1541` retirement condition. The first committed StateEvent consumes it atomically; reuse, a
+different receipt for an already-committed idempotency key, or any binding
+mismatch refuses before a write. It has no local TTL and retires only on the
+host-issued `get-bb/bb#1541` condition. `github_issue_projection`,
 `assignment_dispatch`, and `assignment_reconcile` reserve/finalize paths
 refuse before external adapters because one receipt cannot authorize multiple
-writes. For bootstrap, operator_only Decision create/adopted disposition,
-migration_prepare, and migration_step, confirmation atomically creates a
-verified `plugin/bb-collab` actor receipt linked to the exact operator receipt;
-the actor must present that same operator receipt and is not a standing
-identity. This seam is fixture-tested and does not claim live cutover.
+writes. This seam is fixture-tested and does not claim live cutover.
 
 The plugin database is the sole canonical governance/work store. A second task
 ledger, role store, decision store, migration registry, daemon or mutable
@@ -91,6 +95,7 @@ The goals are:
 | Operator identity spoofing | Display name, checkout possession or thread ID is accepted as privileged actor | Hold privileged mutation until a proven BB-native authenticated receipt or explicit narrow operator decision exists. |
 | Interim receipt replay or phase splitting | One receipt authorizes a second mutation or a reserve/finalize adapter sequence | Exact one-request binding, atomic consumption, original-replay-only idempotency, and pre-adapter refusal for the three unsupported operations; OPERATOR_RECEIPT_REUSED, OPERATOR_RECEIPT_STALE or OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED. |
 | Derived actor standing identity | A plugin actor receipt is reused with another authorization or detached from its approver | Bootstrap-only atomic issuance, durable operator receipt linkage, exact linked-receipt check and host-issued retirement condition; ACTOR_RECEIPT_UNVERIFIED or OPERATOR_RECEIPT_STALE. |
+| Authorized approver spoof/revocation | An unregistered, foreign, changed or revoked approver attests a privileged mutation | Exact project/approver/Decision/disposition registry row, five-class allowlist, caller-plugin check and active-current disposition check; AUTHORIZED_APPROVER_UNKNOWN, AUTHORIZED_APPROVER_INVALID or AUTHORIZED_APPROVER_REVOKED. |
 | Projection drift | External state is used to mutate canonical state for convenience | Projection is rebuildable; canonical state changes only through governed import/adoption. |
 
 ## Resolver invariants

@@ -353,8 +353,11 @@ candidate head, idempotency key, and request digest; the plugin has not been
 installed/reloaded/activated against live project authority, and the
 migration/first-adopter evidence is not yet complete. Candidate heads are
 exact lowercase 40-character bindings supplied by the caller, not observed
-Git/BB facts. Background requests still require human `requestInput`
-confirmation; the digest is integrity-only until a host-issued receipt exists.
+Git/BB facts. The one-time authorizing `operator_only` Decision registers the
+`orchestrator:bb-collab` approver and its exact five-class allowlist; subsequent
+in-scope receipts use `approverAttestation` with zero pending interactions.
+Human `requestInput` remains only at the authorization/revocation boundary; the
+digest is integrity-only until a valid attestation or host-issued receipt exists.
 Interim receipts have no local expiry or revocation and retire only on the
 host-issued `get-bb/bb#1541` condition; stale means an exact binding mismatch.
 `github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`

@@ -9,6 +9,7 @@ import { z } from "zod";
 import plugin from "../server.js";
 import {
   DEFERRED_ISSUE_3_OUTCOMES,
+  AUTHORIZED_APPROVER_ID,
   CONTRACT_VERSION,
   MAX_EXPORT_ROWS,
   MIGRATIONS,
@@ -1186,7 +1187,7 @@ describe("bb-collab plugin boundary", () => {
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "OPERATOR_RECEIPT_REQUIRED" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules).toEqual([]);
-    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "doctor", "export", "lanes", "operatorReceipt", "reorderPinned", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
+    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "approverAttestation", "doctor", "export", "lanes", "operatorReceipt", "reorderPinned", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
   });
 
   it("authorizes exact interim receipts through the same RPC and CLI seam", async () => {
@@ -1437,6 +1438,132 @@ describe("bb-collab plugin boundary", () => {
       db.close();
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  it("registers an operator approver and attests exact derived mutations without UI", async () => {
+    const { host, db, fenceToken } = await assignmentFixture();
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "operator-authorizer", actorKind: "operator", subjectId: "operator-1" });
+    const authorizingCreate = decisionCreateRequest(fenceToken, "authorizing-operator", {
+      actorReceiptId: "operator-authorizer",
+      repoTargetId: null,
+      decision: {
+        decisionId: "authorizing-operator",
+        repoTargetId: null,
+        scope: { projectId: PROJECT_ID, purpose: "operator-approver" },
+        decisionClass: "operator_only",
+        options: { approverId: AUTHORIZED_APPROVER_ID },
+        resourceRevision: 1,
+      },
+    });
+    expect(applyWithFixtureReceipt(db, authorizingCreate)).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "authorizing-operator", 1, {
+      actorReceiptId: "operator-authorizer",
+      repoTargetId: null,
+      idempotencyKey: "adopt-authorizing-operator",
+    }))).toMatchObject({ outcome: "OK" });
+    expect(db.prepare("SELECT project_id, approver_id, authorizing_decision_id, authorizing_disposition_sequence, status, allowed_mutation_classes_json FROM authorized_approvers").get()).toEqual({
+      project_id: PROJECT_ID,
+      approver_id: AUTHORIZED_APPROVER_ID,
+      authorizing_decision_id: "authorizing-operator",
+      authorizing_disposition_sequence: 1,
+      status: "active",
+      allowed_mutation_classes_json: canonicalJson(["bootstrap", "decision_create", "decision_disposition", "migration_prepare", "migration_step"]),
+    });
+
+    const unsigned = decisionCreateRequest(fenceToken, "attested-operator", {
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      candidateHead: CANDIDATE_SHA,
+      repoTargetId: null,
+      decision: {
+        decisionId: "attested-operator",
+        repoTargetId: null,
+        scope: { projectId: PROJECT_ID, purpose: "attested" },
+        decisionClass: "operator_only",
+        options: { approverId: AUTHORIZED_APPROVER_ID },
+        resourceRevision: 1,
+      },
+    });
+    const attestation = {
+      projectId: PROJECT_ID,
+      mutationClass: "decision_create" as const,
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: unsigned.idempotencyKey,
+      requestDigest: operatorRequestDigest(unsigned),
+      callerThreadId: "attestor-thread",
+      requestedFromBackground: true,
+      approverId: AUTHORIZED_APPROVER_ID,
+      authorizingDecisionId: "authorizing-operator",
+      authorizingDispositionSequence: 1,
+    };
+    const pendingBefore = host.harness.inspection.pendingInteractions.length;
+    const issued = await host.harness.callRpc("approverAttestation", attestation) as FoundationResult;
+    expect(issued).toMatchObject({ outcome: "OK", actorReceiptId: expect.any(String), operatorReceipt: {
+      approverId: AUTHORIZED_APPROVER_ID,
+      authorizingDecisionId: "authorizing-operator",
+      authorizingDispositionSequence: 1,
+    } });
+    expect(host.harness.inspection.pendingInteractions).toHaveLength(pendingBefore);
+
+    const receiptId = issued.operatorReceipt!.receiptId;
+    const actorReceiptId = issued.actorReceiptId!;
+    const beforeWrong = db.prepare("SELECT COUNT(*) AS count FROM operator_receipts").get();
+    for (const wrong of [
+      { projectId: "proj-foreign" },
+      { mutationClass: "config_revision" },
+      { authorizingDecisionId: "missing-decision" },
+      { authorizingDispositionSequence: 2 },
+      { approverId: "orchestrator:other" },
+    ]) {
+      const result = await host.harness.callRpc("approverAttestation", { ...attestation, ...wrong }) as FoundationResult;
+      expect(result.outcome).not.toBe("OK");
+    }
+    expect(db.prepare("SELECT COUNT(*) AS count FROM operator_receipts").get()).toEqual(beforeWrong);
+
+    const wrongApplyRequests = [
+      { projectId: "proj-foreign" },
+      { operationClass: "config_revision" },
+      { candidateHead: "c".repeat(40) },
+      { idempotencyKey: "wrong-idempotency" },
+      { decision: { ...unsigned.decision!, options: { approverId: AUTHORIZED_APPROVER_ID, changed: true } } },
+    ];
+    const beforeWrongEvents = db.prepare("SELECT COUNT(*) AS count FROM state_events").get();
+    for (const wrong of wrongApplyRequests) {
+      const refused = await host.harness.callRpc("apply", { ...unsigned, ...wrong, actorReceiptId, operatorReceiptId: receiptId }) as FoundationResult;
+      expect(refused.outcome).not.toBe("OK");
+    }
+    expect(db.prepare("SELECT COUNT(*) AS count FROM state_events").get()).toEqual(beforeWrongEvents);
+    expect(await host.harness.callRpc("apply", { ...unsigned, actorReceiptId, operatorReceiptId: receiptId })).toMatchObject({ outcome: "OK" });
+    expect(await host.harness.callRpc("apply", { ...unsigned, idempotencyKey: "attested-reuse", actorReceiptId, operatorReceiptId: receiptId })).toMatchObject({ outcome: "OPERATOR_RECEIPT_REUSED" });
+
+    const roleUnsigned = decisionCreateRequest(fenceToken, "attested-role", {
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      candidateHead: CANDIDATE_SHA,
+      repoTargetId: TARGET_ID,
+      decision: { ...decisionCreateRequest(fenceToken, "role-template").decision!, decisionId: "attested-role", decisionClass: "assignment_admission" },
+    });
+    const roleAttestation = await host.harness.callRpc("approverAttestation", {
+      ...attestation,
+      idempotencyKey: roleUnsigned.idempotencyKey,
+      requestDigest: operatorRequestDigest(roleUnsigned),
+    }) as FoundationResult;
+    expect(await host.harness.callRpc("apply", {
+      ...roleUnsigned,
+      actorReceiptId: roleAttestation.actorReceiptId,
+      operatorReceiptId: roleAttestation.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "ACTOR_RECEIPT_UNVERIFIED" });
+
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "authorizing-operator", 2, {
+      actorReceiptId: "operator-authorizer",
+      repoTargetId: null,
+      disposition: "revoked",
+      revertsDispositionSequence: 1,
+      idempotencyKey: "revoke-authorizing-operator",
+    }))).toMatchObject({ outcome: "OK" });
+    expect(db.prepare("SELECT status FROM authorized_approvers WHERE project_id = ?").get(PROJECT_ID)).toEqual({ status: "revoked" });
+    const revoked = await host.harness.callRpc("approverAttestation", { ...attestation, idempotencyKey: "after-revocation" }) as FoundationResult;
+    expect(revoked).toMatchObject({ outcome: "AUTHORIZED_APPROVER_REVOKED" });
   });
 
   it("cannot reuse one receipt for two migration steps", async () => {
@@ -1699,16 +1826,17 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("appends the v9 derived actor columns and rolls every cached consumer forward", () => {
-    expect(SCHEMA_VERSION).toBe(9);
-    expect(CONTRACT_VERSION).toBe(5);
-    expect(MIGRATIONS).toHaveLength(22);
-    expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("97fd37424ea09eeb134998f57ae50f97e9b64c7e2fce877f1220e8194b05b774");
-    expect(MIGRATIONS.at(-4)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
-    expect(MIGRATIONS.at(-3)?.match(/CREATE TABLE/gu)).toHaveLength(1);
-    expect(MIGRATIONS.at(-3)).toContain("operator_receipts");
-    expect(MIGRATIONS.at(-2)).toContain("operator_receipt_id");
-    expect(MIGRATIONS.at(-1)).toContain("retirement_condition");
+  it("appends the v10 authorized approver registry and rolls every cached consumer forward", () => {
+    expect(SCHEMA_VERSION).toBe(10);
+    expect(CONTRACT_VERSION).toBe(6);
+    expect(MIGRATIONS).toHaveLength(23);
+    expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("80bfe52641971b984358da6bdfb4aa00d87dd928e611325f23bbbb3a1afa5c7c");
+    expect(MIGRATIONS.at(-5)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
+    expect(MIGRATIONS.at(-4)?.match(/CREATE TABLE/gu)).toHaveLength(1);
+    expect(MIGRATIONS.at(-4)).toContain("operator_receipts");
+    expect(MIGRATIONS.at(-3)).toContain("operator_receipt_id");
+    expect(MIGRATIONS.at(-2)).toContain("retirement_condition");
+    expect(MIGRATIONS.at(-1)).toContain("authorized_approvers");
     expect(TABLES).toContain("migration_runs");
     expect(MIGRATION_STATES).toEqual([
       "prepared", "frozen", "exported", "imported", "equivalent", "target_active", "exercised", "retired", "rolled_back", "fix_forward_required",
@@ -1716,9 +1844,9 @@ describe("bb-collab plugin boundary", () => {
     expect(MIGRATION_STEPS).toEqual([
       "record_inventory", "record_quiescence", "freeze", "record_export", "record_import", "record_equivalence", "activate", "record_exercise", "retire", "rollback", "mark_fix_forward_required",
     ]);
-    expect(cachedConsumerRolloutEvidence(8)).toMatchObject({ oldSchemaVersion: 8, newSchemaVersion: 9, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(9, 4)).toMatchObject({ oldContractVersion: 4, newContractVersion: 5, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(9)).toMatchObject({ oldSchemaVersion: 8, newSchemaVersion: 9, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(9)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(10, 5)).toMatchObject({ oldContractVersion: 5, newContractVersion: 6, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(10)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "reread", expected: 4, attempted: 4, verified: 4 });
 
     const { db, directory } = directDatabase();
     try {
@@ -1832,7 +1960,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ contractVersion: 5, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ contractVersion: 6, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -3247,8 +3375,8 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 8, newSchemaVersion: 9, expected: 4, attempted: 4, verified: 4 },
-        schema: { version: 9 },
+        cachedConsumers: { oldSchemaVersion: 9, newSchemaVersion: 10, expected: 4, attempted: 4, verified: 4 },
+        schema: { version: 10 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -4191,7 +4319,7 @@ describe("bb-collab plugin boundary", () => {
     db.pragma("foreign_keys = OFF");
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
-    db.exec(MIGRATIONS.at(-6)!);
+    db.exec(MIGRATIONS.at(-7)!);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -4211,9 +4339,9 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(8)).toMatchObject({ oldSchemaVersion: 8, newSchemaVersion: 9, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(9, 4)).toMatchObject({ oldContractVersion: 4, newContractVersion: 5, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(9)).toMatchObject({ oldSchemaVersion: 8, newSchemaVersion: 9, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(9)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(10, 5)).toMatchObject({ oldContractVersion: 5, newContractVersion: 6, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(10)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {
