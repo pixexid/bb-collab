@@ -13,11 +13,11 @@ import {
   MIGRATIONS,
   PLUGIN_ID,
   PLUGIN_SDK_VERSION,
+  applyAuthorizedMutation,
   applyRequestSchema,
   databaseIsReady,
   doctor,
   exportFoundation,
-  operatorAuthRequired,
   operatorReceiptConfirmationSchema,
   operatorReceiptRequestSchema,
   OPERATOR_RECEIPT_RETIREMENT_CONDITION,
@@ -268,7 +268,7 @@ async function runCli(
     try {
       const request = parseApplyRequest(JSON.parse(requestJson));
       if (request.projectId !== projectId) return invalidCli("--project does not match request.projectId");
-      return cliResult(operatorAuthRequired(projectId));
+      return cliResult(applyAuthorizedMutation(db, request));
     } catch (error) {
       return invalidCli(error instanceof Error ? error.message : String(error));
     }
@@ -391,7 +391,7 @@ export default async function plugin(bb: BbPluginApi) {
       return exportFoundation(db, input.projectId);
     },
     async apply(input) {
-      return operatorAuthRequired(input.projectId);
+      return applyAuthorizedMutation(db, input);
     },
     async operatorReceipt(input) {
       if (!db) return operatorReceiptResult(input.projectId, "CANONICAL_STORE_UNAVAILABLE", "canonical SQLite store is unavailable");

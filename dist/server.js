@@ -14883,6 +14883,8 @@ var applyRequestSchema = external_exports.object({
   operationClass: external_exports.enum(CANONICAL_MUTATION_CLASSES),
   idempotencyKey: id,
   actorReceiptId: id.nullable().optional(),
+  operatorReceiptId: id.nullable().optional(),
+  candidateHead: gitShaSchema.nullable().optional(),
   expectedConfigRevision: external_exports.number().int().nonnegative().nullable().optional(),
   configRevision: external_exports.number().int().positive().nullable().optional(),
   expectedGovernanceEpoch: external_exports.number().int().nonnegative().nullable().optional(),
@@ -14942,6 +14944,182 @@ var reviewFactsSchema = external_exports.object({
   authors: external_exports.array(gitIdentitySchema).min(1).max(64),
   committers: external_exports.array(gitIdentitySchema).min(1).max(64)
 }).strict();
+function stringField(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 256 ? value : null;
+}
+function resolveRoleContext(reader, request) {
+  if (!reader || !request.roleContext) throw refusal("ROLE_CONTEXT_REQUIRED", "exact BB role context facts are required");
+  let thread;
+  let events;
+  let environment;
+  let project;
+  let host;
+  let bbVersion;
+  let bbServerId;
+  try {
+    bbServerId = reader.serverId();
+    thread = reader.thread(request.roleContext.threadId);
+    events = reader.events(request.roleContext.threadId);
+    if (!thread.environmentId) throw refusal("ROLE_CONTEXT_REQUIRED", "holder thread has no environment");
+    environment = reader.environment(thread.environmentId);
+    project = reader.project(request.projectId);
+    host = reader.host(environment.hostId);
+    bbVersion = reader.version();
+  } catch (error48) {
+    if (error48 instanceof Refusal) throw error48;
+    throw refusal("ROLE_CONTEXT_UNKNOWN", "one or more exact BB context facts are unavailable");
+  }
+  if (thread.id !== request.roleContext.threadId || thread.projectId !== request.projectId || project.id !== request.projectId) {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "thread or project context belongs to another project");
+  }
+  if (thread.visibility !== "visible") throw refusal("ROLE_CONTEXT_HIDDEN", "hidden threads cannot hold active roles");
+  if (!(/* @__PURE__ */ new Set(["active", "idle"])).has(thread.status)) throw refusal("ROLE_CONTEXT_UNKNOWN", "holder thread is not in a usable execution state");
+  if (!thread.environmentId || environment.id !== thread.environmentId || environment.projectId !== request.projectId) {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "environment context does not match the holder thread and project");
+  }
+  if (environment.status !== "ready" || !environment.path || !environment.managed || !environment.isGitRepo || !environment.isWorktree || environment.workspaceProvisionType !== "managed-worktree") {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "holder environment is not an exact ready managed worktree");
+  }
+  const sources = project.sources.filter(
+    (source2) => source2.projectId === request.projectId && source2.hostId === environment.hostId && source2.path === environment.path
+  );
+  if (sources.length !== 1) throw refusal("ROLE_CONTEXT_FOREIGN", "project source does not resolve uniquely by exact host and path");
+  if (host.id !== environment.hostId || host.status !== "connected") throw refusal("ROLE_CONTEXT_UNKNOWN", "holder host is unavailable");
+  if (!stringField(bbVersion) || !stringField(bbServerId) || events.length === 0 || events.length > 256) {
+    throw refusal("ROLE_CONTEXT_UNKNOWN", "bounded BB version or event facts are unavailable");
+  }
+  for (let index = 1; index < events.length; index += 1) {
+    if (events[index].seq <= events[index - 1].seq) throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "BB event ordering is ambiguous");
+  }
+  const requestEvents = events.filter(
+    (event) => event.id === request.roleContext.requestEventId && event.seq === request.roleContext.requestEventSeq && event.type === "client/turn/requested"
+  );
+  if (requestEvents.length !== 1) throw refusal("EXECUTION_PROFILE_UNKNOWN", "the exact execution-bearing request event is unavailable");
+  const requestEvent = requestEvents[0];
+  const execution = requestEvent.data.execution;
+  const requestId = stringField(requestEvent.data.requestId);
+  if (!execution || !requestId) throw refusal("EXECUTION_PROFILE_UNKNOWN", "execution request correlation is incomplete");
+  const model = stringField(execution.model);
+  const reasoningLevel = stringField(execution.reasoningLevel);
+  const permissionMode = stringField(execution.permissionMode);
+  const serviceTier = stringField(execution.serviceTier);
+  const executionSource = stringField(execution.source);
+  if (!model || !reasoningLevel || !permissionMode || !serviceTier || !executionSource) {
+    throw refusal("EXECUTION_PROFILE_UNKNOWN", "execution profile fields are incomplete");
+  }
+  const accepted = events.filter(
+    (event) => event.type === "turn/input/accepted" && event.data.clientRequestId === requestId
+  );
+  if (accepted.length !== 1) throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "execution input correlation is missing or ambiguous");
+  const acceptedEvent = accepted[0];
+  const providerThreadId = stringField(acceptedEvent.data.providerThreadId);
+  if (!providerThreadId) throw refusal("EXECUTION_PROFILE_UNKNOWN", "provider thread correlation is unavailable");
+  const starts = events.filter((event) => event.type === "turn/started" && event.data.providerThreadId === providerThreadId);
+  if (starts.length !== 1) throw refusal("EXECUTION_PROFILE_UNKNOWN", "correlated execution start is missing or ambiguous");
+  const startEvent = starts[0];
+  const completions = events.filter((event) => event.type === "turn/completed" && event.data.providerThreadId === providerThreadId);
+  if (completions.length !== 1) throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "correlated execution completion is missing or ambiguous");
+  const completion = completions[0];
+  if (completion.id !== request.roleContext.completionEventId || completion.seq !== request.roleContext.completionEventSeq) {
+    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion does not match the exact requested correlation");
+  }
+  if (completion.data.status !== "completed") throw refusal("EXECUTION_PROFILE_UNKNOWN", "execution did not complete successfully");
+  if (events.some((event) => event.type === "provider/modelFallback" && event.data.providerThreadId === providerThreadId)) {
+    throw refusal("EXECUTION_PROFILE_UNKNOWN", "model fallback has no final unambiguous executed profile");
+  }
+  const profile = {
+    providerId: thread.providerId,
+    model,
+    reasoningLevel,
+    permissionMode,
+    serviceTier,
+    visibility: thread.visibility
+  };
+  const permissionRank = { "accept-edits": 0, auto: 1, full: 2 };
+  if ((permissionRank[profile.permissionMode] ?? 99) > (permissionRank[host.maxPermissionMode] ?? -1)) {
+    throw refusal("EXECUTION_PROFILE_MISMATCH", "executed permission exceeds the host permission ceiling");
+  }
+  const source = sources[0];
+  const baseContext = {
+    project: { id: project.id, kind: project.kind, gitRemoteUrl: project.gitRemoteUrl },
+    thread: { id: thread.id, projectId: thread.projectId, providerId: thread.providerId, status: thread.status, visibility: thread.visibility },
+    environment: {
+      id: environment.id,
+      projectId: environment.projectId,
+      hostId: environment.hostId,
+      path: environment.path,
+      managed: environment.managed,
+      isGitRepo: environment.isGitRepo,
+      isWorktree: environment.isWorktree,
+      workspaceProvisionType: environment.workspaceProvisionType,
+      branchName: environment.branchName,
+      baseBranch: environment.baseBranch,
+      defaultBranch: environment.defaultBranch,
+      mergeBaseBranch: environment.mergeBaseBranch,
+      status: environment.status
+    },
+    source: { id: source.id, projectId: source.projectId, hostId: source.hostId, path: source.path },
+    host: { id: host.id, status: host.status, maxPermissionMode: host.maxPermissionMode },
+    execution: {
+      providerThreadId,
+      requestId,
+      requestEventId: requestEvent.id,
+      requestEventSeq: requestEvent.seq,
+      acceptedEventId: acceptedEvent.id,
+      acceptedEventSeq: acceptedEvent.seq,
+      startEventId: startEvent.id,
+      startEventSeq: startEvent.seq,
+      completionEventId: completion.id,
+      completionEventSeq: completion.seq,
+      source: executionSource
+    },
+    bbVersion,
+    bbServerId,
+    pluginSdkVersion: PLUGIN_SDK_VERSION
+  };
+  const holderExecutionAttemptId = sha256(canonicalJson({
+    projectId: request.projectId,
+    bbServerId,
+    threadId: thread.id,
+    environmentId: environment.id,
+    providerThreadId,
+    requestId,
+    requestEventId: requestEvent.id,
+    requestEventSeq: requestEvent.seq,
+    completionEventId: completion.id,
+    completionEventSeq: completion.seq
+  }));
+  return {
+    profile,
+    profileDigest: sha256(canonicalJson(profile)),
+    baseContext,
+    holderExecutionAttemptId,
+    threadId: thread.id,
+    environmentId: environment.id,
+    sourceId: source.id,
+    hostId: host.id,
+    providerThreadId,
+    requestEventId: requestEvent.id,
+    requestEventSeq: requestEvent.seq,
+    completionEventId: completion.id,
+    completionEventSeq: completion.seq,
+    bbVersion,
+    bbServerId,
+    nativeRequestId: requestId,
+    acceptedEventId: acceptedEvent.id,
+    acceptedEventSeq: acceptedEvent.seq,
+    startEventId: startEvent.id,
+    startEventSeq: startEvent.seq
+  };
+}
+var GitHubIssueAdapterError = class extends Error {
+  constructor(kind) {
+    super(kind);
+    this.kind = kind;
+    this.name = "GitHubIssueAdapterError";
+  }
+  kind;
+};
 var Refusal = class extends Error {
   data;
   constructor(data) {
@@ -14980,6 +15158,66 @@ function stableValue(value, path = "$", seen = /* @__PURE__ */ new Set()) {
 function canonicalJson(value) {
   return JSON.stringify(stableValue(value));
 }
+function validateConfig(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw refusal("MALFORMED_JSON", "config must be a JSON object");
+  }
+  const config2 = value;
+  assertNoSecretValues(value);
+  if (typeof config2.permissionMode !== "string" || typeof config2.visibility !== "string") {
+    throw refusal("INVALID_INPUT", "config must declare permissionMode and visibility explicitly");
+  }
+  if (!["full", "auto", "accept-edits"].includes(config2.permissionMode)) {
+    throw refusal("INVALID_INPUT", "config permissionMode is not a BB permission mode");
+  }
+  if (!["visible", "hidden"].includes(config2.visibility)) {
+    throw refusal("INVALID_INPUT", "config visibility is not a BB visibility value");
+  }
+  const extensions = config2.extensions;
+  if (extensions !== void 0) {
+    if (extensions === null || typeof extensions !== "object" || Array.isArray(extensions)) {
+      throw refusal("INVALID_INPUT", "config extensions must be an object");
+    }
+    const bbCollab = extensions.bbCollab;
+    if (bbCollab !== void 0) {
+      if (bbCollab === null || typeof bbCollab !== "object" || Array.isArray(bbCollab)) {
+        throw refusal("INVALID_INPUT", "config extensions.bbCollab must be an object");
+      }
+      const githubIssues = bbCollab.githubIssues;
+      if (githubIssues !== void 0) {
+        const parsed = githubIssuesConfigSchema.safeParse(githubIssues);
+        if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
+      }
+      const roleRequirements = bbCollab.roleRequirements;
+      if (roleRequirements !== void 0) {
+        const parsed = roleRequirementsSchema.safeParse(roleRequirements);
+        if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
+      }
+      const writingLaneCeiling = bbCollab.writingLaneCeiling;
+      if (writingLaneCeiling !== void 0 && (!Number.isInteger(writingLaneCeiling) || Number(writingLaneCeiling) < 0 || Number(writingLaneCeiling) > 2)) {
+        throw refusal("INVALID_INPUT", "writingLaneCeiling must be an integer from 0 through 2");
+      }
+      const reviewPolicy = bbCollab.reviewPolicy;
+      if (reviewPolicy !== void 0) {
+        const parsed = reviewPolicySchema.safeParse(reviewPolicy);
+        if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
+      }
+    }
+  }
+  const json2 = canonicalJson(value);
+  if (Buffer.byteLength(json2, "utf8") > 64 * 1024) {
+    throw refusal("MALFORMED_JSON", "config exceeds 64 KiB");
+  }
+  return json2;
+}
+function githubConfigFromJson(configJson) {
+  const config2 = JSON.parse(configJson);
+  const value = config2.extensions?.bbCollab?.githubIssues;
+  if (value === void 0) return null;
+  const parsed = githubIssuesConfigSchema.safeParse(value);
+  if (!parsed.success) throw refusal("INVALID_INPUT", "stored GitHub Issues config is invalid");
+  return parsed.data;
+}
 function roleRequirementsFromJson(configJson) {
   const config2 = JSON.parse(configJson);
   const value = config2.extensions?.bbCollab?.roleRequirements;
@@ -14992,6 +15230,48 @@ function writingLaneCeilingFromJson(configJson) {
   const config2 = JSON.parse(configJson);
   const value = config2.extensions?.bbCollab?.writingLaneCeiling;
   return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 2 ? value : 2;
+}
+function reviewPolicyFromJson(configJson) {
+  const config2 = JSON.parse(configJson);
+  const value = config2.extensions?.bbCollab?.reviewPolicy;
+  if (value === void 0) return null;
+  const parsed = reviewPolicySchema.safeParse(value);
+  if (!parsed.success) throw refusal("INVALID_INPUT", "stored review policy is invalid");
+  return parsed.data;
+}
+function requireMappedTargets(configJson, targets) {
+  const github = githubConfigFromJson(configJson);
+  const targetIds = new Set(targets.map((target) => target.repoTargetId));
+  if (github?.repositoryMappings.some((mapping) => !targetIds.has(mapping.repoTargetId))) {
+    throw refusal("REPO_TARGET_FOREIGN", "GitHub repository mapping names a target outside the config revision");
+  }
+  if (roleRequirementsFromJson(configJson).some((requirement) => requirement.repoTargetId && !targetIds.has(requirement.repoTargetId))) {
+    throw refusal("REPO_TARGET_FOREIGN", "role requirement names a target outside the config revision");
+  }
+  if (reviewPolicyFromJson(configJson)?.connectors.some((connector) => !targetIds.has(connector.repoTargetId))) {
+    throw refusal("REPO_TARGET_FOREIGN", "review connector mapping names a target outside the config revision");
+  }
+}
+function assertNoSecretValues(value, path = "config") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoSecretValues(item, `${path}[${index}]`));
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, child] of Object.entries(value)) {
+    if (/(?:secret|password|token|api[-_]?key|private[-_]?key)/iu.test(key) && !/ref$/iu.test(key)) {
+      throw refusal("CONFIG_SECRET_FORBIDDEN", `config secret material is not allowed at ${path}.${key}`);
+    }
+    assertNoSecretValues(child, `${path}.${key}`);
+  }
+}
+function boundedCanonicalObject(value, label, maxBytes = 16 * 1024) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw refusal("MALFORMED_JSON", `${label} must be a JSON object`);
+  }
+  const json2 = canonicalJson(value);
+  if (Buffer.byteLength(json2, "utf8") > maxBytes) throw refusal("MALFORMED_JSON", `${label} exceeds ${maxBytes} bytes`);
+  return json2;
 }
 function assertRedactedEvidence(value, path) {
   if (Array.isArray(value)) {
@@ -15006,10 +15286,30 @@ function assertRedactedEvidence(value, path) {
     assertRedactedEvidence(child, `${path}.${key}`);
   }
 }
+function parseCanonicalEvidenceJson(text, label) {
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw refusal("MALFORMED_JSON", `${label} is not valid JSON`);
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw refusal("MALFORMED_JSON", `${label} must be a JSON object`);
+  }
+  const json2 = canonicalJson(value);
+  if (Buffer.byteLength(json2, "utf8") > 16 * 1024) {
+    throw refusal("EVIDENCE_REDACTION_INVALID", `${label} exceeds 16384 bytes`);
+  }
+  if (json2 !== text) throw refusal("EVIDENCE_REDACTION_INVALID", `${label} must be canonical JSON`);
+  assertRedactedEvidence(value, label);
+  return { value, json: json2 };
+}
 function normalizeRequest(request) {
   return {
     ...request,
     actorReceiptId: request.actorReceiptId ?? null,
+    operatorReceiptId: request.operatorReceiptId ?? null,
+    candidateHead: request.candidateHead ?? null,
     expectedConfigRevision: request.expectedConfigRevision ?? null,
     configRevision: request.configRevision ?? null,
     expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? null,
@@ -15123,14 +15423,984 @@ function persistInterimOperatorReceipt(db, input, createdAtMs = now()) {
     createdAtMs
   };
 }
+function refusalResult(subject, data, expected = 1, attempted = 0, verified = 0) {
+  return result(data.code, subject, data.expected ?? expected, data.attempted ?? attempted, data.verified ?? verified, {
+    message: data.message,
+    ...data.currentConfigRevision === void 0 ? {} : { currentConfigRevision: data.currentConfigRevision },
+    ...data.expectedConfigRevision === void 0 ? {} : { expectedConfigRevision: data.expectedConfigRevision },
+    ...data.currentGovernanceEpoch === void 0 ? {} : { currentGovernanceEpoch: data.currentGovernanceEpoch },
+    ...data.expectedGovernanceEpoch === void 0 ? {} : { expectedGovernanceEpoch: data.expectedGovernanceEpoch },
+    ...data.currentResourceRevision === void 0 ? {} : { currentResourceRevision: data.currentResourceRevision },
+    ...data.expectedResourceRevision === void 0 ? {} : { expectedResourceRevision: data.expectedResourceRevision }
+  });
+}
+function requestDigest(request) {
+  const digestable = Object.fromEntries(Object.entries(request).filter(([, value]) => value !== void 0));
+  return sha256(canonicalJson(digestable));
+}
 function now() {
   return Date.now();
+}
+function newFenceToken() {
+  return randomBytes(24).toString("hex");
 }
 function asRow(row) {
   return row;
 }
+function transaction(db, fn) {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const value = fn();
+    db.exec("COMMIT");
+    return value;
+  } catch (error48) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+    }
+    throw error48;
+  }
+}
 function currentConfig(db, projectId) {
   return asRow(db.prepare("SELECT config_revision FROM project_config_heads WHERE project_id = ?").get(projectId));
+}
+function requireConfig(db, request) {
+  const head = currentConfig(db, request.projectId);
+  if (!head) throw refusal("PROJECT_CONFIG_REQUIRED", "project has no stored config revision");
+  if (request.expectedConfigRevision !== head.config_revision) {
+    throw refusal("PROJECT_CONFIG_STALE", "expected config revision does not match the current head", {
+      currentConfigRevision: head.config_revision,
+      expectedConfigRevision: request.expectedConfigRevision ?? void 0
+    });
+  }
+  return head.config_revision;
+}
+function requireActor(db, request) {
+  if (!request.actorReceiptId) throw refusal("ACTOR_RECEIPT_REQUIRED", "a typed actor receipt is required");
+  const row = asRow(
+    db.prepare("SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, receipt_digest FROM actor_receipts WHERE receipt_id = ?").get(request.actorReceiptId)
+  );
+  if (!row) throw refusal("ACTOR_RECEIPT_UNKNOWN", "actor receipt is not known");
+  if (row.project_id !== request.projectId) throw refusal("ACTOR_RECEIPT_FOREIGN", "actor receipt belongs to another project");
+  if (row.verification_state !== "verified") throw refusal("ACTOR_RECEIPT_UNVERIFIED", "actor receipt is not verified");
+  const expectedDigest = sha256(
+    canonicalJson({
+      projectId: row.project_id,
+      receiptId: request.actorReceiptId,
+      actorKind: row.actor_kind,
+      subjectId: row.subject_id,
+      roleId: row.role_id,
+      roleGeneration: row.role_generation,
+      verificationState: row.verification_state
+    })
+  );
+  if (row.receipt_digest !== expectedDigest) throw refusal("ACTOR_RECEIPT_UNVERIFIED", "actor receipt digest is invalid");
+  return request.actorReceiptId;
+}
+function requireGovernor(db, request) {
+  const head = asRow(
+    db.prepare("SELECT governance_epoch, fence_token, state FROM project_governorship_heads WHERE project_id = ?").get(request.projectId)
+  );
+  if (!head) throw refusal("GOVERNOR_UNAVAILABLE", "project has no current governorship head");
+  if (request.expectedGovernanceEpoch !== head.governance_epoch || request.expectedFenceToken !== head.fence_token) {
+    throw refusal("GOVERNOR_EPOCH_STALE", "expected governorship epoch or fence token is stale", {
+      currentGovernanceEpoch: head.governance_epoch,
+      expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? void 0
+    });
+  }
+  if (head.state !== "target_active") throw refusal("PROJECT_FROZEN", "project governorship is not writable");
+  return head;
+}
+function targetDigest(target) {
+  return sha256(
+    canonicalJson({
+      repoTargetId: target.repoTargetId,
+      sourceId: target.sourceId,
+      hostId: target.hostId,
+      path: target.path,
+      remoteUrl: target.remoteUrl,
+      defaultBranch: target.defaultBranch
+    })
+  );
+}
+function requireTargetCollection(request, operation) {
+  const targets = request.targets;
+  if (!targets || targets.length === 0) {
+    throw refusal("REPO_TARGET_REQUIRED", `${operation} requires one or more exact repository targets`);
+  }
+  if (request.repoTargetId && !targets.some((target) => target.repoTargetId === request.repoTargetId)) {
+    throw refusal("REPO_TARGET_FOREIGN", "repository target selector is not present in the target collection");
+  }
+  return targets;
+}
+function requireTarget(db, projectId, configRevision, targetId) {
+  const current = db.prepare("SELECT * FROM repository_targets WHERE project_id = ? AND config_revision = ? ORDER BY repo_target_id").all(projectId, configRevision);
+  if (!targetId) {
+    if (current.length > 1) throw refusal("REPO_TARGET_AMBIGUOUS", "an exact repository target is required");
+    throw refusal("REPO_TARGET_REQUIRED", "an exact repository target is required");
+  }
+  const found = asRow(
+    db.prepare(
+      "SELECT * FROM repository_targets WHERE project_id = ? AND repo_target_id = ? AND config_revision = ?"
+    ).get(projectId, targetId, configRevision)
+  );
+  if (found) return found;
+  const sameProject = asRow(
+    db.prepare("SELECT config_revision FROM repository_targets WHERE project_id = ? AND repo_target_id = ? ORDER BY config_revision DESC LIMIT 1").get(projectId, targetId)
+  );
+  if (sameProject) throw refusal("REPO_TARGET_STALE", "repository target is not registered in the expected config revision");
+  throw refusal("REPO_TARGET_FOREIGN", "repository target is not registered for this project");
+}
+function checkIdempotency(db, request, digest) {
+  const row = asRow(
+    db.prepare("SELECT request_digest, outcome_json FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?").get(
+      request.projectId,
+      request.idempotencyKey
+    )
+  );
+  if (!row) return null;
+  if (row.request_digest !== digest) {
+    throw refusal("IDEMPOTENCY_KEY_CONFLICT", "idempotency key was already used for another request");
+  }
+  return JSON.parse(row.outcome_json);
+}
+function nextEventSequence(db, projectId) {
+  const row = asRow(
+    db.prepare("SELECT COALESCE(MAX(event_sequence), 0) + 1 AS next_sequence FROM state_events WHERE project_id = ?").get(projectId)
+  );
+  return row?.next_sequence ?? 1;
+}
+function nextAggregateRevision(db, projectId, aggregateType, aggregateId) {
+  return asRow(db.prepare(
+    `SELECT COALESCE(MAX(aggregate_revision), 0) + 1 AS next_revision
+     FROM state_events WHERE project_id = ? AND aggregate_type = ? AND aggregate_id = ?`
+  ).get(projectId, aggregateType, aggregateId))?.next_revision ?? 1;
+}
+function appendStateEvent(db, request, actorReceiptId, event) {
+  const eventSequence = nextEventSequence(db, request.projectId);
+  const createdAtMs = now();
+  db.prepare(
+    `INSERT INTO state_events (
+      project_id, event_sequence, aggregate_type, aggregate_id, aggregate_revision,
+      event_type, actor_receipt_id, idempotency_key, event_json, created_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    request.projectId,
+    eventSequence,
+    event.aggregateType,
+    event.aggregateId,
+    event.aggregateRevision,
+    event.eventType,
+    actorReceiptId,
+    request.idempotencyKey,
+    canonicalJson(event.event),
+    createdAtMs
+  );
+  return { eventSequence, createdAtMs };
+}
+function commitMutation(db, request, digest, actorReceiptId, event, counts, extra = {}, outcome = "OK") {
+  const { eventSequence, createdAtMs } = appendStateEvent(db, request, actorReceiptId, event);
+  const mutationReceipt = {
+    projectId: request.projectId,
+    idempotencyKey: request.idempotencyKey,
+    operationClass: request.operationClass,
+    requestDigest: digest,
+    committedEventSequence: eventSequence,
+    createdAtMs
+  };
+  const output = result(outcome, request.projectId, counts.expected, counts.attempted, counts.verified, {
+    ...extra,
+    mutationReceipt,
+    eventSequence
+  });
+  db.prepare(
+    `INSERT INTO mutation_receipts (
+      project_id, idempotency_key, operation_class, request_digest,
+      outcome_json, committed_event_sequence, created_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    request.projectId,
+    request.idempotencyKey,
+    request.operationClass,
+    digest,
+    canonicalJson(output),
+    eventSequence,
+    createdAtMs
+  );
+  return output;
+}
+function applyBootstrap(db, request, digest) {
+  if (request.expectedConfigRevision !== null) {
+    throw refusal("PROJECT_CONFIG_STALE", "bootstrap requires an empty config head");
+  }
+  if (request.configRevision !== null && request.configRevision !== 1) {
+    throw refusal("PROJECT_CONFIG_STALE", "bootstrap config revision must be 1", {
+      expectedConfigRevision: 1
+    });
+  }
+  if (request.expectedGovernanceEpoch !== null || request.expectedFenceToken !== null) {
+    throw refusal("GOVERNOR_CAS_FAILED", "bootstrap requires an empty governorship head");
+  }
+  const actorReceiptId = requireActor(db, request);
+  const config2 = request.config === void 0 ? void 0 : validateConfig(request.config);
+  if (!config2) throw refusal("INVALID_INPUT", "bootstrap requires a config object");
+  const targets = requireTargetCollection(request, "bootstrap");
+  requireMappedTargets(config2, targets);
+  const existingConfig = currentConfig(db, request.projectId);
+  const existingGovernor = db.prepare("SELECT 1 FROM project_governorship_heads WHERE project_id = ?").get(request.projectId);
+  if (existingConfig || existingGovernor) throw refusal("GOVERNOR_CAS_FAILED", "bootstrap head already exists");
+  const createdAtMs = now();
+  db.prepare(
+    `INSERT INTO project_config_revisions
+      (project_id, config_revision, canonical_config_json, config_digest, created_at_ms)
+     VALUES (?, 1, ?, ?, ?)`
+  ).run(request.projectId, config2, sha256(config2), createdAtMs);
+  db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, ?)").run(
+    request.projectId,
+    createdAtMs
+  );
+  const insertTarget = db.prepare(
+    `INSERT INTO repository_targets
+      (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest)
+     VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)`
+  );
+  for (const target of targets) {
+    insertTarget.run(
+      request.projectId,
+      target.repoTargetId,
+      target.sourceId,
+      target.hostId,
+      target.path,
+      target.remoteUrl,
+      target.defaultBranch,
+      targetDigest(target)
+    );
+  }
+  const fenceToken = newFenceToken();
+  db.prepare(
+    `INSERT INTO project_governorships
+      (project_id, governance_epoch, runtime_id, state, fence_token, actor_receipt_id, predecessor_epoch, created_at_ms)
+     VALUES (?, 1, ?, 'target_active', ?, ?, NULL, ?)`
+  ).run(request.projectId, request.runtimeId ?? PLUGIN_ID, fenceToken, actorReceiptId, createdAtMs);
+  db.prepare(
+    `INSERT INTO project_governorship_heads
+      (project_id, governance_epoch, fence_token, state, updated_at_ms)
+     VALUES (?, 1, ?, 'target_active', ?)`
+  ).run(request.projectId, fenceToken, createdAtMs);
+  if (request.decision) {
+    const decision = request.decision;
+    if (decision.resourceRevision !== 1) throw refusal("DECISION_IDENTITY_CONFLICT", "new decisions begin at resource revision 1");
+    if (decision.repoTargetId !== null && !targets.some((target) => target.repoTargetId === decision.repoTargetId)) {
+      throw refusal("REPO_TARGET_FOREIGN", "decision target does not match bootstrap target");
+    }
+    const identity = decisionIdentity(request.projectId, 1, decision);
+    if (identity.decisionClass === "review_adjudication") {
+      throw refusal("WORK_ITEM_UNKNOWN", "review Decisions require an existing exact WorkItem and cannot be bootstrapped");
+    }
+    db.prepare(
+      `INSERT INTO decisions
+        (decision_id, project_id, config_revision, repo_target_id, scope_json, scope_digest,
+         current_resource_revision, decision_class, options_json, decision_identity_digest)
+       VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      decision.decisionId,
+      request.projectId,
+      decision.repoTargetId,
+      identity.scopeJson,
+      sha256(identity.scopeJson),
+      decision.resourceRevision,
+      identity.decisionClass,
+      identity.optionsJson,
+      identity.identityDigest
+    );
+  }
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "project",
+      aggregateId: request.projectId,
+      aggregateRevision: 1,
+      eventType: "foundation_bootstrapped",
+      event: { configRevision: 1, repoTargetIds: targets.map((target) => target.repoTargetId), governanceEpoch: 1 }
+    },
+    { expected: targets.length + 2, attempted: targets.length + 2, verified: targets.length + 2 },
+    {
+      currentConfigRevision: 1,
+      currentGovernanceEpoch: 1,
+      evidence: {
+        configDigest: sha256(config2),
+        targetDigests: targets.map((target) => ({ repoTargetId: target.repoTargetId, digest: targetDigest(target) })),
+        fenceToken
+      }
+    }
+  );
+}
+function applyConfigRevision(db, request, digest) {
+  const currentRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  if (!request.config || !request.targets) {
+    requireTarget(db, request.projectId, currentRevision, request.repoTargetId);
+    throw refusal("INVALID_INPUT", "config revision requires config and target collection");
+  }
+  const configJson = validateConfig(request.config);
+  const targets = requireTargetCollection(request, "config revision");
+  requireMappedTargets(configJson, targets);
+  const nextRevision = currentRevision + 1;
+  if (request.configRevision !== null && request.configRevision !== nextRevision) {
+    throw refusal("PROJECT_CONFIG_STALE", "new config revision is not the next immutable revision", {
+      currentConfigRevision: currentRevision,
+      expectedConfigRevision: nextRevision
+    });
+  }
+  const createdAtMs = now();
+  db.prepare(
+    `INSERT INTO project_config_revisions
+      (project_id, config_revision, canonical_config_json, config_digest, created_at_ms)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(request.projectId, nextRevision, configJson, sha256(configJson), createdAtMs);
+  const insertTarget = db.prepare(
+    `INSERT INTO repository_targets
+      (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  for (const target of targets) {
+    insertTarget.run(
+      request.projectId,
+      target.repoTargetId,
+      nextRevision,
+      target.sourceId,
+      target.hostId,
+      target.path,
+      target.remoteUrl,
+      target.defaultBranch,
+      targetDigest(target)
+    );
+  }
+  const headUpdate = db.prepare(
+    "UPDATE project_config_heads SET config_revision = ?, updated_at_ms = ? WHERE project_id = ? AND config_revision = ?"
+  ).run(nextRevision, createdAtMs, request.projectId, currentRevision);
+  if (headUpdate.changes !== 1) {
+    throw refusal("PROJECT_CONFIG_STALE", "config head compare-and-swap failed", {
+      currentConfigRevision: currentRevision,
+      expectedConfigRevision: currentRevision
+    });
+  }
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "project_config",
+      aggregateId: request.projectId,
+      aggregateRevision: nextRevision,
+      eventType: "config_revision_appended",
+      event: { configRevision: nextRevision, repoTargetIds: targets.map((target) => target.repoTargetId), previousGovernorEpoch: governor.governance_epoch }
+    },
+    { expected: targets.length + 1, attempted: targets.length + 1, verified: targets.length + 1 },
+    { currentConfigRevision: nextRevision, currentGovernanceEpoch: governor.governance_epoch }
+  );
+}
+function applyGovernorClaim(db, request, digest) {
+  const currentRevision = requireConfig(db, request);
+  const currentHead = asRow(
+    db.prepare("SELECT governance_epoch, fence_token, state FROM project_governorship_heads WHERE project_id = ?").get(request.projectId)
+  );
+  if (!currentHead) throw refusal("GOVERNOR_UNAVAILABLE", "project has no current governorship head");
+  if (currentHead.state !== "target_active") throw refusal("PROJECT_FROZEN", "project governorship is not writable");
+  const expectedEpoch = request.expectedGovernanceEpoch;
+  const expectedToken = request.expectedFenceToken;
+  if (expectedEpoch === null || expectedEpoch === void 0 || expectedToken === null || expectedToken === void 0) {
+    throw refusal("GOVERNOR_EPOCH_STALE", "governor claim requires an expected epoch and fence token", {
+      currentGovernanceEpoch: currentHead.governance_epoch,
+      expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? void 0
+    });
+  }
+  const actorReceiptId = requireActor(db, request);
+  const nextEpoch = expectedEpoch + 1;
+  const nextToken = newFenceToken();
+  try {
+    db.prepare(
+      `INSERT INTO project_governorships
+        (project_id, governance_epoch, runtime_id, state, fence_token, actor_receipt_id, predecessor_epoch, created_at_ms)
+       VALUES (?, ?, ?, 'target_active', ?, ?, ?, ?)`
+    ).run(
+      request.projectId,
+      nextEpoch,
+      request.runtimeId ?? PLUGIN_ID,
+      nextToken,
+      actorReceiptId,
+      expectedEpoch,
+      now()
+    );
+  } catch (error48) {
+    if (isConstraintError(error48)) throw refusal("GOVERNOR_CAS_FAILED", "governorship claim lost its compare-and-swap race");
+    throw error48;
+  }
+  const headUpdate = db.prepare(
+    `UPDATE project_governorship_heads
+       SET governance_epoch = ?, fence_token = ?, state = 'target_active', updated_at_ms = ?
+       WHERE project_id = ? AND governance_epoch = ? AND fence_token = ?`
+  ).run(nextEpoch, nextToken, now(), request.projectId, expectedEpoch, expectedToken);
+  if (headUpdate.changes !== 1) throw refusal("GOVERNOR_CAS_FAILED", "governorship head compare-and-swap failed");
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "project_governorship",
+      aggregateId: request.projectId,
+      aggregateRevision: nextEpoch,
+      eventType: "governorship_claimed",
+      event: { governanceEpoch: nextEpoch, predecessorEpoch: expectedEpoch }
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    { currentConfigRevision: currentRevision, currentGovernanceEpoch: nextEpoch, evidence: { fenceToken: nextToken } }
+  );
+}
+function exactGovernor(db, request) {
+  const head = asRow(
+    db.prepare("SELECT governance_epoch, fence_token, state FROM project_governorship_heads WHERE project_id = ?").get(request.projectId)
+  );
+  if (!head) throw refusal("GOVERNOR_UNAVAILABLE", "project has no current governorship head");
+  if (request.expectedGovernanceEpoch !== head.governance_epoch || request.expectedFenceToken !== head.fence_token) {
+    throw refusal("GOVERNOR_EPOCH_STALE", "expected governorship epoch or fence token is stale", {
+      currentGovernanceEpoch: head.governance_epoch,
+      expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? void 0
+    });
+  }
+  return head;
+}
+function migrationTargetDigest(db, projectId, configRevision) {
+  const targets = db.prepare(
+    `SELECT repo_target_id, source_id, host_id, path, remote_url, default_branch, target_digest
+     FROM repository_targets WHERE project_id = ? AND config_revision = ? ORDER BY repo_target_id`
+  ).all(projectId, configRevision);
+  if (targets.length === 0) throw refusal("REPO_TARGET_REQUIRED", "migration requires exact configured repository targets");
+  return sha256(canonicalJson(targets));
+}
+function requireAdoptedMigrationDecision(db, projectId, configRevision, decisionId, dispositionSequence) {
+  const decision = asRow(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decisionId));
+  if (!decision || decision.project_id !== projectId) throw refusal("RESOURCE_UNKNOWN", "authorizing Decision is not known in this project");
+  if (decision.config_revision !== configRevision) throw refusal("PROJECT_CONFIG_STALE", "authorizing Decision config revision is stale");
+  if (!decision.decision_class || !decision.options_json || !decision.decision_identity_digest || decision.scope_digest !== sha256(decision.scope_json) || storedDecisionIdentityDigest(decision) !== decision.decision_identity_digest) throw refusal("INVALID_INPUT", "authorizing Decision identity is invalid");
+  const disposition = asRow(db.prepare(
+    `SELECT decision_dispositions.disposition, decision_dispositions.actor_receipt_id,
+            (SELECT MAX(latest.disposition_sequence) FROM decision_dispositions AS latest
+             WHERE latest.decision_id = decision_dispositions.decision_id) AS latest_sequence
+     FROM decision_dispositions WHERE decision_id = ? AND disposition_sequence = ?`
+  ).get(decisionId, dispositionSequence));
+  if (!disposition || disposition.disposition !== "adopted" || disposition.latest_sequence !== dispositionSequence) {
+    throw refusal("INVALID_INPUT", "migration requires the current adopted Decision disposition");
+  }
+  const actor = asRow(db.prepare(
+    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, receipt_digest FROM actor_receipts WHERE receipt_id = ?"
+  ).get(disposition.actor_receipt_id));
+  if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || !["role", "operator"].includes(actor.actor_kind) || actor.receipt_digest !== sha256(canonicalJson({
+    projectId: actor.project_id,
+    receiptId: disposition.actor_receipt_id,
+    actorKind: actor.actor_kind,
+    subjectId: actor.subject_id,
+    roleId: actor.role_id,
+    roleGeneration: actor.role_generation,
+    verificationState: actor.verification_state
+  }))) {
+    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "authorizing Decision actor receipt is not verified");
+  }
+}
+function rotateMigrationGovernor(db, request, actorReceiptId, head, runtimeId, state) {
+  const governanceEpoch = head.governance_epoch + 1;
+  const fenceToken = newFenceToken();
+  try {
+    db.prepare(
+      `INSERT INTO project_governorships
+        (project_id, governance_epoch, runtime_id, state, fence_token, actor_receipt_id, predecessor_epoch, created_at_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(request.projectId, governanceEpoch, runtimeId, state, fenceToken, actorReceiptId, head.governance_epoch, now());
+  } catch (error48) {
+    if (isConstraintError(error48)) throw refusal("GOVERNOR_CAS_FAILED", "migration governorship rotation lost its compare-and-swap race");
+    throw error48;
+  }
+  const updated = db.prepare(
+    `UPDATE project_governorship_heads SET governance_epoch = ?, fence_token = ?, state = ?, updated_at_ms = ?
+     WHERE project_id = ? AND governance_epoch = ? AND fence_token = ? AND state = ?`
+  ).run(governanceEpoch, fenceToken, state, now(), request.projectId, head.governance_epoch, head.fence_token, head.state);
+  if (updated.changes !== 1) throw refusal("GOVERNOR_CAS_FAILED", "migration governorship head compare-and-swap failed");
+  return { governanceEpoch, fenceToken };
+}
+function migrationEvent(step, priorState, next, stepProofDigest) {
+  return {
+    step,
+    priorState,
+    newState: next.state,
+    priorRevision: next.resource_revision - 1,
+    newRevision: next.resource_revision,
+    sourceGovernorEpoch: next.source_governor_epoch,
+    targetGovernorEpoch: next.target_governor_epoch,
+    sourceContractDigest: next.source_contract_digest,
+    sourceSchemaDigest: next.source_schema_digest,
+    sourceExportDigest: next.source_export_digest,
+    sourceSnapshotDigest: next.source_snapshot_digest,
+    mutatorInventoryDigest: next.mutator_inventory_digest,
+    quiescenceDigest: next.quiescence_digest,
+    importRootDigest: next.import_root_digest,
+    equivalenceDigest: next.equivalence_digest,
+    recoveryDigest: next.recovery_digest,
+    stepProofDigest
+  };
+}
+function validateMigrationExport(payload, projectId) {
+  if (!payload) throw refusal("IMPORT_EQUIVALENCE_FAILED", "migration step requires the deterministic fixture export");
+  const manifest = payload.manifest;
+  const expectedTables = Object.fromEntries(TABLES.map((table) => [table, manifest.tableCounts[table] ?? -1]));
+  if (manifest.schemaVersion !== SCHEMA_VERSION || manifest.contractVersion !== CONTRACT_VERSION || manifest.pluginId !== PLUGIN_ID || manifest.projectId !== projectId || canonicalJson(manifest.migrationStatementIds) !== canonicalJson(MIGRATIONS.map((_, index) => index)) || manifest.schemaDigest !== schemaDigest || manifest.contractDigest !== contractDigest || Object.keys(manifest.tableCounts).sort().join("\0") !== [...TABLES].sort().join("\0") || Object.values(expectedTables).some((count) => count < 0)) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export identity does not match the exact runtime/schema/project contract");
+  }
+  const lines = payload.recordsNdjson === "" ? [] : payload.recordsNdjson.split("\n");
+  const counts = Object.fromEntries(TABLES.map((table) => [table, 0]));
+  let lastTableIndex = -1;
+  for (const line of lines) {
+    let record2;
+    try {
+      record2 = JSON.parse(line);
+    } catch {
+      throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export contains malformed NDJSON");
+    }
+    if (canonicalJson(record2) !== line || typeof record2.table !== "string" || !TABLES.includes(record2.table)) {
+      throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export records are not canonical or reference an unknown table");
+    }
+    const tableIndex = TABLES.indexOf(record2.table);
+    if (tableIndex < lastTableIndex) throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export table order is not canonical");
+    lastTableIndex = tableIndex;
+    const row = record2.row;
+    if (!row || typeof row !== "object" || "project_id" in row && row.project_id !== projectId) {
+      throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export record references a foreign project");
+    }
+    counts[record2.table] = (counts[record2.table] ?? 0) + 1;
+  }
+  if (lines.length !== manifest.rowCount || canonicalJson(counts) !== canonicalJson(manifest.tableCounts)) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export counts do not match its records");
+  }
+  if (canonicalJson(payload.artifactIndex.map((artifact) => artifact.evidenceId)) !== canonicalJson(payload.artifactIndex.map((artifact) => artifact.evidenceId).sort()) || new Set(payload.artifactIndex.map((artifact) => artifact.evidenceId)).size !== payload.artifactIndex.length) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture artifact index is not sorted and unique");
+  }
+  for (const artifact of payload.artifactIndex) {
+    const redacted = parseCanonicalEvidenceJson(artifact.redactedJson, "migration artifact redacted metadata");
+    const durable = parseCanonicalEvidenceJson(artifact.durableRefJson, "migration artifact durable reference");
+    try {
+      if (sha256(redacted.json) !== artifact.redactedDigest || sha256(canonicalJson({
+        projectId,
+        evidenceId: artifact.evidenceId,
+        evidenceKind: artifact.evidenceKind,
+        sourceKind: artifact.sourceKind,
+        sourceRef: artifact.sourceRef,
+        executionAttemptId: artifact.executionAttemptId,
+        contentDigest: artifact.contentDigest,
+        redactedDigest: artifact.redactedDigest,
+        durableRef: durable.value
+      })) !== artifact.artifactIdentityDigest) throw new Error("digest mismatch");
+    } catch {
+      throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture artifact index contains invalid redacted or durable metadata");
+    }
+  }
+  const artifactIndexJson = canonicalJson(payload.artifactIndex);
+  const artifactIndexDigest = sha256(artifactIndexJson);
+  const recordsDigest = sha256(payload.recordsNdjson);
+  const rootInput = { ...manifest };
+  delete rootInput.exportRootDigest;
+  const expectedChecksums = {
+    "artifact-index.json": artifactIndexDigest,
+    "manifest.json": sha256(canonicalJson(manifest)),
+    "records.ndjson": recordsDigest
+  };
+  if (payload.artifactIndex.length !== manifest.tableCounts.evidence_artifacts || recordsDigest !== manifest.recordsDigest || artifactIndexDigest !== manifest.artifactIndexDigest || sha256(canonicalJson(rootInput)) !== manifest.exportRootDigest || canonicalJson(payload.checksums) !== canonicalJson(expectedChecksums) || Buffer.byteLength(payload.recordsNdjson, "utf8") + Buffer.byteLength(artifactIndexJson, "utf8") > MAX_EXPORT_BYTES) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export hashes, roots, or bounds do not verify");
+  }
+  return payload;
+}
+function applyMigrationPrepare(db, request, digest) {
+  const configRevision = requireConfig(db, request);
+  if (request.configRevision !== configRevision) throw refusal("PROJECT_CONFIG_STALE", "migration prepare must bind the current config revision");
+  const head = exactGovernor(db, request);
+  if (head.state !== "target_active") throw refusal("PROJECT_FROZEN", "migration prepare requires the current writable target fixture head");
+  const actorReceiptId = requireActor(db, request);
+  const migration = request.migration;
+  if (!migration || request.migrationStep) throw refusal("INVALID_INPUT", "migration_prepare requires one immutable MigrationRun input");
+  if (migration.targetRuntimeId !== PLUGIN_ID || migration.retentionUntilMs <= now()) {
+    throw refusal("INVALID_INPUT", "migration prepare requires the exact target runtime and future retention");
+  }
+  requireAdoptedMigrationDecision(
+    db,
+    request.projectId,
+    configRevision,
+    migration.decisionId,
+    migration.decisionDispositionSequence
+  );
+  if (db.prepare("SELECT 1 FROM migration_runs WHERE source_system = 'llm-collab' AND project_id = ? AND state NOT IN ('retired', 'rolled_back')").get(request.projectId)) {
+    throw refusal("INVALID_INPUT", "project already has an open MigrationRun");
+  }
+  const targetDigest2 = migrationTargetDigest(db, request.projectId, configRevision);
+  const governor = rotateMigrationGovernor(db, request, actorReceiptId, head, migration.sourceRuntimeId, "source_active");
+  const createdAtMs = now();
+  const run = {
+    migration_id: migration.migrationId,
+    project_id: request.projectId,
+    source_system: migration.sourceSystem,
+    source_runtime_id: migration.sourceRuntimeId,
+    target_runtime_id: migration.targetRuntimeId,
+    source_contract_digest: migration.sourceContractDigest,
+    source_schema_digest: migration.sourceSchemaDigest,
+    source_export_digest: null,
+    config_revision: configRevision,
+    decision_id: migration.decisionId,
+    decision_disposition_sequence: migration.decisionDispositionSequence,
+    state: "prepared",
+    resource_revision: 1,
+    source_event_ceiling: null,
+    source_snapshot_digest: migration.sourceSnapshotDigest,
+    source_governor_epoch: governor.governanceEpoch,
+    target_governor_epoch: head.governance_epoch,
+    mutator_inventory_digest: null,
+    quiescence_digest: null,
+    import_root_digest: null,
+    equivalence_digest: null,
+    recovery_digest: null,
+    retention_until_ms: migration.retentionUntilMs,
+    created_at_ms: createdAtMs,
+    updated_at_ms: createdAtMs
+  };
+  db.prepare(
+    `INSERT INTO migration_runs
+      (migration_id, project_id, source_system, source_runtime_id, target_runtime_id,
+       source_contract_digest, source_schema_digest, source_export_digest, config_revision,
+       decision_id, decision_disposition_sequence, state, resource_revision, source_event_ceiling,
+       source_snapshot_digest, source_governor_epoch, target_governor_epoch, mutator_inventory_digest,
+       quiescence_digest, import_root_digest, equivalence_digest, recovery_digest,
+       retention_until_ms, created_at_ms, updated_at_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)`
+  ).run(
+    run.migration_id,
+    run.project_id,
+    run.source_system,
+    run.source_runtime_id,
+    run.target_runtime_id,
+    run.source_contract_digest,
+    run.source_schema_digest,
+    run.config_revision,
+    run.decision_id,
+    run.decision_disposition_sequence,
+    run.state,
+    run.resource_revision,
+    run.source_snapshot_digest,
+    run.source_governor_epoch,
+    run.target_governor_epoch,
+    run.retention_until_ms,
+    run.created_at_ms,
+    run.updated_at_ms
+  );
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    { aggregateType: "migration_run", aggregateId: run.migration_id, aggregateRevision: 1, eventType: "migration_run_changed", event: migrationEvent("prepare", null, run, migration.sourceSnapshotDigest) },
+    { expected: 1, attempted: 1, verified: 1 },
+    {
+      currentConfigRevision: configRevision,
+      currentGovernanceEpoch: governor.governanceEpoch,
+      currentResourceRevision: 1,
+      evidence: { migrationId: run.migration_id, state: run.state, resourceRevision: 1, fenceToken: governor.fenceToken, repositoryTargetsDigest: targetDigest2 }
+    }
+  );
+}
+function requireCompleteCanaries(request) {
+  const canaries = request.migrationStep?.canaries;
+  if (!canaries || canaries.attempted !== canaries.expected || canaries.verified !== canaries.expected) {
+    throw refusal("SOURCE_FREEZE_UNPROVEN", "source mutator canaries are incomplete", {
+      expected: canaries?.expected ?? 1,
+      attempted: canaries?.attempted ?? 0,
+      verified: canaries?.verified ?? 0
+    });
+  }
+}
+function applyMigrationStep(db, request, digest) {
+  const configRevision = requireConfig(db, request);
+  const actorReceiptId = requireActor(db, request);
+  const step = request.migrationStep;
+  if (!step || request.migration) throw refusal("INVALID_INPUT", "migration_step requires one closed transition input");
+  const run = asRow(db.prepare("SELECT * FROM migration_runs WHERE project_id = ? AND migration_id = ?").get(request.projectId, step.migrationId));
+  if (!run) throw refusal("RESOURCE_UNKNOWN", "MigrationRun is not known in this project");
+  if (request.expectedResourceRevision !== run.resource_revision) {
+    throw refusal("RESOURCE_REVISION_STALE", "MigrationRun revision is stale", {
+      currentResourceRevision: run.resource_revision,
+      expectedResourceRevision: request.expectedResourceRevision ?? void 0
+    });
+  }
+  if (request.configRevision !== configRevision || run.config_revision !== configRevision) {
+    throw refusal("PROJECT_CONFIG_STALE", "MigrationRun config revision is stale");
+  }
+  requireAdoptedMigrationDecision(db, request.projectId, configRevision, run.decision_id, run.decision_disposition_sequence);
+  const head = exactGovernor(db, request);
+  const repositoryTargetsDigest = migrationTargetDigest(db, request.projectId, configRevision);
+  if (step.repositoryTargetsDigest !== repositoryTargetsDigest) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "repository target identity changed or is foreign");
+  }
+  if (["record_import", "record_equivalence", "activate"].includes(step.step) && run.retention_until_ms <= now()) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "MigrationRun retention expired before equivalence/activation");
+  }
+  const next = { ...run, resource_revision: run.resource_revision + 1, updated_at_ms: now() };
+  let eventStep = step.step;
+  let outcome = "OK";
+  let nextFenceToken = head.fence_token;
+  const requireState = (...states) => {
+    if (!states.includes(run.state)) throw refusal("INVALID_INPUT", `${step.step} is invalid from ${run.state}`);
+  };
+  const requireGovernorState = (...states) => {
+    if (!states.includes(head.state)) throw refusal("PROJECT_FROZEN", `${step.step} does not match the canonical governorship state`);
+  };
+  switch (step.step) {
+    case "record_inventory":
+      requireState("prepared");
+      requireGovernorState("source_active");
+      next.mutator_inventory_digest = step.proofDigest;
+      break;
+    case "record_quiescence":
+      requireState("prepared");
+      requireGovernorState("source_active");
+      next.quiescence_digest = step.proofDigest;
+      break;
+    case "freeze": {
+      requireState("prepared");
+      requireGovernorState("source_active");
+      if (!run.mutator_inventory_digest || !run.quiescence_digest) {
+        throw refusal("SOURCE_FREEZE_UNPROVEN", "inventory and quiescence proofs are required before freeze");
+      }
+      requireCompleteCanaries(request);
+      const governor = rotateMigrationGovernor(db, request, actorReceiptId, head, run.source_runtime_id, "frozen");
+      next.state = "frozen";
+      next.source_governor_epoch = governor.governanceEpoch;
+      nextFenceToken = governor.fenceToken;
+      break;
+    }
+    case "record_export": {
+      requireState("frozen");
+      requireGovernorState("frozen");
+      const exported = validateMigrationExport(step.export, request.projectId);
+      if (run.source_schema_digest !== exported.manifest.schemaDigest || run.source_contract_digest !== exported.manifest.contractDigest) {
+        throw refusal("IMPORT_EQUIVALENCE_FAILED", "source schema or contract digest does not match the fixture export");
+      }
+      const ceiling = step.sourceEventCeiling;
+      const currentCeiling = asRow(db.prepare("SELECT COALESCE(MAX(event_sequence), 0) AS event_sequence FROM state_events WHERE project_id = ?").get(request.projectId))?.event_sequence ?? 0;
+      if (ceiling === void 0 || ceiling !== currentCeiling || step.sourceSnapshotDigest !== run.source_snapshot_digest) {
+        throw refusal("IMPORT_EQUIVALENCE_FAILED", "source event ceiling or snapshot digest is not exact");
+      }
+      if (db.prepare("SELECT 1 FROM migration_runs WHERE source_system = ? AND project_id = ? AND source_export_digest = ? AND migration_id <> ?").get(run.source_system, run.project_id, exported.manifest.exportRootDigest, run.migration_id)) {
+        throw refusal("INVALID_INPUT", "final source export identity already belongs to another MigrationRun");
+      }
+      next.state = "exported";
+      next.source_event_ceiling = ceiling;
+      next.source_export_digest = exported.manifest.exportRootDigest;
+      break;
+    }
+    case "record_import": {
+      requireState("exported");
+      requireGovernorState("frozen");
+      const exported = validateMigrationExport(step.export, request.projectId);
+      const expectedRoot = sha256(canonicalJson({
+        sourceExportDigest: run.source_export_digest,
+        targetRuntimeId: run.target_runtime_id,
+        configRevision,
+        repositoryTargetsDigest
+      }));
+      if (exported.manifest.exportRootDigest !== run.source_export_digest || step.importRootDigest !== expectedRoot || step.proofDigest !== expectedRoot) {
+        throw refusal("IMPORT_EQUIVALENCE_FAILED", "import root does not bind the exact export/runtime/config/repository identity");
+      }
+      next.state = "imported";
+      next.import_root_digest = expectedRoot;
+      break;
+    }
+    case "record_equivalence": {
+      requireState("imported");
+      requireGovernorState("frozen");
+      const exported = validateMigrationExport(step.export, request.projectId);
+      const expectedDigest = sha256(canonicalJson({
+        sourceExportDigest: run.source_export_digest,
+        importRootDigest: run.import_root_digest,
+        sourceSnapshotDigest: run.source_snapshot_digest,
+        repositoryTargetsDigest
+      }));
+      if (exported.manifest.exportRootDigest !== run.source_export_digest || step.equivalenceDigest !== expectedDigest || step.proofDigest !== expectedDigest) {
+        throw refusal("IMPORT_EQUIVALENCE_FAILED", "equivalence proof does not bind exact hashes and references");
+      }
+      next.state = "equivalent";
+      next.equivalence_digest = expectedDigest;
+      break;
+    }
+    case "activate": {
+      requireState("equivalent");
+      requireGovernorState("frozen");
+      const governor = rotateMigrationGovernor(db, request, actorReceiptId, head, run.target_runtime_id, "target_active");
+      next.state = "target_active";
+      next.target_governor_epoch = governor.governanceEpoch;
+      nextFenceToken = governor.fenceToken;
+      break;
+    }
+    case "record_exercise":
+      requireState("target_active");
+      requireGovernorState("target_active");
+      next.state = "exercised";
+      break;
+    case "retire":
+      requireState("exercised");
+      requireGovernorState("target_active");
+      next.state = "retired";
+      break;
+    case "rollback":
+      if (["target_active", "exercised"].includes(run.state)) {
+        requireGovernorState("target_active");
+        if (!step.recoveryDigest || step.recoveryDigest !== step.proofDigest) throw refusal("INVALID_INPUT", "fix-forward requires exact recovery evidence");
+        next.state = "fix_forward_required";
+        next.recovery_digest = step.recoveryDigest;
+        eventStep = "mark_fix_forward_required";
+        outcome = "MIGRATION_FIX_FORWARD_REQUIRED";
+      } else {
+        requireState("prepared", "frozen", "exported", "imported", "equivalent");
+        requireGovernorState("source_active", "frozen");
+        if (!step.recoveryDigest || step.recoveryDigest !== step.proofDigest) throw refusal("INVALID_INPUT", "rollback requires exact recovery evidence");
+        const governor = rotateMigrationGovernor(db, request, actorReceiptId, head, run.source_runtime_id, "source_active");
+        next.state = "rolled_back";
+        next.source_governor_epoch = governor.governanceEpoch;
+        next.recovery_digest = step.recoveryDigest;
+        nextFenceToken = governor.fenceToken;
+      }
+      break;
+    case "mark_fix_forward_required":
+      requireState("target_active", "exercised");
+      requireGovernorState("target_active");
+      if (!step.recoveryDigest || step.recoveryDigest !== step.proofDigest) throw refusal("INVALID_INPUT", "fix-forward requires exact recovery evidence");
+      next.state = "fix_forward_required";
+      next.recovery_digest = step.recoveryDigest;
+      outcome = "MIGRATION_FIX_FORWARD_REQUIRED";
+      break;
+  }
+  const updated = db.prepare(
+    `UPDATE migration_runs SET state = ?, resource_revision = ?, source_event_ceiling = ?, source_snapshot_digest = ?,
+       source_governor_epoch = ?, target_governor_epoch = ?, mutator_inventory_digest = ?, quiescence_digest = ?,
+       source_export_digest = ?, import_root_digest = ?, equivalence_digest = ?, recovery_digest = ?, updated_at_ms = ?
+     WHERE project_id = ? AND migration_id = ? AND resource_revision = ?`
+  ).run(
+    next.state,
+    next.resource_revision,
+    next.source_event_ceiling,
+    next.source_snapshot_digest,
+    next.source_governor_epoch,
+    next.target_governor_epoch,
+    next.mutator_inventory_digest,
+    next.quiescence_digest,
+    next.source_export_digest,
+    next.import_root_digest,
+    next.equivalence_digest,
+    next.recovery_digest,
+    next.updated_at_ms,
+    request.projectId,
+    next.migration_id,
+    run.resource_revision
+  );
+  if (updated.changes !== 1) throw refusal("RESOURCE_REVISION_STALE", "MigrationRun compare-and-swap failed", {
+    currentResourceRevision: run.resource_revision,
+    expectedResourceRevision: request.expectedResourceRevision ?? void 0
+  });
+  const currentGovernanceEpoch = next.state === "retired" || next.state === "exercised" || next.state === "fix_forward_required" ? head.governance_epoch : next.state === "target_active" ? next.target_governor_epoch : next.source_governor_epoch;
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    { aggregateType: "migration_run", aggregateId: next.migration_id, aggregateRevision: next.resource_revision, eventType: "migration_run_changed", event: migrationEvent(eventStep, run.state, next, step.proofDigest) },
+    { expected: 1, attempted: 1, verified: 1 },
+    {
+      currentConfigRevision: configRevision,
+      currentGovernanceEpoch,
+      currentResourceRevision: next.resource_revision,
+      evidence: {
+        migrationId: next.migration_id,
+        state: next.state,
+        resourceRevision: next.resource_revision,
+        fenceToken: nextFenceToken,
+        repositoryTargetsDigest,
+        sourceExportDigest: next.source_export_digest
+      }
+    },
+    outcome
+  );
+}
+function parseReviewIdentity(scopeJson, optionsJson, configRevision) {
+  const scope = reviewScopeSchema.safeParse(JSON.parse(scopeJson));
+  const options = reviewOptionsSchema.safeParse(JSON.parse(optionsJson));
+  if (!scope.success) throw refusal("DECISION_IDENTITY_CONFLICT", scope.error.message);
+  if (!options.success) throw refusal("DECISION_IDENTITY_CONFLICT", options.error.message);
+  if (scope.data.targets.some((target) => target.configRevision !== configRevision)) {
+    throw refusal("PROJECT_CONFIG_STALE", "review target scope must bind the Decision config revision");
+  }
+  return { scope: scope.data, options: options.data };
+}
+function decisionIdentity(projectId, configRevision, decision) {
+  if (!decision.decisionClass || !DECISION_CLASSES.includes(decision.decisionClass)) {
+    throw refusal("DECISION_CLASS_UNKNOWN", "decision class is not in the bounded v5 class set");
+  }
+  if (decision.options === void 0) throw refusal("DECISION_IDENTITY_CONFLICT", "typed decision options are required");
+  const scopeJson = boundedCanonicalObject(decision.scope, "decision scope");
+  const optionsJson = boundedCanonicalObject(decision.options, "decision options");
+  if (decision.decisionClass === "review_adjudication") parseReviewIdentity(scopeJson, optionsJson, configRevision);
+  const identityDigest = sha256(canonicalJson({
+    projectId,
+    configRevision,
+    repoTargetId: decision.repoTargetId,
+    scope: JSON.parse(scopeJson),
+    decisionClass: decision.decisionClass,
+    options: JSON.parse(optionsJson)
+  }));
+  return {
+    scopeJson,
+    optionsJson,
+    decisionClass: decision.decisionClass,
+    identityDigest
+  };
+}
+function validateReviewDecisionCreate(db, request, decision, identity, configRevision) {
+  if (identity.decisionClass !== "review_adjudication") return;
+  const review = parseReviewIdentity(identity.scopeJson, identity.optionsJson, configRevision);
+  const policy = reviewPolicyFromJson(storedConfigJson(db, request.projectId, configRevision));
+  const targetIds = [...new Set(review.scope.targets.map((target) => target.repoTargetId))];
+  if (!policy || review.options.connectors.length !== targetIds.length) {
+    throw refusal("PROJECT_CONFIG_STALE", "review Decision must freeze one connector mapping per exact target");
+  }
+  for (const targetId of targetIds) {
+    const options = review.options.connectors.filter((connector) => connector.repoTargetId === targetId);
+    if (options.length !== 1 || !policy.connectors.some((connector) => canonicalJson(connector) === canonicalJson(options[0]))) {
+      throw refusal("PROJECT_CONFIG_STALE", "review connector mapping must equal the immutable config revision");
+    }
+  }
+  if (decision.repoTargetId !== null) {
+    if (review.scope.targets.length !== 1 || review.scope.targets[0].repoTargetId !== decision.repoTargetId) {
+      throw refusal("REPO_TARGET_FOREIGN", "target-scoped review Decision must contain only its exact target");
+    }
+  }
+  for (const target of review.scope.targets) {
+    requireTarget(db, request.projectId, configRevision, target.repoTargetId);
+    const workItem = asRow(
+      db.prepare("SELECT * FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, target.workItemId)
+    );
+    if (!workItem) throw refusal("WORK_ITEM_UNKNOWN", "review Decision WorkItem is not known");
+    if (workItem.config_revision !== configRevision || workItem.repo_target_id !== target.repoTargetId) {
+      throw refusal("WORK_ITEM_FOREIGN", "review Decision WorkItem does not match its exact config and target");
+    }
+  }
 }
 function storedDecisionIdentityDigest(decision) {
   if (!decision.decision_class || !decision.options_json) return null;
@@ -15145,6 +16415,1168 @@ function storedDecisionIdentityDigest(decision) {
     }));
   } catch {
     return null;
+  }
+}
+function requireDecisionActor(db, request, decisionClass) {
+  const actorReceiptId = requireActor(db, request);
+  const actor = asRow(
+    db.prepare("SELECT actor_kind, role_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(request.projectId, actorReceiptId)
+  );
+  if (!actor || !["role", "operator"].includes(actor.actor_kind)) {
+    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "decision authority requires a role or operator actor receipt");
+  }
+  if (actor.actor_kind === "operator") return actorReceiptId;
+  requireRoleActorBinding(db, request);
+  const requiredRole = decisionClass === "operator_only" ? null : "project-orchestrator";
+  if (!requiredRole || actor.role_id !== requiredRole) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "decision class is not authorized by this current role");
+  }
+  return actorReceiptId;
+}
+function applyDecisionCreate(db, request, digest) {
+  const currentRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const decision = request.decision;
+  if (!decision) throw refusal("INVALID_INPUT", "decision_create requires immutable decision identity");
+  if (decision.resourceRevision !== 1) throw refusal("DECISION_IDENTITY_CONFLICT", "new decisions begin at resource revision 1");
+  if (decision.repoTargetId === null) {
+    if (request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "project-scoped decision cannot accept a repository target");
+  } else {
+    if (request.repoTargetId !== decision.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "decision target does not match the exact request target");
+    requireTarget(db, request.projectId, currentRevision, decision.repoTargetId);
+  }
+  const identity = decisionIdentity(request.projectId, currentRevision, decision);
+  validateReviewDecisionCreate(db, request, decision, identity, currentRevision);
+  const actorReceiptId = requireDecisionActor(db, request, identity.decisionClass);
+  const existing = asRow(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decision.decisionId));
+  if (existing) {
+    if (existing.project_id !== request.projectId || existing.decision_identity_digest !== identity.identityDigest) {
+      throw refusal("DECISION_IDENTITY_CONFLICT", "decision id is already bound to another immutable identity");
+    }
+    throw refusal("DECISION_IDENTITY_CONFLICT", "decision identity already exists under another idempotency request");
+  }
+  db.prepare(
+    `INSERT INTO decisions
+      (decision_id, project_id, config_revision, repo_target_id, scope_json, scope_digest,
+       current_resource_revision, decision_class, options_json, decision_identity_digest)
+     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`
+  ).run(
+    decision.decisionId,
+    request.projectId,
+    currentRevision,
+    decision.repoTargetId,
+    identity.scopeJson,
+    sha256(identity.scopeJson),
+    identity.decisionClass,
+    identity.optionsJson,
+    identity.identityDigest
+  );
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "decision",
+      aggregateId: decision.decisionId,
+      aggregateRevision: 1,
+      eventType: "decision_created",
+      event: { decisionId: decision.decisionId, decisionClass: identity.decisionClass, decisionIdentityDigest: identity.identityDigest }
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    {
+      currentConfigRevision: currentRevision,
+      currentGovernanceEpoch: governor.governance_epoch,
+      currentResourceRevision: 1,
+      evidence: { decisionId: decision.decisionId, decisionClass: identity.decisionClass, decisionIdentityDigest: identity.identityDigest }
+    }
+  );
+}
+function validateDelegatedDecisionEvidence(db, request, governorEpoch, decisionClass, evidence) {
+  if (!evidence.executionAttemptId) throw refusal("EVIDENCE_REQUIRED", "delegated evidence requires an execution attempt");
+  const attempt = asRow(
+    db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(request.projectId, evidence.executionAttemptId)
+  );
+  if (!attempt) throw refusal("RESOURCE_UNKNOWN", "delegated execution attempt is not known in this project");
+  if (attempt.state === "dispatch_unknown") throw refusal("DISPATCH_UNKNOWN", "delegated execution remains dispatch-ambiguous");
+  if (attempt.conflicting_terminal_digest !== null) throw refusal("TERMINAL_REPORT_AMBIGUOUS", "delegated terminal evidence is conflicting");
+  if (attempt.origin !== "assignment" || !attempt.assignment_id) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "evidence does not name an assignment-origin execution attempt");
+  }
+  if (evidence.assignmentId && evidence.assignmentId !== attempt.assignment_id) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "evidence assignment identity does not match the execution attempt");
+  }
+  const assignment = asRow(
+    db.prepare("SELECT * FROM assignments WHERE project_id = ? AND assignment_id = ?").get(request.projectId, attempt.assignment_id)
+  );
+  if (!assignment || attempt.assignment_digest !== assignment.assignment_digest) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "delegated attempt does not bind its immutable Assignment");
+  }
+  if (decisionClass === "review_adjudication" && (assignment.assignment_kind !== "review" || attempt.assignment_kind !== "review")) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "review adjudication requires an exact review Assignment attempt");
+  }
+  const configRevision = currentConfig(db, request.projectId)?.config_revision;
+  if (configRevision !== assignment.config_revision || assignment.config_revision !== attempt.config_revision || governorEpoch !== assignment.governance_epoch || assignment.governance_epoch !== attempt.governance_epoch) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "delegated assignment config or governorship is stale");
+  }
+  const workItem = asRow(
+    db.prepare("SELECT resource_revision, repo_target_id FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, assignment.work_item_id)
+  );
+  if (!workItem || workItem.resource_revision !== assignment.work_item_revision) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "delegated Assignment WorkItem revision is stale");
+  }
+  const target = asRow(
+    db.prepare("SELECT source_id, host_id, path FROM repository_targets WHERE project_id = ? AND repo_target_id = ? AND config_revision = ?").get(
+      request.projectId,
+      assignment.repo_target_id,
+      assignment.config_revision
+    )
+  );
+  if (!target || workItem.repo_target_id !== assignment.repo_target_id || attempt.repo_target_id !== assignment.repo_target_id || target.source_id !== assignment.source_id || target.host_id !== assignment.host_id || target.path !== assignment.environment_path || attempt.environment_id !== assignment.environment_id || attempt.source_id !== assignment.source_id || attempt.host_id !== assignment.host_id || attempt.environment_path !== assignment.environment_path || attempt.branch_name !== assignment.branch_name || attempt.base_sha !== assignment.base_sha || attempt.frozen_brief_digest !== assignment.frozen_brief_digest || attempt.content_receipt_digest !== assignment.frozen_brief_digest || attempt.role_id !== assignment.role_id || attempt.role_generation !== assignment.role_generation) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "delegated attempt no longer matches its exact Assignment context");
+  }
+  if (assignment.candidate_semantics === "frozen" && attempt.candidate_sha !== assignment.candidate_sha) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "delegated frozen candidate does not match its Assignment");
+  }
+  if (attempt.state !== "done" || attempt.terminal_result !== "DONE" || attempt.reported_outcome !== "DONE" || !attempt.terminal_report_digest || !attempt.terminal_event_id || !attempt.native_receipt_digest || !attempt.actual_profile_digest) {
+    throw refusal("TERMINAL_REPORT_REQUIRED", "delegated evidence is not one exact successful terminal attempt");
+  }
+  if (evidence.contentDigest !== attempt.terminal_report_digest || evidence.terminalReportDigest !== attempt.terminal_report_digest) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "delegated terminal digest does not match canonical evidence");
+  }
+  if (evidence.actualProfileDigest !== attempt.actual_profile_digest) {
+    throw refusal("EXECUTION_PROFILE_MISMATCH", "delegated actual profile digest does not match canonical evidence");
+  }
+  if (evidence.nativeReceiptDigest !== attempt.native_receipt_digest) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "delegated native receipt digest does not match canonical evidence");
+  }
+}
+function prepareDecisionEvidence(db, request, governorEpoch, decisionClass) {
+  const inputs = request.decisionEvidence ?? [];
+  if (new Set(inputs.map((item) => item.evidenceId)).size !== inputs.length) {
+    throw refusal("EVIDENCE_IDENTITY_CONFLICT", "one disposition cannot repeat an evidence identity");
+  }
+  return inputs.map((input) => {
+    const delegated = input.evidenceKind === "delegated_action_receipt";
+    const validPair = delegated ? input.sourceKind === "delegated_action" && input.relationKind === "delegated_action_receipt" && input.executionAttemptId !== null : input.evidenceKind === "advisory_read" ? ["helper", "pro"].includes(input.sourceKind) && input.relationKind === "advisory_read" && input.executionAttemptId === null : input.evidenceKind === "legacy_claim" ? input.sourceKind === "legacy_claim" && input.relationKind === "legacy_claim" && input.executionAttemptId === null : input.sourceKind === input.evidenceKind && input.relationKind === "supporting" && input.executionAttemptId === null;
+    if (!validPair) throw refusal("EVIDENCE_REDACTION_INVALID", "evidence kind, source, relation, and execution binding are inconsistent");
+    const redacted = parseCanonicalEvidenceJson(input.redactedJson, "evidence redacted metadata");
+    const durable = parseCanonicalEvidenceJson(input.durableRefJson, "evidence durable reference");
+    const relationJson = boundedCanonicalObject(input.relation ?? {}, "evidence relation");
+    assertRedactedEvidence(JSON.parse(relationJson), "evidence relation");
+    if (delegated) validateDelegatedDecisionEvidence(db, request, governorEpoch, decisionClass, input);
+    const redactedDigest = sha256(redacted.json);
+    const artifactIdentityDigest = sha256(canonicalJson({
+      projectId: request.projectId,
+      evidenceId: input.evidenceId,
+      evidenceKind: input.evidenceKind,
+      sourceKind: input.sourceKind,
+      sourceRef: input.sourceRef,
+      executionAttemptId: input.executionAttemptId,
+      contentDigest: input.contentDigest,
+      redactedDigest,
+      durableRef: durable.value
+    }));
+    const existing = asRow(
+      db.prepare("SELECT artifact_identity_digest FROM evidence_artifacts WHERE project_id = ? AND evidence_id = ?").get(request.projectId, input.evidenceId)
+    );
+    if (existing && existing.artifact_identity_digest !== artifactIdentityDigest) {
+      throw refusal("EVIDENCE_IDENTITY_CONFLICT", "evidence id is already bound to another immutable digest bundle");
+    }
+    return {
+      input,
+      redactedJson: redacted.json,
+      redactedDigest,
+      durableRefJson: durable.json,
+      relationJson,
+      artifactIdentityDigest,
+      exists: Boolean(existing)
+    };
+  });
+}
+function dispositionReference(db, decisionId, sequence) {
+  if (sequence === null || sequence === void 0) return null;
+  return asRow(
+    db.prepare("SELECT * FROM decision_dispositions WHERE decision_id = ? AND disposition_sequence = ?").get(decisionId, sequence)
+  ) ?? null;
+}
+function reviewRelationRecords(db, request, decisionId) {
+  const stored = db.prepare(
+    `SELECT decision_evidence.evidence_id, decision_evidence.relation_kind,
+            decision_evidence.relation_json, evidence_artifacts.evidence_kind,
+            evidence_artifacts.source_kind, evidence_artifacts.execution_attempt_id,
+            execution_attempts.assignment_id
+     FROM decision_evidence JOIN evidence_artifacts
+       ON evidence_artifacts.project_id = decision_evidence.project_id
+      AND evidence_artifacts.evidence_id = decision_evidence.evidence_id
+     LEFT JOIN execution_attempts
+       ON execution_attempts.project_id = evidence_artifacts.project_id
+      AND execution_attempts.execution_attempt_id = evidence_artifacts.execution_attempt_id
+     WHERE decision_evidence.project_id = ? AND decision_evidence.decision_id = ?
+     ORDER BY decision_evidence.evidence_sequence`
+  ).all(request.projectId, decisionId);
+  const prior = stored.map((row) => ({
+    evidenceId: row.evidence_id,
+    evidenceKind: row.evidence_kind,
+    sourceKind: row.source_kind,
+    relationKind: row.relation_kind,
+    assignmentId: row.assignment_id ?? null,
+    executionAttemptId: row.execution_attempt_id ?? null,
+    relation: JSON.parse(row.relation_json),
+    current: false
+  }));
+  const current = (request.decisionEvidence ?? []).map((evidence) => ({
+    evidenceId: evidence.evidenceId,
+    evidenceKind: evidence.evidenceKind,
+    sourceKind: evidence.sourceKind,
+    relationKind: evidence.relationKind,
+    assignmentId: evidence.assignmentId ?? null,
+    executionAttemptId: evidence.executionAttemptId,
+    relation: evidence.relation ?? {},
+    current: true
+  }));
+  return [...prior, ...current];
+}
+function reviewTargetKey(target) {
+  return `${target.workItemId}\0${target.repoTargetId}`;
+}
+function requireReviewAssignment(db, request, assignmentId, executionAttemptId) {
+  if (!assignmentId || !executionAttemptId) throw refusal("EVIDENCE_REQUIRED", "final review evidence requires exact Assignment and attempt identities");
+  return assignmentRows(db, { ...request, assignmentId, executionAttemptId });
+}
+function requireSuccessfulWrite(db, request, target, assignmentId, executionAttemptId, candidateSha) {
+  const rows = assignmentRows(db, { ...request, assignmentId, executionAttemptId });
+  if (rows.assignment.assignment_kind !== "write" || rows.attempt.assignment_kind !== "write" || rows.assignment.work_item_id !== target.workItemId || rows.assignment.repo_target_id !== target.repoTargetId || rows.assignment.config_revision !== target.configRevision || rows.assignment.base_sha !== target.baseSha || rows.attempt.branch_name !== rows.assignment.branch_name || rows.attempt.base_sha !== target.baseSha || rows.attempt.candidate_sha !== candidateSha || rows.attempt.state !== "done" || rows.attempt.terminal_result !== "DONE" || rows.attempt.reported_outcome !== "DONE") {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "write facts do not bind the exact successful base-to-candidate Assignment range");
+  }
+  revalidateAssignmentReference(db, request, rows.assignment, rows.attempt);
+  return rows;
+}
+function validateAmendmentRelation(db, request, target, amendment) {
+  if (amendment.workItemId !== target.workItemId || amendment.repoTargetId !== target.repoTargetId || amendment.baseSha !== target.baseSha || amendment.h0CandidateSha !== target.h0CandidateSha || amendment.h0TreeDigest !== target.h0TreeDigest || amendment.h1CandidateSha === target.h0CandidateSha || amendment.h1TreeDigest === target.h0TreeDigest) {
+    throw refusal("REVIEW_SCOPE_MISMATCH", "review amendment does not preserve the exact H0 scope and base");
+  }
+  if (amendment.actualChangedFiles.some((file2) => !amendment.allowedChangedFiles.includes(file2))) {
+    throw refusal("REVIEW_SCOPE_MISMATCH", "review amendment changes files outside the adopted findings scope");
+  }
+  const exactReview = (assignmentId, candidateSha) => {
+    const assignment = asRow(db.prepare(
+      "SELECT * FROM assignments WHERE project_id = ? AND assignment_id = ?"
+    ).get(request.projectId, assignmentId));
+    const attempt = asRow(db.prepare(
+      `SELECT * FROM execution_attempts
+       WHERE project_id = ? AND assignment_id = ? AND candidate_sha = ?
+         AND state = 'done' AND terminal_result = 'DONE' AND reported_outcome = 'DONE'`
+    ).get(request.projectId, assignmentId, candidateSha));
+    if (!assignment || !attempt || assignment.assignment_kind !== "review" || assignment.candidate_semantics !== "frozen" || assignment.work_item_id !== target.workItemId || assignment.repo_target_id !== target.repoTargetId || assignment.config_revision !== target.configRevision || assignment.base_sha !== target.baseSha || assignment.candidate_sha !== candidateSha || attempt.assignment_id !== assignment.assignment_id) {
+      throw refusal("ASSIGNMENT_HEAD_STALE", "review amendment does not bind exact successful H0 and H1 review Assignments");
+    }
+    revalidateAssignmentReference(db, request, assignment, attempt);
+    return assignment;
+  };
+  const h0 = exactReview(amendment.h0AssignmentId, amendment.h0CandidateSha);
+  const h1 = exactReview(amendment.h1AssignmentId, amendment.h1CandidateSha);
+  if (h0.governance_epoch !== h1.governance_epoch || h0.work_item_revision !== h1.work_item_revision) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "review amendment changed governorship or WorkItem revision");
+  }
+}
+function preflightReviewDisposition(db, request, factsByWriter) {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const decisionId = request.decisionId;
+  if (!decisionId || !request.disposition) throw refusal("INVALID_INPUT", "decision disposition requires decisionId and disposition");
+  const decision = asRow(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decisionId));
+  if (!decision || decision.project_id !== request.projectId || decision.decision_class !== "review_adjudication" || !decision.options_json) {
+    throw refusal("RESOURCE_UNKNOWN", "review Decision is not known in this project");
+  }
+  requireDecisionActor(db, request, "review_adjudication");
+  if (decision.config_revision !== configRevision) throw refusal("PROJECT_CONFIG_STALE", "review Decision config revision is stale");
+  if (request.expectedResourceRevision !== decision.current_resource_revision) {
+    throw refusal("RESOURCE_REVISION_STALE", "review Decision resource revision is stale", {
+      currentResourceRevision: decision.current_resource_revision,
+      expectedResourceRevision: request.expectedResourceRevision ?? void 0
+    });
+  }
+  if (decision.repo_target_id) {
+    if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "review Decision requires its exact target");
+    if (request.repoTargetId !== decision.repo_target_id) throw refusal("REPO_TARGET_FOREIGN", "review Decision target is foreign");
+  } else if (request.repoTargetId) {
+    throw refusal("REPO_TARGET_FOREIGN", "project-scoped review Decision cannot infer one request target");
+  }
+  const review = parseReviewIdentity(decision.scope_json, decision.options_json, configRevision);
+  const policy = reviewPolicyFromJson(storedConfigJson(db, request.projectId, configRevision));
+  if (!policy || review.options.connectors.length !== new Set(review.scope.targets.map((target) => target.repoTargetId)).size || review.options.connectors.some(
+    (option) => !policy.connectors.some((connector) => canonicalJson(connector) === canonicalJson(option))
+  )) {
+    throw refusal("PROJECT_CONFIG_STALE", "review Decision connector mappings no longer match their config revision");
+  }
+  for (const target of review.scope.targets) {
+    requireTarget(db, request.projectId, configRevision, target.repoTargetId);
+    const workItem = asRow(db.prepare("SELECT * FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, target.workItemId));
+    if (!workItem || workItem.config_revision !== configRevision || workItem.repo_target_id !== target.repoTargetId) {
+      throw refusal("WORK_ITEM_FOREIGN", "review scope WorkItem does not match the exact current target");
+    }
+  }
+  const relations = reviewRelationRecords(db, request, decisionId);
+  const suppliedConnectorRecords = relations.filter((record2) => record2.current && record2.evidenceKind === "connector");
+  if (suppliedConnectorRecords.some((record2) => {
+    const relation = connectorReviewRelationSchema.safeParse(record2.relation);
+    const option = relation.success ? review.options.connectors.find((connector) => connector.repoTargetId === relation.data.repoTargetId && connector.connectorId === relation.data.connectorId) : void 0;
+    return !option || option.policy === "prohibited";
+  })) {
+    throw refusal("INVALID_INPUT", "prohibited or unmapped connector material is not accepted");
+  }
+  if (request.disposition !== "adopted") return [];
+  const connectorRecords = relations.filter((record2) => record2.evidenceKind === "connector");
+  const connectors = connectorRecords.map((record2) => {
+    if (record2.evidenceKind !== "connector" || record2.sourceKind !== "connector" || record2.relationKind !== "supporting") {
+      throw refusal("INVALID_INPUT", "connector evidence kind and relation are inconsistent");
+    }
+    const parsed = connectorReviewRelationSchema.safeParse(record2.relation);
+    if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
+    const target = review.scope.targets.find((candidate) => reviewTargetKey(candidate) === reviewTargetKey(parsed.data));
+    const option = review.options.connectors.find(
+      (connector) => connector.repoTargetId === parsed.data.repoTargetId && connector.connectorId === parsed.data.connectorId
+    );
+    if (!target || !option || option.policy === "prohibited" || parsed.data.h0CandidateSha !== target.h0CandidateSha || parsed.data.h0TreeDigest !== target.h0TreeDigest) {
+      throw refusal("INVALID_INPUT", "connector evidence is not bound to the exact H0 target and configured identity");
+    }
+    return { record: record2, relation: parsed.data, target };
+  });
+  for (const target of review.scope.targets) {
+    const matches = connectors.filter((candidate) => reviewTargetKey(candidate.target) === reviewTargetKey(target));
+    if (matches.length > 1) throw refusal("INVALID_INPUT", "review generation permits only one connector pass per target");
+    const option = review.options.connectors.find((connector) => connector.repoTargetId === target.repoTargetId);
+    if (option.policy === "required" && (matches.length !== 1 || matches[0].relation.state !== "available" || !matches[0].relation.terminal)) {
+      throw refusal("EXTERNAL_CAPABILITY_REQUIRED", "required connector lacks exact available terminal H0 evidence");
+    }
+  }
+  const amendmentRecords = relations.filter((record2) => record2.relation.relationRole === "amendment_scope");
+  if (amendmentRecords.length > 1) {
+    throw refusal("REVIEW_AMENDMENT_CAP", "review Decision already consumed its one bounded amendment");
+  }
+  const amendmentByTarget = /* @__PURE__ */ new Map();
+  for (const record2 of amendmentRecords) {
+    if (record2.evidenceKind !== "review_ready" || record2.sourceKind !== "review_ready" || record2.relationKind !== "supporting") {
+      throw refusal("EVIDENCE_REDACTION_INVALID", "amendment scope requires review_ready supporting evidence");
+    }
+    const parsed = amendmentReviewRelationSchema.safeParse(record2.relation);
+    if (!parsed.success) throw refusal("REVIEW_SCOPE_MISMATCH", parsed.error.message);
+    const target = review.scope.targets.find((candidate) => reviewTargetKey(candidate) === reviewTargetKey(parsed.data));
+    if (!target || amendmentByTarget.has(reviewTargetKey(target))) throw refusal("REVIEW_AMENDMENT_CAP", "review target has more than one amendment relation");
+    validateAmendmentRelation(db, request, target, parsed.data);
+    amendmentByTarget.set(reviewTargetKey(target), parsed.data);
+  }
+  const finalRecords = relations.filter((record2) => record2.current && record2.relation.relationRole === "final_review");
+  const requiredEvidence = new Set((request.conditions ?? []).flatMap((condition) => condition.evidenceIds));
+  const prepared = [];
+  for (const target of review.scope.targets) {
+    const matches = finalRecords.filter((record3) => {
+      const parsed = finalReviewRelationSchema.safeParse(record3.relation);
+      return parsed.success && reviewTargetKey(parsed.data) === reviewTargetKey(target);
+    });
+    if (matches.length !== 1) throw refusal("EVIDENCE_REQUIRED", "adopted review requires one exact final review receipt per target");
+    const record2 = matches[0];
+    if (record2.evidenceKind !== "delegated_action_receipt" || record2.sourceKind !== "delegated_action" || record2.relationKind !== "delegated_action_receipt" || !requiredEvidence.has(record2.evidenceId)) {
+      throw refusal("EVIDENCE_REQUIRED", "final review receipt must be a typed required delegated condition");
+    }
+    const relation = finalReviewRelationSchema.parse(record2.relation);
+    const amendment = amendmentByTarget.get(reviewTargetKey(target)) ?? null;
+    const expectedCandidateSha = amendment?.h1CandidateSha ?? target.h0CandidateSha;
+    const expectedTreeDigest = amendment?.h1TreeDigest ?? target.h0TreeDigest;
+    if (relation.configRevision !== target.configRevision || relation.baseSha !== target.baseSha || relation.candidateSha !== expectedCandidateSha || relation.treeDigest !== expectedTreeDigest || canonicalJson(relation.tierAEntries) !== canonicalJson(target.tierAEntries) || amendment && canonicalJson(relation.changedFiles) !== canonicalJson(amendment.actualChangedFiles)) {
+      throw refusal("REVIEW_SCOPE_MISMATCH", "final review relation does not match the exact frozen target and amendment scope");
+    }
+    const evidenceInput = (request.decisionEvidence ?? []).find((evidence) => evidence.evidenceId === record2.evidenceId);
+    validateDelegatedDecisionEvidence(db, request, governor.governance_epoch, "review_adjudication", evidenceInput);
+    const rows = requireReviewAssignment(db, request, record2.assignmentId, record2.executionAttemptId);
+    revalidateAssignmentReference(db, request, rows.assignment, rows.attempt);
+    if (rows.assignment.assignment_kind !== "review" || rows.assignment.role_id !== "independent-reviewer" || rows.assignment.candidate_semantics !== "frozen" || rows.assignment.work_item_id !== target.workItemId || rows.assignment.repo_target_id !== target.repoTargetId || rows.assignment.config_revision !== target.configRevision || rows.assignment.base_sha !== target.baseSha || rows.assignment.candidate_sha !== expectedCandidateSha || rows.assignment.requested_permission_mode !== "full" || rows.assignment.requested_visibility !== "visible" || rows.attempt.actual_permission_mode !== "full" || rows.attempt.actual_visibility !== "visible") {
+      throw refusal("ASSIGNMENT_HEAD_STALE", "final review Assignment is not the exact visible/full frozen target");
+    }
+    requireCanonicalRoleGeneration(db, request.projectId, rows.assignment.role_id, rows.assignment.role_generation, rows.assignment.role_requirement_id);
+    if (amendment && rows.assignment.assignment_id !== amendment.h1AssignmentId) {
+      throw refusal("REVIEW_SCOPE_MISMATCH", "final review does not bind the exact H1 review Assignment");
+    }
+    const writer = requireSuccessfulWrite(
+      db,
+      request,
+      target,
+      relation.writeAssignmentId,
+      relation.writeExecutionAttemptId,
+      expectedCandidateSha
+    );
+    const writers = db.prepare(
+      `SELECT assignments.assignment_id, assignments.lane_id, assignments.role_id, assignments.role_generation,
+              execution_attempts.execution_attempt_id
+       FROM assignments JOIN execution_attempts
+         ON execution_attempts.project_id = assignments.project_id
+        AND execution_attempts.assignment_id = assignments.assignment_id
+       WHERE assignments.project_id = ? AND assignments.work_item_id = ?
+         AND assignments.repo_target_id = ? AND assignments.assignment_kind = 'write'`
+    ).all(request.projectId, target.workItemId, target.repoTargetId);
+    if (writers.length === 0) throw refusal("EVIDENCE_REQUIRED", "review target has no exact recorded write Assignment");
+    if (writers.some(
+      (candidate) => candidate.assignment_id === rows.assignment.assignment_id || candidate.execution_attempt_id === rows.attempt.execution_attempt_id || candidate.lane_id === rows.assignment.lane_id || candidate.role_id === rows.assignment.role_id || candidate.role_generation === rows.assignment.role_generation
+    )) {
+      throw refusal("ROLE_HOLDER_MISMATCH", "review Assignment is not structurally independent from every write Assignment");
+    }
+    prepared.push({ assignment: rows.assignment, attempt: rows.attempt, writer: writer.assignment, writerAttempt: writer.attempt, target, relation, expectedCandidateSha, expectedTreeDigest });
+  }
+  if (!factsByWriter) return prepared;
+  for (const item of prepared) {
+    const parsedFacts = reviewFactsSchema.safeParse(factsByWriter.get(item.writer.assignment_id));
+    if (!parsedFacts.success) throw refusal("BB_FACTS_UNAVAILABLE", "bounded exact review tree, diff, and authorship facts are unavailable");
+    const facts = parsedFacts.data;
+    if (facts.projectId !== request.projectId || facts.workItemId !== item.target.workItemId || facts.repoTargetId !== item.target.repoTargetId || facts.writeAssignmentId !== item.writer.assignment_id || facts.writeExecutionAttemptId !== item.writerAttempt.execution_attempt_id || facts.branchName !== item.writer.branch_name || facts.baseSha !== item.target.baseSha || facts.candidateSha !== item.expectedCandidateSha || facts.treeDigest !== item.expectedTreeDigest || canonicalJson(facts.changedFiles) !== canonicalJson(item.relation.changedFiles) || canonicalJson(facts.authors) !== canonicalJson(item.relation.authors) || canonicalJson(facts.committers) !== canonicalJson(item.relation.committers) || !sortedIdSetSchema.safeParse(facts.changedFiles).success || facts.authors.length === 0 || facts.committers.length === 0) {
+      throw refusal("ASSIGNMENT_HEAD_STALE", "bounded review facts do not match the exact writer range, tree, diff, and Git evidence");
+    }
+  }
+  return prepared;
+}
+function applyDecisionMutation(db, request, digest, reader) {
+  try {
+    const replay = checkIdempotency(db, request, digest);
+    if (replay) return replay;
+    const decision = request.decisionId ? asRow(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(request.decisionId)) : void 0;
+    if (decision?.decision_class !== "review_adjudication") {
+      return transaction(db, () => {
+        const replayInTransaction = checkIdempotency(db, request, digest);
+        return replayInTransaction ?? applyDecisionDisposition(db, request, digest);
+      });
+    }
+    const prepared = preflightReviewDisposition(db, request, null);
+    if (request.disposition !== "adopted") {
+      return transaction(db, () => {
+        const replayInTransaction = checkIdempotency(db, request, digest);
+        if (replayInTransaction) return replayInTransaction;
+        preflightReviewDisposition(db, request, null);
+        return applyDecisionDisposition(db, request, digest);
+      });
+    }
+    if (!reader) throw refusal("BB_FACTS_UNAVAILABLE", "review adjudication requires the bounded exact review fact reader");
+    const facts = /* @__PURE__ */ new Map();
+    for (const item of prepared) {
+      let value;
+      try {
+        value = reader.read({
+          projectId: request.projectId,
+          workItemId: item.target.workItemId,
+          repoTargetId: item.target.repoTargetId,
+          writeAssignmentId: item.writer.assignment_id,
+          writeExecutionAttemptId: item.writerAttempt.execution_attempt_id,
+          branchName: item.writer.branch_name,
+          baseSha: item.target.baseSha,
+          candidateSha: item.expectedCandidateSha
+        });
+      } catch {
+        throw refusal("BB_FACTS_UNAVAILABLE", "bounded exact review facts are unavailable");
+      }
+      facts.set(item.writer.assignment_id, value);
+    }
+    return transaction(db, () => {
+      const replayInTransaction = checkIdempotency(db, request, digest);
+      if (replayInTransaction) return replayInTransaction;
+      preflightReviewDisposition(db, request, facts);
+      return applyDecisionDisposition(db, request, digest);
+    });
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    if (isConstraintError(error48)) return unavailableResult(request.projectId, "canonical review disposition could not be committed unambiguously");
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal decision mutation error" });
+  }
+}
+function applyDecisionDisposition(db, request, digest) {
+  const currentRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const decisionId = request.decisionId;
+  if (!decisionId || !request.disposition) throw refusal("INVALID_INPUT", "decision disposition requires decisionId and disposition");
+  const decision = asRow(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decisionId));
+  if (!decision || decision.project_id !== request.projectId) throw refusal("RESOURCE_UNKNOWN", "decision is not known in this project");
+  if (!decision.decision_class || !DECISION_CLASSES.includes(decision.decision_class) || !decision.options_json || !decision.decision_identity_digest || storedDecisionIdentityDigest(decision) !== decision.decision_identity_digest) {
+    throw refusal("DECISION_IDENTITY_CONFLICT", "decision has no valid immutable typed identity");
+  }
+  const actorReceiptId = requireDecisionActor(db, request, decision.decision_class);
+  if (decision.config_revision !== currentRevision) {
+    throw refusal("PROJECT_CONFIG_STALE", "decision is bound to a stale config revision", {
+      currentConfigRevision: currentRevision,
+      expectedConfigRevision: request.expectedConfigRevision ?? void 0
+    });
+  }
+  if (decision.repo_target_id) {
+    if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "decision requires its exact repository target");
+    if (request.repoTargetId !== decision.repo_target_id) throw refusal("REPO_TARGET_FOREIGN", "decision target does not match the exact repository target");
+    requireTarget(db, request.projectId, currentRevision, request.repoTargetId);
+  } else if (request.repoTargetId) {
+    throw refusal("REPO_TARGET_FOREIGN", "project-scoped decision cannot accept a repository target");
+  }
+  const expectedResourceRevision = request.expectedResourceRevision;
+  if (expectedResourceRevision !== decision.current_resource_revision) {
+    throw refusal("RESOURCE_REVISION_STALE", "decision resource revision is stale", {
+      currentResourceRevision: decision.current_resource_revision,
+      expectedResourceRevision: expectedResourceRevision ?? void 0
+    });
+  }
+  const sequence = asRow(
+    db.prepare("SELECT COALESCE(MAX(disposition_sequence), 0) + 1 AS next_sequence FROM decision_dispositions WHERE decision_id = ?").get(decisionId)
+  )?.next_sequence ?? 1;
+  const supersedes = request.supersedesDispositionSequence ?? null;
+  const reverts = request.revertsDispositionSequence ?? null;
+  if (request.disposition === "superseded" !== (supersedes !== null) || request.disposition === "revoked" !== (reverts !== null)) {
+    throw refusal("DECISION_DISPOSITION_INVALID", "superseded and revoked dispositions require exactly their matching prior reference");
+  }
+  for (const [kind, reference] of [["supersedes", supersedes], ["reverts", reverts]]) {
+    if (reference === null) continue;
+    if (reference >= sequence || !dispositionReference(db, decisionId, reference)) {
+      throw refusal("DECISION_REFERENCE_INVALID", `${kind} must name an earlier disposition on the same decision`);
+    }
+    if (db.prepare(`SELECT 1 FROM decision_dispositions WHERE decision_id = ? AND ${kind}_disposition_sequence = ?`).get(decisionId, reference)) {
+      throw refusal("DECISION_REFERENCE_INVALID", `${kind} target was already consumed`);
+    }
+  }
+  const holdAction = request.holdAction ?? "none";
+  const holdCode = request.holdCode ?? null;
+  const holdReference = request.holdReferenceSequence ?? null;
+  if (holdAction === "none" && (holdCode !== null || holdReference !== null) || holdAction === "set" && (holdCode === null || holdReference !== null) || holdAction === "clear" && (holdCode === null || holdReference === null)) {
+    throw refusal("DECISION_REFERENCE_INVALID", "hold set/clear fields are inconsistent");
+  }
+  if (holdAction === "clear") {
+    const setter = dispositionReference(db, decisionId, holdReference);
+    if (!setter || setter.hold_action !== "set" || setter.hold_code !== holdCode || holdReference >= sequence || db.prepare("SELECT 1 FROM decision_dispositions WHERE decision_id = ? AND hold_action = 'clear' AND hold_reference_sequence = ?").get(decisionId, holdReference)) {
+      throw refusal("DECISION_REFERENCE_INVALID", "hold clear must name one active earlier setter for the same code");
+    }
+  }
+  const preparedEvidence = prepareDecisionEvidence(db, request, governor.governance_epoch, decision.decision_class);
+  const evidenceIds = new Set(preparedEvidence.map((item) => item.input.evidenceId));
+  const conditions = request.conditions ?? [];
+  for (const condition of conditions) {
+    if (condition.evidenceIds.some((evidenceId) => !evidenceIds.has(evidenceId))) {
+      throw refusal("EVIDENCE_REQUIRED", "every typed condition must name evidence bound to this exact disposition");
+    }
+  }
+  if (request.disposition === "adopted") {
+    const activeHolds = db.prepare(
+      `SELECT setter.disposition_sequence FROM decision_dispositions setter
+       WHERE setter.decision_id = ? AND setter.hold_action = 'set'
+         AND NOT EXISTS (
+           SELECT 1 FROM decision_dispositions clearer
+           WHERE clearer.decision_id = setter.decision_id AND clearer.hold_action = 'clear'
+             AND clearer.hold_reference_sequence = setter.disposition_sequence
+         )`
+    ).all(decisionId);
+    const remaining = activeHolds.filter((row) => !(holdAction === "clear" && row.disposition_sequence === holdReference));
+    if (holdAction === "set" || remaining.length > 0) throw refusal("DECISION_DISPOSITION_INVALID", "active Decision holds block adoption");
+  }
+  const reasonJson = boundedCanonicalObject(request.reason ?? {}, "decision reason");
+  assertRedactedEvidence(JSON.parse(reasonJson), "decision reason");
+  const conditionsJson = canonicalJson(conditions);
+  if (Buffer.byteLength(conditionsJson, "utf8") > 16 * 1024) throw refusal("EVIDENCE_REDACTION_INVALID", "decision conditions exceed 16 KiB");
+  const nextRevision = decision.current_resource_revision + 1;
+  const update = db.prepare(
+    `UPDATE decisions SET current_resource_revision = ?
+     WHERE decision_id = ? AND project_id = ? AND current_resource_revision = ?`
+  ).run(nextRevision, decisionId, request.projectId, expectedResourceRevision);
+  if (update.changes !== 1) {
+    throw refusal("RESOURCE_REVISION_STALE", "decision compare-and-swap failed", {
+      currentResourceRevision: decision.current_resource_revision,
+      expectedResourceRevision
+    });
+  }
+  const createdAtMs = now();
+  db.prepare(
+    `INSERT INTO decision_dispositions
+      (decision_id, disposition_sequence, disposition, actor_receipt_id, reason_json, created_at_ms, idempotency_key,
+       conditions_json, hold_action, hold_code, hold_reference_sequence,
+       supersedes_disposition_sequence, reverts_disposition_sequence)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    decisionId,
+    sequence,
+    request.disposition,
+    actorReceiptId,
+    reasonJson,
+    createdAtMs,
+    request.idempotencyKey,
+    conditionsJson,
+    holdAction,
+    holdCode,
+    holdReference,
+    supersedes,
+    reverts
+  );
+  const insertArtifact = db.prepare(
+    `INSERT INTO evidence_artifacts
+      (project_id, evidence_id, evidence_kind, source_kind, source_ref, execution_attempt_id,
+       content_digest, redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest, created_at_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const insertRelation = db.prepare(
+    `INSERT INTO decision_evidence
+      (project_id, decision_id, evidence_sequence, evidence_id, disposition_sequence,
+       relation_kind, relation_json, created_at_ms, idempotency_key)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  let evidenceSequence = asRow(db.prepare(
+    "SELECT COALESCE(MAX(evidence_sequence), 0) + 1 AS next_sequence FROM decision_evidence WHERE project_id = ? AND decision_id = ?"
+  ).get(request.projectId, decisionId))?.next_sequence ?? 1;
+  for (const prepared of preparedEvidence) {
+    if (!prepared.exists) {
+      insertArtifact.run(
+        request.projectId,
+        prepared.input.evidenceId,
+        prepared.input.evidenceKind,
+        prepared.input.sourceKind,
+        prepared.input.sourceRef,
+        prepared.input.executionAttemptId,
+        prepared.input.contentDigest,
+        prepared.redactedJson,
+        prepared.redactedDigest,
+        prepared.durableRefJson,
+        prepared.artifactIdentityDigest,
+        createdAtMs
+      );
+    }
+    insertRelation.run(
+      request.projectId,
+      decisionId,
+      evidenceSequence++,
+      prepared.input.evidenceId,
+      sequence,
+      prepared.input.relationKind,
+      prepared.relationJson,
+      createdAtMs,
+      request.idempotencyKey
+    );
+  }
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "decision",
+      aggregateId: decisionId,
+      aggregateRevision: nextRevision,
+      eventType: "decision_disposition_appended",
+      event: {
+        decisionId,
+        dispositionSequence: sequence,
+        disposition: request.disposition,
+        evidenceIds: preparedEvidence.map((item) => item.input.evidenceId)
+      }
+    },
+    { expected: preparedEvidence.length + 1, attempted: preparedEvidence.length + 1, verified: preparedEvidence.length + 1 },
+    {
+      currentConfigRevision: currentRevision,
+      currentGovernanceEpoch: governor.governance_epoch,
+      currentResourceRevision: nextRevision,
+      expectedResourceRevision,
+      evidence: { dispositionSequence: sequence, evidenceIds: preparedEvidence.map((item) => item.input.evidenceId) }
+    }
+  );
+}
+function requireRoleRequirement(db, request, configRevision) {
+  if (!request.roleRequirementId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "role requirement identity is required");
+  const requirements = roleRequirementsFromJson(storedConfigJson(db, request.projectId, configRevision));
+  const matches = requirements.filter((candidate) => candidate.roleRequirementId === request.roleRequirementId);
+  if (matches.length !== 1) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "role requirement is not uniquely configured");
+  const requirement = matches[0];
+  if (request.roleId && request.roleId !== requirement.roleId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "logical role does not match its requirement");
+  if (requirement.repoTargetId === null) {
+    if (request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "project-scoped role cannot accept a repository target");
+  } else {
+    if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "target-scoped role requires its exact repository target");
+    if (request.repoTargetId !== requirement.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "role requirement target does not match the exact repository target");
+    requireTarget(db, request.projectId, configRevision, request.repoTargetId);
+  }
+  return { requirement, digest: sha256(canonicalJson(requirement)), configRevision };
+}
+function requireRoleTargetContext(db, request, resolved, context) {
+  if (resolved.requirement.repoTargetId === null) return;
+  const target = requireTarget(db, request.projectId, resolved.configRevision, resolved.requirement.repoTargetId);
+  const environment = context.baseContext.environment;
+  if (target.source_id !== context.sourceId || target.host_id !== context.hostId || target.path !== environment.path) {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "holder context does not match the exact repository target source, host, and path");
+  }
+}
+function requireRoleActorBinding(db, request) {
+  if (!request.actorReceiptId) return;
+  const actor = asRow(
+    db.prepare("SELECT actor_kind, subject_id, role_id, role_generation FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(
+      request.projectId,
+      request.actorReceiptId
+    )
+  );
+  if (!actor || actor.actor_kind !== "role") return;
+  if (!actor.role_id || actor.role_generation === null) throw refusal("ROLE_HOLDER_MISMATCH", "role actor receipt has no exact generation");
+  const head = asRow(
+    db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(request.projectId, actor.role_id)
+  );
+  const generation = asRow(
+    db.prepare(`SELECT status, role_requirement_id, config_revision, holder_execution_attempt_id,
+                       holder_context_digest, holder_executed_profile_digest, qualification_id,
+                       eligibility_derivation_digest
+                FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?`).get(
+      request.projectId,
+      actor.role_id,
+      actor.role_generation
+    )
+  );
+  if (!head || head.current_generation !== actor.role_generation) throw refusal("ROLE_GENERATION_STALE", "role actor is not the current generation");
+  if (!generation || generation.status !== "active") throw refusal("ROLE_NOT_ACTIVE", "role actor is not active");
+  if (generation.holder_execution_attempt_id !== actor.subject_id) throw refusal("ROLE_HOLDER_MISMATCH", "role actor does not bind the current holder context");
+  const attempt = asRow(
+    db.prepare("SELECT origin, state, native_receipt_digest, actual_profile_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(
+      request.projectId,
+      generation.holder_execution_attempt_id
+    )
+  );
+  if (!attempt || attempt.origin !== "role_holder" || attempt.state !== "done" || attempt.native_receipt_digest !== generation.holder_context_digest || attempt.actual_profile_digest !== generation.holder_executed_profile_digest) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "role holder has no complete canonical execution attempt");
+  }
+  const eligibility = asRow(db.prepare(
+    `SELECT current_qualification_id, effective_status, config_revision, expires_at_ms, derivation_digest
+     FROM eligibility_projections
+     WHERE project_id = ? AND role_requirement_id = ? AND profile_digest = ?`
+  ).get(request.projectId, generation.role_requirement_id, generation.holder_executed_profile_digest));
+  if (!eligibility || eligibility.current_qualification_id !== generation.qualification_id || eligibility.effective_status !== "eligible" || eligibility.config_revision !== generation.config_revision || eligibility.derivation_digest !== generation.eligibility_derivation_digest || eligibility.expires_at_ms !== null && eligibility.expires_at_ms <= now()) {
+    throw refusal("ROLE_UNQUALIFIED", "role actor no longer has current eligible qualification evidence");
+  }
+}
+function profileEquals(left, right) {
+  return canonicalJson(left) === canonicalJson(right);
+}
+function qualificationContextDigest(context, resolved, request) {
+  return sha256(canonicalJson({
+    ...context.baseContext,
+    configRevision: resolved.configRevision,
+    roleId: resolved.requirement.roleId,
+    roleRequirementId: resolved.requirement.roleRequirementId,
+    roleRequirementDigest: resolved.digest,
+    repoTargetId: resolved.requirement.repoTargetId,
+    fixtureContextDigest: request.fixtureContextDigest
+  }));
+}
+function applyQualificationObservation(db, request, digest, context) {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request);
+  const resolved = requireRoleRequirement(db, request, configRevision);
+  requireRoleTargetContext(db, request, resolved, context);
+  const qualificationId = request.qualificationId;
+  const requestedOutcome = request.qualificationOutcome;
+  const observedAtMs = request.observedAtMs;
+  const fixtureContextDigest = request.fixtureContextDigest;
+  const expiresAtMs = request.expiresAtMs ?? null;
+  if (!qualificationId || !requestedOutcome || observedAtMs === void 0 || !fixtureContextDigest || !request.reasonCode) {
+    throw refusal("INVALID_INPUT", "qualification recording requires exact observation, outcome, time, fixture, and reason fields");
+  }
+  if (expiresAtMs !== null && expiresAtMs <= observedAtMs) {
+    throw refusal("INVALID_INPUT", "qualification expiry must be later than observation time");
+  }
+  if (db.prepare("SELECT 1 FROM qualification_observations WHERE project_id = ? AND qualification_id = ?").get(request.projectId, qualificationId)) {
+    throw refusal("IDEMPOTENCY_KEY_CONFLICT", "qualification identity is immutable and already exists");
+  }
+  const contextDigest = qualificationContextDigest(context, resolved, request);
+  const requiredMatch = profileEquals(context.profile, resolved.requirement.executedProfile);
+  const declaredMatch = request.declaredProfile === void 0 || profileEquals(context.profile, request.declaredProfile);
+  const mismatch = !requiredMatch || !declaredMatch;
+  const observationOutcome = mismatch ? "unqualified" : requestedOutcome;
+  const effectiveStatus = observationOutcome === "qualified" ? "eligible" : observationOutcome === "unqualified" ? "ineligible" : "unknown";
+  const reasonCode = mismatch ? "execution_profile_mismatch" : request.reasonCode;
+  const evidenceDigest = sha256(canonicalJson({
+    executedProfileDigest: context.profileDigest,
+    qualificationContextDigest: contextDigest,
+    fixtureContextDigest,
+    outcome: observationOutcome,
+    reasonCode
+  }));
+  const observation = {
+    projectId: request.projectId,
+    qualificationId,
+    roleRequirementId: resolved.requirement.roleRequirementId,
+    configRevision,
+    repoTargetId: resolved.requirement.repoTargetId,
+    roleRequirementDigest: resolved.digest,
+    executedProfileDigest: context.profileDigest,
+    qualificationContextDigest: contextDigest,
+    fixtureContextDigest,
+    outcome: observationOutcome,
+    observedAtMs,
+    expiresAtMs,
+    evidenceDigest,
+    reasonCode
+  };
+  const observationDigest = sha256(canonicalJson(observation));
+  db.prepare(
+    `INSERT INTO qualification_observations (
+      project_id, qualification_id, role_requirement_id, config_revision, repo_target_id,
+      role_requirement_digest, executed_profile_digest, provider_id, model, reasoning_level,
+      permission_mode, service_tier, visibility, thread_id, environment_id, source_id, host_id,
+      provider_thread_id, request_event_id, request_event_seq, completion_event_id, completion_event_seq,
+      bb_version, plugin_sdk_version, qualification_context_digest, fixture_context_digest, outcome,
+      observed_at_ms, expires_at_ms, evidence_digest, observation_digest, reason_code
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    request.projectId,
+    qualificationId,
+    resolved.requirement.roleRequirementId,
+    configRevision,
+    resolved.requirement.repoTargetId,
+    resolved.digest,
+    context.profileDigest,
+    context.profile.providerId,
+    context.profile.model,
+    context.profile.reasoningLevel,
+    context.profile.permissionMode,
+    context.profile.serviceTier,
+    context.profile.visibility,
+    context.threadId,
+    context.environmentId,
+    context.sourceId,
+    context.hostId,
+    context.providerThreadId,
+    context.requestEventId,
+    context.requestEventSeq,
+    context.completionEventId,
+    context.completionEventSeq,
+    context.bbVersion,
+    PLUGIN_SDK_VERSION,
+    contextDigest,
+    fixtureContextDigest,
+    observationOutcome,
+    observedAtMs,
+    expiresAtMs,
+    evidenceDigest,
+    observationDigest,
+    reasonCode
+  );
+  const derivedAtMs = now();
+  const derivationDigest = sha256(canonicalJson({
+    qualificationId,
+    profileDigest: context.profileDigest,
+    effectiveStatus,
+    contextDigest,
+    configRevision,
+    roleRequirementDigest: resolved.digest,
+    derivedAtMs,
+    expiresAtMs,
+    reasonCode
+  }));
+  db.prepare(
+    `INSERT INTO eligibility_projections (
+      project_id, role_requirement_id, profile_digest, current_qualification_id,
+      effective_status, qualification_context_digest, config_revision, role_requirement_digest,
+      derived_at_ms, expires_at_ms, derivation_digest, reason_code
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(project_id, role_requirement_id, profile_digest) DO UPDATE SET
+      current_qualification_id = excluded.current_qualification_id,
+      effective_status = excluded.effective_status,
+      qualification_context_digest = excluded.qualification_context_digest,
+      config_revision = excluded.config_revision,
+      role_requirement_digest = excluded.role_requirement_digest,
+      derived_at_ms = excluded.derived_at_ms,
+      expires_at_ms = excluded.expires_at_ms,
+      derivation_digest = excluded.derivation_digest,
+      reason_code = excluded.reason_code`
+  ).run(
+    request.projectId,
+    resolved.requirement.roleRequirementId,
+    context.profileDigest,
+    qualificationId,
+    effectiveStatus,
+    contextDigest,
+    configRevision,
+    resolved.digest,
+    derivedAtMs,
+    expiresAtMs,
+    derivationDigest,
+    reasonCode
+  );
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "qualification_observation",
+      aggregateId: qualificationId,
+      aggregateRevision: 1,
+      eventType: "qualification_observation_recorded",
+      event: { qualificationId, roleRequirementId: resolved.requirement.roleRequirementId, profileDigest: context.profileDigest, outcome: observationOutcome }
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    {
+      currentConfigRevision: configRevision,
+      currentGovernanceEpoch: governor.governance_epoch,
+      evidence: { qualificationId, roleRequirementId: resolved.requirement.roleRequirementId, profileDigest: context.profileDigest, effectiveStatus, observationDigest, derivationDigest, reasonCode }
+    },
+    mismatch ? "EXECUTION_PROFILE_MISMATCH" : "OK"
+  );
+}
+function materializeRoleHolderAttempt(db, request, context, resolved, governanceEpoch, roleGeneration, holderContextDigest) {
+  const environment = context.baseContext.environment;
+  const attemptEvidence = {
+    origin: "role_holder",
+    projectId: request.projectId,
+    executionAttemptId: context.holderExecutionAttemptId,
+    configRevision: resolved.configRevision,
+    governanceEpoch,
+    repoTargetId: resolved.requirement.repoTargetId,
+    roleId: resolved.requirement.roleId,
+    bbServerId: context.bbServerId,
+    threadId: context.threadId,
+    environmentId: context.environmentId,
+    sourceId: context.sourceId,
+    hostId: context.hostId,
+    providerThreadId: context.providerThreadId,
+    nativeRequestId: context.nativeRequestId,
+    requestEventId: context.requestEventId,
+    requestEventSeq: context.requestEventSeq,
+    acceptedEventId: context.acceptedEventId,
+    acceptedEventSeq: context.acceptedEventSeq,
+    startEventId: context.startEventId,
+    startEventSeq: context.startEventSeq,
+    completionEventId: context.completionEventId,
+    completionEventSeq: context.completionEventSeq,
+    actualProfileDigest: context.profileDigest,
+    holderContextDigest
+  };
+  const attemptDigest = sha256(canonicalJson(attemptEvidence));
+  const existing = asRow(
+    db.prepare("SELECT origin, state, attempt_digest, native_receipt_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(
+      request.projectId,
+      context.holderExecutionAttemptId
+    )
+  );
+  if (existing) {
+    if (existing.origin !== "role_holder" || existing.state !== "done" || existing.attempt_digest !== attemptDigest || existing.native_receipt_digest !== holderContextDigest) {
+      throw refusal("ROLE_HOLDER_MISMATCH", "canonical role-holder attempt conflicts with the exact holder facts");
+    }
+    return;
+  }
+  const createdAtMs = now();
+  db.prepare(
+    `INSERT INTO execution_attempts (
+      project_id, execution_attempt_id, assignment_id, origin, assignment_digest, lane_id,
+      assignment_kind, attempt_ordinal, dispatch_kind, config_revision, governance_epoch,
+      work_item_id, repo_target_id, role_id, role_generation, state, bb_server_id,
+      environment_id, source_id, host_id, environment_path, thread_id, provider_thread_id,
+      native_request_id, request_event_id, request_event_seq, accepted_event_id, accepted_event_seq,
+      first_action_event_id, first_action_event_seq, completion_event_id, completion_event_seq,
+      actual_provider_id, actual_model, actual_reasoning_level, actual_permission_mode,
+      actual_service_tier, actual_visibility, actual_profile_digest, branch_name,
+      environment_digest, native_receipt_digest, reason_code, last_event_seq,
+      created_at_ms, observed_at_ms, completed_at_ms, attempt_digest
+    ) VALUES (?, ?, NULL, 'role_holder', NULL, NULL, NULL, 1, NULL, ?, ?, NULL, ?, ?, ?,
+      'done', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+      'role_holder_observed', ?, ?, ?, ?, ?)`
+  ).run(
+    request.projectId,
+    context.holderExecutionAttemptId,
+    resolved.configRevision,
+    governanceEpoch,
+    resolved.requirement.repoTargetId,
+    resolved.requirement.roleId,
+    roleGeneration,
+    context.bbServerId,
+    context.environmentId,
+    context.sourceId,
+    context.hostId,
+    environment.path,
+    context.threadId,
+    context.providerThreadId,
+    context.nativeRequestId,
+    context.requestEventId,
+    context.requestEventSeq,
+    context.acceptedEventId,
+    context.acceptedEventSeq,
+    context.startEventId,
+    context.startEventSeq,
+    context.completionEventId,
+    context.completionEventSeq,
+    context.profile.providerId,
+    context.profile.model,
+    context.profile.reasoningLevel,
+    context.profile.permissionMode,
+    context.profile.serviceTier,
+    context.profile.visibility,
+    context.profileDigest,
+    environment.branchName,
+    sha256(canonicalJson(context.baseContext.environment)),
+    holderContextDigest,
+    context.completionEventSeq,
+    createdAtMs,
+    createdAtMs,
+    createdAtMs,
+    attemptDigest
+  );
+}
+function applyRoleGenerationSuccession(db, request, digest, context) {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request);
+  if (!request.roleId || !request.qualificationId || !request.profileDigest || !request.fixtureContextDigest) {
+    throw refusal("INVALID_INPUT", "role succession requires role, qualification, profile, and fixture context identities");
+  }
+  const resolved = requireRoleRequirement(db, request, configRevision);
+  requireRoleTargetContext(db, request, resolved, context);
+  if (!profileEquals(context.profile, resolved.requirement.executedProfile) || request.profileDigest !== context.profileDigest) {
+    throw refusal("EXECUTION_PROFILE_MISMATCH", "holder executed profile does not match the role requirement");
+  }
+  const expectedContextDigest = qualificationContextDigest(context, resolved, request);
+  const observation = asRow(
+    db.prepare("SELECT * FROM qualification_observations WHERE project_id = ? AND qualification_id = ?").get(request.projectId, request.qualificationId)
+  );
+  if (!observation) throw refusal("ROLE_UNQUALIFIED", "qualification observation is not known");
+  const projection = asRow(
+    db.prepare("SELECT * FROM eligibility_projections WHERE project_id = ? AND role_requirement_id = ? AND profile_digest = ?").get(
+      request.projectId,
+      resolved.requirement.roleRequirementId,
+      request.profileDigest
+    )
+  );
+  if (!projection) throw refusal("CAPABILITY_UNKNOWN", "current eligibility projection is unavailable");
+  if (observation.config_revision !== configRevision || projection.config_revision !== configRevision || observation.role_requirement_digest !== resolved.digest || projection.role_requirement_digest !== resolved.digest || observation.bb_version !== context.bbVersion || observation.plugin_sdk_version !== PLUGIN_SDK_VERSION) {
+    throw refusal("ELIGIBILITY_STALE", "qualification or runtime evidence is stale");
+  }
+  if (observation.role_requirement_id !== resolved.requirement.roleRequirementId || observation.repo_target_id !== resolved.requirement.repoTargetId || observation.executed_profile_digest !== request.profileDigest || observation.qualification_context_digest !== expectedContextDigest || observation.fixture_context_digest !== request.fixtureContextDigest || projection.current_qualification_id !== observation.qualification_id || projection.qualification_context_digest !== expectedContextDigest) {
+    throw refusal("QUALIFICATION_CONTEXT_FOREIGN", "qualification does not match the exact holder context");
+  }
+  const effectiveAtMs = now();
+  if (observation.expires_at_ms !== null && observation.expires_at_ms <= effectiveAtMs || projection.expires_at_ms !== null && projection.expires_at_ms <= effectiveAtMs) {
+    throw refusal("ELIGIBILITY_EXPIRED", "qualification eligibility has expired");
+  }
+  if (observation.outcome === "unknown" || projection.effective_status === "unknown") throw refusal("CAPABILITY_UNKNOWN", "qualification outcome is unknown");
+  if (observation.outcome !== "qualified" || projection.effective_status !== "eligible") throw refusal("ROLE_UNQUALIFIED", "qualification is not eligible");
+  const head = asRow(
+    db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(request.projectId, request.roleId)
+  );
+  const first = request.expectedGeneration === null && request.predecessorGeneration === null;
+  let nextGeneration;
+  if (first) {
+    if (head) throw refusal("ROLE_GENERATION_STALE", "first generation requires no current role head", { currentResourceRevision: head.current_generation });
+    nextGeneration = 1;
+  } else {
+    if (request.expectedGeneration === null || request.predecessorGeneration === null) {
+      throw refusal("ROLE_PREDECESSOR_MISMATCH", "successor requires matching expected and predecessor generations");
+    }
+    if (!head) throw refusal("ROLE_HEAD_UNAVAILABLE", "successor requires a current role head");
+    if (head.current_generation !== request.expectedGeneration) {
+      throw refusal("ROLE_GENERATION_STALE", "role head generation is stale", {
+        currentResourceRevision: head.current_generation,
+        expectedResourceRevision: request.expectedGeneration
+      });
+    }
+    if (request.predecessorGeneration !== request.expectedGeneration) throw refusal("ROLE_PREDECESSOR_MISMATCH", "predecessor does not match the expected current generation");
+    const predecessor = asRow(
+      db.prepare("SELECT status FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?").get(
+        request.projectId,
+        request.roleId,
+        request.predecessorGeneration
+      )
+    );
+    if (!predecessor || !["active", "draining"].includes(predecessor.status)) throw refusal("ROLE_NOT_ACTIVE", "predecessor is not current and active or draining");
+    nextGeneration = request.expectedGeneration + 1;
+  }
+  const createdAtMs = now();
+  materializeRoleHolderAttempt(
+    db,
+    request,
+    context,
+    resolved,
+    governor.governance_epoch,
+    nextGeneration,
+    expectedContextDigest
+  );
+  db.prepare(
+    `INSERT INTO role_generations (
+      project_id, role_id, generation, role_requirement_id, config_revision, repo_target_id,
+      status, predecessor_generation, holder_execution_attempt_id, holder_context_digest,
+      holder_executed_profile_digest, qualification_id, eligibility_derivation_digest,
+      created_at_ms, activated_at_ms, retired_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+  ).run(
+    request.projectId,
+    request.roleId,
+    nextGeneration,
+    resolved.requirement.roleRequirementId,
+    configRevision,
+    resolved.requirement.repoTargetId,
+    request.predecessorGeneration,
+    context.holderExecutionAttemptId,
+    expectedContextDigest,
+    context.profileDigest,
+    request.qualificationId,
+    projection.derivation_digest,
+    createdAtMs,
+    createdAtMs
+  );
+  if (first) {
+    db.prepare("INSERT INTO role_generation_heads (project_id, role_id, current_generation, updated_at_ms) VALUES (?, ?, 1, ?)").run(
+      request.projectId,
+      request.roleId,
+      createdAtMs
+    );
+  } else {
+    const retired = db.prepare(
+      `UPDATE role_generations SET status = 'retired', retired_at_ms = ?
+       WHERE project_id = ? AND role_id = ? AND generation = ? AND status IN ('active', 'draining')`
+    ).run(createdAtMs, request.projectId, request.roleId, request.predecessorGeneration);
+    if (retired.changes !== 1) throw refusal("ROLE_NOT_ACTIVE", "predecessor retirement compare-and-swap failed");
+    const advanced = db.prepare(
+      `UPDATE role_generation_heads SET current_generation = ?, updated_at_ms = ?
+       WHERE project_id = ? AND role_id = ? AND current_generation = ?`
+    ).run(nextGeneration, createdAtMs, request.projectId, request.roleId, request.expectedGeneration);
+    if (advanced.changes !== 1) throw refusal("ROLE_GENERATION_STALE", "role head compare-and-swap failed");
+  }
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "role_generation",
+      aggregateId: request.roleId,
+      aggregateRevision: nextGeneration,
+      eventType: "role_generation_succeeded",
+      event: { roleId: request.roleId, generation: nextGeneration, predecessorGeneration: request.predecessorGeneration, qualificationId: request.qualificationId }
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    {
+      currentConfigRevision: configRevision,
+      currentGovernanceEpoch: governor.governance_epoch,
+      currentResourceRevision: nextGeneration,
+      expectedResourceRevision: request.expectedGeneration ?? void 0,
+      evidence: {
+        roleId: request.roleId,
+        generation: nextGeneration,
+        predecessorGeneration: request.predecessorGeneration,
+        holderExecutionAttemptId: context.holderExecutionAttemptId,
+        holderContextDigest: expectedContextDigest,
+        executedProfileDigest: context.profileDigest,
+        qualificationId: request.qualificationId,
+        eligibilityDerivationDigest: projection.derivation_digest
+      }
+    }
+  );
+}
+function applyRoleMutation(db, request, digest, reader) {
+  try {
+    const replay = checkIdempotency(db, request, digest);
+    if (replay) return replay;
+    const context = resolveRoleContext(reader, request);
+    return transaction(db, () => {
+      const replayInTransaction = checkIdempotency(db, request, digest);
+      if (replayInTransaction) return replayInTransaction;
+      return request.operationClass === "qualification_observation_record" ? applyQualificationObservation(db, request, digest, context) : applyRoleGenerationSuccession(db, request, digest, context);
+    });
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    if (isConstraintError(error48)) return unavailableResult(request.projectId, "canonical role mutation could not be committed unambiguously");
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
   }
 }
 var githubSnapshotSchema = external_exports.object({
@@ -15164,14 +17596,1581 @@ function storedConfigJson(db, projectId, configRevision) {
   if (!row) throw refusal("PROJECT_CONFIG_REQUIRED", "project config revision is unavailable");
   return row.canonical_config_json;
 }
+function requireGithubMapping(db, projectId, configRevision, repoTargetId) {
+  const github = githubConfigFromJson(storedConfigJson(db, projectId, configRevision));
+  if (!github) throw refusal("EXTERNAL_TARGET_REQUIRED", "the config has no GitHub Issues mapping");
+  const mappings = github.repositoryMappings.filter((mapping) => mapping.repoTargetId === repoTargetId);
+  if (mappings.length !== 1) throw refusal("EXTERNAL_TARGET_REQUIRED", "the exact repository target has no unique GitHub Issues mapping");
+  return { github, mapping: mappings[0] };
+}
+function requireWorkItem(db, request, configRevision, expectedRevision = request.expectedResourceRevision) {
+  const workItemId = request.workItemId;
+  if (!workItemId) throw refusal("WORK_ITEM_UNKNOWN", "work item identity is required");
+  const row = asRow(
+    db.prepare("SELECT * FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, workItemId)
+  );
+  if (!row) {
+    const foreign = db.prepare("SELECT 1 FROM work_items WHERE work_item_id = ? LIMIT 1").get(workItemId);
+    throw refusal(foreign ? "WORK_ITEM_FOREIGN" : "WORK_ITEM_UNKNOWN", foreign ? "work item belongs to another project" : "work item is not known");
+  }
+  if (row.config_revision !== configRevision) {
+    throw refusal("PROJECT_CONFIG_STALE", "work item is bound to a stale config revision", {
+      currentConfigRevision: configRevision,
+      expectedConfigRevision: row.config_revision
+    });
+  }
+  if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "work item mutation requires its exact repository target");
+  if (request.repoTargetId !== row.repo_target_id) throw refusal("REPO_TARGET_FOREIGN", "work item target does not match the exact repository target");
+  requireTarget(db, request.projectId, configRevision, request.repoTargetId);
+  if (expectedRevision !== row.resource_revision) {
+    throw refusal("WORK_ITEM_REVISION_STALE", "work item resource revision is stale", {
+      currentResourceRevision: row.resource_revision,
+      expectedResourceRevision: expectedRevision ?? void 0
+    });
+  }
+  return row;
+}
+function applyWorkItemCreate(db, request, digest) {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  if (!request.workItem) throw refusal("INVALID_INPUT", "work item create requires workItem");
+  if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "work item create requires an exact repository target");
+  requireTarget(db, request.projectId, configRevision, request.repoTargetId);
+  if (request.workItemId && request.workItemId !== request.workItem.workItemId) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work item identities conflict");
+  }
+  if (request.expectedResourceRevision !== null) throw refusal("WORK_ITEM_REVISION_STALE", "work item create requires no existing resource revision");
+  if (db.prepare("SELECT 1 FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, request.workItem.workItemId)) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work item already exists");
+  }
+  const createdAtMs = now();
+  db.prepare(
+    `INSERT INTO work_items
+      (project_id, work_item_id, config_revision, repo_target_id, title, body,
+       lifecycle_state, resource_revision, created_at_ms, updated_at_ms)
+     VALUES (?, ?, ?, ?, ?, ?, 'proposed', 1, ?, ?)`
+  ).run(
+    request.projectId,
+    request.workItem.workItemId,
+    configRevision,
+    request.repoTargetId,
+    request.workItem.title,
+    request.workItem.body,
+    createdAtMs,
+    createdAtMs
+  );
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "work_item",
+      aggregateId: request.workItem.workItemId,
+      aggregateRevision: 1,
+      eventType: "work_item_created",
+      event: { workItemId: request.workItem.workItemId, repoTargetId: request.repoTargetId, lifecycleState: "proposed" }
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    {
+      currentConfigRevision: configRevision,
+      currentGovernanceEpoch: governor.governance_epoch,
+      currentResourceRevision: 1,
+      evidence: { workItemId: request.workItem.workItemId, repoTargetId: request.repoTargetId, lifecycleState: "proposed" }
+    }
+  );
+}
+var WORK_ITEM_TRANSITIONS = {
+  proposed: ["ready", "cancelled"],
+  ready: ["in_progress", "cancelled"],
+  in_progress: ["succeeded", "failed", "cancelled"],
+  succeeded: [],
+  failed: [],
+  cancelled: []
+};
+function applyWorkItemTransition(db, request, digest) {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  const workItem = requireWorkItem(db, request, configRevision);
+  const nextState = request.lifecycleState;
+  if (!nextState || !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
+  }
+  const nextRevision = workItem.resource_revision + 1;
+  const updated = db.prepare(
+    `UPDATE work_items SET lifecycle_state = ?, resource_revision = ?, updated_at_ms = ?
+     WHERE project_id = ? AND work_item_id = ? AND resource_revision = ? AND lifecycle_state = ?`
+  ).run(nextState, nextRevision, now(), request.projectId, workItem.work_item_id, workItem.resource_revision, workItem.lifecycle_state);
+  if (updated.changes !== 1) {
+    throw refusal("WORK_ITEM_REVISION_STALE", "work item compare-and-swap failed", {
+      currentResourceRevision: workItem.resource_revision,
+      expectedResourceRevision: request.expectedResourceRevision ?? void 0
+    });
+  }
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "work_item",
+      aggregateId: workItem.work_item_id,
+      aggregateRevision: nextRevision,
+      eventType: "work_item_transitioned",
+      event: { workItemId: workItem.work_item_id, from: workItem.lifecycle_state, to: nextState }
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    {
+      currentConfigRevision: configRevision,
+      currentGovernanceEpoch: governor.governance_epoch,
+      currentResourceRevision: nextRevision,
+      expectedResourceRevision: request.expectedResourceRevision ?? void 0,
+      evidence: { workItemId: workItem.work_item_id, lifecycleState: nextState }
+    }
+  );
+}
+function desiredProjection(workItem, github) {
+  const convention = github.issue;
+  const names = new Set(convention?.managedLabels?.names ?? []);
+  const managedLabels = [...new Set(convention?.managedLabels?.byLifecycle?.[workItem.lifecycle_state] ?? [])].sort();
+  const title = `${convention?.titlePrefix ?? ""}${workItem.title}`;
+  const body = `${convention?.bodyPrefix ?? ""}${workItem.body}`;
+  const state = ["succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state) ? "closed" : "open";
+  return {
+    title,
+    body,
+    state,
+    managedLabels,
+    managedNames: names,
+    digest: sha256(canonicalJson({ title, body, state, managedLabels }))
+  };
+}
+function parseSnapshot(value) {
+  const parsed = githubSnapshotSchema.safeParse(value);
+  if (!parsed.success || new Set(parsed.data.labels).size !== parsed.data.labels.length) {
+    throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue response is invalid", { expected: 1, attempted: 1, verified: 0 });
+  }
+  return parsed.data;
+}
+function observedDigest(snapshot, desired) {
+  return sha256(canonicalJson({
+    title: snapshot.title,
+    body: snapshot.body,
+    state: snapshot.state,
+    managedLabels: snapshot.labels.filter((label) => desired.managedNames.has(label)).sort()
+  }));
+}
+function externalRef(db, projectId, workItemId) {
+  return asRow(
+    db.prepare("SELECT * FROM external_work_refs WHERE project_id = ? AND work_item_id = ? AND provider = 'github'").get(projectId, workItemId)
+  );
+}
+var EXTERNAL_REF_CAS_WHERE = `project_id = ? AND work_item_id = ? AND provider = 'github'
+  AND owner = ? AND repo = ? AND issue_number IS ? AND projection_state = ?
+  AND attempted_resource_revision = ? AND projected_resource_revision IS ?
+  AND desired_digest = ? AND observed_external_revision IS ? AND observed_external_digest IS ?
+  AND last_idempotency_key = ? AND last_request_digest = ?`;
+function externalRefCasArgs(ref) {
+  return [
+    ref.project_id,
+    ref.work_item_id,
+    ref.owner,
+    ref.repo,
+    ref.issue_number,
+    ref.projection_state,
+    ref.attempted_resource_revision,
+    ref.projected_resource_revision,
+    ref.desired_digest,
+    ref.observed_external_revision,
+    ref.observed_external_digest,
+    ref.last_idempotency_key,
+    ref.last_request_digest
+  ];
+}
+function revalidateProjectionContext(db, request, context) {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  const workItem = requireWorkItem(db, request, configRevision);
+  const { mapping } = requireGithubMapping(db, request.projectId, configRevision, workItem.repo_target_id);
+  if (configRevision !== context.configRevision || governor.governance_epoch !== context.governanceEpoch || actorReceiptId !== context.actorReceiptId || workItem.work_item_id !== context.workItem.work_item_id || mapping.repoTargetId !== context.mapping.repoTargetId || mapping.owner !== context.mapping.owner || mapping.repo !== context.mapping.repo || mapping.connectorHost !== context.mapping.connectorHost) {
+    throw refusal("EXTERNAL_TARGET_MISMATCH", "projection authority context changed before local mutation");
+  }
+  return { configRevision, governor, actorReceiptId, workItem, mapping };
+}
+function prepareProjection(db, request, digest, adapter) {
+  return transaction(db, () => {
+    const replay = checkIdempotency(db, request, digest);
+    if (replay) return replay;
+    if (request.projectionKind !== "github_issue") throw refusal("INVALID_INPUT", "GitHub projection requires projectionKind github_issue");
+    const configRevision = requireConfig(db, request);
+    const governor = requireGovernor(db, request);
+    const actorReceiptId = requireActor(db, request);
+    const workItem = requireWorkItem(db, request, configRevision);
+    const { github, mapping } = requireGithubMapping(db, request.projectId, configRevision, workItem.repo_target_id);
+    if (adapter.connectorHost !== mapping.connectorHost) throw refusal("EXTERNAL_TARGET_MISMATCH", "GitHub connector host does not match the exact mapping");
+    const desired = desiredProjection(workItem, github);
+    let ref = externalRef(db, request.projectId, workItem.work_item_id);
+    if (ref) {
+      if (ref.project_id !== request.projectId || ref.work_item_id !== workItem.work_item_id || ref.provider !== "github") {
+        throw refusal("EXTERNAL_REF_FOREIGN", "external ref belongs to another canonical resource");
+      }
+      if (ref.owner !== mapping.owner || ref.repo !== mapping.repo) {
+        throw refusal("EXTERNAL_REF_CONFLICT", "external ref conflicts with the exact repository mapping");
+      }
+      if (ref.projection_state === "pending" || ref.projection_state === "delivery_ambiguous") {
+        throw refusal("EXTERNAL_DELIVERY_AMBIGUOUS", "external delivery is durably fenced", { expected: 1, attempted: 0, verified: 0 });
+      }
+      if (ref.projection_state === "drifted") {
+        throw refusal("EXTERNAL_DIVERGED", "external issue is marked drifted", { expected: 1, attempted: 0, verified: 0 });
+      }
+      if (ref.issue_number === null) throw refusal("EXTERNAL_REF_CONFLICT", "current external ref has no issue number");
+    } else {
+      const createdAtMs = now();
+      db.prepare(
+        `INSERT INTO external_work_refs
+          (project_id, work_item_id, provider, owner, repo, issue_number, projection_state,
+           attempted_resource_revision, projected_resource_revision, desired_digest,
+           observed_external_revision, observed_external_digest, last_idempotency_key,
+           last_request_digest, created_at_ms, updated_at_ms)
+         VALUES (?, ?, 'github', ?, ?, NULL, 'pending', ?, NULL, ?, NULL, NULL, ?, ?, ?, ?)`
+      ).run(
+        request.projectId,
+        workItem.work_item_id,
+        mapping.owner,
+        mapping.repo,
+        workItem.resource_revision,
+        desired.digest,
+        request.idempotencyKey,
+        digest,
+        createdAtMs,
+        createdAtMs
+      );
+      appendStateEvent(db, request, actorReceiptId, {
+        aggregateType: "external_work_ref",
+        aggregateId: workItem.work_item_id,
+        aggregateRevision: workItem.resource_revision,
+        eventType: "github_issue_projection_reserved",
+        event: {
+          workItemId: workItem.work_item_id,
+          provider: "github",
+          from: null,
+          to: "pending",
+          desiredDigest: desired.digest
+        }
+      });
+      ref = externalRef(db, request.projectId, workItem.work_item_id);
+    }
+    return {
+      actorReceiptId,
+      configRevision,
+      governanceEpoch: governor.governance_epoch,
+      workItem,
+      github,
+      mapping,
+      desired,
+      ref
+    };
+  });
+}
+function reserveExistingProjection(db, request, digest, context) {
+  return transaction(db, () => {
+    const replay = checkIdempotency(db, request, digest);
+    if (replay) throw refusal("IDEMPOTENCY_KEY_CONFLICT", "projection was concurrently finalized");
+    revalidateProjectionContext(db, request, context);
+    const updated = db.prepare(
+      `UPDATE external_work_refs SET projection_state = 'pending', attempted_resource_revision = ?,
+       desired_digest = ?, last_idempotency_key = ?, last_request_digest = ?, updated_at_ms = ?
+       WHERE ${EXTERNAL_REF_CAS_WHERE}`
+    ).run(
+      context.workItem.resource_revision,
+      context.desired.digest,
+      request.idempotencyKey,
+      digest,
+      now(),
+      ...externalRefCasArgs(context.ref)
+    );
+    if (updated.changes !== 1) throw refusal("EXTERNAL_REF_CONFLICT", "external ref reservation lost its compare-and-swap race");
+    appendStateEvent(db, request, context.actorReceiptId, {
+      aggregateType: "external_work_ref",
+      aggregateId: context.workItem.work_item_id,
+      aggregateRevision: context.workItem.resource_revision,
+      eventType: "github_issue_projection_reserved",
+      event: {
+        workItemId: context.workItem.work_item_id,
+        provider: "github",
+        from: context.ref.projection_state,
+        to: "pending",
+        desiredDigest: context.desired.digest
+      }
+    });
+    return { ...context, ref: externalRef(db, request.projectId, context.workItem.work_item_id) };
+  });
+}
+function recordProjectionState(db, request, digest, context, state, outcome, counts, message) {
+  return transaction(db, () => {
+    const replay = checkIdempotency(db, request, digest);
+    if (replay) return replay;
+    const authority = revalidateProjectionContext(db, request, context);
+    const updated = db.prepare(
+      `UPDATE external_work_refs SET projection_state = ?, attempted_resource_revision = ?, desired_digest = ?,
+       last_idempotency_key = ?, last_request_digest = ?, updated_at_ms = ?
+       WHERE ${EXTERNAL_REF_CAS_WHERE}`
+    ).run(
+      state,
+      context.workItem.resource_revision,
+      context.desired.digest,
+      request.idempotencyKey,
+      digest,
+      now(),
+      ...externalRefCasArgs(context.ref)
+    );
+    if (updated.changes !== 1) throw refusal("EXTERNAL_REF_CONFLICT", "external ref state changed before projection outcome was recorded");
+    return commitMutation(
+      db,
+      request,
+      digest,
+      authority.actorReceiptId,
+      {
+        aggregateType: "external_work_ref",
+        aggregateId: context.workItem.work_item_id,
+        aggregateRevision: context.workItem.resource_revision,
+        eventType: state === "drifted" ? "github_issue_drifted" : "github_issue_delivery_ambiguous",
+        event: { workItemId: context.workItem.work_item_id, provider: "github", projectionState: state }
+      },
+      counts,
+      {
+        message,
+        currentConfigRevision: authority.configRevision,
+        currentGovernanceEpoch: authority.governor.governance_epoch,
+        currentResourceRevision: authority.workItem.resource_revision,
+        expectedResourceRevision: request.expectedResourceRevision ?? void 0,
+        evidence: { projectionState: state, desiredDigest: context.desired.digest }
+      },
+      outcome
+    );
+  });
+}
+function finalizeProjection(db, request, digest, context, adapter, snapshot, mutationKind) {
+  return transaction(db, () => {
+    const replay = checkIdempotency(db, request, digest);
+    if (replay) return replay;
+    const authority = revalidateProjectionContext(db, request, context);
+    if (authority.mapping.connectorHost !== adapter.connectorHost) {
+      throw refusal("EXTERNAL_TARGET_MISMATCH", "GitHub mapping changed before projection finalization");
+    }
+    if (context.ref.owner !== snapshot.owner || context.ref.repo !== snapshot.repo || context.ref.issue_number !== null && context.ref.issue_number !== snapshot.issueNumber) {
+      throw refusal("EXTERNAL_REF_CONFLICT", "external identity changed before projection finalization");
+    }
+    if (mutationKind === "verify" && context.ref.projection_state !== "current" || mutationKind !== "verify" && (context.ref.projection_state !== "pending" || context.ref.last_idempotency_key !== request.idempotencyKey || context.ref.last_request_digest !== digest)) {
+      throw refusal("EXTERNAL_REF_CONFLICT", "external reservation changed before projection finalization");
+    }
+    const observed = observedDigest(snapshot, context.desired);
+    if (observed !== context.desired.digest) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub read-back does not match the desired projection");
+    const updated = db.prepare(
+      `UPDATE external_work_refs SET issue_number = ?, projection_state = 'current', attempted_resource_revision = ?,
+       projected_resource_revision = ?, desired_digest = ?, observed_external_revision = ?,
+       observed_external_digest = ?, last_idempotency_key = ?, last_request_digest = ?, updated_at_ms = ?
+       WHERE ${EXTERNAL_REF_CAS_WHERE}`
+    ).run(
+      snapshot.issueNumber,
+      authority.workItem.resource_revision,
+      authority.workItem.resource_revision,
+      context.desired.digest,
+      snapshot.externalRevision,
+      observed,
+      request.idempotencyKey,
+      digest,
+      now(),
+      ...externalRefCasArgs(context.ref)
+    );
+    if (updated.changes !== 1) throw refusal("EXTERNAL_REF_CONFLICT", "external ref finalization lost its compare-and-swap race");
+    return commitMutation(
+      db,
+      request,
+      digest,
+      authority.actorReceiptId,
+      {
+        aggregateType: "external_work_ref",
+        aggregateId: authority.workItem.work_item_id,
+        aggregateRevision: authority.workItem.resource_revision,
+        eventType: "github_issue_projected",
+        event: { workItemId: authority.workItem.work_item_id, owner: snapshot.owner, repo: snapshot.repo, issueNumber: snapshot.issueNumber, mutationKind }
+      },
+      { expected: 1, attempted: 1, verified: 1 },
+      {
+        currentConfigRevision: authority.configRevision,
+        currentGovernanceEpoch: authority.governor.governance_epoch,
+        currentResourceRevision: authority.workItem.resource_revision,
+        expectedResourceRevision: request.expectedResourceRevision ?? void 0,
+        evidence: {
+          provider: "github",
+          owner: snapshot.owner,
+          repo: snapshot.repo,
+          issueNumber: snapshot.issueNumber,
+          desiredDigest: context.desired.digest,
+          observedDigest: observed,
+          observedExternalRevision: snapshot.externalRevision,
+          mutationKind
+        }
+      }
+    );
+  });
+}
+function applyGithubIssueProjection(db, request, digest, adapter) {
+  try {
+    const replay = checkIdempotency(db, request, digest);
+    if (replay) return replay;
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+  }
+  if (!adapter) return result("EXTERNAL_CAPABILITY_REQUIRED", request.projectId, 1, 0, 0, { message: "a GitHub Issues adapter capability is required" });
+  if (!adapter.available) return result("EXTERNAL_UNAVAILABLE", request.projectId, 1, 0, 0, { message: "the GitHub Issues adapter is unavailable" });
+  let context;
+  try {
+    const prepared = prepareProjection(db, request, digest, adapter);
+    if ("outcome" in prepared) return prepared;
+    context = prepared;
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+  }
+  let mutation;
+  if (context.ref.issue_number === null) {
+    mutation = {
+      kind: "create",
+      owner: context.mapping.owner,
+      repo: context.mapping.repo,
+      title: context.desired.title,
+      body: context.desired.body,
+      state: context.desired.state,
+      addLabels: context.desired.managedLabels,
+      removeLabels: []
+    };
+  } else {
+    let current;
+    try {
+      const value = adapter.read(context.mapping.owner, context.mapping.repo, context.ref.issue_number);
+      if (value === null) return result("EXTERNAL_NOT_FOUND", request.projectId, 1, 1, 0, { message: "the bound GitHub issue was not found" });
+      current = parseSnapshot(value);
+    } catch (error48) {
+      if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+      return result("EXTERNAL_UNAVAILABLE", request.projectId, 1, 1, 0, { message: "the bound GitHub issue could not be read" });
+    }
+    if (current.owner !== context.mapping.owner || current.repo !== context.mapping.repo || current.issueNumber !== context.ref.issue_number) {
+      return result("EXTERNAL_TARGET_MISMATCH", request.projectId, 1, 1, 0, { message: "the GitHub issue response has the wrong exact identity" });
+    }
+    if (!context.ref.observed_external_digest || observedDigest(current, context.desired) !== context.ref.observed_external_digest) {
+      try {
+        return recordProjectionState(db, request, digest, context, "drifted", "EXTERNAL_DIVERGED", { expected: 1, attempted: 1, verified: 0 }, "the GitHub issue diverged from its last verified projection");
+      } catch {
+        return result("EXTERNAL_DIVERGED", request.projectId, 1, 1, 0, { message: "the GitHub issue diverged from its last verified projection" });
+      }
+    }
+    if (observedDigest(current, context.desired) === context.desired.digest) {
+      try {
+        return finalizeProjection(db, request, digest, context, adapter, current, "verify");
+      } catch (error48) {
+        if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+        return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+      }
+    }
+    try {
+      context = reserveExistingProjection(db, request, digest, context);
+    } catch (error48) {
+      if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+      return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+    }
+    const currentLabels = new Set(current.labels);
+    mutation = {
+      kind: "update",
+      owner: context.mapping.owner,
+      repo: context.mapping.repo,
+      issueNumber: context.ref.issue_number,
+      title: context.desired.title,
+      body: context.desired.body,
+      state: context.desired.state,
+      addLabels: context.desired.managedLabels.filter((label) => !currentLabels.has(label)),
+      removeLabels: current.labels.filter((label) => context.desired.managedNames.has(label) && !context.desired.managedLabels.includes(label))
+    };
+  }
+  try {
+    const mutationResponse = parseSnapshot(adapter.mutate(mutation));
+    if (mutationResponse.owner !== mutation.owner || mutationResponse.repo !== mutation.repo || mutation.issueNumber !== void 0 && mutationResponse.issueNumber !== mutation.issueNumber) {
+      throw new GitHubIssueAdapterError("ambiguous");
+    }
+    const readBackValue = adapter.read(mutation.owner, mutation.repo, mutationResponse.issueNumber);
+    if (readBackValue === null) throw new GitHubIssueAdapterError("ambiguous");
+    const readBack = parseSnapshot(readBackValue);
+    if (readBack.owner !== mutation.owner || readBack.repo !== mutation.repo || readBack.issueNumber !== mutationResponse.issueNumber) {
+      throw new GitHubIssueAdapterError("ambiguous");
+    }
+    return finalizeProjection(db, request, digest, context, adapter, readBack, mutation.kind);
+  } catch {
+    try {
+      return recordProjectionState(
+        db,
+        request,
+        digest,
+        context,
+        "delivery_ambiguous",
+        "EXTERNAL_DELIVERY_AMBIGUOUS",
+        { expected: 1, attempted: 1, verified: 0 },
+        "GitHub delivery or exact read-back could not be proven"
+      );
+    } catch {
+      return result("EXTERNAL_DELIVERY_AMBIGUOUS", request.projectId, 1, 1, 0, { message: "GitHub delivery or local finalization could not be proven" });
+    }
+  }
+}
+var NATIVE_EVIDENCE_COLUMNS = [
+  "thread_id",
+  "provider_thread_id",
+  "native_request_id",
+  "request_event_id",
+  "request_event_seq",
+  "accepted_event_id",
+  "accepted_event_seq",
+  "first_action_event_id",
+  "first_action_event_seq",
+  "content_event_id",
+  "content_event_seq",
+  "content_receipt_digest",
+  "actual_provider_id",
+  "actual_model",
+  "actual_reasoning_level",
+  "actual_permission_mode",
+  "actual_service_tier",
+  "actual_visibility",
+  "actual_profile_digest",
+  "native_receipt_digest",
+  "last_event_seq"
+];
 var ACTIVE_ASSIGNMENT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
+var ACTIVE_ASSIGNMENT_SQL = "('prepared','armed','content_delivered','running','dispatch_unknown')";
+function requestedProfile(assignment) {
+  return {
+    providerId: assignment.requested_provider_id,
+    model: assignment.requested_model,
+    reasoningLevel: assignment.requested_reasoning_level,
+    permissionMode: assignment.requested_permission_mode,
+    serviceTier: assignment.requested_service_tier,
+    visibility: assignment.requested_visibility
+  };
+}
+function assignmentEnvironmentDigest(assignment) {
+  return sha256(canonicalJson({
+    ...assignment.environment,
+    branchName: assignment.branchName,
+    baseSha: assignment.baseSha,
+    candidateSha: assignment.candidateSha
+  }));
+}
+function immutableAssignmentDigest(assignment, projectId, configRevision, governanceEpoch, workItemRevision, repoTargetId) {
+  const { assignmentId: _assignmentId, ...intent } = assignment;
+  return sha256(canonicalJson({ projectId, configRevision, governanceEpoch, workItemRevision, repoTargetId, intent }));
+}
+function storedAssignmentIntent(assignment) {
+  return {
+    assignmentId: assignment.assignment_id,
+    workItemId: assignment.work_item_id,
+    assignmentKind: assignment.assignment_kind,
+    laneId: assignment.lane_id,
+    roleRequirementId: assignment.role_requirement_id,
+    roleId: assignment.role_id,
+    roleGeneration: assignment.role_generation,
+    branchName: assignment.branch_name,
+    baseSha: assignment.base_sha,
+    candidateSemantics: assignment.candidate_semantics,
+    candidateSha: assignment.candidate_sha,
+    environment: {
+      bbServerId: assignment.bb_server_id,
+      environmentId: assignment.environment_id,
+      sourceId: assignment.source_id,
+      hostId: assignment.host_id,
+      path: assignment.environment_path,
+      mode: assignment.environment_mode
+    },
+    frozenBriefVersion: assignment.frozen_brief_version,
+    frozenBriefDigest: assignment.frozen_brief_digest,
+    requestedProfile: requestedProfile(assignment),
+    dispatchKind: assignment.dispatch_kind,
+    attachThreadId: assignment.attach_thread_id,
+    parentAssignmentId: assignment.parent_assignment_id,
+    depth: assignment.depth,
+    deadlineAtMs: assignment.deadline_at_ms
+  };
+}
+function assignmentRows(db, request) {
+  if (!request.assignmentId || !request.executionAttemptId) throw refusal("INVALID_INPUT", "assignment and execution attempt identities are required");
+  const assignment = asRow(
+    db.prepare("SELECT * FROM assignments WHERE project_id = ? AND assignment_id = ?").get(request.projectId, request.assignmentId)
+  );
+  const attempt = asRow(
+    db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(request.projectId, request.executionAttemptId)
+  );
+  if (!assignment || !attempt || attempt.assignment_id !== assignment.assignment_id) {
+    throw refusal("RESOURCE_UNKNOWN", "assignment or canonical execution attempt is unavailable");
+  }
+  return { assignment, attempt };
+}
+function requireCanonicalRoleGeneration(db, projectId, roleId, roleGeneration, roleRequirementId) {
+  const head = asRow(
+    db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(projectId, roleId)
+  );
+  const generation = asRow(
+    db.prepare("SELECT status, role_requirement_id, holder_execution_attempt_id FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?").get(
+      projectId,
+      roleId,
+      roleGeneration
+    )
+  );
+  if (!head || head.current_generation !== roleGeneration) throw refusal("ROLE_GENERATION_STALE", "assignment role generation is not current");
+  if (!generation || generation.status !== "active") throw refusal("ROLE_NOT_ACTIVE", "assignment role generation is not active");
+  if (generation.role_requirement_id !== roleRequirementId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement does not match its generation");
+  const holder = asRow(
+    db.prepare("SELECT origin, state, native_receipt_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(
+      projectId,
+      generation.holder_execution_attempt_id
+    )
+  );
+  if (!holder || holder.origin !== "role_holder" || holder.state !== "done" || !holder.native_receipt_digest) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "assignment role holder has no complete canonical execution attempt");
+  }
+}
+function revalidateAssignmentReference(db, request, assignment, attempt) {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  if (configRevision !== assignment.config_revision || governor.governance_epoch !== assignment.governance_epoch) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "assignment config or governance head moved");
+  }
+  requireCanonicalRoleGeneration(db, request.projectId, assignment.role_id, assignment.role_generation, assignment.role_requirement_id);
+  const workItem = requireWorkItem(
+    db,
+    { ...request, workItemId: assignment.work_item_id, repoTargetId: assignment.repo_target_id, expectedResourceRevision: assignment.work_item_revision },
+    configRevision,
+    assignment.work_item_revision
+  );
+  const target = requireTarget(db, request.projectId, configRevision, assignment.repo_target_id);
+  if (workItem.repo_target_id !== assignment.repo_target_id || target.source_id !== assignment.source_id || target.host_id !== assignment.host_id || target.path !== assignment.environment_path) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment environment no longer matches its exact target");
+  }
+  const intent = storedAssignmentIntent(assignment);
+  const profileDigest = sha256(canonicalJson(intent.requestedProfile));
+  const assignmentDigest = immutableAssignmentDigest(
+    intent,
+    request.projectId,
+    assignment.config_revision,
+    assignment.governance_epoch,
+    assignment.work_item_revision,
+    assignment.repo_target_id
+  );
+  const executionAttemptId = sha256(canonicalJson({ projectId: request.projectId, assignmentDigest, attemptOrdinal: 1 }));
+  const attemptDigest = sha256(canonicalJson({ projectId: request.projectId, executionAttemptId, assignmentDigest, state: "prepared" }));
+  const requirement = roleRequirementsFromJson(storedConfigJson(db, request.projectId, configRevision)).find((candidate) => candidate.roleRequirementId === assignment.role_requirement_id);
+  if (!requirement || requirement.roleId !== assignment.role_id || requirement.repoTargetId !== null && requirement.repoTargetId !== assignment.repo_target_id || !profileEquals(requirement.executedProfile, intent.requestedProfile)) {
+    throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement or executed profile is no longer canonical");
+  }
+  if (assignment.assignment_digest !== assignmentDigest || assignment.requested_profile_digest !== profileDigest || attempt.execution_attempt_id !== executionAttemptId || attempt.attempt_digest !== attemptDigest || attempt.assignment_id !== assignment.assignment_id || attempt.origin !== "assignment" || attempt.assignment_digest !== assignmentDigest || attempt.attempt_ordinal !== 1 || attempt.lane_id !== assignment.lane_id || attempt.assignment_kind !== assignment.assignment_kind || attempt.dispatch_kind !== assignment.dispatch_kind || attempt.config_revision !== assignment.config_revision || attempt.governance_epoch !== assignment.governance_epoch || attempt.work_item_id !== assignment.work_item_id || attempt.repo_target_id !== assignment.repo_target_id || attempt.role_id !== assignment.role_id || attempt.role_generation !== assignment.role_generation || attempt.bb_server_id !== assignment.bb_server_id || attempt.environment_id !== assignment.environment_id || attempt.source_id !== assignment.source_id || attempt.host_id !== assignment.host_id || attempt.environment_path !== assignment.environment_path || attempt.frozen_brief_digest !== assignment.frozen_brief_digest || attempt.branch_name !== assignment.branch_name || attempt.base_sha !== assignment.base_sha || attempt.environment_digest !== assignmentEnvironmentDigest(intent)) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "assignment or execution attempt no longer matches its immutable stored intent");
+  }
+  return { governor };
+}
+function requireAssignmentActor(db, request, roleId, roleGeneration) {
+  const actor = asRow(
+    db.prepare("SELECT actor_kind, subject_id, role_id, role_generation FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(
+      request.projectId,
+      request.actorReceiptId
+    )
+  );
+  const generation = asRow(
+    db.prepare("SELECT holder_execution_attempt_id FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?").get(
+      request.projectId,
+      roleId,
+      roleGeneration
+    )
+  );
+  if (!actor || actor.actor_kind !== "role" || actor.role_id !== roleId || actor.role_generation !== roleGeneration || !generation || actor.subject_id !== generation.holder_execution_attempt_id) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "assignment actor is not the exact current role holder");
+  }
+}
+function revalidateAssignmentAuthority(db, request, assignment, attempt) {
+  const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request);
+  requireAssignmentActor(db, request, assignment.role_id, assignment.role_generation);
+  const { governor } = revalidateAssignmentReference(db, request, assignment, attempt);
+  return { actorReceiptId, governor };
+}
+function hasUnresolvedWriterTerminalConflict(db, projectId) {
+  return Boolean(db.prepare(
+    `SELECT 1 FROM execution_attempts
+     WHERE project_id = ? AND origin = 'assignment' AND assignment_kind = 'write'
+       AND conflicting_terminal_digest IS NOT NULL LIMIT 1`
+  ).get(projectId));
+}
+function preflightAssignmentPrepare(db, request) {
+  const assignment = request.assignment;
+  if (!assignment) throw refusal("INVALID_INPUT", "assignment_prepare requires immutable assignment intent");
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  requireActor(db, request);
+  requireRoleActorBinding(db, request);
+  requireAssignmentActor(db, request, assignment.roleId, assignment.roleGeneration);
+  if (assignment.requestedProfile.permissionMode !== "full" || assignment.requestedProfile.visibility !== "visible") {
+    throw refusal("EXECUTION_PROFILE_MISMATCH", "assignment requires explicit full permission and visible execution");
+  }
+  if (assignment.assignmentKind === "write" ? assignment.candidateSemantics !== "base" : assignment.candidateSemantics !== "frozen") {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "assignment candidate semantics do not match its kind");
+  }
+  if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "assignment requires one exact repository target");
+  const workItem = requireWorkItem(db, { ...request, workItemId: assignment.workItemId }, configRevision);
+  if (assignment.assignmentKind === "write" ? !["ready", "in_progress"].includes(workItem.lifecycle_state) : workItem.lifecycle_state !== "in_progress") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "WorkItem state does not permit this assignment kind");
+  }
+  const target = requireTarget(db, request.projectId, configRevision, request.repoTargetId);
+  if (target.source_id !== assignment.environment.sourceId || target.host_id !== assignment.environment.hostId || target.path !== assignment.environment.path) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment environment does not match the exact repository target");
+  }
+  requireCanonicalRoleGeneration(db, request.projectId, assignment.roleId, assignment.roleGeneration, assignment.roleRequirementId);
+  const requirement = roleRequirementsFromJson(storedConfigJson(db, request.projectId, configRevision)).find((candidate) => candidate.roleRequirementId === assignment.roleRequirementId);
+  if (!requirement || requirement.roleId !== assignment.roleId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement is not configured");
+  if (requirement.repoTargetId !== null && requirement.repoTargetId !== request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "assignment role requirement targets another repository");
+  if (!profileEquals(requirement.executedProfile, assignment.requestedProfile)) throw refusal("EXECUTION_PROFILE_MISMATCH", "requested assignment profile does not match the role requirement");
+  if (assignment.assignmentKind === "write" && hasUnresolvedWriterTerminalConflict(db, request.projectId)) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "an unresolved terminal conflict blocks new writing admission");
+  }
+  const activeWriters = asRow(db.prepare(
+    `SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND origin = 'assignment'
+     AND assignment_kind = 'write' AND state IN ${ACTIVE_ASSIGNMENT_SQL}`
+  ).get(request.projectId))?.count ?? 0;
+  const laneOccupied = db.prepare(
+    `SELECT 1 FROM execution_attempts WHERE project_id = ? AND lane_id = ? AND origin = 'assignment'
+     AND assignment_kind = 'write' AND state IN ${ACTIVE_ASSIGNMENT_SQL}`
+  ).get(request.projectId, assignment.laneId);
+  const ceiling = writingLaneCeilingFromJson(storedConfigJson(db, request.projectId, configRevision));
+  if (assignment.assignmentKind === "write" && (laneOccupied || activeWriters >= ceiling)) {
+    throw refusal("LANE_WRITER_EXISTS", "writing lane or project writing ceiling is occupied", { expected: ceiling, attempted: activeWriters, verified: activeWriters });
+  }
+  const assignmentDigest = immutableAssignmentDigest(
+    assignment,
+    request.projectId,
+    configRevision,
+    governor.governance_epoch,
+    workItem.resource_revision,
+    request.repoTargetId
+  );
+  if (db.prepare(`SELECT 1 FROM execution_attempts WHERE project_id = ? AND assignment_digest = ? AND state IN ${ACTIVE_ASSIGNMENT_SQL}`).get(request.projectId, assignmentDigest)) {
+    throw refusal("LANE_WRITER_EXISTS", "an unresolved attempt already owns this immutable assignment intent");
+  }
+  if (db.prepare("SELECT 1 FROM assignments WHERE project_id = ? AND assignment_id = ?").get(request.projectId, assignment.assignmentId)) {
+    throw refusal("IDEMPOTENCY_KEY_CONFLICT", "assignment identity is immutable and already exists");
+  }
+}
+function requireNativeAssignmentWorkspace(request, assignment, rawInspection, target) {
+  const parsed = external_exports.object({
+    bbServerId: id.nullable(),
+    projectId: id.nullable(),
+    environmentId: id.nullable(),
+    sourceId: id.nullable(),
+    hostId: id.nullable(),
+    environmentPath: id.nullable(),
+    environmentMode: id.nullable(),
+    environmentStatus: id.nullable(),
+    workingTreeState: external_exports.enum(["clean", "dirty", "unknown"]),
+    branchName: id.nullable(),
+    headSha: gitShaSchema.nullable(),
+    baseSha: gitShaSchema.nullable(),
+    candidateSha: gitShaSchema.nullable(),
+    defaultBranchName: id.nullable(),
+    defaultBranchHeadSha: gitShaSchema.nullable(),
+    mergeBaseSha: gitShaSchema.nullable(),
+    threadId: id.nullable(),
+    threadProviderId: id.nullable(),
+    threadVisibility: external_exports.enum(["visible", "hidden"]).nullable()
+  }).strict().safeParse(rawInspection);
+  if (!parsed.success) throw refusal("BB_FACTS_UNAVAILABLE", "exact native BB/Git assignment facts are unavailable");
+  const inspection = parsed.data;
+  if (!inspection.bbServerId || !inspection.projectId || !inspection.environmentId || !inspection.sourceId || !inspection.hostId || !inspection.environmentPath || !inspection.environmentMode || !inspection.environmentStatus || !inspection.branchName || !inspection.headSha || !inspection.baseSha || !inspection.defaultBranchName || !inspection.defaultBranchHeadSha || !inspection.mergeBaseSha || inspection.environmentStatus !== "ready" || inspection.workingTreeState === "unknown") {
+    throw refusal("BB_FACTS_UNAVAILABLE", "native environment identity, readiness, cleanliness, or ancestry is unresolved");
+  }
+  if (inspection.bbServerId !== assignment.environment.bbServerId || inspection.projectId !== request.projectId || inspection.environmentId !== assignment.environment.environmentId || inspection.sourceId !== assignment.environment.sourceId || inspection.hostId !== assignment.environment.hostId || inspection.environmentPath !== assignment.environment.path || inspection.environmentMode !== "managed-worktree" || inspection.workingTreeState !== "clean" || inspection.branchName !== assignment.branchName || inspection.defaultBranchName !== target.default_branch || target.source_id !== assignment.environment.sourceId || target.host_id !== assignment.environment.hostId || target.path !== assignment.environment.path) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "native environment is dirty, moved, foreign, or not the exact managed worktree target");
+  }
+  if (inspection.baseSha !== assignment.baseSha || inspection.candidateSha !== assignment.candidateSha) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "native branch base or candidate does not match the immutable assignment");
+  }
+  if (assignment.assignmentKind === "write") {
+    if (inspection.headSha !== assignment.baseSha || inspection.mergeBaseSha !== inspection.headSha) {
+      throw refusal("ASSIGNMENT_HEAD_STALE", "writer head is stale, ahead of, or not an ancestor of the current default branch");
+    }
+  } else if (inspection.headSha !== assignment.candidateSha || inspection.mergeBaseSha !== inspection.defaultBranchHeadSha) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "frozen candidate is not the exact clean head descended from the current default branch");
+  }
+  return inspection;
+}
+function applyAssignmentPrepare(db, request, digest, inspection) {
+  const assignment = request.assignment;
+  if (!assignment) throw refusal("INVALID_INPUT", "assignment_prepare requires immutable assignment intent");
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request);
+  requireAssignmentActor(db, request, assignment.roleId, assignment.roleGeneration);
+  if (assignment.requestedProfile.permissionMode !== "full" || assignment.requestedProfile.visibility !== "visible") {
+    throw refusal("EXECUTION_PROFILE_MISMATCH", "assignment requires explicit full permission and visible execution");
+  }
+  if (assignment.assignmentKind === "write" ? assignment.candidateSemantics !== "base" : assignment.candidateSemantics !== "frozen") {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "assignment candidate semantics do not match its kind");
+  }
+  if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "assignment requires one exact repository target");
+  const target = requireTarget(db, request.projectId, configRevision, request.repoTargetId);
+  inspection = requireNativeAssignmentWorkspace(request, assignment, inspection, target);
+  if (assignment.dispatchKind === "attach" && (inspection.threadId !== assignment.attachThreadId || inspection.threadProviderId !== assignment.requestedProfile.providerId || inspection.threadVisibility !== "visible")) {
+    throw refusal(inspection.threadVisibility === "hidden" ? "ROLE_CONTEXT_HIDDEN" : "EXECUTION_CONTEXT_FOREIGN", "attach thread does not match the exact visible assignment context");
+  }
+  if (assignment.dispatchKind === "spawn" && (inspection.threadId !== null || inspection.threadProviderId !== null || inspection.threadVisibility !== null)) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "spawn preparation cannot adopt an existing thread");
+  }
+  const workItem = requireWorkItem(
+    db,
+    { ...request, workItemId: assignment.workItemId, expectedResourceRevision: request.expectedResourceRevision },
+    configRevision
+  );
+  if (assignment.assignmentKind === "write" && !["ready", "in_progress"].includes(workItem.lifecycle_state)) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "write assignment requires a ready or in-progress WorkItem");
+  }
+  if (assignment.assignmentKind !== "write" && workItem.lifecycle_state !== "in_progress") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "review and probe assignments require an in-progress WorkItem");
+  }
+  requireCanonicalRoleGeneration(db, request.projectId, assignment.roleId, assignment.roleGeneration, assignment.roleRequirementId);
+  const requirements = roleRequirementsFromJson(storedConfigJson(db, request.projectId, configRevision));
+  const requirement = requirements.find((candidate) => candidate.roleRequirementId === assignment.roleRequirementId);
+  if (!requirement || requirement.roleId !== assignment.roleId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement is not configured");
+  if (requirement.repoTargetId !== null && requirement.repoTargetId !== request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "assignment role requirement targets another repository");
+  if (!profileEquals(requirement.executedProfile, assignment.requestedProfile)) throw refusal("EXECUTION_PROFILE_MISMATCH", "requested assignment profile does not match the role requirement");
+  if (assignment.assignmentKind === "write" && hasUnresolvedWriterTerminalConflict(db, request.projectId)) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "an unresolved terminal conflict blocks new writing admission");
+  }
+  const configJson = storedConfigJson(db, request.projectId, configRevision);
+  const ceiling = writingLaneCeilingFromJson(configJson);
+  const activeWriterRows = db.prepare(
+    `SELECT execution_attempt_id, lane_id FROM execution_attempts
+     WHERE project_id = ? AND origin = 'assignment' AND assignment_kind = 'write' AND state IN ${ACTIVE_ASSIGNMENT_SQL}
+     ORDER BY lane_id, execution_attempt_id`
+  ).all(request.projectId);
+  const laneHolder = activeWriterRows.find((row) => row.lane_id === assignment.laneId);
+  if (assignment.assignmentKind === "write" && (laneHolder || activeWriterRows.length >= ceiling)) {
+    throw refusal("LANE_WRITER_EXISTS", "writing lane or project writing ceiling is occupied", {
+      expected: ceiling,
+      attempted: activeWriterRows.length,
+      verified: activeWriterRows.length
+    });
+  }
+  const assignmentDigest = immutableAssignmentDigest(
+    assignment,
+    request.projectId,
+    configRevision,
+    governor.governance_epoch,
+    workItem.resource_revision,
+    request.repoTargetId
+  );
+  const unresolvedIntent = asRow(
+    db.prepare(`SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND assignment_digest = ? AND state IN ${ACTIVE_ASSIGNMENT_SQL}`).get(
+      request.projectId,
+      assignmentDigest
+    )
+  );
+  if (unresolvedIntent) throw refusal("LANE_WRITER_EXISTS", "an unresolved attempt already owns this immutable assignment intent");
+  if (db.prepare("SELECT 1 FROM assignments WHERE project_id = ? AND assignment_id = ?").get(request.projectId, assignment.assignmentId)) {
+    throw refusal("IDEMPOTENCY_KEY_CONFLICT", "assignment identity is immutable and already exists");
+  }
+  const executionAttemptId = sha256(canonicalJson({ projectId: request.projectId, assignmentDigest, attemptOrdinal: 1 }));
+  const profileDigest = sha256(canonicalJson(assignment.requestedProfile));
+  const environmentDigest = assignmentEnvironmentDigest(assignment);
+  const eventSequence = nextEventSequence(db, request.projectId);
+  const createdAtMs = now();
+  db.prepare(
+    `INSERT INTO assignments (
+      project_id, assignment_id, work_item_id, assignment_kind, lane_id, role_requirement_id,
+      role_id, role_generation, config_revision, governance_epoch, work_item_revision,
+      repo_target_id, branch_name, base_sha, candidate_semantics, candidate_sha, bb_server_id,
+      environment_id, source_id, host_id, environment_path, environment_mode,
+      frozen_brief_version, frozen_brief_digest, requested_provider_id, requested_model,
+      requested_reasoning_level, requested_permission_mode, requested_service_tier,
+      requested_visibility, requested_profile_digest, dispatch_kind, attach_thread_id,
+      parent_assignment_id, depth, deadline_at_ms, assignment_digest, idempotency_key,
+      creation_event_sequence, created_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'managed-worktree',
+      ?, ?, ?, ?, ?, ?, ?, 'visible', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`
+  ).run(
+    request.projectId,
+    assignment.assignmentId,
+    assignment.workItemId,
+    assignment.assignmentKind,
+    assignment.laneId,
+    assignment.roleRequirementId,
+    assignment.roleId,
+    assignment.roleGeneration,
+    configRevision,
+    governor.governance_epoch,
+    workItem.resource_revision,
+    request.repoTargetId,
+    assignment.branchName,
+    assignment.baseSha,
+    assignment.candidateSemantics,
+    assignment.candidateSha,
+    assignment.environment.bbServerId,
+    assignment.environment.environmentId,
+    assignment.environment.sourceId,
+    assignment.environment.hostId,
+    assignment.environment.path,
+    assignment.frozenBriefVersion,
+    assignment.frozenBriefDigest,
+    assignment.requestedProfile.providerId,
+    assignment.requestedProfile.model,
+    assignment.requestedProfile.reasoningLevel,
+    assignment.requestedProfile.permissionMode,
+    assignment.requestedProfile.serviceTier,
+    profileDigest,
+    assignment.dispatchKind,
+    assignment.attachThreadId,
+    assignment.parentAssignmentId,
+    assignment.deadlineAtMs,
+    assignmentDigest,
+    request.idempotencyKey,
+    eventSequence,
+    createdAtMs
+  );
+  const attemptDigest = sha256(canonicalJson({ projectId: request.projectId, executionAttemptId, assignmentDigest, state: "prepared" }));
+  db.prepare(
+    `INSERT INTO execution_attempts (
+      project_id, execution_attempt_id, assignment_id, origin, assignment_digest, lane_id,
+      assignment_kind, attempt_ordinal, dispatch_kind, config_revision, governance_epoch,
+      work_item_id, repo_target_id, role_id, role_generation, state, bb_server_id,
+      environment_id, source_id, host_id, environment_path, thread_id, frozen_brief_digest,
+      branch_name, base_sha, candidate_sha, environment_digest, created_at_ms, attempt_digest
+    ) VALUES (?, ?, ?, 'assignment', ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    request.projectId,
+    executionAttemptId,
+    assignment.assignmentId,
+    assignmentDigest,
+    assignment.laneId,
+    assignment.assignmentKind,
+    assignment.dispatchKind,
+    configRevision,
+    governor.governance_epoch,
+    assignment.workItemId,
+    request.repoTargetId,
+    assignment.roleId,
+    assignment.roleGeneration,
+    assignment.environment.bbServerId,
+    assignment.environment.environmentId,
+    assignment.environment.sourceId,
+    assignment.environment.hostId,
+    assignment.environment.path,
+    assignment.attachThreadId,
+    assignment.frozenBriefDigest,
+    assignment.branchName,
+    assignment.baseSha,
+    assignment.candidateSha,
+    environmentDigest,
+    createdAtMs,
+    attemptDigest
+  );
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    { aggregateType: "assignment", aggregateId: assignment.assignmentId, aggregateRevision: 1, eventType: "assignment_prepared", event: { assignmentId: assignment.assignmentId, executionAttemptId, assignmentDigest, laneId: assignment.laneId, assignmentKind: assignment.assignmentKind } },
+    { expected: 2, attempted: 2, verified: 2 },
+    { currentConfigRevision: configRevision, currentGovernanceEpoch: governor.governance_epoch, currentResourceRevision: workItem.resource_revision, evidence: { assignmentId: assignment.assignmentId, executionAttemptId, assignmentDigest, requestedProfileDigest: profileDigest, environmentDigest, activeWriterCount: activeWriterRows.length + (assignment.assignmentKind === "write" ? 1 : 0), writingLaneCeiling: ceiling } }
+  );
+}
+function explicitExecutionInputSources(serviceTier) {
+  return {
+    providerId: "explicit",
+    model: "explicit",
+    reasoningLevel: "explicit",
+    permissionMode: "explicit",
+    ...serviceTier ? { serviceTier: "explicit" } : {}
+  };
+}
+function nativeAssignmentInput(assignment, attempt, frozenBriefContent) {
+  const candidateScope = assignment.assignment_kind === "write" ? { mode: "write", candidateSemantics: "base", candidateSha: null } : { mode: "read-only", candidateSemantics: "frozen", candidateSha: assignment.candidate_sha, mutations: "forbidden" };
+  return {
+    projectId: assignment.project_id,
+    assignmentId: assignment.assignment_id,
+    executionAttemptId: attempt.execution_attempt_id,
+    assignmentKind: assignment.assignment_kind,
+    dispatchKind: assignment.dispatch_kind,
+    attachThreadId: assignment.attach_thread_id,
+    repoTargetId: assignment.repo_target_id,
+    branchName: assignment.branch_name,
+    baseSha: assignment.base_sha,
+    candidateSha: assignment.candidate_sha,
+    candidateScope,
+    environment: {
+      bbServerId: assignment.bb_server_id,
+      environmentId: assignment.environment_id,
+      sourceId: assignment.source_id,
+      hostId: assignment.host_id,
+      path: assignment.environment_path,
+      mode: "managed-worktree"
+    },
+    requestedProfile: requestedProfile(assignment),
+    executionInputSources: explicitExecutionInputSources(assignment.requested_service_tier || void 0),
+    frozenBriefContent,
+    frozenBriefDigest: assignment.frozen_brief_digest
+  };
+}
+function nativeContextMatches(assignment, attempt, evidence) {
+  return evidence.assignmentId === assignment.assignment_id && evidence.executionAttemptId === attempt.execution_attempt_id && evidence.bbServerId === assignment.bb_server_id && evidence.projectId === assignment.project_id && evidence.environmentId === assignment.environment_id && evidence.sourceId === assignment.source_id && evidence.hostId === assignment.host_id && evidence.environmentPath === assignment.environment_path && evidence.branchName === assignment.branch_name && evidence.baseSha === assignment.base_sha && evidence.candidateSha === assignment.candidate_sha && (attempt.thread_id === null || evidence.threadId === attempt.thread_id) && (attempt.native_request_id === null || evidence.nativeRequestId === attempt.native_request_id);
+}
+function positiveNativeEvidence(assignment, attempt, evidence) {
+  const requiredStrings = [
+    evidence.assignmentId,
+    evidence.executionAttemptId,
+    evidence.bbServerId,
+    evidence.projectId,
+    evidence.environmentId,
+    evidence.sourceId,
+    evidence.hostId,
+    evidence.environmentPath,
+    evidence.threadId,
+    evidence.providerThreadId,
+    evidence.nativeRequestId,
+    evidence.requestEventId,
+    evidence.acceptedEventId,
+    evidence.firstActionEventId,
+    evidence.contentEventId,
+    evidence.contentDigest,
+    evidence.branchName,
+    evidence.baseSha
+  ];
+  if (requiredStrings.some((value) => !stringField(value)) || !evidence.actualProfile) {
+    throw refusal("DISPATCH_UNKNOWN", "native evidence lacks exact first-action, content, context, or profile facts");
+  }
+  if (!nativeContextMatches(assignment, attempt, evidence)) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "native evidence belongs to another exact execution context");
+  }
+  if (evidence.contentDigest !== assignment.frozen_brief_digest) {
+    throw refusal("DISPATCH_UNKNOWN", "native content receipt does not bind the exact frozen brief");
+  }
+  if (!profileEquals(evidence.actualProfile, requestedProfile(assignment))) {
+    throw refusal("EXECUTION_PROFILE_MISMATCH", "actual execution profile does not match the requested profile");
+  }
+  if (!evidence.requestEventSeq || !evidence.acceptedEventSeq || !evidence.firstActionEventSeq || !evidence.contentEventSeq || !(evidence.requestEventSeq < evidence.acceptedEventSeq && evidence.acceptedEventSeq <= evidence.firstActionEventSeq && evidence.firstActionEventSeq <= evidence.contentEventSeq)) {
+    throw refusal("DISPATCH_UNKNOWN", "native event correlation is absent or ambiguously ordered");
+  }
+  const profileDigest = sha256(canonicalJson(evidence.actualProfile));
+  const nativeReceiptDigest = sha256(canonicalJson({
+    projectId: assignment.project_id,
+    assignmentId: assignment.assignment_id,
+    threadId: evidence.threadId,
+    providerThreadId: evidence.providerThreadId,
+    nativeRequestId: evidence.nativeRequestId,
+    requestEventId: evidence.requestEventId,
+    requestEventSeq: evidence.requestEventSeq,
+    acceptedEventId: evidence.acceptedEventId,
+    acceptedEventSeq: evidence.acceptedEventSeq,
+    firstActionEventId: evidence.firstActionEventId,
+    firstActionEventSeq: evidence.firstActionEventSeq,
+    contentEventId: evidence.contentEventId,
+    contentEventSeq: evidence.contentEventSeq,
+    contentDigest: evidence.contentDigest,
+    actualProfileDigest: profileDigest
+  }));
+  return { profile: evidence.actualProfile, profileDigest, nativeReceiptDigest, state: "content_delivered" };
+}
+function nativeEvidenceSnapshot(attempt) {
+  return Object.fromEntries(NATIVE_EVIDENCE_COLUMNS.map((column) => [column, attempt[column]]));
+}
+function incomingNativeEvidence(evidence, positive) {
+  const profile = positive?.profile ?? evidence.actualProfile ?? null;
+  return {
+    thread_id: evidence.threadId ?? null,
+    provider_thread_id: evidence.providerThreadId ?? null,
+    native_request_id: evidence.nativeRequestId ?? null,
+    request_event_id: evidence.requestEventId ?? null,
+    request_event_seq: evidence.requestEventSeq ?? null,
+    accepted_event_id: evidence.acceptedEventId ?? null,
+    accepted_event_seq: evidence.acceptedEventSeq ?? null,
+    first_action_event_id: evidence.firstActionEventId ?? null,
+    first_action_event_seq: evidence.firstActionEventSeq ?? null,
+    content_event_id: evidence.contentEventId ?? null,
+    content_event_seq: evidence.contentEventSeq ?? null,
+    content_receipt_digest: evidence.contentDigest ?? null,
+    actual_provider_id: profile?.providerId ?? null,
+    actual_model: profile?.model ?? null,
+    actual_reasoning_level: profile?.reasoningLevel ?? null,
+    actual_permission_mode: profile?.permissionMode ?? null,
+    actual_service_tier: profile?.serviceTier ?? null,
+    actual_visibility: profile?.visibility ?? null,
+    actual_profile_digest: positive?.profileDigest ?? (profile ? sha256(canonicalJson(profile)) : null),
+    native_receipt_digest: positive?.nativeReceiptDigest ?? null,
+    last_event_seq: evidence.lastEventSeq ?? evidence.contentEventSeq ?? null
+  };
+}
+function mergeNativeEvidence(retained, incoming) {
+  let contradiction = false;
+  const merged = Object.fromEntries(NATIVE_EVIDENCE_COLUMNS.map((column) => {
+    const current = retained[column];
+    const next = incoming[column];
+    if (current !== null && next !== null && current !== next) contradiction = true;
+    return [column, current ?? next];
+  }));
+  return { merged, contradiction };
+}
+function exactPreEffectRefusal(assignment, attempt, evidence, operation, incoming) {
+  if (!nativeContextMatches(assignment, attempt, evidence)) return false;
+  const effectColumns = [
+    "accepted_event_id",
+    "accepted_event_seq",
+    "first_action_event_id",
+    "first_action_event_seq",
+    "content_event_id",
+    "content_event_seq",
+    "content_receipt_digest",
+    "actual_provider_id",
+    "actual_model",
+    "actual_reasoning_level",
+    "actual_permission_mode",
+    "actual_service_tier",
+    "actual_visibility",
+    "actual_profile_digest",
+    "native_receipt_digest"
+  ];
+  if (effectColumns.some((column) => attempt[column] !== null || incoming[column] !== null)) return false;
+  if (operation === "dispatch") {
+    return NATIVE_EVIDENCE_COLUMNS.every(
+      (column) => attempt[column] === null && incoming[column] === null || incoming[column] === attempt[column]
+    );
+  }
+  if (!attempt.thread_id || !attempt.native_request_id) return false;
+  return NATIVE_EVIDENCE_COLUMNS.every((column) => attempt[column] === null || incoming[column] === attempt[column]);
+}
+function recordNativeEvidence(db, request, digest, assignment, attempt, evidence, operation) {
+  return transaction(db, () => {
+    const replay = checkIdempotency(db, request, digest);
+    if (replay) return replay;
+    const current = assignmentRows(db, request);
+    const retained = nativeEvidenceSnapshot(attempt);
+    const currentRetained = nativeEvidenceSnapshot(current.attempt);
+    if (current.attempt.state !== attempt.state || canonicalJson(currentRetained) !== canonicalJson(retained)) {
+      throw refusal("ASSIGNMENT_HEAD_STALE", "attempt state moved before native evidence was recorded");
+    }
+    const authority = revalidateAssignmentAuthority(db, request, current.assignment, current.attempt);
+    const observedAtMs = evidence.observedAtMs ?? now();
+    let positive = null;
+    let outcome = "DISPATCH_UNKNOWN";
+    let state = "dispatch_unknown";
+    let reasonCode = evidence.reasonCode || "dispatch_unknown";
+    let acceptIncoming = nativeContextMatches(current.assignment, current.attempt, evidence);
+    try {
+      if (evidence.disposition === "confirmed") {
+        positive = positiveNativeEvidence(current.assignment, current.attempt, evidence);
+        outcome = "OK";
+        state = positive.state;
+      }
+    } catch (error48) {
+      if (error48 instanceof Refusal && ["EXECUTION_PROFILE_MISMATCH", "EXECUTION_CONTEXT_FOREIGN"].includes(error48.data.code)) {
+        reasonCode = error48.data.code;
+        outcome = error48.data.code;
+        if (error48.data.code === "EXECUTION_CONTEXT_FOREIGN") acceptIncoming = false;
+      }
+      state = "dispatch_unknown";
+    }
+    const incoming = incomingNativeEvidence(evidence, positive);
+    if (evidence.disposition === "refused") {
+      if (exactPreEffectRefusal(current.assignment, current.attempt, evidence, operation, incoming)) {
+        state = "failed";
+        outcome = "EXECUTION_PROFILE_UNKNOWN";
+      } else {
+        state = "dispatch_unknown";
+        outcome = acceptIncoming ? "DISPATCH_UNKNOWN" : "EXECUTION_CONTEXT_FOREIGN";
+        reasonCode = acceptIncoming ? "refusal_not_proven_pre_effect" : "EXECUTION_CONTEXT_FOREIGN";
+      }
+    }
+    const mergedResult = mergeNativeEvidence(retained, acceptIncoming ? incoming : retained);
+    const missingRetainedConfirmation = positive !== null && NATIVE_EVIDENCE_COLUMNS.some(
+      (column) => retained[column] !== null && incoming[column] !== retained[column]
+    );
+    const evidenceContradiction = mergedResult.contradiction || missingRetainedConfirmation;
+    const merged = evidenceContradiction ? retained : mergedResult.merged;
+    if (evidenceContradiction) {
+      positive = null;
+      state = "dispatch_unknown";
+      outcome = "DISPATCH_UNKNOWN";
+      reasonCode = "retained_native_evidence_contradiction";
+    }
+    const terminalDeadlineReason = observedAtMs > current.assignment.deadline_at_ms ? "assignment_deadline_exceeded" : reasonCode;
+    const setColumns = NATIVE_EVIDENCE_COLUMNS.map((column) => `${column} = ?`).join(", ");
+    const priorPredicate = NATIVE_EVIDENCE_COLUMNS.map((column) => `${column} IS ?`).join(" AND ");
+    const updated = db.prepare(
+      `UPDATE execution_attempts SET state = ?, ${setColumns}, reason_code = ?, observed_at_ms = ?
+       WHERE project_id = ? AND execution_attempt_id = ? AND state = ? AND ${priorPredicate}`
+    ).run(
+      state,
+      ...NATIVE_EVIDENCE_COLUMNS.map((column) => merged[column]),
+      terminalDeadlineReason,
+      observedAtMs,
+      request.projectId,
+      current.attempt.execution_attempt_id,
+      current.attempt.state,
+      ...NATIVE_EVIDENCE_COLUMNS.map((column) => retained[column])
+    );
+    if (updated.changes !== 1) throw refusal("DISPATCH_UNKNOWN", "attempt native-evidence compare-and-swap failed");
+    const aggregateRevision = nextAggregateRevision(db, request.projectId, "execution_attempt", current.attempt.execution_attempt_id);
+    return commitMutation(
+      db,
+      request,
+      digest,
+      authority.actorReceiptId,
+      { aggregateType: "execution_attempt", aggregateId: current.attempt.execution_attempt_id, aggregateRevision, eventType: state === "dispatch_unknown" ? "assignment_dispatch_unknown" : state === "failed" ? "assignment_dispatch_failed" : "assignment_content_delivered", event: { assignmentId: current.assignment.assignment_id, executionAttemptId: current.attempt.execution_attempt_id, operation, state, reasonCode: terminalDeadlineReason, nativeRequestId: merged.native_request_id, threadId: merged.thread_id, lastEventSeq: merged.last_event_seq } },
+      { expected: 1, attempted: 1, verified: outcome === "OK" ? 1 : 0 },
+      { currentConfigRevision: current.assignment.config_revision, currentGovernanceEpoch: authority.governor.governance_epoch, evidence: { assignmentId: current.assignment.assignment_id, executionAttemptId: current.attempt.execution_attempt_id, state, reasonCode: terminalDeadlineReason, nativeReceiptDigest: merged.native_receipt_digest, actualProfileDigest: merged.actual_profile_digest, threadId: merged.thread_id, nativeRequestId: merged.native_request_id, lastEventSeq: merged.last_event_seq } },
+      outcome
+    );
+  });
+}
+function applyAssignmentNative(db, request, digest, adapter, operation) {
+  let possibleNativeEffect = false;
+  try {
+    const replay = checkIdempotency(db, request, digest);
+    if (replay) return replay;
+    if (!adapter) return result("DISPATCH_UNKNOWN", request.projectId, 1, 0, 0, { message: "native assignment adapter is unavailable" });
+    const frozenBriefContent = request.frozenBriefContent;
+    const { assignment, attempt } = transaction(db, () => {
+      const replayInTransaction = checkIdempotency(db, request, digest);
+      if (replayInTransaction) throw refusal("IDEMPOTENCY_KEY_CONFLICT", "assignment operation was concurrently committed");
+      const rows = assignmentRows(db, request);
+      const authority = revalidateAssignmentAuthority(db, request, rows.assignment, rows.attempt);
+      if (!frozenBriefContent || sha256(frozenBriefContent) !== rows.assignment.frozen_brief_digest) {
+        throw refusal("ASSIGNMENT_HEAD_STALE", "exact frozen brief content does not match immutable intent");
+      }
+      if (operation === "dispatch" && rows.attempt.state !== "prepared") {
+        throw refusal(rows.attempt.state === "dispatch_unknown" ? "DISPATCH_UNKNOWN" : "ASSIGNMENT_HEAD_STALE", "assignment attempt is not dispatchable");
+      }
+      if (operation === "reconcile" && rows.attempt.state !== "dispatch_unknown") {
+        throw refusal("ASSIGNMENT_HEAD_STALE", "only an ambiguous dispatch may be reconciled");
+      }
+      if (operation === "reconcile") return rows;
+      const retained = nativeEvidenceSnapshot(rows.attempt);
+      const priorPredicate = NATIVE_EVIDENCE_COLUMNS.map((column) => `${column} IS ?`).join(" AND ");
+      const claimed = db.prepare(
+        `UPDATE execution_attempts SET state = 'dispatch_unknown', reason_code = 'dispatch_claimed', observed_at_ms = ?
+         WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND ${priorPredicate}`
+      ).run(
+        now(),
+        request.projectId,
+        rows.attempt.execution_attempt_id,
+        ...NATIVE_EVIDENCE_COLUMNS.map((column) => retained[column])
+      );
+      if (claimed.changes !== 1) throw refusal("DISPATCH_UNKNOWN", "dispatch claim compare-and-swap failed");
+      const claimIdentity = sha256(canonicalJson({
+        phase: "assignment_dispatch_claim",
+        projectId: request.projectId,
+        executionAttemptId: rows.attempt.execution_attempt_id,
+        requestDigest: digest
+      }));
+      const claimRequest = { ...request, idempotencyKey: `assignment-dispatch-claim-${claimIdentity}` };
+      const claimDigest = sha256(canonicalJson({ claimIdentity, requestDigest: digest }));
+      const aggregateRevision = nextAggregateRevision(db, request.projectId, "execution_attempt", rows.attempt.execution_attempt_id);
+      commitMutation(
+        db,
+        claimRequest,
+        claimDigest,
+        authority.actorReceiptId,
+        { aggregateType: "execution_attempt", aggregateId: rows.attempt.execution_attempt_id, aggregateRevision, eventType: "assignment_dispatch_claimed", event: { assignmentId: rows.assignment.assignment_id, executionAttemptId: rows.attempt.execution_attempt_id, state: "dispatch_unknown", reasonCode: "dispatch_claimed" } },
+        { expected: 1, attempted: 1, verified: 1 },
+        { currentConfigRevision: rows.assignment.config_revision, currentGovernanceEpoch: authority.governor.governance_epoch, evidence: { assignmentId: rows.assignment.assignment_id, executionAttemptId: rows.attempt.execution_attempt_id, state: "dispatch_unknown", reasonCode: "dispatch_claimed" } },
+        "DISPATCH_UNKNOWN"
+      );
+      return assignmentRows(db, request);
+    });
+    const input = nativeAssignmentInput(assignment, attempt, frozenBriefContent);
+    let evidence;
+    possibleNativeEffect = true;
+    try {
+      evidence = operation === "dispatch" ? adapter.dispatch(input) : adapter.reconcile({ ...input, threadId: attempt.thread_id, nativeRequestId: attempt.native_request_id });
+    } catch {
+      evidence = { disposition: "ambiguous", reasonCode: "native_transport_ambiguous", threadId: attempt.thread_id ?? void 0, nativeRequestId: attempt.native_request_id ?? void 0 };
+    }
+    return recordNativeEvidence(db, request, digest, assignment, attempt, evidence, operation);
+  } catch (error48) {
+    if (possibleNativeEffect) return result("DISPATCH_UNKNOWN", request.projectId, 1, 1, 0, { message: "native effect may have occurred; durable dispatch claim remains unresolved" });
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal assignment mutation error" });
+  }
+}
+function terminalCorrelationMatches(assignment, attempt, report) {
+  return report.projectId === assignment.project_id && report.assignmentId === assignment.assignment_id && report.executionAttemptId === attempt.execution_attempt_id && report.workItemId === assignment.work_item_id && report.roleId === assignment.role_id && report.roleGeneration === assignment.role_generation && report.repoTargetId === assignment.repo_target_id && report.environmentId === assignment.environment_id && report.threadId === attempt.thread_id && report.branchName === assignment.branch_name && report.baseSha === assignment.base_sha && report.nativeReceiptDigest === attempt.native_receipt_digest && report.actualProfileDigest === attempt.actual_profile_digest && (assignment.candidate_semantics === "base" || report.candidateSha === assignment.candidate_sha) && report.receiptEventSeq > (attempt.last_event_seq ?? 0) && report.reportedAtMs <= report.receivedAtMs;
+}
+function applyAssignmentTerminal(db, request, digest) {
+  const report = request.terminalReport;
+  if (!report) throw refusal("TERMINAL_REPORT_REQUIRED", "assignment terminal mutation requires one exact versioned report");
+  const { assignment, attempt } = assignmentRows(db, request);
+  const reportDigest = sha256(canonicalJson(report));
+  if (attempt.terminal_report_digest) {
+    if (attempt.terminal_report_digest === reportDigest) {
+      const original = asRow(
+        db.prepare("SELECT outcome_json FROM mutation_receipts WHERE project_id = ? AND operation_class = 'assignment_terminal' AND json_extract(outcome_json, '$.evidence.terminalReportDigest') = ? ORDER BY created_at_ms LIMIT 1").get(
+          request.projectId,
+          reportDigest
+        )
+      );
+      if (original) return JSON.parse(original.outcome_json);
+    }
+    const authority2 = revalidateAssignmentAuthority(db, request, assignment, attempt);
+    if (attempt.conflicting_terminal_digest !== null) {
+      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "a different terminal conflict is already retained");
+    }
+    const updated2 = db.prepare(
+      `UPDATE execution_attempts SET conflicting_terminal_digest = ?, reason_code = 'terminal_report_ambiguous'
+       WHERE project_id = ? AND execution_attempt_id = ? AND state IS ?
+         AND terminal_result IS ? AND reported_outcome IS ? AND terminal_report_digest IS ?
+         AND conflicting_terminal_digest IS ? AND terminal_event_id IS ? AND terminal_event_seq IS ?
+         AND candidate_sha IS ? AND native_receipt_digest IS ? AND actual_profile_digest IS ?
+         AND completed_at_ms IS ? AND reason_code IS ? AND last_event_seq IS ?`
+    ).run(
+      reportDigest,
+      request.projectId,
+      attempt.execution_attempt_id,
+      attempt.state,
+      attempt.terminal_result,
+      attempt.reported_outcome,
+      attempt.terminal_report_digest,
+      attempt.conflicting_terminal_digest,
+      attempt.terminal_event_id,
+      attempt.terminal_event_seq,
+      attempt.candidate_sha,
+      attempt.native_receipt_digest,
+      attempt.actual_profile_digest,
+      attempt.completed_at_ms,
+      attempt.reason_code,
+      attempt.last_event_seq
+    );
+    if (updated2.changes !== 1) throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal conflict compare-and-swap failed");
+    const aggregateRevision2 = nextAggregateRevision(db, request.projectId, "execution_attempt", attempt.execution_attempt_id);
+    return commitMutation(
+      db,
+      request,
+      digest,
+      authority2.actorReceiptId,
+      { aggregateType: "execution_attempt", aggregateId: attempt.execution_attempt_id, aggregateRevision: aggregateRevision2, eventType: "assignment_terminal_ambiguous", event: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, terminalReportDigest: attempt.terminal_report_digest, conflictingTerminalDigest: reportDigest } },
+      { expected: 1, attempted: 1, verified: 0 },
+      { message: "terminal evidence conflicts with the retained report", currentConfigRevision: assignment.config_revision, currentGovernanceEpoch: authority2.governor.governance_epoch, evidence: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, terminalReportDigest: attempt.terminal_report_digest, conflictingTerminalDigest: reportDigest } },
+      "TERMINAL_REPORT_AMBIGUOUS"
+    );
+  }
+  if (attempt.state === "dispatch_unknown") throw refusal("DISPATCH_UNKNOWN", "ambiguous dispatch must be reconciled before terminal evidence");
+  if (!attempt.native_receipt_digest || !attempt.actual_profile_digest || !attempt.thread_id || !terminalCorrelationMatches(assignment, attempt, report)) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "terminal report does not match the exact assignment, native receipt, or executed profile");
+  }
+  if (report.candidateObservationDigest !== sha256(canonicalJson({ branchName: report.branchName, baseSha: report.baseSha, candidateSha: report.candidateSha }))) {
+    throw refusal("ASSIGNMENT_HEAD_STALE", "terminal candidate observation digest is invalid");
+  }
+  const authority = revalidateAssignmentAuthority(db, request, assignment, attempt);
+  const late = report.receivedAtMs > assignment.deadline_at_ms;
+  const state = late || report.outcome === "BLOCKED" ? "blocked" : "done";
+  const terminalResult = late ? "BLOCKED" : report.outcome;
+  const reasonCode = late ? "terminal_report_late" : report.reasonCode;
+  const updated = db.prepare(
+    `UPDATE execution_attempts SET state = ?, terminal_result = ?, reported_outcome = ?, terminal_report_digest = ?,
+     terminal_event_id = ?, terminal_event_seq = ?, candidate_sha = ?, reason_code = ?,
+     completed_at_ms = ?, observed_at_ms = ?, last_event_seq = ?
+     WHERE project_id = ? AND execution_attempt_id = ? AND state IN ('armed', 'content_delivered', 'running', 'failed')
+       AND terminal_report_digest IS NULL`
+  ).run(
+    state,
+    terminalResult,
+    report.outcome,
+    reportDigest,
+    report.receiptEventId,
+    report.receiptEventSeq,
+    report.candidateSha,
+    reasonCode,
+    report.receivedAtMs,
+    report.receivedAtMs,
+    report.receiptEventSeq,
+    request.projectId,
+    attempt.execution_attempt_id
+  );
+  if (updated.changes !== 1) throw refusal("ASSIGNMENT_HEAD_STALE", "terminal attempt compare-and-swap failed");
+  const aggregateRevision = nextAggregateRevision(db, request.projectId, "execution_attempt", attempt.execution_attempt_id);
+  return commitMutation(
+    db,
+    request,
+    digest,
+    authority.actorReceiptId,
+    { aggregateType: "execution_attempt", aggregateId: attempt.execution_attempt_id, aggregateRevision, eventType: "assignment_terminal_reported", event: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, state, terminalResult, reportedOutcome: report.outcome, terminalReportDigest: reportDigest, reasonCode } },
+    { expected: 1, attempted: 1, verified: 1 },
+    { currentConfigRevision: assignment.config_revision, currentGovernanceEpoch: authority.governor.governance_epoch, evidence: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, state, terminalResult, reportedOutcome: report.outcome, terminalReportDigest: reportDigest, reasonCode, deadlineAtMs: assignment.deadline_at_ms, receivedAtMs: report.receivedAtMs } }
+  );
+}
+function applyAssignmentMutation(db, request, digest, adapter) {
+  if (request.operationClass === "assignment_dispatch" || request.operationClass === "assignment_reconcile") {
+    return applyAssignmentNative(db, request, digest, adapter, request.operationClass === "assignment_dispatch" ? "dispatch" : "reconcile");
+  }
+  try {
+    let inspection = null;
+    if (request.operationClass === "assignment_prepare") {
+      const replay = checkIdempotency(db, request, digest);
+      if (replay) return replay;
+      if (!request.assignment || !request.repoTargetId) {
+        throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment preparation requires immutable intent and one exact target");
+      }
+      if (!adapter) throw refusal("BB_FACTS_UNAVAILABLE", "assignment preparation requires one native BB fact adapter");
+      transaction(db, () => preflightAssignmentPrepare(db, request));
+      try {
+        inspection = adapter.inspect({ projectId: request.projectId, repoTargetId: request.repoTargetId, assignment: request.assignment });
+      } catch {
+        throw refusal("BB_FACTS_UNAVAILABLE", "exact native BB/Git assignment facts are unavailable");
+      }
+    }
+    return transaction(db, () => {
+      const replay = checkIdempotency(db, request, digest);
+      if (replay) return replay;
+      return request.operationClass === "assignment_prepare" ? applyAssignmentPrepare(db, request, digest, inspection) : applyAssignmentTerminal(db, request, digest);
+    });
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    if (isConstraintError(error48)) return unavailableResult(request.projectId, "canonical assignment mutation could not be committed unambiguously");
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal assignment mutation error" });
+  }
+}
+function isConstraintError(error48) {
+  return error48 instanceof Error && /constraint|unique|busy|locked/iu.test(error48.message);
+}
 function unavailableResult(subject, message) {
   return result("CANONICAL_STORE_UNAVAILABLE", subject, 1, 0, 0, { message });
 }
-function operatorAuthRequired(projectId) {
-  return result("OPERATOR_AUTH_REQUIRED", projectId, 1, 0, 0, {
-    message: "BB has not supplied a trustworthy native operator actor receipt; no write was attempted"
+function requireOperatorReceipt(db, request) {
+  if (!request.operatorReceiptId) throw refusal("OPERATOR_RECEIPT_REQUIRED", "an operator receipt is required");
+  if (!request.candidateHead) throw refusal("OPERATOR_RECEIPT_REQUIRED", "an exact candidate head is required");
+  const row = asRow(db.prepare("SELECT project_id, receipt_id, receipt_type, mutation_class, candidate_head, binding_digest, status, retirement_condition, caller_thread_id, caller_plugin_id, requested_from_background, receipt_digest, created_at_ms FROM operator_receipts WHERE receipt_id = ?").get(request.operatorReceiptId));
+  if (!row) throw refusal("OPERATOR_RECEIPT_UNKNOWN", "operator receipt is not known");
+  if (row.project_id !== request.projectId) throw refusal("OPERATOR_RECEIPT_FOREIGN", "operator receipt belongs to another project");
+  if (row.status !== "interim" || row.retirement_condition !== OPERATOR_RECEIPT_RETIREMENT_CONDITION) {
+    throw refusal("OPERATOR_RECEIPT_RETIRED", "operator receipt is retired");
+  }
+  if (row.receipt_type !== "operator_confirmation" || ![0, 1].includes(row.requested_from_background)) {
+    throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt is malformed");
+  }
+  const receiptRequest = operatorReceiptRequestSchema.safeParse({
+    projectId: row.project_id,
+    mutationClass: row.mutation_class,
+    candidateHead: row.candidate_head,
+    callerThreadId: row.caller_thread_id,
+    requestedFromBackground: row.requested_from_background === 1
   });
+  if (!receiptRequest.success) throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt is malformed");
+  if (row.mutation_class !== request.operationClass || row.candidate_head !== request.candidateHead) {
+    throw refusal("OPERATOR_RECEIPT_STALE", "operator receipt binding is stale");
+  }
+  if (row.binding_digest !== operatorReceiptBindingDigest(receiptRequest.data)) {
+    throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt binding digest is invalid");
+  }
+  const expectedReceiptDigest = sha256(canonicalJson({
+    receiptId: row.receipt_id,
+    projectId: row.project_id,
+    receiptType: row.receipt_type,
+    mutationClass: row.mutation_class,
+    candidateHead: row.candidate_head,
+    bindingDigest: row.binding_digest,
+    status: row.status,
+    retirementCondition: row.retirement_condition,
+    callerThreadId: row.caller_thread_id,
+    callerPluginId: row.caller_plugin_id,
+    requestedFromBackground: receiptRequest.data.requestedFromBackground,
+    createdAtMs: row.created_at_ms
+  }));
+  if (row.receipt_digest !== expectedReceiptDigest) throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt digest is invalid");
+}
+function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null) {
+  let request;
+  try {
+    request = parseApplyRequest(input);
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult("apply", error48.data);
+    return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error48) });
+  }
+  if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
+  try {
+    requireOperatorReceipt(db, request);
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "operator receipt validation failed" });
+  }
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader);
+}
+function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null) {
+  let request;
+  try {
+    request = parseApplyRequest(input);
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult("apply", error48.data);
+    return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error48) });
+  }
+  if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
+  try {
+    const digest = requestDigest(request);
+    if (request.operationClass === "github_issue_projection") {
+      return applyGithubIssueProjection(db, request, digest, githubAdapter);
+    }
+    if (request.operationClass === "qualification_observation_record" || request.operationClass === "role_generation_succession") {
+      return applyRoleMutation(db, request, digest, roleFactReader);
+    }
+    if (["assignment_prepare", "assignment_dispatch", "assignment_reconcile", "assignment_terminal"].includes(request.operationClass)) {
+      return applyAssignmentMutation(db, request, digest, nativeAssignmentAdapter);
+    }
+    if (request.operationClass === "decision_disposition") {
+      return applyDecisionMutation(db, request, digest, reviewFactReader);
+    }
+    return transaction(db, () => {
+      const replay = checkIdempotency(db, request, digest);
+      if (replay) return replay;
+      switch (request.operationClass) {
+        case "bootstrap":
+          return applyBootstrap(db, request, digest);
+        case "config_revision":
+          return applyConfigRevision(db, request, digest);
+        case "governor_claim":
+          return applyGovernorClaim(db, request, digest);
+        case "migration_prepare":
+          return applyMigrationPrepare(db, request, digest);
+        case "migration_step":
+          return applyMigrationStep(db, request, digest);
+        case "decision_create":
+          return applyDecisionCreate(db, request, digest);
+        case "decision_disposition":
+          throw refusal("INTERNAL_ERROR", "decision disposition must use the Decision resolver");
+        case "work_item_create":
+          return applyWorkItemCreate(db, request, digest);
+        case "work_item_transition":
+          return applyWorkItemTransition(db, request, digest);
+        case "github_issue_projection":
+          throw refusal("INTERNAL_ERROR", "projection must not run inside the canonical transaction");
+        case "qualification_observation_record":
+        case "role_generation_succession":
+          throw refusal("INTERNAL_ERROR", "role fact operations must not run inside the canonical transaction");
+        case "assignment_prepare":
+        case "assignment_dispatch":
+        case "assignment_reconcile":
+        case "assignment_terminal":
+          throw refusal("INTERNAL_ERROR", "assignment operations must use the assignment resolver");
+      }
+    });
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    if (isConstraintError(error48)) return result("CANONICAL_STORE_UNAVAILABLE", request.projectId, 1, 0, 0, { message: String(error48) });
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+  }
 }
 function tableRows(db, table, projectId) {
   const orderBy = {
@@ -15799,7 +19798,7 @@ async function runCli(db, sdk, argv, _ctx) {
     try {
       const request = parseApplyRequest(JSON.parse(requestJson));
       if (request.projectId !== projectId) return invalidCli("--project does not match request.projectId");
-      return cliResult(operatorAuthRequired(projectId));
+      return cliResult(applyAuthorizedMutation(db, request));
     } catch (error48) {
       return invalidCli(error48 instanceof Error ? error48.message : String(error48));
     }
@@ -15917,7 +19916,7 @@ async function plugin(bb) {
       return exportFoundation(db, input.projectId);
     },
     async apply(input) {
-      return operatorAuthRequired(input.projectId);
+      return applyAuthorizedMutation(db, input);
     },
     async operatorReceipt(input) {
       if (!db) return operatorReceiptResult(input.projectId, "CANONICAL_STORE_UNAVAILABLE", "canonical SQLite store is unavailable");

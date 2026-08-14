@@ -1106,6 +1106,8 @@ export const applyRequestSchema = z
     operationClass: z.enum(CANONICAL_MUTATION_CLASSES),
     idempotencyKey: id,
     actorReceiptId: id.nullable().optional(),
+    operatorReceiptId: id.nullable().optional(),
+    candidateHead: gitShaSchema.nullable().optional(),
     expectedConfigRevision: z.number().int().nonnegative().nullable().optional(),
     configRevision: z.number().int().positive().nullable().optional(),
     expectedGovernanceEpoch: z.number().int().nonnegative().nullable().optional(),
@@ -1653,6 +1655,11 @@ export type FoundationCode =
   | "CANONICAL_STORE_UNAVAILABLE"
   | "INTERNAL_ERROR"
   | "OPERATOR_AUTH_REQUIRED"
+  | "OPERATOR_RECEIPT_REQUIRED"
+  | "OPERATOR_RECEIPT_UNKNOWN"
+  | "OPERATOR_RECEIPT_FOREIGN"
+  | "OPERATOR_RECEIPT_RETIRED"
+  | "OPERATOR_RECEIPT_INVALID"
   | "CONFIG_SECRET_FORBIDDEN"
   | "MALFORMED_JSON"
   | "INVALID_INPUT"
@@ -1956,6 +1963,8 @@ function normalizeRequest(request: ApplyRequest): ApplyRequest {
   return {
     ...request,
     actorReceiptId: request.actorReceiptId ?? null,
+    operatorReceiptId: request.operatorReceiptId ?? null,
+    candidateHead: request.candidateHead ?? null,
     expectedConfigRevision: request.expectedConfigRevision ?? null,
     configRevision: request.configRevision ?? null,
     expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? null,
@@ -6515,6 +6524,88 @@ function isConstraintError(error: unknown): boolean {
 
 function unavailableResult(subject: string, message: string): FoundationResult {
   return result("CANONICAL_STORE_UNAVAILABLE", subject, 1, 0, 0, { message });
+}
+
+function requireOperatorReceipt(db: SqliteDatabase, request: ApplyRequest): void {
+  if (!request.operatorReceiptId) throw refusal("OPERATOR_RECEIPT_REQUIRED", "an operator receipt is required");
+  if (!request.candidateHead) throw refusal("OPERATOR_RECEIPT_REQUIRED", "an exact candidate head is required");
+  const row = asRow<{
+    project_id: string;
+    receipt_id: string;
+    receipt_type: string;
+    mutation_class: string;
+    candidate_head: string;
+    binding_digest: string;
+    status: string;
+    retirement_condition: string;
+    caller_thread_id: string;
+    caller_plugin_id: string;
+    requested_from_background: number;
+    receipt_digest: string;
+    created_at_ms: number;
+  }>(db.prepare("SELECT project_id, receipt_id, receipt_type, mutation_class, candidate_head, binding_digest, status, retirement_condition, caller_thread_id, caller_plugin_id, requested_from_background, receipt_digest, created_at_ms FROM operator_receipts WHERE receipt_id = ?").get(request.operatorReceiptId));
+  if (!row) throw refusal("OPERATOR_RECEIPT_UNKNOWN", "operator receipt is not known");
+  if (row.project_id !== request.projectId) throw refusal("OPERATOR_RECEIPT_FOREIGN", "operator receipt belongs to another project");
+  if (row.status !== "interim" || row.retirement_condition !== OPERATOR_RECEIPT_RETIREMENT_CONDITION) {
+    throw refusal("OPERATOR_RECEIPT_RETIRED", "operator receipt is retired");
+  }
+  if (row.receipt_type !== "operator_confirmation" || ![0, 1].includes(row.requested_from_background)) {
+    throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt is malformed");
+  }
+  const receiptRequest = operatorReceiptRequestSchema.safeParse({
+    projectId: row.project_id,
+    mutationClass: row.mutation_class,
+    candidateHead: row.candidate_head,
+    callerThreadId: row.caller_thread_id,
+    requestedFromBackground: row.requested_from_background === 1,
+  });
+  if (!receiptRequest.success) throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt is malformed");
+  if (row.mutation_class !== request.operationClass || row.candidate_head !== request.candidateHead) {
+    throw refusal("OPERATOR_RECEIPT_STALE", "operator receipt binding is stale");
+  }
+  if (row.binding_digest !== operatorReceiptBindingDigest(receiptRequest.data)) {
+    throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt binding digest is invalid");
+  }
+  const expectedReceiptDigest = sha256(canonicalJson({
+    receiptId: row.receipt_id,
+    projectId: row.project_id,
+    receiptType: row.receipt_type,
+    mutationClass: row.mutation_class,
+    candidateHead: row.candidate_head,
+    bindingDigest: row.binding_digest,
+    status: row.status,
+    retirementCondition: row.retirement_condition,
+    callerThreadId: row.caller_thread_id,
+    callerPluginId: row.caller_plugin_id,
+    requestedFromBackground: receiptRequest.data.requestedFromBackground,
+    createdAtMs: row.created_at_ms,
+  }));
+  if (row.receipt_digest !== expectedReceiptDigest) throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt digest is invalid");
+}
+
+export function applyAuthorizedMutation(
+  db: SqliteDatabase | null,
+  input: unknown,
+  githubAdapter: GitHubIssueAdapter | null = null,
+  roleFactReader: RoleFactReader | null = null,
+  nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
+  reviewFactReader: ReviewFactReader | null = null,
+): FoundationResult {
+  let request: ApplyRequest;
+  try {
+    request = parseApplyRequest(input);
+  } catch (error) {
+    if (error instanceof Refusal) return refusalResult("apply", error.data);
+    return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error) });
+  }
+  if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
+  try {
+    requireOperatorReceipt(db, request);
+  } catch (error) {
+    if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "operator receipt validation failed" });
+  }
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader);
 }
 
 export function applyFixtureMutation(

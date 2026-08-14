@@ -25,6 +25,7 @@ import {
   doctor,
   explicitExecutionInputSources,
   exportFoundation,
+  persistInterimOperatorReceipt,
   schemaDigest,
   sha256,
   type ApplyRequest,
@@ -1168,7 +1169,7 @@ describe("bb-collab plugin boundary", () => {
     const before = exportFoundation(db, PROJECT_ID);
 
     const rpc = await host.harness.callRpc("apply", request);
-    expect(rpc).toMatchObject({ outcome: "OPERATOR_AUTH_REQUIRED", expected: 1, attempted: 0, verified: 0 });
+    expect(rpc).toMatchObject({ outcome: "OPERATOR_RECEIPT_REQUIRED", expected: 1, attempted: 0, verified: 0 });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
 
     const cli = await host.harness.runCli([
@@ -1179,10 +1180,67 @@ describe("bb-collab plugin boundary", () => {
       JSON.stringify(request),
     ]);
     expect(cli.exitCode).toBe(2);
-    expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "OPERATOR_AUTH_REQUIRED" });
+    expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "OPERATOR_RECEIPT_REQUIRED" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules).toEqual([]);
     expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "doctor", "export", "lanes", "operatorReceipt", "reorderPinned", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
+  });
+
+  it("authorizes exact interim receipts through the same RPC and CLI seam", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID, actorKind: "operator", subjectId: "operator-1" });
+    const request = { ...bootstrapRequest(), candidateHead: CANDIDATE_SHA };
+    const receipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: request.operationClass,
+      candidateHead: CANDIDATE_SHA,
+      callerThreadId: "operator-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 1);
+    const authorized = { ...request, operatorReceiptId: receipt.receiptId };
+
+    const rpc = await host.harness.callRpc("apply", authorized);
+    expect(rpc).toMatchObject({ outcome: "OK", mutationReceipt: { operationClass: "bootstrap" } });
+    const cli = await host.harness.runCli(["apply", "--project", PROJECT_ID, "--request", JSON.stringify(authorized)]);
+    expect(cli.exitCode).toBe(0);
+    expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "OK" });
+  });
+
+  it("rejects every invalid receipt binding before any canonical write", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    const base = { ...bootstrapRequest(), candidateHead: CANDIDATE_SHA };
+    const before = exportFoundation(db, PROJECT_ID);
+    const receipt = (projectId: string, mutationClass: ApplyRequest["operationClass"], id: string) => persistInterimOperatorReceipt(db, {
+      projectId,
+      mutationClass,
+      candidateHead: CANDIDATE_SHA,
+      callerThreadId: `thread-${id}`,
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 1);
+
+    expect((await host.harness.callRpc("apply", base) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_REQUIRED");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    const foreign = receipt(FOREIGN_PROJECT_ID, "bootstrap", "foreign");
+    expect((await host.harness.callRpc("apply", { ...base, operatorReceiptId: foreign.receiptId }) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_FOREIGN");
+    const stale = receipt(PROJECT_ID, "bootstrap", "stale");
+    expect((await host.harness.callRpc("apply", { ...base, operatorReceiptId: stale.receiptId, candidateHead: H1_CANDIDATE_SHA }) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_STALE");
+    const mismatched = receipt(PROJECT_ID, "config_revision", "mismatch");
+    expect((await host.harness.callRpc("apply", { ...base, operatorReceiptId: mismatched.receiptId }) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_STALE");
+    const malformed = receipt(PROJECT_ID, "bootstrap", "malformed");
+    db.prepare("UPDATE operator_receipts SET binding_digest = 'bad' WHERE receipt_id = ?").run(malformed.receiptId);
+    expect((await host.harness.callRpc("apply", { ...base, operatorReceiptId: malformed.receiptId }) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_INVALID");
+    const retired = receipt(PROJECT_ID, "bootstrap", "retired");
+    db.pragma("ignore_check_constraints = ON");
+    db.prepare("UPDATE operator_receipts SET status = 'retired' WHERE receipt_id = ?").run(retired.receiptId);
+    db.pragma("ignore_check_constraints = OFF");
+    const beforeInvalidApplications = exportFoundation(db, PROJECT_ID);
+    expect((await host.harness.callRpc("apply", { ...base, operatorReceiptId: retired.receiptId }) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_RETIRED");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeInvalidApplications);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: 0 });
   });
 
   it("proves fixture bootstrap, read-only doctor, deterministic export, and exact BB fact reads", async () => {
@@ -3417,7 +3475,7 @@ describe("bb-collab plugin boundary", () => {
     });
     const beforeProductionRefusal = exportFoundation(db, PROJECT_ID);
     expect(await host.harness.callRpc("apply", successionRequest(fenceToken, { idempotencyKey: "production-role" }))).toMatchObject({
-      outcome: "OPERATOR_AUTH_REQUIRED",
+      outcome: "OPERATOR_RECEIPT_REQUIRED",
       expected: 1,
       attempted: 0,
       verified: 0,
