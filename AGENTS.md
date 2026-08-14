@@ -1,9 +1,9 @@
 # bb-collab repository contract
 
-CONTRACT_VERSION: 3
+CONTRACT_VERSION: 4
 
 This repository contains the founding contract and the implemented foundation
-through schema v8: a single SQLite store with migrations, resolver,
+through schema v9: a single SQLite store with migrations, resolver,
 state-event and mutation-receipt, deterministic export, and read-only doctor
 seams, plus WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
 Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
@@ -16,6 +16,11 @@ retire only on the host-issued `get-bb/bb#1541` condition, while stale means
 an exact binding mismatch. `github_issue_projection`, `assignment_dispatch`,
 and `assignment_reconcile` reserve/finalize adapter operations are explicitly
 unsupported under this one-request seam and refuse before the adapter. The
+bootstrap operator-confirmation path atomically derives a verified actor receipt
+with `actor_kind=plugin`, `subject_id=bb-collab`, and an exact durable
+`operator_receipt_id` link; the actor is never a standing identity and must be
+supplied with that same operator receipt on apply. Its retirement condition is
+the same host-issued `get-bb/bb#1541` condition. The
 plugin has not been installed, reloaded, or activated against live project
 authority. The complete decision is in
 [ADR 0001](docs/adr/0001-founding-contract.md); the threat boundary is in
@@ -64,9 +69,9 @@ Changing version text alone is not a migration. A zero-work result is not a
 successful apply unless zero expected work, zero attempted work and zero
 verified work are all proven.
 
-Contract v3/schema v8 requires all four cached consumers to reread the
+Contract v4/schema v9 requires all four cached consumers to reread the
 one-request receipt, mutation/export/evidence, and refusal contract or refuse
-schema v7.
+schema v8.
 
 ## Delegation and lane obligations
 

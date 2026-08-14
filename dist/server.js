@@ -13888,8 +13888,8 @@ import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 3;
-var SCHEMA_VERSION = 8;
+var CONTRACT_VERSION = 4;
+var SCHEMA_VERSION = 9;
 var MAX_EXPORT_ROWS = 256;
 var MAX_EXPORT_BYTES = 512 * 1024;
 var TABLES = [
@@ -14435,7 +14435,9 @@ var MIGRATIONS = [
    ALTER TABLE operator_receipts ADD COLUMN consumed_at_ms INTEGER;
    ALTER TABLE operator_receipts ADD COLUMN consumed_event_sequence INTEGER;
    ALTER TABLE state_events ADD COLUMN operator_receipt_id TEXT;
-   ALTER TABLE mutation_receipts ADD COLUMN operator_receipt_id TEXT`
+   ALTER TABLE mutation_receipts ADD COLUMN operator_receipt_id TEXT`,
+  `ALTER TABLE actor_receipts ADD COLUMN operator_receipt_id TEXT;
+   ALTER TABLE actor_receipts ADD COLUMN retirement_condition TEXT`
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var CACHED_CONSUMERS = ["server.rpcContract", "server.collabCli", "src/test-support", "tests/server.test"];
@@ -14443,7 +14445,7 @@ function cachedConsumerRolloutEvidence(observedSchemaVersion) {
   const reread = observedSchemaVersion === SCHEMA_VERSION;
   const evidence = {
     names: [...CACHED_CONSUMERS],
-    oldSchemaVersion: 7,
+    oldSchemaVersion: 8,
     newSchemaVersion: SCHEMA_VERSION,
     observedSchemaVersion,
     action: reread ? "reread" : "refused",
@@ -14511,6 +14513,14 @@ var contractDigest = sha256(canonicalJson({
     scope: "one_request",
     binding: ["projectId", "operationClass", "candidateHead", "idempotencyKey", "requestDigest"],
     consumption: "atomic"
+  },
+  derivedActorReceiptPolicy: {
+    operationClass: "bootstrap",
+    actorKind: "plugin",
+    subjectId: PLUGIN_ID,
+    authorization: "operatorReceiptId",
+    requestDigest: "actorReceiptId omitted because it is derived from operatorReceiptId",
+    retirementCondition: "host-issued receipt get-bb/bb#1541"
   }
 }));
 var migrationArtifactSchema = external_exports.object({
@@ -15448,6 +15458,75 @@ function persistInterimOperatorReceipt(db, input, createdAtMs = now()) {
     createdAtMs
   };
 }
+function actorReceiptDigest(input) {
+  const identity = {
+    projectId: input.projectId,
+    receiptId: input.receiptId,
+    actorKind: input.actorKind,
+    subjectId: input.subjectId,
+    roleId: input.roleId,
+    roleGeneration: input.roleGeneration,
+    verificationState: input.verificationState,
+    ...input.operatorReceiptId || input.retirementCondition ? { operatorReceiptId: input.operatorReceiptId ?? null, retirementCondition: input.retirementCondition ?? null } : {}
+  };
+  return sha256(canonicalJson(identity));
+}
+function derivePluginActorReceipt(db, operatorReceipt) {
+  if (operatorReceipt.mutationClass !== "bootstrap") {
+    throw refusal("INVALID_INPUT", "derived plugin actor receipts are limited to bootstrap");
+  }
+  if (operatorReceipt.callerPluginId !== PLUGIN_ID) {
+    throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt caller plugin is not bb-collab");
+  }
+  const request = {
+    projectId: operatorReceipt.projectId,
+    operationClass: operatorReceipt.mutationClass,
+    idempotencyKey: operatorReceipt.idempotencyKey,
+    actorReceiptId: null,
+    operatorReceiptId: operatorReceipt.receiptId,
+    candidateHead: operatorReceipt.candidateHead
+  };
+  requireOperatorReceipt(db, request, operatorReceipt.requestDigest);
+  if (db.prepare("SELECT 1 FROM actor_receipts WHERE project_id = ? AND operator_receipt_id = ?").get(operatorReceipt.projectId, operatorReceipt.receiptId)) {
+    throw refusal("OPERATOR_RECEIPT_REUSED", "operator receipt already authorizes a derived actor receipt");
+  }
+  const receiptId = `actor-${randomBytes(16).toString("hex")}`;
+  const retirementCondition = OPERATOR_RECEIPT_RETIREMENT_CONDITION;
+  const receiptDigest = actorReceiptDigest({
+    projectId: operatorReceipt.projectId,
+    receiptId,
+    actorKind: "plugin",
+    subjectId: PLUGIN_ID,
+    roleId: null,
+    roleGeneration: null,
+    verificationState: "verified",
+    operatorReceiptId: operatorReceipt.receiptId,
+    retirementCondition
+  });
+  db.prepare(
+    `INSERT INTO actor_receipts (
+      project_id, receipt_id, actor_kind, subject_id, role_id, role_generation,
+      verification_state, receipt_digest, issued_at_ms, operator_receipt_id,
+      retirement_condition
+    ) VALUES (?, ?, 'plugin', ?, NULL, NULL, 'verified', ?, ?, ?, ?)`
+  ).run(
+    operatorReceipt.projectId,
+    receiptId,
+    PLUGIN_ID,
+    receiptDigest,
+    operatorReceipt.createdAtMs,
+    operatorReceipt.receiptId,
+    retirementCondition
+  );
+  return receiptId;
+}
+function persistBootstrapOperatorReceipt(db, input, createdAtMs = now()) {
+  return transaction(db, () => {
+    const operatorReceipt = persistInterimOperatorReceipt(db, input, createdAtMs);
+    const actorReceiptId = derivePluginActorReceipt(db, operatorReceipt);
+    return { operatorReceipt, actorReceiptId };
+  });
+}
 function refusalResult(subject, data, expected = 1, attempted = 0, verified = 0) {
   return result(data.code, subject, data.expected ?? expected, data.attempted ?? attempted, data.verified ?? verified, {
     message: data.message,
@@ -15504,24 +15583,39 @@ function requireConfig(db, request) {
 function requireActor(db, request) {
   if (!request.actorReceiptId) throw refusal("ACTOR_RECEIPT_REQUIRED", "a typed actor receipt is required");
   const row = asRow(
-    db.prepare("SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, receipt_digest FROM actor_receipts WHERE receipt_id = ?").get(request.actorReceiptId)
+    db.prepare("SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, receipt_digest, operator_receipt_id, retirement_condition FROM actor_receipts WHERE receipt_id = ?").get(request.actorReceiptId)
   );
   if (!row) throw refusal("ACTOR_RECEIPT_UNKNOWN", "actor receipt is not known");
   if (row.project_id !== request.projectId) throw refusal("ACTOR_RECEIPT_FOREIGN", "actor receipt belongs to another project");
   if (row.verification_state !== "verified") throw refusal("ACTOR_RECEIPT_UNVERIFIED", "actor receipt is not verified");
-  const expectedDigest = sha256(
-    canonicalJson({
-      projectId: row.project_id,
-      receiptId: request.actorReceiptId,
-      actorKind: row.actor_kind,
-      subjectId: row.subject_id,
-      roleId: row.role_id,
-      roleGeneration: row.role_generation,
-      verificationState: row.verification_state
-    })
-  );
+  if (row.operator_receipt_id !== null || row.retirement_condition !== null) {
+    if (row.actor_kind !== "plugin" || row.subject_id !== PLUGIN_ID || row.operator_receipt_id === null || row.retirement_condition !== OPERATOR_RECEIPT_RETIREMENT_CONDITION || request.operatorReceiptId !== row.operator_receipt_id || request.candidateHead === null) {
+      throw refusal("ACTOR_RECEIPT_UNVERIFIED", "derived actor receipt is not bound to this operator receipt");
+    }
+    requireOperatorReceipt(db, request, mutationRequestDigest(db, request));
+  }
+  const expectedDigest = actorReceiptDigest({
+    projectId: row.project_id,
+    receiptId: request.actorReceiptId,
+    actorKind: row.actor_kind,
+    subjectId: row.subject_id,
+    roleId: row.role_id,
+    roleGeneration: row.role_generation,
+    verificationState: row.verification_state,
+    operatorReceiptId: row.operator_receipt_id,
+    retirementCondition: row.retirement_condition
+  });
   if (row.receipt_digest !== expectedDigest) throw refusal("ACTOR_RECEIPT_UNVERIFIED", "actor receipt digest is invalid");
   return request.actorReceiptId;
+}
+function mutationRequestDigest(db, request) {
+  const digest = operatorRequestDigest(request);
+  if (request.operationClass !== "bootstrap" || !request.actorReceiptId) return digest;
+  const derived = asRow(db.prepare(
+    "SELECT actor_kind, subject_id, operator_receipt_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?"
+  ).get(request.projectId, request.actorReceiptId));
+  if (!derived || derived.actor_kind !== "plugin" || derived.subject_id !== PLUGIN_ID || !derived.operator_receipt_id) return digest;
+  return operatorRequestDigest({ ...request, actorReceiptId: null });
 }
 function requireGovernor(db, request) {
   const head = asRow(
@@ -19163,7 +19257,7 @@ function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   try {
-    const digest = operatorRequestDigest(request);
+    const digest = mutationRequestDigest(db, request);
     const replay = authorizedReplay(db, request, digest);
     if (replay) return replay;
     requireOperatorReceipt(db, request, digest);
@@ -19188,7 +19282,7 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   try {
-    const digest = operatorRequestDigest(request);
+    const digest = mutationRequestDigest(db, request);
     if (request.operationClass === "github_issue_projection") {
       return applyGithubIssueProjection(db, request, digest, githubAdapter);
     }
@@ -19719,6 +19813,7 @@ var foundationResultSchema = external_exports.object({
   currentResourceRevision: external_exports.number().int().positive().optional(),
   expectedResourceRevision: external_exports.number().int().positive().optional(),
   mutationReceipt: mutationReceiptSchema.optional(),
+  actorReceiptId: external_exports.string().optional(),
   operatorReceipt: external_exports.object({
     receiptId: external_exports.string(),
     projectId: projectIdSchema,
@@ -20018,6 +20113,10 @@ async function plugin(bb) {
         return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_STALE", "operator confirmation binding is stale");
       }
       try {
+        if (input.mutationClass === "bootstrap") {
+          const issued = persistBootstrapOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId });
+          return operatorReceiptResult(input.projectId, "OK", "interim operator receipt and derived actor receipt persisted", issued);
+        }
         const receipt = persistInterimOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId });
         return operatorReceiptResult(input.projectId, "OK", "interim operator receipt persisted", { operatorReceipt: receipt });
       } catch {

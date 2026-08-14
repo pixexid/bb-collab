@@ -13,7 +13,7 @@ new-thread, search, navigation rows, and the footer.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through schema v8: a
+The repository now contains the implemented foundation through schema v9: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
@@ -23,7 +23,11 @@ operator receipt bound to project, operation, exact candidate head,
 idempotency key, and request digest; it is consumed atomically and invalid,
 stale, retired, mismatched, or reused receipts refuse before any write. The
 receipt has no local expiry or revocation: it retires only on the host-issued
-`get-bb/bb#1541` condition, and stale means an exact binding mismatch.
+`get-bb/bb#1541` condition, and stale means an exact binding mismatch. A
+confirmed bootstrap operator receipt atomically derives a verified
+`plugin/bb-collab` actor receipt linked to that exact operator receipt; the
+derived actor is not standing authority and apply must provide the same linked
+operator receipt.
 `github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
 reserve/finalize operations refuse before the adapter under this one-request
 seam. The plugin has not been installed, reloaded, or activated against live

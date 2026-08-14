@@ -21,6 +21,7 @@ import {
   operatorReceiptConfirmationSchema,
   operatorReceiptRequestSchema,
   OPERATOR_RECEIPT_RETIREMENT_CONDITION,
+  persistBootstrapOperatorReceipt,
   persistInterimOperatorReceipt,
   parseApplyRequest,
   type FoundationResult,
@@ -92,6 +93,7 @@ export const foundationResultSchema = z
     currentResourceRevision: z.number().int().positive().optional(),
     expectedResourceRevision: z.number().int().positive().optional(),
     mutationReceipt: mutationReceiptSchema.optional(),
+    actorReceiptId: z.string().optional(),
     operatorReceipt: z
       .object({
         receiptId: z.string(),
@@ -229,7 +231,7 @@ function operatorReceiptResult(
   projectId: string,
   outcome: FoundationResult["outcome"],
   message: string,
-  extra: Pick<FoundationResult, "operatorReceipt"> = {},
+  extra: Pick<FoundationResult, "operatorReceipt" | "actorReceiptId"> = {},
 ): FoundationResult {
   return { outcome, subject: projectId, expected: 1, attempted: extra.operatorReceipt ? 1 : 0, verified: extra.operatorReceipt ? 1 : 0, message, ...extra };
 }
@@ -430,6 +432,10 @@ export default async function plugin(bb: BbPluginApi) {
         return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_STALE", "operator confirmation binding is stale");
       }
       try {
+        if (input.mutationClass === "bootstrap") {
+          const issued = persistBootstrapOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId });
+          return operatorReceiptResult(input.projectId, "OK", "interim operator receipt and derived actor receipt persisted", issued);
+        }
         const receipt = persistInterimOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId });
         return operatorReceiptResult(input.projectId, "OK", "interim operator receipt persisted", { operatorReceipt: receipt });
       } catch {
