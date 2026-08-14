@@ -86,7 +86,7 @@ var {
   jsxs
 } = mod3;
 
-// ../../../../../../private/var/folders/sx/p0z7ygy93cs3bdbpl35ykblr0000gn/T/bb-collab-build-ddsnbg/app.tsx
+// app.tsx
 var MAX_VISIBLE_THREADS = 5;
 var RUNNING_INDICATORS = /* @__PURE__ */ new Set([
   "working-draft",

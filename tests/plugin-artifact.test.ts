@@ -53,4 +53,13 @@ describe("path-install server artifact", () => {
     expect(appMeta.pluginVersion).toBe(serverMeta.pluginVersion);
     expect(appMeta.sdkVersion).toBe(serverMeta.sdkVersion);
   });
+
+  // The build stages into a randomly named temp directory. A tracked artifact
+  // that still names it differs on every rebuild, so a clean candidate would
+  // not stay clean.
+  it("normalizes the staging path out of every tracked bundle", () => {
+    for (const artifact of ["dist/server.js", "dist/app.js"]) {
+      expect(readFileSync(join(PROJECT_ROOT, artifact), "utf8"), artifact).not.toContain("bb-collab-build-");
+    }
+  });
 });
