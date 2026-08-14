@@ -295,7 +295,7 @@ describe("replacement thread list", () => {
     expect(executionBadgeLabel("codex", { model: "gpt-5.6-luna", reasoning: "high" })).toBe("codex · model gpt-5.6-luna · reasoning high");
   });
 
-  it("renders the execution badge as short text with the host's own facts", async () => {
+  it("renders the execution badge as the official mark plus short text", async () => {
     const list = await registration();
     const rendered = renderSlot(list, props(), {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [thread("thread-1", "project-a", 1)] },
@@ -306,10 +306,15 @@ describe("replacement thread list", () => {
     expect(badge.textContent).toBe("Luna·H");
     // No long provider/model text survives in the row.
     expect(rendered.queryByText("codex/gpt-5.6-luna")).toBeNull();
-    // Provider artwork is gone: BB's official logos are host-internal and the
-    // SDK exports no way to draw them, so we ship none rather than look-alikes.
-    expect(badge.querySelector("svg")).toBeNull();
-    expect(rendered.container.querySelector("img, image, use, [data-provider-mark]")).toBeNull();
+    // The glyph beside the text is BB's own official mark, vendored verbatim —
+    // never a look-alike we drew, and never fetched.
+    const mark = badge.querySelector("svg[data-provider-mark]")!;
+    expect(mark.getAttribute("data-provider-mark")).toBe("codex");
+    expect(mark.getAttribute("viewBox")).toBe("0 0 24 24");
+    expect(mark.getAttribute("fill")).toBe("currentColor");
+    expect(mark.getAttribute("aria-hidden")).toBe("true");
+    expect(mark.outerHTML).not.toMatch(/https?:|url\(|#[0-9a-f]{3,6}\b|rgb\(/iu);
+    expect(rendered.container.querySelector("img, image, use")).toBeNull();
   });
 
   it("gives the project counter the same typography as the project name", async () => {

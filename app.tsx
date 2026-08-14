@@ -8,6 +8,7 @@ import type {
   PluginSidebarThread,
   PluginThreadListProps,
 } from "@bb/plugin-sdk/app";
+import { providerMark, providerMarkKey } from "./src/provider-marks";
 import type { rpcContract } from "./server";
 
 type Lane = PluginRpcResult<typeof rpcContract["lanes"]>[number];
@@ -150,11 +151,27 @@ function ThreadStateDot({ thread }: { thread: PluginSidebarThread }) {
   );
 }
 
-// No provider glyph here on purpose. BB's official provider logos live in the
-// app's own icon set and `@bb/plugin-sdk/app` exports no way to render them, so
-// the only options were shipping look-alike artwork or shipping nothing. The
-// model short name already names the provider family; look-alike logos would
-// misrepresent the vendors. See docs/sidebar-provider-logos.md.
+// BB's own official marks, vendored verbatim from the host bundle (see
+// src/provider-marks.ts). Monochrome `currentColor` so the glyph inherits the
+// row's theme token, bundled so nothing is fetched. A provider BB ships no
+// mark for renders no glyph rather than an invented one.
+function ProviderMark({ providerId }: { providerId: string }) {
+  const mark = providerMark(providerId);
+  if (!mark) return null;
+  return (
+    <svg
+      viewBox={mark.viewBox}
+      className="size-3 shrink-0"
+      fill="currentColor"
+      fillRule={mark.fillRule}
+      aria-hidden="true"
+      focusable="false"
+      data-provider-mark={providerMarkKey(providerId)}
+    >
+      {mark.paths.map((path) => <path key={path} d={path} />)}
+    </svg>
+  );
+}
 
 // Ordered: the family word is a suffix as often as a prefix, so the first hit
 // wins and the prefix entries stay last.
@@ -202,6 +219,7 @@ function ExecutionBadge({ providerId, execution }: { providerId: string; executi
   const label = executionBadgeLabel(providerId, execution);
   return (
     <span className="flex min-w-0 items-center gap-1" role="img" aria-label={label} title={label} data-thread-execution-badge="">
+      <ProviderMark providerId={providerId} />
       <span className="min-w-0 truncate">{shortModelName(asText(execution?.model))}·{reasoningLetter(asText(execution?.reasoning))}</span>
     </span>
   );

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { cleanup } from "@testing-library/react";
 import { installTestPluginRuntime, loadPluginApp, renderSlot } from "@bb/plugin-sdk/testing/app";
@@ -173,30 +173,77 @@ describe("sidebar visual contract", () => {
     expect(source).not.toContain("indicatorClasses");
   });
 
-  it("ships no look-alike provider artwork", async () => {
+  it("vendors the exact official BB marks for codex, claude-code and pi", async () => {
+    const { providerMark } = await import("../src/provider-marks");
+
+    // Geometry copied verbatim from bb-app@0.37.0's plugin-sdk-hooks chunk.
+    // These assertions are fingerprints: if a refresh redraws or re-fits a
+    // path, they fail rather than silently shipping an approximation.
+    const codex = providerMark("codex")!;
+    expect(codex.title).toBe("OpenAI");
+    expect(codex.viewBox).toBe("0 0 24 24");
+    expect(codex.fillRule).toBe("evenodd");
+    expect(codex.paths).toHaveLength(1);
+    expect(codex.paths[0]).toHaveLength(1461);
+    expect(codex.paths[0].startsWith("M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108")).toBe(true);
+
+    const claude = providerMark("claude-code")!;
+    expect(claude.title).toBe("Claude");
+    expect(claude.viewBox).toBe("0 0 149 149");
+    expect(claude.paths).toHaveLength(1);
+    expect(claude.paths[0]).toHaveLength(1903);
+    expect(claude.paths[0].startsWith("M29.05 98.54L58.19 82.19L58.68 80.77")).toBe(true);
+    expect(claude.paths[0].endsWith("L29.04 98.5L29.05 98.54Z")).toBe(true);
+
+    const pi = providerMark("pi")!;
+    expect(pi.title).toBe("Pi");
+    expect(pi.viewBox).toBe("100 100 600 600");
+    expect(pi.fillRule).toBe("evenodd");
+    // Luna's review named this one specifically: two paths, not one.
+    expect(pi.paths).toHaveLength(2);
+    expect(pi.paths[1]).toBe("M517.36 400 H634.72 V634.72 H517.36 Z");
+
+    // Three distinct official marks, not one shape reused.
+    expect(new Set([codex.paths[0], claude.paths[0], pi.paths[0]]).size).toBe(3);
+  });
+
+  it("matches the marks byte-for-byte against the installed host bundle", async () => {
+    const chunk = "/Applications/bb.app/Contents/Resources/app.asar.unpacked/node_modules/bb-app/app/dist/assets/plugin-sdk-hooks-CPZOXpqm.js";
+    if (!existsSync(chunk)) return; // Host not installed on this machine; the fingerprints above still guard.
+    const source = readFileSync(chunk, "utf8");
+    const { providerMark } = await import("../src/provider-marks");
+    for (const id of ["codex", "claude-code", "pi"]) {
+      for (const path of providerMark(id)!.paths) {
+        expect(source.includes(path), `${id} path drifted from the host bundle`).toBe(true);
+      }
+    }
+  });
+
+  it("maps vendor aliases and refuses to invent a mark for anything else", async () => {
+    const { providerMark } = await import("../src/provider-marks");
+    expect(providerMark("openai")).toBe(providerMark("codex"));
+    expect(providerMark("anthropic")).toBe(providerMark("claude-code"));
+    expect(providerMark("kimi")).toBe(providerMark("pi"));
+    // No mark shipped by BB means no glyph — never a substitute shape.
+    for (const unknown of ["some-new-provider", "acp-cursor", "", undefined, { nope: true }]) {
+      expect(providerMark(unknown), String(unknown)).toBeNull();
+    }
+  });
+
+  it("renders those marks inline as monochrome currentColor with no network", async () => {
     list = await registration();
     const rendered = render([thread("a", "codex"), thread("b", "claude-code"), thread("c", "pi")]);
 
-    // BB's official provider logos are host-internal; `@bb/plugin-sdk/app`
-    // exports no way to render them. Shipping our own shapes would put
-    // unofficial vendor artwork on screen, so the badge is text only.
-    expect(rendered.container.querySelector("[data-provider-mark]")).toBeNull();
-    for (const badge of Array.from(rendered.container.querySelectorAll("[data-thread-execution-badge]"))) {
-      expect(badge.querySelector("svg")).toBeNull();
-      expect(badge.outerHTML).not.toMatch(/<image|href=|url\(/u);
+    const marks = Array.from(rendered.container.querySelectorAll("svg[data-provider-mark]"));
+    expect(marks.map((m) => m.getAttribute("data-provider-mark"))).toEqual(["codex", "claudecode", "pi"]);
+    expect(marks.map((m) => m.getAttribute("viewBox"))).toEqual(["0 0 24 24", "0 0 149 149", "100 100 600 600"]);
+    for (const mark of marks) {
+      expect(mark.getAttribute("fill")).toBe("currentColor");
+      expect(mark.getAttribute("aria-hidden")).toBe("true");
+      // Monochrome and offline: no hard-coded colour, no fetch of any kind.
+      expect(mark.outerHTML).not.toMatch(/https?:|url\(|#[0-9a-f]{3,6}\b|rgb\(/iu);
+      expect(mark.outerHTML).not.toMatch(/<image|href=/u);
     }
-
-    const source = readFileSync(resolve("app.tsx"), "utf8");
-    expect(source).not.toContain("PROVIDER_MARKS");
-    expect(source).not.toContain("ProviderMark");
-  });
-
-  it("keeps the provider fact in the badge's text and accessible name", async () => {
-    list = await registration();
-    const { executionBadgeLabel } = await import("../app");
-    // Provider identity is still reported, from the host's own value.
-    for (const id of ["codex", "claude-code", "pi"]) {
-      expect(executionBadgeLabel(id, { model: "gpt-5.6-luna", reasoning: "high" })).toContain(id);
-    }
+    expect(rendered.container.querySelector("img, image, use")).toBeNull();
   });
 });
