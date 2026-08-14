@@ -347,7 +347,12 @@ adversarial doctor + first adopter` → `P5 leases` → `P6 capacity/failover`;
 `P4 plugin profile` is parallel after P3/#5, and `P7 transport` is parallel
 after P3/P5.
 
-The current bb-collab main branch is not cut over: production apply remains
-`OPERATOR_AUTH_REQUIRED`, the plugin has not been installed/reloaded/activated
-against live project authority, and the migration/first-adopter evidence is
-not yet complete. This report records those facts; it does not change them.
+The current bb-collab main branch is not cut over: production apply requires
+an exact one-request interim operator receipt bound to project, operation,
+candidate head, idempotency key, and request digest; the plugin has not been
+installed/reloaded/activated against live project authority, and the
+migration/first-adopter evidence is not yet complete. Candidate heads are
+exact lowercase 40-character bindings supplied by the caller, not observed
+Git/BB facts. Background requests still require human `requestInput`
+confirmation; the digest is integrity-only until a host-issued receipt exists.
+This report records those facts; it does not change them.

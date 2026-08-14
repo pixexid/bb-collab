@@ -579,13 +579,17 @@ function OperatorReceiptForm({ interaction, submit, cancel }: PluginPendingInter
     projectId?: unknown;
     mutationClass?: unknown;
     candidateHead?: unknown;
+    idempotencyKey?: unknown;
+    requestDigest?: unknown;
     retirementCondition?: unknown;
   };
   const [confirmed, setConfirmed] = useState(false);
-  const valid = typeof payload.projectId === "string" && typeof payload.mutationClass === "string" && typeof payload.candidateHead === "string";
+  const valid = [payload.projectId, payload.mutationClass, payload.candidateHead, payload.idempotencyKey, payload.requestDigest].every((value) => typeof value === "string");
   const projectId = typeof payload.projectId === "string" ? payload.projectId : null;
   const mutationClass = typeof payload.mutationClass === "string" ? payload.mutationClass : null;
   const candidateHead = typeof payload.candidateHead === "string" ? payload.candidateHead : null;
+  const idempotencyKey = typeof payload.idempotencyKey === "string" ? payload.idempotencyKey : null;
+  const requestDigest = typeof payload.requestDigest === "string" ? payload.requestDigest : null;
 
   return (
     <form
@@ -598,22 +602,26 @@ function OperatorReceiptForm({ interaction, submit, cancel }: PluginPendingInter
           projectId,
           mutationClass,
           candidateHead,
+          idempotencyKey,
+          requestDigest,
         });
       }}
     >
       <div>
         <h2 className="font-semibold">Confirm operator receipt</h2>
-        <p className="text-sm text-muted-foreground">This records an interim confirmation only; it does not authorize a mutation.</p>
+        <p className="text-sm text-muted-foreground">This records an interim confirmation for this exact one-request apply; normal actor and resolver checks still apply.</p>
       </div>
       <dl className="grid gap-2 text-sm">
         <div><dt className="text-muted-foreground">Project</dt><dd className="font-mono">{String(payload.projectId ?? "invalid")}</dd></div>
         <div><dt className="text-muted-foreground">Mutation</dt><dd className="font-mono">{String(payload.mutationClass ?? "invalid")}</dd></div>
         <div><dt className="text-muted-foreground">Candidate head</dt><dd className="break-all font-mono">{String(payload.candidateHead ?? "invalid")}</dd></div>
+        <div><dt className="text-muted-foreground">Idempotency key</dt><dd className="break-all font-mono">{String(payload.idempotencyKey ?? "invalid")}</dd></div>
+        <div><dt className="text-muted-foreground">Request digest</dt><dd className="break-all font-mono">{String(payload.requestDigest ?? "invalid")}</dd></div>
         <div><dt className="text-muted-foreground">Retirement condition</dt><dd>{String(payload.retirementCondition ?? "invalid")}</dd></div>
       </dl>
       <label className="flex items-start gap-2 text-sm">
         <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
-        <span>I confirm this exact project, mutation class, and candidate head.</span>
+        <span>I confirm this exact project, mutation class, candidate head, idempotency key, and request digest.</span>
       </label>
       <div className="flex gap-2">
         <button className="rounded border border-border px-3 py-1 text-sm" type="button" onClick={() => void cancel()}>Cancel</button>

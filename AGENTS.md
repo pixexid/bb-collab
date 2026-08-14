@@ -1,15 +1,18 @@
 # bb-collab repository contract
 
-CONTRACT_VERSION: 2
+CONTRACT_VERSION: 3
 
 This repository contains the founding contract and the implemented foundation
-through schema v7: a single SQLite store with migrations, resolver,
+through schema v8: a single SQLite store with migrations, resolver,
 state-event and mutation-receipt, deterministic export, and read-only doctor
 seams, plus WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
 Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
-foundations, with a fixture-only MigrationRun cutover contract. Production RPC/CLI apply remain unconditionally
-`OPERATOR_AUTH_REQUIRED`; the plugin has not been installed, reloaded, or
-activated against live project authority. The complete decision is in
+foundations, with a fixture-only MigrationRun cutover contract. Production
+RPC/CLI apply require an exact one-request interim operator receipt bound to
+project, operation, candidate head, idempotency key, and request digest;
+missing, mismatched, consumed, malformed, stale, or retired receipts refuse
+before any write. The plugin has not been installed, reloaded, or activated
+against live project authority. The complete decision is in
 [ADR 0001](docs/adr/0001-founding-contract.md); the threat boundary is in
 [the threat model](docs/threat-model.md); import and issue disposition are in
 [the import manifest](docs/import-manifest.md); and dependency order is in
@@ -56,9 +59,9 @@ Changing version text alone is not a migration. A zero-work result is not a
 successful apply unless zero expected work, zero attempted work and zero
 verified work are all proven.
 
-Contract v2/schema v7 requires all four cached consumers to reread the
-MigrationRun operation, export/evidence, and refusal contract or refuse schema
-v6.
+Contract v3/schema v8 requires all four cached consumers to reread the
+one-request receipt, mutation/export/evidence, and refusal contract or refuse
+schema v7.
 
 ## Delegation and lane obligations
 

@@ -34,6 +34,7 @@ const mutationReceiptSchema = z
     idempotencyKey: z.string(),
     operationClass: z.string(),
     requestDigest: z.string(),
+    operatorReceiptId: z.string().nullable(),
     committedEventSequence: z.number().int().positive(),
     createdAtMs: z.number().int().nonnegative(),
   })
@@ -104,6 +105,8 @@ export const foundationResultSchema = z
         callerThreadId: z.string(),
         callerPluginId: z.string(),
         requestedFromBackground: z.boolean(),
+        idempotencyKey: z.string(),
+        requestDigest: z.string(),
         receiptDigest: z.string(),
         createdAtMs: z.number().int().nonnegative(),
       })
@@ -404,6 +407,8 @@ export default async function plugin(bb: BbPluginApi) {
           projectId: input.projectId,
           mutationClass: input.mutationClass,
           candidateHead: input.candidateHead,
+          idempotencyKey: input.idempotencyKey,
+          requestDigest: input.requestDigest,
           retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
           requestedFromBackground: input.requestedFromBackground,
         },
@@ -417,7 +422,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (
         confirmation.data.projectId !== input.projectId ||
         confirmation.data.mutationClass !== input.mutationClass ||
-        confirmation.data.candidateHead !== input.candidateHead
+        confirmation.data.candidateHead !== input.candidateHead ||
+        confirmation.data.idempotencyKey !== input.idempotencyKey ||
+        confirmation.data.requestDigest !== input.requestDigest
       ) {
         return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_STALE", "operator confirmation binding is stale");
       }

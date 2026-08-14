@@ -5,8 +5,8 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 2;
-export const SCHEMA_VERSION = 7;
+export const CONTRACT_VERSION = 3;
+export const SCHEMA_VERSION = 8;
 // ponytail: keep exports bounded at 256 rows; add paged/file export before migration or cutover.
 export const MAX_EXPORT_ROWS = 256;
 export const MAX_EXPORT_BYTES = 512 * 1024;
@@ -552,6 +552,12 @@ export const MIGRATIONS: string[] = [
     created_at_ms INTEGER NOT NULL,
     PRIMARY KEY (project_id, receipt_id)
   )`,
+  `ALTER TABLE operator_receipts ADD COLUMN idempotency_key TEXT;
+   ALTER TABLE operator_receipts ADD COLUMN request_digest TEXT;
+   ALTER TABLE operator_receipts ADD COLUMN consumed_at_ms INTEGER;
+   ALTER TABLE operator_receipts ADD COLUMN consumed_event_sequence INTEGER;
+   ALTER TABLE state_events ADD COLUMN operator_receipt_id TEXT;
+   ALTER TABLE mutation_receipts ADD COLUMN operator_receipt_id TEXT`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -561,7 +567,7 @@ export function cachedConsumerRolloutEvidence(observedSchemaVersion: number) {
   const reread = observedSchemaVersion === SCHEMA_VERSION;
   const evidence = {
     names: [...CACHED_CONSUMERS],
-    oldSchemaVersion: 6,
+    oldSchemaVersion: 7,
     newSchemaVersion: SCHEMA_VERSION,
     observedSchemaVersion,
     action: reread ? "reread" : "refused",
@@ -628,6 +634,11 @@ export const contractDigest = sha256(canonicalJson({
   operationClasses: ["migration_prepare", "migration_step"],
   migrationStates: MIGRATION_STATES,
   migrationSteps: MIGRATION_STEPS,
+  operatorReceiptPolicy: {
+    scope: "one_request",
+    binding: ["projectId", "operationClass", "candidateHead", "idempotencyKey", "requestDigest"],
+    consumption: "atomic",
+  },
 }));
 const migrationArtifactSchema = z
   .object({
@@ -974,6 +985,7 @@ const roleContextRefSchema = z
   })
   .strict();
 const gitShaSchema = z.string().regex(/^[0-9a-f]{40,64}$/u);
+const operatorCandidateHeadSchema = z.string().regex(/^[0-9a-f]{40}$/u);
 export const OPERATOR_RECEIPT_RETIREMENT_CONDITION = "host-issued receipt get-bb/bb#1541" as const;
 export const CANONICAL_MUTATION_CLASSES = [
   "bootstrap",
@@ -997,7 +1009,9 @@ const operatorMutationClassSchema = z.enum(CANONICAL_MUTATION_CLASSES);
 export const operatorReceiptRequestSchema = z.object({
   projectId: id,
   mutationClass: operatorMutationClassSchema,
-  candidateHead: gitShaSchema,
+  candidateHead: operatorCandidateHeadSchema,
+  idempotencyKey: id,
+  requestDigest: digestSchema,
   callerThreadId: id,
   requestedFromBackground: z.boolean(),
 }).strict();
@@ -1005,7 +1019,9 @@ export const operatorReceiptConfirmationSchema = z.object({
   confirmed: z.boolean(),
   projectId: id,
   mutationClass: operatorMutationClassSchema,
-  candidateHead: gitShaSchema,
+  candidateHead: operatorCandidateHeadSchema,
+  idempotencyKey: id,
+  requestDigest: digestSchema,
 }).strict();
 
 export type OperatorReceiptRequest = z.infer<typeof operatorReceiptRequestSchema>;
@@ -1017,6 +1033,8 @@ export interface OperatorReceipt {
   receiptType: "operator_confirmation";
   mutationClass: OperatorReceiptRequest["mutationClass"];
   candidateHead: string;
+  idempotencyKey: string;
+  requestDigest: string;
   bindingDigest: string;
   status: "interim";
   retirementCondition: typeof OPERATOR_RECEIPT_RETIREMENT_CONDITION;
@@ -1107,7 +1125,7 @@ export const applyRequestSchema = z
     idempotencyKey: id,
     actorReceiptId: id.nullable().optional(),
     operatorReceiptId: id.nullable().optional(),
-    candidateHead: gitShaSchema.nullable().optional(),
+    candidateHead: operatorCandidateHeadSchema.nullable().optional(),
     expectedConfigRevision: z.number().int().nonnegative().nullable().optional(),
     configRevision: z.number().int().positive().nullable().optional(),
     expectedGovernanceEpoch: z.number().int().nonnegative().nullable().optional(),
@@ -1654,7 +1672,6 @@ export type FoundationCode =
   | "IDEMPOTENCY_KEY_CONFLICT"
   | "CANONICAL_STORE_UNAVAILABLE"
   | "INTERNAL_ERROR"
-  | "OPERATOR_AUTH_REQUIRED"
   | "OPERATOR_RECEIPT_REQUIRED"
   | "OPERATOR_RECEIPT_UNKNOWN"
   | "OPERATOR_RECEIPT_FOREIGN"
@@ -1671,13 +1688,15 @@ export type FoundationCode =
   | "IMPORT_EQUIVALENCE_FAILED"
   | "MIGRATION_FIX_FORWARD_REQUIRED"
   | "OPERATOR_RECEIPT_CANCELLED"
-  | "OPERATOR_RECEIPT_STALE";
+  | "OPERATOR_RECEIPT_STALE"
+  | "OPERATOR_RECEIPT_REUSED";
 
 export interface MutationReceipt {
   projectId: string;
   idempotencyKey: string;
   operationClass: string;
   requestDigest: string;
+  operatorReceiptId: string | null;
   committedEventSequence: number;
   createdAtMs: number;
 }
@@ -2029,11 +2048,13 @@ function result(
   ) as unknown as FoundationResult;
 }
 
-export function operatorReceiptBindingDigest(input: Pick<OperatorReceiptRequest, "projectId" | "mutationClass" | "candidateHead">): string {
+export function operatorReceiptBindingDigest(input: Pick<OperatorReceiptRequest, "projectId" | "mutationClass" | "candidateHead" | "idempotencyKey" | "requestDigest">): string {
   return sha256(canonicalJson({
     projectId: input.projectId,
     mutationClass: input.mutationClass,
     candidateHead: input.candidateHead,
+    idempotencyKey: input.idempotencyKey,
+    requestDigest: input.requestDigest,
   }));
 }
 
@@ -2050,6 +2071,8 @@ export function persistInterimOperatorReceipt(
     receiptType: "operator_confirmation",
     mutationClass: input.mutationClass,
     candidateHead: input.candidateHead,
+    idempotencyKey: input.idempotencyKey,
+    requestDigest: input.requestDigest,
     bindingDigest,
     status: "interim",
     retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
@@ -2062,8 +2085,9 @@ export function persistInterimOperatorReceipt(
     `INSERT INTO operator_receipts (
       project_id, receipt_id, receipt_type, mutation_class, candidate_head,
       binding_digest, status, retirement_condition, caller_thread_id,
-      caller_plugin_id, requested_from_background, receipt_digest, created_at_ms
-    ) VALUES (?, ?, 'operator_confirmation', ?, ?, ?, 'interim', ?, ?, ?, ?, ?, ?)`,
+      caller_plugin_id, requested_from_background, receipt_digest, created_at_ms,
+      idempotency_key, request_digest
+    ) VALUES (?, ?, 'operator_confirmation', ?, ?, ?, 'interim', ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     input.projectId,
     receiptId,
@@ -2076,6 +2100,8 @@ export function persistInterimOperatorReceipt(
     input.requestedFromBackground ? 1 : 0,
     receiptDigest,
     createdAtMs,
+    input.idempotencyKey,
+    input.requestDigest,
   );
   return {
     receiptId,
@@ -2083,6 +2109,8 @@ export function persistInterimOperatorReceipt(
     receiptType: "operator_confirmation",
     mutationClass: input.mutationClass,
     candidateHead: input.candidateHead,
+    idempotencyKey: input.idempotencyKey,
+    requestDigest: input.requestDigest,
     bindingDigest,
     status: "interim",
     retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
@@ -2106,9 +2134,13 @@ function refusalResult(subject: string, data: RefusalData, expected = 1, attempt
   });
 }
 
-function requestDigest(request: ApplyRequest): string {
-  const digestable = Object.fromEntries(Object.entries(request).filter(([, value]) => value !== undefined));
+export function operatorRequestDigest(request: ApplyRequest): string {
+  const digestable = Object.fromEntries(Object.entries(normalizeRequest(request)).filter(([key, value]) => key !== "operatorReceiptId" && value !== undefined));
   return sha256(canonicalJson(digestable));
+}
+
+function requestDigest(request: ApplyRequest): string {
+  return operatorRequestDigest(request);
 }
 
 function now(): number {
@@ -2302,11 +2334,12 @@ function appendStateEvent(
 ): { eventSequence: number; createdAtMs: number } {
   const eventSequence = nextEventSequence(db, request.projectId);
   const createdAtMs = now();
+  consumeOperatorReceipt(db, request, eventSequence, createdAtMs);
   db.prepare(
     `INSERT INTO state_events (
       project_id, event_sequence, aggregate_type, aggregate_id, aggregate_revision,
-      event_type, actor_receipt_id, idempotency_key, event_json, created_at_ms
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      event_type, actor_receipt_id, operator_receipt_id, idempotency_key, event_json, created_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     request.projectId,
     eventSequence,
@@ -2315,6 +2348,7 @@ function appendStateEvent(
     event.aggregateRevision,
     event.eventType,
     actorReceiptId,
+    request.operatorReceiptId,
     request.idempotencyKey,
     canonicalJson(event.event),
     createdAtMs,
@@ -2338,6 +2372,7 @@ function commitMutation(
     idempotencyKey: request.idempotencyKey,
     operationClass: request.operationClass,
     requestDigest: digest,
+    operatorReceiptId: request.operatorReceiptId ?? null,
     committedEventSequence: eventSequence,
     createdAtMs,
   };
@@ -2349,8 +2384,8 @@ function commitMutation(
   db.prepare(
     `INSERT INTO mutation_receipts (
       project_id, idempotency_key, operation_class, request_digest,
-      outcome_json, committed_event_sequence, created_at_ms
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      outcome_json, committed_event_sequence, created_at_ms, operator_receipt_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     request.projectId,
     request.idempotencyKey,
@@ -2359,6 +2394,7 @@ function commitMutation(
     canonicalJson(output),
     eventSequence,
     createdAtMs,
+    request.operatorReceiptId,
   );
   return output;
 }
@@ -6543,7 +6579,11 @@ function requireOperatorReceipt(db: SqliteDatabase, request: ApplyRequest): void
     requested_from_background: number;
     receipt_digest: string;
     created_at_ms: number;
-  }>(db.prepare("SELECT project_id, receipt_id, receipt_type, mutation_class, candidate_head, binding_digest, status, retirement_condition, caller_thread_id, caller_plugin_id, requested_from_background, receipt_digest, created_at_ms FROM operator_receipts WHERE receipt_id = ?").get(request.operatorReceiptId));
+    idempotency_key: string | null;
+    request_digest: string | null;
+    consumed_at_ms: number | null;
+    consumed_event_sequence: number | null;
+  }>(db.prepare("SELECT project_id, receipt_id, receipt_type, mutation_class, candidate_head, binding_digest, status, retirement_condition, caller_thread_id, caller_plugin_id, requested_from_background, receipt_digest, created_at_ms, idempotency_key, request_digest, consumed_at_ms, consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?").get(request.operatorReceiptId));
   if (!row) throw refusal("OPERATOR_RECEIPT_UNKNOWN", "operator receipt is not known");
   if (row.project_id !== request.projectId) throw refusal("OPERATOR_RECEIPT_FOREIGN", "operator receipt belongs to another project");
   if (row.status !== "interim" || row.retirement_condition !== OPERATOR_RECEIPT_RETIREMENT_CONDITION) {
@@ -6556,11 +6596,18 @@ function requireOperatorReceipt(db: SqliteDatabase, request: ApplyRequest): void
     projectId: row.project_id,
     mutationClass: row.mutation_class,
     candidateHead: row.candidate_head,
+    idempotencyKey: row.idempotency_key,
+    requestDigest: row.request_digest,
     callerThreadId: row.caller_thread_id,
     requestedFromBackground: row.requested_from_background === 1,
   });
   if (!receiptRequest.success) throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt is malformed");
-  if (row.mutation_class !== request.operationClass || row.candidate_head !== request.candidateHead) {
+  if (
+    row.mutation_class !== request.operationClass ||
+    row.candidate_head !== request.candidateHead ||
+    row.idempotency_key !== request.idempotencyKey ||
+    row.request_digest !== requestDigest(request)
+  ) {
     throw refusal("OPERATOR_RECEIPT_STALE", "operator receipt binding is stale");
   }
   if (row.binding_digest !== operatorReceiptBindingDigest(receiptRequest.data)) {
@@ -6572,6 +6619,8 @@ function requireOperatorReceipt(db: SqliteDatabase, request: ApplyRequest): void
     receiptType: row.receipt_type,
     mutationClass: row.mutation_class,
     candidateHead: row.candidate_head,
+    idempotencyKey: receiptRequest.data.idempotencyKey,
+    requestDigest: receiptRequest.data.requestDigest,
     bindingDigest: row.binding_digest,
     status: row.status,
     retirementCondition: row.retirement_condition,
@@ -6581,6 +6630,23 @@ function requireOperatorReceipt(db: SqliteDatabase, request: ApplyRequest): void
     createdAtMs: row.created_at_ms,
   }));
   if (row.receipt_digest !== expectedReceiptDigest) throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt digest is invalid");
+  if (row.consumed_at_ms !== null && row.consumed_event_sequence === null) {
+    throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt consumption marker is malformed");
+  }
+}
+
+function consumeOperatorReceipt(db: SqliteDatabase, request: ApplyRequest, eventSequence: number, consumedAtMs: number): void {
+  if (!request.operatorReceiptId) return;
+  requireOperatorReceipt(db, request);
+  const consumed = asRow<{ consumed_at_ms: number | null; consumed_event_sequence: number | null }>(db.prepare(
+    "SELECT consumed_at_ms, consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?",
+  ).get(request.operatorReceiptId));
+  if (!consumed) throw refusal("OPERATOR_RECEIPT_UNKNOWN", "operator receipt is not known");
+  if (consumed.consumed_at_ms !== null) return;
+  const updated = db.prepare(
+    "UPDATE operator_receipts SET consumed_at_ms = ?, consumed_event_sequence = ? WHERE project_id = ? AND receipt_id = ? AND consumed_at_ms IS NULL",
+  ).run(consumedAtMs, eventSequence, request.projectId, request.operatorReceiptId);
+  if (updated.changes !== 1) throw refusal("OPERATOR_RECEIPT_REUSED", "operator receipt was already consumed");
 }
 
 export function applyAuthorizedMutation(
@@ -6677,12 +6743,6 @@ export function applyFixtureMutation(
     if (isConstraintError(error)) return result("CANONICAL_STORE_UNAVAILABLE", request.projectId, 1, 0, 0, { message: String(error) });
     return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
   }
-}
-
-export function operatorAuthRequired(projectId: string): FoundationResult {
-  return result("OPERATOR_AUTH_REQUIRED", projectId, 1, 0, 0, {
-    message: "BB has not supplied a trustworthy native operator actor receipt; no write was attempted",
-  });
 }
 
 function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId: string): Record<string, unknown>[] {

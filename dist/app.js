@@ -611,10 +611,12 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
 function OperatorReceiptForm({ interaction, submit, cancel }) {
   const payload = interaction.payload;
   const [confirmed, setConfirmed] = useState(false);
-  const valid = typeof payload.projectId === "string" && typeof payload.mutationClass === "string" && typeof payload.candidateHead === "string";
+  const valid = [payload.projectId, payload.mutationClass, payload.candidateHead, payload.idempotencyKey, payload.requestDigest].every((value) => typeof value === "string");
   const projectId = typeof payload.projectId === "string" ? payload.projectId : null;
   const mutationClass = typeof payload.mutationClass === "string" ? payload.mutationClass : null;
   const candidateHead = typeof payload.candidateHead === "string" ? payload.candidateHead : null;
+  const idempotencyKey = typeof payload.idempotencyKey === "string" ? payload.idempotencyKey : null;
+  const requestDigest = typeof payload.requestDigest === "string" ? payload.requestDigest : null;
   return /* @__PURE__ */ jsxs(
     "form",
     {
@@ -626,13 +628,15 @@ function OperatorReceiptForm({ interaction, submit, cancel }) {
           confirmed: true,
           projectId,
           mutationClass,
-          candidateHead
+          candidateHead,
+          idempotencyKey,
+          requestDigest
         });
       },
       children: [
         /* @__PURE__ */ jsxs("div", { children: [
           /* @__PURE__ */ jsx("h2", { className: "font-semibold", children: "Confirm operator receipt" }),
-          /* @__PURE__ */ jsx("p", { className: "text-sm text-muted-foreground", children: "This records an interim confirmation only; it does not authorize a mutation." })
+          /* @__PURE__ */ jsx("p", { className: "text-sm text-muted-foreground", children: "This records an interim confirmation for this exact one-request apply; normal actor and resolver checks still apply." })
         ] }),
         /* @__PURE__ */ jsxs("dl", { className: "grid gap-2 text-sm", children: [
           /* @__PURE__ */ jsxs("div", { children: [
@@ -648,13 +652,21 @@ function OperatorReceiptForm({ interaction, submit, cancel }) {
             /* @__PURE__ */ jsx("dd", { className: "break-all font-mono", children: String(payload.candidateHead ?? "invalid") })
           ] }),
           /* @__PURE__ */ jsxs("div", { children: [
+            /* @__PURE__ */ jsx("dt", { className: "text-muted-foreground", children: "Idempotency key" }),
+            /* @__PURE__ */ jsx("dd", { className: "break-all font-mono", children: String(payload.idempotencyKey ?? "invalid") })
+          ] }),
+          /* @__PURE__ */ jsxs("div", { children: [
+            /* @__PURE__ */ jsx("dt", { className: "text-muted-foreground", children: "Request digest" }),
+            /* @__PURE__ */ jsx("dd", { className: "break-all font-mono", children: String(payload.requestDigest ?? "invalid") })
+          ] }),
+          /* @__PURE__ */ jsxs("div", { children: [
             /* @__PURE__ */ jsx("dt", { className: "text-muted-foreground", children: "Retirement condition" }),
             /* @__PURE__ */ jsx("dd", { children: String(payload.retirementCondition ?? "invalid") })
           ] })
         ] }),
         /* @__PURE__ */ jsxs("label", { className: "flex items-start gap-2 text-sm", children: [
           /* @__PURE__ */ jsx("input", { type: "checkbox", checked: confirmed, onChange: (event) => setConfirmed(event.target.checked) }),
-          /* @__PURE__ */ jsx("span", { children: "I confirm this exact project, mutation class, and candidate head." })
+          /* @__PURE__ */ jsx("span", { children: "I confirm this exact project, mutation class, candidate head, idempotency key, and request digest." })
         ] }),
         /* @__PURE__ */ jsxs("div", { className: "flex gap-2", children: [
           /* @__PURE__ */ jsx("button", { className: "rounded border border-border px-3 py-1 text-sm", type: "button", onClick: () => void cancel(), children: "Cancel" }),

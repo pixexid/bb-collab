@@ -13,14 +13,17 @@ new-thread, search, navigation rows, and the footer.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through schema v7: a
+The repository now contains the implemented foundation through schema v8: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
 Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
-foundations. Production RPC/CLI apply remain unconditionally
-`OPERATOR_AUTH_REQUIRED`; the plugin has not been installed, reloaded, or
-activated against live project authority.
+foundations. Production RPC/CLI apply require an exact one-request interim
+operator receipt bound to project, operation, exact candidate head,
+idempotency key, and request digest; it is consumed atomically and invalid,
+stale, retired, mismatched, or reused receipts refuse before any write. The
+plugin has not been installed, reloaded, or activated against live project
+authority.
 
 The founding decision is an **adopt with amendments** disposition of the
 operator-backed review. bb-collab is a public BB-native successor to
