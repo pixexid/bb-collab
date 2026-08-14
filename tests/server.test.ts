@@ -1554,6 +1554,88 @@ describe("bb-collab plugin boundary", () => {
       operatorReceiptId: roleAttestation.operatorReceipt!.receiptId,
     })).toMatchObject({ outcome: "ACTOR_RECEIPT_UNVERIFIED" });
 
+    const dispositionUnsigned = decisionDispositionRequest(fenceToken, "attested-operator", 1, {
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      candidateHead: CANDIDATE_SHA,
+      repoTargetId: null,
+      idempotencyKey: "attested-operator-adopted",
+    });
+    const dispositionAttestation = {
+      ...attestation,
+      mutationClass: "decision_disposition" as const,
+      idempotencyKey: dispositionUnsigned.idempotencyKey,
+      requestDigest: operatorRequestDigest(dispositionUnsigned),
+    };
+    const dispositionIssued = await host.harness.callRpc("approverAttestation", dispositionAttestation) as FoundationResult;
+    expect(dispositionIssued).toMatchObject({ outcome: "OK", actorReceiptId: expect.any(String), operatorReceipt: expect.objectContaining({
+      mutationClass: "decision_disposition",
+    }) });
+    const dispositionReceiptId = dispositionIssued.operatorReceipt!.receiptId;
+    const dispositionActorReceiptId = dispositionIssued.actorReceiptId!;
+    const consumedBeforeDisposition = db.prepare("SELECT COUNT(*) AS count FROM operator_receipts WHERE consumed_at_ms IS NOT NULL").get();
+    const dispositionApplied = await host.harness.callRpc("apply", {
+      ...dispositionUnsigned,
+      actorReceiptId: dispositionActorReceiptId,
+      operatorReceiptId: dispositionReceiptId,
+    }) as FoundationResult;
+    expect(dispositionApplied).toMatchObject({ outcome: "OK" });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM operator_receipts WHERE consumed_at_ms IS NOT NULL").get()).toEqual({
+      count: (consumedBeforeDisposition as { count: number }).count + 1,
+    });
+    expect(db.prepare("SELECT consumed_at_ms, consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?").get(dispositionReceiptId)).toMatchObject({
+      consumed_at_ms: expect.any(Number),
+      consumed_event_sequence: expect.any(Number),
+    });
+    expect(db.prepare("SELECT actor_receipt_id, operator_receipt_id FROM state_events WHERE idempotency_key = ?").get(dispositionUnsigned.idempotencyKey)).toEqual({
+      actor_receipt_id: dispositionActorReceiptId,
+      operator_receipt_id: dispositionReceiptId,
+    });
+    expect(db.prepare("SELECT operator_receipt_id FROM mutation_receipts WHERE idempotency_key = ?").get(dispositionUnsigned.idempotencyKey)).toEqual({
+      operator_receipt_id: dispositionReceiptId,
+    });
+    expect(db.prepare("SELECT actor_receipt_id FROM decision_dispositions WHERE decision_id = ? AND disposition_sequence = 1").get("attested-operator")).toEqual({
+      actor_receipt_id: dispositionActorReceiptId,
+    });
+    expect(db.prepare("SELECT status FROM authorized_approvers WHERE authorizing_decision_id = ?").get("authorizing-operator")).toEqual({ status: "revoked" });
+    expect(db.prepare("SELECT status FROM authorized_approvers WHERE authorizing_decision_id = ? AND authorizing_disposition_sequence = 1").get("attested-operator")).toEqual({ status: "active" });
+
+    const revocationGapUnsigned = decisionCreateRequest(fenceToken, "revocation-gap", {
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      candidateHead: CANDIDATE_SHA,
+      repoTargetId: null,
+      decision: { ...unsigned.decision!, decisionId: "revocation-gap" },
+    });
+    const revocationGapIssued = await host.harness.callRpc("approverAttestation", {
+      ...dispositionAttestation,
+      mutationClass: "decision_create",
+      idempotencyKey: revocationGapUnsigned.idempotencyKey,
+      requestDigest: operatorRequestDigest(revocationGapUnsigned),
+      authorizingDecisionId: "attested-operator",
+      authorizingDispositionSequence: 1,
+    }) as FoundationResult;
+    expect(revocationGapIssued).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "attested-operator", 2, {
+      actorReceiptId: "operator-authorizer",
+      repoTargetId: null,
+      disposition: "revoked",
+      revertsDispositionSequence: 1,
+      idempotencyKey: "revoke-attested-operator",
+    }))).toMatchObject({ outcome: "OK" });
+    const beforeRevokedApplyEvents = db.prepare("SELECT COUNT(*) AS count FROM state_events").get();
+    const beforeRevokedApplyMutations = db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get();
+    const refusedAfterRevocation = await host.harness.callRpc("apply", {
+      ...revocationGapUnsigned,
+      actorReceiptId: revocationGapIssued.actorReceiptId,
+      operatorReceiptId: revocationGapIssued.operatorReceipt!.receiptId,
+    }) as FoundationResult;
+    expect(refusedAfterRevocation).toMatchObject({ outcome: "AUTHORIZED_APPROVER_REVOKED" });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM state_events").get()).toEqual(beforeRevokedApplyEvents);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get()).toEqual(beforeRevokedApplyMutations);
+    expect(db.prepare("SELECT 1 FROM decisions WHERE decision_id = ?").get("revocation-gap")).toBeUndefined();
+    expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(revocationGapIssued.operatorReceipt!.receiptId)).toEqual({ consumed_at_ms: null });
+
     expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "authorizing-operator", 2, {
       actorReceiptId: "operator-authorizer",
       repoTargetId: null,

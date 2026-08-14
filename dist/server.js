@@ -17334,7 +17334,6 @@ function applyDecisionDisposition(db, request, digest) {
     supersedes,
     reverts
   );
-  syncAuthorizedApproverRegistry(db, decision, request.disposition, sequence, createdAtMs);
   const insertArtifact = db.prepare(
     `INSERT INTO evidence_artifacts
       (project_id, evidence_id, evidence_kind, source_kind, source_ref, execution_attempt_id,
@@ -17379,7 +17378,7 @@ function applyDecisionDisposition(db, request, digest) {
       request.idempotencyKey
     );
   }
-  return commitMutation(
+  const output = commitMutation(
     db,
     request,
     digest,
@@ -17405,6 +17404,8 @@ function applyDecisionDisposition(db, request, digest) {
       evidence: { dispositionSequence: sequence, evidenceIds: preparedEvidence.map((item) => item.input.evidenceId) }
     }
   );
+  syncAuthorizedApproverRegistry(db, decision, request.disposition, sequence, createdAtMs);
+  return output;
 }
 function requireRoleRequirement(db, request, configRevision) {
   if (!request.roleRequirementId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "role requirement identity is required");
