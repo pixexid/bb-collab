@@ -361,7 +361,8 @@ installed/reloaded/activated against live project authority, and the
 migration/first-adopter evidence is not yet complete. Candidate heads are
 exact lowercase 40-character bindings supplied by the caller, not observed
 Git/BB facts. The one-time authorizing `operator_only` Decision registers the
-`orchestrator:bb-collab` approver and its exact five-class allowlist; subsequent
+`orchestrator:bb-collab` approver and its exact six-class allowlist, including
+`work_item_create`; subsequent
 in-scope receipts use `approverAttestation` with zero pending interactions.
 Human `requestInput` remains only at the authorization/revocation boundary; the
 digest is integrity-only until a valid attestation or host-issued receipt exists.
