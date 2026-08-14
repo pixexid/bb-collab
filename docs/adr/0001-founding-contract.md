@@ -148,7 +148,7 @@ Refusals are typed; no wrapper may turn a refusal into success.
 
 The contract v3/schema v8 interim operator gate is a one-request grant bound to
 the exact project_id, operation class, lowercase 40-character candidate head,
-idempotency key and canonical raw-request digest. Consumption is an atomic
+idempotency key and canonical normalized request digest. Consumption is an atomic
 compare-and-set in the same transaction as the first StateEvent; an already
 consumed receipt refuses, except that the original operatorReceiptId may return
 its already-committed idempotent result byte-for-byte. The receipt has no local

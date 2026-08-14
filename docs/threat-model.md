@@ -21,7 +21,7 @@ worker.
 
 The v3/schema v8 operator gate is a separate host/UI confirmation boundary:
 an interim receipt binds one exact project, operation class, lowercase
-40-character candidate head, idempotency key and canonical raw-request digest.
+40-character candidate head, idempotency key and canonical normalized request digest.
 The first committed StateEvent consumes it atomically; reuse, a different
 receipt for an already-committed idempotency key, or any binding mismatch
 refuses before a write. It has no local TTL or revocation and retires only on

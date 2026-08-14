@@ -2136,8 +2136,8 @@ function refusalResult(subject: string, data: RefusalData, expected = 1, attempt
 }
 
 export function operatorRequestDigest(input: unknown): string {
-  if (input === null || typeof input !== "object" || Array.isArray(input)) throw new Error("request digest input must be an object");
-  const digestable = Object.fromEntries(Object.entries(input).filter(([key, value]) => !["candidateHead", "operatorReceiptId"].includes(key) && value !== undefined));
+  const request = parseApplyRequest(input);
+  const digestable = Object.fromEntries(Object.entries(request).filter(([key, value]) => !["candidateHead", "operatorReceiptId"].includes(key) && value !== undefined));
   return sha256(canonicalJson(digestable));
 }
 
@@ -6677,7 +6677,7 @@ export function applyAuthorizedMutation(
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   try {
-    const digest = operatorRequestDigest(input);
+    const digest = operatorRequestDigest(request);
     const replay = authorizedReplay(db, request, digest);
     if (replay) return replay;
     requireOperatorReceipt(db, request, digest);
@@ -6710,7 +6710,7 @@ export function applyFixtureMutation(
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   try {
-    const digest = operatorRequestDigest(input);
+    const digest = operatorRequestDigest(request);
     if (request.operationClass === "github_issue_projection") {
       return applyGithubIssueProjection(db, request, digest, githubAdapter);
     }

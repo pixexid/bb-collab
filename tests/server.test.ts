@@ -1258,17 +1258,40 @@ describe("bb-collab plugin boundary", () => {
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeSecond);
   });
 
-  it("replays a v7-era mutation receipt with the pre-v8 raw digest", async () => {
-    const host = await loadedHost();
-    const db = host.bb.storage.database();
-    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
-    const request = bootstrapRequest();
-    const committed = applyFixtureMutation(db, request);
-    expect(committed.outcome).toBe("OK");
-    const preV8RawDigest = sha256(canonicalJson(Object.fromEntries(Object.entries(request).filter(([, value]) => value !== undefined))));
-    expect(operatorRequestDigest(request)).toBe(preV8RawDigest);
-    db.prepare("UPDATE mutation_receipts SET request_digest = ? WHERE project_id = ? AND idempotency_key = ?").run(preV8RawDigest, PROJECT_ID, request.idempotencyKey);
-    expect(applyFixtureMutation(db, request)).toEqual(committed);
+  it("replays a v7 mutation receipt after the v8 ALTER with the base normalized digest", () => {
+    const db = new Database(":memory:");
+    databaseIsReady(db);
+    try {
+      for (const statement of MIGRATIONS.slice(0, -2)) db.exec(statement);
+      const request = bootstrapRequest();
+      const baseV7Digest = "1a9530eb42af63727dd3001bd7990edf147242a525da64578e5d240c75e80027";
+      const committed = { outcome: "OK", subject: PROJECT_ID, expected: 1, attempted: 1, verified: 1 };
+      seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
+      db.prepare(
+        `INSERT INTO state_events
+          (project_id, event_sequence, aggregate_type, aggregate_id, aggregate_revision,
+           event_type, actor_receipt_id, idempotency_key, event_json, created_at_ms)
+         VALUES (?, 1, 'project', ?, 1, 'bootstrapped', ?, ?, ?, 1)`,
+      ).run(PROJECT_ID, PROJECT_ID, RECEIPT_ID, request.idempotencyKey, canonicalJson({ fixture: true }));
+      db.prepare(
+        `INSERT INTO mutation_receipts
+          (project_id, idempotency_key, operation_class, request_digest,
+           outcome_json, committed_event_sequence, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, 1, 1)`,
+      ).run(PROJECT_ID, request.idempotencyKey, request.operationClass, baseV7Digest, canonicalJson(committed));
+      db.exec(MIGRATIONS.at(-2)!);
+      db.exec(MIGRATIONS.at(-1)!);
+
+      expect(operatorRequestDigest(request)).toBe(baseV7Digest);
+      expect(operatorRequestDigest({ ...request, expectedConfigRevision: undefined })).toBe(
+        operatorRequestDigest({ ...request, expectedConfigRevision: null }),
+      );
+      const before = db.prepare("SELECT COUNT(*) AS count FROM state_events").get();
+      expect(applyFixtureMutation(db, request)).toEqual(committed);
+      expect(db.prepare("SELECT COUNT(*) AS count FROM state_events").get()).toEqual(before);
+    } finally {
+      db.close();
+    }
   });
 
   it("refuses receipt-bound adapter reserve/finalize operations before any adapter call", async () => {
