@@ -421,6 +421,18 @@ event ceiling existed at this fence, so the evidence-only path records no
 fabricated source event ceiling and makes no source mutation or retirement
 claim. The source fence, revision and archive hashes remain read-only evidence.
 
+For that evidence-only shape, pre-target rollback from exported or imported
+continues to restore `source_active`. Once equivalent, one bounded terminal
+rollback disposition is allowed while the governor is still frozen: with exact
+recovery proof, the source runtime still holding the frozen epoch, and the
+target runtime exactly `bb-collab`, the resolver rotates the governor directly
+to `target_active`, closes the MigrationRun as `rolled_back`, consumes the
+single `migration_step` receipt, and records the release disposition in the
+StateEvent and mutation receipt. This releases the target governor only; it
+does not import canonical rows, mutate or retire the source, or authorize
+`activate`, exercise or retirement. Wrong state, runtime, binding or proof
+refuses before the transaction. Post-target recovery remains fix-forward only.
+
 Before target mutation, rollback requires imported and target mutation
 sequences to match, unchanged source/export and external heads, no
 target-created canonical or projection mutation, and a successful new
