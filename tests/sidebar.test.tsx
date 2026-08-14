@@ -247,22 +247,27 @@ describe("replacement thread list", () => {
     expect(rendered.getByRole("link", { name: "running" })).toBeTruthy();
   });
 
-  it("puts no ornament or spacer in front of the row title", async () => {
+  it("leads the row with the spinner when working and with the title otherwise", async () => {
     const list = await registration();
     const rendered = renderSlot(list, props(), {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [
-        { ...thread("running", "project-a", 1), indicator: "workflow", indicatorLabel: "Thread is working" },
+        { ...thread("running", "project-a", 2), indicator: "workflow", indicatorLabel: "Thread is working" },
+        thread("still", "project-a", 1),
       ] },
       rpc: rpcHandlers(),
     });
-    const anchor = rendered.container.querySelector<HTMLAnchorElement>('[data-sidebar-thread-id="running"]')!;
-    // The title leads the row: no icon, no dot and no placeholder box holding
+
+    // Working: the spinner sits to the left of the session name.
+    const running = rendered.container.querySelector<HTMLAnchorElement>('[data-sidebar-thread-id="running"]')!;
+    const lead = running.previousElementSibling!;
+    expect(lead.getAttribute("data-sidebar-thread-signal")).toBe("running");
+    expect(lead.querySelector("[data-sidebar-thread-spinner]")).toBeTruthy();
+
+    // Otherwise the title leads: no icon, no dot, no placeholder box holding
     // the space one used to occupy.
-    expect(anchor.previousElementSibling).toBeNull();
-    expect(anchor.parentElement!.firstElementChild).toBe(anchor);
-    // The state dot lives after the title, at the native right edge.
-    const dot = rendered.container.querySelector('[data-sidebar-thread-signal]')!;
-    expect(anchor.compareDocumentPosition(dot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const still = rendered.container.querySelector<HTMLAnchorElement>('[data-sidebar-thread-id="still"]')!;
+    expect(still.previousElementSibling).toBeNull();
+    expect(still.parentElement!.firstElementChild).toBe(still);
   });
 
   it("maps host model and reasoning facts to short badge text with safe fallbacks", async () => {
@@ -290,7 +295,7 @@ describe("replacement thread list", () => {
     expect(executionBadgeLabel("codex", { model: "gpt-5.6-luna", reasoning: "high" })).toBe("codex · model gpt-5.6-luna · reasoning high");
   });
 
-  it("renders the execution badge as a bundled monochrome mark plus short text", async () => {
+  it("renders the execution badge as short text with the host's own facts", async () => {
     const list = await registration();
     const rendered = renderSlot(list, props(), {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [thread("thread-1", "project-a", 1)] },
@@ -301,30 +306,10 @@ describe("replacement thread list", () => {
     expect(badge.textContent).toBe("Luna·H");
     // No long provider/model text survives in the row.
     expect(rendered.queryByText("codex/gpt-5.6-luna")).toBeNull();
-
-    const mark = badge.querySelector("svg")!;
-    expect(mark.getAttribute("data-provider-mark")).toBe("codex");
-    expect(mark.getAttribute("stroke")).toBe("currentColor");
-    expect(mark.getAttribute("aria-hidden")).toBe("true");
-    // Theme token only: nothing hard-codes a colour or reaches off-device.
-    expect(mark.outerHTML).not.toMatch(/https?:|url\(|#[0-9a-f]{3,6}\b|rgb\(/iu);
-    expect(rendered.container.querySelector("img, image, use")).toBeNull();
-  });
-
-  it("falls back to a generic mark for a provider it ships no mark for", async () => {
-    const list = await registration();
-    const rendered = renderSlot(list, props(), {
-      sidebarThreads: {
-        status: "ready",
-        projects: [project("project-a", "Project A")],
-        threads: [{ ...thread("thread-1", "project-a", 1), providerId: "claude-code" }, { ...thread("thread-2", "project-a", 2), providerId: "some-new-provider" }],
-      },
-      rpc: rpcHandlers(),
-    });
-
-    const marks = Array.from(rendered.container.querySelectorAll("svg[data-provider-mark]"));
-    expect(marks.map((mark) => mark.getAttribute("data-provider-mark"))).toEqual(["somenewprovider", "claudecode"]);
-    expect(marks.every((mark) => mark.querySelector("path")!.getAttribute("d"))).toBeTruthy();
+    // Provider artwork is gone: BB's official logos are host-internal and the
+    // SDK exports no way to draw them, so we ship none rather than look-alikes.
+    expect(badge.querySelector("svg")).toBeNull();
+    expect(rendered.container.querySelector("img, image, use, [data-provider-mark]")).toBeNull();
   });
 
   it("gives the project counter the same typography as the project name", async () => {

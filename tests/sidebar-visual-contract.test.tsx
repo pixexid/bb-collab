@@ -92,6 +92,26 @@ describe("sidebar visual contract", () => {
     expect(spinner.getAttribute("stroke")).toBe("currentColor");
   });
 
+  it("puts the spinner to the left of the session name", async () => {
+    list = await registration();
+    const rendered = render([
+      { ...thread("working"), indicator: "workflow", indicatorLabel: "Thread is working" },
+      thread("idle"),
+    ]);
+
+    const anchor = rendered.container.querySelector('[data-sidebar-thread-id="working"]')!;
+    const slot = anchor.previousElementSibling as HTMLElement | null;
+    expect(slot).toBeTruthy();
+    expect(slot!.getAttribute("data-sidebar-thread-signal")).toBe("running");
+    expect(slot!.querySelector("[data-sidebar-thread-spinner]")).toBeTruthy();
+    // It leads the title group rather than floating somewhere else in the row.
+    expect(anchor.parentElement!.firstElementChild).toBe(slot);
+
+    // An idle row reserves no space for it.
+    const idle = rendered.container.querySelector('[data-sidebar-thread-id="idle"]')!;
+    expect(idle.previousElementSibling).toBeNull();
+  });
+
   it("keeps the spinner and the dot distinct and mutually exclusive", async () => {
     list = await registration();
     const rendered = render([
@@ -138,9 +158,13 @@ describe("sidebar visual contract", () => {
     for (const anchor of Array.from(rendered.container.querySelectorAll("[data-sidebar-thread-id]"))) {
       const row = anchor.closest("div")!;
       expect(row.className).not.toMatch(/border-l/u);
-      // Nothing reintroduced in front of the title as a replacement.
-      expect(anchor.previousElementSibling).toBeNull();
-      expect(anchor.parentElement!.firstElementChild).toBe(anchor);
+    }
+    // Only the working row leads with anything, and that thing is the spinner —
+    // never a rail, a bullet, or a blank box holding space.
+    for (const id of ["failed", "idle"]) {
+      const anchor = rendered.container.querySelector(`[data-sidebar-thread-id="${id}"]`)!;
+      expect(anchor.previousElementSibling, id).toBeNull();
+      expect(anchor.parentElement!.firstElementChild, id).toBe(anchor);
     }
 
     // Belt and braces: the rail classes must not survive anywhere in source.
@@ -149,43 +173,30 @@ describe("sidebar visual contract", () => {
     expect(source).not.toContain("indicatorClasses");
   });
 
-  it("maps every provider id the live fleet reports to its own mark", async () => {
-    const { providerMarkPath, providerMarkKey } = await import("../app");
-    const generic = providerMarkPath("definitely-not-a-provider");
-
-    // Ids observed on the operator's live rows: codex 229, claude-code 57, pi 14.
-    for (const id of ["codex", "claude-code", "pi"]) {
-      expect(providerMarkPath(id), id).not.toBe(generic);
-    }
-    // Vendor aliases resolve to the same mark, so a rename cannot silently
-    // downgrade a row to the generic ring.
-    expect(providerMarkPath("openai")).toBe(providerMarkPath("codex"));
-    expect(providerMarkPath("anthropic")).toBe(providerMarkPath("claude-code"));
-    expect(providerMarkPath("kimi")).toBe(providerMarkPath("pi"));
-
-    // Distinct glyphs, not three copies of one shape.
-    const marks = new Set(["codex", "claude-code", "pi"].map(providerMarkPath));
-    expect(marks.size).toBe(3);
-
-    // Unknown and absent ids stay on the safe generic ring.
-    expect(providerMarkPath(undefined)).toBe(generic);
-    expect(providerMarkPath({ nope: true })).toBe(generic);
-    expect(providerMarkKey("claude-code")).toBe("claudecode");
-  });
-
-  it("renders those marks inline as currentColor with no external fetch", async () => {
+  it("ships no look-alike provider artwork", async () => {
     list = await registration();
     const rendered = render([thread("a", "codex"), thread("b", "claude-code"), thread("c", "pi")]);
 
-    const marks = Array.from(rendered.container.querySelectorAll("svg[data-provider-mark]"));
-    expect(marks.map((m) => m.getAttribute("data-provider-mark"))).toEqual(["codex", "claudecode", "pi"]);
-    const paths = new Set<string>();
-    for (const mark of marks) {
-      expect(mark.getAttribute("stroke")).toBe("currentColor");
-      expect(mark.getAttribute("fill")).toBe("none");
-      expect(mark.outerHTML).not.toMatch(/<image|href=|url\(/u);
-      paths.add(mark.querySelector("path")!.getAttribute("d")!);
+    // BB's official provider logos are host-internal; `@bb/plugin-sdk/app`
+    // exports no way to render them. Shipping our own shapes would put
+    // unofficial vendor artwork on screen, so the badge is text only.
+    expect(rendered.container.querySelector("[data-provider-mark]")).toBeNull();
+    for (const badge of Array.from(rendered.container.querySelectorAll("[data-thread-execution-badge]"))) {
+      expect(badge.querySelector("svg")).toBeNull();
+      expect(badge.outerHTML).not.toMatch(/<image|href=|url\(/u);
     }
-    expect(paths.size).toBe(3);
+
+    const source = readFileSync(resolve("app.tsx"), "utf8");
+    expect(source).not.toContain("PROVIDER_MARKS");
+    expect(source).not.toContain("ProviderMark");
+  });
+
+  it("keeps the provider fact in the badge's text and accessible name", async () => {
+    list = await registration();
+    const { executionBadgeLabel } = await import("../app");
+    // Provider identity is still reported, from the host's own value.
+    for (const id of ["codex", "claude-code", "pi"]) {
+      expect(executionBadgeLabel(id, { model: "gpt-5.6-luna", reasoning: "high" })).toContain(id);
+    }
   });
 });

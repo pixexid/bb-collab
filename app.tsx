@@ -80,6 +80,7 @@ function isError(thread: PluginSidebarThread): boolean {
 // 5px. Matching those numbers is the whole point — a different size or slot
 // reads as a different control.
 const TRAILING_SLOT = "inline-flex size-4 shrink-0 items-center justify-center max-md:pointer-coarse:size-5";
+const LEADING_SLOT = "inline-flex size-3.5 shrink-0 items-center justify-center";
 const NATIVE_DOT = "size-[5px] rounded-full max-md:pointer-coarse:size-1.5";
 
 export function signalDotClasses(thread: PluginSidebarThread, kind: SidebarThreadSignal): string {
@@ -116,72 +117,44 @@ function RunningSpinner({ label }: { label: string }) {
   );
 }
 
-// One slot, one glyph, never both: a spinner means working, a dot means
-// unread or waiting. An idle read row draws nothing, exactly as native does.
-function ThreadTrailingIndicator({ thread }: { thread: PluginSidebarThread }) {
+// Working state leads the row, ahead of the session name, so a scan down the
+// left edge answers "what is running" without reading across. Nothing is
+// reserved when idle: the spinner is absent, not invisible, so a still row
+// never carries a blank gutter.
+function ThreadRunningSpinner({ thread }: { thread: PluginSidebarThread }) {
   const signal = threadSignal(thread);
-  if (signal.kind === "idle") return null;
+  if (signal.kind !== "running") return null;
   return (
-    <span className={TRAILING_SLOT} data-sidebar-thread-signal={signal.kind}>
-      {signal.kind === "running" ? (
-        <RunningSpinner label={signal.label} />
-      ) : (
-        <span
-          className={`${NATIVE_DOT} ${signalDotClasses(thread, signal.kind)}`}
-          role="img"
-          aria-label={signal.label}
-          title={signal.label}
-          data-sidebar-thread-dot=""
-        />
-      )}
+    <span className={LEADING_SLOT} data-sidebar-thread-signal="running">
+      <RunningSpinner label={signal.label} />
     </span>
   );
 }
 
-// Minimal bundled marks, not trademark artwork: one currentColor path each, so
-// the badge inherits the row's theme token and fetches nothing.
-// Keyed by the provider ids the host actually reports on live rows — codex,
-// claude-code and pi — with each vendor's own alias pointing at the same mark
-// so a rename to `anthropic`/`openai`/`kimi` does not silently fall back to
-// the generic glyph. Everything else gets the neutral ring.
-const PROVIDER_MARKS: Record<string, string> = {
-  codex: "M8 1.8 13.4 5v6L8 14.2 2.6 11V5z",
-  openai: "M8 1.8 13.4 5v6L8 14.2 2.6 11V5z",
-  claudecode: "M8 2.2v11.6M3 5.1l10 5.8M13 5.1 3 10.9",
-  anthropic: "M8 2.2v11.6M3 5.1l10 5.8M13 5.1 3 10.9",
-  pi: "M2.8 4.6h10.4M6.2 4.6v7.2M10.4 4.6v5.6a1.6 1.6 0 0 0 2.4 1.4",
-  kimi: "M2.8 4.6h10.4M6.2 4.6v7.2M10.4 4.6v5.6a1.6 1.6 0 0 0 2.4 1.4",
-  cursor: "M3.2 2.4 12.8 8l-4.4 1.2L6.6 13.6z",
-};
-const GENERIC_PROVIDER_MARK = "M8 2.6a5.4 5.4 0 1 0 0 10.8 5.4 5.4 0 0 0 0-10.8z";
-
-export function providerMarkKey(providerId: unknown): string {
-  return (asText(providerId) ?? "").toLocaleLowerCase().replace(/[^a-z0-9]/gu, "");
-}
-
-export function providerMarkPath(providerId: unknown): string {
-  return PROVIDER_MARKS[providerMarkKey(providerId)] ?? GENERIC_PROVIDER_MARK;
-}
-
-function ProviderMark({ providerId }: { providerId: string }) {
-  const key = providerMarkKey(providerId);
+// State stays a small colour-only dot in the native trailing slot, the way the
+// built-in list does it. Working rows are the spinner's job, so the dot never
+// doubles as one; an idle read row draws nothing.
+function ThreadStateDot({ thread }: { thread: PluginSidebarThread }) {
+  const signal = threadSignal(thread);
+  if (signal.kind === "idle" || signal.kind === "running") return null;
   return (
-    <svg
-      viewBox="0 0 16 16"
-      className="size-3 shrink-0"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={1.4}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-      focusable="false"
-      data-provider-mark={key}
-    >
-      <path d={providerMarkPath(providerId)} />
-    </svg>
+    <span className={TRAILING_SLOT} data-sidebar-thread-signal={signal.kind}>
+      <span
+        className={`${NATIVE_DOT} ${signalDotClasses(thread, signal.kind)}`}
+        role="img"
+        aria-label={signal.label}
+        title={signal.label}
+        data-sidebar-thread-dot=""
+      />
+    </span>
   );
 }
+
+// No provider glyph here on purpose. BB's official provider logos live in the
+// app's own icon set and `@bb/plugin-sdk/app` exports no way to render them, so
+// the only options were shipping look-alike artwork or shipping nothing. The
+// model short name already names the provider family; look-alike logos would
+// misrepresent the vendors. See docs/sidebar-provider-logos.md.
 
 // Ordered: the family word is a suffix as often as a prefix, so the first hit
 // wins and the prefix entries stay last.
@@ -229,7 +202,6 @@ function ExecutionBadge({ providerId, execution }: { providerId: string; executi
   const label = executionBadgeLabel(providerId, execution);
   return (
     <span className="flex min-w-0 items-center gap-1" role="img" aria-label={label} title={label} data-thread-execution-badge="">
-      <ProviderMark providerId={providerId} />
       <span className="min-w-0 truncate">{shortModelName(asText(execution?.model))}·{reasoningLetter(asText(execution?.reasoning))}</span>
     </span>
   );
@@ -372,6 +344,7 @@ function ThreadRow({
         <input autoFocus className="min-w-0 flex-1 rounded border border-border bg-background px-1 text-sm text-foreground" aria-label={`Rename ${title}`} value={renameValue} onChange={(event) => setRenameValue(event.target.value)} onBlur={finishRename} onKeyDown={(event) => { if (event.key === "Enter") finishRename(); if (event.key === "Escape") setRenaming(false); }} />
       ) : (
         <span className="flex min-w-0 flex-1 items-center gap-1.5">
+          <ThreadRunningSpinner thread={thread} />
           <a
             href="#"
             className="min-w-0 truncate rounded-md text-foreground outline-none focus-visible:ring-2 focus-visible:ring-primary"
@@ -391,7 +364,7 @@ function ThreadRow({
           indicator fade under the hover actions; here the row is denser and a
           working thread you are pointing at is exactly the one whose state you
           still want to read, so it stays put. */}
-      <ThreadTrailingIndicator thread={thread} />
+      <ThreadStateDot thread={thread} />
       {/* Meta and actions share one slot and only cross-fade: hovering a row
           must not reflow it, or whatever you were aiming at moves. Capped so
           the title keeps the majority of the row. */}
