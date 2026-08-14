@@ -1672,6 +1672,136 @@ describe("bb-collab plugin boundary", () => {
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeSecond);
   });
 
+  it("revalidates an in-flight same-Decision adopted disposition without weakening other receipt paths", async () => {
+    const { host, db, fenceToken } = await assignmentFixture();
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "operator-authorizer", actorKind: "operator", subjectId: "operator-1" });
+    const decisionId = "in-flight-operator";
+    const create = decisionCreateRequest(fenceToken, decisionId, {
+      actorReceiptId: "operator-authorizer",
+      repoTargetId: null,
+      decision: {
+        decisionId,
+        repoTargetId: null,
+        scope: { projectId: PROJECT_ID, purpose: "in-flight-approver" },
+        decisionClass: "operator_only",
+        options: { approverId: AUTHORIZED_APPROVER_ID },
+        resourceRevision: 1,
+      },
+    });
+    expect(applyWithFixtureReceipt(db, create).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, decisionId, 1, {
+      actorReceiptId: "operator-authorizer",
+      repoTargetId: null,
+      idempotencyKey: `${decisionId}-seq1`,
+    })).outcome).toBe("OK");
+
+    const dispositionRequest = (sequence: number): ApplyRequest => decisionDispositionRequest(fenceToken, decisionId, sequence, {
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      candidateHead: CANDIDATE_SHA,
+      repoTargetId: null,
+      idempotencyKey: `${decisionId}-seq${sequence}`,
+    });
+    const attest = async (request: ApplyRequest) => host.harness.callRpc("approverAttestation", {
+      projectId: PROJECT_ID,
+      mutationClass: "decision_disposition",
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: operatorRequestDigest(request),
+      callerThreadId: "in-flight-attestor",
+      requestedFromBackground: false,
+      approverId: AUTHORIZED_APPROVER_ID,
+      authorizingDecisionId: decisionId,
+      authorizingDispositionSequence: 1,
+    }) as Promise<FoundationResult>;
+
+    const seq2 = dispositionRequest(2);
+    const failedIssue = await attest(seq2);
+    expect(failedIssue).toMatchObject({ outcome: "OK" });
+    const beforeFailure = exportFoundation(db, PROJECT_ID);
+    db.exec(`CREATE TEMP TRIGGER fail_in_flight_receipt
+      BEFORE INSERT ON mutation_receipts
+      WHEN NEW.operation_class = 'decision_disposition' AND NEW.idempotency_key = '${seq2.idempotencyKey}'
+      BEGIN SELECT RAISE(ABORT, 'injected in-flight constraint'); END`);
+    try {
+      const failed = await host.harness.callRpc("apply", {
+        ...seq2,
+        actorReceiptId: failedIssue.actorReceiptId,
+        operatorReceiptId: failedIssue.operatorReceipt!.receiptId,
+      }) as FoundationResult;
+      expect(failed.outcome).toBe("CANONICAL_STORE_UNAVAILABLE");
+    } finally {
+      db.exec("DROP TRIGGER fail_in_flight_receipt");
+    }
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeFailure);
+    expect(db.prepare("SELECT MAX(disposition_sequence) AS sequence FROM decision_dispositions WHERE decision_id = ?").get(decisionId)).toEqual({ sequence: 1 });
+    expect(db.prepare("SELECT authorizing_disposition_sequence, status FROM authorized_approvers WHERE authorizing_decision_id = ? ORDER BY authorizing_disposition_sequence").all(decisionId)).toEqual([
+      { authorizing_disposition_sequence: 1, status: "active" },
+    ]);
+    expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(failedIssue.operatorReceipt!.receiptId)).toEqual({ consumed_at_ms: null });
+
+    const staleSeq3 = dispositionRequest(3);
+    const staleIssue = await attest(staleSeq3);
+    expect(staleIssue).toMatchObject({ outcome: "OK" });
+    const retryIssue = await attest(seq2);
+    expect(retryIssue).toMatchObject({ outcome: "OK" });
+    const beforeSuccessEvents = (db.prepare("SELECT COUNT(*) AS count FROM state_events").get() as { count: number }).count;
+    const beforeSuccessMutations = (db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get() as { count: number }).count;
+    const applied = await host.harness.callRpc("apply", {
+      ...seq2,
+      actorReceiptId: retryIssue.actorReceiptId,
+      operatorReceiptId: retryIssue.operatorReceipt!.receiptId,
+    }) as FoundationResult;
+    expect(applied).toMatchObject({ outcome: "OK", eventSequence: beforeSuccessEvents + 1 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM state_events").get()).toEqual({ count: beforeSuccessEvents + 1 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get()).toEqual({ count: beforeSuccessMutations + 1 });
+    expect(db.prepare("SELECT disposition_sequence, disposition, idempotency_key FROM decision_dispositions WHERE decision_id = ? ORDER BY disposition_sequence").all(decisionId)).toEqual([
+      { disposition_sequence: 1, disposition: "adopted", idempotency_key: `${decisionId}-seq1` },
+      { disposition_sequence: 2, disposition: "adopted", idempotency_key: `${decisionId}-seq2` },
+    ]);
+    expect(db.prepare("SELECT authorizing_disposition_sequence, status FROM authorized_approvers WHERE authorizing_decision_id = ? ORDER BY authorizing_disposition_sequence").all(decisionId)).toEqual([
+      { authorizing_disposition_sequence: 1, status: "revoked" },
+      { authorizing_disposition_sequence: 2, status: "active" },
+    ]);
+    expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(retryIssue.operatorReceipt!.receiptId)).toMatchObject({ consumed_at_ms: expect.any(Number) });
+
+    const beforeReplay = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", {
+      ...seq2,
+      actorReceiptId: retryIssue.actorReceiptId,
+      operatorReceiptId: retryIssue.operatorReceipt!.receiptId,
+    })).toEqual(applied);
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeReplay);
+
+    const beforeSecondReceipt = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", {
+      ...seq2,
+      actorReceiptId: failedIssue.actorReceiptId,
+      operatorReceiptId: failedIssue.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "OPERATOR_RECEIPT_STALE" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeSecondReceipt);
+    expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(failedIssue.operatorReceipt!.receiptId)).toEqual({ consumed_at_ms: null });
+
+    const beforeStale = exportFoundation(db, PROJECT_ID);
+    const staleResult = await host.harness.callRpc("apply", {
+      ...staleSeq3,
+      actorReceiptId: staleIssue.actorReceiptId,
+      operatorReceiptId: staleIssue.operatorReceipt!.receiptId,
+    }) as FoundationResult;
+    expect(staleResult.outcome).toBe("AUTHORIZED_APPROVER_REVOKED");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeStale);
+    expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(staleIssue.operatorReceipt!.receiptId)).toEqual({ consumed_at_ms: null });
+
+    const crossDecision = { ...seq2, decisionId: "different-operator-decision", idempotencyKey: "cross-decision" };
+    const beforeCrossDecision = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", {
+      ...crossDecision,
+      actorReceiptId: staleIssue.actorReceiptId,
+      operatorReceiptId: staleIssue.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "OPERATOR_RECEIPT_STALE" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeCrossDecision);
+  });
+
   it("replays a v7 mutation receipt after the v8 ALTER with the base normalized digest", () => {
     const db = new Database(":memory:");
     databaseIsReady(db);
