@@ -408,7 +408,10 @@ fence `f988d9711d3778f751e4ec0e32ebbf7b0893c80f`, resource revision 4 and
 merged main `0686d34`. When that source has no canonical bb-collab rows, the
 MigrationRun records a deterministic manifest of sorted historical file paths
 and SHA-256 digests with `canonical: false`; it is source evidence, never the
-target canonical export. `record_import` must prove canonical import
+target canonical export. The manifest is bounded to one eighth of the export
+byte ceiling before any write; durable state keeps its `sourceExportDigest`
+and the `sourceExportKind` discriminator, not a full manifest copy in the
+state event or mutation receipt. `record_import` must prove canonical import
 `expected=0`, `attempted=0`, `verified=0`, and `record_equivalence` must use
 the exact disposition `no canonical state existed to migrate; historical
 archive preserved as evidence, read-only`.

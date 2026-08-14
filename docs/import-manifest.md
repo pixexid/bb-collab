@@ -35,7 +35,10 @@ For the ratified llm-collab fence
 main `0686d34`, an absent canonical bb-collab source uses the same bounded
 MigrationRun path with a separate `sourceEvidenceManifest`. Its sorted
 historical file/digest list is explicitly `canonical: false` and cannot be
-passed as the target canonical export. Import records exact zero work
+passed as the target canonical export. The input is bounded to one eighth of
+the export byte ceiling before any write; the durable state records only its
+`sourceExportDigest` and `sourceExportKind`, so the full manifest is not
+duplicated into state-event or mutation-receipt evidence. Import records exact zero work
 (`expected=0`, `attempted=0`, `verified=0`); equivalence uses the exact
 read-only disposition from ADR 0001. Source-CAS deviation: because no
 source-side canonical bb-collab rows or compare-and-swap event ceiling

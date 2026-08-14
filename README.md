@@ -44,8 +44,10 @@ project authority.
 The ratified evidence-only MigrationRun shape records the llm-collab fence
 `f988d9711d3778f751e4ec0e32ebbf7b0893c80f` at resource revision 4 and merged
 main `0686d34` as sorted, hashed, explicitly non-canonical source evidence.
-It proves canonical import zero-work and preserves the historical archive
-read-only; no source-CAS event ceiling or source retirement is fabricated.
+The manifest is bounded before write; durable evidence retains only its digest
+and `sourceExportKind`. It proves canonical import zero-work and preserves the
+historical archive read-only; no source-CAS event ceiling or source retirement
+is fabricated.
 
 The founding decision is an **adopt with amendments** disposition of the
 operator-backed review. bb-collab is a public BB-native successor to

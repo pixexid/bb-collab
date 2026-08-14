@@ -16,6 +16,8 @@ import {
   LLM_COLLAB_MERGED_MAIN_SHA,
   LLM_COLLAB_SOURCE_FENCE,
   MAX_EXPORT_ROWS,
+  MAX_EXPORT_BYTES,
+  MAX_SOURCE_EVIDENCE_MANIFEST_BYTES,
   MIGRATIONS,
   MIGRATION_STATES,
   MIGRATION_STEPS,
@@ -419,19 +421,27 @@ const MIGRATION_ID = "migration-1";
 const MIGRATION_DECISION_ID = "migration-decision";
 const SOURCE_SNAPSHOT_DIGEST = sha256("source-snapshot");
 
-function sourceEvidenceManifest() {
+function sourceEvidenceManifest(files = [
+  { path: "README.md", digest: sha256("README.md") },
+  { path: "docs/archive.md", digest: sha256("docs/archive.md") },
+]) {
   const manifest = {
     sourceSystem: "llm-collab" as const,
     sourceFence: LLM_COLLAB_SOURCE_FENCE,
     resourceRevision: LLM_COLLAB_EVIDENCE_RESOURCE_REVISION,
     mergedMainSha: LLM_COLLAB_MERGED_MAIN_SHA,
     canonical: false as const,
-    files: [
-      { path: "README.md", digest: sha256("README.md") },
-      { path: "docs/archive.md", digest: sha256("docs/archive.md") },
-    ],
+    files,
   };
   return { ...manifest, manifestDigest: sha256(canonicalJson(manifest)) };
+}
+
+function maximalSourceEvidenceManifest() {
+  const files = Array.from({ length: MAX_EXPORT_ROWS }, (_, index) => {
+    const path = `${String(index).padStart(3, "0")}-${"x".repeat(240)}`;
+    return { path, digest: sha256(path) };
+  });
+  return sourceEvidenceManifest(files);
 }
 
 function nonMigrationRows(db: Database.Database) {
@@ -2281,18 +2291,51 @@ describe("bb-collab plugin boundary", () => {
       freezeMigration(db);
       const beforeCanonicalRows = nonMigrationRows(db);
       const manifest = sourceEvidenceManifest();
+      const maximal = maximalSourceEvidenceManifest();
+      expect(Buffer.byteLength(canonicalJson(maximal), "utf8")).toBeGreaterThan(MAX_SOURCE_EVIDENCE_MANIFEST_BYTES);
+      const beforeMaximal = exportFoundation(db, PROJECT_ID);
+      const maximalRequest = migrationStepRequest(db, "record_export", {
+        sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
+        sourceEvidenceManifest: maximal,
+      }, { idempotencyKey: "evidence-maximal-manifest" });
+      const maximalResult = applyWithFixtureReceipt(db, maximalRequest);
+      expect(maximalResult).toMatchObject({ outcome: "EXPORT_BOUNDED" });
+      expect(db.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = ?").get(maximalRequest.idempotencyKey)).toBeUndefined();
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeMaximal);
+      expect(Buffer.byteLength(beforeMaximal.export!.recordsNdjson, "utf8") + Buffer.byteLength(canonicalJson(beforeMaximal.export!.artifactIndex), "utf8")).toBeLessThanOrEqual(MAX_EXPORT_BYTES);
+
       const exported = applyWithFixtureReceipt(db, migrationStepRequest(db, "record_export", {
         sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
         sourceEvidenceManifest: manifest,
       }));
       expect(exported).toMatchObject({ outcome: "OK", currentResourceRevision: 5, evidence: {
         sourceExportKind: "non_canonical_source_evidence",
-        sourceEvidenceManifest: manifest,
+        sourceExportDigest: manifest.manifestDigest,
       } });
+      expect(exported.evidence).not.toHaveProperty("sourceEvidenceManifest");
+      expect(db.prepare("SELECT event_json FROM state_events WHERE aggregate_type = 'migration_run' ORDER BY event_sequence DESC LIMIT 1").get()).toMatchObject({
+        event_json: expect.not.stringContaining("sourceEvidenceManifest"),
+      });
+      expect(db.prepare("SELECT outcome_json FROM mutation_receipts WHERE idempotency_key = ?").get(exported.mutationReceipt!.idempotencyKey)).toMatchObject({
+        outcome_json: expect.not.stringContaining("sourceEvidenceManifest"),
+      });
       expect(db.prepare("SELECT source_event_ceiling, source_export_digest FROM migration_runs").get()).toEqual({
         source_event_ceiling: null,
         source_export_digest: manifest.manifestDigest,
       });
+
+      const beforeStray = exportFoundation(db, PROJECT_ID);
+      const strayExportFields = migrationStepRequest(db, "record_export", {
+        sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
+        sourceEvidenceManifest: manifest,
+        canonicalImport: { expected: 0, attempted: 0, verified: 0 },
+        importRootDigest: sha256("stray-import"),
+        equivalenceDigest: sha256("stray-equivalence"),
+        equivalenceDisposition: EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION,
+      }, { idempotencyKey: "evidence-stray-export-fields" });
+      expect(applyWithFixtureReceipt(db, strayExportFields).outcome).toBe("INVALID_INPUT");
+      expect(db.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = ?").get(strayExportFields.idempotencyKey)).toBeUndefined();
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeStray);
 
       const targetExport = fixtureExport(db);
       const beforeMixed = exportFoundation(db, PROJECT_ID);
@@ -2315,7 +2358,6 @@ describe("bb-collab plugin boundary", () => {
       const canonicalImport = { expected: 0 as const, attempted: 0 as const, verified: 0 as const };
       const importRootDigest = sha256(canonicalJson({
         sourceExportDigest: manifest.manifestDigest,
-        sourceEvidenceManifestDigest: manifest.manifestDigest,
         targetRuntimeId: PLUGIN_ID,
         configRevision: 1,
         repositoryTargetsDigest: repositoryTargetsDigest(db),
@@ -2333,7 +2375,6 @@ describe("bb-collab plugin boundary", () => {
 
       const equivalenceDigest = sha256(canonicalJson({
         sourceExportDigest: manifest.manifestDigest,
-        sourceEvidenceManifestDigest: manifest.manifestDigest,
         importRootDigest,
         sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
         repositoryTargetsDigest: repositoryTargetsDigest(db),
@@ -2356,6 +2397,13 @@ describe("bb-collab plugin boundary", () => {
       expect(db.prepare("SELECT event_json FROM state_events WHERE aggregate_type = 'migration_run' ORDER BY event_sequence DESC LIMIT 1").get()).toMatchObject({
         event_json: expect.stringContaining(EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION),
       });
+      for (const step of ["activate", "record_exercise", "retire"] as const) {
+        const beforeBlocked = exportFoundation(db, PROJECT_ID);
+        const blockedRequest = migrationStepRequest(db, step, {}, { idempotencyKey: `evidence-${step}-blocked` });
+        expect(applyWithFixtureReceipt(db, blockedRequest)).toMatchObject({ outcome: "IMPORT_EQUIVALENCE_FAILED" });
+        expect(db.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = ?").get(blockedRequest.idempotencyKey)).toBeUndefined();
+        expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeBlocked);
+      }
     } finally {
       db.close();
       rmSync(directory, { recursive: true, force: true });

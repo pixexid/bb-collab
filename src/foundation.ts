@@ -17,6 +17,7 @@ export const EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION =
 // ponytail: keep exports bounded at 256 rows; add paged/file export before migration or cutover.
 export const MAX_EXPORT_ROWS = 256;
 export const MAX_EXPORT_BYTES = 512 * 1024;
+export const MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 8);
 /** Deferred until a later cutover operation; issue #3 has no sanctioned freeze transition. */
 export const DEFERRED_ISSUE_3_OUTCOMES = ["PROJECT_FROZEN"] as const;
 
@@ -3178,7 +3179,6 @@ function migrationEvent(
   stepProofDigest: string,
   extra: {
     sourceExportKind?: "canonical_fixture" | "non_canonical_source_evidence";
-    sourceEvidenceManifest?: SourceEvidenceManifest;
     canonicalImport?: { expected: number; attempted: number; verified: number };
     equivalenceDisposition?: string;
   } = {},
@@ -3210,6 +3210,10 @@ type SourceEvidenceManifest = z.infer<typeof sourceEvidenceManifestSchema>;
 function validateSourceEvidenceManifest(payload: unknown): SourceEvidenceManifest {
   const parsed = sourceEvidenceManifestSchema.safeParse(payload);
   if (!parsed.success) throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence manifest identity is invalid");
+  const manifestJson = canonicalJson(parsed.data);
+  if (Buffer.byteLength(manifestJson, "utf8") > MAX_SOURCE_EVIDENCE_MANIFEST_BYTES) {
+    throw refusal("EXPORT_BOUNDED", "source evidence manifest exceeds the bounded byte limit");
+  }
   const { manifestDigest, ...withoutDigest } = parsed.data;
   if (sha256(canonicalJson(withoutDigest)) !== manifestDigest) {
     throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence manifest digest is not deterministic");
@@ -3228,21 +3232,20 @@ function requireZeroCanonicalImport(value: NonNullable<ApplyRequest["migrationSt
   return { expected: 0, attempted: 0, verified: 0 };
 }
 
-function recordedSourceEvidenceManifest(db: SqliteDatabase, run: MigrationRunRow): SourceEvidenceManifest | null {
+function recordedSourceEvidenceKind(db: SqliteDatabase, run: MigrationRunRow): boolean {
   const event = asRow<{ event_json: string }>(db.prepare(
     `SELECT event_json FROM state_events
      WHERE project_id = ? AND aggregate_type = 'migration_run' AND aggregate_id = ? AND aggregate_revision = ?
      ORDER BY event_sequence DESC LIMIT 1`,
   ).get(run.project_id, run.migration_id, run.resource_revision));
-  if (!event) return null;
+  if (!event) return false;
   let value: unknown;
   try {
     value = JSON.parse(event.event_json);
   } catch {
     throw refusal("IMPORT_EQUIVALENCE_FAILED", "recorded MigrationRun evidence event is malformed");
   }
-  if (!value || typeof value !== "object" || (value as { sourceExportKind?: unknown }).sourceExportKind !== "non_canonical_source_evidence") return null;
-  return validateSourceEvidenceManifest((value as { sourceEvidenceManifest?: unknown }).sourceEvidenceManifest);
+  return Boolean(value && typeof value === "object" && (value as { sourceExportKind?: unknown }).sourceExportKind === "non_canonical_source_evidence");
 }
 
 function validateMigrationExport(payload: NonNullable<ApplyRequest["migrationStep"]>["export"], projectId: string): ExportPayload {
@@ -3439,6 +3442,10 @@ function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: s
   if (step.repositoryTargetsDigest !== repositoryTargetsDigest) {
     throw refusal("IMPORT_EQUIVALENCE_FAILED", "repository target identity changed or is foreign");
   }
+  const evidenceOnly = recordedSourceEvidenceKind(db, run);
+  if (evidenceOnly && ["activate", "record_exercise", "retire"].includes(step.step)) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "evidence-only MigrationRun cannot activate or retire canonical state");
+  }
   if (["record_import", "record_equivalence", "activate"].includes(step.step) && run.retention_until_ms <= now()) {
     throw refusal("IMPORT_EQUIVALENCE_FAILED", "MigrationRun retention expired before equivalence/activation");
   }
@@ -3482,6 +3489,9 @@ function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: s
     case "record_export": {
       requireState("frozen");
       requireGovernorState("frozen");
+      if (step.canonicalImport || step.importRootDigest || step.equivalenceDigest || step.equivalenceDisposition) {
+        throw refusal("INVALID_INPUT", "record_export does not accept canonical import or equivalence fields");
+      }
       if (step.sourceEvidenceManifest && step.export) {
         throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence cannot be supplied as the target canonical export");
       }
@@ -3496,10 +3506,7 @@ function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: s
         next.state = "exported";
         next.source_event_ceiling = null;
         next.source_export_digest = sourceEvidenceManifest.manifestDigest;
-        eventExtra = {
-          sourceExportKind: "non_canonical_source_evidence",
-          sourceEvidenceManifest,
-        };
+        eventExtra = { sourceExportKind: "non_canonical_source_evidence" };
         break;
       }
       const exported = validateMigrationExport(step.export, request.projectId);
@@ -3523,19 +3530,17 @@ function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: s
     case "record_import": {
       requireState("exported");
       requireGovernorState("frozen");
-      const recordedEvidence = recordedSourceEvidenceManifest(db, run);
-      if (recordedEvidence) {
+      if (evidenceOnly) {
         if (step.export || !step.sourceEvidenceManifest) {
           throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence cannot be supplied as the target canonical export");
         }
         const sourceEvidenceManifest = validateSourceEvidenceManifest(step.sourceEvidenceManifest);
-        if (sourceEvidenceManifest.manifestDigest !== recordedEvidence.manifestDigest) {
+        if (sourceEvidenceManifest.manifestDigest !== run.source_export_digest) {
           throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence manifest does not bind the recorded source identity");
         }
         const canonicalImport = requireZeroCanonicalImport(step.canonicalImport);
         const expectedRoot = sha256(canonicalJson({
           sourceExportDigest: run.source_export_digest,
-          sourceEvidenceManifestDigest: sourceEvidenceManifest.manifestDigest,
           targetRuntimeId: run.target_runtime_id,
           configRevision,
           repositoryTargetsDigest,
@@ -3546,7 +3551,7 @@ function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: s
         }
         next.state = "imported";
         next.import_root_digest = expectedRoot;
-        eventExtra = { sourceExportKind: "non_canonical_source_evidence", sourceEvidenceManifest, canonicalImport };
+        eventExtra = { sourceExportKind: "non_canonical_source_evidence", canonicalImport };
         mutationCounts = canonicalImport;
         break;
       }
@@ -3570,13 +3575,12 @@ function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: s
     case "record_equivalence": {
       requireState("imported");
       requireGovernorState("frozen");
-      const recordedEvidence = recordedSourceEvidenceManifest(db, run);
-      if (recordedEvidence) {
+      if (evidenceOnly) {
         if (step.export || !step.sourceEvidenceManifest) {
           throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence cannot be supplied as the target canonical export");
         }
         const sourceEvidenceManifest = validateSourceEvidenceManifest(step.sourceEvidenceManifest);
-        if (sourceEvidenceManifest.manifestDigest !== recordedEvidence.manifestDigest) {
+        if (sourceEvidenceManifest.manifestDigest !== run.source_export_digest) {
           throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence manifest does not bind the recorded source identity");
         }
         const canonicalImport = requireZeroCanonicalImport(step.canonicalImport);
@@ -3585,7 +3589,6 @@ function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: s
         }
         const expectedDigest = sha256(canonicalJson({
           sourceExportDigest: run.source_export_digest,
-          sourceEvidenceManifestDigest: sourceEvidenceManifest.manifestDigest,
           importRootDigest: run.import_root_digest,
           sourceSnapshotDigest: run.source_snapshot_digest,
           repositoryTargetsDigest,
@@ -3599,7 +3602,6 @@ function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: s
         next.equivalence_digest = expectedDigest;
         eventExtra = {
           sourceExportKind: "non_canonical_source_evidence",
-          sourceEvidenceManifest,
           canonicalImport,
           equivalenceDisposition: EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION,
         };
