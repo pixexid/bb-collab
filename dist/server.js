@@ -13888,7 +13888,7 @@ import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 6;
+var CONTRACT_VERSION = 7;
 var SCHEMA_VERSION = 10;
 var AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab";
 var AUTHORIZED_APPROVER_PROJECT_ID = "proj_a8zzfsx36j";
@@ -14476,7 +14476,7 @@ function cachedConsumerRolloutEvidence(observedSchemaVersion, observedContractVe
     oldSchemaVersion: 9,
     newSchemaVersion: SCHEMA_VERSION,
     observedSchemaVersion,
-    oldContractVersion: 5,
+    oldContractVersion: 6,
     newContractVersion: CONTRACT_VERSION,
     observedContractVersion,
     action: reread ? "reread" : "refused",
@@ -14539,6 +14539,7 @@ var DERIVED_ACTOR_MUTATION_CLASSES = [
   "bootstrap",
   "decision_create",
   "decision_disposition",
+  "work_item_create",
   "migration_prepare",
   "migration_step"
 ];
@@ -20415,7 +20416,89 @@ function unexpectedFlags(args, allowed) {
   }
   return null;
 }
-async function runCli(db, sdk, argv, _ctx) {
+function isRoleMutation(request) {
+  return request.operationClass === "qualification_observation_record" || request.operationClass === "role_generation_succession";
+}
+function unavailableRoleFactReader(serverId) {
+  const unavailable = () => {
+    throw new Error("live role facts are unavailable");
+  };
+  return {
+    serverId: () => serverId,
+    thread: unavailable,
+    events: unavailable,
+    environment: unavailable,
+    project: unavailable,
+    host: unavailable,
+    version: unavailable
+  };
+}
+async function readLiveRoleFactReader(sdk, serverId, request) {
+  if (!isRoleMutation(request) || !request.roleContext) return null;
+  try {
+    const thread = await sdk.threads.get({ threadId: request.roleContext.threadId });
+    const events = await sdk.threads.events.list({ threadId: request.roleContext.threadId, limit: "257" });
+    const environment = thread.environmentId ? await sdk.environments.get({ environmentId: thread.environmentId }) : null;
+    const [project, version2, host] = await Promise.all([
+      sdk.projects.get({ projectId: request.projectId }),
+      sdk.system.version(),
+      environment ? sdk.hosts.get({ hostId: environment.hostId }) : Promise.resolve(null)
+    ]);
+    if (!environment || !host) return unavailableRoleFactReader(serverId);
+    const facts = {
+      thread: {
+        id: thread.id,
+        projectId: thread.projectId,
+        environmentId: thread.environmentId,
+        providerId: thread.providerId,
+        status: thread.status,
+        visibility: thread.visibility
+      },
+      events: events.map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data })),
+      environment: {
+        id: environment.id,
+        projectId: environment.projectId,
+        hostId: environment.hostId,
+        path: environment.path,
+        managed: environment.managed,
+        isGitRepo: environment.isGitRepo,
+        isWorktree: environment.isWorktree,
+        workspaceProvisionType: environment.workspaceProvisionType,
+        branchName: environment.branchName,
+        baseBranch: environment.baseBranch,
+        defaultBranch: environment.defaultBranch,
+        mergeBaseBranch: environment.mergeBaseBranch,
+        status: environment.status
+      },
+      project: {
+        id: project.id,
+        kind: project.kind,
+        name: project.name,
+        gitRemoteUrl: project.gitRemoteUrl,
+        sources: project.sources.map((source) => ({ id: source.id, projectId: source.projectId, hostId: source.hostId, path: source.path }))
+      },
+      host: { id: host.id, status: host.status, maxPermissionMode: host.maxPermissionMode },
+      version: version2.currentVersion
+    };
+    return {
+      serverId: () => serverId,
+      thread: (threadId) => threadId === facts.thread.id ? structuredClone(facts.thread) : unavailableRoleFactReader(serverId).thread(threadId),
+      events: (threadId) => threadId === facts.thread.id ? structuredClone(facts.events) : unavailableRoleFactReader(serverId).events(threadId),
+      environment: (environmentId) => environmentId === facts.environment.id ? structuredClone(facts.environment) : unavailableRoleFactReader(serverId).environment(environmentId),
+      project: (projectId) => projectId === facts.project.id ? structuredClone(facts.project) : unavailableRoleFactReader(serverId).project(projectId),
+      host: (hostId) => hostId === facts.host.id ? structuredClone(facts.host) : unavailableRoleFactReader(serverId).host(hostId),
+      version: () => facts.version
+    };
+  } catch {
+    return unavailableRoleFactReader(serverId);
+  }
+}
+async function applyLiveAuthorizedMutation(bb, db, input) {
+  const parsed = applyRequestSchema.safeParse(input);
+  const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
+  return applyAuthorizedMutation(db, input, null, reader);
+}
+async function runCli(db, bb, argv, _ctx) {
   const command = argv[0];
   const args = argv.slice(1);
   if (!command || !["doctor", "export", "apply"].includes(command)) return invalidCli("expected doctor, export, or apply");
@@ -20430,14 +20513,14 @@ async function runCli(db, sdk, argv, _ctx) {
       const rawRequest = JSON.parse(requestJson);
       const request = parseApplyRequest(rawRequest);
       if (request.projectId !== projectId) return invalidCli("--project does not match request.projectId");
-      return cliResult(applyAuthorizedMutation(db, rawRequest));
+      return cliResult(await applyLiveAuthorizedMutation(bb, db, rawRequest));
     } catch (error48) {
       return invalidCli(error48 instanceof Error ? error48.message : String(error48));
     }
   }
   const unknown2 = unexpectedFlags(args, ["--project"]);
   if (unknown2) return invalidCli(`unexpected flag ${unknown2}`);
-  if (command === "doctor") return cliResult(await doctor(db, sdk, projectId));
+  if (command === "doctor") return cliResult(await doctor(db, bb.sdk, projectId));
   return cliResult(exportFoundation(db, projectId));
 }
 async function plugin(bb) {
@@ -20548,7 +20631,7 @@ async function plugin(bb) {
       return exportFoundation(db, input.projectId);
     },
     async apply(input) {
-      return applyAuthorizedMutation(db, input);
+      return applyLiveAuthorizedMutation(bb, db, input);
     },
     async operatorReceipt(input) {
       if (!db) return operatorReceiptResult(input.projectId, "CANONICAL_STORE_UNAVAILABLE", "canonical SQLite store is unavailable");
@@ -20605,7 +20688,7 @@ async function plugin(bb) {
       }
     ],
     run(argv, context) {
-      return runCli(db, bb.sdk, argv, context);
+      return runCli(db, bb, argv, context);
     }
   });
   bb.log.info(`${PLUGIN_ID} loaded for BB ${BB_VERSION_RANGE}; plugin SDK ${PLUGIN_SDK_VERSION}`);

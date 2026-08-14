@@ -27,7 +27,9 @@ import {
   persistBootstrapOperatorReceipt,
   persistInterimOperatorReceipt,
   parseApplyRequest,
+  type ApplyRequest,
   type FoundationResult,
+  type RoleFactReader,
   type SqliteDatabase,
 } from "./src/foundation.js";
 
@@ -264,9 +266,97 @@ function unexpectedFlags(args: string[], allowed: readonly string[]): string | n
   return null;
 }
 
+function isRoleMutation(request: ApplyRequest): boolean {
+  return request.operationClass === "qualification_observation_record" || request.operationClass === "role_generation_succession";
+}
+
+function unavailableRoleFactReader(serverId: string): RoleFactReader {
+  const unavailable = () => { throw new Error("live role facts are unavailable"); };
+  return {
+    serverId: () => serverId,
+    thread: unavailable,
+    events: unavailable,
+    environment: unavailable,
+    project: unavailable,
+    host: unavailable,
+    version: unavailable,
+  };
+}
+
+async function readLiveRoleFactReader(
+  sdk: BbPluginApi["sdk"],
+  serverId: string,
+  request: ApplyRequest,
+): Promise<RoleFactReader | null> {
+  if (!isRoleMutation(request) || !request.roleContext) return null;
+  try {
+    const thread = await sdk.threads.get({ threadId: request.roleContext.threadId });
+    const events = await sdk.threads.events.list({ threadId: request.roleContext.threadId, limit: "257" });
+    const environment = thread.environmentId ? await sdk.environments.get({ environmentId: thread.environmentId }) : null;
+    const [project, version, host] = await Promise.all([
+      sdk.projects.get({ projectId: request.projectId }),
+      sdk.system.version(),
+      environment ? sdk.hosts.get({ hostId: environment.hostId }) : Promise.resolve(null),
+    ]);
+    if (!environment || !host) return unavailableRoleFactReader(serverId);
+    const facts = {
+      thread: {
+        id: thread.id,
+        projectId: thread.projectId,
+        environmentId: thread.environmentId,
+        providerId: thread.providerId,
+        status: thread.status,
+        visibility: thread.visibility,
+      },
+      events: events.map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data as Record<string, unknown> })),
+      environment: {
+        id: environment.id,
+        projectId: environment.projectId,
+        hostId: environment.hostId,
+        path: environment.path,
+        managed: environment.managed,
+        isGitRepo: environment.isGitRepo,
+        isWorktree: environment.isWorktree,
+        workspaceProvisionType: environment.workspaceProvisionType,
+        branchName: environment.branchName,
+        baseBranch: environment.baseBranch,
+        defaultBranch: environment.defaultBranch,
+        mergeBaseBranch: environment.mergeBaseBranch,
+        status: environment.status,
+      },
+      project: {
+        id: project.id,
+        kind: project.kind,
+        name: project.name,
+        gitRemoteUrl: project.gitRemoteUrl,
+        sources: project.sources.map((source) => ({ id: source.id, projectId: source.projectId, hostId: source.hostId, path: source.path })),
+      },
+      host: { id: host.id, status: host.status, maxPermissionMode: host.maxPermissionMode },
+      version: version.currentVersion,
+    };
+    return {
+      serverId: () => serverId,
+      thread: (threadId) => threadId === facts.thread.id ? structuredClone(facts.thread) : unavailableRoleFactReader(serverId).thread(threadId),
+      events: (threadId) => threadId === facts.thread.id ? structuredClone(facts.events) : unavailableRoleFactReader(serverId).events(threadId),
+      environment: (environmentId) => environmentId === facts.environment.id ? structuredClone(facts.environment) : unavailableRoleFactReader(serverId).environment(environmentId),
+      project: (projectId) => projectId === facts.project.id ? structuredClone(facts.project) : unavailableRoleFactReader(serverId).project(projectId),
+      host: (hostId) => hostId === facts.host.id ? structuredClone(facts.host) : unavailableRoleFactReader(serverId).host(hostId),
+      version: () => facts.version,
+    };
+  } catch {
+    return unavailableRoleFactReader(serverId);
+  }
+}
+
+async function applyLiveAuthorizedMutation(bb: BbPluginApi, db: SqliteDatabase | null, input: unknown): Promise<FoundationResult> {
+  const parsed = applyRequestSchema.safeParse(input);
+  const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
+  return applyAuthorizedMutation(db, input, null, reader);
+}
+
 async function runCli(
   db: SqliteDatabase | null,
-  sdk: Parameters<typeof doctor>[1],
+  bb: BbPluginApi,
   argv: string[],
   _ctx: PluginCliContext,
 ) {
@@ -284,14 +374,14 @@ async function runCli(
       const rawRequest = JSON.parse(requestJson);
       const request = parseApplyRequest(rawRequest);
       if (request.projectId !== projectId) return invalidCli("--project does not match request.projectId");
-      return cliResult(applyAuthorizedMutation(db, rawRequest));
+      return cliResult(await applyLiveAuthorizedMutation(bb, db, rawRequest));
     } catch (error) {
       return invalidCli(error instanceof Error ? error.message : String(error));
     }
   }
   const unknown = unexpectedFlags(args, ["--project"]);
   if (unknown) return invalidCli(`unexpected flag ${unknown}`);
-  if (command === "doctor") return cliResult(await doctor(db, sdk, projectId));
+  if (command === "doctor") return cliResult(await doctor(db, bb.sdk, projectId));
   return cliResult(exportFoundation(db, projectId));
 }
 
@@ -407,7 +497,7 @@ export default async function plugin(bb: BbPluginApi) {
       return exportFoundation(db, input.projectId);
     },
     async apply(input) {
-      return applyAuthorizedMutation(db, input);
+      return applyLiveAuthorizedMutation(bb, db, input);
     },
     async operatorReceipt(input) {
       if (!db) return operatorReceiptResult(input.projectId, "CANONICAL_STORE_UNAVAILABLE", "canonical SQLite store is unavailable");
@@ -471,7 +561,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
     ],
     run(argv, context) {
-      return runCli(db, bb.sdk, argv, context);
+      return runCli(db, bb, argv, context);
     },
   });
 
