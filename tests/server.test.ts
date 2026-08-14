@@ -1234,6 +1234,49 @@ describe("bb-collab plugin boundary", () => {
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeReuse);
   });
 
+  it("derives the plugin actor atomically after bootstrap confirmation and applies with that actor", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    const request = { ...bootstrapRequest(), actorReceiptId: null, candidateHead: CANDIDATE_SHA };
+    const operatorInput = {
+      projectId: PROJECT_ID,
+      mutationClass: "bootstrap" as const,
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: operatorRequestDigest(request),
+      callerThreadId: "operator-thread",
+      requestedFromBackground: false,
+    };
+    const pendingResult = host.harness.callRpc("operatorReceipt", operatorInput);
+    await vi.waitFor(() => expect(host.harness.inspection.pendingInteractions).toHaveLength(1));
+    const interaction = host.harness.inspection.pendingInteractions[0];
+    host.harness.behavior.submitInteraction(interaction.id, {
+      confirmed: true,
+      projectId: PROJECT_ID,
+      mutationClass: "bootstrap",
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: operatorInput.requestDigest,
+    });
+    const issued = await pendingResult;
+    expect(issued).toMatchObject({ outcome: "OK", actorReceiptId: expect.any(String) });
+    const actorReceiptId = (issued as FoundationResult).actorReceiptId!;
+    const operatorReceiptId = (issued as FoundationResult).operatorReceipt!.receiptId;
+    expect(db.prepare("SELECT actor_kind, subject_id, verification_state, operator_receipt_id, retirement_condition FROM actor_receipts WHERE receipt_id = ?").get(actorReceiptId)).toEqual({
+      actor_kind: "plugin",
+      subject_id: PLUGIN_ID,
+      verification_state: "verified",
+      operator_receipt_id: operatorReceiptId,
+      retirement_condition: "host-issued receipt get-bb/bb#1541",
+    });
+    const applied = await host.harness.callRpc("apply", { ...request, actorReceiptId, operatorReceiptId });
+    expect(applied).toMatchObject({ outcome: "OK", mutationReceipt: { operatorReceiptId } });
+    expect(db.prepare("SELECT actor_receipt_id, operator_receipt_id FROM state_events WHERE project_id = ?").get(PROJECT_ID)).toEqual({
+      actor_receipt_id: actorReceiptId,
+      operator_receipt_id: operatorReceiptId,
+    });
+  });
+
   it("cannot reuse one receipt for two migration steps", async () => {
     const host = await loadedHost();
     const db = host.bb.storage.database();
@@ -1262,7 +1305,7 @@ describe("bb-collab plugin boundary", () => {
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-      for (const statement of MIGRATIONS.slice(0, -2)) db.exec(statement);
+      for (const statement of MIGRATIONS.slice(0, -3)) db.exec(statement);
       const request = bootstrapRequest();
       const baseV7Digest = "1a9530eb42af63727dd3001bd7990edf147242a525da64578e5d240c75e80027";
       const committed = { outcome: "OK", subject: PROJECT_ID, expected: 1, attempted: 1, verified: 1 };
@@ -1279,6 +1322,7 @@ describe("bb-collab plugin boundary", () => {
            outcome_json, committed_event_sequence, created_at_ms)
          VALUES (?, ?, ?, ?, ?, 1, 1)`,
       ).run(PROJECT_ID, request.idempotencyKey, request.operationClass, baseV7Digest, canonicalJson(committed));
+      db.exec(MIGRATIONS.at(-3)!);
       db.exec(MIGRATIONS.at(-2)!);
       db.exec(MIGRATIONS.at(-1)!);
 
@@ -1493,15 +1537,16 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("appends the v8 one-request receipt columns and rolls every cached consumer forward", () => {
-    expect(SCHEMA_VERSION).toBe(8);
-    expect(CONTRACT_VERSION).toBe(3);
-    expect(MIGRATIONS).toHaveLength(21);
-    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("97fd37424ea09eeb134998f57ae50f97e9b64c7e2fce877f1220e8194b05b774");
-    expect(MIGRATIONS.at(-3)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
-    expect(MIGRATIONS.at(-2)?.match(/CREATE TABLE/gu)).toHaveLength(1);
-    expect(MIGRATIONS.at(-2)).toContain("operator_receipts");
-    expect(MIGRATIONS.at(-1)).toContain("operator_receipt_id");
+  it("appends the v9 derived actor columns and rolls every cached consumer forward", () => {
+    expect(SCHEMA_VERSION).toBe(9);
+    expect(CONTRACT_VERSION).toBe(4);
+    expect(MIGRATIONS).toHaveLength(22);
+    expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("97fd37424ea09eeb134998f57ae50f97e9b64c7e2fce877f1220e8194b05b774");
+    expect(MIGRATIONS.at(-4)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
+    expect(MIGRATIONS.at(-3)?.match(/CREATE TABLE/gu)).toHaveLength(1);
+    expect(MIGRATIONS.at(-3)).toContain("operator_receipts");
+    expect(MIGRATIONS.at(-2)).toContain("operator_receipt_id");
+    expect(MIGRATIONS.at(-1)).toContain("retirement_condition");
     expect(TABLES).toContain("migration_runs");
     expect(MIGRATION_STATES).toEqual([
       "prepared", "frozen", "exported", "imported", "equivalent", "target_active", "exercised", "retired", "rolled_back", "fix_forward_required",
@@ -1509,8 +1554,8 @@ describe("bb-collab plugin boundary", () => {
     expect(MIGRATION_STEPS).toEqual([
       "record_inventory", "record_quiescence", "freeze", "record_export", "record_import", "record_equivalence", "activate", "record_exercise", "retire", "rollback", "mark_fix_forward_required",
     ]);
-    expect(cachedConsumerRolloutEvidence(7)).toMatchObject({ oldSchemaVersion: 7, newSchemaVersion: 8, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(8)).toMatchObject({ oldSchemaVersion: 7, newSchemaVersion: 8, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(8)).toMatchObject({ oldSchemaVersion: 8, newSchemaVersion: 9, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(9)).toMatchObject({ oldSchemaVersion: 8, newSchemaVersion: 9, action: "reread", expected: 4, attempted: 4, verified: 4 });
 
     const { db, directory } = directDatabase();
     try {
@@ -1525,6 +1570,7 @@ describe("bb-collab plugin boundary", () => {
       ]));
       expect((db.prepare("PRAGMA table_info(state_events)").all() as Array<{ name: string }>).map((row) => row.name)).toContain("operator_receipt_id");
       expect((db.prepare("PRAGMA table_info(mutation_receipts)").all() as Array<{ name: string }>).map((row) => row.name)).toContain("operator_receipt_id");
+      expect((db.prepare("PRAGMA table_info(actor_receipts)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual(expect.arrayContaining(["operator_receipt_id", "retirement_condition"]));
       expect((db.prepare("PRAGMA index_list(migration_runs)").all() as Array<{ name: string; unique: number; partial: number }>).filter((row) => row.name.startsWith("migration_runs_"))).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "migration_runs_final_export_identity", unique: 1, partial: 1 }),
         expect.objectContaining({ name: "migration_runs_one_open", unique: 1, partial: 1 }),
@@ -1623,7 +1669,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ contractVersion: 3, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ contractVersion: 4, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -3038,8 +3084,8 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 7, newSchemaVersion: 8, expected: 4, attempted: 4, verified: 4 },
-        schema: { version: 8 },
+        cachedConsumers: { oldSchemaVersion: 8, newSchemaVersion: 9, expected: 4, attempted: 4, verified: 4 },
+        schema: { version: 9 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -3982,7 +4028,7 @@ describe("bb-collab plugin boundary", () => {
     db.pragma("foreign_keys = OFF");
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
-    db.exec(MIGRATIONS.at(-5)!);
+    db.exec(MIGRATIONS.at(-6)!);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -4002,8 +4048,8 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(7)).toMatchObject({ oldSchemaVersion: 7, newSchemaVersion: 8, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(8)).toMatchObject({ oldSchemaVersion: 7, newSchemaVersion: 8, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(8)).toMatchObject({ oldSchemaVersion: 8, newSchemaVersion: 9, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(9)).toMatchObject({ oldSchemaVersion: 8, newSchemaVersion: 9, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {
