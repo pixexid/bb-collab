@@ -2404,6 +2404,158 @@ describe("bb-collab plugin boundary", () => {
         expect(db.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = ?").get(blockedRequest.idempotencyKey)).toBeUndefined();
         expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeBlocked);
       }
+
+      const recoveryDigest = sha256("evidence-only-release");
+      const releaseInput = (overrides: Partial<ApplyRequest> = {}) => migrationStepRequest(db, "rollback", {
+        proofDigest: recoveryDigest,
+        recoveryDigest,
+      }, overrides);
+      const beforeInvalidRelease = exportFoundation(db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "rollback", { proofDigest: sha256("missing-recovery") }, {
+        idempotencyKey: "evidence-release-missing-recovery",
+      })).outcome).toBe("INVALID_INPUT");
+      expect(applyWithFixtureReceipt(db, releaseInput({ idempotencyKey: "evidence-release-wrong-runtime", runtimeId: "wrong-runtime" })).outcome).toBe("IMPORT_EQUIVALENCE_FAILED");
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeInvalidRelease);
+
+      const crossBinding = releaseInput({ idempotencyKey: "evidence-release-cross-binding", candidateHead: CANDIDATE_SHA });
+      const foreignReceipt = persistInterimOperatorReceipt(db, {
+        projectId: FOREIGN_PROJECT_ID,
+        mutationClass: "migration_step",
+        candidateHead: CANDIDATE_SHA,
+        idempotencyKey: crossBinding.idempotencyKey,
+        requestDigest: operatorRequestDigest({ ...crossBinding, operatorReceiptId: null }),
+        callerThreadId: "foreign-thread",
+        requestedFromBackground: false,
+        callerPluginId: PLUGIN_ID,
+      }, 1);
+      expect(applyAuthorizedMutation(db, { ...crossBinding, operatorReceiptId: foreignReceipt.receiptId })).toMatchObject({ outcome: "OPERATOR_RECEIPT_FOREIGN" });
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeInvalidRelease);
+
+      const unsignedRelease = releaseInput({ idempotencyKey: "evidence-release-authorized", candidateHead: null, operatorReceiptId: null });
+      const receipt = persistInterimOperatorReceipt(db, {
+        projectId: PROJECT_ID,
+        mutationClass: "migration_step",
+        candidateHead: CANDIDATE_SHA,
+        idempotencyKey: unsignedRelease.idempotencyKey,
+        requestDigest: operatorRequestDigest(unsignedRelease),
+        callerThreadId: "release-thread",
+        requestedFromBackground: false,
+        callerPluginId: PLUGIN_ID,
+      }, 2);
+      const authorizedRelease = { ...unsignedRelease, candidateHead: CANDIDATE_SHA, operatorReceiptId: receipt.receiptId };
+      const released = applyAuthorizedMutation(db, authorizedRelease);
+      expect(released).toMatchObject({
+        outcome: "OK",
+        currentGovernanceEpoch: 4,
+        currentResourceRevision: 8,
+        evidence: {
+          state: "rolled_back",
+          sourceExportKind: "non_canonical_source_evidence",
+          governorRelease: { runtimeId: PLUGIN_ID, disposition: "evidence_only_equivalent_rollback" },
+        },
+        mutationReceipt: { operationClass: "migration_step", operatorReceiptId: receipt.receiptId },
+      });
+      expect(db.prepare("SELECT project_governorship_heads.state, project_governorships.runtime_id FROM project_governorship_heads JOIN project_governorships USING (project_id, governance_epoch) WHERE project_governorship_heads.project_id = ?").get(PROJECT_ID)).toEqual({ state: "target_active", runtime_id: PLUGIN_ID });
+      expect(db.prepare("SELECT operator_receipt_id, idempotency_key, event_json FROM state_events WHERE project_id = ? ORDER BY event_sequence DESC LIMIT 1").get(PROJECT_ID)).toMatchObject({
+        operator_receipt_id: receipt.receiptId,
+        idempotency_key: authorizedRelease.idempotencyKey,
+        event_json: expect.stringContaining("evidence_only_equivalent_rollback"),
+      });
+      expect(db.prepare("SELECT operator_receipt_id, committed_event_sequence FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?").get(PROJECT_ID, authorizedRelease.idempotencyKey)).toEqual({
+        operator_receipt_id: receipt.receiptId,
+        committed_event_sequence: released.eventSequence,
+      });
+      expect(db.prepare("SELECT consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?").get(receipt.receiptId)).toEqual({ consumed_event_sequence: released.eventSequence });
+      expect(db.prepare("SELECT state, recovery_digest FROM migration_runs WHERE project_id = ?").get(PROJECT_ID)).toEqual({ state: "rolled_back", recovery_digest: recoveryDigest });
+
+      const afterRelease = exportFoundation(db, PROJECT_ID);
+      expect(applyAuthorizedMutation(db, authorizedRelease)).toEqual(released);
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(afterRelease);
+      const secondReceipt = persistInterimOperatorReceipt(db, {
+        projectId: PROJECT_ID,
+        mutationClass: "migration_step",
+        candidateHead: CANDIDATE_SHA,
+        idempotencyKey: authorizedRelease.idempotencyKey,
+        requestDigest: operatorRequestDigest(unsignedRelease),
+        callerThreadId: "release-thread-second",
+        requestedFromBackground: false,
+        callerPluginId: PLUGIN_ID,
+      }, 3);
+      expect(applyAuthorizedMutation(db, { ...authorizedRelease, operatorReceiptId: secondReceipt.receiptId })).toMatchObject({ outcome: "OPERATOR_RECEIPT_STALE" });
+      expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(secondReceipt.receiptId)).toEqual({ consumed_at_ms: null });
+      const beforeWrongState = exportFoundation(db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(db, releaseInput({ idempotencyKey: "evidence-release-wrong-state" })).outcome).toBe("INVALID_INPUT");
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeWrongState);
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps evidence-only exported rollback on the pre-target source_active path", () => {
+    const { db, directory } = directDatabase();
+    try {
+      freezeMigration(db);
+      const manifest = sourceEvidenceManifest();
+      expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_export", {
+        sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
+        sourceEvidenceManifest: manifest,
+      }))).toMatchObject({ outcome: "OK", currentResourceRevision: 5, evidence: { state: "exported" } });
+
+      const recoveryDigest = sha256("evidence-exported-rollback");
+      const rollbackRequest = migrationStepRequest(db, "rollback", { proofDigest: recoveryDigest, recoveryDigest }, {
+        idempotencyKey: "evidence-exported-rollback",
+      });
+      const eventsBefore = (db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { count: number }).count;
+      const mutationsBefore = (db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE project_id = ?").get(PROJECT_ID) as { count: number }).count;
+      const rollback = applyWithFixtureReceipt(db, rollbackRequest);
+      expect(rollback).toMatchObject({
+        outcome: "OK",
+        currentGovernanceEpoch: 4,
+        currentResourceRevision: 6,
+        evidence: { state: "rolled_back" },
+        mutationReceipt: {
+          idempotencyKey: rollbackRequest.idempotencyKey,
+          operationClass: "migration_step",
+          operatorReceiptId: null,
+        },
+      });
+      expect(rollback.evidence).not.toHaveProperty("governorRelease");
+      expect(currentGovernor(db)).toMatchObject({ governance_epoch: 4, state: "source_active" });
+      expect(db.prepare(
+        `SELECT project_governorships.runtime_id, project_governorships.state
+         FROM project_governorships JOIN project_governorship_heads USING (project_id, governance_epoch)
+         WHERE project_governorship_heads.project_id = ?`,
+      ).get(PROJECT_ID)).toEqual({ runtime_id: "llm-collab-runtime", state: "source_active" });
+      expect(db.prepare("SELECT state, source_governor_epoch, target_governor_epoch, recovery_digest FROM migration_runs WHERE project_id = ?").get(PROJECT_ID)).toEqual({
+        state: "rolled_back",
+        source_governor_epoch: 4,
+        target_governor_epoch: 1,
+        recovery_digest: recoveryDigest,
+      });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: eventsBefore + 1 });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: mutationsBefore + 1 });
+      const event = db.prepare(
+        "SELECT event_sequence, actor_receipt_id, operator_receipt_id, idempotency_key, event_json FROM state_events WHERE project_id = ? ORDER BY event_sequence DESC LIMIT 1",
+      ).get(PROJECT_ID) as { event_sequence: number; actor_receipt_id: string; operator_receipt_id: string | null; idempotency_key: string; event_json: string };
+      expect(event).toMatchObject({
+        event_sequence: rollback.eventSequence,
+        actor_receipt_id: RECEIPT_ID,
+        operator_receipt_id: null,
+        idempotency_key: rollbackRequest.idempotencyKey,
+      });
+      expect(JSON.parse(event.event_json)).toMatchObject({ step: "rollback", priorState: "exported", newState: "rolled_back" });
+      const mutation = db.prepare(
+        "SELECT operation_class, operator_receipt_id, idempotency_key, request_digest, outcome_json, committed_event_sequence FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
+      ).get(PROJECT_ID, rollbackRequest.idempotencyKey) as { operation_class: string; operator_receipt_id: string | null; idempotency_key: string; request_digest: string; outcome_json: string; committed_event_sequence: number };
+      expect(mutation).toMatchObject({
+        operation_class: "migration_step",
+        operator_receipt_id: null,
+        idempotency_key: rollbackRequest.idempotencyKey,
+        request_digest: rollback.mutationReceipt?.requestDigest,
+        committed_event_sequence: rollback.eventSequence,
+      });
+      expect(JSON.parse(mutation.outcome_json)).toEqual(rollback);
     } finally {
       db.close();
       rmSync(directory, { recursive: true, force: true });

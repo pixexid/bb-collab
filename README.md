@@ -49,6 +49,16 @@ and `sourceExportKind`. It proves canonical import zero-work and preserves the
 historical archive read-only; no source-CAS event ceiling or source retirement
 is fabricated.
 
+Pre-target rollback from prepared, frozen, exported or imported restores
+`source_active`. Once equivalent, an evidence-only run may close through the
+bounded rollback disposition: exact recovery proof and source/frozen-to-target
+runtime binding rotate the governor directly to `target_active` and record
+release evidence; post-target fix-forward semantics are unchanged.
+This resolver evidence does not make live cutover ready: exact live project
+configuration, repository target, shared source guard, mutator canaries and
+operator-gated runtime identity remain required, and this change performs no
+live install, reload or mutation.
+
 The founding decision is an **adopt with amendments** disposition of the
 operator-backed review. bb-collab is a public BB-native successor to
 llm-collab: distill the surviving invariants; do not fork its history or

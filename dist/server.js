@@ -16187,7 +16187,13 @@ function applyGovernorClaim(db, request, digest) {
 }
 function exactGovernor(db, request) {
   const head = asRow(
-    db.prepare("SELECT governance_epoch, fence_token, state FROM project_governorship_heads WHERE project_id = ?").get(request.projectId)
+    db.prepare(
+      `SELECT heads.governance_epoch, heads.fence_token, heads.state, governors.runtime_id
+       FROM project_governorship_heads AS heads
+       JOIN project_governorships AS governors
+         ON governors.project_id = heads.project_id AND governors.governance_epoch = heads.governance_epoch
+       WHERE heads.project_id = ?`
+    ).get(request.projectId)
   );
   if (!head) throw refusal("GOVERNOR_UNAVAILABLE", "project has no current governorship head");
   if (request.expectedGovernanceEpoch !== head.governance_epoch || request.expectedFenceToken !== head.fence_token) {
@@ -16321,6 +16327,11 @@ function recordedSourceEvidenceKind(db, run) {
     throw refusal("IMPORT_EQUIVALENCE_FAILED", "recorded MigrationRun evidence event is malformed");
   }
   return Boolean(value && typeof value === "object" && value.sourceExportKind === "non_canonical_source_evidence");
+}
+function requireEvidenceOnlyReleaseBinding(run, head, request) {
+  if (run.target_runtime_id !== PLUGIN_ID || head.runtime_id !== run.source_runtime_id || request.runtimeId !== void 0 && request.runtimeId !== PLUGIN_ID) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "evidence-only governor release requires the exact source and bb-collab runtime binding");
+  }
 }
 function validateMigrationExport(payload, projectId) {
   if (!payload) throw refusal("IMPORT_EQUIVALENCE_FAILED", "migration step requires the deterministic fixture export");
@@ -16720,7 +16731,22 @@ function applyMigrationStep(db, request, digest) {
       next.state = "retired";
       break;
     case "rollback":
-      if (["target_active", "exercised"].includes(run.state)) {
+      if (evidenceOnly && run.state === "equivalent") {
+        requireState("equivalent");
+        requireGovernorState("frozen");
+        requireEvidenceOnlyReleaseBinding(run, head, request);
+        if (!step.recoveryDigest || step.recoveryDigest !== step.proofDigest) throw refusal("INVALID_INPUT", "evidence-only release requires exact recovery evidence");
+        const governor = rotateMigrationGovernor(db, request, actorReceiptId, head, run.target_runtime_id, "target_active");
+        next.state = "rolled_back";
+        next.target_governor_epoch = governor.governanceEpoch;
+        next.recovery_digest = step.recoveryDigest;
+        nextFenceToken = governor.fenceToken;
+        eventExtra = {
+          sourceExportKind: "non_canonical_source_evidence",
+          equivalenceDisposition: EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION,
+          governorRelease: { runtimeId: PLUGIN_ID, disposition: "evidence_only_equivalent_rollback" }
+        };
+      } else if (["target_active", "exercised"].includes(run.state)) {
         requireGovernorState("target_active");
         if (!step.recoveryDigest || step.recoveryDigest !== step.proofDigest) throw refusal("INVALID_INPUT", "fix-forward requires exact recovery evidence");
         next.state = "fix_forward_required";
@@ -16774,7 +16800,7 @@ function applyMigrationStep(db, request, digest) {
     currentResourceRevision: run.resource_revision,
     expectedResourceRevision: request.expectedResourceRevision ?? void 0
   });
-  const currentGovernanceEpoch = next.state === "retired" || next.state === "exercised" || next.state === "fix_forward_required" ? head.governance_epoch : next.state === "target_active" ? next.target_governor_epoch : next.source_governor_epoch;
+  const currentGovernanceEpoch = eventExtra.governorRelease ? next.target_governor_epoch : next.state === "retired" || next.state === "exercised" || next.state === "fix_forward_required" ? head.governance_epoch : next.state === "target_active" ? next.target_governor_epoch : next.source_governor_epoch;
   return commitMutation(
     db,
     request,

@@ -3064,9 +3064,15 @@ interface MigrationRunRow {
 function exactGovernor(
   db: SqliteDatabase,
   request: ApplyRequest,
-): { governance_epoch: number; fence_token: string; state: "source_active" | "frozen" | "target_active" | "retired" } {
-  const head = asRow<{ governance_epoch: number; fence_token: string; state: "source_active" | "frozen" | "target_active" | "retired" }>(
-    db.prepare("SELECT governance_epoch, fence_token, state FROM project_governorship_heads WHERE project_id = ?").get(request.projectId),
+): { governance_epoch: number; fence_token: string; state: "source_active" | "frozen" | "target_active" | "retired"; runtime_id: string } {
+  const head = asRow<{ governance_epoch: number; fence_token: string; state: "source_active" | "frozen" | "target_active" | "retired"; runtime_id: string }>(
+    db.prepare(
+      `SELECT heads.governance_epoch, heads.fence_token, heads.state, governors.runtime_id
+       FROM project_governorship_heads AS heads
+       JOIN project_governorships AS governors
+         ON governors.project_id = heads.project_id AND governors.governance_epoch = heads.governance_epoch
+       WHERE heads.project_id = ?`,
+    ).get(request.projectId),
   );
   if (!head) throw refusal("GOVERNOR_UNAVAILABLE", "project has no current governorship head");
   if (request.expectedGovernanceEpoch !== head.governance_epoch || request.expectedFenceToken !== head.fence_token) {
@@ -3181,6 +3187,7 @@ function migrationEvent(
     sourceExportKind?: "canonical_fixture" | "non_canonical_source_evidence";
     canonicalImport?: { expected: number; attempted: number; verified: number };
     equivalenceDisposition?: string;
+    governorRelease?: { runtimeId: string; disposition: string };
   } = {},
 ) {
   return {
@@ -3246,6 +3253,20 @@ function recordedSourceEvidenceKind(db: SqliteDatabase, run: MigrationRunRow): b
     throw refusal("IMPORT_EQUIVALENCE_FAILED", "recorded MigrationRun evidence event is malformed");
   }
   return Boolean(value && typeof value === "object" && (value as { sourceExportKind?: unknown }).sourceExportKind === "non_canonical_source_evidence");
+}
+
+function requireEvidenceOnlyReleaseBinding(
+  run: MigrationRunRow,
+  head: ReturnType<typeof exactGovernor>,
+  request: ApplyRequest,
+): void {
+  if (
+    run.target_runtime_id !== PLUGIN_ID ||
+    head.runtime_id !== run.source_runtime_id ||
+    (request.runtimeId !== undefined && request.runtimeId !== PLUGIN_ID)
+  ) {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "evidence-only governor release requires the exact source and bb-collab runtime binding");
+  }
 }
 
 function validateMigrationExport(payload: NonNullable<ApplyRequest["migrationStep"]>["export"], projectId: string): ExportPayload {
@@ -3645,7 +3666,22 @@ function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: s
       next.state = "retired";
       break;
     case "rollback":
-      if (["target_active", "exercised"].includes(run.state)) {
+      if (evidenceOnly && run.state === "equivalent") {
+        requireState("equivalent");
+        requireGovernorState("frozen");
+        requireEvidenceOnlyReleaseBinding(run, head, request);
+        if (!step.recoveryDigest || step.recoveryDigest !== step.proofDigest) throw refusal("INVALID_INPUT", "evidence-only release requires exact recovery evidence");
+        const governor = rotateMigrationGovernor(db, request, actorReceiptId, head, run.target_runtime_id, "target_active");
+        next.state = "rolled_back";
+        next.target_governor_epoch = governor.governanceEpoch;
+        next.recovery_digest = step.recoveryDigest;
+        nextFenceToken = governor.fenceToken;
+        eventExtra = {
+          sourceExportKind: "non_canonical_source_evidence",
+          equivalenceDisposition: EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION,
+          governorRelease: { runtimeId: PLUGIN_ID, disposition: "evidence_only_equivalent_rollback" },
+        };
+      } else if (["target_active", "exercised"].includes(run.state)) {
         requireGovernorState("target_active");
         if (!step.recoveryDigest || step.recoveryDigest !== step.proofDigest) throw refusal("INVALID_INPUT", "fix-forward requires exact recovery evidence");
         next.state = "fix_forward_required";
@@ -3688,7 +3724,9 @@ function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: s
     currentResourceRevision: run.resource_revision,
     expectedResourceRevision: request.expectedResourceRevision ?? undefined,
   });
-  const currentGovernanceEpoch = next.state === "retired" || next.state === "exercised" || next.state === "fix_forward_required"
+  const currentGovernanceEpoch = eventExtra.governorRelease
+    ? next.target_governor_epoch
+    : next.state === "retired" || next.state === "exercised" || next.state === "fix_forward_required"
     ? head.governance_epoch
     : next.state === "target_active" ? next.target_governor_epoch : next.source_governor_epoch;
   return commitMutation(
