@@ -357,6 +357,7 @@ Git/BB facts. Background requests still require human `requestInput`
 confirmation; the digest is integrity-only until a host-issued receipt exists.
 Interim receipts have no local expiry or revocation and retire only on the
 host-issued `get-bb/bb#1541` condition; stale means an exact binding mismatch.
-Reserve/finalize adapter operations refuse before the adapter because one
+`github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
+reserve/finalize adapter operations refuse before the adapter because one
 receipt cannot authorize multiple writes. This report records those facts; it
 does not change them.

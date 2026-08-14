@@ -19,6 +19,17 @@ worker.
 | GitHub, BB Tasks and Markdown | External projections or evidence | They may not activate work, satisfy a gate or close a WorkItem independently. |
 | Operator/admin/raw BB activity | Unmanaged activity on a full-trust host | It may be detected as evidence or discrepancy, but it acquires no canonical authority by observation. |
 
+The v3/schema v8 operator gate is a separate host/UI confirmation boundary:
+an interim receipt binds one exact project, operation class, lowercase
+40-character candidate head, idempotency key and canonical raw-request digest.
+The first committed StateEvent consumes it atomically; reuse, a different
+receipt for an already-committed idempotency key, or any binding mismatch
+refuses before a write. It has no local TTL or revocation and retires only on
+the host-issued `get-bb/bb#1541` condition. `github_issue_projection`,
+`assignment_dispatch`, and `assignment_reconcile` reserve/finalize paths
+refuse before external adapters because one receipt cannot authorize multiple
+writes. This seam is fixture-tested and does not claim live cutover.
+
 The plugin database is the sole canonical governance/work store. A second task
 ledger, role store, decision store, migration registry, daemon or mutable
 Markdown authority would recreate the split-state threat.
@@ -74,6 +85,7 @@ The goals are:
 | Unmanaged activity | Raw BB thread or direct repository edit appears and is assumed authoritative | Record UNMANAGED_ACTIVITY; it owns no lane, role, review, release or closure until discarded or explicitly adopted. |
 | Legacy authority manufacture | Imported created_by or accepted_by string becomes a new role | Preserve LegacyClaim evidence only; unresolved legacy authority cannot activate or close work. |
 | Operator identity spoofing | Display name, checkout possession or thread ID is accepted as privileged actor | Hold privileged mutation until a proven BB-native authenticated receipt or explicit narrow operator decision exists. |
+| Interim receipt replay or phase splitting | One receipt authorizes a second mutation or a reserve/finalize adapter sequence | Exact one-request binding, atomic consumption, original-replay-only idempotency, and pre-adapter refusal for the three unsupported operations; OPERATOR_RECEIPT_REUSED, OPERATOR_RECEIPT_STALE or OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED. |
 | Projection drift | External state is used to mutate canonical state for convenience | Projection is rebuildable; canonical state changes only through governed import/adoption. |
 
 ## Resolver invariants

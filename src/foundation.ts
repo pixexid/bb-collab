@@ -2135,17 +2135,10 @@ function refusalResult(subject: string, data: RefusalData, expected = 1, attempt
   });
 }
 
-export function operatorRequestDigest(request: ApplyRequest): string {
-  const digestable = Object.fromEntries(Object.entries(normalizeRequest(request)).filter(([key, value]) => !["candidateHead", "operatorReceiptId"].includes(key) && value !== undefined));
+export function operatorRequestDigest(input: unknown): string {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) throw new Error("request digest input must be an object");
+  const digestable = Object.fromEntries(Object.entries(input).filter(([key, value]) => !["candidateHead", "operatorReceiptId"].includes(key) && value !== undefined));
   return sha256(canonicalJson(digestable));
-}
-
-export function legacyRequestDigest(request: ApplyRequest): string {
-  return sha256(canonicalJson(Object.fromEntries(Object.entries(normalizeRequest(request)).filter(([, value]) => value !== undefined))));
-}
-
-function requestDigest(request: ApplyRequest): string {
-  return operatorRequestDigest(request);
 }
 
 function now(): number {
@@ -2303,7 +2296,7 @@ function checkIdempotency(db: SqliteDatabase, request: ApplyRequest, digest: str
     ),
   );
   if (!row) return null;
-  if (row.request_digest !== digest && row.request_digest !== legacyRequestDigest(request)) {
+  if (row.request_digest !== digest) {
     throw refusal("IDEMPOTENCY_KEY_CONFLICT", "idempotency key was already used for another request");
   }
   return JSON.parse(row.outcome_json) as FoundationResult;
@@ -2334,12 +2327,13 @@ interface StateEventInput {
 function appendStateEvent(
   db: SqliteDatabase,
   request: ApplyRequest,
+  digest: string,
   actorReceiptId: string,
   event: StateEventInput,
 ): { eventSequence: number; createdAtMs: number } {
   const eventSequence = nextEventSequence(db, request.projectId);
   const createdAtMs = now();
-  consumeOperatorReceipt(db, request, eventSequence, createdAtMs);
+  consumeOperatorReceipt(db, request, digest, eventSequence, createdAtMs);
   db.prepare(
     `INSERT INTO state_events (
       project_id, event_sequence, aggregate_type, aggregate_id, aggregate_revision,
@@ -2371,7 +2365,7 @@ function commitMutation(
   extra: Omit<FoundationResult, "outcome" | "subject" | "expected" | "attempted" | "verified" | "eventSequence" | "mutationReceipt"> = {},
   outcome: FoundationCode = "OK",
 ): FoundationResult {
-  const { eventSequence, createdAtMs } = appendStateEvent(db, request, actorReceiptId, event);
+  const { eventSequence, createdAtMs } = appendStateEvent(db, request, digest, actorReceiptId, event);
   const mutationReceipt: MutationReceipt = {
     projectId: request.projectId,
     idempotencyKey: request.idempotencyKey,
@@ -5082,7 +5076,7 @@ function prepareProjection(
         createdAtMs,
         createdAtMs,
       );
-      appendStateEvent(db, request, actorReceiptId, {
+      appendStateEvent(db, request, digest, actorReceiptId, {
         aggregateType: "external_work_ref",
         aggregateId: workItem.work_item_id,
         aggregateRevision: workItem.resource_revision,
@@ -5133,7 +5127,7 @@ function reserveExistingProjection(
       ...externalRefCasArgs(context.ref),
     );
     if (updated.changes !== 1) throw refusal("EXTERNAL_REF_CONFLICT", "external ref reservation lost its compare-and-swap race");
-    appendStateEvent(db, request, context.actorReceiptId, {
+    appendStateEvent(db, request, digest, context.actorReceiptId, {
       aggregateType: "external_work_ref",
       aggregateId: context.workItem.work_item_id,
       aggregateRevision: context.workItem.resource_revision,
@@ -6567,7 +6561,7 @@ function unavailableResult(subject: string, message: string): FoundationResult {
   return result("CANONICAL_STORE_UNAVAILABLE", subject, 1, 0, 0, { message });
 }
 
-function requireOperatorReceipt(db: SqliteDatabase, request: ApplyRequest): void {
+function requireOperatorReceipt(db: SqliteDatabase, request: ApplyRequest, digest: string): void {
   if (!request.operatorReceiptId) throw refusal("OPERATOR_RECEIPT_REQUIRED", "an operator receipt is required");
   if (!request.candidateHead) throw refusal("OPERATOR_RECEIPT_REQUIRED", "an exact candidate head is required");
   const row = asRow<{
@@ -6612,7 +6606,7 @@ function requireOperatorReceipt(db: SqliteDatabase, request: ApplyRequest): void
     row.mutation_class !== request.operationClass ||
     row.candidate_head !== request.candidateHead ||
     row.idempotency_key !== request.idempotencyKey ||
-    row.request_digest !== requestDigest(request)
+    row.request_digest !== digest
   ) {
     throw refusal("OPERATOR_RECEIPT_STALE", "operator receipt binding is stale");
   }
@@ -6638,9 +6632,9 @@ function requireOperatorReceipt(db: SqliteDatabase, request: ApplyRequest): void
   if (row.receipt_digest !== expectedReceiptDigest) throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt digest is invalid");
 }
 
-function consumeOperatorReceipt(db: SqliteDatabase, request: ApplyRequest, eventSequence: number, consumedAtMs: number): void {
+function consumeOperatorReceipt(db: SqliteDatabase, request: ApplyRequest, digest: string, eventSequence: number, consumedAtMs: number): void {
   if (!request.operatorReceiptId) return;
-  requireOperatorReceipt(db, request);
+  requireOperatorReceipt(db, request, digest);
   const updated = db.prepare(
     "UPDATE operator_receipts SET consumed_at_ms = ?, consumed_event_sequence = ? WHERE project_id = ? AND receipt_id = ? AND consumed_at_ms IS NULL",
   ).run(consumedAtMs, eventSequence, request.projectId, request.operatorReceiptId);
@@ -6652,9 +6646,12 @@ function authorizedReplay(db: SqliteDatabase, request: ApplyRequest, digest: str
   const mutation = asRow<{ request_digest: string; operator_receipt_id: string | null; outcome_json: string }>(db.prepare(
     "SELECT request_digest, operator_receipt_id, outcome_json FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
   ).get(request.projectId, request.idempotencyKey));
-  if (!mutation || mutation.operator_receipt_id !== request.operatorReceiptId) return null;
-  if (mutation.request_digest !== digest && mutation.request_digest !== legacyRequestDigest(request)) {
+  if (!mutation) return null;
+  if (mutation.request_digest !== digest) {
     throw refusal("IDEMPOTENCY_KEY_CONFLICT", "idempotency key was already used for another request");
+  }
+  if (mutation.operator_receipt_id !== request.operatorReceiptId) {
+    throw refusal("OPERATOR_RECEIPT_STALE", "idempotency key was already committed under another operator receipt");
   }
   const receipt = asRow<{ candidate_head: string; idempotency_key: string | null; request_digest: string | null }>(db.prepare(
     "SELECT candidate_head, idempotency_key, request_digest FROM operator_receipts WHERE project_id = ? AND receipt_id = ?",
@@ -6680,20 +6677,20 @@ export function applyAuthorizedMutation(
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   try {
-    const digest = requestDigest(request);
+    const digest = operatorRequestDigest(input);
     const replay = authorizedReplay(db, request, digest);
     if (replay) return replay;
-    requireOperatorReceipt(db, request);
+    requireOperatorReceipt(db, request, digest);
   } catch (error) {
     if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
     return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "operator receipt validation failed" });
   }
-  if (request.operationClass === "github_issue_projection" || request.operationClass === "assignment_dispatch") {
+  if (request.operationClass === "github_issue_projection" || request.operationClass === "assignment_dispatch" || request.operationClass === "assignment_reconcile") {
     return result("OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED", request.projectId, 1, 0, 0, {
       message: "one-request operator receipts do not authorize reserve/finalize adapter operations",
     });
   }
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader);
+  return applyFixtureMutation(db, input, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader);
 }
 
 export function applyFixtureMutation(
@@ -6713,7 +6710,7 @@ export function applyFixtureMutation(
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   try {
-    const digest = requestDigest(request);
+    const digest = operatorRequestDigest(input);
     if (request.operationClass === "github_issue_projection") {
       return applyGithubIssueProjection(db, request, digest, githubAdapter);
     }

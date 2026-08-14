@@ -23,7 +23,8 @@ operator receipt bound to project, operation, exact candidate head,
 idempotency key, and request digest; it is consumed atomically and invalid,
 stale, retired, mismatched, or reused receipts refuse before any write. The
 receipt has no local expiry or revocation: it retires only on the host-issued
-`get-bb/bb#1541` condition, and stale means an exact binding mismatch. Adapter
+`get-bb/bb#1541` condition, and stale means an exact binding mismatch.
+`github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
 reserve/finalize operations refuse before the adapter under this one-request
 seam. The plugin has not been installed, reloaded, or activated against live
 project authority.

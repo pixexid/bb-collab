@@ -269,9 +269,10 @@ async function runCli(
     const requestJson = parseFlag(args, "--request");
     if (!requestJson) return invalidCli("--request JSON is required");
     try {
-      const request = parseApplyRequest(JSON.parse(requestJson));
+      const rawRequest = JSON.parse(requestJson);
+      const request = parseApplyRequest(rawRequest);
       if (request.projectId !== projectId) return invalidCli("--project does not match request.projectId");
-      return cliResult(applyAuthorizedMutation(db, request));
+      return cliResult(applyAuthorizedMutation(db, rawRequest));
     } catch (error) {
       return invalidCli(error instanceof Error ? error.message : String(error));
     }
@@ -445,7 +446,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "export", summary: "Deterministic bounded foundation export", usage: "bb collab export --project PROJECT_ID" },
       {
         name: "apply",
-        summary: "Explicit foundation apply (operator authentication required)",
+        summary: "Explicit foundation apply (exact one-request receipt required)",
         usage: "bb collab apply --project PROJECT_ID --request JSON",
       },
     ],

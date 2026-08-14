@@ -13,7 +13,8 @@ project, operation, candidate head, idempotency key, and request digest;
 missing, mismatched, consumed, malformed, stale, or retired receipts refuse
 before any write. Interim receipts have no local expiry or revocation; they
 retire only on the host-issued `get-bb/bb#1541` condition, while stale means
-an exact binding mismatch. Reserve/finalize adapter operations are explicitly
+an exact binding mismatch. `github_issue_projection`, `assignment_dispatch`,
+and `assignment_reconcile` reserve/finalize adapter operations are explicitly
 unsupported under this one-request seam and refuse before the adapter. The
 plugin has not been installed, reloaded, or activated against live project
 authority. The complete decision is in

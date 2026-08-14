@@ -28,7 +28,6 @@ import {
   exportFoundation,
   persistInterimOperatorReceipt,
   operatorRequestDigest,
-  legacyRequestDigest,
   schemaDigest,
   sha256,
   type ApplyRequest,
@@ -1213,9 +1212,23 @@ describe("bb-collab plugin boundary", () => {
     expect(db.prepare("SELECT consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?").get(receipt.receiptId)).toEqual({ consumed_event_sequence: 1 });
     const cli = await host.harness.runCli(["apply", "--project", PROJECT_ID, "--request", JSON.stringify(authorized)]);
     expect(cli.exitCode).toBe(0);
-    expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "OK" });
+    expect(JSON.parse(cli.stdout)).toEqual(rpc);
     expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: 1 });
     expect(db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: 1 });
+    const fresh = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: request.operationClass,
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: operatorRequestDigest(request),
+      callerThreadId: "operator-thread-fresh",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 2);
+    const beforeFreshApply = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", { ...authorized, operatorReceiptId: fresh.receiptId })).toMatchObject({ outcome: "OPERATOR_RECEIPT_STALE" });
+    expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(fresh.receiptId)).toEqual({ consumed_at_ms: null });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeFreshApply);
     const beforeReuse = exportFoundation(db, PROJECT_ID);
     expect(await host.harness.callRpc("apply", { ...request, idempotencyKey: "bootstrap-distinct", operatorReceiptId: receipt.receiptId })).toMatchObject({ outcome: "OPERATOR_RECEIPT_REUSED" });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeReuse);
@@ -1245,15 +1258,16 @@ describe("bb-collab plugin boundary", () => {
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeSecond);
   });
 
-  it("replays a v7-era mutation receipt with its legacy digest", async () => {
+  it("replays a v7-era mutation receipt with the pre-v8 raw digest", async () => {
     const host = await loadedHost();
     const db = host.bb.storage.database();
     seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
     const request = bootstrapRequest();
     const committed = applyFixtureMutation(db, request);
     expect(committed.outcome).toBe("OK");
-    expect(legacyRequestDigest(request)).not.toBe(operatorRequestDigest(request));
-    db.prepare("UPDATE mutation_receipts SET request_digest = ? WHERE project_id = ? AND idempotency_key = ?").run(legacyRequestDigest(request), PROJECT_ID, request.idempotencyKey);
+    const preV8RawDigest = sha256(canonicalJson(Object.fromEntries(Object.entries(request).filter(([, value]) => value !== undefined))));
+    expect(operatorRequestDigest(request)).toBe(preV8RawDigest);
+    db.prepare("UPDATE mutation_receipts SET request_digest = ? WHERE project_id = ? AND idempotency_key = ?").run(preV8RawDigest, PROJECT_ID, request.idempotencyKey);
     expect(applyFixtureMutation(db, request)).toEqual(committed);
   });
 
@@ -1279,6 +1293,34 @@ describe("bb-collab plugin boundary", () => {
     const adapter = new DeterministicNativeAssignmentAdapter();
     expect(applyAuthorizedMutation(db, { ...request, operatorReceiptId: receipt.receiptId }, null, null, adapter)).toMatchObject({ outcome: "OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED" });
     expect(adapter.dispatchCalls).toHaveLength(0);
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("refuses receipt-bound assignment reconcile before a non-null adapter call", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    const { fenceToken } = seedAssignmentDatabase(db);
+    const prepAdapter = new DeterministicNativeAssignmentAdapter();
+    const prepared = applyFixtureMutation(db, assignmentPrepareRequest(fenceToken), null, null, prepAdapter);
+    const executionAttemptId = (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+    const dispatchAdapter = new DeterministicNativeAssignmentAdapter();
+    dispatchAdapter.nextEvidence = { disposition: "ambiguous", reasonCode: "request_outcome_unknown" };
+    expect(applyFixtureMutation(db, assignmentPhaseRequest(fenceToken, "assignment_dispatch", "assignment-1", executionAttemptId), null, null, dispatchAdapter).outcome).toBe("DISPATCH_UNKNOWN");
+    const request = { ...assignmentPhaseRequest(fenceToken, "assignment_reconcile", "assignment-1", executionAttemptId), candidateHead: CANDIDATE_SHA };
+    const receipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: "assignment_reconcile",
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: operatorRequestDigest(request),
+      callerThreadId: "operator-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 1);
+    const before = exportFoundation(db, PROJECT_ID);
+    const reconcileAdapter = new DeterministicNativeAssignmentAdapter();
+    expect(applyAuthorizedMutation(db, { ...request, operatorReceiptId: receipt.receiptId }, null, null, reconcileAdapter)).toMatchObject({ outcome: "OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED" });
+    expect(reconcileAdapter.reconcileCalls).toHaveLength(0);
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
   });
 

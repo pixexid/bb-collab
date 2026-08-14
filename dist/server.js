@@ -15459,15 +15459,10 @@ function refusalResult(subject, data, expected = 1, attempted = 0, verified = 0)
     ...data.expectedResourceRevision === void 0 ? {} : { expectedResourceRevision: data.expectedResourceRevision }
   });
 }
-function operatorRequestDigest(request) {
-  const digestable = Object.fromEntries(Object.entries(normalizeRequest(request)).filter(([key, value]) => !["candidateHead", "operatorReceiptId"].includes(key) && value !== void 0));
+function operatorRequestDigest(input) {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) throw new Error("request digest input must be an object");
+  const digestable = Object.fromEntries(Object.entries(input).filter(([key, value]) => !["candidateHead", "operatorReceiptId"].includes(key) && value !== void 0));
   return sha256(canonicalJson(digestable));
-}
-function legacyRequestDigest(request) {
-  return sha256(canonicalJson(Object.fromEntries(Object.entries(normalizeRequest(request)).filter(([, value]) => value !== void 0))));
-}
-function requestDigest(request) {
-  return operatorRequestDigest(request);
 }
 function now() {
   return Date.now();
@@ -15590,7 +15585,7 @@ function checkIdempotency(db, request, digest) {
     )
   );
   if (!row) return null;
-  if (row.request_digest !== digest && row.request_digest !== legacyRequestDigest(request)) {
+  if (row.request_digest !== digest) {
     throw refusal("IDEMPOTENCY_KEY_CONFLICT", "idempotency key was already used for another request");
   }
   return JSON.parse(row.outcome_json);
@@ -15607,10 +15602,10 @@ function nextAggregateRevision(db, projectId, aggregateType, aggregateId) {
      FROM state_events WHERE project_id = ? AND aggregate_type = ? AND aggregate_id = ?`
   ).get(projectId, aggregateType, aggregateId))?.next_revision ?? 1;
 }
-function appendStateEvent(db, request, actorReceiptId, event) {
+function appendStateEvent(db, request, digest, actorReceiptId, event) {
   const eventSequence = nextEventSequence(db, request.projectId);
   const createdAtMs = now();
-  consumeOperatorReceipt(db, request, eventSequence, createdAtMs);
+  consumeOperatorReceipt(db, request, digest, eventSequence, createdAtMs);
   db.prepare(
     `INSERT INTO state_events (
       project_id, event_sequence, aggregate_type, aggregate_id, aggregate_revision,
@@ -15632,7 +15627,7 @@ function appendStateEvent(db, request, actorReceiptId, event) {
   return { eventSequence, createdAtMs };
 }
 function commitMutation(db, request, digest, actorReceiptId, event, counts, extra = {}, outcome = "OK") {
-  const { eventSequence, createdAtMs } = appendStateEvent(db, request, actorReceiptId, event);
+  const { eventSequence, createdAtMs } = appendStateEvent(db, request, digest, actorReceiptId, event);
   const mutationReceipt = {
     projectId: request.projectId,
     idempotencyKey: request.idempotencyKey,
@@ -17883,7 +17878,7 @@ function prepareProjection(db, request, digest, adapter) {
         createdAtMs,
         createdAtMs
       );
-      appendStateEvent(db, request, actorReceiptId, {
+      appendStateEvent(db, request, digest, actorReceiptId, {
         aggregateType: "external_work_ref",
         aggregateId: workItem.work_item_id,
         aggregateRevision: workItem.resource_revision,
@@ -17928,7 +17923,7 @@ function reserveExistingProjection(db, request, digest, context) {
       ...externalRefCasArgs(context.ref)
     );
     if (updated.changes !== 1) throw refusal("EXTERNAL_REF_CONFLICT", "external ref reservation lost its compare-and-swap race");
-    appendStateEvent(db, request, context.actorReceiptId, {
+    appendStateEvent(db, request, digest, context.actorReceiptId, {
       aggregateType: "external_work_ref",
       aggregateId: context.workItem.work_item_id,
       aggregateRevision: context.workItem.resource_revision,
@@ -19085,7 +19080,7 @@ function isConstraintError(error48) {
 function unavailableResult(subject, message) {
   return result("CANONICAL_STORE_UNAVAILABLE", subject, 1, 0, 0, { message });
 }
-function requireOperatorReceipt(db, request) {
+function requireOperatorReceipt(db, request, digest) {
   if (!request.operatorReceiptId) throw refusal("OPERATOR_RECEIPT_REQUIRED", "an operator receipt is required");
   if (!request.candidateHead) throw refusal("OPERATOR_RECEIPT_REQUIRED", "an exact candidate head is required");
   const row = asRow(db.prepare("SELECT project_id, receipt_id, receipt_type, mutation_class, candidate_head, binding_digest, status, retirement_condition, caller_thread_id, caller_plugin_id, requested_from_background, receipt_digest, created_at_ms, idempotency_key, request_digest, consumed_at_ms, consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?").get(request.operatorReceiptId));
@@ -19108,7 +19103,7 @@ function requireOperatorReceipt(db, request) {
     requestedFromBackground: row.requested_from_background === 1
   });
   if (!receiptRequest.success) throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt is malformed");
-  if (row.mutation_class !== request.operationClass || row.candidate_head !== request.candidateHead || row.idempotency_key !== request.idempotencyKey || row.request_digest !== requestDigest(request)) {
+  if (row.mutation_class !== request.operationClass || row.candidate_head !== request.candidateHead || row.idempotency_key !== request.idempotencyKey || row.request_digest !== digest) {
     throw refusal("OPERATOR_RECEIPT_STALE", "operator receipt binding is stale");
   }
   if (row.binding_digest !== operatorReceiptBindingDigest(receiptRequest.data)) {
@@ -19132,9 +19127,9 @@ function requireOperatorReceipt(db, request) {
   }));
   if (row.receipt_digest !== expectedReceiptDigest) throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt digest is invalid");
 }
-function consumeOperatorReceipt(db, request, eventSequence, consumedAtMs) {
+function consumeOperatorReceipt(db, request, digest, eventSequence, consumedAtMs) {
   if (!request.operatorReceiptId) return;
-  requireOperatorReceipt(db, request);
+  requireOperatorReceipt(db, request, digest);
   const updated = db.prepare(
     "UPDATE operator_receipts SET consumed_at_ms = ?, consumed_event_sequence = ? WHERE project_id = ? AND receipt_id = ? AND consumed_at_ms IS NULL"
   ).run(consumedAtMs, eventSequence, request.projectId, request.operatorReceiptId);
@@ -19145,9 +19140,12 @@ function authorizedReplay(db, request, digest) {
   const mutation = asRow(db.prepare(
     "SELECT request_digest, operator_receipt_id, outcome_json FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?"
   ).get(request.projectId, request.idempotencyKey));
-  if (!mutation || mutation.operator_receipt_id !== request.operatorReceiptId) return null;
-  if (mutation.request_digest !== digest && mutation.request_digest !== legacyRequestDigest(request)) {
+  if (!mutation) return null;
+  if (mutation.request_digest !== digest) {
     throw refusal("IDEMPOTENCY_KEY_CONFLICT", "idempotency key was already used for another request");
+  }
+  if (mutation.operator_receipt_id !== request.operatorReceiptId) {
+    throw refusal("OPERATOR_RECEIPT_STALE", "idempotency key was already committed under another operator receipt");
   }
   const receipt = asRow(db.prepare(
     "SELECT candidate_head, idempotency_key, request_digest FROM operator_receipts WHERE project_id = ? AND receipt_id = ?"
@@ -19165,20 +19163,20 @@ function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   try {
-    const digest = requestDigest(request);
+    const digest = operatorRequestDigest(input);
     const replay = authorizedReplay(db, request, digest);
     if (replay) return replay;
-    requireOperatorReceipt(db, request);
+    requireOperatorReceipt(db, request, digest);
   } catch (error48) {
     if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
     return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "operator receipt validation failed" });
   }
-  if (request.operationClass === "github_issue_projection" || request.operationClass === "assignment_dispatch") {
+  if (request.operationClass === "github_issue_projection" || request.operationClass === "assignment_dispatch" || request.operationClass === "assignment_reconcile") {
     return result("OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED", request.projectId, 1, 0, 0, {
       message: "one-request operator receipts do not authorize reserve/finalize adapter operations"
     });
   }
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader);
+  return applyFixtureMutation(db, input, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader);
 }
 function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null) {
   let request;
@@ -19190,7 +19188,7 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   try {
-    const digest = requestDigest(request);
+    const digest = operatorRequestDigest(input);
     if (request.operationClass === "github_issue_projection") {
       return applyGithubIssueProjection(db, request, digest, githubAdapter);
     }
@@ -19870,9 +19868,10 @@ async function runCli(db, sdk, argv, _ctx) {
     const requestJson = parseFlag(args, "--request");
     if (!requestJson) return invalidCli("--request JSON is required");
     try {
-      const request = parseApplyRequest(JSON.parse(requestJson));
+      const rawRequest = JSON.parse(requestJson);
+      const request = parseApplyRequest(rawRequest);
       if (request.projectId !== projectId) return invalidCli("--project does not match request.projectId");
-      return cliResult(applyAuthorizedMutation(db, request));
+      return cliResult(applyAuthorizedMutation(db, rawRequest));
     } catch (error48) {
       return invalidCli(error48 instanceof Error ? error48.message : String(error48));
     }
@@ -20034,7 +20033,7 @@ async function plugin(bb) {
       { name: "export", summary: "Deterministic bounded foundation export", usage: "bb collab export --project PROJECT_ID" },
       {
         name: "apply",
-        summary: "Explicit foundation apply (operator authentication required)",
+        summary: "Explicit foundation apply (exact one-request receipt required)",
         usage: "bb collab apply --project PROJECT_ID --request JSON"
       }
     ],
