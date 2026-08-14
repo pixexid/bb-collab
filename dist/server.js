@@ -20092,6 +20092,7 @@ async function plugin(bb) {
         threadId: input.callerThreadId,
         rendererId: "operator-receipt",
         title: "Confirm operator receipt",
+        timeoutMs: 36e5,
         payload: {
           kind: "operator_receipt_confirmation",
           projectId: input.projectId,

@@ -405,6 +405,7 @@ export default async function plugin(bb: BbPluginApi) {
         threadId: input.callerThreadId,
         rendererId: "operator-receipt",
         title: "Confirm operator receipt",
+        timeoutMs: 3_600_000,
         payload: {
           kind: "operator_receipt_confirmation",
           projectId: input.projectId,

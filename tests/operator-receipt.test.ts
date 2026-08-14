@@ -58,6 +58,7 @@ describe("interim operator receipts", () => {
       requestDigest: input.requestDigest,
       requestedFromBackground: input.requestedFromBackground,
     });
+    expect(host.harness.inspection.pendingInteractions[0].timeoutMs).toBe(3_600_000);
 
     host.harness.behavior.submitInteraction(pending.id, {
       confirmed: true,
