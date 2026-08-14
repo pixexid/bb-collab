@@ -30,6 +30,21 @@ The target remains non-writing until referential integrity, exact key and
 hash equivalence, repository heads, holds, evidence, projection rebuild and
 read-only doctor checks pass.
 
+For the ratified llm-collab fence
+`f988d9711d3778f751e4ec0e32ebbf7b0893c80f` at resource revision 4 on merged
+main `0686d34`, an absent canonical bb-collab source uses the same bounded
+MigrationRun path with a separate `sourceEvidenceManifest`. Its sorted
+historical file/digest list is explicitly `canonical: false` and cannot be
+passed as the target canonical export. The input is bounded to one eighth of
+the export byte ceiling before any write; the durable state records only its
+`sourceExportDigest` and `sourceExportKind`, so the full manifest is not
+duplicated into state-event or mutation-receipt evidence. Import records exact zero work
+(`expected=0`, `attempted=0`, `verified=0`); equivalence uses the exact
+read-only disposition from ADR 0001. Source-CAS deviation: because no
+source-side canonical bb-collab rows or compare-and-swap event ceiling
+existed, `source_event_ceiling` is not fabricated and no source retirement is
+claimed.
+
 The migration sequence is prepare, source instrumentation, quiesce, atomic
 freeze, deterministic export, deterministic import, equivalence, atomic target
 activation, routine exercise and source retirement. The source and target share
