@@ -20,6 +20,7 @@ import {
   exportFoundation,
   operatorReceiptConfirmationSchema,
   operatorReceiptRequestSchema,
+  isDerivedActorMutationClass,
   OPERATOR_RECEIPT_RETIREMENT_CONDITION,
   persistBootstrapOperatorReceipt,
   persistInterimOperatorReceipt,
@@ -433,7 +434,7 @@ export default async function plugin(bb: BbPluginApi) {
         return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_STALE", "operator confirmation binding is stale");
       }
       try {
-        if (input.mutationClass === "bootstrap") {
+        if (isDerivedActorMutationClass(input.mutationClass)) {
           const issued = persistBootstrapOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId });
           return operatorReceiptResult(input.projectId, "OK", "interim operator receipt and derived actor receipt persisted", issued);
         }

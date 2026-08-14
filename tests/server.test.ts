@@ -26,6 +26,7 @@ import {
   doctor,
   explicitExecutionInputSources,
   exportFoundation,
+  persistBootstrapOperatorReceipt,
   persistInterimOperatorReceipt,
   operatorRequestDigest,
   schemaDigest,
@@ -1277,6 +1278,167 @@ describe("bb-collab plugin boundary", () => {
     });
   });
 
+  it("derives only the ratified actor classes and keeps the operator binding digest compatible", () => {
+    const { db, directory } = directDatabase();
+    try {
+      const allowed = ["bootstrap", "decision_create", "decision_disposition", "migration_prepare", "migration_step"] as const;
+      for (const [index, mutationClass] of allowed.entries()) {
+        const operatorReceipt = persistBootstrapOperatorReceipt(db, {
+          projectId: PROJECT_ID,
+          mutationClass,
+          candidateHead: CANDIDATE_SHA,
+          idempotencyKey: `derived-${mutationClass}`,
+          requestDigest: sha256(`derived-${mutationClass}`),
+          callerThreadId: "operator-thread",
+          requestedFromBackground: false,
+          callerPluginId: PLUGIN_ID,
+        }, index + 1);
+        expect(db.prepare("SELECT actor_kind, subject_id, verification_state, operator_receipt_id, retirement_condition FROM actor_receipts WHERE receipt_id = ?").get(operatorReceipt.actorReceiptId)).toEqual({
+          actor_kind: "plugin",
+          subject_id: PLUGIN_ID,
+          verification_state: "verified",
+          operator_receipt_id: operatorReceipt.operatorReceipt.receiptId,
+          retirement_condition: "host-issued receipt get-bb/bb#1541",
+        });
+      }
+      expect(() => persistBootstrapOperatorReceipt(db, {
+        projectId: PROJECT_ID,
+        mutationClass: "config_revision",
+        candidateHead: CANDIDATE_SHA,
+        idempotencyKey: "derived-forbidden",
+        requestDigest: sha256("derived-forbidden"),
+        callerThreadId: "operator-thread",
+        requestedFromBackground: false,
+        callerPluginId: PLUGIN_ID,
+      })).toThrow();
+      expect(db.prepare("SELECT COUNT(*) AS count FROM operator_receipts").get()).toEqual({ count: allowed.length });
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("authorizes operator_only Decisions and migration mutations through distinct linked derived receipts", () => {
+    const { db, directory } = directDatabase();
+    try {
+      const authorize = (request: ApplyRequest): ApplyRequest => {
+        const unsigned = { ...request, actorReceiptId: null, operatorReceiptId: null, candidateHead: CANDIDATE_SHA };
+        const issued = persistBootstrapOperatorReceipt(db, {
+          projectId: unsigned.projectId,
+          mutationClass: unsigned.operationClass,
+          candidateHead: CANDIDATE_SHA,
+          idempotencyKey: unsigned.idempotencyKey,
+          requestDigest: operatorRequestDigest(unsigned),
+          callerThreadId: "operator-thread",
+          requestedFromBackground: false,
+          callerPluginId: PLUGIN_ID,
+        });
+        return { ...unsigned, actorReceiptId: issued.actorReceiptId, operatorReceiptId: issued.operatorReceipt.receiptId };
+      };
+
+      const bootstrap = authorize(bootstrapRequest(PROJECT_ID, { idempotencyKey: "derived-bootstrap", actorReceiptId: null }));
+      const bootstrapped = applyAuthorizedMutation(db, bootstrap);
+      expect(bootstrapped.outcome).toBe("OK");
+      const fenceToken = (bootstrapped.evidence as { fenceToken: string }).fenceToken;
+
+      const decisionCreate = authorize({
+        projectId: PROJECT_ID,
+        operationClass: "decision_create",
+        idempotencyKey: "derived-decision-create",
+        actorReceiptId: null,
+        expectedConfigRevision: 1,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: fenceToken,
+        repoTargetId: null,
+        decision: {
+          decisionId: "decision-bb-collab-migration-cutover",
+          repoTargetId: null,
+          scope: { project: PROJECT_ID, acceptance: ["deterministic_export", "source_fence", "deterministic_import", "equivalence"] },
+          decisionClass: "operator_only",
+          options: { sourceSystem: "llm-collab", sourceFence: "f988d9711d3778f751e4ec0e32ebbf7b0893c80f", deployedSourceContract: "v36", shadowUntilProofs: true, governorCount: 1 },
+          resourceRevision: 1,
+        },
+      });
+      expect(applyAuthorizedMutation(db, decisionCreate)).toMatchObject({ outcome: "OK" });
+      expect((db.prepare("SELECT request_digest FROM mutation_receipts WHERE idempotency_key = ?").get(decisionCreate.idempotencyKey) as { request_digest: string }).request_digest).toBe(
+        operatorRequestDigest({ ...decisionCreate, actorReceiptId: null, operatorReceiptId: null }),
+      );
+
+      const rejectedRoleDecision = authorize({
+        ...decisionCreate,
+        idempotencyKey: "derived-role-decision",
+        actorReceiptId: null,
+        operatorReceiptId: null,
+        decision: { ...decisionCreate.decision!, decisionId: "derived-role-decision", decisionClass: "assignment_admission" },
+      });
+      expect(applyAuthorizedMutation(db, rejectedRoleDecision).outcome).toBe("ACTOR_RECEIPT_UNVERIFIED");
+
+      const disposition = authorize({
+        projectId: PROJECT_ID,
+        operationClass: "decision_disposition",
+        idempotencyKey: "derived-decision-adopted",
+        actorReceiptId: null,
+        expectedConfigRevision: 1,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: fenceToken,
+        repoTargetId: null,
+        decisionId: "decision-bb-collab-migration-cutover",
+        disposition: "adopted",
+        expectedResourceRevision: 1,
+        reason: { sourceFence: "f988d9711d3778f751e4ec0e32ebbf7b0893c80f" },
+      });
+      expect(applyAuthorizedMutation(db, disposition)).toMatchObject({ outcome: "OK" });
+
+      const prepare = authorize({
+        projectId: PROJECT_ID,
+        operationClass: "migration_prepare",
+        idempotencyKey: "derived-migration-prepare",
+        actorReceiptId: null,
+        expectedConfigRevision: 1,
+        configRevision: 1,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: fenceToken,
+        expectedResourceRevision: null,
+        migration: {
+          migrationId: "derived-migration",
+          sourceSystem: "llm-collab",
+          sourceRuntimeId: "llm-collab-runtime",
+          targetRuntimeId: PLUGIN_ID,
+          sourceContractDigest: contractDigest,
+          sourceSchemaDigest: schemaDigest,
+          sourceSnapshotDigest: sha256("derived-source-snapshot"),
+          decisionId: "decision-bb-collab-migration-cutover",
+          decisionDispositionSequence: 1,
+          retentionUntilMs: 9_999_999_999_999,
+        },
+      });
+      expect(applyAuthorizedMutation(db, prepare)).toMatchObject({ outcome: "OK" });
+      const governor = currentGovernor(db);
+      const step = authorize({
+        projectId: PROJECT_ID,
+        operationClass: "migration_step",
+        idempotencyKey: "derived-migration-inventory",
+        actorReceiptId: null,
+        expectedConfigRevision: 1,
+        configRevision: 1,
+        expectedGovernanceEpoch: governor.governance_epoch,
+        expectedFenceToken: governor.fence_token,
+        expectedResourceRevision: 1,
+        migrationStep: {
+          migrationId: "derived-migration",
+          step: "record_inventory",
+          proofDigest: sha256("derived-inventory"),
+          repositoryTargetsDigest: repositoryTargetsDigest(db),
+        },
+      });
+      expect(applyAuthorizedMutation(db, step)).toMatchObject({ outcome: "OK" });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE operator_receipt_id IS NOT NULL AND actor_receipt_id IN (SELECT receipt_id FROM actor_receipts WHERE actor_kind = 'plugin')").get()).toEqual({ count: 5 });
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("cannot reuse one receipt for two migration steps", async () => {
     const host = await loadedHost();
     const db = host.bb.storage.database();
@@ -1539,7 +1701,7 @@ describe("bb-collab plugin boundary", () => {
 
   it("appends the v9 derived actor columns and rolls every cached consumer forward", () => {
     expect(SCHEMA_VERSION).toBe(9);
-    expect(CONTRACT_VERSION).toBe(4);
+    expect(CONTRACT_VERSION).toBe(5);
     expect(MIGRATIONS).toHaveLength(22);
     expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("97fd37424ea09eeb134998f57ae50f97e9b64c7e2fce877f1220e8194b05b774");
     expect(MIGRATIONS.at(-4)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
@@ -1555,6 +1717,7 @@ describe("bb-collab plugin boundary", () => {
       "record_inventory", "record_quiescence", "freeze", "record_export", "record_import", "record_equivalence", "activate", "record_exercise", "retire", "rollback", "mark_fix_forward_required",
     ]);
     expect(cachedConsumerRolloutEvidence(8)).toMatchObject({ oldSchemaVersion: 8, newSchemaVersion: 9, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(9, 4)).toMatchObject({ oldContractVersion: 4, newContractVersion: 5, action: "refused", expected: 4, attempted: 4, verified: 0 });
     expect(cachedConsumerRolloutEvidence(9)).toMatchObject({ oldSchemaVersion: 8, newSchemaVersion: 9, action: "reread", expected: 4, attempted: 4, verified: 4 });
 
     const { db, directory } = directDatabase();
@@ -1669,7 +1832,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ contractVersion: 4, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ contractVersion: 5, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -4049,6 +4212,7 @@ describe("bb-collab plugin boundary", () => {
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
     expect(cachedConsumerRolloutEvidence(8)).toMatchObject({ oldSchemaVersion: 8, newSchemaVersion: 9, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(9, 4)).toMatchObject({ oldContractVersion: 4, newContractVersion: 5, action: "refused", expected: 4, attempted: 4, verified: 0 });
     expect(cachedConsumerRolloutEvidence(9)).toMatchObject({ oldSchemaVersion: 8, newSchemaVersion: 9, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 

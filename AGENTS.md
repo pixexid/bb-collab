@@ -1,9 +1,9 @@
 # bb-collab repository contract
 
-CONTRACT_VERSION: 4
+CONTRACT_VERSION: 5
 
 This repository contains the founding contract and the implemented foundation
-through schema v9: a single SQLite store with migrations, resolver,
+through contract v5/schema v9: a single SQLite store with migrations, resolver,
 state-event and mutation-receipt, deterministic export, and read-only doctor
 seams, plus WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
 Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
@@ -69,9 +69,11 @@ Changing version text alone is not a migration. A zero-work result is not a
 successful apply unless zero expected work, zero attempted work and zero
 verified work are all proven.
 
-Contract v4/schema v9 requires all four cached consumers to reread the
+Contract v5/schema v9 requires all four cached consumers to reread the
 one-request receipt, mutation/export/evidence, and refusal contract or refuse
-schema v8.
+contract v4/schema v8. The verified plugin actor receipt is allowed only for
+bootstrap, operator_only Decision create/adopted disposition, migration_prepare,
+and migration_step; it remains bound to the exact operator receipt.
 
 ## Delegation and lane obligations
 
