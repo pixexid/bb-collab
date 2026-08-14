@@ -13,7 +13,7 @@ new-thread, search, navigation rows, and the footer.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through contract v5/schema v9: a
+The repository now contains the implemented foundation through contract v6/schema v10: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
@@ -27,7 +27,13 @@ receipt has no local expiry or revocation: it retires only on the host-issued
 confirmed bootstrap operator receipt atomically derives a verified
 `plugin/bb-collab` actor receipt linked to that exact operator receipt; the
 derived actor is not standing authority and apply must provide the same linked
-operator receipt.
+operator receipt. An adopted `operator_only` Decision registers the exact
+`orchestrator:bb-collab` approver and five ratified derived mutation classes;
+the `approverAttestation` RPC issues a fresh exact-bound receipt and verified
+plugin actor without `requestInput`. Operator revocation or change marks that
+registry unusable. Human confirmation remains only at the authorization and
+revocation boundary; the interim registry and receipts retain the upstream
+host-issued `get-bb/bb#1541` retirement condition.
 `github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
 reserve/finalize operations refuse before the adapter under this one-request
 seam. The derived actor path is limited to bootstrap, operator_only Decision

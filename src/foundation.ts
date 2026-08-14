@@ -5,8 +5,10 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 5;
-export const SCHEMA_VERSION = 9;
+export const CONTRACT_VERSION = 6;
+export const SCHEMA_VERSION = 10;
+export const AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab" as const;
+export const AUTHORIZED_APPROVER_PROJECT_ID = "proj_a8zzfsx36j" as const;
 // ponytail: keep exports bounded at 256 rows; add paged/file export before migration or cutover.
 export const MAX_EXPORT_ROWS = 256;
 export const MAX_EXPORT_BYTES = 512 * 1024;
@@ -22,6 +24,7 @@ export const TABLES = [
   "migration_runs",
   "actor_receipts",
   "operator_receipts",
+  "authorized_approvers",
   "decisions",
   "decision_dispositions",
   "evidence_artifacts",
@@ -560,6 +563,26 @@ export const MIGRATIONS: string[] = [
    ALTER TABLE mutation_receipts ADD COLUMN operator_receipt_id TEXT`,
   `ALTER TABLE actor_receipts ADD COLUMN operator_receipt_id TEXT;
    ALTER TABLE actor_receipts ADD COLUMN retirement_condition TEXT`,
+  `CREATE TABLE IF NOT EXISTS authorized_approvers (
+    project_id TEXT NOT NULL,
+    approver_id TEXT NOT NULL,
+    authorizing_decision_id TEXT NOT NULL,
+    authorizing_disposition_sequence INTEGER NOT NULL CHECK (authorizing_disposition_sequence > 0),
+    status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
+    allowed_mutation_classes_json TEXT NOT NULL CHECK (json_valid(allowed_mutation_classes_json)),
+    retirement_condition TEXT NOT NULL CHECK (retirement_condition = 'host-issued receipt get-bb/bb#1541'),
+    created_at_ms INTEGER NOT NULL,
+    revoked_at_ms INTEGER,
+    PRIMARY KEY (project_id, approver_id, authorizing_decision_id, authorizing_disposition_sequence),
+    FOREIGN KEY (authorizing_decision_id, authorizing_disposition_sequence)
+      REFERENCES decision_dispositions(decision_id, disposition_sequence),
+    CHECK ((status = 'active' AND revoked_at_ms IS NULL) OR (status = 'revoked' AND revoked_at_ms IS NOT NULL))
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS authorized_approvers_one_active
+    ON authorized_approvers(project_id, approver_id) WHERE status = 'active';
+  ALTER TABLE operator_receipts ADD COLUMN approver_id TEXT;
+  ALTER TABLE operator_receipts ADD COLUMN authorizing_decision_id TEXT;
+  ALTER TABLE operator_receipts ADD COLUMN authorizing_disposition_sequence INTEGER;`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -569,10 +592,10 @@ export function cachedConsumerRolloutEvidence(observedSchemaVersion: number, obs
   const reread = observedSchemaVersion === SCHEMA_VERSION && observedContractVersion === CONTRACT_VERSION;
   const evidence = {
     names: [...CACHED_CONSUMERS],
-    oldSchemaVersion: 8,
+    oldSchemaVersion: 9,
     newSchemaVersion: SCHEMA_VERSION,
     observedSchemaVersion,
-    oldContractVersion: 4,
+    oldContractVersion: 5,
     newContractVersion: CONTRACT_VERSION,
     observedContractVersion,
     action: reread ? "reread" : "refused",
@@ -658,9 +681,16 @@ export const contractDigest = sha256(canonicalJson({
     operationClasses: [...DERIVED_ACTOR_MUTATION_CLASSES],
     actorKind: "plugin",
     subjectId: PLUGIN_ID,
-    authorization: "operatorReceiptId",
+    authorization: "operatorReceiptId or active authorized approver attestation",
     requestDigest: "actorReceiptId omitted because it is derived from operatorReceiptId",
     retirementCondition: "host-issued receipt get-bb/bb#1541",
+  },
+  authorizedApproverPolicy: {
+    projectId: AUTHORIZED_APPROVER_PROJECT_ID,
+    approverId: AUTHORIZED_APPROVER_ID,
+    authorization: "one adopted operator_only Decision disposition",
+    mutationClasses: [...DERIVED_ACTOR_MUTATION_CLASSES],
+    revocation: "operator Decision disposition marks registry revoked",
   },
 }));
 const migrationArtifactSchema = z
@@ -1010,6 +1040,7 @@ const roleContextRefSchema = z
 const gitShaSchema = z.string().regex(/^[0-9a-f]{40,64}$/u);
 const operatorCandidateHeadSchema = z.string().regex(/^[0-9a-f]{40}$/u);
 export const OPERATOR_RECEIPT_RETIREMENT_CONDITION = "host-issued receipt get-bb/bb#1541" as const;
+export const AUTHORIZED_APPROVER_RETIREMENT_CONDITION = OPERATOR_RECEIPT_RETIREMENT_CONDITION;
 export const CANONICAL_MUTATION_CLASSES = [
   "bootstrap",
   "config_revision",
@@ -1046,9 +1077,15 @@ export const operatorReceiptConfirmationSchema = z.object({
   idempotencyKey: id,
   requestDigest: digestSchema,
 }).strict();
+export const approverAttestationRequestSchema = operatorReceiptRequestSchema.extend({
+  approverId: id,
+  authorizingDecisionId: id,
+  authorizingDispositionSequence: z.number().int().positive(),
+}).strict();
 
 export type OperatorReceiptRequest = z.infer<typeof operatorReceiptRequestSchema>;
 export type OperatorReceiptConfirmation = z.infer<typeof operatorReceiptConfirmationSchema>;
+export type ApproverAttestationRequest = z.infer<typeof approverAttestationRequestSchema>;
 
 export interface OperatorReceipt {
   receiptId: string;
@@ -1064,6 +1101,9 @@ export interface OperatorReceipt {
   callerThreadId: string;
   callerPluginId: string;
   requestedFromBackground: boolean;
+  approverId: string | null;
+  authorizingDecisionId: string | null;
+  authorizingDispositionSequence: number | null;
   receiptDigest: string;
   createdAtMs: number;
 }
@@ -1713,7 +1753,10 @@ export type FoundationCode =
   | "OPERATOR_RECEIPT_CANCELLED"
   | "OPERATOR_RECEIPT_STALE"
   | "OPERATOR_RECEIPT_REUSED"
-  | "OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED";
+  | "OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED"
+  | "AUTHORIZED_APPROVER_UNKNOWN"
+  | "AUTHORIZED_APPROVER_REVOKED"
+  | "AUTHORIZED_APPROVER_INVALID";
 
 export interface MutationReceipt {
   projectId: string;
@@ -2085,7 +2128,12 @@ export function operatorReceiptBindingDigest(input: Pick<OperatorReceiptRequest,
 
 export function persistInterimOperatorReceipt(
   db: SqliteDatabase,
-  input: OperatorReceiptRequest & { callerPluginId: string },
+  input: OperatorReceiptRequest & {
+    callerPluginId: string;
+    approverId?: string | null;
+    authorizingDecisionId?: string | null;
+    authorizingDispositionSequence?: number | null;
+  },
   createdAtMs = now(),
 ): OperatorReceipt {
   const receiptId = `operator-${randomBytes(16).toString("hex")}`;
@@ -2104,6 +2152,9 @@ export function persistInterimOperatorReceipt(
     callerThreadId: input.callerThreadId,
     callerPluginId: input.callerPluginId,
     requestedFromBackground: input.requestedFromBackground,
+    approverId: input.approverId ?? null,
+    authorizingDecisionId: input.authorizingDecisionId ?? null,
+    authorizingDispositionSequence: input.authorizingDispositionSequence ?? null,
     createdAtMs,
   }));
   db.prepare(
@@ -2111,8 +2162,9 @@ export function persistInterimOperatorReceipt(
       project_id, receipt_id, receipt_type, mutation_class, candidate_head,
       binding_digest, status, retirement_condition, caller_thread_id,
       caller_plugin_id, requested_from_background, receipt_digest, created_at_ms,
-      idempotency_key, request_digest
-    ) VALUES (?, ?, 'operator_confirmation', ?, ?, ?, 'interim', ?, ?, ?, ?, ?, ?, ?, ?)`,
+      idempotency_key, request_digest, approver_id, authorizing_decision_id,
+      authorizing_disposition_sequence
+    ) VALUES (?, ?, 'operator_confirmation', ?, ?, ?, 'interim', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     input.projectId,
     receiptId,
@@ -2127,6 +2179,9 @@ export function persistInterimOperatorReceipt(
     createdAtMs,
     input.idempotencyKey,
     input.requestDigest,
+    input.approverId ?? null,
+    input.authorizingDecisionId ?? null,
+    input.authorizingDispositionSequence ?? null,
   );
   return {
     receiptId,
@@ -2142,9 +2197,134 @@ export function persistInterimOperatorReceipt(
     callerThreadId: input.callerThreadId,
     callerPluginId: input.callerPluginId,
     requestedFromBackground: input.requestedFromBackground,
+    approverId: input.approverId ?? null,
+    authorizingDecisionId: input.authorizingDecisionId ?? null,
+    authorizingDispositionSequence: input.authorizingDispositionSequence ?? null,
     receiptDigest,
     createdAtMs,
   };
+}
+
+function authorizedApproverId(optionsJson: string): string {
+  let options: unknown;
+  try {
+    options = JSON.parse(optionsJson);
+  } catch {
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorizing Decision options are malformed");
+  }
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorizing Decision options are not an object");
+  }
+  const requested = (options as { approverId?: unknown }).approverId;
+  if (requested !== undefined && requested !== AUTHORIZED_APPROVER_ID) {
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorizing Decision names an unsupported approver");
+  }
+  return AUTHORIZED_APPROVER_ID;
+}
+
+function requireActiveAuthorizedApprover(db: SqliteDatabase, input: ApproverAttestationRequest): void {
+  if (input.approverId !== AUTHORIZED_APPROVER_ID) {
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "approver is not the configured bb-collab approver");
+  }
+  const registry = asRow<{
+    project_id: string;
+    approver_id: string;
+    authorizing_decision_id: string;
+    authorizing_disposition_sequence: number;
+    status: string;
+    allowed_mutation_classes_json: string;
+    retirement_condition: string;
+  }>(db.prepare(
+    `SELECT project_id, approver_id, authorizing_decision_id, authorizing_disposition_sequence,
+            status, allowed_mutation_classes_json, retirement_condition
+     FROM authorized_approvers
+     WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ?
+       AND authorizing_disposition_sequence = ?`,
+  ).get(input.projectId, input.approverId, input.authorizingDecisionId, input.authorizingDispositionSequence));
+  if (!registry) throw refusal("AUTHORIZED_APPROVER_UNKNOWN", "authorized approver registration is not known");
+  if (registry.status !== "active") throw refusal("AUTHORIZED_APPROVER_REVOKED", "authorized approver registration is revoked");
+  if (registry.retirement_condition !== AUTHORIZED_APPROVER_RETIREMENT_CONDITION) {
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver retirement condition is invalid");
+  }
+  let allowed: unknown;
+  try {
+    allowed = JSON.parse(registry.allowed_mutation_classes_json);
+  } catch {
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are malformed");
+  }
+  if (canonicalJson(allowed) !== canonicalJson(DERIVED_ACTOR_MUTATION_CLASSES)) {
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not the ratified set");
+  }
+  if (!(DERIVED_ACTOR_MUTATION_CLASSES as readonly string[]).includes(input.mutationClass)) {
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "mutation class is not authorized by the approver registry");
+  }
+  const decision = asRow<{ project_id: string; decision_class: string | null; options_json: string | null }>(db.prepare(
+    "SELECT project_id, decision_class, options_json FROM decisions WHERE decision_id = ?",
+  ).get(input.authorizingDecisionId));
+  const disposition = asRow<{ disposition: string; disposition_sequence: number }>(db.prepare(
+    "SELECT disposition, disposition_sequence FROM decision_dispositions WHERE decision_id = ? AND disposition_sequence = ?",
+  ).get(input.authorizingDecisionId, input.authorizingDispositionSequence));
+  const latest = asRow<{ disposition_sequence: number }>(db.prepare(
+    "SELECT MAX(disposition_sequence) AS disposition_sequence FROM decision_dispositions WHERE decision_id = ?",
+  ).get(input.authorizingDecisionId));
+  if (
+    !decision || decision.project_id !== input.projectId || decision.decision_class !== "operator_only" || !decision.options_json ||
+    authorizedApproverId(decision.options_json) !== input.approverId ||
+    !disposition || disposition.disposition !== "adopted" || latest?.disposition_sequence !== input.authorizingDispositionSequence
+  ) {
+    throw refusal("AUTHORIZED_APPROVER_REVOKED", "authorizing Decision or adopted disposition is no longer current");
+  }
+}
+
+export function persistAuthorizedApproverAttestation(
+  db: SqliteDatabase,
+  input: ApproverAttestationRequest & { callerPluginId: string },
+  createdAtMs = now(),
+): { operatorReceipt: OperatorReceipt; actorReceiptId: string } {
+  const { callerPluginId, ...attestationInput } = input;
+  const parsed = approverAttestationRequestSchema.safeParse(attestationInput);
+  if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
+  if (callerPluginId !== PLUGIN_ID) throw refusal("AUTHORIZED_APPROVER_INVALID", "attestation caller plugin is not bb-collab");
+  return transaction(db, () => {
+    requireActiveAuthorizedApprover(db, parsed.data);
+    const operatorReceipt = persistInterimOperatorReceipt(db, {
+      ...parsed.data,
+      callerPluginId,
+      approverId: parsed.data.approverId,
+      authorizingDecisionId: parsed.data.authorizingDecisionId,
+      authorizingDispositionSequence: parsed.data.authorizingDispositionSequence,
+    }, createdAtMs);
+    const actorReceiptId = derivePluginActorReceipt(db, operatorReceipt);
+    return { operatorReceipt, actorReceiptId };
+  });
+}
+
+export function authorizedApproverAttestation(
+  db: SqliteDatabase | null,
+  input: unknown,
+  callerPluginId: string,
+): FoundationResult {
+  let request: ApproverAttestationRequest;
+  try {
+    const parsed = approverAttestationRequestSchema.safeParse(input);
+    if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
+    request = parsed.data;
+  } catch (error) {
+    if (error instanceof Refusal) return refusalResult("approverAttestation", error.data);
+    return result("INVALID_INPUT", "approverAttestation", 1, 0, 0, { message: String(error) });
+  }
+  if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
+  try {
+    const issued = persistAuthorizedApproverAttestation(db, { ...request, callerPluginId });
+    return result("OK", request.projectId, 1, 1, 1, {
+      message: "authorized approver attestation issued an interim operator receipt and verified actor receipt",
+      operatorReceipt: issued.operatorReceipt,
+      actorReceiptId: issued.actorReceiptId,
+    });
+  } catch (error) {
+    if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "authorized approver attestation was not persisted" });
+  }
 }
 
 function actorReceiptDigest(input: {
@@ -4056,6 +4236,42 @@ function applyDecisionMutation(
   }
 }
 
+function syncAuthorizedApproverRegistry(
+  db: SqliteDatabase,
+  decision: DecisionRow,
+  disposition: string,
+  sequence: number,
+  createdAtMs: number,
+): void {
+  if (decision.decision_class !== "operator_only" || !decision.options_json) return;
+  const approverId = authorizedApproverId(decision.options_json);
+  if (disposition !== "adopted") {
+    db.prepare(
+      `UPDATE authorized_approvers SET status = 'revoked', revoked_at_ms = ?
+       WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND status = 'active'`,
+    ).run(createdAtMs, decision.project_id, approverId, decision.decision_id);
+    return;
+  }
+  db.prepare(
+    `UPDATE authorized_approvers SET status = 'revoked', revoked_at_ms = ?
+     WHERE project_id = ? AND approver_id = ? AND status = 'active'`,
+  ).run(createdAtMs, decision.project_id, approverId);
+  db.prepare(
+    `INSERT INTO authorized_approvers (
+       project_id, approver_id, authorizing_decision_id, authorizing_disposition_sequence,
+       status, allowed_mutation_classes_json, retirement_condition, created_at_ms, revoked_at_ms
+     ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, NULL)`,
+  ).run(
+    decision.project_id,
+    approverId,
+    decision.decision_id,
+    sequence,
+    canonicalJson(DERIVED_ACTOR_MUTATION_CLASSES),
+    AUTHORIZED_APPROVER_RETIREMENT_CONDITION,
+    createdAtMs,
+  );
+}
+
 function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
   const currentRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
@@ -4070,6 +4286,7 @@ function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, dig
   ) {
     throw refusal("DECISION_IDENTITY_CONFLICT", "decision has no valid immutable typed identity");
   }
+  if (decision.decision_class === "operator_only" && decision.options_json) authorizedApproverId(decision.options_json);
   const actorReceiptId = requireDecisionActor(db, request, decision.decision_class);
   if (decision.config_revision !== currentRevision) {
     throw refusal("PROJECT_CONFIG_STALE", "decision is bound to a stale config revision", {
@@ -4227,7 +4444,7 @@ function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, dig
       request.idempotencyKey,
     );
   }
-  return commitMutation(
+  const output = commitMutation(
     db,
     request,
     digest,
@@ -4253,6 +4470,8 @@ function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, dig
       evidence: { dispositionSequence: sequence, evidenceIds: preparedEvidence.map((item) => item.input.evidenceId) },
     },
   );
+  syncAuthorizedApproverRegistry(db, decision, request.disposition, sequence, createdAtMs);
+  return output;
 }
 
 interface ResolvedRoleRequirement {
@@ -6738,9 +6957,12 @@ function requireOperatorReceipt(db: SqliteDatabase, request: ApplyRequest, diges
     created_at_ms: number;
     idempotency_key: string | null;
     request_digest: string | null;
+    approver_id: string | null;
+    authorizing_decision_id: string | null;
+    authorizing_disposition_sequence: number | null;
     consumed_at_ms: number | null;
     consumed_event_sequence: number | null;
-  }>(db.prepare("SELECT project_id, receipt_id, receipt_type, mutation_class, candidate_head, binding_digest, status, retirement_condition, caller_thread_id, caller_plugin_id, requested_from_background, receipt_digest, created_at_ms, idempotency_key, request_digest, consumed_at_ms, consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?").get(request.operatorReceiptId));
+  }>(db.prepare("SELECT project_id, receipt_id, receipt_type, mutation_class, candidate_head, binding_digest, status, retirement_condition, caller_thread_id, caller_plugin_id, requested_from_background, receipt_digest, created_at_ms, idempotency_key, request_digest, approver_id, authorizing_decision_id, authorizing_disposition_sequence, consumed_at_ms, consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?").get(request.operatorReceiptId));
   if (!row) throw refusal("OPERATOR_RECEIPT_UNKNOWN", "operator receipt is not known");
   if (row.project_id !== request.projectId) throw refusal("OPERATOR_RECEIPT_FOREIGN", "operator receipt belongs to another project");
   if (row.consumed_at_ms !== null) throw refusal("OPERATOR_RECEIPT_REUSED", "operator receipt was already consumed");
@@ -6771,7 +6993,18 @@ function requireOperatorReceipt(db: SqliteDatabase, request: ApplyRequest, diges
   if (row.binding_digest !== operatorReceiptBindingDigest(receiptRequest.data)) {
     throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt binding digest is invalid");
   }
-  const expectedReceiptDigest = sha256(canonicalJson({
+  if ((row.approver_id === null) !== (row.authorizing_decision_id === null) || (row.approver_id === null) !== (row.authorizing_disposition_sequence === null)) {
+    throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt approver provenance is incomplete");
+  }
+  if (row.approver_id !== null) {
+    requireActiveAuthorizedApprover(db, {
+      ...receiptRequest.data,
+      approverId: row.approver_id,
+      authorizingDecisionId: row.authorizing_decision_id!,
+      authorizingDispositionSequence: row.authorizing_disposition_sequence!,
+    });
+  }
+  const receiptIdentity = {
     receiptId: row.receipt_id,
     projectId: row.project_id,
     receiptType: row.receipt_type,
@@ -6785,9 +7018,19 @@ function requireOperatorReceipt(db: SqliteDatabase, request: ApplyRequest, diges
     callerThreadId: row.caller_thread_id,
     callerPluginId: row.caller_plugin_id,
     requestedFromBackground: receiptRequest.data.requestedFromBackground,
+    approverId: row.approver_id,
+    authorizingDecisionId: row.authorizing_decision_id,
+    authorizingDispositionSequence: row.authorizing_disposition_sequence,
     createdAtMs: row.created_at_ms,
-  }));
-  if (row.receipt_digest !== expectedReceiptDigest) throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt digest is invalid");
+  };
+  const expectedReceiptDigest = sha256(canonicalJson(receiptIdentity));
+  const legacyReceiptDigest = sha256(canonicalJson(Object.fromEntries(
+    Object.entries(receiptIdentity).filter(([key]) => !["approverId", "authorizingDecisionId", "authorizingDispositionSequence"].includes(key)),
+  )));
+  if (row.receipt_digest !== expectedReceiptDigest &&
+      !(row.approver_id === null && row.authorizing_decision_id === null && row.authorizing_disposition_sequence === null && row.receipt_digest === legacyReceiptDigest)) {
+    throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt digest is invalid");
+  }
 }
 
 function consumeOperatorReceipt(db: SqliteDatabase, request: ApplyRequest, digest: string, eventSequence: number, consumedAtMs: number): void {
@@ -6932,6 +7175,7 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     migration_runs: "migration_id",
     actor_receipts: "receipt_id",
     operator_receipts: "receipt_id",
+    authorized_approvers: "approver_id, authorizing_decision_id, authorizing_disposition_sequence",
     decisions: "decision_id",
     decision_dispositions: "decision_dispositions.decision_id, decision_dispositions.disposition_sequence",
     evidence_artifacts: "evidence_id",

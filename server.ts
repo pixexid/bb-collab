@@ -15,6 +15,8 @@ import {
   PLUGIN_SDK_VERSION,
   applyAuthorizedMutation,
   applyRequestSchema,
+  approverAttestationRequestSchema,
+  authorizedApproverAttestation,
   databaseIsReady,
   doctor,
   exportFoundation,
@@ -108,6 +110,9 @@ export const foundationResultSchema = z
         callerThreadId: z.string(),
         callerPluginId: z.string(),
         requestedFromBackground: z.boolean(),
+        approverId: z.string().nullable(),
+        authorizingDecisionId: z.string().nullable(),
+        authorizingDispositionSequence: z.number().int().positive().nullable(),
         idempotencyKey: z.string(),
         requestDigest: z.string(),
         receiptDigest: z.string(),
@@ -202,6 +207,10 @@ export const rpcContract = defineRpcContract({
   },
   operatorReceipt: {
     input: operatorReceiptRequestSchema,
+    output: foundationResultSchema,
+  },
+  approverAttestation: {
+    input: approverAttestationRequestSchema,
     output: foundationResultSchema,
   },
 });
@@ -443,6 +452,9 @@ export default async function plugin(bb: BbPluginApi) {
       } catch {
         return operatorReceiptResult(input.projectId, "INTERNAL_ERROR", "interim operator receipt was not persisted");
       }
+    },
+    approverAttestation(input) {
+      return authorizedApproverAttestation(db, input, bb.pluginId);
     },
   });
 
