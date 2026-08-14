@@ -4,4 +4,7 @@ dist/
 dist/*
 !dist/server.js
 !dist/server.meta.json
+!dist/app.js
+!dist/app.css
+!dist/app.meta.json
 npm-debug.log*

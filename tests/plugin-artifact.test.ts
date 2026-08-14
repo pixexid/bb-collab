@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -30,5 +31,26 @@ describe("path-install server artifact", () => {
     } finally {
       rmSync(cleanRoot, { recursive: true, force: true });
     }
+  });
+
+  // The server artifact is tracked but the app bundle was not, so checking a
+  // path install out to a new commit updated the backend and left the previous
+  // frontend in place. The two then disagreed about an RPC's shape and the
+  // sidebar crashed. Ship them together or not at all.
+  it("tracks the app bundle alongside the server artifact", () => {
+    const tracked = execFileSync("git", ["ls-files", "dist"], { cwd: PROJECT_ROOT, encoding: "utf8" })
+      .split("\n")
+      .filter(Boolean);
+    expect(tracked).toEqual(expect.arrayContaining([
+      "dist/server.js",
+      "dist/server.meta.json",
+      "dist/app.js",
+      "dist/app.meta.json",
+    ]));
+
+    const appMeta = JSON.parse(readFileSync(join(PROJECT_ROOT, "dist/app.meta.json"), "utf8"));
+    const serverMeta = JSON.parse(readFileSync(join(PROJECT_ROOT, "dist/server.meta.json"), "utf8"));
+    expect(appMeta.pluginVersion).toBe(serverMeta.pluginVersion);
+    expect(appMeta.sdkVersion).toBe(serverMeta.sdkVersion);
   });
 });
