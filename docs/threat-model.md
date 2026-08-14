@@ -19,7 +19,7 @@ worker.
 | GitHub, BB Tasks and Markdown | External projections or evidence | They may not activate work, satisfy a gate or close a WorkItem independently. |
 | Operator/admin/raw BB activity | Unmanaged activity on a full-trust host | It may be detected as evidence or discrepancy, but it acquires no canonical authority by observation. |
 
-The v4/schema v9 operator gate is a separate host/UI confirmation boundary:
+The v5/schema v9 operator gate is a separate host/UI confirmation boundary:
 an interim receipt binds one exact project, operation class, lowercase
 40-character candidate head, idempotency key and canonical normalized request digest.
 The first committed StateEvent consumes it atomically; reuse, a different
@@ -28,10 +28,11 @@ refuses before a write. It has no local TTL or revocation and retires only on
 the host-issued `get-bb/bb#1541` condition. `github_issue_projection`,
 `assignment_dispatch`, and `assignment_reconcile` reserve/finalize paths
 refuse before external adapters because one receipt cannot authorize multiple
-writes. For bootstrap only, confirmation atomically creates a verified
-`plugin/bb-collab` actor receipt linked to the exact operator receipt; the actor
-must present that same operator receipt and is not a standing identity. This
-seam is fixture-tested and does not claim live cutover.
+writes. For bootstrap, operator_only Decision create/adopted disposition,
+migration_prepare, and migration_step, confirmation atomically creates a
+verified `plugin/bb-collab` actor receipt linked to the exact operator receipt;
+the actor must present that same operator receipt and is not a standing
+identity. This seam is fixture-tested and does not claim live cutover.
 
 The plugin database is the sole canonical governance/work store. A second task
 ledger, role store, decision store, migration registry, daemon or mutable

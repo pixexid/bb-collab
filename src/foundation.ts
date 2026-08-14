@@ -5,7 +5,7 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 4;
+export const CONTRACT_VERSION = 5;
 export const SCHEMA_VERSION = 9;
 // ponytail: keep exports bounded at 256 rows; add paged/file export before migration or cutover.
 export const MAX_EXPORT_ROWS = 256;
@@ -565,13 +565,16 @@ export const MIGRATIONS: string[] = [
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
 export const CACHED_CONSUMERS = ["server.rpcContract", "server.collabCli", "src/test-support", "tests/server.test"] as const;
 
-export function cachedConsumerRolloutEvidence(observedSchemaVersion: number) {
-  const reread = observedSchemaVersion === SCHEMA_VERSION;
+export function cachedConsumerRolloutEvidence(observedSchemaVersion: number, observedContractVersion = CONTRACT_VERSION) {
+  const reread = observedSchemaVersion === SCHEMA_VERSION && observedContractVersion === CONTRACT_VERSION;
   const evidence = {
     names: [...CACHED_CONSUMERS],
     oldSchemaVersion: 8,
     newSchemaVersion: SCHEMA_VERSION,
     observedSchemaVersion,
+    oldContractVersion: 4,
+    newContractVersion: CONTRACT_VERSION,
+    observedContractVersion,
     action: reread ? "reread" : "refused",
     expected: CACHED_CONSUMERS.length,
     attempted: CACHED_CONSUMERS.length,
@@ -631,6 +634,16 @@ export const MIGRATION_STEPS = [
   "rollback",
   "mark_fix_forward_required",
 ] as const;
+export const DERIVED_ACTOR_MUTATION_CLASSES = [
+  "bootstrap",
+  "decision_create",
+  "decision_disposition",
+  "migration_prepare",
+  "migration_step",
+] as const;
+export function isDerivedActorMutationClass(operationClass: string): boolean {
+  return (DERIVED_ACTOR_MUTATION_CLASSES as readonly string[]).includes(operationClass);
+}
 export const contractDigest = sha256(canonicalJson({
   contractVersion: CONTRACT_VERSION,
   operationClasses: ["migration_prepare", "migration_step"],
@@ -642,7 +655,7 @@ export const contractDigest = sha256(canonicalJson({
     consumption: "atomic",
   },
   derivedActorReceiptPolicy: {
-    operationClass: "bootstrap",
+    operationClasses: [...DERIVED_ACTOR_MUTATION_CLASSES],
     actorKind: "plugin",
     subjectId: PLUGIN_ID,
     authorization: "operatorReceiptId",
@@ -2161,8 +2174,8 @@ function actorReceiptDigest(input: {
 }
 
 export function derivePluginActorReceipt(db: SqliteDatabase, operatorReceipt: OperatorReceipt): string {
-  if (operatorReceipt.mutationClass !== "bootstrap") {
-    throw refusal("INVALID_INPUT", "derived plugin actor receipts are limited to bootstrap");
+  if (!isDerivedActorMutationClass(operatorReceipt.mutationClass)) {
+    throw refusal("INVALID_INPUT", "derived plugin actor receipts are limited to the ratified mutation classes");
   }
   if (operatorReceipt.callerPluginId !== PLUGIN_ID) {
     throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt caller plugin is not bb-collab");
@@ -2313,6 +2326,12 @@ function requireActor(db: SqliteDatabase, request: ApplyRequest): string {
     ) {
       throw refusal("ACTOR_RECEIPT_UNVERIFIED", "derived actor receipt is not bound to this operator receipt");
     }
+    const operator = asRow<{ caller_plugin_id: string; mutation_class: string }>(db.prepare(
+      "SELECT caller_plugin_id, mutation_class FROM operator_receipts WHERE project_id = ? AND receipt_id = ?",
+    ).get(row.project_id, row.operator_receipt_id));
+    if (!operator || operator.caller_plugin_id !== PLUGIN_ID || !isDerivedActorMutationClass(operator.mutation_class)) {
+      throw refusal("ACTOR_RECEIPT_UNVERIFIED", "derived actor receipt is not bound to a ratified bb-collab operator receipt");
+    }
     requireOperatorReceipt(db, request, mutationRequestDigest(db, request));
   }
   const expectedDigest = actorReceiptDigest({
@@ -2332,7 +2351,7 @@ function requireActor(db: SqliteDatabase, request: ApplyRequest): string {
 
 function mutationRequestDigest(db: SqliteDatabase, request: ApplyRequest): string {
   const digest = operatorRequestDigest(request);
-  if (request.operationClass !== "bootstrap" || !request.actorReceiptId) return digest;
+  if (!isDerivedActorMutationClass(request.operationClass) || !request.actorReceiptId) return digest;
   const derived = asRow<{ actor_kind: string; subject_id: string; operator_receipt_id: string | null }>(db.prepare(
     "SELECT actor_kind, subject_id, operator_receipt_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?",
   ).get(request.projectId, request.actorReceiptId));
@@ -2850,20 +2869,29 @@ function requireAdoptedMigrationDecision(
   }
   const actor = asRow<{
     project_id: string; actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null;
-    verification_state: string; receipt_digest: string;
+    verification_state: string; receipt_digest: string; operator_receipt_id: string | null; retirement_condition: string | null;
   }>(db.prepare(
-    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, receipt_digest FROM actor_receipts WHERE receipt_id = ?",
+    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, receipt_digest, operator_receipt_id, retirement_condition FROM actor_receipts WHERE receipt_id = ?",
   ).get(disposition.actor_receipt_id));
-  if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || !["role", "operator"].includes(actor.actor_kind) ||
-      actor.receipt_digest !== sha256(canonicalJson({
-        projectId: actor.project_id,
-        receiptId: disposition.actor_receipt_id,
-        actorKind: actor.actor_kind,
-        subjectId: actor.subject_id,
-        roleId: actor.role_id,
-        roleGeneration: actor.role_generation,
-        verificationState: actor.verification_state,
-      }))) {
+  const actorDigest = actor && actorReceiptDigest({
+    projectId: actor.project_id,
+    receiptId: disposition.actor_receipt_id,
+    actorKind: actor.actor_kind,
+    subjectId: actor.subject_id,
+    roleId: actor.role_id,
+    roleGeneration: actor.role_generation,
+    verificationState: actor.verification_state,
+    operatorReceiptId: actor.operator_receipt_id,
+    retirementCondition: actor.retirement_condition,
+  });
+  const linkedReceipt = actor?.operator_receipt_id ? asRow<{ caller_plugin_id: string; mutation_class: string }>(db.prepare(
+    "SELECT caller_plugin_id, mutation_class FROM operator_receipts WHERE project_id = ? AND receipt_id = ?",
+  ).get(projectId, actor.operator_receipt_id)) : undefined;
+  const actorAllowed = actor?.actor_kind === "plugin"
+    ? decision.decision_class === "operator_only" && actor.subject_id === PLUGIN_ID && actor.retirement_condition === OPERATOR_RECEIPT_RETIREMENT_CONDITION &&
+      linkedReceipt?.caller_plugin_id === PLUGIN_ID && linkedReceipt.mutation_class === "decision_disposition"
+    : ["role", "operator"].includes(actor?.actor_kind ?? "");
+  if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || !actorAllowed || actor.receipt_digest !== actorDigest) {
     throw refusal("ACTOR_RECEIPT_UNVERIFIED", "authorizing Decision actor receipt is not verified");
   }
 }
@@ -3403,10 +3431,16 @@ function requireDecisionActor(db: SqliteDatabase, request: ApplyRequest, decisio
   const actor = asRow<{ actor_kind: string; role_id: string | null }>(
     db.prepare("SELECT actor_kind, role_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(request.projectId, actorReceiptId),
   );
-  if (!actor || !["role", "operator"].includes(actor.actor_kind)) {
-    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "decision authority requires a role or operator actor receipt");
+  if (!actor || !["role", "operator", "plugin"].includes(actor.actor_kind)) {
+    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "decision authority requires a verified typed actor receipt");
   }
   if (actor.actor_kind === "operator") return actorReceiptId;
+  if (actor.actor_kind === "plugin") {
+    if (decisionClass !== "operator_only" || (request.operationClass === "decision_disposition" && request.disposition !== "adopted")) {
+      throw refusal("ACTOR_RECEIPT_UNVERIFIED", "the plugin actor is limited to operator_only Decision creation and adopted disposition");
+    }
+    return actorReceiptId;
+  }
   requireRoleActorBinding(db, request);
   const requiredRole = decisionClass === "operator_only" ? null : "project-orchestrator";
   if (!requiredRole || actor.role_id !== requiredRole) {
@@ -7047,21 +7081,29 @@ function decisionDoctorEvidence(db: SqliteDatabase, projectId: string): {
     for (const [index, disposition] of dispositions.entries()) {
       const sequence = Number(disposition.disposition_sequence);
       if (sequence !== index + 1) issues.push({ decisionId: decision.decision_id, reason: "disposition_sequence_not_contiguous" });
-      const actor = asRow<{ actor_kind: string; project_id: string; verification_state: string; receipt_digest: string; subject_id: string; role_id: string | null; role_generation: number | null }>(
+      const actor = asRow<{ actor_kind: string; project_id: string; verification_state: string; receipt_digest: string; subject_id: string; role_id: string | null; role_generation: number | null; operator_receipt_id: string | null; retirement_condition: string | null }>(
         db.prepare("SELECT * FROM actor_receipts WHERE receipt_id = ?").get(disposition.actor_receipt_id),
       );
-      if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || !["role", "operator"].includes(actor.actor_kind)) {
+      const linkedReceipt = actor?.operator_receipt_id ? asRow<{ caller_plugin_id: string; mutation_class: string }>(db.prepare(
+        "SELECT caller_plugin_id, mutation_class FROM operator_receipts WHERE project_id = ? AND receipt_id = ?",
+      ).get(projectId, actor.operator_receipt_id)) : undefined;
+      const pluginActor = actor?.actor_kind === "plugin" && decision.decision_class === "operator_only" && actor.subject_id === PLUGIN_ID &&
+        actor.retirement_condition === OPERATOR_RECEIPT_RETIREMENT_CONDITION && linkedReceipt?.caller_plugin_id === PLUGIN_ID &&
+        linkedReceipt.mutation_class === "decision_disposition";
+      if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || (!pluginActor && !["role", "operator"].includes(actor.actor_kind))) {
         issues.push({ decisionId: decision.decision_id, reason: "decision_actor_invalid" });
       } else {
-        const receiptDigest = sha256(canonicalJson({
+        const receiptDigest = actorReceiptDigest({
           projectId: actor.project_id,
-          receiptId: disposition.actor_receipt_id,
+          receiptId: String(disposition.actor_receipt_id),
           actorKind: actor.actor_kind,
           subjectId: actor.subject_id,
           roleId: actor.role_id,
           roleGeneration: actor.role_generation,
           verificationState: actor.verification_state,
-        }));
+          operatorReceiptId: actor.operator_receipt_id,
+          retirementCondition: actor.retirement_condition,
+        });
         if (receiptDigest !== actor.receipt_digest) issues.push({ decisionId: decision.decision_id, reason: "decision_actor_digest_invalid" });
         if (actor.actor_kind === "role") {
           const role = asRow<{ current_generation: number; status: string; holder_execution_attempt_id: string; holder_context_digest: string; holder_executed_profile_digest: string; qualification_id: string; eligibility_derivation_digest: string; role_requirement_id: string }>(db.prepare(

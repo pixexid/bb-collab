@@ -146,7 +146,7 @@ The result is a machine-readable AuthorityContext containing resolved project,
 config, governorship, actor, repository, resource and evidence revisions.
 Refusals are typed; no wrapper may turn a refusal into success.
 
-The contract v4/schema v9 interim operator gate is a one-request grant bound to
+The contract v5/schema v9 interim operator gate is a one-request grant bound to
 the exact project_id, operation class, lowercase 40-character candidate head,
 idempotency key and canonical normalized request digest. Consumption is an atomic
 compare-and-set in the same transaction as the first StateEvent; an already
@@ -156,15 +156,19 @@ TTL or revocation; it retires only on the host-issued `get-bb/bb#1541`
 condition, and stale means an exact binding mismatch. The
 `github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
 reserve/finalize adapter paths are unsupported by this one-request gate and
-refuse before their adapters. For `bootstrap` only, a confirmed operator
-receipt is atomically paired with a verified actor receipt whose `actor_kind` is
+refuse before their adapters. For `bootstrap`, `decision_create`,
+`decision_disposition`, `migration_prepare`, and `migration_step`, a confirmed
+operator receipt is atomically paired with a verified actor receipt whose `actor_kind` is
 `plugin`, whose `subject_id` is `bb-collab`, and whose durable
 `operator_receipt_id` points to that exact authorizing receipt. The derived
 actor is not standing authority: apply must present the same operator receipt,
 and its retirement condition remains exactly the host-issued
-`get-bb/bb#1541` condition. The derived actor is omitted from the bootstrap
-request digest because it is produced by that authorization; all other request
-binding fields remain exact. This is not live cutover or source retirement.
+`get-bb/bb#1541` condition. The derived actor is omitted from each allowed
+derived-class request digest because it is produced by that authorization; all
+other request binding fields remain exact. The plugin actor may authorize only
+the `operator_only` Decision class and its `adopted` disposition; role-based and
+review Decisions remain role-bound. This is not live cutover or source
+retirement.
 
 ## 6. Roles, delegation and execution
 
@@ -427,10 +431,12 @@ The founding direction adopts:
 The following remain unresolved until the named proof or operator decision:
 
 - General operator actor authentication. Do not infer identity from a display
-  name, checkout possession or thread ID. The narrow bootstrap exception is
-  the explicitly ratified `plugin/bb-collab` derived actor, which remains bound
-  to its exact operator receipt; other operator actors still wait for a proven
-  BB-native authenticated subject/receipt or a separately explicit decision.
+  name, checkout possession or thread ID. The narrow exception is the
+  explicitly ratified `plugin/bb-collab` derived actor for the bounded
+  bootstrap, operator-only Decision, and migration mutation classes, which
+  remains bound to its exact operator receipt; other operator actors still
+  wait for a proven BB-native authenticated subject/receipt or a separately
+  explicit decision.
 - Connector policy per repository. Set required, optional or prohibited only
   after the exact installation and terminal-artifact probe. Capability
   observations cannot rewrite policy.

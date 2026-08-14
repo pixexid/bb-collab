@@ -13,7 +13,7 @@ new-thread, search, navigation rows, and the footer.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through schema v9: a
+The repository now contains the implemented foundation through contract v5/schema v9: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
@@ -30,7 +30,9 @@ derived actor is not standing authority and apply must provide the same linked
 operator receipt.
 `github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
 reserve/finalize operations refuse before the adapter under this one-request
-seam. The plugin has not been installed, reloaded, or activated against live
+seam. The derived actor path is limited to bootstrap, operator_only Decision
+create/adopted disposition, migration_prepare, and migration_step; role-based
+and review Decisions remain role-bound. The plugin has not been installed, reloaded, or activated against live
 project authority.
 
 The founding decision is an **adopt with amendments** disposition of the
