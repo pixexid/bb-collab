@@ -24,6 +24,7 @@
     --shadow-lg: var(--shadow-lg);
     --shadow-xl: var(--shadow-xl);
     --shadow-2xl: var(--shadow-2xl);
+    --animate-spin: spin 1s linear infinite;
     --default-transition-duration: 150ms;
     --default-transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
     --shadow: var(--shadow);
@@ -200,13 +201,13 @@
     .table {
       display: table;
     }
-    .size-1\.5 {
-      width: calc(var(--spacing) * 1.5);
-      height: calc(var(--spacing) * 1.5);
-    }
     .size-3 {
       width: calc(var(--spacing) * 3);
       height: calc(var(--spacing) * 3);
+    }
+    .size-3\.5 {
+      width: calc(var(--spacing) * 3.5);
+      height: calc(var(--spacing) * 3.5);
     }
     .size-4 {
       width: calc(var(--spacing) * 4);
@@ -215,6 +216,10 @@
     .size-5 {
       width: calc(var(--spacing) * 5);
       height: calc(var(--spacing) * 5);
+    }
+    .size-\[5px\] {
+      width: 5px;
+      height: 5px;
     }
     .h-6 {
       height: calc(var(--spacing) * 6);
@@ -251,6 +256,9 @@
     }
     .shrink-0 {
       flex-shrink: 0;
+    }
+    .animate-spin {
+      animation: var(--animate-spin);
     }
     .grid-cols-\[minmax\(0\,1fr\)_auto_auto\] {
       grid-template-columns: minmax(0,1fr) auto auto;
@@ -349,21 +357,8 @@
       border-top-style: var(--tw-border-style);
       border-top-width: 1px;
     }
-    .border-l-2 {
-      border-left-style: var(--tw-border-style);
-      border-left-width: 2px;
-    }
     .border-border {
       border-color: var(--border);
-    }
-    .border-l-destructive {
-      border-left-color: var(--destructive);
-    }
-    .border-l-primary {
-      border-left-color: var(--primary);
-    }
-    .border-l-transparent {
-      border-left-color: transparent;
     }
     .bg-background {
       background-color: var(--background);
@@ -374,10 +369,10 @@
     .bg-muted {
       background-color: var(--muted);
     }
-    .bg-muted-foreground\/40 {
+    .bg-muted-foreground\/60 {
       background-color: var(--muted-foreground);
       @supports (color: color-mix(in lab, red, red)) {
-        background-color: color-mix(in oklab, var(--muted-foreground) 40%, transparent);
+        background-color: color-mix(in oklab, var(--muted-foreground) 60%, transparent);
       }
     }
     .bg-primary {
@@ -471,6 +466,9 @@
     }
     .text-muted-foreground {
       color: var(--muted-foreground);
+    }
+    .text-primary {
+      color: var(--primary);
     }
     .text-primary-foreground {
       color: var(--primary-foreground);
@@ -594,9 +592,30 @@
         opacity: 50%;
       }
     }
+    .motion-reduce\:animate-none {
+      @media (prefers-reduced-motion: reduce) {
+        animation: none;
+      }
+    }
     .motion-reduce\:transition-none {
       @media (prefers-reduced-motion: reduce) {
         transition-property: none;
+      }
+    }
+    .max-md\:pointer-coarse\:size-1\.5 {
+      @media (width < 48rem) {
+        @media (pointer: coarse) {
+          width: calc(var(--spacing) * 1.5);
+          height: calc(var(--spacing) * 1.5);
+        }
+      }
+    }
+    .max-md\:pointer-coarse\:size-5 {
+      @media (width < 48rem) {
+        @media (pointer: coarse) {
+          width: calc(var(--spacing) * 5);
+          height: calc(var(--spacing) * 5);
+        }
       }
     }
   }
@@ -745,6 +764,11 @@
 @property --tw-duration {
   syntax: "*";
   inherits: false;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 @layer properties {
   @supports ((-webkit-hyphens: none) and (not (margin-trim: inline))) or ((-moz-orient: inline) and (not (color:rgb(from red r g b)))) {
