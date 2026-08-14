@@ -1380,7 +1380,7 @@ describe("bb-collab plugin boundary", () => {
   it("derives only the ratified actor classes and keeps the operator binding digest compatible", () => {
     const { db, directory } = directDatabase();
     try {
-      const allowed = ["bootstrap", "decision_create", "decision_disposition", "work_item_create", "migration_prepare", "migration_step"] as const;
+      const allowed = ["bootstrap", "decision_create", "decision_disposition", "work_item_create", "qualification_observation_record", "role_generation_succession", "migration_prepare", "migration_step"] as const;
       for (const [index, mutationClass] of allowed.entries()) {
         const operatorReceipt = persistBootstrapOperatorReceipt(db, {
           projectId: PROJECT_ID,
@@ -1565,7 +1565,7 @@ describe("bb-collab plugin boundary", () => {
       authorizing_decision_id: "authorizing-operator",
       authorizing_disposition_sequence: 1,
       status: "active",
-      allowed_mutation_classes_json: canonicalJson(["bootstrap", "decision_create", "decision_disposition", "work_item_create", "migration_prepare", "migration_step"]),
+      allowed_mutation_classes_json: canonicalJson(["bootstrap", "decision_create", "decision_disposition", "work_item_create", "qualification_observation_record", "role_generation_succession", "migration_prepare", "migration_step"]),
     });
 
     const unsigned = decisionCreateRequest(fenceToken, "attested-operator", {
@@ -2157,7 +2157,7 @@ describe("bb-collab plugin boundary", () => {
 
   it("appends the v10 authorized approver registry and rolls every cached consumer forward", () => {
     expect(SCHEMA_VERSION).toBe(10);
-    expect(CONTRACT_VERSION).toBe(7);
+    expect(CONTRACT_VERSION).toBe(8);
     expect(MIGRATIONS).toHaveLength(23);
     expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("80bfe52641971b984358da6bdfb4aa00d87dd928e611325f23bbbb3a1afa5c7c");
     expect(MIGRATIONS.at(-5)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
@@ -2174,7 +2174,7 @@ describe("bb-collab plugin boundary", () => {
       "record_inventory", "record_quiescence", "freeze", "record_export", "record_import", "record_equivalence", "activate", "record_exercise", "retire", "rollback", "mark_fix_forward_required",
     ]);
     expect(cachedConsumerRolloutEvidence(9)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(10, 6)).toMatchObject({ oldContractVersion: 6, newContractVersion: 7, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(10, 7)).toMatchObject({ oldContractVersion: 7, newContractVersion: 8, action: "refused", expected: 4, attempted: 4, verified: 0 });
     expect(cachedConsumerRolloutEvidence(10)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "reread", expected: 4, attempted: 4, verified: 4 });
 
     const { db, directory } = directDatabase();
@@ -2289,7 +2289,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ contractVersion: 7, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ contractVersion: 8, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -4650,6 +4650,119 @@ describe("bb-collab plugin boundary", () => {
     expect(host.harness.inspection.sdk.callsTo("environments.get").length).toBeGreaterThanOrEqual(2);
   });
 
+  it("issues and consumes derived actor receipts for both live role mutation classes", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "operator-authorizer", actorKind: "operator", subjectId: "operator-1" });
+    const authorizingCreate = decisionCreateRequest(fenceToken, "live-role-approver", {
+      actorReceiptId: "operator-authorizer",
+      repoTargetId: null,
+      decision: {
+        decisionId: "live-role-approver",
+        repoTargetId: null,
+        scope: { projectId: PROJECT_ID, purpose: "operator-approver" },
+        decisionClass: "operator_only",
+        options: { approverId: AUTHORIZED_APPROVER_ID },
+        resourceRevision: 1,
+      },
+    });
+    expect(applyWithFixtureReceipt(db, authorizingCreate)).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "live-role-approver", 1, {
+      actorReceiptId: "operator-authorizer",
+      repoTargetId: null,
+      idempotencyKey: "adopt-live-role-approver",
+    })).outcome).toBe("OK");
+
+    const attest = async (request: ApplyRequest) => {
+      const issued = await host.harness.callRpc("approverAttestation", {
+        projectId: PROJECT_ID,
+        mutationClass: request.operationClass,
+        candidateHead: request.candidateHead,
+        idempotencyKey: request.idempotencyKey,
+        requestDigest: operatorRequestDigest(request),
+        callerThreadId: "live-role-attestor",
+        requestedFromBackground: false,
+        approverId: AUTHORIZED_APPROVER_ID,
+        authorizingDecisionId: "live-role-approver",
+        authorizingDispositionSequence: 1,
+      }) as FoundationResult;
+      expect(issued).toMatchObject({ outcome: "OK", actorReceiptId: expect.any(String), operatorReceipt: {
+        mutationClass: request.operationClass,
+      } });
+      return issued;
+    };
+
+    const qualification = qualificationRequest(fenceToken, {
+      idempotencyKey: "attested-live-qualification",
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      candidateHead: CANDIDATE_SHA,
+    });
+    const qualificationIssued = await attest(qualification);
+    expect(await host.harness.callRpc("apply", {
+      ...qualification,
+      actorReceiptId: qualificationIssued.actorReceiptId,
+      operatorReceiptId: qualificationIssued.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "OK" });
+
+    const succession = successionRequest(fenceToken, {
+      idempotencyKey: "attested-live-succession",
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      candidateHead: CANDIDATE_SHA,
+    });
+    const successionIssued = await attest(succession);
+    expect(await host.harness.callRpc("apply", {
+      ...succession,
+      actorReceiptId: successionIssued.actorReceiptId,
+      operatorReceiptId: successionIssued.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "OK" });
+
+    const negative = qualificationRequest(fenceToken, {
+      idempotencyKey: "attested-live-negative",
+      qualificationId: "attested-live-negative",
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      candidateHead: CANDIDATE_SHA,
+    });
+    const negativeIssued = await attest(negative);
+    const negativeApply = {
+      actorReceiptId: negativeIssued.actorReceiptId,
+      operatorReceiptId: negativeIssued.operatorReceipt!.receiptId,
+    };
+    const beforeNegative = db.prepare(
+      "SELECT (SELECT COUNT(*) FROM state_events) AS events, (SELECT COUNT(*) FROM mutation_receipts) AS mutations, (SELECT COUNT(*) FROM qualification_observations) AS observations",
+    ).get();
+    expect((await host.harness.callRpc("apply", { ...negative, ...negativeApply, projectId: FOREIGN_PROJECT_ID }) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_FOREIGN");
+    expect((await host.harness.callRpc("apply", { ...negative, ...negativeApply, operationClass: "role_generation_succession", idempotencyKey: "cross-role-class" }) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_STALE");
+    expect((await host.harness.callRpc("apply", { ...negative, ...negativeApply, candidateHead: H1_CANDIDATE_SHA }) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_STALE");
+    expect(db.prepare(
+      "SELECT (SELECT COUNT(*) FROM state_events) AS events, (SELECT COUNT(*) FROM mutation_receipts) AS mutations, (SELECT COUNT(*) FROM qualification_observations) AS observations",
+    ).get()).toEqual(beforeNegative);
+
+    const noFacts = qualificationRequest(fenceToken, {
+      idempotencyKey: "attested-live-no-facts",
+      qualificationId: "attested-live-no-facts",
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      candidateHead: CANDIDATE_SHA,
+      roleContext: undefined,
+    });
+    const noFactsIssued = await attest(noFacts);
+    expect((await host.harness.callRpc("apply", {
+      ...noFacts,
+      actorReceiptId: noFactsIssued.actorReceiptId,
+      operatorReceiptId: noFactsIssued.operatorReceipt!.receiptId,
+    }) as FoundationResult).outcome).toBe("ROLE_CONTEXT_REQUIRED");
+    expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(noFactsIssued.operatorReceipt!.receiptId)).toEqual({ consumed_at_ms: null });
+    expect(db.prepare(
+      "SELECT (SELECT COUNT(*) FROM state_events) AS events, (SELECT COUNT(*) FROM mutation_receipts) AS mutations, (SELECT COUNT(*) FROM qualification_observations) AS observations",
+    ).get()).toEqual(beforeNegative);
+
+    expect(await host.harness.callRpc("apply", { ...negative, ...negativeApply })).toMatchObject({ outcome: "OK" });
+    expect(await host.harness.callRpc("apply", { ...negative, ...negativeApply, idempotencyKey: "attested-live-reuse" })).toMatchObject({ outcome: "OPERATOR_RECEIPT_REUSED" });
+  });
+
   it("requires exact target binding for the independent reviewer", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -4975,7 +5088,7 @@ describe("bb-collab plugin boundary", () => {
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
     expect(cachedConsumerRolloutEvidence(9)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(10, 6)).toMatchObject({ oldContractVersion: 6, newContractVersion: 7, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(10, 7)).toMatchObject({ oldContractVersion: 7, newContractVersion: 8, action: "refused", expected: 4, attempted: 4, verified: 0 });
     expect(cachedConsumerRolloutEvidence(10)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 

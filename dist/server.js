@@ -13888,7 +13888,7 @@ import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 7;
+var CONTRACT_VERSION = 8;
 var SCHEMA_VERSION = 10;
 var AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab";
 var AUTHORIZED_APPROVER_PROJECT_ID = "proj_a8zzfsx36j";
@@ -14476,7 +14476,7 @@ function cachedConsumerRolloutEvidence(observedSchemaVersion, observedContractVe
     oldSchemaVersion: 9,
     newSchemaVersion: SCHEMA_VERSION,
     observedSchemaVersion,
-    oldContractVersion: 6,
+    oldContractVersion: 7,
     newContractVersion: CONTRACT_VERSION,
     observedContractVersion,
     action: reread ? "reread" : "refused",
@@ -14540,6 +14540,8 @@ var DERIVED_ACTOR_MUTATION_CLASSES = [
   "decision_create",
   "decision_disposition",
   "work_item_create",
+  "qualification_observation_record",
+  "role_generation_succession",
   "migration_prepare",
   "migration_step"
 ];
