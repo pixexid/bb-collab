@@ -29,12 +29,21 @@ const RUNNING_INDICATORS = new Set<PluginSidebarThread["indicator"]>([
 ]);
 const ATTENTION_INDICATORS = new Set<PluginSidebarThread["indicator"]>(["unread-error", "waiting-for-input", "unread-success"]);
 
-function threadTitle(thread: PluginSidebarThread): string {
-  return thread.title ?? thread.titleFallback ?? "Untitled thread";
+// Values arriving from the host DTO and from this plugin's own RPC are typed,
+// not proven. A frontend bundle can outlive the server build it was compiled
+// against — a stale bundle rendering a newer server's `{ model, reasoning }`
+// object as a React child is what took the sidebar down — so anything that
+// reaches JSX or a string method passes through here first.
+function asText(value: unknown): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value : null;
 }
 
-function projectAvatar(name: string): string {
-  const initials = name
+function threadTitle(thread: PluginSidebarThread): string {
+  return asText(thread.title) ?? asText(thread.titleFallback) ?? "Untitled thread";
+}
+
+function projectAvatar(name: unknown): string {
+  const initials = (asText(name) ?? "")
     .split(/\s+/u)
     .filter(Boolean)
     .slice(0, 2)
@@ -47,7 +56,9 @@ function projectAvatar(name: string): string {
 export type SidebarThreadSignal = "pending" | "attention" | "running" | "idle";
 
 function activeCount(thread: PluginSidebarThread): number {
-  return Object.values(thread.activity).reduce((total, count) => total + count, 0);
+  const activity: unknown = thread.activity;
+  if (!activity || typeof activity !== "object") return 0;
+  return Object.values(activity).reduce<number>((total, count) => total + (typeof count === "number" ? count : 0), 0);
 }
 
 export function threadSignal(thread: PluginSidebarThread): { kind: SidebarThreadSignal; label: string } {
@@ -100,8 +111,8 @@ const PROVIDER_MARKS: Record<string, string> = {
 };
 const GENERIC_PROVIDER_MARK = "M8 2.6a5.4 5.4 0 1 0 0 10.8 5.4 5.4 0 0 0 0-10.8z";
 
-function providerMarkKey(providerId: string): string {
-  return providerId.toLocaleLowerCase().replace(/[^a-z0-9]/gu, "");
+function providerMarkKey(providerId: unknown): string {
+  return (asText(providerId) ?? "").toLocaleLowerCase().replace(/[^a-z0-9]/gu, "");
 }
 
 function ProviderMark({ providerId }: { providerId: string }) {
@@ -162,7 +173,8 @@ export function reasoningLetter(reasoning: string | null): string {
 }
 
 export function executionBadgeLabel(providerId: string, execution: ThreadExecution | null): string {
-  return `${providerId} · model ${execution?.model ?? "unavailable"} · reasoning ${execution?.reasoning ?? "unavailable"}`;
+  const provider = asText(providerId) ?? "unavailable";
+  return `${provider} · model ${asText(execution?.model) ?? "unavailable"} · reasoning ${asText(execution?.reasoning) ?? "unavailable"}`;
 }
 
 function ExecutionBadge({ providerId, execution }: { providerId: string; execution: ThreadExecution | null }) {
@@ -170,7 +182,7 @@ function ExecutionBadge({ providerId, execution }: { providerId: string; executi
   return (
     <span className="flex min-w-0 items-center gap-1" role="img" aria-label={label} title={label} data-thread-execution-badge="">
       <ProviderMark providerId={providerId} />
-      <span className="min-w-0 truncate">{shortModelName(execution?.model ?? null)}·{reasoningLetter(execution?.reasoning ?? null)}</span>
+      <span className="min-w-0 truncate">{shortModelName(asText(execution?.model))}·{reasoningLetter(asText(execution?.reasoning))}</span>
     </span>
   );
 }
@@ -178,8 +190,8 @@ function ExecutionBadge({ providerId, execution }: { providerId: string; executi
 function matchesSearch(thread: PluginSidebarThread, project: PluginSidebarProject, searchQuery: string): boolean {
   const query = searchQuery.trim().toLocaleLowerCase();
   if (!query) return true;
-  return [threadTitle(thread), thread.providerId, project.name, thread.environment?.branchName ?? ""]
-    .some((value) => value.toLocaleLowerCase().includes(query));
+  return [threadTitle(thread), asText(thread.providerId), asText(project.name), asText(thread.environment?.branchName)]
+    .some((value) => (value ?? "").toLocaleLowerCase().includes(query));
 }
 
 function sortRecent(a: PluginSidebarThread, b: PluginSidebarThread): number {
@@ -332,7 +344,7 @@ function ThreadRow({
           the title keeps the majority of the row. */}
       <span className="relative flex min-w-5 max-w-[45%] shrink items-center justify-end">
         <span className={`flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground transition-opacity duration-150 group-focus-within/row:opacity-0 group-hover/row:opacity-0 motion-reduce:transition-none ${menuOpen ? "opacity-0" : ""}`}>
-          {customState ? <span className="min-w-0 truncate rounded bg-muted px-1 leading-4" data-custom-thread-state="">{customState}</span> : null}
+          {asText(customState) ? <span className="min-w-0 truncate rounded bg-muted px-1 leading-4" data-custom-thread-state="">{asText(customState)}</span> : null}
           <ExecutionBadge providerId={thread.providerId} execution={execution} />
           {/* The host's indicator label is its own accessible state, sitting where
               the native list puts it rather than in front of the title. */}
@@ -486,15 +498,16 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
         const collapsed = collapsedProjects.has(project.id);
         const expanded = expandedProjects.has(project.id);
         const visibleThreads = expanded ? tree : tree.slice(0, MAX_VISIBLE_THREADS);
+        const projectName = asText(project.name) ?? asText(project.id) ?? "Untitled project";
         return (
           <section key={project.id} aria-labelledby={`project-${project.id}`}>
             <div className="flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-normal text-muted-foreground">
-              <span className="flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground" aria-hidden="true">{projectAvatar(project.name)}</span>
-              <span id={`project-${project.id}`} className="min-w-0 truncate">{project.name}</span>
+              <span className="flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground" aria-hidden="true">{projectAvatar(projectName)}</span>
+              <span id={`project-${project.id}`} className="min-w-0 truncate">{projectName}</span>
               {/* No type utilities of its own: the counter inherits the header's
                   size, weight, colour and baseline so it never outweighs the name. */}
               <span className="ml-auto shrink-0" data-project-thread-count="">{threads.length}</span>
-              <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none" aria-label={`${collapsed ? "Expand" : "Collapse"} ${project.name} section`} aria-expanded={!collapsed} onClick={() => toggleProject(project.id)}>{collapsed ? "›" : "⌄"}</button>
+              <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none" aria-label={`${collapsed ? "Expand" : "Collapse"} ${projectName} section`} aria-expanded={!collapsed} onClick={() => toggleProject(project.id)}>{collapsed ? "›" : "⌄"}</button>
             </div>
             {!collapsed ? <div className="mt-0.5 space-y-px">
               {visibleThreads.map((node) => renderNode(node, threadModels[node.thread.id] ?? null, 0))}

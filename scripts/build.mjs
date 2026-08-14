@@ -17,13 +17,19 @@ try {
   writeFileSync(join(stage, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
   execFileSync("bb", ["plugin", "build", stage], { stdio: "inherit" });
   cpSync(join(stage, "dist"), join(root, "dist"), { recursive: true });
-  const serverPath = join(root, "dist/server.js");
-  writeFileSync(
-    serverPath,
-    readFileSync(serverPath, "utf8")
-      .replace(/\/\/ .*?bb-collab-build-[^/]+\/(?=(?:server\.ts|src\/))/gu, "// ")
-      .replace(/[ \t]+$/gmu, ""),
-  );
+  // Every tracked artifact names its entry through the throwaway staging
+  // directory, so both need the same rewrite or a rebuild churns a committed
+  // bundle on nothing but a random temp name.
+  const stagedEntryComment = /\/\/ .*?bb-collab-build-[^/]+\/(?=(?:server\.ts|app\.tsx|src\/))/gu;
+  for (const artifact of ["dist/server.js", "dist/app.js"]) {
+    const artifactPath = join(root, artifact);
+    writeFileSync(
+      artifactPath,
+      readFileSync(artifactPath, "utf8")
+        .replace(stagedEntryComment, "// ")
+        .replace(/[ \t]+$/gmu, ""),
+    );
+  }
 } finally {
   rmSync(stage, { recursive: true, force: true });
 }
