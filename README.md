@@ -13,7 +13,7 @@ new-thread, search, navigation rows, and the footer.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through contract v7/schema v10: a
+The repository now contains the implemented foundation through contract v8/schema v10: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
@@ -28,8 +28,9 @@ confirmed bootstrap operator receipt atomically derives a verified
 `plugin/bb-collab` actor receipt linked to that exact operator receipt; the
 derived actor is not standing authority and apply must provide the same linked
 operator receipt. An adopted `operator_only` Decision registers the exact
-`orchestrator:bb-collab` approver and six ratified derived mutation classes,
-including `work_item_create`;
+`orchestrator:bb-collab` approver and eight ratified derived mutation classes,
+including `work_item_create`, `qualification_observation_record`, and
+`role_generation_succession`;
 the `approverAttestation` RPC issues a fresh exact-bound receipt and verified
 plugin actor without `requestInput`. Operator revocation or change marks that
 registry unusable. Human confirmation remains only at the authorization and
@@ -42,7 +43,8 @@ foreign facts refuse before write.
 `github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
 reserve/finalize operations refuse before the adapter under this one-request
 seam. The derived actor path is limited to bootstrap, operator_only Decision
-create/adopted disposition, migration_prepare, and migration_step; role-based
+create/adopted disposition, work_item_create, qualification_observation_record,
+role_generation_succession, migration_prepare, and migration_step; role-based
 and review Decisions remain role-bound. The plugin has not been installed, reloaded, or activated against live
 project authority.
 
