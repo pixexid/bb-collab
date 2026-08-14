@@ -221,20 +221,28 @@ describe("replacement thread list", () => {
       ] },
       rpc: rpcHandlers(),
     });
-    const dotOf = (kind: string) => rendered.container.querySelector(`[data-sidebar-thread-signal="${kind}"]`)! as HTMLElement;
+    const slotOf = (kind: string) => rendered.container.querySelector(`[data-sidebar-thread-signal="${kind}"]`)! as HTMLElement;
 
-    expect(dotOf("running").className).toContain("bg-primary");
-    expect(dotOf("pending").className).toContain("bg-primary");
-    expect(dotOf("attention").className).toContain("bg-destructive");
-    expect(dotOf("idle").className).toContain("bg-muted-foreground/40");
-    // Colour is the only feedback dimension: identical geometry, no motion, and
-    // nothing nested beside it.
-    for (const kind of ["running", "pending", "attention", "idle"]) {
-      expect(dotOf(kind).className).toContain("size-1.5");
-      expect(dotOf(kind).className).not.toMatch(/animate-|size-2|size-3|border-2/u);
-      expect(dotOf(kind).childElementCount).toBe(0);
+    // Working rows get the spinner; unread/attention rows get the dot. One slot,
+    // never both glyphs, and an idle read row draws nothing at all.
+    expect(slotOf("running").querySelector("[data-sidebar-thread-spinner]")).toBeTruthy();
+    expect(slotOf("running").querySelector("[data-sidebar-thread-dot]")).toBeNull();
+    for (const kind of ["pending", "attention"]) {
+      expect(slotOf(kind).querySelector("[data-sidebar-thread-dot]")).toBeTruthy();
+      expect(slotOf(kind).querySelector("[data-sidebar-thread-spinner]")).toBeNull();
     }
-    expect(dotOf("running").getAttribute("aria-label")).toBe("Thread is working");
+    expect(rendered.container.querySelector('[data-sidebar-thread-signal="idle"]')).toBeNull();
+
+    // Dot colour still carries the distinction, at the native 5px geometry.
+    expect(slotOf("pending").querySelector("[data-sidebar-thread-dot]")!.className).toContain("bg-primary");
+    expect(slotOf("attention").querySelector("[data-sidebar-thread-dot]")!.className).toContain("bg-destructive");
+    for (const kind of ["pending", "attention"]) {
+      const dot = slotOf(kind).querySelector("[data-sidebar-thread-dot]")! as HTMLElement;
+      expect(dot.className).toContain("size-[5px]");
+      expect(dot.className).not.toMatch(/animate-/u);
+      expect(dot.childElementCount).toBe(0);
+    }
+    expect(slotOf("running").querySelector("[data-sidebar-thread-spinner]")!.getAttribute("aria-label")).toBe("Thread is working");
     // The indicator label is its own state, not part of the row link's name.
     expect(rendered.getByRole("link", { name: "running" })).toBeTruthy();
   });

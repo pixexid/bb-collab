@@ -74,45 +74,93 @@ function isError(thread: PluginSidebarThread): boolean {
   return thread.indicator === "unread-error";
 }
 
-function indicatorClasses(thread: PluginSidebarThread): string {
-  const signal = threadSignal(thread);
-  if (signal.kind === "idle") return "border-l-transparent";
-  if (signal.kind === "attention" && isError(thread)) return "border-l-destructive";
-  return "border-l-primary";
-}
+// The native list gives status one 16px box at the row's trailing edge holding
+// exactly one glyph. Measured off the built-in list in the running app: the
+// wrapper is `size-4` (`size-5` on coarse pointers) and the dot inside it is
+// 5px. Matching those numbers is the whole point — a different size or slot
+// reads as a different control.
+const TRAILING_SLOT = "inline-flex size-4 shrink-0 items-center justify-center max-md:pointer-coarse:size-5";
+const NATIVE_DOT = "size-[5px] rounded-full max-md:pointer-coarse:size-1.5";
 
-// Colour is the only dimension: one native-sized dot at the native right edge,
-// never a shape, a size step or a motion cue.
 export function signalDotClasses(thread: PluginSidebarThread, kind: SidebarThreadSignal): string {
   if (kind === "attention" && isError(thread)) return "bg-destructive";
-  if (kind === "idle") return "bg-muted-foreground/40";
-  return "bg-primary";
+  if (kind === "pending") return "bg-primary";
+  return "bg-muted-foreground/60";
 }
 
-function ThreadSignalDot({ thread }: { thread: PluginSidebarThread }) {
-  const signal = threadSignal(thread);
+// Native's spinner tick ring, so the working state reads as BB's own rather
+// than a second dialect. Unlike native it takes a theme accent instead of a
+// muted grey: this list is denser, and a muted spinner stops being scannable.
+function RunningSpinner({ label }: { label: string }) {
   return (
-    <span
-      className={`size-1.5 shrink-0 rounded-full ${signalDotClasses(thread, signal.kind)}`}
+    <svg
+      viewBox="0 0 24 24"
+      className="size-4 animate-spin text-primary max-md:pointer-coarse:size-5 motion-reduce:animate-none"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeLinecap="round"
       role="img"
-      aria-label={signal.label}
-      title={signal.label}
-      data-sidebar-thread-signal={signal.kind}
-    />
+      aria-label={label}
+      data-sidebar-thread-spinner=""
+    >
+      <path d="M12 3V6" />
+      <path d="M12 18V21" />
+      <path d="M21 12L18 12" />
+      <path d="M6 12L3 12" />
+      <path d="M18.3635 5.63672L16.2422 7.75804" />
+      <path d="M7.75804 16.2422L5.63672 18.3635" />
+      <path d="M18.3635 18.3635L16.2422 16.2422" />
+      <path d="M7.75804 7.75804L5.63672 5.63672" />
+    </svg>
+  );
+}
+
+// One slot, one glyph, never both: a spinner means working, a dot means
+// unread or waiting. An idle read row draws nothing, exactly as native does.
+function ThreadTrailingIndicator({ thread }: { thread: PluginSidebarThread }) {
+  const signal = threadSignal(thread);
+  if (signal.kind === "idle") return null;
+  return (
+    <span className={TRAILING_SLOT} data-sidebar-thread-signal={signal.kind}>
+      {signal.kind === "running" ? (
+        <RunningSpinner label={signal.label} />
+      ) : (
+        <span
+          className={`${NATIVE_DOT} ${signalDotClasses(thread, signal.kind)}`}
+          role="img"
+          aria-label={signal.label}
+          title={signal.label}
+          data-sidebar-thread-dot=""
+        />
+      )}
+    </span>
   );
 }
 
 // Minimal bundled marks, not trademark artwork: one currentColor path each, so
 // the badge inherits the row's theme token and fetches nothing.
+// Keyed by the provider ids the host actually reports on live rows — codex,
+// claude-code and pi — with each vendor's own alias pointing at the same mark
+// so a rename to `anthropic`/`openai`/`kimi` does not silently fall back to
+// the generic glyph. Everything else gets the neutral ring.
 const PROVIDER_MARKS: Record<string, string> = {
   codex: "M8 1.8 13.4 5v6L8 14.2 2.6 11V5z",
+  openai: "M8 1.8 13.4 5v6L8 14.2 2.6 11V5z",
   claudecode: "M8 2.2v11.6M3 5.1l10 5.8M13 5.1 3 10.9",
+  anthropic: "M8 2.2v11.6M3 5.1l10 5.8M13 5.1 3 10.9",
+  pi: "M2.8 4.6h10.4M6.2 4.6v7.2M10.4 4.6v5.6a1.6 1.6 0 0 0 2.4 1.4",
+  kimi: "M2.8 4.6h10.4M6.2 4.6v7.2M10.4 4.6v5.6a1.6 1.6 0 0 0 2.4 1.4",
   cursor: "M3.2 2.4 12.8 8l-4.4 1.2L6.6 13.6z",
 };
 const GENERIC_PROVIDER_MARK = "M8 2.6a5.4 5.4 0 1 0 0 10.8 5.4 5.4 0 0 0 0-10.8z";
 
-function providerMarkKey(providerId: unknown): string {
+export function providerMarkKey(providerId: unknown): string {
   return (asText(providerId) ?? "").toLocaleLowerCase().replace(/[^a-z0-9]/gu, "");
+}
+
+export function providerMarkPath(providerId: unknown): string {
+  return PROVIDER_MARKS[providerMarkKey(providerId)] ?? GENERIC_PROVIDER_MARK;
 }
 
 function ProviderMark({ providerId }: { providerId: string }) {
@@ -130,7 +178,7 @@ function ProviderMark({ providerId }: { providerId: string }) {
       focusable="false"
       data-provider-mark={key}
     >
-      <path d={PROVIDER_MARKS[key] ?? GENERIC_PROVIDER_MARK} />
+      <path d={providerMarkPath(providerId)} />
     </svg>
   );
 }
@@ -314,7 +362,7 @@ function ThreadRow({
   };
   return (
     <div
-      className={`group/row relative flex h-7 items-center gap-1.5 rounded-md border-l-2 pr-1 text-left text-sm transition-colors duration-150 select-none hover:bg-muted/50 motion-reduce:transition-none ${indicatorClasses(thread)} ${active ? "bg-muted" : ""}`}
+      className={`group/row relative flex h-7 items-center gap-1.5 rounded-md pr-1 text-left text-sm transition-colors duration-150 select-none hover:bg-muted/50 motion-reduce:transition-none ${active ? "bg-muted" : ""}`}
       style={{ paddingLeft: `${8 + depth * 16}px` }}
       onPointerDown={(event) => { if (thread.isPinned && event.button === 0) onPinnedDragStart(thread.id); }}
       onPointerEnter={() => onPinnedDragOver(thread.id)}
@@ -339,6 +387,11 @@ function ThreadRow({
           {hasChildren ? <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded text-xs leading-none text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none" aria-label={`${collapsed ? "Expand" : "Collapse"} ${title} children`} aria-expanded={!collapsed} onClick={onToggleChildren}>{collapsed ? "›" : "⌄"}</button> : null}
         </span>
       )}
+      {/* Status sits outside the cross-fading cluster below. Native lets its
+          indicator fade under the hover actions; here the row is denser and a
+          working thread you are pointing at is exactly the one whose state you
+          still want to read, so it stays put. */}
+      <ThreadTrailingIndicator thread={thread} />
       {/* Meta and actions share one slot and only cross-fade: hovering a row
           must not reflow it, or whatever you were aiming at moves. Capped so
           the title keeps the majority of the row. */}
@@ -346,9 +399,6 @@ function ThreadRow({
         <span className={`flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground transition-opacity duration-150 group-focus-within/row:opacity-0 group-hover/row:opacity-0 motion-reduce:transition-none ${menuOpen ? "opacity-0" : ""}`}>
           {asText(customState) ? <span className="min-w-0 truncate rounded bg-muted px-1 leading-4" data-custom-thread-state="">{asText(customState)}</span> : null}
           <ExecutionBadge providerId={thread.providerId} execution={execution} />
-          {/* The host's indicator label is its own accessible state, sitting where
-              the native list puts it rather than in front of the title. */}
-          <ThreadSignalDot thread={thread} />
         </span>
         <button
           ref={triggerRef}

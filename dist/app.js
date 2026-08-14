@@ -125,38 +125,68 @@ function threadSignal(thread) {
 function isError(thread) {
   return thread.indicator === "unread-error";
 }
-function indicatorClasses(thread) {
-  const signal = threadSignal(thread);
-  if (signal.kind === "idle") return "border-l-transparent";
-  if (signal.kind === "attention" && isError(thread)) return "border-l-destructive";
-  return "border-l-primary";
-}
+var TRAILING_SLOT = "inline-flex size-4 shrink-0 items-center justify-center max-md:pointer-coarse:size-5";
+var NATIVE_DOT = "size-[5px] rounded-full max-md:pointer-coarse:size-1.5";
 function signalDotClasses(thread, kind) {
   if (kind === "attention" && isError(thread)) return "bg-destructive";
-  if (kind === "idle") return "bg-muted-foreground/40";
-  return "bg-primary";
+  if (kind === "pending") return "bg-primary";
+  return "bg-muted-foreground/60";
 }
-function ThreadSignalDot({ thread }) {
-  const signal = threadSignal(thread);
-  return /* @__PURE__ */ jsx(
-    "span",
+function RunningSpinner({ label }) {
+  return /* @__PURE__ */ jsxs(
+    "svg",
     {
-      className: `size-1.5 shrink-0 rounded-full ${signalDotClasses(thread, signal.kind)}`,
+      viewBox: "0 0 24 24",
+      className: "size-4 animate-spin text-primary max-md:pointer-coarse:size-5 motion-reduce:animate-none",
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: 1.5,
+      strokeLinecap: "round",
       role: "img",
-      "aria-label": signal.label,
-      title: signal.label,
-      "data-sidebar-thread-signal": signal.kind
+      "aria-label": label,
+      "data-sidebar-thread-spinner": "",
+      children: [
+        /* @__PURE__ */ jsx("path", { d: "M12 3V6" }),
+        /* @__PURE__ */ jsx("path", { d: "M12 18V21" }),
+        /* @__PURE__ */ jsx("path", { d: "M21 12L18 12" }),
+        /* @__PURE__ */ jsx("path", { d: "M6 12L3 12" }),
+        /* @__PURE__ */ jsx("path", { d: "M18.3635 5.63672L16.2422 7.75804" }),
+        /* @__PURE__ */ jsx("path", { d: "M7.75804 16.2422L5.63672 18.3635" }),
+        /* @__PURE__ */ jsx("path", { d: "M18.3635 18.3635L16.2422 16.2422" }),
+        /* @__PURE__ */ jsx("path", { d: "M7.75804 7.75804L5.63672 5.63672" })
+      ]
     }
   );
 }
+function ThreadTrailingIndicator({ thread }) {
+  const signal = threadSignal(thread);
+  if (signal.kind === "idle") return null;
+  return /* @__PURE__ */ jsx("span", { className: TRAILING_SLOT, "data-sidebar-thread-signal": signal.kind, children: signal.kind === "running" ? /* @__PURE__ */ jsx(RunningSpinner, { label: signal.label }) : /* @__PURE__ */ jsx(
+    "span",
+    {
+      className: `${NATIVE_DOT} ${signalDotClasses(thread, signal.kind)}`,
+      role: "img",
+      "aria-label": signal.label,
+      title: signal.label,
+      "data-sidebar-thread-dot": ""
+    }
+  ) });
+}
 var PROVIDER_MARKS = {
   codex: "M8 1.8 13.4 5v6L8 14.2 2.6 11V5z",
+  openai: "M8 1.8 13.4 5v6L8 14.2 2.6 11V5z",
   claudecode: "M8 2.2v11.6M3 5.1l10 5.8M13 5.1 3 10.9",
+  anthropic: "M8 2.2v11.6M3 5.1l10 5.8M13 5.1 3 10.9",
+  pi: "M2.8 4.6h10.4M6.2 4.6v7.2M10.4 4.6v5.6a1.6 1.6 0 0 0 2.4 1.4",
+  kimi: "M2.8 4.6h10.4M6.2 4.6v7.2M10.4 4.6v5.6a1.6 1.6 0 0 0 2.4 1.4",
   cursor: "M3.2 2.4 12.8 8l-4.4 1.2L6.6 13.6z"
 };
 var GENERIC_PROVIDER_MARK = "M8 2.6a5.4 5.4 0 1 0 0 10.8 5.4 5.4 0 0 0 0-10.8z";
 function providerMarkKey(providerId) {
   return (asText(providerId) ?? "").toLocaleLowerCase().replace(/[^a-z0-9]/gu, "");
+}
+function providerMarkPath(providerId) {
+  return PROVIDER_MARKS[providerMarkKey(providerId)] ?? GENERIC_PROVIDER_MARK;
 }
 function ProviderMark({ providerId }) {
   const key = providerMarkKey(providerId);
@@ -173,7 +203,7 @@ function ProviderMark({ providerId }) {
       "aria-hidden": "true",
       focusable: "false",
       "data-provider-mark": key,
-      children: /* @__PURE__ */ jsx("path", { d: PROVIDER_MARKS[key] ?? GENERIC_PROVIDER_MARK })
+      children: /* @__PURE__ */ jsx("path", { d: providerMarkPath(providerId) })
     }
   );
 }
@@ -320,7 +350,7 @@ function ThreadRow({
   return /* @__PURE__ */ jsxs(
     "div",
     {
-      className: `group/row relative flex h-7 items-center gap-1.5 rounded-md border-l-2 pr-1 text-left text-sm transition-colors duration-150 select-none hover:bg-muted/50 motion-reduce:transition-none ${indicatorClasses(thread)} ${active ? "bg-muted" : ""}`,
+      className: `group/row relative flex h-7 items-center gap-1.5 rounded-md pr-1 text-left text-sm transition-colors duration-150 select-none hover:bg-muted/50 motion-reduce:transition-none ${active ? "bg-muted" : ""}`,
       style: { paddingLeft: `${8 + depth * 16}px` },
       onPointerDown: (event) => {
         if (thread.isPinned && event.button === 0) onPinnedDragStart(thread.id);
@@ -352,11 +382,11 @@ function ThreadRow({
           ),
           hasChildren ? /* @__PURE__ */ jsx("button", { type: "button", className: "inline-flex size-4 shrink-0 items-center justify-center rounded text-xs leading-none text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none", "aria-label": `${collapsed ? "Expand" : "Collapse"} ${title} children`, "aria-expanded": !collapsed, onClick: onToggleChildren, children: collapsed ? "\u203A" : "\u2304" }) : null
         ] }),
+        /* @__PURE__ */ jsx(ThreadTrailingIndicator, { thread }),
         /* @__PURE__ */ jsxs("span", { className: "relative flex min-w-5 max-w-[45%] shrink items-center justify-end", children: [
           /* @__PURE__ */ jsxs("span", { className: `flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground transition-opacity duration-150 group-focus-within/row:opacity-0 group-hover/row:opacity-0 motion-reduce:transition-none ${menuOpen ? "opacity-0" : ""}`, children: [
             asText(customState) ? /* @__PURE__ */ jsx("span", { className: "min-w-0 truncate rounded bg-muted px-1 leading-4", "data-custom-thread-state": "", children: asText(customState) }) : null,
-            /* @__PURE__ */ jsx(ExecutionBadge, { providerId: thread.providerId, execution }),
-            /* @__PURE__ */ jsx(ThreadSignalDot, { thread })
+            /* @__PURE__ */ jsx(ExecutionBadge, { providerId: thread.providerId, execution })
           ] }),
           /* @__PURE__ */ jsx(
             "button",
@@ -710,6 +740,8 @@ export {
   app_default as default,
   executionBadgeLabel,
   groupThreads,
+  providerMarkKey,
+  providerMarkPath,
   reasoningLetter,
   shortModelName,
   signalDotClasses,
