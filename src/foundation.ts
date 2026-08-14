@@ -2222,7 +2222,19 @@ function authorizedApproverId(optionsJson: string): string {
   return AUTHORIZED_APPROVER_ID;
 }
 
-function requireActiveAuthorizedApprover(db: SqliteDatabase, input: ApproverAttestationRequest): void {
+interface InFlightDecisionDispositionTransition {
+  requestDecisionId: string;
+  insertedDispositionSequence: number;
+  requestIdempotencyKey: string;
+  priorAuthorizingDispositionWasAdoptedCurrent: boolean;
+  registryWasActive: boolean;
+}
+
+function requireActiveAuthorizedApprover(
+  db: SqliteDatabase,
+  input: ApproverAttestationRequest,
+  transition?: InFlightDecisionDispositionTransition,
+): void {
   if (input.approverId !== AUTHORIZED_APPROVER_ID) {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "approver is not the configured bb-collab approver");
   }
@@ -2267,10 +2279,33 @@ function requireActiveAuthorizedApprover(db: SqliteDatabase, input: ApproverAtte
   const latest = asRow<{ disposition_sequence: number }>(db.prepare(
     "SELECT MAX(disposition_sequence) AS disposition_sequence FROM decision_dispositions WHERE decision_id = ?",
   ).get(input.authorizingDecisionId));
+  const currentAuthorizingDisposition = Boolean(
+    disposition && disposition.disposition === "adopted" && latest?.disposition_sequence === input.authorizingDispositionSequence,
+  );
+  const validInFlightTransition = Boolean(
+    transition &&
+    input.mutationClass === "decision_disposition" &&
+    transition.requestDecisionId === input.authorizingDecisionId &&
+    transition.insertedDispositionSequence === input.authorizingDispositionSequence + 1 &&
+    transition.requestIdempotencyKey === input.idempotencyKey &&
+    transition.priorAuthorizingDispositionWasAdoptedCurrent &&
+    transition.registryWasActive &&
+    db.prepare(
+      `SELECT 1 FROM decision_dispositions
+       WHERE decision_id = ? AND disposition_sequence = ? AND disposition = 'adopted' AND idempotency_key = ?`,
+    ).get(transition.requestDecisionId, transition.insertedDispositionSequence, transition.requestIdempotencyKey) &&
+    asRow<{ disposition_sequence: number }>(db.prepare(
+      "SELECT MAX(disposition_sequence) AS disposition_sequence FROM decision_dispositions WHERE decision_id = ?",
+    ).get(transition.requestDecisionId))?.disposition_sequence === transition.insertedDispositionSequence &&
+    asRow<{ status: string }>(db.prepare(
+      `SELECT status FROM authorized_approvers
+       WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = ?`,
+    ).get(input.projectId, input.approverId, input.authorizingDecisionId, input.authorizingDispositionSequence))?.status === "active",
+  );
   if (
     !decision || decision.project_id !== input.projectId || decision.decision_class !== "operator_only" || !decision.options_json ||
     authorizedApproverId(decision.options_json) !== input.approverId ||
-    !disposition || disposition.disposition !== "adopted" || latest?.disposition_sequence !== input.authorizingDispositionSequence
+    (!currentAuthorizingDisposition && !validInFlightTransition)
   ) {
     throw refusal("AUTHORIZED_APPROVER_REVOKED", "authorizing Decision or adopted disposition is no longer current");
   }
@@ -2653,10 +2688,11 @@ function appendStateEvent(
   digest: string,
   actorReceiptId: string,
   event: StateEventInput,
+  transition?: InFlightDecisionDispositionTransition,
 ): { eventSequence: number; createdAtMs: number } {
   const eventSequence = nextEventSequence(db, request.projectId);
   const createdAtMs = now();
-  consumeOperatorReceipt(db, request, digest, eventSequence, createdAtMs);
+  consumeOperatorReceipt(db, request, digest, eventSequence, createdAtMs, transition);
   db.prepare(
     `INSERT INTO state_events (
       project_id, event_sequence, aggregate_type, aggregate_id, aggregate_revision,
@@ -2687,8 +2723,9 @@ function commitMutation(
   counts: { expected: number; attempted: number; verified: number },
   extra: Omit<FoundationResult, "outcome" | "subject" | "expected" | "attempted" | "verified" | "eventSequence" | "mutationReceipt"> = {},
   outcome: FoundationCode = "OK",
+  transition?: InFlightDecisionDispositionTransition,
 ): FoundationResult {
-  const { eventSequence, createdAtMs } = appendStateEvent(db, request, digest, actorReceiptId, event);
+  const { eventSequence, createdAtMs } = appendStateEvent(db, request, digest, actorReceiptId, event, transition);
   const mutationReceipt: MutationReceipt = {
     projectId: request.projectId,
     idempotencyKey: request.idempotencyKey,
@@ -4272,6 +4309,44 @@ function syncAuthorizedApproverRegistry(
   );
 }
 
+function captureInFlightDecisionDispositionTransition(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  decisionId: string,
+  insertedDispositionSequence: number,
+): InFlightDecisionDispositionTransition | undefined {
+  if (request.operationClass !== "decision_disposition" || request.disposition !== "adopted" || !request.operatorReceiptId) return undefined;
+  const receipt = asRow<{
+    approver_id: string | null;
+    authorizing_decision_id: string | null;
+    authorizing_disposition_sequence: number | null;
+  }>(db.prepare(
+    `SELECT approver_id, authorizing_decision_id, authorizing_disposition_sequence
+     FROM operator_receipts WHERE project_id = ? AND receipt_id = ?`,
+  ).get(request.projectId, request.operatorReceiptId));
+  const authorizingDecisionId = receipt?.authorizing_decision_id;
+  const authorizingSequence = receipt?.authorizing_disposition_sequence;
+  if (!receipt || !receipt.approver_id || !authorizingDecisionId || authorizingSequence === null) return undefined;
+  const prior = asRow<{ disposition: string }>(db.prepare(
+    "SELECT disposition FROM decision_dispositions WHERE decision_id = ? AND disposition_sequence = ?",
+  ).get(authorizingDecisionId, authorizingSequence));
+  const priorLatest = asRow<{ disposition_sequence: number }>(db.prepare(
+    "SELECT MAX(disposition_sequence) AS disposition_sequence FROM decision_dispositions WHERE decision_id = ?",
+  ).get(authorizingDecisionId));
+  const registry = asRow<{ status: string }>(db.prepare(
+    `SELECT status FROM authorized_approvers
+     WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = ?`,
+  ).get(request.projectId, receipt.approver_id, authorizingDecisionId, authorizingSequence));
+  return {
+    requestDecisionId: decisionId,
+    insertedDispositionSequence: insertedDispositionSequence,
+    requestIdempotencyKey: request.idempotencyKey,
+    priorAuthorizingDispositionWasAdoptedCurrent: authorizingDecisionId === decisionId &&
+      prior?.disposition === "adopted" && priorLatest?.disposition_sequence === authorizingSequence,
+    registryWasActive: registry?.status === "active",
+  };
+}
+
 function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
   const currentRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
@@ -4368,6 +4443,7 @@ function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, dig
   const conditionsJson = canonicalJson(conditions);
   if (Buffer.byteLength(conditionsJson, "utf8") > 16 * 1024) throw refusal("EVIDENCE_REDACTION_INVALID", "decision conditions exceed 16 KiB");
   const nextRevision = decision.current_resource_revision + 1;
+  const inFlightTransition = captureInFlightDecisionDispositionTransition(db, request, decisionId, sequence);
   const update = db.prepare(
     `UPDATE decisions SET current_resource_revision = ?
      WHERE decision_id = ? AND project_id = ? AND current_resource_revision = ?`,
@@ -4469,6 +4545,8 @@ function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, dig
       expectedResourceRevision,
       evidence: { dispositionSequence: sequence, evidenceIds: preparedEvidence.map((item) => item.input.evidenceId) },
     },
+    undefined,
+    inFlightTransition,
   );
   syncAuthorizedApproverRegistry(db, decision, request.disposition, sequence, createdAtMs);
   return output;
@@ -6938,7 +7016,12 @@ function unavailableResult(subject: string, message: string): FoundationResult {
   return result("CANONICAL_STORE_UNAVAILABLE", subject, 1, 0, 0, { message });
 }
 
-function requireOperatorReceipt(db: SqliteDatabase, request: ApplyRequest, digest: string): void {
+function requireOperatorReceipt(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+  transition?: InFlightDecisionDispositionTransition,
+): void {
   if (!request.operatorReceiptId) throw refusal("OPERATOR_RECEIPT_REQUIRED", "an operator receipt is required");
   if (!request.candidateHead) throw refusal("OPERATOR_RECEIPT_REQUIRED", "an exact candidate head is required");
   const row = asRow<{
@@ -7002,7 +7085,7 @@ function requireOperatorReceipt(db: SqliteDatabase, request: ApplyRequest, diges
       approverId: row.approver_id,
       authorizingDecisionId: row.authorizing_decision_id!,
       authorizingDispositionSequence: row.authorizing_disposition_sequence!,
-    });
+    }, transition);
   }
   const receiptIdentity = {
     receiptId: row.receipt_id,
@@ -7033,9 +7116,16 @@ function requireOperatorReceipt(db: SqliteDatabase, request: ApplyRequest, diges
   }
 }
 
-function consumeOperatorReceipt(db: SqliteDatabase, request: ApplyRequest, digest: string, eventSequence: number, consumedAtMs: number): void {
+function consumeOperatorReceipt(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+  eventSequence: number,
+  consumedAtMs: number,
+  transition?: InFlightDecisionDispositionTransition,
+): void {
   if (!request.operatorReceiptId) return;
-  requireOperatorReceipt(db, request, digest);
+  requireOperatorReceipt(db, request, digest, transition);
   const updated = db.prepare(
     "UPDATE operator_receipts SET consumed_at_ms = ?, consumed_event_sequence = ? WHERE project_id = ? AND receipt_id = ? AND consumed_at_ms IS NULL",
   ).run(consumedAtMs, eventSequence, request.projectId, request.operatorReceiptId);

@@ -15533,7 +15533,7 @@ function authorizedApproverId(optionsJson) {
   }
   return AUTHORIZED_APPROVER_ID;
 }
-function requireActiveAuthorizedApprover(db, input) {
+function requireActiveAuthorizedApprover(db, input, transition) {
   if (input.approverId !== AUTHORIZED_APPROVER_ID) {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "approver is not the configured bb-collab approver");
   }
@@ -15570,7 +15570,21 @@ function requireActiveAuthorizedApprover(db, input) {
   const latest = asRow(db.prepare(
     "SELECT MAX(disposition_sequence) AS disposition_sequence FROM decision_dispositions WHERE decision_id = ?"
   ).get(input.authorizingDecisionId));
-  if (!decision || decision.project_id !== input.projectId || decision.decision_class !== "operator_only" || !decision.options_json || authorizedApproverId(decision.options_json) !== input.approverId || !disposition || disposition.disposition !== "adopted" || latest?.disposition_sequence !== input.authorizingDispositionSequence) {
+  const currentAuthorizingDisposition = Boolean(
+    disposition && disposition.disposition === "adopted" && latest?.disposition_sequence === input.authorizingDispositionSequence
+  );
+  const validInFlightTransition = Boolean(
+    transition && input.mutationClass === "decision_disposition" && transition.requestDecisionId === input.authorizingDecisionId && transition.insertedDispositionSequence === input.authorizingDispositionSequence + 1 && transition.requestIdempotencyKey === input.idempotencyKey && transition.priorAuthorizingDispositionWasAdoptedCurrent && transition.registryWasActive && db.prepare(
+      `SELECT 1 FROM decision_dispositions
+       WHERE decision_id = ? AND disposition_sequence = ? AND disposition = 'adopted' AND idempotency_key = ?`
+    ).get(transition.requestDecisionId, transition.insertedDispositionSequence, transition.requestIdempotencyKey) && asRow(db.prepare(
+      "SELECT MAX(disposition_sequence) AS disposition_sequence FROM decision_dispositions WHERE decision_id = ?"
+    ).get(transition.requestDecisionId))?.disposition_sequence === transition.insertedDispositionSequence && asRow(db.prepare(
+      `SELECT status FROM authorized_approvers
+       WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = ?`
+    ).get(input.projectId, input.approverId, input.authorizingDecisionId, input.authorizingDispositionSequence))?.status === "active"
+  );
+  if (!decision || decision.project_id !== input.projectId || decision.decision_class !== "operator_only" || !decision.options_json || authorizedApproverId(decision.options_json) !== input.approverId || !currentAuthorizingDisposition && !validInFlightTransition) {
     throw refusal("AUTHORIZED_APPROVER_REVOKED", "authorizing Decision or adopted disposition is no longer current");
   }
 }
@@ -15859,10 +15873,10 @@ function nextAggregateRevision(db, projectId, aggregateType, aggregateId) {
      FROM state_events WHERE project_id = ? AND aggregate_type = ? AND aggregate_id = ?`
   ).get(projectId, aggregateType, aggregateId))?.next_revision ?? 1;
 }
-function appendStateEvent(db, request, digest, actorReceiptId, event) {
+function appendStateEvent(db, request, digest, actorReceiptId, event, transition) {
   const eventSequence = nextEventSequence(db, request.projectId);
   const createdAtMs = now();
-  consumeOperatorReceipt(db, request, digest, eventSequence, createdAtMs);
+  consumeOperatorReceipt(db, request, digest, eventSequence, createdAtMs, transition);
   db.prepare(
     `INSERT INTO state_events (
       project_id, event_sequence, aggregate_type, aggregate_id, aggregate_revision,
@@ -15883,8 +15897,8 @@ function appendStateEvent(db, request, digest, actorReceiptId, event) {
   );
   return { eventSequence, createdAtMs };
 }
-function commitMutation(db, request, digest, actorReceiptId, event, counts, extra = {}, outcome = "OK") {
-  const { eventSequence, createdAtMs } = appendStateEvent(db, request, digest, actorReceiptId, event);
+function commitMutation(db, request, digest, actorReceiptId, event, counts, extra = {}, outcome = "OK", transition) {
+  const { eventSequence, createdAtMs } = appendStateEvent(db, request, digest, actorReceiptId, event, transition);
   const mutationReceipt = {
     projectId: request.projectId,
     idempotencyKey: request.idempotencyKey,
@@ -17215,6 +17229,33 @@ function syncAuthorizedApproverRegistry(db, decision, disposition, sequence, cre
     createdAtMs
   );
 }
+function captureInFlightDecisionDispositionTransition(db, request, decisionId, insertedDispositionSequence) {
+  if (request.operationClass !== "decision_disposition" || request.disposition !== "adopted" || !request.operatorReceiptId) return void 0;
+  const receipt = asRow(db.prepare(
+    `SELECT approver_id, authorizing_decision_id, authorizing_disposition_sequence
+     FROM operator_receipts WHERE project_id = ? AND receipt_id = ?`
+  ).get(request.projectId, request.operatorReceiptId));
+  const authorizingDecisionId = receipt?.authorizing_decision_id;
+  const authorizingSequence = receipt?.authorizing_disposition_sequence;
+  if (!receipt || !receipt.approver_id || !authorizingDecisionId || authorizingSequence === null) return void 0;
+  const prior = asRow(db.prepare(
+    "SELECT disposition FROM decision_dispositions WHERE decision_id = ? AND disposition_sequence = ?"
+  ).get(authorizingDecisionId, authorizingSequence));
+  const priorLatest = asRow(db.prepare(
+    "SELECT MAX(disposition_sequence) AS disposition_sequence FROM decision_dispositions WHERE decision_id = ?"
+  ).get(authorizingDecisionId));
+  const registry2 = asRow(db.prepare(
+    `SELECT status FROM authorized_approvers
+     WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = ?`
+  ).get(request.projectId, receipt.approver_id, authorizingDecisionId, authorizingSequence));
+  return {
+    requestDecisionId: decisionId,
+    insertedDispositionSequence,
+    requestIdempotencyKey: request.idempotencyKey,
+    priorAuthorizingDispositionWasAdoptedCurrent: authorizingDecisionId === decisionId && prior?.disposition === "adopted" && priorLatest?.disposition_sequence === authorizingSequence,
+    registryWasActive: registry2?.status === "active"
+  };
+}
 function applyDecisionDisposition(db, request, digest) {
   const currentRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
@@ -17302,6 +17343,7 @@ function applyDecisionDisposition(db, request, digest) {
   const conditionsJson = canonicalJson(conditions);
   if (Buffer.byteLength(conditionsJson, "utf8") > 16 * 1024) throw refusal("EVIDENCE_REDACTION_INVALID", "decision conditions exceed 16 KiB");
   const nextRevision = decision.current_resource_revision + 1;
+  const inFlightTransition = captureInFlightDecisionDispositionTransition(db, request, decisionId, sequence);
   const update = db.prepare(
     `UPDATE decisions SET current_resource_revision = ?
      WHERE decision_id = ? AND project_id = ? AND current_resource_revision = ?`
@@ -17402,7 +17444,9 @@ function applyDecisionDisposition(db, request, digest) {
       currentResourceRevision: nextRevision,
       expectedResourceRevision,
       evidence: { dispositionSequence: sequence, evidenceIds: preparedEvidence.map((item) => item.input.evidenceId) }
-    }
+    },
+    void 0,
+    inFlightTransition
   );
   syncAuthorizedApproverRegistry(db, decision, request.disposition, sequence, createdAtMs);
   return output;
@@ -19382,7 +19426,7 @@ function isConstraintError(error48) {
 function unavailableResult(subject, message) {
   return result("CANONICAL_STORE_UNAVAILABLE", subject, 1, 0, 0, { message });
 }
-function requireOperatorReceipt(db, request, digest) {
+function requireOperatorReceipt(db, request, digest, transition) {
   if (!request.operatorReceiptId) throw refusal("OPERATOR_RECEIPT_REQUIRED", "an operator receipt is required");
   if (!request.candidateHead) throw refusal("OPERATOR_RECEIPT_REQUIRED", "an exact candidate head is required");
   const row = asRow(db.prepare("SELECT project_id, receipt_id, receipt_type, mutation_class, candidate_head, binding_digest, status, retirement_condition, caller_thread_id, caller_plugin_id, requested_from_background, receipt_digest, created_at_ms, idempotency_key, request_digest, approver_id, authorizing_decision_id, authorizing_disposition_sequence, consumed_at_ms, consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?").get(request.operatorReceiptId));
@@ -19420,7 +19464,7 @@ function requireOperatorReceipt(db, request, digest) {
       approverId: row.approver_id,
       authorizingDecisionId: row.authorizing_decision_id,
       authorizingDispositionSequence: row.authorizing_disposition_sequence
-    });
+    }, transition);
   }
   const receiptIdentity = {
     receiptId: row.receipt_id,
@@ -19449,9 +19493,9 @@ function requireOperatorReceipt(db, request, digest) {
     throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt digest is invalid");
   }
 }
-function consumeOperatorReceipt(db, request, digest, eventSequence, consumedAtMs) {
+function consumeOperatorReceipt(db, request, digest, eventSequence, consumedAtMs, transition) {
   if (!request.operatorReceiptId) return;
-  requireOperatorReceipt(db, request, digest);
+  requireOperatorReceipt(db, request, digest, transition);
   const updated = db.prepare(
     "UPDATE operator_receipts SET consumed_at_ms = ?, consumed_event_sequence = ? WHERE project_id = ? AND receipt_id = ? AND consumed_at_ms IS NULL"
   ).run(consumedAtMs, eventSequence, request.projectId, request.operatorReceiptId);
