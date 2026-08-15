@@ -171,8 +171,17 @@
     .mt-0\.5 {
       margin-top: calc(var(--spacing) * 0.5);
     }
+    .mt-3 {
+      margin-top: calc(var(--spacing) * 3);
+    }
+    .mb-3 {
+      margin-bottom: calc(var(--spacing) * 3);
+    }
     .mb-5 {
       margin-bottom: calc(var(--spacing) * 5);
+    }
+    .mb-6 {
+      margin-bottom: calc(var(--spacing) * 6);
     }
     .ml-auto {
       margin-left: auto;
@@ -229,6 +238,9 @@
     }
     .h-full {
       height: 100%;
+    }
+    .min-h-9 {
+      min-height: calc(var(--spacing) * 9);
     }
     .w-44 {
       width: calc(var(--spacing) * 44);
@@ -290,6 +302,9 @@
     .gap-2 {
       gap: calc(var(--spacing) * 2);
     }
+    .gap-3 {
+      gap: calc(var(--spacing) * 3);
+    }
     .gap-4 {
       gap: calc(var(--spacing) * 4);
     }
@@ -341,6 +356,9 @@
     }
     .rounded-full {
       border-radius: calc(infinity * 1px);
+    }
+    .rounded-lg {
+      border-radius: var(--radius);
     }
     .rounded-md {
       border-radius: calc(var(--radius) - 2px);
@@ -398,6 +416,9 @@
     }
     .px-3 {
       padding-inline: calc(var(--spacing) * 3);
+    }
+    .py-0\.5 {
+      padding-block: calc(var(--spacing) * 0.5);
     }
     .py-1 {
       padding-block: calc(var(--spacing) * 1);
@@ -600,6 +621,16 @@
     .motion-reduce\:transition-none {
       @media (prefers-reduced-motion: reduce) {
         transition-property: none;
+      }
+    }
+    .sm\:grid-cols-2 {
+      @media (width >= 40rem) {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+    .sm\:flex-row {
+      @media (width >= 40rem) {
+        flex-direction: row;
       }
     }
     .max-md\:pointer-coarse\:size-1\.5 {

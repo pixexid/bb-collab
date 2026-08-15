@@ -2239,6 +2239,67 @@ export function persistInterimOperatorReceipt(
   };
 }
 
+export function persistOperatorReceiptWithSessionEvidence(
+  db: SqliteDatabase,
+  input: OperatorReceiptRequest & { callerPluginId: string },
+  interactionId: string,
+  createdAtMs = now(),
+): { operatorReceipt: OperatorReceipt; actorReceiptId?: string; evidenceId: string } {
+  return transaction(db, () => {
+    const operatorReceipt = persistInterimOperatorReceipt(db, input, createdAtMs);
+    const actorReceiptId = isDerivedActorMutationClass(input.mutationClass)
+      ? derivePluginActorReceipt(db, operatorReceipt)
+      : undefined;
+    const evidenceId = `operator-session-${operatorReceipt.receiptId}`;
+    const redacted = canonicalJson({ source: "connect-session", interactionId, operatorReceiptId: operatorReceipt.receiptId });
+    const durableRef = canonicalJson({ kind: "connect-session", operatorReceiptId: operatorReceipt.receiptId });
+    const contentDigest = sha256(canonicalJson({
+      projectId: operatorReceipt.projectId,
+      mutationClass: operatorReceipt.mutationClass,
+      candidateHead: operatorReceipt.candidateHead,
+      idempotencyKey: operatorReceipt.idempotencyKey,
+      requestDigest: operatorReceipt.requestDigest,
+      interactionId,
+    }));
+    const artifactIdentityDigest = sha256(canonicalJson({
+      projectId: operatorReceipt.projectId,
+      evidenceId,
+      evidenceKind: "legacy_claim",
+      sourceKind: "legacy_claim",
+      sourceRef: `operator-receipt:${operatorReceipt.receiptId}`,
+      executionAttemptId: null,
+      contentDigest,
+      redactedDigest: sha256(redacted),
+      durableRef: JSON.parse(durableRef),
+    }));
+    db.prepare(
+      `INSERT INTO evidence_artifacts
+        (project_id, evidence_id, evidence_kind, source_kind, source_ref, execution_attempt_id,
+         content_digest, redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest, created_at_ms)
+       VALUES (?, ?, 'legacy_claim', 'legacy_claim', ?, NULL, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      operatorReceipt.projectId,
+      evidenceId,
+      `operator-receipt:${operatorReceipt.receiptId}`,
+      contentDigest,
+      redacted,
+      sha256(redacted),
+      durableRef,
+      artifactIdentityDigest,
+      createdAtMs,
+    );
+    return { operatorReceipt, ...(actorReceiptId ? { actorReceiptId } : {}), evidenceId };
+  });
+}
+
+export function operatorReceiptBindingExists(db: SqliteDatabase, input: OperatorReceiptRequest): boolean {
+  return Boolean(db.prepare(
+    `SELECT 1 FROM operator_receipts
+     WHERE project_id = ? AND mutation_class = ? AND candidate_head = ?
+       AND idempotency_key = ? AND request_digest = ?`,
+  ).get(input.projectId, input.mutationClass, input.candidateHead, input.idempotencyKey, input.requestDigest));
+}
+
 function authorizedApproverId(optionsJson: string): string {
   let options: unknown;
   try {
