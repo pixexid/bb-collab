@@ -1,11 +1,14 @@
 import { defineRpcContract, type BbPluginApi, type PluginCliContext } from "@bb/plugin-sdk";
 import { z } from "zod";
 import {
+  OPEN_ATTEMPT_STATES,
   SUPERVISOR_THREAD_ID,
   createContinuationLedger,
   createLaneWatcher,
   openLaneViews,
   readLaneStates,
+  readRoleHolderStates,
+  roleQueueScopes,
   subscribeToThreadChanges,
   threadEventStatus,
   type OperatorWait,
@@ -556,11 +559,38 @@ export default async function plugin(bb: BbPluginApi) {
     write: (state: Record<string, true>) => bb.storage.kv.set("lane-watcher.operator-wait-fyi", state),
   };
 
+  const roleIdlePersistence = {
+    read: () => bb.storage.kv.get<unknown>("lane-watcher.role-idle"),
+    write: (state: Record<string, { steerCount: number; failedSteers: number; escalated: boolean; idleSinceMs: number | null; awaitingSteerOutcome: boolean }>) => bb.storage.kv.set("lane-watcher.role-idle", state),
+  };
+
+  const readRoleScopes = async () => {
+    if (!db) return [];
+    const operatorWaits = new Map<string, OperatorWait>();
+    const threadIds = [...new Set(readLaneStates(db)
+      .filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state))
+      .map((lane) => lane.thread_id)
+      .filter((threadId): threadId is string => threadId !== null))];
+    await Promise.all(threadIds.map(async (threadId) => {
+      const wait = await readPendingOperatorWaitForThread(threadId);
+      if (wait) operatorWaits.set(threadId, wait);
+    }));
+    return roleQueueScopes(
+      openLaneViews(db, Date.now(), operatorWaits),
+    );
+  };
+
   const watcher = createLaneWatcher({
     readLanes: () => (db ? readLaneStates(db) : []),
+    readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
+    readRoleScopes,
+    roleIdlePersistence,
     continuationLedger,
     operatorWaitAlertPersistence,
-    onAlert: (alert) => bb.log.warn(`lane awareness ${alert.kind}: ${alert.lane.laneId} (${alert.count}/${alert.max})`),
+    onAlert: (alert) => alert.lane
+      ? bb.log.warn(`lane awareness ${alert.kind}: ${alert.lane.laneId} (${alert.count}/${alert.max})`)
+      : bb.log.warn(`role awareness ${alert.kind}: ${alert.role.roleId}@${alert.role.roleGeneration} queue ${alert.role.queueHeadId}`),
+    onRoleSuccessionRequired: (role) => bb.log.warn(`role succession required: ${role.roleId}@${role.roleGeneration}`),
     isExternallyWaiting: readPendingExternalWait,
     readOperatorWait: readPendingOperatorWaitForThread,
     readWorker: async (threadId) => {
@@ -583,6 +613,8 @@ export default async function plugin(bb: BbPluginApi) {
         archived,
         operatorWait,
         operatorWaitKnown,
+        // Native ThreadResponse has no idle-since field; the role ledger anchors this proxy on first observation.
+        idleSinceMs: thread.status === "idle" ? thread.updatedAt : null,
       };
     },
     steer: async (lane) => {
@@ -595,6 +627,20 @@ export default async function plugin(bb: BbPluginApi) {
             type: "text",
             visibility: "agent-only",
             text: `Lane ${lane.laneId} is idle without a terminal receipt or pending external wait. Continue assignment ${lane.assignmentId} and finish with exactly one DONE|BLOCKED terminal receipt.`,
+            mentions: [],
+          },
+        ],
+      });
+    },
+    steerRole: async (role) => {
+      await bb.sdk.threads.send({
+        threadId: role.threadId,
+        mode: "steer",
+        input: [
+          {
+            type: "text",
+            visibility: "agent-only",
+            text: `Wrongful idle: queue head ${role.queueHeadId} is startable. Inspect the queue and act or record the blocker.`,
             mentions: [],
           },
         ],

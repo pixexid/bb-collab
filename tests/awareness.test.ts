@@ -7,6 +7,9 @@ import {
   openLaneViews,
   type OperatorWait,
   readLaneStates,
+  readRoleHolderStates,
+  type RoleHolderState,
+  type RoleIdleView,
   type LaneState,
   type LaneView,
 } from "../src/awareness.js";
@@ -24,6 +27,24 @@ function lane(threadId = "worker-1"): LaneState {
     terminal_report_digest: null,
     created_at_ms: 1,
   };
+}
+
+function roleHolder(threadId = "director-1"): RoleHolderState {
+  return {
+    project_id: "project-1",
+    role_id: "project-orchestrator",
+    role_generation: 3,
+    execution_attempt_id: "role-attempt-3",
+    thread_id: threadId,
+  };
+}
+
+function roleScope(queueHeadId: string | null, deferredReason: OperatorWait["reason"] | null = null) {
+  return { projectId: "project-1", nextStartable: queueHeadId !== null, queueHeadId, deferredReason };
+}
+
+function roleObservation(idleSinceMs: number): { status: "idle"; pendingExternalWait: false; archived: false; operatorWait: null; operatorWaitKnown: true; idleSinceMs: number } {
+  return { status: "idle", pendingExternalWait: false, archived: false, operatorWait: null, operatorWaitKnown: true, idleSinceMs };
 }
 
 describe("lane awareness", () => {
@@ -51,6 +72,206 @@ describe("lane awareness", () => {
     });
     expect(views[1]).toMatchObject({ laneId: "lane-ready", queueBlocked: false, nextStartable: true });
     db.close();
+  });
+
+  it("detects only a startable, non-deferred queue for a role", async () => {
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    let scopes = [roleScope(null, "awaiting_operator")];
+    let currentNow = 0;
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => scopes,
+      readWorker: async () => roleObservation(0),
+      steerRole,
+      now: () => currentNow,
+    });
+
+    await watcher.poll();
+    expect(steerRole).not.toHaveBeenCalled();
+
+    scopes = [roleScope("queue-head")];
+    await watcher.poll();
+    currentNow = 10 * 60_000;
+    await watcher.poll();
+    expect(steerRole).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for the exact ten-minute wrongful-idle threshold", async () => {
+    let currentNow = 0;
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => [roleScope("queue-head")],
+      readWorker: async () => roleObservation(0),
+      steerRole,
+      now: () => currentNow,
+    });
+
+    await watcher.poll();
+    expect(steerRole).not.toHaveBeenCalled();
+    currentNow = 10 * 60_000 - 1;
+    await watcher.poll();
+    expect(steerRole).not.toHaveBeenCalled();
+    currentNow += 1;
+    await watcher.poll();
+    expect(steerRole).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesces repeated role-idle observations to one steer", async () => {
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    let currentNow = 0;
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => [roleScope("queue-head")],
+      readWorker: async () => roleObservation(0),
+      steerRole,
+      now: () => currentNow,
+    });
+
+    await watcher.poll();
+    currentNow = 10 * 60_000;
+    await watcher.poll();
+    expect(steerRole).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not escalate a second delivered steer until it is observed ineffective", async () => {
+    let currentNow = 0;
+    let nativeUpdatedAt = 0;
+    let status: "idle" | "starting" | "active" | "stopping" | "error" = "idle";
+    const alerts: string[] = [];
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockImplementation(async () => {
+      nativeUpdatedAt = currentNow;
+      status = "starting";
+    });
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => [roleScope("queue-head")],
+      readWorker: async () => status === "idle"
+        ? roleObservation(nativeUpdatedAt)
+        : { ...roleObservation(nativeUpdatedAt), status: "active", idleSinceMs: null },
+      steerRole,
+      now: () => currentNow,
+      onAlert: (alert) => alerts.push(alert.kind),
+    });
+
+    await watcher.poll();
+    currentNow = 10 * 60_000;
+    await watcher.poll();
+    await watcher.poll();
+    status = "active";
+    await watcher.poll();
+    status = "stopping";
+    await watcher.poll();
+    status = "error";
+    await watcher.poll();
+    status = "idle";
+    currentNow = 20 * 60_000;
+    await watcher.poll();
+    await watcher.poll();
+    await watcher.poll();
+    currentNow = 30 * 60_000;
+    await watcher.poll();
+    await watcher.poll();
+    await watcher.poll();
+    status = "starting";
+    await watcher.poll();
+    status = "active";
+    await watcher.poll();
+    status = "stopping";
+    await watcher.poll();
+    status = "error";
+    await watcher.poll();
+    expect(steerRole).toHaveBeenCalledTimes(2);
+    expect(alerts).toEqual([]);
+    status = "idle";
+    currentNow = 40 * 60_000;
+    await watcher.poll();
+    await watcher.poll();
+    await watcher.poll();
+    currentNow = 50 * 60_000;
+    await watcher.poll();
+    expect(alerts).toEqual(["wrongful_idle_fyi"]);
+  });
+
+  it("survives reload and clears the role key on queue change or active state", async () => {
+    let currentNow = 0;
+    let status: "idle" | "active" = "idle";
+    let queueHead = "queue-head-1";
+    let persisted: unknown;
+    const persistence = {
+      read: async () => persisted,
+      write: async (state: Record<string, unknown>) => { persisted = state; },
+    };
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    const options = {
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => [roleScope(status === "idle" ? queueHead : null)],
+      readWorker: async () => ({ ...roleObservation(0), status, pendingExternalWait: false }),
+      steerRole,
+      roleIdlePersistence: persistence,
+      now: () => currentNow,
+    };
+    const firstWatcher = createLaneWatcher(options);
+    await firstWatcher.poll();
+    const restartedWatcher = createLaneWatcher(options);
+    await restartedWatcher.recover();
+    await restartedWatcher.poll();
+    currentNow = 10 * 60_000;
+    await restartedWatcher.poll();
+    expect(steerRole).toHaveBeenCalledTimes(1);
+
+    queueHead = "queue-head-2";
+    await restartedWatcher.poll();
+    expect(steerRole).toHaveBeenCalledTimes(1);
+    currentNow = 20 * 60_000;
+    await restartedWatcher.poll();
+    expect(steerRole).toHaveBeenCalledTimes(2);
+    status = "active";
+    await restartedWatcher.poll();
+    status = "idle";
+    currentNow = 30 * 60_000;
+    await restartedWatcher.poll();
+    expect(steerRole).toHaveBeenCalledTimes(2);
+  });
+
+  it("escalates once after two failed role steers", async () => {
+    let currentNow = 0;
+    const alerts: string[] = [];
+    const succession: RoleIdleView[] = [];
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockRejectedValue(new Error("send failed"));
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => [roleScope("queue-head")],
+      readWorker: async () => roleObservation(0),
+      steerRole,
+      now: () => currentNow,
+      onAlert: (alert) => alerts.push(alert.kind),
+      onRoleSuccessionRequired: (role) => succession.push(role),
+    });
+    await watcher.poll();
+    currentNow = 10 * 60_000;
+
+    await watcher.poll();
+    currentNow = 20 * 60_000;
+    await watcher.poll();
+    currentNow = 30 * 60_000;
+    await watcher.poll();
+
+    expect(steerRole).toHaveBeenCalledTimes(2);
+    expect(alerts).toEqual(["wrongful_idle_fyi"]);
+    expect(succession).toHaveLength(1);
   });
 
   it("steers on a synthetic idle transition", async () => {
@@ -292,6 +513,48 @@ describe("lane awareness", () => {
     await watcher.observe("worker-1", "idle");
 
     expect({ assignments: db.prepare("SELECT * FROM assignments").all(), attempts: db.prepare("SELECT * FROM execution_attempts").all() }).toEqual(before);
+    db.close();
+  });
+
+  it("does not write canonical role or lane rows while observing", async () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE assignments (project_id TEXT, assignment_id TEXT, lane_id TEXT, assignment_kind TEXT, work_item_id TEXT, created_at_ms INTEGER)");
+    db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT, role_id TEXT, role_generation INTEGER)");
+    db.exec("CREATE TABLE role_generation_heads (project_id TEXT, role_id TEXT, current_generation INTEGER)");
+    db.exec("CREATE TABLE role_generations (project_id TEXT, role_id TEXT, generation INTEGER, status TEXT)");
+    db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "lane-1", "write", "work-1", 1);
+    db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "director-1", "role-attempt-3", "role_holder", "done", null, "project-orchestrator", 3);
+    db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "worker-role-1", "worker-role-attempt", "role_holder", "done", null, "worker", 1);
+    db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "worker-1", "attempt-1", "assignment", "prepared", null, "worker", 1);
+    db.prepare("INSERT INTO role_generation_heads VALUES (?, ?, ?)").run("project-1", "project-orchestrator", 3);
+    db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?)").run("project-1", "project-orchestrator", 3, "active");
+    db.prepare("INSERT INTO role_generation_heads VALUES (?, ?, ?)").run("project-1", "worker", 1);
+    db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?)").run("project-1", "worker", 1, "active");
+    expect(readRoleHolderStates(db)).toHaveLength(1);
+    const before = {
+      assignments: db.prepare("SELECT * FROM assignments").all(),
+      attempts: db.prepare("SELECT * FROM execution_attempts").all(),
+      heads: db.prepare("SELECT * FROM role_generation_heads").all(),
+      generations: db.prepare("SELECT * FROM role_generations").all(),
+    };
+    const watcher = createLaneWatcher({
+      readLanes: () => readLaneStates(db),
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => readRoleHolderStates(db),
+      readRoleScopes: () => [roleScope("queue-head")],
+      readWorker: async () => roleObservation(0),
+      steerRole: vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined),
+      now: () => 10 * 60_000,
+    });
+
+    await watcher.poll();
+
+    expect({
+      assignments: db.prepare("SELECT * FROM assignments").all(),
+      attempts: db.prepare("SELECT * FROM execution_attempts").all(),
+      heads: db.prepare("SELECT * FROM role_generation_heads").all(),
+      generations: db.prepare("SELECT * FROM role_generations").all(),
+    }).toEqual(before);
     db.close();
   });
 });
