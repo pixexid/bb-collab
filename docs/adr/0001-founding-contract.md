@@ -147,9 +147,18 @@ The result is a machine-readable AuthorityContext containing resolved project,
 config, governorship, actor, repository, resource and evidence revisions.
 Refusals are typed; no wrapper may turn a refusal into success.
 
-The contract v8/schema v10 interim operator gate is a one-request grant bound to
+The contract v9/schema v10 interim operator gate is a one-request grant bound to
 the exact project_id, operation class, lowercase 40-character candidate head,
-idempotency key and canonical normalized request digest. Consumption is an atomic
+idempotency key and canonical normalized request digest. The shared
+authorization-digest projection parses the apply request, normalizes nullable
+optionals so omitted and explicit-null values are both `null`, and projects
+`expectedConfigRevision`, `expectedGovernanceEpoch`, and `expectedFenceToken`
+to `null`. Those three fields are execution-time config/governor guards, not
+authorization identity: apply still requires and validates their live values.
+`candidateHead` and `operatorReceiptId` remain outside the request digest because
+they are bound separately or derived; project, operation class, idempotency key,
+and all other request content remain exact. This is a contract-only bump to v9;
+schema remains v10 because no stored shape or migration changed. Consumption is an atomic
 compare-and-set in the same transaction as the first StateEvent; an already
 consumed receipt refuses, except that the original operatorReceiptId may return
 its already-committed idempotent result byte-for-byte. The receipt has no local

@@ -14163,7 +14163,7 @@ import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 8;
+var CONTRACT_VERSION = 9;
 var SCHEMA_VERSION = 10;
 var AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab";
 var AUTHORIZED_APPROVER_PROJECT_ID = "proj_a8zzfsx36j";
@@ -14751,7 +14751,7 @@ function cachedConsumerRolloutEvidence(observedSchemaVersion, observedContractVe
     oldSchemaVersion: 9,
     newSchemaVersion: SCHEMA_VERSION,
     observedSchemaVersion,
-    oldContractVersion: 7,
+    oldContractVersion: 8,
     newContractVersion: CONTRACT_VERSION,
     observedContractVersion,
     action: reread ? "reread" : "refused",
@@ -16129,10 +16129,13 @@ function refusalResult(subject, data, expected = 1, attempted = 0, verified = 0)
     ...data.expectedResourceRevision === void 0 ? {} : { expectedResourceRevision: data.expectedResourceRevision }
   });
 }
-function operatorRequestDigest(input) {
+var OPERATOR_DIGEST_GUARDS = /* @__PURE__ */ new Set(["expectedConfigRevision", "expectedGovernanceEpoch", "expectedFenceToken"]);
+function operatorAuthorizationDigestProjection(input) {
   const request = parseApplyRequest(input);
-  const digestable = Object.fromEntries(Object.entries(request).filter(([key, value]) => !["candidateHead", "operatorReceiptId"].includes(key) && value !== void 0));
-  return sha256(canonicalJson(digestable));
+  return Object.fromEntries(Object.entries(request).filter(([key]) => !["candidateHead", "operatorReceiptId"].includes(key)).map(([key, value]) => [key, OPERATOR_DIGEST_GUARDS.has(key) ? null : value]).filter(([, value]) => value !== void 0));
+}
+function operatorRequestDigest(input) {
+  return sha256(canonicalJson(operatorAuthorizationDigestProjection(input)));
 }
 function now() {
   return Date.now();

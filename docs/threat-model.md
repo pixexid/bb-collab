@@ -19,7 +19,7 @@ worker.
 | GitHub, BB Tasks and Markdown | External projections or evidence | They may not activate work, satisfy a gate or close a WorkItem independently. |
 | Operator/admin/raw BB activity | Unmanaged activity on a full-trust host | It may be detected as evidence or discrepancy, but it acquires no canonical authority by observation. |
 
-The v8/schema v10 operator gate has a host/UI confirmation boundary only for
+The v9/schema v10 operator gate has a host/UI confirmation boundary only for
 authorizing or revoking the approver. An adopted `operator_only` Decision
 registers `approverId=orchestrator:bb-collab` for the exact project and adopted
 disposition, with the eight ratified derived mutation classes, including
@@ -31,7 +31,11 @@ issues a fresh interim receipt plus verified plugin actor with no pending UI
 interaction. Revocation or change marks the registry revoked and attestation
 fails closed. The receipt binds one exact project, operation class, lowercase
 40-character candidate head, idempotency key and canonical normalized request
-digest. Both the registry and interim receipt retain the upstream host-issued
+digest. The shared authorization-digest projection normalizes omitted nullable
+fields to `null` and projects expected config/governor/fence guards to `null`;
+apply still validates those live guards separately and fails closed when stale.
+Project, operation class, candidate head, idempotency key, and all other request
+content remain bound. Both the registry and interim receipt retain the upstream host-issued
 `get-bb/bb#1541` retirement condition. The first committed StateEvent consumes it atomically; reuse, a
 different receipt for an already-committed idempotency key, or any binding
 mismatch refuses before a write. It has no local TTL and retires only on the

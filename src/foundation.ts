@@ -5,7 +5,7 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 8;
+export const CONTRACT_VERSION = 9;
 export const SCHEMA_VERSION = 10;
 export const AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab" as const;
 export const AUTHORIZED_APPROVER_PROJECT_ID = "proj_a8zzfsx36j" as const;
@@ -601,7 +601,7 @@ export function cachedConsumerRolloutEvidence(observedSchemaVersion: number, obs
     oldSchemaVersion: 9,
     newSchemaVersion: SCHEMA_VERSION,
     observedSchemaVersion,
-    oldContractVersion: 7,
+    oldContractVersion: 8,
     newContractVersion: CONTRACT_VERSION,
     observedContractVersion,
     action: reread ? "reread" : "refused",
@@ -2085,6 +2085,9 @@ function parseCanonicalEvidenceJson(text: string, label: string): { value: Recor
 }
 
 function normalizeRequest(request: ApplyRequest): ApplyRequest {
+  // Authorization digests use this parsed form. Nullable optionals are
+  // materialized as null so omitted and explicit-null requests are identical;
+  // resolver-only config/governor guards are projected to null below.
   return {
     ...request,
     actorReceiptId: request.actorReceiptId ?? null,
@@ -2652,10 +2655,18 @@ function refusalResult(subject: string, data: RefusalData, expected = 1, attempt
   });
 }
 
-export function operatorRequestDigest(input: unknown): string {
+const OPERATOR_DIGEST_GUARDS = new Set(["expectedConfigRevision", "expectedGovernanceEpoch", "expectedFenceToken"]);
+
+export function operatorAuthorizationDigestProjection(input: unknown): Record<string, unknown> {
   const request = parseApplyRequest(input);
-  const digestable = Object.fromEntries(Object.entries(request).filter(([key, value]) => !["candidateHead", "operatorReceiptId"].includes(key) && value !== undefined));
-  return sha256(canonicalJson(digestable));
+  return Object.fromEntries(Object.entries(request)
+    .filter(([key]) => !["candidateHead", "operatorReceiptId"].includes(key))
+    .map(([key, value]) => [key, OPERATOR_DIGEST_GUARDS.has(key) ? null : value])
+    .filter(([, value]) => value !== undefined));
+}
+
+export function operatorRequestDigest(input: unknown): string {
+  return sha256(canonicalJson(operatorAuthorizationDigestProjection(input)));
 }
 
 function now(): number {
