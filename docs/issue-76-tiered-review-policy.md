@@ -10,8 +10,8 @@ one tier with `Review tier: A`, `Review tier: B`, or `Review tier: C`.
 
 - **Tier A:** authority/provenance, canonical DDL/lifecycle, operator
   receipts/approval, spend, concurrency/atomicity, migration/cutover, or
-  review/release policy. Require an independent cold review of the exact
-  candidate head before merge.
+  review/release policy, including tracked runtime artifacts. Require an
+  independent cold review of the exact candidate head before merge.
 - **Tier B:** features or refactors with no Tier-A contact. Merge after local
   verification and CI. Run cold review post-merge in parallel; turn findings
   into follow-up work unless a confirmed serious defect requires revert.

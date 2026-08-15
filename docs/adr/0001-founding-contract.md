@@ -349,8 +349,8 @@ surfaces:
 
 - Tier A covers authority/provenance, canonical DDL/lifecycle, operator
   receipts/approval, spend, concurrency/atomicity, migration/cutover, and
-  review/release policy. It requires an independent exact-head cold review
-  before merge.
+  review/release policy, including tracked runtime artifacts. It requires an
+  independent exact-head cold review before merge.
 - Tier B covers features/refactors with no Tier-A contact. Local verification
   and CI permit merge; cold review runs post-merge in parallel, with a serious
   confirmed defect taking the existing revert path.

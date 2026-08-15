@@ -11,13 +11,16 @@ const declarations = body.match(/^\s*Review tier\s*:\s*([ABC])\s*$/gmu) ?? [];
 const declared = declarations.length === 1 ? declarations[0].match(/([ABC])\s*$/u)?.[1] ?? null : null;
 const tierA = [
   /^AGENTS\.md$/u,
+  /^app\.tsx$/u,
   /^\.github\/workflows\/verify\.yml$/u,
-  /^docs\/(?:adr\/0001-founding-contract|issue-76-tiered-review-policy|operations-model|roadmap)\.md$/u,
+  /^dist\//u,
+  /^docs\/(?:adr\/0001-founding-contract|import-manifest|issue-76-tiered-review-policy|operations-model|roadmap|threat-model)\.md$/u,
   /^scripts\/check-review-tier\.mjs$/u,
-  /(^|\/)(?:authority|approval|atomicity|concurrency|cutover|migration|provenance|receipt|spend)(?:[-_.\/]|$)/iu,
+  /^server\.ts$/u,
+  /(?:^|\/|[-_.])(?:authority|approval|atomicity|concurrenc(?:y|ies)|cutover|migrations?|provenance|receipts?|spend)(?:[-_.\/]|$)/iu,
   /(^|\/)foundation\.ts$/u,
 ];
-const tierC = [/^docs\//u, /^tests\//u, /(?:^|\/)(?:README|AGENTS)\.md$/u, /^dist\//u];
+const tierC = [/^docs\//u, /^tests\//u, /(?:^|\/)(?:README|AGENTS)\.md$/u];
 const required = files.some((file) => tierA.some((pattern) => pattern.test(file)))
   ? "A"
   : files.length > 0 && files.every((file) => tierC.some((pattern) => pattern.test(file)))

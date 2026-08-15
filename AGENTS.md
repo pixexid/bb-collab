@@ -128,8 +128,9 @@ cached consumers emit a durable reread/refusal rollout receipt.
   it is not authority or queue state.
 - Tier-A surfaces include authority/provenance, canonical DDL/lifecycle,
   operator receipts/approval, spend, concurrency/atomicity, migration/cutover,
-  and review/release policy. The next unrelated lane may start while a Tier-A
-  review runs; only the candidate merge waits for its review.
+  review/release policy, and tracked runtime artifacts. The next unrelated
+  lane may start while a Tier-A review runs; only the candidate merge waits for
+  its review.
 - External connector policy is project configuration: required, optional or
   prohibited. Observed capability is separate evidence: available, absent,
   degraded or unknown. Required policy with absent, degraded or unknown

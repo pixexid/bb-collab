@@ -22,9 +22,18 @@ describe("pull-request review tier policy", () => {
   it("requires a declaration, derives risk, and encodes merge timing", () => {
     expect(check("Related GH-76", ["docs/roadmap.md"]).status).toBe(1);
     expect(check("Review tier: A\nReview tier: B", ["docs/roadmap.md"]).status).toBe(1);
-    expect(check("Review tier: C", ["docs/roadmap.md", "tests/review-policy.test.ts"]).stdout).toContain("local verify and CI only");
-    expect(check("Review tier: B", ["src/awareness.ts"]).stdout).toContain("post-merge in parallel");
-    expect(check("Review tier: A", ["src/foundation.ts"]).stdout).toContain("before merge");
+    const tierC = check("Review tier: C", ["docs/issue-57-mechanism-1.md", "tests/review-policy.test.ts"]);
+    expect(tierC.status).toBe(0);
+    expect(tierC.stderr).not.toContain("Review finding");
+    expect(tierC.stdout).toContain("local verify and CI only");
+    const tierB = check("Review tier: B", ["src/awareness.ts"]);
+    expect(tierB.status).toBe(0);
+    expect(tierB.stderr).not.toContain("Review finding");
+    expect(tierB.stdout).toContain("post-merge in parallel");
+    const tierA = check("Review tier: A", ["src/foundation.ts", "server.ts", "dist/server.js"]);
+    expect(tierA.status).toBe(0);
+    expect(tierA.stderr).not.toContain("Review finding");
+    expect(tierA.stdout).toContain("before merge");
   });
 
   it("keeps wrong-tiering visible as a review finding without changing merge policy", () => {

@@ -38,7 +38,7 @@ review finding and does not become safe merely because CI is green.
 
 | Tier | Touched surface | Merge rule |
 | --- | --- | --- |
-| A | authority/provenance, canonical store DDL or lifecycle, operator receipts or approval, spend, concurrency or atomicity, migration or cutover, and review/release policy | Independent cold review of the exact candidate head is mandatory before merge. The review may run beside other startable lanes, but this candidate does not merge until the review and CI gates pass. |
+| A | authority/provenance, canonical store DDL or lifecycle, operator receipts or approval, spend, concurrency or atomicity, migration or cutover, review/release policy, and tracked runtime artifacts | Independent cold review of the exact candidate head is mandatory before merge. The review may run beside other startable lanes, but this candidate does not merge until the review and CI gates pass. |
 | B | features or refactors with no Tier-A contact | Local verification and CI are sufficient to merge. Cold review runs post-merge in parallel; findings become follow-up work unless a confirmed serious defect requires revert. |
 | C | documentation, mechanical edits, and additive tests | Local verification and CI only; no cold review is required. |
 
