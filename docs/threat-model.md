@@ -37,11 +37,10 @@ immutable project configuration and its mapped targets, including
 `approverAttestation` RPC validates that active registry row, exact Decision
 and disposition, caller plugin, and request binding, then atomically issues a
 fresh interim receipt plus verified plugin actor with no pending UI interaction.
-The exact current ten-class set authorizes all current classes. For bump
-survival, an active exact historical v11 nine-class set authorizes only its
-nine members, including authority-maintenance `decision_create` and adopted
-`decision_disposition`; it does not authorize `work_item_transition`.
-Re-adoption revokes that row and installs the exact current ten-class set.
+The exact current ten-class set authorizes all current classes. Contract v13
+leaves that allowlist unchanged. The already-bounded v11 nine-class set remains
+readable but does not authorize `work_item_transition`; authority-maintenance
+re-adoption installs the exact current ten-class set.
 Malformed, reordered, subset, extra, v9, and arbitrary other sets refuse at
 both attestation and apply. Revocation or change marks the registry revoked and
 attestation fails closed. The receipt binds one exact project, operation class, lowercase
@@ -58,8 +57,13 @@ host-issued `get-bb/bb#1541` condition. The historical contract-v9 eight-class
 registry was accepted only during the one-release v9-to-v10 re-adoption.
 Contract v11 required the exact nine-class set; contract v12 adds only
 `work_item_transition`. Contract v13 adds the canonical named standby profile
-for new project-orchestrator generations; it must use a different provider from
-the executed holder and has no authority or traffic.
+for new project-orchestrator generations and the bounded per-orchestrator
+writing-lane dial; the standby must use a different provider from the executed
+holder and has no authority or traffic. Stale v12 consumers refuse, current v13
+consumers reread, and schema/migrations remain unchanged by this lane-policy
+amendment. The dial is a canonical config revision recorded through the adopted
+Decision and operator-authorized `config_revision` seam; review and probe
+Assignments are excluded from the writing count.
 `github_issue_projection`,
 `assignment_dispatch`, and `assignment_reconcile` reserve/finalize paths
 refuse before external adapters because one receipt cannot authorize multiple
