@@ -15,6 +15,7 @@ const tierA = [
   /^\.github\/workflows\/verify\.yml$/u,
   /^dist\//u,
   /^docs\/(?:adr\/0001-founding-contract|import-manifest|issue-76-tiered-review-policy|operations-model|roadmap|threat-model)\.md$/u,
+  /^scripts\/build\.mjs$/u,
   /^scripts\/check-review-tier\.mjs$/u,
   /^server\.ts$/u,
   /(?:^|\/|[-_.])(?:authority|approval|atomicity|concurrenc(?:y|ies)|cutover|migrations?|provenance|receipts?|spend)(?:[-_.\/]|$)/iu,

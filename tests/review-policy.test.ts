@@ -30,10 +30,12 @@ describe("pull-request review tier policy", () => {
     expect(tierB.status).toBe(0);
     expect(tierB.stderr).not.toContain("Review finding");
     expect(tierB.stdout).toContain("post-merge in parallel");
-    const tierA = check("Review tier: A", ["src/foundation.ts", "server.ts", "dist/server.js"]);
-    expect(tierA.status).toBe(0);
-    expect(tierA.stderr).not.toContain("Review finding");
-    expect(tierA.stdout).toContain("before merge");
+    for (const file of ["src/foundation.ts", "server.ts", "app.tsx", "dist/server.js", "scripts/build.mjs"]) {
+      const tierA = check("Review tier: A", [file]);
+      expect(tierA.status, file).toBe(0);
+      expect(tierA.stderr, file).not.toContain("Review finding");
+      expect(tierA.stdout, file).toContain("before merge");
+    }
   });
 
   it("keeps wrong-tiering visible as a review finding without changing merge policy", () => {
