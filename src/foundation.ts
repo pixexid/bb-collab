@@ -679,6 +679,18 @@ export const DERIVED_ACTOR_MUTATION_CLASSES = [
   "migration_prepare",
   "migration_step",
 ] as const;
+/** Exact contract-v11 registry retained only for bounded v12 re-adoption. */
+export const PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES = Object.freeze([
+  "bootstrap",
+  "config_revision",
+  "decision_create",
+  "decision_disposition",
+  "work_item_create",
+  "qualification_observation_record",
+  "role_generation_succession",
+  "migration_prepare",
+  "migration_step",
+] as const);
 export function isDerivedActorMutationClass(operationClass: string): boolean {
   return (DERIVED_ACTOR_MUTATION_CLASSES as readonly string[]).includes(operationClass);
 }
@@ -2480,10 +2492,15 @@ function requireActiveAuthorizedApprover(
   } catch {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are malformed");
   }
-  if (!isExactAuthorizedApproverMutationClassSet(allowed, DERIVED_ACTOR_MUTATION_CLASSES)) {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current set");
+  const allowedMutationClasses = isExactAuthorizedApproverMutationClassSet(allowed, DERIVED_ACTOR_MUTATION_CLASSES)
+    ? DERIVED_ACTOR_MUTATION_CLASSES
+    : isExactAuthorizedApproverMutationClassSet(allowed, PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES)
+      ? PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES
+      : null;
+  if (!allowedMutationClasses) {
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current or bump-surviving v11 set");
   }
-  if (!(DERIVED_ACTOR_MUTATION_CLASSES as readonly string[]).includes(input.mutationClass)) {
+  if (!(allowedMutationClasses as readonly string[]).includes(input.mutationClass)) {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "mutation class is not authorized by the approver registry");
   }
   const decision = asRow<{ project_id: string; decision_class: string | null; options_json: string | null }>(db.prepare(

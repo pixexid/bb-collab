@@ -66,8 +66,14 @@ remain required.
 
 The historical contract-v9 eight-class registry was accepted only during the
 one-release v9-to-v10 re-adoption. Contract v11 required the exact nine-class
-row; contract v12 retires that prior row and requires the exact current
-ten-class row, while the former sets and arbitrary other sets remain invalid.
+row. Contract v12 keeps an active exact v11 row alive only for the nine classes
+in that immutable historical set, so authority-maintenance `decision_create`
+and adopted `decision_disposition` can re-adopt the approver without a human
+form; `work_item_transition` still refuses under that row. The re-adoption
+installs the exact current ten-class row. Malformed, reordered, subset, extra,
+v9, and other arbitrary sets remain invalid. This compatibility repair leaves
+contract/schema versions, digests, migrations, and cached-consumer rollout
+unchanged.
 
 The ratified evidence-only MigrationRun shape records the llm-collab fence
 `f988d9711d3778f751e4ec0e32ebbf7b0893c80f` at resource revision 4 and merged
