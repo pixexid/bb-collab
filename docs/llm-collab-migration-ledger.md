@@ -186,6 +186,10 @@ review mode.
 - project, config revision, repo target, branch/base/candidate, environment,
   actual provider/model/reasoning, permission, visibility, first-action receipt,
   and terminal DONE|BLOCKED evidence are all exact and correlated;
+- a ready BB-native managed worktree may use a derived path only when its exact
+  project/host resolves to one canonical source; source and environment paths
+  remain separate evidence, while unmanaged, ephemeral, foreign, or ambiguous
+  contexts refuse;
 - dispatch ambiguity becomes DISPATCH_UNKNOWN and suppresses blind retry;
 - dirty, moved, foreign, missing, or ambiguous environments refuse before
   mutation; and

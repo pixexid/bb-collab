@@ -1581,10 +1581,13 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
   ) {
     throw refusal("ROLE_CONTEXT_FOREIGN", "holder environment is not an exact ready managed worktree");
   }
+  // BB-managed worktrees have a derived execution path, not the canonical source path.
+  // Keep both exact paths in the evidence and resolve the source only through the
+  // native project/host binding; unmanaged or ambiguous contexts already refused above.
   const sources = project.sources.filter(
-    (source) => source.projectId === request.projectId && source.hostId === environment.hostId && source.path === environment.path,
+    (source) => source.projectId === request.projectId && source.hostId === environment.hostId,
   );
-  if (sources.length !== 1) throw refusal("ROLE_CONTEXT_FOREIGN", "project source does not resolve uniquely by exact host and path");
+  if (sources.length !== 1) throw refusal("ROLE_CONTEXT_FOREIGN", "managed worktree does not resolve to one exact project source on its host");
   if (host.id !== environment.hostId || host.status !== "connected") throw refusal("ROLE_CONTEXT_UNKNOWN", "holder host is unavailable");
   if (!stringField(bbVersion) || !stringField(bbServerId) || events.length === 0 || events.length > 256) {
     throw refusal("ROLE_CONTEXT_UNKNOWN", "bounded BB version or event facts are unavailable");
@@ -4985,8 +4988,8 @@ function requireRoleTargetContext(
     host_id: string;
     path: string;
   };
-  const environment = context.baseContext.environment as { path?: unknown };
-  if (target.source_id !== context.sourceId || target.host_id !== context.hostId || target.path !== environment.path) {
+  const source = context.baseContext.source as { path?: unknown };
+  if (target.source_id !== context.sourceId || target.host_id !== context.hostId || target.path !== source.path) {
     throw refusal("ROLE_CONTEXT_FOREIGN", "holder context does not match the exact repository target source, host, and path");
   }
 }

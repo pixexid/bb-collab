@@ -218,7 +218,12 @@ Live RPC and CLI role mutations use the existing `RoleFactReader` seam backed by
 BB core thread, event, environment, project, host and version reads. The reader
 feeds only the existing `roleRequirements`, `qualification_observation_record`
 and `role_generation_succession` APIs; unavailable, foreign, stale or incomplete
-facts refuse before canonical state changes. Fixture readers remain test-only.
+facts refuse before canonical state changes. A ready native `managed-worktree`
+may have a derived environment path that differs from the canonical project
+source path: resolution still requires the exact project, host and one unique
+project source on that host, and records both paths separately. Unmanaged,
+non-ready, foreign or ambiguous environments refuse. Fixture readers remain
+test-only.
 
 An Assignment binds:
 

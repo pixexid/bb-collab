@@ -15,7 +15,7 @@ worker.
 | BB core | Native project, source, host, environment, thread, provider and event facts | bb-collab records exact references and receipts; it does not replace BB core authority. |
 | bb-collab plugin database | Project configuration, repository targets, governorship, roles, WorkItems, assignments, decisions, qualifications, evidence, migration and current projections | One transactional canonical store; unavailable or corrupt means governed writes stop. |
 | Governorship fence | Current runtime, epoch, token and mutation sequence | Every sanctioned source, target, import and projection mutation presents the same expected epoch/token. |
-| Project repository and worktrees | Versioned project extensions, candidate code and human documentation | Exact target, branch, base and candidate identity are required; a checkout never proves authority. |
+| Project repository and worktrees | Versioned project extensions, candidate code and human documentation | Exact target, branch, base and candidate identity are required; a checkout never proves authority. A native ready managed worktree may use a derived path, but its exact project/host/source binding and both source and environment paths are retained. |
 | GitHub, BB Tasks and Markdown | External projections or evidence | They may not activate work, satisfy a gate or close a WorkItem independently. |
 | Operator/admin/raw BB activity | Unmanaged activity on a full-trust host | It may be detected as evidence or discrepancy, but it acquires no canonical authority by observation. |
 
@@ -164,6 +164,11 @@ project/repository/environment/path, no active or unresolved assignment,
 clean/disposable proof against the correct candidate, unique-state checks,
 recovery evidence and current revisions. A failed proof leaves state untouched
 where BB permits.
+
+Role qualification accepts a derived path only for a ready BB-native
+`managed-worktree` whose project and host resolve to exactly one canonical
+source. The canonical source path and derived environment path remain separate
+evidence; unmanaged, ephemeral, foreign or ambiguous contexts fail closed.
 
 Cutover has a no-writer interval:
 

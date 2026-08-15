@@ -5037,7 +5037,7 @@ describe("bb-collab plugin boundary", () => {
   it("records immutable qualification and activates one exact first orchestrator generation", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
-    const facts = roleReader();
+    const facts = roleReader((value) => { value.environment.path = "/workspace/managed-worktree"; });
     const qualified = applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, facts);
     expect(qualified).toMatchObject({ outcome: "OK", expected: 1, attempted: 1, verified: 1 });
     const activated = applyWithFixtureReceipt(db, successionRequest(fenceToken), null, facts);
@@ -5233,7 +5233,7 @@ describe("bb-collab plugin boundary", () => {
   it("requires exact target binding for target-scoped roles", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
-    const facts = roleReader();
+    const facts = roleReader((value) => { value.environment.path = "/workspace/managed-worktree"; });
     const reviewerQualification = qualificationRequest(fenceToken, {
       idempotencyKey: "reviewer-qualification",
       repoTargetId: TARGET_ID,
@@ -5317,6 +5317,20 @@ describe("bb-collab plugin boundary", () => {
     });
   });
 
+  it("resolves a canonical source behind a distinct ready managed-worktree path", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    const facts = roleReader((value) => { value.environment.path = "/workspace/managed-worktree"; });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "managed-worktree-source-resolution",
+      qualificationId: "managed-worktree-source-resolution",
+    }), null, facts)).toMatchObject({ outcome: "OK", expected: 1, attempted: 1, verified: 1 });
+    expect(db.prepare("SELECT source_id, host_id FROM qualification_observations WHERE qualification_id = ?").get("managed-worktree-source-resolution")).toEqual({
+      source_id: "source-main",
+      host_id: "host-main",
+    });
+  });
+
   it("decides replay and conflict before role fact access and does not cache transient unknown facts", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -5370,14 +5384,23 @@ describe("bb-collab plugin boundary", () => {
     expect(db.prepare("SELECT current_qualification_id FROM eligibility_projections").get()).toEqual({ current_qualification_id: "qualification-2" });
   });
 
-  it("refuses hidden, foreign, missing, ambiguous, and incomplete BB holder contexts without mutation", async () => {
+  it("refuses hidden, foreign, ephemeral, ambiguous, and incomplete BB holder contexts without mutation", async () => {
     const cases: Array<[string, (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => void, string, Partial<ApplyRequest>?]> = [
       ["hidden", (facts) => { facts.thread.visibility = "hidden"; }, "ROLE_CONTEXT_HIDDEN"],
       ["foreign-thread", (facts) => { facts.thread.projectId = FOREIGN_PROJECT_ID; }, "ROLE_CONTEXT_FOREIGN"],
       ["missing-environment", (facts) => { facts.thread.environmentId = null; }, "ROLE_CONTEXT_REQUIRED"],
       ["foreign-environment", (facts) => { facts.environment.projectId = FOREIGN_PROJECT_ID; }, "ROLE_CONTEXT_FOREIGN"],
-      ["source-mismatch", (facts) => { facts.project.sources[0]!.path = "/other"; }, "ROLE_CONTEXT_FOREIGN"],
+      ["foreign-source-host", (facts) => { facts.project.sources[0]!.hostId = "host-foreign"; }, "ROLE_CONTEXT_FOREIGN"],
       ["ambiguous-source", (facts) => { facts.project.sources.push({ ...facts.project.sources[0]!, id: "source-duplicate" }); }, "ROLE_CONTEXT_FOREIGN"],
+      ["unmanaged-environment", (facts) => {
+        facts.environment.managed = false;
+        facts.environment.isWorktree = false;
+        facts.environment.workspaceProvisionType = "unmanaged";
+      }, "ROLE_CONTEXT_FOREIGN"],
+      ["ephemeral-environment", (facts) => {
+        facts.environment.path = null;
+        facts.environment.status = "provisioning";
+      }, "ROLE_CONTEXT_FOREIGN"],
       ["host-unavailable", (facts) => { facts.host.status = "disconnected"; }, "ROLE_CONTEXT_UNKNOWN"],
       ["missing-start", (facts) => { facts.events = facts.events.filter((event) => event.type !== "turn/started"); }, "EXECUTION_PROFILE_UNKNOWN"],
       ["failed-completion", (facts) => { facts.events[3]!.data.status = "failed"; }, "EXECUTION_PROFILE_UNKNOWN"],
