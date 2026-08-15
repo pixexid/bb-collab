@@ -10,6 +10,7 @@ import plugin from "../server.js";
 import {
   DEFERRED_ISSUE_3_OUTCOMES,
   AUTHORIZED_APPROVER_ID,
+  CACHED_CONSUMERS,
   CONTRACT_VERSION,
   DERIVED_ACTOR_MUTATION_CLASSES,
   EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION,
@@ -22,7 +23,6 @@ import {
   MIGRATIONS,
   MIGRATION_STATES,
   MIGRATION_STEPS,
-  PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES,
   PLUGIN_ID,
   SCHEMA_VERSION,
   TABLES,
@@ -95,6 +95,7 @@ function roleConfig(connector: "required" | "optional" | "prohibited" = "optiona
   };
   config.extensions.bbCollab.roleRequirements = [
     { roleRequirementId: "orchestrator-v1", roleId: "project-orchestrator", repoTargetId: null, executedProfile: ROLE_PROFILE },
+    { roleRequirementId: "worker-v1", roleId: "worker", repoTargetId: TARGET_ID, executedProfile: ROLE_PROFILE },
     { roleRequirementId: "reviewer-v1", roleId: "independent-reviewer", repoTargetId: TARGET_ID, executedProfile: ROLE_PROFILE },
   ];
   config.extensions.bbCollab.reviewPolicy = {
@@ -1852,7 +1853,7 @@ describe("bb-collab plugin boundary", () => {
     expect(revoked).toMatchObject({ outcome: "AUTHORIZED_APPROVER_REVOKED" });
   });
 
-  it("upgrades an exact v9 approver registry without widening legacy authority", async () => {
+  it("refuses a retired v9 approver registry under contract v11", async () => {
     const { host, db, fenceToken } = await assignmentFixture();
     seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "compat-operator", actorKind: "operator", subjectId: "operator-1" });
     const decisionId = "compat-operator";
@@ -1875,185 +1876,98 @@ describe("bb-collab plugin boundary", () => {
       idempotencyKey: `${decisionId}-seq1`,
     }))).toMatchObject({ outcome: "OK" });
 
-    const previousJson = canonicalJson(PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES);
-    const currentJson = canonicalJson(DERIVED_ACTOR_MUTATION_CLASSES);
+    const retiredV9Json = canonicalJson([
+      "bootstrap",
+      "decision_create",
+      "decision_disposition",
+      "work_item_create",
+      "qualification_observation_record",
+      "role_generation_succession",
+      "migration_prepare",
+      "migration_step",
+    ]);
     db.prepare(
       `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
        WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = 1`,
-    ).run(previousJson, PROJECT_ID, AUTHORIZED_APPROVER_ID, decisionId);
+    ).run(retiredV9Json, PROJECT_ID, AUTHORIZED_APPROVER_ID, decisionId);
     expect(db.prepare("SELECT status, allowed_mutation_classes_json FROM authorized_approvers WHERE authorizing_decision_id = ?").get(decisionId)).toEqual({
       status: "active",
-      allowed_mutation_classes_json: previousJson,
+      allowed_mutation_classes_json: retiredV9Json,
     });
 
-    const attest = async (
-      request: ApplyRequest,
-      mutationClass: "decision_create" | "config_revision" | "decision_disposition",
-      authorizingDispositionSequence = 1,
-    ) => host.harness.callRpc("approverAttestation", {
+    const currentJson = canonicalJson(DERIVED_ACTOR_MUTATION_CLASSES);
+    const attest = async (attestedRequest: ApplyRequest, mutationClass: "decision_create" | "governor_claim") => host.harness.callRpc("approverAttestation", {
       projectId: PROJECT_ID,
       mutationClass,
       candidateHead: CANDIDATE_SHA,
-      idempotencyKey: request.idempotencyKey,
-      requestDigest: operatorRequestDigest(request),
-      callerThreadId: "v9-compat-attestor",
+      idempotencyKey: attestedRequest.idempotencyKey,
+      requestDigest: operatorRequestDigest(attestedRequest),
+      callerThreadId: "v11-approver-matrix-attestor",
       requestedFromBackground: false,
       approverId: AUTHORIZED_APPROVER_ID,
       authorizingDecisionId: decisionId,
-      authorizingDispositionSequence,
+      authorizingDispositionSequence: 1,
     }) as Promise<FoundationResult>;
 
-    const legacyUnsigned = decisionCreateRequest(fenceToken, "compat-legacy", {
+    const request = decisionCreateRequest(fenceToken, "compat-retired", {
       actorReceiptId: null,
       operatorReceiptId: null,
       candidateHead: CANDIDATE_SHA,
       repoTargetId: null,
       decision: {
-        decisionId: "compat-legacy",
+        decisionId: "compat-retired",
         repoTargetId: null,
-        scope: { projectId: PROJECT_ID, purpose: "legacy-class" },
+        scope: { projectId: PROJECT_ID, purpose: "retired-v9" },
         decisionClass: "operator_only",
         options: { approverId: AUTHORIZED_APPROVER_ID },
         resourceRevision: 1,
       },
     });
-    const legacyIssued = await attest(legacyUnsigned, "decision_create");
-    expect(legacyIssued).toMatchObject({ outcome: "OK" });
-    const legacyApplied = await host.harness.callRpc("apply", {
-      ...legacyUnsigned,
-      actorReceiptId: legacyIssued.actorReceiptId,
-      operatorReceiptId: legacyIssued.operatorReceipt!.receiptId,
-    }) as FoundationResult;
-    expect(legacyApplied).toMatchObject({ outcome: "OK" });
-    const beforeReplay = exportFoundation(db, PROJECT_ID);
-    expect(await host.harness.callRpc("apply", {
-      ...legacyUnsigned,
-      actorReceiptId: legacyIssued.actorReceiptId,
-      operatorReceiptId: legacyIssued.operatorReceipt!.receiptId,
-    })).toEqual(legacyApplied);
-    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeReplay);
-    const beforeReplayConflict = exportFoundation(db, PROJECT_ID);
-    expect(await host.harness.callRpc("apply", {
-      ...legacyUnsigned,
-      idempotencyKey: "compat-legacy-replay-conflict",
-      actorReceiptId: legacyIssued.actorReceiptId,
-      operatorReceiptId: legacyIssued.operatorReceipt!.receiptId,
-    })).toMatchObject({ outcome: "OPERATOR_RECEIPT_REUSED" });
-    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeReplayConflict);
-
-    const configUnsigned = bootstrapRequest(PROJECT_ID, {
-      operationClass: "config_revision",
-      idempotencyKey: "compat-config-rejected",
-      actorReceiptId: null,
-      operatorReceiptId: null,
+    const before = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("approverAttestation", {
+      projectId: PROJECT_ID,
+      mutationClass: request.operationClass,
       candidateHead: CANDIDATE_SHA,
-      expectedConfigRevision: 1,
-      configRevision: 2,
-      expectedGovernanceEpoch: 1,
-      expectedFenceToken: fenceToken,
-      repoTargetId: null,
-      config: { permissionMode: "auto", visibility: "visible", repositoryTargets: [TARGET_ID] },
-      targets: [{ ...bootstrapRequest().targets![0]!, defaultBranch: "develop" }],
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: operatorRequestDigest(request),
+      callerThreadId: "v11-retired-v9-attestor",
+      requestedFromBackground: false,
+      approverId: AUTHORIZED_APPROVER_ID,
+      authorizingDecisionId: decisionId,
+      authorizingDispositionSequence: 1,
+    }) as FoundationResult).toMatchObject({ outcome: "AUTHORIZED_APPROVER_INVALID" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    expect(db.prepare("SELECT status, allowed_mutation_classes_json FROM authorized_approvers WHERE authorizing_decision_id = ?").get(decisionId)).toEqual({
+      status: "active",
+      allowed_mutation_classes_json: retiredV9Json,
     });
-    const beforeConfigRefusal = {
-      receipts: (db.prepare("SELECT COUNT(*) AS count FROM operator_receipts").get() as { count: number }).count,
-      actors: (db.prepare("SELECT COUNT(*) AS count FROM actor_receipts").get() as { count: number }).count,
-      events: (db.prepare("SELECT COUNT(*) AS count FROM state_events").get() as { count: number }).count,
-      mutations: (db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get() as { count: number }).count,
-    };
-    expect(await attest(configUnsigned, "config_revision")).toMatchObject({ outcome: "AUTHORIZED_APPROVER_INVALID" });
-    expect(db.prepare("SELECT COUNT(*) AS count FROM operator_receipts").get()).toEqual({ count: beforeConfigRefusal.receipts });
-    expect(db.prepare("SELECT COUNT(*) AS count FROM actor_receipts").get()).toEqual({ count: beforeConfigRefusal.actors });
-    expect(db.prepare("SELECT COUNT(*) AS count FROM state_events").get()).toEqual({ count: beforeConfigRefusal.events });
-    expect(db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get()).toEqual({ count: beforeConfigRefusal.mutations });
-    expect(db.prepare("SELECT config_revision FROM project_config_heads WHERE project_id = ?").get(PROJECT_ID)).toEqual({ config_revision: 1 });
 
-    const malformedSets: Array<[string, string]> = [
-      ["malformed", canonicalJson({ classes: PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES })],
-      ["extra", canonicalJson([...PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES, "governor_claim"])],
-      ["missing", canonicalJson(PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES.slice(0, -1))],
+    const invalidSets: Array<[string, string]> = [
+      ["malformed", canonicalJson({ classes: DERIVED_ACTOR_MUTATION_CLASSES })],
+      ["extra", canonicalJson([...DERIVED_ACTOR_MUTATION_CLASSES, "governor_claim"])],
+      ["missing", canonicalJson(DERIVED_ACTOR_MUTATION_CLASSES.slice(0, -1))],
       ["reordered", canonicalJson([
-        PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES[1]!,
-        PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES[0]!,
-        ...PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES.slice(2),
+        DERIVED_ACTOR_MUTATION_CLASSES[1]!,
+        DERIVED_ACTOR_MUTATION_CLASSES[0]!,
+        ...DERIVED_ACTOR_MUTATION_CLASSES.slice(2),
       ])],
     ];
-    for (const [label, classSetJson] of malformedSets) {
+    for (const [label, classSetJson] of invalidSets) {
       db.prepare(
         `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
          WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = 1`,
       ).run(classSetJson, PROJECT_ID, AUTHORIZED_APPROVER_ID, decisionId);
-      const beforeInvalidSet = {
-        receipts: (db.prepare("SELECT COUNT(*) AS count FROM operator_receipts").get() as { count: number }).count,
-        actors: (db.prepare("SELECT COUNT(*) AS count FROM actor_receipts").get() as { count: number }).count,
-        events: (db.prepare("SELECT COUNT(*) AS count FROM state_events").get() as { count: number }).count,
-        mutations: (db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get() as { count: number }).count,
-      };
-      expect(await attest({ ...legacyUnsigned, idempotencyKey: `compat-invalid-${label}` }, "decision_create")).toMatchObject({ outcome: "AUTHORIZED_APPROVER_INVALID" });
-      expect(db.prepare("SELECT COUNT(*) AS count FROM operator_receipts").get()).toEqual({ count: beforeInvalidSet.receipts });
-      expect(db.prepare("SELECT COUNT(*) AS count FROM actor_receipts").get()).toEqual({ count: beforeInvalidSet.actors });
-      expect(db.prepare("SELECT COUNT(*) AS count FROM state_events").get()).toEqual({ count: beforeInvalidSet.events });
-      expect(db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get()).toEqual({ count: beforeInvalidSet.mutations });
-      db.prepare(
-        `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
-         WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = 1`,
-      ).run(previousJson, PROJECT_ID, AUTHORIZED_APPROVER_ID, decisionId);
+      const beforeInvalid = exportFoundation(db, PROJECT_ID);
+      expect(await attest({ ...request, idempotencyKey: `compat-invalid-${label}` }, "decision_create")).toMatchObject({ outcome: "AUTHORIZED_APPROVER_INVALID" });
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeInvalid);
     }
-
-    const reAdoption = decisionDispositionRequest(fenceToken, decisionId, 2, {
-      actorReceiptId: null,
-      operatorReceiptId: null,
-      candidateHead: CANDIDATE_SHA,
-      repoTargetId: null,
-      idempotencyKey: `${decisionId}-seq2`,
-    });
-    const reAdoptionIssued = await attest(reAdoption, "decision_disposition");
-    expect(reAdoptionIssued).toMatchObject({ outcome: "OK" });
-    const beforeRotationEvents = (db.prepare("SELECT COUNT(*) AS count FROM state_events").get() as { count: number }).count;
-    const beforeRotationMutations = (db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get() as { count: number }).count;
-    const reAdoptionApplied = await host.harness.callRpc("apply", {
-      ...reAdoption,
-      actorReceiptId: reAdoptionIssued.actorReceiptId,
-      operatorReceiptId: reAdoptionIssued.operatorReceipt!.receiptId,
-    }) as FoundationResult;
-    expect(reAdoptionApplied).toMatchObject({ outcome: "OK", eventSequence: beforeRotationEvents + 1 });
-    expect(db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get()).toEqual({ count: beforeRotationMutations + 1 });
-    expect(db.prepare("SELECT consumed_at_ms, consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?").get(reAdoptionIssued.operatorReceipt!.receiptId)).toMatchObject({
-      consumed_at_ms: expect.any(Number),
-      consumed_event_sequence: reAdoptionApplied.eventSequence,
-    });
-    expect(db.prepare("SELECT actor_receipt_id, operator_receipt_id FROM state_events WHERE idempotency_key = ?").get(reAdoption.idempotencyKey)).toEqual({
-      actor_receipt_id: reAdoptionIssued.actorReceiptId,
-      operator_receipt_id: reAdoptionIssued.operatorReceipt!.receiptId,
-    });
-    expect(db.prepare("SELECT authorizing_disposition_sequence, status, allowed_mutation_classes_json FROM authorized_approvers WHERE project_id = ? AND approver_id = ? ORDER BY authorizing_disposition_sequence").all(PROJECT_ID, AUTHORIZED_APPROVER_ID)).toEqual([
-      { authorizing_disposition_sequence: 1, status: "revoked", allowed_mutation_classes_json: previousJson },
-      { authorizing_disposition_sequence: 2, status: "active", allowed_mutation_classes_json: currentJson },
-    ]);
-
-    expect(await attest({ ...legacyUnsigned, idempotencyKey: "compat-old-registry-after-rotation" }, "decision_create", 1)).toMatchObject({ outcome: "AUTHORIZED_APPROVER_REVOKED" });
-    const rollback = decisionDispositionRequest(fenceToken, decisionId, 3, {
-      actorReceiptId: null,
-      operatorReceiptId: null,
-      candidateHead: CANDIDATE_SHA,
-      repoTargetId: null,
-      disposition: "revoked",
-      revertsDispositionSequence: 2,
-      idempotencyKey: `${decisionId}-seq3-revoked`,
-    });
-    const rollbackIssued = await attest(rollback, "decision_disposition", 2);
-    expect(rollbackIssued).toMatchObject({ outcome: "OK" });
-    const beforeRollbackRefusal = exportFoundation(db, PROJECT_ID);
-    expect(await host.harness.callRpc("apply", {
-      ...rollback,
-      actorReceiptId: rollbackIssued.actorReceiptId,
-      operatorReceiptId: rollbackIssued.operatorReceipt!.receiptId,
-    })).toMatchObject({ outcome: "ACTOR_RECEIPT_UNVERIFIED" });
-    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRollbackRefusal);
-    expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(rollbackIssued.operatorReceipt!.receiptId)).toEqual({ consumed_at_ms: null });
-    expect(applyWithFixtureReceipt(db, { ...rollback, actorReceiptId: "compat-operator", operatorReceiptId: null })).toMatchObject({ outcome: "OK" });
-    expect(db.prepare("SELECT status FROM authorized_approvers WHERE project_id = ? AND status = 'active'").get(PROJECT_ID)).toBeUndefined();
-    expect(await attest({ ...legacyUnsigned, idempotencyKey: "compat-revoked-after-rollback" }, "decision_create", 2)).toMatchObject({ outcome: "AUTHORIZED_APPROVER_REVOKED" });
+    db.prepare(
+      `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
+       WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = 1`,
+    ).run(currentJson, PROJECT_ID, AUTHORIZED_APPROVER_ID, decisionId);
+    const beforeUnauthorized = exportFoundation(db, PROJECT_ID);
+    expect(await attest({ ...request, idempotencyKey: "compat-unauthorized-class" }, "governor_claim")).toMatchObject({ outcome: "AUTHORIZED_APPROVER_INVALID" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeUnauthorized);
   });
 
   it("authorizes config revisions carrying roleRequirements and refuses before write on mismatches", async () => {
@@ -2141,6 +2055,10 @@ describe("bb-collab plugin boundary", () => {
     const stored = db.prepare("SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = 2").get(PROJECT_ID) as { canonical_config_json: string };
     const storedConfig = JSON.parse(stored.canonical_config_json) as { extensions: { bbCollab: Record<string, unknown> } };
     expect(storedConfig.extensions.bbCollab.roleRequirements).toEqual(nextConfig.extensions.bbCollab.roleRequirements);
+    expect(storedConfig.extensions.bbCollab.roleRequirements).toEqual(expect.arrayContaining([
+      { roleRequirementId: "worker-v1", roleId: "worker", repoTargetId: TARGET_ID, executedProfile: ROLE_PROFILE },
+    ]));
+    expect(storedConfig.extensions.bbCollab.roleRequirements).toHaveLength(3);
     expect(db.prepare("SELECT actor_receipt_id, operator_receipt_id FROM state_events WHERE idempotency_key = ?").get(unsigned.idempotencyKey)).toEqual({
       actor_receipt_id: authorized.actorReceiptId,
       operator_receipt_id: authorized.operatorReceiptId,
@@ -2151,39 +2069,67 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(await host.harness.callRpc("apply", authorized)).toEqual(applied);
 
-    const invalidConfig = roleConfig();
-    const invalidRequirements = invalidConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>;
-    invalidConfig.extensions.bbCollab.roleRequirements = [
-      invalidRequirements[0]!,
-      { ...invalidRequirements[1]!, roleRequirementId: invalidRequirements[0]!.roleRequirementId },
-    ];
-    const invalidUnsigned = bootstrapRequest(PROJECT_ID, {
-      operationClass: "config_revision",
-      idempotencyKey: "config-role-requirements-invalid",
-      actorReceiptId: null,
-      operatorReceiptId: null,
-      candidateHead: CANDIDATE_SHA,
-      expectedConfigRevision: 2,
-      configRevision: 3,
-      expectedGovernanceEpoch: 1,
-      expectedFenceToken: fenceToken,
-      config: invalidConfig,
-    });
-    const invalidIssued = await host.harness.callRpc("approverAttestation", {
-      ...attestationInput,
-      idempotencyKey: invalidUnsigned.idempotencyKey,
-      requestDigest: operatorRequestDigest(invalidUnsigned),
-    }) as FoundationResult;
-    expect(invalidIssued).toMatchObject({ outcome: "OK" });
-    const beforeInvalid = exportFoundation(db, PROJECT_ID);
-    expect(await host.harness.callRpc("apply", {
-      ...invalidUnsigned,
-      actorReceiptId: invalidIssued.actorReceiptId,
-      operatorReceiptId: invalidIssued.operatorReceipt!.receiptId,
-    })).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
-    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeInvalid);
-    expect(db.prepare("SELECT config_revision FROM project_config_heads WHERE project_id = ?").get(PROJECT_ID)).toEqual({ config_revision: 2 });
-    expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(invalidIssued.operatorReceipt!.receiptId)).toEqual({ consumed_at_ms: null });
+    const rejectConfig = async (name: string, config: ReturnType<typeof roleConfig>, outcome: FoundationResult["outcome"], message?: string) => {
+      const invalidUnsigned = bootstrapRequest(PROJECT_ID, {
+        operationClass: "config_revision",
+        idempotencyKey: `config-role-requirements-${name}`,
+        actorReceiptId: null,
+        operatorReceiptId: null,
+        candidateHead: CANDIDATE_SHA,
+        expectedConfigRevision: 2,
+        configRevision: 3,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: fenceToken,
+        config,
+      });
+      const invalidIssued = await host.harness.callRpc("approverAttestation", {
+        ...attestationInput,
+        idempotencyKey: invalidUnsigned.idempotencyKey,
+        requestDigest: operatorRequestDigest(invalidUnsigned),
+      }) as FoundationResult;
+      expect(invalidIssued).toMatchObject({ outcome: "OK" });
+      const beforeInvalid = exportFoundation(db, PROJECT_ID);
+      const rejected = await host.harness.callRpc("apply", {
+        ...invalidUnsigned,
+        actorReceiptId: invalidIssued.actorReceiptId,
+        operatorReceiptId: invalidIssued.operatorReceipt!.receiptId,
+      }) as FoundationResult;
+      expect(rejected).toMatchObject({ outcome, attempted: 0, verified: 0 });
+      if (message) expect(rejected.message).toContain(message);
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeInvalid);
+      expect(db.prepare("SELECT config_revision FROM project_config_heads WHERE project_id = ?").get(PROJECT_ID)).toEqual({ config_revision: 2 });
+      expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(invalidIssued.operatorReceipt!.receiptId)).toEqual({ consumed_at_ms: null });
+    };
+
+    const duplicateConfig = roleConfig();
+    const duplicateRequirements = duplicateConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>;
+    duplicateRequirements[1] = { ...duplicateRequirements[1]!, roleRequirementId: duplicateRequirements[0]!.roleRequirementId };
+    await rejectConfig("duplicate", duplicateConfig, "INVALID_INPUT");
+
+    const duplicateRoleConfig = roleConfig();
+    const duplicateRoleRequirements = duplicateRoleConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>;
+    duplicateRoleRequirements[1] = { ...duplicateRoleRequirements[1]!, roleId: "project-orchestrator", repoTargetId: null };
+    await rejectConfig("duplicate-role", duplicateRoleConfig, "INVALID_INPUT", "duplicate logical role");
+
+    const foreignRoleConfig = roleConfig();
+    const foreignRoleRequirements = foreignRoleConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>;
+    foreignRoleRequirements[1] = { ...foreignRoleRequirements[1]!, roleId: "foreign-role" };
+    await rejectConfig("foreign-role", foreignRoleConfig, "INVALID_INPUT");
+
+    const foreignConfig = roleConfig();
+    const foreignRequirements = foreignConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>;
+    foreignRequirements.find((requirement) => requirement.roleRequirementId === "worker-v1")!.repoTargetId = SECOND_TARGET_ID;
+    await rejectConfig("foreign-target", foreignConfig, "REPO_TARGET_FOREIGN");
+
+    const incorrectScopeConfig = roleConfig();
+    const incorrectScopeRequirements = incorrectScopeConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>;
+    incorrectScopeRequirements.find((requirement) => requirement.roleRequirementId === "worker-v1")!.repoTargetId = null;
+    await rejectConfig("worker-project-scope", incorrectScopeConfig, "INVALID_INPUT");
+
+    const overCapacityConfig = roleConfig();
+    const overCapacityRequirements = overCapacityConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>;
+    overCapacityRequirements.push({ roleRequirementId: "worker-v2", roleId: "worker", repoTargetId: TARGET_ID, executedProfile: ROLE_PROFILE });
+    await rejectConfig("over-capacity", overCapacityConfig, "INVALID_INPUT", "Too big");
   });
 
   it("cannot reuse one receipt for two migration steps", async () => {
@@ -2645,9 +2591,9 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("appends the v10 authorized approver registry and rolls every cached consumer forward", () => {
+  it("appends the v11 role-capacity contract and rolls every cached consumer forward", () => {
     expect(SCHEMA_VERSION).toBe(10);
-    expect(CONTRACT_VERSION).toBe(10);
+    expect(CONTRACT_VERSION).toBe(11);
     expect(MIGRATIONS).toHaveLength(23);
     expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("80bfe52641971b984358da6bdfb4aa00d87dd928e611325f23bbbb3a1afa5c7c");
     expect(MIGRATIONS.at(-5)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
@@ -2663,9 +2609,40 @@ describe("bb-collab plugin boundary", () => {
     expect(MIGRATION_STEPS).toEqual([
       "record_inventory", "record_quiescence", "freeze", "record_export", "record_import", "record_equivalence", "activate", "record_exercise", "retire", "rollback", "mark_fix_forward_required",
     ]);
-    expect(cachedConsumerRolloutEvidence(9)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(10, 9)).toMatchObject({ oldContractVersion: 9, newContractVersion: 10, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(10)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(10, 10)).toMatchObject({
+      names: [...CACHED_CONSUMERS],
+      oldSchemaVersion: 10,
+      newSchemaVersion: 10,
+      oldContractVersion: 10,
+      newContractVersion: 11,
+      action: "refused",
+      expected: 4,
+      attempted: 4,
+      verified: 0,
+    });
+    expect(cachedConsumerRolloutEvidence(9, 11)).toMatchObject({
+      oldSchemaVersion: 10,
+      newSchemaVersion: 10,
+      observedSchemaVersion: 9,
+      oldContractVersion: 10,
+      newContractVersion: 11,
+      observedContractVersion: 11,
+      action: "refused",
+      expected: 4,
+      attempted: 4,
+      verified: 0,
+    });
+    expect(cachedConsumerRolloutEvidence(10, 11)).toMatchObject({
+      names: [...CACHED_CONSUMERS],
+      oldSchemaVersion: 10,
+      newSchemaVersion: 10,
+      oldContractVersion: 10,
+      newContractVersion: 11,
+      action: "reread",
+      expected: 4,
+      attempted: 4,
+      verified: 4,
+    });
 
     const { db, directory } = directDatabase();
     try {
@@ -2779,7 +2756,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ contractVersion: 10, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 10, schemaDigest, contractVersion: 11, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -4471,7 +4448,7 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 9, newSchemaVersion: 10, expected: 4, attempted: 4, verified: 4 },
+        cachedConsumers: { oldSchemaVersion: 10, newSchemaVersion: 10, expected: 4, attempted: 4, verified: 4 },
         schema: { version: 10 },
       },
     });
@@ -5253,7 +5230,7 @@ describe("bb-collab plugin boundary", () => {
     expect(await host.harness.callRpc("apply", { ...negative, ...negativeApply, idempotencyKey: "attested-live-reuse" })).toMatchObject({ outcome: "OPERATOR_RECEIPT_REUSED" });
   });
 
-  it("requires exact target binding for the independent reviewer", async () => {
+  it("requires exact target binding for target-scoped roles", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     const facts = roleReader();
@@ -5283,6 +5260,58 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(applyWithFixtureReceipt(db, reviewerSuccession, null, facts).outcome).toBe("OK");
     expect(db.prepare("SELECT repo_target_id, status FROM role_generations WHERE role_id = 'independent-reviewer'").get()).toEqual({
+      repo_target_id: TARGET_ID,
+      status: "active",
+    });
+
+    const workerFacts = roleReader((value) => {
+      value.thread.id = "worker-thread-holder";
+      value.thread.environmentId = "worker-environment-holder";
+      value.environment.id = "worker-environment-holder";
+      value.environment.branchName = "bb/worker-role-holder";
+      value.events[0]!.id = "worker-event-request";
+      value.events[3]!.id = "worker-event-completion";
+    });
+    const workerRoleContext = {
+      threadId: "worker-thread-holder",
+      requestEventId: "worker-event-request",
+      requestEventSeq: 1,
+      completionEventId: "worker-event-completion",
+      completionEventSeq: 4,
+    };
+    const workerQualification = qualificationRequest(fenceToken, {
+      idempotencyKey: "worker-qualification",
+      repoTargetId: TARGET_ID,
+      roleId: "worker",
+      roleRequirementId: "worker-v1",
+      qualificationId: "worker-qualification",
+      roleContext: workerRoleContext,
+    });
+    const workerBefore = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, { ...workerQualification, idempotencyKey: "worker-missing-target", repoTargetId: null }, null, workerFacts).outcome).toBe("REPO_TARGET_REQUIRED");
+    expect(applyWithFixtureReceipt(db, { ...workerQualification, idempotencyKey: "worker-foreign-target", repoTargetId: SECOND_TARGET_ID }, null, workerFacts).outcome).toBe("REPO_TARGET_FOREIGN");
+    const workerWrongTargetContext = roleReader((value) => {
+      value.thread.id = workerRoleContext.threadId;
+      value.thread.environmentId = "worker-environment-holder";
+      value.environment.id = "worker-environment-holder";
+      value.environment.branchName = "bb/worker-role-holder";
+      value.environment.path = "/workspace/other";
+      value.project.sources[0]!.path = "/workspace/other";
+      value.events[0]!.id = workerRoleContext.requestEventId;
+      value.events[3]!.id = workerRoleContext.completionEventId;
+    });
+    expect(applyWithFixtureReceipt(db, { ...workerQualification, idempotencyKey: "worker-wrong-context", qualificationId: "worker-wrong-context" }, null, workerWrongTargetContext).outcome).toBe("ROLE_CONTEXT_FOREIGN");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(workerBefore);
+    expect(applyWithFixtureReceipt(db, workerQualification, null, workerFacts).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      idempotencyKey: "worker-succession",
+      repoTargetId: TARGET_ID,
+      roleId: "worker",
+      roleRequirementId: "worker-v1",
+      qualificationId: "worker-qualification",
+      roleContext: workerRoleContext,
+    }), null, workerFacts).outcome).toBe("OK");
+    expect(db.prepare("SELECT repo_target_id, status FROM role_generations WHERE role_id = 'worker'").get()).toEqual({
       repo_target_id: TARGET_ID,
       status: "active",
     });
@@ -5577,9 +5606,9 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(9)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(10, 9)).toMatchObject({ oldContractVersion: 9, newContractVersion: 10, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(10)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(10, 10)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, oldContractVersion: 10, newContractVersion: 11, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(9, 11)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, observedSchemaVersion: 9, oldContractVersion: 10, newContractVersion: 11, observedContractVersion: 11, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(10, 11)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, oldContractVersion: 10, newContractVersion: 11, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {

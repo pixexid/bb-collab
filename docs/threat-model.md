@@ -19,8 +19,14 @@ worker.
 | GitHub, BB Tasks and Markdown | External projections or evidence | They may not activate work, satisfy a gate or close a WorkItem independently. |
 | Operator/admin/raw BB activity | Unmanaged activity on a full-trust host | It may be detected as evidence or discrepancy, but it acquires no canonical authority by observation. |
 
-The v10/schema v10 operator gate has a host/UI confirmation boundary only for
-authorizing or revoking the approver. An adopted `operator_only` Decision
+Role requirements are bounded at three logical roles: project-orchestrator is
+project-scoped, while worker and independent-reviewer bind to an exact
+repository target. Each role requirement carries its executed-profile
+qualification; this adds no assignment or dispatch authority.
+
+The v11/schema v10 contract retains the v10 operator gate, which has a host/UI
+confirmation boundary only for authorizing or revoking the approver. An adopted
+`operator_only` Decision
 registers `approverId=orchestrator:bb-collab` for the exact project and adopted
 disposition, with the nine ratified derived mutation classes, including
 `config_revision` for the existing canonical mutation that replaces the full
@@ -29,8 +35,8 @@ immutable project configuration and its mapped targets, including
 `work_item_create`, `qualification_observation_record`, and
 `role_generation_succession`. The
 `approverAttestation` RPC validates that active registry row, exact Decision
-and disposition, caller plugin, current nine-class or exact transitional v9
-class set and request binding, then atomically
+and disposition, caller plugin, exact current nine-class set and request
+binding, then atomically
 issues a fresh interim receipt plus verified plugin actor with no pending UI
 interaction. Revocation or change marks the registry revoked and attestation
 fails closed. The receipt binds one exact project, operation class, lowercase
@@ -43,12 +49,11 @@ content remain bound. Both the registry and interim receipt retain the upstream 
 `get-bb/bb#1541` retirement condition. The first committed StateEvent consumes it atomically; reuse, a
 different receipt for an already-committed idempotency key, or any binding
 mismatch refuses before a write. It has no local TTL and retires only on the
-host-issued `get-bb/bb#1541` condition. For the one-release v9-to-v10 rollout
-only, an already-stored registry whose JSON is exactly the contract-v9
-eight-class set may attest only those eight classes and never `config_revision`;
-an adopted same-Decision `seq+1` re-adoption atomically supersedes it with the
-current nine-class row. Arbitrary subsets or other class sets remain invalid,
-and the v9 set is retired after that live v10 re-adoption. `github_issue_projection`,
+host-issued `get-bb/bb#1541` condition. The historical contract-v9 eight-class
+registry was accepted only during the one-release v9-to-v10 re-adoption.
+Contract v11 retires that transitional allowlist: attestation requires the
+exact current nine-class set, while the former set and arbitrary other class
+sets remain invalid. `github_issue_projection`,
 `assignment_dispatch`, and `assignment_reconcile` reserve/finalize paths
 refuse before external adapters because one receipt cannot authorize multiple
 writes. This seam is fixture-tested and does not claim live cutover.
@@ -110,7 +115,7 @@ The goals are:
 | Operator identity spoofing | Display name, checkout possession or thread ID is accepted as privileged actor | Hold privileged mutation until a proven BB-native authenticated receipt or explicit narrow operator decision exists. |
 | Interim receipt replay or phase splitting | One receipt authorizes a second mutation or a reserve/finalize adapter sequence | Exact one-request binding, atomic consumption, original-replay-only idempotency, and pre-adapter refusal for the three unsupported operations; OPERATOR_RECEIPT_REUSED, OPERATOR_RECEIPT_STALE or OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED. |
 | Derived actor standing identity | A plugin actor receipt is reused with another authorization or detached from its approver | Bootstrap-only atomic issuance, durable operator receipt linkage, exact linked-receipt check and host-issued retirement condition; ACTOR_RECEIPT_UNVERIFIED or OPERATOR_RECEIPT_STALE. |
-| Authorized approver spoof/revocation | An unregistered, foreign, changed or revoked approver attests a privileged mutation | Exact project/approver/Decision/disposition registry row, current nine-class or exact transitional v9 allowlist, caller-plugin check and active-current disposition check; AUTHORIZED_APPROVER_UNKNOWN, AUTHORIZED_APPROVER_INVALID or AUTHORIZED_APPROVER_REVOKED. |
+| Authorized approver spoof/revocation | An unregistered, foreign, changed or revoked approver attests a privileged mutation | Exact project/approver/Decision/disposition registry row, exact current nine-class allowlist, caller-plugin check and active-current disposition check; AUTHORIZED_APPROVER_UNKNOWN, AUTHORIZED_APPROVER_INVALID or AUTHORIZED_APPROVER_REVOKED. |
 | Projection drift | External state is used to mutate canonical state for convenience | Projection is rebuildable; canonical state changes only through governed import/adoption. |
 
 ## Resolver invariants

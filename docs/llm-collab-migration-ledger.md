@@ -377,9 +377,18 @@ reserve/finalize adapter operations refuse before the adapter because one
 receipt cannot authorize multiple writes. This report records those facts; it
 does not change them.
 
-For the one-release v9-to-v10 rollout only, an already-stored registry whose
-JSON is exactly the contract-v9 eight-class set may attest only those eight
-classes and never `config_revision`; an adopted same-Decision `seq+1`
-re-adoption atomically supersedes it with the current nine-class row. Arbitrary
-subsets or other class sets remain invalid, and the v9 set is retired after
-that live v10 re-adoption.
+The current contract is v11/schema v10. Its bounded role-capacity seam admits
+the three project requirements used by the first-adopter request:
+project-orchestrator is project-scoped, while worker and independent-reviewer
+bind to the exact repository target required by canonical WorkItem writes. The
+change preserves the existing qualification, generation, Assignment and
+receipt/approver seams; no capacity router, assignment or dispatch mechanism is
+introduced. The triggering #31 live evidence is the merged-v10 deployed
+resolver's two-role `ROLE_IDS` set and `roleRequirements.max(2)`, which cannot
+represent the ratified three-role request; this amendment records that concrete
+representation gap without claiming a live config or first-adopter write.
+
+The historical contract-v9 eight-class registry was accepted only during the
+one-release v9-to-v10 re-adoption. Contract v11 retires that transitional
+allowlist: attestation requires the exact current nine-class row, while the
+former set and arbitrary other sets remain invalid.

@@ -181,8 +181,7 @@ the `operator_only` Decision class and its `adopted` disposition; role-based and
 review Decisions remain role-bound. After the one-time adopted authorizing
 `operator_only` Decision registers `approverId=orchestrator:bb-collab`, the
 `approverAttestation` RPC validates the active registry row, exact authorizing
-Decision/disposition, caller plugin, current nine-class or exact transitional
-v9 allowlist and exact request
+Decision/disposition, caller plugin, exact current nine-class allowlist and exact request
 binding, then atomically issues a fresh receipt plus the same verified plugin
 actor without `requestInput`. A later operator revocation or change marks the
 registry unusable; both registry and interim receipt retain the upstream
@@ -190,16 +189,22 @@ host-issued `get-bb/bb#1541` retirement condition, and human confirmation remain
 only at that boundary. This is
 not live cutover or source retirement.
 
-For the one-release v9-to-v10 rollout only, an already-stored registry whose
-JSON is exactly the contract-v9 eight-class set may attest only those eight
-classes and never `config_revision`; an adopted same-Decision `seq+1`
-re-adoption atomically supersedes it with the current nine-class row. Arbitrary
-subsets or other class sets remain invalid, and the v9 set is retired after
-that live v10 re-adoption.
+The historical contract-v9 eight-class registry was accepted only during the
+one-release v9-to-v10 re-adoption. Contract v11 retires that transitional
+allowlist: attestation requires the exact current nine-class row, while the
+former set and arbitrary other sets remain invalid.
+
+The contract v11/schema v10 role-capacity amendment is contract-only; schema
+migrations remain unchanged. `roleRequirements` admits at most three logical
+roles: `project-orchestrator` is project-scoped, while `worker` and
+`independent-reviewer` require the exact repository target used by canonical
+WorkItem writes. Each requirement retains its explicit executed-profile
+qualification. The v10 receipt, approver, derived-actor and nine-class
+mutation bindings are unchanged; cached consumers reread v11 or refuse v10.
 
 ## 6. Roles, delegation and execution
 
-A logical role is a project-scoped seat such as project-orchestrator or
+A logical role is a project-scoped seat such as project-orchestrator, worker or
 independent-reviewer. It is never a model, provider, harness, human display
 name, app session or current thread.
 
