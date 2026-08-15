@@ -13781,624 +13781,6 @@ function date4(params) {
 // node_modules/zod/v4/classic/external.js
 config(en_default());
 
-// src/awareness.ts
-var SUPERVISOR_THREAD_ID = "thr_b94i3csnme";
-var DEFAULT_MAX_CONTINUATIONS = 3;
-var OPERATOR_WAIT_FYI_THRESHOLD_MS = 15 * 6e4;
-var WRONGFUL_IDLE_THRESHOLD_MS = 10 * 6e4;
-var ORCHESTRATOR_ROLE_ID = "project-orchestrator";
-var OPEN_ATTEMPT_STATES = /* @__PURE__ */ new Set([
-  "prepared",
-  "armed",
-  "content_delivered",
-  "running",
-  "dispatch_unknown"
-]);
-function operatorWaitAlertState(input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
-  const state = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (value !== true) throw new Error("invalid operator wait alert state");
-    state[key] = true;
-  }
-  return state;
-}
-function createOperatorWaitAlertLedger(persistence) {
-  let state = {};
-  let loaded = false;
-  let queue = Promise.resolve();
-  const enqueue = (work) => {
-    const result2 = queue.then(work);
-    queue = result2.then(() => void 0, () => void 0);
-    return result2;
-  };
-  const load = async () => {
-    if (loaded) return;
-    state = operatorWaitAlertState(persistence ? await persistence.read() : null);
-    loaded = true;
-  };
-  const save = () => persistence?.write(structuredClone(state));
-  return {
-    recover: () => enqueue(async () => {
-      await load();
-    }),
-    notified: (key) => enqueue(async () => {
-      await load();
-      return state[key] === true;
-    }),
-    mark: (key) => enqueue(async () => {
-      await load();
-      if (state[key]) return;
-      state[key] = true;
-      await save();
-    }),
-    clear: (key) => enqueue(async () => {
-      await load();
-      if (!state[key]) return;
-      delete state[key];
-      await save();
-    })
-  };
-}
-function roleIdleState(input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
-  const state = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid role idle state");
-    const record2 = value;
-    const failedSteers = typeof record2.failedSteers === "number" ? record2.failedSteers : 0;
-    const idleSinceMs = typeof record2.idleSinceMs === "number" && Number.isFinite(record2.idleSinceMs) ? record2.idleSinceMs : null;
-    const lastSteerAtMs = typeof record2.lastSteerAtMs === "number" && Number.isFinite(record2.lastSteerAtMs) ? record2.lastSteerAtMs : null;
-    const awaitingSteerOutcome = record2.awaitingSteerOutcome === true;
-    if (!Number.isInteger(record2.steerCount) || record2.steerCount < 0 || record2.steerCount > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || idleSinceMs !== null && idleSinceMs < 0 || lastSteerAtMs !== null && lastSteerAtMs < 0 || typeof record2.escalated !== "boolean") {
-      throw new Error("invalid role idle state");
-    }
-    state[key] = { steerCount: record2.steerCount, failedSteers, escalated: record2.escalated, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome };
-  }
-  return state;
-}
-function createRoleIdleLedger(persistence) {
-  let state = {};
-  let loaded = false;
-  let queue = Promise.resolve();
-  const enqueue = (work) => {
-    const result2 = queue.then(work);
-    queue = result2.then(() => void 0, () => void 0);
-    return result2;
-  };
-  const load = async () => {
-    if (loaded) return;
-    state = roleIdleState(persistence ? await persistence.read() : null);
-    loaded = true;
-  };
-  const save = () => persistence?.write(structuredClone(state));
-  return {
-    recover: () => enqueue(async () => {
-      await load();
-    }),
-    get: (key) => enqueue(async () => {
-      await load();
-      return state[key] ?? null;
-    }),
-    observeIdle: (key, idleSinceMs) => enqueue(async () => {
-      await load();
-      const record2 = state[key];
-      if (record2?.idleSinceMs !== null && record2?.idleSinceMs !== void 0) {
-        if (record2.awaitingSteerOutcome) {
-          record2.awaitingSteerOutcome = false;
-          record2.idleSinceMs = idleSinceMs;
-          await save();
-        }
-        return { ...record2 };
-      }
-      state[key] = { ...record2 ?? { steerCount: 0, failedSteers: 0, escalated: false, lastSteerAtMs: null, awaitingSteerOutcome: false }, idleSinceMs, awaitingSteerOutcome: false };
-      await save();
-      return { ...state[key] };
-    }),
-    preserveAfterSteerWake: (key) => enqueue(async () => {
-      await load();
-      const record2 = state[key];
-      return record2?.awaitingSteerOutcome === true;
-    }),
-    recordSteer: (key, failed, steeredAtMs) => enqueue(async () => {
-      await load();
-      const record2 = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false };
-      record2.steerCount = Math.min(2, record2.steerCount + 1);
-      if (failed) record2.failedSteers = Math.min(2, record2.failedSteers + 1);
-      record2.lastSteerAtMs = steeredAtMs;
-      record2.awaitingSteerOutcome = !failed;
-      state[key] = record2;
-      await save();
-      return { ...record2 };
-    }),
-    markEscalated: (key) => enqueue(async () => {
-      await load();
-      const record2 = state[key] ?? { steerCount: 2, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false };
-      if (record2.escalated) return false;
-      record2.escalated = true;
-      state[key] = record2;
-      await save();
-      return true;
-    }),
-    clearPrefixExcept: (prefix, keepKey) => enqueue(async () => {
-      await load();
-      let changed = false;
-      for (const key of Object.keys(state)) {
-        if (key.startsWith(prefix) && key !== keepKey) {
-          delete state[key];
-          changed = true;
-        }
-      }
-      if (changed) await save();
-    })
-  };
-}
-function continuationState(input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
-  const state = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid continuation state");
-    const candidate = value;
-    if (candidate.mode !== "automatic" || !["ready", "claimed", "paused", "limit_reached"].includes(candidate.status) || !Number.isInteger(candidate.count) || candidate.count < 0 || !Number.isInteger(candidate.max) || candidate.max < 1 || !(candidate.claimId === null || typeof candidate.claimId === "string")) throw new Error("invalid continuation state");
-    state[key] = {
-      mode: "automatic",
-      status: candidate.status,
-      count: candidate.count,
-      max: candidate.max,
-      claimId: candidate.claimId
-    };
-  }
-  return state;
-}
-function createContinuationLedger(persistence) {
-  let state = {};
-  let loaded = false;
-  let queue = Promise.resolve();
-  const enqueue = (work) => {
-    const result2 = queue.then(work);
-    queue = result2.then(() => void 0, () => void 0);
-    return result2;
-  };
-  const load = async () => {
-    if (loaded) return;
-    state = continuationState(persistence ? await persistence.read() : null);
-    loaded = true;
-  };
-  const save = () => persistence?.write(structuredClone(state));
-  return {
-    recover() {
-      return enqueue(async () => {
-        await load();
-        let changed = false;
-        for (const record2 of Object.values(state)) {
-          if (record2.status !== "claimed") continue;
-          record2.status = "paused";
-          record2.claimId = null;
-          changed = true;
-        }
-        if (changed) await save();
-      });
-    },
-    claim(key, max) {
-      return enqueue(async () => {
-        await load();
-        const existing = state[key];
-        if (existing?.status === "claimed") return { claim: null, reason: "claimed" };
-        if (existing?.status === "paused") return { claim: null, reason: "paused" };
-        if (existing?.status === "limit_reached") return { claim: null, reason: "limit_reached" };
-        const count = existing?.count ?? 0;
-        if (count >= max) {
-          state[key] = { mode: "automatic", status: "limit_reached", count, max, claimId: null };
-          await save();
-          return { claim: null, reason: "limit_reached" };
-        }
-        const claim = { claimId: `${key}:${count + 1}`, count: count + 1, max };
-        state[key] = { mode: "automatic", status: "claimed", count: claim.count, max, claimId: claim.claimId };
-        await save();
-        return { claim };
-      });
-    },
-    complete(key, claimId) {
-      return enqueue(async () => {
-        await load();
-        const record2 = state[key];
-        if (!record2 || record2.status !== "claimed" || record2.claimId !== claimId) throw new Error("continuation claim is not current");
-        record2.status = "ready";
-        record2.claimId = null;
-        await save();
-      });
-    },
-    resume(key, resetCount = false) {
-      return enqueue(async () => {
-        await load();
-        const record2 = state[key];
-        if (!record2 || record2.status === "claimed") throw new Error("continuation is not paused");
-        record2.status = "ready";
-        record2.claimId = null;
-        if (resetCount) record2.count = 0;
-        await save();
-      });
-    }
-  };
-}
-function continuationModeFor(assignmentKind) {
-  return assignmentKind === "write" ? "automatic" : assignmentKind === "review" ? "approval" : "tracking";
-}
-function readLaneStates(db) {
-  return db.prepare(
-    `SELECT assignments.project_id, assignments.assignment_id, assignments.lane_id,
-              assignments.assignment_kind, assignments.work_item_id,
-              execution_attempts.thread_id, execution_attempts.execution_attempt_id,
-              execution_attempts.state AS attempt_state,
-              execution_attempts.terminal_report_digest,
-              assignments.created_at_ms
-       FROM assignments
-       JOIN execution_attempts
-         ON execution_attempts.project_id = assignments.project_id
-        AND execution_attempts.assignment_id = assignments.assignment_id
-       WHERE execution_attempts.origin = 'assignment'
-       ORDER BY assignments.created_at_ms, assignments.assignment_id`
-  ).all();
-}
-function readRoleHolderStates(db) {
-  return db.prepare(
-    `SELECT attempts.project_id, attempts.role_id, attempts.role_generation,
-              attempts.execution_attempt_id, attempts.thread_id
-       FROM execution_attempts AS attempts
-       JOIN role_generation_heads AS heads
-         ON heads.project_id = attempts.project_id
-        AND heads.role_id = attempts.role_id
-        AND heads.current_generation = attempts.role_generation
-       JOIN role_generations AS generations
-         ON generations.project_id = attempts.project_id
-        AND generations.role_id = attempts.role_id
-        AND generations.generation = attempts.role_generation
-       WHERE attempts.origin = 'role_holder'
-         AND attempts.thread_id IS NOT NULL
-         AND attempts.role_id = '${ORCHESTRATOR_ROLE_ID}'
-         AND generations.status = 'active'
-       ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`
-  ).all();
-}
-function openLaneViews(db, now2 = Date.now(), operatorWaits = /* @__PURE__ */ new Map()) {
-  const lanes = readLaneStates(db).filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state)).map((lane) => {
-    const operatorWait = lane.thread_id ? operatorWaits.get(lane.thread_id) ?? null : null;
-    return {
-      projectId: lane.project_id,
-      laneId: lane.lane_id,
-      assignmentId: lane.assignment_id,
-      assignmentKind: lane.assignment_kind,
-      workItemId: lane.work_item_id,
-      threadId: lane.thread_id,
-      executionAttemptId: lane.execution_attempt_id,
-      attemptState: lane.attempt_state,
-      workerStatus: null,
-      waitingOn: operatorWait?.reason ?? (lane.terminal_report_digest === null ? "terminal receipt" : null),
-      ageMs: Math.max(0, now2 - lane.created_at_ms),
-      tone: lane.attempt_state === "running" ? "running" : "default",
-      queueState: operatorWait ? "deferred" : lane.attempt_state === "running" ? "running" : "ready",
-      queueBlocked: false,
-      nextStartable: false,
-      deferredReason: operatorWait?.reason ?? null,
-      deferredAtMs: operatorWait?.createdAtMs ?? null,
-      deferredAgeMs: operatorWait ? Math.max(0, now2 - operatorWait.createdAtMs) : null
-    };
-  });
-  const nextByProject = /* @__PURE__ */ new Map();
-  for (const lane of lanes) {
-    if (lane.queueState === "ready" && (lane.attemptState === "prepared" || lane.attemptState === "armed") && !lane.deferredReason && !nextByProject.has(lane.projectId)) nextByProject.set(lane.projectId, lane.executionAttemptId);
-  }
-  return lanes.map((lane) => ({
-    ...lane,
-    queueBlocked: lane.queueState === "ready" && (lane.attemptState === "prepared" || lane.attemptState === "armed") && nextByProject.get(lane.projectId) !== lane.executionAttemptId,
-    nextStartable: nextByProject.get(lane.projectId) === lane.executionAttemptId
-  }));
-}
-function roleQueueScopes(lanes) {
-  const projectIds = new Set(lanes.map((lane) => lane.projectId));
-  return [...projectIds].map((projectId) => {
-    const next = lanes.find((lane) => lane.projectId === projectId && lane.nextStartable);
-    return {
-      projectId,
-      nextStartable: next !== void 0,
-      queueHeadId: next?.executionAttemptId ?? null,
-      deferredReason: next?.deferredReason ?? null
-    };
-  });
-}
-function createLaneWatcher(options) {
-  const supervisorThreadId = options.supervisorThreadId ?? SUPERVISOR_THREAD_ID;
-  const continuationLedger = options.continuationLedger ?? createContinuationLedger();
-  const operatorWaitAlertLedger = createOperatorWaitAlertLedger(options.operatorWaitAlertPersistence);
-  const roleIdleLedger = createRoleIdleLedger(options.roleIdlePersistence);
-  const roleIdleThresholdMs = Number.isInteger(options.roleIdleThresholdMs) && (options.roleIdleThresholdMs ?? 0) >= 0 ? options.roleIdleThresholdMs : WRONGFUL_IDLE_THRESHOLD_MS;
-  const now2 = options.now ?? Date.now;
-  const operatorWaitFyiThresholdMs = Number.isInteger(options.operatorWaitFyiThresholdMs) && (options.operatorWaitFyiThresholdMs ?? 0) >= 0 ? options.operatorWaitFyiThresholdMs : OPERATOR_WAIT_FYI_THRESHOLD_MS;
-  const maxContinuations = Number.isInteger(options.maxContinuations) && (options.maxContinuations ?? 0) > 0 ? options.maxContinuations : DEFAULT_MAX_CONTINUATIONS;
-  const coalesced = /* @__PURE__ */ new Set();
-  let queue = Promise.resolve();
-  const laneKey = (lane) => `${lane.project_id}:${lane.execution_attempt_id}`;
-  const clearResolved = (lanes) => {
-    const unresolved = new Set(
-      lanes.filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.terminal_report_digest === null).map(laneKey)
-    );
-    for (const key of coalesced) {
-      if (!unresolved.has(key)) coalesced.delete(key);
-    }
-  };
-  const viewFor = (lane, status, now3, operatorWait) => ({
-    projectId: lane.project_id,
-    laneId: lane.lane_id,
-    assignmentId: lane.assignment_id,
-    assignmentKind: lane.assignment_kind,
-    workItemId: lane.work_item_id,
-    threadId: lane.thread_id,
-    executionAttemptId: lane.execution_attempt_id,
-    attemptState: lane.attempt_state,
-    workerStatus: status,
-    waitingOn: operatorWait?.reason ?? "terminal receipt",
-    ageMs: Math.max(0, now3 - lane.created_at_ms),
-    tone: "error",
-    queueState: operatorWait ? "deferred" : lane.attempt_state === "running" ? "running" : "ready",
-    queueBlocked: false,
-    nextStartable: false,
-    deferredReason: operatorWait?.reason ?? null,
-    deferredAtMs: operatorWait?.createdAtMs ?? null,
-    deferredAgeMs: operatorWait ? Math.max(0, now3 - operatorWait.createdAtMs) : null
-  });
-  const alert = (kind, lane, count, max) => {
-    options.onAlert?.({ kind, lane, count, max });
-  };
-  const roleAlert = (role) => {
-    options.onAlert?.({ kind: "wrongful_idle_fyi", lane: null, role, count: 2, max: 2 });
-  };
-  const escalateRole = async (key, role) => {
-    if (!await roleIdleLedger.markEscalated(key)) return;
-    roleAlert(role);
-    options.onRoleSuccessionRequired?.(role);
-  };
-  const observeRoleNow = async (threadId, suppliedScopes) => {
-    if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return;
-    let holders;
-    try {
-      holders = options.readRoleHolders().filter((holder) => holder.role_id === ORCHESTRATOR_ROLE_ID && (!threadId || holder.thread_id === threadId));
-    } catch {
-      return;
-    }
-    if (holders.length === 0) return;
-    let scopes = suppliedScopes;
-    if (!scopes) {
-      try {
-        scopes = await options.readRoleScopes();
-      } catch {
-        return;
-      }
-    }
-    for (const holder of holders) {
-      const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
-      const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
-      let observation;
-      try {
-        observation = await options.readWorker(holder.thread_id);
-      } catch {
-        continue;
-      }
-      if (observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || !scope?.nextStartable || scope.deferredReason) {
-        await roleIdleLedger.clearPrefixExcept(prefix);
-        continue;
-      }
-      if (!scope.queueHeadId) {
-        await roleIdleLedger.clearPrefixExcept(prefix);
-        continue;
-      }
-      const key = `${prefix}${scope.queueHeadId}`;
-      await roleIdleLedger.clearPrefixExcept(prefix, key);
-      if (observation.status !== "idle") {
-        if (await roleIdleLedger.preserveAfterSteerWake(key)) continue;
-        await roleIdleLedger.clearPrefixExcept(prefix);
-        continue;
-      }
-      if (observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) {
-        await roleIdleLedger.clearPrefixExcept(prefix);
-        continue;
-      }
-      const currentNow = now2();
-      const record2 = await roleIdleLedger.observeIdle(key, currentNow);
-      const idleAgeMs = Math.max(0, currentNow - (record2.idleSinceMs ?? currentNow));
-      const steerAgeMs = record2.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : Math.max(0, currentNow - record2.lastSteerAtMs);
-      if (idleAgeMs < roleIdleThresholdMs) continue;
-      if (record2?.escalated) continue;
-      if ((record2?.steerCount ?? 0) >= 2) {
-        if (idleAgeMs >= roleIdleThresholdMs && steerAgeMs >= roleIdleThresholdMs) {
-          await escalateRole(key, {
-            projectId: holder.project_id,
-            roleId: holder.role_id,
-            roleGeneration: holder.role_generation,
-            executionAttemptId: holder.execution_attempt_id,
-            threadId: holder.thread_id,
-            queueHeadId: scope.queueHeadId,
-            idleAgeMs
-          });
-        }
-        continue;
-      }
-      if (idleAgeMs < roleIdleThresholdMs || steerAgeMs < roleIdleThresholdMs) continue;
-      const role = {
-        projectId: holder.project_id,
-        roleId: holder.role_id,
-        roleGeneration: holder.role_generation,
-        executionAttemptId: holder.execution_attempt_id,
-        threadId: holder.thread_id,
-        queueHeadId: scope.queueHeadId,
-        idleAgeMs
-      };
-      let failed = false;
-      try {
-        await options.steerRole(role);
-      } catch {
-        failed = true;
-      }
-      const updated = await roleIdleLedger.recordSteer(key, failed, currentNow);
-      if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, role);
-    }
-  };
-  const observeNow = async (threadId, status, pendingExternalWait, archived = false, suppliedOperatorWait, suppliedOperatorWaitKnown = status !== "idle" || suppliedOperatorWait !== void 0 || !options.readOperatorWait) => {
-    const allLanes = options.readLanes();
-    clearResolved(allLanes);
-    const candidates = allLanes.filter(
-      (lane) => lane.thread_id === threadId && lane.thread_id !== supervisorThreadId && OPEN_ATTEMPT_STATES.has(lane.attempt_state)
-    );
-    if (candidates.length === 0) return;
-    let operatorWait = suppliedOperatorWait ?? null;
-    let operatorWaitKnown = suppliedOperatorWaitKnown;
-    if (!archived && status === "idle" && suppliedOperatorWait === void 0 && options.readOperatorWait) {
-      try {
-        operatorWait = await options.readOperatorWait(threadId);
-      } catch {
-        operatorWait = null;
-        operatorWaitKnown = false;
-      }
-    }
-    let waiting = pendingExternalWait ?? false;
-    if (operatorWait) waiting = true;
-    if (!archived && status === "idle" && pendingExternalWait === void 0 && !operatorWait && options.isExternallyWaiting) {
-      try {
-        waiting = await options.isExternallyWaiting(threadId);
-      } catch {
-        waiting = true;
-      }
-    }
-    const currentNow = now2();
-    if (archived || status !== "idle" || waiting && !operatorWait) {
-      for (const lane of candidates) {
-        const key = laneKey(lane);
-        coalesced.delete(key);
-        if (archived || operatorWaitKnown && !operatorWait) await operatorWaitAlertLedger.clear(key);
-      }
-      return;
-    }
-    for (const lane of candidates) {
-      const key = laneKey(lane);
-      if (lane.terminal_report_digest !== null) {
-        await operatorWaitAlertLedger.clear(key);
-        continue;
-      }
-      if (operatorWait) {
-        coalesced.delete(key);
-        const view2 = viewFor(lane, status, currentNow, operatorWait);
-        if (view2.deferredAgeMs !== null && view2.deferredAgeMs >= operatorWaitFyiThresholdMs && !await operatorWaitAlertLedger.notified(key)) {
-          await operatorWaitAlertLedger.mark(key);
-          alert("operator_wait_fyi", view2, 0, 0);
-        }
-        continue;
-      }
-      await operatorWaitAlertLedger.clear(key);
-      if (coalesced.has(key)) continue;
-      coalesced.add(key);
-      const view = viewFor(lane, status, currentNow, null);
-      const mode = continuationModeFor(lane.assignment_kind);
-      if (mode === "tracking") continue;
-      if (mode === "approval") {
-        alert("approval_required", view, 0, maxContinuations);
-        continue;
-      }
-      const claimed = await continuationLedger.claim(key, maxContinuations);
-      if (!claimed.claim) {
-        if (claimed.reason === "limit_reached") alert("limit_reached", view, maxContinuations, maxContinuations);
-        if (claimed.reason === "paused") alert("restart_review", view, 0, maxContinuations);
-        continue;
-      }
-      try {
-        await options.steer(view);
-        await continuationLedger.complete(key, claimed.claim.claimId);
-      } catch (error48) {
-        alert("delivery_uncertain", view, claimed.claim.count, claimed.claim.max);
-        throw error48;
-      }
-    }
-  };
-  const enqueue = (work) => {
-    const result2 = queue.then(work);
-    queue = result2.then(() => void 0, () => void 0);
-    return result2;
-  };
-  return {
-    observe(threadId, status, pendingExternalWait, archived, operatorWait) {
-      if (threadId === supervisorThreadId) return Promise.resolve();
-      return enqueue(async () => {
-        await observeNow(threadId, status, pendingExternalWait, archived, operatorWait);
-        await observeRoleNow(threadId);
-      });
-    },
-    poll() {
-      return enqueue(async () => {
-        const lanes = options.readLanes();
-        clearResolved(lanes);
-        if (!options.readWorker) return;
-        const workerIds = new Set(
-          lanes.filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.thread_id).map((lane) => lane.thread_id).filter((threadId) => threadId !== supervisorThreadId)
-        );
-        for (const threadId of workerIds) {
-          let observation;
-          try {
-            observation = await options.readWorker(threadId);
-          } catch {
-            continue;
-          }
-          await observeNow(
-            threadId,
-            observation.status,
-            observation.pendingExternalWait,
-            observation.archived,
-            observation.operatorWait,
-            observation.operatorWaitKnown
-          );
-        }
-        if (options.readRoleHolders) {
-          const roleThreadIds = new Set(options.readRoleHolders().map((holder) => holder.thread_id).filter((threadId) => threadId !== supervisorThreadId));
-          let roleScopes = null;
-          if (roleThreadIds.size > 0 && options.readRoleScopes) {
-            try {
-              roleScopes = await options.readRoleScopes();
-            } catch {
-              roleScopes = null;
-            }
-          }
-          if (roleScopes) {
-            for (const threadId of roleThreadIds) await observeRoleNow(threadId, roleScopes);
-          }
-        }
-      });
-    },
-    recover() {
-      return enqueue(async () => {
-        await continuationLedger.recover();
-        await operatorWaitAlertLedger.recover();
-        await roleIdleLedger.recover();
-      });
-    }
-  };
-}
-function threadEventStatus(payload) {
-  return {
-    id: payload.thread.id,
-    status: payload.thread.status
-  };
-}
-function subscribeToThreadChanges(sdk, observe) {
-  try {
-    return sdk.subscribe({
-      event: "thread:changed",
-      callback: (event) => {
-        if (event.entity !== "thread" || !event.id) return;
-        void sdk.threads.get({ threadId: event.id }).then((thread) => thread.archivedAt === null && thread.deletedAt === null ? observe(thread.id, thread.status) : observe(thread.id, thread.status, true)).catch(() => void 0);
-      }
-    });
-  } catch {
-    return () => void 0;
-  }
-}
-
 // src/foundation.ts
 import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
@@ -14407,6 +13789,8 @@ var PLUGIN_SDK_VERSION = "0.4.1";
 var CONTRACT_VERSION = 13;
 var SCHEMA_VERSION = 11;
 var PREVIOUS_CONTRACT_VERSION = 12;
+var DEFAULT_WRITING_LANE_CEILING = 3;
+var MAX_WRITING_LANE_CEILING = 3;
 var PREVIOUS_SCHEMA_VERSION = 10;
 var ROLE_IDS = ["project-orchestrator", "worker", "independent-reviewer"];
 var AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab";
@@ -15105,6 +14489,13 @@ var contractDigest = sha256(canonicalJson({
     requirement: "one named profile with a provider different from the executed holder",
     authority: "none",
     traffic: "none"
+  },
+  writingLanePolicy: {
+    configPath: "extensions.bbCollab.writingLaneCeiling",
+    default: DEFAULT_WRITING_LANE_CEILING,
+    maximum: MAX_WRITING_LANE_CEILING,
+    lowerRequiresExplicitDecision: true,
+    readOnlyAssignmentKinds: ["review", "probe"]
   },
   operatorReceiptPolicy: {
     scope: "one_request",
@@ -15853,8 +15244,8 @@ function validateConfig(value) {
         if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
       }
       const writingLaneCeiling = bbCollab.writingLaneCeiling;
-      if (writingLaneCeiling !== void 0 && (!Number.isInteger(writingLaneCeiling) || Number(writingLaneCeiling) < 0 || Number(writingLaneCeiling) > 2)) {
-        throw refusal("INVALID_INPUT", "writingLaneCeiling must be an integer from 0 through 2");
+      if (writingLaneCeiling !== void 0 && (!Number.isInteger(writingLaneCeiling) || Number(writingLaneCeiling) < 0 || Number(writingLaneCeiling) > MAX_WRITING_LANE_CEILING)) {
+        throw refusal("INVALID_INPUT", `writingLaneCeiling must be an integer from 0 through ${MAX_WRITING_LANE_CEILING}`);
       }
       const reviewPolicy = bbCollab.reviewPolicy;
       if (reviewPolicy !== void 0) {
@@ -15888,7 +15279,23 @@ function roleRequirementsFromJson(configJson) {
 function writingLaneCeilingFromJson(configJson) {
   const config2 = JSON.parse(configJson);
   const value = config2.extensions?.bbCollab?.writingLaneCeiling;
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 2 ? value : 2;
+  if (value === void 0) return DEFAULT_WRITING_LANE_CEILING;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > MAX_WRITING_LANE_CEILING) {
+    throw refusal("INVALID_INPUT", `stored writingLaneCeiling must be an integer from 0 through ${MAX_WRITING_LANE_CEILING}`);
+  }
+  return value;
+}
+function writingLaneCeilingForProject(db, projectId) {
+  const row = asRow(db.prepare(
+    `SELECT revisions.canonical_config_json
+     FROM project_config_heads AS heads
+     JOIN project_config_revisions AS revisions
+       ON revisions.project_id = heads.project_id
+      AND revisions.config_revision = heads.config_revision
+     WHERE heads.project_id = ?`
+  ).get(projectId));
+  if (!row) throw refusal("PROJECT_CONFIG_REQUIRED", "project config head is unavailable");
+  return writingLaneCeilingFromJson(row.canonical_config_json);
 }
 function reviewPolicyFromJson(configJson) {
   const config2 = JSON.parse(configJson);
@@ -16258,7 +15665,7 @@ function requireActiveAuthorizedApprover(db, input, transition) {
   }
   const allowedMutationClasses = isExactAuthorizedApproverMutationClassSet(allowed, DERIVED_ACTOR_MUTATION_CLASSES) ? DERIVED_ACTOR_MUTATION_CLASSES : isExactAuthorizedApproverMutationClassSet(allowed, PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES) ? PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES : null;
   if (!allowedMutationClasses) {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current or bump-surviving v11 set");
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current or bump-surviving historical set");
   }
   if (!allowedMutationClasses.includes(input.mutationClass)) {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "mutation class is not authorized by the approver registry");
@@ -20912,6 +20319,646 @@ async function doctor(db, sdk, projectId) {
 function databaseIsReady(db) {
   db.pragma("foreign_keys = ON");
   db.pragma("busy_timeout = 5000");
+}
+
+// src/awareness.ts
+var SUPERVISOR_THREAD_ID = "thr_b94i3csnme";
+var DEFAULT_MAX_CONTINUATIONS = 3;
+var OPERATOR_WAIT_FYI_THRESHOLD_MS = 15 * 6e4;
+var WRONGFUL_IDLE_THRESHOLD_MS = 10 * 6e4;
+var ORCHESTRATOR_ROLE_ID = "project-orchestrator";
+var OPEN_ATTEMPT_STATES = /* @__PURE__ */ new Set([
+  "prepared",
+  "armed",
+  "content_delivered",
+  "running",
+  "dispatch_unknown"
+]);
+function operatorWaitAlertState(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  const state = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (value !== true) throw new Error("invalid operator wait alert state");
+    state[key] = true;
+  }
+  return state;
+}
+function createOperatorWaitAlertLedger(persistence) {
+  let state = {};
+  let loaded = false;
+  let queue = Promise.resolve();
+  const enqueue = (work) => {
+    const result2 = queue.then(work);
+    queue = result2.then(() => void 0, () => void 0);
+    return result2;
+  };
+  const load = async () => {
+    if (loaded) return;
+    state = operatorWaitAlertState(persistence ? await persistence.read() : null);
+    loaded = true;
+  };
+  const save = () => persistence?.write(structuredClone(state));
+  return {
+    recover: () => enqueue(async () => {
+      await load();
+    }),
+    notified: (key) => enqueue(async () => {
+      await load();
+      return state[key] === true;
+    }),
+    mark: (key) => enqueue(async () => {
+      await load();
+      if (state[key]) return;
+      state[key] = true;
+      await save();
+    }),
+    clear: (key) => enqueue(async () => {
+      await load();
+      if (!state[key]) return;
+      delete state[key];
+      await save();
+    })
+  };
+}
+function roleIdleState(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  const state = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid role idle state");
+    const record2 = value;
+    const failedSteers = typeof record2.failedSteers === "number" ? record2.failedSteers : 0;
+    const idleSinceMs = typeof record2.idleSinceMs === "number" && Number.isFinite(record2.idleSinceMs) ? record2.idleSinceMs : null;
+    const lastSteerAtMs = typeof record2.lastSteerAtMs === "number" && Number.isFinite(record2.lastSteerAtMs) ? record2.lastSteerAtMs : null;
+    const awaitingSteerOutcome = record2.awaitingSteerOutcome === true;
+    if (!Number.isInteger(record2.steerCount) || record2.steerCount < 0 || record2.steerCount > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || idleSinceMs !== null && idleSinceMs < 0 || lastSteerAtMs !== null && lastSteerAtMs < 0 || typeof record2.escalated !== "boolean") {
+      throw new Error("invalid role idle state");
+    }
+    state[key] = { steerCount: record2.steerCount, failedSteers, escalated: record2.escalated, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome };
+  }
+  return state;
+}
+function createRoleIdleLedger(persistence) {
+  let state = {};
+  let loaded = false;
+  let queue = Promise.resolve();
+  const enqueue = (work) => {
+    const result2 = queue.then(work);
+    queue = result2.then(() => void 0, () => void 0);
+    return result2;
+  };
+  const load = async () => {
+    if (loaded) return;
+    state = roleIdleState(persistence ? await persistence.read() : null);
+    loaded = true;
+  };
+  const save = () => persistence?.write(structuredClone(state));
+  return {
+    recover: () => enqueue(async () => {
+      await load();
+    }),
+    get: (key) => enqueue(async () => {
+      await load();
+      return state[key] ?? null;
+    }),
+    observeIdle: (key, idleSinceMs) => enqueue(async () => {
+      await load();
+      const record2 = state[key];
+      if (record2?.idleSinceMs !== null && record2?.idleSinceMs !== void 0) {
+        if (record2.awaitingSteerOutcome) {
+          record2.awaitingSteerOutcome = false;
+          record2.idleSinceMs = idleSinceMs;
+          await save();
+        }
+        return { ...record2 };
+      }
+      state[key] = { ...record2 ?? { steerCount: 0, failedSteers: 0, escalated: false, lastSteerAtMs: null, awaitingSteerOutcome: false }, idleSinceMs, awaitingSteerOutcome: false };
+      await save();
+      return { ...state[key] };
+    }),
+    preserveAfterSteerWake: (key) => enqueue(async () => {
+      await load();
+      const record2 = state[key];
+      return record2?.awaitingSteerOutcome === true;
+    }),
+    recordSteer: (key, failed, steeredAtMs) => enqueue(async () => {
+      await load();
+      const record2 = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false };
+      record2.steerCount = Math.min(2, record2.steerCount + 1);
+      if (failed) record2.failedSteers = Math.min(2, record2.failedSteers + 1);
+      record2.lastSteerAtMs = steeredAtMs;
+      record2.awaitingSteerOutcome = !failed;
+      state[key] = record2;
+      await save();
+      return { ...record2 };
+    }),
+    markEscalated: (key) => enqueue(async () => {
+      await load();
+      const record2 = state[key] ?? { steerCount: 2, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false };
+      if (record2.escalated) return false;
+      record2.escalated = true;
+      state[key] = record2;
+      await save();
+      return true;
+    }),
+    clearPrefixExcept: (prefix, keepKey) => enqueue(async () => {
+      await load();
+      let changed = false;
+      for (const key of Object.keys(state)) {
+        if (key.startsWith(prefix) && key !== keepKey) {
+          delete state[key];
+          changed = true;
+        }
+      }
+      if (changed) await save();
+    })
+  };
+}
+function continuationState(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  const state = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid continuation state");
+    const candidate = value;
+    if (candidate.mode !== "automatic" || !["ready", "claimed", "paused", "limit_reached"].includes(candidate.status) || !Number.isInteger(candidate.count) || candidate.count < 0 || !Number.isInteger(candidate.max) || candidate.max < 1 || !(candidate.claimId === null || typeof candidate.claimId === "string")) throw new Error("invalid continuation state");
+    state[key] = {
+      mode: "automatic",
+      status: candidate.status,
+      count: candidate.count,
+      max: candidate.max,
+      claimId: candidate.claimId
+    };
+  }
+  return state;
+}
+function createContinuationLedger(persistence) {
+  let state = {};
+  let loaded = false;
+  let queue = Promise.resolve();
+  const enqueue = (work) => {
+    const result2 = queue.then(work);
+    queue = result2.then(() => void 0, () => void 0);
+    return result2;
+  };
+  const load = async () => {
+    if (loaded) return;
+    state = continuationState(persistence ? await persistence.read() : null);
+    loaded = true;
+  };
+  const save = () => persistence?.write(structuredClone(state));
+  return {
+    recover() {
+      return enqueue(async () => {
+        await load();
+        let changed = false;
+        for (const record2 of Object.values(state)) {
+          if (record2.status !== "claimed") continue;
+          record2.status = "paused";
+          record2.claimId = null;
+          changed = true;
+        }
+        if (changed) await save();
+      });
+    },
+    claim(key, max) {
+      return enqueue(async () => {
+        await load();
+        const existing = state[key];
+        if (existing?.status === "claimed") return { claim: null, reason: "claimed" };
+        if (existing?.status === "paused") return { claim: null, reason: "paused" };
+        if (existing?.status === "limit_reached") return { claim: null, reason: "limit_reached" };
+        const count = existing?.count ?? 0;
+        if (count >= max) {
+          state[key] = { mode: "automatic", status: "limit_reached", count, max, claimId: null };
+          await save();
+          return { claim: null, reason: "limit_reached" };
+        }
+        const claim = { claimId: `${key}:${count + 1}`, count: count + 1, max };
+        state[key] = { mode: "automatic", status: "claimed", count: claim.count, max, claimId: claim.claimId };
+        await save();
+        return { claim };
+      });
+    },
+    complete(key, claimId) {
+      return enqueue(async () => {
+        await load();
+        const record2 = state[key];
+        if (!record2 || record2.status !== "claimed" || record2.claimId !== claimId) throw new Error("continuation claim is not current");
+        record2.status = "ready";
+        record2.claimId = null;
+        await save();
+      });
+    },
+    resume(key, resetCount = false) {
+      return enqueue(async () => {
+        await load();
+        const record2 = state[key];
+        if (!record2 || record2.status === "claimed") throw new Error("continuation is not paused");
+        record2.status = "ready";
+        record2.claimId = null;
+        if (resetCount) record2.count = 0;
+        await save();
+      });
+    }
+  };
+}
+function continuationModeFor(assignmentKind) {
+  return assignmentKind === "write" ? "automatic" : assignmentKind === "review" ? "approval" : "tracking";
+}
+function readLaneStates(db) {
+  return db.prepare(
+    `SELECT assignments.project_id, assignments.assignment_id, assignments.lane_id,
+              assignments.assignment_kind, assignments.work_item_id,
+              execution_attempts.thread_id, execution_attempts.execution_attempt_id,
+              execution_attempts.state AS attempt_state,
+              execution_attempts.terminal_report_digest,
+              assignments.created_at_ms
+       FROM assignments
+       JOIN execution_attempts
+         ON execution_attempts.project_id = assignments.project_id
+        AND execution_attempts.assignment_id = assignments.assignment_id
+       WHERE execution_attempts.origin = 'assignment'
+       ORDER BY assignments.created_at_ms, assignments.assignment_id`
+  ).all();
+}
+function readRoleHolderStates(db) {
+  return db.prepare(
+    `SELECT attempts.project_id, attempts.role_id, attempts.role_generation,
+              attempts.execution_attempt_id, attempts.thread_id
+       FROM execution_attempts AS attempts
+       JOIN role_generation_heads AS heads
+         ON heads.project_id = attempts.project_id
+        AND heads.role_id = attempts.role_id
+        AND heads.current_generation = attempts.role_generation
+       JOIN role_generations AS generations
+         ON generations.project_id = attempts.project_id
+        AND generations.role_id = attempts.role_id
+        AND generations.generation = attempts.role_generation
+       WHERE attempts.origin = 'role_holder'
+         AND attempts.thread_id IS NOT NULL
+         AND attempts.role_id = '${ORCHESTRATOR_ROLE_ID}'
+         AND generations.status = 'active'
+       ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`
+  ).all();
+}
+function openLaneViews(db, now2 = Date.now(), operatorWaits = /* @__PURE__ */ new Map()) {
+  const lanes = readLaneStates(db).filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state)).map((lane) => {
+    const operatorWait = lane.thread_id ? operatorWaits.get(lane.thread_id) ?? null : null;
+    return {
+      projectId: lane.project_id,
+      laneId: lane.lane_id,
+      assignmentId: lane.assignment_id,
+      assignmentKind: lane.assignment_kind,
+      workItemId: lane.work_item_id,
+      threadId: lane.thread_id,
+      executionAttemptId: lane.execution_attempt_id,
+      attemptState: lane.attempt_state,
+      workerStatus: null,
+      waitingOn: operatorWait?.reason ?? (lane.terminal_report_digest === null ? "terminal receipt" : null),
+      ageMs: Math.max(0, now2 - lane.created_at_ms),
+      tone: lane.attempt_state === "running" ? "running" : "default",
+      queueState: operatorWait ? "deferred" : lane.attempt_state === "running" ? "running" : "ready",
+      queueBlocked: false,
+      nextStartable: false,
+      deferredReason: operatorWait?.reason ?? null,
+      deferredAtMs: operatorWait?.createdAtMs ?? null,
+      deferredAgeMs: operatorWait ? Math.max(0, now2 - operatorWait.createdAtMs) : null
+    };
+  });
+  const startable = /* @__PURE__ */ new Set();
+  const readyWriterCount = /* @__PURE__ */ new Map();
+  const occupiedWriterCount = /* @__PURE__ */ new Map();
+  const ceilingByProject = /* @__PURE__ */ new Map();
+  for (const lane of lanes) {
+    if (lane.assignmentKind !== "write") continue;
+    if (lane.queueState === "deferred" || lane.queueState === "running" || lane.attemptState !== "prepared" && lane.attemptState !== "armed") {
+      occupiedWriterCount.set(lane.projectId, (occupiedWriterCount.get(lane.projectId) ?? 0) + 1);
+    }
+  }
+  for (const lane of lanes) {
+    if (lane.queueState !== "ready" || lane.attemptState !== "prepared" && lane.attemptState !== "armed" || lane.deferredReason) continue;
+    if (lane.assignmentKind !== "write") {
+      startable.add(lane.executionAttemptId);
+      continue;
+    }
+    const ready = readyWriterCount.get(lane.projectId) ?? 0;
+    const occupied = occupiedWriterCount.get(lane.projectId) ?? 0;
+    const ceiling = ceilingByProject.get(lane.projectId) ?? writingLaneCeilingForProject(db, lane.projectId);
+    ceilingByProject.set(lane.projectId, ceiling);
+    const available = Math.max(0, ceiling - occupied);
+    if (ready < available) {
+      startable.add(lane.executionAttemptId);
+      readyWriterCount.set(lane.projectId, ready + 1);
+    }
+  }
+  return lanes.map((lane) => ({
+    ...lane,
+    queueBlocked: lane.queueState === "ready" && (lane.attemptState === "prepared" || lane.attemptState === "armed") && !startable.has(lane.executionAttemptId),
+    nextStartable: startable.has(lane.executionAttemptId)
+  }));
+}
+function roleQueueScopes(lanes) {
+  const projectIds = new Set(lanes.map((lane) => lane.projectId));
+  return [...projectIds].map((projectId) => {
+    const next = lanes.find((lane) => lane.projectId === projectId && lane.nextStartable);
+    return {
+      projectId,
+      nextStartable: next !== void 0,
+      queueHeadId: next?.executionAttemptId ?? null,
+      deferredReason: next?.deferredReason ?? null
+    };
+  });
+}
+function createLaneWatcher(options) {
+  const supervisorThreadId = options.supervisorThreadId ?? SUPERVISOR_THREAD_ID;
+  const continuationLedger = options.continuationLedger ?? createContinuationLedger();
+  const operatorWaitAlertLedger = createOperatorWaitAlertLedger(options.operatorWaitAlertPersistence);
+  const roleIdleLedger = createRoleIdleLedger(options.roleIdlePersistence);
+  const roleIdleThresholdMs = Number.isInteger(options.roleIdleThresholdMs) && (options.roleIdleThresholdMs ?? 0) >= 0 ? options.roleIdleThresholdMs : WRONGFUL_IDLE_THRESHOLD_MS;
+  const now2 = options.now ?? Date.now;
+  const operatorWaitFyiThresholdMs = Number.isInteger(options.operatorWaitFyiThresholdMs) && (options.operatorWaitFyiThresholdMs ?? 0) >= 0 ? options.operatorWaitFyiThresholdMs : OPERATOR_WAIT_FYI_THRESHOLD_MS;
+  const maxContinuations = Number.isInteger(options.maxContinuations) && (options.maxContinuations ?? 0) > 0 ? options.maxContinuations : DEFAULT_MAX_CONTINUATIONS;
+  const coalesced = /* @__PURE__ */ new Set();
+  let queue = Promise.resolve();
+  const laneKey = (lane) => `${lane.project_id}:${lane.execution_attempt_id}`;
+  const clearResolved = (lanes) => {
+    const unresolved = new Set(
+      lanes.filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.terminal_report_digest === null).map(laneKey)
+    );
+    for (const key of coalesced) {
+      if (!unresolved.has(key)) coalesced.delete(key);
+    }
+  };
+  const viewFor = (lane, status, now3, operatorWait) => ({
+    projectId: lane.project_id,
+    laneId: lane.lane_id,
+    assignmentId: lane.assignment_id,
+    assignmentKind: lane.assignment_kind,
+    workItemId: lane.work_item_id,
+    threadId: lane.thread_id,
+    executionAttemptId: lane.execution_attempt_id,
+    attemptState: lane.attempt_state,
+    workerStatus: status,
+    waitingOn: operatorWait?.reason ?? "terminal receipt",
+    ageMs: Math.max(0, now3 - lane.created_at_ms),
+    tone: "error",
+    queueState: operatorWait ? "deferred" : lane.attempt_state === "running" ? "running" : "ready",
+    queueBlocked: false,
+    nextStartable: false,
+    deferredReason: operatorWait?.reason ?? null,
+    deferredAtMs: operatorWait?.createdAtMs ?? null,
+    deferredAgeMs: operatorWait ? Math.max(0, now3 - operatorWait.createdAtMs) : null
+  });
+  const alert = (kind, lane, count, max) => {
+    options.onAlert?.({ kind, lane, count, max });
+  };
+  const roleAlert = (role) => {
+    options.onAlert?.({ kind: "wrongful_idle_fyi", lane: null, role, count: 2, max: 2 });
+  };
+  const escalateRole = async (key, role) => {
+    if (!await roleIdleLedger.markEscalated(key)) return;
+    roleAlert(role);
+    options.onRoleSuccessionRequired?.(role);
+  };
+  const observeRoleNow = async (threadId, suppliedScopes) => {
+    if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return;
+    let holders;
+    try {
+      holders = options.readRoleHolders().filter((holder) => holder.role_id === ORCHESTRATOR_ROLE_ID && (!threadId || holder.thread_id === threadId));
+    } catch {
+      return;
+    }
+    if (holders.length === 0) return;
+    let scopes = suppliedScopes;
+    if (!scopes) {
+      try {
+        scopes = await options.readRoleScopes();
+      } catch {
+        return;
+      }
+    }
+    for (const holder of holders) {
+      const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
+      const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
+      let observation;
+      try {
+        observation = await options.readWorker(holder.thread_id);
+      } catch {
+        continue;
+      }
+      if (observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || !scope?.nextStartable || scope.deferredReason) {
+        await roleIdleLedger.clearPrefixExcept(prefix);
+        continue;
+      }
+      if (!scope.queueHeadId) {
+        await roleIdleLedger.clearPrefixExcept(prefix);
+        continue;
+      }
+      const key = `${prefix}${scope.queueHeadId}`;
+      await roleIdleLedger.clearPrefixExcept(prefix, key);
+      if (observation.status !== "idle") {
+        if (await roleIdleLedger.preserveAfterSteerWake(key)) continue;
+        await roleIdleLedger.clearPrefixExcept(prefix);
+        continue;
+      }
+      if (observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) {
+        await roleIdleLedger.clearPrefixExcept(prefix);
+        continue;
+      }
+      const currentNow = now2();
+      const record2 = await roleIdleLedger.observeIdle(key, currentNow);
+      const idleAgeMs = Math.max(0, currentNow - (record2.idleSinceMs ?? currentNow));
+      const steerAgeMs = record2.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : Math.max(0, currentNow - record2.lastSteerAtMs);
+      if (idleAgeMs < roleIdleThresholdMs) continue;
+      if (record2?.escalated) continue;
+      if ((record2?.steerCount ?? 0) >= 2) {
+        if (idleAgeMs >= roleIdleThresholdMs && steerAgeMs >= roleIdleThresholdMs) {
+          await escalateRole(key, {
+            projectId: holder.project_id,
+            roleId: holder.role_id,
+            roleGeneration: holder.role_generation,
+            executionAttemptId: holder.execution_attempt_id,
+            threadId: holder.thread_id,
+            queueHeadId: scope.queueHeadId,
+            idleAgeMs
+          });
+        }
+        continue;
+      }
+      if (idleAgeMs < roleIdleThresholdMs || steerAgeMs < roleIdleThresholdMs) continue;
+      const role = {
+        projectId: holder.project_id,
+        roleId: holder.role_id,
+        roleGeneration: holder.role_generation,
+        executionAttemptId: holder.execution_attempt_id,
+        threadId: holder.thread_id,
+        queueHeadId: scope.queueHeadId,
+        idleAgeMs
+      };
+      let failed = false;
+      try {
+        await options.steerRole(role);
+      } catch {
+        failed = true;
+      }
+      const updated = await roleIdleLedger.recordSteer(key, failed, currentNow);
+      if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, role);
+    }
+  };
+  const observeNow = async (threadId, status, pendingExternalWait, archived = false, suppliedOperatorWait, suppliedOperatorWaitKnown = status !== "idle" || suppliedOperatorWait !== void 0 || !options.readOperatorWait) => {
+    const allLanes = options.readLanes();
+    clearResolved(allLanes);
+    const candidates = allLanes.filter(
+      (lane) => lane.thread_id === threadId && lane.thread_id !== supervisorThreadId && OPEN_ATTEMPT_STATES.has(lane.attempt_state)
+    );
+    if (candidates.length === 0) return;
+    let operatorWait = suppliedOperatorWait ?? null;
+    let operatorWaitKnown = suppliedOperatorWaitKnown;
+    if (!archived && status === "idle" && suppliedOperatorWait === void 0 && options.readOperatorWait) {
+      try {
+        operatorWait = await options.readOperatorWait(threadId);
+      } catch {
+        operatorWait = null;
+        operatorWaitKnown = false;
+      }
+    }
+    let waiting = pendingExternalWait ?? false;
+    if (operatorWait) waiting = true;
+    if (!archived && status === "idle" && pendingExternalWait === void 0 && !operatorWait && options.isExternallyWaiting) {
+      try {
+        waiting = await options.isExternallyWaiting(threadId);
+      } catch {
+        waiting = true;
+      }
+    }
+    const currentNow = now2();
+    if (archived || status !== "idle" || waiting && !operatorWait) {
+      for (const lane of candidates) {
+        const key = laneKey(lane);
+        coalesced.delete(key);
+        if (archived || operatorWaitKnown && !operatorWait) await operatorWaitAlertLedger.clear(key);
+      }
+      return;
+    }
+    for (const lane of candidates) {
+      const key = laneKey(lane);
+      if (lane.terminal_report_digest !== null) {
+        await operatorWaitAlertLedger.clear(key);
+        continue;
+      }
+      if (operatorWait) {
+        coalesced.delete(key);
+        const view2 = viewFor(lane, status, currentNow, operatorWait);
+        if (view2.deferredAgeMs !== null && view2.deferredAgeMs >= operatorWaitFyiThresholdMs && !await operatorWaitAlertLedger.notified(key)) {
+          await operatorWaitAlertLedger.mark(key);
+          alert("operator_wait_fyi", view2, 0, 0);
+        }
+        continue;
+      }
+      await operatorWaitAlertLedger.clear(key);
+      if (coalesced.has(key)) continue;
+      coalesced.add(key);
+      const view = viewFor(lane, status, currentNow, null);
+      const mode = continuationModeFor(lane.assignment_kind);
+      if (mode === "tracking") continue;
+      if (mode === "approval") {
+        alert("approval_required", view, 0, maxContinuations);
+        continue;
+      }
+      const claimed = await continuationLedger.claim(key, maxContinuations);
+      if (!claimed.claim) {
+        if (claimed.reason === "limit_reached") alert("limit_reached", view, maxContinuations, maxContinuations);
+        if (claimed.reason === "paused") alert("restart_review", view, 0, maxContinuations);
+        continue;
+      }
+      try {
+        await options.steer(view);
+        await continuationLedger.complete(key, claimed.claim.claimId);
+      } catch (error48) {
+        alert("delivery_uncertain", view, claimed.claim.count, claimed.claim.max);
+        throw error48;
+      }
+    }
+  };
+  const enqueue = (work) => {
+    const result2 = queue.then(work);
+    queue = result2.then(() => void 0, () => void 0);
+    return result2;
+  };
+  return {
+    observe(threadId, status, pendingExternalWait, archived, operatorWait) {
+      if (threadId === supervisorThreadId) return Promise.resolve();
+      return enqueue(async () => {
+        await observeNow(threadId, status, pendingExternalWait, archived, operatorWait);
+        await observeRoleNow(threadId);
+      });
+    },
+    poll() {
+      return enqueue(async () => {
+        const lanes = options.readLanes();
+        clearResolved(lanes);
+        if (!options.readWorker) return;
+        const workerIds = new Set(
+          lanes.filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.thread_id).map((lane) => lane.thread_id).filter((threadId) => threadId !== supervisorThreadId)
+        );
+        for (const threadId of workerIds) {
+          let observation;
+          try {
+            observation = await options.readWorker(threadId);
+          } catch {
+            continue;
+          }
+          await observeNow(
+            threadId,
+            observation.status,
+            observation.pendingExternalWait,
+            observation.archived,
+            observation.operatorWait,
+            observation.operatorWaitKnown
+          );
+        }
+        if (options.readRoleHolders) {
+          const roleThreadIds = new Set(options.readRoleHolders().map((holder) => holder.thread_id).filter((threadId) => threadId !== supervisorThreadId));
+          let roleScopes = null;
+          if (roleThreadIds.size > 0 && options.readRoleScopes) {
+            try {
+              roleScopes = await options.readRoleScopes();
+            } catch {
+              roleScopes = null;
+            }
+          }
+          if (roleScopes) {
+            for (const threadId of roleThreadIds) await observeRoleNow(threadId, roleScopes);
+          }
+        }
+      });
+    },
+    recover() {
+      return enqueue(async () => {
+        await continuationLedger.recover();
+        await operatorWaitAlertLedger.recover();
+        await roleIdleLedger.recover();
+      });
+    }
+  };
+}
+function threadEventStatus(payload) {
+  return {
+    id: payload.thread.id,
+    status: payload.thread.status
+  };
+}
+function subscribeToThreadChanges(sdk, observe) {
+  try {
+    return sdk.subscribe({
+      event: "thread:changed",
+      callback: (event) => {
+        if (event.entity !== "thread" || !event.id) return;
+        void sdk.threads.get({ threadId: event.id }).then((thread) => thread.archivedAt === null && thread.deletedAt === null ? observe(thread.id, thread.status) : observe(thread.id, thread.status, true)).catch(() => void 0);
+      }
+    });
+  } catch {
+    return () => void 0;
+  }
 }
 
 // server.ts

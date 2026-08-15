@@ -1934,7 +1934,7 @@ describe("bb-collab plugin boundary", () => {
     expect(revoked).toMatchObject({ outcome: "AUTHORIZED_APPROVER_REVOKED" });
   });
 
-  it("survives the v12 approver bump through exact v11 re-adoption", async () => {
+  it("survives the v13 approver bump through exact historical re-adoption", async () => {
     const { host, db, fenceToken } = await assignmentFixture();
     seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "compat-operator", actorKind: "operator", subjectId: "operator-1" });
     const decisionId = "compat-operator";
@@ -1987,7 +1987,7 @@ describe("bb-collab plugin boundary", () => {
       candidateHead: attestedRequest.candidateHead ?? CANDIDATE_SHA,
       idempotencyKey: attestedRequest.idempotencyKey,
       requestDigest: operatorRequestDigest(attestedRequest),
-      callerThreadId: "v12-approver-matrix-attestor",
+      callerThreadId: "v13-approver-matrix-attestor",
       requestedFromBackground: false,
       approverId: AUTHORIZED_APPROVER_ID,
       authorizingDecisionId,
@@ -2172,6 +2172,7 @@ describe("bb-collab plugin boundary", () => {
     }))).toMatchObject({ outcome: "OK" });
 
     const nextConfig = roleConfig();
+    (nextConfig.extensions.bbCollab as Record<string, unknown>).writingLaneCeiling = 3;
     const unsigned = bootstrapRequest(PROJECT_ID, {
       operationClass: "config_revision",
       idempotencyKey: "config-role-requirements-2",
@@ -2231,6 +2232,7 @@ describe("bb-collab plugin boundary", () => {
     });
     const stored = db.prepare("SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = 2").get(PROJECT_ID) as { canonical_config_json: string };
     const storedConfig = JSON.parse(stored.canonical_config_json) as { extensions: { bbCollab: Record<string, unknown> } };
+    expect(storedConfig.extensions.bbCollab.writingLaneCeiling).toBe(3);
     expect(storedConfig.extensions.bbCollab.roleRequirements).toEqual(nextConfig.extensions.bbCollab.roleRequirements);
     expect(storedConfig.extensions.bbCollab.roleRequirements).toEqual(expect.arrayContaining([
       { roleRequirementId: "worker-v1", roleId: "worker", repoTargetId: TARGET_ID, executedProfile: ROLE_PROFILE },
@@ -2307,6 +2309,10 @@ describe("bb-collab plugin boundary", () => {
     const overCapacityRequirements = overCapacityConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>;
     overCapacityRequirements.push({ roleRequirementId: "worker-v2", roleId: "worker", repoTargetId: TARGET_ID, executedProfile: ROLE_PROFILE });
     await rejectConfig("over-capacity", overCapacityConfig, "INVALID_INPUT", "Too big");
+
+    const overLaneCapConfig = roleConfig();
+    (overLaneCapConfig.extensions.bbCollab as Record<string, unknown>).writingLaneCeiling = 4;
+    await rejectConfig("over-lane-cap", overLaneCapConfig, "INVALID_INPUT", "integer from 0 through 3");
   });
 
   it("cannot reuse one receipt for two migration steps", async () => {
@@ -2851,7 +2857,7 @@ describe("bb-collab plugin boundary", () => {
     expect(SCHEMA_VERSION).toBe(11);
     expect(MIGRATIONS).toHaveLength(24);
     expect(schemaDigest).toBe("5ee5cd12902e433825558c27b9a20d8bc2e86c5ffe018bf5b59e207d5d2d684e");
-    expect(contractDigest).toBe("99521c29739f3b6b2175f13159ef5a952888652d2fe448bd76a9df49c1891077");
+    expect(contractDigest).toBe("dd8f687559b077add55d73258c8880930162fb4298aaf86f4d8118adb5cbf826");
     expect(cachedConsumerRolloutEvidence(SCHEMA_VERSION, CONTRACT_VERSION)).toMatchObject({
       oldSchemaVersion: 10,
       newSchemaVersion: 11,
@@ -5897,7 +5903,7 @@ describe("bb-collab plugin boundary", () => {
     const adapter = new DeterministicNativeAssignmentAdapter();
     const prepare = assignmentPrepareRequest(fenceToken);
     const prepared = applyWithFixtureReceipt(db, prepare, null, null, adapter);
-    expect(prepared).toMatchObject({ outcome: "OK", evidence: { assignmentId: "assignment-1", writingLaneCeiling: 2, activeWriterCount: 1 } });
+    expect(prepared).toMatchObject({ outcome: "OK", evidence: { assignmentId: "assignment-1", writingLaneCeiling: 3, activeWriterCount: 1 } });
     expect(applyWithFixtureReceipt(db, prepare, null, null, adapter)).toEqual(prepared);
     expect(adapter.inspectCalls).toHaveLength(1);
     expect(adapter.dispatchCalls).toHaveLength(0);
@@ -6581,9 +6587,13 @@ describe("bb-collab plugin boundary", () => {
           const third = assignmentPrepareRequest(fenceToken, "ceiling-2-third", {
             assignment: { ...assignmentPrepareRequest(fenceToken).assignment!, assignmentId: "ceiling-2-third", laneId: "lane-third", branchName: "bb/ceiling-2-third", environment: { ...assignmentPrepareRequest(fenceToken).assignment!.environment, environmentId: "environment-ceiling-2-third" } },
           });
-          expect(applyWithFixtureReceipt(firstDb, third, null, null, firstAdapter).outcome).toBe("LANE_WRITER_EXISTS");
-          expect(firstDb.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'assignment' AND assignment_kind = 'write'").get()).toEqual({ count: 2 });
-          expect(firstDb.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE idempotency_key = ?").get(third.idempotencyKey)).toEqual({ count: 0 });
+          expect(applyWithFixtureReceipt(firstDb, third, null, null, firstAdapter).outcome).toBe("OK");
+          expect(firstDb.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'assignment' AND assignment_kind = 'write'").get()).toEqual({ count: 3 });
+          const fourth = assignmentPrepareRequest(fenceToken, "ceiling-3-fourth", {
+            assignment: { ...assignmentPrepareRequest(fenceToken).assignment!, assignmentId: "ceiling-3-fourth", laneId: "lane-fourth", branchName: "bb/ceiling-3-fourth", environment: { ...assignmentPrepareRequest(fenceToken).assignment!.environment, environmentId: "environment-ceiling-3-fourth" } },
+          });
+          expect(applyWithFixtureReceipt(firstDb, fourth, null, null, firstAdapter).outcome).toBe("LANE_WRITER_EXISTS");
+          expect(firstDb.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE idempotency_key = ?").get(fourth.idempotencyKey)).toEqual({ count: 0 });
         } else {
           expect(secondResults[0]?.outcome).toBe("OK");
           expect(firstResult.outcome).toBe("LANE_WRITER_EXISTS");

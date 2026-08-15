@@ -9,6 +9,8 @@ export const CONTRACT_VERSION = 13;
 export const SCHEMA_VERSION = 11;
 // RoleGeneration standby field and succession rule v12 -> v13 / schema v10 -> v11.
 const PREVIOUS_CONTRACT_VERSION = 12;
+export const DEFAULT_WRITING_LANE_CEILING = 3;
+export const MAX_WRITING_LANE_CEILING = 3;
 const PREVIOUS_SCHEMA_VERSION = 10;
 export const ROLE_IDS = ["project-orchestrator", "worker", "independent-reviewer"] as const;
 export const AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab" as const;
@@ -681,7 +683,7 @@ export const DERIVED_ACTOR_MUTATION_CLASSES = [
   "migration_prepare",
   "migration_step",
 ] as const;
-/** Exact contract-v11 registry retained only for bounded v12 re-adoption. */
+/** Historical v11 rows remain readable during the already-bounded authority repair. */
 export const PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES = Object.freeze([
   "bootstrap",
   "config_revision",
@@ -719,6 +721,13 @@ export const contractDigest = sha256(canonicalJson({
     requirement: "one named profile with a provider different from the executed holder",
     authority: "none",
     traffic: "none",
+  },
+  writingLanePolicy: {
+    configPath: "extensions.bbCollab.writingLaneCeiling",
+    default: DEFAULT_WRITING_LANE_CEILING,
+    maximum: MAX_WRITING_LANE_CEILING,
+    lowerRequiresExplicitDecision: true,
+    readOnlyAssignmentKinds: ["review", "probe"],
   },
   operatorReceiptPolicy: {
     scope: "one_request",
@@ -2000,8 +2009,8 @@ function validateConfig(value: unknown): string {
         if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
       }
       const writingLaneCeiling = (bbCollab as Record<string, unknown>).writingLaneCeiling;
-      if (writingLaneCeiling !== undefined && (!Number.isInteger(writingLaneCeiling) || Number(writingLaneCeiling) < 0 || Number(writingLaneCeiling) > 2)) {
-        throw refusal("INVALID_INPUT", "writingLaneCeiling must be an integer from 0 through 2");
+      if (writingLaneCeiling !== undefined && (!Number.isInteger(writingLaneCeiling) || Number(writingLaneCeiling) < 0 || Number(writingLaneCeiling) > MAX_WRITING_LANE_CEILING)) {
+        throw refusal("INVALID_INPUT", `writingLaneCeiling must be an integer from 0 through ${MAX_WRITING_LANE_CEILING}`);
       }
       const reviewPolicy = (bbCollab as Record<string, unknown>).reviewPolicy;
       if (reviewPolicy !== undefined) {
@@ -2044,10 +2053,27 @@ function roleRequirementsFromJson(configJson: string): RoleRequirement[] {
   return parsed.data;
 }
 
-function writingLaneCeilingFromJson(configJson: string): number {
+export function writingLaneCeilingFromJson(configJson: string): number {
   const config = JSON.parse(configJson) as { extensions?: { bbCollab?: { writingLaneCeiling?: unknown } } };
   const value = config.extensions?.bbCollab?.writingLaneCeiling;
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 2 ? value : 2;
+  if (value === undefined) return DEFAULT_WRITING_LANE_CEILING;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > MAX_WRITING_LANE_CEILING) {
+    throw refusal("INVALID_INPUT", `stored writingLaneCeiling must be an integer from 0 through ${MAX_WRITING_LANE_CEILING}`);
+  }
+  return value;
+}
+
+export function writingLaneCeilingForProject(db: SqliteDatabase, projectId: string): number {
+  const row = asRow<{ canonical_config_json: string }>(db.prepare(
+    `SELECT revisions.canonical_config_json
+     FROM project_config_heads AS heads
+     JOIN project_config_revisions AS revisions
+       ON revisions.project_id = heads.project_id
+      AND revisions.config_revision = heads.config_revision
+     WHERE heads.project_id = ?`,
+  ).get(projectId));
+  if (!row) throw refusal("PROJECT_CONFIG_REQUIRED", "project config head is unavailable");
+  return writingLaneCeilingFromJson(row.canonical_config_json);
 }
 
 function reviewPolicyFromJson(configJson: string): z.infer<typeof reviewPolicySchema> | null {
@@ -2509,7 +2535,7 @@ function requireActiveAuthorizedApprover(
       ? PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES
       : null;
   if (!allowedMutationClasses) {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current or bump-surviving v11 set");
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current or bump-surviving historical set");
   }
   if (!(allowedMutationClasses as readonly string[]).includes(input.mutationClass)) {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "mutation class is not authorized by the approver registry");
