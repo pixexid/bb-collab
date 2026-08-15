@@ -249,6 +249,16 @@ export const rpcContract = defineRpcContract({
     input: z.object({}).strict(),
     output: z.array(operatorReceiptRequestViewSchema),
   },
+  // Whether the secret exists, never what it is. `useSettings()` excludes
+  // secret settings, so the console cannot otherwise tell "unset" from
+  // "set but not typed yet" — and only the first of those is an onboarding
+  // problem the operator can fix. `null` is a third answer, not a default:
+  // the read failed, so the console knows nothing rather than accusing the
+  // operator of a setup they did do.
+  operatorPassphraseState: {
+    input: z.object({}).strict(),
+    output: z.object({ configured: z.boolean().nullable() }).strict(),
+  },
   operatorReceiptDecision: {
     input: operatorReceiptDecisionSchema,
     output: foundationResultSchema,
@@ -467,6 +477,8 @@ async function runCli(
   return cliResult(exportFoundation(db, projectId));
 }
 
+type OperatorPassphraseRead = { configured: true; secret: string } | { configured: false } | { configured: null };
+
 export default async function plugin(bb: BbPluginApi) {
   const operatorPassphrase = bb.settings.define({
     operatorPassphrase: {
@@ -476,6 +488,22 @@ export default async function plugin(bb: BbPluginApi) {
       secret: true,
     },
   });
+  // The one place the secret is read. Tri-state by construction: a failed read
+  // is `configured: null`, never `false`, because those are different facts
+  // and only `false` is fixable by the operator. Both refuse an approval —
+  // only `true` carries material, and only `configured` ever leaves the server.
+  const readOperatorPassphrase = async (): Promise<OperatorPassphraseRead> => {
+    let values: { operatorPassphrase?: string };
+    try {
+      values = await operatorPassphrase.get();
+    } catch (error) {
+      bb.log.error(`operator approval passphrase state unreadable: ${String(error)}`);
+      return { configured: null };
+    }
+    return typeof values.operatorPassphrase === "string" && values.operatorPassphrase !== ""
+      ? { configured: true, secret: values.operatorPassphrase }
+      : { configured: false };
+  };
   let db: SqliteDatabase | null = null;
   try {
     db = bb.storage.database();
@@ -621,6 +649,18 @@ export default async function plugin(bb: BbPluginApi) {
     }),
   );
 
+  // Counts only. A sidebar glyph needs how many are waiting and on which
+  // thread; it has no use for the project, candidate head, digest or
+  // idempotency key those requests carry, so this surface never carries them.
+  bb.http.route("GET", "/operator-receipt-waits", async () => {
+    const requests = await readOperatorReceiptRequests(bb).catch(() => []);
+    const threads: Record<string, number> = {};
+    for (const request of requests) threads[request.threadId] = (threads[request.threadId] ?? 0) + 1;
+    return new Response(JSON.stringify({ total: requests.length, threads }), {
+      headers: { "content-type": "application/json" },
+    });
+  });
+
   bb.rpc.register(rpcContract, {
     lanes() {
       return readOpenLaneViews();
@@ -754,6 +794,9 @@ export default async function plugin(bb: BbPluginApi) {
         return [];
       }
     },
+    async operatorPassphraseState() {
+      return { configured: (await readOperatorPassphrase()).configured };
+    },
     async operatorReceiptDecision(input) {
       if (!db) return operatorReceiptResult(input.projectId, "CANONICAL_STORE_UNAVAILABLE", "canonical SQLite store is unavailable");
       let interaction: Awaited<ReturnType<typeof bb.sdk.threads.interactions.get>>;
@@ -785,8 +828,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (input.approverThreadId === data.callerThreadId) {
         return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_INVALID", "worker self-approval is not permitted");
       }
-      const configured = await operatorPassphrase.get().catch(() => ({ operatorPassphrase: undefined }));
-      if (!configured.operatorPassphrase || !input.passphrase || input.passphrase !== configured.operatorPassphrase) {
+      const stored = await readOperatorPassphrase();
+      if (!stored.configured || !input.passphrase || input.passphrase !== stored.secret) {
         return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_INVALID", "operator approval passphrase is missing or incorrect");
       }
       const confirmation = {

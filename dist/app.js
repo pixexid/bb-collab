@@ -684,12 +684,21 @@ function age(ms) {
   if (hours < 24) return `${hours}h ${minutes % 60}m`;
   return `${Math.floor(hours / 24)}d`;
 }
-function AwaitingOperator({ requests, refresh }) {
+var SETTINGS_ACTION_TITLE = "bb-collab settings";
+var PASSPHRASE_ONBOARDING = "Set your approval passphrase first";
+var PASSPHRASE_UNREADABLE = "Can't check the approval passphrase";
+function AwaitingOperator({
+  requests,
+  refresh,
+  passphraseState
+}) {
   const rpc = useRpc();
   const { threadId: approverThreadId } = useBbContext();
   const [passphrases, setPassphrases] = useState({});
   const [busyId, setBusyId] = useState(null);
   const [error, setError] = useState(null);
+  const armed = passphraseState === "set";
+  const notice = passphraseState === "unset" ? "awaiting-operator-passphrase-unset" : passphraseState === "unknown" ? "awaiting-operator-passphrase-unknown" : void 0;
   const decide = async (request, decision) => {
     setBusyId(request.interactionId);
     setError(null);
@@ -725,10 +734,29 @@ function AwaitingOperator({ requests, refresh }) {
       /* @__PURE__ */ jsx("span", { className: "rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground", children: requests.length })
     ] }),
     error ? /* @__PURE__ */ jsx("p", { className: "mb-3 text-sm text-destructive", role: "alert", children: error }) : null,
+    passphraseState === "unset" ? /* @__PURE__ */ jsxs("div", { id: "awaiting-operator-passphrase-unset", className: "mb-3 rounded-md border border-border bg-muted/50 p-3 text-sm", role: "status", children: [
+      /* @__PURE__ */ jsx("p", { className: "font-semibold text-foreground", children: PASSPHRASE_ONBOARDING }),
+      /* @__PURE__ */ jsxs("p", { className: "mt-1 text-muted-foreground", children: [
+        "Approvals stay refused until it is set. Open ",
+        /* @__PURE__ */ jsx("b", { className: "font-medium text-foreground", children: SETTINGS_ACTION_TITLE }),
+        " in the sidebar footer, then fill in ",
+        /* @__PURE__ */ jsx("b", { className: "font-medium text-foreground", children: "Operator approval passphrase" }),
+        "."
+      ] })
+    ] }) : null,
+    passphraseState === "unknown" ? /* @__PURE__ */ jsxs("div", { id: "awaiting-operator-passphrase-unknown", className: "mb-3 rounded-md border border-border bg-muted/50 p-3 text-sm", role: "status", children: [
+      /* @__PURE__ */ jsx("p", { className: "font-semibold text-foreground", children: PASSPHRASE_UNREADABLE }),
+      /* @__PURE__ */ jsxs("p", { className: "mt-1 text-muted-foreground", children: [
+        "Nothing has changed and nothing needs setting up \u2014 the check itself failed. Approval stays disabled until it succeeds. ",
+        /* @__PURE__ */ jsx("button", { className: "underline underline-offset-2 hover:text-foreground", type: "button", onClick: refresh, children: "Try again" }),
+        "."
+      ] })
+    ] }) : null,
     requests.length === 0 ? /* @__PURE__ */ jsx("p", { className: "border-y border-border py-3 text-sm text-muted-foreground", children: "No pending receipt requests." }) : null,
     /* @__PURE__ */ jsx("div", { className: "space-y-3", children: requests.map((request) => {
       const busy = busyId === request.interactionId;
       const passphrase = passphrases[request.interactionId] ?? "";
+      const blocked = busy || !armed || !passphrase;
       return /* @__PURE__ */ jsxs("article", { className: "rounded-lg border border-border p-3", children: [
         /* @__PURE__ */ jsxs("div", { className: "mb-3 flex items-center justify-between gap-3", children: [
           /* @__PURE__ */ jsx("span", { className: "font-medium", children: request.mutationClass }),
@@ -756,30 +784,42 @@ function AwaitingOperator({ requests, refresh }) {
           /* @__PURE__ */ jsx(
             "input",
             {
-              className: "min-h-9 min-w-0 flex-1 rounded border border-border bg-background px-2 text-sm",
+              className: "min-h-9 min-w-0 flex-1 rounded border border-border bg-background px-2 text-sm disabled:opacity-50",
               type: "password",
               value: passphrase,
               placeholder: "Approval passphrase",
               "aria-label": `Approval passphrase for ${request.mutationClass}`,
+              "aria-describedby": notice,
               autoComplete: "current-password",
+              disabled: !armed,
               onChange: (event) => setPassphrases((current) => ({ ...current, [request.interactionId]: event.target.value }))
             }
           ),
-          /* @__PURE__ */ jsx("button", { className: "min-h-9 rounded bg-primary px-3 text-sm text-primary-foreground disabled:opacity-50", type: "button", disabled: busy || !passphrase, onClick: () => void decide(request, "approve"), children: "Approve" }),
-          /* @__PURE__ */ jsx("button", { className: "min-h-9 rounded border border-border px-3 text-sm disabled:opacity-50", type: "button", disabled: busy || !passphrase, onClick: () => void decide(request, "reject"), children: "Reject" })
+          /* @__PURE__ */ jsx("button", { className: "min-h-9 rounded bg-primary px-3 text-sm text-primary-foreground disabled:opacity-50", type: "button", disabled: blocked, onClick: () => void decide(request, "approve"), children: "Approve" }),
+          /* @__PURE__ */ jsx("button", { className: "min-h-9 rounded border border-border px-3 text-sm disabled:opacity-50", type: "button", disabled: blocked, onClick: () => void decide(request, "reject"), children: "Reject" })
         ] })
       ] }, request.interactionId);
     }) })
   ] });
 }
+function laneQueueLabel(lane) {
+  if (lane.queueState !== "deferred" && !lane.deferredReason) {
+    return lane.nextStartable ? "next startable" : lane.waitingOn ?? "worker";
+  }
+  const reason = lane.deferredReason?.replace(/_/gu, " ") ?? "reason unavailable";
+  const since = typeof lane.deferredAgeMs === "number" ? ` \xB7 ${age(lane.deferredAgeMs)}` : "";
+  return `Deferred \xB7 ${reason}${since}`;
+}
 function LanesPanel(_props) {
   const rpc = useRpc();
   const [lanes, setLanes] = useState([]);
   const [requests, setRequests] = useState([]);
+  const [passphraseState, setPassphraseState] = useState("loading");
   const [error, setError] = useState(null);
   const refresh = useCallback(() => {
     void rpc.call("lanes", {}).then((next) => setLanes(next)).catch((reason) => setError(String(reason)));
     void rpc.call("operatorReceiptRequests", {}).then((next) => setRequests(next)).catch((reason) => setError(String(reason)));
+    void rpc.call("operatorPassphraseState", {}).then((next) => setPassphraseState(next.configured === null ? "unknown" : next.configured ? "set" : "unset")).catch(() => setPassphraseState("unknown"));
   }, [rpc]);
   useEffect(() => {
     refresh();
@@ -799,7 +839,7 @@ function LanesPanel(_props) {
       "Unable to read lanes: ",
       error
     ] }) : null,
-    /* @__PURE__ */ jsx(AwaitingOperator, { requests, refresh }),
+    /* @__PURE__ */ jsx(AwaitingOperator, { requests, refresh, passphraseState }),
     lanes.length === 0 ? /* @__PURE__ */ jsx("p", { className: "text-sm text-muted-foreground", children: "No open lanes." }) : null,
     /* @__PURE__ */ jsx("div", { className: "divide-y divide-border border-y border-border", children: lanes.map((lane) => /* @__PURE__ */ jsxs("div", { className: "grid grid-cols-[minmax(0,1fr)_auto_auto] gap-4 py-3 text-sm", children: [
       /* @__PURE__ */ jsxs("div", { className: "min-w-0", children: [
@@ -810,21 +850,36 @@ function LanesPanel(_props) {
           lane.threadId ?? "worker not attached"
         ] })
       ] }),
-      /* @__PURE__ */ jsx("div", { className: "text-muted-foreground", children: lane.deferredReason ? `${lane.deferredReason} \xB7 ${age(lane.deferredAgeMs ?? 0)}` : lane.nextStartable ? "next startable" : lane.waitingOn ?? "worker" }),
+      /* @__PURE__ */ jsx("div", { className: "text-muted-foreground", children: laneQueueLabel(lane) }),
       /* @__PURE__ */ jsx("time", { className: "text-muted-foreground", title: `${lane.ageMs}ms old`, children: age(lane.ageMs) })
     ] }, lane.executionAttemptId)) })
   ] }) });
 }
-async function readLanes(signal) {
-  const response = await fetch("/api/v1/plugins/bb-collab/http/lanes", { credentials: "same-origin", signal });
+async function readPluginHttp(path, signal) {
+  const response = await fetch(`/api/v1/plugins/bb-collab/http/${path}`, { credentials: "same-origin", signal });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return await response.json();
+}
+function operatorReceiptWaits(value) {
+  const source = value ?? {};
+  const entries = source.threads && typeof source.threads === "object" ? Object.entries(source.threads) : [];
+  return {
+    total: typeof source.total === "number" && source.total > 0 ? source.total : 0,
+    byThread: entries.flatMap(([threadId, count]) => asText(threadId) && typeof count === "number" && count > 0 ? [[threadId, count]] : [])
+  };
+}
+function awaitingOperatorStatus(count, total) {
+  const here = `${count} approval${count === 1 ? "" : "s"} awaiting operator`;
+  return { icon: "Bell", label: total > count ? `${here} on this thread (${total} in all lanes)` : here, tone: "running" };
 }
 function mountLanePulse({ signal, setStatus }) {
   let previous = /* @__PURE__ */ new Set();
   const refresh = async () => {
     try {
-      const lanes = await readLanes(signal);
+      const [lanes, waits] = await Promise.all([
+        readPluginHttp("lanes", signal),
+        readPluginHttp("operator-receipt-waits", signal).then(operatorReceiptWaits)
+      ]);
       const next = /* @__PURE__ */ new Set();
       for (const lane of lanes) {
         if (!lane.threadId) continue;
@@ -834,6 +889,10 @@ function mountLanePulse({ signal, setStatus }) {
           label: lane.waitingOn ? `Lane ${lane.laneId}: waiting on ${lane.waitingOn}` : `Lane ${lane.laneId}: open`,
           tone: lane.tone
         });
+      }
+      for (const [threadId, count] of waits.byThread) {
+        next.add(threadId);
+        setStatus(threadId, awaitingOperatorStatus(count, waits.total));
       }
       for (const threadId of previous) if (!next.has(threadId)) setStatus(threadId, null);
       previous = next;
@@ -852,6 +911,12 @@ var app_default = definePluginApp((app) => {
     component: SidebarThreadList
   });
   app.slots.pendingInteraction({ id: "operator-receipt", component: OperatorReceiptForm });
+  app.slots.sidebarFooterAction({
+    id: "bb-collab-settings",
+    title: SETTINGS_ACTION_TITLE,
+    icon: "Settings",
+    run: ({ openSettings }) => openSettings()
+  });
   app.slots.navPanel({
     id: "lanes",
     title: "Lanes",
@@ -869,10 +934,13 @@ var app_default = definePluginApp((app) => {
 });
 export {
   SidebarThreadList,
+  awaitingOperatorStatus,
   buildThreadTree,
   app_default as default,
   executionBadgeLabel,
   groupThreads,
+  laneQueueLabel,
+  operatorReceiptWaits,
   reasoningLetter,
   shortModelName,
   signalDotClasses,

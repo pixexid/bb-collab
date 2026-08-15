@@ -20804,6 +20804,16 @@ var rpcContract = defineRpcContract({
     input: external_exports.object({}).strict(),
     output: external_exports.array(operatorReceiptRequestViewSchema)
   },
+  // Whether the secret exists, never what it is. `useSettings()` excludes
+  // secret settings, so the console cannot otherwise tell "unset" from
+  // "set but not typed yet" — and only the first of those is an onboarding
+  // problem the operator can fix. `null` is a third answer, not a default:
+  // the read failed, so the console knows nothing rather than accusing the
+  // operator of a setup they did do.
+  operatorPassphraseState: {
+    input: external_exports.object({}).strict(),
+    output: external_exports.object({ configured: external_exports.boolean().nullable() }).strict()
+  },
   operatorReceiptDecision: {
     input: operatorReceiptDecisionSchema,
     output: foundationResultSchema
@@ -21005,6 +21015,16 @@ async function plugin(bb) {
       secret: true
     }
   });
+  const readOperatorPassphrase = async () => {
+    let values;
+    try {
+      values = await operatorPassphrase.get();
+    } catch (error48) {
+      bb.log.error(`operator approval passphrase state unreadable: ${String(error48)}`);
+      return { configured: null };
+    }
+    return typeof values.operatorPassphrase === "string" && values.operatorPassphrase !== "" ? { configured: true, secret: values.operatorPassphrase } : { configured: false };
+  };
   let db = null;
   try {
     db = bb.storage.database();
@@ -21141,6 +21161,14 @@ async function plugin(bb) {
       headers: { "content-type": "application/json" }
     })
   );
+  bb.http.route("GET", "/operator-receipt-waits", async () => {
+    const requests = await readOperatorReceiptRequests(bb).catch(() => []);
+    const threads = {};
+    for (const request of requests) threads[request.threadId] = (threads[request.threadId] ?? 0) + 1;
+    return new Response(JSON.stringify({ total: requests.length, threads }), {
+      headers: { "content-type": "application/json" }
+    });
+  });
   bb.rpc.register(rpcContract, {
     lanes() {
       return readOpenLaneViews();
@@ -21266,6 +21294,9 @@ async function plugin(bb) {
         return [];
       }
     },
+    async operatorPassphraseState() {
+      return { configured: (await readOperatorPassphrase()).configured };
+    },
     async operatorReceiptDecision(input) {
       if (!db) return operatorReceiptResult(input.projectId, "CANONICAL_STORE_UNAVAILABLE", "canonical SQLite store is unavailable");
       let interaction;
@@ -21291,8 +21322,8 @@ async function plugin(bb) {
       if (input.approverThreadId === data.callerThreadId) {
         return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_INVALID", "worker self-approval is not permitted");
       }
-      const configured = await operatorPassphrase.get().catch(() => ({ operatorPassphrase: void 0 }));
-      if (!configured.operatorPassphrase || !input.passphrase || input.passphrase !== configured.operatorPassphrase) {
+      const stored = await readOperatorPassphrase();
+      if (!stored.configured || !input.passphrase || input.passphrase !== stored.secret) {
         return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_INVALID", "operator approval passphrase is missing or incorrect");
       }
       const confirmation = {

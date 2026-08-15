@@ -305,6 +305,68 @@ describe("interim operator receipts", () => {
     expect(host.bb.storage.database().prepare("SELECT COUNT(*) AS count FROM operator_receipts").get()).toEqual({ count: 1 });
   });
 
+  it("reports whether the approval passphrase is set, never what it is", async () => {
+    for (const [settings, configured] of [[undefined, false], [{ operatorPassphrase: "" }, false], [{ operatorPassphrase: "correct-secret" }, true]] as const) {
+      const host = createFakePluginHost({ pluginId: "bb-collab", settings });
+      await plugin(host.bb);
+      const state = await host.harness.callRpc("operatorPassphraseState", {});
+      expect(state, JSON.stringify(settings)).toEqual({ configured });
+      // The contract is `{ configured }` strict, so passphrase material has no
+      // field to ride out on even if a handler tried to attach it.
+      expect(JSON.stringify(state)).not.toContain("correct-secret");
+    }
+  });
+
+  it("answers unknown, not unset, when the secret settings read fails", async () => {
+    // #given a passphrase that *is* set, behind a settings store that throws:
+    // the discriminating case, because "unset" would be a false accusation.
+    const host = createFakePluginHost({ pluginId: "bb-collab", settings: { operatorPassphrase: "correct-secret" } });
+    const define = host.bb.settings.define;
+    host.bb.settings.define = ((descriptors) => ({
+      ...define(descriptors),
+      get: async () => { throw new Error("secret settings unavailable"); },
+    })) as typeof define;
+    await plugin(host.bb);
+
+    // #then the console is told nothing rather than told a falsehood...
+    expect(await host.harness.callRpc("operatorPassphraseState", {})).toEqual({ configured: null });
+
+    // #and the decision path still refuses the passphrase that would have worked.
+    const interaction = consoleInteraction();
+    host.harness.sdk.stub("threads.list", async () => [{ id: "worker-thread", hasPendingInteraction: true }]);
+    host.harness.sdk.stub("threads.interactions.list", async () => [interaction]);
+    host.harness.sdk.stub("threads.interactions.get", async () => interaction);
+    const [binding] = await host.harness.callRpc("operatorReceiptRequests", {}) as Array<Record<string, unknown>>;
+    const refused = await host.harness.callRpc("operatorReceiptDecision", {
+      ...binding,
+      decision: "approve",
+      passphrase: "correct-secret",
+      approverThreadId: "operator-thread",
+    }) as { outcome: string };
+    expect(refused.outcome).toBe("OPERATOR_RECEIPT_INVALID");
+    expect(host.bb.storage.database().prepare("SELECT COUNT(*) AS count FROM operator_receipts").get()).toEqual({ count: 0 });
+  });
+
+  it("publishes sidebar waiting counts without any receipt binding material", async () => {
+    const host = createFakePluginHost({ pluginId: "bb-collab", settings: { operatorPassphrase: "correct-secret" } });
+    await plugin(host.bb);
+    const interaction = consoleInteraction();
+    host.harness.sdk.stub("threads.list", async () => [{ id: "worker-thread", hasPendingInteraction: true }]);
+    host.harness.sdk.stub("threads.interactions.list", async () => [
+      interaction,
+      { ...interaction, id: "interaction-console-2" },
+      { ...interaction, id: "resolved", status: "resolved" },
+    ]);
+
+    const response = await host.harness.fetchHttp("GET", "/operator-receipt-waits");
+    const body = await response.text();
+    expect(response.status).toBe(200);
+    expect(JSON.parse(body)).toEqual({ total: 2, threads: { "worker-thread": 2 } });
+    for (const material of [PROJECT_ID, CANDIDATE_HEAD, REQUEST_DIGEST, MUTATION_CLASS, "correct-secret"]) {
+      expect(body, material).not.toContain(material);
+    }
+  });
+
   it("rejects a live request through the same host interaction without writing a receipt", async () => {
     const host = createFakePluginHost({ pluginId: "bb-collab", settings: { operatorPassphrase: "correct-secret" } });
     await plugin(host.bb);
