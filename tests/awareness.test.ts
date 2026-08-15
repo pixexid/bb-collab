@@ -25,14 +25,19 @@ describe("lane awareness", () => {
     await watcher.observe("worker-1", "idle");
 
     expect(steer).toHaveBeenCalledTimes(1);
-    expect(steer.mock.calls[0]?.[0].laneId).toBe("lane-1");
+    expect(steer.mock.calls[0]?.[0]).toMatchObject({ laneId: "lane-1", threadId: "worker-1" });
   });
 
   it("coalesces duplicate observations until the worker becomes active", async () => {
     const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    const watcher = createLaneWatcher({ readLanes: () => [lane()], steer });
+    const watcher = createLaneWatcher({
+      readLanes: () => [lane()],
+      steer,
+      readWorker: vi.fn().mockResolvedValue({ status: "idle", pendingExternalWait: false, archived: false }),
+    });
 
     await watcher.observe("worker-1", "idle");
+    await watcher.poll();
     await watcher.observe("worker-1", "idle");
     await watcher.observe("worker-1", "active");
     await watcher.observe("worker-1", "idle");
@@ -47,6 +52,47 @@ describe("lane awareness", () => {
     await watcher.observe("thr_b94i3csnme", "idle");
 
     expect(steer).not.toHaveBeenCalled();
+  });
+
+  it("stays silent for a genuine pending external wait", async () => {
+    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
+    const watcher = createLaneWatcher({
+      readLanes: () => [lane()],
+      steer,
+      isExternallyWaiting: vi.fn().mockResolvedValue(true),
+    });
+
+    await watcher.observe("worker-1", "idle");
+    expect(steer).not.toHaveBeenCalled();
+  });
+
+  it("clears an anomaly when the lane becomes terminal or archived", async () => {
+    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
+    let current = lane();
+    const watcher = createLaneWatcher({ readLanes: () => [current], steer });
+
+    await watcher.observe("worker-1", "idle");
+    current = { ...current, terminal_report_digest: "terminal" };
+    await watcher.observe("worker-1", "idle");
+    current = { ...current, terminal_report_digest: null };
+    await watcher.observe("worker-1", "idle");
+    await watcher.observe("worker-1", "idle", false, true);
+
+    expect(steer).toHaveBeenCalledTimes(2);
+  });
+
+  it("polls worker state through the native read seam", async () => {
+    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
+    const watcher = createLaneWatcher({
+      readLanes: () => [lane()],
+      steer,
+      readWorker: vi.fn().mockResolvedValue({ status: "idle", pendingExternalWait: false, archived: false }),
+    });
+
+    await watcher.poll();
+
+    expect(steer).toHaveBeenCalledTimes(1);
+    expect(steer.mock.calls[0]?.[0].threadId).toBe("worker-1");
   });
 
   it("keeps the read seam SQLite-backed", () => {

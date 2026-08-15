@@ -42,7 +42,19 @@ export interface LaneView {
 }
 
 export interface LaneWatcher {
-  observe(threadId: string, status: ThreadStatus): Promise<void>;
+  observe(
+    threadId: string,
+    status: ThreadStatus,
+    pendingExternalWait?: boolean,
+    archived?: boolean,
+  ): Promise<void>;
+  poll(): Promise<void>;
+}
+
+export interface WorkerObservation {
+  status: ThreadStatus;
+  pendingExternalWait: boolean;
+  archived: boolean;
 }
 
 export function readLaneStates(db: SqliteDatabase): LaneState[] {
@@ -86,49 +98,123 @@ export function openLaneViews(db: SqliteDatabase, now = Date.now()): LaneView[] 
 export function createLaneWatcher(options: {
   readLanes: () => LaneState[];
   steer: (lane: LaneView) => Promise<void>;
+  isExternallyWaiting?: (threadId: string) => Promise<boolean>;
+  readWorker?: (threadId: string) => Promise<WorkerObservation>;
   supervisorThreadId?: string;
 }): LaneWatcher {
   const supervisorThreadId = options.supervisorThreadId ?? SUPERVISOR_THREAD_ID;
   const coalesced = new Set<string>();
+  let queue = Promise.resolve();
+
+  const laneKey = (lane: LaneState) => `${lane.project_id}:${lane.execution_attempt_id}`;
+  const clearResolved = (lanes: LaneState[]) => {
+    const unresolved = new Set(
+      lanes
+        .filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.terminal_report_digest === null)
+        .map(laneKey),
+    );
+    for (const key of coalesced) {
+      if (!unresolved.has(key)) coalesced.delete(key);
+    }
+  };
+
+  const observeNow = async (
+    threadId: string,
+    status: ThreadStatus,
+    pendingExternalWait?: boolean,
+    archived = false,
+  ): Promise<void> => {
+    const allLanes = options.readLanes();
+    clearResolved(allLanes);
+    const candidates = allLanes.filter(
+      (lane) =>
+        lane.thread_id === threadId &&
+        lane.thread_id !== supervisorThreadId &&
+        OPEN_ATTEMPT_STATES.has(lane.attempt_state),
+    );
+    if (candidates.length === 0) return;
+
+    let waiting = pendingExternalWait ?? false;
+    if (!archived && status === "idle" && pendingExternalWait === undefined && options.isExternallyWaiting) {
+      try {
+        waiting = await options.isExternallyWaiting(threadId);
+      } catch {
+        // Unknown wait state is not evidence that steering is safe.
+        waiting = true;
+      }
+    }
+
+    if (archived || status !== "idle" || waiting) {
+      for (const lane of candidates) coalesced.delete(laneKey(lane));
+      return;
+    }
+
+    for (const lane of candidates) {
+      const key = laneKey(lane);
+      if (lane.terminal_report_digest !== null || coalesced.has(key)) continue;
+
+      coalesced.add(key);
+      try {
+        await options.steer({
+          projectId: lane.project_id,
+          laneId: lane.lane_id,
+          assignmentId: lane.assignment_id,
+          assignmentKind: lane.assignment_kind,
+          workItemId: lane.work_item_id,
+          threadId: lane.thread_id,
+          executionAttemptId: lane.execution_attempt_id,
+          attemptState: lane.attempt_state,
+          workerStatus: status,
+          waitingOn: "terminal receipt",
+          ageMs: 0,
+          tone: "error",
+        });
+      } catch (error) {
+        coalesced.delete(key);
+        throw error;
+      }
+    }
+  };
+
+  const enqueue = <T>(work: () => Promise<T>): Promise<T> => {
+    const result = queue.then(work);
+    queue = result.then(() => undefined, () => undefined);
+    return result;
+  };
 
   return {
-    async observe(threadId, status) {
-      if (threadId === supervisorThreadId) return;
+    observe(threadId, status, pendingExternalWait, archived) {
+      if (threadId === supervisorThreadId) return Promise.resolve();
+      return enqueue(() => observeNow(threadId, status, pendingExternalWait, archived));
+    },
+    poll() {
+      return enqueue(async () => {
+        const lanes = options.readLanes();
+        clearResolved(lanes);
+        if (!options.readWorker) return;
 
-      const lanes = options.readLanes().filter(
-        (lane) =>
-          lane.thread_id === threadId && OPEN_ATTEMPT_STATES.has(lane.attempt_state),
-      );
-      for (const lane of lanes) {
-        const key = `${lane.project_id}:${lane.execution_attempt_id}`;
-        const anomaly = status === "idle" && lane.terminal_report_digest === null;
-        if (!anomaly) {
-          coalesced.delete(key);
-          continue;
+        const workerIds = new Set(
+          lanes
+            .filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.thread_id)
+            .map((lane) => lane.thread_id as string)
+            .filter((threadId) => threadId !== supervisorThreadId),
+        );
+        for (const threadId of workerIds) {
+          let observation: WorkerObservation;
+          try {
+            observation = await options.readWorker(threadId);
+          } catch {
+            // A failed native read cannot prove that steering is safe.
+            continue;
+          }
+          await observeNow(
+            threadId,
+            observation.status,
+            observation.pendingExternalWait,
+            observation.archived,
+          );
         }
-        if (coalesced.has(key)) continue;
-
-        coalesced.add(key);
-        try {
-          await options.steer({
-            projectId: lane.project_id,
-            laneId: lane.lane_id,
-            assignmentId: lane.assignment_id,
-            assignmentKind: lane.assignment_kind,
-            workItemId: lane.work_item_id,
-            threadId: lane.thread_id,
-            executionAttemptId: lane.execution_attempt_id,
-            attemptState: lane.attempt_state,
-            workerStatus: status,
-            waitingOn: "terminal receipt",
-            ageMs: 0,
-            tone: "error",
-          });
-        } catch (error) {
-          coalesced.delete(key);
-          throw error;
-        }
-      }
+      });
     },
   };
 }
@@ -147,7 +233,7 @@ export function threadEventStatus(
 
 export function subscribeToThreadChanges(
   sdk: Pick<BbPluginApi["sdk"], "subscribe" | "threads">,
-  observe: (threadId: string, status: ThreadStatus) => Promise<void>,
+  observe: (threadId: string, status: ThreadStatus, archived?: boolean) => Promise<void>,
 ): () => void {
   try {
     return sdk.subscribe({
@@ -156,7 +242,9 @@ export function subscribeToThreadChanges(
         if (event.entity !== "thread" || !event.id) return;
         void sdk.threads
           .get({ threadId: event.id })
-          .then((thread) => observe(thread.id, thread.status))
+          .then((thread) => thread.archivedAt === null
+            ? observe(thread.id, thread.status)
+            : observe(thread.id, thread.status, true))
           .catch(() => undefined);
       },
     });
