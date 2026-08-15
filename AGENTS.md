@@ -1,9 +1,9 @@
 # bb-collab repository contract
 
-CONTRACT_VERSION: 12
+CONTRACT_VERSION: 13
 
 This repository contains the founding contract and the implemented foundation
-through contract v12/schema v10: a single SQLite store with migrations, resolver,
+through contract v13/schema v10: a single SQLite store with migrations, resolver,
 state-event and mutation-receipt, deterministic export, and read-only doctor
 seams, plus WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
 Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
@@ -73,10 +73,10 @@ Changing version text alone is not a migration. A zero-work result is not a
 successful apply unless zero expected work, zero attempted work and zero
 verified work are all proven.
 
-Contract v12/schema v10 requires all four cached consumers to reread the
+Contract v13/schema v10 requires all four cached consumers to reread the
 one-request receipt, authorized-approver registry/attestation,
 mutation/export/evidence, role IDs/scoping, and refusal contract or refuse
-contract v11/schema v10.
+contract v12/schema v10.
 An adopted operator_only Decision registers approverId=orchestrator:bb-collab
 with the exact ten derived mutation classes, including config_revision,
 work_item_create, work_item_transition and
@@ -84,17 +84,15 @@ the two existing role mutation classes. Attestation has no requestInput
 interaction and atomically creates the same exact-bound receipt plus verified
 plugin actor; operator revocation/change marks the registry unusable. The
 historical contract-v9 eight-class registry was accepted only during the
-one-release v9-to-v10 re-adoption. Contract v11 retires that transitional
-allowlist. A live exact v11 nine-class row is a bounded bump-surviving
-compatibility state: it may attest and apply only the nine classes in the
-immutable historical v11 set, including decision_create and
-decision_disposition for authority-maintenance re-adoption; work_item_transition
-still refuses. Re-adoption installs a new exact current ten-class row, after
-which all ten current classes are accepted. Malformed, reordered, subset,
-extra, v9, or other arbitrary sets refuse at attestation and apply. This is a
-compatibility repair, not a contract change: CONTRACT_VERSION, SCHEMA_VERSION,
-contractDigest, schemaDigest, and the cached-consumer rollout remain
-unchanged and are asserted by tests.
+one-release v9-to-v10 re-adoption. A live exact v12 ten-class row is the
+bump-surviving compatibility state for v13 and may attest only that exact
+historical set until re-adoption installs the current row. The already-bounded
+v11 nine-class repair remains readable for authority maintenance, but does not
+authorize the v12-only work-item transition class. Malformed, reordered,
+subset, extra, v9, or other arbitrary sets refuse at attestation and apply.
+This v13 change is a contract bump: CONTRACT_VERSION and contractDigest change;
+SCHEMA_VERSION, schemaDigest and migrations remain unchanged, and all four
+cached consumers emit a durable reread/refusal rollout receipt.
 
 ## Delegation and lane obligations
 
@@ -103,11 +101,12 @@ unchanged and are asserted by tests.
 - An Assignment is immutable requested intent. An ExecutionAttempt is separate
   evidence of what BB actually executed. Requested provider, model, reasoning,
   permission and visibility never prove executed values.
-- A writing lane has at most one active writer. A project has a hard ceiling
-  of two writing lanes and may lower that ceiling, never raise it.
-- Read-only review and probe work does not consume the writing cap, but it is
-  still assigned, explicitly isolated and bound to the exact project and
-  repository target where applicable.
+- A writing lane has at most one active writer. Each orchestrator has an
+  explicit `extensions.bbCollab.writingLaneCeiling` dial, defaulting to 3 for
+  bb-collab and bounded at 3; it may be lowered by canonical configuration but
+  is never silently raised. Read-only review and probe work does not consume
+  the writing cap, but it is still assigned, explicitly isolated and bound to
+  the exact project and repository target where applicable.
 - A delegated worker uses a versioned frozen brief, an isolated managed
   environment, exact branch/base/candidate semantics and a terminal
   DONE|BLOCKED receipt. Native BB/provider events are the execution evidence;

@@ -381,25 +381,29 @@ reserve/finalize adapter operations refuse before the adapter because one
 receipt cannot authorize multiple writes. This report records those facts; it
 does not change them.
 
-The current contract is v12/schema v10. Its bounded role-capacity seam admits
+The current contract is v13/schema v10. Its bounded role-capacity seam admits
 the three project requirements used by the first-adopter request:
 project-orchestrator is project-scoped, while worker and independent-reviewer
 bind to the exact repository target required by canonical WorkItem writes. The
 change preserves the existing qualification, generation, Assignment and
-receipt/approver seams; it adds only `work_item_transition` to the exact
-derived authorized-approver set. No capacity router, assignment or dispatch
-mechanism is introduced. The triggering #31 live evidence is the merged-v10 deployed
-resolver's two-role `ROLE_IDS` set and `roleRequirements.max(2)`, which cannot
-represent the ratified three-role request; this amendment records that concrete
+receipt/approver seams; it adds the explicit per-orchestrator
+`writingLaneCeiling` config dial, defaulting to 3 for bb-collab, while keeping
+reviews/probes outside the cap. Canonical Assignment admission and lane
+awareness read the same config head; no capacity router, second queue, raw task
+count, or dispatch bypass is introduced. The cap is recorded through the
+existing adopted Decision and operator-authorized `config_revision` seam. The
+triggering #31 live evidence is the merged-v10 deployed resolver's two-role
+`ROLE_IDS` set and `roleRequirements.max(2)`, which cannot represent the
+ratified three-role request; this amendment records that concrete
 representation gap without claiming a live config or first-adopter write.
 
 The historical contract-v9 eight-class registry was accepted only during the
 one-release v9-to-v10 re-adoption. Contract v11 required the exact nine-class
-row; contract v12 adds only `work_item_transition`. Its compatibility repair
-keeps an active exact v11 row usable only for those nine historical classes,
-including authority-maintenance `decision_create` and adopted
-`decision_disposition`; `work_item_transition` refuses until re-adoption
-installs the exact current ten-class row. Malformed, reordered, subset, extra,
-v9, and arbitrary other sets remain invalid. No contract/cache bump is owed:
-contract/schema versions and digests, migrations, and cached-consumer rollout
-remain unchanged, with fixture proof in the current test matrix.
+row; contract v12 added only `work_item_transition`. Contract v13 adds the
+bounded writing-lane dial and carries an exact v12 ten-class row through one
+authority-maintenance re-adoption. The already-bounded v11 row remains readable
+only for its nine historical classes. Malformed, reordered, subset, extra, v9,
+and arbitrary other sets remain invalid. This is a contract/cache bump:
+contract v13 consumers reread, stale v12 consumers refuse, and the four-consumer
+rollout receipt records expected=4, attempted=4, verified=4 for the current
+runtime; schema, migrations, and stored authority shape remain unchanged.

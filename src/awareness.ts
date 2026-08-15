@@ -1,5 +1,5 @@
 import type { BbPluginApi, PluginThreadEventPayloads } from "@bb/plugin-sdk";
-import type { SqliteDatabase } from "./foundation.js";
+import { writingLaneCeilingForProject, type SqliteDatabase } from "./foundation.js";
 
 export const SUPERVISOR_THREAD_ID = "thr_b94i3csnme";
 export const DEFAULT_MAX_CONTINUATIONS = 3;
@@ -318,19 +318,33 @@ export function openLaneViews(
       deferredAgeMs: operatorWait ? Math.max(0, now - operatorWait.createdAtMs) : null,
     } satisfies LaneView;
     });
-  const nextByProject = new Map<string, string>();
+  const startable = new Set<string>();
+  const readyWriterCount = new Map<string, number>();
+  const occupiedWriterCount = new Map<string, number>();
   for (const lane of lanes) {
-    if (
-      lane.queueState === "ready" &&
-      (lane.attemptState === "prepared" || lane.attemptState === "armed") &&
-      !lane.deferredReason &&
-      !nextByProject.has(lane.projectId)
-    ) nextByProject.set(lane.projectId, lane.executionAttemptId);
+    if (lane.assignmentKind !== "write") continue;
+    if (lane.queueState === "running" || (lane.attemptState !== "prepared" && lane.attemptState !== "armed")) {
+      occupiedWriterCount.set(lane.projectId, (occupiedWriterCount.get(lane.projectId) ?? 0) + 1);
+    }
+  }
+  for (const lane of lanes) {
+    if (lane.queueState !== "ready" || (lane.attemptState !== "prepared" && lane.attemptState !== "armed") || lane.deferredReason) continue;
+    if (lane.assignmentKind !== "write") {
+      startable.add(lane.executionAttemptId);
+      continue;
+    }
+    const ready = readyWriterCount.get(lane.projectId) ?? 0;
+    const occupied = occupiedWriterCount.get(lane.projectId) ?? 0;
+    const available = Math.max(0, writingLaneCeilingForProject(db, lane.projectId) - occupied);
+    if (ready < available) {
+      startable.add(lane.executionAttemptId);
+      readyWriterCount.set(lane.projectId, ready + 1);
+    }
   }
   return lanes.map((lane) => ({
     ...lane,
-    queueBlocked: lane.queueState === "ready" && (lane.attemptState === "prepared" || lane.attemptState === "armed") && nextByProject.get(lane.projectId) !== lane.executionAttemptId,
-    nextStartable: nextByProject.get(lane.projectId) === lane.executionAttemptId,
+    queueBlocked: lane.queueState === "ready" && (lane.attemptState === "prepared" || lane.attemptState === "armed") && !startable.has(lane.executionAttemptId),
+    nextStartable: startable.has(lane.executionAttemptId),
   }));
 }
 

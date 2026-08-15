@@ -7,6 +7,14 @@ condition; a later step must not smuggle authority into an earlier one.
 The detailed 40-issue source disposition is in the
 [llm-collab migration ledger](llm-collab-migration-ledger.md).
 
+## Throughput directive order
+
+Issue #77 is the first bounded throughput slice: establish the explicit
+per-orchestrator writing-lane cap at 3 for bb-collab, preserve lower canonical
+dials, and expose parallel startable queue lanes while keeping reviews/probes
+outside the cap. It precedes #76 and all feature work; #78, #79, and #80 remain
+separate follow-up slices.
+
 ## Founding documentation
 
 1. Freeze the contract, threat model, import manifest and evidence links.
@@ -52,10 +60,12 @@ The detailed 40-issue source disposition is in the
    and automatic failover deferred.
 
 8. **Assignment and ExecutionAttempt.** Enforce one writer per lane and the
-   project ceiling of two, exact branch/base/candidate semantics, frozen-brief
-   digest, native BB spawn/attach, actual profile receipt, isolated
-   environment and terminal DONE|BLOCKED report. Reconcile ambiguous dispatch
-   as DISPATCH_UNKNOWN; do not blind-retry.
+   contract-v13 per-orchestrator `writingLaneCeiling` dial (default 3 for
+   bb-collab, lowerable only through canonical operator-authorized config),
+   exact branch/base/candidate semantics, frozen-brief digest, native BB
+   spawn/attach, actual profile receipt, isolated environment and terminal
+   DONE|BLOCKED report. Read-only reviews/probes do not consume the cap.
+   Reconcile ambiguous dispatch as DISPATCH_UNKNOWN; do not blind-retry.
 
 9. **Decision, disposition and evidence.** Add typed operator/role actors,
    immutable Decision identity, append-only dispositions, helper/Pro advisory

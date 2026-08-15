@@ -13,7 +13,7 @@ new-thread, search, navigation rows, and the footer.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through contract v12/schema v10: a
+The repository now contains the implemented foundation through contract v13/schema v10: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
@@ -62,18 +62,21 @@ canonical WorkItem writes. All three retain executed-profile qualification and
 the v10 receipt/approver bindings are unchanged. Contract v12 is a contract-only
 allowlist amendment that adds `work_item_transition`; schema and migrations remain
 unchanged, and the existing receipt, actor, config, governor and resource guards
-remain required.
+remain required. Contract v13 replaces the founding hard-2 writing-lane ceiling
+with the explicit `extensions.bbCollab.writingLaneCeiling` per-orchestrator dial,
+defaulting to 3 for bb-collab. Lower values remain canonical configuration; no
+runtime path silently raises them. Read-only reviews and probes do not consume
+the writing cap, and the queue exposes up to the configured number of startable
+write lanes.
 
 The historical contract-v9 eight-class registry was accepted only during the
-one-release v9-to-v10 re-adoption. Contract v11 required the exact nine-class
-row. Contract v12 keeps an active exact v11 row alive only for the nine classes
-in that immutable historical set, so authority-maintenance `decision_create`
-and adopted `decision_disposition` can re-adopt the approver without a human
-form; `work_item_transition` still refuses under that row. The re-adoption
-installs the exact current ten-class row. Malformed, reordered, subset, extra,
-v9, and other arbitrary sets remain invalid. This compatibility repair leaves
-contract/schema versions, digests, migrations, and cached-consumer rollout
-unchanged.
+one-release v9-to-v10 re-adoption. Contract v13 keeps an active exact v12
+ten-class row as the one-bump compatibility state until authority-maintenance
+re-adoption installs the exact current row; the already-bounded v11 nine-class
+repair remains readable but still refuses `work_item_transition`. Malformed,
+reordered, subset, extra, v9, and other arbitrary sets remain invalid. This is
+a contract bump: cached consumers must reread v13 or refuse v12, with durable
+rollout evidence; schema and migrations remain unchanged.
 
 The ratified evidence-only MigrationRun shape records the llm-collab fence
 `f988d9711d3778f751e4ec0e32ebbf7b0893c80f` at resource revision 4 and merged

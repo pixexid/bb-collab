@@ -23,6 +23,7 @@ import {
   MIGRATIONS,
   MIGRATION_STATES,
   MIGRATION_STEPS,
+  PREVIOUS_V12_DERIVED_ACTOR_MUTATION_CLASSES,
   PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES,
   PLUGIN_ID,
   SCHEMA_VERSION,
@@ -1925,7 +1926,7 @@ describe("bb-collab plugin boundary", () => {
     expect(revoked).toMatchObject({ outcome: "AUTHORIZED_APPROVER_REVOKED" });
   });
 
-  it("survives the v12 approver bump through exact v11 re-adoption", async () => {
+  it("survives the v13 approver bump through exact historical re-adoption", async () => {
     const { host, db, fenceToken } = await assignmentFixture();
     seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "compat-operator", actorKind: "operator", subjectId: "operator-1" });
     const decisionId = "compat-operator";
@@ -1949,6 +1950,7 @@ describe("bb-collab plugin boundary", () => {
     }))).toMatchObject({ outcome: "OK" });
 
     const previousJson = canonicalJson(PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES);
+    const bumpPreviousJson = canonicalJson(PREVIOUS_V12_DERIVED_ACTOR_MUTATION_CLASSES);
     const currentJson = canonicalJson(DERIVED_ACTOR_MUTATION_CLASSES);
     const setRegistry = (allowedMutationClassesJson: string) => db.prepare(
       `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
@@ -1978,7 +1980,7 @@ describe("bb-collab plugin boundary", () => {
       candidateHead: attestedRequest.candidateHead ?? CANDIDATE_SHA,
       idempotencyKey: attestedRequest.idempotencyKey,
       requestDigest: operatorRequestDigest(attestedRequest),
-      callerThreadId: "v12-approver-matrix-attestor",
+      callerThreadId: "v13-approver-matrix-attestor",
       requestedFromBackground: false,
       approverId: AUTHORIZED_APPROVER_ID,
       authorizingDecisionId,
@@ -2090,6 +2092,16 @@ describe("bb-collab plugin boundary", () => {
       expectedGovernanceEpoch: 1,
       expectedFenceToken: fenceToken,
     });
+    db.prepare(
+      `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
+       WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = 'compat-v12-readopt' AND authorizing_disposition_sequence = 1`,
+    ).run(bumpPreviousJson, PROJECT_ID, AUTHORIZED_APPROVER_ID);
+    expect(await attest(currentRequest("work_item_transition", "compat-v12-transition"), "work_item_transition", "compat-v12-readopt")).toMatchObject({ outcome: "OK" });
+    db.prepare(
+      `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
+       WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = 'compat-v12-readopt' AND authorizing_disposition_sequence = 1`,
+    ).run(currentJson, PROJECT_ID, AUTHORIZED_APPROVER_ID);
+
     const invalidSets: Array<[string, string]> = [
       ["malformed", "{not-json"],
       ["object", canonicalJson({ classes: DERIVED_ACTOR_MUTATION_CLASSES })],
@@ -2163,6 +2175,7 @@ describe("bb-collab plugin boundary", () => {
     }))).toMatchObject({ outcome: "OK" });
 
     const nextConfig = roleConfig();
+    (nextConfig.extensions.bbCollab as Record<string, unknown>).writingLaneCeiling = 3;
     const unsigned = bootstrapRequest(PROJECT_ID, {
       operationClass: "config_revision",
       idempotencyKey: "config-role-requirements-2",
@@ -2222,6 +2235,7 @@ describe("bb-collab plugin boundary", () => {
     });
     const stored = db.prepare("SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = 2").get(PROJECT_ID) as { canonical_config_json: string };
     const storedConfig = JSON.parse(stored.canonical_config_json) as { extensions: { bbCollab: Record<string, unknown> } };
+    expect(storedConfig.extensions.bbCollab.writingLaneCeiling).toBe(3);
     expect(storedConfig.extensions.bbCollab.roleRequirements).toEqual(nextConfig.extensions.bbCollab.roleRequirements);
     expect(storedConfig.extensions.bbCollab.roleRequirements).toEqual(expect.arrayContaining([
       { roleRequirementId: "worker-v1", roleId: "worker", repoTargetId: TARGET_ID, executedProfile: ROLE_PROFILE },
@@ -2298,6 +2312,10 @@ describe("bb-collab plugin boundary", () => {
     const overCapacityRequirements = overCapacityConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>;
     overCapacityRequirements.push({ roleRequirementId: "worker-v2", roleId: "worker", repoTargetId: TARGET_ID, executedProfile: ROLE_PROFILE });
     await rejectConfig("over-capacity", overCapacityConfig, "INVALID_INPUT", "Too big");
+
+    const overLaneCapConfig = roleConfig();
+    (overLaneCapConfig.extensions.bbCollab as Record<string, unknown>).writingLaneCeiling = 4;
+    await rejectConfig("over-lane-cap", overLaneCapConfig, "INVALID_INPUT", "integer from 0 through 3");
   });
 
   it("cannot reuse one receipt for two migration steps", async () => {
@@ -2759,9 +2777,9 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("appends the v12 work-item transition contract and rolls every cached consumer forward", () => {
+  it("bumps the v13 writing-lane contract and rolls every cached consumer forward", () => {
     expect(SCHEMA_VERSION).toBe(10);
-    expect(CONTRACT_VERSION).toBe(12);
+    expect(CONTRACT_VERSION).toBe(13);
     expect(MIGRATIONS).toHaveLength(23);
     expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("80bfe52641971b984358da6bdfb4aa00d87dd928e611325f23bbbb3a1afa5c7c");
     expect(MIGRATIONS.at(-5)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
@@ -2777,35 +2795,35 @@ describe("bb-collab plugin boundary", () => {
     expect(MIGRATION_STEPS).toEqual([
       "record_inventory", "record_quiescence", "freeze", "record_export", "record_import", "record_equivalence", "activate", "record_exercise", "retire", "rollback", "mark_fix_forward_required",
     ]);
-    expect(cachedConsumerRolloutEvidence(10, 11)).toMatchObject({
-      names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 10,
-      newSchemaVersion: 10,
-      oldContractVersion: 11,
-      newContractVersion: 12,
-      action: "refused",
-      expected: 4,
-      attempted: 4,
-      verified: 0,
-    });
-    expect(cachedConsumerRolloutEvidence(9, 12)).toMatchObject({
-      oldSchemaVersion: 10,
-      newSchemaVersion: 10,
-      observedSchemaVersion: 9,
-      oldContractVersion: 11,
-      newContractVersion: 12,
-      observedContractVersion: 12,
-      action: "refused",
-      expected: 4,
-      attempted: 4,
-      verified: 0,
-    });
     expect(cachedConsumerRolloutEvidence(10, 12)).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 10,
       newSchemaVersion: 10,
-      oldContractVersion: 11,
-      newContractVersion: 12,
+      oldContractVersion: 12,
+      newContractVersion: 13,
+      action: "refused",
+      expected: 4,
+      attempted: 4,
+      verified: 0,
+    });
+    expect(cachedConsumerRolloutEvidence(9, 13)).toMatchObject({
+      oldSchemaVersion: 10,
+      newSchemaVersion: 10,
+      observedSchemaVersion: 9,
+      oldContractVersion: 12,
+      newContractVersion: 13,
+      observedContractVersion: 13,
+      action: "refused",
+      expected: 4,
+      attempted: 4,
+      verified: 0,
+    });
+    expect(cachedConsumerRolloutEvidence(10, 13)).toMatchObject({
+      names: [...CACHED_CONSUMERS],
+      oldSchemaVersion: 10,
+      newSchemaVersion: 10,
+      oldContractVersion: 12,
+      newContractVersion: 13,
       action: "reread",
       expected: 4,
       attempted: 4,
@@ -2836,17 +2854,17 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("records the v12 allowlist compatibility repair without a contract or cache bump", () => {
-    expect(CONTRACT_VERSION).toBe(12);
+  it("records the v13 allowlist compatibility repair without a schema bump", () => {
+    expect(CONTRACT_VERSION).toBe(13);
     expect(SCHEMA_VERSION).toBe(10);
     expect(MIGRATIONS).toHaveLength(23);
     expect(schemaDigest).toBe("6f9f8b91784b2834d061a68bfe99241f24a93e32e786822894871f601a2f86a7");
-    expect(contractDigest).toBe("88055921b003a07349c3c6dcf2786c52bdeaa7741e8c1d070ed4796e36ff8818");
+    expect(contractDigest).toBe("25c962d1f1ea126430c00a6e40f4c85e703ab2b423028a1ab5069d2fc6f37bcb");
     expect(cachedConsumerRolloutEvidence(SCHEMA_VERSION, CONTRACT_VERSION)).toMatchObject({
       oldSchemaVersion: 10,
       newSchemaVersion: 10,
-      oldContractVersion: 11,
-      newContractVersion: 12,
+      oldContractVersion: 12,
+      newContractVersion: 13,
       action: "reread",
       expected: CACHED_CONSUMERS.length,
       attempted: CACHED_CONSUMERS.length,
@@ -2942,7 +2960,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 10, schemaDigest, contractVersion: 12, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 10, schemaDigest, contractVersion: 13, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -5815,9 +5833,9 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(10, 11)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, oldContractVersion: 11, newContractVersion: 12, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(9, 12)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, observedSchemaVersion: 9, oldContractVersion: 11, newContractVersion: 12, observedContractVersion: 12, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(10, 12)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, oldContractVersion: 11, newContractVersion: 12, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(10, 12)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, oldContractVersion: 12, newContractVersion: 13, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(9, 13)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, observedSchemaVersion: 9, oldContractVersion: 12, newContractVersion: 13, observedContractVersion: 13, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(10, 13)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, oldContractVersion: 12, newContractVersion: 13, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {
@@ -5825,7 +5843,7 @@ describe("bb-collab plugin boundary", () => {
     const adapter = new DeterministicNativeAssignmentAdapter();
     const prepare = assignmentPrepareRequest(fenceToken);
     const prepared = applyWithFixtureReceipt(db, prepare, null, null, adapter);
-    expect(prepared).toMatchObject({ outcome: "OK", evidence: { assignmentId: "assignment-1", writingLaneCeiling: 2, activeWriterCount: 1 } });
+    expect(prepared).toMatchObject({ outcome: "OK", evidence: { assignmentId: "assignment-1", writingLaneCeiling: 3, activeWriterCount: 1 } });
     expect(applyWithFixtureReceipt(db, prepare, null, null, adapter)).toEqual(prepared);
     expect(adapter.inspectCalls).toHaveLength(1);
     expect(adapter.dispatchCalls).toHaveLength(0);
@@ -6509,9 +6527,13 @@ describe("bb-collab plugin boundary", () => {
           const third = assignmentPrepareRequest(fenceToken, "ceiling-2-third", {
             assignment: { ...assignmentPrepareRequest(fenceToken).assignment!, assignmentId: "ceiling-2-third", laneId: "lane-third", branchName: "bb/ceiling-2-third", environment: { ...assignmentPrepareRequest(fenceToken).assignment!.environment, environmentId: "environment-ceiling-2-third" } },
           });
-          expect(applyWithFixtureReceipt(firstDb, third, null, null, firstAdapter).outcome).toBe("LANE_WRITER_EXISTS");
-          expect(firstDb.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'assignment' AND assignment_kind = 'write'").get()).toEqual({ count: 2 });
-          expect(firstDb.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE idempotency_key = ?").get(third.idempotencyKey)).toEqual({ count: 0 });
+          expect(applyWithFixtureReceipt(firstDb, third, null, null, firstAdapter).outcome).toBe("OK");
+          expect(firstDb.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'assignment' AND assignment_kind = 'write'").get()).toEqual({ count: 3 });
+          const fourth = assignmentPrepareRequest(fenceToken, "ceiling-3-fourth", {
+            assignment: { ...assignmentPrepareRequest(fenceToken).assignment!, assignmentId: "ceiling-3-fourth", laneId: "lane-fourth", branchName: "bb/ceiling-3-fourth", environment: { ...assignmentPrepareRequest(fenceToken).assignment!.environment, environmentId: "environment-ceiling-3-fourth" } },
+          });
+          expect(applyWithFixtureReceipt(firstDb, fourth, null, null, firstAdapter).outcome).toBe("LANE_WRITER_EXISTS");
+          expect(firstDb.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE idempotency_key = ?").get(fourth.idempotencyKey)).toEqual({ count: 0 });
         } else {
           expect(secondResults[0]?.outcome).toBe("OK");
           expect(firstResult.outcome).toBe("LANE_WRITER_EXISTS");

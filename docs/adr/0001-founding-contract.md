@@ -71,7 +71,7 @@ infrastructure, but they must not create duplicate authority concepts.
 | ExecutionAttempt | execution_attempt_id | One dispatch attempt under an Assignment, including BB server, thread, environment, host, native correlation IDs, actual profile, lifecycle and terminal evidence. Native references are unique in their BB server scope. |
 | Decision | decision_id | Immutable project, scope, class and options identity. A consult does not become an authority decision merely by existing. |
 | DecisionDisposition | decision_id, disposition_sequence | Append-only proposed, adopted, rejected, superseded or revoked disposition, with typed actor, conditions, reason and revert. Current state is derived. |
-| AuthorizedApprover | project_id, approver_id, authorizing_decision_id, authorizing_disposition_sequence | Durable active/revoked registry row for `orchestrator:bb-collab`, linked to the exact adopted `operator_only` Decision disposition and the exact current ten-class set or bounded historical v11 set during re-adoption. |
+| AuthorizedApprover | project_id, approver_id, authorizing_decision_id, authorizing_disposition_sequence | Durable active/revoked registry row for `orchestrator:bb-collab`, linked to the exact adopted `operator_only` Decision disposition and the exact current ten-class set or bounded historical v12 set during re-adoption. |
 | QualificationObservation | qualification_id | Immutable fixture-bound capability result for an exact executed-profile digest and observed BB/runtime/fixture context. |
 | EligibilityProjection | project_id, role_requirement_id, profile_digest | Rebuildable current eligibility with observation references, expiry and requalification trigger. |
 | EvidenceArtifact | evidence_id, content_digest where appropriate | Content-addressed review, test, consult, release, export, receipt or legacy artifact with durable location metadata. |
@@ -184,37 +184,36 @@ review Decisions remain role-bound. After the one-time adopted authorizing
 Decision/disposition, caller plugin, and exact request binding, then atomically
 issues a fresh receipt plus the same verified plugin actor without `requestInput`.
 The current exact ten-class allowlist authorizes all current classes. To survive
-the v11-to-v12 code bump, an active exact historical v11 nine-class row is also
-accepted only for members of that nine-class set; it may therefore authorize
-authority-maintenance `decision_create` and adopted `decision_disposition`, but
-not the new `work_item_transition` class. Applying that re-adoption revokes the
-old row and installs the exact current ten-class row. Malformed, reordered,
-subset, extra, v9, and other arbitrary sets refuse at both attestation and
-apply. A later operator revocation or change marks the registry unusable; both
-registry and interim receipt retain the upstream host-issued
-`get-bb/bb#1541` retirement condition, and human confirmation remains only at
-that boundary. This is not live cutover or source retirement.
+the v12-to-v13 code bump, an active exact historical v12 ten-class row is also
+accepted only for that exact set until authority-maintenance re-adoption
+installs the current row; the already-bounded v11 nine-class row remains
+readable but still refuses `work_item_transition`. Malformed, reordered, subset,
+extra, v9, and other arbitrary sets refuse at both attestation and apply. A
+later operator revocation or change marks the registry unusable; both registry
+and interim receipt retain the upstream host-issued `get-bb/bb#1541` retirement
+condition, and human confirmation remains only at that boundary. This is not
+live cutover or source retirement.
 
 The historical contract-v9 eight-class registry was accepted only during the
 one-release v9-to-v10 re-adoption. Contract v11 required the exact nine-class
-row. Contract v12 adds only `work_item_transition`; its bounded compatibility
-repair preserves an active exact v11 row for the prior nine classes during
-authority-maintenance re-adoption, while the new class requires the exact
-current ten-class row. The repair does not bump contract/cache identity:
-`CONTRACT_VERSION`, `SCHEMA_VERSION`, `contractDigest`, `schemaDigest`,
-migrations, and cached-consumer rollout remain unchanged and are asserted by
-tests.
+row. Contract v12 added only `work_item_transition`; contract v13 adds the
+bounded writing-lane dial and carries the exact v12 ten-class row for one
+authority-maintenance re-adoption. This is a contract/cache bump: v13 changes
+`CONTRACT_VERSION` and `contractDigest`; `SCHEMA_VERSION`, `schemaDigest`, and
+migrations remain unchanged. Cached-consumer evidence records four attempted,
+four verified rereads for v13 and refusal for stale v12 consumers.
 
 The contract v11/schema v10 role-capacity amendment remains contract-only.
 Contract v12/schema v10 adds only `work_item_transition` to the derived
-authorized-approver set; schema migrations remain unchanged. `roleRequirements` admits at most three logical
-roles: `project-orchestrator` is project-scoped, while `worker` and
-`independent-reviewer` require the exact repository target used by canonical
-WorkItem writes. Each requirement retains its explicit executed-profile
-qualification. The v10 receipt, approver, derived-actor and existing refusal
-bindings are unchanged; cached consumers reread v12 or refuse v11. The
-compatibility repair is an implementation correction for already-persisted
-v11 authority state, not a new schema or contract version.
+authorized-approver set; schema migrations remain unchanged. Contract v13/schema
+v10 replaces the founding hard-2 writing-lane ceiling with the explicit
+per-orchestrator `extensions.bbCollab.writingLaneCeiling` dial, defaulting to 3
+for bb-collab and bounded at 3. Lower values are preserved by canonical config
+revisions and are never silently raised. Read-only review and probe Assignments
+do not consume the writing cap. The cap is configured through the existing
+operator-authorized `config_revision` mutation and recorded by the adopted
+Decision/authority chain; no second queue or authority store exists. Cached
+consumers reread v13 or refuse v12; schema migrations remain unchanged.
 
 ## 6. Roles, delegation and execution
 
@@ -271,6 +270,11 @@ explicitly assigned, uses a clean isolated environment bound to the exact
 candidate where applicable, and does not consume the writing cap. An
 automated subagent is not a v1 authority path; if used later it is depth one,
 draft-only and cannot own a write, review, merge, release or operator action.
+Each orchestrator's explicit `writingLaneCeiling` defaults to 3, may be lowered
+by an operator-authorized config revision, and cannot be silently raised. The
+canonical Assignment resolver enforces the cap atomically; lane awareness reads
+the same config head and marks up to the available write lanes startable while
+keeping review/probe lanes outside the cap.
 
 The sanctioned worker report is a literal terminal DONE|BLOCKED tell. Native
 BB/provider receipts prove lifecycle; silence, a status read, a reaction or an
