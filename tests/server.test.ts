@@ -1339,6 +1339,12 @@ describe("bb-collab plugin boundary", () => {
     fixture.changed({ entity: "thread", id: "worker-1" });
     await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2));
 
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")[0]?.[0]).toMatchObject({
+      threadId: "worker-1",
+      mode: "steer",
+      input: [{ type: "text", visibility: "agent-only" }],
+    });
+
     await fixture.host.harness.lifecycle.dispose();
   });
 
