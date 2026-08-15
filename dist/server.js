@@ -13825,41 +13825,93 @@ function openLaneViews(db, now2 = Date.now()) {
 function createLaneWatcher(options) {
   const supervisorThreadId = options.supervisorThreadId ?? SUPERVISOR_THREAD_ID;
   const coalesced = /* @__PURE__ */ new Set();
-  return {
-    async observe(threadId, status) {
-      if (threadId === supervisorThreadId) return;
-      const lanes = options.readLanes().filter(
-        (lane) => lane.thread_id === threadId && OPEN_ATTEMPT_STATES.has(lane.attempt_state)
-      );
-      for (const lane of lanes) {
-        const key = `${lane.project_id}:${lane.execution_attempt_id}`;
-        const anomaly = status === "idle" && lane.terminal_report_digest === null;
-        if (!anomaly) {
-          coalesced.delete(key);
-          continue;
-        }
-        if (coalesced.has(key)) continue;
-        coalesced.add(key);
-        try {
-          await options.steer({
-            projectId: lane.project_id,
-            laneId: lane.lane_id,
-            assignmentId: lane.assignment_id,
-            assignmentKind: lane.assignment_kind,
-            workItemId: lane.work_item_id,
-            threadId: lane.thread_id,
-            executionAttemptId: lane.execution_attempt_id,
-            attemptState: lane.attempt_state,
-            workerStatus: status,
-            waitingOn: "terminal receipt",
-            ageMs: 0,
-            tone: "error"
-          });
-        } catch (error48) {
-          coalesced.delete(key);
-          throw error48;
-        }
+  let queue = Promise.resolve();
+  const laneKey = (lane) => `${lane.project_id}:${lane.execution_attempt_id}`;
+  const clearResolved = (lanes) => {
+    const unresolved = new Set(
+      lanes.filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.terminal_report_digest === null).map(laneKey)
+    );
+    for (const key of coalesced) {
+      if (!unresolved.has(key)) coalesced.delete(key);
+    }
+  };
+  const observeNow = async (threadId, status, pendingExternalWait, archived = false) => {
+    const allLanes = options.readLanes();
+    clearResolved(allLanes);
+    const candidates = allLanes.filter(
+      (lane) => lane.thread_id === threadId && lane.thread_id !== supervisorThreadId && OPEN_ATTEMPT_STATES.has(lane.attempt_state)
+    );
+    if (candidates.length === 0) return;
+    let waiting = pendingExternalWait ?? false;
+    if (!archived && status === "idle" && pendingExternalWait === void 0 && options.isExternallyWaiting) {
+      try {
+        waiting = await options.isExternallyWaiting(threadId);
+      } catch {
+        waiting = true;
       }
+    }
+    if (archived || status !== "idle" || waiting) {
+      for (const lane of candidates) coalesced.delete(laneKey(lane));
+      return;
+    }
+    for (const lane of candidates) {
+      const key = laneKey(lane);
+      if (lane.terminal_report_digest !== null || coalesced.has(key)) continue;
+      coalesced.add(key);
+      try {
+        await options.steer({
+          projectId: lane.project_id,
+          laneId: lane.lane_id,
+          assignmentId: lane.assignment_id,
+          assignmentKind: lane.assignment_kind,
+          workItemId: lane.work_item_id,
+          threadId: lane.thread_id,
+          executionAttemptId: lane.execution_attempt_id,
+          attemptState: lane.attempt_state,
+          workerStatus: status,
+          waitingOn: "terminal receipt",
+          ageMs: 0,
+          tone: "error"
+        });
+      } catch (error48) {
+        coalesced.delete(key);
+        throw error48;
+      }
+    }
+  };
+  const enqueue = (work) => {
+    const result2 = queue.then(work);
+    queue = result2.then(() => void 0, () => void 0);
+    return result2;
+  };
+  return {
+    observe(threadId, status, pendingExternalWait, archived) {
+      if (threadId === supervisorThreadId) return Promise.resolve();
+      return enqueue(() => observeNow(threadId, status, pendingExternalWait, archived));
+    },
+    poll() {
+      return enqueue(async () => {
+        const lanes = options.readLanes();
+        clearResolved(lanes);
+        if (!options.readWorker) return;
+        const workerIds = new Set(
+          lanes.filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.thread_id).map((lane) => lane.thread_id).filter((threadId) => threadId !== supervisorThreadId)
+        );
+        for (const threadId of workerIds) {
+          let observation;
+          try {
+            observation = await options.readWorker(threadId);
+          } catch {
+            continue;
+          }
+          await observeNow(
+            threadId,
+            observation.status,
+            observation.pendingExternalWait,
+            observation.archived
+          );
+        }
+      });
     }
   };
 }
@@ -13875,7 +13927,7 @@ function subscribeToThreadChanges(sdk, observe) {
       event: "thread:changed",
       callback: (event) => {
         if (event.entity !== "thread" || !event.id) return;
-        void sdk.threads.get({ threadId: event.id }).then((thread) => observe(thread.id, thread.status)).catch(() => void 0);
+        void sdk.threads.get({ threadId: event.id }).then((thread) => thread.archivedAt === null && thread.deletedAt === null ? observe(thread.id, thread.status) : observe(thread.id, thread.status, true)).catch(() => void 0);
       }
     });
   } catch {
@@ -20535,16 +20587,35 @@ async function plugin(bb) {
     bb.log.error(`canonical store unavailable: ${String(error48)}`);
     db = null;
   }
+  const readPendingExternalWait = async (threadId) => {
+    try {
+      const interactions = await bb.sdk.threads.interactions.list({ threadId });
+      return interactions.some((interaction) => interaction.status === "pending");
+    } catch {
+      return true;
+    }
+  };
   const watcher = createLaneWatcher({
     readLanes: () => db ? readLaneStates(db) : [],
+    isExternallyWaiting: readPendingExternalWait,
+    readWorker: async (threadId) => {
+      const thread = await bb.sdk.threads.get({ threadId });
+      const archived = thread.archivedAt !== null || thread.deletedAt !== null;
+      return {
+        status: thread.status,
+        pendingExternalWait: archived ? true : await readPendingExternalWait(threadId),
+        archived
+      };
+    },
     steer: async (lane) => {
+      if (!lane.threadId || lane.threadId === SUPERVISOR_THREAD_ID) return;
       await bb.sdk.threads.send({
-        threadId: SUPERVISOR_THREAD_ID,
+        threadId: lane.threadId,
         mode: "steer",
         input: [
           {
             type: "text",
-            text: `Lane ${lane.laneId} is open while worker ${lane.threadId ?? "unknown"} is idle without a terminal receipt. Reconcile assignment ${lane.assignmentId}.`,
+            text: `Lane ${lane.laneId} is idle without a terminal receipt or pending external wait. Continue assignment ${lane.assignmentId} and finish with exactly one DONE|BLOCKED terminal receipt.`,
             mentions: []
           }
         ]
@@ -20558,14 +20629,26 @@ async function plugin(bb) {
   bb.events.on("thread.active", (payload) => void observe(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
   bb.events.on("thread.idle", (payload) => void observe(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
   bb.events.on("thread.failed", (payload) => void observe(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
-  const unsubscribe = subscribeToThreadChanges(bb.sdk, (threadId, status) => watcher.observe(threadId, status));
+  bb.events.on("thread.archived", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
+  bb.events.on("thread.deleted", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
+  const unsubscribe = subscribeToThreadChanges(bb.sdk, (threadId, status, archived = false) => watcher.observe(threadId, status, void 0, archived));
   bb.onDispose(unsubscribe);
   bb.background.service("lane-watcher", {
-    start(signal) {
-      return new Promise((resolve) => {
-        if (signal.aborted) return resolve();
-        signal.addEventListener("abort", () => resolve(), { once: true });
-      });
+    async start(signal) {
+      while (!signal.aborted) {
+        await watcher.poll().catch((error48) => bb.log.warn(`lane poll failed: ${String(error48)}`));
+        if (signal.aborted) break;
+        await new Promise((resolve) => {
+          let timer;
+          const done = () => {
+            clearTimeout(timer);
+            signal.removeEventListener("abort", done);
+            resolve();
+          };
+          timer = setTimeout(done, 1e3);
+          signal.addEventListener("abort", done, { once: true });
+        });
+      }
     }
   });
   bb.http.route(

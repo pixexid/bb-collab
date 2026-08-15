@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defineRpcContract } from "@bb/plugin-sdk";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing";
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
@@ -452,6 +452,40 @@ async function loadedHost(projectId = PROJECT_ID) {
   const host = hostFor(projectId);
   await plugin(host.bb);
   return host;
+}
+
+async function loadedLaneWatcherHost() {
+  const host = hostFor();
+  let changed: ((event: { entity: string; id: string }) => void) | null = null;
+  host.harness.sdk.stub("subscribe", ((input: { callback: (event: { entity: string; id: string }) => void }) => {
+    changed = input.callback;
+    return () => undefined;
+  }) as never);
+  await plugin(host.bb);
+
+  const db = host.bb.storage.database();
+  const { fenceToken } = seedAssignmentDatabase(db);
+  const adapter = new DeterministicNativeAssignmentAdapter();
+  const prepared = applyWithFixtureReceipt(db, assignmentPrepareRequest(fenceToken), null, null, adapter);
+  expect(prepared.outcome).toBe("OK");
+  const executionAttemptId = (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+  db.prepare("UPDATE execution_attempts SET thread_id = ?, state = 'running' WHERE execution_attempt_id = ?").run("worker-1", executionAttemptId);
+
+  let thread = makeThreadResponse({ id: "worker-1", status: "idle", archivedAt: null, deletedAt: null });
+  let pendingExternalWait = false;
+  host.harness.sdk.stub("threads.get", (async () => thread) as never);
+  host.harness.sdk.stub("threads.interactions.list", (async () => pendingExternalWait ? [{ status: "pending" }] : []) as never);
+  host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
+  return {
+    host,
+    changed: changed!,
+    setPending(next: boolean) {
+      pendingExternalWait = next;
+    },
+    setThread(next: Partial<typeof thread>) {
+      thread = makeThreadResponse({ ...thread, ...next });
+    },
+  };
 }
 
 function seedAndBootstrap(host: ReturnType<typeof hostFor>, projectId = PROJECT_ID, overrides: Partial<ApplyRequest> = {}) {
@@ -1264,6 +1298,50 @@ function connectorEvidence(state: "available" | "absent" | "degraded" | "unknown
 }
 
 describe("bb-collab plugin boundary", () => {
+  it("does not steer a thread:changed idle worker with a pending interaction", async () => {
+    const fixture = await loadedLaneWatcherHost();
+    fixture.setPending(true);
+
+    fixture.changed({ entity: "thread", id: "worker-1" });
+    await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.interactions.list")).toHaveLength(1));
+
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    await fixture.host.harness.lifecycle.dispose();
+  });
+
+  it("keeps deleted workers silent on realtime changes and background polls", async () => {
+    const fixture = await loadedLaneWatcherHost();
+    fixture.setThread({ deletedAt: Date.now() });
+
+    fixture.changed({ entity: "thread", id: "worker-1" });
+    await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(1));
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.interactions.list")).toHaveLength(0);
+
+    const service = fixture.host.harness.behavior.runService("lane-watcher");
+    await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(2));
+    service.controller.abort();
+    await service.done;
+
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    await fixture.host.harness.lifecycle.dispose();
+  });
+
+  it("sends once per idle anomaly until a real active resolution", async () => {
+    const fixture = await loadedLaneWatcherHost();
+
+    fixture.changed({ entity: "thread", id: "worker-1" });
+    fixture.changed({ entity: "thread", id: "worker-1" });
+    await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1));
+
+    fixture.setThread({ status: "active" });
+    fixture.changed({ entity: "thread", id: "worker-1" });
+    fixture.setThread({ status: "idle" });
+    fixture.changed({ entity: "thread", id: "worker-1" });
+    await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2));
+
+    await fixture.host.harness.lifecycle.dispose();
+  });
+
   it("loads one CLI/RPC seam and refuses production apply before any write", async () => {
     const host = await loadedHost();
     const db = host.bb.storage.database();

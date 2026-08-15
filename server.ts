@@ -396,16 +396,36 @@ export default async function plugin(bb: BbPluginApi) {
     db = null;
   }
 
+  const readPendingExternalWait = async (threadId: string) => {
+    try {
+      const interactions = await bb.sdk.threads.interactions.list({ threadId });
+      return interactions.some((interaction) => interaction.status === "pending");
+    } catch {
+      return true;
+    }
+  };
+
   const watcher = createLaneWatcher({
     readLanes: () => (db ? readLaneStates(db) : []),
+    isExternallyWaiting: readPendingExternalWait,
+    readWorker: async (threadId) => {
+      const thread = await bb.sdk.threads.get({ threadId });
+      const archived = thread.archivedAt !== null || thread.deletedAt !== null;
+      return {
+        status: thread.status,
+        pendingExternalWait: archived ? true : await readPendingExternalWait(threadId),
+        archived,
+      };
+    },
     steer: async (lane) => {
+      if (!lane.threadId || lane.threadId === SUPERVISOR_THREAD_ID) return;
       await bb.sdk.threads.send({
-        threadId: SUPERVISOR_THREAD_ID,
+        threadId: lane.threadId,
         mode: "steer",
         input: [
           {
             type: "text",
-            text: `Lane ${lane.laneId} is open while worker ${lane.threadId ?? "unknown"} is idle without a terminal receipt. Reconcile assignment ${lane.assignmentId}.`,
+            text: `Lane ${lane.laneId} is idle without a terminal receipt or pending external wait. Continue assignment ${lane.assignmentId} and finish with exactly one DONE|BLOCKED terminal receipt.`,
             mentions: [],
           },
         ],
@@ -420,14 +440,26 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("thread.active", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
   bb.events.on("thread.idle", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
   bb.events.on("thread.failed", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
-  const unsubscribe = subscribeToThreadChanges(bb.sdk, (threadId, status) => watcher.observe(threadId, status));
+  bb.events.on("thread.archived", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
+  bb.events.on("thread.deleted", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
+  const unsubscribe = subscribeToThreadChanges(bb.sdk, (threadId, status, archived = false) => watcher.observe(threadId, status, undefined, archived));
   bb.onDispose(unsubscribe);
   bb.background.service("lane-watcher", {
-    start(signal) {
-      return new Promise<void>((resolve) => {
-        if (signal.aborted) return resolve();
-        signal.addEventListener("abort", () => resolve(), { once: true });
-      });
+    async start(signal) {
+      while (!signal.aborted) {
+        await watcher.poll().catch((error) => bb.log.warn(`lane poll failed: ${String(error)}`));
+        if (signal.aborted) break;
+        await new Promise<void>((resolve) => {
+          let timer: ReturnType<typeof setTimeout>;
+          const done = () => {
+            clearTimeout(timer);
+            signal.removeEventListener("abort", done);
+            resolve();
+          };
+          timer = setTimeout(done, 1_000);
+          signal.addEventListener("abort", done, { once: true });
+        });
+      }
     },
   });
 
