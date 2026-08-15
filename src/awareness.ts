@@ -3,6 +3,7 @@ import type { SqliteDatabase } from "./foundation.js";
 
 export const SUPERVISOR_THREAD_ID = "thr_b94i3csnme";
 export const DEFAULT_MAX_CONTINUATIONS = 3;
+export const OPERATOR_WAIT_FYI_THRESHOLD_MS = 15 * 60_000;
 
 const OPEN_ATTEMPT_STATES = new Set([
   "prepared",
@@ -27,6 +28,13 @@ export interface LaneState {
   created_at_ms: number;
 }
 
+export interface OperatorWait {
+  reason: "awaiting_operator";
+  createdAtMs: number;
+}
+
+export type LaneQueueState = "ready" | "running" | "deferred";
+
 export interface LaneView {
   projectId: string;
   laneId: string;
@@ -40,6 +48,12 @@ export interface LaneView {
   waitingOn: string | null;
   ageMs: number;
   tone: "default" | "running" | "success" | "error";
+  queueState: LaneQueueState;
+  queueBlocked: boolean;
+  nextStartable: boolean;
+  deferredReason: OperatorWait["reason"] | null;
+  deferredAtMs: number | null;
+  deferredAgeMs: number | null;
 }
 
 export type ContinuationMode = "automatic" | "approval" | "tracking";
@@ -57,6 +71,11 @@ interface ContinuationRecord {
 export interface ContinuationPersistence {
   read(): Promise<unknown>;
   write(state: Record<string, ContinuationRecord>): Promise<void>;
+}
+
+export interface OperatorWaitAlertPersistence {
+  read(): Promise<unknown>;
+  write(state: Record<string, true>): Promise<void>;
 }
 
 export interface ContinuationClaim {
@@ -77,11 +96,55 @@ export interface ContinuationLedger {
 }
 
 export type LaneWatcherAlert = {
-  kind: "approval_required" | "limit_reached" | "restart_review" | "delivery_uncertain";
+  kind: "approval_required" | "limit_reached" | "restart_review" | "delivery_uncertain" | "operator_wait_fyi";
   lane: LaneView;
   count: number;
   max: number;
 };
+
+function operatorWaitAlertState(input: unknown): Record<string, true> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  const state: Record<string, true> = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (value !== true) throw new Error("invalid operator wait alert state");
+    state[key] = true;
+  }
+  return state;
+}
+
+function createOperatorWaitAlertLedger(persistence?: OperatorWaitAlertPersistence) {
+  let state: Record<string, true> = {};
+  let loaded = false;
+  let queue = Promise.resolve();
+  const enqueue = <T>(work: () => Promise<T>): Promise<T> => {
+    const result = queue.then(work);
+    queue = result.then(() => undefined, () => undefined);
+    return result;
+  };
+  const load = async () => {
+    if (loaded) return;
+    state = operatorWaitAlertState(persistence ? await persistence.read() : null);
+    loaded = true;
+  };
+  const save = () => persistence?.write(structuredClone(state));
+
+  return {
+    recover: () => enqueue(async () => { await load(); }),
+    notified: (key: string) => enqueue(async () => { await load(); return state[key] === true; }),
+    mark: (key: string) => enqueue(async () => {
+      await load();
+      if (state[key]) return;
+      state[key] = true;
+      await save();
+    }),
+    clear: (key: string) => enqueue(async () => {
+      await load();
+      if (!state[key]) return;
+      delete state[key];
+      await save();
+    }),
+  };
+}
 
 function continuationState(input: unknown): Record<string, ContinuationRecord> {
   if (!input || typeof input !== "object" || Array.isArray(input)) return {};
@@ -192,6 +255,7 @@ export interface LaneWatcher {
     status: ThreadStatus,
     pendingExternalWait?: boolean,
     archived?: boolean,
+    operatorWait?: OperatorWait | null,
   ): Promise<void>;
   poll(): Promise<void>;
   recover(): Promise<void>;
@@ -201,6 +265,8 @@ export interface WorkerObservation {
   status: ThreadStatus;
   pendingExternalWait: boolean;
   archived: boolean;
+  operatorWait?: OperatorWait | null;
+  operatorWaitKnown?: boolean;
 }
 
 export function readLaneStates(db: SqliteDatabase): LaneState[] {
@@ -222,10 +288,16 @@ export function readLaneStates(db: SqliteDatabase): LaneState[] {
     .all() as LaneState[];
 }
 
-export function openLaneViews(db: SqliteDatabase, now = Date.now()): LaneView[] {
-  return readLaneStates(db)
+export function openLaneViews(
+  db: SqliteDatabase,
+  now = Date.now(),
+  operatorWaits: ReadonlyMap<string, OperatorWait> = new Map(),
+): LaneView[] {
+  const lanes = readLaneStates(db)
     .filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state))
-    .map((lane) => ({
+    .map((lane) => {
+      const operatorWait = lane.thread_id ? operatorWaits.get(lane.thread_id) ?? null : null;
+      return {
       projectId: lane.project_id,
       laneId: lane.lane_id,
       assignmentId: lane.assignment_id,
@@ -235,10 +307,31 @@ export function openLaneViews(db: SqliteDatabase, now = Date.now()): LaneView[] 
       executionAttemptId: lane.execution_attempt_id,
       attemptState: lane.attempt_state,
       workerStatus: null,
-      waitingOn: lane.terminal_report_digest === null ? "terminal receipt" : null,
+      waitingOn: operatorWait?.reason ?? (lane.terminal_report_digest === null ? "terminal receipt" : null),
       ageMs: Math.max(0, now - lane.created_at_ms),
       tone: lane.attempt_state === "running" ? "running" : "default",
-    }));
+      queueState: operatorWait ? "deferred" as const : lane.attempt_state === "running" ? "running" as const : "ready" as const,
+      queueBlocked: false,
+      nextStartable: false,
+      deferredReason: operatorWait?.reason ?? null,
+      deferredAtMs: operatorWait?.createdAtMs ?? null,
+      deferredAgeMs: operatorWait ? Math.max(0, now - operatorWait.createdAtMs) : null,
+    } satisfies LaneView;
+    });
+  const nextByProject = new Map<string, string>();
+  for (const lane of lanes) {
+    if (
+      lane.queueState === "ready" &&
+      (lane.attemptState === "prepared" || lane.attemptState === "armed") &&
+      !lane.deferredReason &&
+      !nextByProject.has(lane.projectId)
+    ) nextByProject.set(lane.projectId, lane.executionAttemptId);
+  }
+  return lanes.map((lane) => ({
+    ...lane,
+    queueBlocked: lane.queueState === "ready" && (lane.attemptState === "prepared" || lane.attemptState === "armed") && nextByProject.get(lane.projectId) !== lane.executionAttemptId,
+    nextStartable: nextByProject.get(lane.projectId) === lane.executionAttemptId,
+  }));
 }
 
 export function createLaneWatcher(options: {
@@ -248,11 +341,18 @@ export function createLaneWatcher(options: {
   readWorker?: (threadId: string) => Promise<WorkerObservation>;
   supervisorThreadId?: string;
   continuationLedger?: ContinuationLedger;
+  operatorWaitAlertPersistence?: OperatorWaitAlertPersistence;
+  operatorWaitFyiThresholdMs?: number;
+  readOperatorWait?: (threadId: string) => Promise<OperatorWait | null>;
   maxContinuations?: number;
   onAlert?: (alert: LaneWatcherAlert) => void;
 }): LaneWatcher {
   const supervisorThreadId = options.supervisorThreadId ?? SUPERVISOR_THREAD_ID;
   const continuationLedger = options.continuationLedger ?? createContinuationLedger();
+  const operatorWaitAlertLedger = createOperatorWaitAlertLedger(options.operatorWaitAlertPersistence);
+  const operatorWaitFyiThresholdMs = Number.isInteger(options.operatorWaitFyiThresholdMs) && (options.operatorWaitFyiThresholdMs ?? 0) >= 0
+    ? options.operatorWaitFyiThresholdMs as number
+    : OPERATOR_WAIT_FYI_THRESHOLD_MS;
   const maxContinuations = Number.isInteger(options.maxContinuations) && (options.maxContinuations ?? 0) > 0
     ? options.maxContinuations as number
     : DEFAULT_MAX_CONTINUATIONS;
@@ -271,7 +371,7 @@ export function createLaneWatcher(options: {
     }
   };
 
-  const viewFor = (lane: LaneState, status: ThreadStatus): LaneView => ({
+  const viewFor = (lane: LaneState, status: ThreadStatus, now: number, operatorWait: OperatorWait | null): LaneView => ({
     projectId: lane.project_id,
     laneId: lane.lane_id,
     assignmentId: lane.assignment_id,
@@ -281,9 +381,15 @@ export function createLaneWatcher(options: {
     executionAttemptId: lane.execution_attempt_id,
     attemptState: lane.attempt_state,
     workerStatus: status,
-    waitingOn: "terminal receipt",
-    ageMs: 0,
+    waitingOn: operatorWait?.reason ?? "terminal receipt",
+    ageMs: Math.max(0, now - lane.created_at_ms),
     tone: "error",
+    queueState: operatorWait ? "deferred" : lane.attempt_state === "running" ? "running" : "ready",
+    queueBlocked: false,
+    nextStartable: false,
+    deferredReason: operatorWait?.reason ?? null,
+    deferredAtMs: operatorWait?.createdAtMs ?? null,
+    deferredAgeMs: operatorWait ? Math.max(0, now - operatorWait.createdAtMs) : null,
   });
 
   const alert = (kind: LaneWatcherAlert["kind"], lane: LaneView, count: number, max: number) => {
@@ -295,6 +401,8 @@ export function createLaneWatcher(options: {
     status: ThreadStatus,
     pendingExternalWait?: boolean,
     archived = false,
+    suppliedOperatorWait?: OperatorWait | null,
+    suppliedOperatorWaitKnown = status !== "idle" || suppliedOperatorWait !== undefined || !options.readOperatorWait,
   ): Promise<void> => {
     const allLanes = options.readLanes();
     clearResolved(allLanes);
@@ -306,8 +414,19 @@ export function createLaneWatcher(options: {
     );
     if (candidates.length === 0) return;
 
+    let operatorWait = suppliedOperatorWait ?? null;
+    let operatorWaitKnown = suppliedOperatorWaitKnown;
+    if (!archived && status === "idle" && suppliedOperatorWait === undefined && options.readOperatorWait) {
+      try {
+        operatorWait = await options.readOperatorWait(threadId);
+      } catch {
+        operatorWait = null;
+        operatorWaitKnown = false;
+      }
+    }
     let waiting = pendingExternalWait ?? false;
-    if (!archived && status === "idle" && pendingExternalWait === undefined && options.isExternallyWaiting) {
+    if (operatorWait) waiting = true;
+    if (!archived && status === "idle" && pendingExternalWait === undefined && !operatorWait && options.isExternallyWaiting) {
       try {
         waiting = await options.isExternallyWaiting(threadId);
       } catch {
@@ -316,17 +435,38 @@ export function createLaneWatcher(options: {
       }
     }
 
-    if (archived || status !== "idle" || waiting) {
-      for (const lane of candidates) coalesced.delete(laneKey(lane));
+    const now = Date.now();
+    if (archived || status !== "idle" || (waiting && !operatorWait)) {
+      for (const lane of candidates) {
+        const key = laneKey(lane);
+        coalesced.delete(key);
+        if (archived || (operatorWaitKnown && !operatorWait)) await operatorWaitAlertLedger.clear(key);
+      }
       return;
     }
 
     for (const lane of candidates) {
       const key = laneKey(lane);
-      if (lane.terminal_report_digest !== null || coalesced.has(key)) continue;
+      if (lane.terminal_report_digest !== null) {
+        await operatorWaitAlertLedger.clear(key);
+        continue;
+      }
+
+      if (operatorWait) {
+        coalesced.delete(key);
+        const view = viewFor(lane, status, now, operatorWait);
+        if (view.deferredAgeMs !== null && view.deferredAgeMs >= operatorWaitFyiThresholdMs && !(await operatorWaitAlertLedger.notified(key))) {
+          await operatorWaitAlertLedger.mark(key);
+          alert("operator_wait_fyi", view, 0, 0);
+        }
+        continue;
+      }
+
+      await operatorWaitAlertLedger.clear(key);
+      if (coalesced.has(key)) continue;
 
       coalesced.add(key);
-      const view = viewFor(lane, status);
+      const view = viewFor(lane, status, now, null);
       const mode = continuationModeFor(lane.assignment_kind);
       if (mode === "tracking") continue;
       if (mode === "approval") {
@@ -357,9 +497,9 @@ export function createLaneWatcher(options: {
   };
 
   return {
-    observe(threadId, status, pendingExternalWait, archived) {
+    observe(threadId, status, pendingExternalWait, archived, operatorWait) {
       if (threadId === supervisorThreadId) return Promise.resolve();
-      return enqueue(() => observeNow(threadId, status, pendingExternalWait, archived));
+      return enqueue(() => observeNow(threadId, status, pendingExternalWait, archived, operatorWait));
     },
     poll() {
       return enqueue(async () => {
@@ -386,12 +526,17 @@ export function createLaneWatcher(options: {
             observation.status,
             observation.pendingExternalWait,
             observation.archived,
+            observation.operatorWait,
+            observation.operatorWaitKnown,
           );
         }
       });
     },
     recover() {
-      return enqueue(() => continuationLedger.recover());
+      return enqueue(async () => {
+        await continuationLedger.recover();
+        await operatorWaitAlertLedger.recover();
+      });
     },
   };
 }

@@ -762,7 +762,11 @@ function LanesPanel(_props: PluginNavPanelProps) {
                 <div className="truncate font-medium">{lane.laneId}</div>
                 <div className="truncate text-xs text-muted-foreground">{lane.assignmentKind} · {lane.threadId ?? "worker not attached"}</div>
               </div>
-              <div className="text-muted-foreground">{lane.waitingOn ?? "worker"}</div>
+              <div className="text-muted-foreground">
+                {lane.deferredReason
+                  ? `${lane.deferredReason} · ${age(lane.deferredAgeMs ?? 0)}`
+                  : lane.nextStartable ? "next startable" : lane.waitingOn ?? "worker"}
+              </div>
               <time className="text-muted-foreground" title={`${lane.ageMs}ms old`}>{age(lane.ageMs)}</time>
             </div>
           ))}

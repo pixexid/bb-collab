@@ -4,6 +4,8 @@ import {
   continuationModeFor,
   createContinuationLedger,
   createLaneWatcher,
+  openLaneViews,
+  type OperatorWait,
   readLaneStates,
   type LaneState,
   type LaneView,
@@ -25,6 +27,32 @@ function lane(threadId = "worker-1"): LaneState {
 }
 
 describe("lane awareness", () => {
+  it("does not let an awaiting operator lane block the next startable lane", () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE assignments (project_id TEXT, assignment_id TEXT, lane_id TEXT, assignment_kind TEXT, work_item_id TEXT, created_at_ms INTEGER)");
+    db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT)");
+    db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", "deferred", "lane-deferred", "write", "work-deferred", 1);
+    db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", "ready", "lane-ready", "write", "work-ready", 2);
+    db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?)").run("project-1", "deferred", "worker-deferred", "attempt-deferred", "assignment", "prepared", null);
+    db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?)").run("project-1", "ready", "worker-ready", "attempt-ready", "assignment", "prepared", null);
+
+    const views = openLaneViews(db, 1_000, new Map<string, OperatorWait>([
+      ["worker-deferred", { reason: "awaiting_operator", createdAtMs: 900 }],
+    ]));
+
+    expect(views[0]).toMatchObject({
+      laneId: "lane-deferred",
+      queueState: "deferred",
+      queueBlocked: false,
+      nextStartable: false,
+      deferredReason: "awaiting_operator",
+      deferredAtMs: 900,
+      deferredAgeMs: 100,
+    });
+    expect(views[1]).toMatchObject({ laneId: "lane-ready", queueBlocked: false, nextStartable: true });
+    db.close();
+  });
+
   it("steers on a synthetic idle transition", async () => {
     const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
     const watcher = createLaneWatcher({ readLanes: () => [lane()], steer });
@@ -70,6 +98,65 @@ describe("lane awareness", () => {
     });
 
     await watcher.observe("worker-1", "idle");
+    expect(steer).not.toHaveBeenCalled();
+  });
+
+  it("resumes the same lane after its exact operator wait resolves", async () => {
+    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
+    let operatorWait: OperatorWait | null = { reason: "awaiting_operator", createdAtMs: Date.now() };
+    const watcher = createLaneWatcher({
+      readLanes: () => [lane()],
+      steer,
+      readOperatorWait: async () => operatorWait,
+    });
+
+    await watcher.observe("worker-1", "idle");
+    expect(steer).not.toHaveBeenCalled();
+    operatorWait = null;
+    await watcher.observe("worker-1", "idle");
+
+    expect(steer).toHaveBeenCalledTimes(1);
+    expect(steer.mock.calls[0]?.[0]).toMatchObject({ laneId: "lane-1", assignmentId: "assignment-1", executionAttemptId: "attempt-1" });
+  });
+
+  it("fires one persisted operator-wait FYI across polls and restart", async () => {
+    let persisted: unknown;
+    const persistence = {
+      read: async () => persisted,
+      write: async (state: Record<string, true>) => { persisted = state; },
+    };
+    const operatorWait: OperatorWait = { reason: "awaiting_operator", createdAtMs: 0 };
+    const alerts: string[] = [];
+    const options = {
+      readLanes: () => [lane()],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readOperatorWait: async () => operatorWait,
+      operatorWaitAlertPersistence: persistence,
+      operatorWaitFyiThresholdMs: 0,
+      onAlert: (alert: { kind: string }) => alerts.push(alert.kind),
+    };
+    const watcher = createLaneWatcher(options);
+
+    await watcher.observe("worker-1", "idle");
+    await watcher.observe("worker-1", "idle");
+    const restartedWatcher = createLaneWatcher({ ...options, onAlert: (alert) => alerts.push(alert.kind) });
+    await restartedWatcher.recover();
+    await restartedWatcher.observe("worker-1", "idle");
+
+    expect(alerts).toEqual(["operator_wait_fyi"]);
+  });
+
+  it("fails closed when the operator state cannot be read", async () => {
+    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
+    const watcher = createLaneWatcher({
+      readLanes: () => [lane()],
+      steer,
+      readOperatorWait: async () => { throw new Error("unknown interaction state"); },
+      isExternallyWaiting: async () => { throw new Error("unknown interaction state"); },
+    });
+
+    await watcher.observe("worker-1", "idle");
+
     expect(steer).not.toHaveBeenCalled();
   });
 
@@ -185,6 +272,26 @@ describe("lane awareness", () => {
     db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "lane-1", "write", "work-1", 1);
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "worker-1", "attempt-1", "assignment", "running", null);
     expect(readLaneStates(db)).toEqual([lane()]);
+    db.close();
+  });
+
+  it("does not mutate canonical lane rows while observing", async () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE assignments (project_id TEXT, assignment_id TEXT, lane_id TEXT, assignment_kind TEXT, work_item_id TEXT, created_at_ms INTEGER)");
+    db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT)");
+    db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "lane-1", "write", "work-1", 1);
+    db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "worker-1", "attempt-1", "assignment", "prepared", null);
+    const before = { assignments: db.prepare("SELECT * FROM assignments").all(), attempts: db.prepare("SELECT * FROM execution_attempts").all() };
+    const watcher = createLaneWatcher({
+      readLanes: () => readLaneStates(db),
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readOperatorWait: async () => ({ reason: "awaiting_operator", createdAtMs: 0 }),
+      operatorWaitFyiThresholdMs: 0,
+    });
+
+    await watcher.observe("worker-1", "idle");
+
+    expect({ assignments: db.prepare("SELECT * FROM assignments").all(), attempts: db.prepare("SELECT * FROM execution_attempts").all() }).toEqual(before);
     db.close();
   });
 });
