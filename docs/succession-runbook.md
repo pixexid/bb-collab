@@ -77,3 +77,34 @@ cannot receive a tell.
   no longer holds the role, not to a ceremony name.
 - The successor's first act is to re-check the handoff against live state;
   finding a real contradiction is a successful safety check.
+
+## Live v13 evidence (2026-08-15)
+
+The live `bb-collab` checkout was refreshed to merge
+`468c770ed4f94975ace80bd5d36f5d0b67feaddf` for project
+`proj_a8zzfsx36j`. Doctor and export report contract v13/schema v11, with all
+four cached consumers reread (`expected=4 attempted=4 verified=4`). The active
+standing approver is the exact ten-class registry adopted by
+`decision-bb-collab-authorized-approver-v13` (disposition sequence 1).
+
+The recorded project-orchestrator generation is generation 2, predecessor 1,
+active, with holder execution attempt
+`a10c36147f8a585f94fd140f2caec739e7abeda16ef750f46fad62518db86875` and
+executed profile `claude-code/claude-opus-5[1m]/max/full/default/visible`.
+Its standby is the witnessed different-provider profile
+`pi/zai/glm-5.3/high/full/default/visible`, profile digest
+`40047e9f3f3db755b0dd7639860ddcf6e4e2f0a32d13e2acc6a051b440d5cc82`.
+The standby witness was native BB thread `thr_3wkgakfr8a`, request sequence
+1104 and completed sequence 1218; the holder witness was
+`thr_pd39icjc8x`, request event `evt_48i9bwxrea` and completion event
+`evt_y9fktuun5e`.
+
+The exact receipt-gated audit chain is: re-adoption mutations/events 26 and
+27 (`operator-a1db3f834155e2311513cc53db99f1ea`,
+`operator-d48154d6a106cf40caf8aa354a2ba9e1`), qualification mutation/event
+28 (`operator-862f446c5a4d61c61c4b07e93aac08ff`), and succession
+mutation/event 29 (`operator-a09f45bfb5119774599baa6dffc38da4`). All four
+receipts were consumed exactly once. The succession path changed only the
+role-generation state: final export counts show two role generations, two
+execution attempts, two qualification observations, zero assignments, and
+one work item.
