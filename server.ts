@@ -8,6 +8,7 @@ import {
   readLaneStates,
   subscribeToThreadChanges,
   threadEventStatus,
+  type OperatorWait,
 } from "./src/awareness.js";
 import {
   BB_VERSION_RANGE,
@@ -145,6 +146,12 @@ const laneViewSchema = z
     waitingOn: z.string().nullable(),
     ageMs: z.number().int().nonnegative(),
     tone: z.enum(["default", "running", "success", "error"]),
+    queueState: z.enum(["ready", "running", "deferred"]),
+    queueBlocked: z.boolean(),
+    nextStartable: z.boolean(),
+    deferredReason: z.literal("awaiting_operator").nullable(),
+    deferredAtMs: z.number().int().nonnegative().nullable(),
+    deferredAgeMs: z.number().int().nonnegative().nullable(),
   })
   .strict();
 
@@ -479,7 +486,13 @@ export default async function plugin(bb: BbPluginApi) {
     db = null;
   }
 
+  const interactionStateCache = new Map<string, { pending: boolean; operatorWait: OperatorWait | null }>();
   const readPendingExternalWait = async (threadId: string) => {
+    const cached = interactionStateCache.get(threadId);
+    if (cached) {
+      interactionStateCache.delete(threadId);
+      return cached.pending;
+    }
     try {
       const interactions = await bb.sdk.threads.interactions.list({ threadId });
       return interactions.some((interaction) => interaction.status === "pending");
@@ -488,23 +501,58 @@ export default async function plugin(bb: BbPluginApi) {
     }
   };
 
+  const readPendingOperatorWaitForThread = async (threadId: string): Promise<OperatorWait | null> => {
+    const interactions = await bb.sdk.threads.interactions.list({ threadId });
+    const pending = interactions.filter((interaction) => interaction.status === "pending");
+    let wait: OperatorWait | null = null;
+    for (const interaction of pending) {
+      if (!operatorReceiptInteractionData(interaction, bb.pluginId)) continue;
+      wait = {
+        reason: "awaiting_operator",
+        createdAtMs: typeof interaction.createdAt === "number" && Number.isFinite(interaction.createdAt) ? Math.max(0, interaction.createdAt) : 0,
+      };
+      break;
+    }
+    interactionStateCache.set(threadId, { pending: pending.length > 0, operatorWait: wait });
+    return wait;
+  };
+
   const continuationLedger = createContinuationLedger({
     read: () => bb.storage.kv.get<unknown>("lane-watcher.continuations"),
     write: (state) => bb.storage.kv.set("lane-watcher.continuations", state),
   });
 
+  const operatorWaitAlertPersistence = {
+    read: () => bb.storage.kv.get<unknown>("lane-watcher.operator-wait-fyi"),
+    write: (state: Record<string, true>) => bb.storage.kv.set("lane-watcher.operator-wait-fyi", state),
+  };
+
   const watcher = createLaneWatcher({
     readLanes: () => (db ? readLaneStates(db) : []),
     continuationLedger,
-    onAlert: (alert) => bb.log.warn(`lane continuation ${alert.kind}: ${alert.lane.laneId} (${alert.count}/${alert.max})`),
+    operatorWaitAlertPersistence,
+    onAlert: (alert) => bb.log.warn(`lane awareness ${alert.kind}: ${alert.lane.laneId} (${alert.count}/${alert.max})`),
     isExternallyWaiting: readPendingExternalWait,
+    readOperatorWait: readPendingOperatorWaitForThread,
     readWorker: async (threadId) => {
       const thread = await bb.sdk.threads.get({ threadId });
       const archived = thread.archivedAt !== null || thread.deletedAt !== null;
+      let operatorWait: OperatorWait | null = null;
+      let operatorWaitKnown = true;
+      if (!archived) {
+        try {
+          operatorWait = await readPendingOperatorWaitForThread(threadId);
+        } catch {
+          operatorWaitKnown = false;
+        }
+      }
       return {
         status: thread.status,
-        pendingExternalWait: archived ? true : await readPendingExternalWait(threadId),
+        pendingExternalWait: archived || !operatorWaitKnown
+          ? true
+          : operatorWait ? true : await readPendingExternalWait(threadId),
         archived,
+        operatorWait,
       };
     },
     steer: async (lane) => {
@@ -555,15 +603,25 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  bb.http.route("GET", "/lanes", () =>
-    new Response(JSON.stringify(db ? openLaneViews(db) : []), {
+  const readOpenLaneViews = async () => {
+    if (!db) return [];
+    const requests = await readOperatorReceiptRequests(bb);
+    return openLaneViews(
+      db,
+      Date.now(),
+      new Map(requests.map((request) => [request.callerThreadId, { reason: "awaiting_operator", createdAtMs: request.createdAt } satisfies OperatorWait])),
+    );
+  };
+
+  bb.http.route("GET", "/lanes", async () =>
+    new Response(JSON.stringify(await readOpenLaneViews()), {
       headers: { "content-type": "application/json" },
     }),
   );
 
   bb.rpc.register(rpcContract, {
     lanes() {
-      return db ? openLaneViews(db) : [];
+      return readOpenLaneViews();
     },
     async threadStates(input) {
       const entries = await Promise.all(input.threadIds.map(async (threadId) => {

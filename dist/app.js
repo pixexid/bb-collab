@@ -810,7 +810,7 @@ function LanesPanel(_props) {
           lane.threadId ?? "worker not attached"
         ] })
       ] }),
-      /* @__PURE__ */ jsx("div", { className: "text-muted-foreground", children: lane.waitingOn ?? "worker" }),
+      /* @__PURE__ */ jsx("div", { className: "text-muted-foreground", children: lane.deferredReason ? `${lane.deferredReason} \xB7 ${age(lane.deferredAgeMs ?? 0)}` : lane.nextStartable ? "next startable" : lane.waitingOn ?? "worker" }),
       /* @__PURE__ */ jsx("time", { className: "text-muted-foreground", title: `${lane.ageMs}ms old`, children: age(lane.ageMs) })
     ] }, lane.executionAttemptId)) })
   ] }) });
