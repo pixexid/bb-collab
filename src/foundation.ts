@@ -5,7 +5,7 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 9;
+export const CONTRACT_VERSION = 10;
 export const SCHEMA_VERSION = 10;
 export const AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab" as const;
 export const AUTHORIZED_APPROVER_PROJECT_ID = "proj_a8zzfsx36j" as const;
@@ -601,7 +601,7 @@ export function cachedConsumerRolloutEvidence(observedSchemaVersion: number, obs
     oldSchemaVersion: 9,
     newSchemaVersion: SCHEMA_VERSION,
     observedSchemaVersion,
-    oldContractVersion: 8,
+    oldContractVersion: 9,
     newContractVersion: CONTRACT_VERSION,
     observedContractVersion,
     action: reread ? "reread" : "refused",
@@ -665,6 +665,7 @@ export const MIGRATION_STEPS = [
 ] as const;
 export const DERIVED_ACTOR_MUTATION_CLASSES = [
   "bootstrap",
+  "config_revision",
   "decision_create",
   "decision_disposition",
   "work_item_create",
