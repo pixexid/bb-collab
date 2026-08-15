@@ -5,10 +5,10 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 12;
-export const SCHEMA_VERSION = 10;
-// Contract-only v11 -> v12 bump; schema remains v10.
-const PREVIOUS_CONTRACT_VERSION = 11;
+export const CONTRACT_VERSION = 13;
+export const SCHEMA_VERSION = 11;
+// RoleGeneration standby field and succession rule v12 -> v13 / schema v10 -> v11.
+const PREVIOUS_CONTRACT_VERSION = 12;
 const PREVIOUS_SCHEMA_VERSION = 10;
 export const ROLE_IDS = ["project-orchestrator", "worker", "independent-reviewer"] as const;
 export const AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab" as const;
@@ -593,6 +593,8 @@ export const MIGRATIONS: string[] = [
   ALTER TABLE operator_receipts ADD COLUMN approver_id TEXT;
   ALTER TABLE operator_receipts ADD COLUMN authorizing_decision_id TEXT;
   ALTER TABLE operator_receipts ADD COLUMN authorizing_disposition_sequence INTEGER;`,
+  `ALTER TABLE role_generations ADD COLUMN standby_profile_json TEXT
+   CHECK (standby_profile_json IS NULL OR json_valid(standby_profile_json))`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -710,6 +712,13 @@ export const contractDigest = sha256(canonicalJson({
       worker: "repository-target",
       "independent-reviewer": "repository-target",
     },
+  },
+  roleStandbyPolicy: {
+    role: "project-orchestrator",
+    field: "standby_profile_json",
+    requirement: "one named profile with a provider different from the executed holder",
+    authority: "none",
+    traffic: "none",
   },
   operatorReceiptPolicy: {
     scope: "one_request",
@@ -1298,6 +1307,7 @@ export const applyRequestSchema = z
     reasonCode: id.optional(),
     fixtureContextDigest: id.optional(),
     declaredProfile: executionProfileSchema.optional(),
+    standbyProfile: executionProfileSchema.optional(),
     assignment: assignmentIntentSchema.optional(),
     assignmentId: id.optional(),
     executionAttemptId: id.optional(),
@@ -1789,6 +1799,7 @@ export type FoundationCode =
   | "ROLE_CONTEXT_FOREIGN"
   | "ROLE_CONTEXT_HIDDEN"
   | "ROLE_HOLDER_MISMATCH"
+  | "ROLE_STANDBY_INVALID"
   | "EXECUTION_PROFILE_UNKNOWN"
   | "EXECUTION_PROFILE_MISMATCH"
   | "EXECUTION_COMPLETION_AMBIGUOUS"
@@ -5417,6 +5428,14 @@ function applyRoleGenerationSuccession(
   if (!profileEquals(context.profile, resolved.requirement.executedProfile) || request.profileDigest !== context.profileDigest) {
     throw refusal("EXECUTION_PROFILE_MISMATCH", "holder executed profile does not match the role requirement");
   }
+  const standbyProfile = request.standbyProfile;
+  if (request.roleId === "project-orchestrator") {
+    if (!standbyProfile || standbyProfile.providerId === context.profile.providerId) {
+      throw refusal("ROLE_STANDBY_INVALID", "project-orchestrator succession requires a named standby from another provider");
+    }
+  } else if (standbyProfile) {
+    throw refusal("ROLE_STANDBY_INVALID", "standby is reserved for the project-orchestrator seat");
+  }
   const expectedContextDigest = qualificationContextDigest(context, resolved, request);
   const observation = asRow<QualificationObservationRow>(
     db.prepare("SELECT * FROM qualification_observations WHERE project_id = ? AND qualification_id = ?").get(request.projectId, request.qualificationId),
@@ -5502,8 +5521,8 @@ function applyRoleGenerationSuccession(
       project_id, role_id, generation, role_requirement_id, config_revision, repo_target_id,
       status, predecessor_generation, holder_execution_attempt_id, holder_context_digest,
       holder_executed_profile_digest, qualification_id, eligibility_derivation_digest,
-      created_at_ms, activated_at_ms, retired_at_ms
-    ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+      created_at_ms, activated_at_ms, retired_at_ms, standby_profile_json
+    ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
   ).run(
     request.projectId,
     request.roleId,
@@ -5519,6 +5538,7 @@ function applyRoleGenerationSuccession(
     projection.derivation_digest,
     createdAtMs,
     createdAtMs,
+    standbyProfile ? canonicalJson(standbyProfile) : null,
   );
   if (first) {
     db.prepare("INSERT INTO role_generation_heads (project_id, role_id, current_generation, updated_at_ms) VALUES (?, ?, 1, ?)").run(
@@ -5548,7 +5568,13 @@ function applyRoleGenerationSuccession(
       aggregateId: request.roleId,
       aggregateRevision: nextGeneration,
       eventType: "role_generation_succeeded",
-      event: { roleId: request.roleId, generation: nextGeneration, predecessorGeneration: request.predecessorGeneration, qualificationId: request.qualificationId },
+      event: {
+        roleId: request.roleId,
+        generation: nextGeneration,
+        predecessorGeneration: request.predecessorGeneration,
+        qualificationId: request.qualificationId,
+        standbyProfileDigest: standbyProfile ? sha256(canonicalJson(standbyProfile)) : null,
+      },
     },
     { expected: 1, attempted: 1, verified: 1 },
     {
@@ -5565,6 +5591,7 @@ function applyRoleGenerationSuccession(
         executedProfileDigest: context.profileDigest,
         qualificationId: request.qualificationId,
         eligibilityDerivationDigest: projection.derivation_digest,
+        standbyProfile: standbyProfile ?? null,
       },
     },
   );
@@ -8066,6 +8093,7 @@ export async function doctor(
       `SELECT role_generation_heads.role_id, role_generation_heads.current_generation,
               role_generations.status, role_generations.qualification_id,
               role_generations.holder_execution_attempt_id,
+              role_generations.standby_profile_json,
               execution_attempts.state AS holder_attempt_state,
               execution_attempts.native_receipt_digest AS holder_native_receipt_digest
        FROM role_generation_heads

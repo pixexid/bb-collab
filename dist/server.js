@@ -14404,9 +14404,9 @@ import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 12;
-var SCHEMA_VERSION = 10;
-var PREVIOUS_CONTRACT_VERSION = 11;
+var CONTRACT_VERSION = 13;
+var SCHEMA_VERSION = 11;
+var PREVIOUS_CONTRACT_VERSION = 12;
 var PREVIOUS_SCHEMA_VERSION = 10;
 var ROLE_IDS = ["project-orchestrator", "worker", "independent-reviewer"];
 var AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab";
@@ -14984,7 +14984,9 @@ var MIGRATIONS = [
     ON authorized_approvers(project_id, approver_id) WHERE status = 'active';
   ALTER TABLE operator_receipts ADD COLUMN approver_id TEXT;
   ALTER TABLE operator_receipts ADD COLUMN authorizing_decision_id TEXT;
-  ALTER TABLE operator_receipts ADD COLUMN authorizing_disposition_sequence INTEGER;`
+  ALTER TABLE operator_receipts ADD COLUMN authorizing_disposition_sequence INTEGER;`,
+  `ALTER TABLE role_generations ADD COLUMN standby_profile_json TEXT
+   CHECK (standby_profile_json IS NULL OR json_valid(standby_profile_json))`
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var CACHED_CONSUMERS = ["server.rpcContract", "server.collabCli", "src/test-support", "tests/server.test"];
@@ -15096,6 +15098,13 @@ var contractDigest = sha256(canonicalJson({
       worker: "repository-target",
       "independent-reviewer": "repository-target"
     }
+  },
+  roleStandbyPolicy: {
+    role: "project-orchestrator",
+    field: "standby_profile_json",
+    requirement: "one named profile with a provider different from the executed holder",
+    authority: "none",
+    traffic: "none"
   },
   operatorReceiptPolicy: {
     scope: "one_request",
@@ -15571,6 +15580,7 @@ var applyRequestSchema = external_exports.object({
   reasonCode: id.optional(),
   fixtureContextDigest: id.optional(),
   declaredProfile: executionProfileSchema.optional(),
+  standbyProfile: executionProfileSchema.optional(),
   assignment: assignmentIntentSchema.optional(),
   assignmentId: id.optional(),
   executionAttemptId: id.optional(),
@@ -18654,6 +18664,14 @@ function applyRoleGenerationSuccession(db, request, digest, context) {
   if (!profileEquals(context.profile, resolved.requirement.executedProfile) || request.profileDigest !== context.profileDigest) {
     throw refusal("EXECUTION_PROFILE_MISMATCH", "holder executed profile does not match the role requirement");
   }
+  const standbyProfile = request.standbyProfile;
+  if (request.roleId === "project-orchestrator") {
+    if (!standbyProfile || standbyProfile.providerId === context.profile.providerId) {
+      throw refusal("ROLE_STANDBY_INVALID", "project-orchestrator succession requires a named standby from another provider");
+    }
+  } else if (standbyProfile) {
+    throw refusal("ROLE_STANDBY_INVALID", "standby is reserved for the project-orchestrator seat");
+  }
   const expectedContextDigest = qualificationContextDigest(context, resolved, request);
   const observation = asRow(
     db.prepare("SELECT * FROM qualification_observations WHERE project_id = ? AND qualification_id = ?").get(request.projectId, request.qualificationId)
@@ -18724,8 +18742,8 @@ function applyRoleGenerationSuccession(db, request, digest, context) {
       project_id, role_id, generation, role_requirement_id, config_revision, repo_target_id,
       status, predecessor_generation, holder_execution_attempt_id, holder_context_digest,
       holder_executed_profile_digest, qualification_id, eligibility_derivation_digest,
-      created_at_ms, activated_at_ms, retired_at_ms
-    ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      created_at_ms, activated_at_ms, retired_at_ms, standby_profile_json
+    ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
   ).run(
     request.projectId,
     request.roleId,
@@ -18740,7 +18758,8 @@ function applyRoleGenerationSuccession(db, request, digest, context) {
     request.qualificationId,
     projection.derivation_digest,
     createdAtMs,
-    createdAtMs
+    createdAtMs,
+    standbyProfile ? canonicalJson(standbyProfile) : null
   );
   if (first) {
     db.prepare("INSERT INTO role_generation_heads (project_id, role_id, current_generation, updated_at_ms) VALUES (?, ?, 1, ?)").run(
@@ -18770,7 +18789,13 @@ function applyRoleGenerationSuccession(db, request, digest, context) {
       aggregateId: request.roleId,
       aggregateRevision: nextGeneration,
       eventType: "role_generation_succeeded",
-      event: { roleId: request.roleId, generation: nextGeneration, predecessorGeneration: request.predecessorGeneration, qualificationId: request.qualificationId }
+      event: {
+        roleId: request.roleId,
+        generation: nextGeneration,
+        predecessorGeneration: request.predecessorGeneration,
+        qualificationId: request.qualificationId,
+        standbyProfileDigest: standbyProfile ? sha256(canonicalJson(standbyProfile)) : null
+      }
     },
     { expected: 1, attempted: 1, verified: 1 },
     {
@@ -18786,7 +18811,8 @@ function applyRoleGenerationSuccession(db, request, digest, context) {
         holderContextDigest: expectedContextDigest,
         executedProfileDigest: context.profileDigest,
         qualificationId: request.qualificationId,
-        eligibilityDerivationDigest: projection.derivation_digest
+        eligibilityDerivationDigest: projection.derivation_digest,
+        standbyProfile: standbyProfile ?? null
       }
     }
   );
@@ -20784,6 +20810,7 @@ async function doctor(db, sdk, projectId) {
       `SELECT role_generation_heads.role_id, role_generation_heads.current_generation,
               role_generations.status, role_generations.qualification_id,
               role_generations.holder_execution_attempt_id,
+              role_generations.standby_profile_json,
               execution_attempts.state AS holder_attempt_state,
               execution_attempts.native_receipt_digest AS holder_native_receipt_digest
        FROM role_generation_heads

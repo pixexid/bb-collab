@@ -381,13 +381,14 @@ reserve/finalize adapter operations refuse before the adapter because one
 receipt cannot authorize multiple writes. This report records those facts; it
 does not change them.
 
-The current contract is v12/schema v10. Its bounded role-capacity seam admits
+The current contract is v13/schema v11. Its bounded role-capacity seam admits
 the three project requirements used by the first-adopter request:
 project-orchestrator is project-scoped, while worker and independent-reviewer
 bind to the exact repository target required by canonical WorkItem writes. The
 change preserves the existing qualification, generation, Assignment and
-receipt/approver seams; it adds only `work_item_transition` to the exact
-derived authorized-approver set. No capacity router, assignment or dispatch
+receipt/approver seams; contract v12 adds only `work_item_transition`, while
+contract v13 adds the named standby profile for new project-orchestrator
+generations. No capacity router, assignment or dispatch
 mechanism is introduced. The triggering #31 live evidence is the merged-v10 deployed
 resolver's two-role `ROLE_IDS` set and `roleRequirements.max(2)`, which cannot
 represent the ratified three-role request; this amendment records that concrete
