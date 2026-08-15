@@ -5,10 +5,10 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 11;
+export const CONTRACT_VERSION = 12;
 export const SCHEMA_VERSION = 10;
-// Contract-only v10 -> v11 bump; schema remains v10.
-const PREVIOUS_CONTRACT_VERSION = 10;
+// Contract-only v11 -> v12 bump; schema remains v10.
+const PREVIOUS_CONTRACT_VERSION = 11;
 const PREVIOUS_SCHEMA_VERSION = 10;
 export const ROLE_IDS = ["project-orchestrator", "worker", "independent-reviewer"] as const;
 export const AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab" as const;
@@ -673,6 +673,7 @@ export const DERIVED_ACTOR_MUTATION_CLASSES = [
   "decision_create",
   "decision_disposition",
   "work_item_create",
+  "work_item_transition",
   "qualification_observation_record",
   "role_generation_succession",
   "migration_prepare",

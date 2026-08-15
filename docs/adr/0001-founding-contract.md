@@ -71,7 +71,7 @@ infrastructure, but they must not create duplicate authority concepts.
 | ExecutionAttempt | execution_attempt_id | One dispatch attempt under an Assignment, including BB server, thread, environment, host, native correlation IDs, actual profile, lifecycle and terminal evidence. Native references are unique in their BB server scope. |
 | Decision | decision_id | Immutable project, scope, class and options identity. A consult does not become an authority decision merely by existing. |
 | DecisionDisposition | decision_id, disposition_sequence | Append-only proposed, adopted, rejected, superseded or revoked disposition, with typed actor, conditions, reason and revert. Current state is derived. |
-| AuthorizedApprover | project_id, approver_id, authorizing_decision_id, authorizing_disposition_sequence | Durable active/revoked registry row for `orchestrator:bb-collab`, linked to the exact adopted `operator_only` Decision disposition and the nine ratified derived mutation classes. |
+| AuthorizedApprover | project_id, approver_id, authorizing_decision_id, authorizing_disposition_sequence | Durable active/revoked registry row for `orchestrator:bb-collab`, linked to the exact adopted `operator_only` Decision disposition and the ten ratified derived mutation classes. |
 | QualificationObservation | qualification_id | Immutable fixture-bound capability result for an exact executed-profile digest and observed BB/runtime/fixture context. |
 | EligibilityProjection | project_id, role_requirement_id, profile_digest | Rebuildable current eligibility with observation references, expiry and requalification trigger. |
 | EvidenceArtifact | evidence_id, content_digest where appropriate | Content-addressed review, test, consult, release, export, receipt or legacy artifact with durable location metadata. |
@@ -167,7 +167,7 @@ condition, and stale means an exact binding mismatch. The
 `github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
 reserve/finalize adapter paths are unsupported by this one-request gate and
 refuse before their adapters. For `bootstrap`, `config_revision`, `decision_create`,
-`decision_disposition`, `work_item_create`, `qualification_observation_record`,
+`decision_disposition`, `work_item_create`, `work_item_transition`, `qualification_observation_record`,
 `role_generation_succession`, `migration_prepare`, and `migration_step`, a confirmed
 operator receipt is atomically paired with a verified actor receipt whose `actor_kind` is
 `plugin`, whose `subject_id` is `bb-collab`, and whose durable
@@ -181,7 +181,7 @@ the `operator_only` Decision class and its `adopted` disposition; role-based and
 review Decisions remain role-bound. After the one-time adopted authorizing
 `operator_only` Decision registers `approverId=orchestrator:bb-collab`, the
 `approverAttestation` RPC validates the active registry row, exact authorizing
-Decision/disposition, caller plugin, exact current nine-class allowlist and exact request
+Decision/disposition, caller plugin, exact current ten-class allowlist and exact request
 binding, then atomically issues a fresh receipt plus the same verified plugin
 actor without `requestInput`. A later operator revocation or change marks the
 registry unusable; both registry and interim receipt retain the upstream
@@ -190,17 +190,19 @@ only at that boundary. This is
 not live cutover or source retirement.
 
 The historical contract-v9 eight-class registry was accepted only during the
-one-release v9-to-v10 re-adoption. Contract v11 retires that transitional
-allowlist: attestation requires the exact current nine-class row, while the
-former set and arbitrary other sets remain invalid.
+one-release v9-to-v10 re-adoption. Contract v11 then required the exact
+nine-class row. Contract v12 adds only `work_item_transition` and retires that
+prior row: attestation requires the exact current ten-class row, while the
+former sets and arbitrary other sets remain invalid.
 
-The contract v11/schema v10 role-capacity amendment is contract-only; schema
-migrations remain unchanged. `roleRequirements` admits at most three logical
+The contract v11/schema v10 role-capacity amendment remains contract-only.
+Contract v12/schema v10 adds only `work_item_transition` to the derived
+authorized-approver set; schema migrations remain unchanged. `roleRequirements` admits at most three logical
 roles: `project-orchestrator` is project-scoped, while `worker` and
 `independent-reviewer` require the exact repository target used by canonical
 WorkItem writes. Each requirement retains its explicit executed-profile
-qualification. The v10 receipt, approver, derived-actor and nine-class
-mutation bindings are unchanged; cached consumers reread v11 or refuse v10.
+qualification. The v10 receipt, approver, derived-actor and existing refusal
+bindings are unchanged; cached consumers reread v12 or refuse v11.
 
 ## 6. Roles, delegation and execution
 

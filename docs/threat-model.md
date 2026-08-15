@@ -24,18 +24,18 @@ project-scoped, while worker and independent-reviewer bind to an exact
 repository target. Each role requirement carries its executed-profile
 qualification; this adds no assignment or dispatch authority.
 
-The v11/schema v10 contract retains the v10 operator gate, which has a host/UI
+The v12/schema v10 contract retains the v10 operator gate, which has a host/UI
 confirmation boundary only for authorizing or revoking the approver. An adopted
 `operator_only` Decision
 registers `approverId=orchestrator:bb-collab` for the exact project and adopted
-disposition, with the nine ratified derived mutation classes, including
+disposition, with the ten ratified derived mutation classes, including
 `config_revision` for the existing canonical mutation that replaces the full
 immutable project configuration and its mapped targets, including
 `roleRequirements` provisioning,
-`work_item_create`, `qualification_observation_record`, and
+`work_item_create`, `work_item_transition`, `qualification_observation_record`, and
 `role_generation_succession`. The
 `approverAttestation` RPC validates that active registry row, exact Decision
-and disposition, caller plugin, exact current nine-class set and request
+and disposition, caller plugin, exact current ten-class set and request
 binding, then atomically
 issues a fresh interim receipt plus verified plugin actor with no pending UI
 interaction. Revocation or change marks the registry revoked and attestation
@@ -51,9 +51,9 @@ different receipt for an already-committed idempotency key, or any binding
 mismatch refuses before a write. It has no local TTL and retires only on the
 host-issued `get-bb/bb#1541` condition. The historical contract-v9 eight-class
 registry was accepted only during the one-release v9-to-v10 re-adoption.
-Contract v11 retires that transitional allowlist: attestation requires the
-exact current nine-class set, while the former set and arbitrary other class
-sets remain invalid. `github_issue_projection`,
+Contract v11 required the exact nine-class set; contract v12 adds only
+`work_item_transition` and requires the exact current ten-class set, while the
+former sets and arbitrary other class sets remain invalid. `github_issue_projection`,
 `assignment_dispatch`, and `assignment_reconcile` reserve/finalize paths
 refuse before external adapters because one receipt cannot authorize multiple
 writes. This seam is fixture-tested and does not claim live cutover.
@@ -115,7 +115,7 @@ The goals are:
 | Operator identity spoofing | Display name, checkout possession or thread ID is accepted as privileged actor | Hold privileged mutation until a proven BB-native authenticated receipt or explicit narrow operator decision exists. |
 | Interim receipt replay or phase splitting | One receipt authorizes a second mutation or a reserve/finalize adapter sequence | Exact one-request binding, atomic consumption, original-replay-only idempotency, and pre-adapter refusal for the three unsupported operations; OPERATOR_RECEIPT_REUSED, OPERATOR_RECEIPT_STALE or OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED. |
 | Derived actor standing identity | A plugin actor receipt is reused with another authorization or detached from its approver | Bootstrap-only atomic issuance, durable operator receipt linkage, exact linked-receipt check and host-issued retirement condition; ACTOR_RECEIPT_UNVERIFIED or OPERATOR_RECEIPT_STALE. |
-| Authorized approver spoof/revocation | An unregistered, foreign, changed or revoked approver attests a privileged mutation | Exact project/approver/Decision/disposition registry row, exact current nine-class allowlist, caller-plugin check and active-current disposition check; AUTHORIZED_APPROVER_UNKNOWN, AUTHORIZED_APPROVER_INVALID or AUTHORIZED_APPROVER_REVOKED. |
+| Authorized approver spoof/revocation | An unregistered, foreign, changed or revoked approver attests a privileged mutation | Exact project/approver/Decision/disposition registry row, exact current ten-class allowlist, caller-plugin check and active-current disposition check; AUTHORIZED_APPROVER_UNKNOWN, AUTHORIZED_APPROVER_INVALID or AUTHORIZED_APPROVER_REVOKED. |
 | Projection drift | External state is used to mutate canonical state for convenience | Projection is rebuildable; canonical state changes only through governed import/adoption. |
 
 ## Resolver invariants
