@@ -35,6 +35,7 @@ import {
   exportFoundation,
   persistBootstrapOperatorReceipt,
   persistInterimOperatorReceipt,
+  operatorAuthorizationDigestProjection,
   operatorRequestDigest,
   schemaDigest,
   sha256,
@@ -2040,6 +2041,75 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
+  it("uses one authorization digest for the amended approver disposition with live guards", async () => {
+    const reason = {
+      approverId: "orchestrator:bb-collab",
+      authorityBootstrapMaintenanceActs: ["approver_re_adoption", "authorized_approver_registry_maintenance", "approver_scope_updates"],
+      operationalMutationClasses: ["bootstrap", "decision_create", "decision_disposition", "migration_prepare", "migration_step"],
+      crownJewelHumanGate: "operator console approval remains required for authorizing, revoking, or changing this approver and its scope; no derived actor or standing approval bypasses that gate",
+      purpose: "operator-authorized standing operational approval",
+      retirementCondition: "host-issued receipt get-bb/bb#1541",
+    };
+    const guarded = {
+      projectId: "proj_a8zzfsx36j",
+      operationClass: "decision_disposition" as const,
+      candidateHead: "892cc01cea251f9943f0cfa963013b5f286bafa4",
+      idempotencyKey: "v8-authorized-approver-readopt-892cc01-amended-scope-v2",
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      expectedConfigRevision: 1,
+      configRevision: null,
+      expectedGovernanceEpoch: 4,
+      expectedFenceToken: "0bbaf55e88b7e3908923760d88fa05445722e5395c0e9284",
+      repoTargetId: null,
+      expectedResourceRevision: 2,
+      decisionId: "decision-bb-collab-authorized-approver",
+      disposition: "adopted" as const,
+      reason,
+    };
+    const omitted = { ...guarded, expectedConfigRevision: undefined, expectedGovernanceEpoch: undefined, expectedFenceToken: undefined };
+    const explicitNull = { ...omitted, expectedConfigRevision: null, expectedGovernanceEpoch: null, expectedFenceToken: null };
+    expect(operatorAuthorizationDigestProjection(guarded)).toMatchObject({ expectedConfigRevision: null, expectedGovernanceEpoch: null, expectedFenceToken: null });
+    expect(operatorRequestDigest(guarded)).toBe(operatorRequestDigest(omitted));
+    expect(operatorRequestDigest(omitted)).toBe(operatorRequestDigest(explicitNull));
+    expect(operatorRequestDigest(guarded)).toBe("72431ae86639a111e0692ae2c0a8f5d4b638784f7a4d1d980791112d9ffa9ff2");
+    expect(operatorRequestDigest({ ...guarded, reason: { ...reason, purpose: "different" } })).not.toBe(operatorRequestDigest(guarded));
+
+    const host = await loadedHost(guarded.projectId);
+    const { db } = seedAndBootstrap(host, guarded.projectId);
+    db.prepare(
+      `INSERT INTO project_governorships
+        (project_id, governance_epoch, runtime_id, state, fence_token, actor_receipt_id, predecessor_epoch, created_at_ms)
+       VALUES (?, 4, 'bb-collab', 'target_active', ?, ?, 1, 1)`,
+    ).run(guarded.projectId, guarded.expectedFenceToken, RECEIPT_ID);
+    db.prepare("UPDATE project_governorship_heads SET governance_epoch = 4, fence_token = ? WHERE project_id = ?").run(guarded.expectedFenceToken, guarded.projectId);
+    seedFixtureDecision(db, {
+      projectId: guarded.projectId,
+      decisionId: guarded.decisionId,
+      repoTargetId: null,
+      decisionClass: "operator_only",
+      options: { approverId: "orchestrator:bb-collab" },
+      resourceRevision: 2,
+    });
+    const issued = persistBootstrapOperatorReceipt(db, {
+      projectId: guarded.projectId,
+      mutationClass: guarded.operationClass,
+      candidateHead: guarded.candidateHead,
+      idempotencyKey: guarded.idempotencyKey,
+      requestDigest: operatorRequestDigest(guarded),
+      callerThreadId: "fixture-approver-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    }, 1);
+    const applied = applyAuthorizedMutation(db, {
+      ...guarded,
+      actorReceiptId: issued.actorReceiptId,
+      operatorReceiptId: issued.operatorReceipt.receiptId,
+    });
+    expect(applied).toMatchObject({ outcome: "OK", mutationReceipt: { requestDigest: "72431ae86639a111e0692ae2c0a8f5d4b638784f7a4d1d980791112d9ffa9ff2" } });
+    expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(issued.operatorReceipt.receiptId)).toMatchObject({ consumed_at_ms: expect.any(Number) });
+  });
+
   it("refuses receipt-bound adapter reserve/finalize operations before any adapter call", async () => {
     const host = await loadedHost();
     const db = host.bb.storage.database();
@@ -2241,7 +2311,7 @@ describe("bb-collab plugin boundary", () => {
 
   it("appends the v10 authorized approver registry and rolls every cached consumer forward", () => {
     expect(SCHEMA_VERSION).toBe(10);
-    expect(CONTRACT_VERSION).toBe(8);
+    expect(CONTRACT_VERSION).toBe(9);
     expect(MIGRATIONS).toHaveLength(23);
     expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("80bfe52641971b984358da6bdfb4aa00d87dd928e611325f23bbbb3a1afa5c7c");
     expect(MIGRATIONS.at(-5)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
@@ -2258,7 +2328,7 @@ describe("bb-collab plugin boundary", () => {
       "record_inventory", "record_quiescence", "freeze", "record_export", "record_import", "record_equivalence", "activate", "record_exercise", "retire", "rollback", "mark_fix_forward_required",
     ]);
     expect(cachedConsumerRolloutEvidence(9)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(10, 7)).toMatchObject({ oldContractVersion: 7, newContractVersion: 8, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(10, 8)).toMatchObject({ oldContractVersion: 8, newContractVersion: 9, action: "refused", expected: 4, attempted: 4, verified: 0 });
     expect(cachedConsumerRolloutEvidence(10)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "reread", expected: 4, attempted: 4, verified: 4 });
 
     const { db, directory } = directDatabase();
@@ -2373,7 +2443,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ contractVersion: 8, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ contractVersion: 9, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -5172,7 +5242,7 @@ describe("bb-collab plugin boundary", () => {
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
     expect(cachedConsumerRolloutEvidence(9)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(10, 7)).toMatchObject({ oldContractVersion: 7, newContractVersion: 8, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(10, 8)).toMatchObject({ oldContractVersion: 8, newContractVersion: 9, action: "refused", expected: 4, attempted: 4, verified: 0 });
     expect(cachedConsumerRolloutEvidence(10)).toMatchObject({ oldSchemaVersion: 9, newSchemaVersion: 10, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
