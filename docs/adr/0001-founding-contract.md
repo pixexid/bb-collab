@@ -207,14 +207,17 @@ tests.
 
 The contract v11/schema v10 role-capacity amendment remains contract-only.
 Contract v12/schema v10 adds only `work_item_transition` to the derived
-authorized-approver set; schema migrations remain unchanged. `roleRequirements` admits at most three logical
+authorized-approver set. Contract v13/schema v11 adds one nullable
+`role_generations.standby_profile_json` migration and requires a named,
+different-provider standby for new project-orchestrator generations; the
+standby has no authority or traffic. `roleRequirements` admits at most three logical
 roles: `project-orchestrator` is project-scoped, while `worker` and
 `independent-reviewer` require the exact repository target used by canonical
 WorkItem writes. Each requirement retains its explicit executed-profile
 qualification. The v10 receipt, approver, derived-actor and existing refusal
-bindings are unchanged; cached consumers reread v12 or refuse v11. The
-compatibility repair is an implementation correction for already-persisted
-v11 authority state, not a new schema or contract version.
+bindings are unchanged; cached consumers reread v13/schema v11 or refuse the
+previous versions. Existing generations remain readable without fabricated
+standby evidence.
 
 ## 6. Roles, delegation and execution
 
@@ -227,6 +230,9 @@ an exact holder ExecutionAttempt, valid project/environment/thread references,
 current qualification, and a valid monotonic predecessor relation. Role
 states are pending, active, draining, retired or invalidated. Leases,
 heartbeat expiry and automatic succession are reserved for post-v1.
+New project-orchestrator generations also carry one explicit standby profile;
+the provider must differ from the executed holder, and the standby is not an
+actor, authority, lease, assignment, dispatch target, or traffic recipient.
 
 Live RPC and CLI role mutations use the existing `RoleFactReader` seam backed by
 BB core thread, event, environment, project, host and version reads. The reader

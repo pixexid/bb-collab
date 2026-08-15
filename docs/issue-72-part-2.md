@@ -24,5 +24,6 @@ existing ratified, receipt-gated path and is not applied by the watcher.
 
 This is awareness only: it adds no role generation, assignment, dispatch,
 receipt, SQLite, console, or GitHub mutation, and it does not create or record
-the Part 1 standby seat. The standby belongs to the succession runbook and is
-needed only when a separate bounded succession seam is implemented.
+the Part 1 standby seat. The standby is recorded by the existing
+receipt-gated RoleGeneration succession path described in
+[the succession runbook](succession-runbook.md).

@@ -24,7 +24,7 @@ project-scoped, while worker and independent-reviewer bind to an exact
 repository target. Each role requirement carries its executed-profile
 qualification; this adds no assignment or dispatch authority.
 
-The v12/schema v10 contract retains the v10 operator gate, which has a host/UI
+The v13/schema v11 contract retains the v10 operator gate, which has a host/UI
 confirmation boundary only for authorizing or revoking the approver. An adopted
 `operator_only` Decision
 registers `approverId=orchestrator:bb-collab` for the exact project and adopted
@@ -57,8 +57,9 @@ mismatch refuses before a write. It has no local TTL and retires only on the
 host-issued `get-bb/bb#1541` condition. The historical contract-v9 eight-class
 registry was accepted only during the one-release v9-to-v10 re-adoption.
 Contract v11 required the exact nine-class set; contract v12 adds only
-`work_item_transition`. This v11 compatibility repair does not change
-contract/schema versions or digests, migrations, or cached-consumer rollout.
+`work_item_transition`. Contract v13 adds the canonical named standby profile
+for new project-orchestrator generations; it must use a different provider from
+the executed holder and has no authority or traffic.
 `github_issue_projection`,
 `assignment_dispatch`, and `assignment_reconcile` reserve/finalize paths
 refuse before external adapters because one receipt cannot authorize multiple

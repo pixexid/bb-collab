@@ -79,6 +79,14 @@ const ROLE_PROFILE = {
   visibility: "visible" as const,
 };
 const ROLE_PROFILE_DIGEST = sha256(canonicalJson(ROLE_PROFILE));
+const STANDBY_PROFILE = {
+  providerId: "luna",
+  model: "gpt-5.6-luna",
+  reasoningLevel: "high",
+  permissionMode: "full",
+  serviceTier: "default",
+  visibility: "visible" as const,
+};
 const BASE_SHA = "a".repeat(40);
 const CANDIDATE_SHA = "b".repeat(40);
 const H1_CANDIDATE_SHA = "c".repeat(40);
@@ -215,6 +223,7 @@ function successionRequest(fenceToken: string, overrides: Partial<ApplyRequest> 
       completionEventSeq: 4,
     },
     ...overrides,
+    standbyProfile: overrides.standbyProfile ?? ((overrides.roleId ?? "project-orchestrator") === "project-orchestrator" ? STANDBY_PROFILE : undefined),
   };
 }
 
@@ -2759,17 +2768,18 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("appends the v12 work-item transition contract and rolls every cached consumer forward", () => {
-    expect(SCHEMA_VERSION).toBe(10);
-    expect(CONTRACT_VERSION).toBe(12);
-    expect(MIGRATIONS).toHaveLength(23);
-    expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("80bfe52641971b984358da6bdfb4aa00d87dd928e611325f23bbbb3a1afa5c7c");
-    expect(MIGRATIONS.at(-5)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
-    expect(MIGRATIONS.at(-4)?.match(/CREATE TABLE/gu)).toHaveLength(1);
-    expect(MIGRATIONS.at(-4)).toContain("operator_receipts");
-    expect(MIGRATIONS.at(-3)).toContain("operator_receipt_id");
-    expect(MIGRATIONS.at(-2)).toContain("retirement_condition");
-    expect(MIGRATIONS.at(-1)).toContain("authorized_approvers");
+  it("appends the v13 RoleGeneration standby contract and rolls every cached consumer forward", () => {
+    expect(SCHEMA_VERSION).toBe(11);
+    expect(CONTRACT_VERSION).toBe(13);
+    expect(MIGRATIONS).toHaveLength(24);
+    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("6f9f8b91784b2834d061a68bfe99241f24a93e32e786822894871f601a2f86a7");
+    expect(MIGRATIONS.at(-6)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
+    expect(MIGRATIONS.at(-5)?.match(/CREATE TABLE/gu)).toHaveLength(1);
+    expect(MIGRATIONS.at(-5)).toContain("operator_receipts");
+    expect(MIGRATIONS.at(-4)).toContain("operator_receipt_id");
+    expect(MIGRATIONS.at(-3)).toContain("retirement_condition");
+    expect(MIGRATIONS.at(-2)).toContain("authorized_approvers");
+    expect(MIGRATIONS.at(-1)).toContain("standby_profile_json");
     expect(TABLES).toContain("migration_runs");
     expect(MIGRATION_STATES).toEqual([
       "prepared", "frozen", "exported", "imported", "equivalent", "target_active", "exercised", "retired", "rolled_back", "fix_forward_required",
@@ -2777,35 +2787,35 @@ describe("bb-collab plugin boundary", () => {
     expect(MIGRATION_STEPS).toEqual([
       "record_inventory", "record_quiescence", "freeze", "record_export", "record_import", "record_equivalence", "activate", "record_exercise", "retire", "rollback", "mark_fix_forward_required",
     ]);
-    expect(cachedConsumerRolloutEvidence(10, 11)).toMatchObject({
-      names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 10,
-      newSchemaVersion: 10,
-      oldContractVersion: 11,
-      newContractVersion: 12,
-      action: "refused",
-      expected: 4,
-      attempted: 4,
-      verified: 0,
-    });
-    expect(cachedConsumerRolloutEvidence(9, 12)).toMatchObject({
-      oldSchemaVersion: 10,
-      newSchemaVersion: 10,
-      observedSchemaVersion: 9,
-      oldContractVersion: 11,
-      newContractVersion: 12,
-      observedContractVersion: 12,
-      action: "refused",
-      expected: 4,
-      attempted: 4,
-      verified: 0,
-    });
     expect(cachedConsumerRolloutEvidence(10, 12)).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 10,
-      newSchemaVersion: 10,
-      oldContractVersion: 11,
-      newContractVersion: 12,
+      newSchemaVersion: 11,
+      oldContractVersion: 12,
+      newContractVersion: 13,
+      action: "refused",
+      expected: 4,
+      attempted: 4,
+      verified: 0,
+    });
+    expect(cachedConsumerRolloutEvidence(10, 13)).toMatchObject({
+      oldSchemaVersion: 10,
+      newSchemaVersion: 11,
+      observedSchemaVersion: 10,
+      oldContractVersion: 12,
+      newContractVersion: 13,
+      observedContractVersion: 13,
+      action: "refused",
+      expected: 4,
+      attempted: 4,
+      verified: 0,
+    });
+    expect(cachedConsumerRolloutEvidence(11, 13)).toMatchObject({
+      names: [...CACHED_CONSUMERS],
+      oldSchemaVersion: 10,
+      newSchemaVersion: 11,
+      oldContractVersion: 12,
+      newContractVersion: 13,
       action: "reread",
       expected: 4,
       attempted: 4,
@@ -2836,17 +2846,17 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("records the v12 allowlist compatibility repair without a contract or cache bump", () => {
-    expect(CONTRACT_VERSION).toBe(12);
-    expect(SCHEMA_VERSION).toBe(10);
-    expect(MIGRATIONS).toHaveLength(23);
-    expect(schemaDigest).toBe("6f9f8b91784b2834d061a68bfe99241f24a93e32e786822894871f601a2f86a7");
-    expect(contractDigest).toBe("88055921b003a07349c3c6dcf2786c52bdeaa7741e8c1d070ed4796e36ff8818");
+  it("records the v13 standby schema and cache bump evidence", () => {
+    expect(CONTRACT_VERSION).toBe(13);
+    expect(SCHEMA_VERSION).toBe(11);
+    expect(MIGRATIONS).toHaveLength(24);
+    expect(schemaDigest).toBe("5ee5cd12902e433825558c27b9a20d8bc2e86c5ffe018bf5b59e207d5d2d684e");
+    expect(contractDigest).toBe("99521c29739f3b6b2175f13159ef5a952888652d2fe448bd76a9df49c1891077");
     expect(cachedConsumerRolloutEvidence(SCHEMA_VERSION, CONTRACT_VERSION)).toMatchObject({
       oldSchemaVersion: 10,
-      newSchemaVersion: 10,
-      oldContractVersion: 11,
-      newContractVersion: 12,
+      newSchemaVersion: 11,
+      oldContractVersion: 12,
+      newContractVersion: 13,
       action: "reread",
       expected: CACHED_CONSUMERS.length,
       attempted: CACHED_CONSUMERS.length,
@@ -2942,7 +2952,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 10, schemaDigest, contractVersion: 12, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 11, schemaDigest, contractVersion: 13, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -4634,8 +4644,8 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 10, newSchemaVersion: 10, expected: 4, attempted: 4, verified: 4 },
-        schema: { version: 10 },
+        cachedConsumers: { oldSchemaVersion: 10, newSchemaVersion: 11, expected: 4, attempted: 4, verified: 4 },
+        schema: { version: 11 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -5274,6 +5284,59 @@ describe("bb-collab plugin boundary", () => {
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeProductionRefusal);
   });
 
+  it("records one exact orchestrator standby and refuses wrong-provider, foreign, stale, and replay paths without writes", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+    const request = successionRequest(fenceToken, { idempotencyKey: "standby-generation" });
+    const committed = applyWithFixtureReceipt(db, request, null, roleReader());
+    expect(committed).toMatchObject({ outcome: "OK", currentResourceRevision: 1, evidence: { standbyProfile: STANDBY_PROFILE } });
+    expect(db.prepare(
+      "SELECT project_id, role_id, generation, standby_profile_json FROM role_generations",
+    ).get()).toEqual({
+      project_id: PROJECT_ID,
+      role_id: "project-orchestrator",
+      generation: 1,
+      standby_profile_json: canonicalJson(STANDBY_PROFILE),
+    });
+    expect(applyWithFixtureReceipt(db, request, null, null)).toEqual(committed);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM role_generations").get()).toEqual({ count: 1 });
+
+    const beforeWrongProvider = exportFoundation(db, PROJECT_ID);
+    const wrongProvider = applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      idempotencyKey: "standby-wrong-provider",
+      standbyProfile: { ...STANDBY_PROFILE, providerId: ROLE_PROFILE.providerId },
+    }), null, roleReader());
+    expect(wrongProvider).toMatchObject({ outcome: "ROLE_STANDBY_INVALID", attempted: 0, verified: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeWrongProvider);
+
+    const missingStandby = applyWithFixtureReceipt(db, {
+      ...request,
+      idempotencyKey: "standby-missing",
+      standbyProfile: undefined,
+    }, null, roleReader());
+    expect(missingStandby).toMatchObject({ outcome: "ROLE_STANDBY_INVALID", attempted: 0, verified: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeWrongProvider);
+
+    const foreign = applyWithFixtureReceipt(
+      db,
+      { ...request, projectId: FOREIGN_PROJECT_ID, idempotencyKey: "standby-foreign" },
+      null,
+      roleReader((facts) => { facts.project.id = FOREIGN_PROJECT_ID; }),
+    );
+    expect(foreign).toMatchObject({ outcome: "ROLE_CONTEXT_FOREIGN", attempted: 0, verified: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeWrongProvider);
+
+    const stale = applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      idempotencyKey: "standby-stale",
+      expectedGeneration: 1,
+      predecessorGeneration: 1,
+      expectedConfigRevision: 2,
+    }), null, roleReader());
+    expect(stale).toMatchObject({ outcome: "PROJECT_CONFIG_STALE", attempted: 0, verified: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeWrongProvider);
+  });
+
   it("routes live RPC and CLI role facts into the existing qualification and succession resolvers", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -5489,14 +5552,23 @@ describe("bb-collab plugin boundary", () => {
     expect(applyWithFixtureReceipt(db, { ...workerQualification, idempotencyKey: "worker-wrong-context", qualificationId: "worker-wrong-context" }, null, workerWrongTargetContext).outcome).toBe("ROLE_CONTEXT_FOREIGN");
     expect(exportFoundation(db, PROJECT_ID)).toEqual(workerBefore);
     expect(applyWithFixtureReceipt(db, workerQualification, null, workerFacts).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+    const workerSuccession = successionRequest(fenceToken, {
       idempotencyKey: "worker-succession",
       repoTargetId: TARGET_ID,
       roleId: "worker",
       roleRequirementId: "worker-v1",
       qualificationId: "worker-qualification",
       roleContext: workerRoleContext,
-    }), null, workerFacts).outcome).toBe("OK");
+      standbyProfile: STANDBY_PROFILE,
+    });
+    const beforeWorkerStandbyRefusal = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, workerSuccession, null, workerFacts)).toMatchObject({
+      outcome: "ROLE_STANDBY_INVALID",
+      attempted: 0,
+      verified: 0,
+    });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeWorkerStandbyRefusal);
+    expect(applyWithFixtureReceipt(db, { ...workerSuccession, idempotencyKey: "worker-succession-valid", standbyProfile: undefined }, null, workerFacts).outcome).toBe("OK");
     expect(db.prepare("SELECT repo_target_id, status FROM role_generations WHERE role_id = 'worker'").get()).toEqual({
       repo_target_id: TARGET_ID,
       status: "active",
@@ -5795,7 +5867,7 @@ describe("bb-collab plugin boundary", () => {
     db.pragma("foreign_keys = OFF");
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
-    db.exec(MIGRATIONS.at(-7)!);
+    db.exec(MIGRATIONS.at(-8)!);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -5815,9 +5887,9 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(10, 11)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, oldContractVersion: 11, newContractVersion: 12, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(9, 12)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, observedSchemaVersion: 9, oldContractVersion: 11, newContractVersion: 12, observedContractVersion: 12, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(10, 12)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, oldContractVersion: 11, newContractVersion: 12, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(10, 12)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 11, oldContractVersion: 12, newContractVersion: 13, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(10, 13)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 11, observedSchemaVersion: 10, oldContractVersion: 12, newContractVersion: 13, observedContractVersion: 13, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(11, 13)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 11, oldContractVersion: 12, newContractVersion: 13, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {

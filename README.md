@@ -13,12 +13,14 @@ new-thread, search, navigation rows, and the footer.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through contract v12/schema v10: a
+The repository now contains the implemented foundation through contract v13/schema v11: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
 Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
-foundations. Production RPC/CLI apply require an exact one-request interim
+foundations. New project-orchestrator RoleGenerations carry one named
+receipt-gated standby profile with no authority or traffic; its provider must
+differ from the executed holder. Production RPC/CLI apply require an exact one-request interim
 operator receipt bound to project, operation, exact candidate head,
 idempotency key, and request digest; it is consumed atomically and invalid,
 stale, retired, mismatched, or reused receipts refuse before any write. The
@@ -63,6 +65,11 @@ the v10 receipt/approver bindings are unchanged. Contract v12 is a contract-only
 allowlist amendment that adds `work_item_transition`; schema and migrations remain
 unchanged, and the existing receipt, actor, config, governor and resource guards
 remain required.
+
+Contract v13 adds the schema-backed named standby profile for new
+project-orchestrator generations. The standby provider must differ from the
+executed holder and the standby has no authority or traffic; existing receipt,
+qualification, and succession guards remain unchanged.
 
 The historical contract-v9 eight-class registry was accepted only during the
 one-release v9-to-v10 re-adoption. Contract v11 required the exact nine-class

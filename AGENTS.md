@@ -1,9 +1,9 @@
 # bb-collab repository contract
 
-CONTRACT_VERSION: 12
+CONTRACT_VERSION: 13
 
 This repository contains the founding contract and the implemented foundation
-through contract v12/schema v10: a single SQLite store with migrations, resolver,
+through contract v13/schema v11: a single SQLite store with migrations, resolver,
 state-event and mutation-receipt, deterministic export, and read-only doctor
 seams, plus WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
 Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
@@ -73,10 +73,10 @@ Changing version text alone is not a migration. A zero-work result is not a
 successful apply unless zero expected work, zero attempted work and zero
 verified work are all proven.
 
-Contract v12/schema v10 requires all four cached consumers to reread the
+Contract v13/schema v11 requires all four cached consumers to reread the
 one-request receipt, authorized-approver registry/attestation,
 mutation/export/evidence, role IDs/scoping, and refusal contract or refuse
-contract v11/schema v10.
+contract v12/schema v10.
 An adopted operator_only Decision registers approverId=orchestrator:bb-collab
 with the exact ten derived mutation classes, including config_revision,
 work_item_create, work_item_transition and
