@@ -344,6 +344,25 @@ trigger ref, candidate or merge SHA and terminal conclusion. A green result
 from another repository or ref is not evidence. Cleanup is a separate action;
 thread archival is never an environment-destruction receipt.
 
+Issue #76 adds a process-only tiered review rule on these existing evidence
+surfaces:
+
+- Tier A covers authority/provenance, canonical DDL/lifecycle, operator
+  receipts/approval, spend, concurrency/atomicity, migration/cutover, and
+  review/release policy, including tracked runtime artifacts. It requires an
+  independent exact-head cold review before merge.
+- Tier B covers features/refactors with no Tier-A contact. Local verification
+  and CI permit merge; cold review runs post-merge in parallel, with a serious
+  confirmed defect taking the existing revert path.
+- Tier C covers documentation, mechanical edits, and additive tests. Local
+  verification and CI are sufficient.
+
+Every PR body declares `Review tier: A|B|C`; touched-surface derivation is
+checked by the existing Verify workflow and wrong-tiering is a review finding.
+The check is stateless and creates no canonical row, receipt, schema object,
+queue, or authority store. This amendment changes no contract/schema version,
+cached-consumer set, migration, or receipt binding, so no bump is owed.
+
 ## 8. Conformance and external projections
 
 bb-collab has one conformance surface with a read-only default and an explicit
@@ -564,6 +583,7 @@ The advisory verdict is adopted only through these dispositions:
 | Cutover protocol | Amend: shared CAS guard, source instrumentation, canaries, no-writer interval, equivalence and post-write fix-forward. |
 | Economic test | Amend: add read-only doctor, explicit apply/verify, zero-work proof and the four-hour executable target. |
 | Physical enforcement | Ratify the ceiling: only sanctioned canonical mutations are enforceable; raw BB/admin/Git/filesystem activity cannot be physically vetoed by this plugin. |
+| Tiered review policy | Amend: derive Tier A/B/C from touched surfaces; require PR tier declaration; make Tier-A cold review pre-merge, Tier-B cold review post-merge in parallel, and Tier-C local/CI-only, without adding canonical state. |
 
 ## 14. v1 required, reserved and cut
 

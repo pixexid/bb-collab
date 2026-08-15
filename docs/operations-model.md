@@ -1,8 +1,8 @@
 # Operations model
 
 This document describes the operator-ratified queue behavior for issues #61 and
-#77. Issue #77 is the bounded parallel-lanes slice and precedes #76 and feature
-work in the throughput directive.
+#77, and the tiered review policy for #76. Issue #77 is the bounded
+parallel-lanes slice; #76 keeps review from serializing unrelated lanes.
 It is an operations model, not a second authority store. Canonical work remains
 the existing WorkItem, Assignment, and ExecutionAttempt state; lane-watcher
 observes that state and native BB thread interactions.
@@ -27,6 +27,26 @@ current canonical ProjectConfigRevision and is never silently raised. Review
 and probe lanes are independently startable and never consume this writing cap.
 A deferred lane has `queueBlocked: false`. No assignment, attempt, WorkItem, or
 canonical event is rewritten to make this happen.
+
+## Tiered review policy
+
+Review tier is derived from the touched surface, not chosen for convenience.
+Every pull request body must contain exactly one declaration in the form
+`Review tier: A`, `Review tier: B`, or `Review tier: C`. The existing Verify
+workflow checks that declaration; a declaration below the derived tier is a
+review finding and does not become safe merely because CI is green.
+
+| Tier | Touched surface | Merge rule |
+| --- | --- | --- |
+| A | authority/provenance, canonical store DDL or lifecycle, operator receipts or approval, spend, concurrency or atomicity, migration or cutover, review/release policy, and tracked runtime artifacts | Independent cold review of the exact candidate head is mandatory before merge. The review may run beside other startable lanes, but this candidate does not merge until the review and CI gates pass. |
+| B | features or refactors with no Tier-A contact | Local verification and CI are sufficient to merge. Cold review runs post-merge in parallel; findings become follow-up work unless a confirmed serious defect requires revert. |
+| C | documentation, mechanical edits, and additive tests | Local verification and CI only; no cold review is required. |
+
+The tier check is a stateless validation of PR metadata and touched paths. It
+does not create queue state, authority, receipts, or a second review ledger.
+Tier-A review remains evidence bound to the existing exact candidate and
+ExecutionAttempt mechanisms. A Tier-B post-merge review must still name the
+merge SHA and use the existing serious-defect follow-up or revert path.
 
 The exact console approval resolves the same native interaction and the
 existing operator-receipt seam. The lane-watcher then observes the resolved
