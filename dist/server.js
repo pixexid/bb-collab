@@ -14821,8 +14821,21 @@ var DERIVED_ACTOR_MUTATION_CLASSES = [
   "migration_prepare",
   "migration_step"
 ];
+var PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES = [
+  "bootstrap",
+  "decision_create",
+  "decision_disposition",
+  "work_item_create",
+  "qualification_observation_record",
+  "role_generation_succession",
+  "migration_prepare",
+  "migration_step"
+];
 function isDerivedActorMutationClass(operationClass) {
   return DERIVED_ACTOR_MUTATION_CLASSES.includes(operationClass);
+}
+function isExactAuthorizedApproverMutationClassSet(value, expected) {
+  return canonicalJson(value) === canonicalJson(expected);
 }
 var contractDigest = sha256(canonicalJson({
   contractVersion: CONTRACT_VERSION,
@@ -15976,10 +15989,11 @@ function requireActiveAuthorizedApprover(db, input, transition) {
   } catch {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are malformed");
   }
-  if (canonicalJson(allowed) !== canonicalJson(DERIVED_ACTOR_MUTATION_CLASSES)) {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not the ratified set");
+  const allowedMutationClasses = isExactAuthorizedApproverMutationClassSet(allowed, DERIVED_ACTOR_MUTATION_CLASSES) ? DERIVED_ACTOR_MUTATION_CLASSES : isExactAuthorizedApproverMutationClassSet(allowed, PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES) ? PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES : null;
+  if (!allowedMutationClasses) {
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current or transitional v9 set");
   }
-  if (!DERIVED_ACTOR_MUTATION_CLASSES.includes(input.mutationClass)) {
+  if (!allowedMutationClasses.includes(input.mutationClass)) {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "mutation class is not authorized by the approver registry");
   }
   const decision = asRow(db.prepare(

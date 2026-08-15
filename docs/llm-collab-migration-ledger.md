@@ -376,3 +376,10 @@ host-issued `get-bb/bb#1541` condition; stale means an exact binding mismatch.
 reserve/finalize adapter operations refuse before the adapter because one
 receipt cannot authorize multiple writes. This report records those facts; it
 does not change them.
+
+For the one-release v9-to-v10 rollout only, an already-stored registry whose
+JSON is exactly the contract-v9 eight-class set may attest only those eight
+classes and never `config_revision`; an adopted same-Decision `seq+1`
+re-adoption atomically supersedes it with the current nine-class row. Arbitrary
+subsets or other class sets remain invalid, and the v9 set is retired after
+that live v10 re-adoption.

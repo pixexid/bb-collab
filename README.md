@@ -52,6 +52,13 @@ role_generation_succession, migration_prepare, and migration_step; role-based
 and review Decisions remain role-bound. The plugin has not been installed, reloaded, or activated against live
 project authority.
 
+For the one-release v9-to-v10 rollout only, an already-stored registry whose
+JSON is exactly the contract-v9 eight-class set may attest only those eight
+classes and never `config_revision`; an adopted same-Decision `seq+1`
+re-adoption atomically supersedes it with the current nine-class row. Arbitrary
+subsets or other class sets remain invalid, and the v9 set is retired after
+that live v10 re-adoption.
+
 The ratified evidence-only MigrationRun shape records the llm-collab fence
 `f988d9711d3778f751e4ec0e32ebbf7b0893c80f` at resource revision 4 and merged
 main `0686d34` as sorted, hashed, explicitly non-canonical source evidence.

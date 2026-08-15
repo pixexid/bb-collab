@@ -77,7 +77,12 @@ with the exact nine derived mutation classes, including config_revision,
 work_item_create and
 the two existing role mutation classes. Attestation has no requestInput
 interaction and atomically creates the same exact-bound receipt plus verified
-plugin actor; operator revocation/change marks the registry unusable.
+plugin actor; operator revocation/change marks the registry unusable. For the
+one-release v9-to-v10 rollout only, an already-stored exact v9 eight-class
+registry may attest only those eight classes, never config_revision, and an
+adopted same-Decision seq+1 re-adoption atomically supersedes it with the
+current nine-class row. Arbitrary subsets or other sets refuse; the v9 set is
+retired after live v10 re-adoption.
 
 ## Delegation and lane obligations
 

@@ -181,13 +181,21 @@ the `operator_only` Decision class and its `adopted` disposition; role-based and
 review Decisions remain role-bound. After the one-time adopted authorizing
 `operator_only` Decision registers `approverId=orchestrator:bb-collab`, the
 `approverAttestation` RPC validates the active registry row, exact authorizing
-Decision/disposition, caller plugin, nine-class allowlist and exact request
+Decision/disposition, caller plugin, current nine-class or exact transitional
+v9 allowlist and exact request
 binding, then atomically issues a fresh receipt plus the same verified plugin
 actor without `requestInput`. A later operator revocation or change marks the
 registry unusable; both registry and interim receipt retain the upstream
 host-issued `get-bb/bb#1541` retirement condition, and human confirmation remains
 only at that boundary. This is
 not live cutover or source retirement.
+
+For the one-release v9-to-v10 rollout only, an already-stored registry whose
+JSON is exactly the contract-v9 eight-class set may attest only those eight
+classes and never `config_revision`; an adopted same-Decision `seq+1`
+re-adoption atomically supersedes it with the current nine-class row. Arbitrary
+subsets or other class sets remain invalid, and the v9 set is retired after
+that live v10 re-adoption.
 
 ## 6. Roles, delegation and execution
 
