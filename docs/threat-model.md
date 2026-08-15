@@ -23,7 +23,9 @@ The v10/schema v10 operator gate has a host/UI confirmation boundary only for
 authorizing or revoking the approver. An adopted `operator_only` Decision
 registers `approverId=orchestrator:bb-collab` for the exact project and adopted
 disposition, with the nine ratified derived mutation classes, including
-`config_revision` for immutable `roleRequirements` provisioning,
+`config_revision` for the existing canonical mutation that replaces the full
+immutable project configuration and its mapped targets, including
+`roleRequirements` provisioning,
 `work_item_create`, `qualification_observation_record`, and
 `role_generation_succession`. The
 `approverAttestation` RPC validates that active registry row, exact Decision

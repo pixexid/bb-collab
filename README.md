@@ -29,7 +29,9 @@ confirmed bootstrap operator receipt atomically derives a verified
 derived actor is not standing authority and apply must provide the same linked
 operator receipt. An adopted `operator_only` Decision registers the exact
 `orchestrator:bb-collab` approver and nine ratified derived mutation classes,
-including `config_revision` for immutable `roleRequirements` provisioning,
+including `config_revision` for the existing canonical mutation that replaces
+the full immutable project configuration and its mapped targets, including
+`roleRequirements` provisioning,
 `work_item_create`, `qualification_observation_record`, and
 `role_generation_succession`;
 the `approverAttestation` RPC issues a fresh exact-bound receipt and verified
@@ -43,7 +45,8 @@ facts through the existing `RoleFactReader` seam before issuing
 foreign facts refuse before write.
 `github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
 reserve/finalize operations refuse before the adapter under this one-request
-seam. The derived actor path is limited to bootstrap, `config_revision`, operator_only Decision
+seam. The derived actor path is limited to bootstrap, `config_revision` for
+that full project-configuration/target replacement, operator_only Decision
 create/adopted disposition, work_item_create, qualification_observation_record,
 role_generation_succession, migration_prepare, and migration_step; role-based
 and review Decisions remain role-bound. The plugin has not been installed, reloaded, or activated against live

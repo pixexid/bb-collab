@@ -362,7 +362,9 @@ migration/first-adopter evidence is not yet complete. Candidate heads are
 exact lowercase 40-character bindings supplied by the caller, not observed
 Git/BB facts. The one-time authorizing `operator_only` Decision registers the
 `orchestrator:bb-collab` approver and its exact nine-class allowlist, including
-`config_revision` for immutable `roleRequirements` provisioning,
+`config_revision` for the existing canonical mutation that replaces the full
+immutable project configuration and its mapped targets, including
+`roleRequirements` provisioning,
 `work_item_create`, `qualification_observation_record`, and
 `role_generation_succession`; subsequent
 in-scope receipts use `approverAttestation` with zero pending interactions.
