@@ -45,10 +45,11 @@ The detailed 40-issue source disposition is in the
    enforce transitions and holds, and rebuild projection drift from canonical
    state. External issue/task state cannot activate work.
 
-7. **Role generations and qualification.** Implement manual orchestrator and
-   reviewer succession, holder ExecutionAttempt binding, executed-profile
-   digests, current eligibility, expiry and stale/retired-generation refusal.
-   Keep leases, heartbeat expiry and automatic failover deferred.
+7. **Role generations and qualification.** Implement manual
+   project-orchestrator, worker and independent-reviewer succession, holder
+   ExecutionAttempt binding, executed-profile digests, current eligibility,
+   expiry and stale/retired-generation refusal. Keep leases, heartbeat expiry
+   and automatic failover deferred.
 
 8. **Assignment and ExecutionAttempt.** Enforce one writer per lane and the
    project ceiling of two, exact branch/base/candidate semantics, frozen-brief

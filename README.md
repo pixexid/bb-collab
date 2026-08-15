@@ -13,7 +13,7 @@ new-thread, search, navigation rows, and the footer.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through contract v10/schema v10: a
+The repository now contains the implemented foundation through contract v11/schema v10: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
@@ -52,12 +52,16 @@ role_generation_succession, migration_prepare, and migration_step; role-based
 and review Decisions remain role-bound. The plugin has not been installed, reloaded, or activated against live
 project authority.
 
-For the one-release v9-to-v10 rollout only, an already-stored registry whose
-JSON is exactly the contract-v9 eight-class set may attest only those eight
-classes and never `config_revision`; an adopted same-Decision `seq+1`
-re-adoption atomically supersedes it with the current nine-class row. Arbitrary
-subsets or other class sets remain invalid, and the v9 set is retired after
-that live v10 re-adoption.
+Contract v11 is a contract-only role-capacity amendment: `roleRequirements`
+admits at most three logical roles. `project-orchestrator` is project-scoped;
+`worker` and `independent-reviewer` require the exact repository target used by
+canonical WorkItem writes. All three retain executed-profile qualification and
+the v10 receipt/approver bindings are unchanged.
+
+The historical contract-v9 eight-class registry was accepted only during the
+one-release v9-to-v10 re-adoption. Contract v11 retires that transitional
+allowlist: attestation requires the exact current nine-class row, while the
+former set and arbitrary other sets remain invalid.
 
 The ratified evidence-only MigrationRun shape records the llm-collab fence
 `f988d9711d3778f751e4ec0e32ebbf7b0893c80f` at resource revision 4 and merged
@@ -124,7 +128,8 @@ The first release is complete only when it can provide:
    versioned mutation resolver.
 5. A canonical WorkItem lifecycle and GitHub Issues as the first projection.
 6. Role generations, manual succession and the minimum qualification and
-   eligibility evidence needed for the orchestrator and reviewer roles.
+   eligibility evidence needed for the project-orchestrator, worker and
+   independent-reviewer roles.
 7. One sanctioned native BB assignment path with separate Assignment and
    ExecutionAttempt records, exact executed-profile receipts, isolated
    environments and terminal reports.

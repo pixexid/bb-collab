@@ -14163,8 +14163,11 @@ import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 10;
+var CONTRACT_VERSION = 11;
 var SCHEMA_VERSION = 10;
+var PREVIOUS_CONTRACT_VERSION = 10;
+var PREVIOUS_SCHEMA_VERSION = 10;
+var ROLE_IDS = ["project-orchestrator", "worker", "independent-reviewer"];
 var AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab";
 var AUTHORIZED_APPROVER_PROJECT_ID = "proj_a8zzfsx36j";
 var LLM_COLLAB_SOURCE_FENCE = "f988d9711d3778f751e4ec0e32ebbf7b0893c80f";
@@ -14744,14 +14747,14 @@ var MIGRATIONS = [
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var CACHED_CONSUMERS = ["server.rpcContract", "server.collabCli", "src/test-support", "tests/server.test"];
-function cachedConsumerRolloutEvidence(observedSchemaVersion, observedContractVersion = CONTRACT_VERSION) {
+function cachedConsumerRolloutEvidence(observedSchemaVersion, observedContractVersion) {
   const reread = observedSchemaVersion === SCHEMA_VERSION && observedContractVersion === CONTRACT_VERSION;
   const evidence = {
     names: [...CACHED_CONSUMERS],
-    oldSchemaVersion: 9,
+    oldSchemaVersion: PREVIOUS_SCHEMA_VERSION,
     newSchemaVersion: SCHEMA_VERSION,
     observedSchemaVersion,
-    oldContractVersion: 9,
+    oldContractVersion: PREVIOUS_CONTRACT_VERSION,
     newContractVersion: CONTRACT_VERSION,
     observedContractVersion,
     action: reread ? "reread" : "refused",
@@ -14821,16 +14824,6 @@ var DERIVED_ACTOR_MUTATION_CLASSES = [
   "migration_prepare",
   "migration_step"
 ];
-var PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES = [
-  "bootstrap",
-  "decision_create",
-  "decision_disposition",
-  "work_item_create",
-  "qualification_observation_record",
-  "role_generation_succession",
-  "migration_prepare",
-  "migration_step"
-];
 function isDerivedActorMutationClass(operationClass) {
   return DERIVED_ACTOR_MUTATION_CLASSES.includes(operationClass);
 }
@@ -14842,6 +14835,15 @@ var contractDigest = sha256(canonicalJson({
   operationClasses: ["migration_prepare", "migration_step"],
   migrationStates: MIGRATION_STATES,
   migrationSteps: MIGRATION_STEPS,
+  roleCapacityPolicy: {
+    roleIds: [...ROLE_IDS],
+    maxRequirements: ROLE_IDS.length,
+    scoping: {
+      "project-orchestrator": "project",
+      worker: "repository-target",
+      "independent-reviewer": "repository-target"
+    }
+  },
   operatorReceiptPolicy: {
     scope: "one_request",
     binding: ["projectId", "operationClass", "candidateHead", "idempotencyKey", "requestDigest"],
@@ -15111,7 +15113,6 @@ var githubIssuesConfigSchema = external_exports.object({
   }
 });
 var reviewPolicySchema = external_exports.object({ connectors: reviewConnectorsSchema }).strict();
-var ROLE_IDS = ["project-orchestrator", "independent-reviewer"];
 var roleIdSchema = external_exports.enum(ROLE_IDS);
 var executionProfileSchema = external_exports.object({
   providerId: id,
@@ -15130,6 +15131,9 @@ var roleRequirementSchema = external_exports.object({
   if (requirement.roleId === "project-orchestrator" && requirement.repoTargetId !== null) {
     ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "project-orchestrator must be project-scoped" });
   }
+  if (requirement.roleId === "worker" && requirement.repoTargetId === null) {
+    ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "worker requires an exact repository target" });
+  }
   if (requirement.roleId === "independent-reviewer" && requirement.repoTargetId === null) {
     ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "independent-reviewer requires an exact repository target" });
   }
@@ -15137,7 +15141,7 @@ var roleRequirementSchema = external_exports.object({
     ctx.addIssue({ code: "custom", path: ["executedProfile", "visibility"], message: "active role holders must be visible" });
   }
 });
-var roleRequirementsSchema = external_exports.array(roleRequirementSchema).max(2).superRefine((requirements, ctx) => {
+var roleRequirementsSchema = external_exports.array(roleRequirementSchema).max(ROLE_IDS.length).superRefine((requirements, ctx) => {
   const requirementIds = /* @__PURE__ */ new Set();
   const roleIds = /* @__PURE__ */ new Set();
   requirements.forEach((requirement, index) => {
@@ -15989,11 +15993,10 @@ function requireActiveAuthorizedApprover(db, input, transition) {
   } catch {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are malformed");
   }
-  const allowedMutationClasses = isExactAuthorizedApproverMutationClassSet(allowed, DERIVED_ACTOR_MUTATION_CLASSES) ? DERIVED_ACTOR_MUTATION_CLASSES : isExactAuthorizedApproverMutationClassSet(allowed, PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES) ? PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES : null;
-  if (!allowedMutationClasses) {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current or transitional v9 set");
+  if (!isExactAuthorizedApproverMutationClassSet(allowed, DERIVED_ACTOR_MUTATION_CLASSES)) {
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current set");
   }
-  if (!allowedMutationClasses.includes(input.mutationClass)) {
+  if (!DERIVED_ACTOR_MUTATION_CLASSES.includes(input.mutationClass)) {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "mutation class is not authorized by the approver registry");
   }
   const decision = asRow(db.prepare(
@@ -20589,7 +20592,7 @@ async function doctor(db, sdk, projectId) {
     );
     const unresolvedRoleHolders = roleGenerationHeads.filter((row) => row.holder_attempt_state !== "done" || !row.holder_native_receipt_digest).map((row) => ({ roleId: row.role_id, generation: row.current_generation, holderExecutionAttemptId: row.holder_execution_attempt_id, reason: "ROLE_HOLDER_UNRESOLVED" }));
     const decisionIntegrity = decisionDoctorEvidence(db, projectId);
-    const cachedConsumers = cachedConsumerRolloutEvidence(SCHEMA_VERSION);
+    const cachedConsumers = cachedConsumerRolloutEvidence(SCHEMA_VERSION, CONTRACT_VERSION);
     const expected = targets.length + 1;
     return result("OK", projectId, expected, expected, expected, {
       currentConfigRevision: configHead.config_revision,

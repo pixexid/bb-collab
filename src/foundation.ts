@@ -5,8 +5,12 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 10;
+export const CONTRACT_VERSION = 11;
 export const SCHEMA_VERSION = 10;
+// Contract-only v10 -> v11 bump; schema remains v10.
+const PREVIOUS_CONTRACT_VERSION = 10;
+const PREVIOUS_SCHEMA_VERSION = 10;
+export const ROLE_IDS = ["project-orchestrator", "worker", "independent-reviewer"] as const;
 export const AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab" as const;
 export const AUTHORIZED_APPROVER_PROJECT_ID = "proj_a8zzfsx36j" as const;
 export const LLM_COLLAB_SOURCE_FENCE = "f988d9711d3778f751e4ec0e32ebbf7b0893c80f" as const;
@@ -594,14 +598,14 @@ export const MIGRATIONS: string[] = [
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
 export const CACHED_CONSUMERS = ["server.rpcContract", "server.collabCli", "src/test-support", "tests/server.test"] as const;
 
-export function cachedConsumerRolloutEvidence(observedSchemaVersion: number, observedContractVersion = CONTRACT_VERSION) {
+export function cachedConsumerRolloutEvidence(observedSchemaVersion: number, observedContractVersion: number) {
   const reread = observedSchemaVersion === SCHEMA_VERSION && observedContractVersion === CONTRACT_VERSION;
   const evidence = {
     names: [...CACHED_CONSUMERS],
-    oldSchemaVersion: 9,
+    oldSchemaVersion: PREVIOUS_SCHEMA_VERSION,
     newSchemaVersion: SCHEMA_VERSION,
     observedSchemaVersion,
-    oldContractVersion: 9,
+    oldContractVersion: PREVIOUS_CONTRACT_VERSION,
     newContractVersion: CONTRACT_VERSION,
     observedContractVersion,
     action: reread ? "reread" : "refused",
@@ -674,17 +678,6 @@ export const DERIVED_ACTOR_MUTATION_CLASSES = [
   "migration_prepare",
   "migration_step",
 ] as const;
-/** Transitional v9 registry only; retired after the live v10 re-adoption. */
-export const PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES = [
-  "bootstrap",
-  "decision_create",
-  "decision_disposition",
-  "work_item_create",
-  "qualification_observation_record",
-  "role_generation_succession",
-  "migration_prepare",
-  "migration_step",
-] as const;
 export function isDerivedActorMutationClass(operationClass: string): boolean {
   return (DERIVED_ACTOR_MUTATION_CLASSES as readonly string[]).includes(operationClass);
 }
@@ -696,6 +689,15 @@ export const contractDigest = sha256(canonicalJson({
   operationClasses: ["migration_prepare", "migration_step"],
   migrationStates: MIGRATION_STATES,
   migrationSteps: MIGRATION_STEPS,
+  roleCapacityPolicy: {
+    roleIds: [...ROLE_IDS],
+    maxRequirements: ROLE_IDS.length,
+    scoping: {
+      "project-orchestrator": "project",
+      worker: "repository-target",
+      "independent-reviewer": "repository-target",
+    },
+  },
   operatorReceiptPolicy: {
     scope: "one_request",
     binding: ["projectId", "operationClass", "candidateHead", "idempotencyKey", "requestDigest"],
@@ -1032,7 +1034,6 @@ const githubIssuesConfigSchema = z
   });
 const reviewPolicySchema = z.object({ connectors: reviewConnectorsSchema }).strict();
 
-export const ROLE_IDS = ["project-orchestrator", "independent-reviewer"] as const;
 const roleIdSchema = z.enum(ROLE_IDS);
 const executionProfileSchema = z
   .object({
@@ -1056,6 +1057,9 @@ const roleRequirementSchema = z
     if (requirement.roleId === "project-orchestrator" && requirement.repoTargetId !== null) {
       ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "project-orchestrator must be project-scoped" });
     }
+    if (requirement.roleId === "worker" && requirement.repoTargetId === null) {
+      ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "worker requires an exact repository target" });
+    }
     if (requirement.roleId === "independent-reviewer" && requirement.repoTargetId === null) {
       ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "independent-reviewer requires an exact repository target" });
     }
@@ -1063,7 +1067,7 @@ const roleRequirementSchema = z
       ctx.addIssue({ code: "custom", path: ["executedProfile", "visibility"], message: "active role holders must be visible" });
     }
   });
-const roleRequirementsSchema = z.array(roleRequirementSchema).max(2).superRefine((requirements, ctx) => {
+const roleRequirementsSchema = z.array(roleRequirementSchema).max(ROLE_IDS.length).superRefine((requirements, ctx) => {
   const requirementIds = new Set<string>();
   const roleIds = new Set<string>();
   requirements.forEach((requirement, index) => {
@@ -2472,15 +2476,10 @@ function requireActiveAuthorizedApprover(
   } catch {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are malformed");
   }
-  const allowedMutationClasses = isExactAuthorizedApproverMutationClassSet(allowed, DERIVED_ACTOR_MUTATION_CLASSES)
-    ? DERIVED_ACTOR_MUTATION_CLASSES
-    : isExactAuthorizedApproverMutationClassSet(allowed, PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES)
-      ? PREVIOUS_V9_DERIVED_ACTOR_MUTATION_CLASSES
-      : null;
-  if (!allowedMutationClasses) {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current or transitional v9 set");
+  if (!isExactAuthorizedApproverMutationClassSet(allowed, DERIVED_ACTOR_MUTATION_CLASSES)) {
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current set");
   }
-  if (!(allowedMutationClasses as readonly string[]).includes(input.mutationClass)) {
+  if (!(DERIVED_ACTOR_MUTATION_CLASSES as readonly string[]).includes(input.mutationClass)) {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "mutation class is not authorized by the approver registry");
   }
   const decision = asRow<{ project_id: string; decision_class: string | null; options_json: string | null }>(db.prepare(
@@ -8114,7 +8113,7 @@ export async function doctor(
       .filter((row) => row.holder_attempt_state !== "done" || !row.holder_native_receipt_digest)
       .map((row) => ({ roleId: row.role_id, generation: row.current_generation, holderExecutionAttemptId: row.holder_execution_attempt_id, reason: "ROLE_HOLDER_UNRESOLVED" }));
     const decisionIntegrity = decisionDoctorEvidence(db, projectId);
-    const cachedConsumers = cachedConsumerRolloutEvidence(SCHEMA_VERSION);
+    const cachedConsumers = cachedConsumerRolloutEvidence(SCHEMA_VERSION, CONTRACT_VERSION);
     const expected = targets.length + 1;
     return result("OK", projectId, expected, expected, expected, {
       currentConfigRevision: configHead.config_revision,
