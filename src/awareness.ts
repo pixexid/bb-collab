@@ -4,8 +4,10 @@ import type { SqliteDatabase } from "./foundation.js";
 export const SUPERVISOR_THREAD_ID = "thr_b94i3csnme";
 export const DEFAULT_MAX_CONTINUATIONS = 3;
 export const OPERATOR_WAIT_FYI_THRESHOLD_MS = 15 * 60_000;
+export const WRONGFUL_IDLE_THRESHOLD_MS = 10 * 60_000;
+export const ORCHESTRATOR_ROLE_ID = "project-orchestrator" as const;
 
-const OPEN_ATTEMPT_STATES = new Set([
+export const OPEN_ATTEMPT_STATES: ReadonlySet<string> = new Set([
   "prepared",
   "armed",
   "content_delivered",
@@ -31,6 +33,31 @@ export interface LaneState {
 export interface OperatorWait {
   reason: "awaiting_operator";
   createdAtMs: number;
+}
+
+export interface RoleHolderState {
+  project_id: string;
+  role_id: string;
+  role_generation: number;
+  execution_attempt_id: string;
+  thread_id: string;
+}
+
+export interface RoleQueueScope {
+  projectId: string;
+  nextStartable: boolean;
+  queueHeadId: string | null;
+  deferredReason: OperatorWait["reason"] | null;
+}
+
+export interface RoleIdleView {
+  projectId: string;
+  roleId: string;
+  roleGeneration: number;
+  executionAttemptId: string;
+  threadId: string;
+  queueHeadId: string;
+  idleAgeMs: number;
 }
 
 export type LaneQueueState = "ready" | "running" | "deferred";
@@ -78,6 +105,20 @@ export interface OperatorWaitAlertPersistence {
   write(state: Record<string, true>): Promise<void>;
 }
 
+export interface RoleIdlePersistence {
+  read(): Promise<unknown>;
+  write(state: Record<string, RoleIdleRecord>): Promise<void>;
+}
+
+interface RoleIdleRecord {
+  steerCount: number;
+  failedSteers: number;
+  escalated: boolean;
+  idleSinceMs: number | null;
+  lastSteerAtMs: number | null;
+  awaitingSteerOutcome: boolean;
+}
+
 export interface ContinuationClaim {
   claimId: string;
   count: number;
@@ -100,7 +141,15 @@ export type LaneWatcherAlert = {
   lane: LaneView;
   count: number;
   max: number;
+} | {
+  kind: "wrongful_idle_fyi";
+  lane: null;
+  role: RoleIdleView;
+  count: 2;
+  max: 2;
 };
+
+type LaneAlertKind = "approval_required" | "limit_reached" | "restart_review" | "delivery_uncertain" | "operator_wait_fyi";
 
 function operatorWaitAlertState(input: unknown): Record<string, true> {
   if (!input || typeof input !== "object" || Array.isArray(input)) return {};
@@ -142,6 +191,97 @@ function createOperatorWaitAlertLedger(persistence?: OperatorWaitAlertPersistenc
       if (!state[key]) return;
       delete state[key];
       await save();
+    }),
+  };
+}
+
+function roleIdleState(input: unknown): Record<string, RoleIdleRecord> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  const state: Record<string, RoleIdleRecord> = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid role idle state");
+    const record = value as Record<string, unknown>;
+    const failedSteers = typeof record.failedSteers === "number" ? record.failedSteers : 0;
+    const idleSinceMs = typeof record.idleSinceMs === "number" && Number.isFinite(record.idleSinceMs) ? record.idleSinceMs : null;
+    const lastSteerAtMs = typeof record.lastSteerAtMs === "number" && Number.isFinite(record.lastSteerAtMs) ? record.lastSteerAtMs : null;
+    const awaitingSteerOutcome = record.awaitingSteerOutcome === true;
+    if (!Number.isInteger(record.steerCount) || (record.steerCount as number) < 0 || (record.steerCount as number) > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || (idleSinceMs !== null && idleSinceMs < 0) || (lastSteerAtMs !== null && lastSteerAtMs < 0) || typeof record.escalated !== "boolean") {
+      throw new Error("invalid role idle state");
+    }
+    state[key] = { steerCount: record.steerCount as number, failedSteers, escalated: record.escalated as boolean, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome };
+  }
+  return state;
+}
+
+function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
+  let state: Record<string, RoleIdleRecord> = {};
+  let loaded = false;
+  let queue = Promise.resolve();
+  const enqueue = <T>(work: () => Promise<T>): Promise<T> => {
+    const result = queue.then(work);
+    queue = result.then(() => undefined, () => undefined);
+    return result;
+  };
+  const load = async () => {
+    if (loaded) return;
+    state = roleIdleState(persistence ? await persistence.read() : null);
+    loaded = true;
+  };
+  const save = () => persistence?.write(structuredClone(state));
+
+  return {
+    recover: () => enqueue(async () => { await load(); }),
+    get: (key: string) => enqueue(async () => { await load(); return state[key] ?? null; }),
+    observeIdle: (key: string, idleSinceMs: number) => enqueue(async () => {
+      await load();
+      const record = state[key];
+      if (record?.idleSinceMs !== null && record?.idleSinceMs !== undefined) {
+        if (record.awaitingSteerOutcome) {
+          record.awaitingSteerOutcome = false;
+          record.idleSinceMs = idleSinceMs;
+          await save();
+        }
+        return { ...record };
+      }
+      state[key] = { ...(record ?? { steerCount: 0, failedSteers: 0, escalated: false, lastSteerAtMs: null, awaitingSteerOutcome: false }), idleSinceMs, awaitingSteerOutcome: false };
+      await save();
+      return { ...state[key] };
+    }),
+    preserveAfterSteerWake: (key: string) => enqueue(async () => {
+      await load();
+      const record = state[key];
+      return record?.awaitingSteerOutcome === true;
+    }),
+    recordSteer: (key: string, failed: boolean, steeredAtMs: number) => enqueue(async () => {
+      await load();
+      const record = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false };
+      record.steerCount = Math.min(2, record.steerCount + 1);
+      if (failed) record.failedSteers = Math.min(2, record.failedSteers + 1);
+      record.lastSteerAtMs = steeredAtMs;
+      record.awaitingSteerOutcome = !failed;
+      state[key] = record;
+      await save();
+      return { ...record };
+    }),
+    markEscalated: (key: string) => enqueue(async () => {
+      await load();
+      const record = state[key] ?? { steerCount: 2, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false };
+      if (record.escalated) return false;
+      record.escalated = true;
+      state[key] = record;
+      await save();
+      return true;
+    }),
+    clearPrefixExcept: (prefix: string, keepKey?: string) => enqueue(async () => {
+      await load();
+      let changed = false;
+      for (const key of Object.keys(state)) {
+        if (key.startsWith(prefix) && key !== keepKey) {
+          delete state[key];
+          changed = true;
+        }
+      }
+      if (changed) await save();
     }),
   };
 }
@@ -267,6 +407,7 @@ export interface WorkerObservation {
   archived: boolean;
   operatorWait?: OperatorWait | null;
   operatorWaitKnown?: boolean;
+  idleSinceMs?: number | null;
 }
 
 export function readLaneStates(db: SqliteDatabase): LaneState[] {
@@ -286,6 +427,29 @@ export function readLaneStates(db: SqliteDatabase): LaneState[] {
        ORDER BY assignments.created_at_ms, assignments.assignment_id`,
     )
     .all() as LaneState[];
+}
+
+export function readRoleHolderStates(db: SqliteDatabase): RoleHolderState[] {
+  return db
+    .prepare(
+      `SELECT attempts.project_id, attempts.role_id, attempts.role_generation,
+              attempts.execution_attempt_id, attempts.thread_id
+       FROM execution_attempts AS attempts
+       JOIN role_generation_heads AS heads
+         ON heads.project_id = attempts.project_id
+        AND heads.role_id = attempts.role_id
+        AND heads.current_generation = attempts.role_generation
+       JOIN role_generations AS generations
+         ON generations.project_id = attempts.project_id
+        AND generations.role_id = attempts.role_id
+        AND generations.generation = attempts.role_generation
+       WHERE attempts.origin = 'role_holder'
+         AND attempts.thread_id IS NOT NULL
+         AND attempts.role_id = '${ORCHESTRATOR_ROLE_ID}'
+         AND generations.status = 'active'
+       ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`,
+    )
+    .all() as RoleHolderState[];
 }
 
 export function openLaneViews(
@@ -334,6 +498,19 @@ export function openLaneViews(
   }));
 }
 
+export function roleQueueScopes(lanes: readonly LaneView[]): RoleQueueScope[] {
+  const projectIds = new Set(lanes.map((lane) => lane.projectId));
+  return [...projectIds].map((projectId) => {
+    const next = lanes.find((lane) => lane.projectId === projectId && lane.nextStartable);
+    return {
+      projectId,
+      nextStartable: next !== undefined,
+      queueHeadId: next?.executionAttemptId ?? null,
+      deferredReason: next?.deferredReason ?? null,
+    };
+  });
+}
+
 export function createLaneWatcher(options: {
   readLanes: () => LaneState[];
   steer: (lane: LaneView) => Promise<void>;
@@ -344,12 +521,24 @@ export function createLaneWatcher(options: {
   operatorWaitAlertPersistence?: OperatorWaitAlertPersistence;
   operatorWaitFyiThresholdMs?: number;
   readOperatorWait?: (threadId: string) => Promise<OperatorWait | null>;
+  readRoleHolders?: () => RoleHolderState[];
+  readRoleScopes?: () => Promise<RoleQueueScope[]> | RoleQueueScope[];
+  roleIdlePersistence?: RoleIdlePersistence;
+  roleIdleThresholdMs?: number;
+  steerRole?: (role: RoleIdleView) => Promise<void>;
+  onRoleSuccessionRequired?: (role: RoleIdleView) => void;
+  now?: () => number;
   maxContinuations?: number;
   onAlert?: (alert: LaneWatcherAlert) => void;
 }): LaneWatcher {
   const supervisorThreadId = options.supervisorThreadId ?? SUPERVISOR_THREAD_ID;
   const continuationLedger = options.continuationLedger ?? createContinuationLedger();
   const operatorWaitAlertLedger = createOperatorWaitAlertLedger(options.operatorWaitAlertPersistence);
+  const roleIdleLedger = createRoleIdleLedger(options.roleIdlePersistence);
+  const roleIdleThresholdMs = Number.isInteger(options.roleIdleThresholdMs) && (options.roleIdleThresholdMs ?? 0) >= 0
+    ? options.roleIdleThresholdMs as number
+    : WRONGFUL_IDLE_THRESHOLD_MS;
+  const now = options.now ?? Date.now;
   const operatorWaitFyiThresholdMs = Number.isInteger(options.operatorWaitFyiThresholdMs) && (options.operatorWaitFyiThresholdMs ?? 0) >= 0
     ? options.operatorWaitFyiThresholdMs as number
     : OPERATOR_WAIT_FYI_THRESHOLD_MS;
@@ -392,8 +581,110 @@ export function createLaneWatcher(options: {
     deferredAgeMs: operatorWait ? Math.max(0, now - operatorWait.createdAtMs) : null,
   });
 
-  const alert = (kind: LaneWatcherAlert["kind"], lane: LaneView, count: number, max: number) => {
+  const alert = (kind: LaneAlertKind, lane: LaneView, count: number, max: number) => {
     options.onAlert?.({ kind, lane, count, max });
+  };
+
+  const roleAlert = (role: RoleIdleView) => {
+    options.onAlert?.({ kind: "wrongful_idle_fyi", lane: null, role, count: 2, max: 2 });
+  };
+
+  const escalateRole = async (key: string, role: RoleIdleView) => {
+    if (!await roleIdleLedger.markEscalated(key)) return;
+    roleAlert(role);
+    options.onRoleSuccessionRequired?.(role);
+  };
+
+  const observeRoleNow = async (threadId?: string, suppliedScopes?: RoleQueueScope[]): Promise<void> => {
+    if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return;
+    let holders: RoleHolderState[];
+    try {
+      holders = options.readRoleHolders().filter((holder) =>
+        holder.role_id === ORCHESTRATOR_ROLE_ID && (!threadId || holder.thread_id === threadId));
+    } catch {
+      return;
+    }
+    if (holders.length === 0) return;
+
+    let scopes = suppliedScopes;
+    if (!scopes) {
+      try {
+        scopes = await options.readRoleScopes();
+      } catch {
+        return;
+      }
+    }
+
+    for (const holder of holders) {
+      const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
+      const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
+      let observation: WorkerObservation;
+      try {
+        observation = await options.readWorker(holder.thread_id);
+      } catch {
+        continue;
+      }
+      if (observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || !scope?.nextStartable || scope.deferredReason) {
+        await roleIdleLedger.clearPrefixExcept(prefix);
+        continue;
+      }
+
+      if (!scope.queueHeadId) {
+        await roleIdleLedger.clearPrefixExcept(prefix);
+        continue;
+      }
+      const key = `${prefix}${scope.queueHeadId}`;
+      await roleIdleLedger.clearPrefixExcept(prefix, key);
+      if (observation.status !== "idle") {
+        if (await roleIdleLedger.preserveAfterSteerWake(key)) continue;
+        await roleIdleLedger.clearPrefixExcept(prefix);
+        continue;
+      }
+      if (observation.idleSinceMs === null || observation.idleSinceMs === undefined || !Number.isFinite(observation.idleSinceMs)) {
+        await roleIdleLedger.clearPrefixExcept(prefix);
+        continue;
+      }
+      const currentNow = now();
+      const record = await roleIdleLedger.observeIdle(key, currentNow);
+      const idleAgeMs = Math.max(0, currentNow - (record.idleSinceMs ?? currentNow));
+      const steerAgeMs = record.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : Math.max(0, currentNow - record.lastSteerAtMs);
+      if (idleAgeMs < roleIdleThresholdMs) continue;
+      if (record?.escalated) continue;
+      if ((record?.steerCount ?? 0) >= 2) {
+        if (idleAgeMs >= roleIdleThresholdMs && steerAgeMs >= roleIdleThresholdMs) {
+          await escalateRole(key, {
+            projectId: holder.project_id,
+            roleId: holder.role_id,
+            roleGeneration: holder.role_generation,
+            executionAttemptId: holder.execution_attempt_id,
+            threadId: holder.thread_id,
+            queueHeadId: scope.queueHeadId,
+            idleAgeMs,
+          });
+        }
+        continue;
+      }
+      if (idleAgeMs < roleIdleThresholdMs || steerAgeMs < roleIdleThresholdMs) continue;
+
+      const role: RoleIdleView = {
+        projectId: holder.project_id,
+        roleId: holder.role_id,
+        roleGeneration: holder.role_generation,
+        executionAttemptId: holder.execution_attempt_id,
+        threadId: holder.thread_id,
+        queueHeadId: scope.queueHeadId,
+        idleAgeMs,
+      };
+      let failed = false;
+      try {
+        await options.steerRole(role);
+      } catch {
+        // A failed send is itself a failed steer; the second failure escalates once.
+        failed = true;
+      }
+      const updated = await roleIdleLedger.recordSteer(key, failed, currentNow);
+      if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, role);
+    }
   };
 
   const observeNow = async (
@@ -435,7 +726,7 @@ export function createLaneWatcher(options: {
       }
     }
 
-    const now = Date.now();
+    const currentNow = now();
     if (archived || status !== "idle" || (waiting && !operatorWait)) {
       for (const lane of candidates) {
         const key = laneKey(lane);
@@ -454,7 +745,7 @@ export function createLaneWatcher(options: {
 
       if (operatorWait) {
         coalesced.delete(key);
-        const view = viewFor(lane, status, now, operatorWait);
+        const view = viewFor(lane, status, currentNow, operatorWait);
         if (view.deferredAgeMs !== null && view.deferredAgeMs >= operatorWaitFyiThresholdMs && !(await operatorWaitAlertLedger.notified(key))) {
           await operatorWaitAlertLedger.mark(key);
           alert("operator_wait_fyi", view, 0, 0);
@@ -466,7 +757,7 @@ export function createLaneWatcher(options: {
       if (coalesced.has(key)) continue;
 
       coalesced.add(key);
-      const view = viewFor(lane, status, now, null);
+      const view = viewFor(lane, status, currentNow, null);
       const mode = continuationModeFor(lane.assignment_kind);
       if (mode === "tracking") continue;
       if (mode === "approval") {
@@ -499,7 +790,10 @@ export function createLaneWatcher(options: {
   return {
     observe(threadId, status, pendingExternalWait, archived, operatorWait) {
       if (threadId === supervisorThreadId) return Promise.resolve();
-      return enqueue(() => observeNow(threadId, status, pendingExternalWait, archived, operatorWait));
+      return enqueue(async () => {
+        await observeNow(threadId, status, pendingExternalWait, archived, operatorWait);
+        await observeRoleNow(threadId);
+      });
     },
     poll() {
       return enqueue(async () => {
@@ -530,12 +824,30 @@ export function createLaneWatcher(options: {
             observation.operatorWaitKnown,
           );
         }
+
+        if (options.readRoleHolders) {
+          const roleThreadIds = new Set(options.readRoleHolders()
+            .map((holder) => holder.thread_id)
+            .filter((threadId) => threadId !== supervisorThreadId));
+          let roleScopes: RoleQueueScope[] | null = null;
+          if (roleThreadIds.size > 0 && options.readRoleScopes) {
+            try {
+              roleScopes = await options.readRoleScopes();
+            } catch {
+              roleScopes = null;
+            }
+          }
+          if (roleScopes) {
+            for (const threadId of roleThreadIds) await observeRoleNow(threadId, roleScopes);
+          }
+        }
       });
     },
     recover() {
       return enqueue(async () => {
         await continuationLedger.recover();
         await operatorWaitAlertLedger.recover();
+        await roleIdleLedger.recover();
       });
     },
   };

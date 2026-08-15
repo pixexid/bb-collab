@@ -1323,7 +1323,7 @@ describe("bb-collab plugin boundary", () => {
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.interactions.list")).toHaveLength(0);
 
     const service = fixture.host.harness.behavior.runService("lane-watcher");
-    await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(2));
+    await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.get").length).toBeGreaterThanOrEqual(2));
     service.controller.abort();
     await service.done;
 
