@@ -35,11 +35,16 @@ immutable project configuration and its mapped targets, including
 `work_item_create`, `work_item_transition`, `qualification_observation_record`, and
 `role_generation_succession`. The
 `approverAttestation` RPC validates that active registry row, exact Decision
-and disposition, caller plugin, exact current ten-class set and request
-binding, then atomically
-issues a fresh interim receipt plus verified plugin actor with no pending UI
-interaction. Revocation or change marks the registry revoked and attestation
-fails closed. The receipt binds one exact project, operation class, lowercase
+and disposition, caller plugin, and request binding, then atomically issues a
+fresh interim receipt plus verified plugin actor with no pending UI interaction.
+The exact current ten-class set authorizes all current classes. For bump
+survival, an active exact historical v11 nine-class set authorizes only its
+nine members, including authority-maintenance `decision_create` and adopted
+`decision_disposition`; it does not authorize `work_item_transition`.
+Re-adoption revokes that row and installs the exact current ten-class set.
+Malformed, reordered, subset, extra, v9, and arbitrary other sets refuse at
+both attestation and apply. Revocation or change marks the registry revoked and
+attestation fails closed. The receipt binds one exact project, operation class, lowercase
 40-character candidate head, idempotency key and canonical normalized request
 digest. The shared authorization-digest projection normalizes omitted nullable
 fields to `null` and projects expected config/governor/fence guards to `null`;
@@ -52,8 +57,9 @@ mismatch refuses before a write. It has no local TTL and retires only on the
 host-issued `get-bb/bb#1541` condition. The historical contract-v9 eight-class
 registry was accepted only during the one-release v9-to-v10 re-adoption.
 Contract v11 required the exact nine-class set; contract v12 adds only
-`work_item_transition` and requires the exact current ten-class set, while the
-former sets and arbitrary other class sets remain invalid. `github_issue_projection`,
+`work_item_transition`. This v11 compatibility repair does not change
+contract/schema versions or digests, migrations, or cached-consumer rollout.
+`github_issue_projection`,
 `assignment_dispatch`, and `assignment_reconcile` reserve/finalize paths
 refuse before external adapters because one receipt cannot authorize multiple
 writes. This seam is fixture-tested and does not claim live cutover.

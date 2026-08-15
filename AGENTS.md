@@ -85,9 +85,16 @@ interaction and atomically creates the same exact-bound receipt plus verified
 plugin actor; operator revocation/change marks the registry unusable. The
 historical contract-v9 eight-class registry was accepted only during the
 one-release v9-to-v10 re-adoption. Contract v11 retires that transitional
-allowlist. Contract v12 retires the prior exact nine-class row: attestation
-requires the exact current ten-class row, while the former sets and arbitrary
-other sets refuse.
+allowlist. A live exact v11 nine-class row is a bounded bump-surviving
+compatibility state: it may attest and apply only the nine classes in the
+immutable historical v11 set, including decision_create and
+decision_disposition for authority-maintenance re-adoption; work_item_transition
+still refuses. Re-adoption installs a new exact current ten-class row, after
+which all ten current classes are accepted. Malformed, reordered, subset,
+extra, v9, or other arbitrary sets refuse at attestation and apply. This is a
+compatibility repair, not a contract change: CONTRACT_VERSION, SCHEMA_VERSION,
+contractDigest, schemaDigest, and the cached-consumer rollout remain
+unchanged and are asserted by tests.
 
 ## Delegation and lane obligations
 

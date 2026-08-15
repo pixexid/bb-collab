@@ -395,6 +395,11 @@ representation gap without claiming a live config or first-adopter write.
 
 The historical contract-v9 eight-class registry was accepted only during the
 one-release v9-to-v10 re-adoption. Contract v11 required the exact nine-class
-row; contract v12 adds only `work_item_transition` and requires the exact
-current ten-class row, while the former sets and arbitrary other sets remain
-invalid.
+row; contract v12 adds only `work_item_transition`. Its compatibility repair
+keeps an active exact v11 row usable only for those nine historical classes,
+including authority-maintenance `decision_create` and adopted
+`decision_disposition`; `work_item_transition` refuses until re-adoption
+installs the exact current ten-class row. Malformed, reordered, subset, extra,
+v9, and arbitrary other sets remain invalid. No contract/cache bump is owed:
+contract/schema versions and digests, migrations, and cached-consumer rollout
+remain unchanged, with fixture proof in the current test matrix.

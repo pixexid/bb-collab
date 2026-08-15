@@ -54,6 +54,15 @@ itself. This is an operations-model scope extension only; canonical activation
 still awaits the one exact v8 console approval bound to the project,
 operation, candidate head, idempotency key, and request digest.
 
+Authority-maintenance re-adoption has no human form. An active exact v11
+nine-class registry may attest and apply only its historical nine classes,
+including `decision_create` and adopted `decision_disposition`; the v12-only
+`work_item_transition` class refuses until re-adoption installs the exact
+current ten-class registry. The registry check is exact and order-sensitive:
+malformed, reordered, subset, extra, v9, and arbitrary sets refuse before any
+receipt or canonical write. This is a v12 compatibility repair, so contract,
+schema, digests, migrations, and cached-consumer rollout are unchanged.
+
 The approved default profile for non-visual queue and documentation engineering
 is `codex/gpt-5.6-luna`. An independent cold review is routed later to
 `claude-code/opus`; that review is evidence, not authority.

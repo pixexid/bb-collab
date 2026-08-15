@@ -23,6 +23,7 @@ import {
   MIGRATIONS,
   MIGRATION_STATES,
   MIGRATION_STEPS,
+  PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES,
   PLUGIN_ID,
   SCHEMA_VERSION,
   TABLES,
@@ -1924,7 +1925,7 @@ describe("bb-collab plugin boundary", () => {
     expect(revoked).toMatchObject({ outcome: "AUTHORIZED_APPROVER_REVOKED" });
   });
 
-  it("refuses retired v9/v11 approver registries under contract v12", async () => {
+  it("survives the v12 approver bump through exact v11 re-adoption", async () => {
     const { host, db, fenceToken } = await assignmentFixture();
     seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "compat-operator", actorKind: "operator", subjectId: "operator-1" });
     const decisionId = "compat-operator";
@@ -1947,101 +1948,163 @@ describe("bb-collab plugin boundary", () => {
       idempotencyKey: `${decisionId}-seq1`,
     }))).toMatchObject({ outcome: "OK" });
 
-    const retiredV9Json = canonicalJson([
-      "bootstrap",
-      "decision_create",
-      "decision_disposition",
-      "work_item_create",
-      "qualification_observation_record",
-      "role_generation_succession",
-      "migration_prepare",
-      "migration_step",
-    ]);
-    const retiredV11Json = canonicalJson([
-      "bootstrap",
-      "config_revision",
-      "decision_create",
-      "decision_disposition",
-      "work_item_create",
-      "qualification_observation_record",
-      "role_generation_succession",
-      "migration_prepare",
-      "migration_step",
-    ]);
-    db.prepare(
+    const previousJson = canonicalJson(PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES);
+    const currentJson = canonicalJson(DERIVED_ACTOR_MUTATION_CLASSES);
+    const setRegistry = (allowedMutationClassesJson: string) => db.prepare(
       `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
        WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = 1`,
-    ).run(retiredV9Json, PROJECT_ID, AUTHORIZED_APPROVER_ID, decisionId);
-    expect(db.prepare("SELECT status, allowed_mutation_classes_json FROM authorized_approvers WHERE authorizing_decision_id = ?").get(decisionId)).toEqual({
+    ).run(allowedMutationClassesJson, PROJECT_ID, AUTHORIZED_APPROVER_ID, decisionId);
+    const activeRegistry = () => db.prepare(
+      `SELECT authorizing_decision_id, authorizing_disposition_sequence, status, allowed_mutation_classes_json
+       FROM authorized_approvers WHERE project_id = ? AND approver_id = ? ORDER BY authorizing_decision_id`,
+    ).all(PROJECT_ID, AUTHORIZED_APPROVER_ID);
+    setRegistry(previousJson);
+    expect(Object.isFrozen(PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES)).toBe(true);
+    expect(activeRegistry()).toEqual([{
+      authorizing_decision_id: decisionId,
+      authorizing_disposition_sequence: 1,
       status: "active",
-      allowed_mutation_classes_json: retiredV9Json,
-    });
+      allowed_mutation_classes_json: previousJson,
+    }]);
 
-    const currentJson = canonicalJson(DERIVED_ACTOR_MUTATION_CLASSES);
-    const attest = async (attestedRequest: ApplyRequest, mutationClass: "decision_create" | "work_item_transition" | "governor_claim") => host.harness.callRpc("approverAttestation", {
-      projectId: PROJECT_ID,
+    const attest = async (
+      attestedRequest: ApplyRequest,
+      mutationClass: ApplyRequest["operationClass"] = attestedRequest.operationClass,
+      authorizingDecisionId = decisionId,
+      authorizingDispositionSequence = 1,
+    ) => host.harness.callRpc("approverAttestation", {
+      projectId: attestedRequest.projectId,
       mutationClass,
-      candidateHead: CANDIDATE_SHA,
+      candidateHead: attestedRequest.candidateHead ?? CANDIDATE_SHA,
       idempotencyKey: attestedRequest.idempotencyKey,
       requestDigest: operatorRequestDigest(attestedRequest),
       callerThreadId: "v12-approver-matrix-attestor",
       requestedFromBackground: false,
       approverId: AUTHORIZED_APPROVER_ID,
-      authorizingDecisionId: decisionId,
-      authorizingDispositionSequence: 1,
+      authorizingDecisionId,
+      authorizingDispositionSequence,
     }) as Promise<FoundationResult>;
 
-    const request = decisionCreateRequest(fenceToken, "compat-retired", {
+    const readoptCreate = decisionCreateRequest(fenceToken, "compat-v12-readopt", {
       actorReceiptId: null,
       operatorReceiptId: null,
       candidateHead: CANDIDATE_SHA,
       repoTargetId: null,
       decision: {
-        decisionId: "compat-retired",
+        decisionId: "compat-v12-readopt",
         repoTargetId: null,
-        scope: { projectId: PROJECT_ID, purpose: "retired-v9" },
+        scope: { projectId: PROJECT_ID, purpose: "v12-authority-maintenance-re-adoption" },
         decisionClass: "operator_only",
         options: { approverId: AUTHORIZED_APPROVER_ID },
         resourceRevision: 1,
       },
     });
-    const before = exportFoundation(db, PROJECT_ID);
-    expect(await host.harness.callRpc("approverAttestation", {
-      projectId: PROJECT_ID,
-      mutationClass: request.operationClass,
-      candidateHead: CANDIDATE_SHA,
-      idempotencyKey: request.idempotencyKey,
-      requestDigest: operatorRequestDigest(request),
-      callerThreadId: "v12-retired-v9-attestor",
-      requestedFromBackground: false,
-      approverId: AUTHORIZED_APPROVER_ID,
-      authorizingDecisionId: decisionId,
-      authorizingDispositionSequence: 1,
-    }) as FoundationResult).toMatchObject({ outcome: "AUTHORIZED_APPROVER_INVALID" });
-    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
-    expect(db.prepare("SELECT status, allowed_mutation_classes_json FROM authorized_approvers WHERE authorizing_decision_id = ?").get(decisionId)).toEqual({
-      status: "active",
-      allowed_mutation_classes_json: retiredV9Json,
-    });
+    const pendingBeforeReAdoption = host.harness.inspection.pendingInteractions.length;
+    const readoptCreateIssue = await attest(readoptCreate);
+    expect(readoptCreateIssue).toMatchObject({ outcome: "OK", actorReceiptId: expect.any(String) });
+    expect(host.harness.inspection.pendingInteractions).toHaveLength(pendingBeforeReAdoption);
+    expect(await host.harness.callRpc("apply", {
+      ...readoptCreate,
+      actorReceiptId: readoptCreateIssue.actorReceiptId,
+      operatorReceiptId: readoptCreateIssue.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "OK" });
 
-    db.prepare(
-      `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
-       WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = 1`,
-    ).run(retiredV11Json, PROJECT_ID, AUTHORIZED_APPROVER_ID, decisionId);
     const transition = transitionRequest(fenceToken, "ready", 1, {
+      workItemId: WORK_ITEM_ID,
       idempotencyKey: "compat-v11-transition",
       actorReceiptId: null,
       operatorReceiptId: null,
       candidateHead: CANDIDATE_SHA,
     });
-    const beforeRetiredV11 = exportFoundation(db, PROJECT_ID);
+    const beforeOldNewClass = exportFoundation(db, PROJECT_ID);
     expect(await attest(transition, "work_item_transition")).toMatchObject({ outcome: "AUTHORIZED_APPROVER_INVALID" });
-    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRetiredV11);
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeOldNewClass);
 
+    const readoptDisposition = decisionDispositionRequest(fenceToken, "compat-v12-readopt", 1, {
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      candidateHead: CANDIDATE_SHA,
+      repoTargetId: null,
+      idempotencyKey: "compat-v12-readopt-adopted",
+    });
+    const readoptDispositionIssue = await attest(readoptDisposition, "decision_disposition");
+    expect(readoptDispositionIssue).toMatchObject({ outcome: "OK", actorReceiptId: expect.any(String) });
+
+    const beforeForeignApply = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", {
+      ...readoptDisposition,
+      projectId: FOREIGN_PROJECT_ID,
+      actorReceiptId: readoptDispositionIssue.actorReceiptId,
+      operatorReceiptId: readoptDispositionIssue.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "OPERATOR_RECEIPT_FOREIGN" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeForeignApply);
+
+    setRegistry(canonicalJson([...PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES].reverse()));
+    const beforeTamperedApply = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", {
+      ...readoptDisposition,
+      actorReceiptId: readoptDispositionIssue.actorReceiptId,
+      operatorReceiptId: readoptDispositionIssue.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "AUTHORIZED_APPROVER_INVALID" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeTamperedApply);
+    expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(readoptDispositionIssue.operatorReceipt!.receiptId)).toEqual({ consumed_at_ms: null });
+    setRegistry(previousJson);
+
+    expect(await host.harness.callRpc("apply", {
+      ...readoptDisposition,
+      actorReceiptId: readoptDispositionIssue.actorReceiptId,
+      operatorReceiptId: readoptDispositionIssue.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "OK" });
+    expect(activeRegistry()).toEqual([
+      {
+        authorizing_decision_id: decisionId,
+        authorizing_disposition_sequence: 1,
+        status: "revoked",
+        allowed_mutation_classes_json: previousJson,
+      },
+      {
+        authorizing_decision_id: "compat-v12-readopt",
+        authorizing_disposition_sequence: 1,
+        status: "active",
+        allowed_mutation_classes_json: currentJson,
+      },
+    ]);
+
+    const beforeReuse = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", {
+      ...readoptDisposition,
+      idempotencyKey: "compat-v12-readopt-reuse",
+      actorReceiptId: readoptDispositionIssue.actorReceiptId,
+      operatorReceiptId: readoptDispositionIssue.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "OPERATOR_RECEIPT_REUSED" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeReuse);
+
+    const currentRequest = (mutationClass: ApplyRequest["operationClass"], idempotencyKey: string): ApplyRequest => ({
+      projectId: PROJECT_ID,
+      operationClass: mutationClass,
+      idempotencyKey,
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      candidateHead: CANDIDATE_SHA,
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fenceToken,
+    });
     const invalidSets: Array<[string, string]> = [
-      ["malformed", canonicalJson({ classes: DERIVED_ACTOR_MUTATION_CLASSES })],
+      ["malformed", "{not-json"],
+      ["object", canonicalJson({ classes: DERIVED_ACTOR_MUTATION_CLASSES })],
+      ["v9", canonicalJson([
+        "bootstrap",
+        "decision_create",
+        "decision_disposition",
+        "work_item_create",
+        "qualification_observation_record",
+        "role_generation_succession",
+        "migration_prepare",
+        "migration_step",
+      ])],
       ["extra", canonicalJson([...DERIVED_ACTOR_MUTATION_CLASSES, "governor_claim"])],
-      ["missing", canonicalJson(DERIVED_ACTOR_MUTATION_CLASSES.slice(0, -1))],
+      ["subset", canonicalJson(DERIVED_ACTOR_MUTATION_CLASSES.slice(0, -1))],
       ["reordered", canonicalJson([
         DERIVED_ACTOR_MUTATION_CLASSES[1]!,
         DERIVED_ACTOR_MUTATION_CLASSES[0]!,
@@ -2049,23 +2112,30 @@ describe("bb-collab plugin boundary", () => {
       ])],
     ];
     for (const [label, classSetJson] of invalidSets) {
-      db.prepare(
-        `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
-         WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = 1`,
-      ).run(classSetJson, PROJECT_ID, AUTHORIZED_APPROVER_ID, decisionId);
+      if (label === "malformed") db.pragma("ignore_check_constraints = ON");
+      try {
+        db.prepare(
+          `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
+           WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = 'compat-v12-readopt' AND authorizing_disposition_sequence = 1`,
+        ).run(classSetJson, PROJECT_ID, AUTHORIZED_APPROVER_ID);
+      } finally {
+        if (label === "malformed") db.pragma("ignore_check_constraints = OFF");
+      }
+      const invalidRequest = currentRequest("decision_create", `compat-invalid-${label}`);
       const beforeInvalid = exportFoundation(db, PROJECT_ID);
-      expect(await attest({ ...request, idempotencyKey: `compat-invalid-${label}` }, "decision_create")).toMatchObject({ outcome: "AUTHORIZED_APPROVER_INVALID" });
+      expect(await attest(invalidRequest, "decision_create", "compat-v12-readopt")).toMatchObject({ outcome: "AUTHORIZED_APPROVER_INVALID" });
       expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeInvalid);
     }
     db.prepare(
       `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
-       WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = 1`,
-    ).run(currentJson, PROJECT_ID, AUTHORIZED_APPROVER_ID, decisionId);
-    const currentTransition = await attest(transition, "work_item_transition") as FoundationResult;
-    expect(currentTransition).toMatchObject({ outcome: "OK", operatorReceipt: { mutationClass: "work_item_transition" }, actorReceiptId: expect.any(String) });
-    const beforeUnauthorized = exportFoundation(db, PROJECT_ID);
-    expect(await attest({ ...request, idempotencyKey: "compat-unauthorized-class" }, "governor_claim")).toMatchObject({ outcome: "AUTHORIZED_APPROVER_INVALID" });
-    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeUnauthorized);
+       WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = 'compat-v12-readopt' AND authorizing_disposition_sequence = 1`,
+    ).run(currentJson, PROJECT_ID, AUTHORIZED_APPROVER_ID);
+
+    for (const mutationClass of DERIVED_ACTOR_MUTATION_CLASSES) {
+      const currentIssue = await attest(currentRequest(mutationClass, `compat-current-${mutationClass}`), mutationClass, "compat-v12-readopt");
+      expect(currentIssue).toMatchObject({ outcome: "OK", actorReceiptId: expect.any(String), operatorReceipt: { mutationClass } });
+    }
+    expect(host.harness.inspection.pendingInteractions).toHaveLength(pendingBeforeReAdoption);
   });
 
   it("authorizes config revisions carrying roleRequirements and refuses before write on mismatches", async () => {
@@ -2764,6 +2834,24 @@ describe("bb-collab plugin boundary", () => {
       db.close();
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  it("records the v12 allowlist compatibility repair without a contract or cache bump", () => {
+    expect(CONTRACT_VERSION).toBe(12);
+    expect(SCHEMA_VERSION).toBe(10);
+    expect(MIGRATIONS).toHaveLength(23);
+    expect(schemaDigest).toBe("6f9f8b91784b2834d061a68bfe99241f24a93e32e786822894871f601a2f86a7");
+    expect(contractDigest).toBe("88055921b003a07349c3c6dcf2786c52bdeaa7741e8c1d070ed4796e36ff8818");
+    expect(cachedConsumerRolloutEvidence(SCHEMA_VERSION, CONTRACT_VERSION)).toMatchObject({
+      oldSchemaVersion: 10,
+      newSchemaVersion: 10,
+      oldContractVersion: 11,
+      newContractVersion: 12,
+      action: "reread",
+      expected: CACHED_CONSUMERS.length,
+      attempted: CACHED_CONSUMERS.length,
+      verified: CACHED_CONSUMERS.length,
+    });
   });
 
   it("prepares one sanctioned run, binds adopted authority, and enforces open/final identities", () => {
