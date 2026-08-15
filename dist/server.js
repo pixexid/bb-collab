@@ -13969,13 +13969,14 @@ function openLaneViews(db, now2 = Date.now(), operatorWaits = /* @__PURE__ */ ne
       deferredAgeMs: operatorWait ? Math.max(0, now2 - operatorWait.createdAtMs) : null
     };
   });
-  const next = lanes.find(
-    (lane) => lane.queueState === "ready" && (lane.attemptState === "prepared" || lane.attemptState === "armed") && !lane.deferredReason
-  );
+  const nextByProject = /* @__PURE__ */ new Map();
+  for (const lane of lanes) {
+    if (lane.queueState === "ready" && (lane.attemptState === "prepared" || lane.attemptState === "armed") && !lane.deferredReason && !nextByProject.has(lane.projectId)) nextByProject.set(lane.projectId, lane.executionAttemptId);
+  }
   return lanes.map((lane) => ({
     ...lane,
-    queueBlocked: lane.queueState === "ready" && (lane.attemptState === "prepared" || lane.attemptState === "armed") && lane !== next,
-    nextStartable: lane === next
+    queueBlocked: lane.queueState === "ready" && (lane.attemptState === "prepared" || lane.attemptState === "armed") && nextByProject.get(lane.projectId) !== lane.executionAttemptId,
+    nextStartable: nextByProject.get(lane.projectId) === lane.executionAttemptId
   }));
 }
 function createLaneWatcher(options) {
@@ -14018,7 +14019,7 @@ function createLaneWatcher(options) {
   const alert = (kind, lane, count, max) => {
     options.onAlert?.({ kind, lane, count, max });
   };
-  const observeNow = async (threadId, status, pendingExternalWait, archived = false, suppliedOperatorWait) => {
+  const observeNow = async (threadId, status, pendingExternalWait, archived = false, suppliedOperatorWait, suppliedOperatorWaitKnown = suppliedOperatorWait !== void 0 || !options.readOperatorWait) => {
     const allLanes = options.readLanes();
     clearResolved(allLanes);
     const candidates = allLanes.filter(
@@ -14026,11 +14027,13 @@ function createLaneWatcher(options) {
     );
     if (candidates.length === 0) return;
     let operatorWait = suppliedOperatorWait ?? null;
-    if (!archived && status === "idle" && suppliedOperatorWait === void 0 && options.readOperatorWait) {
+    let operatorWaitKnown = suppliedOperatorWaitKnown;
+    if (!archived && suppliedOperatorWait === void 0 && options.readOperatorWait) {
       try {
         operatorWait = await options.readOperatorWait(threadId);
       } catch {
         operatorWait = null;
+        operatorWaitKnown = false;
       }
     }
     let waiting = pendingExternalWait ?? false;
@@ -14047,7 +14050,7 @@ function createLaneWatcher(options) {
       for (const lane of candidates) {
         const key = laneKey(lane);
         coalesced.delete(key);
-        if (archived || status === "idle" && !operatorWait && !waiting) await operatorWaitAlertLedger.clear(key);
+        if (archived || operatorWaitKnown && !operatorWait) await operatorWaitAlertLedger.clear(key);
       }
       return;
     }
@@ -14121,7 +14124,8 @@ function createLaneWatcher(options) {
             observation.status,
             observation.pendingExternalWait,
             observation.archived,
-            observation.operatorWait
+            observation.operatorWait,
+            observation.operatorWaitKnown
           );
         }
       });
@@ -21036,7 +21040,8 @@ async function plugin(bb) {
       };
       break;
     }
-    interactionStateCache.set(threadId, { pending: pending.length > 0, operatorWait: wait });
+    if (wait) interactionStateCache.delete(threadId);
+    else interactionStateCache.set(threadId, { pending: pending.length > 0, operatorWait: wait });
     return wait;
   };
   const continuationLedger = createContinuationLedger({
@@ -21070,7 +21075,8 @@ async function plugin(bb) {
         status: thread.status,
         pendingExternalWait: archived || !operatorWaitKnown ? true : operatorWait ? true : await readPendingExternalWait(threadId),
         archived,
-        operatorWait
+        operatorWait,
+        operatorWaitKnown
       };
     },
     steer: async (lane) => {

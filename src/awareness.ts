@@ -266,6 +266,7 @@ export interface WorkerObservation {
   pendingExternalWait: boolean;
   archived: boolean;
   operatorWait?: OperatorWait | null;
+  operatorWaitKnown?: boolean;
 }
 
 export function readLaneStates(db: SqliteDatabase): LaneState[] {
@@ -317,13 +318,19 @@ export function openLaneViews(
       deferredAgeMs: operatorWait ? Math.max(0, now - operatorWait.createdAtMs) : null,
     } satisfies LaneView;
     });
-  const next = lanes.find((lane) =>
-    lane.queueState === "ready" && (lane.attemptState === "prepared" || lane.attemptState === "armed") && !lane.deferredReason,
-  );
+  const nextByProject = new Map<string, string>();
+  for (const lane of lanes) {
+    if (
+      lane.queueState === "ready" &&
+      (lane.attemptState === "prepared" || lane.attemptState === "armed") &&
+      !lane.deferredReason &&
+      !nextByProject.has(lane.projectId)
+    ) nextByProject.set(lane.projectId, lane.executionAttemptId);
+  }
   return lanes.map((lane) => ({
     ...lane,
-    queueBlocked: lane.queueState === "ready" && (lane.attemptState === "prepared" || lane.attemptState === "armed") && lane !== next,
-    nextStartable: lane === next,
+    queueBlocked: lane.queueState === "ready" && (lane.attemptState === "prepared" || lane.attemptState === "armed") && nextByProject.get(lane.projectId) !== lane.executionAttemptId,
+    nextStartable: nextByProject.get(lane.projectId) === lane.executionAttemptId,
   }));
 }
 
@@ -395,6 +402,7 @@ export function createLaneWatcher(options: {
     pendingExternalWait?: boolean,
     archived = false,
     suppliedOperatorWait?: OperatorWait | null,
+    suppliedOperatorWaitKnown = suppliedOperatorWait !== undefined || !options.readOperatorWait,
   ): Promise<void> => {
     const allLanes = options.readLanes();
     clearResolved(allLanes);
@@ -407,11 +415,13 @@ export function createLaneWatcher(options: {
     if (candidates.length === 0) return;
 
     let operatorWait = suppliedOperatorWait ?? null;
-    if (!archived && status === "idle" && suppliedOperatorWait === undefined && options.readOperatorWait) {
+    let operatorWaitKnown = suppliedOperatorWaitKnown;
+    if (!archived && suppliedOperatorWait === undefined && options.readOperatorWait) {
       try {
         operatorWait = await options.readOperatorWait(threadId);
       } catch {
         operatorWait = null;
+        operatorWaitKnown = false;
       }
     }
     let waiting = pendingExternalWait ?? false;
@@ -430,7 +440,7 @@ export function createLaneWatcher(options: {
       for (const lane of candidates) {
         const key = laneKey(lane);
         coalesced.delete(key);
-        if (archived || (status === "idle" && !operatorWait && !waiting)) await operatorWaitAlertLedger.clear(key);
+        if (archived || (operatorWaitKnown && !operatorWait)) await operatorWaitAlertLedger.clear(key);
       }
       return;
     }
@@ -517,6 +527,7 @@ export function createLaneWatcher(options: {
             observation.pendingExternalWait,
             observation.archived,
             observation.operatorWait,
+            observation.operatorWaitKnown,
           );
         }
       });

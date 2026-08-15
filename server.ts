@@ -513,7 +513,8 @@ export default async function plugin(bb: BbPluginApi) {
       };
       break;
     }
-    interactionStateCache.set(threadId, { pending: pending.length > 0, operatorWait: wait });
+    if (wait) interactionStateCache.delete(threadId);
+    else interactionStateCache.set(threadId, { pending: pending.length > 0, operatorWait: wait });
     return wait;
   };
 
@@ -553,6 +554,7 @@ export default async function plugin(bb: BbPluginApi) {
           : operatorWait ? true : await readPendingExternalWait(threadId),
         archived,
         operatorWait,
+        operatorWaitKnown,
       };
     },
     steer: async (lane) => {
