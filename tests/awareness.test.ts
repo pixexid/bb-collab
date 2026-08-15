@@ -1,6 +1,13 @@
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
-import { createLaneWatcher, readLaneStates, type LaneState, type LaneView } from "../src/awareness.js";
+import {
+  continuationModeFor,
+  createContinuationLedger,
+  createLaneWatcher,
+  readLaneStates,
+  type LaneState,
+  type LaneView,
+} from "../src/awareness.js";
 
 function lane(threadId = "worker-1"): LaneState {
   return {
@@ -93,6 +100,82 @@ describe("lane awareness", () => {
 
     expect(steer).toHaveBeenCalledTimes(1);
     expect(steer.mock.calls[0]?.[0].threadId).toBe("worker-1");
+  });
+
+  it("uses automatic, approval, and tracking modes by lane kind", async () => {
+    expect(continuationModeFor("write")).toBe("automatic");
+    expect(continuationModeFor("review")).toBe("approval");
+    expect(continuationModeFor("probe")).toBe("tracking");
+
+    let current = lane();
+    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
+    const alerts: string[] = [];
+    const watcher = createLaneWatcher({
+      readLanes: () => [current],
+      steer,
+      onAlert: (alert) => alerts.push(alert.kind),
+    });
+
+    current = { ...current, assignment_kind: "review" };
+    await watcher.observe("worker-1", "idle");
+    current = { ...current, assignment_kind: "probe" };
+    await watcher.observe("worker-1", "active");
+    await watcher.observe("worker-1", "idle");
+
+    expect(steer).not.toHaveBeenCalled();
+    expect(alerts).toEqual(["approval_required"]);
+  });
+
+  it("pauses and alerts at the per-lane continuation limit", async () => {
+    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
+    const alerts: string[] = [];
+    const watcher = createLaneWatcher({
+      readLanes: () => [lane()],
+      steer,
+      maxContinuations: 1,
+      onAlert: (alert) => alerts.push(alert.kind),
+    });
+
+    await watcher.observe("worker-1", "idle");
+    await watcher.observe("worker-1", "active");
+    await watcher.observe("worker-1", "idle");
+
+    expect(steer).toHaveBeenCalledTimes(1);
+    expect(alerts).toEqual(["limit_reached"]);
+  });
+
+  it("recovers a claimed delivery as paused and cannot double-fire after restart", async () => {
+    let persisted: unknown;
+    const persistence = {
+      read: async () => persisted,
+      write: async (state: Record<string, unknown>) => { persisted = state; },
+    };
+    let release!: () => void;
+    const firstSteer = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
+    const firstWatcher = createLaneWatcher({
+      readLanes: () => [lane()],
+      steer: firstSteer,
+      continuationLedger: createContinuationLedger(persistence),
+    });
+
+    const first = firstWatcher.observe("worker-1", "idle");
+    await vi.waitFor(() => expect(firstSteer).toHaveBeenCalledTimes(1));
+
+    const alerts: string[] = [];
+    const secondSteer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
+    const restartedWatcher = createLaneWatcher({
+      readLanes: () => [lane()],
+      steer: secondSteer,
+      continuationLedger: createContinuationLedger(persistence),
+      onAlert: (alert) => alerts.push(alert.kind),
+    });
+    await restartedWatcher.recover();
+    await restartedWatcher.observe("worker-1", "idle");
+
+    expect(secondSteer).not.toHaveBeenCalled();
+    expect(alerts).toEqual(["restart_review"]);
+    release();
+    await first;
   });
 
   it("keeps the read seam SQLite-backed", () => {

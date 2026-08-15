@@ -13783,6 +13783,7 @@ config(en_default());
 
 // src/awareness.ts
 var SUPERVISOR_THREAD_ID = "thr_b94i3csnme";
+var DEFAULT_MAX_CONTINUATIONS = 3;
 var OPEN_ATTEMPT_STATES = /* @__PURE__ */ new Set([
   "prepared",
   "armed",
@@ -13790,6 +13791,97 @@ var OPEN_ATTEMPT_STATES = /* @__PURE__ */ new Set([
   "running",
   "dispatch_unknown"
 ]);
+function continuationState(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  const state = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid continuation state");
+    const candidate = value;
+    if (candidate.mode !== "automatic" || !["ready", "claimed", "paused", "limit_reached"].includes(candidate.status) || !Number.isInteger(candidate.count) || candidate.count < 0 || !Number.isInteger(candidate.max) || candidate.max < 1 || !(candidate.claimId === null || typeof candidate.claimId === "string")) throw new Error("invalid continuation state");
+    state[key] = {
+      mode: "automatic",
+      status: candidate.status,
+      count: candidate.count,
+      max: candidate.max,
+      claimId: candidate.claimId
+    };
+  }
+  return state;
+}
+function createContinuationLedger(persistence) {
+  let state = {};
+  let loaded = false;
+  let queue = Promise.resolve();
+  const enqueue = (work) => {
+    const result2 = queue.then(work);
+    queue = result2.then(() => void 0, () => void 0);
+    return result2;
+  };
+  const load = async () => {
+    if (loaded) return;
+    state = continuationState(persistence ? await persistence.read() : null);
+    loaded = true;
+  };
+  const save = () => persistence?.write(structuredClone(state));
+  return {
+    recover() {
+      return enqueue(async () => {
+        await load();
+        let changed = false;
+        for (const record2 of Object.values(state)) {
+          if (record2.status !== "claimed") continue;
+          record2.status = "paused";
+          record2.claimId = null;
+          changed = true;
+        }
+        if (changed) await save();
+      });
+    },
+    claim(key, max) {
+      return enqueue(async () => {
+        await load();
+        const existing = state[key];
+        if (existing?.status === "claimed") return { claim: null, reason: "claimed" };
+        if (existing?.status === "paused") return { claim: null, reason: "paused" };
+        if (existing?.status === "limit_reached") return { claim: null, reason: "limit_reached" };
+        const count = existing?.count ?? 0;
+        if (count >= max) {
+          state[key] = { mode: "automatic", status: "limit_reached", count, max, claimId: null };
+          await save();
+          return { claim: null, reason: "limit_reached" };
+        }
+        const claim = { claimId: `${key}:${count + 1}`, count: count + 1, max };
+        state[key] = { mode: "automatic", status: "claimed", count: claim.count, max, claimId: claim.claimId };
+        await save();
+        return { claim };
+      });
+    },
+    complete(key, claimId) {
+      return enqueue(async () => {
+        await load();
+        const record2 = state[key];
+        if (!record2 || record2.status !== "claimed" || record2.claimId !== claimId) throw new Error("continuation claim is not current");
+        record2.status = "ready";
+        record2.claimId = null;
+        await save();
+      });
+    },
+    resume(key, resetCount = false) {
+      return enqueue(async () => {
+        await load();
+        const record2 = state[key];
+        if (!record2 || record2.status === "claimed") throw new Error("continuation is not paused");
+        record2.status = "ready";
+        record2.claimId = null;
+        if (resetCount) record2.count = 0;
+        await save();
+      });
+    }
+  };
+}
+function continuationModeFor(assignmentKind) {
+  return assignmentKind === "write" ? "automatic" : assignmentKind === "review" ? "approval" : "tracking";
+}
 function readLaneStates(db) {
   return db.prepare(
     `SELECT assignments.project_id, assignments.assignment_id, assignments.lane_id,
@@ -13824,6 +13916,8 @@ function openLaneViews(db, now2 = Date.now()) {
 }
 function createLaneWatcher(options) {
   const supervisorThreadId = options.supervisorThreadId ?? SUPERVISOR_THREAD_ID;
+  const continuationLedger = options.continuationLedger ?? createContinuationLedger();
+  const maxContinuations = Number.isInteger(options.maxContinuations) && (options.maxContinuations ?? 0) > 0 ? options.maxContinuations : DEFAULT_MAX_CONTINUATIONS;
   const coalesced = /* @__PURE__ */ new Set();
   let queue = Promise.resolve();
   const laneKey = (lane) => `${lane.project_id}:${lane.execution_attempt_id}`;
@@ -13834,6 +13928,23 @@ function createLaneWatcher(options) {
     for (const key of coalesced) {
       if (!unresolved.has(key)) coalesced.delete(key);
     }
+  };
+  const viewFor = (lane, status) => ({
+    projectId: lane.project_id,
+    laneId: lane.lane_id,
+    assignmentId: lane.assignment_id,
+    assignmentKind: lane.assignment_kind,
+    workItemId: lane.work_item_id,
+    threadId: lane.thread_id,
+    executionAttemptId: lane.execution_attempt_id,
+    attemptState: lane.attempt_state,
+    workerStatus: status,
+    waitingOn: "terminal receipt",
+    ageMs: 0,
+    tone: "error"
+  });
+  const alert = (kind, lane, count, max) => {
+    options.onAlert?.({ kind, lane, count, max });
   };
   const observeNow = async (threadId, status, pendingExternalWait, archived = false) => {
     const allLanes = options.readLanes();
@@ -13858,23 +13969,24 @@ function createLaneWatcher(options) {
       const key = laneKey(lane);
       if (lane.terminal_report_digest !== null || coalesced.has(key)) continue;
       coalesced.add(key);
+      const view = viewFor(lane, status);
+      const mode = continuationModeFor(lane.assignment_kind);
+      if (mode === "tracking") continue;
+      if (mode === "approval") {
+        alert("approval_required", view, 0, maxContinuations);
+        continue;
+      }
+      const claimed = await continuationLedger.claim(key, maxContinuations);
+      if (!claimed.claim) {
+        if (claimed.reason === "limit_reached") alert("limit_reached", view, maxContinuations, maxContinuations);
+        if (claimed.reason === "paused") alert("restart_review", view, 0, maxContinuations);
+        continue;
+      }
       try {
-        await options.steer({
-          projectId: lane.project_id,
-          laneId: lane.lane_id,
-          assignmentId: lane.assignment_id,
-          assignmentKind: lane.assignment_kind,
-          workItemId: lane.work_item_id,
-          threadId: lane.thread_id,
-          executionAttemptId: lane.execution_attempt_id,
-          attemptState: lane.attempt_state,
-          workerStatus: status,
-          waitingOn: "terminal receipt",
-          ageMs: 0,
-          tone: "error"
-        });
+        await options.steer(view);
+        await continuationLedger.complete(key, claimed.claim.claimId);
       } catch (error48) {
-        coalesced.delete(key);
+        alert("delivery_uncertain", view, claimed.claim.count, claimed.claim.max);
         throw error48;
       }
     }
@@ -13912,6 +14024,9 @@ function createLaneWatcher(options) {
           );
         }
       });
+    },
+    recover() {
+      return enqueue(() => continuationLedger.recover());
     }
   };
 }
@@ -20793,8 +20908,14 @@ async function plugin(bb) {
       return true;
     }
   };
+  const continuationLedger = createContinuationLedger({
+    read: () => bb.storage.kv.get("lane-watcher.continuations"),
+    write: (state) => bb.storage.kv.set("lane-watcher.continuations", state)
+  });
   const watcher = createLaneWatcher({
     readLanes: () => db ? readLaneStates(db) : [],
+    continuationLedger,
+    onAlert: (alert) => bb.log.warn(`lane continuation ${alert.kind}: ${alert.lane.laneId} (${alert.count}/${alert.max})`),
     isExternallyWaiting: readPendingExternalWait,
     readWorker: async (threadId) => {
       const thread = await bb.sdk.threads.get({ threadId });
@@ -20813,6 +20934,7 @@ async function plugin(bb) {
         input: [
           {
             type: "text",
+            visibility: "agent-only",
             text: `Lane ${lane.laneId} is idle without a terminal receipt or pending external wait. Continue assignment ${lane.assignmentId} and finish with exactly one DONE|BLOCKED terminal receipt.`,
             mentions: []
           }
@@ -20820,6 +20942,7 @@ async function plugin(bb) {
       });
     }
   });
+  await watcher.recover().catch((error48) => bb.log.error(`lane continuation recovery failed: ${String(error48)}`));
   const observe = (payload) => {
     const { id: id2, status } = threadEventStatus(payload);
     return watcher.observe(id2, status);

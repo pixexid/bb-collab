@@ -2,6 +2,7 @@ import { defineRpcContract, type BbPluginApi, type PluginCliContext } from "@bb/
 import { z } from "zod";
 import {
   SUPERVISOR_THREAD_ID,
+  createContinuationLedger,
   createLaneWatcher,
   openLaneViews,
   readLaneStates,
@@ -487,8 +488,15 @@ export default async function plugin(bb: BbPluginApi) {
     }
   };
 
+  const continuationLedger = createContinuationLedger({
+    read: () => bb.storage.kv.get<unknown>("lane-watcher.continuations"),
+    write: (state) => bb.storage.kv.set("lane-watcher.continuations", state),
+  });
+
   const watcher = createLaneWatcher({
     readLanes: () => (db ? readLaneStates(db) : []),
+    continuationLedger,
+    onAlert: (alert) => bb.log.warn(`lane continuation ${alert.kind}: ${alert.lane.laneId} (${alert.count}/${alert.max})`),
     isExternallyWaiting: readPendingExternalWait,
     readWorker: async (threadId) => {
       const thread = await bb.sdk.threads.get({ threadId });
@@ -507,6 +515,7 @@ export default async function plugin(bb: BbPluginApi) {
         input: [
           {
             type: "text",
+            visibility: "agent-only",
             text: `Lane ${lane.laneId} is idle without a terminal receipt or pending external wait. Continue assignment ${lane.assignmentId} and finish with exactly one DONE|BLOCKED terminal receipt.`,
             mentions: [],
           },
@@ -514,6 +523,7 @@ export default async function plugin(bb: BbPluginApi) {
       });
     },
   });
+  await watcher.recover().catch((error) => bb.log.error(`lane continuation recovery failed: ${String(error)}`));
 
   const observe = (payload: Parameters<typeof threadEventStatus>[0]) => {
     const { id, status } = threadEventStatus(payload);
