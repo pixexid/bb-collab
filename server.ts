@@ -410,10 +410,11 @@ export default async function plugin(bb: BbPluginApi) {
     isExternallyWaiting: readPendingExternalWait,
     readWorker: async (threadId) => {
       const thread = await bb.sdk.threads.get({ threadId });
+      const archived = thread.archivedAt !== null || thread.deletedAt !== null;
       return {
         status: thread.status,
-        pendingExternalWait: await readPendingExternalWait(threadId),
-        archived: thread.archivedAt !== null,
+        pendingExternalWait: archived ? true : await readPendingExternalWait(threadId),
+        archived,
       };
     },
     steer: async (lane) => {
@@ -441,7 +442,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("thread.failed", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
   bb.events.on("thread.archived", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
   bb.events.on("thread.deleted", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
-  const unsubscribe = subscribeToThreadChanges(bb.sdk, (threadId, status, archived = false) => watcher.observe(threadId, status, false, archived));
+  const unsubscribe = subscribeToThreadChanges(bb.sdk, (threadId, status, archived = false) => watcher.observe(threadId, status, undefined, archived));
   bb.onDispose(unsubscribe);
   bb.background.service("lane-watcher", {
     async start(signal) {

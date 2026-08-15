@@ -13927,7 +13927,7 @@ function subscribeToThreadChanges(sdk, observe) {
       event: "thread:changed",
       callback: (event) => {
         if (event.entity !== "thread" || !event.id) return;
-        void sdk.threads.get({ threadId: event.id }).then((thread) => thread.archivedAt === null ? observe(thread.id, thread.status) : observe(thread.id, thread.status, true)).catch(() => void 0);
+        void sdk.threads.get({ threadId: event.id }).then((thread) => thread.archivedAt === null && thread.deletedAt === null ? observe(thread.id, thread.status) : observe(thread.id, thread.status, true)).catch(() => void 0);
       }
     });
   } catch {
@@ -20600,10 +20600,11 @@ async function plugin(bb) {
     isExternallyWaiting: readPendingExternalWait,
     readWorker: async (threadId) => {
       const thread = await bb.sdk.threads.get({ threadId });
+      const archived = thread.archivedAt !== null || thread.deletedAt !== null;
       return {
         status: thread.status,
-        pendingExternalWait: await readPendingExternalWait(threadId),
-        archived: thread.archivedAt !== null
+        pendingExternalWait: archived ? true : await readPendingExternalWait(threadId),
+        archived
       };
     },
     steer: async (lane) => {
@@ -20630,7 +20631,7 @@ async function plugin(bb) {
   bb.events.on("thread.failed", (payload) => void observe(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
   bb.events.on("thread.archived", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
   bb.events.on("thread.deleted", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
-  const unsubscribe = subscribeToThreadChanges(bb.sdk, (threadId, status, archived = false) => watcher.observe(threadId, status, false, archived));
+  const unsubscribe = subscribeToThreadChanges(bb.sdk, (threadId, status, archived = false) => watcher.observe(threadId, status, void 0, archived));
   bb.onDispose(unsubscribe);
   bb.background.service("lane-watcher", {
     async start(signal) {

@@ -242,7 +242,7 @@ export function subscribeToThreadChanges(
         if (event.entity !== "thread" || !event.id) return;
         void sdk.threads
           .get({ threadId: event.id })
-          .then((thread) => thread.archivedAt === null
+          .then((thread) => thread.archivedAt === null && thread.deletedAt === null
             ? observe(thread.id, thread.status)
             : observe(thread.id, thread.status, true))
           .catch(() => undefined);
