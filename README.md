@@ -42,7 +42,9 @@ host-issued `get-bb/bb#1541` retirement condition. Live RPC and CLI role
 mutations read exact BB thread, event, environment, project, host and version
 facts through the existing `RoleFactReader` seam before issuing
 `qualification_observation_record` or `role_generation_succession`; missing or
-foreign facts refuse before write.
+foreign facts refuse before write. A ready native managed worktree may have a
+derived path distinct from its canonical source; exact project/host/source
+resolution retains both paths and still refuses unmanaged or ephemeral contexts.
 `github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
 reserve/finalize operations refuse before the adapter under this one-request
 seam. The derived actor path is limited to bootstrap, `config_revision` for
