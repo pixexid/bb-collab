@@ -321,9 +321,10 @@ export function openLaneViews(
   const startable = new Set<string>();
   const readyWriterCount = new Map<string, number>();
   const occupiedWriterCount = new Map<string, number>();
+  const ceilingByProject = new Map<string, number>();
   for (const lane of lanes) {
     if (lane.assignmentKind !== "write") continue;
-    if (lane.queueState === "running" || (lane.attemptState !== "prepared" && lane.attemptState !== "armed")) {
+    if (lane.queueState === "deferred" || lane.queueState === "running" || (lane.attemptState !== "prepared" && lane.attemptState !== "armed")) {
       occupiedWriterCount.set(lane.projectId, (occupiedWriterCount.get(lane.projectId) ?? 0) + 1);
     }
   }
@@ -335,7 +336,9 @@ export function openLaneViews(
     }
     const ready = readyWriterCount.get(lane.projectId) ?? 0;
     const occupied = occupiedWriterCount.get(lane.projectId) ?? 0;
-    const available = Math.max(0, writingLaneCeilingForProject(db, lane.projectId) - occupied);
+    const ceiling = ceilingByProject.get(lane.projectId) ?? writingLaneCeilingForProject(db, lane.projectId);
+    ceilingByProject.set(lane.projectId, ceiling);
+    const available = Math.max(0, ceiling - occupied);
     if (ready < available) {
       startable.add(lane.executionAttemptId);
       readyWriterCount.set(lane.projectId, ready + 1);

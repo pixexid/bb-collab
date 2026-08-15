@@ -681,19 +681,6 @@ export const DERIVED_ACTOR_MUTATION_CLASSES = [
   "migration_prepare",
   "migration_step",
 ] as const;
-/** Exact contract-v12 registry retained only for bounded v13 re-adoption. */
-export const PREVIOUS_V12_DERIVED_ACTOR_MUTATION_CLASSES = Object.freeze([
-  "bootstrap",
-  "config_revision",
-  "decision_create",
-  "decision_disposition",
-  "work_item_create",
-  "work_item_transition",
-  "qualification_observation_record",
-  "role_generation_succession",
-  "migration_prepare",
-  "migration_step",
-] as const);
 /** Historical v11 rows remain readable during the already-bounded authority repair. */
 export const PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES = Object.freeze([
   "bootstrap",
@@ -730,7 +717,7 @@ export const contractDigest = sha256(canonicalJson({
     configPath: "extensions.bbCollab.writingLaneCeiling",
     default: DEFAULT_WRITING_LANE_CEILING,
     maximum: MAX_WRITING_LANE_CEILING,
-    lowerWithoutExplicitDecision: true,
+    lowerRequiresExplicitDecision: true,
     readOnlyAssignmentKinds: ["review", "probe"],
   },
   operatorReceiptPolicy: {
@@ -2074,7 +2061,8 @@ export function writingLaneCeilingForProject(db: SqliteDatabase, projectId: stri
       AND revisions.config_revision = heads.config_revision
      WHERE heads.project_id = ?`,
   ).get(projectId));
-  return row ? writingLaneCeilingFromJson(row.canonical_config_json) : DEFAULT_WRITING_LANE_CEILING;
+  if (!row) throw refusal("PROJECT_CONFIG_REQUIRED", "project config head is unavailable");
+  return writingLaneCeilingFromJson(row.canonical_config_json);
 }
 
 function reviewPolicyFromJson(configJson: string): z.infer<typeof reviewPolicySchema> | null {
@@ -2532,11 +2520,9 @@ function requireActiveAuthorizedApprover(
   }
   const allowedMutationClasses = isExactAuthorizedApproverMutationClassSet(allowed, DERIVED_ACTOR_MUTATION_CLASSES)
     ? DERIVED_ACTOR_MUTATION_CLASSES
-    : isExactAuthorizedApproverMutationClassSet(allowed, PREVIOUS_V12_DERIVED_ACTOR_MUTATION_CLASSES)
-      ? PREVIOUS_V12_DERIVED_ACTOR_MUTATION_CLASSES
-      : isExactAuthorizedApproverMutationClassSet(allowed, PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES)
-        ? PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES
-        : null;
+    : isExactAuthorizedApproverMutationClassSet(allowed, PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES)
+      ? PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES
+      : null;
   if (!allowedMutationClasses) {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current or bump-surviving historical set");
   }

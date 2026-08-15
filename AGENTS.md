@@ -84,13 +84,12 @@ the two existing role mutation classes. Attestation has no requestInput
 interaction and atomically creates the same exact-bound receipt plus verified
 plugin actor; operator revocation/change marks the registry unusable. The
 historical contract-v9 eight-class registry was accepted only during the
-one-release v9-to-v10 re-adoption. A live exact v12 ten-class row is the
-bump-surviving compatibility state for v13 and may attest only that exact
-historical set until re-adoption installs the current row. The already-bounded
-v11 nine-class repair remains readable for authority maintenance, but does not
-authorize the v12-only work-item transition class. Malformed, reordered,
-subset, extra, v9, or other arbitrary sets refuse at attestation and apply.
-This v13 change is a contract bump: CONTRACT_VERSION and contractDigest change;
+one-release v9-to-v10 re-adoption. Contract v13 leaves the exact current
+ten-class allowlist unchanged; the already-bounded v11 nine-class repair
+remains readable for authority maintenance, but does not authorize
+`work_item_transition`. Malformed, reordered, subset, extra, v9, or other
+arbitrary sets refuse at attestation and apply. This v13 change is a contract
+bump for the lane policy: CONTRACT_VERSION and contractDigest change;
 SCHEMA_VERSION, schemaDigest and migrations remain unchanged, and all four
 cached consumers emit a durable reread/refusal rollout receipt.
 

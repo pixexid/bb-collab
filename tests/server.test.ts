@@ -23,7 +23,6 @@ import {
   MIGRATIONS,
   MIGRATION_STATES,
   MIGRATION_STEPS,
-  PREVIOUS_V12_DERIVED_ACTOR_MUTATION_CLASSES,
   PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES,
   PLUGIN_ID,
   SCHEMA_VERSION,
@@ -1950,7 +1949,6 @@ describe("bb-collab plugin boundary", () => {
     }))).toMatchObject({ outcome: "OK" });
 
     const previousJson = canonicalJson(PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES);
-    const bumpPreviousJson = canonicalJson(PREVIOUS_V12_DERIVED_ACTOR_MUTATION_CLASSES);
     const currentJson = canonicalJson(DERIVED_ACTOR_MUTATION_CLASSES);
     const setRegistry = (allowedMutationClassesJson: string) => db.prepare(
       `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
@@ -2092,16 +2090,6 @@ describe("bb-collab plugin boundary", () => {
       expectedGovernanceEpoch: 1,
       expectedFenceToken: fenceToken,
     });
-    db.prepare(
-      `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
-       WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = 'compat-v12-readopt' AND authorizing_disposition_sequence = 1`,
-    ).run(bumpPreviousJson, PROJECT_ID, AUTHORIZED_APPROVER_ID);
-    expect(await attest(currentRequest("work_item_transition", "compat-v12-transition"), "work_item_transition", "compat-v12-readopt")).toMatchObject({ outcome: "OK" });
-    db.prepare(
-      `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
-       WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = 'compat-v12-readopt' AND authorizing_disposition_sequence = 1`,
-    ).run(currentJson, PROJECT_ID, AUTHORIZED_APPROVER_ID);
-
     const invalidSets: Array<[string, string]> = [
       ["malformed", "{not-json"],
       ["object", canonicalJson({ classes: DERIVED_ACTOR_MUTATION_CLASSES })],
@@ -2854,12 +2842,12 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("records the v13 allowlist compatibility repair without a schema bump", () => {
+  it("records the v13 lane-policy bump without a schema bump", () => {
     expect(CONTRACT_VERSION).toBe(13);
     expect(SCHEMA_VERSION).toBe(10);
     expect(MIGRATIONS).toHaveLength(23);
     expect(schemaDigest).toBe("6f9f8b91784b2834d061a68bfe99241f24a93e32e786822894871f601a2f86a7");
-    expect(contractDigest).toBe("25c962d1f1ea126430c00a6e40f4c85e703ab2b423028a1ab5069d2fc6f37bcb");
+    expect(contractDigest).toBe("89d02c0734808e381f5bf346a032bfbce6a2cbc17cd39f5d6806ff6e8c43ce7a");
     expect(cachedConsumerRolloutEvidence(SCHEMA_VERSION, CONTRACT_VERSION)).toMatchObject({
       oldSchemaVersion: 10,
       newSchemaVersion: 10,

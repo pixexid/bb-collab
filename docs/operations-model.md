@@ -17,9 +17,10 @@ pending exact operator-receipt interaction is represented as a deferred lane:
 - `deferredAtMs` from the native interaction creation time; and
 - `deferredAgeMs`, calculated from that time at read/observation time.
 
-Deferred operator work is a lane state, never a queue blocker. Queue selection
-ignores that lane when calculating `nextStartable`; up to the configured number
-of eligible prepared or armed write lanes are immediately visible as
+Deferred operator work is a lane state and is never itself marked as a queue
+blocker. It remains an occupied writer reservation for cap accounting, while
+queue selection chooses ready lanes in the remaining slots; up to the configured
+number of eligible prepared or armed write lanes are immediately visible as
 `nextStartable: true`. For bb-collab the default per-orchestrator
 `extensions.bbCollab.writingLaneCeiling` is 3. A lower value is read from the
 current canonical ProjectConfigRevision and is never silently raised. Review
@@ -62,16 +63,15 @@ itself. This is an operations-model scope extension only; canonical activation
 still awaits the one exact v8 console approval bound to the project,
 operation, candidate head, idempotency key, and request digest.
 
-Authority-maintenance re-adoption has no human form. An active exact v12
-ten-class registry may attest and apply only its historical set until
-re-adoption installs the exact current v13 registry; the already-bounded v11
-nine-class state remains readable but refuses `work_item_transition`. The
-registry check is exact and order-sensitive: malformed, reordered, subset,
-extra, v9, and arbitrary sets refuse before any receipt or canonical write.
-This is a v13 contract bump: four cached consumers must reread v13 or refuse
-v12, with durable rollout evidence. The cap itself is recorded by the existing
-adopted Decision plus operator-authorized `config_revision`; it does not create
-a second authority store.
+Authority-maintenance re-adoption has no human form. Contract v13 leaves the
+exact ten-class registry unchanged; the already-bounded v11 nine-class state
+remains readable but refuses `work_item_transition`. The registry check is exact
+and order-sensitive: malformed, reordered, subset, extra, v9, and arbitrary
+sets refuse before any receipt or canonical write. This is a v13 contract bump:
+four cached consumers must reread v13 or refuse v12, with durable rollout
+evidence. The cap itself is recorded by the existing adopted Decision plus
+operator-authorized `config_revision`; it does not create a second authority
+store.
 
 The approved default profile for non-visual queue and documentation engineering
 is `codex/gpt-5.6-luna`. An independent cold review is routed later to

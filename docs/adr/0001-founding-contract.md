@@ -71,7 +71,7 @@ infrastructure, but they must not create duplicate authority concepts.
 | ExecutionAttempt | execution_attempt_id | One dispatch attempt under an Assignment, including BB server, thread, environment, host, native correlation IDs, actual profile, lifecycle and terminal evidence. Native references are unique in their BB server scope. |
 | Decision | decision_id | Immutable project, scope, class and options identity. A consult does not become an authority decision merely by existing. |
 | DecisionDisposition | decision_id, disposition_sequence | Append-only proposed, adopted, rejected, superseded or revoked disposition, with typed actor, conditions, reason and revert. Current state is derived. |
-| AuthorizedApprover | project_id, approver_id, authorizing_decision_id, authorizing_disposition_sequence | Durable active/revoked registry row for `orchestrator:bb-collab`, linked to the exact adopted `operator_only` Decision disposition and the exact current ten-class set or bounded historical v12 set during re-adoption. |
+| AuthorizedApprover | project_id, approver_id, authorizing_decision_id, authorizing_disposition_sequence | Durable active/revoked registry row for `orchestrator:bb-collab`, linked to the exact adopted `operator_only` Decision disposition and the exact current ten-class set; the bounded historical v11 repair remains readable during authority maintenance. |
 | QualificationObservation | qualification_id | Immutable fixture-bound capability result for an exact executed-profile digest and observed BB/runtime/fixture context. |
 | EligibilityProjection | project_id, role_requirement_id, profile_digest | Rebuildable current eligibility with observation references, expiry and requalification trigger. |
 | EvidenceArtifact | evidence_id, content_digest where appropriate | Content-addressed review, test, consult, release, export, receipt or legacy artifact with durable location metadata. |
@@ -79,9 +79,11 @@ infrastructure, but they must not create duplicate authority concepts.
 | StateEvent | project_id, event_sequence | Append-only mutation history. The current-state mutation and its event commit atomically. |
 
 The project has at most one active writing assignment for a
-project_id/lane_id pair. The v1 project-wide writing ceiling is two; a
-project may lower it but never raise it. Read-only work does not consume the
-writing cap, but remains assigned and isolated.
+project_id/lane_id pair. Contract v13 gives each orchestrator an explicit
+`extensions.bbCollab.writingLaneCeiling` dial, defaulting to 3 for bb-collab
+and bounded at 3; an operator-authorized config revision may lower it but no
+runtime path silently raises it. Read-only work does not consume the writing
+cap, but remains assigned and isolated.
 
 Exactly one current ProjectGovernorship head exists. A valid canonical write
 requires the current head to name the permitted runtime, be in a writable
@@ -91,7 +93,7 @@ state, and match the caller's expected epoch and fencing token.
 
 Project configuration is immutable by revision. A revision contains explicit
 permission and visibility policy, role requirements, connector policy,
-operator holds, project-specific lower lane caps, repository targets and
+operator holds, the per-orchestrator writing-lane dial, repository targets and
 project-extension surfaces. Secret values never appear in configuration or
 exports; only secret references may be stored.
 
@@ -183,12 +185,10 @@ review Decisions remain role-bound. After the one-time adopted authorizing
 `approverAttestation` RPC validates the active registry row, exact authorizing
 Decision/disposition, caller plugin, and exact request binding, then atomically
 issues a fresh receipt plus the same verified plugin actor without `requestInput`.
-The current exact ten-class allowlist authorizes all current classes. To survive
-the v12-to-v13 code bump, an active exact historical v12 ten-class row is also
-accepted only for that exact set until authority-maintenance re-adoption
-installs the current row; the already-bounded v11 nine-class row remains
-readable but still refuses `work_item_transition`. Malformed, reordered, subset,
-extra, v9, and other arbitrary sets refuse at both attestation and apply. A
+The current exact ten-class allowlist authorizes all current classes. Contract
+v13 leaves that allowlist unchanged; the already-bounded v11 nine-class row
+remains readable but still refuses `work_item_transition`. Malformed, reordered,
+subset, extra, v9, and other arbitrary sets refuse at both attestation and apply. A
 later operator revocation or change marks the registry unusable; both registry
 and interim receipt retain the upstream host-issued `get-bb/bb#1541` retirement
 condition, and human confirmation remains only at that boundary. This is not
@@ -197,11 +197,11 @@ live cutover or source retirement.
 The historical contract-v9 eight-class registry was accepted only during the
 one-release v9-to-v10 re-adoption. Contract v11 required the exact nine-class
 row. Contract v12 added only `work_item_transition`; contract v13 adds the
-bounded writing-lane dial and carries the exact v12 ten-class row for one
-authority-maintenance re-adoption. This is a contract/cache bump: v13 changes
-`CONTRACT_VERSION` and `contractDigest`; `SCHEMA_VERSION`, `schemaDigest`, and
-migrations remain unchanged. Cached-consumer evidence records four attempted,
-four verified rereads for v13 and refusal for stale v12 consumers.
+bounded writing-lane dial while leaving the exact ten-class allowlist unchanged.
+This is a contract/cache bump: v13 changes `CONTRACT_VERSION` and
+`contractDigest`; `SCHEMA_VERSION`, `schemaDigest`, and migrations remain
+unchanged. Cached-consumer evidence records four attempted, four verified
+rereads for v13 and refusal for stale v12 consumers.
 
 The contract v11/schema v10 role-capacity amendment remains contract-only.
 Contract v12/schema v10 adds only `work_item_transition` to the derived

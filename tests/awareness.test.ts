@@ -38,7 +38,7 @@ describe("lane awareness", () => {
     const db = new Database(":memory:");
     db.exec("CREATE TABLE assignments (project_id TEXT, assignment_id TEXT, lane_id TEXT, assignment_kind TEXT, work_item_id TEXT, created_at_ms INTEGER)");
     db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT)");
-    laneConfig(db);
+    laneConfig(db, 2);
     db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", "deferred", "lane-deferred", "write", "work-deferred", 1);
     db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", "ready", "lane-ready", "write", "work-ready", 2);
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?)").run("project-1", "deferred", "worker-deferred", "attempt-deferred", "assignment", "prepared", null);
@@ -58,6 +58,10 @@ describe("lane awareness", () => {
       deferredAgeMs: 100,
     });
     expect(views[1]).toMatchObject({ laneId: "lane-ready", queueBlocked: false, nextStartable: true });
+    db.prepare("UPDATE project_config_revisions SET canonical_config_json = ?").run(JSON.stringify({ extensions: { bbCollab: { writingLaneCeiling: 1 } } }));
+    expect(openLaneViews(db, 1_000, new Map<string, OperatorWait>([
+      ["worker-deferred", { reason: "awaiting_operator", createdAtMs: 900 }],
+    ]))[1]).toMatchObject({ laneId: "lane-ready", queueBlocked: true, nextStartable: false });
     db.close();
   });
 
@@ -65,6 +69,9 @@ describe("lane awareness", () => {
     const db = new Database(":memory:");
     db.exec("CREATE TABLE assignments (project_id TEXT, assignment_id TEXT, lane_id TEXT, assignment_kind TEXT, work_item_id TEXT, created_at_ms INTEGER)");
     db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT)");
+    db.exec("CREATE TABLE tasks (id TEXT); CREATE TABLE threads (id TEXT)");
+    db.prepare("INSERT INTO tasks VALUES ('raw-task-1'), ('raw-task-2'), ('raw-task-3'), ('raw-task-4')").run();
+    db.prepare("INSERT INTO threads VALUES ('raw-thread-1'), ('raw-thread-2'), ('raw-thread-3'), ('raw-thread-4')").run();
     laneConfig(db);
     const add = (assignmentId: string, kind: string, state: string, createdAtMs: number) => {
       db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", assignmentId, `lane-${assignmentId}`, kind, `work-${assignmentId}`, createdAtMs);
@@ -104,18 +111,6 @@ describe("lane awareness", () => {
       ["queued-write", false, true],
       ["queued-review", true, false],
     ]);
-    db.close();
-  });
-
-  it("ignores raw task and thread rows when deriving canonical lane capacity", () => {
-    const db = new Database(":memory:");
-    db.exec("CREATE TABLE assignments (project_id TEXT, assignment_id TEXT, lane_id TEXT, assignment_kind TEXT, work_item_id TEXT, created_at_ms INTEGER)");
-    db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT)");
-    db.exec("CREATE TABLE tasks (id TEXT); CREATE TABLE threads (id TEXT)");
-    db.prepare("INSERT INTO tasks VALUES ('raw-task-1'), ('raw-task-2'), ('raw-task-3'), ('raw-task-4')").run();
-    db.prepare("INSERT INTO threads VALUES ('raw-thread-1'), ('raw-thread-2'), ('raw-thread-3'), ('raw-thread-4')").run();
-    laneConfig(db);
-    expect(openLaneViews(db)).toEqual([]);
     db.close();
   });
 

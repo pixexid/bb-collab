@@ -400,10 +400,10 @@ representation gap without claiming a live config or first-adopter write.
 The historical contract-v9 eight-class registry was accepted only during the
 one-release v9-to-v10 re-adoption. Contract v11 required the exact nine-class
 row; contract v12 added only `work_item_transition`. Contract v13 adds the
-bounded writing-lane dial and carries an exact v12 ten-class row through one
-authority-maintenance re-adoption. The already-bounded v11 row remains readable
-only for its nine historical classes. Malformed, reordered, subset, extra, v9,
-and arbitrary other sets remain invalid. This is a contract/cache bump:
+bounded writing-lane dial while leaving the exact current ten-class allowlist
+unchanged. The already-bounded v11 row remains readable only for its nine
+historical classes. Malformed, reordered, subset, extra, v9, and arbitrary
+other sets remain invalid. This is a contract/cache bump:
 contract v13 consumers reread, stale v12 consumers refuse, and the four-consumer
 rollout receipt records expected=4, attempted=4, verified=4 for the current
 runtime; schema, migrations, and stored authority shape remain unchanged.

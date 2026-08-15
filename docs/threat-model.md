@@ -37,12 +37,10 @@ immutable project configuration and its mapped targets, including
 `approverAttestation` RPC validates that active registry row, exact Decision
 and disposition, caller plugin, and request binding, then atomically issues a
 fresh interim receipt plus verified plugin actor with no pending UI interaction.
-The exact current ten-class set authorizes all current classes. For v13 bump
-survival, an active exact historical v12 ten-class set authorizes only that
-exact set until re-adoption installs the current row. The already-bounded v11
-nine-class set remains readable but does not authorize `work_item_transition`.
-Re-adoption revokes the historical row and installs the exact current ten-class
-set.
+The exact current ten-class set authorizes all current classes. Contract v13
+leaves that allowlist unchanged. The already-bounded v11 nine-class set remains
+readable but does not authorize `work_item_transition`; authority-maintenance
+re-adoption installs the exact current ten-class set.
 Malformed, reordered, subset, extra, v9, and arbitrary other sets refuse at
 both attestation and apply. Revocation or change marks the registry revoked and
 attestation fails closed. The receipt binds one exact project, operation class, lowercase

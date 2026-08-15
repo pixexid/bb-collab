@@ -14450,18 +14450,6 @@ var DERIVED_ACTOR_MUTATION_CLASSES = [
   "migration_prepare",
   "migration_step"
 ];
-var PREVIOUS_V12_DERIVED_ACTOR_MUTATION_CLASSES = Object.freeze([
-  "bootstrap",
-  "config_revision",
-  "decision_create",
-  "decision_disposition",
-  "work_item_create",
-  "work_item_transition",
-  "qualification_observation_record",
-  "role_generation_succession",
-  "migration_prepare",
-  "migration_step"
-]);
 var PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES = Object.freeze([
   "bootstrap",
   "config_revision",
@@ -14497,7 +14485,7 @@ var contractDigest = sha256(canonicalJson({
     configPath: "extensions.bbCollab.writingLaneCeiling",
     default: DEFAULT_WRITING_LANE_CEILING,
     maximum: MAX_WRITING_LANE_CEILING,
-    lowerWithoutExplicitDecision: true,
+    lowerRequiresExplicitDecision: true,
     readOnlyAssignmentKinds: ["review", "probe"]
   },
   operatorReceiptPolicy: {
@@ -15296,7 +15284,8 @@ function writingLaneCeilingForProject(db, projectId) {
       AND revisions.config_revision = heads.config_revision
      WHERE heads.project_id = ?`
   ).get(projectId));
-  return row ? writingLaneCeilingFromJson(row.canonical_config_json) : DEFAULT_WRITING_LANE_CEILING;
+  if (!row) throw refusal("PROJECT_CONFIG_REQUIRED", "project config head is unavailable");
+  return writingLaneCeilingFromJson(row.canonical_config_json);
 }
 function reviewPolicyFromJson(configJson) {
   const config2 = JSON.parse(configJson);
@@ -15664,7 +15653,7 @@ function requireActiveAuthorizedApprover(db, input, transition) {
   } catch {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are malformed");
   }
-  const allowedMutationClasses = isExactAuthorizedApproverMutationClassSet(allowed, DERIVED_ACTOR_MUTATION_CLASSES) ? DERIVED_ACTOR_MUTATION_CLASSES : isExactAuthorizedApproverMutationClassSet(allowed, PREVIOUS_V12_DERIVED_ACTOR_MUTATION_CLASSES) ? PREVIOUS_V12_DERIVED_ACTOR_MUTATION_CLASSES : isExactAuthorizedApproverMutationClassSet(allowed, PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES) ? PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES : null;
+  const allowedMutationClasses = isExactAuthorizedApproverMutationClassSet(allowed, DERIVED_ACTOR_MUTATION_CLASSES) ? DERIVED_ACTOR_MUTATION_CLASSES : isExactAuthorizedApproverMutationClassSet(allowed, PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES) ? PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES : null;
   if (!allowedMutationClasses) {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current or bump-surviving historical set");
   }
@@ -20496,9 +20485,10 @@ function openLaneViews(db, now2 = Date.now(), operatorWaits = /* @__PURE__ */ ne
   const startable = /* @__PURE__ */ new Set();
   const readyWriterCount = /* @__PURE__ */ new Map();
   const occupiedWriterCount = /* @__PURE__ */ new Map();
+  const ceilingByProject = /* @__PURE__ */ new Map();
   for (const lane of lanes) {
     if (lane.assignmentKind !== "write") continue;
-    if (lane.queueState === "running" || lane.attemptState !== "prepared" && lane.attemptState !== "armed") {
+    if (lane.queueState === "deferred" || lane.queueState === "running" || lane.attemptState !== "prepared" && lane.attemptState !== "armed") {
       occupiedWriterCount.set(lane.projectId, (occupiedWriterCount.get(lane.projectId) ?? 0) + 1);
     }
   }
@@ -20510,7 +20500,9 @@ function openLaneViews(db, now2 = Date.now(), operatorWaits = /* @__PURE__ */ ne
     }
     const ready = readyWriterCount.get(lane.projectId) ?? 0;
     const occupied = occupiedWriterCount.get(lane.projectId) ?? 0;
-    const available = Math.max(0, writingLaneCeilingForProject(db, lane.projectId) - occupied);
+    const ceiling = ceilingByProject.get(lane.projectId) ?? writingLaneCeilingForProject(db, lane.projectId);
+    ceilingByProject.set(lane.projectId, ceiling);
+    const available = Math.max(0, ceiling - occupied);
     if (ready < available) {
       startable.add(lane.executionAttemptId);
       readyWriterCount.set(lane.projectId, ready + 1);
