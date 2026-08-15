@@ -14163,9 +14163,9 @@ import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 11;
+var CONTRACT_VERSION = 12;
 var SCHEMA_VERSION = 10;
-var PREVIOUS_CONTRACT_VERSION = 10;
+var PREVIOUS_CONTRACT_VERSION = 11;
 var PREVIOUS_SCHEMA_VERSION = 10;
 var ROLE_IDS = ["project-orchestrator", "worker", "independent-reviewer"];
 var AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab";
@@ -14819,6 +14819,7 @@ var DERIVED_ACTOR_MUTATION_CLASSES = [
   "decision_create",
   "decision_disposition",
   "work_item_create",
+  "work_item_transition",
   "qualification_observation_record",
   "role_generation_succession",
   "migration_prepare",

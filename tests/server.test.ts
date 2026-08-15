@@ -1468,7 +1468,7 @@ describe("bb-collab plugin boundary", () => {
   it("derives only the ratified actor classes and keeps the operator binding digest compatible", () => {
     const { db, directory } = directDatabase();
     try {
-      const allowed = ["bootstrap", "config_revision", "decision_create", "decision_disposition", "work_item_create", "qualification_observation_record", "role_generation_succession", "migration_prepare", "migration_step"] as const;
+      const allowed = ["bootstrap", "config_revision", "decision_create", "decision_disposition", "work_item_create", "work_item_transition", "qualification_observation_record", "role_generation_succession", "migration_prepare", "migration_step"] as const;
       for (const [index, mutationClass] of allowed.entries()) {
         const operatorReceipt = persistBootstrapOperatorReceipt(db, {
           projectId: PROJECT_ID,
@@ -1653,7 +1653,7 @@ describe("bb-collab plugin boundary", () => {
       authorizing_decision_id: "authorizing-operator",
       authorizing_disposition_sequence: 1,
       status: "active",
-      allowed_mutation_classes_json: canonicalJson(["bootstrap", "config_revision", "decision_create", "decision_disposition", "work_item_create", "qualification_observation_record", "role_generation_succession", "migration_prepare", "migration_step"]),
+      allowed_mutation_classes_json: canonicalJson(["bootstrap", "config_revision", "decision_create", "decision_disposition", "work_item_create", "work_item_transition", "qualification_observation_record", "role_generation_succession", "migration_prepare", "migration_step"]),
     });
 
     const unsigned = decisionCreateRequest(fenceToken, "attested-operator", {
@@ -1709,6 +1709,77 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: workItemAttestation.actorReceiptId,
       operatorReceiptId: workItemAttestation.operatorReceipt!.receiptId,
     })).toMatchObject({ outcome: "OK" });
+
+    const transitionUnsigned = transitionRequest(fenceToken, "ready", 1, {
+      workItemId: "attested-work-item",
+      idempotencyKey: "attested-work-item-ready",
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      candidateHead: CANDIDATE_SHA,
+    });
+    const missingRegistryRequest = { ...transitionUnsigned, idempotencyKey: "attested-work-item-missing-registry" };
+    const beforeMissingRegistry = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("approverAttestation", {
+      ...attestation,
+      mutationClass: "work_item_transition",
+      idempotencyKey: missingRegistryRequest.idempotencyKey,
+      requestDigest: operatorRequestDigest(missingRegistryRequest),
+      authorizingDecisionId: "missing-authorizing-decision",
+    })).toMatchObject({ outcome: "AUTHORIZED_APPROVER_UNKNOWN" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeMissingRegistry);
+
+    const transitionAttestation = await host.harness.callRpc("approverAttestation", {
+      ...attestation,
+      mutationClass: "work_item_transition",
+      idempotencyKey: transitionUnsigned.idempotencyKey,
+      requestDigest: operatorRequestDigest(transitionUnsigned),
+    }) as FoundationResult;
+    expect(transitionAttestation).toMatchObject({ outcome: "OK", actorReceiptId: expect.any(String), operatorReceipt: {
+      mutationClass: "work_item_transition",
+    } });
+    const transitionAuthorized = {
+      ...transitionUnsigned,
+      actorReceiptId: transitionAttestation.actorReceiptId,
+      operatorReceiptId: transitionAttestation.operatorReceipt!.receiptId,
+    };
+    const beforeTransitionRefusals = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", { ...transitionAuthorized, projectId: FOREIGN_PROJECT_ID })).toMatchObject({ outcome: "OPERATOR_RECEIPT_FOREIGN" });
+    expect(await host.harness.callRpc("apply", { ...transitionAuthorized, operationClass: "work_item_create" })).toMatchObject({ outcome: "OPERATOR_RECEIPT_STALE" });
+    expect(await host.harness.callRpc("apply", { ...transitionAuthorized, candidateHead: H1_CANDIDATE_SHA })).toMatchObject({ outcome: "OPERATOR_RECEIPT_STALE" });
+    expect(await host.harness.callRpc("apply", { ...transitionAuthorized, expectedConfigRevision: 0 })).toMatchObject({ outcome: "PROJECT_CONFIG_STALE" });
+    expect(await host.harness.callRpc("apply", { ...transitionAuthorized, expectedFenceToken: "stale-fence" })).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeTransitionRefusals);
+    expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(transitionAuthorized.operatorReceiptId)).toEqual({ consumed_at_ms: null });
+
+    const staleResourceRequest = transitionRequest(fenceToken, "ready", 99, {
+      workItemId: "attested-work-item",
+      idempotencyKey: "attested-work-item-stale-resource",
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      candidateHead: CANDIDATE_SHA,
+    });
+    const staleResourceAttestation = await host.harness.callRpc("approverAttestation", {
+      ...attestation,
+      mutationClass: "work_item_transition",
+      idempotencyKey: staleResourceRequest.idempotencyKey,
+      requestDigest: operatorRequestDigest(staleResourceRequest),
+    }) as FoundationResult;
+    expect(staleResourceAttestation).toMatchObject({ outcome: "OK" });
+    const beforeStaleResource = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", {
+      ...staleResourceRequest,
+      actorReceiptId: staleResourceAttestation.actorReceiptId,
+      operatorReceiptId: staleResourceAttestation.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "WORK_ITEM_REVISION_STALE" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeStaleResource);
+
+    const appliedTransition = await host.harness.callRpc("apply", transitionAuthorized) as FoundationResult;
+    expect(appliedTransition).toMatchObject({ outcome: "OK", currentResourceRevision: 2, mutationReceipt: {
+      operationClass: "work_item_transition",
+      operatorReceiptId: transitionAuthorized.operatorReceiptId,
+    } });
+    expect(await host.harness.callRpc("apply", transitionAuthorized)).toEqual(appliedTransition);
+    expect(await host.harness.callRpc("apply", { ...transitionAuthorized, idempotencyKey: "attested-work-item-ready-reuse" })).toMatchObject({ outcome: "OPERATOR_RECEIPT_REUSED" });
 
     const receiptId = issued.operatorReceipt!.receiptId;
     const actorReceiptId = issued.actorReceiptId!;
@@ -1853,7 +1924,7 @@ describe("bb-collab plugin boundary", () => {
     expect(revoked).toMatchObject({ outcome: "AUTHORIZED_APPROVER_REVOKED" });
   });
 
-  it("refuses a retired v9 approver registry under contract v11", async () => {
+  it("refuses retired v9/v11 approver registries under contract v12", async () => {
     const { host, db, fenceToken } = await assignmentFixture();
     seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "compat-operator", actorKind: "operator", subjectId: "operator-1" });
     const decisionId = "compat-operator";
@@ -1886,6 +1957,17 @@ describe("bb-collab plugin boundary", () => {
       "migration_prepare",
       "migration_step",
     ]);
+    const retiredV11Json = canonicalJson([
+      "bootstrap",
+      "config_revision",
+      "decision_create",
+      "decision_disposition",
+      "work_item_create",
+      "qualification_observation_record",
+      "role_generation_succession",
+      "migration_prepare",
+      "migration_step",
+    ]);
     db.prepare(
       `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
        WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = 1`,
@@ -1896,13 +1978,13 @@ describe("bb-collab plugin boundary", () => {
     });
 
     const currentJson = canonicalJson(DERIVED_ACTOR_MUTATION_CLASSES);
-    const attest = async (attestedRequest: ApplyRequest, mutationClass: "decision_create" | "governor_claim") => host.harness.callRpc("approverAttestation", {
+    const attest = async (attestedRequest: ApplyRequest, mutationClass: "decision_create" | "work_item_transition" | "governor_claim") => host.harness.callRpc("approverAttestation", {
       projectId: PROJECT_ID,
       mutationClass,
       candidateHead: CANDIDATE_SHA,
       idempotencyKey: attestedRequest.idempotencyKey,
       requestDigest: operatorRequestDigest(attestedRequest),
-      callerThreadId: "v11-approver-matrix-attestor",
+      callerThreadId: "v12-approver-matrix-attestor",
       requestedFromBackground: false,
       approverId: AUTHORIZED_APPROVER_ID,
       authorizingDecisionId: decisionId,
@@ -1930,7 +2012,7 @@ describe("bb-collab plugin boundary", () => {
       candidateHead: CANDIDATE_SHA,
       idempotencyKey: request.idempotencyKey,
       requestDigest: operatorRequestDigest(request),
-      callerThreadId: "v11-retired-v9-attestor",
+      callerThreadId: "v12-retired-v9-attestor",
       requestedFromBackground: false,
       approverId: AUTHORIZED_APPROVER_ID,
       authorizingDecisionId: decisionId,
@@ -1941,6 +2023,20 @@ describe("bb-collab plugin boundary", () => {
       status: "active",
       allowed_mutation_classes_json: retiredV9Json,
     });
+
+    db.prepare(
+      `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
+       WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = 1`,
+    ).run(retiredV11Json, PROJECT_ID, AUTHORIZED_APPROVER_ID, decisionId);
+    const transition = transitionRequest(fenceToken, "ready", 1, {
+      idempotencyKey: "compat-v11-transition",
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      candidateHead: CANDIDATE_SHA,
+    });
+    const beforeRetiredV11 = exportFoundation(db, PROJECT_ID);
+    expect(await attest(transition, "work_item_transition")).toMatchObject({ outcome: "AUTHORIZED_APPROVER_INVALID" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRetiredV11);
 
     const invalidSets: Array<[string, string]> = [
       ["malformed", canonicalJson({ classes: DERIVED_ACTOR_MUTATION_CLASSES })],
@@ -1965,6 +2061,8 @@ describe("bb-collab plugin boundary", () => {
       `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
        WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = 1`,
     ).run(currentJson, PROJECT_ID, AUTHORIZED_APPROVER_ID, decisionId);
+    const currentTransition = await attest(transition, "work_item_transition") as FoundationResult;
+    expect(currentTransition).toMatchObject({ outcome: "OK", operatorReceipt: { mutationClass: "work_item_transition" }, actorReceiptId: expect.any(String) });
     const beforeUnauthorized = exportFoundation(db, PROJECT_ID);
     expect(await attest({ ...request, idempotencyKey: "compat-unauthorized-class" }, "governor_claim")).toMatchObject({ outcome: "AUTHORIZED_APPROVER_INVALID" });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeUnauthorized);
@@ -2591,9 +2689,9 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("appends the v11 role-capacity contract and rolls every cached consumer forward", () => {
+  it("appends the v12 work-item transition contract and rolls every cached consumer forward", () => {
     expect(SCHEMA_VERSION).toBe(10);
-    expect(CONTRACT_VERSION).toBe(11);
+    expect(CONTRACT_VERSION).toBe(12);
     expect(MIGRATIONS).toHaveLength(23);
     expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("80bfe52641971b984358da6bdfb4aa00d87dd928e611325f23bbbb3a1afa5c7c");
     expect(MIGRATIONS.at(-5)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
@@ -2609,35 +2707,35 @@ describe("bb-collab plugin boundary", () => {
     expect(MIGRATION_STEPS).toEqual([
       "record_inventory", "record_quiescence", "freeze", "record_export", "record_import", "record_equivalence", "activate", "record_exercise", "retire", "rollback", "mark_fix_forward_required",
     ]);
-    expect(cachedConsumerRolloutEvidence(10, 10)).toMatchObject({
-      names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 10,
-      newSchemaVersion: 10,
-      oldContractVersion: 10,
-      newContractVersion: 11,
-      action: "refused",
-      expected: 4,
-      attempted: 4,
-      verified: 0,
-    });
-    expect(cachedConsumerRolloutEvidence(9, 11)).toMatchObject({
-      oldSchemaVersion: 10,
-      newSchemaVersion: 10,
-      observedSchemaVersion: 9,
-      oldContractVersion: 10,
-      newContractVersion: 11,
-      observedContractVersion: 11,
-      action: "refused",
-      expected: 4,
-      attempted: 4,
-      verified: 0,
-    });
     expect(cachedConsumerRolloutEvidence(10, 11)).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 10,
       newSchemaVersion: 10,
-      oldContractVersion: 10,
-      newContractVersion: 11,
+      oldContractVersion: 11,
+      newContractVersion: 12,
+      action: "refused",
+      expected: 4,
+      attempted: 4,
+      verified: 0,
+    });
+    expect(cachedConsumerRolloutEvidence(9, 12)).toMatchObject({
+      oldSchemaVersion: 10,
+      newSchemaVersion: 10,
+      observedSchemaVersion: 9,
+      oldContractVersion: 11,
+      newContractVersion: 12,
+      observedContractVersion: 12,
+      action: "refused",
+      expected: 4,
+      attempted: 4,
+      verified: 0,
+    });
+    expect(cachedConsumerRolloutEvidence(10, 12)).toMatchObject({
+      names: [...CACHED_CONSUMERS],
+      oldSchemaVersion: 10,
+      newSchemaVersion: 10,
+      oldContractVersion: 11,
+      newContractVersion: 12,
       action: "reread",
       expected: 4,
       attempted: 4,
@@ -2756,7 +2854,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 10, schemaDigest, contractVersion: 11, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 10, schemaDigest, contractVersion: 12, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -5629,9 +5727,9 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(10, 10)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, oldContractVersion: 10, newContractVersion: 11, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(9, 11)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, observedSchemaVersion: 9, oldContractVersion: 10, newContractVersion: 11, observedContractVersion: 11, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(10, 11)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, oldContractVersion: 10, newContractVersion: 11, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(10, 11)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, oldContractVersion: 11, newContractVersion: 12, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(9, 12)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, observedSchemaVersion: 9, oldContractVersion: 11, newContractVersion: 12, observedContractVersion: 12, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(10, 12)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 10, oldContractVersion: 11, newContractVersion: 12, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {

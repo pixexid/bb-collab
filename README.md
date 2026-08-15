@@ -13,7 +13,7 @@ new-thread, search, navigation rows, and the footer.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through contract v11/schema v10: a
+The repository now contains the implemented foundation through contract v12/schema v10: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
@@ -28,11 +28,11 @@ confirmed bootstrap operator receipt atomically derives a verified
 `plugin/bb-collab` actor receipt linked to that exact operator receipt; the
 derived actor is not standing authority and apply must provide the same linked
 operator receipt. An adopted `operator_only` Decision registers the exact
-`orchestrator:bb-collab` approver and nine ratified derived mutation classes,
+`orchestrator:bb-collab` approver and ten ratified derived mutation classes,
 including `config_revision` for the existing canonical mutation that replaces
 the full immutable project configuration and its mapped targets, including
 `roleRequirements` provisioning,
-`work_item_create`, `qualification_observation_record`, and
+`work_item_create`, `work_item_transition`, `qualification_observation_record`, and
 `role_generation_succession`;
 the `approverAttestation` RPC issues a fresh exact-bound receipt and verified
 plugin actor without `requestInput`. Operator revocation or change marks that
@@ -49,21 +49,25 @@ resolution retains both paths and still refuses unmanaged or ephemeral contexts.
 reserve/finalize operations refuse before the adapter under this one-request
 seam. The derived actor path is limited to bootstrap, `config_revision` for
 that full project-configuration/target replacement, operator_only Decision
-create/adopted disposition, work_item_create, qualification_observation_record,
-role_generation_succession, migration_prepare, and migration_step; role-based
+create/adopted disposition, work_item_create, work_item_transition,
+qualification_observation_record, role_generation_succession, migration_prepare,
+and migration_step; role-based
 and review Decisions remain role-bound. The plugin has not been installed, reloaded, or activated against live
 project authority.
 
-Contract v11 is a contract-only role-capacity amendment: `roleRequirements`
+Contract v11 was a contract-only role-capacity amendment: `roleRequirements`
 admits at most three logical roles. `project-orchestrator` is project-scoped;
 `worker` and `independent-reviewer` require the exact repository target used by
 canonical WorkItem writes. All three retain executed-profile qualification and
-the v10 receipt/approver bindings are unchanged.
+the v10 receipt/approver bindings are unchanged. Contract v12 is a contract-only
+allowlist amendment that adds `work_item_transition`; schema and migrations remain
+unchanged, and the existing receipt, actor, config, governor and resource guards
+remain required.
 
 The historical contract-v9 eight-class registry was accepted only during the
-one-release v9-to-v10 re-adoption. Contract v11 retires that transitional
-allowlist: attestation requires the exact current nine-class row, while the
-former set and arbitrary other sets remain invalid.
+one-release v9-to-v10 re-adoption. Contract v11 required the exact nine-class
+row; contract v12 retires that prior row and requires the exact current
+ten-class row, while the former sets and arbitrary other sets remain invalid.
 
 The ratified evidence-only MigrationRun shape records the llm-collab fence
 `f988d9711d3778f751e4ec0e32ebbf7b0893c80f` at resource revision 4 and merged
