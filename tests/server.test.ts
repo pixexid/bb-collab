@@ -1369,7 +1369,7 @@ describe("bb-collab plugin boundary", () => {
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "OPERATOR_RECEIPT_REQUIRED" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules).toEqual([]);
-    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "approverAttestation", "doctor", "export", "lanes", "operatorReceipt", "operatorReceiptDecision", "operatorReceiptRequests", "reorderPinned", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
+    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "approverAttestation", "doctor", "export", "lanes", "operatorPassphraseState", "operatorReceipt", "operatorReceiptDecision", "operatorReceiptRequests", "reorderPinned", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
   });
 
   it("authorizes exact interim receipts through the same RPC and CLI seam", async () => {
@@ -5899,7 +5899,7 @@ describe("bb-collab plugin boundary", () => {
     const registrations = host.harness.inspection.registrations;
     expect(registrations.rpcMethods).not.toContain("seed-fixture-receipt");
     expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply"]);
-    expect(registrations.httpRoutes.map((route) => route.path)).toEqual(["/lanes"]);
+    expect(registrations.httpRoutes.map((route) => route.path)).toEqual(["/lanes", "/operator-receipt-waits"]);
     expect(seedFixtureDecision).toBeTypeOf("function");
   });
 });
