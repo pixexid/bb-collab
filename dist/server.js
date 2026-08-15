@@ -14019,7 +14019,7 @@ function createLaneWatcher(options) {
   const alert = (kind, lane, count, max) => {
     options.onAlert?.({ kind, lane, count, max });
   };
-  const observeNow = async (threadId, status, pendingExternalWait, archived = false, suppliedOperatorWait, suppliedOperatorWaitKnown = suppliedOperatorWait !== void 0 || !options.readOperatorWait) => {
+  const observeNow = async (threadId, status, pendingExternalWait, archived = false, suppliedOperatorWait, suppliedOperatorWaitKnown = status !== "idle" || suppliedOperatorWait !== void 0 || !options.readOperatorWait) => {
     const allLanes = options.readLanes();
     clearResolved(allLanes);
     const candidates = allLanes.filter(
@@ -14028,7 +14028,7 @@ function createLaneWatcher(options) {
     if (candidates.length === 0) return;
     let operatorWait = suppliedOperatorWait ?? null;
     let operatorWaitKnown = suppliedOperatorWaitKnown;
-    if (!archived && suppliedOperatorWait === void 0 && options.readOperatorWait) {
+    if (!archived && status === "idle" && suppliedOperatorWait === void 0 && options.readOperatorWait) {
       try {
         operatorWait = await options.readOperatorWait(threadId);
       } catch {
@@ -21064,7 +21064,7 @@ async function plugin(bb) {
       const archived = thread.archivedAt !== null || thread.deletedAt !== null;
       let operatorWait = null;
       let operatorWaitKnown = true;
-      if (!archived) {
+      if (!archived && thread.status === "idle") {
         try {
           operatorWait = await readPendingOperatorWaitForThread(threadId);
         } catch {

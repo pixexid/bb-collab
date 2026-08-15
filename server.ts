@@ -540,7 +540,7 @@ export default async function plugin(bb: BbPluginApi) {
       const archived = thread.archivedAt !== null || thread.deletedAt !== null;
       let operatorWait: OperatorWait | null = null;
       let operatorWaitKnown = true;
-      if (!archived) {
+      if (!archived && thread.status === "idle") {
         try {
           operatorWait = await readPendingOperatorWaitForThread(threadId);
         } catch {

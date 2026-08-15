@@ -402,7 +402,7 @@ export function createLaneWatcher(options: {
     pendingExternalWait?: boolean,
     archived = false,
     suppliedOperatorWait?: OperatorWait | null,
-    suppliedOperatorWaitKnown = suppliedOperatorWait !== undefined || !options.readOperatorWait,
+    suppliedOperatorWaitKnown = status !== "idle" || suppliedOperatorWait !== undefined || !options.readOperatorWait,
   ): Promise<void> => {
     const allLanes = options.readLanes();
     clearResolved(allLanes);
@@ -416,7 +416,7 @@ export function createLaneWatcher(options: {
 
     let operatorWait = suppliedOperatorWait ?? null;
     let operatorWaitKnown = suppliedOperatorWaitKnown;
-    if (!archived && suppliedOperatorWait === undefined && options.readOperatorWait) {
+    if (!archived && status === "idle" && suppliedOperatorWait === undefined && options.readOperatorWait) {
       try {
         operatorWait = await options.readOperatorWait(threadId);
       } catch {
