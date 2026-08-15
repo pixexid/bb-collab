@@ -90,6 +90,9 @@ Its limits, stated plainly:
 The counts arrive over `GET /operator-receipt-waits`, which returns
 `{ total, threads }` and deliberately carries no project, candidate head,
 request digest, or idempotency key — a glyph has no use for receipt binding.
+A failed interaction read answers 503, never `{ total: 0, threads: {} }`: a
+proven zero clears the row, so an outage must stay distinguishable from one and
+leave the last known status in place.
 
 **Deletion condition.** Delete this section and the tripwire in
 `tests/sidebar-nav-capability.test.ts` when BB ships a nav-row attention or

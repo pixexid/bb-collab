@@ -653,7 +653,16 @@ export default async function plugin(bb: BbPluginApi) {
   // thread; it has no use for the project, candidate head, digest or
   // idempotency key those requests carry, so this surface never carries them.
   bb.http.route("GET", "/operator-receipt-waits", async () => {
-    const requests = await readOperatorReceiptRequests(bb).catch(() => []);
+    // An unreadable interaction list is not zero waits. Answering a read
+    // outage with a non-2xx leaves the client on its last known row status
+    // instead of erasing a live approval, and the body carries no read detail.
+    const requests = await readOperatorReceiptRequests(bb).catch(() => null);
+    if (!requests) {
+      return new Response(JSON.stringify({ error: "operator receipt waits unavailable" }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      });
+    }
     const threads: Record<string, number> = {};
     for (const request of requests) threads[request.threadId] = (threads[request.threadId] ?? 0) + 1;
     return new Response(JSON.stringify({ total: requests.length, threads }), {

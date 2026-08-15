@@ -21162,7 +21162,13 @@ async function plugin(bb) {
     })
   );
   bb.http.route("GET", "/operator-receipt-waits", async () => {
-    const requests = await readOperatorReceiptRequests(bb).catch(() => []);
+    const requests = await readOperatorReceiptRequests(bb).catch(() => null);
+    if (!requests) {
+      return new Response(JSON.stringify({ error: "operator receipt waits unavailable" }), {
+        status: 503,
+        headers: { "content-type": "application/json" }
+      });
+    }
     const threads = {};
     for (const request of requests) threads[request.threadId] = (threads[request.threadId] ?? 0) + 1;
     return new Response(JSON.stringify({ total: requests.length, threads }), {

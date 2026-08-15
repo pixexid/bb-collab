@@ -216,6 +216,35 @@ describe("universal operator console", () => {
     }
   });
 
+  // #given a row already showing a live approval #when the counts read fails
+  // #then the failure must not read as zero and erase it.
+  it("keeps an already-set waiting row through a counts read outage", async () => {
+    let status = 200;
+    vi.stubGlobal("fetch", vi.fn(async (url: string) =>
+      String(url).endsWith("/lanes")
+        ? new Response("[]", { status: 200 })
+        : new Response(
+          JSON.stringify(status === 200 ? { total: 1, threads: { "worker-thread": 1 } } : { error: "operator receipt waits unavailable" }),
+          { status },
+        )));
+    vi.useFakeTimers();
+    try {
+      installTestPluginRuntime();
+      const app = await loadPluginApp(() => import("../app"));
+      const mounted = await mountPluginContentScripts(app, { pluginId: "bb-collab" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mounted.inspection.getThreadRowStatus("worker-thread")?.label).toBe("1 approval awaiting operator");
+
+      status = 503;
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(mounted.inspection.getThreadRowStatus("worker-thread")?.label).toBe("1 approval awaiting operator");
+      await mounted.lifecycle.dispose();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("drops counts a stale server shape cannot prove", async () => {
     installTestPluginRuntime();
     const { operatorReceiptWaits } = await import("../app");

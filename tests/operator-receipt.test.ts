@@ -367,6 +367,30 @@ describe("interim operator receipts", () => {
     }
   });
 
+  // #given the interaction read is the only source of these counts #when that
+  // read fails #then the outage must stay distinguishable from a proven zero,
+  // because the sidebar consumer treats a 200 body as authoritative.
+  it("refuses the waiting counts when the interaction read fails and still proves a real zero", async () => {
+    const host = createFakePluginHost({ pluginId: "bb-collab", settings: { operatorPassphrase: "correct-secret" } });
+    await plugin(host.bb);
+
+    host.harness.sdk.stub("threads.list", async () => {
+      throw new Error("interaction read unavailable");
+    });
+    const failed = await host.harness.fetchHttp("GET", "/operator-receipt-waits");
+    const failedBody = await failed.text();
+    expect(failed.ok).toBe(false);
+    expect(failed.status).toBe(503);
+    expect(failedBody).not.toBe(JSON.stringify({ total: 0, threads: {} }));
+    expect(failedBody).not.toContain("interaction read unavailable");
+
+    // #and a genuine no-pending read is still the exact authoritative zero.
+    host.harness.sdk.stub("threads.list", async () => []);
+    const empty = await host.harness.fetchHttp("GET", "/operator-receipt-waits");
+    expect(empty.status).toBe(200);
+    expect(JSON.parse(await empty.text())).toEqual({ total: 0, threads: {} });
+  });
+
   it("rejects a live request through the same host interaction without writing a receipt", async () => {
     const host = createFakePluginHost({ pluginId: "bb-collab", settings: { operatorPassphrase: "correct-secret" } });
     await plugin(host.bb);
