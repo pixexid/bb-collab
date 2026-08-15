@@ -13,7 +13,7 @@ new-thread, search, navigation rows, and the footer.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through contract v9/schema v10: a
+The repository now contains the implemented foundation through contract v10/schema v10: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
@@ -28,8 +28,11 @@ confirmed bootstrap operator receipt atomically derives a verified
 `plugin/bb-collab` actor receipt linked to that exact operator receipt; the
 derived actor is not standing authority and apply must provide the same linked
 operator receipt. An adopted `operator_only` Decision registers the exact
-`orchestrator:bb-collab` approver and eight ratified derived mutation classes,
-including `work_item_create`, `qualification_observation_record`, and
+`orchestrator:bb-collab` approver and nine ratified derived mutation classes,
+including `config_revision` for the existing canonical mutation that replaces
+the full immutable project configuration and its mapped targets, including
+`roleRequirements` provisioning,
+`work_item_create`, `qualification_observation_record`, and
 `role_generation_succession`;
 the `approverAttestation` RPC issues a fresh exact-bound receipt and verified
 plugin actor without `requestInput`. Operator revocation or change marks that
@@ -42,11 +45,19 @@ facts through the existing `RoleFactReader` seam before issuing
 foreign facts refuse before write.
 `github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
 reserve/finalize operations refuse before the adapter under this one-request
-seam. The derived actor path is limited to bootstrap, operator_only Decision
+seam. The derived actor path is limited to bootstrap, `config_revision` for
+that full project-configuration/target replacement, operator_only Decision
 create/adopted disposition, work_item_create, qualification_observation_record,
 role_generation_succession, migration_prepare, and migration_step; role-based
 and review Decisions remain role-bound. The plugin has not been installed, reloaded, or activated against live
 project authority.
+
+For the one-release v9-to-v10 rollout only, an already-stored registry whose
+JSON is exactly the contract-v9 eight-class set may attest only those eight
+classes and never `config_revision`; an adopted same-Decision `seq+1`
+re-adoption atomically supersedes it with the current nine-class row. Arbitrary
+subsets or other class sets remain invalid, and the v9 set is retired after
+that live v10 re-adoption.
 
 The ratified evidence-only MigrationRun shape records the llm-collab fence
 `f988d9711d3778f751e4ec0e32ebbf7b0893c80f` at resource revision 4 and merged
