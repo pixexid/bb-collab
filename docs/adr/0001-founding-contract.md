@@ -205,18 +205,7 @@ rereads for v13 and refusal for stale v12 consumers.
 
 The contract v11/schema v10 role-capacity amendment remains contract-only.
 Contract v12/schema v10 adds only `work_item_transition` to the derived
- authorized-approver set. Contract v13/schema v11 adds one nullable
-`role_generations.standby_profile_json` migration and requires a named,
-different-provider standby for new project-orchestrator generations; the
-standby has no authority or traffic. `roleRequirements` admits at most three logical
-roles: `project-orchestrator` is project-scoped, while `worker` and
-`independent-reviewer` require the exact repository target used by canonical
-WorkItem writes. Each requirement retains its explicit executed-profile
-qualification. The v10 receipt, approver, derived-actor and existing refusal
-bindings are unchanged; cached consumers reread v13/schema v11 or refuse the
-previous versions. Existing generations remain readable without fabricated
-standby evidence.
- authorized-approver set. Contract v13/schema v11 adds one nullable
+authorized-approver set. Contract v13/schema v11 adds one nullable
 `role_generations.standby_profile_json` migration and requires a named,
 different-provider standby for new project-orchestrator generations; the
 standby has no authority or traffic. It also replaces the founding hard-2
@@ -230,8 +219,9 @@ chain; no second queue or authority store exists. `roleRequirements` admits at
 most three logical roles: `project-orchestrator` is project-scoped, while
 `worker` and `independent-reviewer` require the exact repository target used by
 canonical WorkItem writes. Each requirement retains its explicit
-executed-profile qualification. Cached consumers reread v13/schema v11 or
-refuse the previous versions. Existing generations remain readable without
+executed-profile qualification. The v10 receipt, approver, derived-actor and
+existing refusal bindings are unchanged; cached consumers reread v13/schema v11
+or refuse the previous versions. Existing generations remain readable without
 fabricated standby evidence.
 
 ## 6. Roles, delegation and execution
