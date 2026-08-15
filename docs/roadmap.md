@@ -12,8 +12,10 @@ The detailed 40-issue source disposition is in the
 Issue #77 is the first bounded throughput slice: establish the explicit
 per-orchestrator writing-lane cap at 3 for bb-collab, preserve lower canonical
 dials, and expose parallel startable queue lanes while keeping reviews/probes
-outside the cap. It precedes #76 and all feature work; #78, #79, and #80 remain
-separate follow-up slices.
+outside the cap. It is present on current `origin/main` through merged PR #85.
+Issue #76 is the next bounded slice: derive Tier A/B/C from touched surfaces,
+require PR tier declarations, and keep Tier-B/C review from serializing the
+queue. #78, #79, and #80 remain separate follow-up slices and are not included.
 
 ## Founding documentation
 
@@ -72,10 +74,13 @@ separate follow-up slices.
    relations, holds, conditions, revert and delegated-action receipts. Import
    legacy authority strings as evidence only.
 
-10. **Review, release and environment safety.** Require final independent
-   local exact-head review, connector policy/capability truth table, bounded
-   one-pass amendments, exact repository-target release evidence, literal
-   aggregate verification, clean/disposable proof and exact cleanup blockers.
+10. **Review, release and environment safety.** Apply the Tier A/B/C policy:
+   Tier A requires independent local exact-head review before merge; Tier B
+   merges on local verify plus CI and reviews post-merge in parallel; Tier C
+   uses local verify plus CI only. Keep the connector policy/capability truth
+   table, bounded one-pass amendments, exact repository-target release
+   evidence, literal aggregate verification, clean/disposable proof and exact
+   cleanup blockers.
 
 11. **Migration and cutover.** Build deterministic export/import, source
    mutator inventory, shared governorship guard, freeze canaries, no-writer

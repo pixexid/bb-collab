@@ -108,16 +108,28 @@ cached consumers emit a durable reread/refusal rollout receipt.
   the exact project and repository target where applicable.
 - A delegated worker uses a versioned frozen brief, an isolated managed
   environment, exact branch/base/candidate semantics and a terminal
-  DONE|BLOCKED receipt. Native BB/provider events are the execution evidence;
-  quiet is not success.
+  DONE|BLOCKED receipt. The brief and its PR body declare the derived review
+  tier. Native BB/provider events are the execution evidence; quiet is not
+  success.
 - Automated subagents, if introduced later, are depth one and draft-only.
   They do not own writing, authority, merge, release or operator decisions.
 
 ## Review and release obligations
 
 - Tier-A work receives a structurally independent local cold review of the
-  exact candidate head. The reviewer has no writing assignment or authorship
-  in the lane and emits an exact-head terminal artifact.
+  exact candidate head before merge. Tier-B work merges on local verification
+  and CI, then receives cold review post-merge in parallel; a confirmed serious
+  defect follows the existing revert path, otherwise findings become follow-up
+  work. Tier-C documentation, mechanical edits and additive tests use local
+  verification and CI only.
+- Every PR body contains one `Review tier: A|B|C` declaration. The tier is
+  derived from touched surfaces, and wrong-tiering is a review finding. The
+  stateless check in `scripts/check-review-tier.mjs` only validates metadata;
+  it is not authority or queue state.
+- Tier-A surfaces include authority/provenance, canonical DDL/lifecycle,
+  operator receipts/approval, spend, concurrency/atomicity, migration/cutover,
+  and review/release policy. The next unrelated lane may start while a Tier-A
+  review runs; only the candidate merge waits for its review.
 - External connector policy is project configuration: required, optional or
   prohibited. Observed capability is separate evidence: available, absent,
   degraded or unknown. Required policy with absent, degraded or unknown

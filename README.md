@@ -137,6 +137,11 @@ The plugin governs sanctioned canonical mutations. It cannot physically veto
 raw BB, administrator, Git or filesystem activity; unmanaged activity gains no
 canonical authority merely by being observed.
 
+Review is tiered by touched surface: Tier A requires independent exact-head
+cold review before merge, Tier B merges on local verification and CI with cold
+review post-merge in parallel, and Tier C uses local verification and CI only.
+Every PR body declares its tier; wrong-tiering is a review finding.
+
 ## v1 boundary
 
 The first release is complete only when it can provide:
@@ -156,8 +161,8 @@ The first release is complete only when it can provide:
    environments and terminal reports.
 8. Decisions, dispositions, evidence artifacts and operator holds, with
    consults explicitly advisory.
-9. Exact-head review, release and environment-safety gates with
-   capability-aware connector handling.
+9. Tiered review, release and environment-safety gates with Tier-A exact-head
+   review and capability-aware connector handling.
 10. Deterministic source freeze, export, import, equivalence and one-governor
     activation.
 11. One adversarial first-adopter conformance lane through routine closure.
