@@ -26,6 +26,8 @@ import {
   OPERATOR_RECEIPT_RETIREMENT_CONDITION,
   persistBootstrapOperatorReceipt,
   persistInterimOperatorReceipt,
+  persistOperatorReceiptWithSessionEvidence,
+  readOperatorReceiptWithSessionEvidence,
   parseApplyRequest,
   type ApplyRequest,
   type FoundationResult,
@@ -155,6 +157,30 @@ const sidebarThreadExecutionSchema = z
   .strict();
 const sidebarCollapseKindSchema = z.enum(["project", "thread"]);
 const sidebarCollapseKey = (kind: "project" | "thread", id: string) => `sidebar.collapse:${kind}:${id}`;
+const operatorReceiptInteractionDataSchema = operatorReceiptRequestSchema.extend({
+  kind: z.literal("operator_receipt_confirmation"),
+  retirementCondition: z.literal(OPERATOR_RECEIPT_RETIREMENT_CONDITION),
+}).strict();
+const operatorReceiptRequestViewSchema = z.object({
+  interactionId: sidebarThreadIdSchema,
+  threadId: sidebarThreadIdSchema,
+  projectId: projectIdSchema,
+  mutationClass: z.string().min(1),
+  candidateHead: z.string().regex(/^[0-9a-f]{40,64}$/u),
+  idempotencyKey: z.string().min(1),
+  requestDigest: z.string().regex(/^[0-9a-f]{64}$/u),
+  callerThreadId: sidebarThreadIdSchema,
+  requestedFromBackground: z.boolean(),
+  createdAt: z.number().int().nonnegative(),
+  expiresAt: z.number().int().nonnegative().nullable(),
+  ageMs: z.number().int().nonnegative(),
+}).strict();
+const operatorReceiptDecisionSchema = operatorReceiptRequestViewSchema.extend({
+  decision: z.enum(["approve", "reject"]),
+  passphrase: z.string().optional(),
+  approverThreadId: sidebarThreadIdSchema.nullable(),
+}).strict();
+type OperatorReceiptRequestView = z.infer<typeof operatorReceiptRequestViewSchema>;
 
 export const rpcContract = defineRpcContract({
   lanes: {
@@ -211,6 +237,14 @@ export const rpcContract = defineRpcContract({
     input: operatorReceiptRequestSchema,
     output: foundationResultSchema,
   },
+  operatorReceiptRequests: {
+    input: z.object({}).strict(),
+    output: z.array(operatorReceiptRequestViewSchema),
+  },
+  operatorReceiptDecision: {
+    input: operatorReceiptDecisionSchema,
+    output: foundationResultSchema,
+  },
   approverAttestation: {
     input: approverAttestationRequestSchema,
     output: foundationResultSchema,
@@ -243,9 +277,49 @@ function operatorReceiptResult(
   projectId: string,
   outcome: FoundationResult["outcome"],
   message: string,
-  extra: Pick<FoundationResult, "operatorReceipt" | "actorReceiptId"> = {},
+  extra: Pick<FoundationResult, "operatorReceipt" | "actorReceiptId" | "evidence"> = {},
 ): FoundationResult {
   return { outcome, subject: projectId, expected: 1, attempted: extra.operatorReceipt ? 1 : 0, verified: extra.operatorReceipt ? 1 : 0, message, ...extra };
+}
+
+function operatorReceiptInteractionData(interaction: unknown, pluginId: string): z.infer<typeof operatorReceiptInteractionDataSchema> | null {
+  if (!interaction || typeof interaction !== "object") return null;
+  const value = interaction as { status?: unknown; origin?: unknown; payload?: unknown; threadId?: unknown };
+  if (value.status !== "pending" || value.threadId === undefined || !value.origin || typeof value.origin !== "object") return null;
+  const origin = value.origin as { kind?: unknown; pluginId?: unknown; rendererId?: unknown };
+  if (origin.kind !== "plugin" || origin.pluginId !== pluginId || origin.rendererId !== "operator-receipt") return null;
+  if (!value.payload || typeof value.payload !== "object") return null;
+  const payload = value.payload as { kind?: unknown; data?: unknown };
+  if (payload.kind !== "plugin") return null;
+  const parsed = operatorReceiptInteractionDataSchema.safeParse(payload.data);
+  return parsed.success && parsed.data.callerThreadId === value.threadId ? parsed.data : null;
+}
+
+async function readOperatorReceiptRequests(bb: BbPluginApi): Promise<OperatorReceiptRequestView[]> {
+  const threads = await bb.sdk.threads.list({ archived: false, includeHidden: true, limit: 1000 });
+  const pending = await Promise.all(threads.filter((thread) => thread.hasPendingInteraction).map(async (thread) => {
+    const interactions = await bb.sdk.threads.interactions.list({ threadId: thread.id }).catch(() => []);
+    return interactions.flatMap((interaction) => {
+      const data = operatorReceiptInteractionData(interaction, bb.pluginId);
+      if (!data) return [];
+      const createdAt = typeof interaction.createdAt === "number" ? interaction.createdAt : 0;
+      return [{
+        interactionId: interaction.id,
+        threadId: thread.id,
+        projectId: data.projectId,
+        mutationClass: data.mutationClass,
+        candidateHead: data.candidateHead,
+        idempotencyKey: data.idempotencyKey,
+        requestDigest: data.requestDigest,
+        callerThreadId: data.callerThreadId,
+        requestedFromBackground: data.requestedFromBackground,
+        createdAt,
+        expiresAt: typeof interaction.expiresAt === "number" ? interaction.expiresAt : null,
+        ageMs: Math.max(0, Date.now() - createdAt),
+      } satisfies OperatorReceiptRequestView];
+    });
+  }));
+  return pending.flat().sort((left, right) => right.createdAt - left.createdAt);
 }
 
 function parseFlag(args: string[], name: string): string | null {
@@ -386,6 +460,14 @@ async function runCli(
 }
 
 export default async function plugin(bb: BbPluginApi) {
+  const operatorPassphrase = bb.settings.define({
+    operatorPassphrase: {
+      type: "string",
+      label: "Operator approval passphrase",
+      description: "Required by the universal Lanes approval console; stored as a secret.",
+      secret: true,
+    },
+  });
   let db: SqliteDatabase | null = null;
   try {
     db = bb.storage.database();
@@ -533,7 +615,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     async operatorReceipt(input) {
       if (!db) return operatorReceiptResult(input.projectId, "CANONICAL_STORE_UNAVAILABLE", "canonical SQLite store is unavailable");
-      const interaction = await bb.ui.requestInput({
+      const interactionPromise = bb.ui.requestInput({
         threadId: input.callerThreadId,
         rendererId: "operator-receipt",
         title: "Confirm operator receipt",
@@ -545,11 +627,15 @@ export default async function plugin(bb: BbPluginApi) {
           candidateHead: input.candidateHead,
           idempotencyKey: input.idempotencyKey,
           requestDigest: input.requestDigest,
+          callerThreadId: input.callerThreadId,
           retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
           requestedFromBackground: input.requestedFromBackground,
         },
       });
+      bb.realtime.publish("operator-receipts", { changed: true });
+      const interaction = await interactionPromise;
       if (interaction.outcome === "cancelled") {
+        bb.realtime.publish("operator-receipts", { changed: true });
         return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_CANCELLED", `operator confirmation cancelled: ${interaction.reason}`);
       }
       const confirmation = operatorReceiptConfirmationSchema.safeParse(interaction.value);
@@ -565,14 +651,116 @@ export default async function plugin(bb: BbPluginApi) {
         return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_STALE", "operator confirmation binding is stale");
       }
       try {
+        if (confirmation.data.operatorReceiptId) {
+          const issued = readOperatorReceiptWithSessionEvidence(
+            db,
+            input,
+            confirmation.data.operatorReceiptId,
+            confirmation.data.actorReceiptId,
+            confirmation.data.evidenceId,
+          );
+          const { evidenceId, ...receiptResult } = issued;
+          return operatorReceiptResult(input.projectId, "OK", "operator receipt and connect-session evidence already persisted", {
+            ...receiptResult,
+            evidence: { source: "connect-session", evidenceId, interactionId: confirmation.data.interactionId ?? null, workerThreadId: input.callerThreadId },
+          });
+        }
         if (isDerivedActorMutationClass(input.mutationClass)) {
           const issued = persistBootstrapOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId });
+          bb.realtime.publish("operator-receipts", { changed: true });
           return operatorReceiptResult(input.projectId, "OK", "interim operator receipt and derived actor receipt persisted", issued);
         }
         const receipt = persistInterimOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId });
+        bb.realtime.publish("operator-receipts", { changed: true });
         return operatorReceiptResult(input.projectId, "OK", "interim operator receipt persisted", { operatorReceipt: receipt });
       } catch {
         return operatorReceiptResult(input.projectId, "INTERNAL_ERROR", "interim operator receipt was not persisted");
+      }
+    },
+    async operatorReceiptRequests() {
+      try {
+        return await readOperatorReceiptRequests(bb);
+      } catch {
+        return [];
+      }
+    },
+    async operatorReceiptDecision(input) {
+      if (!db) return operatorReceiptResult(input.projectId, "CANONICAL_STORE_UNAVAILABLE", "canonical SQLite store is unavailable");
+      let interaction: Awaited<ReturnType<typeof bb.sdk.threads.interactions.get>>;
+      try {
+        interaction = await bb.sdk.threads.interactions.get({ threadId: input.threadId, interactionId: input.interactionId });
+      } catch {
+        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_UNKNOWN", "pending operator interaction is not known");
+      }
+      if (interaction.id !== input.interactionId || interaction.threadId !== input.threadId) {
+        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_FOREIGN", "operator interaction belongs to another session");
+      }
+      if (interaction.status !== "pending") {
+        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_REUSED", "operator interaction was already resolved");
+      }
+      const data = operatorReceiptInteractionData(interaction, bb.pluginId);
+      if (!data) return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_UNKNOWN", "interaction is not a pending operator receipt request");
+      if (data.projectId !== input.projectId) {
+        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_FOREIGN", "operator receipt belongs to another project");
+      }
+      if (
+        data.mutationClass !== input.mutationClass ||
+        data.candidateHead !== input.candidateHead ||
+        data.idempotencyKey !== input.idempotencyKey ||
+        data.requestDigest !== input.requestDigest ||
+        data.callerThreadId !== input.callerThreadId
+      ) {
+        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_STALE", "operator receipt binding is stale");
+      }
+      if (input.approverThreadId === data.callerThreadId) {
+        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_INVALID", "worker self-approval is not permitted");
+      }
+      const configured = await operatorPassphrase.get().catch(() => ({ operatorPassphrase: undefined }));
+      if (!configured.operatorPassphrase || !input.passphrase || input.passphrase !== configured.operatorPassphrase) {
+        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_INVALID", "operator approval passphrase is missing or incorrect");
+      }
+      const confirmation = {
+        confirmed: input.decision === "approve",
+        projectId: data.projectId,
+        mutationClass: data.mutationClass,
+        candidateHead: data.candidateHead,
+        idempotencyKey: data.idempotencyKey,
+        requestDigest: data.requestDigest,
+      };
+      if (input.decision === "reject") {
+        try {
+          await bb.sdk.threads.interactions.respond({ threadId: input.threadId, interactionId: input.interactionId, value: confirmation });
+          bb.realtime.publish("operator-receipts", { changed: true });
+          return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_CANCELLED", "operator receipt request rejected", {
+            evidence: { source: "connect-session", interactionId: input.interactionId, workerThreadId: data.callerThreadId },
+          });
+        } catch {
+          return operatorReceiptResult(input.projectId, "INTERNAL_ERROR", "operator receipt rejection was not delivered");
+        }
+      }
+      try {
+        const issued = persistOperatorReceiptWithSessionEvidence(
+          db,
+          { ...data, callerThreadId: data.callerThreadId, callerPluginId: bb.pluginId },
+          input.interactionId,
+        );
+        if (!issued) return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_REUSED", "operator receipt binding was already issued");
+        const { evidenceId, ...receiptResult } = issued;
+        const response = {
+          ...confirmation,
+          operatorReceiptId: receiptResult.operatorReceipt.receiptId,
+          ...(receiptResult.actorReceiptId ? { actorReceiptId: receiptResult.actorReceiptId } : {}),
+          evidenceId,
+          interactionId: input.interactionId,
+        };
+        await bb.sdk.threads.interactions.respond({ threadId: input.threadId, interactionId: input.interactionId, value: response });
+        bb.realtime.publish("operator-receipts", { changed: true });
+        return operatorReceiptResult(input.projectId, "OK", "operator receipt persisted and worker interaction resolved", {
+          ...receiptResult,
+          evidence: { source: "connect-session", evidenceId, interactionId: input.interactionId, workerThreadId: data.callerThreadId },
+        });
+      } catch {
+        return operatorReceiptResult(input.projectId, "INTERNAL_ERROR", "operator receipt approval was not persisted or delivered");
       }
     },
     approverAttestation(input) {

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { definePluginApp, experimental_useSidebarThreadActions, experimental_useSidebarThreads, useRpc } from "@bb/plugin-sdk/app";
+import { definePluginApp, experimental_useSidebarThreadActions, experimental_useSidebarThreads, useBbContext, useRealtime, useRpc } from "@bb/plugin-sdk/app";
 import type {
   PluginComposerThreadRowStatus,
+  PluginNavPanelProps,
   PluginPendingInteractionProps,
   PluginRpcResult,
   PluginSidebarProject,
@@ -16,6 +17,7 @@ type ThreadStates = PluginRpcResult<typeof rpcContract["threadStates"]>;
 type ThreadModels = PluginRpcResult<typeof rpcContract["threadModels"]>;
 type ThreadExecution = NonNullable<ThreadModels[string]>;
 type SidebarCollapseState = PluginRpcResult<typeof rpcContract["sidebarCollapseState"]>;
+type PendingOperatorReceipt = PluginRpcResult<typeof rpcContract["operatorReceiptRequests"]>[number];
 
 const MAX_VISIBLE_THREADS = 5;
 const RUNNING_INDICATORS = new Set<PluginSidebarThread["indicator"]>([
@@ -640,19 +642,97 @@ function age(ms: number): string {
   return `${Math.floor(hours / 24)}d`;
 }
 
-function LanesPanel() {
+function AwaitingOperator({ requests, refresh }: { requests: readonly PendingOperatorReceipt[]; refresh: () => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const { threadId: approverThreadId } = useBbContext();
+  const [passphrases, setPassphrases] = useState<Record<string, string>>({});
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const decide = async (request: PendingOperatorReceipt, decision: "approve" | "reject") => {
+    setBusyId(request.interactionId);
+    setError(null);
+    try {
+      const result = await rpc.call("operatorReceiptDecision", {
+        ...request,
+        decision,
+        passphrase: passphrases[request.interactionId] ?? "",
+        approverThreadId,
+      });
+      if (result.outcome !== "OK" && result.outcome !== "OPERATOR_RECEIPT_CANCELLED") {
+        setError(result.message ?? result.outcome);
+        return;
+      }
+      setPassphrases((current) => {
+        const next = { ...current };
+        delete next[request.interactionId];
+        return next;
+      });
+      refresh();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <section className="mb-6" aria-labelledby="awaiting-operator-heading">
+      <div className="mb-3 flex items-center justify-between">
+        <div>
+          <h2 id="awaiting-operator-heading" className="font-semibold">Awaiting operator</h2>
+          <p className="text-sm text-muted-foreground">Exact receipt requests from connected worker sessions.</p>
+        </div>
+        <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">{requests.length}</span>
+      </div>
+      {error ? <p className="mb-3 text-sm text-destructive" role="alert">{error}</p> : null}
+      {requests.length === 0 ? <p className="border-y border-border py-3 text-sm text-muted-foreground">No pending receipt requests.</p> : null}
+      <div className="space-y-3">
+        {requests.map((request) => {
+          const busy = busyId === request.interactionId;
+          const passphrase = passphrases[request.interactionId] ?? "";
+          return (
+            <article className="rounded-lg border border-border p-3" key={request.interactionId}>
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <span className="font-medium">{request.mutationClass}</span>
+                <time className="shrink-0 text-xs text-muted-foreground" dateTime={new Date(request.createdAt).toISOString()}>{age(request.ageMs)}</time>
+              </div>
+              <dl className="grid gap-2 text-xs sm:grid-cols-2">
+                <div><dt className="text-muted-foreground">Project</dt><dd className="break-all font-mono">{request.projectId}</dd></div>
+                <div><dt className="text-muted-foreground">Candidate head</dt><dd className="break-all font-mono">{request.candidateHead}</dd></div>
+                <div><dt className="text-muted-foreground">Request digest</dt><dd className="break-all font-mono">{request.requestDigest}</dd></div>
+                <div><dt className="text-muted-foreground">Idempotency key</dt><dd className="break-all font-mono">{request.idempotencyKey}</dd></div>
+              </dl>
+              <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                <input
+                  className="min-h-9 min-w-0 flex-1 rounded border border-border bg-background px-2 text-sm"
+                  type="password"
+                  value={passphrase}
+                  placeholder="Approval passphrase"
+                  aria-label={`Approval passphrase for ${request.mutationClass}`}
+                  autoComplete="current-password"
+                  onChange={(event) => setPassphrases((current) => ({ ...current, [request.interactionId]: event.target.value }))}
+                />
+                <button className="min-h-9 rounded bg-primary px-3 text-sm text-primary-foreground disabled:opacity-50" type="button" disabled={busy || !passphrase} onClick={() => void decide(request, "approve")}>Approve</button>
+                <button className="min-h-9 rounded border border-border px-3 text-sm disabled:opacity-50" type="button" disabled={busy || !passphrase} onClick={() => void decide(request, "reject")}>Reject</button>
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function LanesPanel(_props: PluginNavPanelProps) {
   const rpc = useRpc<typeof rpcContract>();
   const [lanes, setLanes] = useState<readonly Lane[]>([]);
+  const [requests, setRequests] = useState<readonly PendingOperatorReceipt[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(() => {
-    void rpc
-      .call("lanes", {})
-      .then((next) => {
-        setLanes(next);
-        setError(null);
-      })
-      .catch((reason: unknown) => setError(String(reason)));
+    void rpc.call("lanes", {}).then((next) => setLanes(next)).catch((reason: unknown) => setError(String(reason)));
+    void rpc.call("operatorReceiptRequests", {}).then((next) => setRequests(next)).catch((reason: unknown) => setError(String(reason)));
   }, [rpc]);
 
   useEffect(() => {
@@ -660,6 +740,7 @@ function LanesPanel() {
     const timer = window.setInterval(refresh, 5_000);
     return () => window.clearInterval(timer);
   }, [refresh]);
+  useRealtime("operator-receipts", refresh);
 
   return (
     <main className="h-full overflow-y-auto p-5">
@@ -672,6 +753,7 @@ function LanesPanel() {
           <button className="text-sm text-muted-foreground hover:text-foreground" onClick={refresh}>Refresh</button>
         </div>
         {error ? <p className="text-sm text-destructive">Unable to read lanes: {error}</p> : null}
+        <AwaitingOperator requests={requests} refresh={refresh} />
         {lanes.length === 0 ? <p className="text-sm text-muted-foreground">No open lanes.</p> : null}
         <div className="divide-y divide-border border-y border-border">
           {lanes.map((lane) => (

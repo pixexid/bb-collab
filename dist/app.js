@@ -684,21 +684,109 @@ function age(ms) {
   if (hours < 24) return `${hours}h ${minutes % 60}m`;
   return `${Math.floor(hours / 24)}d`;
 }
-function LanesPanel() {
+function AwaitingOperator({ requests, refresh }) {
+  const rpc = useRpc();
+  const { threadId: approverThreadId } = useBbContext();
+  const [passphrases, setPassphrases] = useState({});
+  const [busyId, setBusyId] = useState(null);
+  const [error, setError] = useState(null);
+  const decide = async (request, decision) => {
+    setBusyId(request.interactionId);
+    setError(null);
+    try {
+      const result = await rpc.call("operatorReceiptDecision", {
+        ...request,
+        decision,
+        passphrase: passphrases[request.interactionId] ?? "",
+        approverThreadId
+      });
+      if (result.outcome !== "OK" && result.outcome !== "OPERATOR_RECEIPT_CANCELLED") {
+        setError(result.message ?? result.outcome);
+        return;
+      }
+      setPassphrases((current) => {
+        const next = { ...current };
+        delete next[request.interactionId];
+        return next;
+      });
+      refresh();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBusyId(null);
+    }
+  };
+  return /* @__PURE__ */ jsxs("section", { className: "mb-6", "aria-labelledby": "awaiting-operator-heading", children: [
+    /* @__PURE__ */ jsxs("div", { className: "mb-3 flex items-center justify-between", children: [
+      /* @__PURE__ */ jsxs("div", { children: [
+        /* @__PURE__ */ jsx("h2", { id: "awaiting-operator-heading", className: "font-semibold", children: "Awaiting operator" }),
+        /* @__PURE__ */ jsx("p", { className: "text-sm text-muted-foreground", children: "Exact receipt requests from connected worker sessions." })
+      ] }),
+      /* @__PURE__ */ jsx("span", { className: "rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground", children: requests.length })
+    ] }),
+    error ? /* @__PURE__ */ jsx("p", { className: "mb-3 text-sm text-destructive", role: "alert", children: error }) : null,
+    requests.length === 0 ? /* @__PURE__ */ jsx("p", { className: "border-y border-border py-3 text-sm text-muted-foreground", children: "No pending receipt requests." }) : null,
+    /* @__PURE__ */ jsx("div", { className: "space-y-3", children: requests.map((request) => {
+      const busy = busyId === request.interactionId;
+      const passphrase = passphrases[request.interactionId] ?? "";
+      return /* @__PURE__ */ jsxs("article", { className: "rounded-lg border border-border p-3", children: [
+        /* @__PURE__ */ jsxs("div", { className: "mb-3 flex items-center justify-between gap-3", children: [
+          /* @__PURE__ */ jsx("span", { className: "font-medium", children: request.mutationClass }),
+          /* @__PURE__ */ jsx("time", { className: "shrink-0 text-xs text-muted-foreground", dateTime: new Date(request.createdAt).toISOString(), children: age(request.ageMs) })
+        ] }),
+        /* @__PURE__ */ jsxs("dl", { className: "grid gap-2 text-xs sm:grid-cols-2", children: [
+          /* @__PURE__ */ jsxs("div", { children: [
+            /* @__PURE__ */ jsx("dt", { className: "text-muted-foreground", children: "Project" }),
+            /* @__PURE__ */ jsx("dd", { className: "break-all font-mono", children: request.projectId })
+          ] }),
+          /* @__PURE__ */ jsxs("div", { children: [
+            /* @__PURE__ */ jsx("dt", { className: "text-muted-foreground", children: "Candidate head" }),
+            /* @__PURE__ */ jsx("dd", { className: "break-all font-mono", children: request.candidateHead })
+          ] }),
+          /* @__PURE__ */ jsxs("div", { children: [
+            /* @__PURE__ */ jsx("dt", { className: "text-muted-foreground", children: "Request digest" }),
+            /* @__PURE__ */ jsx("dd", { className: "break-all font-mono", children: request.requestDigest })
+          ] }),
+          /* @__PURE__ */ jsxs("div", { children: [
+            /* @__PURE__ */ jsx("dt", { className: "text-muted-foreground", children: "Idempotency key" }),
+            /* @__PURE__ */ jsx("dd", { className: "break-all font-mono", children: request.idempotencyKey })
+          ] })
+        ] }),
+        /* @__PURE__ */ jsxs("div", { className: "mt-3 flex flex-col gap-2 sm:flex-row", children: [
+          /* @__PURE__ */ jsx(
+            "input",
+            {
+              className: "min-h-9 min-w-0 flex-1 rounded border border-border bg-background px-2 text-sm",
+              type: "password",
+              value: passphrase,
+              placeholder: "Approval passphrase",
+              "aria-label": `Approval passphrase for ${request.mutationClass}`,
+              autoComplete: "current-password",
+              onChange: (event) => setPassphrases((current) => ({ ...current, [request.interactionId]: event.target.value }))
+            }
+          ),
+          /* @__PURE__ */ jsx("button", { className: "min-h-9 rounded bg-primary px-3 text-sm text-primary-foreground disabled:opacity-50", type: "button", disabled: busy || !passphrase, onClick: () => void decide(request, "approve"), children: "Approve" }),
+          /* @__PURE__ */ jsx("button", { className: "min-h-9 rounded border border-border px-3 text-sm disabled:opacity-50", type: "button", disabled: busy || !passphrase, onClick: () => void decide(request, "reject"), children: "Reject" })
+        ] })
+      ] }, request.interactionId);
+    }) })
+  ] });
+}
+function LanesPanel(_props) {
   const rpc = useRpc();
   const [lanes, setLanes] = useState([]);
+  const [requests, setRequests] = useState([]);
   const [error, setError] = useState(null);
   const refresh = useCallback(() => {
-    void rpc.call("lanes", {}).then((next) => {
-      setLanes(next);
-      setError(null);
-    }).catch((reason) => setError(String(reason)));
+    void rpc.call("lanes", {}).then((next) => setLanes(next)).catch((reason) => setError(String(reason)));
+    void rpc.call("operatorReceiptRequests", {}).then((next) => setRequests(next)).catch((reason) => setError(String(reason)));
   }, [rpc]);
   useEffect(() => {
     refresh();
     const timer = window.setInterval(refresh, 5e3);
     return () => window.clearInterval(timer);
   }, [refresh]);
+  useRealtime("operator-receipts", refresh);
   return /* @__PURE__ */ jsx("main", { className: "h-full overflow-y-auto p-5", children: /* @__PURE__ */ jsxs("div", { className: "mx-auto max-w-4xl", children: [
     /* @__PURE__ */ jsxs("div", { className: "mb-5 flex items-center justify-between", children: [
       /* @__PURE__ */ jsxs("div", { children: [
@@ -711,6 +799,7 @@ function LanesPanel() {
       "Unable to read lanes: ",
       error
     ] }) : null,
+    /* @__PURE__ */ jsx(AwaitingOperator, { requests, refresh }),
     lanes.length === 0 ? /* @__PURE__ */ jsx("p", { className: "text-sm text-muted-foreground", children: "No open lanes." }) : null,
     /* @__PURE__ */ jsx("div", { className: "divide-y divide-border border-y border-border", children: lanes.map((lane) => /* @__PURE__ */ jsxs("div", { className: "grid grid-cols-[minmax(0,1fr)_auto_auto] gap-4 py-3 text-sm", children: [
       /* @__PURE__ */ jsxs("div", { className: "min-w-0", children: [
