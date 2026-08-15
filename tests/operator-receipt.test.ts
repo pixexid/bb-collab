@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import type { JsonValue } from "@bb/plugin-sdk";
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import plugin from "../server.js";
@@ -141,6 +142,42 @@ describe("interim operator receipts", () => {
 
     await expect(pending.result).resolves.toMatchObject({ outcome: "OPERATOR_RECEIPT_CANCELLED" });
     expect(host.bb.storage.database().prepare("SELECT COUNT(*) AS count FROM operator_receipts").get()).toEqual({ count: 0 });
+  });
+
+  it("wakes the desktop worker with the console-issued receipt and evidence", async () => {
+    const host = createFakePluginHost({ pluginId: "bb-collab", settings: { operatorPassphrase: "correct-secret" } });
+    await plugin(host.bb);
+    const input = request({ callerThreadId: "worker-thread" });
+    const pending = await pendingRequest(host, input);
+    const interaction = consoleInteraction({ id: pending.id, threadId: input.callerThreadId });
+    host.harness.sdk.stub("threads.interactions.get", async () => interaction);
+    host.harness.sdk.stub("threads.interactions.respond", async (args: unknown) => {
+      host.harness.behavior.submitInteraction(pending.id, (args as { value: JsonValue }).value);
+      return interaction;
+    });
+    const approved = await host.harness.callRpc("operatorReceiptDecision", {
+      interactionId: pending.id,
+      threadId: input.callerThreadId,
+      projectId: input.projectId,
+      mutationClass: input.mutationClass,
+      candidateHead: input.candidateHead,
+      idempotencyKey: input.idempotencyKey,
+      requestDigest: input.requestDigest,
+      callerThreadId: input.callerThreadId,
+      requestedFromBackground: input.requestedFromBackground,
+      createdAt: 100,
+      expiresAt: 3_600_100,
+      ageMs: 0,
+      decision: "approve",
+      passphrase: "correct-secret",
+      approverThreadId: "operator-thread",
+    }) as { outcome: string; operatorReceipt?: { receiptId: string }; evidence?: { evidenceId: string } };
+    const worker = await pending.result as { outcome: string; operatorReceipt?: { receiptId: string }; evidence?: { evidenceId: string; source: string } };
+    expect(approved.outcome).toBe("OK");
+    expect(worker).toMatchObject({ outcome: "OK", operatorReceipt: { receiptId: approved.operatorReceipt?.receiptId } });
+    expect(worker.evidence).toMatchObject({ evidenceId: approved.evidence?.evidenceId, source: "connect-session" });
+    expect(host.bb.storage.database().prepare("SELECT COUNT(*) AS count FROM operator_receipts").get()).toEqual({ count: 1 });
+    expect(host.bb.storage.database().prepare("SELECT COUNT(*) AS count FROM evidence_artifacts").get()).toEqual({ count: 1 });
   });
 
   it("refuses invalid form results without persisting", async () => {

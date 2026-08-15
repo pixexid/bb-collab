@@ -22,12 +22,12 @@ import {
   exportFoundation,
   operatorReceiptConfirmationSchema,
   operatorReceiptRequestSchema,
-  operatorReceiptBindingExists,
   isDerivedActorMutationClass,
   OPERATOR_RECEIPT_RETIREMENT_CONDITION,
   persistBootstrapOperatorReceipt,
   persistInterimOperatorReceipt,
   persistOperatorReceiptWithSessionEvidence,
+  readOperatorReceiptWithSessionEvidence,
   parseApplyRequest,
   type ApplyRequest,
   type FoundationResult,
@@ -651,6 +651,20 @@ export default async function plugin(bb: BbPluginApi) {
         return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_STALE", "operator confirmation binding is stale");
       }
       try {
+        if (confirmation.data.operatorReceiptId) {
+          const issued = readOperatorReceiptWithSessionEvidence(
+            db,
+            input,
+            confirmation.data.operatorReceiptId,
+            confirmation.data.actorReceiptId,
+            confirmation.data.evidenceId,
+          );
+          const { evidenceId, ...receiptResult } = issued;
+          return operatorReceiptResult(input.projectId, "OK", "operator receipt and connect-session evidence already persisted", {
+            ...receiptResult,
+            evidence: { source: "connect-session", evidenceId, interactionId: confirmation.data.interactionId ?? null, workerThreadId: input.callerThreadId },
+          });
+        }
         if (isDerivedActorMutationClass(input.mutationClass)) {
           const issued = persistBootstrapOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId });
           bb.realtime.publish("operator-receipts", { changed: true });
@@ -725,16 +739,21 @@ export default async function plugin(bb: BbPluginApi) {
         }
       }
       try {
-        if (operatorReceiptBindingExists(db, data)) {
-          return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_REUSED", "operator receipt binding was already issued");
-        }
         const issued = persistOperatorReceiptWithSessionEvidence(
           db,
           { ...data, callerThreadId: data.callerThreadId, callerPluginId: bb.pluginId },
           input.interactionId,
         );
+        if (!issued) return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_REUSED", "operator receipt binding was already issued");
         const { evidenceId, ...receiptResult } = issued;
-        await bb.sdk.threads.interactions.respond({ threadId: input.threadId, interactionId: input.interactionId, value: confirmation });
+        const response = {
+          ...confirmation,
+          operatorReceiptId: receiptResult.operatorReceipt.receiptId,
+          ...(receiptResult.actorReceiptId ? { actorReceiptId: receiptResult.actorReceiptId } : {}),
+          evidenceId,
+          interactionId: input.interactionId,
+        };
+        await bb.sdk.threads.interactions.respond({ threadId: input.threadId, interactionId: input.interactionId, value: response });
         bb.realtime.publish("operator-receipts", { changed: true });
         return operatorReceiptResult(input.projectId, "OK", "operator receipt persisted and worker interaction resolved", {
           ...receiptResult,

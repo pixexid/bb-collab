@@ -14959,7 +14959,11 @@ var operatorReceiptConfirmationSchema = external_exports.object({
   mutationClass: operatorMutationClassSchema,
   candidateHead: operatorCandidateHeadSchema,
   idempotencyKey: id,
-  requestDigest: digestSchema
+  requestDigest: digestSchema,
+  operatorReceiptId: id.optional(),
+  actorReceiptId: id.optional(),
+  evidenceId: id.optional(),
+  interactionId: id.optional()
 }).strict();
 var approverAttestationRequestSchema = operatorReceiptRequestSchema.extend({
   approverId: id,
@@ -15595,6 +15599,7 @@ function persistInterimOperatorReceipt(db, input, createdAtMs = now()) {
 }
 function persistOperatorReceiptWithSessionEvidence(db, input, interactionId, createdAtMs = now()) {
   return transaction(db, () => {
+    if (operatorReceiptBindingExists(db, input)) return null;
     const operatorReceipt = persistInterimOperatorReceipt(db, input, createdAtMs);
     const actorReceiptId = isDerivedActorMutationClass(input.mutationClass) ? derivePluginActorReceipt(db, operatorReceipt) : void 0;
     const evidenceId = `operator-session-${operatorReceipt.receiptId}`;
@@ -15637,6 +15642,70 @@ function persistOperatorReceiptWithSessionEvidence(db, input, interactionId, cre
     );
     return { operatorReceipt, ...actorReceiptId ? { actorReceiptId } : {}, evidenceId };
   });
+}
+function readOperatorReceiptWithSessionEvidence(db, input, operatorReceiptId, actorReceiptId, evidenceId) {
+  requireOperatorReceipt(db, {
+    projectId: input.projectId,
+    operationClass: input.mutationClass,
+    candidateHead: input.candidateHead,
+    idempotencyKey: input.idempotencyKey,
+    requestDigest: input.requestDigest,
+    operatorReceiptId
+  }, input.requestDigest);
+  const row = asRow(db.prepare(
+    `SELECT receipt_id, project_id, receipt_type, mutation_class, candidate_head,
+            idempotency_key, request_digest, binding_digest, status,
+            retirement_condition, caller_thread_id, caller_plugin_id,
+            requested_from_background, approver_id, authorizing_decision_id,
+            authorizing_disposition_sequence, receipt_digest, created_at_ms
+     FROM operator_receipts WHERE project_id = ? AND receipt_id = ?`
+  ).get(input.projectId, operatorReceiptId));
+  if (!row || row.caller_plugin_id !== PLUGIN_ID) throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt provenance is invalid");
+  if (!evidenceId) throw refusal("OPERATOR_RECEIPT_INVALID", "connect-session evidence is missing");
+  const evidence = asRow(db.prepare(
+    `SELECT evidence_id FROM evidence_artifacts
+     WHERE project_id = ? AND evidence_id = ? AND evidence_kind = 'legacy_claim'
+       AND source_kind = 'legacy_claim' AND source_ref = ?
+       AND durable_ref_json = ?`
+  ).get(
+    input.projectId,
+    evidenceId,
+    `operator-receipt:${operatorReceiptId}`,
+    canonicalJson({ kind: "connect-session", operatorReceiptId })
+  ));
+  if (!evidence) throw refusal("OPERATOR_RECEIPT_INVALID", "connect-session evidence is missing or foreign");
+  let verifiedActorReceiptId;
+  if (isDerivedActorMutationClass(input.mutationClass)) {
+    if (!actorReceiptId) throw refusal("OPERATOR_RECEIPT_INVALID", "derived actor receipt is missing");
+    const actor = asRow(db.prepare(
+      `SELECT receipt_id FROM actor_receipts
+       WHERE project_id = ? AND receipt_id = ? AND operator_receipt_id = ?
+         AND actor_kind = 'plugin' AND subject_id = ? AND verification_state = 'verified'`
+    ).get(input.projectId, actorReceiptId, operatorReceiptId, PLUGIN_ID));
+    if (!actor) throw refusal("OPERATOR_RECEIPT_INVALID", "derived actor receipt is missing or foreign");
+    verifiedActorReceiptId = actor.receipt_id;
+  }
+  const operatorReceipt = {
+    receiptId: row.receipt_id,
+    projectId: row.project_id,
+    receiptType: "operator_confirmation",
+    mutationClass: row.mutation_class,
+    candidateHead: row.candidate_head,
+    idempotencyKey: row.idempotency_key,
+    requestDigest: row.request_digest,
+    bindingDigest: row.binding_digest,
+    status: "interim",
+    retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
+    callerThreadId: row.caller_thread_id,
+    callerPluginId: row.caller_plugin_id,
+    requestedFromBackground: row.requested_from_background === 1,
+    approverId: row.approver_id,
+    authorizingDecisionId: row.authorizing_decision_id,
+    authorizingDispositionSequence: row.authorizing_disposition_sequence,
+    receiptDigest: row.receipt_digest,
+    createdAtMs: row.created_at_ms
+  };
+  return { operatorReceipt, ...verifiedActorReceiptId ? { actorReceiptId: verifiedActorReceiptId } : {}, evidenceId };
 }
 function operatorReceiptBindingExists(db, input) {
   return Boolean(db.prepare(
@@ -20879,6 +20948,20 @@ async function plugin(bb) {
         return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_STALE", "operator confirmation binding is stale");
       }
       try {
+        if (confirmation.data.operatorReceiptId) {
+          const issued = readOperatorReceiptWithSessionEvidence(
+            db,
+            input,
+            confirmation.data.operatorReceiptId,
+            confirmation.data.actorReceiptId,
+            confirmation.data.evidenceId
+          );
+          const { evidenceId, ...receiptResult } = issued;
+          return operatorReceiptResult(input.projectId, "OK", "operator receipt and connect-session evidence already persisted", {
+            ...receiptResult,
+            evidence: { source: "connect-session", evidenceId, interactionId: confirmation.data.interactionId ?? null, workerThreadId: input.callerThreadId }
+          });
+        }
         if (isDerivedActorMutationClass(input.mutationClass)) {
           const issued = persistBootstrapOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId });
           bb.realtime.publish("operator-receipts", { changed: true });
@@ -20947,16 +21030,21 @@ async function plugin(bb) {
         }
       }
       try {
-        if (operatorReceiptBindingExists(db, data)) {
-          return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_REUSED", "operator receipt binding was already issued");
-        }
         const issued = persistOperatorReceiptWithSessionEvidence(
           db,
           { ...data, callerThreadId: data.callerThreadId, callerPluginId: bb.pluginId },
           input.interactionId
         );
+        if (!issued) return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_REUSED", "operator receipt binding was already issued");
         const { evidenceId, ...receiptResult } = issued;
-        await bb.sdk.threads.interactions.respond({ threadId: input.threadId, interactionId: input.interactionId, value: confirmation });
+        const response = {
+          ...confirmation,
+          operatorReceiptId: receiptResult.operatorReceipt.receiptId,
+          ...receiptResult.actorReceiptId ? { actorReceiptId: receiptResult.actorReceiptId } : {},
+          evidenceId,
+          interactionId: input.interactionId
+        };
+        await bb.sdk.threads.interactions.respond({ threadId: input.threadId, interactionId: input.interactionId, value: response });
         bb.realtime.publish("operator-receipts", { changed: true });
         return operatorReceiptResult(input.projectId, "OK", "operator receipt persisted and worker interaction resolved", {
           ...receiptResult,
