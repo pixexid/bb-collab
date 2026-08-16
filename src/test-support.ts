@@ -1,10 +1,14 @@
 import type Database from "better-sqlite3";
 import {
   applyFixtureMutation,
+  cachedConsumerRolloutEvidence,
   canonicalJson,
+  CONTRACT_VERSION,
   GitHubIssueAdapterError,
+  SCHEMA_VERSION,
   sha256,
   type ApplyRequest,
+  type CachedConsumerObservation,
   type FoundationResult,
   type GitHubIssueAdapter,
   type GitHubIssueMutation,
@@ -23,6 +27,43 @@ import {
   type RoleThreadFact,
   type SqliteDatabase,
 } from "./foundation.js";
+
+export function testSupportV17Reread(): CachedConsumerObservation {
+  return { name: "src/test-support", observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION };
+}
+
+export function assembleV17CachedConsumerRolloutEvidence(
+  readers: readonly (() => CachedConsumerObservation)[],
+  staleV16Refusal: { exemption: Pick<FoundationResult, "outcome">; placement: Pick<FoundationResult, "outcome"> },
+): NonNullable<ApplyRequest["decisionEvidence"]>[number] {
+  const reread = cachedConsumerRolloutEvidence(readers.map((reader) => reader()));
+  if (
+    reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 ||
+    staleV16Refusal.exemption.outcome !== "INVALID_INPUT" || staleV16Refusal.placement.outcome !== "INVALID_INPUT"
+  ) {
+    throw new Error("cached-consumer v17 rollout evidence requires four rereads and two INVALID_INPUT stale-v16 refusals");
+  }
+  const durableRefJson = canonicalJson({
+    kind: "cached_consumer_v17_rollout_receipt",
+    reread,
+    staleV16Refusal: {
+      exemption: { outcome: staleV16Refusal.exemption.outcome },
+      placement: { outcome: staleV16Refusal.placement.outcome },
+    },
+  });
+  return {
+    evidenceId: "cached-consumer-v17-rollout-receipt",
+    evidenceKind: "test",
+    sourceKind: "test",
+    sourceRef: "cached-consumer-v17-rollout-probes",
+    executionAttemptId: null,
+    contentDigest: sha256(durableRefJson),
+    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v17-rollout-receipt", redacted: true }),
+    durableRefJson,
+    relationKind: "supporting",
+    relation: { purpose: "cached-consumer-v17-rollout" },
+  };
+}
 
 export function seedVerifiedFixtureReceipt(
   db: SqliteDatabase,

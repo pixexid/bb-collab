@@ -6,7 +6,7 @@ import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import plugin from "../server.js";
+import plugin, { collabCliV17Reread, rpcContractV17Reread } from "../server.js";
 import {
   DEFERRED_ISSUE_3_OUTCOMES,
   AUTHORIZED_APPROVER_ID,
@@ -51,12 +51,14 @@ import {
 } from "../src/foundation.js";
 import {
   applyWithFixtureReceipt,
+  assembleV17CachedConsumerRolloutEvidence,
   DeterministicGitHubIssueAdapter,
   DeterministicNativeAssignmentAdapter,
   DeterministicReviewFactReader,
   DeterministicRoleFactReader,
   seedFixtureDecision,
   seedVerifiedFixtureReceipt,
+  testSupportV17Reread,
 } from "../src/test-support.js";
 
 const PROJECT_ID = "proj_test";
@@ -149,6 +151,14 @@ function directorSeatConfig() {
 
 function cachedConsumerObservations(observedSchemaVersion: number, observedContractVersion: number) {
   return CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion, observedContractVersion }));
+}
+
+function serverTestV17Reread() {
+  return { name: "tests/server.test" as const, observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION };
+}
+
+function serverTestV16Reread() {
+  return { name: "tests/server.test" as const, observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: 16 };
 }
 
 function directorRoleReader(
@@ -3230,29 +3240,17 @@ describe("bb-collab plugin boundary", () => {
     staleRequirement.currentGenerationExemption = { generation: 2, holderThreadId: "thr_gsb7m77ciz", environmentId: "env_3znzsxb7ce", sourceId: "src_x8veidmpik" };
     const stalePlacement = directorSeatConfig();
     (stalePlacement.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>)[0]!.roleId = "project-orchestrator";
-    seedEvidenceArtifact(db, "cached-consumer-v16-fixture", 0, {
-      kind: "cached_consumer_v16_fixture",
-      staleV16Config,
-      stalePlacement,
-      rereadObservations: [
-        { name: "server.rpcContract", observedSchemaVersion: 11, observedContractVersion: 17 },
-        { name: "server.collabCli", observedSchemaVersion: 11, observedContractVersion: 17 },
-        { name: "src/test-support", observedSchemaVersion: 11, observedContractVersion: 17 },
-        { name: "tests/server.test", observedSchemaVersion: 11, observedContractVersion: 17 },
-      ],
-    });
-    const persistedFixture = JSON.parse((db.prepare(
-      "SELECT durable_ref_json FROM evidence_artifacts WHERE project_id = ? AND evidence_id = ?",
-    ).get(PROJECT_ID, "cached-consumer-v16-fixture") as { durable_ref_json: string }).durable_ref_json) as {
-      staleV16Config: ReturnType<typeof directorSeatConfig>;
-      stalePlacement: ReturnType<typeof directorSeatConfig>;
-      rereadObservations: Parameters<typeof cachedConsumerRolloutEvidence>[0];
-    };
-    const rollout = cachedConsumerRolloutEvidence(persistedFixture.rereadObservations);
-    expect(rollout).toMatchObject({ action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({ outcome: "OK" });
+    expect(JSON.parse((await host.harness.runCli(["doctor", "--project", PROJECT_ID])).stdout)).toMatchObject({ outcome: "OK" });
+    const rereadReaders = [
+      vi.fn(rpcContractV17Reread),
+      vi.fn(collabCliV17Reread),
+      vi.fn(testSupportV17Reread),
+      vi.fn(serverTestV17Reread),
+    ] as const;
     const beforeRefusal = exportFoundation(db, PROJECT_ID);
     const staleV16 = applyWithFixtureReceipt(db, {
-      ...bootstrapRequest(PROJECT_ID, { config: persistedFixture.staleV16Config }),
+      ...bootstrapRequest(PROJECT_ID, { config: staleV16Config }),
       operationClass: "config_revision",
       idempotencyKey: "stale-v16-director-policy",
       expectedConfigRevision: 1,
@@ -3263,7 +3261,7 @@ describe("bb-collab plugin boundary", () => {
     expect(staleV16).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
     expect(staleV16.message).toContain("currentGenerationExemption");
     const stalePlacementResult = applyWithFixtureReceipt(db, {
-      ...bootstrapRequest(PROJECT_ID, { config: persistedFixture.stalePlacement }),
+      ...bootstrapRequest(PROJECT_ID, { config: stalePlacement }),
       operationClass: "config_revision",
       idempotencyKey: "stale-v16-director-placement",
       expectedConfigRevision: 1,
@@ -3274,29 +3272,52 @@ describe("bb-collab plugin boundary", () => {
     expect(stalePlacementResult).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
     expect(stalePlacementResult.message).toContain("director-seat must use the director role");
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
-    seedEvidenceArtifact(db, "cached-consumer-v17-rollout-receipt", 0, {
-      kind: "cached_consumer_v17_rollout_receipt",
-      fixtureEvidenceId: "cached-consumer-v16-fixture",
-      reread: rollout,
-      staleV16Refusal: {
-        exemption: { outcome: staleV16.outcome, message: staleV16.message },
-        placement: { outcome: stalePlacementResult.outcome, message: stalePlacementResult.message },
-      },
+    const evidence = assembleV17CachedConsumerRolloutEvidence(rereadReaders, {
+      exemption: staleV16,
+      placement: stalePlacementResult,
     });
+    rereadReaders.forEach((reader) => expect(reader).toHaveBeenCalledOnce());
+    expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 11, observedContractVersion: 17 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      staleV16Refusal: { exemption: { outcome: "INVALID_INPUT" }, placement: { outcome: "INVALID_INPUT" } },
+    });
+    const actorReceiptId = "cached-consumer-rollout-decision-actor";
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: actorReceiptId, actorKind: "operator" });
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v17-rollout-decision", {
+      actorReceiptId,
+    }))).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "cached-consumer-v17-rollout-decision", 1, {
+      actorReceiptId,
+      decisionEvidence: [evidence],
+      conditions: [{ kind: "evidence_required", evidenceIds: [evidence.evidenceId] }],
+    }))).toMatchObject({ outcome: "OK", evidence: { evidenceIds: ["cached-consumer-v17-rollout-receipt"] } });
     const exported = exportFoundation(db, PROJECT_ID).export!;
-    expect(exported.artifactIndex.find((artifact) => artifact.evidenceId === "cached-consumer-v17-rollout-receipt")?.durableRefJson).toBe(canonicalJson({
-      kind: "cached_consumer_v17_rollout_receipt",
-      fixtureEvidenceId: "cached-consumer-v16-fixture",
-      reread: rollout,
-      staleV16Refusal: {
-        exemption: { outcome: staleV16.outcome, message: staleV16.message },
-        placement: { outcome: stalePlacementResult.outcome, message: stalePlacementResult.message },
-      },
-    }));
+    expect(exported.artifactIndex.find((artifact) => artifact.evidenceId === evidence.evidenceId)?.durableRefJson).toBe(evidence.durableRefJson);
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
       outcome: "OK",
       evidence: { cachedConsumers: { action: "reread", expected: 4, attempted: 4, verified: 4 } },
     });
+  });
+
+  it("refuses v17 rollout evidence when one cached consumer did not reread", () => {
+    const { db, directory } = directDatabase();
+    try {
+      const rereadReaders = [
+        vi.fn(rpcContractV17Reread),
+        vi.fn(collabCliV17Reread),
+        vi.fn(testSupportV17Reread),
+        vi.fn(serverTestV16Reread),
+      ] as const;
+      expect(() => assembleV17CachedConsumerRolloutEvidence(rereadReaders, {
+        exemption: { outcome: "INVALID_INPUT" },
+        placement: { outcome: "INVALID_INPUT" },
+      })).toThrow("requires four rereads");
+      rereadReaders.forEach((reader) => expect(reader).toHaveBeenCalledOnce());
+      expect(db.prepare("SELECT COUNT(*) AS count FROM evidence_artifacts").get()).toEqual({ count: 0 });
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("prepares one sanctioned run, binds adopted authority, and enforces open/final identities", () => {

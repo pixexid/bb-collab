@@ -21843,6 +21843,12 @@ var rpcContract = defineRpcContract({
     output: foundationResultSchema
   }
 });
+function rpcContractV17Reread() {
+  return { name: "server.rpcContract", observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION };
+}
+function collabCliV17Reread() {
+  return { name: "server.collabCli", observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION };
+}
 function jsonResult(result2) {
   return JSON.stringify(result2);
 }
@@ -22715,8 +22721,10 @@ ${thread.titleFallback ?? ""}`);
   bb.log.info(`${PLUGIN_ID} loaded for BB ${BB_VERSION_RANGE}; plugin SDK ${PLUGIN_SDK_VERSION}`);
 }
 export {
+  collabCliV17Reread,
   plugin as default,
   foundationResultSchema,
-  rpcContract
+  rpcContract,
+  rpcContractV17Reread
 };
 //# sourceMappingURL=server.js.map
