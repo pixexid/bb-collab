@@ -20819,7 +20819,6 @@ function readRoleHolderStates(db) {
         AND generations.holder_execution_attempt_id = attempts.execution_attempt_id
        WHERE attempts.origin = 'role_holder'
          AND attempts.thread_id IS NOT NULL
-        AND attempts.role_id IN (${ROLE_IDS.map((roleId) => `'${roleId}'`).join(", ")})
          AND generations.status = 'active'
        ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`
   ).all();
@@ -21113,10 +21112,15 @@ function createLaneWatcher(options) {
         continue;
       }
       let failed = false;
+      let delivered = void 0;
       try {
-        await options.steerRole(role);
+        delivered = await options.steerRole(role);
       } catch {
         failed = true;
+      }
+      if (delivered === false) {
+        await roleIdleLedger.clearPrefixExcept(prefix);
+        continue;
       }
       const updated = await roleIdleLedger.recordSteer(key, failed, currentNow);
       if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, role);
@@ -22142,6 +22146,20 @@ async function plugin(bb) {
     read: () => bb.storage.kv.get("lane-watcher.role-idle"),
     write: (state) => bb.storage.kv.set("lane-watcher.role-idle", state)
   };
+  const roleLivenessWarnings = /* @__PURE__ */ new Map();
+  const roleLivenessKey = (holder) => `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${holder.execution_attempt_id}:${holder.thread_id}`;
+  const warnRoleLiveness = (holder, evidence) => {
+    const key = roleLivenessKey(holder);
+    if (roleLivenessWarnings.get(key) === evidence) return;
+    roleLivenessWarnings.set(key, evidence);
+    bb.log.warn(`role steer refused: project=${holder.project_id} role=${holder.role_id}@${holder.role_generation} holder=${holder.execution_attempt_id} thread=${holder.thread_id} ${evidence}`);
+  };
+  const roleThreadRefusal = (holder, thread, requireIdle) => {
+    const witness = /\bwitness\b/iu.test(`${thread.title ?? ""}
+${thread.titleFallback ?? ""}`);
+    const usableStatus = requireIdle ? thread.status === "idle" : thread.status === "idle" || thread.status === "active";
+    return thread.projectId === holder.project_id && thread.archivedAt === null && thread.deletedAt === null && !witness && usableStatus ? null : `observedProject=${thread.projectId} archivedAt=${thread.archivedAt ?? "null"} deletedAt=${thread.deletedAt ?? "null"} status=${thread.status} witness=${witness}`;
+  };
   const readRoleScopes = async () => {
     if (!db) return [];
     const operatorWaits = /* @__PURE__ */ new Map();
@@ -22167,8 +22185,25 @@ async function plugin(bb) {
     isExternallyWaiting: readPendingExternalWait,
     readOperatorWait: readPendingOperatorWaitForThread,
     readWorker: async (threadId) => {
-      const thread = await bb.sdk.threads.get({ threadId });
-      const archived = thread.archivedAt !== null || thread.deletedAt !== null;
+      const roleHolders = db ? readRoleHolderStates(db).filter((holder) => holder.thread_id === threadId) : [];
+      let thread;
+      try {
+        thread = await bb.sdk.threads.get({ threadId });
+      } catch (error48) {
+        for (const holder of roleHolders) warnRoleLiveness(holder, `liveness=unknown error=${String(error48)}`);
+        throw error48;
+      }
+      let roleThreadRefused = false;
+      for (const holder of roleHolders) {
+        const refusal2 = roleThreadRefusal(holder, thread, false);
+        if (refusal2) {
+          roleThreadRefused = true;
+          warnRoleLiveness(holder, refusal2);
+        } else {
+          roleLivenessWarnings.delete(roleLivenessKey(holder));
+        }
+      }
+      const archived = thread.archivedAt !== null || thread.deletedAt !== null || roleThreadRefused;
       let operatorWait = null;
       let operatorWaitKnown = true;
       if (!archived && thread.status === "idle") {
@@ -22206,18 +22241,40 @@ async function plugin(bb) {
       });
     },
     steerRole: async (role) => {
-      if (!db) return;
-      const holders = readRoleHolderStates(db).filter(
-        (holder) => holder.project_id === role.projectId && holder.role_id === role.roleId && holder.role_generation === role.roleGeneration && holder.execution_attempt_id === role.executionAttemptId
-      );
-      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) return;
+      if (!db) return false;
+      const expectedHolder = {
+        project_id: role.projectId,
+        role_id: role.roleId,
+        role_generation: role.roleGeneration,
+        execution_attempt_id: role.executionAttemptId,
+        thread_id: role.threadId
+      };
+      let holders;
+      try {
+        holders = readRoleHolderStates(db).filter(
+          (holder) => holder.project_id === role.projectId && holder.role_id === role.roleId && holder.role_generation === role.roleGeneration && holder.execution_attempt_id === role.executionAttemptId
+        );
+      } catch (error48) {
+        warnRoleLiveness(expectedHolder, `holder=unknown error=${String(error48)}`);
+        return false;
+      }
+      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) {
+        warnRoleLiveness(expectedHolder, `holderMatches=${holders.length} observedThread=${holders[0]?.thread_id ?? "null"}`);
+        return false;
+      }
       let thread;
       try {
         thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
-      } catch {
-        return;
+      } catch (error48) {
+        warnRoleLiveness(holders[0], `liveness=unknown error=${String(error48)}`);
+        return false;
       }
-      if (thread.projectId !== role.projectId || thread.archivedAt !== null || thread.deletedAt !== null) return;
+      const refusal2 = roleThreadRefusal(holders[0], thread, true);
+      if (refusal2) {
+        warnRoleLiveness(holders[0], refusal2);
+        return false;
+      }
+      roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
       await bb.sdk.threads.send({
         threadId: holders[0].thread_id,
         mode: "steer",
@@ -22230,6 +22287,7 @@ async function plugin(bb) {
           }
         ]
       });
+      return true;
     }
   });
   await watcher.recover().catch((error48) => bb.log.error(`lane continuation recovery failed: ${String(error48)}`));

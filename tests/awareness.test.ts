@@ -377,6 +377,32 @@ describe("lane awareness", () => {
     expect(steerRole).toHaveBeenCalledTimes(1);
   });
 
+  it("does not record a role steer refused by final revalidation", async () => {
+    let persisted: Record<string, unknown> = {};
+    let currentNow = 0;
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<boolean>>().mockResolvedValue(false);
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => [roleScope("queue-head")],
+      readWorker: async () => roleObservation(0),
+      steerRole,
+      roleIdlePersistence: {
+        read: async () => persisted,
+        write: async (state) => { persisted = structuredClone(state); },
+      },
+      now: () => currentNow,
+    });
+
+    await watcher.poll();
+    currentNow = 10 * 60_000;
+    await watcher.poll();
+
+    expect(steerRole).toHaveBeenCalledTimes(1);
+    expect(persisted).toEqual({});
+  });
+
   it("does not escalate a second delivered steer until it is observed ineffective", async () => {
     let currentNow = 0;
     let nativeUpdatedAt = 0;
@@ -940,7 +966,7 @@ describe("lane awareness", () => {
     db.close();
   });
 
-  it("does not write canonical role or lane rows while observing", async () => {
+  it("polls every current canonical role seat during quiet GitHub without targeting historical holders or writing canonical rows", async () => {
     const db = new Database(":memory:");
     db.exec("CREATE TABLE assignments (project_id TEXT, assignment_id TEXT, lane_id TEXT, assignment_kind TEXT, work_item_id TEXT, created_at_ms INTEGER)");
     db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT, role_id TEXT, role_generation INTEGER)");
@@ -951,31 +977,42 @@ describe("lane awareness", () => {
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "retired-director", "role-attempt-stale", "role_holder", "done", null, "project-orchestrator", 3);
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "previous-director", "role-attempt-2", "role_holder", "done", null, "project-orchestrator", 2);
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "worker-role-1", "worker-role-attempt", "role_holder", "done", null, "worker", 1);
+    db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "reviewer-4", "reviewer-attempt-4", "role_holder", "done", null, "independent-reviewer", 4);
+    db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "future-seat-9", "future-seat-attempt-9", "role_holder", "done", null, "role-added-after-watcher-build", 9);
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "worker-1", "attempt-1", "assignment", "prepared", null, "worker", 1);
     db.prepare("INSERT INTO role_generation_heads VALUES (?, ?, ?)").run("project-1", "project-orchestrator", 3);
     db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?, ?)").run("project-1", "project-orchestrator", 3, "active", "role-attempt-3");
     db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?, ?)").run("project-1", "project-orchestrator", 2, "retired", "role-attempt-2");
     db.prepare("INSERT INTO role_generation_heads VALUES (?, ?, ?)").run("project-1", "worker", 1);
     db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?, ?)").run("project-1", "worker", 1, "active", "worker-role-attempt");
-    expect(readRoleHolderStates(db)).toHaveLength(2);
-    expect(readRoleHolderStates(db).map((holder) => holder.thread_id)).toEqual(["director-1", "worker-role-1"]);
+    db.prepare("INSERT INTO role_generation_heads VALUES (?, ?, ?)").run("project-1", "independent-reviewer", 4);
+    db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?, ?)").run("project-1", "independent-reviewer", 4, "active", "reviewer-attempt-4");
+    db.prepare("INSERT INTO role_generation_heads VALUES (?, ?, ?)").run("project-1", "role-added-after-watcher-build", 9);
+    db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?, ?)").run("project-1", "role-added-after-watcher-build", 9, "active", "future-seat-attempt-9");
+    expect(readRoleHolderStates(db).map((holder) => holder.thread_id)).toEqual(["reviewer-4", "director-1", "future-seat-9", "worker-role-1"]);
     const before = {
       assignments: db.prepare("SELECT * FROM assignments").all(),
       attempts: db.prepare("SELECT * FROM execution_attempts").all(),
       heads: db.prepare("SELECT * FROM role_generation_heads").all(),
       generations: db.prepare("SELECT * FROM role_generations").all(),
     };
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    let currentNow = 0;
     const watcher = createLaneWatcher({
       readLanes: () => readLaneStates(db),
       steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => readRoleHolderStates(db),
       readRoleScopes: () => [roleScope("queue-head")],
       readWorker: async () => roleObservation(0),
-      steerRole: vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined),
-      now: () => 10 * 60_000,
+      steerRole,
+      now: () => currentNow,
     });
 
     await watcher.poll();
+    currentNow = 10 * 60_000;
+    await watcher.poll();
+
+    expect(steerRole.mock.calls.map(([role]) => role.threadId).sort()).toEqual(["director-1", "future-seat-9", "reviewer-4", "worker-role-1"]);
 
     expect({
       assignments: db.prepare("SELECT * FROM assignments").all(),

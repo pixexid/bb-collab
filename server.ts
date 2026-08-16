@@ -12,6 +12,7 @@ import {
   subscribeToThreadChanges,
   threadEventStatus,
   type OperatorWait,
+  type RoleHolderState,
 } from "./src/awareness.js";
 import {
   BB_VERSION_RANGE,
@@ -735,6 +736,26 @@ export default async function plugin(bb: BbPluginApi) {
     write: (state: Record<string, { steerCount: number; failedSteers: number; escalated: boolean; idleSinceMs: number | null; awaitingSteerOutcome: boolean }>) => bb.storage.kv.set("lane-watcher.role-idle", state),
   };
 
+  const roleLivenessWarnings = new Map<string, string>();
+  const roleLivenessKey = (holder: RoleHolderState) => `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${holder.execution_attempt_id}:${holder.thread_id}`;
+  const warnRoleLiveness = (holder: RoleHolderState, evidence: string) => {
+    const key = roleLivenessKey(holder);
+    if (roleLivenessWarnings.get(key) === evidence) return;
+    roleLivenessWarnings.set(key, evidence);
+    bb.log.warn(`role steer refused: project=${holder.project_id} role=${holder.role_id}@${holder.role_generation} holder=${holder.execution_attempt_id} thread=${holder.thread_id} ${evidence}`);
+  };
+  const roleThreadRefusal = (
+    holder: RoleHolderState,
+    thread: Awaited<ReturnType<typeof bb.sdk.threads.get>>,
+    requireIdle: boolean,
+  ) => {
+    const witness = /\bwitness\b/iu.test(`${thread.title ?? ""}\n${thread.titleFallback ?? ""}`);
+    const usableStatus = requireIdle ? thread.status === "idle" : thread.status === "idle" || thread.status === "active";
+    return thread.projectId === holder.project_id && thread.archivedAt === null && thread.deletedAt === null && !witness && usableStatus
+      ? null
+      : `observedProject=${thread.projectId} archivedAt=${thread.archivedAt ?? "null"} deletedAt=${thread.deletedAt ?? "null"} status=${thread.status} witness=${witness}`;
+  };
+
   const readRoleScopes = async () => {
     if (!db) return [];
     const operatorWaits = new Map<string, OperatorWait>();
@@ -766,8 +787,25 @@ export default async function plugin(bb: BbPluginApi) {
     isExternallyWaiting: readPendingExternalWait,
     readOperatorWait: readPendingOperatorWaitForThread,
     readWorker: async (threadId) => {
-      const thread = await bb.sdk.threads.get({ threadId });
-      const archived = thread.archivedAt !== null || thread.deletedAt !== null;
+      const roleHolders = db ? readRoleHolderStates(db).filter((holder) => holder.thread_id === threadId) : [];
+      let thread;
+      try {
+        thread = await bb.sdk.threads.get({ threadId });
+      } catch (error) {
+        for (const holder of roleHolders) warnRoleLiveness(holder, `liveness=unknown error=${String(error)}`);
+        throw error;
+      }
+      let roleThreadRefused = false;
+      for (const holder of roleHolders) {
+        const refusal = roleThreadRefusal(holder, thread, false);
+        if (refusal) {
+          roleThreadRefused = true;
+          warnRoleLiveness(holder, refusal);
+        } else {
+          roleLivenessWarnings.delete(roleLivenessKey(holder));
+        }
+      }
+      const archived = thread.archivedAt !== null || thread.deletedAt !== null || roleThreadRefused;
       let operatorWait: OperatorWait | null = null;
       let operatorWaitKnown = true;
       if (!archived && thread.status === "idle") {
@@ -807,21 +845,43 @@ export default async function plugin(bb: BbPluginApi) {
       });
     },
     steerRole: async (role) => {
-      if (!db) return;
-      const holders = readRoleHolderStates(db).filter((holder) =>
-        holder.project_id === role.projectId &&
-        holder.role_id === role.roleId &&
-        holder.role_generation === role.roleGeneration &&
-        holder.execution_attempt_id === role.executionAttemptId,
-      );
-      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) return;
+      if (!db) return false;
+      const expectedHolder: RoleHolderState = {
+        project_id: role.projectId,
+        role_id: role.roleId,
+        role_generation: role.roleGeneration,
+        execution_attempt_id: role.executionAttemptId,
+        thread_id: role.threadId,
+      };
+      let holders: RoleHolderState[];
+      try {
+        holders = readRoleHolderStates(db).filter((holder) =>
+          holder.project_id === role.projectId &&
+          holder.role_id === role.roleId &&
+          holder.role_generation === role.roleGeneration &&
+          holder.execution_attempt_id === role.executionAttemptId,
+        );
+      } catch (error) {
+        warnRoleLiveness(expectedHolder, `holder=unknown error=${String(error)}`);
+        return false;
+      }
+      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) {
+        warnRoleLiveness(expectedHolder, `holderMatches=${holders.length} observedThread=${holders[0]?.thread_id ?? "null"}`);
+        return false;
+      }
       let thread;
       try {
         thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
-      } catch {
-        return;
+      } catch (error) {
+        warnRoleLiveness(holders[0], `liveness=unknown error=${String(error)}`);
+        return false;
       }
-      if (thread.projectId !== role.projectId || thread.archivedAt !== null || thread.deletedAt !== null) return;
+      const refusal = roleThreadRefusal(holders[0], thread, true);
+      if (refusal) {
+        warnRoleLiveness(holders[0], refusal);
+        return false;
+      }
+      roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
       await bb.sdk.threads.send({
         threadId: holders[0].thread_id,
         mode: "steer",
@@ -834,6 +894,7 @@ export default async function plugin(bb: BbPluginApi) {
           },
         ],
       });
+      return true;
     },
   });
   await watcher.recover().catch((error) => bb.log.error(`lane continuation recovery failed: ${String(error)}`));
