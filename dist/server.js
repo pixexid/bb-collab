@@ -20458,7 +20458,6 @@ function databaseIsReady(db) {
 var DEFAULT_MAX_CONTINUATIONS = 3;
 var OPERATOR_WAIT_FYI_THRESHOLD_MS = 15 * 6e4;
 var WRONGFUL_IDLE_THRESHOLD_MS = 10 * 6e4;
-var ORCHESTRATOR_ROLE_ID = "project-orchestrator";
 var OPEN_ATTEMPT_STATES = /* @__PURE__ */ new Set([
   "prepared",
   "armed",
@@ -20812,7 +20811,7 @@ function readRoleHolderStates(db) {
         AND generations.holder_execution_attempt_id = attempts.execution_attempt_id
        WHERE attempts.origin = 'role_holder'
          AND attempts.thread_id IS NOT NULL
-         AND attempts.role_id = '${ORCHESTRATOR_ROLE_ID}'
+        AND attempts.role_id IN (${ROLE_IDS.map((roleId) => `'${roleId}'`).join(", ")})
          AND generations.status = 'active'
        ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`
   ).all();
@@ -20999,7 +20998,7 @@ function createLaneWatcher(options) {
   const isCurrentCanonicalHolder = (projectId, threadId) => {
     if (!options.readRoleHolders) return false;
     try {
-      return options.readRoleHolders().filter((holder) => holder.project_id === projectId && holder.role_id === ORCHESTRATOR_ROLE_ID).some((holder) => holder.thread_id === threadId);
+      return options.readRoleHolders().filter((holder) => holder.project_id === projectId).some((holder) => holder.thread_id === threadId);
     } catch {
       return true;
     }
@@ -21008,7 +21007,7 @@ function createLaneWatcher(options) {
     if (!options.readRoleHolders) return null;
     try {
       const current = options.readRoleHolders().filter(
-        (candidate) => candidate.project_id === holder.project_id && candidate.role_id === ORCHESTRATOR_ROLE_ID
+        (candidate) => candidate.project_id === holder.project_id && candidate.role_id === holder.role_id
       );
       return current.length === 1 && current[0]?.role_generation === holder.role_generation && current[0]?.execution_attempt_id === holder.execution_attempt_id && current[0]?.thread_id === holder.thread_id ? current[0] : null;
     } catch {
@@ -21024,7 +21023,7 @@ function createLaneWatcher(options) {
     if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return;
     let holders;
     try {
-      holders = options.readRoleHolders().filter((holder) => holder.role_id === ORCHESTRATOR_ROLE_ID);
+      holders = options.readRoleHolders();
     } catch {
       return;
     }
@@ -21039,7 +21038,7 @@ function createLaneWatcher(options) {
       }
     }
     for (const holder of holders) {
-      const projectHolders = holders.filter((candidate) => candidate.project_id === holder.project_id);
+      const projectHolders = holders.filter((candidate) => candidate.project_id === holder.project_id && candidate.role_id === holder.role_id);
       if (projectHolders.length !== 1 || !holder.thread_id) continue;
       const targetThreadId = holder.thread_id;
       if (threadId && targetThreadId !== threadId) continue;

@@ -1,5 +1,5 @@
 import type { BbPluginApi, PluginThreadEventPayloads } from "@bb/plugin-sdk";
-import { writingLaneCeilingForProject, type SqliteDatabase } from "./foundation.js";
+import { ROLE_IDS, writingLaneCeilingForProject, type SqliteDatabase } from "./foundation.js";
 
 export const DEFAULT_MAX_CONTINUATIONS = 3;
 export const OPERATOR_WAIT_FYI_THRESHOLD_MS = 15 * 60_000;
@@ -585,7 +585,7 @@ export function readRoleHolderStates(db: SqliteDatabase): RoleHolderState[] {
         AND generations.holder_execution_attempt_id = attempts.execution_attempt_id
        WHERE attempts.origin = 'role_holder'
          AND attempts.thread_id IS NOT NULL
-         AND attempts.role_id = '${ORCHESTRATOR_ROLE_ID}'
+        AND attempts.role_id IN (${ROLE_IDS.map((roleId) => `'${roleId}'`).join(", ")})
          AND generations.status = 'active'
        ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`,
     )
@@ -823,7 +823,7 @@ export function createLaneWatcher(options: {
     if (!options.readRoleHolders) return false;
     try {
       return options.readRoleHolders()
-        .filter((holder) => holder.project_id === projectId && holder.role_id === ORCHESTRATOR_ROLE_ID)
+        .filter((holder) => holder.project_id === projectId)
         .some((holder) => holder.thread_id === threadId);
     } catch {
       return true;
@@ -834,7 +834,7 @@ export function createLaneWatcher(options: {
     if (!options.readRoleHolders) return null;
     try {
       const current = options.readRoleHolders().filter((candidate) =>
-        candidate.project_id === holder.project_id && candidate.role_id === ORCHESTRATOR_ROLE_ID,
+        candidate.project_id === holder.project_id && candidate.role_id === holder.role_id,
       );
       return current.length === 1 &&
         current[0]?.role_generation === holder.role_generation &&
@@ -857,7 +857,7 @@ export function createLaneWatcher(options: {
     if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return;
     let holders: RoleHolderState[];
     try {
-      holders = options.readRoleHolders().filter((holder) => holder.role_id === ORCHESTRATOR_ROLE_ID);
+      holders = options.readRoleHolders();
     } catch {
       return;
     }
@@ -874,7 +874,7 @@ export function createLaneWatcher(options: {
     }
 
     for (const holder of holders) {
-      const projectHolders = holders.filter((candidate) => candidate.project_id === holder.project_id);
+      const projectHolders = holders.filter((candidate) => candidate.project_id === holder.project_id && candidate.role_id === holder.role_id);
       if (projectHolders.length !== 1 || !holder.thread_id) continue;
       const targetThreadId = holder.thread_id;
       if (threadId && targetThreadId !== threadId) continue;

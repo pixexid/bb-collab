@@ -196,6 +196,31 @@ describe("lane awareness", () => {
     expect(readWorker).toHaveBeenCalledWith("director-1");
   });
 
+  it("coalesces duplicate idle observations for a startable dispatcher seat", async () => {
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    let currentNow = 0;
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => [{ ...roleHolder("dispatcher-1"), role_id: "worker" }],
+      readRoleScopes: () => [roleScope("queue-head")],
+      readWorker: async () => roleObservation(0),
+      steerRole,
+      now: () => currentNow,
+    });
+
+    await watcher.poll();
+    currentNow = 10 * 60_000;
+    await watcher.poll();
+    await Promise.all([
+      watcher.observe("dispatcher-1", "idle"),
+      watcher.poll(),
+    ]);
+
+    expect(steerRole).toHaveBeenCalledTimes(1);
+    expect(steerRole).toHaveBeenCalledWith(expect.objectContaining({ roleId: "worker", threadId: "dispatcher-1" }));
+  });
+
   it("suppresses role observation when the canonical holder is ambiguous", async () => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     const watcher = createLaneWatcher({
@@ -932,8 +957,8 @@ describe("lane awareness", () => {
     db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?, ?)").run("project-1", "project-orchestrator", 2, "retired", "role-attempt-2");
     db.prepare("INSERT INTO role_generation_heads VALUES (?, ?, ?)").run("project-1", "worker", 1);
     db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?, ?)").run("project-1", "worker", 1, "active", "worker-role-attempt");
-    expect(readRoleHolderStates(db)).toHaveLength(1);
-    expect(readRoleHolderStates(db)[0]?.thread_id).toBe("director-1");
+    expect(readRoleHolderStates(db)).toHaveLength(2);
+    expect(readRoleHolderStates(db).map((holder) => holder.thread_id)).toEqual(["director-1", "worker-role-1"]);
     const before = {
       assignments: db.prepare("SELECT * FROM assignments").all(),
       attempts: db.prepare("SELECT * FROM execution_attempts").all(),
