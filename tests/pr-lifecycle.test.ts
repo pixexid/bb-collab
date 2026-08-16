@@ -42,6 +42,8 @@ describe("pull-request lifecycle linkage", () => {
   it("rejects automatic GitHub closure hidden in commit messages", () => {
     const related = parsePullRequestDisposition({ body: "Related GH-80" });
     expect(validateCommitMessages(related, ["Fixes #80"]).ok).toBe(false);
+    expect(validateCommitMessages(related, ["Fixes: #80"]).ok).toBe(false);
+    expect(validateCommitMessages(related, ["Resolves: #80"]).ok).toBe(false);
     expect(validateCommitMessages(related, ["ordinary implementation"]).ok).toBe(true);
     const closes = parsePullRequestDisposition({ body: "Closes #80\nAcceptance: complete" });
     expect(validateCommitMessages(closes, ["Fixes #80"]).ok).toBe(true);

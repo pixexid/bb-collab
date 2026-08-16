@@ -1,7 +1,7 @@
 const dispositionPattern = /^\s*(Closes #[1-9]\d*|Related GH-[1-9]\d*|No issue:\s*\S.*)\s*$/iu;
 const acceptancePattern = /^\s*Acceptance\s*:\s*(complete|incomplete|unknown)\s*$/iu;
 const linkageCandidatePattern = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|related)\b[^\r\n]*(?:#|GH-)\S+/iu;
-const linkageMentionPattern = /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|related)\s+(?:#|GH-)([1-9]\d*)\b/giu;
+const linkageMentionPattern = /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|related)\s*:?\s*(?:#|GH-)([1-9]\d*)\b/giu;
 
 export function visibleMarkdown(text) {
   const withoutComments = text.replace(/<!--[\s\S]*?(?:-->|$)/gu, "");
