@@ -129,21 +129,25 @@ itself. This is an operations-model scope extension only; canonical activation
 still awaits the one exact v8 console approval bound to the project,
 operation, candidate head, idempotency key, and request digest.
 
-Authority-maintenance re-adoption has no human form. Contract v14 leaves the
+Authority-maintenance re-adoption has no human form. Contract v15 leaves the
 exact ten-class registry unchanged; the already-bounded v11 nine-class state
 remains readable but refuses `work_item_transition`. The registry check is exact
 and order-sensitive: malformed, reordered, subset, extra, v9, and arbitrary
-sets refuse before any receipt or canonical write. This is a v14 contract bump:
-four cached consumers must reread v14 or refuse v13, with durable rollout
+sets refuse before any receipt or canonical write. This is a v15 contract bump:
+four cached consumers must reread v15 or refuse v14, with durable rollout
 evidence. The cap itself is recorded by the existing adopted Decision plus
 operator-authorized `config_revision`; it does not create a second authority
 store.
 
 The v14 `director-seat` amendment remains the existing project-orchestrator
 role with primary `pi/kimi-coding/k3/high`, Opus-medium standby, managed-
-worktree-only holder facts, and zero writing-lane capacity. Epoch-2 service on
-the unmanaged canonical environment is grandfathered evidence, not generation
-3 occupancy. A future successor is first preflighted and then recorded through
+worktree-only future holder facts, and zero writing-lane capacity. Contract v15
+permits only current-generation qualification recording for generation 2,
+holder `thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source
+`src_x8veidmpik`, while the exact current head and holder execution attempt
+remain bound. It cannot admit writing or succession. Epoch-2 service on the
+unmanaged canonical environment is grandfathered evidence, not generation 3
+occupancy. A future successor is first preflighted and then recorded through
 the receipt-gated succession apply; witness evidence and operator word do not
 occupy the seat.
 

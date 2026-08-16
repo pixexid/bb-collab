@@ -1,9 +1,9 @@
 # bb-collab repository contract
 
-CONTRACT_VERSION: 14
+CONTRACT_VERSION: 15
 
 This repository contains the founding contract and the implemented foundation
-through contract v14/schema v11: a single SQLite store with migrations, resolver,
+through contract v15/schema v11: a single SQLite store with migrations, resolver,
 state-event and mutation-receipt, deterministic export, and read-only doctor
 seams, plus WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
 Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
@@ -73,10 +73,10 @@ Changing version text alone is not a migration. A zero-work result is not a
 successful apply unless zero expected work, zero attempted work and zero
 verified work are all proven.
 
-Contract v14/schema v11 requires all four cached consumers to reread the
+Contract v15/schema v11 requires all four cached consumers to reread the
 one-request receipt, authorized-approver registry/attestation,
 mutation/export/evidence, role IDs/scoping, and refusal contract or refuse
-contract v13/schema v11.
+contract v14/schema v11.
 An adopted operator_only Decision registers approverId=orchestrator:bb-collab
 with the exact ten derived mutation classes, including config_revision,
 work_item_create, work_item_transition and
@@ -84,20 +84,23 @@ the two existing role mutation classes. Attestation has no requestInput
 interaction and atomically creates the same exact-bound receipt plus verified
 plugin actor; operator revocation/change marks the registry unusable. The
 historical contract-v9 eight-class registry was accepted only during the
-one-release v9-to-v10 re-adoption. Contract v14 leaves the exact current
+one-release v9-to-v10 re-adoption. Contract v15 leaves the exact current
 ten-class allowlist unchanged; the already-bounded v11 nine-class repair
 remains readable for authority maintenance, but does not authorize
 `work_item_transition`. Malformed, reordered, subset, extra, v9, or other
-arbitrary sets refuse at attestation and apply. This v14 change is a contract
-bump for the director-seat role requirement: CONTRACT_VERSION and contractDigest change;
+arbitrary sets refuse at attestation and apply. This v15 change is a semantic
+contract bump for the current-generation director-seat environment exemption:
+CONTRACT_VERSION and contractDigest change;
 SCHEMA_VERSION, schemaDigest and migrations remain unchanged, and all four
 cached consumers emit a durable reread/refusal rollout receipt. The
 `director-seat` requirement remains the existing `project-orchestrator` role,
 requires the exact `pi/kimi-coding/k3/high` primary profile and the exact
-Opus-medium standby, is managed-worktree-only, and has zero writing-lane
-capacity. The current epoch-2 director is grandfathered; a future generation
-must be recorded through the normal receipt-gated succession apply before it
-takes the seat.
+Opus-medium standby, and has zero writing-lane capacity. Only the exact current
+generation 2 / holder `thr_gsb7m77ciz` / environment `env_3znzsxb7ce` / source
+`src_x8veidmpik` may record its current qualification from the approved unmanaged
+canonical environment. Every future generation requires the existing managed,
+isolated worktree and exact source/environment checks; the exemption is not
+general, cannot admit writing, and future succession remains receipt-gated.
 
 ## Delegation and lane obligations
 

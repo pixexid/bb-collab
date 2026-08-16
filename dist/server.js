@@ -13786,14 +13786,20 @@ import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 14;
+var CONTRACT_VERSION = 15;
 var SCHEMA_VERSION = 11;
-var PREVIOUS_CONTRACT_VERSION = 13;
+var PREVIOUS_CONTRACT_VERSION = 14;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
 var PREVIOUS_SCHEMA_VERSION = 11;
 var ROLE_IDS = ["project-orchestrator", "worker", "independent-reviewer"];
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
+var DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION = {
+  generation: 2,
+  holderThreadId: "thr_gsb7m77ciz",
+  environmentId: "env_3znzsxb7ce",
+  sourceId: "src_x8veidmpik"
+};
 var directorSeatProfile = {
   providerId: "pi",
   model: "kimi-coding/k3",
@@ -14520,7 +14526,8 @@ var contractDigest = sha256(canonicalJson({
     executedProfile: directorSeatProfile,
     standbyProfile: directorSeatStandbyProfile,
     writingLaneCapacity: 0,
-    environment: "managed-worktree only",
+    environment: "managed-worktree for future generations; exact current-generation exemption only",
+    currentGenerationExemption: DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION,
     assignmentKinds: []
   },
   operatorReceiptPolicy: {
@@ -14801,13 +14808,20 @@ var executionProfileSchema = external_exports.object({
   serviceTier: id,
   visibility: external_exports.enum(["visible", "hidden"])
 }).strict();
+var directorSeatCurrentGenerationExemptionSchema = external_exports.object({
+  generation: external_exports.literal(DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.generation),
+  holderThreadId: external_exports.literal(DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.holderThreadId),
+  environmentId: external_exports.literal(DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.environmentId),
+  sourceId: external_exports.literal(DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.sourceId)
+}).strict();
 var roleRequirementSchema = external_exports.object({
   roleRequirementId: id,
   roleId: roleIdSchema,
   repoTargetId: id.nullable(),
   executedProfile: executionProfileSchema,
   standbyProfile: executionProfileSchema.optional(),
-  writingLaneCapacity: external_exports.literal(0).optional()
+  writingLaneCapacity: external_exports.literal(0).optional(),
+  currentGenerationExemption: directorSeatCurrentGenerationExemptionSchema.optional()
 }).strict().superRefine((requirement, ctx) => {
   if (requirement.roleId === "project-orchestrator" && requirement.repoTargetId !== null) {
     ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "project-orchestrator must be project-scoped" });
@@ -14838,7 +14852,10 @@ var roleRequirementSchema = external_exports.object({
     if (canonicalJson(requirement.executedProfile) !== canonicalJson(directorSeatProfile)) {
       ctx.addIssue({ code: "custom", path: ["executedProfile"], message: "director-seat requires the exact judgment profile" });
     }
-  } else if (requirement.standbyProfile !== void 0 || requirement.writingLaneCapacity !== void 0) {
+    if (!requirement.currentGenerationExemption || canonicalJson(requirement.currentGenerationExemption) !== canonicalJson(DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION)) {
+      ctx.addIssue({ code: "custom", path: ["currentGenerationExemption"], message: "director-seat requires the exact current-generation environment exemption" });
+    }
+  } else if (requirement.standbyProfile !== void 0 || requirement.writingLaneCapacity !== void 0 || requirement.currentGenerationExemption !== void 0) {
     ctx.addIssue({ code: "custom", path: ["roleRequirementId"], message: "standby profile and writing capacity are reserved for director-seat" });
   }
 });
@@ -15045,7 +15062,7 @@ var reviewFactsSchema = external_exports.object({
 function stringField(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 256 ? value : null;
 }
-function resolveRoleContext(reader, request) {
+function resolveRoleContext(reader, request, allowCurrentDirectorEnvironment = false) {
   if (!reader || !request.roleContext) throw refusal("ROLE_CONTEXT_REQUIRED", "exact BB role context facts are required");
   let thread;
   let events;
@@ -15075,13 +15092,21 @@ function resolveRoleContext(reader, request) {
   if (!thread.environmentId || environment.id !== thread.environmentId || environment.projectId !== request.projectId) {
     throw refusal("ROLE_CONTEXT_FOREIGN", "environment context does not match the holder thread and project");
   }
-  if (environment.status !== "ready" || !environment.path || !environment.managed || !environment.isGitRepo || !environment.isWorktree || environment.workspaceProvisionType !== "managed-worktree") {
+  const exactManagedWorktree = environment.status === "ready" && !!environment.path && environment.managed && environment.isGitRepo && environment.isWorktree && environment.workspaceProvisionType === "managed-worktree";
+  const exactCurrentDirectorEnvironment = allowCurrentDirectorEnvironment && environment.status === "ready" && !!environment.path && environment.id === DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.environmentId && thread.id === DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.holderThreadId && !environment.managed && environment.isGitRepo && !environment.isWorktree && environment.workspaceProvisionType === "unmanaged";
+  if (!exactManagedWorktree && !exactCurrentDirectorEnvironment) {
     throw refusal("ROLE_CONTEXT_FOREIGN", "holder environment is not an exact ready managed worktree");
   }
   const sources = project.sources.filter(
     (source2) => source2.projectId === request.projectId && source2.hostId === environment.hostId
   );
-  if (sources.length !== 1) throw refusal("ROLE_CONTEXT_FOREIGN", "managed worktree does not resolve to one exact project source on its host");
+  if (sources.length !== 1) throw refusal("ROLE_CONTEXT_FOREIGN", "holder environment does not resolve to one exact project source on its host");
+  if (exactCurrentDirectorEnvironment && sources[0].id !== DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.sourceId) {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "current director environment does not match its exact canonical source");
+  }
+  if (exactCurrentDirectorEnvironment && sources[0].path !== environment.path) {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "current director environment path does not match its canonical source path");
+  }
   if (host.id !== environment.hostId || host.status !== "connected") throw refusal("ROLE_CONTEXT_UNKNOWN", "holder host is unavailable");
   if (!stringField(bbVersion) || !stringField(bbServerId) || events.length === 0 || events.length > 256) {
     throw refusal("ROLE_CONTEXT_UNKNOWN", "bounded BB version or event facts are unavailable");
@@ -17784,6 +17809,24 @@ function requireRoleRequirement(db, request, configRevision) {
   }
   return { requirement, digest: sha256(canonicalJson(requirement)), configRevision };
 }
+function currentDirectorGenerationExemptionAllowed(db, request, resolved) {
+  const exemption = resolved.requirement.currentGenerationExemption;
+  if (request.operationClass !== "qualification_observation_record" || resolved.requirement.roleRequirementId !== DIRECTOR_SEAT_ROLE_REQUIREMENT_ID || request.roleId !== "project-orchestrator" || !request.roleContext || !exemption || request.roleContext.threadId !== exemption.holderThreadId) {
+    return false;
+  }
+  const head = asRow(db.prepare(
+    "SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?"
+  ).get(request.projectId, "project-orchestrator"));
+  const generation = asRow(db.prepare(
+    "SELECT status, holder_execution_attempt_id FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?"
+  ).get(request.projectId, "project-orchestrator", exemption.generation));
+  const holder = generation && asRow(db.prepare(
+    "SELECT thread_id, environment_id, source_id FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?"
+  ).get(request.projectId, generation.holder_execution_attempt_id));
+  return Boolean(
+    head?.current_generation === exemption.generation && generation?.status === "active" && holder?.thread_id === exemption.holderThreadId && holder.environment_id === exemption.environmentId && holder.source_id === exemption.sourceId
+  );
+}
 function requireRoleTargetContext(db, request, resolved, context) {
   if (resolved.requirement.repoTargetId === null) return;
   const target = requireTarget(db, request.projectId, resolved.configRevision, resolved.requirement.repoTargetId);
@@ -18279,10 +18322,24 @@ function applyRoleMutation(db, request, digest, reader) {
   try {
     const replay = checkIdempotency(db, request, digest);
     if (replay) return replay;
-    const context = resolveRoleContext(reader, request);
+    const currentDirectorContextCandidate = request.operationClass === "qualification_observation_record" && request.roleId === "project-orchestrator" && request.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID && request.roleContext?.threadId === DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.holderThreadId;
+    const context = resolveRoleContext(reader, request, currentDirectorContextCandidate);
+    const configRevision = requireConfig(db, request);
+    const resolved = requireRoleRequirement(db, request, configRevision);
+    const allowCurrentDirectorEnvironment = currentDirectorGenerationExemptionAllowed(db, request, resolved);
+    const managedDirectorContext = context.baseContext.environment.managed === true && context.baseContext.environment.workspaceProvisionType === "managed-worktree";
+    if (currentDirectorContextCandidate && !allowCurrentDirectorEnvironment && !managedDirectorContext) {
+      throw refusal("ROLE_CONTEXT_FOREIGN", "current director environment is not bound to the current generation head and holder");
+    }
+    if (allowCurrentDirectorEnvironment && (!profileEquals(context.profile, resolved.requirement.executedProfile) || request.declaredProfile !== void 0 && !profileEquals(context.profile, request.declaredProfile))) {
+      throw refusal("EXECUTION_PROFILE_MISMATCH", "current director holder executed profile does not match the exact role requirement");
+    }
     return transaction(db, () => {
       const replayInTransaction = checkIdempotency(db, request, digest);
       if (replayInTransaction) return replayInTransaction;
+      if (allowCurrentDirectorEnvironment && !currentDirectorGenerationExemptionAllowed(db, request, resolved)) {
+        throw refusal("ROLE_CONTEXT_FOREIGN", "current director generation head or holder changed before commit");
+      }
       return request.operationClass === "qualification_observation_record" ? applyQualificationObservation(db, request, digest, context) : applyRoleGenerationSuccession(db, request, digest, context);
     });
   } catch (error48) {

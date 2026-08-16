@@ -381,7 +381,7 @@ reserve/finalize adapter operations refuse before the adapter because one
 receipt cannot authorize multiple writes. This report records those facts; it
 does not change them.
 
-The current contract is v14/schema v11. Its bounded role-capacity seam admits
+The current contract is v15/schema v11. Its bounded role-capacity seam admits
 the three project requirements used by the first-adopter request:
 project-orchestrator is project-scoped, while worker and independent-reviewer
 bind to the exact repository target required by canonical WorkItem writes. The
@@ -402,7 +402,11 @@ Contract v14 adds the prepared `director-seat` role-requirement amendment:
 primary `pi/kimi-coding/k3/high`, Opus-medium standby, managed-worktree-only
 holder facts, and zero writing-lane capacity. Epoch-2 service on the unmanaged
 canonical environment is grandfathered evidence, not a generation-3 holder;
-recording remains receipt-gated and no live mutation is claimed.
+recording remains receipt-gated and no live mutation is claimed. Contract v15
+adds only the exact current-generation qualification exemption for generation 2,
+holder `thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source
+`src_x8veidmpik`; future generations require managed isolated worktrees and the
+exemption cannot admit writing or succession.
 
 The historical contract-v9 eight-class registry was accepted only during the
 one-release v9-to-v10 re-adoption. Contract v11 required the exact nine-class
@@ -411,6 +415,6 @@ bounded writing-lane dial while leaving the exact current ten-class allowlist
 unchanged. The already-bounded v11 row remains readable only for its nine
 historical classes. Malformed, reordered, subset, extra, v9, and arbitrary
 other sets remain invalid. This is a contract/cache bump:
-contract v14 consumers reread, stale v13 consumers refuse, and the four-consumer
+contract v15 consumers reread, stale v14 consumers refuse, and the four-consumer
 rollout receipt records expected=4, attempted=4, verified=4 for the current
 runtime; schema, migrations, and stored authority shape remain unchanged.

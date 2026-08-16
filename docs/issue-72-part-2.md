@@ -30,12 +30,17 @@ receipt-gated RoleGeneration succession path described in
 
 ## Director-seat recording gate
 
-The contract-v14 `director-seat` amendment is configuration and preparation
+The contract-v15 `director-seat` amendment is configuration and preparation
 only. It keeps the existing managed-worktree/source/environment identity gate,
 requires primary `pi/kimi-coding/k3/high`, names Opus-medium as the alternate,
 and has zero writing-lane capacity. Epoch-1 `thr_krqfdv79xw` and epoch-2
 `thr_gsb7m77ciz` service are ratified grandfathered service evidence; the
 unmanaged epoch-2 environment `env_3znzsxb7ce` is not a generation-3 holder.
+The only unmanaged exception is current-generation qualification recording for
+generation 2, holder `thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source
+`src_x8veidmpik`, while the exact current role head and holder execution attempt
+remain bound. It cannot admit writing or succession; every future generation
+requires a managed isolated worktree.
 
 The seat-succession recording gate is explicit: preflight the proposed holder
 against the current requirement, executed profile, exact managed environment,

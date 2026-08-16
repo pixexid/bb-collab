@@ -24,7 +24,7 @@ project-scoped, while worker and independent-reviewer bind to an exact
 repository target. Each role requirement carries its executed-profile
 qualification; this adds no assignment or dispatch authority.
 
-The v14/schema v11 contract retains the v10 operator gate, which has a host/UI
+The v15/schema v11 contract retains the v10 operator gate, which has a host/UI
 confirmation boundary only for authorizing or revoking the approver. An adopted
 `operator_only` Decision
 registers `approverId=orchestrator:bb-collab` for the exact project and adopted
@@ -59,12 +59,16 @@ Contract v11 required the exact nine-class set; contract v12 adds only
 `work_item_transition`. Contract v14 adds the bounded `director-seat`
 requirement with the exact primary `pi/kimi-coding/k3/high` and Opus-medium
 standby profiles, zero writing-lane capacity, and the existing
-managed-worktree/source/environment checks. The grandfathered unmanaged
-epoch-2 service cannot establish generation-3 occupancy without a later
-receipt-gated succession. Contract v13 adds the canonical named standby profile
+managed-worktree/source/environment checks. Contract v15 adds only the exact
+current-generation qualification exemption for generation 2, holder
+`thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source `src_x8veidmpik`.
+The current head and holder execution attempt remain required; foreign, stale,
+wrong-profile, future-generation, succession, and writing requests refuse
+before any write. The grandfathered unmanaged epoch-2 service cannot establish
+generation-3 occupancy without a later receipt-gated succession. Contract v13 adds the canonical named standby profile
 for new project-orchestrator generations and the bounded per-orchestrator
 writing-lane dial; the standby must use a different provider from the executed
-holder and has no authority or traffic. Stale v13 consumers refuse, current v14
+holder and has no authority or traffic. Stale v14 consumers refuse, current v15
 consumers reread, and schema/migrations remain unchanged by this role-policy
 amendment. The dial is a canonical config revision recorded through the adopted
 Decision and operator-authorized `config_revision` seam; review and probe
