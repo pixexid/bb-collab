@@ -6,7 +6,7 @@ import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import plugin from "../server.js";
+import plugin, { rpcContract } from "../server.js";
 import {
   DEFERRED_ISSUE_3_OUTCOMES,
   AUTHORIZED_APPROVER_ID,
@@ -51,12 +51,14 @@ import {
 } from "../src/foundation.js";
 import {
   applyWithFixtureReceipt,
+  assembleV17CachedConsumerRolloutEvidence,
   DeterministicGitHubIssueAdapter,
   DeterministicNativeAssignmentAdapter,
   DeterministicReviewFactReader,
   DeterministicRoleFactReader,
   seedFixtureDecision,
   seedVerifiedFixtureReceipt,
+  testSupportV17Reread,
 } from "../src/test-support.js";
 
 const PROJECT_ID = "proj_test";
@@ -149,6 +151,23 @@ function directorSeatConfig() {
 
 function cachedConsumerObservations(observedSchemaVersion: number, observedContractVersion: number) {
   return CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion, observedContractVersion }));
+}
+
+function serverTestV17Reread(result: FoundationResult) {
+  if (result.outcome !== "INVALID_INPUT") throw new Error("test stale-v16 probe did not refuse");
+  const reread = cachedConsumerRolloutEvidence(cachedConsumerObservations(SCHEMA_VERSION, CONTRACT_VERSION));
+  if (reread.action !== "reread") throw new Error("test did not reread v17");
+  const observation = reread.observations.find((candidate) => candidate.name === "tests/server.test");
+  if (!observation) throw new Error("test reread observation is unavailable");
+  return { observedSchemaVersion: observation.observedSchemaVersion, observedContractVersion: observation.observedContractVersion };
+}
+
+function doctorV17Reread(name: "server.rpcContract" | "server.collabCli", result: FoundationResult) {
+  const cachedConsumers = (result.evidence as { cachedConsumers?: { newSchemaVersion?: unknown; newContractVersion?: unknown } } | undefined)?.cachedConsumers;
+  if (result.outcome !== "OK" || typeof cachedConsumers?.newSchemaVersion !== "number" || typeof cachedConsumers.newContractVersion !== "number") {
+    throw new Error(`${name} did not return cached-consumer evidence`);
+  }
+  return { observedSchemaVersion: cachedConsumers.newSchemaVersion, observedContractVersion: cachedConsumers.newContractVersion };
 }
 
 function directorRoleReader(
@@ -3230,73 +3249,85 @@ describe("bb-collab plugin boundary", () => {
     staleRequirement.currentGenerationExemption = { generation: 2, holderThreadId: "thr_gsb7m77ciz", environmentId: "env_3znzsxb7ce", sourceId: "src_x8veidmpik" };
     const stalePlacement = directorSeatConfig();
     (stalePlacement.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>)[0]!.roleId = "project-orchestrator";
-    seedEvidenceArtifact(db, "cached-consumer-v16-fixture", 0, {
-      kind: "cached_consumer_v16_fixture",
-      staleV16Config,
-      stalePlacement,
-      rereadObservations: [
-        { name: "server.rpcContract", observedSchemaVersion: 11, observedContractVersion: 17 },
-        { name: "server.collabCli", observedSchemaVersion: 11, observedContractVersion: 17 },
-        { name: "src/test-support", observedSchemaVersion: 11, observedContractVersion: 17 },
-        { name: "tests/server.test", observedSchemaVersion: 11, observedContractVersion: 17 },
-      ],
-    });
-    const persistedFixture = JSON.parse((db.prepare(
-      "SELECT durable_ref_json FROM evidence_artifacts WHERE project_id = ? AND evidence_id = ?",
-    ).get(PROJECT_ID, "cached-consumer-v16-fixture") as { durable_ref_json: string }).durable_ref_json) as {
-      staleV16Config: ReturnType<typeof directorSeatConfig>;
-      stalePlacement: ReturnType<typeof directorSeatConfig>;
-      rereadObservations: Parameters<typeof cachedConsumerRolloutEvidence>[0];
-    };
-    const rollout = cachedConsumerRolloutEvidence(persistedFixture.rereadObservations);
-    expect(rollout).toMatchObject({ action: "reread", expected: 4, attempted: 4, verified: 4 });
     const beforeRefusal = exportFoundation(db, PROJECT_ID);
-    const staleV16 = applyWithFixtureReceipt(db, {
-      ...bootstrapRequest(PROJECT_ID, { config: persistedFixture.staleV16Config }),
-      operationClass: "config_revision",
-      idempotencyKey: "stale-v16-director-policy",
-      expectedConfigRevision: 1,
-      configRevision: 2,
-      expectedGovernanceEpoch: 1,
-      expectedFenceToken: fenceToken,
+    const evidence = await assembleV17CachedConsumerRolloutEvidence({
+      rpcContract: async () => doctorV17Reread("server.rpcContract", rpcContract.doctor.output.parse(
+        await host.harness.callRpc("doctor", { projectId: PROJECT_ID }),
+      ) as FoundationResult),
+      collabCli: async () => doctorV17Reread("server.collabCli", JSON.parse(
+        (await host.harness.runCli(["doctor", "--project", PROJECT_ID])).stdout,
+      ) as FoundationResult),
+      testSupport: async () => {
+        const result = applyWithFixtureReceipt(db, {
+          ...bootstrapRequest(PROJECT_ID, { config: staleV16Config }),
+          operationClass: "config_revision",
+          idempotencyKey: "stale-v16-director-policy",
+          expectedConfigRevision: 1,
+          configRevision: 2,
+          expectedGovernanceEpoch: 1,
+          expectedFenceToken: fenceToken,
+        });
+        expect(result).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
+        expect(result.message).toContain("currentGenerationExemption");
+        return { ...testSupportV17Reread(result), staleV16Refusal: result };
+      },
+      serverTest: async () => {
+        const result = applyWithFixtureReceipt(db, {
+          ...bootstrapRequest(PROJECT_ID, { config: stalePlacement }),
+          operationClass: "config_revision",
+          idempotencyKey: "stale-v16-director-placement",
+          expectedConfigRevision: 1,
+          configRevision: 2,
+          expectedGovernanceEpoch: 1,
+          expectedFenceToken: fenceToken,
+        });
+        expect(result).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
+        expect(result.message).toContain("director-seat must use the director role");
+        return { ...serverTestV17Reread(result), staleV16Refusal: result };
+      },
     });
-    expect(staleV16).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
-    expect(staleV16.message).toContain("currentGenerationExemption");
-    const stalePlacementResult = applyWithFixtureReceipt(db, {
-      ...bootstrapRequest(PROJECT_ID, { config: persistedFixture.stalePlacement }),
-      operationClass: "config_revision",
-      idempotencyKey: "stale-v16-director-placement",
-      expectedConfigRevision: 1,
-      configRevision: 2,
-      expectedGovernanceEpoch: 1,
-      expectedFenceToken: fenceToken,
-    });
-    expect(stalePlacementResult).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
-    expect(stalePlacementResult.message).toContain("director-seat must use the director role");
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
-    seedEvidenceArtifact(db, "cached-consumer-v17-rollout-receipt", 0, {
-      kind: "cached_consumer_v17_rollout_receipt",
-      fixtureEvidenceId: "cached-consumer-v16-fixture",
-      reread: rollout,
-      staleV16Refusal: {
-        exemption: { outcome: staleV16.outcome, message: staleV16.message },
-        placement: { outcome: stalePlacementResult.outcome, message: stalePlacementResult.message },
-      },
+    expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 11, observedContractVersion: 17 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      staleV16Refusal: { exemption: { outcome: "INVALID_INPUT" }, placement: { outcome: "INVALID_INPUT" } },
     });
+    const actorReceiptId = "cached-consumer-rollout-decision-actor";
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: actorReceiptId, actorKind: "operator" });
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v17-rollout-decision", {
+      actorReceiptId,
+    }))).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "cached-consumer-v17-rollout-decision", 1, {
+      actorReceiptId,
+      decisionEvidence: [evidence],
+      conditions: [{ kind: "evidence_required", evidenceIds: [evidence.evidenceId] }],
+    }))).toMatchObject({ outcome: "OK", evidence: { evidenceIds: ["cached-consumer-v17-rollout-receipt"] } });
     const exported = exportFoundation(db, PROJECT_ID).export!;
-    expect(exported.artifactIndex.find((artifact) => artifact.evidenceId === "cached-consumer-v17-rollout-receipt")?.durableRefJson).toBe(canonicalJson({
-      kind: "cached_consumer_v17_rollout_receipt",
-      fixtureEvidenceId: "cached-consumer-v16-fixture",
-      reread: rollout,
-      staleV16Refusal: {
-        exemption: { outcome: staleV16.outcome, message: staleV16.message },
-        placement: { outcome: stalePlacementResult.outcome, message: stalePlacementResult.message },
-      },
-    }));
+    expect(exported.artifactIndex.find((artifact) => artifact.evidenceId === evidence.evidenceId)?.durableRefJson).toBe(evidence.durableRefJson);
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
       outcome: "OK",
       evidence: { cachedConsumers: { action: "reread", expected: 4, attempted: 4, verified: 4 } },
     });
+  });
+
+  it("refuses v17 rollout evidence when one cached consumer did not execute", async () => {
+    const { db, directory } = directDatabase();
+    try {
+      const rpcContractProbe = vi.fn(async () => ({ observedSchemaVersion: 11, observedContractVersion: 17 }));
+      const collabCliProbe = vi.fn(async () => ({ observedSchemaVersion: 11, observedContractVersion: 17 }));
+      const serverTestProbe = vi.fn(async () => ({ observedSchemaVersion: 11, observedContractVersion: 17 }));
+      await expect(assembleV17CachedConsumerRolloutEvidence({
+        rpcContract: rpcContractProbe,
+        collabCli: collabCliProbe,
+        serverTest: serverTestProbe,
+      })).rejects.toThrow("all four consumers");
+      expect(rpcContractProbe).not.toHaveBeenCalled();
+      expect(collabCliProbe).not.toHaveBeenCalled();
+      expect(serverTestProbe).not.toHaveBeenCalled();
+      expect(db.prepare("SELECT COUNT(*) AS count FROM evidence_artifacts").get()).toEqual({ count: 0 });
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("prepares one sanctioned run, binds adopted authority, and enforces open/final identities", () => {
