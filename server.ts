@@ -5,6 +5,7 @@ import {
   SUPERVISOR_THREAD_ID,
   createContinuationLedger,
   createLaneWatcher,
+  createWaitRegistry,
   openLaneViews,
   readLaneStates,
   readRoleHolderStates,
@@ -160,6 +161,13 @@ const laneViewSchema = z
 
 const laneListSchema = z.array(laneViewSchema);
 const sidebarThreadIdSchema = z.string().trim().min(1).max(256);
+const registeredWaitSchema = z.object({
+  waitId: sidebarThreadIdSchema,
+  waiterThreadId: sidebarThreadIdSchema,
+  sourceThreadId: sidebarThreadIdSchema,
+  sourceEvent: z.enum(["terminal", "failure"]),
+  deadlineAtMs: z.number().int().nonnegative(),
+}).strict();
 const sidebarThreadStateSchema = z.string().trim().min(1).max(64);
 const sidebarThreadStateKey = (threadId: string) => `sidebar.thread-state:${threadId}`;
 const sidebarReasoningLevelSchema = z.enum(["none", "low", "medium", "high", "xhigh", "ultracode", "max", "ultra"]);
@@ -197,6 +205,10 @@ export const rpcContract = defineRpcContract({
   lanes: {
     input: z.object({}).strict(),
     output: laneListSchema,
+  },
+  registerWait: {
+    input: registeredWaitSchema,
+    output: registeredWaitSchema,
   },
   threadStates: {
     input: z.object({ threadIds: z.array(sidebarThreadIdSchema).max(256) }).strict(),
@@ -554,6 +566,11 @@ export default async function plugin(bb: BbPluginApi) {
     write: (state) => bb.storage.kv.set("lane-watcher.continuations", state),
   });
 
+  const waitRegistry = createWaitRegistry({
+    read: () => bb.storage.kv.get<unknown>("lane-watcher.registered-waits"),
+    write: (state) => bb.storage.kv.set("lane-watcher.registered-waits", state),
+  });
+
   const operatorWaitAlertPersistence = {
     read: () => bb.storage.kv.get<unknown>("lane-watcher.operator-wait-fyi"),
     write: (state: Record<string, true>) => bb.storage.kv.set("lane-watcher.operator-wait-fyi", state),
@@ -587,6 +604,7 @@ export default async function plugin(bb: BbPluginApi) {
     readDispatcherProjectIdentity: async () => (await bb.sdk.threads.get({ threadId: SUPERVISOR_THREAD_ID })).projectId,
     roleIdlePersistence,
     continuationLedger,
+    waitRegistry,
     operatorWaitAlertPersistence,
     onAlert: (alert) => alert.lane
       ? bb.log.warn(`lane awareness ${alert.kind}: ${alert.lane.laneId} (${alert.count}/${alert.max})`)
@@ -720,6 +738,10 @@ export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(rpcContract, {
     lanes() {
       return readOpenLaneViews();
+    },
+    async registerWait(input) {
+      await watcher.registerWait(input);
+      return input;
     },
     async threadStates(input) {
       const entries = await Promise.all(input.threadIds.map(async (threadId) => {
