@@ -8,6 +8,7 @@ import {
   type OperatorWait,
   readLaneStates,
   readRoleHolderStates,
+  SUPERVISOR_THREAD_ID,
   type RoleHolderState,
   type RoleIdleView,
   type LaneState,
@@ -217,6 +218,27 @@ describe("lane awareness", () => {
     await watcher.poll();
 
     expect(steerRole).not.toHaveBeenCalled();
+  });
+
+  it("observes the dispatcher target from a supervisor event", async () => {
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    let currentNow = 0;
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => [roleScope("queue-head")],
+      readDispatcherProjectIdentity: async () => "project-1",
+      readWorker: async (threadId) => ({ ...roleObservation(0), status: threadId === SUPERVISOR_THREAD_ID ? "idle" : "active" }),
+      steerRole,
+      now: () => currentNow,
+    });
+
+    await watcher.observe(SUPERVISOR_THREAD_ID, "idle");
+    currentNow = 10 * 60_000;
+    await watcher.observe(SUPERVISOR_THREAD_ID, "idle");
+
+    expect(steerRole).toHaveBeenCalledWith(expect.objectContaining({ threadId: SUPERVISOR_THREAD_ID }));
   });
 
   it("waits for the exact ten-minute wrongful-idle threshold", async () => {
