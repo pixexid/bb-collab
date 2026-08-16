@@ -32,15 +32,15 @@ describe("subagent effort directive", () => {
 
   it("records the current supervisor-ratified role matrix and explicit spawn boundary", () => {
     expect(operationsModel).toContain("Director | `pi` | `kimi-coding/k3` | HIGH");
+    expect(operationsModel).toContain("K3 is director-only; it is never a review fallback.");
     expect(operationsModel).toContain("Orchestrator primary | Claude harness / `claude-code` | `claude-opus-5` | MEDIUM");
     expect(operationsModel).toContain("Orchestrator alternate | Codex harness / `codex` | `gpt-5.6-sol` | MEDIUM");
     expect(operationsModel).toContain("Orchestrator alternate | Terra harness/provider | `gpt-5.6-terra` | MEDIUM");
     expect(operationsModel).toContain("Never Luna or below.");
     expect(operationsModel).toContain("pending epoch-2 orchestrator succession");
-    expect(operationsModel).toContain("Watch item: monitor the shared Anthropic account window");
+    expect(operationsModel).toMatch(/Watch item: monitor the shared Anthropic account window across the amended\norchestrator, app-side supervisor wakes, and Opus cold reviews\./u);
     expect(operationsModel).toContain("do not hot-swap a healthy live orchestrator");
-    expect(operationsModel).toContain("If that window saturates, Sol MEDIUM is the standing fallback");
-    expect(operationsModel).toContain("pre-authorized without a new decision");
+    expect(operationsModel).toMatch(/If that window saturates, Sol MEDIUM is the standing fallback,\npre-authorized without a new decision\./u);
     expect(operationsModel).toContain("`glm-5.3` | MEDIUM or HIGH | Admitted now");
     expect(operationsModel).toContain("Tier-A reviewer | Sol harness/provider | Sol | HIGH");
     expect(operationsModel).toContain("Terra HIGH is also acceptable when Sol authored");
@@ -51,7 +51,8 @@ describe("subagent effort directive", () => {
     expect(operationsModel).toContain("current graded qualification probe");
     expect(operationsModel).toMatch(/The coding probe for\n`muse-spark-1\.2` is \[GH-106\]/u);
     expect(operationsModel).toMatch(/the Terra placement probe is\n\[GH-105\]/u);
-    expect(operationsModel).toContain("explicit `provider`, `model`, `reasoning`, and\n`visibility: \"visible\"` flags");
+    expect(operationsModel).toMatch(/Every new spawn must provide explicit `provider`, `model`, `reasoning`, and\n`visibility: "visible"` flags\./u);
+    expect(operationsModel).toMatch(/A requested profile is Assignment intent only\. Eligibility and review routing\nuse the actual harness\/provider, model, reasoning, permission and visibility\nrecorded by the ExecutionAttempt\/provider receipt;/u);
     expect(operationsModel).not.toContain("K3 HIGH");
     expect(operationsModel).not.toContain("`glm-5.3` is barred");
   });
