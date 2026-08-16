@@ -65,8 +65,10 @@ field can activate work or authorize a canonical mutation by itself.
   current-directory fallback.
 - Configuration stores secret references, never secret material.
 - Permission and visibility are explicit values in each project-config
-  revision and execution request. Full permission is a possible starter
-  value, never an invisible inherited default.
+  revision and execution request. Project configuration must set
+  `visibility: "visible"`; hidden or omitted defaults refuse before persistence.
+  Full permission is a possible starter value, never an invisible inherited
+  default.
 
 ## Cached-consumer bump test
 

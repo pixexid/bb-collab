@@ -3040,6 +3040,14 @@ describe("bb-collab plugin boundary", () => {
     const overLaneCapConfig = roleConfig();
     (overLaneCapConfig.extensions.bbCollab as Record<string, unknown>).writingLaneCeiling = 4;
     await rejectConfig("over-lane-cap", overLaneCapConfig, "INVALID_INPUT", "integer from 0 through 3");
+
+    const hiddenVisibilityConfig = roleConfig();
+    (hiddenVisibilityConfig as Record<string, unknown>).visibility = "hidden";
+    await rejectConfig("hidden-visibility", hiddenVisibilityConfig, "INVALID_INPUT", "config visibility must be explicitly visible");
+
+    const omittedVisibilityConfig = roleConfig();
+    delete (omittedVisibilityConfig as Record<string, unknown>).visibility;
+    await rejectConfig("omitted-visibility", omittedVisibilityConfig, "INVALID_INPUT", "config must declare permissionMode and visibility explicitly");
   });
 
   it("replays a consumed legacy receipt but refuses a new legacy receipt or wrong actor binding", async () => {

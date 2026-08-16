@@ -15459,8 +15459,8 @@ function validateConfig(value) {
   if (!["full", "auto", "accept-edits"].includes(config2.permissionMode)) {
     throw refusal("INVALID_INPUT", "config permissionMode is not a BB permission mode");
   }
-  if (!["visible", "hidden"].includes(config2.visibility)) {
-    throw refusal("INVALID_INPUT", "config visibility is not a BB visibility value");
+  if (config2.visibility !== "visible") {
+    throw refusal("INVALID_INPUT", "config visibility must be explicitly visible");
   }
   const extensions = config2.extensions;
   if (extensions !== void 0) {
