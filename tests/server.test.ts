@@ -544,8 +544,16 @@ async function loadedLaneWatcherHost() {
   db.prepare("UPDATE execution_attempts SET thread_id = ?, state = 'running' WHERE execution_attempt_id = ?").run("worker-1", executionAttemptId);
 
   let thread = makeThreadResponse({ id: "worker-1", status: "idle", archivedAt: null, deletedAt: null });
+  const roleThread = makeThreadResponse({ id: ROLE_THREAD_ID, projectId: PROJECT_ID, status: "idle", archivedAt: null, deletedAt: null });
+  let roleReads = 0;
+  let failRoleReadAt: number | null = null;
   let pendingExternalWait = false;
-  host.harness.sdk.stub("threads.get", (async () => thread) as never);
+  host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => {
+    if (threadId !== ROLE_THREAD_ID) return thread;
+    roleReads += 1;
+    if (roleReads === failRoleReadAt) throw new Error("role thread unavailable");
+    return roleThread;
+  }) as never);
   host.harness.sdk.stub("threads.interactions.list", (async () => pendingExternalWait ? [{ status: "pending" }] : []) as never);
   host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
   return {
@@ -556,6 +564,12 @@ async function loadedLaneWatcherHost() {
     },
     setThread(next: Partial<typeof thread>) {
       thread = makeThreadResponse({ ...thread, ...next });
+    },
+    setLaneState(state: string) {
+      db.prepare("UPDATE execution_attempts SET state = ? WHERE execution_attempt_id = ?").run(state, executionAttemptId);
+    },
+    failRoleReadAfter(successfulReads: number) {
+      failRoleReadAt = roleReads + successfulReads + 1;
     },
   };
 }
@@ -1430,6 +1444,41 @@ describe("bb-collab plugin boundary", () => {
     });
 
     await fixture.host.harness.lifecycle.dispose();
+  });
+
+  it("warns with role-seat evidence on an unreadable final liveness check and stays silent for a healthy holder", async () => {
+    let currentNow = 0;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => currentNow);
+    const warning = (fixture: Awaited<ReturnType<typeof loadedLaneWatcherHost>>) => fixture.host.harness.inspection.logEntries
+      .filter((entry) => entry.level === "warn" && entry.message.startsWith("role steer refused:"));
+    const roleSends = (fixture: Awaited<ReturnType<typeof loadedLaneWatcherHost>>) => fixture.host.harness.inspection.sdk.callsTo("threads.send")
+      .filter(([input]) => (input as { threadId?: string }).threadId === ROLE_THREAD_ID);
+    try {
+      const healthy = await loadedLaneWatcherHost();
+      healthy.setLaneState("prepared");
+      await healthy.host.harness.runCli(["wait-validator", "--cycle"]);
+      currentNow = 10 * 60_000;
+      await healthy.host.harness.runCli(["wait-validator", "--cycle"]);
+      expect(roleSends(healthy)).toHaveLength(1);
+      expect(warning(healthy)).toHaveLength(0);
+      await healthy.host.harness.lifecycle.dispose();
+
+      currentNow = 0;
+      const unreadable = await loadedLaneWatcherHost();
+      unreadable.setLaneState("prepared");
+      await unreadable.host.harness.runCli(["wait-validator", "--cycle"]);
+      unreadable.failRoleReadAfter(1);
+      currentNow = 10 * 60_000;
+      await unreadable.host.harness.runCli(["wait-validator", "--cycle"]);
+      expect(roleSends(unreadable)).toHaveLength(0);
+      expect(warning(unreadable)).toEqual([expect.objectContaining({
+        message: expect.stringContaining(`project=${PROJECT_ID} role=project-orchestrator@1 holder=`),
+      })]);
+      expect(warning(unreadable)[0]?.message).toContain(`thread=${ROLE_THREAD_ID} liveness=unknown error=Error: role thread unavailable`);
+      await unreadable.host.harness.lifecycle.dispose();
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it("loads one CLI/RPC seam and refuses production apply before any write", async () => {

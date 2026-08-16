@@ -818,10 +818,14 @@ export default async function plugin(bb: BbPluginApi) {
       let thread;
       try {
         thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
-      } catch {
+      } catch (error) {
+        bb.log.warn(`role steer refused: project=${role.projectId} role=${role.roleId}@${role.roleGeneration} holder=${role.executionAttemptId} thread=${holders[0].thread_id} liveness=unknown error=${String(error)}`);
         return;
       }
-      if (thread.projectId !== role.projectId || thread.archivedAt !== null || thread.deletedAt !== null) return;
+      if (thread.projectId !== role.projectId || thread.archivedAt !== null || thread.deletedAt !== null) {
+        bb.log.warn(`role steer refused: project=${role.projectId} role=${role.roleId}@${role.roleGeneration} holder=${role.executionAttemptId} thread=${holders[0].thread_id} observedProject=${thread.projectId} archivedAt=${thread.archivedAt ?? "null"} deletedAt=${thread.deletedAt ?? "null"}`);
+        return;
+      }
       await bb.sdk.threads.send({
         threadId: holders[0].thread_id,
         mode: "steer",
