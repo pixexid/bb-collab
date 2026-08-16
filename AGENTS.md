@@ -154,10 +154,12 @@ general, cannot admit writing, and future succession remains receipt-gated.
   PR commit history must contain no conflicting close-like linkage. `issues:
   read` and branch-protection/ruleset enforcement of the Verify check are
   external prerequisites, not canonical authority.
-- The merge-only `pull_request_target` workflow uses `issues: write` only with
-  code checked out from `refs/heads/main`; it never executes the PR head or
-  merge ref. Its deterministic marker/concurrency path is projection evidence,
-  not canonical governance.
+- The `pull_request_target` lifecycle workflow uses `contents: read`,
+  `issues: write`, and `pull-requests: write` for its merge trigger and its
+  specific merged-PR backfill trigger, with code checked out from
+  `refs/heads/main`; it never executes the PR head or merge ref. Its
+  deterministic marker/concurrency path is projection evidence, not canonical
+  governance.
 - The lifecycle disposition, Verify, merge-comment, and audit rules above are
   external CI/release conformance projections. They do not change the
   canonical contract, `CONTRACT_VERSION`, `contractDigest`, schema, cached

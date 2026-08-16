@@ -1,6 +1,28 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
+import { handleMergedPullRequestLifecycle } from "../scripts/handle-merged-pr-lifecycle.mjs";
 import { hasLifecycleMarker, lifecycleMarker, parsePullRequestDisposition, planMergedLifecycle, validateCommitMessages, validateIssueTarget, validateLifecycleComments } from "../scripts/pr-lifecycle.mjs";
+
+const noIssuePullRequest = (number = 94, body = "No issue: the original lifecycle run lacked the required permission") => ({
+  number,
+  state: "closed",
+  merged_at: "2026-08-15T00:00:00Z",
+  title: "Backfill lifecycle evidence",
+  body,
+});
+
+type LifecycleCall = { method: string; path: string; body?: BodyInit | null };
+type FakeFetchOptions = { pullRequest?: { number: number; [key: string]: unknown }; commits?: unknown[]; comments?: unknown; postStatus?: number; calls?: LifecycleCall[] };
+const fakeFetch = ({ pullRequest = noIssuePullRequest(), commits = [{ commit: { message: "ordinary implementation" } }], comments = [], postStatus = 201, calls = [] }: FakeFetchOptions = {}) => async (input: RequestInfo | URL, init?: RequestInit) => {
+  const url = new URL(String(input));
+  const method = init?.method ?? "GET";
+  calls.push({ method, path: url.pathname, body: init?.body });
+  if (method === "POST") return { ok: postStatus >= 200 && postStatus < 300, status: postStatus, json: async () => ({}) } as Response;
+  if (url.pathname.endsWith(`/pulls/${pullRequest.number}`)) return { ok: true, status: 200, json: async () => pullRequest } as Response;
+  if (url.pathname.endsWith(`/pulls/${pullRequest.number}/commits`)) return { ok: true, status: 200, json: async () => commits } as Response;
+  if (url.pathname.endsWith(`/issues/${pullRequest.number}/comments`)) return { ok: true, status: 200, json: async () => comments } as Response;
+  return { ok: false, status: 404, json: async () => ({}) } as Response;
+};
 
 describe("pull-request lifecycle linkage", () => {
   it("accepts one related disposition and a completed close disposition", () => {
@@ -87,8 +109,92 @@ describe("pull-request lifecycle linkage", () => {
   it("pins the write-token merge workflow to trusted default-branch code", () => {
     const workflow = readFileSync(".github/workflows/issue-lifecycle.yml", "utf8");
     expect(workflow).toContain("pull_request_target:");
+    expect(workflow).toContain("workflow_dispatch:");
+    expect(workflow).toContain("pr_number:");
     expect(workflow).toContain("ref: refs/heads/main");
     expect(workflow).not.toContain("github.event.pull_request.head.sha");
+    expect(workflow).toContain("contents: read");
     expect(workflow).toContain("issues: write");
+    expect(workflow).toContain("pull-requests: write");
+  });
+
+  it("backfills one verified merged no-issue PR with one rationale comment", async () => {
+    const calls: LifecycleCall[] = [];
+    const result = await handleMergedPullRequestLifecycle({
+      event: { inputs: { pr_number: 94 } },
+      eventName: "workflow_dispatch",
+      token: "test-token",
+      repository: "pixexid/bb-collab",
+      fetchImpl: fakeFetch({ calls }),
+    });
+    expect(result.actions).toHaveLength(1);
+    expect(result.actions[0]).toMatchObject({ kind: "comment", target: 94 });
+    expect(calls.filter(({ method }) => method === "POST")).toHaveLength(1);
+    expect(String(calls.find(({ method }) => method === "POST")?.body)).toContain(result.marker);
+  });
+
+  it("does not re-post a deterministic marker during backfill", async () => {
+    const marker = lifecycleMarker(94, "pr-94", "no-issue");
+    const calls: LifecycleCall[] = [];
+    const result = await handleMergedPullRequestLifecycle({
+      event: { inputs: { pr_number: "94" } },
+      eventName: "workflow_dispatch",
+      token: "test-token",
+      repository: "pixexid/bb-collab",
+      fetchImpl: fakeFetch({ comments: [{ body: marker, user: { login: "github-actions[bot]", type: "Bot" } }], calls }),
+    });
+    expect(result.actions).toEqual([]);
+    expect(calls.filter(({ method }) => method === "POST")).toEqual([]);
+  });
+
+  it("refuses unmerged, unknown, mismatched, ambiguous, and non-no-issue backfill targets", async () => {
+    const cases = [
+      { pullRequest: { ...noIssuePullRequest(), state: "open", merged_at: null } },
+      { pullRequest: { ...noIssuePullRequest(), number: 95 } },
+      { pullRequest: noIssuePullRequest(94, "No issue: one\nNo issue: two") },
+      { pullRequest: noIssuePullRequest(94, "Related GH-80") },
+    ];
+    for (const options of cases) {
+      const calls: LifecycleCall[] = [];
+      await expect(handleMergedPullRequestLifecycle({
+        event: { inputs: { pr_number: "94" } },
+        eventName: "workflow_dispatch",
+        token: "test-token",
+        repository: "pixexid/bb-collab",
+        fetchImpl: fakeFetch({ ...options, calls }),
+      })).rejects.toThrow();
+      expect(calls.filter(({ method }) => method === "POST")).toEqual([]);
+    }
+    await expect(handleMergedPullRequestLifecycle({
+      event: { inputs: { pr_number: "94" } },
+      eventName: "workflow_dispatch",
+      token: "test-token",
+      repository: "pixexid/bb-collab",
+      fetchImpl: async () => ({ ok: false, status: 404, json: async () => ({}) }) as Response,
+    })).rejects.toThrow("404");
+    await expect(handleMergedPullRequestLifecycle({
+      event: { inputs: { pr_number: "94" } },
+      eventName: "workflow_dispatch",
+      token: "test-token",
+      repository: "pixexid/bb-collab",
+      fetchImpl: fakeFetch({ postStatus: 403 }),
+    })).rejects.toThrow("POST");
+    await expect(handleMergedPullRequestLifecycle({
+      event: { inputs: { pr_number: "94" } },
+      eventName: "workflow_dispatch",
+      token: "test-token",
+      repository: "pixexid/bb-collab",
+      fetchImpl: fakeFetch({ comments: { uncertain: true } }),
+    })).rejects.toThrow("uncertain lifecycle comment collection");
+  });
+
+  it("keeps the merge-event parser fail-closed for a null body", async () => {
+    await expect(handleMergedPullRequestLifecycle({
+      event: { pull_request: { merged: true, number: 94, title: "", body: null } },
+      eventName: "pull_request_target",
+      token: "test-token",
+      repository: "pixexid/bb-collab",
+      fetchImpl: fakeFetch(),
+    })).rejects.toThrow("Every pull request body must contain exactly one unambiguous disposition line");
   });
 });

@@ -236,13 +236,17 @@ GitHub state, canonical SQLite state, receipts, or governance decisions.
 Verify reads linked issue metadata with `issues: read` and fails closed on a
 missing, invalid, or unavailable target. Repository branch protection or a
 ruleset requiring the Verify check is an external release prerequisite; source
-cannot claim that GitHub has enabled it. The merge-only lifecycle workflow uses
+cannot claim that GitHub has enabled it. The lifecycle workflow uses
 PR-number concurrency, a deterministic hidden marker, duplicate detection,
-and fail-closed API errors. Because it is `pull_request_target` with
-`issues: write`, checkout is pinned to `refs/heads/main`; PR head and merge
-refs are never executed. It posts one Related status comment while leaving the
-issue open, one no-issue rationale on the PR, or closes only an explicitly
-complete `Closes` disposition after merge.
+and fail-closed API errors for both its merged `pull_request_target` trigger
+and its manual `workflow_dispatch` backfill trigger. The backfill accepts one
+specific merged PR, validates it through the shared parser and evidence reads,
+and permits only the missing no-issue rationale comment. Both triggers use
+`contents: read`, `issues: write`, and `pull-requests: write`; checkout is
+pinned to `refs/heads/main`, and PR head and merge refs are never executed. The
+merge trigger posts one Related status comment while leaving the issue open,
+one no-issue rationale on the PR, or closes only an explicitly complete
+`Closes` disposition after merge.
 
 The weekly audit is a scheduled and manually dispatchable GitHub API read-only
 workflow. It collects open issues and merged pull requests, then reports the
