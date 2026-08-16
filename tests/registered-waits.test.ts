@@ -118,7 +118,7 @@ async function boundedRegister(h: Harness, input: unknown, ctxThreadId?: string)
 /** Adapter from the one wait registry to the bounded validator seam. */
 const bounded = (r: ReturnType<typeof createWaitRegistry>) => ({
   register: (wait: Parameters<typeof r.register>[0]) => r.register(wait),
-  list: () => r.list(),
+  list: async () => { await r.recover(); return r.list(); },
   firedWaitIds: async () => { await r.recover(); return r.firedList() as Array<{ waitId: string; reason: string; waiterThreadId: string }>; },
 });
 
@@ -191,6 +191,28 @@ describe("registered-wait registration (drill: deadline-less wait refused)", () 
     expect(await boundedRegister(h, waitRequest())).toMatchObject({ outcome: "refused", message: expect.stringContaining("unknown status") });
   });
 
+  it("refuses a keyless registration: no shared default waitId", async () => {
+    const h = harness();
+    h.sources.set("source-1", { status: "idle", archived: false });
+    const keyless = { ...waitRequest() } as Record<string, unknown>;
+    delete keyless.idempotencyKey;
+    expect(await boundedRegister(h, keyless)).toMatchObject({
+      outcome: "refused",
+      message: expect.stringContaining("idempotencyKey is required"),
+    });
+    expect(h.registry.list()).toHaveLength(0);
+  });
+
+  it("refuses an explicit-deadline replay with a different explicit deadline", async () => {
+    const h = harness();
+    h.sources.set("source-1", { status: "idle", archived: false });
+    expect(await boundedRegister(h, waitRequest({ deadlineAtMs: h.now.value + 3600_000, overrideReason: "first window" }))).toMatchObject({ outcome: "registered" });
+    expect(await boundedRegister(h, waitRequest({ deadlineAtMs: h.now.value + 7200_000, overrideReason: "second window" }))).toMatchObject({
+      outcome: "refused",
+      message: expect.stringContaining("different wait"),
+    });
+  });
+
   it("binds the waiter to the calling thread and replays idempotently", async () => {
     const h = harness();
     h.sources.set("source-1", { status: "idle", archived: false });
@@ -244,6 +266,7 @@ describe("firing through the watcher (drill: failure propagates as events, never
       mutate(h);
       await h.watcher.poll();
       expect(h.registry.list().map((wait) => h.registry.state(wait.waitId))).toEqual(["fired"]);
+      expect(h.registry.firedList().map((fired) => fired.reason)).toEqual(["source_terminal"]);
       const other = harness();
       other.sources.set("source-1", { status: "idle", archived: false });
       await register(other);
@@ -287,7 +310,7 @@ describe("escalation ladder (drill: bounded escalation, never a steer loop)", ()
     await h.watcher.poll();
   }
 
-  it("steers a fired waiter, marks an active waiter delivered, and never re-fires", async () => {
+  it("steers a fired waiter, pauses for an active waiter, and never re-fires", async () => {
     const h = harness({ graceMs: 10_000 });
     h.sources.set("source-1", { status: "idle", archived: false });
     h.waiters.set("waiter-1", { status: "idle", archived: false });
@@ -305,7 +328,7 @@ describe("escalation ladder (drill: bounded escalation, never a steer loop)", ()
     h.now.value += 20_000;
     const delivered = await h.escalation.cycle();
     expect(delivered).toMatchObject({ steered: 0, escalated: 0 });
-    expect(h.steers).toHaveLength(1); // delivered: done forever
+    expect(h.steers).toHaveLength(1); // no grace has passed since steer 1
   });
 
   it("never loses a wake to a momentarily active waiter: the ladder resumes on idle", async () => {
@@ -372,6 +395,44 @@ describe("escalation ladder (drill: bounded escalation, never a steer loop)", ()
     expect(summary).toMatchObject({ steered: 0 });
   });
 
+  it("refuses re-registration of a fired wait key with its dead deadline", async () => {
+    const h = harness({ graceMs: 10_000 });
+    h.sources.set("source-1", { status: "idle", archived: false });
+    h.waiters.set("waiter-1", { status: "idle", archived: false });
+    // Fire through a terminal attempt state so the source THREAD stays a
+    // valid live target: only the fired-key guard can explain the refusal.
+    await boundedRegister(h, waitRequest());
+    h.lanes[0].attempt_state = "done";
+    await h.watcher.poll();
+    await h.escalation.cycle();
+    // The documented recovery move — wait again on the same source — must not
+    // hand back the dead wait as a replay (round-2 review finding #1).
+    const reregister = await boundedRegister(h, waitRequest());
+    expect(reregister).toMatchObject({
+      outcome: "refused",
+      message: expect.stringContaining("consumed by a fired wait"),
+    });
+    // A fresh key on the same source registers cleanly.
+    const fresh = await boundedRegister(h, waitRequest({ idempotencyKey: "wait-key-next" }));
+    expect(fresh).toMatchObject({ outcome: "registered" });
+  });
+
+  it("retention never re-arms the ladder for a wait still in the fired set", async () => {
+    const h = harness({ graceMs: 0 });
+    h.sources.set("source-1", { status: "idle", archived: false });
+    h.waiters.set("waiter-1", { status: "idle", archived: false });
+    await fireOne(h);
+    await h.escalation.cycle(); // fire + steer 1
+    await h.escalation.cycle(); // steer 2 (ignored)
+    await h.escalation.cycle(); // two ignored steers escalate once
+    expect(h.escalations).toHaveLength(1);
+    h.now.value += 8 * 24 * 60 * 60_000; // far past retention
+    await h.escalation.cycle();
+    await h.escalation.cycle();
+    expect(h.steers).toHaveLength(2); // no re-steer
+    expect(h.escalations).toHaveLength(1); // no second operator alert
+  });
+
   it("survives a restart without re-firing or forgetting: a fresh cycle replays from KV", async () => {
     const h = harness({ graceMs: 10_000 });
     h.sources.set("source-1", { status: "idle", archived: false });
@@ -385,11 +446,7 @@ describe("escalation ladder (drill: bounded escalation, never a steer loop)", ()
     const registry2 = createWaitRegistry({ read: async () => kv.get("waits"), write: async (state) => { kv.set("waits", structuredClone(state)); } });
     const steers: Array<{ waitId: string; reason: string }> = [];
     const escalation2 = createWaitEscalationCycle({
-      registry: {
-        register: (wait) => registry2.register(wait),
-        list: () => registry2.list(),
-        firedWaitIds: async () => { await registry2.recover(); return registry2.firedList() as Array<{ waitId: string; reason: string; waiterThreadId: string }>; },
-      },
+      registry: bounded(registry2),
       escalationPersistence: { read: async () => kv.get("escalation"), write: async (state) => { kv.set("escalation", structuredClone(state)); } },
       readWaiter: async (threadId) => h.waiters.get(threadId) ?? null,
       steerWaiter: async (target) => { steers.push({ waitId: target.waitId, reason: target.reason }); },
@@ -406,7 +463,7 @@ describe("escalation ladder (drill: bounded escalation, never a steer loop)", ()
     expect(steers).toHaveLength(1);
   });
 
-  it("never writes a canonical SQLite table", async () => {
+  it("adds no canonical DDL; the plugin-seam digest test carries the full no-write claim", async () => {
     const db = new Database(":memory:");
     db.exec("CREATE TABLE assignments (project_id TEXT)");
     const digest = () => JSON.stringify(db.prepare("SELECT * FROM sqlite_master").all());

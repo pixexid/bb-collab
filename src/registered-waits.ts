@@ -41,7 +41,7 @@ export type RegisterWaitResult =
 
 export interface BoundedWaitRegistry {
   register(wait: { waitId: string; waiterThreadId: string; sourceThreadId: string; sourceEvent: "terminal" | "failure"; deadlineAtMs: number }): Promise<void>;
-  list(): Array<{ waitId: string; waiterThreadId: string; sourceThreadId: string; sourceEvent: "terminal" | "failure"; deadlineAtMs: number }>;
+  list(): Promise<Array<{ waitId: string; waiterThreadId: string; sourceThreadId: string; sourceEvent: "terminal" | "failure"; deadlineAtMs: number }>>;
   firedWaitIds(): Promise<Array<{ waitId: string; reason: string; waiterThreadId: string }>>;
 }
 
@@ -55,7 +55,6 @@ export interface WaitEscalationRecord {
   steers: number;
   failedSteers: number;
   lastSteerAtMs: number | null;
-  delivered: boolean;
   escalated: boolean;
 }
 
@@ -146,8 +145,8 @@ export async function registerBoundedWait(options: {
   if (sourceEvent !== "terminal" && sourceEvent !== "failure") {
     return { outcome: "refused", message: 'sourceEvent must be "terminal" or "failure"' };
   }
-  if (input.idempotencyKey !== undefined && !nonEmptyString(input.idempotencyKey, 256)) {
-    return { outcome: "refused", message: "idempotencyKey must be a non-empty string" };
+  if (!nonEmptyString(input.idempotencyKey, 256)) {
+    return { outcome: "refused", message: "idempotencyKey is required: every registration names its own key" };
   }
 
   // Source-liveness validation: a wait on an unknown, archived, or
@@ -181,7 +180,15 @@ export async function registerBoundedWait(options: {
     sourceEvent: sourceEvent as "terminal" | "failure",
     deadlineAtMs: deadline.deadlineAtMs,
   };
-  const existing = options.registry.list().find((candidate) => candidate.waitId === wait.waitId);
+  // A key whose wait already fired is consumed: replaying it would hand the
+  // waiter a dead wait with an expired deadline and no further wake (round-2
+  // review finding #1). Check fired state BEFORE the replay branch — a fired
+  // wait stays in list() forever, so the later firedAlready guard is dead.
+  const firedAlready = (await options.registry.firedWaitIds()).some((fired) => fired.waitId === wait.waitId);
+  if (firedAlready) {
+    return { outcome: "refused", message: "idempotency key was already consumed by a fired wait: register a new wait with a new key" };
+  }
+  const existing = (await options.registry.list()).find((candidate) => candidate.waitId === wait.waitId);
   if (existing) {
     // A replay must bind the same wait. An omitted deadline means "the
     // default", whose wall-clock value legitimately differs between calls —
@@ -196,15 +203,13 @@ export async function registerBoundedWait(options: {
       ? { outcome: "registered", wait: existing, replay: true }
       : { outcome: "refused", message: "idempotency key is already bound to a different wait" };
   }
-  const firedAlready = (await options.registry.firedWaitIds()).some((fired) => fired.waitId === wait.waitId);
-  if (firedAlready) return { outcome: "refused", message: "idempotency key was already consumed by a fired wait" };
   await options.registry.register(wait);
   return { outcome: "registered", wait, replay: false };
 }
 
 function parseEscalationRecord(value: unknown, maxSteers: number): WaitEscalationRecord {
   if (!isPlainObject(value)) throw new Error("invalid wait escalation state");
-  const { waitId, waiterThreadId, reason, firstSeenAtMs, steers, failedSteers, lastSteerAtMs, delivered, escalated } = value;
+  const { waitId, waiterThreadId, reason, firstSeenAtMs, steers, failedSteers, lastSteerAtMs, escalated } = value;
   if (
     !nonEmptyString(waitId, 64) || !nonEmptyString(waiterThreadId) ||
     !(reason === "source_terminal" || reason === "source_failure" || reason === "deadline_expired") ||
@@ -212,7 +217,7 @@ function parseEscalationRecord(value: unknown, maxSteers: number): WaitEscalatio
     !Number.isInteger(steers) || (steers as number) < 0 || (steers as number) > maxSteers ||
     !Number.isInteger(failedSteers) || (failedSteers as number) < 0 || (failedSteers as number) > maxSteers ||
     !(lastSteerAtMs === null || (Number.isInteger(lastSteerAtMs) && (lastSteerAtMs as number) >= 0)) ||
-    typeof delivered !== "boolean" || typeof escalated !== "boolean"
+    typeof escalated !== "boolean"
   ) throw new Error("invalid wait escalation state");
   return {
     waitId: waitId as string,
@@ -222,7 +227,6 @@ function parseEscalationRecord(value: unknown, maxSteers: number): WaitEscalatio
     steers: steers as number,
     failedSteers: failedSteers as number,
     lastSteerAtMs: lastSteerAtMs as number | null,
-    delivered: delivered as boolean,
     escalated: escalated as boolean,
   };
 }
@@ -295,7 +299,6 @@ export function createWaitEscalationCycle(options: {
           steers: 0,
           failedSteers: 0,
           lastSteerAtMs: null,
-          delivered: false,
           escalated: false,
         };
         records[record.waitId] = record;
@@ -305,8 +308,13 @@ export function createWaitEscalationCycle(options: {
         options.onFire?.(record);
       }
 
+      const firedIds = new Set((await options.registry.firedWaitIds()).map((fired) => fired.waitId));
       for (const record of Object.values(records)) {
-        if (currentNow - record.firstSeenAtMs > WAIT_ESCALATION_RETENTION_MS) {
+        // Retention prunes only records whose fired wait left the store. A
+        // time-based deletion would re-arm the ladder against a wait that is
+        // still in firedList(), re-steering and re-alerting forever (round-2
+        // review finding #3); the store's own lifetime is the record's.
+        if (!firedIds.has(record.waitId) && currentNow - record.firstSeenAtMs > WAIT_ESCALATION_RETENTION_MS) {
           delete records[record.waitId];
           await save();
           continue;
@@ -336,8 +344,7 @@ export function createWaitEscalationCycle(options: {
         }
         let failed = false;
         try {
-          await options.steerWaiter(record);
-          record.delivered = true; // the wake was sent; acting on it is the waiter's move
+          await options.steerWaiter(record); // the wake was sent; acting on it is the waiter's move
         } catch {
           failed = true; // a failed send is a failed steer; the second failure escalates
         }

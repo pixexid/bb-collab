@@ -28,13 +28,22 @@ durability and discipline around that one store:
 - **Source-liveness validation.** A `source_terminal` wait on an unknown,
   archived, already-errored, or unknown-status source is refused — you
   cannot start waiting on something already finished; act on its outcome.
-- **Waiter binding.** `bb collab wait-register` binds the waiter to the
-  calling thread; a mismatched binding is refused. Identical replays are
-  idempotent; a key rebound to a different wait is a conflict.
+- **Waiter binding and key discipline.** `bb collab wait-register` binds
+  the waiter to the calling thread (mismatch refused) and requires an
+  `idempotencyKey` per registration: identical replays are idempotent, a
+  key rebound to a different wait is a conflict, and a key whose wait
+  already fired is consumed — re-waiting on the same source registers a
+  new key. This law binds the waiter CLI seam; the app-facing
+  `registerWait` RPC is the substrate's own surface and accepts a
+  caller-supplied finite deadline (a follow-up may route it through the
+  same law).
 - **Bounded escalation ladder for fired waits.** A fired wait steers its
-  waiter at most twice (grace-spaced, KV-deduped); a waiter that is active
-  is marked delivered; two ignored or failed steers escalate to exactly ONE
-  operator alert plus a succession trigger. Steers never loop.
+  waiter at most twice (grace-spaced, KV-deduped) while the waiter is
+  observed idle; an active waiter pauses the ladder — it is alive and the
+  wake reaches it, and the ladder resumes if it goes idle; two ignored or
+  failed steers escalate to exactly ONE operator alert plus a succession
+  trigger. Steers never loop, and a ladder record outlives its fired wait
+  exactly as long as the store holds it: retention never re-arms.
 - **Host supervision.** `scripts/wait-validator.mjs` is a pure-code loop —
   no model, no tokens — supervised by a launchd LaunchAgent
   (`launchd/com.bbcollab.wait-validator.plist`, KeepAlive=true): it survives
@@ -105,9 +114,18 @@ when it must not) by `tests/registered-waits.test.ts` and
 
 Plus: escalation bounds (never a third steer, one operator alert, failed
 sends count), replay/idempotence through the CLI (default-deadline replays
-match on the binding, explicit-deadline conflicts refused), and zero
-canonical SQLite writes (full-database digests before/after registration
-and cycles at the plugin seam).
+match on the binding, explicit-deadline conflicts refused, fired keys
+consumed), the never-lost wake for a momentarily active waiter, retention
+that never re-arms the ladder, and zero canonical SQLite writes
+(full-database row digests before/after registration and cycles at the
+plugin seam).
+
+Known bounded behavior (follow-up, not a defect of this lane): one
+`--cycle` that fires a wait whose waiter is also an open lane worker can
+send two wake messages — one from the substrate's own auto-steer
+(spending one continuation claim) and one from the ladder — because the
+two ledgers are independently bounded. Both are deduped per their own
+bounds; the wakes are agent-only.
 
 ## Deployment (operator-owned; NOT performed by code lanes)
 

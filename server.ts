@@ -44,6 +44,7 @@ import {
   LIVENESS_MARKER_FILENAME,
   WAIT_ESCALATION_KV_KEY,
   createWaitEscalationCycle,
+  LIVENESS_STALE_MS,
   livenessDecision,
   livenessState,
   registerBoundedWait,
@@ -685,7 +686,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   const boundedRegistry = {
     register: (wait: Parameters<typeof waitRegistry.register>[0]) => waitRegistry.register(wait),
-    list: () => waitRegistry.list(),
+    // The store loads lazily; every read recovers first so a cold host never
+    // answers an empty list from a populated registry (round-2 finding #4).
+    list: async () => { await waitRegistry.recover(); return waitRegistry.list(); },
     firedWaitIds: async () => { await waitRegistry.recover(); return waitRegistry.firedList() as Array<{ waitId: string; reason: string; waiterThreadId: string }>; },
   };
   const escalationCycle = createWaitEscalationCycle({
@@ -882,7 +885,9 @@ export default async function plugin(bb: BbPluginApi) {
       } catch {
         markerAtMs = null;
       }
-      const decision = livenessDecision(livenessState(markerAtMs, Date.now()), existsSync(flagPath));
+      const configuredStaleMs = Number(process.env.BB_COLLAB_LIVENESS_STALE_MS);
+      const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync(flagPath));
       if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
       if (decision === "alert-once") {
         mkdirSync(stateDir, { recursive: true });
@@ -1188,16 +1193,12 @@ export default async function plugin(bb: BbPluginApi) {
       return runCli(db, bb, argv, context, {
         watcher,
         registerBoundedWaitForCli: (input, ctxThreadId) => registerBoundedWait({
-          registry: {
-            register: async (wait) => watcher.registerWait(wait),
-            list: () => waitRegistry.list(),
-            firedWaitIds: boundedRegistry.firedWaitIds,
-          },
+          registry: boundedRegistry,
           readSource: readThreadObservation,
           input,
           ctxThreadId,
         }),
-        listWaitsForCli: async () => waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) })),
+        listWaitsForCli: async () => { await waitRegistry.recover(); return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) })); },
         escalationCycle,
       });
     },

@@ -21284,8 +21284,8 @@ async function registerBoundedWait(options) {
   if (sourceEvent !== "terminal" && sourceEvent !== "failure") {
     return { outcome: "refused", message: 'sourceEvent must be "terminal" or "failure"' };
   }
-  if (input.idempotencyKey !== void 0 && !nonEmptyString(input.idempotencyKey, 256)) {
-    return { outcome: "refused", message: "idempotencyKey must be a non-empty string" };
+  if (!nonEmptyString(input.idempotencyKey, 256)) {
+    return { outcome: "refused", message: "idempotencyKey is required: every registration names its own key" };
   }
   let observation;
   try {
@@ -21314,21 +21314,23 @@ async function registerBoundedWait(options) {
     sourceEvent,
     deadlineAtMs: deadline.deadlineAtMs
   };
-  const existing = options.registry.list().find((candidate) => candidate.waitId === wait.waitId);
+  const firedAlready = (await options.registry.firedWaitIds()).some((fired) => fired.waitId === wait.waitId);
+  if (firedAlready) {
+    return { outcome: "refused", message: "idempotency key was already consumed by a fired wait: register a new wait with a new key" };
+  }
+  const existing = (await options.registry.list()).find((candidate) => candidate.waitId === wait.waitId);
   if (existing) {
     const explicitDeadline = input.deadlineAtMs !== void 0;
     const same = existing.waiterThreadId === wait.waiterThreadId && existing.sourceThreadId === wait.sourceThreadId && existing.sourceEvent === wait.sourceEvent && (!explicitDeadline || existing.deadlineAtMs === wait.deadlineAtMs);
     return same ? { outcome: "registered", wait: existing, replay: true } : { outcome: "refused", message: "idempotency key is already bound to a different wait" };
   }
-  const firedAlready = (await options.registry.firedWaitIds()).some((fired) => fired.waitId === wait.waitId);
-  if (firedAlready) return { outcome: "refused", message: "idempotency key was already consumed by a fired wait" };
   await options.registry.register(wait);
   return { outcome: "registered", wait, replay: false };
 }
 function parseEscalationRecord(value, maxSteers) {
   if (!isPlainObject2(value)) throw new Error("invalid wait escalation state");
-  const { waitId, waiterThreadId, reason, firstSeenAtMs, steers, failedSteers, lastSteerAtMs, delivered, escalated } = value;
-  if (!nonEmptyString(waitId, 64) || !nonEmptyString(waiterThreadId) || !(reason === "source_terminal" || reason === "source_failure" || reason === "deadline_expired") || !Number.isInteger(firstSeenAtMs) || firstSeenAtMs < 0 || !Number.isInteger(steers) || steers < 0 || steers > maxSteers || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > maxSteers || !(lastSteerAtMs === null || Number.isInteger(lastSteerAtMs) && lastSteerAtMs >= 0) || typeof delivered !== "boolean" || typeof escalated !== "boolean") throw new Error("invalid wait escalation state");
+  const { waitId, waiterThreadId, reason, firstSeenAtMs, steers, failedSteers, lastSteerAtMs, escalated } = value;
+  if (!nonEmptyString(waitId, 64) || !nonEmptyString(waiterThreadId) || !(reason === "source_terminal" || reason === "source_failure" || reason === "deadline_expired") || !Number.isInteger(firstSeenAtMs) || firstSeenAtMs < 0 || !Number.isInteger(steers) || steers < 0 || steers > maxSteers || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > maxSteers || !(lastSteerAtMs === null || Number.isInteger(lastSteerAtMs) && lastSteerAtMs >= 0) || typeof escalated !== "boolean") throw new Error("invalid wait escalation state");
   return {
     waitId,
     waiterThreadId,
@@ -21337,7 +21339,6 @@ function parseEscalationRecord(value, maxSteers) {
     steers,
     failedSteers,
     lastSteerAtMs,
-    delivered,
     escalated
   };
 }
@@ -21384,7 +21385,6 @@ function createWaitEscalationCycle(options) {
           steers: 0,
           failedSteers: 0,
           lastSteerAtMs: null,
-          delivered: false,
           escalated: false
         };
         records[record2.waitId] = record2;
@@ -21393,8 +21393,9 @@ function createWaitEscalationCycle(options) {
         summary.alerts += 1;
         options.onFire?.(record2);
       }
+      const firedIds = new Set((await options.registry.firedWaitIds()).map((fired) => fired.waitId));
       for (const record2 of Object.values(records)) {
-        if (currentNow - record2.firstSeenAtMs > WAIT_ESCALATION_RETENTION_MS) {
+        if (!firedIds.has(record2.waitId) && currentNow - record2.firstSeenAtMs > WAIT_ESCALATION_RETENTION_MS) {
           delete records[record2.waitId];
           await save();
           continue;
@@ -21421,7 +21422,6 @@ function createWaitEscalationCycle(options) {
         let failed = false;
         try {
           await options.steerWaiter(record2);
-          record2.delivered = true;
         } catch {
           failed = true;
         }
@@ -22009,7 +22009,12 @@ async function plugin(bb) {
   };
   const boundedRegistry = {
     register: (wait) => waitRegistry.register(wait),
-    list: () => waitRegistry.list(),
+    // The store loads lazily; every read recovers first so a cold host never
+    // answers an empty list from a populated registry (round-2 finding #4).
+    list: async () => {
+      await waitRegistry.recover();
+      return waitRegistry.list();
+    },
     firedWaitIds: async () => {
       await waitRegistry.recover();
       return waitRegistry.firedList();
@@ -22187,7 +22192,9 @@ async function plugin(bb) {
       } catch {
         markerAtMs = null;
       }
-      const decision = livenessDecision(livenessState(markerAtMs, Date.now()), existsSync(flagPath));
+      const configuredStaleMs = Number(process.env.BB_COLLAB_LIVENESS_STALE_MS);
+      const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync(flagPath));
       if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
       if (decision === "alert-once") {
         mkdirSync(stateDir, { recursive: true });
@@ -22469,16 +22476,15 @@ async function plugin(bb) {
       return runCli(db, bb, argv, context, {
         watcher,
         registerBoundedWaitForCli: (input, ctxThreadId) => registerBoundedWait({
-          registry: {
-            register: async (wait) => watcher.registerWait(wait),
-            list: () => waitRegistry.list(),
-            firedWaitIds: boundedRegistry.firedWaitIds
-          },
+          registry: boundedRegistry,
           readSource: readThreadObservation,
           input,
           ctxThreadId
         }),
-        listWaitsForCli: async () => waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) })),
+        listWaitsForCli: async () => {
+          await waitRegistry.recover();
+          return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) }));
+        },
         escalationCycle
       });
     }

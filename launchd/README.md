@@ -52,7 +52,11 @@ watcher-of-watchers.
      nothing re-fires.
    - `tail ~/.bb/bb-collab/wait-validator.log` shows one cycle result per
      interval; the marker file's content is a fresh timestamp.
-4. Optional host cron (belt alongside the plugin schedule, never instead of
+4. The log at `~/.bb/bb-collab/wait-validator.log` grows one JSON cycle
+   line per interval (~5.7k lines/day). Rotate or truncate it like any
+   launchd `StandardOutPath` artifact; the loop is stateless across log
+   loss.
+5. Optional host cron (belt alongside the plugin schedule, never instead of
    launchd):
    ```
    */5 * * * * node @@REPO_ROOT@@/scripts/wait-validator-liveness-check.mjs
