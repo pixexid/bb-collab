@@ -8327,6 +8327,26 @@ export async function doctor(
     const unresolvedAttempts = assignmentAttempts.filter(
       (row) => row.state === "dispatch_unknown" || row.conflicting_terminal_digest !== null || row.terminal_report_digest === null,
     );
+    const profileAuditEntries = assignmentAttempts.map((row) => ({
+      assignmentId: row.assignment_id,
+      executionAttemptId: row.execution_attempt_id,
+      requestedProfileDigest: row.requested_profile_digest,
+      actualProfileDigest: row.actual_profile_digest,
+      status: row.actual_profile_digest !== null && row.actual_profile_digest !== row.requested_profile_digest
+        ? "mismatch"
+        : row.actual_profile_digest !== null && row.native_receipt_digest !== null
+          ? "compliant"
+          : "unknown",
+      reason: row.actual_profile_digest === null || row.native_receipt_digest === null ? "EXECUTION_PROFILE_UNKNOWN" : undefined,
+    }));
+    const profileAudit = {
+      status: assignmentAttempts.length === 0 ? "no_canonical_assignments" : "recorded",
+      total: profileAuditEntries.length,
+      compliant: profileAuditEntries.filter((row) => row.status === "compliant").length,
+      mismatch: profileAuditEntries.filter((row) => row.status === "mismatch").length,
+      unknown: profileAuditEntries.filter((row) => row.status === "unknown").length,
+      entries: profileAuditEntries,
+    };
     const unresolvedRoleHolders = roleGenerationHeads
       .filter((row) => row.holder_attempt_state !== "done" || !row.holder_native_receipt_digest)
       .map((row) => ({ roleId: row.role_id, generation: row.current_generation, holderExecutionAttemptId: row.holder_execution_attempt_id, reason: "ROLE_HOLDER_UNRESOLVED" }));
@@ -8350,6 +8370,7 @@ export async function doctor(
         qualificationObservationCount: observationCount,
         eligibility,
         assignments: assignmentAttempts,
+        profileAudit,
         capacity: {
           writingLaneCeiling,
           activeWriterCount: activeWriters.length,
