@@ -549,12 +549,25 @@ async function loadedLaneWatcherHost() {
   let failRoleReadAt: number | null = null;
   let changeRoleReadAt: number | null = null;
   let changedRoleThread: Partial<typeof roleThread> = {};
+  let roleHolderReads = 0;
+  let mutateRoleHolderReadAt: number | null = null;
+  let mutateRoleHolderRead: (() => void) | null = null;
+  let armRoleHolderMutationAtRoleRead: number | null = null;
+  const prepare = db.prepare.bind(db);
+  vi.spyOn(db, "prepare").mockImplementation(((source: string) => {
+    if (source.includes("FROM execution_attempts AS attempts")) {
+      roleHolderReads += 1;
+      if (roleHolderReads === mutateRoleHolderReadAt) mutateRoleHolderRead?.();
+    }
+    return prepare(source);
+  }) as never);
   let pendingExternalWait = false;
   host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => {
     if (threadId !== ROLE_THREAD_ID) return thread;
     roleReads += 1;
     if (roleReads === failRoleReadAt) throw new Error("role thread unavailable");
     if (roleReads === changeRoleReadAt) roleThread = makeThreadResponse({ ...roleThread, ...changedRoleThread });
+    if (roleReads === armRoleHolderMutationAtRoleRead) mutateRoleHolderReadAt = roleHolderReads + 2;
     return roleThread;
   }) as never);
   host.harness.sdk.stub("threads.interactions.list", (async () => pendingExternalWait ? [{ status: "pending" }] : []) as never);
@@ -581,6 +594,11 @@ async function loadedLaneWatcherHost() {
       changeRoleReadAt = roleReads + successfulReads + 1;
       changedRoleThread = next;
     },
+    mutateFinalRoleHolderReadAfter(successfulReads: number, mutate: () => void) {
+      armRoleHolderMutationAtRoleRead = roleReads + successfulReads + 1;
+      mutateRoleHolderRead = mutate;
+    },
+    db,
   };
 }
 
@@ -1543,6 +1561,7 @@ describe("bb-collab plugin boundary", () => {
         .filter((entry) => entry.level === "warn" && entry.message.startsWith("role steer refused:"));
       expect(warnings).toHaveLength(1);
       expect(warnings[0]?.message).toContain(evidence);
+      expect(await fixture.host.bb.storage.kv.get("lane-watcher.role-idle")).toEqual({});
 
       fixture.setRoleThread({
         projectId: PROJECT_ID,
@@ -1559,6 +1578,33 @@ describe("bb-collab plugin boundary", () => {
         .filter(([input]) => (input as { threadId?: string }).threadId === ROLE_THREAD_ID)).toHaveLength(1);
       expect(fixture.host.harness.inspection.logEntries
         .filter((entry) => entry.level === "warn" && entry.message.startsWith("role succession required:"))).toHaveLength(0);
+      await fixture.host.harness.lifecycle.dispose();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it.each([
+    ["missing", (fixture: Awaited<ReturnType<typeof loadedLaneWatcherHost>>) => fixture.db.prepare("DELETE FROM role_generation_heads").run(), "holderMatches=0"],
+    ["unreadable", (fixture: Awaited<ReturnType<typeof loadedLaneWatcherHost>>) => fixture.db.exec("DROP TABLE role_generation_heads"), "holder=unknown error="],
+  ])("warns and records no steer when the final canonical holder is %s", async (_name, mutate, evidence) => {
+    let currentNow = 0;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => currentNow);
+    try {
+      const fixture = await loadedLaneWatcherHost();
+      fixture.setLaneState("prepared");
+      await fixture.host.harness.runCli(["wait-validator", "--cycle"]);
+      fixture.mutateFinalRoleHolderReadAfter(0, () => mutate(fixture));
+      currentNow = 10 * 60_000;
+      await fixture.host.harness.runCli(["wait-validator", "--cycle"]);
+
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")
+        .filter(([input]) => (input as { threadId?: string }).threadId === ROLE_THREAD_ID)).toHaveLength(0);
+      const warnings = fixture.host.harness.inspection.logEntries
+        .filter((entry) => entry.level === "warn" && entry.message.startsWith("role steer refused:"));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]?.message).toContain(evidence);
+      expect(await fixture.host.bb.storage.kv.get("lane-watcher.role-idle")).toEqual({});
       await fixture.host.harness.lifecycle.dispose();
     } finally {
       now.mockRestore();

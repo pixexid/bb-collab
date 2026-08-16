@@ -22242,10 +22242,26 @@ ${thread.titleFallback ?? ""}`);
     },
     steerRole: async (role) => {
       if (!db) return false;
-      const holders = readRoleHolderStates(db).filter(
-        (holder) => holder.project_id === role.projectId && holder.role_id === role.roleId && holder.role_generation === role.roleGeneration && holder.execution_attempt_id === role.executionAttemptId
-      );
-      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) return false;
+      const expectedHolder = {
+        project_id: role.projectId,
+        role_id: role.roleId,
+        role_generation: role.roleGeneration,
+        execution_attempt_id: role.executionAttemptId,
+        thread_id: role.threadId
+      };
+      let holders;
+      try {
+        holders = readRoleHolderStates(db).filter(
+          (holder) => holder.project_id === role.projectId && holder.role_id === role.roleId && holder.role_generation === role.roleGeneration && holder.execution_attempt_id === role.executionAttemptId
+        );
+      } catch (error48) {
+        warnRoleLiveness(expectedHolder, `holder=unknown error=${String(error48)}`);
+        return false;
+      }
+      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) {
+        warnRoleLiveness(expectedHolder, `holderMatches=${holders.length} observedThread=${holders[0]?.thread_id ?? "null"}`);
+        return false;
+      }
       let thread;
       try {
         thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
