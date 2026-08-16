@@ -42,4 +42,6 @@ jobs:
           git diff --name-only "$BASE_SHA...$HEAD_SHA" | node scripts/check-review-tier.mjs "$GITHUB_EVENT_PATH"
       - name: Check pull-request lifecycle linkage
         if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node scripts/check-pr-lifecycle.mjs "$GITHUB_EVENT_PATH"
