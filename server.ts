@@ -16,11 +16,9 @@ import {
 } from "./src/awareness.js";
 import {
   BB_VERSION_RANGE,
-  CONTRACT_VERSION,
   MIGRATIONS,
   PLUGIN_ID,
   PLUGIN_SDK_VERSION,
-  SCHEMA_VERSION,
   applyAuthorizedMutation,
   applyRequestSchema,
   approverAttestationRequestSchema,
@@ -38,7 +36,6 @@ import {
   readOperatorReceiptWithSessionEvidence,
   parseApplyRequest,
   type ApplyRequest,
-  type CachedConsumerObservation,
   type FoundationResult,
   type RoleFactReader,
   type SqliteDatabase,
@@ -300,16 +297,6 @@ export const rpcContract = defineRpcContract({
     output: foundationResultSchema,
   },
 });
-
-// These two consumers deliberately read the imported contract constants at
-// execution time; the rollout fixture invokes both rather than inventing them.
-export function rpcContractV17Reread(): CachedConsumerObservation {
-  return { name: "server.rpcContract", observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION };
-}
-
-export function collabCliV17Reread(): CachedConsumerObservation {
-  return { name: "server.collabCli", observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION };
-}
 
 function jsonResult(result: FoundationResult): string {
   return JSON.stringify(result);

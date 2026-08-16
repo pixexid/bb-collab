@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import {
   applyFixtureMutation,
+  CACHED_CONSUMERS,
   cachedConsumerRolloutEvidence,
   canonicalJson,
   CONTRACT_VERSION,
@@ -28,18 +29,48 @@ import {
   type SqliteDatabase,
 } from "./foundation.js";
 
-export function testSupportV17Reread(): CachedConsumerObservation {
-  return { name: "src/test-support", observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION };
+export function testSupportV17Reread(result: FoundationResult): CachedConsumerObservation {
+  if (result.outcome !== "INVALID_INPUT") throw new Error("test-support stale-v16 probe did not refuse");
+  const reread = cachedConsumerRolloutEvidence(CACHED_CONSUMERS.map((name) => ({
+    name,
+    observedSchemaVersion: SCHEMA_VERSION,
+    observedContractVersion: CONTRACT_VERSION,
+  })));
+  if (reread.action !== "reread") throw new Error("test-support did not reread v17");
+  return reread.observations.find((observation) => observation.name === "src/test-support")!;
 }
 
-export function assembleV17CachedConsumerRolloutEvidence(
-  readers: readonly (() => CachedConsumerObservation)[],
-  staleV16Refusal: { exemption: Pick<FoundationResult, "outcome">; placement: Pick<FoundationResult, "outcome"> },
-): NonNullable<ApplyRequest["decisionEvidence"]>[number] {
-  const reread = cachedConsumerRolloutEvidence(readers.map((reader) => reader()));
+type CachedConsumerProbe = () => Promise<{
+  observedSchemaVersion: number;
+  observedContractVersion: number;
+  staleV16Refusal?: Pick<FoundationResult, "outcome">;
+}>;
+
+export async function assembleV17CachedConsumerRolloutEvidence(input: {
+  rpcContract?: CachedConsumerProbe;
+  collabCli?: CachedConsumerProbe;
+  testSupport?: CachedConsumerProbe;
+  serverTest?: CachedConsumerProbe;
+}): Promise<NonNullable<ApplyRequest["decisionEvidence"]>[number]> {
+  const probes = [
+    ["server.rpcContract", input.rpcContract],
+    ["server.collabCli", input.collabCli],
+    ["src/test-support", input.testSupport],
+    ["tests/server.test", input.serverTest],
+  ] as const;
+  if (probes.some(([, probe]) => typeof probe !== "function")) {
+    throw new Error("cached-consumer v17 rollout evidence requires execution from all four consumers");
+  }
+  const executed = await Promise.all(probes.map(async ([name, probe]) => ({
+    name,
+    ...(await probe!()),
+  })));
+  const reread = cachedConsumerRolloutEvidence(executed);
+  const exemption = executed[2]!.staleV16Refusal;
+  const placement = executed[3]!.staleV16Refusal;
   if (
     reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 ||
-    staleV16Refusal.exemption.outcome !== "INVALID_INPUT" || staleV16Refusal.placement.outcome !== "INVALID_INPUT"
+    exemption?.outcome !== "INVALID_INPUT" || placement?.outcome !== "INVALID_INPUT"
   ) {
     throw new Error("cached-consumer v17 rollout evidence requires four rereads and two INVALID_INPUT stale-v16 refusals");
   }
@@ -47,8 +78,8 @@ export function assembleV17CachedConsumerRolloutEvidence(
     kind: "cached_consumer_v17_rollout_receipt",
     reread,
     staleV16Refusal: {
-      exemption: { outcome: staleV16Refusal.exemption.outcome },
-      placement: { outcome: staleV16Refusal.placement.outcome },
+      exemption: { outcome: exemption.outcome },
+      placement: { outcome: placement.outcome },
     },
   });
   return {
