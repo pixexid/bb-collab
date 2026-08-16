@@ -29,4 +29,17 @@ describe("subagent effort directive", () => {
     expect(operationsModel).toMatch(/Assignment\/ExecutionAttempt receipt comparison records requested versus\nexecuted reasoning/u);
     expect(adr).toMatch(/Assignment requested profile and ExecutionAttempt actual profile are the\nconformance record/u);
   });
+
+  it("records the current supervisor-ratified role matrix and explicit spawn boundary", () => {
+    expect(operationsModel).toContain("Director | `pi` | `kimi-coding/k3` | HIGH");
+    expect(operationsModel).toContain("Orchestrator primary | Codex harness / `codex` | `gpt-5.6-sol` | MEDIUM");
+    expect(operationsModel).toContain("`glm-5.3` | MEDIUM or HIGH | Admitted now");
+    expect(operationsModel).toContain("Tier-A reviewer | Sol harness/provider | Sol | HIGH");
+    expect(operationsModel).toContain("current graded qualification probe");
+    expect(operationsModel).toContain("GH-105");
+    expect(operationsModel).toContain("GH-106");
+    expect(operationsModel).toContain("explicit `provider`, `model`, `reasoning`, and\n`visibility: \"visible\"` flags");
+    expect(operationsModel).not.toContain("K3 HIGH");
+    expect(operationsModel).not.toContain("`glm-5.3` is barred");
+  });
 });

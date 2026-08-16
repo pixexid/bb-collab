@@ -11,23 +11,37 @@ observes that state and native BB thread interactions.
 ## Supervisor-ratified model-to-role routing
 
 Role names remain logical project roles, not provider, model, harness or thread
-identities. The following matrix governs requested assignment profiles and
-review independence:
+identities. Harness/provider and model are recorded as separate fields. The
+supervisor is dormant and app-side in Fable only; it is not a BB role, worker,
+reviewer, orchestrator or routing fallback. The supervisor-ratified matrix is:
 
-| Role or lane | Allowed requested profile | Boundary |
-| --- | --- | --- |
-| Orchestrator | Primary: `codex/gpt-5.6-sol` MEDIUM. Alternate: `claude-code/claude-opus-5[1m]` MEDIUM. | Luna is never an orchestrator profile. |
-| Merge-bound implementer | MEDIUM or HIGH; LOW is prohibited. Routine implementation: `codex/gpt-5.6-luna` MEDIUM. Hard-core implementation: Sol or Opus HIGH. | `glm-5.3` is barred from implementation until a graded qualification probe passes. |
-| Reviewer | Default Codex. Tier-A cold review: Sol HIGH. Tier-B post-merge review: Luna MEDIUM. | Reviewer model must differ from the author; a different provider is preferred. If the author is Sol, use Opus MEDIUM or K3 HIGH. |
-| Mechanical subagent | Luna LOW is permitted for fixtures, sweeps, doc-sync and scaffolds. | Legality follows the artifact scope, not the spawn label. |
+| Role or lane | Harness/provider | Model | Reasoning | Boundary |
+| --- | --- | --- | --- | --- |
+| Director | `pi` | `kimi-coding/k3` | HIGH | K3 is director-only; it is never a review fallback. |
+| Orchestrator primary | Codex harness / `codex` | `gpt-5.6-sol` | MEDIUM | Never Luna or below. |
+| Orchestrator alternate | Terra harness/provider or Claude harness / `claude-code` | Terra or `claude-opus-5[1m]` | MEDIUM | Both are alternates; never Luna or below. |
+| Merge-bound implementer | Codex harness / `codex` | `gpt-5.6-luna` | MEDIUM or HIGH | Luna is admitted at MEDIUM or above; LOW is prohibited. |
+| Merge-bound implementer | Configured harness/provider | `glm-5.3` | MEDIUM or HIGH | Admitted now at MEDIUM or above. |
+| Merge-bound implementer | Terra harness/provider | Terra | MEDIUM or HIGH | Admitted at MEDIUM or above. Hard core uses Sol HIGH or Opus-5 HIGH. |
+| Reviewer | Codex harness | Configured Codex model | As assigned | Default reviewer model differs from the author. |
+| Tier-A reviewer | Sol harness/provider | Sol | HIGH | Terra HIGH is also acceptable when Sol authored; never the author's model. |
+| Tier-B reviewer | Codex harness / `codex` | `gpt-5.6-luna` | MEDIUM | Never the author's model. |
+| Mechanical subagent | Configured harness/provider | `gpt-5.6-luna` | LOW | Fixtures, sweeps, doc-sync and scaffolds only; legality follows artifact scope, not spawn label. |
+| Mechanical probe | Configured harness/provider | `deepseek-v4-flash` or `glm-5-turbo` | LOW | Probe-only; current graded evidence controls admission. |
 
 The approved default profile for mechanical and documentation engineering is
 `codex/gpt-5.6-luna`; that wording does not make Luna a general implementation
-default or an orchestrator profile. A requested profile is Assignment intent
-only. Eligibility and review routing use the actual provider, model, reasoning,
-permission and visibility recorded by the ExecutionAttempt/provider receipt;
-remembered defaults, labels and plausible output are not executed-profile
-evidence. Unknown or mismatched executed values remain ineligible.
+default or an orchestrator profile. Prior measured-failure exclusions are void:
+only a current graded qualification probe excludes a model. The coding probe for
+`muse-spark-1.2` is [GH-106](https://github.com/pixexid/bb-collab/issues/106);
+the Terra placement probe is
+[GH-105](https://github.com/pixexid/bb-collab/issues/105).
+
+A requested profile is Assignment intent only. Eligibility and review routing
+use the actual harness/provider, model, reasoning, permission and visibility
+recorded by the ExecutionAttempt/provider receipt; remembered defaults, labels
+and plausible output are not executed-profile evidence. Unknown or mismatched
+executed values remain ineligible.
 
 Every new spawn must provide explicit `provider`, `model`, `reasoning`, and
 `visibility: "visible"` flags. A remembered or host-inferred default is not
