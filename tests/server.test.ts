@@ -2803,6 +2803,74 @@ describe("bb-collab plugin boundary", () => {
     });
   });
 
+  it("audits requested versus executed profiles from canonical assignment receipts", async () => {
+    const fixture = await assignmentFixture();
+    const prepared = applyWithFixtureReceipt(
+      fixture.db,
+      assignmentPrepareRequest(fixture.fenceToken),
+      null,
+      null,
+      new DeterministicNativeAssignmentAdapter(),
+    );
+    expect(prepared.outcome).toBe("OK");
+    const audit = await doctor(fixture.db, fixture.host.bb.sdk, PROJECT_ID);
+    expect(audit).toMatchObject({
+      outcome: "OK",
+      evidence: {
+        profileAudit: {
+          status: "recorded",
+          total: 1,
+          compliant: 0,
+          mismatch: 0,
+          unknown: 1,
+          entries: [{ status: "unknown", reason: "EXECUTION_PROFILE_UNKNOWN" }],
+        },
+      },
+    });
+
+    const mismatchFixture = await assignmentFixture();
+    const mismatchAdapter = new DeterministicNativeAssignmentAdapter();
+    const mismatchPrepared = applyWithFixtureReceipt(
+      mismatchFixture.db,
+      assignmentPrepareRequest(mismatchFixture.fenceToken),
+      null,
+      null,
+      mismatchAdapter,
+    );
+    const executionAttemptId = (mismatchPrepared.evidence as { executionAttemptId: string }).executionAttemptId;
+    mismatchAdapter.nextEvidence = { actualProfile: { ...ROLE_PROFILE, model: "fallback-model" } };
+    expect(applyWithFixtureReceipt(
+      mismatchFixture.db,
+      assignmentPhaseRequest(mismatchFixture.fenceToken, "assignment_dispatch", "assignment-1", executionAttemptId),
+      null,
+      null,
+      mismatchAdapter,
+    ).outcome).toBe("EXECUTION_PROFILE_MISMATCH");
+    const mismatchAudit = await doctor(mismatchFixture.db, mismatchFixture.host.bb.sdk, PROJECT_ID);
+    expect(mismatchAudit).toMatchObject({ evidence: { profileAudit: { compliant: 0, mismatch: 1, unknown: 0 } } });
+
+    const incompleteFixture = await assignmentFixture();
+    const incompleteAdapter = new DeterministicNativeAssignmentAdapter();
+    const incompletePrepared = applyWithFixtureReceipt(
+      incompleteFixture.db,
+      assignmentPrepareRequest(incompleteFixture.fenceToken),
+      null,
+      null,
+      incompleteAdapter,
+    );
+    const incompleteAttemptId = (incompletePrepared.evidence as { executionAttemptId: string }).executionAttemptId;
+    incompleteAdapter.nextEvidence = { contentEventId: undefined };
+    expect(applyWithFixtureReceipt(
+      incompleteFixture.db,
+      assignmentPhaseRequest(incompleteFixture.fenceToken, "assignment_dispatch", "assignment-1", incompleteAttemptId),
+      null,
+      null,
+      incompleteAdapter,
+    ).outcome).toBe("DISPATCH_UNKNOWN");
+    const incompleteAudit = await doctor(incompleteFixture.db, incompleteFixture.host.bb.sdk, PROJECT_ID);
+    expect(incompleteAudit).toMatchObject({ evidence: { profileAudit: { compliant: 0, mismatch: 0, unknown: 1 } } });
+  });
+
   it("returns a deterministic bounded result past the export row ceiling", () => {
     const { db, directory } = directDatabase();
     try {
