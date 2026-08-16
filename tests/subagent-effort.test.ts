@@ -34,10 +34,17 @@ describe("subagent effort directive", () => {
     expect(operationsModel).toContain("Director | `pi` | `kimi-coding/k3` | HIGH");
     expect(operationsModel).toContain("Orchestrator primary | Claude harness / `claude-code` | `claude-opus-5` | MEDIUM");
     expect(operationsModel).toContain("Orchestrator alternate | Codex harness / `codex` | `gpt-5.6-sol` | MEDIUM");
+    expect(operationsModel).toContain("Orchestrator alternate | Terra harness/provider | `gpt-5.6-terra` | MEDIUM");
+    expect(operationsModel).toContain("Never Luna or below.");
     expect(operationsModel).toContain("pending epoch-2 orchestrator succession");
+    expect(operationsModel).toContain("do not hot-swap a healthy live orchestrator");
     expect(operationsModel).toContain("If that window saturates, Sol MEDIUM is the standing fallback");
+    expect(operationsModel).toContain("pre-authorized without a new decision");
     expect(operationsModel).toContain("`glm-5.3` | MEDIUM or HIGH | Admitted now");
     expect(operationsModel).toContain("Tier-A reviewer | Sol harness/provider | Sol | HIGH");
+    expect(operationsModel).toContain("Default reviewer model differs from the author");
+    expect(operationsModel).toContain("The v14 `director-seat` amendment remains the existing project-orchestrator");
+    expect(operationsModel).toContain("Opus-medium standby");
     expect(operationsModel).toContain("current graded qualification probe");
     expect(operationsModel).toContain("GH-105");
     expect(operationsModel).toContain("GH-106");
