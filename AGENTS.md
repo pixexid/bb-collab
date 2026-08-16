@@ -21,8 +21,7 @@ with `actor_kind=plugin`, `subject_id=bb-collab`, and an exact durable
 `operator_receipt_id` link; the actor is never a standing identity and must be
 supplied with that same operator receipt on apply. Its retirement condition is
 the same host-issued `get-bb/bb#1541` condition. The
-plugin has not been installed, reloaded, or activated against live project
-authority. The complete decision is in
+plugin was reloaded against live project authority at 2026-08-16T14:06:56-0700 by the sentinel under supervisor authorization (bb plugin reload bb-collab) against merge dff355c3d203 (PR #121, contract v17 director role split); an earlier same-day reload by the director seat (thr_gsb7m77ciz) had already brought the running process to v17. Verified live via doctor: contract v17, schema v11, config revision 3, epoch 4, guard PID 14823 alive. The complete decision is in
 [ADR 0001](docs/adr/0001-founding-contract.md); the threat boundary is in
 [the threat model](docs/threat-model.md); import and issue disposition are in
 [the import manifest](docs/import-manifest.md); and dependency order is in
