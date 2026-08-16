@@ -498,6 +498,29 @@ describe("lane awareness", () => {
     expect(steer).not.toHaveBeenCalled();
   });
 
+  it("keeps mixed registered-wait outcomes fail-closed regardless of registration order", async () => {
+    const run = async (waits: RegisteredWait[]) => {
+      const registry = createWaitRegistry();
+      for (const wait of waits) await registry.register(wait);
+      const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
+      await createLaneWatcher({
+        readLanes: () => [lane(), { ...lane("source-done"), terminal_report_digest: "done" }],
+        steer,
+        waitRegistry: registry,
+        readWorker: async (threadId) => {
+          if (threadId === "missing") throw new Error("thread unknown");
+          return { status: "idle" as const, pendingExternalWait: false, archived: false };
+        },
+      }).observe("worker-1", "idle");
+      return steer;
+    };
+    const unknown = registeredWait({ waitId: "unknown", sourceThreadId: "missing" });
+    const fired = registeredWait({ waitId: "fired", sourceThreadId: "source-done" });
+
+    expect((await run([unknown, fired]))).not.toHaveBeenCalled();
+    expect((await run([fired, unknown]))).not.toHaveBeenCalled();
+  });
+
   it("cascades known terminal and failure source events to waiters", async () => {
     const registry = createWaitRegistry();
     await registry.register(registeredWait({ waitId: "terminal-wait", sourceThreadId: "source-terminal" }));
