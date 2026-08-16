@@ -13,7 +13,7 @@ new-thread, search, navigation rows, and the footer.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through contract v14/schema v11: a
+The repository now contains the implemented foundation through contract v15/schema v11: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
@@ -46,7 +46,8 @@ facts through the existing `RoleFactReader` seam before issuing
 `qualification_observation_record` or `role_generation_succession`; missing or
 foreign facts refuse before write. A ready native managed worktree may have a
 derived path distinct from its canonical source; exact project/host/source
-resolution retains both paths and still refuses unmanaged or ephemeral contexts.
+resolution retains both paths and still refuses unmanaged or ephemeral contexts,
+except for the exact current director-generation qualification exemption below.
 `github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
 reserve/finalize operations refuse before the adapter under this one-request
 seam. The derived actor path is limited to bootstrap, `config_revision` for
@@ -87,12 +88,20 @@ must pass a dry-run/preflight and be recorded by the receipt-gated succession
 apply before taking the seat.
 
 The historical contract-v9 eight-class registry was accepted only during the
-one-release v9-to-v10 re-adoption. Contract v14 leaves the exact current
+one-release v9-to-v10 re-adoption. Contract v15 leaves the exact current
 ten-class allowlist unchanged; the already-bounded v11 nine-class repair
 remains readable but still refuses `work_item_transition`. Malformed, reordered,
 subset, extra, v9, and other arbitrary sets remain invalid. This is a contract
-bump for the director-seat policy: cached consumers must reread v14 or refuse v13, with
-durable rollout evidence; schema and migrations remain unchanged.
+bump for the current-generation director-seat exemption: cached consumers must
+reread v15 or refuse v14, with durable rollout evidence; schema and migrations
+remain unchanged.
+
+Contract v15 adds only the current-generation environment exemption required to
+record the grandfathered epoch-2 director qualification: generation 2, holder
+`thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source `src_x8veidmpik`.
+It is valid only while that exact role head and holder execution evidence remain
+current, only for qualification recording, and never for writing admission or
+succession. Every future generation requires a managed isolated worktree.
 
 The ratified evidence-only MigrationRun shape records the llm-collab fence
 `f988d9711d3778f751e4ec0e32ebbf7b0893c80f` at resource revision 4 and merged

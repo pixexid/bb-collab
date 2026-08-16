@@ -220,7 +220,7 @@ most three logical roles: `project-orchestrator` is project-scoped, while
 `worker` and `independent-reviewer` require the exact repository target used by
 canonical WorkItem writes. Each requirement retains its explicit
 executed-profile qualification. The v10 receipt, approver, derived-actor and
-existing refusal bindings are unchanged; cached consumers reread v14/schema v11
+existing refusal bindings are unchanged; cached consumers reread v13/schema v11
 or refuse the previous versions. Existing generations remain readable without
 fabricated standby evidence.
 
@@ -233,8 +233,20 @@ not add a logical role, assignment kind, dispatch path, or unmanaged-environment
 exception. The epoch-2 director service on `thr_gsb7m77ciz` in
 `env_3znzsxb7ce` is grandfathered preparation evidence only; generation 3 is
 not represented until a later receipt-gated succession apply records it.
-All four cached consumers reread v14 or refuse v13; schema, migrations,
+The v14 release required all four cached consumers to reread v14 or refuse v13;
+schema, migrations,
 operator receipts, and approver bindings remain otherwise unchanged.
+
+Contract v15 adds one strict current-generation exemption to the same
+director-seat requirement. Qualification recording may use the approved
+unmanaged canonical environment only for generation 2, holder
+`thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source `src_x8veidmpik`,
+while the current role head and holder execution attempt match those exact
+facts. It does not permit writing, succession, foreign or stale contexts, or
+future generations; future generations require managed isolated worktrees.
+`CONTRACT_VERSION` and `contractDigest` change, while schema, migrations,
+operator receipts, and approver bindings remain unchanged. All four cached
+consumers reread v15 or refuse v14.
 
 ## 6. Roles, delegation and execution
 

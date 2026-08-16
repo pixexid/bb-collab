@@ -7,15 +7,19 @@ second role store.
 
 ## Prepared director-seat amendment
 
-Contract v14 amends the existing `project-orchestrator` requirement as the
-`director-seat`. The primary executed profile is exactly
+Contract v15 carries the existing v14 `director-seat` amendment and adds the
+small, exact current-generation environment exemption. The primary executed profile is exactly
 `pi/kimi-coding/k3/high` (`providerId: pi`, `model: kimi-coding/k3`,
 `reasoningLevel: high`, `permissionMode: full`, `serviceTier: default`,
 `visibility: visible`). Its alternate/standby is exactly Opus-medium
 (`claude-code/claude-opus-5[1m]`, `reasoningLevel: medium`, with explicit
 full/default/visible fields). The seat has zero writing-lane capacity and
-retains the existing ready managed-worktree, exact project/source/host, and
-event-correlation checks.
+retains the existing exact project/source/host and event-correlation checks.
+Only generation 2 with holder `thr_gsb7m77ciz`, environment
+`env_3znzsxb7ce`, and source `src_x8veidmpik` may record the current
+qualification from that approved unmanaged canonical environment. Every future
+generation requires a ready managed isolated worktree; the exemption is not a
+general unmanaged path.
 
 The following is a prepared operator-only Decision payload, not a canonical
 Decision row or a succession apply:
@@ -30,7 +34,13 @@ Decision row or a succession apply:
     "primaryProfile": "pi/kimi-coding/k3/high",
     "standbyProfile": "claude-code/claude-opus-5[1m]/medium",
     "writingLaneCapacity": 0,
-    "environment": "managed-worktree-only"
+    "environment": "managed-worktree-for-future-generations",
+    "currentGenerationExemption": {
+      "generation": 2,
+      "holderThreadId": "thr_gsb7m77ciz",
+      "environmentId": "env_3znzsxb7ce",
+      "sourceId": "src_x8veidmpik"
+    }
   },
   "ratification": {
     "epoch1": "thr_krqfdv79xw",
@@ -41,7 +51,10 @@ Decision row or a succession apply:
 ```
 
 The epoch-2 holder `thr_gsb7m77ciz` on unmanaged `env_3znzsxb7ce` is not the
-generation-3 holder. No historical RoleGeneration row is fabricated; generation
+generation-3 holder. The exact current-generation exemption is bound to the
+current role head, holder execution attempt, source, environment, and profile;
+foreign, stale, wrong-generation, wrong-profile, and writing requests refuse
+before any write. No historical RoleGeneration row is fabricated; generation
 3 is the first recorded director generation. Before any future handover, dry-run
 the proposed holder against the current requirement, exact managed environment
 and executed profile, and generation head plus one. If that preflight predicts a
