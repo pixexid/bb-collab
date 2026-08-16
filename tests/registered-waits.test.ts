@@ -308,6 +308,21 @@ describe("escalation ladder (drill: bounded escalation, never a steer loop)", ()
     expect(h.steers).toHaveLength(1); // delivered: done forever
   });
 
+  it("never loses a wake to a momentarily active waiter: the ladder resumes on idle", async () => {
+    const h = harness({ graceMs: 10_000 });
+    h.sources.set("source-1", { status: "idle", archived: false });
+    h.waiters.set("waiter-1", { status: "active", archived: false }); // busy on other work when the wait fires
+    await fireOne(h);
+    const busy = await h.escalation.cycle();
+    expect(busy).toMatchObject({ fired: 1, steered: 0, escalated: 0 }); // alive: no steer now
+
+    h.waiters.set("waiter-1", { status: "idle", archived: false });
+    h.now.value += 20_000;
+    const woken = await h.escalation.cycle();
+    expect(woken).toMatchObject({ steered: 1 }); // the wake is NOT lost: it steers once it goes idle
+    expect(h.steers).toHaveLength(1);
+  });
+
   it("escalates after two ignored steers to exactly one operator alert, then stops", async () => {
     const h = harness({ graceMs: 10_000 });
     h.sources.set("source-1", { status: "idle", archived: false });

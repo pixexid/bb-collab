@@ -49,7 +49,12 @@ if (Date.now() - markerAtMs < staleMs) {
 if (existsSync(flagPath)) process.exit(0); // already alerted for this episode
 
 mkdirSync(stateDir, { recursive: true });
-writeFileSync(flagPath, String(Date.now()));
+try {
+  // O_EXCL claim: concurrent checkers cannot both win the one alert.
+  writeFileSync(flagPath, String(Date.now()), { flag: "wx" });
+} catch {
+  process.exit(0); // another checker already claimed this episode's single alert
+}
 const message = `bb-collab wait-validator marker stale since ${new Date(markerAtMs).toISOString()}: launchd supervision failed; operator attention required`;
 console.error(`OPERATOR ALERT: ${message}`);
 try {

@@ -886,7 +886,12 @@ export default async function plugin(bb: BbPluginApi) {
       if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
       if (decision === "alert-once") {
         mkdirSync(stateDir, { recursive: true });
-        writeFileSync(flagPath, String(Date.now()));
+        // O_EXCL claim: concurrent checkers cannot both win the one alert.
+        try {
+          writeFileSync(flagPath, String(Date.now()), { flag: "wx" });
+        } catch {
+          return; // another checker already claimed this episode's single alert
+        }
         bb.log.error("wait-validator liveness marker is stale: host launchd supervision failed; operator attention required");
         bb.realtime.publish("wait-validator", { liveness: "stale", alert: "operator-once" });
       }

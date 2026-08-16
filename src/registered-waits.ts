@@ -202,15 +202,15 @@ export async function registerBoundedWait(options: {
   return { outcome: "registered", wait, replay: false };
 }
 
-function parseEscalationRecord(value: unknown): WaitEscalationRecord {
+function parseEscalationRecord(value: unknown, maxSteers: number): WaitEscalationRecord {
   if (!isPlainObject(value)) throw new Error("invalid wait escalation state");
   const { waitId, waiterThreadId, reason, firstSeenAtMs, steers, failedSteers, lastSteerAtMs, delivered, escalated } = value;
   if (
     !nonEmptyString(waitId, 64) || !nonEmptyString(waiterThreadId) ||
     !(reason === "source_terminal" || reason === "source_failure" || reason === "deadline_expired") ||
     !Number.isInteger(firstSeenAtMs) || (firstSeenAtMs as number) < 0 ||
-    !Number.isInteger(steers) || (steers as number) < 0 || (steers as number) > MAX_WAIT_STEERS ||
-    !Number.isInteger(failedSteers) || (failedSteers as number) < 0 || (failedSteers as number) > MAX_WAIT_STEERS ||
+    !Number.isInteger(steers) || (steers as number) < 0 || (steers as number) > maxSteers ||
+    !Number.isInteger(failedSteers) || (failedSteers as number) < 0 || (failedSteers as number) > maxSteers ||
     !(lastSteerAtMs === null || (Number.isInteger(lastSteerAtMs) && (lastSteerAtMs as number) >= 0)) ||
     typeof delivered !== "boolean" || typeof escalated !== "boolean"
   ) throw new Error("invalid wait escalation state");
@@ -227,11 +227,11 @@ function parseEscalationRecord(value: unknown): WaitEscalationRecord {
   };
 }
 
-export function waitEscalationState(input: unknown): Record<string, WaitEscalationRecord> {
+export function waitEscalationState(input: unknown, maxSteers: number = MAX_WAIT_STEERS): Record<string, WaitEscalationRecord> {
   if (input === undefined || input === null) return {};
   if (!isPlainObject(input)) throw new Error("invalid wait escalation state");
   const state: Record<string, WaitEscalationRecord> = {};
-  for (const [key, value] of Object.entries(input)) state[key] = parseEscalationRecord(value);
+  for (const [key, value] of Object.entries(input)) state[key] = parseEscalationRecord(value, maxSteers);
   return state;
 }
 
@@ -242,10 +242,11 @@ export interface WaitEscalationCycle {
 
 /**
  * Bounded escalation for fired waits (#93 requirement 6): each fired wait
- * steers its waiter at most twice; a waiter that is active is marked
- * delivered; two ignored or failed steers escalate to exactly ONE operator
- * alert plus a succession trigger, never a steer loop. The ledger lives in
- * the plugin KV seam, so a restart neither re-steers nor forgets.
+ * steers its waiter at most twice, grace-spaced, while the waiter is
+ * observed idle; an active waiter pauses the ladder (it is alive and the
+ * wake reaches it); two ignored or failed steers escalate to exactly ONE
+ * operator alert plus a succession trigger, never a steer loop. The ledger
+ * lives in the plugin KV seam, so a restart neither re-steers nor forgets.
  */
 export function createWaitEscalationCycle(options: {
   registry: BoundedWaitRegistry;
@@ -270,7 +271,7 @@ export function createWaitEscalationCycle(options: {
     return result;
   };
   const loaded = async () => {
-    if (!escalations) escalations = waitEscalationState(options.escalationPersistence ? await options.escalationPersistence.read() : null);
+    if (!escalations) escalations = waitEscalationState(options.escalationPersistence ? await options.escalationPersistence.read() : null, maxSteers);
     return escalations;
   };
   const save = async () => {
@@ -310,7 +311,7 @@ export function createWaitEscalationCycle(options: {
           await save();
           continue;
         }
-        if (record.delivered || record.escalated) continue;
+        if (record.escalated) continue;
         let observation: SourceObservation;
         try {
           observation = await options.readWaiter(record.waiterThreadId);
@@ -318,11 +319,11 @@ export function createWaitEscalationCycle(options: {
           continue; // unknown waiter state is not evidence to steer or escalate
         }
         if (observation === null) continue;
-        if (observation.status === "active") {
-          record.delivered = true; // the waiter woke: no steer needed, ever
-          await save();
-          continue;
-        }
+        // An active waiter is alive: no steer is needed now and escalation is
+        // wrong while it demonstrably works. The ladder resumes if it goes
+        // idle — activity never marks the wake delivered, because delivery
+        // of the wake is proven by acting on it, not by being busy.
+        if (observation.status === "active") continue;
         const steerAgeMs = record.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : currentNow - record.lastSteerAtMs;
         if (steerAgeMs < graceMs) continue;
         if (record.steers >= maxSteers) {
@@ -336,6 +337,7 @@ export function createWaitEscalationCycle(options: {
         let failed = false;
         try {
           await options.steerWaiter(record);
+          record.delivered = true; // the wake was sent; acting on it is the waiter's move
         } catch {
           failed = true; // a failed send is a failed steer; the second failure escalates
         }

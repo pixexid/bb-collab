@@ -21325,10 +21325,10 @@ async function registerBoundedWait(options) {
   await options.registry.register(wait);
   return { outcome: "registered", wait, replay: false };
 }
-function parseEscalationRecord(value) {
+function parseEscalationRecord(value, maxSteers) {
   if (!isPlainObject2(value)) throw new Error("invalid wait escalation state");
   const { waitId, waiterThreadId, reason, firstSeenAtMs, steers, failedSteers, lastSteerAtMs, delivered, escalated } = value;
-  if (!nonEmptyString(waitId, 64) || !nonEmptyString(waiterThreadId) || !(reason === "source_terminal" || reason === "source_failure" || reason === "deadline_expired") || !Number.isInteger(firstSeenAtMs) || firstSeenAtMs < 0 || !Number.isInteger(steers) || steers < 0 || steers > MAX_WAIT_STEERS || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > MAX_WAIT_STEERS || !(lastSteerAtMs === null || Number.isInteger(lastSteerAtMs) && lastSteerAtMs >= 0) || typeof delivered !== "boolean" || typeof escalated !== "boolean") throw new Error("invalid wait escalation state");
+  if (!nonEmptyString(waitId, 64) || !nonEmptyString(waiterThreadId) || !(reason === "source_terminal" || reason === "source_failure" || reason === "deadline_expired") || !Number.isInteger(firstSeenAtMs) || firstSeenAtMs < 0 || !Number.isInteger(steers) || steers < 0 || steers > maxSteers || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > maxSteers || !(lastSteerAtMs === null || Number.isInteger(lastSteerAtMs) && lastSteerAtMs >= 0) || typeof delivered !== "boolean" || typeof escalated !== "boolean") throw new Error("invalid wait escalation state");
   return {
     waitId,
     waiterThreadId,
@@ -21341,11 +21341,11 @@ function parseEscalationRecord(value) {
     escalated
   };
 }
-function waitEscalationState(input) {
+function waitEscalationState(input, maxSteers = MAX_WAIT_STEERS) {
   if (input === void 0 || input === null) return {};
   if (!isPlainObject2(input)) throw new Error("invalid wait escalation state");
   const state = {};
-  for (const [key, value] of Object.entries(input)) state[key] = parseEscalationRecord(value);
+  for (const [key, value] of Object.entries(input)) state[key] = parseEscalationRecord(value, maxSteers);
   return state;
 }
 function createWaitEscalationCycle(options) {
@@ -21360,7 +21360,7 @@ function createWaitEscalationCycle(options) {
     return result2;
   };
   const loaded = async () => {
-    if (!escalations) escalations = waitEscalationState(options.escalationPersistence ? await options.escalationPersistence.read() : null);
+    if (!escalations) escalations = waitEscalationState(options.escalationPersistence ? await options.escalationPersistence.read() : null, maxSteers);
     return escalations;
   };
   const save = async () => {
@@ -21399,7 +21399,7 @@ function createWaitEscalationCycle(options) {
           await save();
           continue;
         }
-        if (record2.delivered || record2.escalated) continue;
+        if (record2.escalated) continue;
         let observation;
         try {
           observation = await options.readWaiter(record2.waiterThreadId);
@@ -21407,11 +21407,7 @@ function createWaitEscalationCycle(options) {
           continue;
         }
         if (observation === null) continue;
-        if (observation.status === "active") {
-          record2.delivered = true;
-          await save();
-          continue;
-        }
+        if (observation.status === "active") continue;
         const steerAgeMs = record2.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : currentNow - record2.lastSteerAtMs;
         if (steerAgeMs < graceMs) continue;
         if (record2.steers >= maxSteers) {
@@ -21425,6 +21421,7 @@ function createWaitEscalationCycle(options) {
         let failed = false;
         try {
           await options.steerWaiter(record2);
+          record2.delivered = true;
         } catch {
           failed = true;
         }
@@ -22194,7 +22191,11 @@ async function plugin(bb) {
       if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
       if (decision === "alert-once") {
         mkdirSync(stateDir, { recursive: true });
-        writeFileSync(flagPath, String(Date.now()));
+        try {
+          writeFileSync(flagPath, String(Date.now()), { flag: "wx" });
+        } catch {
+          return;
+        }
         bb.log.error("wait-validator liveness marker is stale: host launchd supervision failed; operator attention required");
         bb.realtime.publish("wait-validator", { liveness: "stale", alert: "operator-once" });
       }
