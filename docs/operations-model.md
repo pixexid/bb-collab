@@ -117,6 +117,26 @@ evidence. The cap itself is recorded by the existing adopted Decision plus
 operator-authorized `config_revision`; it does not create a second authority
 store.
 
+The v14 `director-seat` amendment remains the existing project-orchestrator
+role with primary `pi/kimi-coding/k3/high`, Opus-medium standby, managed-
+worktree-only holder facts, and zero writing-lane capacity. Epoch-2 service on
+the unmanaged canonical environment is grandfathered evidence, not generation
+3 occupancy. A future successor is first preflighted and then recorded through
+the receipt-gated succession apply; witness evidence and operator word do not
+occupy the seat.
+
+The approved default model for non-visual queue and documentation engineering
+is `codex/gpt-5.6-luna`. On a cheap tier, an omitted reasoning value on a
+mechanical subtask (fixtures, sweeps, doc sync, or scaffolds) resolves to LOW
+(`low/full/default/visible`); a parent worker's HIGH or MAX effort must not
+silently escalate it. The hard core may opt into an explicit HIGH or MAX value.
+The spawn brief supplies the cheap-tier classification explicitly; it is not
+inferred from the parent's effort.
+Every spawn brief declares the requested reasoning value, and the existing
+Assignment/ExecutionAttempt receipt comparison records requested versus
+executed reasoning for the conformance audit. An independent cold review is
+routed later to `claude-code/opus`; that review is evidence, not authority.
+
 ## Dormant supervisor escalation
 
 The operator-held supervisor seat described here is distinct from the existing
@@ -157,26 +177,6 @@ time canonical routing, v14 exemption, receipt, schema, migration, or runtime
 path. `CONTRACT_VERSION`, `contractDigest`, cached-consumer versions, and
 rollout receipts remain unchanged; the cached-consumer bump test does not
 apply.
-
-The v14 `director-seat` amendment remains the existing project-orchestrator
-role with primary `pi/kimi-coding/k3/high`, Opus-medium standby, managed-
-worktree-only holder facts, and zero writing-lane capacity. Epoch-2 service on
-the unmanaged canonical environment is grandfathered evidence, not generation
-3 occupancy. A future successor is first preflighted and then recorded through
-the receipt-gated succession apply; witness evidence and operator word do not
-occupy the seat.
-
-The approved default model for non-visual queue and documentation engineering
-is `codex/gpt-5.6-luna`. On a cheap tier, an omitted reasoning value on a
-mechanical subtask (fixtures, sweeps, doc sync, or scaffolds) resolves to LOW
-(`low/full/default/visible`); a parent worker's HIGH or MAX effort must not
-silently escalate it. The hard core may opt into an explicit HIGH or MAX value.
-The spawn brief supplies the cheap-tier classification explicitly; it is not
-inferred from the parent's effort.
-Every spawn brief declares the requested reasoning value, and the existing
-Assignment/ExecutionAttempt receipt comparison records requested versus
-executed reasoning for the conformance audit. An independent cold review is
-routed later to `claude-code/opus`; that review is evidence, not authority.
 
 ## Issue lifecycle linkage and #80 audit
 
