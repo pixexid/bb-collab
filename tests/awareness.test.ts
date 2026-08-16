@@ -4,8 +4,10 @@ import {
   continuationModeFor,
   createContinuationLedger,
   createLaneWatcher,
+  createWaitRegistry,
   openLaneViews,
   type OperatorWait,
+  type RegisteredWait,
   readLaneStates,
   readRoleHolderStates,
   SUPERVISOR_THREAD_ID,
@@ -46,6 +48,17 @@ function roleScope(queueHeadId: string | null, deferredReason: OperatorWait["rea
 
 function roleObservation(idleSinceMs: number): { status: "idle"; pendingExternalWait: false; archived: false; operatorWait: null; operatorWaitKnown: true; idleSinceMs: number } {
   return { status: "idle", pendingExternalWait: false, archived: false, operatorWait: null, operatorWaitKnown: true, idleSinceMs };
+}
+
+function registeredWait(overrides: Partial<RegisteredWait> = {}): RegisteredWait {
+  return {
+    waitId: "wait-1",
+    waiterThreadId: "worker-1",
+    sourceThreadId: "source-1",
+    sourceEvent: "terminal",
+    deadlineAtMs: Date.now() + 60_000,
+    ...overrides,
+  };
 }
 
 function laneConfig(db: Database.Database, writingLaneCeiling = 3) {
@@ -444,6 +457,89 @@ describe("lane awareness", () => {
     expect(steer).toHaveBeenCalledTimes(2);
   });
 
+  it("allows only a registered wait to explain an idle worker", async () => {
+    const registered = createWaitRegistry();
+    await registered.register(registeredWait());
+    const readWorker = async (threadId: string) => threadId === "source-1"
+      ? { status: "active" as const, pendingExternalWait: false, archived: false }
+      : { status: "idle" as const, pendingExternalWait: false, archived: false };
+    const registeredSteer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
+    await createLaneWatcher({ readLanes: () => [lane()], steer: registeredSteer, waitRegistry: registered, readWorker }).observe("worker-1", "idle");
+    expect(registeredSteer).not.toHaveBeenCalled();
+
+    const unregisteredSteer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
+    await createLaneWatcher({ readLanes: () => [lane()], steer: unregisteredSteer, readWorker }).observe("worker-1", "idle");
+    expect(unregisteredSteer).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses deadline-less waits and accepts exact duplicate registration only", async () => {
+    const registry = createWaitRegistry();
+    await expect(registry.register({ ...registeredWait(), deadlineAtMs: undefined } as unknown as RegisteredWait)).rejects.toThrow("deadline");
+    await registry.register(registeredWait());
+    await expect(registry.register(registeredWait())).resolves.toBeUndefined();
+    await expect(registry.register(registeredWait({ sourceThreadId: "different-source" }))).rejects.toThrow("conflicting");
+  });
+
+  it("fails closed when a registered wait source is missing or unreadable", async () => {
+    const registry = createWaitRegistry();
+    await registry.register(registeredWait({ sourceThreadId: "missing" }));
+    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
+    const watcher = createLaneWatcher({
+      readLanes: () => [lane()],
+      steer,
+      waitRegistry: registry,
+      readWorker: async (threadId) => {
+        if (threadId === "missing") throw new Error("thread unknown");
+        return { status: "idle", pendingExternalWait: false, archived: false };
+      },
+    });
+
+    await watcher.observe("worker-1", "idle");
+    expect(steer).not.toHaveBeenCalled();
+  });
+
+  it("cascades known terminal and failure source events to waiters", async () => {
+    const registry = createWaitRegistry();
+    await registry.register(registeredWait({ waitId: "terminal-wait", sourceThreadId: "source-terminal" }));
+    await registry.register(registeredWait({ waitId: "failure-wait", waiterThreadId: "worker-2", sourceThreadId: "source-failure", sourceEvent: "failure" }));
+    const events: string[] = [];
+    const steered: string[] = [];
+    const lanes = [lane(), { ...lane("worker-2"), assignment_id: "assignment-2", lane_id: "lane-2", execution_attempt_id: "attempt-2" }, { ...lane("source-terminal"), terminal_report_digest: "done" }];
+    const watcher = createLaneWatcher({
+      readLanes: () => lanes,
+      steer: vi.fn(async (view: LaneView) => { steered.push(view.threadId ?? ""); }),
+      waitRegistry: registry,
+      readWorker: async (threadId) => ({ status: threadId === "source-failure" ? "error" as const : "idle" as const, pendingExternalWait: false, archived: false }),
+      onWaitEvent: (event) => { events.push(`${event.waitId}:${event.reason}`); },
+    });
+
+    await watcher.observe("worker-1", "idle");
+
+    expect(steered.sort()).toEqual(["worker-1", "worker-2"]);
+    expect(events.sort()).toEqual(["failure-wait:source_failure", "terminal-wait:source_terminal"]);
+  });
+
+  it("fires an expired wait immediately and terminally deduplicates replay", async () => {
+    const registry = createWaitRegistry();
+    await registry.register(registeredWait({ deadlineAtMs: 100 }));
+    const events: string[] = [];
+    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
+    const watcher = createLaneWatcher({
+      readLanes: () => [lane()],
+      steer,
+      waitRegistry: registry,
+      readWorker: async () => ({ status: "active", pendingExternalWait: false, archived: false }),
+      now: () => 100,
+      onWaitEvent: (event) => { events.push(event.waitId); },
+    });
+
+    await watcher.observe("worker-1", "idle");
+    await watcher.observe("worker-1", "idle");
+
+    expect(steer).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["wait-1"]);
+  });
+
   it("does not self-wake the supervisor", async () => {
     const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
     const watcher = createLaneWatcher({ readLanes: () => [lane("thr_b94i3csnme")], steer });
@@ -451,6 +547,48 @@ describe("lane awareness", () => {
     await watcher.observe("thr_b94i3csnme", "idle");
 
     expect(steer).not.toHaveBeenCalled();
+  });
+
+  it("self-watches the director once when its registered source completes", async () => {
+    const registry = createWaitRegistry();
+    await registry.register(registeredWait({ waiterThreadId: SUPERVISOR_THREAD_ID, sourceThreadId: "worker-source" }));
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      waitRegistry: registry,
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => [roleScope("queue-head")],
+      readDispatcherProjectIdentity: async () => "project-1",
+      readWorker: async (threadId) => threadId === "worker-source"
+        ? { status: "error" as const, pendingExternalWait: false, archived: false }
+        : roleObservation(0),
+      steerRole,
+      roleIdleThresholdMs: 0,
+    });
+
+    await watcher.observe("worker-source", "error");
+    await watcher.observe("worker-source", "error");
+
+    expect(steerRole).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the director covered: prose-only idle work is not a wait", async () => {
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => [roleScope("queue-head")],
+      readWorker: async () => roleObservation(0),
+      steerRole,
+      roleIdleThresholdMs: 0,
+      now: () => 1,
+    });
+
+    await watcher.poll();
+
+    expect(steerRole).toHaveBeenCalledTimes(1);
   });
 
   it("stays silent for a genuine pending external wait", async () => {
@@ -646,9 +784,13 @@ describe("lane awareness", () => {
     db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "lane-1", "write", "work-1", 1);
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "worker-1", "attempt-1", "assignment", "prepared", null);
     const before = { assignments: db.prepare("SELECT * FROM assignments").all(), attempts: db.prepare("SELECT * FROM execution_attempts").all() };
+    const waitRegistry = createWaitRegistry();
+    await waitRegistry.register(registeredWait({ sourceThreadId: "source-1" }));
     const watcher = createLaneWatcher({
       readLanes: () => readLaneStates(db),
       steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      waitRegistry,
+      readWorker: async () => ({ status: "active" as const, pendingExternalWait: false, archived: false }),
       readOperatorWait: async () => ({ reason: "awaiting_operator", createdAtMs: 0 }),
       operatorWaitFyiThresholdMs: 0,
     });

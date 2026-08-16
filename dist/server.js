@@ -20393,6 +20393,84 @@ var OPEN_ATTEMPT_STATES = /* @__PURE__ */ new Set([
   "running",
   "dispatch_unknown"
 ]);
+function normalizeRegisteredWait(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid registered wait");
+  const value = input;
+  if (typeof value.waitId !== "string" || value.waitId.length === 0 || typeof value.waiterThreadId !== "string" || value.waiterThreadId.length === 0 || typeof value.sourceThreadId !== "string" || value.sourceThreadId.length === 0 || value.sourceEvent !== "terminal" && value.sourceEvent !== "failure" || !Number.isInteger(value.deadlineAtMs) || value.deadlineAtMs < 0) throw new Error("registered wait requires waiter, source, event, and deadline");
+  return {
+    waitId: value.waitId,
+    waiterThreadId: value.waiterThreadId,
+    sourceThreadId: value.sourceThreadId,
+    sourceEvent: value.sourceEvent,
+    deadlineAtMs: value.deadlineAtMs
+  };
+}
+function waitRegistryState(input) {
+  if (input === void 0 || input === null) return { waits: [], fired: {} };
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid wait registry state");
+  const value = input;
+  if (!Array.isArray(value.waits) || !value.fired || typeof value.fired !== "object" || Array.isArray(value.fired)) {
+    throw new Error("invalid wait registry state");
+  }
+  const waits = value.waits.map(normalizeRegisteredWait);
+  const byId = /* @__PURE__ */ new Map();
+  for (const wait of waits) {
+    const existing = byId.get(wait.waitId);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(wait)) throw new Error("conflicting registered wait");
+    byId.set(wait.waitId, wait);
+  }
+  const fired = {};
+  for (const [waitId, reason] of Object.entries(value.fired)) {
+    if (!byId.has(waitId) || !["source_terminal", "source_failure", "deadline_expired"].includes(reason)) {
+      throw new Error("invalid fired wait");
+    }
+    fired[waitId] = reason;
+  }
+  return { waits: [...byId.values()], fired };
+}
+function createWaitRegistry(persistence) {
+  let state = { waits: [], fired: {} };
+  let loaded = false;
+  let queue = Promise.resolve();
+  const enqueue = (work) => {
+    const result2 = queue.then(work);
+    queue = result2.then(() => void 0, () => void 0);
+    return result2;
+  };
+  const load = async () => {
+    if (loaded) return;
+    state = waitRegistryState(persistence ? await persistence.read() : null);
+    loaded = true;
+  };
+  const save = () => persistence?.write(structuredClone(state));
+  return {
+    recover: () => enqueue(async () => {
+      await load();
+    }),
+    register: (input) => enqueue(async () => {
+      await load();
+      const wait = normalizeRegisteredWait(input);
+      const existing = state.waits.find((candidate) => candidate.waitId === wait.waitId);
+      if (existing) {
+        if (JSON.stringify(existing) !== JSON.stringify(wait)) throw new Error("conflicting registered wait");
+        return;
+      }
+      state.waits.push(wait);
+      await save();
+    }),
+    list: () => state.waits.map((wait) => ({ ...wait })),
+    state: (waitId) => state.fired[waitId] ? "fired" : state.waits.some((wait) => wait.waitId === waitId) ? "pending" : "unknown",
+    fire: (waitId, reason, firedAtMs) => enqueue(async () => {
+      await load();
+      const wait = state.waits.find((candidate) => candidate.waitId === waitId);
+      if (!wait || state.fired[waitId]) return null;
+      const event = { ...wait, reason, firedAtMs };
+      state.fired[waitId] = reason;
+      await save();
+      return event;
+    })
+  };
+}
 function operatorWaitAlertState(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) return {};
   const state = {};
@@ -20730,6 +20808,7 @@ function roleQueueScopes(lanes) {
 function createLaneWatcher(options) {
   const supervisorThreadId = options.supervisorThreadId ?? SUPERVISOR_THREAD_ID;
   const continuationLedger = options.continuationLedger ?? createContinuationLedger();
+  const waitRegistry = options.waitRegistry ?? createWaitRegistry();
   const operatorWaitAlertLedger = createOperatorWaitAlertLedger(options.operatorWaitAlertPersistence);
   const roleIdleLedger = createRoleIdleLedger(options.roleIdlePersistence);
   const roleIdleThresholdMs = Number.isInteger(options.roleIdleThresholdMs) && (options.roleIdleThresholdMs ?? 0) >= 0 ? options.roleIdleThresholdMs : WRONGFUL_IDLE_THRESHOLD_MS;
@@ -20738,6 +20817,66 @@ function createLaneWatcher(options) {
   const maxContinuations = Number.isInteger(options.maxContinuations) && (options.maxContinuations ?? 0) > 0 ? options.maxContinuations : DEFAULT_MAX_CONTINUATIONS;
   const coalesced = /* @__PURE__ */ new Set();
   let queue = Promise.resolve();
+  const readWaitContext = async (allLanes, suppliedSource) => {
+    let waits;
+    try {
+      await waitRegistry.recover();
+      waits = (options.readRegisteredWaits ? await options.readRegisteredWaits() : waitRegistry.list()).map(normalizeRegisteredWait);
+      if (options.readRegisteredWaits) for (const wait of waits) await waitRegistry.register(wait);
+    } catch {
+      return { known: false, byWaiter: /* @__PURE__ */ new Map(), events: [] };
+    }
+    if (waits.length === 0) return { known: true, byWaiter: /* @__PURE__ */ new Map(), events: [] };
+    const sourceStates = /* @__PURE__ */ new Map();
+    for (const sourceThreadId of new Set(waits.map((wait) => wait.sourceThreadId))) {
+      const sourceLanes = allLanes.filter((lane) => lane.thread_id === sourceThreadId);
+      const terminalFromLane = sourceLanes.some((lane) => lane.terminal_report_digest !== null || !OPEN_ATTEMPT_STATES.has(lane.attempt_state));
+      let observation = null;
+      if (suppliedSource?.threadId === sourceThreadId) {
+        observation = {
+          status: suppliedSource.status,
+          pendingExternalWait: false,
+          archived: suppliedSource.archived
+        };
+      } else if (options.readWorker) {
+        try {
+          observation = await options.readWorker(sourceThreadId);
+        } catch {
+          observation = null;
+        }
+      }
+      const failedFromLane = sourceLanes.some((lane) => lane.attempt_state === "failed");
+      sourceStates.set(sourceThreadId, {
+        known: terminalFromLane || observation !== null,
+        terminal: terminalFromLane || observation?.archived === true || observation?.status === "error",
+        failed: failedFromLane || observation?.archived === true || observation?.status === "error"
+      });
+    }
+    const byWaiter = /* @__PURE__ */ new Map();
+    const events = [];
+    for (const wait of waits) {
+      if (waitRegistry.state(wait.waitId) === "fired") {
+        if (byWaiter.get(wait.waiterThreadId) !== "pending") byWaiter.set(wait.waiterThreadId, "fired");
+        continue;
+      }
+      const source = sourceStates.get(wait.sourceThreadId);
+      let reason = null;
+      if (now2() >= wait.deadlineAtMs) reason = "deadline_expired";
+      else if (!source?.known) {
+        if (byWaiter.get(wait.waiterThreadId) !== "pending") byWaiter.set(wait.waiterThreadId, "unknown");
+        continue;
+      } else if (wait.sourceEvent === "terminal" && source.terminal) reason = "source_terminal";
+      else if (wait.sourceEvent === "failure" && source.failed) reason = "source_failure";
+      else {
+        byWaiter.set(wait.waiterThreadId, "pending");
+        continue;
+      }
+      const event = await waitRegistry.fire(wait.waitId, reason, now2());
+      if (event) events.push(event);
+      if (byWaiter.get(wait.waiterThreadId) !== "pending") byWaiter.set(wait.waiterThreadId, "fired");
+    }
+    return { known: true, byWaiter, events };
+  };
   const laneKey = (lane) => `${lane.project_id}:${lane.execution_attempt_id}`;
   const clearResolved = (lanes) => {
     const unresolved = new Set(
@@ -20778,7 +20917,7 @@ function createLaneWatcher(options) {
     roleAlert(role);
     options.onRoleSuccessionRequired?.(role);
   };
-  const observeRoleNow = async (threadId, suppliedScopes) => {
+  const observeRoleNow = async (threadId, suppliedScopes, waitContext) => {
     if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return;
     let holders;
     try {
@@ -20816,7 +20955,8 @@ function createLaneWatcher(options) {
       } catch {
         continue;
       }
-      if (observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || !scope?.nextStartable || scope.deferredReason) {
+      const waitState = waitContext?.byWaiter.get(targetThreadId) ?? "none";
+      if (waitContext && !waitContext.known || waitState === "pending" || waitState === "unknown" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || !scope?.nextStartable || scope.deferredReason) {
         await roleIdleLedger.clearPrefixExcept(prefix);
         continue;
       }
@@ -20875,13 +21015,18 @@ function createLaneWatcher(options) {
       if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, role);
     }
   };
-  const observeNow = async (threadId, status, pendingExternalWait, archived = false, suppliedOperatorWait, suppliedOperatorWaitKnown = status !== "idle" || suppliedOperatorWait !== void 0 || !options.readOperatorWait) => {
+  const observeNow = async (threadId, status, pendingExternalWait, archived = false, suppliedOperatorWait, suppliedOperatorWaitKnown = status !== "idle" || suppliedOperatorWait !== void 0 || !options.readOperatorWait, waitContext) => {
     const allLanes = options.readLanes();
     clearResolved(allLanes);
     const candidates = allLanes.filter(
       (lane) => lane.thread_id === threadId && lane.thread_id !== supervisorThreadId && OPEN_ATTEMPT_STATES.has(lane.attempt_state)
     );
     if (candidates.length === 0) return;
+    const registeredWaitState = waitContext?.byWaiter.get(threadId) ?? "none";
+    if (status === "idle" && (waitContext && (!waitContext.known || registeredWaitState === "pending" || registeredWaitState === "unknown"))) {
+      for (const lane of candidates) coalesced.delete(laneKey(lane));
+      return;
+    }
     let operatorWait = suppliedOperatorWait ?? null;
     let operatorWaitKnown = suppliedOperatorWaitKnown;
     if (!archived && status === "idle" && suppliedOperatorWait === void 0 && options.readOperatorWait) {
@@ -20955,17 +21100,36 @@ function createLaneWatcher(options) {
     queue = result2.then(() => void 0, () => void 0);
     return result2;
   };
+  const emitWaitEvents = async (context) => {
+    for (const event of context.events) await options.onWaitEvent?.(event);
+  };
   return {
+    registerWait(wait) {
+      return waitRegistry.register(wait);
+    },
     observe(threadId, status, pendingExternalWait, archived, operatorWait) {
       return enqueue(async () => {
-        if (threadId !== supervisorThreadId) await observeNow(threadId, status, pendingExternalWait, archived, operatorWait);
-        await observeRoleNow(threadId);
+        const context = await readWaitContext(options.readLanes(), { threadId, status, archived: archived ?? false });
+        await emitWaitEvents(context);
+        if (threadId !== supervisorThreadId) await observeNow(threadId, status, pendingExternalWait, archived, operatorWait, void 0, context);
+        await observeRoleNow(threadId, void 0, context);
+        for (const event of context.events) {
+          if (event.waiterThreadId === threadId || !options.readWorker) continue;
+          try {
+            const observation = await options.readWorker(event.waiterThreadId);
+            await observeNow(event.waiterThreadId, observation.status, observation.pendingExternalWait, observation.archived, observation.operatorWait, observation.operatorWaitKnown, context);
+            await observeRoleNow(event.waiterThreadId, void 0, context);
+          } catch {
+          }
+        }
       });
     },
     poll() {
       return enqueue(async () => {
         const lanes = options.readLanes();
         clearResolved(lanes);
+        const context = await readWaitContext(lanes);
+        await emitWaitEvents(context);
         if (!options.readWorker) return;
         const workerIds = new Set(
           lanes.filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.thread_id).map((lane) => lane.thread_id).filter((threadId) => threadId !== supervisorThreadId)
@@ -20983,7 +21147,8 @@ function createLaneWatcher(options) {
             observation.pendingExternalWait,
             observation.archived,
             observation.operatorWait,
-            observation.operatorWaitKnown
+            observation.operatorWaitKnown,
+            context
           );
         }
         if (options.readRoleHolders) {
@@ -20998,7 +21163,7 @@ function createLaneWatcher(options) {
             }
           }
           if (roleScopes) {
-            for (const threadId of roleThreadIds) await observeRoleNow(threadId, roleScopes);
+            for (const threadId of roleThreadIds) await observeRoleNow(threadId, roleScopes, context);
           }
         }
       });
@@ -21006,6 +21171,7 @@ function createLaneWatcher(options) {
     recover() {
       return enqueue(async () => {
         await continuationLedger.recover();
+        await waitRegistry.recover();
         await operatorWaitAlertLedger.recover();
         await roleIdleLedger.recover();
       });
@@ -21136,6 +21302,13 @@ var laneViewSchema = external_exports.object({
 }).strict();
 var laneListSchema = external_exports.array(laneViewSchema);
 var sidebarThreadIdSchema = external_exports.string().trim().min(1).max(256);
+var registeredWaitSchema = external_exports.object({
+  waitId: sidebarThreadIdSchema,
+  waiterThreadId: sidebarThreadIdSchema,
+  sourceThreadId: sidebarThreadIdSchema,
+  sourceEvent: external_exports.enum(["terminal", "failure"]),
+  deadlineAtMs: external_exports.number().int().nonnegative()
+}).strict();
 var sidebarThreadStateSchema = external_exports.string().trim().min(1).max(64);
 var sidebarThreadStateKey = (threadId) => `sidebar.thread-state:${threadId}`;
 var sidebarReasoningLevelSchema = external_exports.enum(["none", "low", "medium", "high", "xhigh", "ultracode", "max", "ultra"]);
@@ -21169,6 +21342,10 @@ var rpcContract = defineRpcContract({
   lanes: {
     input: external_exports.object({}).strict(),
     output: laneListSchema
+  },
+  registerWait: {
+    input: registeredWaitSchema,
+    output: registeredWaitSchema
   },
   threadStates: {
     input: external_exports.object({ threadIds: external_exports.array(sidebarThreadIdSchema).max(256) }).strict(),
@@ -21488,6 +21665,10 @@ async function plugin(bb) {
     read: () => bb.storage.kv.get("lane-watcher.continuations"),
     write: (state) => bb.storage.kv.set("lane-watcher.continuations", state)
   });
+  const waitRegistry = createWaitRegistry({
+    read: () => bb.storage.kv.get("lane-watcher.registered-waits"),
+    write: (state) => bb.storage.kv.set("lane-watcher.registered-waits", state)
+  });
   const operatorWaitAlertPersistence = {
     read: () => bb.storage.kv.get("lane-watcher.operator-wait-fyi"),
     write: (state) => bb.storage.kv.set("lane-watcher.operator-wait-fyi", state)
@@ -21515,6 +21696,7 @@ async function plugin(bb) {
     readDispatcherProjectIdentity: async () => (await bb.sdk.threads.get({ threadId: SUPERVISOR_THREAD_ID })).projectId,
     roleIdlePersistence,
     continuationLedger,
+    waitRegistry,
     operatorWaitAlertPersistence,
     onAlert: (alert) => alert.lane ? bb.log.warn(`lane awareness ${alert.kind}: ${alert.lane.laneId} (${alert.count}/${alert.max})`) : bb.log.warn(`role awareness ${alert.kind}: ${alert.role.roleId}@${alert.role.roleGeneration} queue ${alert.role.queueHeadId}`),
     onRoleSuccessionRequired: (role) => bb.log.warn(`role succession required: ${role.roleId}@${role.roleGeneration}`),
@@ -21635,6 +21817,10 @@ async function plugin(bb) {
   bb.rpc.register(rpcContract, {
     lanes() {
       return readOpenLaneViews();
+    },
+    async registerWait(input) {
+      await watcher.registerWait(input);
+      return input;
     },
     async threadStates(input) {
       const entries = await Promise.all(input.threadIds.map(async (threadId) => {
