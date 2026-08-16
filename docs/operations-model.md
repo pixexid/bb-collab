@@ -30,7 +30,9 @@ reviewer, orchestrator or routing fallback. The supervisor-ratified matrix is:
 | Mechanical subagent | Configured harness/provider | `gpt-5.6-luna` | LOW | Fixtures, sweeps, doc-sync and scaffolds only; legality follows artifact scope, not spawn label. |
 | Mechanical probe | Configured harness/provider | `deepseek-v4-flash` or `glm-5-turbo` | LOW | Probe-only; current graded evidence controls admission. |
 
-The amended orchestrator profile applies only at the next natural
+Watch item: monitor the shared Anthropic account window across the amended
+orchestrator, app-side supervisor wakes, and Opus cold reviews. The amended
+orchestrator profile applies only at the next natural
 succession/spawn. The pending epoch-2 orchestrator succession is that natural
 spawn; do not hot-swap a healthy live orchestrator. `claude-opus-5` shares the
 operator Anthropic account window with app-side supervisor wakes and any Opus
