@@ -5809,7 +5809,7 @@ describe("bb-collab plugin boundary", () => {
     expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get()).toEqual({ count: 0 });
 
     const activated = applyWithFixtureReceipt(db, successionRequest(fenceToken, {
-      idempotencyKey: "director-generation-3-recording",
+      idempotencyKey: "director-first-generation-creation",
       roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
       qualificationId: "director-qualification",
       profileDigest: DIRECTOR_PROFILE_DIGEST,
