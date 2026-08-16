@@ -62,6 +62,28 @@ bus, or mutable Markdown task database. It reads the canonical config head and
 Assignment/ExecutionAttempt rows only; raw BB task/thread counts cannot bypass
 the cap or make a lane authoritative.
 
+## Gate-epic decomposition
+
+An issue or epic is planning work, not a lane. A worker/orchestrator brief must
+declare either `workShape: slice` or `workShape: epic`. An epic brief must list
+mergeable child slices with `sliceId`, `dependsOn`, `readiness`, and
+`estimateHours` metadata; every child estimate is at most 8 hours. A child is
+startable only when every listed dependency is merged and its readiness gate is
+true. The epic itself is never assigned to a lane, so an unfinished child or
+operator wait cannot hold one giant lane across the queue.
+
+If a proposed slice is estimated above 8 hours, the brief is rejected until it
+is decomposed. Child slices may still be ordered by dependencies, but unrelated
+ready children remain visible through the existing `lanes` queue. A deferred
+child retains the existing `queueBlocked: false` behavior and its writer
+reservation; ready writing lanes beyond the remaining cap may be
+`queueBlocked: true`. Read-only lanes remain unaffected by that writer
+reservation.
+
+The historical #31 gate program is the counterexample only: its recorded 52
+hours across four PRs should have been four to six independently mergeable
+issues. #31 remains historical evidence and is not reopened or mutated.
+
 ## Awareness and FYI notification
 
 An operator-deferred lane becomes FYI-eligible after 15 minutes. The watcher

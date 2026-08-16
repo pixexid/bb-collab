@@ -15,7 +15,21 @@ dials, and expose parallel startable queue lanes while keeping reviews/probes
 outside the cap. It is present on current `origin/main` through merged PR #85.
 Issue #76 is the next bounded slice: derive Tier A/B/C from touched surfaces,
 require PR tier declarations, and keep Tier-B/C review from serializing the
-queue. #78, #79, and #80 remain separate follow-up slices and are not included.
+queue. Issue #78 is the next bounded slice: gate-epics are planning-only, each
+child is mergeable and dependency/readiness-declared, and no child estimate may
+exceed 8 hours. #31 remains the historical counterexample (52 hours across
+four PRs); it is not reopened or mutated. #79 and #80 remain separate
+follow-up slices and are not included.
+
+Issue #78 exit condition: worker/orchestrator briefs reject an unsplit slice
+above the 8-hour ceiling; an epic has at least two mergeable child slices with
+explicit `sliceId`, `dependsOn`, `readiness`, and `estimateHours`; only a child
+whose dependencies are merged and readiness is true is startable; and a
+deferred/operator-wait child remains `queueBlocked: false` while its writer
+reservation can queue-block ready writing lanes beyond the remaining cap, never
+read-only lanes. This reuses the existing WorkItem, Assignment,
+ExecutionAttempt, and `lanes` queue;
+it adds no queue, task database, SQLite mutation, or receipt seam.
 
 ## Founding documentation
 
