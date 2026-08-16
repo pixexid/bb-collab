@@ -22141,6 +22141,14 @@ async function plugin(bb) {
     read: () => bb.storage.kv.get("lane-watcher.role-idle"),
     write: (state) => bb.storage.kv.set("lane-watcher.role-idle", state)
   };
+  const roleLivenessWarnings = /* @__PURE__ */ new Map();
+  const roleLivenessKey = (holder) => `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${holder.execution_attempt_id}:${holder.thread_id}`;
+  const warnRoleLiveness = (holder, evidence) => {
+    const key = roleLivenessKey(holder);
+    if (roleLivenessWarnings.get(key) === evidence) return;
+    roleLivenessWarnings.set(key, evidence);
+    bb.log.warn(`role steer refused: project=${holder.project_id} role=${holder.role_id}@${holder.role_generation} holder=${holder.execution_attempt_id} thread=${holder.thread_id} ${evidence}`);
+  };
   const readRoleScopes = async () => {
     if (!db) return [];
     const operatorWaits = /* @__PURE__ */ new Map();
@@ -22166,8 +22174,22 @@ async function plugin(bb) {
     isExternallyWaiting: readPendingExternalWait,
     readOperatorWait: readPendingOperatorWaitForThread,
     readWorker: async (threadId) => {
-      const thread = await bb.sdk.threads.get({ threadId });
+      const roleHolders = db ? readRoleHolderStates(db).filter((holder) => holder.thread_id === threadId) : [];
+      let thread;
+      try {
+        thread = await bb.sdk.threads.get({ threadId });
+      } catch (error48) {
+        for (const holder of roleHolders) warnRoleLiveness(holder, `liveness=unknown error=${String(error48)}`);
+        throw error48;
+      }
       const archived = thread.archivedAt !== null || thread.deletedAt !== null;
+      for (const holder of roleHolders) {
+        if (thread.projectId !== holder.project_id || archived) {
+          warnRoleLiveness(holder, `observedProject=${thread.projectId} archivedAt=${thread.archivedAt ?? "null"} deletedAt=${thread.deletedAt ?? "null"}`);
+        } else {
+          roleLivenessWarnings.delete(roleLivenessKey(holder));
+        }
+      }
       let operatorWait = null;
       let operatorWaitKnown = true;
       if (!archived && thread.status === "idle") {
@@ -22214,13 +22236,14 @@ async function plugin(bb) {
       try {
         thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
       } catch (error48) {
-        bb.log.warn(`role steer refused: project=${role.projectId} role=${role.roleId}@${role.roleGeneration} holder=${role.executionAttemptId} thread=${holders[0].thread_id} liveness=unknown error=${String(error48)}`);
+        warnRoleLiveness(holders[0], `liveness=unknown error=${String(error48)}`);
         return;
       }
       if (thread.projectId !== role.projectId || thread.archivedAt !== null || thread.deletedAt !== null) {
-        bb.log.warn(`role steer refused: project=${role.projectId} role=${role.roleId}@${role.roleGeneration} holder=${role.executionAttemptId} thread=${holders[0].thread_id} observedProject=${thread.projectId} archivedAt=${thread.archivedAt ?? "null"} deletedAt=${thread.deletedAt ?? "null"}`);
+        warnRoleLiveness(holders[0], `observedProject=${thread.projectId} archivedAt=${thread.archivedAt ?? "null"} deletedAt=${thread.deletedAt ?? "null"}`);
         return;
       }
+      roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
       await bb.sdk.threads.send({
         threadId: holders[0].thread_id,
         mode: "steer",

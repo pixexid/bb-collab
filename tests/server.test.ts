@@ -544,7 +544,7 @@ async function loadedLaneWatcherHost() {
   db.prepare("UPDATE execution_attempts SET thread_id = ?, state = 'running' WHERE execution_attempt_id = ?").run("worker-1", executionAttemptId);
 
   let thread = makeThreadResponse({ id: "worker-1", status: "idle", archivedAt: null, deletedAt: null });
-  const roleThread = makeThreadResponse({ id: ROLE_THREAD_ID, projectId: PROJECT_ID, status: "idle", archivedAt: null, deletedAt: null });
+  let roleThread = makeThreadResponse({ id: ROLE_THREAD_ID, projectId: PROJECT_ID, status: "idle", archivedAt: null, deletedAt: null });
   let roleReads = 0;
   let failRoleReadAt: number | null = null;
   let pendingExternalWait = false;
@@ -564,6 +564,9 @@ async function loadedLaneWatcherHost() {
     },
     setThread(next: Partial<typeof thread>) {
       thread = makeThreadResponse({ ...thread, ...next });
+    },
+    setRoleThread(next: Partial<typeof roleThread>) {
+      roleThread = makeThreadResponse({ ...roleThread, ...next });
     },
     setLaneState(state: string) {
       db.prepare("UPDATE execution_attempts SET state = ? WHERE execution_attempt_id = ?").run(state, executionAttemptId);
@@ -1479,6 +1482,31 @@ describe("bb-collab plugin boundary", () => {
     } finally {
       now.mockRestore();
     }
+  });
+
+  it.each([
+    ["archived", { archivedAt: 1 }, "archivedAt=1 deletedAt=null"],
+    ["deleted", { deletedAt: 1 }, "archivedAt=null deletedAt=1"],
+    ["foreign-project", { projectId: "other-project" }, "observedProject=other-project"],
+  ])("warns once when the current role holder is %s during periodic evaluation", async (_name, roleThread, evidence) => {
+    const fixture = await loadedLaneWatcherHost();
+    fixture.setLaneState("prepared");
+    fixture.setRoleThread(roleThread);
+
+    await fixture.host.harness.runCli(["wait-validator", "--cycle"]);
+    await fixture.host.harness.runCli(["wait-validator", "--cycle"]);
+    await fixture.host.harness.runCli(["wait-validator", "--cycle"]);
+
+    const warnings = fixture.host.harness.inspection.logEntries
+      .filter((entry) => entry.level === "warn" && entry.message.startsWith("role steer refused:"));
+    expect(warnings).toEqual([expect.objectContaining({
+      message: expect.stringContaining(`project=${PROJECT_ID} role=project-orchestrator@1 holder=`),
+    })]);
+    expect(warnings[0]?.message).toContain(`thread=${ROLE_THREAD_ID}`);
+    expect(warnings[0]?.message).toContain(evidence);
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")
+      .filter(([input]) => (input as { threadId?: string }).threadId === ROLE_THREAD_ID)).toHaveLength(0);
+    await fixture.host.harness.lifecycle.dispose();
   });
 
   it("loads one CLI/RPC seam and refuses production apply before any write", async () => {
