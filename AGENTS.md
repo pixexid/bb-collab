@@ -109,8 +109,11 @@ cached consumers emit a durable reread/refusal rollout receipt.
 - A delegated worker uses a versioned frozen brief, an isolated managed
   environment, exact branch/base/candidate semantics and a terminal
   DONE|BLOCKED receipt. The brief and its PR body declare the derived review
-  tier. Native BB/provider events are the execution evidence; quiet is not
-  success.
+  tier and exactly one lifecycle disposition: `Closes #NN` only with an
+  explicit `Acceptance: complete`, `Related GH-NN` otherwise, or a rare
+  `No issue: <rationale>`. No Fix/Close/Resolve keyword may appear unless the
+  close disposition and acceptance declaration are both valid. Native
+  BB/provider events are the execution evidence; quiet is not success.
 - Mechanical subagent work (fixtures, sweeps, doc sync and scaffolds) declares
   LOW reasoning in its spawn brief by default. Omitted effort is LOW on cheap
   tiers; a parent's HIGH or MAX effort is not inherited by mechanical work.
@@ -133,6 +136,17 @@ cached consumers emit a durable reread/refusal rollout receipt.
   derived from touched surfaces, and wrong-tiering is a review finding. The
   stateless check in `scripts/check-review-tier.mjs` only validates metadata;
   it is not authority or queue state.
+- Every PR body also contains exactly one lifecycle disposition line. Verify
+  rejects missing or ambiguous linkage, premature close keywords, and a close
+  claim without `Acceptance: complete`; GitHub issue state remains projection
+  evidence and never canonical governance.
+- Verify may read the linked GitHub issue only to validate target existence and
+  explicit state; `issues: read` and branch-protection/ruleset enforcement of
+  the Verify check are external prerequisites, not canonical authority.
+- The merge-only `pull_request_target` workflow uses `issues: write` only with
+  code checked out from `refs/heads/main`; it never executes the PR head or
+  merge ref. Its deterministic marker/concurrency path is projection evidence,
+  not canonical governance.
 - Tier-A surfaces include authority/provenance, canonical DDL/lifecycle,
   operator receipts/approval, spend, concurrency/atomicity, migration/cutover,
   review/release policy, and tracked runtime artifacts. The next unrelated

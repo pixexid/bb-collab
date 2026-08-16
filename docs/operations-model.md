@@ -1,7 +1,8 @@
 # Operations model
 
 This document describes the operator-ratified queue behavior for issues #61 and
-#77, and the tiered review policy for #76. Issue #77 is the bounded
+#77, the tiered review policy for #76, and the weekly throughput report for #80.
+Issue #77 is the bounded
 parallel-lanes slice; #76 keeps review from serializing unrelated lanes.
 It is an operations model, not a second authority store. Canonical work remains
 the existing WorkItem, Assignment, and ExecutionAttempt state; lane-watcher
@@ -126,3 +127,43 @@ Every spawn brief declares the requested reasoning value, and the existing
 Assignment/ExecutionAttempt receipt comparison records requested versus
 executed reasoning for the conformance audit. An independent cold review is
 routed later to `claude-code/opus`; that review is evidence, not authority.
+
+## Issue lifecycle linkage and #80 audit
+
+Every worker brief and pull request body carries exactly one lifecycle
+disposition line: `Closes #NN` only when that pull request completes the issue
+acceptance and the body declares `Acceptance: complete`; `Related GH-NN`
+otherwise; or a rare `No issue: <rationale>` when no tracked issue applies.
+Missing, multiple, or ambiguous lines fail Verify. Fix/Close/Resolve keywords
+are rejected unless the exact close disposition and completion declaration are
+present. For the #80 lane, the pull request title and body use `Related GH-80`
+while the first report and acceptance remain pending; merge adds exactly one
+status comment to #80 unless the merged pull request demonstrably completes
+that acceptance, and does not close #80 merely because code merged.
+
+The existing `weeklyThroughputReport` emits `issueAcceptanceAudit` from the
+same read-only facts surface. It lists open issues as `openCompleted` only when
+acceptance is complete and at least one merged work item is evidenced;
+explicitly incomplete issues remain in `openIncomplete`, and missing or
+unknown GitHub/acceptance/merged-work facts remain in `unknown`. Its status is
+`fail` when an open completed issue is found, `unknown` when evidence is
+missing, and `pass` only when neither condition exists. The audit never writes
+GitHub state, canonical SQLite state, receipts, or governance decisions.
+
+Verify reads linked issue metadata with `issues: read` and fails closed on a
+missing, invalid, or unavailable target. Repository branch protection or a
+ruleset requiring the Verify check is an external release prerequisite; source
+cannot claim that GitHub has enabled it. The merge-only lifecycle workflow uses
+PR-number concurrency, a deterministic hidden marker, duplicate detection,
+and fail-closed API errors. Because it is `pull_request_target` with
+`issues: write`, checkout is pinned to `refs/heads/main`; PR head and merge
+refs are never executed. It posts one Related status comment while leaving the
+issue open, one no-issue rationale on the PR, or closes only an explicitly
+complete `Closes` disposition after merge.
+
+The weekly audit is a scheduled and manually dispatchable GitHub API read-only
+workflow. It collects open issues and merged pull requests, then reports the
+same `openCompleted`, `openIncomplete`, `unknown`, and `pass|fail|unknown`
+states. API failure emits `unknown` and fails the check; the pure calculator is
+not presented as a publisher. The audit never auto-closes incomplete or
+unknown issues.

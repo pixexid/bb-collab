@@ -31,6 +31,14 @@ read-only lanes. This reuses the existing WorkItem, Assignment,
 ExecutionAttempt, and `lanes` queue;
 it adds no queue, task database, SQLite mutation, or receipt seam.
 
+Issue #80 adds the pure weekly report and its lifecycle audit: open completed
+work is reported for operator disposition, while incomplete or unknown
+GitHub/BB facts remain explicit. Verify linkage and merge comments are
+projection/release evidence only; they do not close or authorize canonical
+work. Its scheduled/manual GitHub API audit fails closed to `unknown` when
+facts cannot be collected and never auto-closes incomplete or unknown issues.
+#79 remains a separate follow-up slice.
+
 ## Founding documentation
 
 1. Freeze the contract, threat model, import manifest and evidence links.
