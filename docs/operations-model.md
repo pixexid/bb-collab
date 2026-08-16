@@ -93,6 +93,14 @@ evidence. The cap itself is recorded by the existing adopted Decision plus
 operator-authorized `config_revision`; it does not create a second authority
 store.
 
-The approved default profile for non-visual queue and documentation engineering
-is `codex/gpt-5.6-luna`. An independent cold review is routed later to
-`claude-code/opus`; that review is evidence, not authority.
+The approved default model for non-visual queue and documentation engineering
+is `codex/gpt-5.6-luna`. On a cheap tier, an omitted reasoning value on a
+mechanical subtask (fixtures, sweeps, doc sync, or scaffolds) resolves to LOW
+(`low/full/default/visible`); a parent worker's HIGH or MAX effort must not
+silently escalate it. The hard core may opt into an explicit HIGH or MAX value.
+The spawn brief supplies the cheap-tier classification explicitly; it is not
+inferred from the parent's effort.
+Every spawn brief declares the requested reasoning value, and the existing
+Assignment/ExecutionAttempt receipt comparison records requested versus
+executed reasoning for the conformance audit. An independent cold review is
+routed later to `claude-code/opus`; that review is evidence, not authority.

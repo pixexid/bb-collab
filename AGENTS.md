@@ -111,6 +111,13 @@ cached consumers emit a durable reread/refusal rollout receipt.
   DONE|BLOCKED receipt. The brief and its PR body declare the derived review
   tier. Native BB/provider events are the execution evidence; quiet is not
   success.
+- Mechanical subagent work (fixtures, sweeps, doc sync and scaffolds) declares
+  LOW reasoning in its spawn brief by default. Omitted effort is LOW on cheap
+  tiers; a parent's HIGH or MAX effort is not inherited by mechanical work.
+  Hard-core work may retain HIGH or MAX only through an explicit request.
+  Assignment/ExecutionAttempt evidence compares requested and executed
+  reasoning; this is a brief/receipt rule, not a second queue or authority
+  store.
 - Automated subagents, if introduced later, are depth one and draft-only.
   They do not own writing, authority, merge, release or operator decisions.
 

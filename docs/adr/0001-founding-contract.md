@@ -292,6 +292,13 @@ The sanctioned worker report is a literal terminal DONE|BLOCKED tell. Native
 BB/provider receipts prove lifecycle; silence, a status read, a reaction or an
 empty container does not.
 
+Worker briefs also make subagent effort explicit. Mechanical subtasks such as
+fixtures, sweeps, documentation sync and scaffolds default to LOW reasoning
+when the value is omitted, including when their parent used HIGH or MAX. HIGH
+or MAX is retained only for an explicit hard-core request. The existing
+Assignment requested profile and ExecutionAttempt actual profile are the
+conformance record; this rule adds no spawn queue or authority store.
+
 ## 7. Review, release and connector policy
 
 Structural independence is universal for Tier-A work. The final reviewer is a
