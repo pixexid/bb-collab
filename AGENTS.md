@@ -76,7 +76,7 @@ verified work are all proven.
 Contract v15/schema v11 requires all four cached consumers to reread the
 one-request receipt, authorized-approver registry/attestation,
 mutation/export/evidence, role IDs/scoping, and refusal contract or refuse
-contract v13/schema v11.
+contract v14/schema v11.
 An adopted operator_only Decision registers approverId=orchestrator:bb-collab
 with the exact ten derived mutation classes, including config_revision,
 work_item_create, work_item_transition and
