@@ -13786,13 +13786,30 @@ import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 13;
+var CONTRACT_VERSION = 14;
 var SCHEMA_VERSION = 11;
-var PREVIOUS_CONTRACT_VERSION = 12;
+var PREVIOUS_CONTRACT_VERSION = 13;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
-var PREVIOUS_SCHEMA_VERSION = 10;
+var PREVIOUS_SCHEMA_VERSION = 11;
 var ROLE_IDS = ["project-orchestrator", "worker", "independent-reviewer"];
+var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
+var directorSeatProfile = {
+  providerId: "pi",
+  model: "kimi-coding/k3",
+  reasoningLevel: "high",
+  permissionMode: "full",
+  serviceTier: "default",
+  visibility: "visible"
+};
+var directorSeatStandbyProfile = {
+  providerId: "claude-code",
+  model: "claude-opus-5[1m]",
+  reasoningLevel: "medium",
+  permissionMode: "full",
+  serviceTier: "default",
+  visibility: "visible"
+};
 var AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab";
 var AUTHORIZED_APPROVER_PROJECT_ID = "proj_a8zzfsx36j";
 var LLM_COLLAB_SOURCE_FENCE = "f988d9711d3778f751e4ec0e32ebbf7b0893c80f";
@@ -14497,6 +14514,15 @@ var contractDigest = sha256(canonicalJson({
     lowerRequiresExplicitDecision: true,
     readOnlyAssignmentKinds: ["review", "probe"]
   },
+  directorSeatPolicy: {
+    roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+    roleId: "project-orchestrator",
+    executedProfile: directorSeatProfile,
+    standbyProfile: directorSeatStandbyProfile,
+    writingLaneCapacity: 0,
+    environment: "managed-worktree only",
+    assignmentKinds: []
+  },
   operatorReceiptPolicy: {
     scope: "one_request",
     binding: ["projectId", "operationClass", "candidateHead", "idempotencyKey", "requestDigest"],
@@ -14779,7 +14805,9 @@ var roleRequirementSchema = external_exports.object({
   roleRequirementId: id,
   roleId: roleIdSchema,
   repoTargetId: id.nullable(),
-  executedProfile: executionProfileSchema
+  executedProfile: executionProfileSchema,
+  standbyProfile: executionProfileSchema.optional(),
+  writingLaneCapacity: external_exports.literal(0).optional()
 }).strict().superRefine((requirement, ctx) => {
   if (requirement.roleId === "project-orchestrator" && requirement.repoTargetId !== null) {
     ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "project-orchestrator must be project-scoped" });
@@ -14792,6 +14820,26 @@ var roleRequirementSchema = external_exports.object({
   }
   if (requirement.executedProfile.visibility !== "visible") {
     ctx.addIssue({ code: "custom", path: ["executedProfile", "visibility"], message: "active role holders must be visible" });
+  }
+  const isDirectorSeat = requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID;
+  if (isDirectorSeat) {
+    if (requirement.roleId !== "project-orchestrator") {
+      ctx.addIssue({ code: "custom", path: ["roleId"], message: "director-seat must use the project-orchestrator role" });
+    }
+    if (requirement.repoTargetId !== null) {
+      ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "director-seat must be project-scoped" });
+    }
+    if (!requirement.standbyProfile || canonicalJson(requirement.standbyProfile) !== canonicalJson(directorSeatStandbyProfile)) {
+      ctx.addIssue({ code: "custom", path: ["standbyProfile"], message: "director-seat requires the exact Opus-medium standby profile" });
+    }
+    if (requirement.writingLaneCapacity !== 0) {
+      ctx.addIssue({ code: "custom", path: ["writingLaneCapacity"], message: "director-seat has no writing-lane capacity" });
+    }
+    if (canonicalJson(requirement.executedProfile) !== canonicalJson(directorSeatProfile)) {
+      ctx.addIssue({ code: "custom", path: ["executedProfile"], message: "director-seat requires the exact judgment profile" });
+    }
+  } else if (requirement.standbyProfile !== void 0 || requirement.writingLaneCapacity !== void 0) {
+    ctx.addIssue({ code: "custom", path: ["roleRequirementId"], message: "standby profile and writing capacity are reserved for director-seat" });
   }
 });
 var roleRequirementsSchema = external_exports.array(roleRequirementSchema).max(ROLE_IDS.length).superRefine((requirements, ctx) => {
@@ -18072,6 +18120,9 @@ function applyRoleGenerationSuccession(db, request, digest, context) {
     throw refusal("EXECUTION_PROFILE_MISMATCH", "holder executed profile does not match the role requirement");
   }
   const standbyProfile = request.standbyProfile;
+  if (resolved.requirement.standbyProfile && (!standbyProfile || !profileEquals(standbyProfile, resolved.requirement.standbyProfile))) {
+    throw refusal("ROLE_STANDBY_INVALID", "director-seat succession requires its configured Opus-medium standby profile");
+  }
   if (request.roleId === "project-orchestrator") {
     if (!standbyProfile || standbyProfile.providerId === context.profile.providerId) {
       throw refusal("ROLE_STANDBY_INVALID", "project-orchestrator succession requires a named standby from another provider");
@@ -18787,6 +18838,11 @@ function applyGithubIssueProjection(db, request, digest, adapter) {
     }
   }
 }
+function requireAssignmentWritingCapacity(requirement, assignmentKind) {
+  if (assignmentKind === "write" && requirement.writingLaneCapacity === 0) {
+    throw refusal("LANE_WRITER_EXISTS", "role requirement has no writing-lane capacity", { expected: 0, attempted: 0, verified: 0 });
+  }
+}
 var NATIVE_EVIDENCE_COLUMNS = [
   "thread_id",
   "provider_thread_id",
@@ -18996,10 +19052,12 @@ function preflightAssignmentPrepare(db, request) {
     throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment environment does not match the exact repository target");
   }
   requireCanonicalRoleGeneration(db, request.projectId, assignment.roleId, assignment.roleGeneration, assignment.roleRequirementId);
-  const requirement = roleRequirementsFromJson(storedConfigJson(db, request.projectId, configRevision)).find((candidate) => candidate.roleRequirementId === assignment.roleRequirementId);
+  const configJson = storedConfigJson(db, request.projectId, configRevision);
+  const requirement = roleRequirementsFromJson(configJson).find((candidate) => candidate.roleRequirementId === assignment.roleRequirementId);
   if (!requirement || requirement.roleId !== assignment.roleId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement is not configured");
   if (requirement.repoTargetId !== null && requirement.repoTargetId !== request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "assignment role requirement targets another repository");
   if (!profileEquals(requirement.executedProfile, assignment.requestedProfile)) throw refusal("EXECUTION_PROFILE_MISMATCH", "requested assignment profile does not match the role requirement");
+  requireAssignmentWritingCapacity(requirement, assignment.assignmentKind);
   if (assignment.assignmentKind === "write" && hasUnresolvedWriterTerminalConflict(db, request.projectId)) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "an unresolved terminal conflict blocks new writing admission");
   }
@@ -19011,7 +19069,7 @@ function preflightAssignmentPrepare(db, request) {
     `SELECT 1 FROM execution_attempts WHERE project_id = ? AND lane_id = ? AND origin = 'assignment'
      AND assignment_kind = 'write' AND state IN ${ACTIVE_ASSIGNMENT_SQL}`
   ).get(request.projectId, assignment.laneId);
-  const ceiling = writingLaneCeilingFromJson(storedConfigJson(db, request.projectId, configRevision));
+  const ceiling = writingLaneCeilingFromJson(configJson);
   if (assignment.assignmentKind === "write" && (laneOccupied || activeWriters >= ceiling)) {
     throw refusal("LANE_WRITER_EXISTS", "writing lane or project writing ceiling is occupied", { expected: ceiling, attempted: activeWriters, verified: activeWriters });
   }
@@ -19112,6 +19170,7 @@ function applyAssignmentPrepare(db, request, digest, inspection) {
   if (!requirement || requirement.roleId !== assignment.roleId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement is not configured");
   if (requirement.repoTargetId !== null && requirement.repoTargetId !== request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "assignment role requirement targets another repository");
   if (!profileEquals(requirement.executedProfile, assignment.requestedProfile)) throw refusal("EXECUTION_PROFILE_MISMATCH", "requested assignment profile does not match the role requirement");
+  requireAssignmentWritingCapacity(requirement, assignment.assignmentKind);
   if (assignment.assignmentKind === "write" && hasUnresolvedWriterTerminalConflict(db, request.projectId)) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "an unresolved terminal conflict blocks new writing admission");
   }
