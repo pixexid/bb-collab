@@ -3,19 +3,25 @@ name: Issue lifecycle
 on:
   pull_request_target:
     types: [closed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Merged pull request number to backfill
+        required: true
+        type: number
 
 permissions:
   contents: read
   issues: write
-  pull-requests: read
+  pull-requests: write
 
 concurrency:
-  group: issue-lifecycle-pr-${{ github.event.pull_request.number }}
+  group: issue-lifecycle-pr-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: false
 
 jobs:
   disposition:
-    if: github.event.pull_request.merged == true
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
