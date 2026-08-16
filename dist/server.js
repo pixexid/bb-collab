@@ -516,7 +516,7 @@ __export(core_exports2, {
   parse: () => parse,
   parseAsync: () => parseAsync,
   prettifyError: () => prettifyError,
-  process: () => process,
+  process: () => process2,
   regexes: () => regexes_exports,
   registry: () => registry,
   safeDecode: () => safeDecode,
@@ -10917,7 +10917,7 @@ function initializeContext(params) {
     external: params?.external ?? void 0
   };
 }
-function process(schema, ctx, _params = { path: [], schemaPath: [] }) {
+function process2(schema, ctx, _params = { path: [], schemaPath: [] }) {
   var _a2;
   const def = schema._zod.def;
   const seen = ctx.seen.get(schema);
@@ -10954,7 +10954,7 @@ function process(schema, ctx, _params = { path: [], schemaPath: [] }) {
     if (parent) {
       if (!result2.ref)
         result2.ref = parent;
-      process(parent, ctx, params);
+      process2(parent, ctx, params);
       ctx.seen.get(parent).isParent = true;
     }
   }
@@ -11235,14 +11235,14 @@ function isTransforming(_schema, _ctx) {
 }
 var createToJSONSchemaMethod = (schema, processors = {}) => (params) => {
   const ctx = initializeContext({ ...params, processors });
-  process(schema, ctx);
+  process2(schema, ctx);
   extractDefs(ctx, schema);
   return finalize(ctx, schema);
 };
 var createStandardJSONSchemaMethod = (schema, io, processors = {}) => (params) => {
   const { libraryOptions, target } = params ?? {};
   const ctx = initializeContext({ ...libraryOptions ?? {}, target, io, processors });
-  process(schema, ctx);
+  process2(schema, ctx);
   extractDefs(ctx, schema);
   return finalize(ctx, schema);
 };
@@ -11499,7 +11499,7 @@ var arrayProcessor = (schema, ctx, _json, params) => {
   if (typeof maximum === "number")
     json2.maxItems = maximum;
   json2.type = "array";
-  json2.items = process(def.element, ctx, { ...params, path: [...params.path, "items"] });
+  json2.items = process2(def.element, ctx, { ...params, path: [...params.path, "items"] });
 };
 var objectProcessor = (schema, ctx, _json, params) => {
   const json2 = _json;
@@ -11508,7 +11508,7 @@ var objectProcessor = (schema, ctx, _json, params) => {
   json2.properties = {};
   const shape = def.shape;
   for (const key in shape) {
-    json2.properties[key] = process(shape[key], ctx, {
+    json2.properties[key] = process2(shape[key], ctx, {
       ...params,
       path: [...params.path, "properties", key]
     });
@@ -11531,7 +11531,7 @@ var objectProcessor = (schema, ctx, _json, params) => {
     if (ctx.io === "output")
       json2.additionalProperties = false;
   } else if (def.catchall) {
-    json2.additionalProperties = process(def.catchall, ctx, {
+    json2.additionalProperties = process2(def.catchall, ctx, {
       ...params,
       path: [...params.path, "additionalProperties"]
     });
@@ -11540,7 +11540,7 @@ var objectProcessor = (schema, ctx, _json, params) => {
 var unionProcessor = (schema, ctx, json2, params) => {
   const def = schema._zod.def;
   const isExclusive = def.inclusive === false;
-  const options = def.options.map((x, i) => process(x, ctx, {
+  const options = def.options.map((x, i) => process2(x, ctx, {
     ...params,
     path: [...params.path, isExclusive ? "oneOf" : "anyOf", i]
   }));
@@ -11552,11 +11552,11 @@ var unionProcessor = (schema, ctx, json2, params) => {
 };
 var intersectionProcessor = (schema, ctx, json2, params) => {
   const def = schema._zod.def;
-  const a = process(def.left, ctx, {
+  const a = process2(def.left, ctx, {
     ...params,
     path: [...params.path, "allOf", 0]
   });
-  const b = process(def.right, ctx, {
+  const b = process2(def.right, ctx, {
     ...params,
     path: [...params.path, "allOf", 1]
   });
@@ -11573,11 +11573,11 @@ var tupleProcessor = (schema, ctx, _json, params) => {
   json2.type = "array";
   const prefixPath = ctx.target === "draft-2020-12" ? "prefixItems" : "items";
   const restPath = ctx.target === "draft-2020-12" ? "items" : ctx.target === "openapi-3.0" ? "items" : "additionalItems";
-  const prefixItems = def.items.map((x, i) => process(x, ctx, {
+  const prefixItems = def.items.map((x, i) => process2(x, ctx, {
     ...params,
     path: [...params.path, prefixPath, i]
   }));
-  const rest = def.rest ? process(def.rest, ctx, {
+  const rest = def.rest ? process2(def.rest, ctx, {
     ...params,
     path: [...params.path, restPath, ...ctx.target === "openapi-3.0" ? [def.items.length] : []]
   }) : null;
@@ -11617,7 +11617,7 @@ var recordProcessor = (schema, ctx, _json, params) => {
   const keyBag = keyType._zod.bag;
   const patterns = keyBag?.patterns;
   if (def.mode === "loose" && patterns && patterns.size > 0) {
-    const valueSchema = process(def.valueType, ctx, {
+    const valueSchema = process2(def.valueType, ctx, {
       ...params,
       path: [...params.path, "patternProperties", "*"]
     });
@@ -11627,12 +11627,12 @@ var recordProcessor = (schema, ctx, _json, params) => {
     }
   } else {
     if (ctx.target === "draft-07" || ctx.target === "draft-2020-12") {
-      json2.propertyNames = process(def.keyType, ctx, {
+      json2.propertyNames = process2(def.keyType, ctx, {
         ...params,
         path: [...params.path, "propertyNames"]
       });
     }
-    json2.additionalProperties = process(def.valueType, ctx, {
+    json2.additionalProperties = process2(def.valueType, ctx, {
       ...params,
       path: [...params.path, "additionalProperties"]
     });
@@ -11647,7 +11647,7 @@ var recordProcessor = (schema, ctx, _json, params) => {
 };
 var nullableProcessor = (schema, ctx, json2, params) => {
   const def = schema._zod.def;
-  const inner = process(def.innerType, ctx, params);
+  const inner = process2(def.innerType, ctx, params);
   const seen = ctx.seen.get(schema);
   if (ctx.target === "openapi-3.0") {
     seen.ref = def.innerType;
@@ -11658,20 +11658,20 @@ var nullableProcessor = (schema, ctx, json2, params) => {
 };
 var nonoptionalProcessor = (schema, ctx, _json, params) => {
   const def = schema._zod.def;
-  process(def.innerType, ctx, params);
+  process2(def.innerType, ctx, params);
   const seen = ctx.seen.get(schema);
   seen.ref = def.innerType;
 };
 var defaultProcessor = (schema, ctx, json2, params) => {
   const def = schema._zod.def;
-  process(def.innerType, ctx, params);
+  process2(def.innerType, ctx, params);
   const seen = ctx.seen.get(schema);
   seen.ref = def.innerType;
   json2.default = JSON.parse(JSON.stringify(def.defaultValue));
 };
 var prefaultProcessor = (schema, ctx, json2, params) => {
   const def = schema._zod.def;
-  process(def.innerType, ctx, params);
+  process2(def.innerType, ctx, params);
   const seen = ctx.seen.get(schema);
   seen.ref = def.innerType;
   if (ctx.io === "input")
@@ -11679,7 +11679,7 @@ var prefaultProcessor = (schema, ctx, json2, params) => {
 };
 var catchProcessor = (schema, ctx, json2, params) => {
   const def = schema._zod.def;
-  process(def.innerType, ctx, params);
+  process2(def.innerType, ctx, params);
   const seen = ctx.seen.get(schema);
   seen.ref = def.innerType;
   let catchValue;
@@ -11693,32 +11693,32 @@ var catchProcessor = (schema, ctx, json2, params) => {
 var pipeProcessor = (schema, ctx, _json, params) => {
   const def = schema._zod.def;
   const innerType = ctx.io === "input" ? def.in._zod.def.type === "transform" ? def.out : def.in : def.out;
-  process(innerType, ctx, params);
+  process2(innerType, ctx, params);
   const seen = ctx.seen.get(schema);
   seen.ref = innerType;
 };
 var readonlyProcessor = (schema, ctx, json2, params) => {
   const def = schema._zod.def;
-  process(def.innerType, ctx, params);
+  process2(def.innerType, ctx, params);
   const seen = ctx.seen.get(schema);
   seen.ref = def.innerType;
   json2.readOnly = true;
 };
 var promiseProcessor = (schema, ctx, _json, params) => {
   const def = schema._zod.def;
-  process(def.innerType, ctx, params);
+  process2(def.innerType, ctx, params);
   const seen = ctx.seen.get(schema);
   seen.ref = def.innerType;
 };
 var optionalProcessor = (schema, ctx, _json, params) => {
   const def = schema._zod.def;
-  process(def.innerType, ctx, params);
+  process2(def.innerType, ctx, params);
   const seen = ctx.seen.get(schema);
   seen.ref = def.innerType;
 };
 var lazyProcessor = (schema, ctx, _json, params) => {
   const innerType = schema._zod.innerType;
-  process(innerType, ctx, params);
+  process2(innerType, ctx, params);
   const seen = ctx.seen.get(schema);
   seen.ref = innerType;
 };
@@ -11770,7 +11770,7 @@ function toJSONSchema(input, params) {
     const defs = {};
     for (const entry of registry2._idmap.entries()) {
       const [_, schema] = entry;
-      process(schema, ctx2);
+      process2(schema, ctx2);
     }
     const schemas = {};
     const external = {
@@ -11793,7 +11793,7 @@ function toJSONSchema(input, params) {
     return { schemas };
   }
   const ctx = initializeContext({ ...params, processors: allProcessors });
-  process(input, ctx);
+  process2(input, ctx);
   extractDefs(ctx, input);
   return finalize(ctx, input);
 }
@@ -11851,7 +11851,7 @@ var JSONSchemaGenerator = class {
    * This must be called before emit().
    */
   process(schema, _params = { path: [], schemaPath: [] }) {
-    return process(schema, this.ctx, _params);
+    return process2(schema, this.ctx, _params);
   }
   /**
    * Emit the final JSON Schema after processing.
@@ -20600,7 +20600,7 @@ function readRoleHolderStates(db) {
        ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`
   ).all();
 }
-function openLaneViews(db, now2 = Date.now(), operatorWaits = /* @__PURE__ */ new Map()) {
+function openLaneViews(db, now2 = Date.now(), operatorWaits = /* @__PURE__ */ new Map(), registeredWaiters = /* @__PURE__ */ new Set()) {
   const lanes = readLaneStates(db).filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state)).map((lane) => {
     const operatorWait = lane.thread_id ? operatorWaits.get(lane.thread_id) ?? null : null;
     return {
@@ -20613,7 +20613,7 @@ function openLaneViews(db, now2 = Date.now(), operatorWaits = /* @__PURE__ */ ne
       executionAttemptId: lane.execution_attempt_id,
       attemptState: lane.attempt_state,
       workerStatus: null,
-      waitingOn: operatorWait?.reason ?? (lane.terminal_report_digest === null ? "terminal receipt" : null),
+      waitingOn: operatorWait?.reason ?? (lane.thread_id !== null && registeredWaiters.has(lane.thread_id) ? "registered wait" : lane.terminal_report_digest === null ? "terminal receipt" : null),
       ageMs: Math.max(0, now2 - lane.created_at_ms),
       tone: lane.attempt_state === "running" ? "running" : "default",
       queueState: operatorWait ? "deferred" : lane.attempt_state === "running" ? "running" : "ready",
@@ -20719,6 +20719,14 @@ function createLaneWatcher(options) {
     roleAlert(role);
     options.onRoleSuccessionRequired?.(role);
   };
+  const readRegisteredWaitForSafe = async (threadId) => {
+    if (!options.readRegisteredWaitFor) return false;
+    try {
+      return await options.readRegisteredWaitFor(threadId);
+    } catch {
+      return true;
+    }
+  };
   const observeRoleNow = async (threadId, suppliedScopes) => {
     if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return;
     let holders;
@@ -20757,7 +20765,7 @@ function createLaneWatcher(options) {
       } catch {
         continue;
       }
-      if (observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || !scope?.nextStartable || scope.deferredReason) {
+      if (observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || await readRegisteredWaitForSafe(targetThreadId) || !scope?.nextStartable || scope.deferredReason) {
         await roleIdleLedger.clearPrefixExcept(prefix);
         continue;
       }
@@ -20835,7 +20843,8 @@ function createLaneWatcher(options) {
     }
     let waiting = pendingExternalWait ?? false;
     if (operatorWait) waiting = true;
-    if (!archived && status === "idle" && pendingExternalWait === void 0 && !operatorWait && options.isExternallyWaiting) {
+    if (!archived && status === "idle" && await readRegisteredWaitForSafe(threadId)) waiting = true;
+    if (!archived && status === "idle" && pendingExternalWait === void 0 && !operatorWait && !waiting && options.isExternallyWaiting) {
       try {
         waiting = await options.isExternallyWaiting(threadId);
       } catch {
@@ -20973,7 +20982,475 @@ function subscribeToThreadChanges(sdk, observe) {
   }
 }
 
+// src/registered-waits.ts
+import { createHash as createHash2 } from "node:crypto";
+import { homedir } from "node:os";
+import { join } from "node:path";
+var WAIT_EVENT_TYPES = ["source_terminal", "operator_response", "external_event"];
+var DEFAULT_WAIT_DEADLINES_MS = {
+  source_terminal: 8 * 60 * 6e4,
+  operator_response: 4 * 60 * 6e4,
+  external_event: 24 * 60 * 6e4
+};
+var MAX_WAIT_DEADLINE_MS = 7 * 24 * 60 * 6e4;
+var MAX_ACTIVE_WAITS = 128;
+var MAX_TERMINAL_WAIT_HISTORY = 256;
+var MAX_WAIT_STEERS = 2;
+var WAIT_STEER_GRACE_MS = 5 * 6e4;
+var WAIT_ESCALATION_RETENTION_MS = 7 * 24 * 60 * 6e4;
+var LIVENESS_STALE_MS = 5 * 6e4;
+var THREAD_STATUSES = /* @__PURE__ */ new Set(["active", "idle", "error", "starting", "stopping"]);
+var WAIT_REGISTRY_KV_KEY = "wait-registry.waits";
+var WAIT_ESCALATION_KV_KEY = "wait-registry.escalation";
+var LIVENESS_MARKER_FILENAME = "wait-validator.liveness";
+var LIVENESS_ALERT_FLAG_FILENAME = "wait-validator.alerted";
+function waitValidatorStateDir() {
+  return process.env.BB_COLLAB_VALIDATOR_STATE_DIR ?? join(homedir(), ".bb", "bb-collab");
+}
+function isPlainObject2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function nonEmptyString(value, max = 256) {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= max;
+}
+function optionalString(value) {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+function waitIdFor(projectId, idempotencyKey) {
+  return createHash2("sha256").update(`${projectId}
+${idempotencyKey}`).digest("hex").slice(0, 40);
+}
+function parseRegisteredWait(value) {
+  if (!isPlainObject2(value)) throw new Error("invalid registered wait");
+  const {
+    waitId,
+    projectId,
+    waiterThreadId,
+    eventType,
+    sourceThreadId,
+    reason,
+    overrideReason,
+    deadlineMs,
+    createdAtMs,
+    idempotencyKey
+  } = value;
+  if (!nonEmptyString(waitId, 64) || !nonEmptyString(projectId) || !nonEmptyString(waiterThreadId) || !WAIT_EVENT_TYPES.includes(eventType) || !(sourceThreadId === null || nonEmptyString(sourceThreadId)) || !nonEmptyString(reason, 2048) || !(overrideReason === null || nonEmptyString(overrideReason, 2048)) || !Number.isInteger(deadlineMs) || deadlineMs <= 0 || !Number.isInteger(createdAtMs) || createdAtMs < 0 || !nonEmptyString(idempotencyKey, 256)) throw new Error("invalid registered wait");
+  return {
+    waitId,
+    projectId,
+    waiterThreadId,
+    eventType,
+    sourceThreadId,
+    reason,
+    overrideReason,
+    deadlineMs,
+    createdAtMs,
+    idempotencyKey
+  };
+}
+function parseTerminalWait(value) {
+  if (!isPlainObject2(value)) throw new Error("invalid terminal wait record");
+  const { waitId, projectId, waiterThreadId, outcome, reason, detail, endedAtMs } = value;
+  if (!nonEmptyString(waitId, 64) || !nonEmptyString(projectId) || !nonEmptyString(waiterThreadId) || outcome !== "fired" && outcome !== "cancelled" || !(reason === null || nonEmptyString(reason, 64)) || !(detail === null || nonEmptyString(detail, 256)) || !Number.isInteger(endedAtMs) || endedAtMs < 0) throw new Error("invalid terminal wait record");
+  return {
+    waitId,
+    projectId,
+    waiterThreadId,
+    outcome,
+    reason,
+    detail,
+    endedAtMs
+  };
+}
+function waitRegistryState(input) {
+  if (!isPlainObject2(input)) {
+    if (input === void 0 || input === null) return { active: [], terminal: [] };
+    throw new Error("invalid wait registry state");
+  }
+  if (!Array.isArray(input.active) || !Array.isArray(input.terminal)) throw new Error("invalid wait registry state");
+  return {
+    active: input.active.map(parseRegisteredWait),
+    terminal: input.terminal.map(parseTerminalWait)
+  };
+}
+function parseWaitSteerRecord(value) {
+  if (!isPlainObject2(value)) throw new Error("invalid wait escalation state");
+  const {
+    waitId,
+    projectId,
+    waiterThreadId,
+    reason,
+    detail,
+    firedAtMs,
+    steers,
+    failedSteers,
+    lastSteerAtMs,
+    delivered,
+    escalated
+  } = value;
+  if (!nonEmptyString(waitId, 64) || !nonEmptyString(projectId) || !nonEmptyString(waiterThreadId) || reason !== "source_terminal" && reason !== "deadline_exceeded" || !(detail === null || nonEmptyString(detail, 256)) || !Number.isInteger(firedAtMs) || firedAtMs < 0 || !Number.isInteger(steers) || steers < 0 || steers > MAX_WAIT_STEERS || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > MAX_WAIT_STEERS || !(lastSteerAtMs === null || Number.isInteger(lastSteerAtMs) && lastSteerAtMs >= 0) || typeof delivered !== "boolean" || typeof escalated !== "boolean" || escalated && steers < MAX_WAIT_STEERS && !(failedSteers === MAX_WAIT_STEERS)) throw new Error("invalid wait escalation state");
+  return {
+    waitId,
+    projectId,
+    waiterThreadId,
+    reason,
+    detail,
+    firedAtMs,
+    steers,
+    failedSteers,
+    lastSteerAtMs,
+    delivered,
+    escalated
+  };
+}
+function waitEscalationState(input) {
+  if (!isPlainObject2(input)) {
+    if (input === void 0 || input === null) return {};
+    throw new Error("invalid wait escalation state");
+  }
+  const state = {};
+  for (const [key, value] of Object.entries(input)) state[key] = parseWaitSteerRecord(value);
+  return state;
+}
+function resolveWaitDeadline(input) {
+  const defaults = DEFAULT_WAIT_DEADLINES_MS[input.eventType];
+  if (input.deadlineMs === void 0) {
+    if (defaults === void 0) return { ok: false, message: "wait has no deadline: unknown event type has no default deadline" };
+    return { ok: true, deadlineMs: input.now + defaults, overrideReason: null };
+  }
+  if (input.deadlineMs === null) return { ok: false, message: "wait without a deadline is refused: every wait must be bounded" };
+  if (typeof input.deadlineMs !== "number" || !Number.isInteger(input.deadlineMs)) {
+    return { ok: false, message: "wait deadline must be an integer millisecond timestamp" };
+  }
+  if (input.deadlineMs <= input.now) return { ok: false, message: "wait deadline must be in the future" };
+  if (input.deadlineMs > input.now + MAX_WAIT_DEADLINE_MS) {
+    return { ok: false, message: `wait deadline exceeds the ${MAX_WAIT_DEADLINE_MS}ms horizon` };
+  }
+  if (!nonEmptyString(input.overrideReason, 2048)) {
+    return { ok: false, message: "an explicit wait deadline override requires a reason" };
+  }
+  return { ok: true, deadlineMs: input.deadlineMs, overrideReason: input.overrideReason };
+}
+function sameWaitBinding(left, right) {
+  return left.projectId === right.projectId && left.waiterThreadId === right.waiterThreadId && left.eventType === right.eventType && left.sourceThreadId === right.sourceThreadId && left.idempotencyKey === right.idempotencyKey;
+}
+function createWaitRegistry(options) {
+  const now2 = options.now ?? Date.now;
+  const maxActive = Number.isInteger(options.maxActive) && (options.maxActive ?? 0) > 0 ? options.maxActive : MAX_ACTIVE_WAITS;
+  let state = null;
+  let queue = Promise.resolve();
+  const enqueue = (work) => {
+    const result2 = queue.then(work);
+    queue = result2.then(() => void 0, () => void 0);
+    return result2;
+  };
+  const loaded = async () => {
+    if (!state) state = waitRegistryState(options.persistence ? await options.persistence.read() : null);
+    return state;
+  };
+  const save = async () => {
+    if (options.persistence && state) await options.persistence.write(structuredClone(state));
+  };
+  const terminalizeWait = async (waitId, outcome, reason, detail) => {
+    const current = await loaded();
+    const index = current.active.findIndex((candidate) => candidate.waitId === waitId);
+    if (index < 0) return false;
+    const wait = current.active[index];
+    current.active.splice(index, 1);
+    current.terminal.push({
+      waitId: wait.waitId,
+      projectId: wait.projectId,
+      waiterThreadId: wait.waiterThreadId,
+      outcome,
+      reason,
+      detail,
+      endedAtMs: now2()
+    });
+    if (current.terminal.length > MAX_TERMINAL_WAIT_HISTORY) {
+      current.terminal.splice(0, current.terminal.length - MAX_TERMINAL_WAIT_HISTORY);
+    }
+    await save();
+    return true;
+  };
+  return {
+    recover: () => enqueue(async () => {
+      await loaded();
+    }),
+    register: (input, ctxThreadId) => enqueue(async () => {
+      if (!isPlainObject2(input)) return { outcome: "refused", message: "wait registration must be a JSON object" };
+      const current = await loaded();
+      const projectId = nonEmptyString(input.projectId) ? input.projectId : null;
+      if (!projectId) return { outcome: "refused", message: "projectId is required" };
+      if (!nonEmptyString(input.idempotencyKey)) return { outcome: "refused", message: "idempotencyKey is required" };
+      let waiterThreadId = nonEmptyString(input.waiterThreadId) ? input.waiterThreadId : null;
+      if (ctxThreadId !== void 0) {
+        if (waiterThreadId !== null && waiterThreadId !== ctxThreadId) {
+          return { outcome: "refused", message: "waiterThreadId does not match the calling thread" };
+        }
+        waiterThreadId = ctxThreadId;
+      }
+      if (!waiterThreadId) return { outcome: "refused", message: "waiterThreadId is required" };
+      const eventType = input.eventType;
+      if (!WAIT_EVENT_TYPES.includes(eventType)) {
+        return { outcome: "refused", message: `eventType must be one of ${WAIT_EVENT_TYPES.join(", ")}` };
+      }
+      if (!nonEmptyString(input.reason, 2048)) return { outcome: "refused", message: "reason is required: name what the wait is waiting for" };
+      let sourceThreadId = optionalString(input.sourceThreadId);
+      if (eventType === "source_terminal") {
+        if (!sourceThreadId) return { outcome: "refused", message: "source_terminal waits require sourceThreadId" };
+      } else if (sourceThreadId !== null) {
+        return { outcome: "refused", message: "only source_terminal waits carry sourceThreadId" };
+      }
+      const deadline = resolveWaitDeadline({
+        eventType,
+        deadlineMs: input.deadlineMs === null ? null : input.deadlineMs,
+        overrideReason: input.overrideReason,
+        now: now2()
+      });
+      if (!deadline.ok) return { outcome: "refused", message: deadline.message };
+      const waitId = waitIdFor(projectId, input.idempotencyKey);
+      const activeMatch = current.active.find((candidate) => candidate.waitId === waitId) ?? null;
+      if (activeMatch) {
+        return sameWaitBinding(activeMatch, {
+          projectId,
+          waiterThreadId,
+          eventType,
+          sourceThreadId,
+          idempotencyKey: input.idempotencyKey
+        }) ? { outcome: "registered", wait: structuredClone(activeMatch), replay: true } : { outcome: "refused", message: "idempotency key is already bound to a different wait" };
+      }
+      if (current.terminal.some((record2) => record2.waitId === waitId)) {
+        return { outcome: "refused", message: "idempotency key was already consumed by a terminal wait" };
+      }
+      if (current.active.length >= maxActive) {
+        return { outcome: "refused", message: `wait registry is full: at most ${maxActive} active waits` };
+      }
+      if (eventType === "source_terminal") {
+        if (!options.readSource) return { outcome: "refused", message: "source liveness cannot be verified" };
+        let observation;
+        try {
+          observation = await options.readSource(sourceThreadId);
+        } catch {
+          observation = null;
+        }
+        if (observation === null) return { outcome: "refused", message: `source thread ${sourceThreadId} is unknown: waits on an unverifiable source are refused` };
+        if (observation.archived) return { outcome: "refused", message: `source thread ${sourceThreadId} is already archived: act on its outcome instead of waiting` };
+        if (!THREAD_STATUSES.has(observation.status)) return { outcome: "refused", message: `source thread ${sourceThreadId} has unknown status ${String(observation.status)}` };
+        if (observation.status === "error") return { outcome: "refused", message: `source thread ${sourceThreadId} has already failed: act on its failure instead of waiting` };
+      }
+      const wait = {
+        waitId,
+        projectId,
+        waiterThreadId,
+        eventType,
+        sourceThreadId,
+        reason: input.reason,
+        overrideReason: deadline.overrideReason,
+        deadlineMs: deadline.deadlineMs,
+        createdAtMs: now2(),
+        idempotencyKey: input.idempotencyKey
+      };
+      current.active.push(wait);
+      await save();
+      return { outcome: "registered", wait: structuredClone(wait), replay: false };
+    }),
+    cancel: (input, ctxThreadId) => enqueue(async () => {
+      if (!isPlainObject2(input)) return { outcome: "refused", message: "wait cancellation must be a JSON object" };
+      const current = await loaded();
+      const projectId = nonEmptyString(input.projectId) ? input.projectId : null;
+      const waitId = nonEmptyString(input.waitId, 64) ? input.waitId : null;
+      if (!projectId || !waitId) return { outcome: "refused", message: "projectId and waitId are required" };
+      const index = current.active.findIndex((candidate) => candidate.projectId === projectId && candidate.waitId === waitId);
+      if (index < 0) return { outcome: "refused", message: "unknown waitId for this project" };
+      const wait = current.active[index];
+      if (ctxThreadId !== void 0 && ctxThreadId !== wait.waiterThreadId) {
+        return { outcome: "refused", message: "only the waiter thread may cancel its registered wait" };
+      }
+      current.active.splice(index, 1);
+      current.terminal.push({
+        waitId: wait.waitId,
+        projectId: wait.projectId,
+        waiterThreadId: wait.waiterThreadId,
+        outcome: "cancelled",
+        reason: null,
+        detail: null,
+        endedAtMs: now2()
+      });
+      if (current.terminal.length > MAX_TERMINAL_WAIT_HISTORY) {
+        current.terminal.splice(0, current.terminal.length - MAX_TERMINAL_WAIT_HISTORY);
+      }
+      await save();
+      return { outcome: "cancelled", waitId: wait.waitId };
+    }),
+    list: () => enqueue(async () => structuredClone(await loaded())),
+    activeWaitsFor: (threadId) => enqueue(async () => (await loaded()).active.filter((wait) => wait.waiterThreadId === threadId).map((wait) => structuredClone(wait))),
+    activeWaiterThreadIds: () => enqueue(async () => new Set((await loaded()).active.map((wait) => wait.waiterThreadId))),
+    terminalizeWait: (waitId, outcome, reason, detail) => enqueue(() => terminalizeWait(waitId, outcome, reason, detail))
+  };
+}
+function evaluateRegisteredWaits(waits, sources, sourceTerminals, now2) {
+  const fires = [];
+  for (const wait of waits) {
+    if (wait.eventType === "source_terminal" && wait.sourceThreadId !== null) {
+      const observation = sources.get(wait.sourceThreadId) ?? null;
+      if (observation !== null) {
+        if (observation.archived) {
+          fires.push({ wait, reason: "source_terminal", detail: "source archived" });
+          continue;
+        }
+        if (observation.status === "error") {
+          fires.push({ wait, reason: "source_terminal", detail: "source error" });
+          continue;
+        }
+        const laneTerminal = sourceTerminals.get(wait.sourceThreadId);
+        if (laneTerminal !== void 0) {
+          fires.push({ wait, reason: "source_terminal", detail: laneTerminal });
+          continue;
+        }
+      }
+    }
+    if (now2 >= wait.deadlineMs) fires.push({ wait, reason: "deadline_exceeded", detail: `deadline ${wait.deadlineMs}` });
+  }
+  return fires;
+}
+function livenessState(markerAtMs, now2, staleMs = LIVENESS_STALE_MS) {
+  if (markerAtMs === null || !Number.isFinite(markerAtMs)) return "missing";
+  return now2 - markerAtMs >= staleMs ? "stale" : "fresh";
+}
+function livenessDecision(state, alerted) {
+  if (state === "fresh") return alerted ? "clear-alert-flag" : "silent";
+  if (state === "stale") return alerted ? "silent" : "alert-once";
+  return "silent";
+}
+function createWaitValidator(options) {
+  const now2 = options.now ?? Date.now;
+  const graceMs = Number.isInteger(options.graceMs) && (options.graceMs ?? 0) >= 0 ? options.graceMs : WAIT_STEER_GRACE_MS;
+  const maxSteers = Number.isInteger(options.maxSteers) && (options.maxSteers ?? 0) > 0 ? options.maxSteers : MAX_WAIT_STEERS;
+  let escalations = null;
+  let queue = Promise.resolve();
+  const enqueue = (work) => {
+    const result2 = queue.then(work);
+    queue = result2.then(() => void 0, () => void 0);
+    return result2;
+  };
+  const loaded = async () => {
+    if (!escalations) escalations = waitEscalationState(options.escalationPersistence ? await options.escalationPersistence.read() : null);
+    return escalations;
+  };
+  const save = async () => {
+    if (options.escalationPersistence && escalations) await options.escalationPersistence.write(structuredClone(escalations));
+  };
+  const observeSource = async (threadId) => {
+    try {
+      return await options.readSource(threadId);
+    } catch {
+      return null;
+    }
+  };
+  return {
+    recover: () => enqueue(async () => {
+      await loaded();
+    }),
+    cycle: () => enqueue(async () => {
+      const currentNow = now2();
+      const registry2 = await options.registry.list();
+      const summary = {
+        outcome: "OK",
+        subject: "wait-validator",
+        evaluated: registry2.active.length,
+        held: registry2.active.length,
+        fired: 0,
+        steered: 0,
+        escalated: 0,
+        alerts: 0
+      };
+      const records = await loaded();
+      const sourceIds = new Set(
+        registry2.active.filter((wait) => wait.eventType === "source_terminal" && wait.sourceThreadId !== null).map((wait) => wait.sourceThreadId)
+      );
+      const sources = /* @__PURE__ */ new Map();
+      for (const sourceId of sourceIds) sources.set(sourceId, await observeSource(sourceId));
+      const sourceTerminals = options.readSourceTerminals();
+      for (const fire of evaluateRegisteredWaits(registry2.active, sources, sourceTerminals, currentNow)) {
+        if (records[fire.wait.waitId]) continue;
+        const record2 = {
+          waitId: fire.wait.waitId,
+          projectId: fire.wait.projectId,
+          waiterThreadId: fire.wait.waiterThreadId,
+          reason: fire.reason,
+          detail: fire.detail,
+          firedAtMs: currentNow,
+          steers: 0,
+          failedSteers: 0,
+          lastSteerAtMs: null,
+          delivered: false,
+          escalated: false
+        };
+        records[record2.waitId] = record2;
+        await save();
+        const terminalized = await options.registry.terminalizeWait(fire.wait.waitId, "fired", fire.reason, fire.detail);
+        if (!terminalized) continue;
+        summary.held -= 1;
+        summary.fired += 1;
+        summary.alerts += 1;
+        options.onFire?.(record2);
+      }
+      for (const record2 of Object.values(records)) {
+        if (currentNow - record2.firedAtMs > WAIT_ESCALATION_RETENTION_MS) {
+          delete records[record2.waitId];
+          await save();
+          continue;
+        }
+        if (record2.delivered || record2.escalated) continue;
+        let observation;
+        try {
+          observation = await options.readWaiter(record2.waiterThreadId);
+        } catch {
+          continue;
+        }
+        if (observation === null) continue;
+        if (observation.status === "active") {
+          record2.delivered = true;
+          await save();
+          continue;
+        }
+        const steerAgeMs = record2.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : currentNow - record2.lastSteerAtMs;
+        if (steerAgeMs < graceMs) continue;
+        if (record2.steers >= maxSteers) {
+          record2.escalated = true;
+          await save();
+          summary.escalated += 1;
+          summary.alerts += 1;
+          options.onEscalate?.(record2);
+          continue;
+        }
+        let failed = false;
+        try {
+          await options.steerWaiter(record2);
+        } catch {
+          failed = true;
+        }
+        record2.steers = Math.min(maxSteers, record2.steers + 1);
+        if (failed) record2.failedSteers = Math.min(maxSteers, record2.failedSteers + 1);
+        record2.lastSteerAtMs = currentNow;
+        await save();
+        summary.steered += 1;
+        if (record2.steers >= maxSteers && record2.failedSteers >= maxSteers) {
+          record2.escalated = true;
+          await save();
+          summary.escalated += 1;
+          summary.alerts += 1;
+          options.onEscalate?.(record2);
+        }
+      }
+      return summary;
+    })
+  };
+}
+
 // server.ts
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { join as join2 } from "node:path";
 var projectIdSchema = external_exports.string().trim().min(1).max(256);
 var mutationReceiptSchema = external_exports.object({
   projectId: projectIdSchema,
@@ -21342,12 +21819,83 @@ async function applyLiveAuthorizedMutation(bb, db, input) {
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
   return applyAuthorizedMutation(db, input, null, reader);
 }
-async function runCli(db, bb, argv, _ctx) {
+async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply"].includes(command)) return invalidCli("expected doctor, export, or apply");
+  if (!command || !["doctor", "export", "apply", "wait-register", "wait-cancel", "wait-list", "wait-validator"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, wait-register, wait-cancel, wait-list, or wait-validator");
+  }
+  if (command === "wait-validator") {
+    const unknown3 = args.find((arg) => arg !== "--cycle");
+    if (unknown3) return invalidCli(`unexpected argument ${unknown3}`);
+    if (!args.includes("--cycle")) return invalidCli("--cycle is required: the validator runs exactly one durable cycle per invocation");
+    try {
+      await deps.watcher.poll();
+      const summary = await deps.waitValidator.cycle();
+      return cliResult({
+        outcome: "OK",
+        subject: "wait-validator",
+        expected: summary.evaluated,
+        attempted: summary.fired + summary.steered,
+        verified: summary.fired,
+        message: "durable wait validation cycle complete",
+        evidence: summary
+      });
+    } catch (error48) {
+      return cliResult({
+        outcome: "INTERNAL_ERROR",
+        subject: "wait-validator",
+        expected: 1,
+        attempted: 0,
+        verified: 0,
+        message: error48 instanceof Error ? error48.message : String(error48)
+      });
+    }
+  }
   const projectId = parseFlag(args, "--project");
   if (!projectId) return invalidCli("--project PROJECT_ID is required; CLI context is never used as a fallback");
+  if (command === "wait-register" || command === "wait-cancel") {
+    const unknown3 = unexpectedFlags(args, ["--project", "--request"]);
+    if (unknown3) return invalidCli(`unexpected flag ${unknown3}`);
+    const requestJson = parseFlag(args, "--request");
+    if (!requestJson) return invalidCli("--request JSON is required");
+    let request;
+    try {
+      request = JSON.parse(requestJson);
+    } catch (error48) {
+      return invalidCli(error48 instanceof Error ? error48.message : String(error48));
+    }
+    const result2 = command === "wait-register" ? await deps.waitRegistry.register(request, ctx.threadId).catch(() => null) : await deps.waitRegistry.cancel(request, ctx.threadId).catch(() => null);
+    if (result2 === null) {
+      return cliResult({ outcome: "INTERNAL_ERROR", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "wait registry state is unreadable; refusing fail closed" });
+    }
+    if (result2.outcome === "refused") {
+      return cliResult({ outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message: result2.message });
+    }
+    return cliResult({
+      outcome: "OK",
+      subject: projectId,
+      expected: 1,
+      attempted: 1,
+      verified: 1,
+      message: result2.outcome === "registered" ? result2.replay ? "registered wait replayed idempotently" : "registered wait persisted" : "registered wait cancelled",
+      evidence: result2.outcome === "registered" ? { wait: result2.wait } : { waitId: result2.waitId }
+    });
+  }
+  if (command === "wait-list") {
+    const unknown3 = unexpectedFlags(args, ["--project"]);
+    if (unknown3) return invalidCli(`unexpected flag ${unknown3}`);
+    const state = await deps.waitRegistry.list();
+    return cliResult({
+      outcome: "OK",
+      subject: projectId,
+      expected: state.active.length,
+      attempted: state.active.length,
+      verified: state.active.length,
+      message: `${state.active.length} active registered waits`,
+      evidence: state
+    });
+  }
   if (command === "apply") {
     const unknown3 = unexpectedFlags(args, ["--project", "--request"]);
     if (unknown3) return invalidCli(`unexpected flag ${unknown3}`);
@@ -21449,6 +21997,60 @@ async function plugin(bb) {
       openLaneViews(db, Date.now(), operatorWaits)
     );
   };
+  const readThreadObservation = async (threadId) => {
+    const thread = await bb.sdk.threads.get({ threadId });
+    return thread.archivedAt !== null || thread.deletedAt !== null ? { status: thread.status, archived: true } : { status: thread.status, archived: false };
+  };
+  const waitRegistry = createWaitRegistry({
+    persistence: {
+      read: () => bb.storage.kv.get(WAIT_REGISTRY_KV_KEY),
+      write: (state) => bb.storage.kv.set(WAIT_REGISTRY_KV_KEY, state)
+    },
+    readSource: readThreadObservation
+  });
+  const waitValidator = createWaitValidator({
+    registry: waitRegistry,
+    escalationPersistence: {
+      read: () => bb.storage.kv.get(WAIT_ESCALATION_KV_KEY),
+      write: (state) => bb.storage.kv.set(WAIT_ESCALATION_KV_KEY, state)
+    },
+    readSource: readThreadObservation,
+    readWaiter: readThreadObservation,
+    readSourceTerminals: () => {
+      const terminals = /* @__PURE__ */ new Map();
+      if (!db) return terminals;
+      for (const lane of readLaneStates(db)) {
+        if (!lane.thread_id) continue;
+        if (!OPEN_ATTEMPT_STATES.has(lane.attempt_state)) terminals.set(lane.thread_id, `attempt ${lane.attempt_state}`);
+        else if (lane.terminal_report_digest !== null) terminals.set(lane.thread_id, "terminal receipt");
+      }
+      return terminals;
+    },
+    steerWaiter: async (target) => {
+      await bb.sdk.threads.send({
+        threadId: target.waiterThreadId,
+        mode: "steer",
+        input: [
+          {
+            type: "text",
+            visibility: "agent-only",
+            text: `Registered wait ${target.waitId} fired (${target.reason}${target.detail ? `: ${target.detail}` : ""}). Wake: inspect what you were waiting on, act on it, and record the next step or blocker.`,
+            mentions: []
+          }
+        ]
+      });
+    },
+    onFire: (record2) => {
+      bb.log.warn(`registered wait fired: ${record2.waitId} (${record2.reason}${record2.detail ? `: ${record2.detail}` : ""})`);
+      bb.realtime.publish("wait-validator", { fired: record2.waitId, reason: record2.reason });
+    },
+    onEscalate: (record2) => {
+      bb.log.error(`registered wait escalation: waiter ${record2.waiterThreadId} ignored ${record2.steers} steers for ${record2.waitId}; succession trigger`);
+      bb.realtime.publish("wait-validator", { escalated: record2.waitId, waiterThreadId: record2.waiterThreadId, successionTrigger: true });
+    }
+  });
+  await waitRegistry.recover().catch((error48) => bb.log.error(`wait registry state is unreadable: ${String(error48)}`));
+  await waitValidator.recover().catch((error48) => bb.log.error(`wait escalation state is unreadable: ${String(error48)}`));
   const watcher = createLaneWatcher({
     readLanes: () => db ? readLaneStates(db) : [],
     readRoleHolders: () => db ? readRoleHolderStates(db) : [],
@@ -21461,6 +22063,7 @@ async function plugin(bb) {
     onRoleSuccessionRequired: (role) => bb.log.warn(`role succession required: ${role.roleId}@${role.roleGeneration}`),
     isExternallyWaiting: readPendingExternalWait,
     readOperatorWait: readPendingOperatorWaitForThread,
+    readRegisteredWaitFor: async (threadId) => (await waitRegistry.activeWaitsFor(threadId)).length > 0,
     readWorker: async (threadId) => {
       const thread = await bb.sdk.threads.get({ threadId });
       const archived = thread.archivedAt !== null || thread.deletedAt !== null;
@@ -21529,6 +22132,7 @@ async function plugin(bb) {
     async start(signal) {
       while (!signal.aborted) {
         await watcher.poll().catch((error48) => bb.log.warn(`lane poll failed: ${String(error48)}`));
+        await waitValidator.cycle().catch((error48) => bb.log.warn(`wait validation failed: ${String(error48)}`));
         if (signal.aborted) break;
         await new Promise((resolve) => {
           let timer;
@@ -21543,13 +22147,38 @@ async function plugin(bb) {
       }
     }
   });
+  bb.background.schedule("wait-validator-liveness", "*/5 * * * *", async () => {
+    try {
+      const stateDir = waitValidatorStateDir();
+      const markerPath = join2(stateDir, LIVENESS_MARKER_FILENAME);
+      const flagPath = join2(stateDir, LIVENESS_ALERT_FLAG_FILENAME);
+      let markerAtMs = null;
+      try {
+        const parsed = Number(readFileSync(markerPath, "utf8").trim());
+        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync(markerPath).mtimeMs;
+      } catch {
+        markerAtMs = null;
+      }
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now()), existsSync(flagPath));
+      if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
+      if (decision === "alert-once") {
+        mkdirSync(stateDir, { recursive: true });
+        writeFileSync(flagPath, String(Date.now()));
+        bb.log.error("wait-validator liveness marker is stale: host launchd supervision failed; operator attention required");
+        bb.realtime.publish("wait-validator", { liveness: "stale", alert: "operator-once" });
+      }
+    } catch (error48) {
+      bb.log.warn(`wait-validator liveness check failed: ${String(error48)}`);
+    }
+  });
   const readOpenLaneViews = async () => {
     if (!db) return [];
     const requests = await readOperatorReceiptRequests(bb);
     return openLaneViews(
       db,
       Date.now(),
-      new Map(requests.map((request) => [request.callerThreadId, { reason: "awaiting_operator", createdAtMs: request.createdAt }]))
+      new Map(requests.map((request) => [request.callerThreadId, { reason: "awaiting_operator", createdAtMs: request.createdAt }])),
+      await waitRegistry.activeWaiterThreadIds()
     );
   };
   bb.http.route(
@@ -21788,10 +22417,22 @@ async function plugin(bb) {
         name: "apply",
         summary: "Explicit foundation apply (exact one-request receipt required)",
         usage: "bb collab apply --project PROJECT_ID --request JSON"
+      },
+      {
+        name: "wait-register",
+        summary: "Register one bounded durable wait (deadline mandatory, fail closed)",
+        usage: "bb collab wait-register --project PROJECT_ID --request JSON"
+      },
+      { name: "wait-cancel", summary: "Cancel one active registered wait", usage: "bb collab wait-cancel --project PROJECT_ID --request JSON" },
+      { name: "wait-list", summary: "List registered waits (read-only)", usage: "bb collab wait-list --project PROJECT_ID" },
+      {
+        name: "wait-validator",
+        summary: "Run one durable wait-validator cycle (host-supervised seam)",
+        usage: "bb collab wait-validator --cycle"
       }
     ],
     run(argv, context) {
-      return runCli(db, bb, argv, context);
+      return runCli(db, bb, argv, context, { waitRegistry, waitValidator, watcher });
     }
   });
   bb.log.info(`${PLUGIN_ID} loaded for BB ${BB_VERSION_RANGE}; plugin SDK ${PLUGIN_SDK_VERSION}`);

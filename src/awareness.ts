@@ -456,6 +456,7 @@ export function openLaneViews(
   db: SqliteDatabase,
   now = Date.now(),
   operatorWaits: ReadonlyMap<string, OperatorWait> = new Map(),
+  registeredWaiters: ReadonlySet<string> = new Set(),
 ): LaneView[] {
   const lanes = readLaneStates(db)
     .filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state))
@@ -471,7 +472,7 @@ export function openLaneViews(
       executionAttemptId: lane.execution_attempt_id,
       attemptState: lane.attempt_state,
       workerStatus: null,
-      waitingOn: operatorWait?.reason ?? (lane.terminal_report_digest === null ? "terminal receipt" : null),
+      waitingOn: operatorWait?.reason ?? (lane.thread_id !== null && registeredWaiters.has(lane.thread_id) ? "registered wait" : lane.terminal_report_digest === null ? "terminal receipt" : null),
       ageMs: Math.max(0, now - lane.created_at_ms),
       tone: lane.attempt_state === "running" ? "running" : "default",
       queueState: operatorWait ? "deferred" as const : lane.attempt_state === "running" ? "running" as const : "ready" as const,
@@ -538,6 +539,10 @@ export function createLaneWatcher(options: {
   operatorWaitAlertPersistence?: OperatorWaitAlertPersistence;
   operatorWaitFyiThresholdMs?: number;
   readOperatorWait?: (threadId: string) => Promise<OperatorWait | null>;
+  // A thread with an active registered wait (#57 mechanism 8) is legally
+  // idle: the wait row, not prose, is the only accepted wait evidence. A
+  // failed read counts as waiting — unknown state never licenses a steer.
+  readRegisteredWaitFor?: (threadId: string) => Promise<boolean>;
   readRoleHolders?: () => RoleHolderState[];
   readRoleScopes?: () => Promise<RoleQueueScope[]> | RoleQueueScope[];
   readDispatcherProjectIdentity?: () => Promise<string | null>;
@@ -613,6 +618,15 @@ export function createLaneWatcher(options: {
     options.onRoleSuccessionRequired?.(role);
   };
 
+  const readRegisteredWaitForSafe = async (threadId: string): Promise<boolean> => {
+    if (!options.readRegisteredWaitFor) return false;
+    try {
+      return await options.readRegisteredWaitFor(threadId);
+    } catch {
+      return true;
+    }
+  };
+
   const observeRoleNow = async (threadId?: string, suppliedScopes?: RoleQueueScope[]): Promise<void> => {
     if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return;
     let holders: RoleHolderState[];
@@ -656,7 +670,7 @@ export function createLaneWatcher(options: {
       } catch {
         continue;
       }
-      if (observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || !scope?.nextStartable || scope.deferredReason) {
+      if (observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || await readRegisteredWaitForSafe(targetThreadId) || !scope?.nextStartable || scope.deferredReason) {
         await roleIdleLedger.clearPrefixExcept(prefix);
         continue;
       }
@@ -749,7 +763,8 @@ export function createLaneWatcher(options: {
     }
     let waiting = pendingExternalWait ?? false;
     if (operatorWait) waiting = true;
-    if (!archived && status === "idle" && pendingExternalWait === undefined && !operatorWait && options.isExternallyWaiting) {
+    if (!archived && status === "idle" && await readRegisteredWaitForSafe(threadId)) waiting = true;
+    if (!archived && status === "idle" && pendingExternalWait === undefined && !operatorWait && !waiting && options.isExternallyWaiting) {
       try {
         waiting = await options.isExternallyWaiting(threadId);
       } catch {

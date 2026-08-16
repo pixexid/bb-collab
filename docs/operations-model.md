@@ -96,6 +96,28 @@ terminal/archive cleanup removes the dedupe entry. FYI awareness never changes
 the blocking human-gate policy: it informs the operator but does not approve,
 reject, or activate a mutation.
 
+## Registered waits and the durable wait-validator (#93)
+
+Every "waiting for X" is a registered durable row — waiter, event type,
+source thread, mandatory bounded deadline — written by the waiter through
+the `bb collab wait-register` CLI seam at the moment it decides to wait.
+Registering a wait is how a thread is allowed to go idle; an unregistered
+wait is not a legal idle reason for workers, the director, or the
+dispatcher. The model-free validator fires waits when their source
+terminalizes (thread error/archived, or a terminal attempt state or
+receipt) or their deadline passes, wakes the waiter once through the
+agent-only steer seam, escalates at most twice to exactly one operator
+alert plus a succession trigger, and never writes a canonical table,
+resolver row, or receipt. Wait rows, fired-wake dedupe, and escalation state
+live in the plugin KV seam, bounded and restart-safe; a host launchd
+LaunchAgent (`launchd/`) supervises the loop so validation survives bb
+restarts and app crashes, and a liveness schedule alerts the operator
+exactly once if launchd itself fails. The full frozen contract, deadline
+table, drills, and deployment/deletion conditions are in
+[the #93 document](issue-93-durable-wait-validator.md). This is an
+operations-model extension of the awareness substrate, not a canonical
+contract change.
+
 ## Standing Decision scope
 
 The standing orchestrator approval scope includes authority-bootstrap and
