@@ -14426,6 +14426,57 @@ function cachedConsumerRolloutEvidence(observations) {
   };
   return { ...evidence, rolloutReceiptDigest: sha256(canonicalJson(evidence)) };
 }
+function unknownCachedConsumerRolloutEvidence() {
+  return {
+    names: [...CACHED_CONSUMERS],
+    observations: [],
+    oldSchemaVersion: PREVIOUS_SCHEMA_VERSION,
+    newSchemaVersion: SCHEMA_VERSION,
+    oldContractVersion: PREVIOUS_CONTRACT_VERSION,
+    newContractVersion: CONTRACT_VERSION,
+    action: "unknown",
+    incompatiblePolicy: CACHED_CONSUMER_ROLLOUT_POLICY,
+    expected: CACHED_CONSUMERS.length,
+    attempted: 0,
+    verified: 0,
+    schemaDigest,
+    reason: "no persisted cached-consumer rollout receipt is available"
+  };
+}
+function persistedCachedConsumerRolloutEvidence(db, projectId) {
+  const row = asRow(db.prepare(
+    `SELECT evidence_kind, source_kind, source_ref, execution_attempt_id, content_digest,
+            redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest
+     FROM evidence_artifacts
+     WHERE project_id = ? AND evidence_id = 'cached-consumer-v17-rollout-receipt'`
+  ).get(projectId));
+  if (!row) return unknownCachedConsumerRolloutEvidence();
+  try {
+    const redacted = JSON.parse(row.redacted_json);
+    const durableRef = JSON.parse(row.durable_ref_json);
+    assertRedactedEvidence(redacted, "cached-consumer rollout redacted metadata");
+    assertRedactedEvidence(durableRef, "cached-consumer rollout durable reference");
+    const expectedIdentity = sha256(canonicalJson({
+      projectId,
+      evidenceId: "cached-consumer-v17-rollout-receipt",
+      evidenceKind: row.evidence_kind,
+      sourceKind: row.source_kind,
+      sourceRef: row.source_ref,
+      executionAttemptId: row.execution_attempt_id,
+      contentDigest: row.content_digest,
+      redactedDigest: sha256(canonicalJson(redacted)),
+      durableRef
+    }));
+    if (canonicalJson(redacted) !== row.redacted_json || canonicalJson(durableRef) !== row.durable_ref_json || sha256(canonicalJson(redacted)) !== row.redacted_digest || expectedIdentity !== row.artifact_identity_digest) return unknownCachedConsumerRolloutEvidence();
+    const receipt = durableRef;
+    if (!Array.isArray(receipt.reread?.observations)) return unknownCachedConsumerRolloutEvidence();
+    const reread = cachedConsumerRolloutEvidence(receipt.reread.observations);
+    if (receipt.kind !== "cached_consumer_v17_rollout_receipt" || receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest || reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || receipt.staleV16Refusal?.exemption?.outcome !== "INVALID_INPUT" || receipt.staleV16Refusal?.placement?.outcome !== "INVALID_INPUT") return unknownCachedConsumerRolloutEvidence();
+    return reread;
+  } catch {
+    return unknownCachedConsumerRolloutEvidence();
+  }
+}
 var id = external_exports.string().trim().min(1).max(256);
 var targetSchema = external_exports.object({
   repoTargetId: id,
@@ -16007,6 +16058,13 @@ function requireAttestedPluginActor(db, request, actorReceiptId) {
   if (actor?.actor_kind === "fixture" && request.operatorReceiptId === null) return;
   if (!actor || actor.actor_kind !== "plugin" || actor.subject_id !== PLUGIN_ID || actor.operator_receipt_id === null || actor.operator_receipt_id !== request.operatorReceiptId || actor.retirement_condition !== OPERATOR_RECEIPT_RETIREMENT_CONDITION) {
     throw refusal("ACTOR_RECEIPT_UNVERIFIED", "config revision requires its attestation-derived plugin actor");
+  }
+  const operator = asRow(db.prepare(
+    `SELECT approver_id, authorizing_decision_id, authorizing_disposition_sequence
+     FROM operator_receipts WHERE project_id = ? AND receipt_id = ?`
+  ).get(request.projectId, request.operatorReceiptId));
+  if (!operator || operator.approver_id !== AUTHORIZED_APPROVER_ID || operator.authorizing_decision_id === null || operator.authorizing_disposition_sequence === null) {
+    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "config revision requires its approverAttestation-derived plugin actor");
   }
 }
 function mutationRequestDigest(db, request) {
@@ -20444,7 +20502,7 @@ async function doctor(db, sdk, projectId) {
     };
     const unresolvedRoleHolders = roleGenerationHeads.filter((row) => row.holder_attempt_state !== "done" || !row.holder_native_receipt_digest).map((row) => ({ roleId: row.role_id, generation: row.current_generation, holderExecutionAttemptId: row.holder_execution_attempt_id, reason: "ROLE_HOLDER_UNRESOLVED" }));
     const decisionIntegrity = decisionDoctorEvidence(db, projectId);
-    const cachedConsumers = cachedConsumerRolloutEvidence(CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION })));
+    const cachedConsumers = persistedCachedConsumerRolloutEvidence(db, projectId);
     const expected = targets.length + 1;
     return result("OK", projectId, expected, expected, expected, {
       currentConfigRevision: configHead.config_revision,

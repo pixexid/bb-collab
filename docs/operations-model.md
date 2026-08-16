@@ -188,18 +188,20 @@ Authority-maintenance re-adoption has no human form. Contract v15 leaves the
 exact ten-class registry unchanged; the already-bounded v11 nine-class state
 remains readable but refuses `work_item_transition`. The registry check is exact
 and order-sensitive: malformed, reordered, subset, extra, v9, and arbitrary
-sets refuse before any receipt or canonical write. This is a v15 contract bump:
-four cached consumers must reread v15 or refuse v14, with durable rollout
-evidence. The cap itself is recorded by the existing adopted Decision plus
+sets refuse before any receipt or canonical write. Historically, the v15
+contract bump required four cached consumers to reread v15 or refuse v14.
+Contract v17 instead requires a persisted four-of-four reread receipt or an
+unknown, fail-closed rollout status. The cap itself is recorded by the existing adopted Decision plus
 operator-authorized `config_revision`; it does not create a second authority
 store.
 
-The v14 `director-seat` amendment remains the existing project-orchestrator
-role with primary `pi/kimi-coding/k3/high`, Opus-medium standby, managed-
-worktree-only future holder facts, and zero writing-lane capacity. Contract v15
-permits only current-generation qualification recording for generation 2,
-holder `thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source
-`src_x8veidmpik`, while the exact current head and holder execution attempt
+Contract v17 supersedes the historical v14/v15 placement: `director-seat` is
+the only `director` requirement, with primary `pi/kimi-coding/k3/high`,
+Opus-medium standby, and zero writing-lane capacity. Only director generation
+1 may use the approved unmanaged holder `thr_gsb7m77ciz`, environment
+`env_3znzsxb7ce`, and source `src_x8veidmpik`; later director generations use
+managed worktrees, and project-orchestrator generations omit a standby. The
+exact current head and holder execution attempt
 remain bound. It cannot admit writing or succession. Epoch-2 service on the
 unmanaged canonical environment is grandfathered evidence, not generation 3
 occupancy. A future successor is first preflighted and then recorded through

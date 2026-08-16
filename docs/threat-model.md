@@ -19,10 +19,12 @@ worker.
 | GitHub, BB Tasks and Markdown | External projections or evidence | They may not activate work, satisfy a gate or close a WorkItem independently. |
 | Operator/admin/raw BB activity | Unmanaged activity on a full-trust host | It may be detected as evidence or discrepancy, but it acquires no canonical authority by observation. |
 
-Role requirements are bounded at three logical roles: project-orchestrator is
-project-scoped, while worker and independent-reviewer bind to an exact
-repository target. Each role requirement carries its executed-profile
-qualification; this adds no assignment or dispatch authority.
+Role requirements are bounded at four logical roles: director and
+project-orchestrator are project-scoped, while worker and independent-reviewer
+bind to an exact repository target. `director-seat` is the only director
+requirement and has zero writing-lane capacity. Each role requirement carries
+its executed-profile qualification; this adds no assignment or dispatch
+authority.
 
 The v16/schema v11 contract retains the v10 operator gate, which has a host/UI
 confirmation boundary only for authorizing or revoking the approver. An adopted
@@ -65,14 +67,15 @@ current-generation qualification exemption for generation 2, holder
 The current head and holder execution attempt remain required; foreign, stale,
 wrong-profile, future-generation, succession, and writing requests refuse
 before any write. The grandfathered unmanaged epoch-2 service cannot establish
-generation-3 occupancy without a later receipt-gated succession. Contract v13 adds the canonical named standby profile
-for new project-orchestrator generations and the bounded per-orchestrator
-writing-lane dial; the standby must use a different provider from the executed
-holder and has no authority or traffic. Contract v16 additionally rejects a
-native thread designated as a witness by its title or title fallback before
-qualification or succession can materialize a holder attempt; it preserves the
-existing role/head, environment/source, and executed-profile checks. Stale v15
-consumers refuse, current v16 consumers reread, and schema/migrations remain unchanged by this role-policy
+generation-3 occupancy without a later receipt-gated succession. Contract v17
+supersedes those historical v13-v15 rules: only director generation 1 uses the
+exact holder/environment/source exemption, only director generations carry the
+named different-provider standby, and project-orchestrator generations omit it.
+Contract v16 additionally rejects a native thread designated as a witness by
+its title or title fallback before qualification or succession can materialize a
+holder attempt; it preserves the existing role/head, environment/source, and
+executed-profile checks. Stale v16
+consumers refuse, current v17 consumers reread, and schema/migrations remain unchanged by this role-policy
 amendment. The dial is a canonical config revision recorded through the adopted
 Decision and operator-authorized `config_revision` seam; review and probe
 Assignments are excluded from the writing count.

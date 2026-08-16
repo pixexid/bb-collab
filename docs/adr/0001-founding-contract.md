@@ -205,7 +205,7 @@ rereads for v14 and refusal for stale v13 consumers.
 
 The contract v11/schema v10 role-capacity amendment remains contract-only.
 Contract v12/schema v10 adds only `work_item_transition` to the derived
-authorized-approver set. Contract v13/schema v11 adds one nullable
+authorized-approver set. Historically, contract v13/schema v11 added one nullable
 `role_generations.standby_profile_json` migration and requires a named,
 different-provider standby for new project-orchestrator generations; the
 standby has no authority or traffic. It also replaces the founding hard-2
@@ -215,8 +215,8 @@ Lower values are preserved by canonical config revisions and never silently
 raised. Read-only review and probe Assignments do not consume the writing cap.
 The cap is configured through the existing operator-authorized
 `config_revision` mutation and recorded by the adopted Decision/authority
-chain; no second queue or authority store exists. `roleRequirements` admits at
-most three logical roles: `project-orchestrator` is project-scoped, while
+chain; no second queue or authority store exists. `roleRequirements` then admitted at
+most three logical roles: `project-orchestrator` was project-scoped, while
 `worker` and `independent-reviewer` require the exact repository target used by
 canonical WorkItem writes. Each requirement retains its explicit
 executed-profile qualification. The v10 receipt, approver, derived-actor and
@@ -224,7 +224,7 @@ existing refusal bindings are unchanged; cached consumers reread v13/schema v11
 or refuse the previous versions. Existing generations remain readable without
 fabricated standby evidence.
 
-Contract v14 adds one bounded exception to the project-orchestrator
+Historically, contract v14 added one bounded exception to the project-orchestrator
 role-requirement configuration: the `director-seat` entry fixes the primary
 executed profile to `pi/kimi-coding/k3/high` with explicit full/default/visible
 fields, names the exact Opus-medium alternate/standby profile, retains the
@@ -237,7 +237,7 @@ The v14 release required all four cached consumers to reread v14 or refuse v13;
 schema, migrations,
 operator receipts, and approver bindings remain otherwise unchanged.
 
-Contract v15 adds one strict current-generation exemption to the same
+Historically, contract v15 added one strict current-generation exemption to the same
 director-seat requirement. Qualification recording may use the approved
 unmanaged canonical environment only for generation 2, holder
 `thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source `src_x8veidmpik`,
@@ -255,9 +255,28 @@ authority store: role head, generation, managed environment/source, and
 executed-profile checks remain mandatory. Schema and migrations remain
 unchanged; cached consumers reread v16 or refuse v15.
 
+Contract v17 supersedes the v14/v15 director placement and exemption: the
+logical role set is `director`, `project-orchestrator`, `worker`, and
+`independent-reviewer`; director and project-orchestrator are project-scoped,
+while worker and independent-reviewer remain repository-target scoped.
+`director-seat` is the only director requirement and carries the exact
+Pi/Kimi primary profile, Opus-medium standby, and zero writing-lane capacity.
+The v15 current-generation exemption is replaced by the exact director
+generation-1 holder/environment/source triple; it admits no later generation,
+writing, foreign context, or stale state. New director generations alone carry
+the named standby; project-orchestrator generations omit it. The
+`config_revision` resolver requires the exact active
+`approverAttestation`-derived plugin actor bound to its current operator
+receipt, so a verified but unlinked or role actor refuses before a write. The
+schema and migrations remain unchanged. A cached-consumer rollout succeeds
+only from a persisted receipt with four expected, attempted, and verified
+rereads plus the discriminating stale-v16 refusal; unavailable rollout
+evidence is reported as unknown and is not success.
+
 ## 6. Roles, delegation and execution
 
-A logical role is a project-scoped seat such as project-orchestrator, worker or
+A logical role is a project-scoped seat such as director or
+project-orchestrator, or a repository-target-scoped seat such as worker or
 independent-reviewer. It is never a model, provider, harness, human display
 name, app session or current thread.
 
@@ -266,9 +285,11 @@ an exact holder ExecutionAttempt, valid project/environment/thread references,
 current qualification, and a valid monotonic predecessor relation. Role
 states are pending, active, draining, retired or invalidated. Leases,
 heartbeat expiry and automatic succession are reserved for post-v1.
-New project-orchestrator generations also carry one explicit standby profile;
-the provider must differ from the executed holder, and the standby is not an
-actor, authority, lease, assignment, dispatch target, or traffic recipient.
+Under contract v13, new project-orchestrator generations carried one explicit
+standby profile. Contract v17 supersedes that forward-looking rule: only new
+director-seat generations carry the exact named standby profile; the provider
+must differ from the director holder, and the standby is not an actor,
+authority, lease, assignment, dispatch target, or traffic recipient.
 
 Live RPC and CLI role mutations use the existing `RoleFactReader` seam backed by
 BB core thread, event, environment, project, host and version reads. The reader

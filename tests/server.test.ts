@@ -2473,6 +2473,26 @@ describe("bb-collab plugin boundary", () => {
       operatorReceiptId: issued.operatorReceipt!.receiptId,
     };
 
+    const unlinkedPluginReceipt = persistBootstrapOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: "config_revision",
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: "config-unlinked-plugin-actor",
+      requestDigest: operatorRequestDigest({ ...unsigned, idempotencyKey: "config-unlinked-plugin-actor" }),
+      callerThreadId: "config-unlinked-plugin",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    });
+    const unlinkedPlugin = {
+      ...unsigned,
+      idempotencyKey: "config-unlinked-plugin-actor",
+      actorReceiptId: unlinkedPluginReceipt.actorReceiptId,
+      operatorReceiptId: unlinkedPluginReceipt.operatorReceipt.receiptId,
+    };
+    const beforeUnlinkedPlugin = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", unlinkedPlugin)).toMatchObject({ outcome: "ACTOR_RECEIPT_UNVERIFIED", attempted: 0, verified: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeUnlinkedPlugin);
+
     seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "config-role-actor", actorKind: "role", subjectId: "preexisting-holder", roleId: "project-orchestrator", roleGeneration: 1 });
     const roleActorBaseline = db.prepare("SELECT COUNT(*) AS count FROM actor_receipts WHERE actor_kind = 'role'").get() as { count: number };
     const roleAuthorized = { ...authorized, actorReceiptId: "config-role-actor", operatorReceiptId: null };
@@ -3201,30 +3221,6 @@ describe("bb-collab plugin boundary", () => {
     expect(MIGRATIONS).toHaveLength(24);
     expect(schemaDigest).toBe("5ee5cd12902e433825558c27b9a20d8bc2e86c5ffe018bf5b59e207d5d2d684e");
     expect(contractDigest).toBe("7014824023042a8de12434cf9331e1ca351ea2f6bb3652371f44cd5323fb6a82");
-    const rollout = cachedConsumerRolloutEvidence(cachedConsumerObservations(SCHEMA_VERSION, CONTRACT_VERSION));
-    expect(rollout).toMatchObject({
-      oldSchemaVersion: 11,
-      newSchemaVersion: 11,
-      oldContractVersion: 16,
-      newContractVersion: 17,
-      action: "reread",
-      expected: CACHED_CONSUMERS.length,
-      attempted: CACHED_CONSUMERS.length,
-      verified: 4,
-      incompatiblePolicy: {
-        class: "roleRequirements.director-seat",
-        staleV16RoleId: "project-orchestrator",
-        requiredV17RoleId: "director",
-        staleV16ExemptionField: "currentGenerationExemption",
-        refusal: "INVALID_INPUT",
-      },
-    });
-    expect(rollout.rolloutReceiptDigest).toBe(sha256(canonicalJson({
-      names: [...CACHED_CONSUMERS], observations: cachedConsumerObservations(11, 17), oldSchemaVersion: 11, newSchemaVersion: 11,
-      oldContractVersion: 16, newContractVersion: 17, action: "reread", expected: 4, attempted: 4, verified: 4, schemaDigest,
-      incompatiblePolicy: { class: "roleRequirements.director-seat", staleV16RoleId: "project-orchestrator", requiredV17RoleId: "director", staleV16ExemptionField: "currentGenerationExemption", refusal: "INVALID_INPUT" },
-    })));
-
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     const staleV16Config = directorSeatConfig();
@@ -3238,13 +3234,22 @@ describe("bb-collab plugin boundary", () => {
       kind: "cached_consumer_v16_fixture",
       staleV16Config,
       stalePlacement,
+      rereadObservations: [
+        { name: "server.rpcContract", observedSchemaVersion: 11, observedContractVersion: 17 },
+        { name: "server.collabCli", observedSchemaVersion: 11, observedContractVersion: 17 },
+        { name: "src/test-support", observedSchemaVersion: 11, observedContractVersion: 17 },
+        { name: "tests/server.test", observedSchemaVersion: 11, observedContractVersion: 17 },
+      ],
     });
     const persistedFixture = JSON.parse((db.prepare(
       "SELECT durable_ref_json FROM evidence_artifacts WHERE project_id = ? AND evidence_id = ?",
     ).get(PROJECT_ID, "cached-consumer-v16-fixture") as { durable_ref_json: string }).durable_ref_json) as {
       staleV16Config: ReturnType<typeof directorSeatConfig>;
       stalePlacement: ReturnType<typeof directorSeatConfig>;
+      rereadObservations: Parameters<typeof cachedConsumerRolloutEvidence>[0];
     };
+    const rollout = cachedConsumerRolloutEvidence(persistedFixture.rereadObservations);
+    expect(rollout).toMatchObject({ action: "reread", expected: 4, attempted: 4, verified: 4 });
     const beforeRefusal = exportFoundation(db, PROJECT_ID);
     const staleV16 = applyWithFixtureReceipt(db, {
       ...bootstrapRequest(PROJECT_ID, { config: persistedFixture.staleV16Config }),
@@ -3288,6 +3293,10 @@ describe("bb-collab plugin boundary", () => {
         placement: { outcome: stalePlacementResult.outcome, message: stalePlacementResult.message },
       },
     }));
+    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
+      outcome: "OK",
+      evidence: { cachedConsumers: { action: "reread", expected: 4, attempted: 4, verified: 4 } },
+    });
   });
 
   it("prepares one sanctioned run, binds adopted authority, and enforces open/final identities", () => {
@@ -5070,7 +5079,7 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 11, newSchemaVersion: 11, expected: 4, attempted: 4, verified: 4 },
+        cachedConsumers: { oldSchemaVersion: 11, newSchemaVersion: 11, action: "unknown", expected: 4, attempted: 0, verified: 0 },
         schema: { version: 11 },
       },
     });
@@ -6080,7 +6089,7 @@ describe("bb-collab plugin boundary", () => {
         qualificationObservationCount: 1,
         roleGenerationHeads: [{ role_id: "project-orchestrator", current_generation: 1, status: "active" }],
         eligibility: [{ roleRequirementId: "orchestrator-v1", effectiveStatus: "eligible" }],
-        cachedConsumers: { expected: 4, attempted: 4, verified: 4 },
+        cachedConsumers: { action: "unknown", expected: 4, attempted: 0, verified: 0 },
       },
     });
     const beforeProductionRefusal = exportFoundation(db, PROJECT_ID);

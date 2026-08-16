@@ -664,6 +664,85 @@ export function cachedConsumerRolloutEvidence(observations: readonly CachedConsu
   return { ...evidence, rolloutReceiptDigest: sha256(canonicalJson(evidence)) };
 }
 
+function unknownCachedConsumerRolloutEvidence() {
+  return {
+    names: [...CACHED_CONSUMERS],
+    observations: [],
+    oldSchemaVersion: PREVIOUS_SCHEMA_VERSION,
+    newSchemaVersion: SCHEMA_VERSION,
+    oldContractVersion: PREVIOUS_CONTRACT_VERSION,
+    newContractVersion: CONTRACT_VERSION,
+    action: "unknown" as const,
+    incompatiblePolicy: CACHED_CONSUMER_ROLLOUT_POLICY,
+    expected: CACHED_CONSUMERS.length,
+    attempted: 0,
+    verified: 0,
+    schemaDigest,
+    reason: "no persisted cached-consumer rollout receipt is available",
+  };
+}
+
+function persistedCachedConsumerRolloutEvidence(db: SqliteDatabase, projectId: string) {
+  const row = asRow<{
+    evidence_kind: string;
+    source_kind: string;
+    source_ref: string;
+    execution_attempt_id: string | null;
+    content_digest: string;
+    redacted_json: string;
+    redacted_digest: string;
+    durable_ref_json: string;
+    artifact_identity_digest: string;
+  }>(db.prepare(
+    `SELECT evidence_kind, source_kind, source_ref, execution_attempt_id, content_digest,
+            redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest
+     FROM evidence_artifacts
+     WHERE project_id = ? AND evidence_id = 'cached-consumer-v17-rollout-receipt'`,
+  ).get(projectId));
+  if (!row) return unknownCachedConsumerRolloutEvidence();
+  try {
+    const redacted = JSON.parse(row.redacted_json);
+    const durableRef = JSON.parse(row.durable_ref_json);
+    assertRedactedEvidence(redacted, "cached-consumer rollout redacted metadata");
+    assertRedactedEvidence(durableRef, "cached-consumer rollout durable reference");
+    const expectedIdentity = sha256(canonicalJson({
+      projectId,
+      evidenceId: "cached-consumer-v17-rollout-receipt",
+      evidenceKind: row.evidence_kind,
+      sourceKind: row.source_kind,
+      sourceRef: row.source_ref,
+      executionAttemptId: row.execution_attempt_id,
+      contentDigest: row.content_digest,
+      redactedDigest: sha256(canonicalJson(redacted)),
+      durableRef,
+    }));
+    if (
+      canonicalJson(redacted) !== row.redacted_json || canonicalJson(durableRef) !== row.durable_ref_json ||
+      sha256(canonicalJson(redacted)) !== row.redacted_digest || expectedIdentity !== row.artifact_identity_digest
+    ) return unknownCachedConsumerRolloutEvidence();
+    const receipt = durableRef as {
+      kind?: unknown;
+      reread?: { observations?: unknown; rolloutReceiptDigest?: unknown };
+      staleV16Refusal?: {
+        exemption?: { outcome?: unknown };
+        placement?: { outcome?: unknown };
+      };
+    };
+    if (!Array.isArray(receipt.reread?.observations)) return unknownCachedConsumerRolloutEvidence();
+    const reread = cachedConsumerRolloutEvidence(receipt.reread.observations as CachedConsumerObservation[]);
+    if (
+      receipt.kind !== "cached_consumer_v17_rollout_receipt" ||
+      receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest ||
+      reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 ||
+      receipt.staleV16Refusal?.exemption?.outcome !== "INVALID_INPUT" ||
+      receipt.staleV16Refusal?.placement?.outcome !== "INVALID_INPUT"
+    ) return unknownCachedConsumerRolloutEvidence();
+    return reread;
+  } catch {
+    return unknownCachedConsumerRolloutEvidence();
+  }
+}
+
 const id = z.string().trim().min(1).max(256);
 const targetSchema = z
   .object({
@@ -2967,6 +3046,23 @@ function requireAttestedPluginActor(db: SqliteDatabase, request: ApplyRequest, a
     actor.retirement_condition !== OPERATOR_RECEIPT_RETIREMENT_CONDITION
   ) {
     throw refusal("ACTOR_RECEIPT_UNVERIFIED", "config revision requires its attestation-derived plugin actor");
+  }
+  // requireActor has already verified this exact receipt binding and, when
+  // present, the active approver registry. Config revisions additionally
+  // require that the bound receipt was issued with that provenance.
+  const operator = asRow<{
+    approver_id: string | null;
+    authorizing_decision_id: string | null;
+    authorizing_disposition_sequence: number | null;
+  }>(db.prepare(
+    `SELECT approver_id, authorizing_decision_id, authorizing_disposition_sequence
+     FROM operator_receipts WHERE project_id = ? AND receipt_id = ?`,
+  ).get(request.projectId, request.operatorReceiptId));
+  if (
+    !operator || operator.approver_id !== AUTHORIZED_APPROVER_ID ||
+    operator.authorizing_decision_id === null || operator.authorizing_disposition_sequence === null
+  ) {
+    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "config revision requires its approverAttestation-derived plugin actor");
   }
 }
 
@@ -8397,7 +8493,7 @@ export async function doctor(
       .filter((row) => row.holder_attempt_state !== "done" || !row.holder_native_receipt_digest)
       .map((row) => ({ roleId: row.role_id, generation: row.current_generation, holderExecutionAttemptId: row.holder_execution_attempt_id, reason: "ROLE_HOLDER_UNRESOLVED" }));
     const decisionIntegrity = decisionDoctorEvidence(db, projectId);
-    const cachedConsumers = cachedConsumerRolloutEvidence(CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION })));
+    const cachedConsumers = persistedCachedConsumerRolloutEvidence(db, projectId);
     const expected = targets.length + 1;
     return result("OK", projectId, expected, expected, expected, {
       currentConfigRevision: configHead.config_revision,

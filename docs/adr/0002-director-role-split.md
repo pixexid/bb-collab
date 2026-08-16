@@ -1,9 +1,9 @@
 # ADR 0002: Contract v17 — director/orchestrator role split
 
-Status: proposed. Implements stated operator direction of 2026-08-16
-(succession is for BOTH director and orchestrator — paired). The operator
-veto window on this read is handled in the operator-facing session; if the
-read is wrong, this ADR is withdrawn, not amended.
+Status: accepted. Implements stated operator direction of 2026-08-16. The
+director and project-orchestrator are separate roles with independent
+succession; this contract change creates neither a live role holder nor a
+paired succession action.
 
 Supersedes: the contract v14 director-seat placement under the
 `project-orchestrator` role, the contract v15 current-generation exemption
@@ -57,7 +57,10 @@ Contract v17 splits the director into its own logical role.
 - `CONTRACT_VERSION` becomes 17 and `contractDigest` changes
   (roleCapacityPolicy roleIds/scoping, directorSeatPolicy role reference,
   exemption shape). `SCHEMA_VERSION` remains 11; schema, migrations,
-  operator receipts, and approver bindings are unchanged.
+  and the approver registry are unchanged. `config_revision` additionally
+  requires the exact current `approverAttestation`-derived plugin actor bound
+  to its operator receipt; a verified but unlinked actor, including a role
+  actor, refuses before any write.
 - Cached-consumer bump test: enumerate all four cached consumers; each
   rereads contract v17 or refuses v16; record expected=4 attempted=4
   verified=4 and emit a durable rollout receipt. Zero-work is not success.
