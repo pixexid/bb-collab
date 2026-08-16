@@ -43,9 +43,12 @@ describe("subagent effort directive", () => {
     expect(operationsModel).toMatch(/If that window saturates, `codex\/gpt-5\.6-sol`\nMEDIUM is the standing fallback,\npre-authorized without a new decision\./u);
     expect(operationsModel).toContain("Merge-bound implementer | Pi harness / `pi` | `zai/glm-5.3` | MEDIUM or HIGH");
     expect(operationsModel).toContain("Tier-A reviewer | Codex harness / `codex` | `gpt-5.6-sol` | HIGH");
+    expect(operationsModel).toContain("Tier-A reviewer fallback | Codex harness / `codex` | `gpt-5.6-terra` | HIGH");
     expect(operationsModel).toContain("`gpt-5.6-terra` HIGH is acceptable when `gpt-5.6-sol` authored");
     expect(operationsModel).toContain("Tier-B reviewer | Codex harness / `codex` | `gpt-5.6-luna` | MEDIUM");
     expect(operationsModel).toContain("Reviewer default harness/provider is Codex; the tier rows name the actual model");
+    expect(operationsModel).toContain("Mechanical probe | Pi harness / `pi` | `deepseek-v4-flash` | LOW");
+    expect(operationsModel).toContain("Mechanical probe | Pi harness / `pi` | `glm-5-turbo` | LOW");
     expect(operationsModel).toContain("The v14 `director-seat` amendment remains the existing project-orchestrator");
     expect(operationsModel).toContain("Opus-medium standby");
     expect(operationsModel).toContain("current graded qualification probe");
