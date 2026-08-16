@@ -24,7 +24,7 @@ project-scoped, while worker and independent-reviewer bind to an exact
 repository target. Each role requirement carries its executed-profile
 qualification; this adds no assignment or dispatch authority.
 
-The v13/schema v11 contract retains the v10 operator gate, which has a host/UI
+The v14/schema v11 contract retains the v10 operator gate, which has a host/UI
 confirmation boundary only for authorizing or revoking the approver. An adopted
 `operator_only` Decision
 registers `approverId=orchestrator:bb-collab` for the exact project and adopted
@@ -56,11 +56,16 @@ mismatch refuses before a write. It has no local TTL and retires only on the
 host-issued `get-bb/bb#1541` condition. The historical contract-v9 eight-class
 registry was accepted only during the one-release v9-to-v10 re-adoption.
 Contract v11 required the exact nine-class set; contract v12 adds only
-`work_item_transition`. Contract v13 adds the canonical named standby profile
+`work_item_transition`. Contract v14 adds the bounded `director-seat`
+requirement with the exact primary `pi/kimi-coding/k3/high` and Opus-medium
+standby profiles, zero writing-lane capacity, and the existing
+managed-worktree/source/environment checks. The grandfathered unmanaged
+epoch-2 service cannot establish generation-3 occupancy without a later
+receipt-gated succession. Contract v13 adds the canonical named standby profile
 for new project-orchestrator generations and the bounded per-orchestrator
 writing-lane dial; the standby must use a different provider from the executed
-holder and has no authority or traffic. Stale v12 consumers refuse, current v13
-consumers reread, and schema/migrations remain unchanged by this lane-policy
+holder and has no authority or traffic. Stale v13 consumers refuse, current v14
+consumers reread, and schema/migrations remain unchanged by this role-policy
 amendment. The dial is a canonical config revision recorded through the adopted
 Decision and operator-authorized `config_revision` seam; review and probe
 Assignments are excluded from the writing count.

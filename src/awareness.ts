@@ -1,7 +1,6 @@
 import type { BbPluginApi, PluginThreadEventPayloads } from "@bb/plugin-sdk";
 import { writingLaneCeilingForProject, type SqliteDatabase } from "./foundation.js";
 
-export const SUPERVISOR_THREAD_ID = "thr_b94i3csnme";
 export const DEFAULT_MAX_CONTINUATIONS = 3;
 export const OPERATOR_WAIT_FYI_THRESHOLD_MS = 15 * 60_000;
 export const WRONGFUL_IDLE_THRESHOLD_MS = 10 * 60_000;
@@ -33,6 +32,125 @@ export interface LaneState {
 export interface OperatorWait {
   reason: "awaiting_operator";
   createdAtMs: number;
+}
+
+export type RegisteredWaitSourceEvent = "terminal" | "failure";
+
+export interface RegisteredWait {
+  waitId: string;
+  waiterThreadId: string;
+  sourceThreadId: string;
+  sourceEvent: RegisteredWaitSourceEvent;
+  deadlineAtMs: number;
+}
+
+export interface WaitEvent extends RegisteredWait {
+  reason: "source_terminal" | "source_failure" | "deadline_expired";
+  firedAtMs: number;
+}
+
+export interface WaitRegistryPersistence {
+  read(): Promise<unknown>;
+  write(state: { waits: RegisteredWait[]; fired: Record<string, WaitEvent["reason"]> }): Promise<void>;
+}
+
+export interface WaitRegistry {
+  recover(): Promise<void>;
+  register(wait: RegisteredWait): Promise<void>;
+  list(): RegisteredWait[];
+  state(waitId: string): "pending" | "fired" | "unknown";
+  fire(waitId: string, reason: WaitEvent["reason"], firedAtMs: number): Promise<WaitEvent | null>;
+  /** Fired waits with their reason and waiter, for the durable validator. */
+  firedList(): Array<{ waitId: string; reason: WaitEvent["reason"]; waiterThreadId: string }>;
+}
+
+function normalizeRegisteredWait(input: unknown): RegisteredWait {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid registered wait");
+  const value = input as Record<string, unknown>;
+  if (
+    typeof value.waitId !== "string" || value.waitId.length === 0 ||
+    typeof value.waiterThreadId !== "string" || value.waiterThreadId.length === 0 ||
+    typeof value.sourceThreadId !== "string" || value.sourceThreadId.length === 0 ||
+    (value.sourceEvent !== "terminal" && value.sourceEvent !== "failure") ||
+    !Number.isInteger(value.deadlineAtMs) || (value.deadlineAtMs as number) < 0
+  ) throw new Error("registered wait requires waiter, source, event, and deadline");
+  return {
+    waitId: value.waitId,
+    waiterThreadId: value.waiterThreadId,
+    sourceThreadId: value.sourceThreadId,
+    sourceEvent: value.sourceEvent,
+    deadlineAtMs: value.deadlineAtMs as number,
+  };
+}
+
+function waitRegistryState(input: unknown): { waits: RegisteredWait[]; fired: Record<string, WaitEvent["reason"]> } {
+  if (input === undefined || input === null) return { waits: [], fired: {} };
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid wait registry state");
+  const value = input as Record<string, unknown>;
+  if (!Array.isArray(value.waits) || !value.fired || typeof value.fired !== "object" || Array.isArray(value.fired)) {
+    throw new Error("invalid wait registry state");
+  }
+  const waits = value.waits.map(normalizeRegisteredWait);
+  const byId = new Map<string, RegisteredWait>();
+  for (const wait of waits) {
+    const existing = byId.get(wait.waitId);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(wait)) throw new Error("conflicting registered wait");
+    byId.set(wait.waitId, wait);
+  }
+  const fired: Record<string, WaitEvent["reason"]> = {};
+  for (const [waitId, reason] of Object.entries(value.fired)) {
+    if (!byId.has(waitId) || !["source_terminal", "source_failure", "deadline_expired"].includes(reason as string)) {
+      throw new Error("invalid fired wait");
+    }
+    fired[waitId] = reason as WaitEvent["reason"];
+  }
+  return { waits: [...byId.values()], fired };
+}
+
+export function createWaitRegistry(persistence?: WaitRegistryPersistence): WaitRegistry {
+  let state: { waits: RegisteredWait[]; fired: Record<string, WaitEvent["reason"]> } = { waits: [], fired: {} };
+  let loaded = false;
+  let queue = Promise.resolve();
+  const enqueue = <T>(work: () => Promise<T>): Promise<T> => {
+    const result = queue.then(work);
+    queue = result.then(() => undefined, () => undefined);
+    return result;
+  };
+  const load = async () => {
+    if (loaded) return;
+    state = waitRegistryState(persistence ? await persistence.read() : null);
+    loaded = true;
+  };
+  return {
+    recover: () => enqueue(async () => { await load(); }),
+    register: (input) => enqueue(async () => {
+      await load();
+      const wait = normalizeRegisteredWait(input);
+      const existing = state.waits.find((candidate) => candidate.waitId === wait.waitId);
+      if (existing) {
+        if (JSON.stringify(existing) !== JSON.stringify(wait)) throw new Error("conflicting registered wait");
+        return;
+      }
+      const waits = [...state.waits, wait];
+      await persistence?.write(structuredClone({ waits, fired: state.fired }));
+      state = { waits, fired: state.fired };
+    }),
+    list: () => state.waits.map((wait) => ({ ...wait })),
+    state: (waitId) => state.fired[waitId] ? "fired" : state.waits.some((wait) => wait.waitId === waitId) ? "pending" : "unknown",
+    firedList: () => state.waits
+      .filter((wait) => state.fired[wait.waitId] !== undefined)
+      .map((wait) => ({ waitId: wait.waitId, reason: state.fired[wait.waitId], waiterThreadId: wait.waiterThreadId })),
+    fire: (waitId, reason, firedAtMs) => enqueue(async () => {
+      await load();
+      const wait = state.waits.find((candidate) => candidate.waitId === waitId);
+      if (!wait || state.fired[waitId]) return null;
+      const event = { ...wait, reason, firedAtMs } satisfies WaitEvent;
+      const fired = { ...state.fired, [waitId]: reason };
+      await persistence?.write(structuredClone({ waits: state.waits, fired }));
+      state = { waits: state.waits, fired };
+      return event;
+    }),
+  };
 }
 
 export interface RoleHolderState {
@@ -390,6 +508,7 @@ export function continuationModeFor(assignmentKind: LaneState["assignment_kind"]
 }
 
 export interface LaneWatcher {
+  registerWait(wait: RegisteredWait): Promise<void>;
   observe(
     threadId: string,
     status: ThreadStatus,
@@ -405,9 +524,29 @@ export interface WorkerObservation {
   status: ThreadStatus;
   pendingExternalWait: boolean;
   archived: boolean;
+  projectId?: string;
   operatorWait?: OperatorWait | null;
   operatorWaitKnown?: boolean;
   idleSinceMs?: number | null;
+}
+
+type RegisteredWaitState = "none" | "pending" | "unknown" | "fired";
+
+function mergeRegisteredWaitState(current: RegisteredWaitState | undefined, next: Exclude<RegisteredWaitState, "none">): RegisteredWaitState {
+  const rank: Record<Exclude<RegisteredWaitState, "none">, number> = { fired: 1, pending: 2, unknown: 3 };
+  return !current || current === "none" || rank[next] > rank[current] ? next : current;
+}
+
+interface WaitSourceObservation {
+  known: boolean;
+  terminal: boolean;
+  failed: boolean;
+}
+
+interface WaitContext {
+  known: boolean;
+  byWaiter: ReadonlyMap<string, RegisteredWaitState>;
+  events: readonly WaitEvent[];
 }
 
 export function readLaneStates(db: SqliteDatabase): LaneState[] {
@@ -443,6 +582,7 @@ export function readRoleHolderStates(db: SqliteDatabase): RoleHolderState[] {
          ON generations.project_id = attempts.project_id
         AND generations.role_id = attempts.role_id
         AND generations.generation = attempts.role_generation
+        AND generations.holder_execution_attempt_id = attempts.execution_attempt_id
        WHERE attempts.origin = 'role_holder'
          AND attempts.thread_id IS NOT NULL
          AND attempts.role_id = '${ORCHESTRATOR_ROLE_ID}'
@@ -456,7 +596,6 @@ export function openLaneViews(
   db: SqliteDatabase,
   now = Date.now(),
   operatorWaits: ReadonlyMap<string, OperatorWait> = new Map(),
-  registeredWaiters: ReadonlySet<string> = new Set(),
 ): LaneView[] {
   const lanes = readLaneStates(db)
     .filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state))
@@ -472,7 +611,7 @@ export function openLaneViews(
       executionAttemptId: lane.execution_attempt_id,
       attemptState: lane.attempt_state,
       workerStatus: null,
-      waitingOn: operatorWait?.reason ?? (lane.thread_id !== null && registeredWaiters.has(lane.thread_id) ? "registered wait" : lane.terminal_report_digest === null ? "terminal receipt" : null),
+      waitingOn: operatorWait?.reason ?? (lane.terminal_report_digest === null ? "terminal receipt" : null),
       ageMs: Math.max(0, now - lane.created_at_ms),
       tone: lane.attempt_state === "running" ? "running" : "default",
       queueState: operatorWait ? "deferred" as const : lane.attempt_state === "running" ? "running" as const : "ready" as const,
@@ -534,18 +673,15 @@ export function createLaneWatcher(options: {
   steer: (lane: LaneView) => Promise<void>;
   isExternallyWaiting?: (threadId: string) => Promise<boolean>;
   readWorker?: (threadId: string) => Promise<WorkerObservation>;
-  supervisorThreadId?: string;
   continuationLedger?: ContinuationLedger;
+  waitRegistry?: WaitRegistry;
+  readRegisteredWaits?: () => RegisteredWait[] | Promise<RegisteredWait[]>;
+  onWaitEvent?: (event: WaitEvent) => void | Promise<void>;
   operatorWaitAlertPersistence?: OperatorWaitAlertPersistence;
   operatorWaitFyiThresholdMs?: number;
   readOperatorWait?: (threadId: string) => Promise<OperatorWait | null>;
-  // A thread with an active registered wait (#57 mechanism 8) is legally
-  // idle: the wait row, not prose, is the only accepted wait evidence. A
-  // failed read counts as waiting — unknown state never licenses a steer.
-  readRegisteredWaitFor?: (threadId: string) => Promise<boolean>;
   readRoleHolders?: () => RoleHolderState[];
   readRoleScopes?: () => Promise<RoleQueueScope[]> | RoleQueueScope[];
-  readDispatcherProjectIdentity?: () => Promise<string | null>;
   roleIdlePersistence?: RoleIdlePersistence;
   roleIdleThresholdMs?: number;
   steerRole?: (role: RoleIdleView) => Promise<void>;
@@ -554,8 +690,8 @@ export function createLaneWatcher(options: {
   maxContinuations?: number;
   onAlert?: (alert: LaneWatcherAlert) => void;
 }): LaneWatcher {
-  const supervisorThreadId = options.supervisorThreadId ?? SUPERVISOR_THREAD_ID;
   const continuationLedger = options.continuationLedger ?? createContinuationLedger();
+  const waitRegistry = options.waitRegistry ?? createWaitRegistry();
   const operatorWaitAlertLedger = createOperatorWaitAlertLedger(options.operatorWaitAlertPersistence);
   const roleIdleLedger = createRoleIdleLedger(options.roleIdlePersistence);
   const roleIdleThresholdMs = Number.isInteger(options.roleIdleThresholdMs) && (options.roleIdleThresholdMs ?? 0) >= 0
@@ -570,6 +706,77 @@ export function createLaneWatcher(options: {
     : DEFAULT_MAX_CONTINUATIONS;
   const coalesced = new Set<string>();
   let queue = Promise.resolve();
+
+  const readWaitContext = async (
+    allLanes: LaneState[],
+    suppliedSource?: { threadId: string; status: ThreadStatus; archived: boolean },
+  ): Promise<WaitContext> => {
+    let waits: RegisteredWait[];
+    try {
+      await waitRegistry.recover();
+      waits = (options.readRegisteredWaits ? await options.readRegisteredWaits() : waitRegistry.list()).map(normalizeRegisteredWait);
+      if (options.readRegisteredWaits) for (const wait of waits) await waitRegistry.register(wait);
+    } catch {
+      return { known: false, byWaiter: new Map(), events: [] };
+    }
+    if (waits.length === 0) return { known: true, byWaiter: new Map(), events: [] };
+
+    const sourceStates = new Map<string, WaitSourceObservation>();
+    for (const sourceThreadId of new Set(waits.map((wait) => wait.sourceThreadId))) {
+      const sourceLanes = allLanes.filter((lane) => lane.thread_id === sourceThreadId);
+      const terminalFromLane = sourceLanes.some((lane) => lane.terminal_report_digest !== null || !OPEN_ATTEMPT_STATES.has(lane.attempt_state));
+      let observation: WorkerObservation | null = null;
+      if (suppliedSource?.threadId === sourceThreadId) {
+        observation = {
+          status: suppliedSource.status,
+          pendingExternalWait: false,
+          archived: suppliedSource.archived,
+        };
+      } else if (options.readWorker) {
+        try {
+          observation = await options.readWorker(sourceThreadId);
+        } catch {
+          observation = null;
+        }
+      }
+      const failedFromLane = sourceLanes.some((lane) => lane.attempt_state === "failed");
+      sourceStates.set(sourceThreadId, {
+        known: terminalFromLane || observation !== null,
+        terminal: terminalFromLane || observation?.archived === true || observation?.status === "error",
+        failed: failedFromLane || observation?.archived === true || observation?.status === "error",
+      });
+    }
+
+    const byWaiter = new Map<string, RegisteredWaitState>();
+    const events: WaitEvent[] = [];
+    for (const wait of waits) {
+      if (waitRegistry.state(wait.waitId) === "fired") {
+        byWaiter.set(wait.waiterThreadId, mergeRegisteredWaitState(byWaiter.get(wait.waiterThreadId), "fired"));
+        continue;
+      }
+      const source = sourceStates.get(wait.sourceThreadId);
+      let reason: WaitEvent["reason"] | null = null;
+      if (now() >= wait.deadlineAtMs) reason = "deadline_expired";
+      else if (!source?.known) {
+        byWaiter.set(wait.waiterThreadId, mergeRegisteredWaitState(byWaiter.get(wait.waiterThreadId), "unknown"));
+        continue;
+      } else if (wait.sourceEvent === "terminal" && source.terminal) reason = "source_terminal";
+      else if (wait.sourceEvent === "failure" && source.failed) reason = "source_failure";
+      else {
+        byWaiter.set(wait.waiterThreadId, mergeRegisteredWaitState(byWaiter.get(wait.waiterThreadId), "pending"));
+        continue;
+      }
+      let event: WaitEvent | null;
+      try {
+        event = await waitRegistry.fire(wait.waitId, reason, now());
+      } catch {
+        return { known: false, byWaiter: new Map(), events: [] };
+      }
+      if (event) events.push(event);
+      byWaiter.set(wait.waiterThreadId, mergeRegisteredWaitState(byWaiter.get(wait.waiterThreadId), "fired"));
+    }
+    return { known: true, byWaiter, events };
+  };
 
   const laneKey = (lane: LaneState) => `${lane.project_id}:${lane.execution_attempt_id}`;
   const clearResolved = (lanes: LaneState[]) => {
@@ -612,22 +819,41 @@ export function createLaneWatcher(options: {
     options.onAlert?.({ kind: "wrongful_idle_fyi", lane: null, role, count: 2, max: 2 });
   };
 
+  const isCurrentCanonicalHolder = (projectId: string, threadId: string): boolean => {
+    if (!options.readRoleHolders) return false;
+    try {
+      return options.readRoleHolders()
+        .filter((holder) => holder.project_id === projectId && holder.role_id === ORCHESTRATOR_ROLE_ID)
+        .some((holder) => holder.thread_id === threadId);
+    } catch {
+      return true;
+    }
+  };
+
+  const resolveCurrentCanonicalHolder = (holder: RoleHolderState): RoleHolderState | null => {
+    if (!options.readRoleHolders) return null;
+    try {
+      const current = options.readRoleHolders().filter((candidate) =>
+        candidate.project_id === holder.project_id && candidate.role_id === ORCHESTRATOR_ROLE_ID,
+      );
+      return current.length === 1 &&
+        current[0]?.role_generation === holder.role_generation &&
+        current[0]?.execution_attempt_id === holder.execution_attempt_id &&
+        current[0]?.thread_id === holder.thread_id
+        ? current[0]
+        : null;
+    } catch {
+      return null;
+    }
+  };
+
   const escalateRole = async (key: string, role: RoleIdleView) => {
     if (!await roleIdleLedger.markEscalated(key)) return;
     roleAlert(role);
     options.onRoleSuccessionRequired?.(role);
   };
 
-  const readRegisteredWaitForSafe = async (threadId: string): Promise<boolean> => {
-    if (!options.readRegisteredWaitFor) return false;
-    try {
-      return await options.readRegisteredWaitFor(threadId);
-    } catch {
-      return true;
-    }
-  };
-
-  const observeRoleNow = async (threadId?: string, suppliedScopes?: RoleQueueScope[]): Promise<void> => {
+  const observeRoleNow = async (threadId?: string, suppliedScopes?: RoleQueueScope[], waitContext?: WaitContext): Promise<void> => {
     if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return;
     let holders: RoleHolderState[];
     try {
@@ -636,17 +862,7 @@ export function createLaneWatcher(options: {
       return;
     }
     if (holders.length === 0) return;
-    if (threadId && threadId !== supervisorThreadId && !holders.some((holder) => holder.thread_id === threadId)) return;
-
-    let dispatcherProjectId: string | null = null;
-    if (options.readDispatcherProjectIdentity) {
-      try {
-        dispatcherProjectId = await options.readDispatcherProjectIdentity();
-      } catch {
-        return;
-      }
-      if (!dispatcherProjectId) return;
-    }
+    if (threadId && !holders.some((holder) => holder.thread_id === threadId)) return;
 
     let scopes = suppliedScopes;
     if (!scopes) {
@@ -658,9 +874,9 @@ export function createLaneWatcher(options: {
     }
 
     for (const holder of holders) {
-      const targetThreadId = options.readDispatcherProjectIdentity && dispatcherProjectId === holder.project_id
-        ? supervisorThreadId
-        : holder.thread_id;
+      const projectHolders = holders.filter((candidate) => candidate.project_id === holder.project_id);
+      if (projectHolders.length !== 1 || !holder.thread_id) continue;
+      const targetThreadId = holder.thread_id;
       if (threadId && targetThreadId !== threadId) continue;
       const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
       const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
@@ -670,7 +886,8 @@ export function createLaneWatcher(options: {
       } catch {
         continue;
       }
-      if (observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || await readRegisteredWaitForSafe(targetThreadId) || !scope?.nextStartable || scope.deferredReason) {
+      const waitState = waitContext?.byWaiter.get(targetThreadId) ?? "none";
+      if (observation.projectId !== holder.project_id || waitContext && !waitContext.known || waitState === "pending" || waitState === "unknown" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || !scope?.nextStartable || scope.deferredReason) {
         await roleIdleLedger.clearPrefixExcept(prefix);
         continue;
       }
@@ -721,6 +938,10 @@ export function createLaneWatcher(options: {
         queueHeadId: scope.queueHeadId,
         idleAgeMs,
       };
+      if (!resolveCurrentCanonicalHolder(holder)) {
+        await roleIdleLedger.clearPrefixExcept(prefix);
+        continue;
+      }
       let failed = false;
       try {
         await options.steerRole(role);
@@ -740,16 +961,23 @@ export function createLaneWatcher(options: {
     archived = false,
     suppliedOperatorWait?: OperatorWait | null,
     suppliedOperatorWaitKnown = status !== "idle" || suppliedOperatorWait !== undefined || !options.readOperatorWait,
+    waitContext?: WaitContext,
   ): Promise<void> => {
     const allLanes = options.readLanes();
     clearResolved(allLanes);
     const candidates = allLanes.filter(
       (lane) =>
         lane.thread_id === threadId &&
-        lane.thread_id !== supervisorThreadId &&
+        (!lane.thread_id || !isCurrentCanonicalHolder(lane.project_id, lane.thread_id)) &&
         OPEN_ATTEMPT_STATES.has(lane.attempt_state),
     );
     if (candidates.length === 0) return;
+
+    const registeredWaitState = waitContext?.byWaiter.get(threadId) ?? "none";
+    if (status === "idle" && (waitContext && (!waitContext.known || registeredWaitState === "pending" || registeredWaitState === "unknown"))) {
+      for (const lane of candidates) coalesced.delete(laneKey(lane));
+      return;
+    }
 
     let operatorWait = suppliedOperatorWait ?? null;
     let operatorWaitKnown = suppliedOperatorWaitKnown;
@@ -763,8 +991,7 @@ export function createLaneWatcher(options: {
     }
     let waiting = pendingExternalWait ?? false;
     if (operatorWait) waiting = true;
-    if (!archived && status === "idle" && await readRegisteredWaitForSafe(threadId)) waiting = true;
-    if (!archived && status === "idle" && pendingExternalWait === undefined && !operatorWait && !waiting && options.isExternallyWaiting) {
+    if (!archived && status === "idle" && pendingExternalWait === undefined && !operatorWait && options.isExternallyWaiting) {
       try {
         waiting = await options.isExternallyWaiting(threadId);
       } catch {
@@ -834,24 +1061,44 @@ export function createLaneWatcher(options: {
     return result;
   };
 
+  const emitWaitEvents = async (context: WaitContext) => {
+    for (const event of context.events) await options.onWaitEvent?.(event);
+  };
+
   return {
+    registerWait(wait) {
+      return waitRegistry.register(wait);
+    },
     observe(threadId, status, pendingExternalWait, archived, operatorWait) {
       return enqueue(async () => {
-        if (threadId !== supervisorThreadId) await observeNow(threadId, status, pendingExternalWait, archived, operatorWait);
-        await observeRoleNow(threadId);
+        const context = await readWaitContext(options.readLanes(), { threadId, status, archived: archived ?? false });
+        await emitWaitEvents(context);
+        await observeNow(threadId, status, pendingExternalWait, archived, operatorWait, undefined, context);
+        await observeRoleNow(threadId, undefined, context);
+        for (const event of context.events) {
+          if (event.waiterThreadId === threadId || !options.readWorker) continue;
+          try {
+            const observation = await options.readWorker(event.waiterThreadId);
+            await observeNow(event.waiterThreadId, observation.status, observation.pendingExternalWait, observation.archived, observation.operatorWait, observation.operatorWaitKnown, context);
+            await observeRoleNow(event.waiterThreadId, undefined, context);
+          } catch {
+            // An unreadable waiter cannot be safely woken.
+          }
+        }
       });
     },
     poll() {
       return enqueue(async () => {
         const lanes = options.readLanes();
         clearResolved(lanes);
+        const context = await readWaitContext(lanes);
+        await emitWaitEvents(context);
         if (!options.readWorker) return;
 
         const workerIds = new Set(
           lanes
             .filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.thread_id)
-            .map((lane) => lane.thread_id as string)
-            .filter((threadId) => threadId !== supervisorThreadId),
+            .map((lane) => lane.thread_id as string),
         );
         for (const threadId of workerIds) {
           let observation: WorkerObservation;
@@ -868,14 +1115,13 @@ export function createLaneWatcher(options: {
             observation.archived,
             observation.operatorWait,
             observation.operatorWaitKnown,
+            context,
           );
         }
 
         if (options.readRoleHolders) {
           const roleThreadIds = new Set(options.readRoleHolders()
-            .map((holder) => holder.thread_id)
-            .filter((threadId) => threadId !== supervisorThreadId));
-          if (options.readDispatcherProjectIdentity) roleThreadIds.add(supervisorThreadId);
+            .map((holder) => holder.thread_id));
           let roleScopes: RoleQueueScope[] | null = null;
           if (roleThreadIds.size > 0 && options.readRoleScopes) {
             try {
@@ -885,7 +1131,7 @@ export function createLaneWatcher(options: {
             }
           }
           if (roleScopes) {
-            for (const threadId of roleThreadIds) await observeRoleNow(threadId, roleScopes);
+            for (const threadId of roleThreadIds) await observeRoleNow(threadId, roleScopes, context);
           }
         }
       });
@@ -893,6 +1139,7 @@ export function createLaneWatcher(options: {
     recover() {
       return enqueue(async () => {
         await continuationLedger.recover();
+        await waitRegistry.recover();
         await operatorWaitAlertLedger.recover();
         await roleIdleLedger.recover();
       });

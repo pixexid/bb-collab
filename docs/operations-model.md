@@ -98,22 +98,22 @@ reject, or activate a mutation.
 
 ## Registered waits and the durable wait-validator (#93)
 
-Every "waiting for X" is a registered durable row — waiter, event type,
-source thread, mandatory bounded deadline — written by the waiter through
-the `bb collab wait-register` CLI seam at the moment it decides to wait.
-Registering a wait is how a thread is allowed to go idle; an unregistered
-wait is not a legal idle reason for workers, the director, or the
-dispatcher. The model-free validator fires waits when their source
-terminalizes (thread error/archived, or a terminal attempt state or
-receipt) or their deadline passes, wakes the waiter once through the
-agent-only steer seam, escalates at most twice to exactly one operator
-alert plus a succession trigger, and never writes a canonical table,
-resolver row, or receipt. Wait rows, fired-wake dedupe, and escalation state
-live in the plugin KV seam, bounded and restart-safe; a host launchd
-LaunchAgent (`launchd/`) supervises the loop so validation survives bb
-restarts and app crashes, and a liveness schedule alerts the operator
-exactly once if launchd itself fails. The full frozen contract, deadline
-table, drills, and deployment/deletion conditions are in
+Every "waiting for X" is a registered durable row — waiter, source thread,
+source event, mandatory bounded deadline. The plugin-side watcher treats a
+registered wait as the only legal idle (mechanism eight); a waiter thread
+registers through the `bb collab wait-register` CLI seam, which enforces
+the #93 law: a default bounded deadline (explicit overrides need a reason
+and a horizon), source-liveness validation, and waiter-thread binding, all
+fail closed. The model-free validator fires waits when their source
+terminalizes or their deadline passes, wakes the waiter once through the
+agent-only steer seam, and escalates at most two ignored or failed steers
+to exactly one operator alert plus a succession trigger. Waits, fired-wake
+dedupe, and escalation state live in the one plugin KV registry; a host
+launchd LaunchAgent (`launchd/`) supervises the loop so validation survives
+bb restarts and app crashes, and a liveness schedule alerts the operator
+exactly once if launchd itself fails. Nothing in the wait path writes a
+canonical table, resolver row, or receipt. The full frozen contract,
+deadline table, drills, and deployment/deletion conditions are in
 [the #93 document](issue-93-durable-wait-validator.md). This is an
 operations-model extension of the awareness substrate, not a canonical
 contract change.
@@ -128,15 +128,23 @@ itself. This is an operations-model scope extension only; canonical activation
 still awaits the one exact v8 console approval bound to the project,
 operation, candidate head, idempotency key, and request digest.
 
-Authority-maintenance re-adoption has no human form. Contract v13 leaves the
+Authority-maintenance re-adoption has no human form. Contract v14 leaves the
 exact ten-class registry unchanged; the already-bounded v11 nine-class state
 remains readable but refuses `work_item_transition`. The registry check is exact
 and order-sensitive: malformed, reordered, subset, extra, v9, and arbitrary
-sets refuse before any receipt or canonical write. This is a v13 contract bump:
-four cached consumers must reread v13 or refuse v12, with durable rollout
+sets refuse before any receipt or canonical write. This is a v14 contract bump:
+four cached consumers must reread v14 or refuse v13, with durable rollout
 evidence. The cap itself is recorded by the existing adopted Decision plus
 operator-authorized `config_revision`; it does not create a second authority
 store.
+
+The v14 `director-seat` amendment remains the existing project-orchestrator
+role with primary `pi/kimi-coding/k3/high`, Opus-medium standby, managed-
+worktree-only holder facts, and zero writing-lane capacity. Epoch-2 service on
+the unmanaged canonical environment is grandfathered evidence, not generation
+3 occupancy. A future successor is first preflighted and then recorded through
+the receipt-gated succession apply; witness evidence and operator word do not
+occupy the seat.
 
 The approved default model for non-visual queue and documentation engineering
 is `codex/gpt-5.6-luna`. On a cheap tier, an omitted reasoning value on a

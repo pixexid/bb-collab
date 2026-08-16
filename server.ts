@@ -2,9 +2,9 @@ import { defineRpcContract, type BbPluginApi, type PluginCliContext } from "@bb/
 import { z } from "zod";
 import {
   OPEN_ATTEMPT_STATES,
-  SUPERVISOR_THREAD_ID,
   createContinuationLedger,
   createLaneWatcher,
+  createWaitRegistry,
   openLaneViews,
   readLaneStates,
   readRoleHolderStates,
@@ -43,11 +43,10 @@ import {
   LIVENESS_ALERT_FLAG_FILENAME,
   LIVENESS_MARKER_FILENAME,
   WAIT_ESCALATION_KV_KEY,
-  WAIT_REGISTRY_KV_KEY,
-  createWaitRegistry,
-  createWaitValidator,
+  createWaitEscalationCycle,
   livenessDecision,
   livenessState,
+  registerBoundedWait,
   waitValidatorStateDir,
   type SourceObservation,
 } from "./src/registered-waits.js";
@@ -174,6 +173,13 @@ const laneViewSchema = z
 
 const laneListSchema = z.array(laneViewSchema);
 const sidebarThreadIdSchema = z.string().trim().min(1).max(256);
+const registeredWaitSchema = z.object({
+  waitId: sidebarThreadIdSchema,
+  waiterThreadId: sidebarThreadIdSchema,
+  sourceThreadId: sidebarThreadIdSchema,
+  sourceEvent: z.enum(["terminal", "failure"]),
+  deadlineAtMs: z.number().int().nonnegative(),
+}).strict();
 const sidebarThreadStateSchema = z.string().trim().min(1).max(64);
 const sidebarThreadStateKey = (threadId: string) => `sidebar.thread-state:${threadId}`;
 const sidebarReasoningLevelSchema = z.enum(["none", "low", "medium", "high", "xhigh", "ultracode", "max", "ultra"]);
@@ -211,6 +217,10 @@ export const rpcContract = defineRpcContract({
   lanes: {
     input: z.object({}).strict(),
     output: laneListSchema,
+  },
+  registerWait: {
+    input: registeredWaitSchema,
+    output: registeredWaitSchema,
   },
   threadStates: {
     input: z.object({ threadIds: z.array(sidebarThreadIdSchema).max(256) }).strict(),
@@ -463,10 +473,11 @@ async function applyLiveAuthorizedMutation(bb: BbPluginApi, db: SqliteDatabase |
   return applyAuthorizedMutation(db, input, null, reader);
 }
 
-interface ValidatorCliDeps {
-  waitRegistry: import("./src/registered-waits.js").WaitRegistry;
-  waitValidator: import("./src/registered-waits.js").WaitValidator;
+interface WaitValidatorCliDeps {
   watcher: import("./src/awareness.js").LaneWatcher;
+  registerBoundedWaitForCli: (input: unknown, ctxThreadId?: string) => Promise<import("./src/registered-waits.js").RegisterWaitResult>;
+  listWaitsForCli: () => Promise<Array<Record<string, unknown>>>;
+  escalationCycle: import("./src/registered-waits.js").WaitEscalationCycle;
 }
 
 async function runCli(
@@ -474,24 +485,27 @@ async function runCli(
   bb: BbPluginApi,
   argv: string[],
   ctx: PluginCliContext,
-  deps: ValidatorCliDeps,
+  deps: WaitValidatorCliDeps,
 ) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "wait-register", "wait-cancel", "wait-list", "wait-validator"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, wait-register, wait-cancel, wait-list, or wait-validator");
+  if (!command || !["doctor", "export", "apply", "wait-register", "wait-list", "wait-validator"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, wait-register, wait-list, or wait-validator");
   }
   if (command === "wait-validator") {
     const unknown = args.find((arg) => arg !== "--cycle");
     if (unknown) return invalidCli(`unexpected argument ${unknown}`);
     if (!args.includes("--cycle")) return invalidCli("--cycle is required: the validator runs exactly one durable cycle per invocation");
     try {
+      // One cycle = the watcher's own wait firing/validation pass plus the
+      // bounded escalation pass over fired waits. Both are read-only on
+      // canonical state and act only through sanctioned seams.
       await deps.watcher.poll();
-      const summary = await deps.waitValidator.cycle();
+      const summary = await deps.escalationCycle.cycle();
       return cliResult({
         outcome: "OK",
         subject: "wait-validator",
-        expected: summary.evaluated,
+        expected: 1,
         attempted: summary.fired + summary.steered,
         verified: summary.fired,
         message: "durable wait validation cycle complete",
@@ -510,7 +524,7 @@ async function runCli(
   }
   const projectId = parseFlag(args, "--project");
   if (!projectId) return invalidCli("--project PROJECT_ID is required; CLI context is never used as a fallback");
-  if (command === "wait-register" || command === "wait-cancel") {
+  if (command === "wait-register") {
     const unknown = unexpectedFlags(args, ["--project", "--request"]);
     if (unknown) return invalidCli(`unexpected flag ${unknown}`);
     const requestJson = parseFlag(args, "--request");
@@ -521,10 +535,10 @@ async function runCli(
     } catch (error) {
       return invalidCli(error instanceof Error ? error.message : String(error));
     }
-    const result = command === "wait-register"
-      ? await deps.waitRegistry.register(request, ctx.threadId).catch(() => null)
-      : await deps.waitRegistry.cancel(request, ctx.threadId).catch(() => null);
-    if (result === null) {
+    let result: import("./src/registered-waits.js").RegisterWaitResult;
+    try {
+      result = await deps.registerBoundedWaitForCli(request, ctx.threadId);
+    } catch {
       return cliResult({ outcome: "INTERNAL_ERROR", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "wait registry state is unreadable; refusing fail closed" });
     }
     if (result.outcome === "refused") {
@@ -536,22 +550,27 @@ async function runCli(
       expected: 1,
       attempted: 1,
       verified: 1,
-      message: result.outcome === "registered" ? (result.replay ? "registered wait replayed idempotently" : "registered wait persisted") : "registered wait cancelled",
-      evidence: result.outcome === "registered" ? { wait: result.wait } : { waitId: result.waitId },
+      message: result.replay ? "registered wait replayed idempotently" : "registered wait persisted",
+      evidence: { wait: result.wait },
     });
   }
   if (command === "wait-list") {
     const unknown = unexpectedFlags(args, ["--project"]);
     if (unknown) return invalidCli(`unexpected flag ${unknown}`);
-    const state = await deps.waitRegistry.list();
+    let waits: Array<Record<string, unknown>>;
+    try {
+      waits = await deps.listWaitsForCli();
+    } catch {
+      return cliResult({ outcome: "INTERNAL_ERROR", subject: projectId, expected: 0, attempted: 0, verified: 0, message: "wait registry state is unreadable; refusing fail closed" });
+    }
     return cliResult({
       outcome: "OK",
       subject: projectId,
-      expected: state.active.length,
-      attempted: state.active.length,
-      verified: state.active.length,
-      message: `${state.active.length} active registered waits`,
-      evidence: state,
+      expected: waits.length,
+      attempted: waits.length,
+      verified: waits.length,
+      message: `${waits.length} registered waits`,
+      evidence: waits,
     });
   }
   if (command === "apply") {
@@ -648,6 +667,59 @@ export default async function plugin(bb: BbPluginApi) {
     write: (state) => bb.storage.kv.set("lane-watcher.continuations", state),
   });
 
+  const waitRegistry = createWaitRegistry({
+    read: () => bb.storage.kv.get<unknown>("lane-watcher.registered-waits"),
+    write: (state) => bb.storage.kv.set("lane-watcher.registered-waits", state),
+  });
+
+  // #93 durable wait-validator layer over the one wait registry: the
+  // bounded escalation ladder for fired waits and the host-supervised
+  // liveness rule. Escalation state lives in the plugin KV seam; canonical
+  // SQLite, the resolver, and receipts are never touched.
+  const readThreadObservation = async (threadId: string): Promise<SourceObservation> => {
+    const thread = await bb.sdk.threads.get({ threadId });
+    return thread.archivedAt !== null || thread.deletedAt !== null
+      ? { status: thread.status, archived: true }
+      : { status: thread.status, archived: false };
+  };
+
+  const boundedRegistry = {
+    register: (wait: Parameters<typeof waitRegistry.register>[0]) => waitRegistry.register(wait),
+    list: () => waitRegistry.list(),
+    firedWaitIds: async () => { await waitRegistry.recover(); return waitRegistry.firedList() as Array<{ waitId: string; reason: string; waiterThreadId: string }>; },
+  };
+  const escalationCycle = createWaitEscalationCycle({
+    registry: boundedRegistry,
+    escalationPersistence: {
+      read: () => bb.storage.kv.get<unknown>(WAIT_ESCALATION_KV_KEY),
+      write: (state) => bb.storage.kv.set(WAIT_ESCALATION_KV_KEY, state),
+    },
+    readWaiter: readThreadObservation,
+    steerWaiter: async (target) => {
+      await bb.sdk.threads.send({
+        threadId: target.waiterThreadId,
+        mode: "steer",
+        input: [
+          {
+            type: "text",
+            visibility: "agent-only",
+            text: `Registered wait ${target.waitId} fired (${target.reason}). Wake: inspect what you were waiting on, act on it, and record the next step or blocker.`,
+            mentions: [],
+          },
+        ],
+      });
+    },
+    onFire: (record) => {
+      bb.log.warn(`registered wait fired: ${record.waitId} (${record.reason})`);
+      bb.realtime.publish("wait-validator", { fired: record.waitId, reason: record.reason });
+    },
+    onEscalate: (record) => {
+      bb.log.error(`registered wait escalation: waiter ${record.waiterThreadId} ignored ${record.steers} steers for ${record.waitId}; succession trigger`);
+      bb.realtime.publish("wait-validator", { escalated: record.waitId, waiterThreadId: record.waiterThreadId, successionTrigger: true });
+    },
+  });
+  await escalationCycle.recover().catch((error) => bb.log.error(`wait escalation state is unreadable: ${String(error)}`));
+
   const operatorWaitAlertPersistence = {
     read: () => bb.storage.kv.get<unknown>("lane-watcher.operator-wait-fyi"),
     write: (state: Record<string, true>) => bb.storage.kv.set("lane-watcher.operator-wait-fyi", state),
@@ -674,78 +746,13 @@ export default async function plugin(bb: BbPluginApi) {
     );
   };
 
-  // Registered waits (#93 / #57 mechanism 8). Waits are written by the
-  // WAITER through the CLI seam at the moment it decides to wait; the
-  // validator below only reads them, steers through the same agent-only
-  // sdk seam the lane watcher uses, and records dedupe/escalation state in
-  // the plugin KV. No canonical SQLite table, resolver, or receipt is ever
-  // touched by a wait or by validation.
-  const readThreadObservation = async (threadId: string): Promise<SourceObservation> => {
-    const thread = await bb.sdk.threads.get({ threadId });
-    return thread.archivedAt !== null || thread.deletedAt !== null
-      ? { status: thread.status, archived: true }
-      : { status: thread.status, archived: false };
-  };
-
-  const waitRegistry = createWaitRegistry({
-    persistence: {
-      read: () => bb.storage.kv.get<unknown>(WAIT_REGISTRY_KV_KEY),
-      write: (state) => bb.storage.kv.set(WAIT_REGISTRY_KV_KEY, state),
-    },
-    readSource: readThreadObservation,
-  });
-
-  const waitValidator = createWaitValidator({
-    registry: waitRegistry,
-    escalationPersistence: {
-      read: () => bb.storage.kv.get<unknown>(WAIT_ESCALATION_KV_KEY),
-      write: (state) => bb.storage.kv.set(WAIT_ESCALATION_KV_KEY, state),
-    },
-    readSource: readThreadObservation,
-    readWaiter: readThreadObservation,
-    readSourceTerminals: () => {
-      const terminals = new Map<string, string>();
-      if (!db) return terminals;
-      for (const lane of readLaneStates(db)) {
-        if (!lane.thread_id) continue;
-        if (!OPEN_ATTEMPT_STATES.has(lane.attempt_state)) terminals.set(lane.thread_id, `attempt ${lane.attempt_state}`);
-        else if (lane.terminal_report_digest !== null) terminals.set(lane.thread_id, "terminal receipt");
-      }
-      return terminals;
-    },
-    steerWaiter: async (target) => {
-      await bb.sdk.threads.send({
-        threadId: target.waiterThreadId,
-        mode: "steer",
-        input: [
-          {
-            type: "text",
-            visibility: "agent-only",
-            text: `Registered wait ${target.waitId} fired (${target.reason}${target.detail ? `: ${target.detail}` : ""}). Wake: inspect what you were waiting on, act on it, and record the next step or blocker.`,
-            mentions: [],
-          },
-        ],
-      });
-    },
-    onFire: (record) => {
-      bb.log.warn(`registered wait fired: ${record.waitId} (${record.reason}${record.detail ? `: ${record.detail}` : ""})`);
-      bb.realtime.publish("wait-validator", { fired: record.waitId, reason: record.reason });
-    },
-    onEscalate: (record) => {
-      bb.log.error(`registered wait escalation: waiter ${record.waiterThreadId} ignored ${record.steers} steers for ${record.waitId}; succession trigger`);
-      bb.realtime.publish("wait-validator", { escalated: record.waitId, waiterThreadId: record.waiterThreadId, successionTrigger: true });
-    },
-  });
-  await waitRegistry.recover().catch((error) => bb.log.error(`wait registry state is unreadable: ${String(error)}`));
-  await waitValidator.recover().catch((error) => bb.log.error(`wait escalation state is unreadable: ${String(error)}`));
-
   const watcher = createLaneWatcher({
     readLanes: () => (db ? readLaneStates(db) : []),
     readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
     readRoleScopes,
-    readDispatcherProjectIdentity: async () => (await bb.sdk.threads.get({ threadId: SUPERVISOR_THREAD_ID })).projectId,
     roleIdlePersistence,
     continuationLedger,
+    waitRegistry,
     operatorWaitAlertPersistence,
     onAlert: (alert) => alert.lane
       ? bb.log.warn(`lane awareness ${alert.kind}: ${alert.lane.laneId} (${alert.count}/${alert.max})`)
@@ -753,7 +760,6 @@ export default async function plugin(bb: BbPluginApi) {
     onRoleSuccessionRequired: (role) => bb.log.warn(`role succession required: ${role.roleId}@${role.roleGeneration}`),
     isExternallyWaiting: readPendingExternalWait,
     readOperatorWait: readPendingOperatorWaitForThread,
-    readRegisteredWaitFor: async (threadId) => (await waitRegistry.activeWaitsFor(threadId)).length > 0,
     readWorker: async (threadId) => {
       const thread = await bb.sdk.threads.get({ threadId });
       const archived = thread.archivedAt !== null || thread.deletedAt !== null;
@@ -767,6 +773,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
       }
       return {
+        projectId: thread.projectId,
         status: thread.status,
         pendingExternalWait: archived || !operatorWaitKnown
           ? true
@@ -779,7 +786,8 @@ export default async function plugin(bb: BbPluginApi) {
       };
     },
     steer: async (lane) => {
-      if (!lane.threadId || lane.threadId === SUPERVISOR_THREAD_ID) return;
+      if (!lane.threadId) return;
+      if (db && readRoleHolderStates(db).some((holder) => holder.project_id === lane.projectId && holder.thread_id === lane.threadId)) return;
       await bb.sdk.threads.send({
         threadId: lane.threadId,
         mode: "steer",
@@ -794,8 +802,23 @@ export default async function plugin(bb: BbPluginApi) {
       });
     },
     steerRole: async (role) => {
+      if (!db) return;
+      const holders = readRoleHolderStates(db).filter((holder) =>
+        holder.project_id === role.projectId &&
+        holder.role_id === role.roleId &&
+        holder.role_generation === role.roleGeneration &&
+        holder.execution_attempt_id === role.executionAttemptId,
+      );
+      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) return;
+      let thread;
+      try {
+        thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
+      } catch {
+        return;
+      }
+      if (thread.projectId !== role.projectId || thread.archivedAt !== null || thread.deletedAt !== null) return;
       await bb.sdk.threads.send({
-        threadId: role.threadId,
+        threadId: holders[0].thread_id,
         mode: "steer",
         input: [
           {
@@ -825,7 +848,7 @@ export default async function plugin(bb: BbPluginApi) {
     async start(signal) {
       while (!signal.aborted) {
         await watcher.poll().catch((error) => bb.log.warn(`lane poll failed: ${String(error)}`));
-        await waitValidator.cycle().catch((error) => bb.log.warn(`wait validation failed: ${String(error)}`));
+        await escalationCycle.cycle().catch((error) => bb.log.warn(`wait escalation failed: ${String(error)}`));
         if (signal.aborted) break;
         await new Promise<void>((resolve) => {
           let timer: ReturnType<typeof setTimeout>;
@@ -841,12 +864,12 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  // The self-watch, once: launchd KeepAlive restarts the validator process
-  // on death; this schedule is the trivial second check. It alerts the
-  // operator exactly once when the liveness marker the host-supervised
-  // validator refreshes every cycle goes stale — meaning launchd itself
-  // failed, which is operator territory. A missing marker is never launchd-
-  // failure evidence, so it stays silent.
+  // The self-watch, once: launchd KeepAlive restarts the host-supervised
+  // validator loop on death; this schedule is the trivial second check. It
+  // alerts the operator exactly once when the liveness marker that loop
+  // refreshes every cycle goes stale — meaning launchd itself failed, which
+  // is operator territory. A missing marker is never launchd-failure
+  // evidence (the agent may not be deployed), so it stays silent.
   bb.background.schedule("wait-validator-liveness", "*/5 * * * *", async () => {
     try {
       const stateDir = waitValidatorStateDir();
@@ -879,7 +902,6 @@ export default async function plugin(bb: BbPluginApi) {
       db,
       Date.now(),
       new Map(requests.map((request) => [request.callerThreadId, { reason: "awaiting_operator", createdAtMs: request.createdAt } satisfies OperatorWait])),
-      await waitRegistry.activeWaiterThreadIds(),
     );
   };
 
@@ -913,6 +935,10 @@ export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(rpcContract, {
     lanes() {
       return readOpenLaneViews();
+    },
+    async registerWait(input) {
+      await watcher.registerWait(input);
+      return input;
     },
     async threadStates(input) {
       const entries = await Promise.all(input.threadIds.map(async (threadId) => {
@@ -1146,7 +1172,6 @@ export default async function plugin(bb: BbPluginApi) {
         summary: "Register one bounded durable wait (deadline mandatory, fail closed)",
         usage: "bb collab wait-register --project PROJECT_ID --request JSON",
       },
-      { name: "wait-cancel", summary: "Cancel one active registered wait", usage: "bb collab wait-cancel --project PROJECT_ID --request JSON" },
       { name: "wait-list", summary: "List registered waits (read-only)", usage: "bb collab wait-list --project PROJECT_ID" },
       {
         name: "wait-validator",
@@ -1155,7 +1180,21 @@ export default async function plugin(bb: BbPluginApi) {
       },
     ],
     run(argv, context) {
-      return runCli(db, bb, argv, context, { waitRegistry, waitValidator, watcher });
+      return runCli(db, bb, argv, context, {
+        watcher,
+        registerBoundedWaitForCli: (input, ctxThreadId) => registerBoundedWait({
+          registry: {
+            register: async (wait) => watcher.registerWait(wait),
+            list: () => waitRegistry.list(),
+            firedWaitIds: boundedRegistry.firedWaitIds,
+          },
+          readSource: readThreadObservation,
+          input,
+          ctxThreadId,
+        }),
+        listWaitsForCli: async () => waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) })),
+        escalationCycle,
+      });
     },
   });
 

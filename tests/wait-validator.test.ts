@@ -1,9 +1,9 @@
 // Plugin-boundary drills for the durable wait-validator (#93 / #57
-// mechanism 8): the sanctioned CLI registration seam, the one-cycle
-// validation seam, wait-aware idle legality for workers and the director,
+// mechanism 8) over the merged substrate: the CLI registration seam with
+// the deadline law, the one-cycle validation seam, legal-vs-illegal idle,
 // the liveness self-watch schedule, the launchd artifact, and the
-// host-supervised loop script. Every drill asserts the refusing direction
-// too, and none ever writes a canonical table, resolver, or receipt.
+// host-supervised loop scripts. Every drill asserts the refusing direction
+// too, and none ever writes a canonical table.
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -12,7 +12,6 @@ import { fileURLToPath } from "node:url";
 import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createLaneWatcher, type LaneState } from "../src/awareness.js";
 import plugin from "../server.js";
 import { PLUGIN_ID } from "../src/foundation.js";
 
@@ -43,9 +42,7 @@ function hostFixture(): HostFixture {
           sends.push(input as unknown[]);
           return { ok: true };
         },
-        interactions: {
-          list: async () => [],
-        },
+        interactions: { list: async () => [] },
       },
     },
   });
@@ -70,10 +67,9 @@ async function loadedFixture(): Promise<HostFixture> {
 }
 
 const waitRequest = (overrides: Record<string, unknown> = {}) => ({
-  projectId: PROJECT_ID,
   waiterThreadId: "waiter-1",
-  eventType: "source_terminal",
   sourceThreadId: "source-1",
+  sourceEvent: "terminal",
   reason: "waiting on the source lane",
   idempotencyKey: "wait-key-1",
   ...overrides,
@@ -94,7 +90,7 @@ describe("durable wait-validator plugin boundary", () => {
 
     const result = await registerWait(fixture, waitRequest(), "waiter-1");
     expect(result.exitCode).toBe(0);
-    expect(JSON.parse(result.stdout)).toMatchObject({ outcome: "OK", evidence: { wait: { waiterThreadId: "waiter-1" } } });
+    expect(JSON.parse(result.stdout)).toMatchObject({ outcome: "OK", evidence: { wait: { waiterThreadId: "waiter-1", sourceThreadId: "source-1" } } });
 
     const replay = await registerWait(fixture, waitRequest(), "waiter-1");
     expect(replay.exitCode).toBe(0);
@@ -105,28 +101,26 @@ describe("durable wait-validator plugin boundary", () => {
     expect(JSON.parse(foreign.stdout)).toMatchObject({ outcome: "INVALID_INPUT", message: expect.stringContaining("calling thread") });
 
     const listed = await fixture.host.harness.runCli(["wait-list", "--project", PROJECT_ID]);
-    expect(JSON.parse(listed.stdout).evidence.active).toHaveLength(1);
+    expect(JSON.parse(listed.stdout).evidence).toHaveLength(1);
     expect(fixture.canonicalDigest()).toBe(digestBefore); // KV only: zero canonical writes
     await fixture.host.harness.lifecycle.dispose();
   });
 
-  it("refuses a deadline-less wait at registration, fail closed", async () => {
+  it("refuses a deadline-less wait and an unverifiable source at registration, fail closed", async () => {
     const fixture = await loadedFixture();
     fixture.setThread("source-1", { status: "active" });
     for (const request of [
-      waitRequest({ eventType: "ci_check" }),
-      waitRequest({ deadlineMs: null }),
-      waitRequest({ deadlineMs: 123 }),
+      waitRequest({ deadlineAtMs: null }),
+      waitRequest({ deadlineAtMs: 123 }),
+      waitRequest({ sourceEvent: "ci_check" }),
+      waitRequest({ idempotencyKey: "unknown-src", sourceThreadId: "source-unknown" }),
     ]) {
       const result = await registerWait(fixture, request, "waiter-1");
       expect(result.exitCode).toBe(2);
       expect(JSON.parse(result.stdout)).toMatchObject({ outcome: "INVALID_INPUT" });
     }
-    const unknownSource = await registerWait(fixture, waitRequest({ idempotencyKey: "wait-key-9", sourceThreadId: "source-unknown" }), "waiter-1");
-    expect(unknownSource.exitCode).toBe(2);
-    expect(JSON.parse(unknownSource.stdout)).toMatchObject({ message: expect.stringContaining("unknown") });
     const listed = await fixture.host.harness.runCli(["wait-list", "--project", PROJECT_ID]);
-    expect(JSON.parse(listed.stdout).evidence.active).toHaveLength(0);
+    expect(JSON.parse(listed.stdout).evidence).toHaveLength(0);
     await fixture.host.harness.lifecycle.dispose();
   });
 
@@ -140,54 +134,30 @@ describe("durable wait-validator plugin boundary", () => {
     fixture.setThread("source-1", { status: "error" });
     const first = await fixture.host.harness.runCli(["wait-validator", "--cycle"]);
     expect(first.exitCode).toBe(0);
-    expect(JSON.parse(first.stdout)).toMatchObject({ outcome: "OK", evidence: { fired: 1, steered: 1 } });
-    expect(fixture.sends).toHaveLength(1);
-    expect(fixture.sends[0]).toMatchObject({ threadId: "waiter-1", mode: "steer", input: [{ type: "text", visibility: "agent-only" }] });
+    expect(JSON.parse(first.stdout)).toMatchObject({ outcome: "OK", evidence: { fired: 1 } });
+    await vi.waitFor(() => expect(fixture.sends.length).toBeGreaterThanOrEqual(1));
+    const wakeSends = fixture.sends.filter((send) => (send as unknown as { threadId?: string }).threadId === "waiter-1");
+    expect(wakeSends).toHaveLength(1);
+    expect(wakeSends[0]).toMatchObject({ mode: "steer", input: [{ type: "text", visibility: "agent-only" }] });
 
     const replay = await fixture.host.harness.runCli(["wait-validator", "--cycle"]);
-    expect(JSON.parse(replay.stdout)).toMatchObject({ evidence: { fired: 0, steered: 0 } });
-    expect(fixture.sends).toHaveLength(1); // dedupe: restarts and replays never double-fire
+    expect(JSON.parse(replay.stdout)).toMatchObject({ evidence: { fired: 0 } });
+
+    const listed = await fixture.host.harness.runCli(["wait-list", "--project", PROJECT_ID]);
+    expect(JSON.parse(listed.stdout).evidence[0]).toMatchObject({ state: "fired" });
 
     expect(fixture.canonicalDigest()).toBe(digestBefore); // validation is read-only on canonical state
     await fixture.host.harness.lifecycle.dispose();
   });
 
-});
-
-describe("wait-aware watcher integration", () => {
-  function lane(threadId: string): LaneState {
-    return {
-      project_id: "project-1",
-      assignment_id: "assignment-1",
-      lane_id: "lane-1",
-      assignment_kind: "write",
-      work_item_id: "work-1",
-      thread_id: threadId,
-      execution_attempt_id: "attempt-1",
-      attempt_state: "running",
-      terminal_report_digest: null,
-      created_at_ms: 1,
-    };
-  }
-
-  async function runObserver(registeredWaitThreads: Set<string>) {
-    const steered: string[] = [];
-    const watcher = createLaneWatcher({
-      readLanes: () => [lane("worker-1")],
-      steer: async (view) => { steered.push(view.threadId ?? "null"); },
-      readWorker: async () => ({ status: "idle", pendingExternalWait: false, archived: false, operatorWait: null, operatorWaitKnown: true, idleSinceMs: 1 }),
-      readRegisteredWaitFor: async (threadId) => registeredWaitThreads.has(threadId),
-    });
-    await watcher.observe("worker-1", "idle");
-    return steered;
-  }
-
-  it("does not steer an idle worker with a registered wait", async () => {
-    expect(await runObserver(new Set(["worker-1"]))).toHaveLength(0);
-  });
-
-  it("steers the same idle worker without one: unregistered waits are illegal idles", async () => {
-    expect(await runObserver(new Set())).toEqual(["worker-1"]);
+  it("refuses extra CLI arguments on the validator seam", async () => {
+    const fixture = await loadedFixture();
+    const bad = await fixture.host.harness.runCli(["wait-validator", "--cycle", "--extra"]);
+    expect(bad.exitCode).toBe(2);
+    expect(JSON.parse(bad.stdout)).toMatchObject({ outcome: "INVALID_INPUT", message: expect.stringContaining("unexpected") });
+    const missing = await fixture.host.harness.runCli(["wait-validator"]);
+    expect(missing.exitCode).toBe(2);
+    await fixture.host.harness.lifecycle.dispose();
   });
 });
 

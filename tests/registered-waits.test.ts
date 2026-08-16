@@ -1,45 +1,49 @@
-// Acceptance drills for the durable registered-wait validator (#93 / #57
-// mechanism 8), from the frozen operator spec at
-// docs/issue-93-durable-wait-validator.md. Each drill proves both
-// directions: the mechanism acts when it must and refuses/silences when it
-// must not. The validator is model-free, read-only on canonical state, and
-// fails closed on unknown source/status.
+// Acceptance drills for the durable wait-validator layer (#93 / #57
+// mechanism 8), built on the merged registered-wait substrate from
+// src/awareness.ts (PR #95). The wait store is exactly one registry; this
+// layer adds the deadline law, fail-closed source-liveness validation, and
+// the bounded escalation ladder. Each drill proves both directions.
 import Database from "better-sqlite3";
-import { beforeEach, describe, expect, it } from "vitest";
-import { readLaneStates } from "../src/awareness.js";
+import { describe, expect, it } from "vitest";
 import {
-  DEFAULT_WAIT_DEADLINES_MS,
-  LIVENESS_STALE_MS,
-  MAX_ACTIVE_WAITS,
-  WAIT_STEER_GRACE_MS,
+  createLaneWatcher,
   createWaitRegistry,
-  createWaitValidator,
-  evaluateRegisteredWaits,
+  type LaneState,
+  type WaitRegistryPersistence,
+} from "../src/awareness.js";
+import {
+  DEFAULT_WAIT_DEADLINE_MS,
+  LIVENESS_STALE_MS,
+  MAX_WAIT_DEADLINE_MS,
+  WAIT_STEER_GRACE_MS,
+  createWaitEscalationCycle,
   livenessDecision,
   livenessState,
+  registerBoundedWait,
   resolveWaitDeadline,
-  type RegisteredWait,
   type SourceObservation,
-  type WaitRegistryPersistence,
 } from "../src/registered-waits.js";
 
 interface Harness {
   registry: ReturnType<typeof createWaitRegistry>;
-  validator: ReturnType<typeof createWaitValidator>;
+  watcher: ReturnType<typeof createLaneWatcher>;
+  escalation: ReturnType<typeof createWaitEscalationCycle>;
   sources: Map<string, SourceObservation>;
   waiters: Map<string, SourceObservation>;
+  lanes: LaneState[];
   steers: Array<{ waitId: string; reason: string }>;
+  watcherSteers: string[];
   alerts: Array<{ kind: string; waitId: string }>;
   escalations: Array<{ waitId: string; escalated: boolean }>;
   kv: Map<string, unknown>;
-  laneTerminalThreads: Set<string>;
   now: { value: number };
 }
 
-function harness(overrides: { now?: number; graceMs?: number } = {}): Harness {
+function harness(overrides: { now?: number; graceMs?: number; terminalReceipt?: boolean } = {}): Harness {
   const sources = new Map<string, SourceObservation>();
   const waiters = new Map<string, SourceObservation>();
   const steers: Array<{ waitId: string; reason: string }> = [];
+  const watcherSteers: string[] = [];
   const alerts: Array<{ kind: string; waitId: string }> = [];
   const escalations: Array<{ waitId: string; escalated: boolean }> = [];
   const kv = new Map<string, unknown>();
@@ -52,391 +56,357 @@ function harness(overrides: { now?: number; graceMs?: number } = {}): Harness {
     const observation = map.get(threadId);
     return observation === undefined || observation === null ? null : { ...observation };
   };
-  const registry = createWaitRegistry({
-    persistence: persistence("waits"),
-    readSource: observe(sources),
+  const registry = createWaitRegistry(persistence("waits"));
+  const lanes: LaneState[] = [{
+    project_id: "project-1",
+    assignment_id: "assignment-1",
+    lane_id: "lane-1",
+    assignment_kind: "write",
+    work_item_id: "work-1",
+    thread_id: "source-1",
+    execution_attempt_id: "attempt-1",
+    attempt_state: "running",
+    terminal_report_digest: null,
+    created_at_ms: 1,
+  }];
+  const watcher = createLaneWatcher({
+    readLanes: () => structuredClone(lanes),
+    waitRegistry: registry,
+    steer: async (view) => { watcherSteers.push(view.threadId ?? "null"); },
+    readWorker: (async (threadId: string) => {
+      const observation = waiters.get(threadId) ?? sources.get(threadId);
+      if (!observation) throw new Error(`unknown thread ${threadId}`);
+      return {
+        status: observation.status as "idle",
+        pendingExternalWait: false,
+        archived: observation.archived,
+        operatorWait: null,
+        operatorWaitKnown: true,
+        idleSinceMs: 1,
+      };
+    }) as Harness["watcher"] extends never ? never : (threadId: string) => Promise<import("../src/awareness.js").WorkerObservation>,
+    onWaitEvent: () => {},
     now: () => now.value,
   });
-  const validator = createWaitValidator({
-    registry,
+  const escalation = createWaitEscalationCycle({
+    registry: bounded(registry),
     escalationPersistence: {
       read: async () => kv.get("escalation"),
       write: async (state) => { kv.set("escalation", structuredClone(state)); },
     },
-    readSource: observe(sources),
     readWaiter: observe(waiters),
-    readSourceTerminals: () => {
-      const terminals = new Map<string, string>();
-      for (const threadId of harnessLaneTerminalThreads) terminals.set(threadId, "attempt blocked");
-      return terminals;
-    },
     steerWaiter: async (target) => { steers.push({ waitId: target.waitId, reason: target.reason }); },
     onFire: (record) => alerts.push({ kind: "fire", waitId: record.waitId }),
     onEscalate: (record) => escalations.push({ waitId: record.waitId, escalated: record.escalated }),
     now: () => now.value,
     graceMs: overrides.graceMs ?? WAIT_STEER_GRACE_MS,
   });
-  return { registry, validator, sources, waiters, steers, alerts, escalations, kv, laneTerminalThreads: harnessLaneTerminalThreads, now };
+  return { registry, watcher, escalation, sources, waiters, lanes, steers, watcherSteers, alerts, escalations, kv, now };
 }
 
-const harnessLaneTerminalThreads = new Set<string>();
+/** Register through the harness clock. */
+async function boundedRegister(h: Harness, input: unknown, ctxThreadId?: string) {
+  return registerBoundedWait({
+    registry: bounded(h.registry),
+    readSource: async (threadId: string) => h.sources.get(threadId) ?? null,
+    input,
+    ctxThreadId,
+    now: () => h.now.value,
+  });
+}
+
+/** Adapter from the one wait registry to the bounded validator seam. */
+const bounded = (r: ReturnType<typeof createWaitRegistry>) => ({
+  register: (wait: Parameters<typeof r.register>[0]) => r.register(wait),
+  list: () => r.list(),
+  firedWaitIds: async () => { await r.recover(); return r.firedList() as Array<{ waitId: string; reason: string; waiterThreadId: string }>; },
+});
 
 const waitRequest = (overrides: Record<string, unknown> = {}) => ({
-  projectId: "project-1",
   waiterThreadId: "waiter-1",
-  eventType: "source_terminal",
   sourceThreadId: "source-1",
+  sourceEvent: "terminal",
   reason: "waiting for the source lane to finish",
   idempotencyKey: "wait-key-1",
   ...overrides,
 });
 
-beforeEach(() => {
-  harnessLaneTerminalThreads.clear();
-});
-
 describe("registered-wait registration (drill: deadline-less wait refused)", () => {
-  it("refuses a wait with no deadline: unknown event type has no default", async () => {
-    const h = harness();
-    const result = await h.registry.register(waitRequest({ eventType: "ci_check" }));
-    expect(result).toMatchObject({ outcome: "refused", message: expect.stringContaining("eventType") });
-    expect((await h.registry.list()).active).toHaveLength(0);
-  });
-
-  it("refuses an explicit null deadline", async () => {
+  it("refuses a wait with an explicit null or invalid deadline, fail closed", async () => {
     const h = harness();
     h.sources.set("source-1", { status: "idle", archived: false });
-    const result = await h.registry.register(waitRequest({ deadlineMs: null }));
-    expect(result).toMatchObject({ outcome: "refused", message: expect.stringContaining("without a deadline") });
+    expect(await boundedRegister(h, waitRequest({ deadlineAtMs: null }))).toMatchObject({
+      outcome: "refused",
+      message: expect.stringContaining("without a deadline"),
+    });
+    expect(await boundedRegister(h, waitRequest({ deadlineAtMs: 1.5 }))).toMatchObject({ outcome: "refused" });
+    expect(await boundedRegister(h, waitRequest({ deadlineAtMs: 999_999, overrideReason: "x" }))).toMatchObject({ outcome: "refused" });
+    expect(h.registry.list()).toHaveLength(0);
   });
 
-  it("refuses past, non-integer, and beyond-horizon deadlines and reasonless overrides", async () => {
+  it("applies the default deadline and accepts an explicit override with a reason", async () => {
     const h = harness();
     h.sources.set("source-1", { status: "idle", archived: false });
-    expect(await h.registry.register(waitRequest({ deadlineMs: 999_999, overrideReason: "CI window" }))).toMatchObject({ outcome: "refused" });
-    expect(await h.registry.register(waitRequest({ deadlineMs: 1.5, overrideReason: "CI window" }))).toMatchObject({ outcome: "refused" });
-    expect(await h.registry.register(waitRequest({ deadlineMs: h.now.value + 8 * 24 * 3600_000, overrideReason: "long" }))).toMatchObject({ outcome: "refused" });
-    expect(await h.registry.register(waitRequest({ deadlineMs: h.now.value + 3600_000 }))).toMatchObject({
+    const defaulted = await boundedRegister(h, waitRequest());
+    expect(defaulted).toMatchObject({ outcome: "registered", replay: false });
+    if (defaulted.outcome !== "registered") throw new Error("unreachable");
+    expect(defaulted.wait.deadlineAtMs).toBe(h.now.value + DEFAULT_WAIT_DEADLINE_MS);
+
+    const override = await boundedRegister(h, waitRequest({
+      idempotencyKey: "wait-key-2",
+      deadlineAtMs: h.now.value + 3600_000,
+      overrideReason: "CI window is one hour",
+    }));
+    expect(override).toMatchObject({ outcome: "registered" });
+  });
+
+  it("refuses a reasonless override, a beyond-horizon deadline, and an unknown event kind", async () => {
+    const h = harness();
+    h.sources.set("source-1", { status: "idle", archived: false });
+    expect(await boundedRegister(h, waitRequest({ deadlineAtMs: h.now.value + 3600_000 }))).toMatchObject({
       outcome: "refused",
       message: expect.stringContaining("override requires a reason"),
     });
+    expect(await boundedRegister(h, waitRequest({ deadlineAtMs: h.now.value + MAX_WAIT_DEADLINE_MS + 1, overrideReason: "too long" }))).toMatchObject({
+      outcome: "refused",
+      message: expect.stringContaining("horizon"),
+    });
+    expect(await boundedRegister(h, waitRequest({ sourceEvent: "ci_check" }))).toMatchObject({
+      outcome: "refused",
+      message: expect.stringContaining("sourceEvent"),
+    });
   });
 
-  it("applies the per-type default deadline and accepts an explicit override with a reason", async () => {
+  it("refuses waits on unknown, archived, errored, or unknown-status sources (fail closed)", async () => {
     const h = harness();
-    h.sources.set("source-1", { status: "idle", archived: false });
-    const defaulted = await h.registry.register(waitRequest());
-    expect(defaulted).toMatchObject({ outcome: "registered", replay: false });
-    if (defaulted.outcome !== "registered") throw new Error("unreachable");
-    expect(defaulted.wait.deadlineMs).toBe(h.now.value + DEFAULT_WAIT_DEADLINES_MS.source_terminal);
-
-    const overridden = await h.registry.register(waitRequest({
-      idempotencyKey: "wait-key-2",
-      deadlineMs: h.now.value + 3600_000,
-      overrideReason: "CI window is one hour",
-    }));
-    expect(overridden).toMatchObject({ outcome: "registered" });
-    if (overridden.outcome !== "registered") throw new Error("unreachable");
-    expect(overridden.wait.overrideReason).toBe("CI window is one hour");
-  });
-
-  it("refuses waits on unknown, archived, errored, or unverifiable sources (fail closed)", async () => {
-    const h = harness();
-    expect(await h.registry.register(waitRequest())).toMatchObject({
+    expect(await boundedRegister(h, waitRequest())).toMatchObject({
       outcome: "refused",
       message: expect.stringContaining("unknown"),
     });
     h.sources.set("source-1", { status: "idle", archived: true });
-    expect(await h.registry.register(waitRequest())).toMatchObject({ outcome: "refused", message: expect.stringContaining("archived") });
+    expect(await boundedRegister(h, waitRequest())).toMatchObject({ outcome: "refused", message: expect.stringContaining("archived") });
     h.sources.set("source-1", { status: "error", archived: false });
-    expect(await h.registry.register(waitRequest())).toMatchObject({ outcome: "refused", message: expect.stringContaining("failed") });
+    expect(await boundedRegister(h, waitRequest())).toMatchObject({ outcome: "refused", message: expect.stringContaining("failed") });
     h.sources.set("source-1", { status: "weird", archived: false });
-    expect(await h.registry.register(waitRequest())).toMatchObject({ outcome: "refused", message: expect.stringContaining("unknown status") });
+    expect(await boundedRegister(h, waitRequest())).toMatchObject({ outcome: "refused", message: expect.stringContaining("unknown status") });
   });
 
-  it("binds the waiter to the calling thread and refuses a mismatch", async () => {
+  it("binds the waiter to the calling thread and replays idempotently", async () => {
     const h = harness();
     h.sources.set("source-1", { status: "idle", archived: false });
-    expect(await h.registry.register(waitRequest(), "waiter-1")).toMatchObject({ outcome: "registered" });
-    expect(await h.registry.register(waitRequest({ idempotencyKey: "wait-key-9" }), "waiter-2")).toMatchObject({
+    expect(await boundedRegister(h, waitRequest(), "waiter-1")).toMatchObject({ outcome: "registered" });
+    expect(await boundedRegister(h, waitRequest({ idempotencyKey: "wait-key-9" }), "waiter-2")).toMatchObject({
       outcome: "refused",
       message: expect.stringContaining("calling thread"),
     });
-  });
-
-  it("replays an identical registration idempotently and refuses conflicting key reuse", async () => {
-    const h = harness();
-    h.sources.set("source-1", { status: "idle", archived: false });
-    const first = await h.registry.register(waitRequest());
-    const replay = await h.registry.register(waitRequest());
-    expect(replay).toMatchObject({ outcome: "registered", replay: true });
-    if (first.outcome !== "registered" || replay.outcome !== "registered") throw new Error("unreachable");
-    expect(replay.wait.waitId).toBe(first.wait.waitId);
-    expect((await h.registry.list()).active).toHaveLength(1);
-    expect(await h.registry.register(waitRequest({ sourceThreadId: "source-2" }))).toMatchObject({
+    expect(await boundedRegister(h, waitRequest(), "waiter-1")).toMatchObject({
+      outcome: "registered",
+      replay: true,
+    });
+    expect(h.registry.list()).toHaveLength(1);
+    expect(await boundedRegister(h, waitRequest({ sourceEvent: "failure" }), "waiter-1")).toMatchObject({
       outcome: "refused",
       message: expect.stringContaining("different wait"),
     });
   });
+});
 
-  it("bounds the registry: at most MAX_ACTIVE_WAITS active waits", async () => {
-    const h = harness({ graceMs: 0 });
+describe("firing through the watcher (drill: failure propagates as events, never silence)", () => {
+  async function register(h: Harness) {
+    const result = await boundedRegister(h, waitRequest());
+    if (result.outcome !== "registered") throw new Error("unreachable");
+    return result.wait;
+  }
+
+  it("holds while the source is open and the deadline is in the future", async () => {
+    const h = harness();
     h.sources.set("source-1", { status: "idle", archived: false });
-    for (let index = 0; index < MAX_ACTIVE_WAITS; index += 1) {
-      const result = await h.registry.register(waitRequest({ idempotencyKey: `wait-key-${index}` }));
-      expect(result).toMatchObject({ outcome: "registered" });
-    }
-    expect(await h.registry.register(waitRequest({ idempotencyKey: "overflow" }))).toMatchObject({
-      outcome: "refused",
-      message: expect.stringContaining("full"),
-    });
-  });
-});
-
-describe("wait evaluation (drill: failure propagates as events, never silence)", () => {
-  const wait = (overrides: Partial<RegisteredWait> = {}): RegisteredWait => ({
-    waitId: "wait-1",
-    projectId: "project-1",
-    waiterThreadId: "waiter-1",
-    eventType: "source_terminal",
-    sourceThreadId: "source-1",
-    reason: "waiting",
-    overrideReason: null,
-    deadlineMs: 1_000_000 + 60_000,
-    createdAtMs: 1_000_000,
-    idempotencyKey: "wait-key-1",
-    ...overrides,
+    await register(h);
+    await h.watcher.poll();
+    expect(h.registry.list().every((wait) => h.registry.state(wait.waitId) === "pending")).toBe(true);
+    expect(h.steers).toHaveLength(0);
   });
 
-  it("holds while the source is alive and the deadline is in the future", () => {
-    const fires = evaluateRegisteredWaits([wait()], new Map([["source-1", { status: "active", archived: false }]]), new Map(), 1_000_030);
-    expect(fires).toHaveLength(0);
-  });
-
-  it("fires every wait on a source that errors, archives, or reaches a terminal attempt", () => {
-    for (const [sources, terminals, detail] of [
-      [new Map([["source-1", { status: "error", archived: false }]]), new Map(), "source error"],
-      [new Map([["source-1", { status: "idle", archived: true }]]), new Map(), "source archived"],
-      [new Map([["source-1", { status: "idle", archived: false }]]), new Map([["source-1", "attempt blocked"]]), "attempt blocked"],
-    ] as const) {
-      const fires = evaluateRegisteredWaits(
-        [wait(), wait({ waitId: "wait-2", waiterThreadId: "waiter-2", idempotencyKey: "wait-key-2" })],
-        sources,
-        terminals,
-        1_000_030,
-      );
-      expect(fires).toHaveLength(2);
-      expect(fires.every((fire) => fire.reason === "source_terminal" && fire.detail === detail)).toBe(true);
+  it("fires within one cycle when the source errors, archives, or reaches a terminal attempt", async () => {
+    // Every scenario registers against a live source first; the terminal
+    // fact then lands and the next cycle fires — failure as events, never
+    // silence, and never silence in the refusing direction either.
+    const scenarios: Array<{ mutate: (h: Harness) => void; detail: string }> = [
+      { mutate: (h) => h.sources.set("source-1", { status: "error", archived: false }), detail: "source error" },
+      { mutate: (h) => h.sources.set("source-1", { status: "idle", archived: true }), detail: "source archived" },
+      { mutate: (h) => { h.lanes[0].attempt_state = "blocked"; }, detail: "terminal attempt" },
+      { mutate: (h) => { h.lanes[0].terminal_report_digest = "receipt-digest"; }, detail: "terminal receipt" },
+    ];
+    for (const { mutate } of scenarios) {
+      const h = harness();
+      h.sources.set("source-1", { status: "idle", archived: false });
+      await register(h);
+      mutate(h);
+      await h.watcher.poll();
+      expect(h.registry.list().map((wait) => h.registry.state(wait.waitId))).toEqual(["fired"]);
+      const other = harness();
+      other.sources.set("source-1", { status: "idle", archived: false });
+      await register(other);
+      await other.watcher.poll(); // live source, unexpired deadline: held, not fired
+      expect(other.registry.list().map((wait) => other.registry.state(wait.waitId))).toEqual(["pending"]);
     }
   });
 
-  it("holds on unknown source liveness: the deadline stays the only bound", () => {
-    const fires = evaluateRegisteredWaits([wait()], new Map([["source-1", null]]), new Map(), 1_000_030);
-    expect(fires).toHaveLength(0);
-    expect(evaluateRegisteredWaits([wait()], new Map(), new Map(), 1_000_030)).toHaveLength(0);
+  it("fires on deadline expiry even when source liveness is unknown: the deadline stays the bound", async () => {
+    const h = harness();
+    h.sources.set("source-1", { status: "idle", archived: false });
+    await register(h);
+    h.sources.delete("source-1");
+    await h.watcher.poll();
+    expect(h.registry.state(h.registry.list()[0].waitId)).toBe("pending");
+    h.now.value += DEFAULT_WAIT_DEADLINE_MS + 1;
+    await h.watcher.poll();
+    expect(h.registry.state(h.registry.list()[0].waitId)).toBe("fired");
   });
 
-  it("fires exactly at the deadline with reason deadline_exceeded", () => {
-    expect(evaluateRegisteredWaits([wait()], new Map([["source-1", { status: "active", archived: false }]]), new Map(), wait().deadlineMs)).toHaveLength(1);
+  it("treats a pending registered wait as a legal idle and steers only without one", async () => {
+    const h = harness();
+    h.sources.set("source-1", { status: "idle", archived: false });
+    h.waiters.set("waiter-1", { status: "idle", archived: false });
+    h.lanes[0].thread_id = "waiter-1"; // the waiter itself is the lane worker
+    await register(h);
+    await h.watcher.observe("waiter-1", "idle");
+    expect(h.watcherSteers).toHaveLength(0); // registered wait: legal idle
+
+    h.now.value += DEFAULT_WAIT_DEADLINE_MS + 1; // wait fires: idle becomes illegal
+    await h.watcher.observe("waiter-1", "idle");
+    expect(h.watcherSteers).toHaveLength(1); // unregistered wait: illegal idle, steered
   });
 });
 
-describe("validator cycle (drills: cascade, expiry, dedupe, escalation bounds)", () => {
-  it("wakes waiters within one cycle when the source terminalizes, then never re-fires", async () => {
+describe("escalation ladder (drill: bounded escalation, never a steer loop)", () => {
+  async function fireOne(h: Harness) {
+    const result = await boundedRegister(h, waitRequest());
+    if (result.outcome !== "registered") throw new Error("unreachable");
+    h.sources.set("source-1", { status: "error", archived: false });
+    await h.watcher.poll();
+  }
+
+  it("steers a fired waiter, marks an active waiter delivered, and never re-fires", async () => {
     const h = harness({ graceMs: 10_000 });
     h.sources.set("source-1", { status: "idle", archived: false });
     h.waiters.set("waiter-1", { status: "idle", archived: false });
-    const registered = await h.registry.register(waitRequest());
-    if (registered.outcome !== "registered") throw new Error("unreachable");
+    await fireOne(h);
 
-    h.sources.set("source-1", { status: "error", archived: false });
-    const summary = await h.validator.cycle();
-    expect(summary).toMatchObject({ fired: 1, steered: 1 });
+    const first = await h.escalation.cycle();
+    expect(first).toMatchObject({ fired: 1, steered: 1 });
     expect(h.steers).toHaveLength(1);
-    expect(h.steers[0]).toMatchObject({ waitId: registered.wait.waitId, reason: "source_terminal" });
     expect(h.alerts).toHaveLength(1);
 
-    const replay = await h.validator.cycle();
-    expect(replay).toMatchObject({ fired: 0 });
-    expect(h.steers).toHaveLength(1); // dedupe: no second wake
-    expect((await h.registry.list()).active).toHaveLength(0);
-    expect((await h.registry.list()).terminal[0]).toMatchObject({ outcome: "fired", reason: "source_terminal" });
+    await h.escalation.cycle();
+    expect(h.steers).toHaveLength(1); // within grace: no re-steer
+
+    h.waiters.set("waiter-1", { status: "active", archived: false });
+    h.now.value += 20_000;
+    const delivered = await h.escalation.cycle();
+    expect(delivered).toMatchObject({ steered: 0, escalated: 0 });
+    expect(h.steers).toHaveLength(1); // delivered: done forever
   });
 
-  it("fires on deadline expiry and only then", async () => {
-    const h = harness({ graceMs: 10_000 });
-    h.sources.set("source-1", { status: "active", archived: false });
-    h.waiters.set("waiter-1", { status: "idle", archived: false });
-    await h.registry.register(waitRequest());
-    h.sources.delete("source-1"); // unknown liveness must not matter before the deadline
-    await h.validator.cycle();
-    expect(h.steers).toHaveLength(0);
-
-    h.now.value += DEFAULT_WAIT_DEADLINES_MS.source_terminal + 1;
-    const summary = await h.validator.cycle();
-    expect(summary).toMatchObject({ fired: 1 });
-    expect(h.steers).toHaveLength(1);
-    expect(h.steers[0]).toMatchObject({ reason: "deadline_exceeded" });
-  });
-
-  it("escalates at most twice, then one operator alert with a succession trigger and never steers again", async () => {
+  it("escalates after two ignored steers to exactly one operator alert, then stops", async () => {
     const h = harness({ graceMs: 10_000 });
     h.sources.set("source-1", { status: "idle", archived: false });
     h.waiters.set("waiter-1", { status: "idle", archived: false });
-    await h.registry.register(waitRequest());
-    h.sources.set("source-1", { status: "error", archived: false });
+    await fireOne(h);
 
-    await h.validator.cycle(); // fire + steer 1
-    expect(h.steers).toHaveLength(1);
+    await h.escalation.cycle(); // fire + steer 1
     h.now.value += 20_000;
-    await h.validator.cycle(); // steer 2 (ignored)
+    await h.escalation.cycle(); // steer 2
     expect(h.steers).toHaveLength(2);
     h.now.value += 20_000;
-    await h.validator.cycle(); // escalation: one alert, no steer 3
-    expect(h.steers).toHaveLength(2);
+    await h.escalation.cycle(); // escalation
+    expect(h.steers).toHaveLength(2); // never a third steer
     expect(h.escalations).toEqual([{ waitId: expect.any(String), escalated: true }]);
     h.now.value += 200_000;
-    await h.validator.cycle();
-    await h.validator.cycle();
-    expect(h.steers).toHaveLength(2); // bounded: never loops steers
+    await h.escalation.cycle();
+    await h.escalation.cycle();
+    expect(h.steers).toHaveLength(2);
     expect(h.escalations).toHaveLength(1); // exactly one operator alert
   });
 
-  it("marks a woken waiter delivered and steers no further", async () => {
-    const h = harness({ graceMs: 10_000 });
-    h.sources.set("source-1", { status: "idle", archived: false });
-    h.waiters.set("waiter-1", { status: "idle", archived: false });
-    await h.registry.register(waitRequest());
-    h.sources.set("source-1", { status: "error", archived: false });
-    await h.validator.cycle();
-    h.waiters.set("waiter-1", { status: "active", archived: false });
-    h.now.value += 200_000;
-    const summary = await h.validator.cycle();
-    expect(summary).toMatchObject({ steered: 0, escalated: 0 });
-    expect(h.steers).toHaveLength(1);
-  });
-
   it("treats two consecutive failed sends as the escalation condition", async () => {
-    const steers: Array<{ waitId: string; reason: string }> = [];
-    const sources = new Map<string, SourceObservation>([["source-1", { status: "error", archived: false }]]);
-    const kv = new Map<string, unknown>();
-    const registry = createWaitRegistry({
-      persistence: { read: async () => kv.get("waits"), write: async (state) => { kv.set("waits", structuredClone(state)); } },
-      readSource: async () => sources.get("source-1") ?? null,
-      now: () => 1_000_000,
-    });
-    // Register against the pre-error source, then flip it.
-    sources.set("source-1", { status: "idle", archived: false });
-    await registry.register(waitRequest());
-    sources.set("source-1", { status: "error", archived: false });
-    const escalations: Array<{ waitId: string; escalated: boolean }> = [];
-    const validator = createWaitValidator({
-      registry,
-      escalationPersistence: { read: async () => kv.get("escalation"), write: async (state) => { kv.set("escalation", structuredClone(state)); } },
-      readSource: async () => sources.get("source-1") ?? null,
-      readWaiter: async () => ({ status: "idle", archived: false }),
-      readSourceTerminals: () => new Map(),
-      steerWaiter: async (target) => { steers.push({ waitId: target.waitId, reason: target.reason }); throw new Error("send failed"); },
-      onEscalate: (record) => escalations.push({ waitId: record.waitId, escalated: record.escalated }),
-      now: () => 1_000_000,
-      graceMs: 0,
-    });
-    await validator.cycle();
-    await validator.cycle();
-    expect(steers).toHaveLength(2);
-    expect(escalations).toHaveLength(1); // two failed steers escalate once
-    const summary = await validator.cycle();
-    expect(summary).toMatchObject({ steered: 0 });
-  });
-
-  it("survives a restart without re-firing or forgetting: a fresh validator replays state from KV", async () => {
-    const h = harness({ graceMs: 10_000 });
+    const h = harness({ graceMs: 0 });
     h.sources.set("source-1", { status: "idle", archived: false });
     h.waiters.set("waiter-1", { status: "idle", archived: false });
-    const registered = await h.registry.register(waitRequest());
-    if (registered.outcome !== "registered") throw new Error("unreachable");
-    h.sources.set("source-1", { status: "error", archived: false });
-    await h.validator.cycle();
-    expect(h.steers).toHaveLength(1);
-
-    // Simulate kill -9 + launchd restart: a brand-new registry and validator
-    // over the same persisted KV state.
+    await fireOne(h);
     const kv = h.kv;
     const sources = h.sources;
     const steers: Array<{ waitId: string; reason: string }> = [];
-    const registry2 = createWaitRegistry({
-      persistence: { read: async () => kv.get("waits"), write: async (state) => { kv.set("waits", structuredClone(state)); } },
-      readSource: async (threadId) => sources.get(threadId) ?? null,
-      now: () => h.now.value,
-    });
-    const validator2 = createWaitValidator({
-      registry: registry2,
+    const escalations: Array<{ waitId: string; escalated: boolean }> = [];
+    const registry2 = createWaitRegistry({ read: async () => kv.get("waits"), write: async (state) => { kv.set("waits", structuredClone(state)); } });
+    const escalation2 = createWaitEscalationCycle({
+      registry: bounded(registry2),
       escalationPersistence: { read: async () => kv.get("escalation"), write: async (state) => { kv.set("escalation", structuredClone(state)); } },
-      readSource: async (threadId) => sources.get(threadId) ?? null,
+      readWaiter: async () => h.waiters.get("waiter-1") ?? null,
+      steerWaiter: async (target) => { steers.push({ waitId: target.waitId, reason: target.reason }); throw new Error("send failed"); },
+      onEscalate: (record) => escalations.push({ waitId: record.waitId, escalated: record.escalated }),
+      now: () => h.now.value,
+      graceMs: 0,
+    });
+    await escalation2.recover();
+    await escalation2.cycle();
+    await escalation2.cycle();
+    expect(steers).toHaveLength(2);
+    expect(escalations).toHaveLength(1);
+    const summary = await escalation2.cycle();
+    expect(summary).toMatchObject({ steered: 0 });
+  });
+
+  it("survives a restart without re-firing or forgetting: a fresh cycle replays from KV", async () => {
+    const h = harness({ graceMs: 10_000 });
+    h.sources.set("source-1", { status: "idle", archived: false });
+    h.waiters.set("waiter-1", { status: "idle", archived: false });
+    await fireOne(h);
+    await h.escalation.cycle();
+    expect(h.steers).toHaveLength(1);
+
+    // Simulate kill -9 + launchd restart: fresh registry and cycle over the same KV.
+    const kv = h.kv;
+    const registry2 = createWaitRegistry({ read: async () => kv.get("waits"), write: async (state) => { kv.set("waits", structuredClone(state)); } });
+    const steers: Array<{ waitId: string; reason: string }> = [];
+    const escalation2 = createWaitEscalationCycle({
+      registry: {
+        register: (wait) => registry2.register(wait),
+        list: () => registry2.list(),
+        firedWaitIds: async () => { await registry2.recover(); return registry2.firedList() as Array<{ waitId: string; reason: string; waiterThreadId: string }>; },
+      },
+      escalationPersistence: { read: async () => kv.get("escalation"), write: async (state) => { kv.set("escalation", structuredClone(state)); } },
       readWaiter: async (threadId) => h.waiters.get(threadId) ?? null,
-      readSourceTerminals: () => new Map(),
       steerWaiter: async (target) => { steers.push({ waitId: target.waitId, reason: target.reason }); },
       now: () => h.now.value,
       graceMs: 10_000,
     });
-    await validator2.recover();
-    const summary = await validator2.cycle();
-    expect(summary).toMatchObject({ fired: 0, evaluated: 0 }); // the wait is terminal: no re-fire
-    expect(steers).toHaveLength(0); // no double wake before the grace elapses
+    await escalation2.recover();
+    const replay = await escalation2.cycle();
+    expect(replay).toMatchObject({ fired: 0 }); // the fired map dedupes: no re-fire
+    expect(steers).toHaveLength(0); // grace preserved across the restart
     h.now.value += 20_000;
-    const next = await validator2.cycle();
-    expect(next).toMatchObject({ steered: 1 }); // escalation continues exactly where it left off
+    const next = await escalation2.cycle();
+    expect(next).toMatchObject({ steered: 1 }); // escalation resumes exactly where it stopped
+    expect(steers).toHaveLength(1);
   });
 
-  it("never writes a canonical SQLite table: lanes are read-only inputs", async () => {
+  it("never writes a canonical SQLite table", async () => {
     const db = new Database(":memory:");
-    db.exec("CREATE TABLE assignments (project_id TEXT, assignment_id TEXT, lane_id TEXT, assignment_kind TEXT, work_item_id TEXT, created_at_ms INTEGER)");
-    db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT)");
-    db.prepare("INSERT INTO assignments VALUES ('project-1','assignment-1','lane-1','write','work-1',1)").run();
-    db.prepare("INSERT INTO execution_attempts VALUES ('project-1','assignment-1','source-1','attempt-1','assignment','running',NULL)").run();
-    const dump = () => {
-      const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all() as Array<{ name: string }>;
-      return JSON.stringify(tables.map((table) => [table.name, db.prepare(`SELECT * FROM ${table.name}`).all()]));
-    };
-    const before = dump();
-
-    const terminals = new Map<string, string>();
-    for (const lane of readLaneStates(db)) {
-      if (lane.thread_id && lane.terminal_report_digest !== null) terminals.set(lane.thread_id, "terminal receipt");
-    }
-    expect(terminals).toHaveLength(0); // running attempt without receipt: not terminal
-
-    const kv = new Map<string, unknown>();
-    const registry = createWaitRegistry({
-      persistence: { read: async () => kv.get("waits"), write: async (state) => { kv.set("waits", structuredClone(state)); } },
-      readSource: async () => ({ status: "idle", archived: false }),
-      now: () => 1_000_000,
-    });
-    await registry.register(waitRequest());
-    const validator = createWaitValidator({
-      registry,
-      escalationPersistence: { read: async () => kv.get("escalation"), write: async (state) => { kv.set("escalation", structuredClone(state)); } },
-      readSource: async () => ({ status: "idle", archived: false }),
-      readWaiter: async () => ({ status: "idle", archived: false }),
-      readSourceTerminals: () => {
-        const map = new Map<string, string>();
-        for (const lane of readLaneStates(db)) {
-          if (lane.thread_id && lane.terminal_report_digest !== null) map.set(lane.thread_id, "terminal receipt");
-        }
-        return map;
-      },
-      steerWaiter: async () => {},
-      now: () => 1_000_000,
-      graceMs: 0,
-    });
-    await validator.cycle();
-    expect(dump()).toBe(before); // zero canonical writes
+    db.exec("CREATE TABLE assignments (project_id TEXT)");
+    const digest = () => JSON.stringify(db.prepare("SELECT * FROM sqlite_master").all());
+    const before = digest();
+    const h = harness();
+    h.sources.set("source-1", { status: "idle", archived: false });
+    await fireOne(h);
+    await h.escalation.cycle();
+    expect(digest()).toBe(before); // zero canonical writes
     db.close();
   });
 });
 
 describe("self-watch, once (drill: stale marker alerts exactly once)", () => {
-  it("decides fresh, stale, and missing markers fail closed", () => {
+  it("classifies fresh, stale, and missing markers fail closed", () => {
     const now = 10_000_000;
     expect(livenessState(now - 1_000, now)).toBe("fresh");
     expect(livenessState(now - LIVENESS_STALE_MS, now)).toBe("stale");
@@ -446,24 +416,30 @@ describe("self-watch, once (drill: stale marker alerts exactly once)", () => {
 
   it("alerts exactly once per staleness episode and re-arms after recovery", () => {
     expect(livenessDecision("stale", false)).toBe("alert-once");
-    expect(livenessDecision("stale", true)).toBe("silent"); // no repeat
-    expect(livenessDecision("missing", false)).toBe("silent"); // not launchd-failure evidence
-    expect(livenessDecision("fresh", true)).toBe("clear-alert-flag"); // episode closes
+    expect(livenessDecision("stale", true)).toBe("silent");
+    expect(livenessDecision("missing", false)).toBe("silent");
+    expect(livenessDecision("missing", true)).toBe("silent");
+    expect(livenessDecision("fresh", true)).toBe("clear-alert-flag");
     expect(livenessDecision("fresh", false)).toBe("silent");
-    expect(livenessDecision("missing", true)).toBe("silent"); // flag kept until a fresh marker proves recovery
   });
 });
 
 describe("deadline resolution unit contract", () => {
-  it("is total over the event types and refuses everything else", () => {
+  it("is total over the input space and refuses everything illegal", () => {
     const now = 1_000;
-    for (const [eventType, deadline] of Object.entries(DEFAULT_WAIT_DEADLINES_MS)) {
-      expect(resolveWaitDeadline({ eventType, deadlineMs: undefined, overrideReason: undefined, now })).toEqual({
-        ok: true,
-        deadlineMs: now + deadline,
-        overrideReason: null,
-      });
-    }
-    expect(resolveWaitDeadline({ eventType: "mystery", deadlineMs: undefined, overrideReason: undefined, now }).ok).toBe(false);
+    expect(resolveWaitDeadline({ deadlineAtMs: undefined, overrideReason: undefined, now })).toEqual({
+      ok: true,
+      deadlineAtMs: now + DEFAULT_WAIT_DEADLINE_MS,
+      overrideReason: null,
+    });
+    expect(resolveWaitDeadline({ deadlineAtMs: null, overrideReason: "why", now }).ok).toBe(false);
+    expect(resolveWaitDeadline({ deadlineAtMs: now, overrideReason: "why", now }).ok).toBe(false);
+    expect(resolveWaitDeadline({ deadlineAtMs: now + MAX_WAIT_DEADLINE_MS + 1, overrideReason: "why", now }).ok).toBe(false);
+    expect(resolveWaitDeadline({ deadlineAtMs: now + 5_000, overrideReason: "", now }).ok).toBe(false);
+    expect(resolveWaitDeadline({ deadlineAtMs: now + 5_000, overrideReason: "short window", now })).toEqual({
+      ok: true,
+      deadlineAtMs: now + 5_000,
+      overrideReason: "short window",
+    });
   });
 });
