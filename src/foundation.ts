@@ -1674,7 +1674,9 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
   const exactCurrentDirectorEnvironment =
     allowCurrentDirectorEnvironment && environment.status === "ready" && !!environment.path &&
     environment.id === DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.environmentId &&
-    thread.id === DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.holderThreadId;
+    thread.id === DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.holderThreadId &&
+    !environment.managed && environment.isGitRepo && !environment.isWorktree &&
+    environment.workspaceProvisionType === "unmanaged";
   if (!exactManagedWorktree && !exactCurrentDirectorEnvironment) {
     throw refusal("ROLE_CONTEXT_FOREIGN", "holder environment is not an exact ready managed worktree");
   }
@@ -1687,6 +1689,9 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
   if (sources.length !== 1) throw refusal("ROLE_CONTEXT_FOREIGN", "holder environment does not resolve to one exact project source on its host");
   if (exactCurrentDirectorEnvironment && sources[0]!.id !== DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.sourceId) {
     throw refusal("ROLE_CONTEXT_FOREIGN", "current director environment does not match its exact canonical source");
+  }
+  if (exactCurrentDirectorEnvironment && sources[0]!.path !== environment.path) {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "current director environment path does not match its canonical source path");
   }
   if (host.id !== environment.hostId || host.status !== "connected") throw refusal("ROLE_CONTEXT_UNKNOWN", "holder host is unavailable");
   if (!stringField(bbVersion) || !stringField(bbServerId) || events.length === 0 || events.length > 256) {
@@ -5762,6 +5767,9 @@ function applyRoleMutation(
     return transaction(db, () => {
       const replayInTransaction = checkIdempotency(db, request, digest);
       if (replayInTransaction) return replayInTransaction;
+      if (allowCurrentDirectorEnvironment && !currentDirectorGenerationExemptionAllowed(db, request, resolved)) {
+        throw refusal("ROLE_CONTEXT_FOREIGN", "current director generation head or holder changed before commit");
+      }
       return request.operationClass === "qualification_observation_record"
         ? applyQualificationObservation(db, request, digest, context)
         : applyRoleGenerationSuccession(db, request, digest, context);

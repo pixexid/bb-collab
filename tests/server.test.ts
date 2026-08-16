@@ -5490,6 +5490,11 @@ describe("bb-collab plugin boundary", () => {
       ["holder", (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { facts.thread.projectId = FOREIGN_PROJECT_ID; }, "ROLE_CONTEXT_FOREIGN"],
       ["environment", (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { facts.thread.environmentId = "env_foreign"; facts.environment.id = "env_foreign"; }, "ROLE_CONTEXT_FOREIGN"],
       ["source", (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { facts.project.sources[0]!.id = "src_foreign"; }, "ROLE_CONTEXT_FOREIGN"],
+      ["path", (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { facts.environment.path = "/foreign/source"; }, "ROLE_CONTEXT_FOREIGN"],
+      ["managed", (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { facts.environment.managed = true; }, "ROLE_CONTEXT_FOREIGN"],
+      ["git-repo", (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { facts.environment.isGitRepo = false; }, "ROLE_CONTEXT_FOREIGN"],
+      ["worktree", (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { facts.environment.isWorktree = true; }, "ROLE_CONTEXT_FOREIGN"],
+      ["provision", (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { facts.environment.workspaceProvisionType = "managed-worktree"; }, "ROLE_CONTEXT_FOREIGN"],
       ["profile", (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { (facts.events[0]!.data.execution as Record<string, unknown>).model = "kimi-coding/k2"; }, "EXECUTION_PROFILE_MISMATCH"],
     ] as const) {
       const before = exportFoundation(db, PROJECT_ID);
@@ -5513,6 +5518,47 @@ describe("bb-collab plugin boundary", () => {
       expect(applyWithFixtureReceipt(db, request, null, currentUnmanagedReader())).toMatchObject({ outcome: "ROLE_CONTEXT_FOREIGN", attempted: 0, verified: 0 });
       expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
     }
+
+    const futureContext = {
+      threadId: "director-future-managed",
+      requestEventId: "director-future-request",
+      requestEventSeq: 1,
+      completionEventId: "director-future-completion",
+      completionEventSeq: 4,
+    };
+    const futureManagedReader = directorRoleReader((facts) => {
+      facts.thread.id = futureContext.threadId;
+      facts.thread.environmentId = "environment-director-future";
+      facts.environment.id = "environment-director-future";
+      facts.events[0]!.id = futureContext.requestEventId;
+      facts.events[3]!.id = futureContext.completionEventId;
+    });
+    const futureQualification = qualificationRequest(fenceToken, {
+      idempotencyKey: "director-future-generation-qualification",
+      qualificationId: "director-future-generation-qualification",
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      roleContext: futureContext,
+      declaredProfile: DIRECTOR_PROFILE,
+    });
+    expect(applyWithFixtureReceipt(db, futureQualification, null, futureManagedReader).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      idempotencyKey: "director-future-generation-succession",
+      qualificationId: futureQualification.qualificationId,
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      roleContext: futureContext,
+      expectedGeneration: 2,
+      predecessorGeneration: 2,
+      profileDigest: DIRECTOR_PROFILE_DIGEST,
+      standbyProfile: DIRECTOR_STANDBY_PROFILE,
+    }), null, futureManagedReader).outcome).toBe("OK");
+    const beforeFutureUnmanaged = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, {
+      ...currentQualification,
+      idempotencyKey: "director-current-unmanaged-after-future-head",
+      qualificationId: "director-current-unmanaged-after-future-head",
+    }, null, currentUnmanagedReader())).toMatchObject({ outcome: "ROLE_CONTEXT_FOREIGN", attempted: 0, verified: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeFutureUnmanaged);
+
     const stale = { ...currentQualification, idempotencyKey: "director-current-stale-config", expectedConfigRevision: 2 };
     expect(applyWithFixtureReceipt(db, stale, null, currentUnmanagedReader())).toMatchObject({ outcome: "PROJECT_CONFIG_STALE", attempted: 0, verified: 0 });
   });
