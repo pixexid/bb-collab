@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { parsePullRequestDisposition, planMergedLifecycle, validateCommitMessages, validateIssueTarget } from "./pr-lifecycle.mjs";
+import { parsePullRequestDisposition, planMergedLifecycle, validateCommitMessages, validateIssueTarget, validateLifecycleComments } from "./pr-lifecycle.mjs";
 
 const eventPath = process.argv[2];
 if (!eventPath) throw new Error("usage: handle-merged-pr-lifecycle.mjs <github-event-path>");
@@ -45,13 +45,19 @@ const commitCheck = validateCommitMessages(parsed, (await pullRequestCommits()).
 if (!commitCheck.ok) throw new Error(commitCheck.error);
 const checked = await validateIssueTarget(parsed, (issueNumber) => api(`/issues/${issueNumber}`));
 if (!checked.ok) throw new Error(checked.error);
+const pullRequestComments = await comments(pullRequest.number);
+const issueComments = parsed.kind === "related" ? await comments(parsed.issueNumber) : [];
+for (const evidence of [pullRequestComments, issueComments]) {
+  const evidenceCheck = validateLifecycleComments(evidence);
+  if (!evidenceCheck.ok) throw new Error(evidenceCheck.error);
+}
 
 const actions = planMergedLifecycle({
   pullRequestNumber: pullRequest.number,
   parsed,
   issueState: checked.issue?.state ?? null,
-  pullRequestComments: await comments(pullRequest.number),
-  issueComments: parsed.kind === "related" ? await comments(parsed.issueNumber) : [],
+  pullRequestComments,
+  issueComments,
 });
 for (const action of actions.actions) {
   if (action.kind === "close") await api(`/issues/${action.target}`, { method: "PATCH", body: JSON.stringify({ state: "closed" }) });

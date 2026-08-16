@@ -128,6 +128,14 @@ export function validateCommitMessages(parsed, commitMessages) {
 }
 
 const trustedLifecycleComment = (entry) => entry?.user?.login === "github-actions[bot]" && entry.user.type === "Bot";
+export function validateLifecycleComments(comments) {
+  if (!Array.isArray(comments) || comments.some((entry) => !entry || typeof entry !== "object"
+    || typeof entry.body !== "string" || !entry.user || typeof entry.user !== "object"
+    || typeof entry.user.login !== "string" || typeof entry.user.type !== "string")) {
+    return { ok: false, error: "GitHub lifecycle comments contain uncertain evidence; refusing lifecycle action." };
+  }
+  return { ok: true };
+}
 export const hasLifecycleMarker = (comments, marker) => comments.some((entry) => trustedLifecycleComment(entry)
   && typeof entry.body === "string" && entry.body.includes(marker));
 export const lifecycleMarker = (pullRequestNumber, target, kind) => `<!-- bb-collab:issue-lifecycle:pr-${pullRequestNumber}:${target}:${kind} -->`;

@@ -9,6 +9,7 @@ export function auditGitHubFacts({ issues, mergedPullRequests }) {
     && ["open", "closed"].includes(issue.state) && (typeof issue.body === "string" || issue.body === null)
     && (issue.pull_request === undefined || (issue.pull_request && typeof issue.pull_request === "object"));
   const validPullRequest = (pullRequest) => pullRequest && typeof pullRequest === "object"
+    && Number.isSafeInteger(pullRequest.number) && pullRequest.number > 0
     && (typeof pullRequest.title === "string" || pullRequest.title === null)
     && (typeof pullRequest.body === "string" || pullRequest.body === null)
     && (typeof pullRequest.merged_at === "string" || pullRequest.merged_at === null);

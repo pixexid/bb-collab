@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { hasLifecycleMarker, lifecycleMarker, parsePullRequestDisposition, planMergedLifecycle, validateCommitMessages, validateIssueTarget } from "../scripts/pr-lifecycle.mjs";
+import { hasLifecycleMarker, lifecycleMarker, parsePullRequestDisposition, planMergedLifecycle, validateCommitMessages, validateIssueTarget, validateLifecycleComments } from "../scripts/pr-lifecycle.mjs";
 
 describe("pull-request lifecycle linkage", () => {
   it("accepts one related disposition and a completed close disposition", () => {
@@ -55,6 +55,9 @@ describe("pull-request lifecycle linkage", () => {
     expect(hasLifecycleMarker([{ body: `status\n${marker}`, user: { login: "github-actions[bot]", type: "Bot" } }], marker)).toBe(true);
     expect(hasLifecycleMarker([{ body: `status\n${marker}`, user: { login: "attacker", type: "User" } }], marker)).toBe(false);
     expect(hasLifecycleMarker([{ body: "different status" }], marker)).toBe(false);
+    expect(validateLifecycleComments([{ body: marker, user: { login: "github-actions[bot]", type: "Bot" } }]).ok).toBe(true);
+    expect(validateLifecycleComments([{ body: marker }]).ok).toBe(false);
+    expect(validateLifecycleComments([null]).ok).toBe(false);
   });
 
   it("plans related comments once and closes only a complete disposition", () => {
