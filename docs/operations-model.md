@@ -56,8 +56,9 @@ execution-attempt binding. A stale, foreign, resolved, malformed, or unknown
 interaction remains fail-closed and cannot steer or authorize work.
 
 Pending external waits retain their existing behavior. Archived/deleted
-threads, supervisor work, review approval mode, probe tracking mode, terminal
-attempts, continuation limits, and agent-only continuation sends are unchanged.
+threads, supervisor-thread observer work, review approval mode, probe tracking
+mode, terminal attempts, continuation limits, and agent-only continuation sends
+are unchanged.
 The watcher never writes canonical SQLite tables and never creates a queue,
 bus, or mutable Markdown task database. It reads the canonical config head and
 Assignment/ExecutionAttempt rows only; raw BB task/thread counts cannot bypass
@@ -118,7 +119,10 @@ store.
 
 ## Dormant supervisor escalation
 
-The supervisor is above the director but is an escalation-only, dormant seat.
+The operator-held supervisor seat described here is distinct from the existing
+BB `SUPERVISOR_THREAD_ID` observer/dispatcher thread and its watcher behavior;
+that BB machinery is unchanged. The supervisor seat is above the director but
+is an escalation-only, dormant seat.
 It is held by the operator's app-side Fable session outside BB. It has no BB
 thread, lane, standing traffic, routine reports, FYIs, or routine decisions;
 the director remains the top standing seat for normal operation. The
@@ -150,7 +154,9 @@ as a Decision attributed `supervisor (operator-delegated)`. The supervisor
 writes nothing directly in bb-collab. This documentation preserves the
 existing director/orchestrator routing and authority seams and adds no route-
 time canonical routing, v14 exemption, receipt, schema, migration, or runtime
-path.
+path. `CONTRACT_VERSION`, `contractDigest`, cached-consumer versions, and
+rollout receipts remain unchanged; the cached-consumer bump test does not
+apply.
 
 The v14 `director-seat` amendment remains the existing project-orchestrator
 role with primary `pi/kimi-coding/k3/high`, Opus-medium standby, managed-
