@@ -858,9 +858,11 @@ async function assignmentFixture(options: {
   writingLaneCeiling?: number;
   connectorPolicy?: "required" | "optional" | "prohibited";
   targetDefaultBranch?: string;
+  directorSeat?: boolean;
 } = {}) {
   const host = await loadedHost();
-  const config = roleConfig(options.connectorPolicy);
+  const directorSeat = options.directorSeat === true;
+  const config = directorSeat ? directorSeatConfig() : roleConfig(options.connectorPolicy);
   if (options.writingLaneCeiling !== undefined) {
     (config.extensions.bbCollab as Record<string, unknown>).writingLaneCeiling = options.writingLaneCeiling;
   }
@@ -870,8 +872,18 @@ async function assignmentFixture(options: {
   const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config, ...(targets ? { targets } : {}) });
   expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
   expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
-  expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
-  const succession = applyWithFixtureReceipt(db, successionRequest(fenceToken), null, roleReader());
+  const roleFacts = directorSeat ? directorRoleReader() : roleReader();
+  expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, directorSeat ? {
+    roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+    qualificationId: "director-assignment-qualification",
+    declaredProfile: DIRECTOR_PROFILE,
+  } : {}), null, roleFacts).outcome).toBe("OK");
+  const succession = applyWithFixtureReceipt(db, successionRequest(fenceToken, directorSeat ? {
+    roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+    qualificationId: "director-assignment-qualification",
+    profileDigest: DIRECTOR_PROFILE_DIGEST,
+    standbyProfile: DIRECTOR_STANDBY_PROFILE,
+  } : {}), null, directorSeat ? directorRoleReader() : roleReader());
   expect(succession.outcome).toBe("OK");
   const holderExecutionAttemptId = (succession.evidence as { holderExecutionAttemptId: string }).holderExecutionAttemptId;
   seedVerifiedFixtureReceipt(db, {
@@ -2841,9 +2853,9 @@ describe("bb-collab plugin boundary", () => {
     expect(MIGRATION_STEPS).toEqual([
       "record_inventory", "record_quiescence", "freeze", "record_export", "record_import", "record_equivalence", "activate", "record_exercise", "retire", "rollback", "mark_fix_forward_required",
     ]);
-    expect(cachedConsumerRolloutEvidence(10, 12)).toMatchObject({
+    expect(cachedConsumerRolloutEvidence(11, 13)).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 10,
+      oldSchemaVersion: 11,
       newSchemaVersion: 11,
       oldContractVersion: 13,
       newContractVersion: 14,
@@ -2853,7 +2865,7 @@ describe("bb-collab plugin boundary", () => {
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(10, 13)).toMatchObject({
-      oldSchemaVersion: 10,
+      oldSchemaVersion: 11,
       newSchemaVersion: 11,
       observedSchemaVersion: 10,
       oldContractVersion: 13,
@@ -2866,7 +2878,7 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(cachedConsumerRolloutEvidence(11, 14)).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 10,
+      oldSchemaVersion: 11,
       newSchemaVersion: 11,
       oldContractVersion: 13,
       newContractVersion: 14,
@@ -2907,7 +2919,7 @@ describe("bb-collab plugin boundary", () => {
     expect(schemaDigest).toBe("5ee5cd12902e433825558c27b9a20d8bc2e86c5ffe018bf5b59e207d5d2d684e");
     expect(contractDigest).toBe("dc79e78de54af21f1fabb4ecd266d6af463e0a02b4fb557404e07924bbbc3cad");
     expect(cachedConsumerRolloutEvidence(SCHEMA_VERSION, CONTRACT_VERSION)).toMatchObject({
-      oldSchemaVersion: 10,
+      oldSchemaVersion: 11,
       newSchemaVersion: 11,
       oldContractVersion: 13,
       newContractVersion: 14,
@@ -4698,7 +4710,7 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 10, newSchemaVersion: 11, expected: 4, attempted: 4, verified: 4 },
+        cachedConsumers: { oldSchemaVersion: 11, newSchemaVersion: 11, expected: 4, attempted: 4, verified: 4 },
         schema: { version: 11 },
       },
     });
@@ -6049,9 +6061,9 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(10, 13)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 11, oldContractVersion: 13, newContractVersion: 14, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(10, 14)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 11, observedSchemaVersion: 10, oldContractVersion: 13, newContractVersion: 14, observedContractVersion: 14, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(11, 14)).toMatchObject({ oldSchemaVersion: 10, newSchemaVersion: 11, oldContractVersion: 13, newContractVersion: 14, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(11, 13)).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 11, oldContractVersion: 13, newContractVersion: 14, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(10, 14)).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 11, observedSchemaVersion: 10, oldContractVersion: 13, newContractVersion: 14, observedContractVersion: 14, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(11, 14)).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 11, oldContractVersion: 13, newContractVersion: 14, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {
@@ -6644,6 +6656,46 @@ describe("bb-collab plugin boundary", () => {
     const beforeRelabeled = mutationCounts(relabeled.db);
     expect(applyWithFixtureReceipt(relabeled.db, relabeledRequest, null, null, new DeterministicNativeAssignmentAdapter()).outcome).toBe("ASSIGNMENT_HEAD_STALE");
     expect(mutationCounts(relabeled.db)).toEqual(beforeRelabeled);
+  });
+
+  it("refuses director write admission while preserving read-only assignment admission", async () => {
+    const { db, fenceToken } = await assignmentFixture({ directorSeat: true });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    const adapter = new DeterministicNativeAssignmentAdapter();
+    const write = assignmentPrepareRequest(fenceToken, "director-write", {
+      expectedResourceRevision: 3,
+      assignment: {
+        ...assignmentPrepareRequest(fenceToken).assignment!,
+        assignmentId: "director-write",
+        roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+        requestedProfile: DIRECTOR_PROFILE,
+        branchName: "bb/director-write",
+        environment: { ...assignmentPrepareRequest(fenceToken).assignment!.environment, environmentId: "environment-director-write" },
+      },
+    });
+    const before = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, write, null, null, adapter)).toMatchObject({ outcome: "LANE_WRITER_EXISTS", attempted: 0, verified: 0 });
+    expect(adapter.inspectCalls).toHaveLength(0);
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM assignments").get()).toEqual({ count: 0 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'assignment'").get()).toEqual({ count: 0 });
+
+    const readOnly = assignmentPrepareRequest(fenceToken, "director-review", {
+      expectedResourceRevision: 3,
+      assignment: {
+        ...write.assignment!,
+        assignmentId: "director-review",
+        assignmentKind: "review",
+        laneId: "director-review-lane",
+        branchName: "bb/director-review",
+        candidateSemantics: "frozen",
+        candidateSha: CANDIDATE_SHA,
+        environment: { ...write.assignment!.environment, environmentId: "environment-director-review" },
+      },
+    });
+    expect(applyWithFixtureReceipt(db, readOnly, null, null, adapter)).toMatchObject({ outcome: "OK", evidence: { activeWriterCount: 0 } });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM assignments").get()).toEqual({ count: 1 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'assignment'").get()).toEqual({ count: 1 });
   });
 
   it("serializes writer lanes and the lower project ceiling while read-only assignments do not count", async () => {

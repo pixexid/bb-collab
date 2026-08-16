@@ -55,15 +55,24 @@ Future bootstrap briefs must report the holder's recorded generation or the
 typed refusal that prevented recording; a native witness is not proof of a
 seated successor.
 
+## Separate generic orchestrator seat
+
+The ordinary `orchestrator-v1` project-orchestrator requirement is a separate
+seat from `director-seat`. Its actual executed profile is the exact profile in
+the canonical requirement and native execution evidence; the repository's
+current generic fixture is `codex/gpt-5.6-sol/high/full/default/visible`. It
+does not inherit the director primary or standby profile. A director seat
+must use `pi/kimi-coding/k3/high` with Opus-medium standby as stated above.
+
 ## Standby
 
-Every newly recorded `project-orchestrator` generation names one standby
-profile in `RoleGeneration.standby_profile_json`. The ratified default name is
-`luna/gpt-5.6-luna` (`providerId: luna`, `model: gpt-5.6-luna`, with explicit
-reasoning, permission, service tier, and visibility). The standby provider
-must differ from the holder's executed provider; a same-provider or missing
-standby refuses before any canonical write. A standby is not a role, actor,
-authority, lease, assignment, dispatch target, or traffic recipient.
+Every newly recorded generic `project-orchestrator` generation names one
+standby profile in `RoleGeneration.standby_profile_json`. The current generic
+standby is `luna/gpt-5.6-luna` (`providerId: luna`, `model: gpt-5.6-luna`, with
+explicit reasoning, permission, service tier, and visibility). The standby
+provider must differ from the holder's executed provider; a same-provider or
+missing standby refuses before any canonical write. A standby is not a role,
+actor, authority, lease, assignment, dispatch target, or traffic recipient.
 
 Pre-existing generations may have no standby because the schema migration does
 not invent provider evidence. Record the standby on the next canonical

@@ -11,7 +11,7 @@ export const SCHEMA_VERSION = 11;
 const PREVIOUS_CONTRACT_VERSION = 13;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-const PREVIOUS_SCHEMA_VERSION = 10;
+const PREVIOUS_SCHEMA_VERSION = 11;
 export const ROLE_IDS = ["project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatProfile = {
@@ -6383,6 +6383,12 @@ function applyGithubIssueProjection(
 type AssignmentIntent = z.infer<typeof assignmentIntentSchema>;
 type TerminalReport = z.infer<typeof terminalReportSchema>;
 
+function requireAssignmentWritingCapacity(requirement: RoleRequirement, assignmentKind: AssignmentIntent["assignmentKind"]): void {
+  if (assignmentKind === "write" && requirement.writingLaneCapacity === 0) {
+    throw refusal("LANE_WRITER_EXISTS", "role requirement has no writing-lane capacity", { expected: 0, attempted: 0, verified: 0 });
+  }
+}
+
 interface AssignmentRow {
   project_id: string;
   assignment_id: string;
@@ -6743,11 +6749,13 @@ function preflightAssignmentPrepare(db: SqliteDatabase, request: ApplyRequest): 
     throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment environment does not match the exact repository target");
   }
   requireCanonicalRoleGeneration(db, request.projectId, assignment.roleId, assignment.roleGeneration, assignment.roleRequirementId);
-  const requirement = roleRequirementsFromJson(storedConfigJson(db, request.projectId, configRevision))
+  const configJson = storedConfigJson(db, request.projectId, configRevision);
+  const requirement = roleRequirementsFromJson(configJson)
     .find((candidate) => candidate.roleRequirementId === assignment.roleRequirementId);
   if (!requirement || requirement.roleId !== assignment.roleId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement is not configured");
   if (requirement.repoTargetId !== null && requirement.repoTargetId !== request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "assignment role requirement targets another repository");
   if (!profileEquals(requirement.executedProfile, assignment.requestedProfile)) throw refusal("EXECUTION_PROFILE_MISMATCH", "requested assignment profile does not match the role requirement");
+  requireAssignmentWritingCapacity(requirement, assignment.assignmentKind);
   if (assignment.assignmentKind === "write" && hasUnresolvedWriterTerminalConflict(db, request.projectId)) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "an unresolved terminal conflict blocks new writing admission");
   }
@@ -6759,7 +6767,7 @@ function preflightAssignmentPrepare(db: SqliteDatabase, request: ApplyRequest): 
     `SELECT 1 FROM execution_attempts WHERE project_id = ? AND lane_id = ? AND origin = 'assignment'
      AND assignment_kind = 'write' AND state IN ${ACTIVE_ASSIGNMENT_SQL}`,
   ).get(request.projectId, assignment.laneId);
-  const ceiling = writingLaneCeilingFromJson(storedConfigJson(db, request.projectId, configRevision));
+  const ceiling = writingLaneCeilingFromJson(configJson);
   if (assignment.assignmentKind === "write" && (laneOccupied || activeWriters >= ceiling)) {
     throw refusal("LANE_WRITER_EXISTS", "writing lane or project writing ceiling is occupied", { expected: ceiling, attempted: activeWriters, verified: activeWriters });
   }
@@ -6904,6 +6912,7 @@ function applyAssignmentPrepare(
   if (!requirement || requirement.roleId !== assignment.roleId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement is not configured");
   if (requirement.repoTargetId !== null && requirement.repoTargetId !== request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "assignment role requirement targets another repository");
   if (!profileEquals(requirement.executedProfile, assignment.requestedProfile)) throw refusal("EXECUTION_PROFILE_MISMATCH", "requested assignment profile does not match the role requirement");
+  requireAssignmentWritingCapacity(requirement, assignment.assignmentKind);
   if (assignment.assignmentKind === "write" && hasUnresolvedWriterTerminalConflict(db, request.projectId)) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "an unresolved terminal conflict blocks new writing admission");
   }
