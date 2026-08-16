@@ -196,8 +196,9 @@ The first release is complete only when it can provide:
    versioned mutation resolver.
 5. A canonical WorkItem lifecycle and GitHub Issues as the first projection.
 6. Role generations, manual succession and the minimum qualification and
-   eligibility evidence needed for the project-orchestrator, worker and
-   independent-reviewer roles.
+   eligibility evidence needed for the director, project-orchestrator, worker
+   and independent-reviewer roles; only director generation 1 may use the
+   exact receipt-gated unmanaged qualification-and-creation exception.
 7. One sanctioned native BB assignment path with separate Assignment and
    ExecutionAttempt records, exact executed-profile receipts, isolated
    environments and terminal reports.

@@ -79,11 +79,12 @@ the cached-consumer bump test.
    enforce transitions and holds, and rebuild projection drift from canonical
    state. External issue/task state cannot activate work.
 
-7. **Role generations and qualification.** Implement manual
+7. **Role generations and qualification.** Implement manual director,
    project-orchestrator, worker and independent-reviewer succession, holder
    ExecutionAttempt binding, executed-profile digests, current eligibility,
-   expiry and stale/retired-generation refusal. Keep leases, heartbeat expiry
-   and automatic failover deferred.
+   expiry and stale/retired-generation refusal. Only director generation 1 may
+   use the exact receipt-gated unmanaged qualification-and-creation exception;
+   keep leases, heartbeat expiry and automatic failover deferred.
 
 8. **Assignment and ExecutionAttempt.** Enforce one writer per lane and the
    contract-v13 per-orchestrator `writingLaneCeiling` dial (default 3 for
