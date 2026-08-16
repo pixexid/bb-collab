@@ -47,4 +47,20 @@ describe("weekly throughput report", () => {
     expect(weeklyThroughputReport(facts, window).dialGuidance).toContain("at or below");
     expect(weeklyThroughputReport({ ...facts, issues: [{ ...facts.issues[0], closedAtMs: 2_880_001 }] }, window).dialGuidance).toContain("above");
   });
+
+  it("audits open issue acceptance without treating incomplete or unknown state as closable", () => {
+    const report = weeklyThroughputReport({
+      ...empty,
+      issues: [
+        { id: "complete", openedAtMs: null, closedAtMs: null, githubState: "open", acceptance: "complete", mergedWorkCount: 1 },
+        { id: "incomplete", openedAtMs: null, closedAtMs: null, githubState: "open", acceptance: "incomplete", mergedWorkCount: 2 },
+        { id: "incomplete-no-count", openedAtMs: null, closedAtMs: null, githubState: "open", acceptance: "incomplete", mergedWorkCount: null },
+        { id: "unknown", openedAtMs: null, closedAtMs: null, githubState: "unknown", acceptance: "complete", mergedWorkCount: 1 },
+        { id: "closed", openedAtMs: null, closedAtMs: null, githubState: "closed", acceptance: "complete", mergedWorkCount: 1 },
+      ],
+    }, window);
+    expect(report.issueAcceptanceAudit).toEqual({ openCompleted: ["complete"], openIncomplete: ["incomplete", "incomplete-no-count"], unknown: ["unknown"], status: "fail" });
+    expect(weeklyThroughputReport({ ...empty, issues: [{ id: "incomplete", openedAtMs: null, closedAtMs: null, githubState: "open", acceptance: "incomplete", mergedWorkCount: 0 }] }, window).issueAcceptanceAudit.status).toBe("pass");
+    expect(weeklyThroughputReport({ ...empty, issues: [{ id: "unknown", openedAtMs: null, closedAtMs: null, githubState: "unknown", acceptance: "complete", mergedWorkCount: 1 }] }, window).issueAcceptanceAudit.status).toBe("unknown");
+  });
 });

@@ -18,8 +18,8 @@ require PR tier declarations, and keep Tier-B/C review from serializing the
 queue. Issue #78 is the next bounded slice: gate-epics are planning-only, each
 child is mergeable and dependency/readiness-declared, and no child estimate may
 exceed 8 hours. #31 remains the historical counterexample (52 hours across
-four PRs); it is not reopened or mutated. #79 and #80 remain separate
-follow-up slices and are not included.
+four PRs); it is not reopened or mutated. #79 remains a separate follow-up
+slice; the #80 lifecycle slice is defined below.
 
 Issue #78 exit condition: worker/orchestrator briefs reject an unsplit slice
 above the 8-hour ceiling; an epic has at least two mergeable child slices with
@@ -30,6 +30,16 @@ reservation can queue-block ready writing lanes beyond the remaining cap, never
 read-only lanes. This reuses the existing WorkItem, Assignment,
 ExecutionAttempt, and `lanes` queue;
 it adds no queue, task database, SQLite mutation, or receipt seam.
+
+Issue #80 adds the pure weekly report and its lifecycle audit: open completed
+work is reported for operator disposition, while incomplete or unknown
+GitHub/BB facts remain explicit. Verify linkage and merge comments are
+projection/release evidence only; they do not close or authorize canonical
+work. Its scheduled/manual GitHub API audit fails closed to `unknown` when
+facts cannot be collected and never auto-closes incomplete or unknown issues.
+This slice does not change the canonical contract or schema and does not invoke
+the cached-consumer bump test.
+#79 remains a separate follow-up slice.
 
 ## Founding documentation
 

@@ -1,10 +1,11 @@
 import { readFileSync } from "node:fs";
+import { visibleMarkdown } from "./pr-lifecycle.mjs";
 
 const eventPath = process.argv[2];
 if (!eventPath) throw new Error("usage: check-review-tier.mjs <github-event-path>");
 
 const event = JSON.parse(readFileSync(eventPath, "utf8"));
-const body = event.pull_request?.body ?? "";
+const body = visibleMarkdown(event.pull_request?.body ?? "");
 const files = readFileSync(0, "utf8").split(/\r?\n/u).filter(Boolean);
 
 const declarations = body.match(/^\s*Review tier\s*:\s*([ABC])\s*$/gmu) ?? [];
@@ -13,9 +14,17 @@ const tierA = [
   /^AGENTS\.md$/u,
   /^app\.tsx$/u,
   /^\.github\/workflows\/verify\.yml$/u,
+  /^\.github\/workflows\/issue-lifecycle\.yml$/u,
+  /^\.github\/workflows\/issue-lifecycle-audit\.yml$/u,
   /^dist\//u,
   /^docs\/(?:adr\/0001-founding-contract|import-manifest|issue-76-tiered-review-policy|operations-model|roadmap|threat-model)\.md$/u,
   /^scripts\/build\.mjs$/u,
+  /^scripts\/check-pr-lifecycle\.mjs$/u,
+  /^scripts\/handle-merged-pr-lifecycle\.mjs$/u,
+  /^scripts\/audit-issue-lifecycle\.mjs$/u,
+  /^scripts\/audit-issue-lifecycle\.d\.mts$/u,
+  /^scripts\/pr-lifecycle\.d\.mts$/u,
+  /^scripts\/pr-lifecycle\.mjs$/u,
   /^scripts\/check-review-tier\.mjs$/u,
   /^server\.ts$/u,
   /(?:^|\/|[-_.])(?:authority|approval|atomicity|concurrenc(?:y|ies)|cutover|migrations?|provenance|receipts?|spend)(?:[-_.\/]|$)/iu,

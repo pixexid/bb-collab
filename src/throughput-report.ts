@@ -2,7 +2,14 @@ export type ReportTier = "A" | "B" | "C";
 
 export type ThroughputFacts = {
   dialsLandedAtMs: number | null;
-  issues: Array<{ id: string; openedAtMs: number | null; closedAtMs: number | null }>;
+  issues: Array<{
+    id: string;
+    openedAtMs: number | null;
+    closedAtMs: number | null;
+    githubState?: "open" | "closed" | "unknown";
+    acceptance?: "complete" | "incomplete" | "unknown";
+    mergedWorkCount?: number | null;
+  }>;
   merges: Array<{ id: string; mergedAtMs: number | null }>;
   lanes: Array<{
     id: string;
@@ -34,6 +41,7 @@ export type WeeklyThroughputReport = {
   firstReportAtMs: number | null;
   benchmark: { issueOpenToCloseMedianHours: 0.8 };
   issueOpenToClose: { medianHours: number | null; completed: number; unknown: number };
+  issueAcceptanceAudit: { openCompleted: string[]; openIncomplete: string[]; unknown: string[]; status: "pass" | "fail" | "unknown" };
   mergeCadence: { histogram: Record<"<1d" | "1-3d" | "3-7d" | ">=7d", number>; knownMerges: number; unknown: number };
   laneSlotUtilization: Record<string, { utilization: number | null; occupiedMs: number; availableMs: number; unknown: number }>;
   reviewLatencyByTier: Record<ReportTier, { medianHours: number | null; completed: number; unknown: number }>;
@@ -57,6 +65,27 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
   const issueDurations = issueCandidates.filter((issue) => inWindow(issue.closedAtMs, window.startAtMs, window.endAtMs) && issue.openedAtMs !== null)
     .map((issue) => issue.closedAtMs! - issue.openedAtMs!);
   const issueUnknown = issueCandidates.filter((issue) => issue.openedAtMs === null || issue.closedAtMs === null).length;
+  const issueAcceptanceAudit = { openCompleted: [], openIncomplete: [], unknown: [], status: "pass" } as WeeklyThroughputReport["issueAcceptanceAudit"];
+  for (const issue of facts.issues) {
+    const state = issue.githubState ?? "unknown";
+    if (state === "closed") continue;
+    if (state !== "open" || issue.acceptance === "unknown" || issue.acceptance === undefined) {
+      issueAcceptanceAudit.unknown.push(issue.id);
+    } else if (issue.acceptance === "incomplete") {
+      issueAcceptanceAudit.openIncomplete.push(issue.id);
+    } else if (issue.mergedWorkCount === null || issue.mergedWorkCount === undefined) {
+      issueAcceptanceAudit.unknown.push(issue.id);
+    } else if (issue.acceptance === "complete" && issue.mergedWorkCount > 0) {
+      issueAcceptanceAudit.openCompleted.push(issue.id);
+    } else {
+      issueAcceptanceAudit.unknown.push(issue.id);
+    }
+  }
+  issueAcceptanceAudit.status = issueAcceptanceAudit.openCompleted.length > 0
+    ? "fail"
+    : issueAcceptanceAudit.unknown.length > 0
+      ? "unknown"
+      : "pass";
 
   const mergeTimes = facts.merges.filter((merge) => merge.mergedAtMs !== null).map((merge) => merge.mergedAtMs!).sort((a, b) => a - b);
   const histogram = { "<1d": 0, "1-3d": 0, "3-7d": 0, ">=7d": 0 } as Record<"<1d" | "1-3d" | "3-7d" | ">=7d", number>;
@@ -100,6 +129,7 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
     firstReportAtMs: facts.dialsLandedAtMs === null ? null : facts.dialsLandedAtMs + 7 * 86_400_000,
     benchmark: { issueOpenToCloseMedianHours: 0.8 },
     issueOpenToClose: { medianHours: issueMedian === null ? null : hours(issueMedian), completed: issueDurations.length, unknown: issueUnknown },
+    issueAcceptanceAudit,
     mergeCadence: { histogram, knownMerges: mergeTimes.filter((merge) => inWindow(merge, window.startAtMs, window.endAtMs)).length, unknown: facts.merges.filter((merge) => merge.mergedAtMs === null).length },
     laneSlotUtilization: utilization,
     reviewLatencyByTier,
