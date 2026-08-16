@@ -84,9 +84,10 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
   const issueMedian = median(issueDurations);
   const maxCeiling = Math.max(0, ...facts.startableWindows.map((entry) => entry.writingLaneCeiling ?? 0));
   const utilizationValues = Object.values(utilization).map((entry) => entry.utilization).filter((value): value is number => value !== null);
-  const dialGuidance = issueMedian === null
+  const issueMedianHours = issueMedian === null ? null : issueMedian / 3_600_000;
+  const dialGuidance = issueMedianHours === null
     ? "unknown: no complete issue open-to-close observations; do not adjust dials."
-    : issueMedian <= 0.8
+    : issueMedianHours <= 0.8
       ? "at or below the 0.8h benchmark: hold dials; do not auto-adjust."
       : utilizationValues.some((value) => value >= 0.8) && maxCeiling < 3
         ? `above the 0.8h benchmark with busy startable slots: consider raising writingLaneCeiling by one, up to 3, after defect/review checks; do not auto-adjust.`
