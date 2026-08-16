@@ -93,3 +93,11 @@ Contract v17 splits the director into its own logical role.
   superRefine checks (:1145-1163), the exemption schema (:1112), and the
   bump test including a persisted discriminating policy test proving stale
   v16 consumers refuse.
+
+## 4. Later corrective history
+
+Contract v18 does not revise this director/orchestrator decision. It corrects
+the rollout assembler so its four consumers are real production paths: the
+registered RPC `doctor` handler, CLI `doctor` dispatcher, and two named
+live-project stale-policy clone validations. The v18 receipt alone is current;
+v17 or missing evidence is unknown. See [ADR 0003](0003-cached-consumer-rollout-repair.md).

@@ -5,10 +5,10 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 17;
+export const CONTRACT_VERSION = 18;
 export const SCHEMA_VERSION = 11;
-// The director-role split follows the witness-holder refusal v16.
-const PREVIOUS_CONTRACT_VERSION = 16;
+// The corrected rollout mechanism follows the v17 director-role split.
+const PREVIOUS_CONTRACT_VERSION = 17;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
 const PREVIOUS_SCHEMA_VERSION = 11;
@@ -623,12 +623,17 @@ export const MIGRATIONS: string[] = [
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
-export const CACHED_CONSUMERS = ["server.rpcContract", "server.collabCli", "src/test-support", "tests/server.test"] as const;
+export const CACHED_CONSUMERS = [
+  "server.rpcContract",
+  "server.collabCli",
+  "src/foundation.staleV17ExemptionProbe",
+  "src/foundation.staleV17PlacementProbe",
+] as const;
 const CACHED_CONSUMER_ROLLOUT_POLICY = {
   class: "roleRequirements.director-seat",
-  staleV16RoleId: "project-orchestrator",
-  requiredV17RoleId: "director",
-  staleV16ExemptionField: "currentGenerationExemption",
+  staleV17RoleId: "project-orchestrator",
+  requiredV18RoleId: "director",
+  staleV17ExemptionField: "currentGenerationExemption",
   refusal: "INVALID_INPUT",
 } as const;
 
@@ -637,6 +642,62 @@ export type CachedConsumerObservation = {
   observedSchemaVersion: number;
   observedContractVersion: number;
 };
+
+type CachedConsumerProbe = () => Promise<{
+  observedSchemaVersion: number;
+  observedContractVersion: number;
+  staleV17Refusal?: Pick<FoundationResult, "outcome">;
+}>;
+
+export async function assembleV18CachedConsumerRolloutEvidence(input: {
+  rpcContract?: CachedConsumerProbe;
+  collabCli?: CachedConsumerProbe;
+  staleV17Exemption?: CachedConsumerProbe;
+  staleV17Placement?: CachedConsumerProbe;
+}): Promise<NonNullable<ApplyRequest["decisionEvidence"]>[number]> {
+  const probes = [
+    ["server.rpcContract", input.rpcContract],
+    ["server.collabCli", input.collabCli],
+    ["src/foundation.staleV17ExemptionProbe", input.staleV17Exemption],
+    ["src/foundation.staleV17PlacementProbe", input.staleV17Placement],
+  ] as const;
+  if (probes.some(([, probe]) => typeof probe !== "function")) {
+    throw new Error("cached-consumer v18 rollout evidence requires execution from all four consumers");
+  }
+  const executed = await Promise.all(probes.map(async ([name, probe]) => ({
+    name,
+    ...(await probe!()),
+  })));
+  const reread = cachedConsumerRolloutEvidence(executed);
+  const exemption = executed[2]!.staleV17Refusal;
+  const placement = executed[3]!.staleV17Refusal;
+  if (
+    reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 ||
+    exemption?.outcome !== "INVALID_INPUT" || placement?.outcome !== "INVALID_INPUT"
+  ) {
+    throw new Error("cached-consumer v18 rollout evidence requires four rereads and two INVALID_INPUT stale-v17 refusals");
+  }
+  const durableRefJson = canonicalJson({
+    kind: "cached_consumer_v18_rollout_receipt",
+    reread,
+    staleV17Refusal: {
+      exemption: { outcome: exemption.outcome },
+      placement: { outcome: placement.outcome },
+    },
+  });
+  return {
+    evidenceId: "cached-consumer-v18-rollout-receipt",
+    evidenceKind: "release",
+    sourceKind: "release",
+    sourceRef: "live-plugin:dist/server.js",
+    executionAttemptId: null,
+    contentDigest: sha256(durableRefJson),
+    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v18-rollout-receipt", redacted: true }),
+    durableRefJson,
+    relationKind: "supporting",
+    relation: { purpose: "cached-consumer-v18-rollout" },
+  };
+}
 
 export function cachedConsumerRolloutEvidence(observations: readonly CachedConsumerObservation[]) {
   const names = observations.map((observation) => observation.name);
@@ -697,7 +758,7 @@ function persistedCachedConsumerRolloutEvidence(db: SqliteDatabase, projectId: s
     `SELECT evidence_kind, source_kind, source_ref, execution_attempt_id, content_digest,
             redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest
      FROM evidence_artifacts
-     WHERE project_id = ? AND evidence_id = 'cached-consumer-v17-rollout-receipt'`,
+     WHERE project_id = ? AND evidence_id = 'cached-consumer-v18-rollout-receipt'`,
   ).get(projectId));
   if (!row) return unknownCachedConsumerRolloutEvidence();
   try {
@@ -707,7 +768,7 @@ function persistedCachedConsumerRolloutEvidence(db: SqliteDatabase, projectId: s
     assertRedactedEvidence(durableRef, "cached-consumer rollout durable reference");
     const expectedIdentity = sha256(canonicalJson({
       projectId,
-      evidenceId: "cached-consumer-v17-rollout-receipt",
+      evidenceId: "cached-consumer-v18-rollout-receipt",
       evidenceKind: row.evidence_kind,
       sourceKind: row.source_kind,
       sourceRef: row.source_ref,
@@ -717,13 +778,14 @@ function persistedCachedConsumerRolloutEvidence(db: SqliteDatabase, projectId: s
       durableRef,
     }));
     if (
+      row.evidence_kind !== "release" || row.source_kind !== "release" || row.source_ref !== "live-plugin:dist/server.js" ||
       canonicalJson(redacted) !== row.redacted_json || canonicalJson(durableRef) !== row.durable_ref_json ||
       sha256(canonicalJson(redacted)) !== row.redacted_digest || expectedIdentity !== row.artifact_identity_digest
     ) return unknownCachedConsumerRolloutEvidence();
     const receipt = durableRef as {
       kind?: unknown;
       reread?: { observations?: unknown; rolloutReceiptDigest?: unknown };
-      staleV16Refusal?: {
+      staleV17Refusal?: {
         exemption?: { outcome?: unknown };
         placement?: { outcome?: unknown };
       };
@@ -731,11 +793,11 @@ function persistedCachedConsumerRolloutEvidence(db: SqliteDatabase, projectId: s
     if (!Array.isArray(receipt.reread?.observations)) return unknownCachedConsumerRolloutEvidence();
     const reread = cachedConsumerRolloutEvidence(receipt.reread.observations as CachedConsumerObservation[]);
     if (
-      receipt.kind !== "cached_consumer_v17_rollout_receipt" ||
+      receipt.kind !== "cached_consumer_v18_rollout_receipt" ||
       receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest ||
       reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 ||
-      receipt.staleV16Refusal?.exemption?.outcome !== "INVALID_INPUT" ||
-      receipt.staleV16Refusal?.placement?.outcome !== "INVALID_INPUT"
+      receipt.staleV17Refusal?.exemption?.outcome !== "INVALID_INPUT" ||
+      receipt.staleV17Refusal?.placement?.outcome !== "INVALID_INPUT"
     ) return unknownCachedConsumerRolloutEvidence();
     return reread;
   } catch {
@@ -867,7 +929,7 @@ export const contractDigest = sha256(canonicalJson({
     expected: 4,
     attempted: 4,
     verified: 4,
-    staleV16Refusal: CACHED_CONSUMER_ROLLOUT_POLICY,
+    staleV17Refusal: CACHED_CONSUMER_ROLLOUT_POLICY,
   },
   roleHolderEligibilityPolicy: {
     nativeWitnessMarker: "witness",
@@ -2244,6 +2306,49 @@ function roleRequirementsFromJson(configJson: string): RoleRequirement[] {
   const parsed = roleRequirementsSchema.safeParse(value);
   if (!parsed.success) throw refusal("INVALID_INPUT", "stored role requirements are invalid");
   return parsed.data;
+}
+
+function liveDirectorSeatConfig(db: SqliteDatabase, projectId: string): Record<string, unknown> {
+  const config = JSON.parse(storedConfigJson(db, projectId, currentConfig(db, projectId)?.config_revision ?? 0)) as Record<string, unknown>;
+  const requirements = (config.extensions as { bbCollab?: { roleRequirements?: unknown } } | undefined)?.bbCollab?.roleRequirements;
+  if (!Array.isArray(requirements)) throw new Error("live project has no cached-consumer v18 role requirements");
+  const directorSeat = requirements.find((requirement) => (
+    requirement !== null && typeof requirement === "object" &&
+    (requirement as Record<string, unknown>).roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID
+  ));
+  if (!directorSeat || typeof directorSeat !== "object") throw new Error("live project has no director-seat role requirement");
+  return config;
+}
+
+function staleV17RefusalProbe(
+  db: SqliteDatabase,
+  projectId: string,
+  mutate: (requirement: Record<string, unknown>) => void,
+): Pick<FoundationResult, "outcome"> {
+  const candidate = structuredClone(liveDirectorSeatConfig(db, projectId));
+  const candidateRequirements = ((candidate.extensions as { bbCollab?: { roleRequirements?: unknown } }).bbCollab?.roleRequirements) as Record<string, unknown>[];
+  const candidateDirectorSeat = candidateRequirements.find((requirement) => requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID);
+  if (!candidateDirectorSeat) throw new Error("live director-seat role requirement disappeared during probe construction");
+  mutate(candidateDirectorSeat);
+  try {
+    validateConfig(candidate);
+    return { outcome: "OK" };
+  } catch (error) {
+    return { outcome: error instanceof Refusal ? error.data.code : "INTERNAL_ERROR" };
+  }
+}
+
+export function probeV18StaleExemptionRefusal(db: SqliteDatabase, projectId: string) {
+  const staleV17Refusal = staleV17RefusalProbe(db, projectId, (requirement) => {
+    delete requirement.firstGenerationExemption;
+    requirement.currentGenerationExemption = DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION;
+  });
+  return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION, staleV17Refusal };
+}
+
+export function probeV18StalePlacementRefusal(db: SqliteDatabase, projectId: string) {
+  const staleV17Refusal = staleV17RefusalProbe(db, projectId, (requirement) => { requirement.roleId = "project-orchestrator"; });
+  return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION, staleV17Refusal };
 }
 
 export function writingLaneCeilingFromJson(configJson: string): number {

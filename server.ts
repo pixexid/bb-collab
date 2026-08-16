@@ -19,6 +19,7 @@ import {
   MIGRATIONS,
   PLUGIN_ID,
   PLUGIN_SDK_VERSION,
+  assembleV18CachedConsumerRolloutEvidence,
   applyAuthorizedMutation,
   applyRequestSchema,
   approverAttestationRequestSchema,
@@ -26,6 +27,7 @@ import {
   databaseIsReady,
   doctor,
   exportFoundation,
+  canonicalJson,
   operatorReceiptConfirmationSchema,
   operatorReceiptRequestSchema,
   isDerivedActorMutationClass,
@@ -33,6 +35,8 @@ import {
   persistBootstrapOperatorReceipt,
   persistInterimOperatorReceipt,
   persistOperatorReceiptWithSessionEvidence,
+  probeV18StaleExemptionRefusal,
+  probeV18StalePlacementRefusal,
   readOperatorReceiptWithSessionEvidence,
   parseApplyRequest,
   type ApplyRequest,
@@ -296,6 +300,10 @@ export const rpcContract = defineRpcContract({
     input: approverAttestationRequestSchema,
     output: foundationResultSchema,
   },
+  cachedConsumerRollout: {
+    input: applyRequestSchema,
+    output: foundationResultSchema,
+  },
 });
 
 function jsonResult(result: FoundationResult): string {
@@ -471,10 +479,73 @@ async function readLiveRoleFactReader(
   }
 }
 
-async function applyLiveAuthorizedMutation(bb: BbPluginApi, db: SqliteDatabase | null, input: unknown): Promise<FoundationResult> {
+async function applyLiveAuthorizedMutation(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  input: unknown,
+  allowCachedConsumerRollout = false,
+): Promise<FoundationResult> {
   const parsed = applyRequestSchema.safeParse(input);
+  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v18-rollout-receipt")) {
+    return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
+  }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
   return applyAuthorizedMutation(db, input, null, reader);
+}
+
+function cachedConsumerRolloutRefusal(projectId: string, message: string): FoundationResult {
+  return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message };
+}
+
+function liveCachedConsumerReread(name: string, result: FoundationResult) {
+  const cachedConsumers = (result.evidence as { cachedConsumers?: { newSchemaVersion?: unknown; newContractVersion?: unknown } } | undefined)?.cachedConsumers;
+  if (result.outcome !== "OK" || typeof cachedConsumers?.newSchemaVersion !== "number" || typeof cachedConsumers.newContractVersion !== "number") {
+    throw new Error(`${name} did not return cached-consumer evidence from the live project`);
+  }
+  return { observedSchemaVersion: cachedConsumers.newSchemaVersion, observedContractVersion: cachedConsumers.newContractVersion };
+}
+
+async function applyLiveCachedConsumerRollout(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  input: unknown,
+  cliDeps: WaitValidatorCliDeps,
+  cliContext?: PluginCliContext,
+): Promise<FoundationResult> {
+  const parsed = applyRequestSchema.safeParse(input);
+  if (!parsed.success) return cachedConsumerRolloutRefusal("cached-consumer-rollout", parsed.error.message);
+  const request = parseApplyRequest(parsed.data);
+  if (request.operationClass !== "decision_disposition") {
+    return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout requires a governed decision_disposition request");
+  }
+  if (!import.meta.url.endsWith("/dist/server.js")) {
+    return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout requires the running dist/server.js plugin artifact");
+  }
+  if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
+  try {
+    const project = await bb.sdk.projects.get({ projectId: request.projectId });
+    if (project.id !== request.projectId) return { outcome: "PROJECT_UNKNOWN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "live project identity does not match the rollout request" };
+    const evidence = await assembleV18CachedConsumerRolloutEvidence({
+      rpcContract: async () => liveCachedConsumerReread("server.rpcContract", await bb.sdk.plugins.callRpc({
+        pluginId: bb.pluginId,
+        method: "doctor",
+        input: { projectId: request.projectId },
+        outputSchema: rpcContract.doctor.output,
+      }) as FoundationResult),
+      collabCli: async () => liveCachedConsumerReread("server.collabCli", foundationResultSchema.parse(JSON.parse(
+        (await runCli(db, bb, ["doctor", "--project", request.projectId], cliContext, cliDeps)).stdout,
+      )) as FoundationResult),
+      staleV17Exemption: async () => probeV18StaleExemptionRefusal(db, request.projectId),
+      staleV17Placement: async () => probeV18StalePlacementRefusal(db, request.projectId),
+    });
+    const supplied = (request.decisionEvidence ?? []).filter((item) => item.evidenceId === evidence.evidenceId);
+    if (supplied.length !== 1 || canonicalJson(supplied[0]) !== canonicalJson(evidence)) {
+      return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout request must carry the exact live production evidence");
+    }
+    return applyLiveAuthorizedMutation(bb, db, request, true);
+  } catch (error) {
+    return cachedConsumerRolloutRefusal(request.projectId, error instanceof Error ? error.message : String(error));
+  }
 }
 
 interface WaitValidatorCliDeps {
@@ -488,13 +559,13 @@ async function runCli(
   db: SqliteDatabase | null,
   bb: BbPluginApi,
   argv: string[],
-  ctx: PluginCliContext,
+  ctx: PluginCliContext | undefined,
   deps: WaitValidatorCliDeps,
 ) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "wait-register", "wait-list", "wait-validator"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, wait-register, wait-list, or wait-validator");
+  if (!command || !["doctor", "export", "apply", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, cached-consumer-rollout, wait-register, wait-list, or wait-validator");
   }
   if (command === "wait-validator") {
     const unknown = args.find((arg) => arg !== "--cycle");
@@ -541,7 +612,7 @@ async function runCli(
     }
     let result: import("./src/registered-waits.js").RegisterWaitResult;
     try {
-      result = await deps.registerBoundedWaitForCli(request, ctx.threadId);
+      result = await deps.registerBoundedWaitForCli(request, ctx?.threadId);
     } catch {
       return cliResult({ outcome: "INTERNAL_ERROR", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "wait registry state is unreadable; refusing fail closed" });
     }
@@ -587,6 +658,19 @@ async function runCli(
       const request = parseApplyRequest(rawRequest);
       if (request.projectId !== projectId) return invalidCli("--project does not match request.projectId");
       return cliResult(await applyLiveAuthorizedMutation(bb, db, rawRequest));
+    } catch (error) {
+      return invalidCli(error instanceof Error ? error.message : String(error));
+    }
+  }
+  if (command === "cached-consumer-rollout") {
+    const unknown = unexpectedFlags(args, ["--project", "--request"]);
+    if (unknown) return invalidCli(`unexpected flag ${unknown}`);
+    const requestJson = parseFlag(args, "--request");
+    if (!requestJson) return invalidCli("--request JSON is required");
+    try {
+      const request = JSON.parse(requestJson);
+      if (parseApplyRequest(request).projectId !== projectId) return invalidCli("--project does not match request.projectId");
+      return cliResult(await applyLiveCachedConsumerRollout(bb, db, request, deps, ctx));
     } catch (error) {
       return invalidCli(error instanceof Error ? error.message : String(error));
     }
@@ -1005,6 +1089,18 @@ export default async function plugin(bb: BbPluginApi) {
     });
   });
 
+  const cliDeps: WaitValidatorCliDeps = {
+    watcher,
+    registerBoundedWaitForCli: (input, ctxThreadId) => registerBoundedWait({
+      registry: boundedRegistry,
+      readSource: readThreadObservation,
+      input,
+      ctxThreadId,
+    }),
+    listWaitsForCli: async () => { await waitRegistry.recover(); return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) })); },
+    escalationCycle,
+  };
+
   bb.rpc.register(rpcContract, {
     lanes() {
       return readOpenLaneViews();
@@ -1070,6 +1166,9 @@ export default async function plugin(bb: BbPluginApi) {
     },
     async apply(input) {
       return applyLiveAuthorizedMutation(bb, db, input);
+    },
+    async cachedConsumerRollout(input) {
+      return applyLiveCachedConsumerRollout(bb, db, input, cliDeps);
     },
     async operatorReceipt(input) {
       if (!db) return operatorReceiptResult(input.projectId, "CANONICAL_STORE_UNAVAILABLE", "canonical SQLite store is unavailable");
@@ -1241,6 +1340,11 @@ export default async function plugin(bb: BbPluginApi) {
         usage: "bb collab apply --project PROJECT_ID --request JSON",
       },
       {
+        name: "cached-consumer-rollout",
+        summary: "Persist the live v18 cached-consumer rollout receipt (exact one-request receipt required)",
+        usage: "bb collab cached-consumer-rollout --project PROJECT_ID --request JSON",
+      },
+      {
         name: "wait-register",
         summary: "Register one bounded durable wait (deadline mandatory, fail closed)",
         usage: "bb collab wait-register --project PROJECT_ID --request JSON",
@@ -1253,17 +1357,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
     ],
     run(argv, context) {
-      return runCli(db, bb, argv, context, {
-        watcher,
-        registerBoundedWaitForCli: (input, ctxThreadId) => registerBoundedWait({
-          registry: boundedRegistry,
-          readSource: readThreadObservation,
-          input,
-          ctxThreadId,
-        }),
-        listWaitsForCli: async () => { await waitRegistry.recover(); return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) })); },
-        escalationCycle,
-      });
+      return runCli(db, bb, argv, context, cliDeps);
     },
   });
 

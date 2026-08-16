@@ -13786,9 +13786,9 @@ import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 17;
+var CONTRACT_VERSION = 18;
 var SCHEMA_VERSION = 11;
-var PREVIOUS_CONTRACT_VERSION = 16;
+var PREVIOUS_CONTRACT_VERSION = 17;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
 var PREVIOUS_SCHEMA_VERSION = 11;
@@ -14396,14 +14396,60 @@ var MIGRATIONS = [
    CHECK (standby_profile_json IS NULL OR json_valid(standby_profile_json))`
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
-var CACHED_CONSUMERS = ["server.rpcContract", "server.collabCli", "src/test-support", "tests/server.test"];
+var CACHED_CONSUMERS = [
+  "server.rpcContract",
+  "server.collabCli",
+  "src/foundation.staleV17ExemptionProbe",
+  "src/foundation.staleV17PlacementProbe"
+];
 var CACHED_CONSUMER_ROLLOUT_POLICY = {
   class: "roleRequirements.director-seat",
-  staleV16RoleId: "project-orchestrator",
-  requiredV17RoleId: "director",
-  staleV16ExemptionField: "currentGenerationExemption",
+  staleV17RoleId: "project-orchestrator",
+  requiredV18RoleId: "director",
+  staleV17ExemptionField: "currentGenerationExemption",
   refusal: "INVALID_INPUT"
 };
+async function assembleV18CachedConsumerRolloutEvidence(input) {
+  const probes = [
+    ["server.rpcContract", input.rpcContract],
+    ["server.collabCli", input.collabCli],
+    ["src/foundation.staleV17ExemptionProbe", input.staleV17Exemption],
+    ["src/foundation.staleV17PlacementProbe", input.staleV17Placement]
+  ];
+  if (probes.some(([, probe]) => typeof probe !== "function")) {
+    throw new Error("cached-consumer v18 rollout evidence requires execution from all four consumers");
+  }
+  const executed = await Promise.all(probes.map(async ([name, probe]) => ({
+    name,
+    ...await probe()
+  })));
+  const reread = cachedConsumerRolloutEvidence(executed);
+  const exemption = executed[2].staleV17Refusal;
+  const placement = executed[3].staleV17Refusal;
+  if (reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || exemption?.outcome !== "INVALID_INPUT" || placement?.outcome !== "INVALID_INPUT") {
+    throw new Error("cached-consumer v18 rollout evidence requires four rereads and two INVALID_INPUT stale-v17 refusals");
+  }
+  const durableRefJson = canonicalJson({
+    kind: "cached_consumer_v18_rollout_receipt",
+    reread,
+    staleV17Refusal: {
+      exemption: { outcome: exemption.outcome },
+      placement: { outcome: placement.outcome }
+    }
+  });
+  return {
+    evidenceId: "cached-consumer-v18-rollout-receipt",
+    evidenceKind: "release",
+    sourceKind: "release",
+    sourceRef: "live-plugin:dist/server.js",
+    executionAttemptId: null,
+    contentDigest: sha256(durableRefJson),
+    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v18-rollout-receipt", redacted: true }),
+    durableRefJson,
+    relationKind: "supporting",
+    relation: { purpose: "cached-consumer-v18-rollout" }
+  };
+}
 function cachedConsumerRolloutEvidence(observations) {
   const names = observations.map((observation) => observation.name);
   const requiredNames = [...CACHED_CONSUMERS];
@@ -14448,7 +14494,7 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
     `SELECT evidence_kind, source_kind, source_ref, execution_attempt_id, content_digest,
             redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest
      FROM evidence_artifacts
-     WHERE project_id = ? AND evidence_id = 'cached-consumer-v17-rollout-receipt'`
+     WHERE project_id = ? AND evidence_id = 'cached-consumer-v18-rollout-receipt'`
   ).get(projectId));
   if (!row) return unknownCachedConsumerRolloutEvidence();
   try {
@@ -14458,7 +14504,7 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
     assertRedactedEvidence(durableRef, "cached-consumer rollout durable reference");
     const expectedIdentity = sha256(canonicalJson({
       projectId,
-      evidenceId: "cached-consumer-v17-rollout-receipt",
+      evidenceId: "cached-consumer-v18-rollout-receipt",
       evidenceKind: row.evidence_kind,
       sourceKind: row.source_kind,
       sourceRef: row.source_ref,
@@ -14467,11 +14513,11 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
       redactedDigest: sha256(canonicalJson(redacted)),
       durableRef
     }));
-    if (canonicalJson(redacted) !== row.redacted_json || canonicalJson(durableRef) !== row.durable_ref_json || sha256(canonicalJson(redacted)) !== row.redacted_digest || expectedIdentity !== row.artifact_identity_digest) return unknownCachedConsumerRolloutEvidence();
+    if (row.evidence_kind !== "release" || row.source_kind !== "release" || row.source_ref !== "live-plugin:dist/server.js" || canonicalJson(redacted) !== row.redacted_json || canonicalJson(durableRef) !== row.durable_ref_json || sha256(canonicalJson(redacted)) !== row.redacted_digest || expectedIdentity !== row.artifact_identity_digest) return unknownCachedConsumerRolloutEvidence();
     const receipt = durableRef;
     if (!Array.isArray(receipt.reread?.observations)) return unknownCachedConsumerRolloutEvidence();
     const reread = cachedConsumerRolloutEvidence(receipt.reread.observations);
-    if (receipt.kind !== "cached_consumer_v17_rollout_receipt" || receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest || reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || receipt.staleV16Refusal?.exemption?.outcome !== "INVALID_INPUT" || receipt.staleV16Refusal?.placement?.outcome !== "INVALID_INPUT") return unknownCachedConsumerRolloutEvidence();
+    if (receipt.kind !== "cached_consumer_v18_rollout_receipt" || receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest || reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || receipt.staleV17Refusal?.exemption?.outcome !== "INVALID_INPUT" || receipt.staleV17Refusal?.placement?.outcome !== "INVALID_INPUT") return unknownCachedConsumerRolloutEvidence();
     return reread;
   } catch {
     return unknownCachedConsumerRolloutEvidence();
@@ -14598,7 +14644,7 @@ var contractDigest = sha256(canonicalJson({
     expected: 4,
     attempted: 4,
     verified: 4,
-    staleV16Refusal: CACHED_CONSUMER_ROLLOUT_POLICY
+    staleV17Refusal: CACHED_CONSUMER_ROLLOUT_POLICY
   },
   roleHolderEligibilityPolicy: {
     nativeWitnessMarker: "witness",
@@ -15429,6 +15475,40 @@ function roleRequirementsFromJson(configJson) {
   const parsed = roleRequirementsSchema.safeParse(value);
   if (!parsed.success) throw refusal("INVALID_INPUT", "stored role requirements are invalid");
   return parsed.data;
+}
+function liveDirectorSeatConfig(db, projectId) {
+  const config2 = JSON.parse(storedConfigJson(db, projectId, currentConfig(db, projectId)?.config_revision ?? 0));
+  const requirements = config2.extensions?.bbCollab?.roleRequirements;
+  if (!Array.isArray(requirements)) throw new Error("live project has no cached-consumer v18 role requirements");
+  const directorSeat = requirements.find((requirement) => requirement !== null && typeof requirement === "object" && requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID);
+  if (!directorSeat || typeof directorSeat !== "object") throw new Error("live project has no director-seat role requirement");
+  return config2;
+}
+function staleV17RefusalProbe(db, projectId, mutate) {
+  const candidate = structuredClone(liveDirectorSeatConfig(db, projectId));
+  const candidateRequirements = candidate.extensions.bbCollab?.roleRequirements;
+  const candidateDirectorSeat = candidateRequirements.find((requirement) => requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID);
+  if (!candidateDirectorSeat) throw new Error("live director-seat role requirement disappeared during probe construction");
+  mutate(candidateDirectorSeat);
+  try {
+    validateConfig(candidate);
+    return { outcome: "OK" };
+  } catch (error48) {
+    return { outcome: error48 instanceof Refusal ? error48.data.code : "INTERNAL_ERROR" };
+  }
+}
+function probeV18StaleExemptionRefusal(db, projectId) {
+  const staleV17Refusal = staleV17RefusalProbe(db, projectId, (requirement) => {
+    delete requirement.firstGenerationExemption;
+    requirement.currentGenerationExemption = DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION;
+  });
+  return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION, staleV17Refusal };
+}
+function probeV18StalePlacementRefusal(db, projectId) {
+  const staleV17Refusal = staleV17RefusalProbe(db, projectId, (requirement) => {
+    requirement.roleId = "project-orchestrator";
+  });
+  return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION, staleV17Refusal };
 }
 function writingLaneCeilingFromJson(configJson) {
   const config2 = JSON.parse(configJson);
@@ -21841,6 +21921,10 @@ var rpcContract = defineRpcContract({
   approverAttestation: {
     input: approverAttestationRequestSchema,
     output: foundationResultSchema
+  },
+  cachedConsumerRollout: {
+    input: applyRequestSchema,
+    output: foundationResultSchema
   }
 });
 function jsonResult(result2) {
@@ -21998,16 +22082,65 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
     return unavailableRoleFactReader(serverId);
   }
 }
-async function applyLiveAuthorizedMutation(bb, db, input) {
+async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false) {
   const parsed = applyRequestSchema.safeParse(input);
+  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v18-rollout-receipt")) {
+    return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
+  }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
   return applyAuthorizedMutation(db, input, null, reader);
+}
+function cachedConsumerRolloutRefusal(projectId, message) {
+  return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message };
+}
+function liveCachedConsumerReread(name, result2) {
+  const cachedConsumers = result2.evidence?.cachedConsumers;
+  if (result2.outcome !== "OK" || typeof cachedConsumers?.newSchemaVersion !== "number" || typeof cachedConsumers.newContractVersion !== "number") {
+    throw new Error(`${name} did not return cached-consumer evidence from the live project`);
+  }
+  return { observedSchemaVersion: cachedConsumers.newSchemaVersion, observedContractVersion: cachedConsumers.newContractVersion };
+}
+async function applyLiveCachedConsumerRollout(bb, db, input, cliDeps, cliContext) {
+  const parsed = applyRequestSchema.safeParse(input);
+  if (!parsed.success) return cachedConsumerRolloutRefusal("cached-consumer-rollout", parsed.error.message);
+  const request = parseApplyRequest(parsed.data);
+  if (request.operationClass !== "decision_disposition") {
+    return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout requires a governed decision_disposition request");
+  }
+  if (!import.meta.url.endsWith("/dist/server.js")) {
+    return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout requires the running dist/server.js plugin artifact");
+  }
+  if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
+  try {
+    const project = await bb.sdk.projects.get({ projectId: request.projectId });
+    if (project.id !== request.projectId) return { outcome: "PROJECT_UNKNOWN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "live project identity does not match the rollout request" };
+    const evidence = await assembleV18CachedConsumerRolloutEvidence({
+      rpcContract: async () => liveCachedConsumerReread("server.rpcContract", await bb.sdk.plugins.callRpc({
+        pluginId: bb.pluginId,
+        method: "doctor",
+        input: { projectId: request.projectId },
+        outputSchema: rpcContract.doctor.output
+      })),
+      collabCli: async () => liveCachedConsumerReread("server.collabCli", foundationResultSchema.parse(JSON.parse(
+        (await runCli(db, bb, ["doctor", "--project", request.projectId], cliContext, cliDeps)).stdout
+      ))),
+      staleV17Exemption: async () => probeV18StaleExemptionRefusal(db, request.projectId),
+      staleV17Placement: async () => probeV18StalePlacementRefusal(db, request.projectId)
+    });
+    const supplied = (request.decisionEvidence ?? []).filter((item) => item.evidenceId === evidence.evidenceId);
+    if (supplied.length !== 1 || canonicalJson(supplied[0]) !== canonicalJson(evidence)) {
+      return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout request must carry the exact live production evidence");
+    }
+    return applyLiveAuthorizedMutation(bb, db, request, true);
+  } catch (error48) {
+    return cachedConsumerRolloutRefusal(request.projectId, error48 instanceof Error ? error48.message : String(error48));
+  }
 }
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "wait-register", "wait-list", "wait-validator"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, wait-register, wait-list, or wait-validator");
+  if (!command || !["doctor", "export", "apply", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, cached-consumer-rollout, wait-register, wait-list, or wait-validator");
   }
   if (command === "wait-validator") {
     const unknown3 = args.find((arg) => arg !== "--cycle");
@@ -22051,7 +22184,7 @@ async function runCli(db, bb, argv, ctx, deps) {
     }
     let result2;
     try {
-      result2 = await deps.registerBoundedWaitForCli(request, ctx.threadId);
+      result2 = await deps.registerBoundedWaitForCli(request, ctx?.threadId);
     } catch {
       return cliResult({ outcome: "INTERNAL_ERROR", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "wait registry state is unreadable; refusing fail closed" });
     }
@@ -22097,6 +22230,19 @@ async function runCli(db, bb, argv, ctx, deps) {
       const request = parseApplyRequest(rawRequest);
       if (request.projectId !== projectId) return invalidCli("--project does not match request.projectId");
       return cliResult(await applyLiveAuthorizedMutation(bb, db, rawRequest));
+    } catch (error48) {
+      return invalidCli(error48 instanceof Error ? error48.message : String(error48));
+    }
+  }
+  if (command === "cached-consumer-rollout") {
+    const unknown3 = unexpectedFlags(args, ["--project", "--request"]);
+    if (unknown3) return invalidCli(`unexpected flag ${unknown3}`);
+    const requestJson = parseFlag(args, "--request");
+    if (!requestJson) return invalidCli("--request JSON is required");
+    try {
+      const request = JSON.parse(requestJson);
+      if (parseApplyRequest(request).projectId !== projectId) return invalidCli("--project does not match request.projectId");
+      return cliResult(await applyLiveCachedConsumerRollout(bb, db, request, deps, ctx));
     } catch (error48) {
       return invalidCli(error48 instanceof Error ? error48.message : String(error48));
     }
@@ -22463,6 +22609,20 @@ ${thread.titleFallback ?? ""}`);
       headers: { "content-type": "application/json" }
     });
   });
+  const cliDeps = {
+    watcher,
+    registerBoundedWaitForCli: (input, ctxThreadId) => registerBoundedWait({
+      registry: boundedRegistry,
+      readSource: readThreadObservation,
+      input,
+      ctxThreadId
+    }),
+    listWaitsForCli: async () => {
+      await waitRegistry.recover();
+      return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) }));
+    },
+    escalationCycle
+  };
   bb.rpc.register(rpcContract, {
     lanes() {
       return readOpenLaneViews();
@@ -22526,6 +22686,9 @@ ${thread.titleFallback ?? ""}`);
     },
     async apply(input) {
       return applyLiveAuthorizedMutation(bb, db, input);
+    },
+    async cachedConsumerRollout(input) {
+      return applyLiveCachedConsumerRollout(bb, db, input, cliDeps);
     },
     async operatorReceipt(input) {
       if (!db) return operatorReceiptResult(input.projectId, "CANONICAL_STORE_UNAVAILABLE", "canonical SQLite store is unavailable");
@@ -22684,6 +22847,11 @@ ${thread.titleFallback ?? ""}`);
         usage: "bb collab apply --project PROJECT_ID --request JSON"
       },
       {
+        name: "cached-consumer-rollout",
+        summary: "Persist the live v18 cached-consumer rollout receipt (exact one-request receipt required)",
+        usage: "bb collab cached-consumer-rollout --project PROJECT_ID --request JSON"
+      },
+      {
         name: "wait-register",
         summary: "Register one bounded durable wait (deadline mandatory, fail closed)",
         usage: "bb collab wait-register --project PROJECT_ID --request JSON"
@@ -22696,20 +22864,7 @@ ${thread.titleFallback ?? ""}`);
       }
     ],
     run(argv, context) {
-      return runCli(db, bb, argv, context, {
-        watcher,
-        registerBoundedWaitForCli: (input, ctxThreadId) => registerBoundedWait({
-          registry: boundedRegistry,
-          readSource: readThreadObservation,
-          input,
-          ctxThreadId
-        }),
-        listWaitsForCli: async () => {
-          await waitRegistry.recover();
-          return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) }));
-        },
-        escalationCycle
-      });
+      return runCli(db, bb, argv, context, cliDeps);
     }
   });
   bb.log.info(`${PLUGIN_ID} loaded for BB ${BB_VERSION_RANGE}; plugin SDK ${PLUGIN_SDK_VERSION}`);
