@@ -1495,6 +1495,7 @@ describe("bb-collab plugin boundary", () => {
     ["archived", { archivedAt: 1 }, "archivedAt=1 deletedAt=null"],
     ["deleted", { deletedAt: 1 }, "archivedAt=null deletedAt=1"],
     ["foreign-project", { projectId: "other-project" }, "observedProject=other-project"],
+    ["error status", { status: "error" as const }, "status=error"],
     ["title witness", { title: "handoff witness" }, "witness=true"],
     ["fallback witness", { titleFallback: "witness only" }, "witness=true"],
   ])("warns once when the current role holder is %s during periodic evaluation", async (_name, roleThread, evidence) => {
@@ -1520,6 +1521,9 @@ describe("bb-collab plugin boundary", () => {
 
   it.each([
     ["active", { status: "active" as const }, "status=active"],
+    ["foreign-project", { projectId: "other-project" }, "observedProject=other-project"],
+    ["archived", { archivedAt: 1 }, "archivedAt=1"],
+    ["deleted", { deletedAt: 1 }, "deletedAt=1"],
     ["title witness", { title: "handoff witness" }, "witness=true"],
     ["fallback witness", { titleFallback: "witness only" }, "witness=true"],
   ])("revalidates final role-holder %s eligibility before steering", async (_name, roleThread, evidence) => {
@@ -1539,6 +1543,22 @@ describe("bb-collab plugin boundary", () => {
         .filter((entry) => entry.level === "warn" && entry.message.startsWith("role steer refused:"));
       expect(warnings).toHaveLength(1);
       expect(warnings[0]?.message).toContain(evidence);
+
+      fixture.setRoleThread({
+        projectId: PROJECT_ID,
+        status: "idle",
+        archivedAt: null,
+        deletedAt: null,
+        title: "Managed role holder",
+        titleFallback: "",
+      });
+      await fixture.host.harness.runCli(["wait-validator", "--cycle"]);
+      currentNow = 20 * 60_000;
+      await fixture.host.harness.runCli(["wait-validator", "--cycle"]);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")
+        .filter(([input]) => (input as { threadId?: string }).threadId === ROLE_THREAD_ID)).toHaveLength(1);
+      expect(fixture.host.harness.inspection.logEntries
+        .filter((entry) => entry.level === "warn" && entry.message.startsWith("role succession required:"))).toHaveLength(0);
       await fixture.host.harness.lifecycle.dispose();
     } finally {
       now.mockRestore();

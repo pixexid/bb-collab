@@ -845,25 +845,25 @@ export default async function plugin(bb: BbPluginApi) {
       });
     },
     steerRole: async (role) => {
-      if (!db) return;
+      if (!db) return false;
       const holders = readRoleHolderStates(db).filter((holder) =>
         holder.project_id === role.projectId &&
         holder.role_id === role.roleId &&
         holder.role_generation === role.roleGeneration &&
         holder.execution_attempt_id === role.executionAttemptId,
       );
-      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) return;
+      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) return false;
       let thread;
       try {
         thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
       } catch (error) {
         warnRoleLiveness(holders[0], `liveness=unknown error=${String(error)}`);
-        return;
+        return false;
       }
       const refusal = roleThreadRefusal(holders[0], thread, true);
       if (refusal) {
         warnRoleLiveness(holders[0], refusal);
-        return;
+        return false;
       }
       roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
       await bb.sdk.threads.send({
@@ -878,6 +878,7 @@ export default async function plugin(bb: BbPluginApi) {
           },
         ],
       });
+      return true;
     },
   });
   await watcher.recover().catch((error) => bb.log.error(`lane continuation recovery failed: ${String(error)}`));

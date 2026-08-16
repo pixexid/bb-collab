@@ -682,7 +682,7 @@ export function createLaneWatcher(options: {
   readRoleScopes?: () => Promise<RoleQueueScope[]> | RoleQueueScope[];
   roleIdlePersistence?: RoleIdlePersistence;
   roleIdleThresholdMs?: number;
-  steerRole?: (role: RoleIdleView) => Promise<void>;
+  steerRole?: (role: RoleIdleView) => Promise<boolean | void>;
   onRoleSuccessionRequired?: (role: RoleIdleView) => void;
   now?: () => number;
   maxContinuations?: number;
@@ -941,11 +941,16 @@ export function createLaneWatcher(options: {
         continue;
       }
       let failed = false;
+      let delivered: boolean | void = undefined;
       try {
-        await options.steerRole(role);
+        delivered = await options.steerRole(role);
       } catch {
         // A failed send is itself a failed steer; the second failure escalates once.
         failed = true;
+      }
+      if (delivered === false) {
+        await roleIdleLedger.clearPrefixExcept(prefix);
+        continue;
       }
       const updated = await roleIdleLedger.recordSteer(key, failed, currentNow);
       if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, role);

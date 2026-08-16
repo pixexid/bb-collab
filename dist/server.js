@@ -21112,10 +21112,15 @@ function createLaneWatcher(options) {
         continue;
       }
       let failed = false;
+      let delivered = void 0;
       try {
-        await options.steerRole(role);
+        delivered = await options.steerRole(role);
       } catch {
         failed = true;
+      }
+      if (delivered === false) {
+        await roleIdleLedger.clearPrefixExcept(prefix);
+        continue;
       }
       const updated = await roleIdleLedger.recordSteer(key, failed, currentNow);
       if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, role);
@@ -22236,22 +22241,22 @@ ${thread.titleFallback ?? ""}`);
       });
     },
     steerRole: async (role) => {
-      if (!db) return;
+      if (!db) return false;
       const holders = readRoleHolderStates(db).filter(
         (holder) => holder.project_id === role.projectId && holder.role_id === role.roleId && holder.role_generation === role.roleGeneration && holder.execution_attempt_id === role.executionAttemptId
       );
-      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) return;
+      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) return false;
       let thread;
       try {
         thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
       } catch (error48) {
         warnRoleLiveness(holders[0], `liveness=unknown error=${String(error48)}`);
-        return;
+        return false;
       }
       const refusal2 = roleThreadRefusal(holders[0], thread, true);
       if (refusal2) {
         warnRoleLiveness(holders[0], refusal2);
-        return;
+        return false;
       }
       roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
       await bb.sdk.threads.send({
@@ -22266,6 +22271,7 @@ ${thread.titleFallback ?? ""}`);
           }
         ]
       });
+      return true;
     }
   });
   await watcher.recover().catch((error48) => bb.log.error(`lane continuation recovery failed: ${String(error48)}`));
