@@ -20442,7 +20442,6 @@ function createWaitRegistry(persistence) {
     state = waitRegistryState(persistence ? await persistence.read() : null);
     loaded = true;
   };
-  const save = () => persistence?.write(structuredClone(state));
   return {
     recover: () => enqueue(async () => {
       await load();
@@ -20455,8 +20454,9 @@ function createWaitRegistry(persistence) {
         if (JSON.stringify(existing) !== JSON.stringify(wait)) throw new Error("conflicting registered wait");
         return;
       }
-      state.waits.push(wait);
-      await save();
+      const waits = [...state.waits, wait];
+      await persistence?.write(structuredClone({ waits, fired: state.fired }));
+      state = { waits, fired: state.fired };
     }),
     list: () => state.waits.map((wait) => ({ ...wait })),
     state: (waitId) => state.fired[waitId] ? "fired" : state.waits.some((wait) => wait.waitId === waitId) ? "pending" : "unknown",
@@ -20465,8 +20465,9 @@ function createWaitRegistry(persistence) {
       const wait = state.waits.find((candidate) => candidate.waitId === waitId);
       if (!wait || state.fired[waitId]) return null;
       const event = { ...wait, reason, firedAtMs };
-      state.fired[waitId] = reason;
-      await save();
+      const fired = { ...state.fired, [waitId]: reason };
+      await persistence?.write(structuredClone({ waits: state.waits, fired }));
+      state = { waits: state.waits, fired };
       return event;
     })
   };
@@ -20871,7 +20872,12 @@ function createLaneWatcher(options) {
         byWaiter.set(wait.waiterThreadId, "pending");
         continue;
       }
-      const event = await waitRegistry.fire(wait.waitId, reason, now2());
+      let event;
+      try {
+        event = await waitRegistry.fire(wait.waitId, reason, now2());
+      } catch {
+        return { known: false, byWaiter: /* @__PURE__ */ new Map(), events: [] };
+      }
       if (event) events.push(event);
       if (byWaiter.get(wait.waiterThreadId) !== "pending") byWaiter.set(wait.waiterThreadId, "fired");
     }
