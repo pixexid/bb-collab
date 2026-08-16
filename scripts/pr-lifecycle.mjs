@@ -1,7 +1,7 @@
 const dispositionPattern = /^\s*(Closes #[1-9]\d*|Related GH-[1-9]\d*|No issue:\s*\S.*)\s*$/iu;
 const acceptancePattern = /^\s*Acceptance\s*:\s*(complete|incomplete|unknown)\s*$/iu;
-const linkageCandidatePattern = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|related)\b[^\r\n]*(?:#|GH-)\S+/iu;
-const linkageMentionPattern = /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|related)\s*:?\s*(?:#|GH-)([1-9]\d*)\b/giu;
+const linkageCandidatePattern = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|related)\b[^\r\n]*(?:(?:#|GH-)\S+|[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\S+|https?:\/\/github\.com\/\S+)/iu;
+const linkageMentionPattern = /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|related)\s*:?\s*(?:(https?:\/\/github\.com\/[^\s/]+\/[^\s/]+\/(?:issues|pull)\/)|([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#)|(#|GH-))([1-9]\d*)\b/giu;
 
 export function visibleMarkdown(text) {
   const withoutComments = text.replace(/<!--[\s\S]*?(?:-->|$)/gu, "");
@@ -54,7 +54,8 @@ export function parsePullRequestDisposition({ title = "", body = "" }) {
     const lineEnd = text.indexOf("\n", index);
     return {
       kind: match[1].toLowerCase(),
-      target: Number(match[2]),
+      target: Number(match[5]),
+      qualified: Boolean(match[2] || match[3]),
       line: text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd).trim(),
     };
   });
@@ -118,7 +119,8 @@ export function validateCommitMessages(parsed, commitMessages) {
   }
   const mentions = commitMessages.flatMap((message) => [...message.matchAll(linkageMentionPattern)].map((match) => ({
     kind: match[1].toLowerCase(),
-    target: Number(match[2]),
+    target: Number(match[5]),
+    qualified: Boolean(match[2] || match[3]),
   })));
   if (mentions.length === 0) return { ok: true };
   if (parsed.kind !== "closes" || mentions.some(({ kind, target }) => kind === "related" || kind.startsWith("ref") || target !== parsed.issueNumber)) {

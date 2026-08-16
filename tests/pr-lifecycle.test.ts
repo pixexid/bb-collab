@@ -22,6 +22,8 @@ describe("pull-request lifecycle linkage", () => {
       "No issue: GH-80 is not tracked",
       "Closes #80\nRefs #80\nAcceptance: complete",
       "Closes #80\nFixes #81\nAcceptance: complete",
+      "Fixes pixexid/bb-collab#80\nAcceptance: incomplete",
+      "Fixes: pixexid/bb-collab#80\nAcceptance: incomplete",
       "<!--\nCloses #80\nAcceptance: complete\n-->",
       "```\nCloses #80\nAcceptance: complete\n```",
     ]) expect(parsePullRequestDisposition({ body }).ok, body).toBe(false);
@@ -42,12 +44,19 @@ describe("pull-request lifecycle linkage", () => {
   it("rejects automatic GitHub closure hidden in commit messages", () => {
     const related = parsePullRequestDisposition({ body: "Related GH-80" });
     expect(validateCommitMessages(related, ["Fixes #80"]).ok).toBe(false);
+    expect(validateCommitMessages(related, ["Fixes GH-80"]).ok).toBe(false);
+    expect(validateCommitMessages(related, ["Fixes pixexid/bb-collab#80"]).ok).toBe(false);
+    expect(validateCommitMessages(related, ["Fixes:  pixexid/bb-collab#80"]).ok).toBe(false);
+    expect(validateCommitMessages(related, ["Fixes: https://github.com/pixexid/bb-collab/issues/80"]).ok).toBe(false);
     expect(validateCommitMessages(related, ["Fixes: #80"]).ok).toBe(false);
     expect(validateCommitMessages(related, ["Resolves: #80"]).ok).toBe(false);
     expect(validateCommitMessages(related, ["ordinary implementation"]).ok).toBe(true);
     const closes = parsePullRequestDisposition({ body: "Closes #80\nAcceptance: complete" });
     expect(validateCommitMessages(closes, ["Fixes #80"]).ok).toBe(true);
+    expect(validateCommitMessages(closes, ["Fixes pixexid/bb-collab#80"]).ok).toBe(true);
+    expect(validateCommitMessages(closes, ["Fixes: https://github.com/pixexid/bb-collab/issues/80"]).ok).toBe(true);
     expect(validateCommitMessages(closes, ["Fixes #81"]).ok).toBe(false);
+    expect(validateCommitMessages(closes, ["Fixes pixexid/bb-collab#81"]).ok).toBe(false);
     expect(validateCommitMessages(related, null).ok).toBe(false);
   });
 
