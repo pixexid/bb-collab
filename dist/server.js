@@ -20381,7 +20381,6 @@ function databaseIsReady(db) {
 }
 
 // src/awareness.ts
-var SUPERVISOR_THREAD_ID = "thr_b94i3csnme";
 var DEFAULT_MAX_CONTINUATIONS = 3;
 var OPERATOR_WAIT_FYI_THRESHOLD_MS = 15 * 6e4;
 var WRONGFUL_IDLE_THRESHOLD_MS = 10 * 6e4;
@@ -20735,6 +20734,7 @@ function readRoleHolderStates(db) {
          ON generations.project_id = attempts.project_id
         AND generations.role_id = attempts.role_id
         AND generations.generation = attempts.role_generation
+        AND generations.holder_execution_attempt_id = attempts.execution_attempt_id
        WHERE attempts.origin = 'role_holder'
          AND attempts.thread_id IS NOT NULL
          AND attempts.role_id = '${ORCHESTRATOR_ROLE_ID}'
@@ -20811,7 +20811,6 @@ function roleQueueScopes(lanes) {
   });
 }
 function createLaneWatcher(options) {
-  const supervisorThreadId = options.supervisorThreadId ?? SUPERVISOR_THREAD_ID;
   const continuationLedger = options.continuationLedger ?? createContinuationLedger();
   const waitRegistry = options.waitRegistry ?? createWaitRegistry();
   const operatorWaitAlertLedger = createOperatorWaitAlertLedger(options.operatorWaitAlertPersistence);
@@ -20922,6 +20921,25 @@ function createLaneWatcher(options) {
   const roleAlert = (role) => {
     options.onAlert?.({ kind: "wrongful_idle_fyi", lane: null, role, count: 2, max: 2 });
   };
+  const isCurrentCanonicalHolder = (projectId, threadId) => {
+    if (!options.readRoleHolders) return false;
+    try {
+      return options.readRoleHolders().filter((holder) => holder.project_id === projectId && holder.role_id === ORCHESTRATOR_ROLE_ID).some((holder) => holder.thread_id === threadId);
+    } catch {
+      return true;
+    }
+  };
+  const resolveCurrentCanonicalHolder = (holder) => {
+    if (!options.readRoleHolders) return null;
+    try {
+      const current = options.readRoleHolders().filter(
+        (candidate) => candidate.project_id === holder.project_id && candidate.role_id === ORCHESTRATOR_ROLE_ID
+      );
+      return current.length === 1 && current[0]?.role_generation === holder.role_generation && current[0]?.execution_attempt_id === holder.execution_attempt_id && current[0]?.thread_id === holder.thread_id ? current[0] : null;
+    } catch {
+      return null;
+    }
+  };
   const escalateRole = async (key, role) => {
     if (!await roleIdleLedger.markEscalated(key)) return;
     roleAlert(role);
@@ -20936,16 +20954,7 @@ function createLaneWatcher(options) {
       return;
     }
     if (holders.length === 0) return;
-    if (threadId && threadId !== supervisorThreadId && !holders.some((holder) => holder.thread_id === threadId)) return;
-    let dispatcherProjectId = null;
-    if (options.readDispatcherProjectIdentity) {
-      try {
-        dispatcherProjectId = await options.readDispatcherProjectIdentity();
-      } catch {
-        return;
-      }
-      if (!dispatcherProjectId) return;
-    }
+    if (threadId && !holders.some((holder) => holder.thread_id === threadId)) return;
     let scopes = suppliedScopes;
     if (!scopes) {
       try {
@@ -20955,7 +20964,9 @@ function createLaneWatcher(options) {
       }
     }
     for (const holder of holders) {
-      const targetThreadId = options.readDispatcherProjectIdentity && dispatcherProjectId === holder.project_id ? supervisorThreadId : holder.thread_id;
+      const projectHolders = holders.filter((candidate) => candidate.project_id === holder.project_id);
+      if (projectHolders.length !== 1 || !holder.thread_id) continue;
+      const targetThreadId = holder.thread_id;
       if (threadId && targetThreadId !== threadId) continue;
       const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
       const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
@@ -20966,7 +20977,7 @@ function createLaneWatcher(options) {
         continue;
       }
       const waitState = waitContext?.byWaiter.get(targetThreadId) ?? "none";
-      if (waitContext && !waitContext.known || waitState === "pending" || waitState === "unknown" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || !scope?.nextStartable || scope.deferredReason) {
+      if (observation.projectId !== holder.project_id || waitContext && !waitContext.known || waitState === "pending" || waitState === "unknown" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || !scope?.nextStartable || scope.deferredReason) {
         await roleIdleLedger.clearPrefixExcept(prefix);
         continue;
       }
@@ -21015,6 +21026,10 @@ function createLaneWatcher(options) {
         queueHeadId: scope.queueHeadId,
         idleAgeMs
       };
+      if (!resolveCurrentCanonicalHolder(holder)) {
+        await roleIdleLedger.clearPrefixExcept(prefix);
+        continue;
+      }
       let failed = false;
       try {
         await options.steerRole(role);
@@ -21029,7 +21044,7 @@ function createLaneWatcher(options) {
     const allLanes = options.readLanes();
     clearResolved(allLanes);
     const candidates = allLanes.filter(
-      (lane) => lane.thread_id === threadId && lane.thread_id !== supervisorThreadId && OPEN_ATTEMPT_STATES.has(lane.attempt_state)
+      (lane) => lane.thread_id === threadId && (!lane.thread_id || !isCurrentCanonicalHolder(lane.project_id, lane.thread_id)) && OPEN_ATTEMPT_STATES.has(lane.attempt_state)
     );
     if (candidates.length === 0) return;
     const registeredWaitState = waitContext?.byWaiter.get(threadId) ?? "none";
@@ -21121,7 +21136,7 @@ function createLaneWatcher(options) {
       return enqueue(async () => {
         const context = await readWaitContext(options.readLanes(), { threadId, status, archived: archived ?? false });
         await emitWaitEvents(context);
-        if (threadId !== supervisorThreadId) await observeNow(threadId, status, pendingExternalWait, archived, operatorWait, void 0, context);
+        await observeNow(threadId, status, pendingExternalWait, archived, operatorWait, void 0, context);
         await observeRoleNow(threadId, void 0, context);
         for (const event of context.events) {
           if (event.waiterThreadId === threadId || !options.readWorker) continue;
@@ -21142,7 +21157,7 @@ function createLaneWatcher(options) {
         await emitWaitEvents(context);
         if (!options.readWorker) return;
         const workerIds = new Set(
-          lanes.filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.thread_id).map((lane) => lane.thread_id).filter((threadId) => threadId !== supervisorThreadId)
+          lanes.filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.thread_id).map((lane) => lane.thread_id)
         );
         for (const threadId of workerIds) {
           let observation;
@@ -21162,8 +21177,7 @@ function createLaneWatcher(options) {
           );
         }
         if (options.readRoleHolders) {
-          const roleThreadIds = new Set(options.readRoleHolders().map((holder) => holder.thread_id).filter((threadId) => threadId !== supervisorThreadId));
-          if (options.readDispatcherProjectIdentity) roleThreadIds.add(supervisorThreadId);
+          const roleThreadIds = new Set(options.readRoleHolders().map((holder) => holder.thread_id));
           let roleScopes = null;
           if (roleThreadIds.size > 0 && options.readRoleScopes) {
             try {
@@ -21703,7 +21717,6 @@ async function plugin(bb) {
     readLanes: () => db ? readLaneStates(db) : [],
     readRoleHolders: () => db ? readRoleHolderStates(db) : [],
     readRoleScopes,
-    readDispatcherProjectIdentity: async () => (await bb.sdk.threads.get({ threadId: SUPERVISOR_THREAD_ID })).projectId,
     roleIdlePersistence,
     continuationLedger,
     waitRegistry,
@@ -21725,6 +21738,7 @@ async function plugin(bb) {
         }
       }
       return {
+        projectId: thread.projectId,
         status: thread.status,
         pendingExternalWait: archived || !operatorWaitKnown ? true : operatorWait ? true : await readPendingExternalWait(threadId),
         archived,
@@ -21735,7 +21749,8 @@ async function plugin(bb) {
       };
     },
     steer: async (lane) => {
-      if (!lane.threadId || lane.threadId === SUPERVISOR_THREAD_ID) return;
+      if (!lane.threadId) return;
+      if (db && readRoleHolderStates(db).some((holder) => holder.project_id === lane.projectId && holder.thread_id === lane.threadId)) return;
       await bb.sdk.threads.send({
         threadId: lane.threadId,
         mode: "steer",
@@ -21750,8 +21765,20 @@ async function plugin(bb) {
       });
     },
     steerRole: async (role) => {
+      if (!db) return;
+      const holders = readRoleHolderStates(db).filter(
+        (holder) => holder.project_id === role.projectId && holder.role_id === role.roleId && holder.role_generation === role.roleGeneration && holder.execution_attempt_id === role.executionAttemptId
+      );
+      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) return;
+      let thread;
+      try {
+        thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
+      } catch {
+        return;
+      }
+      if (thread.projectId !== role.projectId || thread.archivedAt !== null || thread.deletedAt !== null) return;
       await bb.sdk.threads.send({
-        threadId: role.threadId,
+        threadId: holders[0].thread_id,
         mode: "steer",
         input: [
           {

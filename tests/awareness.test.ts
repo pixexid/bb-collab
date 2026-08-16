@@ -10,7 +10,6 @@ import {
   type RegisteredWait,
   readLaneStates,
   readRoleHolderStates,
-  SUPERVISOR_THREAD_ID,
   type RoleHolderState,
   type RoleIdleView,
   type LaneState,
@@ -46,8 +45,8 @@ function roleScope(queueHeadId: string | null, deferredReason: OperatorWait["rea
   return { projectId: "project-1", nextStartable: queueHeadId !== null, queueHeadId, deferredReason };
 }
 
-function roleObservation(idleSinceMs: number): { status: "idle"; pendingExternalWait: false; archived: false; operatorWait: null; operatorWaitKnown: true; idleSinceMs: number } {
-  return { status: "idle", pendingExternalWait: false, archived: false, operatorWait: null, operatorWaitKnown: true, idleSinceMs };
+function roleObservation(idleSinceMs: number): { projectId: string; status: "idle"; pendingExternalWait: false; archived: false; operatorWait: null; operatorWaitKnown: true; idleSinceMs: number } {
+  return { projectId: "project-1", status: "idle", pendingExternalWait: false, operatorWait: null, operatorWaitKnown: true, archived: false, idleSinceMs };
 }
 
 const TEST_REGISTERED_WAIT_DEADLINE_AT_MS = 4_000_000_000_000;
@@ -175,19 +174,16 @@ describe("lane awareness", () => {
     expect(steerRole).toHaveBeenCalledTimes(1);
   });
 
-  it.each([
-    ["matching", "project-1", "thr_b94i3csnme"],
-    ["foreign", "project-2", "director-1"],
-  ])("selects the %s role observation target", async (_name, dispatcherProjectId, targetThreadId) => {
+  it("selects the current canonical holder instead of a dispatcher identity", async () => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    const readWorker = vi.fn(async (threadId: string) => ({ ...roleObservation(0), status: threadId === "director-1" ? "idle" as const : "active" as const }));
     let currentNow = 0;
     const watcher = createLaneWatcher({
       readLanes: () => [],
       steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => [roleScope("queue-head")],
-      readDispatcherProjectIdentity: async () => dispatcherProjectId,
-      readWorker: async (threadId) => ({ ...roleObservation(0), status: threadId === targetThreadId ? "idle" : "active" }),
+      readWorker,
       steerRole,
       now: () => currentNow,
     });
@@ -196,17 +192,77 @@ describe("lane awareness", () => {
     currentNow = 10 * 60_000;
     await watcher.poll();
 
-    expect(steerRole).toHaveBeenCalledWith(expect.objectContaining({ threadId: targetThreadId }));
+    expect(steerRole).toHaveBeenCalledWith(expect.objectContaining({ threadId: "director-1" }));
+    expect(readWorker).toHaveBeenCalledWith("director-1");
   });
 
-  it("suppresses role observation when native dispatcher identity is ambiguous", async () => {
+  it("suppresses role observation when the canonical holder is ambiguous", async () => {
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => [roleHolder("director-1"), roleHolder("director-2")],
+      readRoleScopes: () => [roleScope("queue-head")],
+      readWorker: async () => roleObservation(0),
+      steerRole,
+      now: () => 10 * 60_000,
+    });
+
+    await watcher.poll();
+
+    expect(steerRole).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["missing", [] as RoleHolderState[]],
+  ])("refuses a %s canonical holder", async (_name, holders) => {
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => holders,
+      readRoleScopes: () => [roleScope("queue-head")],
+      readWorker: async () => roleObservation(0),
+      steerRole,
+      now: () => 10 * 60_000,
+    });
+
+    await watcher.poll();
+
+    expect(steerRole).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["archived", { ...roleObservation(0), archived: true }],
+    ["foreign", { ...roleObservation(0), projectId: "project-2" }],
+  ])("refuses an %s native holder observation", async (_name, observation) => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     const watcher = createLaneWatcher({
       readLanes: () => [],
       steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => [roleScope("queue-head")],
-      readDispatcherProjectIdentity: async () => null,
+      readWorker: async () => observation,
+      steerRole,
+      now: () => 10 * 60_000,
+    });
+
+    await watcher.poll();
+
+    expect(steerRole).not.toHaveBeenCalled();
+  });
+
+  it("rechecks the canonical holder before steering", async () => {
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    let reads = 0;
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => {
+        reads += 1;
+        return [roleHolder(reads > 2 ? "successor-1" : "director-1")];
+      },
+      readRoleScopes: () => [roleScope("queue-head")],
       readWorker: async () => roleObservation(0),
       steerRole,
       now: () => 10 * 60_000,
@@ -224,7 +280,6 @@ describe("lane awareness", () => {
       steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => [],
-      readDispatcherProjectIdentity: async () => "project-1",
       readWorker: async () => roleObservation(0),
       steerRole,
       now: () => 10 * 60_000,
@@ -235,7 +290,7 @@ describe("lane awareness", () => {
     expect(steerRole).not.toHaveBeenCalled();
   });
 
-  it("observes the dispatcher target from a supervisor event", async () => {
+  it("observes the current canonical holder from its thread event", async () => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     let currentNow = 0;
     const watcher = createLaneWatcher({
@@ -243,17 +298,16 @@ describe("lane awareness", () => {
       steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => [roleScope("queue-head")],
-      readDispatcherProjectIdentity: async () => "project-1",
-      readWorker: async (threadId) => ({ ...roleObservation(0), status: threadId === SUPERVISOR_THREAD_ID ? "idle" : "active" }),
+      readWorker: async (threadId) => ({ ...roleObservation(0), status: threadId === "director-1" ? "idle" : "active" }),
       steerRole,
       now: () => currentNow,
     });
 
-    await watcher.observe(SUPERVISOR_THREAD_ID, "idle");
+    await watcher.observe("director-1", "idle");
     currentNow = 10 * 60_000;
-    await watcher.observe(SUPERVISOR_THREAD_ID, "idle");
+    await watcher.observe("director-1", "idle");
 
-    expect(steerRole).toHaveBeenCalledWith(expect.objectContaining({ threadId: SUPERVISOR_THREAD_ID }));
+    expect(steerRole).toHaveBeenCalledWith(expect.objectContaining({ threadId: "director-1" }));
   });
 
   it("waits for the exact ten-minute wrongful-idle threshold", async () => {
@@ -597,18 +651,22 @@ describe("lane awareness", () => {
     expect(events).toEqual(["wait-1"]);
   });
 
-  it("does not self-wake the supervisor", async () => {
+  it("does not self-wake the current canonical holder as an assignment lane", async () => {
     const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    const watcher = createLaneWatcher({ readLanes: () => [lane("thr_b94i3csnme")], steer });
+    const watcher = createLaneWatcher({
+      readLanes: () => [lane("director-1")],
+      readRoleHolders: () => [roleHolder()],
+      steer,
+    });
 
-    await watcher.observe("thr_b94i3csnme", "idle");
+    await watcher.observe("director-1", "idle");
 
     expect(steer).not.toHaveBeenCalled();
   });
 
   it("self-watches the director once when its registered source completes", async () => {
     const registry = createWaitRegistry();
-    await registry.register(registeredWait({ waiterThreadId: SUPERVISOR_THREAD_ID, sourceThreadId: "worker-source" }));
+    await registry.register(registeredWait({ waiterThreadId: "director-1", sourceThreadId: "worker-source" }));
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     const watcher = createLaneWatcher({
       readLanes: () => [],
@@ -616,7 +674,6 @@ describe("lane awareness", () => {
       waitRegistry: registry,
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => [roleScope("queue-head")],
-      readDispatcherProjectIdentity: async () => "project-1",
       readWorker: async (threadId) => threadId === "worker-source"
         ? { status: "error" as const, pendingExternalWait: false, archived: false }
         : roleObservation(0),
@@ -863,16 +920,20 @@ describe("lane awareness", () => {
     db.exec("CREATE TABLE assignments (project_id TEXT, assignment_id TEXT, lane_id TEXT, assignment_kind TEXT, work_item_id TEXT, created_at_ms INTEGER)");
     db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT, role_id TEXT, role_generation INTEGER)");
     db.exec("CREATE TABLE role_generation_heads (project_id TEXT, role_id TEXT, current_generation INTEGER)");
-    db.exec("CREATE TABLE role_generations (project_id TEXT, role_id TEXT, generation INTEGER, status TEXT)");
+    db.exec("CREATE TABLE role_generations (project_id TEXT, role_id TEXT, generation INTEGER, status TEXT, holder_execution_attempt_id TEXT)");
     db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "lane-1", "write", "work-1", 1);
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "director-1", "role-attempt-3", "role_holder", "done", null, "project-orchestrator", 3);
+    db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "retired-director", "role-attempt-stale", "role_holder", "done", null, "project-orchestrator", 3);
+    db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "previous-director", "role-attempt-2", "role_holder", "done", null, "project-orchestrator", 2);
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "worker-role-1", "worker-role-attempt", "role_holder", "done", null, "worker", 1);
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "worker-1", "attempt-1", "assignment", "prepared", null, "worker", 1);
     db.prepare("INSERT INTO role_generation_heads VALUES (?, ?, ?)").run("project-1", "project-orchestrator", 3);
-    db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?)").run("project-1", "project-orchestrator", 3, "active");
+    db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?, ?)").run("project-1", "project-orchestrator", 3, "active", "role-attempt-3");
+    db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?, ?)").run("project-1", "project-orchestrator", 2, "retired", "role-attempt-2");
     db.prepare("INSERT INTO role_generation_heads VALUES (?, ?, ?)").run("project-1", "worker", 1);
-    db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?)").run("project-1", "worker", 1, "active");
+    db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?, ?)").run("project-1", "worker", 1, "active", "worker-role-attempt");
     expect(readRoleHolderStates(db)).toHaveLength(1);
+    expect(readRoleHolderStates(db)[0]?.thread_id).toBe("director-1");
     const before = {
       assignments: db.prepare("SELECT * FROM assignments").all(),
       attempts: db.prepare("SELECT * FROM execution_attempts").all(),

@@ -2,7 +2,6 @@ import { defineRpcContract, type BbPluginApi, type PluginCliContext } from "@bb/
 import { z } from "zod";
 import {
   OPEN_ATTEMPT_STATES,
-  SUPERVISOR_THREAD_ID,
   createContinuationLedger,
   createLaneWatcher,
   createWaitRegistry,
@@ -601,7 +600,6 @@ export default async function plugin(bb: BbPluginApi) {
     readLanes: () => (db ? readLaneStates(db) : []),
     readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
     readRoleScopes,
-    readDispatcherProjectIdentity: async () => (await bb.sdk.threads.get({ threadId: SUPERVISOR_THREAD_ID })).projectId,
     roleIdlePersistence,
     continuationLedger,
     waitRegistry,
@@ -625,6 +623,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
       }
       return {
+        projectId: thread.projectId,
         status: thread.status,
         pendingExternalWait: archived || !operatorWaitKnown
           ? true
@@ -637,7 +636,8 @@ export default async function plugin(bb: BbPluginApi) {
       };
     },
     steer: async (lane) => {
-      if (!lane.threadId || lane.threadId === SUPERVISOR_THREAD_ID) return;
+      if (!lane.threadId) return;
+      if (db && readRoleHolderStates(db).some((holder) => holder.project_id === lane.projectId && holder.thread_id === lane.threadId)) return;
       await bb.sdk.threads.send({
         threadId: lane.threadId,
         mode: "steer",
@@ -652,8 +652,23 @@ export default async function plugin(bb: BbPluginApi) {
       });
     },
     steerRole: async (role) => {
+      if (!db) return;
+      const holders = readRoleHolderStates(db).filter((holder) =>
+        holder.project_id === role.projectId &&
+        holder.role_id === role.roleId &&
+        holder.role_generation === role.roleGeneration &&
+        holder.execution_attempt_id === role.executionAttemptId,
+      );
+      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) return;
+      let thread;
+      try {
+        thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
+      } catch {
+        return;
+      }
+      if (thread.projectId !== role.projectId || thread.archivedAt !== null || thread.deletedAt !== null) return;
       await bb.sdk.threads.send({
-        threadId: role.threadId,
+        threadId: holders[0].thread_id,
         mode: "steer",
         input: [
           {
