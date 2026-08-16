@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { hasLifecycleMarker, lifecycleMarker, parsePullRequestDisposition, planMergedLifecycle, validateIssueTarget } from "../scripts/pr-lifecycle.mjs";
+import { hasLifecycleMarker, lifecycleMarker, parsePullRequestDisposition, planMergedLifecycle, validateCommitMessages, validateIssueTarget } from "../scripts/pr-lifecycle.mjs";
 
 describe("pull-request lifecycle linkage", () => {
   it("accepts one related disposition and a completed close disposition", () => {
@@ -34,8 +34,19 @@ describe("pull-request lifecycle linkage", () => {
     await expect(validateIssueTarget(valid, async () => ({ number: 81, state: "open" }))).resolves.toMatchObject({ ok: false });
     await expect(validateIssueTarget(valid, async () => ({ number: 80, state: "open", pull_request: {} }))).resolves.toMatchObject({ ok: false });
     await expect(validateIssueTarget(valid, async () => ({ number: 80, state: "unknown" }))).resolves.toMatchObject({ ok: false });
+    await expect(validateIssueTarget(valid, async () => ({ number: 80, state: "closed" }))).resolves.toMatchObject({ ok: false });
     await expect(validateIssueTarget(valid, async () => { throw new Error("rate limited"); })).resolves.toMatchObject({ ok: false });
     await expect(validateIssueTarget(valid, async () => ({ number: 80, state: "open" }))).resolves.toMatchObject({ ok: true });
+  });
+
+  it("rejects automatic GitHub closure hidden in commit messages", () => {
+    const related = parsePullRequestDisposition({ body: "Related GH-80" });
+    expect(validateCommitMessages(related, ["Fixes #80"]).ok).toBe(false);
+    expect(validateCommitMessages(related, ["ordinary implementation"]).ok).toBe(true);
+    const closes = parsePullRequestDisposition({ body: "Closes #80\nAcceptance: complete" });
+    expect(validateCommitMessages(closes, ["Fixes #80"]).ok).toBe(true);
+    expect(validateCommitMessages(closes, ["Fixes #81"]).ok).toBe(false);
+    expect(validateCommitMessages(related, null).ok).toBe(false);
   });
 
   it("uses one deterministic marker to make merge handling duplicate-safe", () => {

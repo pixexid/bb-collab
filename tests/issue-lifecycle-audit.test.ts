@@ -21,7 +21,10 @@ describe("scheduled issue lifecycle audit", () => {
     expect(auditGitHubFacts({
       issues: [{ number: 80, state: "open", body: "acceptance" }],
       mergedPullRequests: [{ title: "malformed", body: "Closes #80\nAcceptance: complete" }],
-    })).toEqual({ openCompleted: [], openIncomplete: [], unknown: ["github-merged-pr-state-unknown", "80"], status: "unknown" });
+    })).toEqual({ openCompleted: [], openIncomplete: [], unknown: ["github-merged-pr-shape-unknown", "80"], status: "unknown" });
+    expect(auditGitHubFacts({ issues: [{ state: "closed", body: null }], mergedPullRequests: [] })).toEqual({
+      openCompleted: [], openIncomplete: [], unknown: ["github-issue-shape-unknown"], status: "unknown",
+    });
   });
 
   it("fails closed when GitHub facts cannot be collected", async () => {

@@ -5,16 +5,30 @@ const emptyAudit = () => ({ openCompleted: [], openIncomplete: [], unknown: [], 
 
 export function auditGitHubFacts({ issues, mergedPullRequests }) {
   const audit = emptyAudit();
-  if (mergedPullRequests.some((pullRequest) => pullRequest.merged_at !== null && typeof pullRequest.merged_at !== "string")) {
-    audit.unknown.push("github-merged-pr-state-unknown");
+  const validIssue = (issue) => issue && typeof issue === "object" && Number.isSafeInteger(issue.number) && issue.number > 0
+    && ["open", "closed"].includes(issue.state) && (typeof issue.body === "string" || issue.body === null)
+    && (issue.pull_request === undefined || (issue.pull_request && typeof issue.pull_request === "object"));
+  const validPullRequest = (pullRequest) => pullRequest && typeof pullRequest === "object"
+    && (typeof pullRequest.title === "string" || pullRequest.title === null)
+    && (typeof pullRequest.body === "string" || pullRequest.body === null)
+    && (typeof pullRequest.merged_at === "string" || pullRequest.merged_at === null);
+  if (!Array.isArray(issues) || !Array.isArray(mergedPullRequests)) {
+    audit.unknown.push("github-collection-shape-unknown");
+    audit.status = "unknown";
+    return audit;
   }
+  for (const issue of issues) if (!validIssue(issue)) audit.unknown.push("github-issue-shape-unknown");
+  for (const pullRequest of mergedPullRequests) if (!validPullRequest(pullRequest)) audit.unknown.push("github-merged-pr-shape-unknown");
   for (const issue of issues) {
+    if (!validIssue(issue)) continue;
+    if (issue.pull_request) continue;
     if (issue.state === "closed") continue;
     if (issue.state !== "open" || typeof issue.number !== "number") {
       audit.unknown.push(String(issue.number ?? "unknown"));
       continue;
     }
     const related = mergedPullRequests.filter((pullRequest) => {
+      if (!validPullRequest(pullRequest)) return false;
       if (typeof pullRequest.merged_at !== "string") return false;
       const parsed = parsePullRequestDisposition({ title: pullRequest.title ?? "", body: pullRequest.body ?? "" });
       return parsed.ok && parsed.issueNumber === issue.number;
@@ -51,9 +65,9 @@ async function readAll(url, token) {
 
 export async function collectGitHubAudit({ apiUrl, repository, token }) {
   if (!apiUrl || !repository || !token) throw new Error("missing GitHub API identity; refusing to infer lifecycle state");
-  const issues = (await readAll(`${apiUrl}/repos/${repository}/issues?state=all`, token)).filter((issue) => !issue.pull_request);
-  const pullRequests = (await readAll(`${apiUrl}/repos/${repository}/pulls?state=closed&sort=updated&direction=desc`, token)).filter((pullRequest) => pullRequest.merged_at !== null);
-  return { issues, mergedPullRequests: pullRequests };
+  const issues = await readAll(`${apiUrl}/repos/${repository}/issues?state=all`, token);
+  const mergedPullRequests = await readAll(`${apiUrl}/repos/${repository}/pulls?state=closed&sort=updated&direction=desc`, token);
+  return { issues, mergedPullRequests };
 }
 
 export const auditExitCode = (status) => status === "pass" ? 0 : 1;

@@ -1,10 +1,11 @@
 import { readFileSync } from "node:fs";
+import { visibleMarkdown } from "./pr-lifecycle.mjs";
 
 const eventPath = process.argv[2];
 if (!eventPath) throw new Error("usage: check-review-tier.mjs <github-event-path>");
 
 const event = JSON.parse(readFileSync(eventPath, "utf8"));
-const body = event.pull_request?.body ?? "";
+const body = visibleMarkdown(event.pull_request?.body ?? "");
 const files = readFileSync(0, "utf8").split(/\r?\n/u).filter(Boolean);
 
 const declarations = body.match(/^\s*Review tier\s*:\s*([ABC])\s*$/gmu) ?? [];

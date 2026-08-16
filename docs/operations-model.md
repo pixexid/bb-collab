@@ -141,7 +141,9 @@ acceptance and the body declares `Acceptance: complete`; `Related GH-NN`
 otherwise; or a rare `No issue: <rationale>` when no tracked issue applies.
 Missing, multiple, or ambiguous lines fail Verify. Fix/Close/Resolve keywords
 are rejected unless the exact close disposition and completion declaration are
-present. For the #80 lane, the pull request title and body use `Related GH-80`
+present; the checked commit history must also contain no conflicting
+close/fix/resolve/reference linkage. A Related target must be explicitly open
+at Verify time. For the #80 lane, the pull request title and body use `Related GH-80`
 while the first report and acceptance remain pending; merge adds exactly one
 status comment to #80 unless the merged pull request demonstrably completes
 that acceptance, and does not close #80 merely because code merged.

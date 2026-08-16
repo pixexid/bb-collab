@@ -3,7 +3,7 @@ const acceptancePattern = /^\s*Acceptance\s*:\s*(complete|incomplete|unknown)\s*
 const linkageCandidatePattern = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|related)\b[^\r\n]*(?:#|GH-)\S+/iu;
 const linkageMentionPattern = /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|related)\s+(?:#|GH-)([1-9]\d*)\b/giu;
 
-function visibleMarkdown(text) {
+export function visibleMarkdown(text) {
   const withoutComments = text.replace(/<!--[\s\S]*?(?:-->|$)/gu, "");
   let inFence = false;
   let fenceCharacter = "";
@@ -102,13 +102,29 @@ export async function validateIssueTarget(parsed, readIssue) {
   if (!parsed.ok || parsed.issueNumber === null) return parsed.ok ? { ok: true, issue: null } : parsed;
   try {
     const issue = await readIssue(parsed.issueNumber);
-    if (!issue || issue.number !== parsed.issueNumber || issue.pull_request || !["open", "closed"].includes(issue.state)) {
+    if (!issue || issue.number !== parsed.issueNumber || issue.pull_request || !["open", "closed"].includes(issue.state)
+      || (parsed.kind === "related" && issue.state !== "open")) {
       return { ok: false, error: `GitHub target #${parsed.issueNumber} is missing, not an issue, or has uncertain state.` };
     }
     return { ok: true, issue };
   } catch {
     return { ok: false, error: `GitHub target #${parsed.issueNumber} could not be verified; refusing closed-world inference.` };
   }
+}
+
+export function validateCommitMessages(parsed, commitMessages) {
+  if (!parsed.ok || !Array.isArray(commitMessages) || commitMessages.some((message) => typeof message !== "string")) {
+    return { ok: false, error: "Pull-request commit messages could not be verified; refusing uncertain lifecycle linkage." };
+  }
+  const mentions = commitMessages.flatMap((message) => [...message.matchAll(linkageMentionPattern)].map((match) => ({
+    kind: match[1].toLowerCase(),
+    target: Number(match[2]),
+  })));
+  if (mentions.length === 0) return { ok: true };
+  if (parsed.kind !== "closes" || mentions.some(({ kind, target }) => kind === "related" || kind.startsWith("ref") || target !== parsed.issueNumber)) {
+    return { ok: false, error: "Commit messages contain close, fix, resolve, reference, or related linkage that conflicts with the PR disposition." };
+  }
+  return { ok: true };
 }
 
 const trustedLifecycleComment = (entry) => entry?.user?.login === "github-actions[bot]" && entry.user.type === "Bot";

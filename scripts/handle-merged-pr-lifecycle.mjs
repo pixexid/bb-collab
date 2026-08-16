@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { parsePullRequestDisposition, planMergedLifecycle, validateIssueTarget } from "./pr-lifecycle.mjs";
+import { parsePullRequestDisposition, planMergedLifecycle, validateCommitMessages, validateIssueTarget } from "./pr-lifecycle.mjs";
 
 const eventPath = process.argv[2];
 if (!eventPath) throw new Error("usage: handle-merged-pr-lifecycle.mjs <github-event-path>");
@@ -28,10 +28,21 @@ const comments = async (issueNumber) => {
     if (batch.length < 100) return values;
   }
 };
+const pullRequestCommits = async () => {
+  const values = [];
+  for (let page = 1; ; page += 1) {
+    const batch = await api(`/pulls/${pullRequest.number}/commits?per_page=100&page=${page}`);
+    if (!Array.isArray(batch)) throw new Error("GitHub returned an uncertain commit collection");
+    values.push(...batch);
+    if (batch.length < 100) return values;
+  }
+};
 const comment = async (issueNumber, body) => api(`/issues/${issueNumber}/comments`, { method: "POST", body: JSON.stringify({ body }) });
 
 const parsed = parsePullRequestDisposition({ title: pullRequest.title ?? "", body: pullRequest.body ?? "" });
 if (!parsed.ok) throw new Error(parsed.error);
+const commitCheck = validateCommitMessages(parsed, (await pullRequestCommits()).map((commit) => commit?.commit?.message));
+if (!commitCheck.ok) throw new Error(commitCheck.error);
 const checked = await validateIssueTarget(parsed, (issueNumber) => api(`/issues/${issueNumber}`));
 if (!checked.ok) throw new Error(checked.error);
 

@@ -141,8 +141,10 @@ cached consumers emit a durable reread/refusal rollout receipt.
   claim without `Acceptance: complete`; GitHub issue state remains projection
   evidence and never canonical governance.
 - Verify may read the linked GitHub issue only to validate target existence and
-  explicit state; `issues: read` and branch-protection/ruleset enforcement of
-  the Verify check are external prerequisites, not canonical authority.
+  explicit state; a `Related GH-NN` target must still be open, and the checked
+  PR commit history must contain no conflicting close-like linkage. `issues:
+  read` and branch-protection/ruleset enforcement of the Verify check are
+  external prerequisites, not canonical authority.
 - The merge-only `pull_request_target` workflow uses `issues: write` only with
   code checked out from `refs/heads/main`; it never executes the PR head or
   merge ref. Its deterministic marker/concurrency path is projection evidence,
