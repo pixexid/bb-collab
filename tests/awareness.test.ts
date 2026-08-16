@@ -540,6 +540,38 @@ describe("lane awareness", () => {
     expect(events).toEqual(["wait-1"]);
   });
 
+  it("fails closed on a fired-state persistence outage and retries without phantom dedupe", async () => {
+    let persisted: unknown;
+    let failWrites = false;
+    const registry = createWaitRegistry({
+      read: async () => persisted,
+      write: async (state) => {
+        if (failWrites) throw new Error("awareness storage unavailable");
+        persisted = state;
+      },
+    });
+    await registry.register(registeredWait({ sourceThreadId: "source-1" }));
+    failWrites = true;
+    const events: string[] = [];
+    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
+    const watcher = createLaneWatcher({
+      readLanes: () => [lane(), { ...lane("source-1"), terminal_report_digest: "done" }],
+      steer,
+      waitRegistry: registry,
+      readWorker: async () => ({ status: "active" as const, pendingExternalWait: false, archived: false }),
+      onWaitEvent: (event) => { events.push(event.waitId); },
+    });
+
+    await watcher.observe("worker-1", "idle");
+    expect(steer).not.toHaveBeenCalled();
+    expect(registry.state("wait-1")).toBe("pending");
+
+    failWrites = false;
+    await watcher.observe("worker-1", "idle");
+    expect(steer).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["wait-1"]);
+  });
+
   it("does not self-wake the supervisor", async () => {
     const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
     const watcher = createLaneWatcher({ readLanes: () => [lane("thr_b94i3csnme")], steer });
