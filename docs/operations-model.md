@@ -199,10 +199,12 @@ Contract v17 supersedes the historical v14/v15 placement: `director-seat` is
 the only `director` requirement, with primary `pi/kimi-coding/k3/high`,
 Opus-medium standby, and zero writing-lane capacity. Only director generation
 1 may use the approved unmanaged holder `thr_gsb7m77ciz`, environment
-`env_3znzsxb7ce`, and source `src_x8veidmpik`; later director generations use
-managed worktrees, and project-orchestrator generations omit a standby. The
-exact current head and holder execution attempt
-remain bound. It cannot admit writing or succession. Epoch-2 service on the
+`env_3znzsxb7ce`, and source `src_x8veidmpik`; it may record the fresh
+qualification and create director generation 1 through the receipt-gated
+`role_generation_succession` path with no predecessor and no existing director
+head. It cannot admit writing, a foreign or stale context, or any later
+generation; later director generations use managed worktrees, and
+project-orchestrator generations omit a standby. Epoch-2 service on the
 unmanaged canonical environment is grandfathered evidence, not generation 3
 occupancy. A future successor is first preflighted and then recorded through
 the receipt-gated succession apply; witness evidence and operator word do not

@@ -194,7 +194,10 @@ where BB permits.
 Role qualification accepts a derived path only for a ready BB-native
 `managed-worktree` whose project and host resolve to exactly one canonical
 source. The canonical source path and derived environment path remain separate
-evidence; unmanaged, ephemeral, foreign or ambiguous contexts fail closed.
+evidence; unmanaged, ephemeral, foreign or ambiguous contexts fail closed,
+except the exact v17 director generation-1 holder/environment/source triple
+for its bounded qualification recording and receipt-gated first-generation
+creation. That exception admits neither writing nor later generations.
 
 Cutover has a no-writer interval:
 
