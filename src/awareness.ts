@@ -60,6 +60,8 @@ export interface WaitRegistry {
   list(): RegisteredWait[];
   state(waitId: string): "pending" | "fired" | "unknown";
   fire(waitId: string, reason: WaitEvent["reason"], firedAtMs: number): Promise<WaitEvent | null>;
+  /** Fired waits with their reason and waiter, for the durable validator. */
+  firedList(): Array<{ waitId: string; reason: WaitEvent["reason"]; waiterThreadId: string }>;
 }
 
 function normalizeRegisteredWait(input: unknown): RegisteredWait {
@@ -135,6 +137,9 @@ export function createWaitRegistry(persistence?: WaitRegistryPersistence): WaitR
     }),
     list: () => state.waits.map((wait) => ({ ...wait })),
     state: (waitId) => state.fired[waitId] ? "fired" : state.waits.some((wait) => wait.waitId === waitId) ? "pending" : "unknown",
+    firedList: () => state.waits
+      .filter((wait) => state.fired[wait.waitId] !== undefined)
+      .map((wait) => ({ waitId: wait.waitId, reason: state.fired[wait.waitId], waiterThreadId: wait.waiterThreadId })),
     fire: (waitId, reason, firedAtMs) => enqueue(async () => {
       await load();
       const wait = state.waits.find((candidate) => candidate.waitId === waitId);
