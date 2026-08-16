@@ -13,7 +13,7 @@ import {
   CACHED_CONSUMERS,
   CONTRACT_VERSION,
   DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
-  DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION,
+  DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION,
   DERIVED_ACTOR_MUTATION_CLASSES,
   EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION,
   LLM_COLLAB_EVIDENCE_RESOURCE_REVISION,
@@ -137,14 +137,18 @@ function directorSeatConfig() {
   const requirements = config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>;
   requirements[0] = {
     roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
-    roleId: "project-orchestrator",
+    roleId: "director",
     repoTargetId: null,
     executedProfile: DIRECTOR_PROFILE,
     standbyProfile: DIRECTOR_STANDBY_PROFILE,
     writingLaneCapacity: 0,
-    currentGenerationExemption: DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION,
+    firstGenerationExemption: DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION,
   };
   return config;
+}
+
+function cachedConsumerObservations(observedSchemaVersion: number, observedContractVersion: number) {
+  return CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion, observedContractVersion }));
 }
 
 function directorRoleReader(
@@ -230,7 +234,7 @@ function qualificationRequest(fenceToken: string, overrides: Partial<ApplyReques
     expectedGovernanceEpoch: 1,
     expectedFenceToken: fenceToken,
     repoTargetId: null,
-    roleId: "project-orchestrator",
+    roleId: overrides.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID ? "director" : "project-orchestrator",
     roleRequirementId: "orchestrator-v1",
     qualificationId: "qualification-1",
     roleContext: {
@@ -260,7 +264,7 @@ function successionRequest(fenceToken: string, overrides: Partial<ApplyRequest> 
     expectedGovernanceEpoch: 1,
     expectedFenceToken: fenceToken,
     repoTargetId: null,
-    roleId: "project-orchestrator",
+    roleId: overrides.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID ? "director" : "project-orchestrator",
     roleRequirementId: "orchestrator-v1",
     qualificationId: "qualification-1",
     expectedGeneration: null,
@@ -275,7 +279,7 @@ function successionRequest(fenceToken: string, overrides: Partial<ApplyRequest> 
       completionEventSeq: 4,
     },
     ...overrides,
-    standbyProfile: overrides.standbyProfile ?? ((overrides.roleId ?? "project-orchestrator") === "project-orchestrator" ? STANDBY_PROFILE : undefined),
+    standbyProfile: overrides.standbyProfile ?? (overrides.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID ? DIRECTOR_STANDBY_PROFILE : undefined),
   };
 }
 
@@ -852,9 +856,9 @@ function activateMigration(db: Database.Database) {
   return { exported, activate };
 }
 
-function seedEvidenceArtifact(db: Database.Database, evidenceId: string, payloadBytes = 0) {
+function seedEvidenceArtifact(db: Database.Database, evidenceId: string, payloadBytes = 0, durableRef?: Record<string, unknown>) {
   const redactedJson = canonicalJson({ evidenceId, redacted: true });
-  const durableRefJson = canonicalJson({ kind: "fixture", ref: evidenceId, fixtureContent: "x".repeat(payloadBytes) });
+  const durableRefJson = canonicalJson(durableRef ?? { kind: "fixture", ref: evidenceId, fixtureContent: "x".repeat(payloadBytes) });
   const artifact = {
     projectId: PROJECT_ID,
     evidenceId,
@@ -862,7 +866,7 @@ function seedEvidenceArtifact(db: Database.Database, evidenceId: string, payload
     sourceKind: "test",
     sourceRef: `fixture:${evidenceId}`,
     executionAttemptId: null,
-    contentDigest: sha256(`content:${evidenceId}`),
+    contentDigest: sha256(durableRefJson),
     redactedDigest: sha256(redactedJson),
     durableRef: JSON.parse(durableRefJson),
   };
@@ -943,7 +947,7 @@ async function assignmentFixture(options: {
     receiptId: "role-actor-assignment",
     actorKind: "role",
     subjectId: holderExecutionAttemptId,
-    roleId: "project-orchestrator",
+    roleId: directorSeat ? "director" : "project-orchestrator",
     roleGeneration: 1,
   });
   return { host, db, fenceToken, holderExecutionAttemptId };
@@ -2453,11 +2457,53 @@ describe("bb-collab plugin boundary", () => {
       authorizingDecisionId: "config-role-approver",
       authorizingDispositionSequence: 1,
     } });
+    expect(db.prepare("SELECT actor_kind, subject_id, operator_receipt_id FROM actor_receipts WHERE receipt_id = ?").get(issued.actorReceiptId)).toEqual({
+      actor_kind: "plugin",
+      subject_id: PLUGIN_ID,
+      operator_receipt_id: issued.operatorReceipt!.receiptId,
+    });
+    expect(db.prepare("SELECT actor_kind, COUNT(*) AS count FROM actor_receipts GROUP BY actor_kind ORDER BY actor_kind").all()).toEqual([
+      { actor_kind: "fixture", count: 1 },
+      { actor_kind: "operator", count: 1 },
+      { actor_kind: "plugin", count: 1 },
+    ]);
     const authorized = {
       ...unsigned,
       actorReceiptId: issued.actorReceiptId!,
       operatorReceiptId: issued.operatorReceipt!.receiptId,
     };
+
+    const unlinkedPluginReceipt = persistBootstrapOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: "config_revision",
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: "config-unlinked-plugin-actor",
+      requestDigest: operatorRequestDigest({ ...unsigned, idempotencyKey: "config-unlinked-plugin-actor" }),
+      callerThreadId: "config-unlinked-plugin",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    });
+    const unlinkedPlugin = {
+      ...unsigned,
+      idempotencyKey: "config-unlinked-plugin-actor",
+      actorReceiptId: unlinkedPluginReceipt.actorReceiptId,
+      operatorReceiptId: unlinkedPluginReceipt.operatorReceipt.receiptId,
+    };
+    const beforeUnlinkedPlugin = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", unlinkedPlugin)).toMatchObject({ outcome: "ACTOR_RECEIPT_UNVERIFIED", attempted: 0, verified: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeUnlinkedPlugin);
+
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "config-role-actor", actorKind: "role", subjectId: "preexisting-holder", roleId: "project-orchestrator", roleGeneration: 1 });
+    const roleActorBaseline = db.prepare("SELECT COUNT(*) AS count FROM actor_receipts WHERE actor_kind = 'role'").get() as { count: number };
+    const roleAuthorized = { ...authorized, actorReceiptId: "config-role-actor", operatorReceiptId: null };
+    const compatibleRoleReceipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID, mutationClass: "config_revision", candidateHead: CANDIDATE_SHA,
+      idempotencyKey: roleAuthorized.idempotencyKey, requestDigest: operatorRequestDigest(roleAuthorized),
+      callerThreadId: "config-role-attestor", requestedFromBackground: false, callerPluginId: PLUGIN_ID,
+    });
+    const beforeRoleActor = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", { ...roleAuthorized, operatorReceiptId: compatibleRoleReceipt.receiptId })).toMatchObject({ outcome: "ACTOR_RECEIPT_UNVERIFIED", attempted: 0, verified: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRoleActor);
 
     const beforeRefusals = exportFoundation(db, PROJECT_ID);
     expect(await host.harness.callRpc("apply", { ...authorized, projectId: FOREIGN_PROJECT_ID })).toMatchObject({ outcome: "OPERATOR_RECEIPT_FOREIGN" });
@@ -2479,6 +2525,7 @@ describe("bb-collab plugin boundary", () => {
       currentConfigRevision: 2,
       mutationReceipt: { operationClass: "config_revision", operatorReceiptId: authorized.operatorReceiptId },
     });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM actor_receipts WHERE actor_kind = 'role'").get()).toEqual(roleActorBaseline);
     const stored = db.prepare("SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = 2").get(PROJECT_ID) as { canonical_config_json: string };
     const storedConfig = JSON.parse(stored.canonical_config_json) as { extensions: { bbCollab: Record<string, unknown> } };
     expect(storedConfig.extensions.bbCollab.writingLaneCeiling).toBe(3);
@@ -2557,6 +2604,7 @@ describe("bb-collab plugin boundary", () => {
     const overCapacityConfig = roleConfig();
     const overCapacityRequirements = overCapacityConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>;
     overCapacityRequirements.push({ roleRequirementId: "worker-v2", roleId: "worker", repoTargetId: TARGET_ID, executedProfile: ROLE_PROFILE });
+    overCapacityRequirements.push({ roleRequirementId: "worker-v3", roleId: "worker", repoTargetId: TARGET_ID, executedProfile: ROLE_PROFILE });
     await rejectConfig("over-capacity", overCapacityConfig, "INVALID_INPUT", "Too big");
 
     const overLaneCapConfig = roleConfig();
@@ -3091,9 +3139,9 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("appends the v16 witness-holder refusal contract and rolls every cached consumer forward", () => {
+  it("appends the v17 director-role split contract and rolls every cached consumer forward", () => {
     expect(SCHEMA_VERSION).toBe(11);
-    expect(CONTRACT_VERSION).toBe(16);
+    expect(CONTRACT_VERSION).toBe(17);
     expect(MIGRATIONS).toHaveLength(24);
     expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("6f9f8b91784b2834d061a68bfe99241f24a93e32e786822894871f601a2f86a7");
     expect(MIGRATIONS.at(-6)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
@@ -3110,35 +3158,33 @@ describe("bb-collab plugin boundary", () => {
     expect(MIGRATION_STEPS).toEqual([
       "record_inventory", "record_quiescence", "freeze", "record_export", "record_import", "record_equivalence", "activate", "record_exercise", "retire", "rollback", "mark_fix_forward_required",
     ]);
-    expect(cachedConsumerRolloutEvidence(11, 15)).toMatchObject({
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 16))).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 11,
       newSchemaVersion: 11,
-      oldContractVersion: 15,
-      newContractVersion: 16,
+      oldContractVersion: 16,
+      newContractVersion: 17,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
-    expect(cachedConsumerRolloutEvidence(10, 16)).toMatchObject({
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(10, 17))).toMatchObject({
       oldSchemaVersion: 11,
       newSchemaVersion: 11,
-      observedSchemaVersion: 10,
-      oldContractVersion: 15,
-      newContractVersion: 16,
-      observedContractVersion: 16,
+      oldContractVersion: 16,
+      newContractVersion: 17,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
-    expect(cachedConsumerRolloutEvidence(11, 16)).toMatchObject({
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 17))).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 11,
       newSchemaVersion: 11,
-      oldContractVersion: 15,
-      newContractVersion: 16,
+      oldContractVersion: 16,
+      newContractVersion: 17,
       action: "reread",
       expected: 4,
       attempted: 4,
@@ -3169,21 +3215,87 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("records the v16 witness-holder refusal contract and cache bump evidence", () => {
-    expect(CONTRACT_VERSION).toBe(16);
+  it("persists the v17 cached-consumer rollout receipt and refuses the stale v16 director policy", async () => {
+    expect(CONTRACT_VERSION).toBe(17);
     expect(SCHEMA_VERSION).toBe(11);
     expect(MIGRATIONS).toHaveLength(24);
     expect(schemaDigest).toBe("5ee5cd12902e433825558c27b9a20d8bc2e86c5ffe018bf5b59e207d5d2d684e");
-    expect(contractDigest).toBe("862728e18f73aaaa679d25fb092576d671f1e9cc93379546dca016e932e2dc20");
-    expect(cachedConsumerRolloutEvidence(SCHEMA_VERSION, CONTRACT_VERSION)).toMatchObject({
-      oldSchemaVersion: 11,
-      newSchemaVersion: 11,
-      oldContractVersion: 15,
-      newContractVersion: 16,
-      action: "reread",
-      expected: CACHED_CONSUMERS.length,
-      attempted: CACHED_CONSUMERS.length,
-      verified: CACHED_CONSUMERS.length,
+    expect(contractDigest).toBe("7014824023042a8de12434cf9331e1ca351ea2f6bb3652371f44cd5323fb6a82");
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    const staleV16Config = directorSeatConfig();
+    const staleRequirement = (staleV16Config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>)[0]!;
+    staleRequirement.roleId = "project-orchestrator";
+    delete staleRequirement.firstGenerationExemption;
+    staleRequirement.currentGenerationExemption = { generation: 2, holderThreadId: "thr_gsb7m77ciz", environmentId: "env_3znzsxb7ce", sourceId: "src_x8veidmpik" };
+    const stalePlacement = directorSeatConfig();
+    (stalePlacement.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>)[0]!.roleId = "project-orchestrator";
+    seedEvidenceArtifact(db, "cached-consumer-v16-fixture", 0, {
+      kind: "cached_consumer_v16_fixture",
+      staleV16Config,
+      stalePlacement,
+      rereadObservations: [
+        { name: "server.rpcContract", observedSchemaVersion: 11, observedContractVersion: 17 },
+        { name: "server.collabCli", observedSchemaVersion: 11, observedContractVersion: 17 },
+        { name: "src/test-support", observedSchemaVersion: 11, observedContractVersion: 17 },
+        { name: "tests/server.test", observedSchemaVersion: 11, observedContractVersion: 17 },
+      ],
+    });
+    const persistedFixture = JSON.parse((db.prepare(
+      "SELECT durable_ref_json FROM evidence_artifacts WHERE project_id = ? AND evidence_id = ?",
+    ).get(PROJECT_ID, "cached-consumer-v16-fixture") as { durable_ref_json: string }).durable_ref_json) as {
+      staleV16Config: ReturnType<typeof directorSeatConfig>;
+      stalePlacement: ReturnType<typeof directorSeatConfig>;
+      rereadObservations: Parameters<typeof cachedConsumerRolloutEvidence>[0];
+    };
+    const rollout = cachedConsumerRolloutEvidence(persistedFixture.rereadObservations);
+    expect(rollout).toMatchObject({ action: "reread", expected: 4, attempted: 4, verified: 4 });
+    const beforeRefusal = exportFoundation(db, PROJECT_ID);
+    const staleV16 = applyWithFixtureReceipt(db, {
+      ...bootstrapRequest(PROJECT_ID, { config: persistedFixture.staleV16Config }),
+      operationClass: "config_revision",
+      idempotencyKey: "stale-v16-director-policy",
+      expectedConfigRevision: 1,
+      configRevision: 2,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fenceToken,
+    });
+    expect(staleV16).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
+    expect(staleV16.message).toContain("currentGenerationExemption");
+    const stalePlacementResult = applyWithFixtureReceipt(db, {
+      ...bootstrapRequest(PROJECT_ID, { config: persistedFixture.stalePlacement }),
+      operationClass: "config_revision",
+      idempotencyKey: "stale-v16-director-placement",
+      expectedConfigRevision: 1,
+      configRevision: 2,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fenceToken,
+    });
+    expect(stalePlacementResult).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
+    expect(stalePlacementResult.message).toContain("director-seat must use the director role");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
+    seedEvidenceArtifact(db, "cached-consumer-v17-rollout-receipt", 0, {
+      kind: "cached_consumer_v17_rollout_receipt",
+      fixtureEvidenceId: "cached-consumer-v16-fixture",
+      reread: rollout,
+      staleV16Refusal: {
+        exemption: { outcome: staleV16.outcome, message: staleV16.message },
+        placement: { outcome: stalePlacementResult.outcome, message: stalePlacementResult.message },
+      },
+    });
+    const exported = exportFoundation(db, PROJECT_ID).export!;
+    expect(exported.artifactIndex.find((artifact) => artifact.evidenceId === "cached-consumer-v17-rollout-receipt")?.durableRefJson).toBe(canonicalJson({
+      kind: "cached_consumer_v17_rollout_receipt",
+      fixtureEvidenceId: "cached-consumer-v16-fixture",
+      reread: rollout,
+      staleV16Refusal: {
+        exemption: { outcome: staleV16.outcome, message: staleV16.message },
+        placement: { outcome: stalePlacementResult.outcome, message: stalePlacementResult.message },
+      },
+    }));
+    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
+      outcome: "OK",
+      evidence: { cachedConsumers: { action: "reread", expected: 4, attempted: 4, verified: 4 } },
     });
   });
 
@@ -3275,7 +3387,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 11, schemaDigest, contractVersion: 16, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 11, schemaDigest, contractVersion: 17, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -4967,7 +5079,7 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 11, newSchemaVersion: 11, expected: 4, attempted: 4, verified: 4 },
+        cachedConsumers: { oldSchemaVersion: 11, newSchemaVersion: 11, action: "unknown", expected: 4, attempted: 0, verified: 0 },
         schema: { version: 11 },
       },
     });
@@ -5591,7 +5703,7 @@ describe("bb-collab plugin boundary", () => {
       ["reasoning", (requirement) => { requirement.executedProfile = { ...DIRECTOR_PROFILE, reasoningLevel: "medium" }; }],
       ["writing", (requirement) => { requirement.writingLaneCapacity = 1; }],
       ["missing-standby", (requirement) => { delete requirement.standbyProfile; }],
-      ["missing-current-exemption", (requirement) => { delete requirement.currentGenerationExemption; }],
+      ["missing-first-exemption", (requirement) => { delete requirement.firstGenerationExemption; }],
     ];
     for (const [name, mutate] of invalidCases) {
       const host = await loadedHost();
@@ -5610,6 +5722,23 @@ describe("bb-collab plugin boundary", () => {
       expect(db.prepare("SELECT COUNT(*) AS count FROM project_config_revisions").get()).toEqual({ count: 0 });
     }
 
+    const aliasHost = await loadedHost();
+    const aliasDb = aliasHost.bb.storage.database();
+    seedVerifiedFixtureReceipt(aliasDb, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
+    const aliasConfig = directorSeatConfig();
+    const aliasRequirement = (aliasConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>)[0]!;
+    aliasRequirement.roleRequirementId = "director-alias";
+    aliasRequirement.executedProfile = ROLE_PROFILE;
+    delete aliasRequirement.standbyProfile;
+    delete aliasRequirement.writingLaneCapacity;
+    delete aliasRequirement.firstGenerationExemption;
+    const aliasBefore = exportFoundation(aliasDb, PROJECT_ID);
+    const alias = applyWithFixtureReceipt(aliasDb, bootstrapRequest(PROJECT_ID, { idempotencyKey: "director-alias-refusal", config: aliasConfig }));
+    expect(alias).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
+    expect(alias.message).toContain("director role is reserved for director-seat");
+    expect(exportFoundation(aliasDb, PROJECT_ID)).toEqual(aliasBefore);
+    expect(aliasDb.prepare("SELECT COUNT(*) AS count FROM project_config_revisions").get()).toEqual({ count: 0 });
+
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
     const stored = JSON.parse((db.prepare(
@@ -5617,12 +5746,12 @@ describe("bb-collab plugin boundary", () => {
     ).get(PROJECT_ID) as { canonical_config_json: string }).canonical_config_json) as { extensions: { bbCollab: Record<string, unknown> } };
     expect(stored.extensions.bbCollab.roleRequirements).toEqual(expect.arrayContaining([{
       roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
-      roleId: "project-orchestrator",
+      roleId: "director",
       repoTargetId: null,
       executedProfile: DIRECTOR_PROFILE,
       standbyProfile: DIRECTOR_STANDBY_PROFILE,
       writingLaneCapacity: 0,
-      currentGenerationExemption: DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION,
+      firstGenerationExemption: DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION,
     }]));
 
     const request = qualificationRequest(fenceToken, {
@@ -5680,7 +5809,7 @@ describe("bb-collab plugin boundary", () => {
     expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get()).toEqual({ count: 0 });
 
     const activated = applyWithFixtureReceipt(db, successionRequest(fenceToken, {
-      idempotencyKey: "director-generation-3-recording",
+      idempotencyKey: "director-first-generation-creation",
       roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
       qualificationId: "director-qualification",
       profileDigest: DIRECTOR_PROFILE_DIGEST,
@@ -5688,17 +5817,87 @@ describe("bb-collab plugin boundary", () => {
     }), null, directorRoleReader());
     expect(activated).toMatchObject({ outcome: "OK", currentResourceRevision: 1 });
     expect(db.prepare("SELECT role_id, generation, status FROM role_generations").get()).toEqual({
-      role_id: "project-orchestrator",
+      role_id: "director",
       generation: 1,
       status: "active",
     });
   });
 
-  it("admits only the exact current director generation on the unmanaged canonical environment", async () => {
+  it("admits only the exact director first generation on the unmanaged canonical environment", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
+    const firstContext = {
+      threadId: DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.holderThreadId,
+      requestEventId: "director-first-request",
+      requestEventSeq: 1,
+      completionEventId: "director-first-completion",
+      completionEventSeq: 4,
+    };
+    const firstReader = (mutate?: (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => void) => directorRoleReader((facts) => {
+      facts.thread.id = firstContext.threadId;
+      facts.thread.environmentId = DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.environmentId;
+      facts.environment.id = DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.environmentId;
+      facts.environment.managed = false;
+      facts.environment.isWorktree = false;
+      facts.environment.workspaceProvisionType = "unmanaged";
+      facts.environment.path = "/Users/pixexid/Projects/bb-collab";
+      facts.project.sources[0]!.id = DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.sourceId;
+      facts.project.sources[0]!.path = "/Users/pixexid/Projects/bb-collab";
+      facts.events[0]!.id = firstContext.requestEventId;
+      facts.events[3]!.id = firstContext.completionEventId;
+      mutate?.(facts);
+    });
+    const qualification = qualificationRequest(fenceToken, {
+      idempotencyKey: "director-first-qualification",
+      qualificationId: "director-first-qualification",
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      roleContext: firstContext,
+      declaredProfile: DIRECTOR_PROFILE,
+    });
+    for (const [name, roleContext, mutate, outcome] of [
+      ["reordered-triple", { ...firstContext, threadId: DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.environmentId }, undefined, "ROLE_CONTEXT_UNKNOWN"],
+      ["foreign-holder", firstContext, (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { facts.thread.id = "thr_foreign"; }, "ROLE_CONTEXT_UNKNOWN"],
+      ["foreign-environment", firstContext, (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { facts.thread.environmentId = "env_foreign"; facts.environment.id = "env_foreign"; }, "ROLE_CONTEXT_FOREIGN"],
+      ["foreign-source", firstContext, (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { facts.project.sources[0]!.id = "src_foreign"; }, "ROLE_CONTEXT_FOREIGN"],
+    ] as const) {
+      const before = exportFoundation(db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(db, {
+        ...qualification,
+        idempotencyKey: `director-first-${name}`,
+        qualificationId: `director-first-${name}`,
+        roleContext,
+      }, null, firstReader(mutate))).toMatchObject({ outcome, attempted: 0, verified: 0 });
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    }
+    expect(applyWithFixtureReceipt(db, qualification, null, firstReader())).toMatchObject({ outcome: "OK", attempted: 1, verified: 1 });
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      idempotencyKey: "director-first-generation",
+      qualificationId: qualification.qualificationId,
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      roleContext: firstContext,
+      profileDigest: DIRECTOR_PROFILE_DIGEST,
+      standbyProfile: DIRECTOR_STANDBY_PROFILE,
+    }), null, firstReader())).toMatchObject({ outcome: "OK", currentResourceRevision: 1 });
+    const beforeRetry = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, { ...qualification, idempotencyKey: "director-first-after-head", qualificationId: "director-first-after-head" }, null, firstReader())).toMatchObject({ outcome: "ROLE_CONTEXT_FOREIGN", attempted: 0, verified: 0 });
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      idempotencyKey: "director-future-unmanaged-generation",
+      qualificationId: qualification.qualificationId,
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      roleContext: firstContext,
+      expectedGeneration: 1,
+      predecessorGeneration: 1,
+      profileDigest: DIRECTOR_PROFILE_DIGEST,
+      standbyProfile: DIRECTOR_STANDBY_PROFILE,
+    }), null, firstReader())).toMatchObject({ outcome: "ROLE_CONTEXT_FOREIGN", attempted: 0, verified: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRetry);
+  });
+
+  it("refuses unmanaged director contexts beyond the exact first generation", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
     const currentContext = {
-      threadId: DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.holderThreadId,
+      threadId: DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.holderThreadId,
       requestEventId: "director-current-request",
       requestEventSeq: 1,
       completionEventId: "director-current-completion",
@@ -5706,9 +5905,9 @@ describe("bb-collab plugin boundary", () => {
     };
     const currentManagedReader = () => directorRoleReader((facts) => {
       facts.thread.id = currentContext.threadId;
-      facts.thread.environmentId = DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.environmentId;
-      facts.environment.id = DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.environmentId;
-      facts.project.sources[0]!.id = DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.sourceId;
+      facts.thread.environmentId = DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.environmentId;
+      facts.environment.id = DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.environmentId;
+      facts.project.sources[0]!.id = DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.sourceId;
       facts.events[0]!.id = currentContext.requestEventId;
       facts.events[3]!.id = currentContext.completionEventId;
     });
@@ -5745,17 +5944,17 @@ describe("bb-collab plugin boundary", () => {
       predecessorGeneration: 1,
       standbyProfile: DIRECTOR_STANDBY_PROFILE,
     }), null, currentManagedReader()).outcome).toBe("OK");
-    expect(db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(PROJECT_ID, "project-orchestrator")).toEqual({ current_generation: 2 });
+    expect(db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(PROJECT_ID, "director")).toEqual({ current_generation: 2 });
 
     const currentUnmanagedReader = (mutate?: (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => void) => directorRoleReader((facts) => {
       facts.thread.id = currentContext.threadId;
-      facts.thread.environmentId = DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.environmentId;
-      facts.environment.id = DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.environmentId;
+      facts.thread.environmentId = DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.environmentId;
+      facts.environment.id = DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.environmentId;
       facts.environment.managed = false;
       facts.environment.isWorktree = false;
       facts.environment.workspaceProvisionType = "unmanaged";
       facts.environment.path = "/Users/pixexid/Projects/bb-collab";
-      facts.project.sources[0]!.id = DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.sourceId;
+      facts.project.sources[0]!.id = DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.sourceId;
       facts.project.sources[0]!.path = "/Users/pixexid/Projects/bb-collab";
       facts.events[0]!.id = currentContext.requestEventId;
       facts.events[3]!.id = currentContext.completionEventId;
@@ -5768,9 +5967,9 @@ describe("bb-collab plugin boundary", () => {
       roleContext: currentContext,
       declaredProfile: DIRECTOR_PROFILE,
     });
-    const admitted = applyWithFixtureReceipt(db, currentQualification, null, currentUnmanagedReader());
-    expect(admitted).toMatchObject({ outcome: "OK", attempted: 1, verified: 1 });
-    expect(applyWithFixtureReceipt(db, currentQualification, null, currentUnmanagedReader())).toEqual(admitted);
+    const rejected = applyWithFixtureReceipt(db, currentQualification, null, currentUnmanagedReader());
+    expect(rejected).toMatchObject({ outcome: "ROLE_CONTEXT_FOREIGN", attempted: 0, verified: 0 });
+    expect(applyWithFixtureReceipt(db, currentQualification, null, currentUnmanagedReader())).toEqual(rejected);
 
     for (const [name, mutate, outcome] of [
       ["holder", (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { facts.thread.projectId = FOREIGN_PROJECT_ID; }, "ROLE_CONTEXT_FOREIGN"],
@@ -5781,7 +5980,7 @@ describe("bb-collab plugin boundary", () => {
       ["git-repo", (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { facts.environment.isGitRepo = false; }, "ROLE_CONTEXT_FOREIGN"],
       ["worktree", (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { facts.environment.isWorktree = true; }, "ROLE_CONTEXT_FOREIGN"],
       ["provision", (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { facts.environment.workspaceProvisionType = "managed-worktree"; }, "ROLE_CONTEXT_FOREIGN"],
-      ["profile", (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { (facts.events[0]!.data.execution as Record<string, unknown>).model = "kimi-coding/k2"; }, "EXECUTION_PROFILE_MISMATCH"],
+      ["profile", (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => { (facts.events[0]!.data.execution as Record<string, unknown>).model = "kimi-coding/k2"; }, "ROLE_CONTEXT_FOREIGN"],
     ] as const) {
       const before = exportFoundation(db, PROJECT_ID);
       const request = { ...currentQualification, idempotencyKey: `director-current-refusal-${name}`, qualificationId: `director-current-refusal-${name}` };
@@ -5890,7 +6089,7 @@ describe("bb-collab plugin boundary", () => {
         qualificationObservationCount: 1,
         roleGenerationHeads: [{ role_id: "project-orchestrator", current_generation: 1, status: "active" }],
         eligibility: [{ roleRequirementId: "orchestrator-v1", effectiveStatus: "eligible" }],
-        cachedConsumers: { expected: 4, attempted: 4, verified: 4 },
+        cachedConsumers: { action: "unknown", expected: 4, attempted: 0, verified: 0 },
       },
     });
     const beforeProductionRefusal = exportFoundation(db, PROJECT_ID);
@@ -5903,20 +6102,20 @@ describe("bb-collab plugin boundary", () => {
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeProductionRefusal);
   });
 
-  it("records one exact orchestrator standby and refuses wrong-provider, foreign, stale, and replay paths without writes", async () => {
+  it("records one exact director standby and refuses wrong-provider, foreign, stale, and replay paths without writes", async () => {
     const host = await loadedHost();
-    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
-    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
-    const request = successionRequest(fenceToken, { idempotencyKey: "standby-generation" });
-    const committed = applyWithFixtureReceipt(db, request, null, roleReader());
-    expect(committed).toMatchObject({ outcome: "OK", currentResourceRevision: 1, evidence: { standbyProfile: STANDBY_PROFILE } });
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, { roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID, declaredProfile: DIRECTOR_PROFILE }), null, directorRoleReader()).outcome).toBe("OK");
+    const request = successionRequest(fenceToken, { idempotencyKey: "standby-generation", roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID, profileDigest: DIRECTOR_PROFILE_DIGEST, standbyProfile: DIRECTOR_STANDBY_PROFILE });
+    const committed = applyWithFixtureReceipt(db, request, null, directorRoleReader());
+    expect(committed).toMatchObject({ outcome: "OK", currentResourceRevision: 1, evidence: { standbyProfile: DIRECTOR_STANDBY_PROFILE } });
     expect(db.prepare(
       "SELECT project_id, role_id, generation, standby_profile_json FROM role_generations",
     ).get()).toEqual({
       project_id: PROJECT_ID,
-      role_id: "project-orchestrator",
+      role_id: "director",
       generation: 1,
-      standby_profile_json: canonicalJson(STANDBY_PROFILE),
+      standby_profile_json: canonicalJson(DIRECTOR_STANDBY_PROFILE),
     });
     expect(applyWithFixtureReceipt(db, request, null, null)).toEqual(committed);
     expect(db.prepare("SELECT COUNT(*) AS count FROM role_generations").get()).toEqual({ count: 1 });
@@ -5924,8 +6123,10 @@ describe("bb-collab plugin boundary", () => {
     const beforeWrongProvider = exportFoundation(db, PROJECT_ID);
     const wrongProvider = applyWithFixtureReceipt(db, successionRequest(fenceToken, {
       idempotencyKey: "standby-wrong-provider",
-      standbyProfile: { ...STANDBY_PROFILE, providerId: ROLE_PROFILE.providerId },
-    }), null, roleReader());
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      profileDigest: DIRECTOR_PROFILE_DIGEST,
+      standbyProfile: { ...DIRECTOR_STANDBY_PROFILE, providerId: DIRECTOR_PROFILE.providerId },
+    }), null, directorRoleReader());
     expect(wrongProvider).toMatchObject({ outcome: "ROLE_STANDBY_INVALID", attempted: 0, verified: 0 });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeWrongProvider);
 
@@ -5933,7 +6134,7 @@ describe("bb-collab plugin boundary", () => {
       ...request,
       idempotencyKey: "standby-missing",
       standbyProfile: undefined,
-    }, null, roleReader());
+    }, null, directorRoleReader());
     expect(missingStandby).toMatchObject({ outcome: "ROLE_STANDBY_INVALID", attempted: 0, verified: 0 });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeWrongProvider);
 
@@ -5941,7 +6142,7 @@ describe("bb-collab plugin boundary", () => {
       db,
       { ...request, projectId: FOREIGN_PROJECT_ID, idempotencyKey: "standby-foreign" },
       null,
-      roleReader((facts) => { facts.project.id = FOREIGN_PROJECT_ID; }),
+      directorRoleReader((facts) => { facts.project.id = FOREIGN_PROJECT_ID; }),
     );
     expect(foreign).toMatchObject({ outcome: "ROLE_CONTEXT_FOREIGN", attempted: 0, verified: 0 });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeWrongProvider);
@@ -5951,7 +6152,9 @@ describe("bb-collab plugin boundary", () => {
       expectedGeneration: 1,
       predecessorGeneration: 1,
       expectedConfigRevision: 2,
-    }), null, roleReader());
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      profileDigest: DIRECTOR_PROFILE_DIGEST,
+    }), null, directorRoleReader());
     expect(stale).toMatchObject({ outcome: "PROJECT_CONFIG_STALE", attempted: 0, verified: 0 });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeWrongProvider);
   });
@@ -6536,9 +6739,9 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(11, 15)).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 11, oldContractVersion: 15, newContractVersion: 16, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(10, 16)).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 11, observedSchemaVersion: 10, oldContractVersion: 15, newContractVersion: 16, observedContractVersion: 16, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(11, 16)).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 11, oldContractVersion: 15, newContractVersion: 16, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 16))).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 11, oldContractVersion: 16, newContractVersion: 17, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(10, 17))).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 11, oldContractVersion: 16, newContractVersion: 17, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 17))).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 11, oldContractVersion: 16, newContractVersion: 17, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {
@@ -7143,6 +7346,8 @@ describe("bb-collab plugin boundary", () => {
         ...assignmentPrepareRequest(fenceToken).assignment!,
         assignmentId: "director-write",
         roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+        roleId: "director",
+        roleGeneration: 1,
         requestedProfile: DIRECTOR_PROFILE,
         branchName: "bb/director-write",
         environment: { ...assignmentPrepareRequest(fenceToken).assignment!.environment, environmentId: "environment-director-write" },

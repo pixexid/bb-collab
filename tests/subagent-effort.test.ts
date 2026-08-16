@@ -49,7 +49,7 @@ describe("subagent effort directive", () => {
     expect(operationsModel).toContain("Reviewer default harness/provider is Codex; the tier rows name the actual model");
     expect(operationsModel).toContain("Mechanical probe | Pi harness / `pi` | `deepseek-v4-flash` | LOW");
     expect(operationsModel).toContain("Mechanical probe | Pi harness / `pi` | `glm-5-turbo` | LOW");
-    expect(operationsModel).toContain("The v14 `director-seat` amendment remains the existing project-orchestrator");
+    expect(operationsModel).toContain("Contract v17 supersedes the historical v14/v15 placement: `director-seat` is");
     expect(operationsModel).toContain("Opus-medium standby");
     expect(operationsModel).toContain("current graded qualification probe");
     expect(operationsModel).toMatch(/The coding probe for\n`muse-spark-1\.2` is \[GH-106\]/u);

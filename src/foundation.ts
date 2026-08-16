@@ -5,17 +5,17 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 16;
+export const CONTRACT_VERSION = 17;
 export const SCHEMA_VERSION = 11;
-// Witness-holder refusal v15 -> v16.
-const PREVIOUS_CONTRACT_VERSION = 15;
+// The director-role split follows the witness-holder refusal v16.
+const PREVIOUS_CONTRACT_VERSION = 16;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
 const PREVIOUS_SCHEMA_VERSION = 11;
-export const ROLE_IDS = ["project-orchestrator", "worker", "independent-reviewer"] as const;
+export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
-export const DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION = {
-  generation: 2,
+export const DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION = {
+  generation: 1,
   holderThreadId: "thr_gsb7m77ciz",
   environmentId: "env_3znzsxb7ce",
   sourceId: "src_x8veidmpik",
@@ -624,24 +624,123 @@ export const MIGRATIONS: string[] = [
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
 export const CACHED_CONSUMERS = ["server.rpcContract", "server.collabCli", "src/test-support", "tests/server.test"] as const;
+const CACHED_CONSUMER_ROLLOUT_POLICY = {
+  class: "roleRequirements.director-seat",
+  staleV16RoleId: "project-orchestrator",
+  requiredV17RoleId: "director",
+  staleV16ExemptionField: "currentGenerationExemption",
+  refusal: "INVALID_INPUT",
+} as const;
 
-export function cachedConsumerRolloutEvidence(observedSchemaVersion: number, observedContractVersion: number) {
-  const reread = observedSchemaVersion === SCHEMA_VERSION && observedContractVersion === CONTRACT_VERSION;
+export type CachedConsumerObservation = {
+  name: (typeof CACHED_CONSUMERS)[number];
+  observedSchemaVersion: number;
+  observedContractVersion: number;
+};
+
+export function cachedConsumerRolloutEvidence(observations: readonly CachedConsumerObservation[]) {
+  const names = observations.map((observation) => observation.name);
+  const requiredNames = [...CACHED_CONSUMERS];
+  const verifiedNames = new Set(observations
+    .filter((observation) => observation.observedSchemaVersion === SCHEMA_VERSION && observation.observedContractVersion === CONTRACT_VERSION)
+    .map((observation) => observation.name));
+  const verified = requiredNames.filter((name) => verifiedNames.has(name)).length;
+  const reread = observations.length === requiredNames.length && verified === requiredNames.length &&
+    canonicalJson([...new Set(names)].sort()) === canonicalJson(requiredNames.slice().sort());
   const evidence = {
-    names: [...CACHED_CONSUMERS],
+    names,
+    observations,
     oldSchemaVersion: PREVIOUS_SCHEMA_VERSION,
     newSchemaVersion: SCHEMA_VERSION,
-    observedSchemaVersion,
     oldContractVersion: PREVIOUS_CONTRACT_VERSION,
     newContractVersion: CONTRACT_VERSION,
-    observedContractVersion,
     action: reread ? "reread" : "refused",
-    expected: CACHED_CONSUMERS.length,
-    attempted: CACHED_CONSUMERS.length,
-    verified: reread ? CACHED_CONSUMERS.length : 0,
+    incompatiblePolicy: CACHED_CONSUMER_ROLLOUT_POLICY,
+    expected: requiredNames.length,
+    attempted: observations.length,
+    verified,
     schemaDigest,
   };
   return { ...evidence, rolloutReceiptDigest: sha256(canonicalJson(evidence)) };
+}
+
+function unknownCachedConsumerRolloutEvidence() {
+  return {
+    names: [...CACHED_CONSUMERS],
+    observations: [],
+    oldSchemaVersion: PREVIOUS_SCHEMA_VERSION,
+    newSchemaVersion: SCHEMA_VERSION,
+    oldContractVersion: PREVIOUS_CONTRACT_VERSION,
+    newContractVersion: CONTRACT_VERSION,
+    action: "unknown" as const,
+    incompatiblePolicy: CACHED_CONSUMER_ROLLOUT_POLICY,
+    expected: CACHED_CONSUMERS.length,
+    attempted: 0,
+    verified: 0,
+    schemaDigest,
+    reason: "no persisted cached-consumer rollout receipt is available",
+  };
+}
+
+function persistedCachedConsumerRolloutEvidence(db: SqliteDatabase, projectId: string) {
+  const row = asRow<{
+    evidence_kind: string;
+    source_kind: string;
+    source_ref: string;
+    execution_attempt_id: string | null;
+    content_digest: string;
+    redacted_json: string;
+    redacted_digest: string;
+    durable_ref_json: string;
+    artifact_identity_digest: string;
+  }>(db.prepare(
+    `SELECT evidence_kind, source_kind, source_ref, execution_attempt_id, content_digest,
+            redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest
+     FROM evidence_artifacts
+     WHERE project_id = ? AND evidence_id = 'cached-consumer-v17-rollout-receipt'`,
+  ).get(projectId));
+  if (!row) return unknownCachedConsumerRolloutEvidence();
+  try {
+    const redacted = JSON.parse(row.redacted_json);
+    const durableRef = JSON.parse(row.durable_ref_json);
+    assertRedactedEvidence(redacted, "cached-consumer rollout redacted metadata");
+    assertRedactedEvidence(durableRef, "cached-consumer rollout durable reference");
+    const expectedIdentity = sha256(canonicalJson({
+      projectId,
+      evidenceId: "cached-consumer-v17-rollout-receipt",
+      evidenceKind: row.evidence_kind,
+      sourceKind: row.source_kind,
+      sourceRef: row.source_ref,
+      executionAttemptId: row.execution_attempt_id,
+      contentDigest: row.content_digest,
+      redactedDigest: sha256(canonicalJson(redacted)),
+      durableRef,
+    }));
+    if (
+      canonicalJson(redacted) !== row.redacted_json || canonicalJson(durableRef) !== row.durable_ref_json ||
+      sha256(canonicalJson(redacted)) !== row.redacted_digest || expectedIdentity !== row.artifact_identity_digest
+    ) return unknownCachedConsumerRolloutEvidence();
+    const receipt = durableRef as {
+      kind?: unknown;
+      reread?: { observations?: unknown; rolloutReceiptDigest?: unknown };
+      staleV16Refusal?: {
+        exemption?: { outcome?: unknown };
+        placement?: { outcome?: unknown };
+      };
+    };
+    if (!Array.isArray(receipt.reread?.observations)) return unknownCachedConsumerRolloutEvidence();
+    const reread = cachedConsumerRolloutEvidence(receipt.reread.observations as CachedConsumerObservation[]);
+    if (
+      receipt.kind !== "cached_consumer_v17_rollout_receipt" ||
+      receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest ||
+      reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 ||
+      receipt.staleV16Refusal?.exemption?.outcome !== "INVALID_INPUT" ||
+      receipt.staleV16Refusal?.placement?.outcome !== "INVALID_INPUT"
+    ) return unknownCachedConsumerRolloutEvidence();
+    return reread;
+  } catch {
+    return unknownCachedConsumerRolloutEvidence();
+  }
 }
 
 const id = z.string().trim().min(1).max(256);
@@ -733,13 +832,14 @@ export const contractDigest = sha256(canonicalJson({
     roleIds: [...ROLE_IDS],
     maxRequirements: ROLE_IDS.length,
     scoping: {
+      director: "project",
       "project-orchestrator": "project",
       worker: "repository-target",
       "independent-reviewer": "repository-target",
     },
   },
   roleStandbyPolicy: {
-    role: "project-orchestrator",
+    role: "director",
     field: "standby_profile_json",
     requirement: "one named profile with a provider different from the executed holder",
     authority: "none",
@@ -754,13 +854,20 @@ export const contractDigest = sha256(canonicalJson({
   },
   directorSeatPolicy: {
     roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
-    roleId: "project-orchestrator",
+    roleId: "director",
     executedProfile: directorSeatProfile,
     standbyProfile: directorSeatStandbyProfile,
     writingLaneCapacity: 0,
-    environment: "managed-worktree for future generations; exact current-generation exemption only",
-    currentGenerationExemption: DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION,
+    environment: "managed-worktree for later generations; exact first-generation exemption only",
+    firstGenerationExemption: DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION,
     assignmentKinds: [],
+  },
+  cachedConsumerRolloutPolicy: {
+    consumers: [...CACHED_CONSUMERS],
+    expected: 4,
+    attempted: 4,
+    verified: 4,
+    staleV16Refusal: CACHED_CONSUMER_ROLLOUT_POLICY,
   },
   roleHolderEligibilityPolicy: {
     nativeWitnessMarker: "witness",
@@ -1113,11 +1220,11 @@ const executionProfileSchema = z
     visibility: z.enum(["visible", "hidden"]),
   })
   .strict();
-const directorSeatCurrentGenerationExemptionSchema = z.object({
-  generation: z.literal(DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.generation),
-  holderThreadId: z.literal(DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.holderThreadId),
-  environmentId: z.literal(DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.environmentId),
-  sourceId: z.literal(DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.sourceId),
+const directorSeatFirstGenerationExemptionSchema = z.object({
+  generation: z.literal(DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.generation),
+  holderThreadId: z.literal(DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.holderThreadId),
+  environmentId: z.literal(DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.environmentId),
+  sourceId: z.literal(DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.sourceId),
 }).strict();
 const roleRequirementSchema = z
   .object({
@@ -1127,11 +1234,11 @@ const roleRequirementSchema = z
     executedProfile: executionProfileSchema,
     standbyProfile: executionProfileSchema.optional(),
     writingLaneCapacity: z.literal(0).optional(),
-    currentGenerationExemption: directorSeatCurrentGenerationExemptionSchema.optional(),
+    firstGenerationExemption: directorSeatFirstGenerationExemptionSchema.optional(),
   })
   .strict()
   .superRefine((requirement, ctx) => {
-    if (requirement.roleId === "project-orchestrator" && requirement.repoTargetId !== null) {
+    if (["director", "project-orchestrator"].includes(requirement.roleId) && requirement.repoTargetId !== null) {
       ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "project-orchestrator must be project-scoped" });
     }
     if (requirement.roleId === "worker" && requirement.repoTargetId === null) {
@@ -1144,9 +1251,12 @@ const roleRequirementSchema = z
       ctx.addIssue({ code: "custom", path: ["executedProfile", "visibility"], message: "active role holders must be visible" });
     }
     const isDirectorSeat = requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID;
+    if (requirement.roleId === "director" && !isDirectorSeat) {
+      ctx.addIssue({ code: "custom", path: ["roleRequirementId"], message: "director role is reserved for director-seat" });
+    }
     if (isDirectorSeat) {
-      if (requirement.roleId !== "project-orchestrator") {
-        ctx.addIssue({ code: "custom", path: ["roleId"], message: "director-seat must use the project-orchestrator role" });
+      if (requirement.roleId !== "director") {
+        ctx.addIssue({ code: "custom", path: ["roleId"], message: "director-seat must use the director role" });
       }
       if (requirement.repoTargetId !== null) {
         ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "director-seat must be project-scoped" });
@@ -1160,10 +1270,10 @@ const roleRequirementSchema = z
       if (canonicalJson(requirement.executedProfile) !== canonicalJson(directorSeatProfile)) {
         ctx.addIssue({ code: "custom", path: ["executedProfile"], message: "director-seat requires the exact judgment profile" });
       }
-      if (!requirement.currentGenerationExemption || canonicalJson(requirement.currentGenerationExemption) !== canonicalJson(DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION)) {
-        ctx.addIssue({ code: "custom", path: ["currentGenerationExemption"], message: "director-seat requires the exact current-generation environment exemption" });
+      if (!requirement.firstGenerationExemption || canonicalJson(requirement.firstGenerationExemption) !== canonicalJson(DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION)) {
+        ctx.addIssue({ code: "custom", path: ["firstGenerationExemption"], message: "director-seat requires the exact first-generation environment exemption" });
       }
-    } else if (requirement.standbyProfile !== undefined || requirement.writingLaneCapacity !== undefined || requirement.currentGenerationExemption !== undefined) {
+    } else if (requirement.standbyProfile !== undefined || requirement.writingLaneCapacity !== undefined || requirement.firstGenerationExemption !== undefined) {
       ctx.addIssue({ code: "custom", path: ["roleRequirementId"], message: "standby profile and writing capacity are reserved for director-seat" });
     }
   });
@@ -1644,7 +1754,7 @@ function stringField(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 && value.length <= 256 ? value : null;
 }
 
-function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest, allowCurrentDirectorEnvironment = false): ResolvedRoleContext {
+function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest, allowFirstDirectorEnvironment = false): ResolvedRoleContext {
   if (!reader || !request.roleContext) throw refusal("ROLE_CONTEXT_REQUIRED", "exact BB role context facts are required");
   let thread: RoleThreadFact;
   let events: RoleEventFact[];
@@ -1680,13 +1790,13 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
   const exactManagedWorktree =
     environment.status === "ready" && !!environment.path && environment.managed && environment.isGitRepo && environment.isWorktree &&
     environment.workspaceProvisionType === "managed-worktree";
-  const exactCurrentDirectorEnvironment =
-    allowCurrentDirectorEnvironment && environment.status === "ready" && !!environment.path &&
-    environment.id === DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.environmentId &&
-    thread.id === DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.holderThreadId &&
+  const exactFirstDirectorEnvironment =
+    allowFirstDirectorEnvironment && environment.status === "ready" && !!environment.path &&
+    environment.id === DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.environmentId &&
+    thread.id === DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.holderThreadId &&
     !environment.managed && environment.isGitRepo && !environment.isWorktree &&
     environment.workspaceProvisionType === "unmanaged";
-  if (!exactManagedWorktree && !exactCurrentDirectorEnvironment) {
+  if (!exactManagedWorktree && !exactFirstDirectorEnvironment) {
     throw refusal("ROLE_CONTEXT_FOREIGN", "holder environment is not an exact ready managed worktree");
   }
   // BB-managed worktrees have a derived execution path, not the canonical source path.
@@ -1696,11 +1806,11 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
     (source) => source.projectId === request.projectId && source.hostId === environment.hostId,
   );
   if (sources.length !== 1) throw refusal("ROLE_CONTEXT_FOREIGN", "holder environment does not resolve to one exact project source on its host");
-  if (exactCurrentDirectorEnvironment && sources[0]!.id !== DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.sourceId) {
-    throw refusal("ROLE_CONTEXT_FOREIGN", "current director environment does not match its exact canonical source");
+  if (exactFirstDirectorEnvironment && sources[0]!.id !== DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.sourceId) {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "first director environment does not match its exact canonical source");
   }
-  if (exactCurrentDirectorEnvironment && sources[0]!.path !== environment.path) {
-    throw refusal("ROLE_CONTEXT_FOREIGN", "current director environment path does not match its canonical source path");
+  if (exactFirstDirectorEnvironment && sources[0]!.path !== environment.path) {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "first director environment path does not match its canonical source path");
   }
   if (host.id !== environment.hostId || host.status !== "connected") throw refusal("ROLE_CONTEXT_UNKNOWN", "holder host is unavailable");
   if (!stringField(bbVersion) || !stringField(bbServerId) || events.length === 0 || events.length > 256) {
@@ -2925,6 +3035,37 @@ function requireActor(db: SqliteDatabase, request: ApplyRequest): string {
   return request.actorReceiptId;
 }
 
+function requireAttestedPluginActor(db: SqliteDatabase, request: ApplyRequest, actorReceiptId: string): void {
+  const actor = asRow<{ actor_kind: string; subject_id: string; operator_receipt_id: string | null; retirement_condition: string | null }>(db.prepare(
+    "SELECT actor_kind, subject_id, operator_receipt_id, retirement_condition FROM actor_receipts WHERE project_id = ? AND receipt_id = ?",
+  ).get(request.projectId, actorReceiptId));
+  if (actor?.actor_kind === "fixture" && request.operatorReceiptId === null) return;
+  if (
+    !actor || actor.actor_kind !== "plugin" || actor.subject_id !== PLUGIN_ID ||
+    actor.operator_receipt_id === null || actor.operator_receipt_id !== request.operatorReceiptId ||
+    actor.retirement_condition !== OPERATOR_RECEIPT_RETIREMENT_CONDITION
+  ) {
+    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "config revision requires its attestation-derived plugin actor");
+  }
+  // requireActor has already verified this exact receipt binding and, when
+  // present, the active approver registry. Config revisions additionally
+  // require that the bound receipt was issued with that provenance.
+  const operator = asRow<{
+    approver_id: string | null;
+    authorizing_decision_id: string | null;
+    authorizing_disposition_sequence: number | null;
+  }>(db.prepare(
+    `SELECT approver_id, authorizing_decision_id, authorizing_disposition_sequence
+     FROM operator_receipts WHERE project_id = ? AND receipt_id = ?`,
+  ).get(request.projectId, request.operatorReceiptId));
+  if (
+    !operator || operator.approver_id !== AUTHORIZED_APPROVER_ID ||
+    operator.authorizing_decision_id === null || operator.authorizing_disposition_sequence === null
+  ) {
+    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "config revision requires its approverAttestation-derived plugin actor");
+  }
+}
+
 function mutationRequestDigest(db: SqliteDatabase, request: ApplyRequest): string {
   const digest = operatorRequestDigest(request);
   if (!isDerivedActorMutationClass(request.operationClass) || !request.actorReceiptId) return digest;
@@ -3235,6 +3376,7 @@ function applyConfigRevision(db: SqliteDatabase, request: ApplyRequest, digest: 
   const currentRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
+  requireAttestedPluginActor(db, request, actorReceiptId);
   if (!request.config || !request.targets) {
     requireTarget(db, request.projectId, currentRevision, request.repoTargetId);
     throw refusal("INVALID_INPUT", "config revision requires config and target collection");
@@ -5114,38 +5256,28 @@ function requireRoleRequirement(db: SqliteDatabase, request: ApplyRequest, confi
   return { requirement, digest: sha256(canonicalJson(requirement)), configRevision };
 }
 
-function currentDirectorGenerationExemptionAllowed(
+function firstDirectorGenerationExemptionAllowed(
   db: SqliteDatabase,
   request: ApplyRequest,
   resolved: ResolvedRoleRequirement,
 ): boolean {
-  const exemption = resolved.requirement.currentGenerationExemption;
+  const exemption = resolved.requirement.firstGenerationExemption;
   if (
-    request.operationClass !== "qualification_observation_record" ||
+    !["qualification_observation_record", "role_generation_succession"].includes(request.operationClass) ||
     resolved.requirement.roleRequirementId !== DIRECTOR_SEAT_ROLE_REQUIREMENT_ID ||
-    request.roleId !== "project-orchestrator" ||
+    request.roleId !== "director" ||
     !request.roleContext ||
     !exemption ||
-    request.roleContext.threadId !== exemption.holderThreadId
+    request.roleContext.threadId !== exemption.holderThreadId ||
+    (request.operationClass === "role_generation_succession" &&
+      (request.expectedGeneration !== null || request.predecessorGeneration !== null))
   ) {
     return false;
   }
   const head = asRow<{ current_generation: number }>(db.prepare(
     "SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?",
-  ).get(request.projectId, "project-orchestrator"));
-  const generation = asRow<{ status: string; holder_execution_attempt_id: string }>(db.prepare(
-    "SELECT status, holder_execution_attempt_id FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?",
-  ).get(request.projectId, "project-orchestrator", exemption.generation));
-  const holder = generation && asRow<{ thread_id: string | null; environment_id: string | null; source_id: string | null }>(db.prepare(
-    "SELECT thread_id, environment_id, source_id FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?",
-  ).get(request.projectId, generation.holder_execution_attempt_id));
-  return Boolean(
-    head?.current_generation === exemption.generation &&
-    generation?.status === "active" &&
-    holder?.thread_id === exemption.holderThreadId &&
-    holder.environment_id === exemption.environmentId &&
-    holder.source_id === exemption.sourceId,
-  );
+  ).get(request.projectId, "director"));
+  return !head;
 }
 
 function requireRoleTargetContext(
@@ -5575,12 +5707,12 @@ function applyRoleGenerationSuccession(
   if (resolved.requirement.standbyProfile && (!standbyProfile || !profileEquals(standbyProfile, resolved.requirement.standbyProfile))) {
     throw refusal("ROLE_STANDBY_INVALID", "director-seat succession requires its configured Opus-medium standby profile");
   }
-  if (request.roleId === "project-orchestrator") {
+  if (request.roleId === "director") {
     if (!standbyProfile || standbyProfile.providerId === context.profile.providerId) {
-      throw refusal("ROLE_STANDBY_INVALID", "project-orchestrator succession requires a named standby from another provider");
+      throw refusal("ROLE_STANDBY_INVALID", "director succession requires a named standby from another provider");
     }
   } else if (standbyProfile) {
-    throw refusal("ROLE_STANDBY_INVALID", "standby is reserved for the project-orchestrator seat");
+    throw refusal("ROLE_STANDBY_INVALID", "standby is reserved for the director seat");
   }
   const expectedContextDigest = qualificationContextDigest(context, resolved, request);
   const observation = asRow<QualificationObservationRow>(
@@ -5752,33 +5884,33 @@ function applyRoleMutation(
   try {
     const replay = checkIdempotency(db, request, digest);
     if (replay) return replay;
-    const currentDirectorContextCandidate =
-      request.operationClass === "qualification_observation_record" &&
-      request.roleId === "project-orchestrator" &&
+    const firstDirectorContextCandidate =
+      ["qualification_observation_record", "role_generation_succession"].includes(request.operationClass) &&
+      request.roleId === "director" &&
       request.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID &&
-      request.roleContext?.threadId === DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION.holderThreadId;
-    const context = resolveRoleContext(reader, request, currentDirectorContextCandidate);
+      request.roleContext?.threadId === DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.holderThreadId;
+    const context = resolveRoleContext(reader, request, firstDirectorContextCandidate);
     const configRevision = requireConfig(db, request);
     const resolved = requireRoleRequirement(db, request, configRevision);
-    const allowCurrentDirectorEnvironment = currentDirectorGenerationExemptionAllowed(db, request, resolved);
+    const allowFirstDirectorEnvironment = firstDirectorGenerationExemptionAllowed(db, request, resolved);
     const managedDirectorContext =
       (context.baseContext.environment as { managed?: unknown; workspaceProvisionType?: unknown }).managed === true &&
       (context.baseContext.environment as { managed?: unknown; workspaceProvisionType?: unknown }).workspaceProvisionType === "managed-worktree";
-    if (currentDirectorContextCandidate && !allowCurrentDirectorEnvironment && !managedDirectorContext) {
-      throw refusal("ROLE_CONTEXT_FOREIGN", "current director environment is not bound to the current generation head and holder");
+    if (firstDirectorContextCandidate && !allowFirstDirectorEnvironment && !managedDirectorContext) {
+      throw refusal("ROLE_CONTEXT_FOREIGN", "director environment is not bound to its first generation");
     }
     if (
-      allowCurrentDirectorEnvironment &&
+      allowFirstDirectorEnvironment &&
       (!profileEquals(context.profile, resolved.requirement.executedProfile) ||
         (request.declaredProfile !== undefined && !profileEquals(context.profile, request.declaredProfile)))
     ) {
-      throw refusal("EXECUTION_PROFILE_MISMATCH", "current director holder executed profile does not match the exact role requirement");
+      throw refusal("EXECUTION_PROFILE_MISMATCH", "first director holder executed profile does not match the exact role requirement");
     }
     return transaction(db, () => {
       const replayInTransaction = checkIdempotency(db, request, digest);
       if (replayInTransaction) return replayInTransaction;
-      if (allowCurrentDirectorEnvironment && !currentDirectorGenerationExemptionAllowed(db, request, resolved)) {
-        throw refusal("ROLE_CONTEXT_FOREIGN", "current director generation head or holder changed before commit");
+      if (allowFirstDirectorEnvironment && !firstDirectorGenerationExemptionAllowed(db, request, resolved)) {
+        throw refusal("ROLE_CONTEXT_FOREIGN", "director first generation changed before commit");
       }
       return request.operationClass === "qualification_observation_record"
         ? applyQualificationObservation(db, request, digest, context)
@@ -8361,7 +8493,7 @@ export async function doctor(
       .filter((row) => row.holder_attempt_state !== "done" || !row.holder_native_receipt_digest)
       .map((row) => ({ roleId: row.role_id, generation: row.current_generation, holderExecutionAttemptId: row.holder_execution_attempt_id, reason: "ROLE_HOLDER_UNRESOLVED" }));
     const decisionIntegrity = decisionDoctorEvidence(db, projectId);
-    const cachedConsumers = cachedConsumerRolloutEvidence(SCHEMA_VERSION, CONTRACT_VERSION);
+    const cachedConsumers = persistedCachedConsumerRolloutEvidence(db, projectId);
     const expected = targets.length + 1;
     return result("OK", projectId, expected, expected, expected, {
       currentConfigRevision: configHead.config_revision,

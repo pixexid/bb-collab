@@ -7,19 +7,21 @@ second role store.
 
 ## Prepared director-seat amendment
 
-Contract v15 carries the existing v14 `director-seat` amendment and adds the
-small, exact current-generation environment exemption. The primary executed profile is exactly
+Contract v17 moves `director-seat` to the separate `director` role and
+supersedes the v15 current-generation exemption with one exact
+first-generation environment exemption. The primary executed profile is exactly
 `pi/kimi-coding/k3/high` (`providerId: pi`, `model: kimi-coding/k3`,
 `reasoningLevel: high`, `permissionMode: full`, `serviceTier: default`,
 `visibility: visible`). Its alternate/standby is exactly Opus-medium
 (`claude-code/claude-opus-5[1m]`, `reasoningLevel: medium`, with explicit
 full/default/visible fields). The seat has zero writing-lane capacity and
 retains the existing exact project/source/host and event-correlation checks.
-Only generation 2 with holder `thr_gsb7m77ciz`, environment
-`env_3znzsxb7ce`, and source `src_x8veidmpik` may record the current
-qualification from that approved unmanaged canonical environment. Every future
-generation requires a ready managed isolated worktree; the exemption is not a
-general unmanaged path.
+Only director generation 1 with holder `thr_gsb7m77ciz`, environment
+`env_3znzsxb7ce`, and source `src_x8veidmpik` may record the fresh
+qualification and create director generation 1, receipt-gated with no
+predecessor and no existing director head, from that approved unmanaged
+canonical environment. Every later director generation requires a ready managed
+isolated worktree; the exemption is not a general unmanaged path.
 
 The following is a prepared operator-only Decision payload, not a canonical
 Decision row or a succession apply:
@@ -35,8 +37,8 @@ Decision row or a succession apply:
     "standbyProfile": "claude-code/claude-opus-5[1m]/medium",
     "writingLaneCapacity": 0,
     "environment": "managed-worktree-for-future-generations",
-    "currentGenerationExemption": {
-      "generation": 2,
+    "firstGenerationExemption": {
+      "generation": 1,
       "holderThreadId": "thr_gsb7m77ciz",
       "environmentId": "env_3znzsxb7ce",
       "sourceId": "src_x8veidmpik"
@@ -50,19 +52,18 @@ Decision row or a succession apply:
 }
 ```
 
-The epoch-2 holder `thr_gsb7m77ciz` on unmanaged `env_3znzsxb7ce` is not the
-generation-3 holder. The exact current-generation exemption is bound to the
-current role head, holder execution attempt, source, environment, and profile;
-foreign, stale, wrong-generation, wrong-profile, and writing requests refuse
-before any write. No historical RoleGeneration row is fabricated; generation
-3 is the first recorded director generation. Before any future handover, dry-run
+The holder `thr_gsb7m77ciz` on unmanaged `env_3znzsxb7ce` is the exact
+director generation-1 candidate. The exact first-generation exemption is bound
+to the holder, source, environment, and profile; foreign, stale,
+wrong-generation, wrong-profile, and writing requests refuse before any write.
+No historical RoleGeneration row is fabricated. Before any future handover, dry-run
 the proposed holder against the current requirement, exact managed environment
 and executed profile, and generation head plus one. If that preflight predicts a
 refusal, amend the requirement through `config_revision` and its exact operator
 receipt first. Then record the succession through the receipt-gated apply before
 the successor takes the seat. Operator word or witness evidence alone never
-occupies the seat. The current epoch-2 service is grandfathered and remains the
-last succession allowed before this recording gate is enforced.
+occupies the seat. The witness-bound project-orchestrator generation 2 remains
+retired-but-readable evidence; it is not a director generation.
 
 Future bootstrap briefs must report the holder's recorded generation or the
 typed refusal that prevented recording; a native witness is not proof of a
@@ -79,18 +80,17 @@ must use `pi/kimi-coding/k3/high` with Opus-medium standby as stated above.
 
 ## Standby
 
-Every newly recorded generic `project-orchestrator` generation names one
-standby profile in `RoleGeneration.standby_profile_json`. The current generic
-standby is `luna/gpt-5.6-luna` (`providerId: luna`, `model: gpt-5.6-luna`, with
-explicit reasoning, permission, service tier, and visibility). The standby
-provider must differ from the holder's executed provider; a same-provider or
-missing standby refuses before any canonical write. A standby is not a role,
-actor, authority, lease, assignment, dispatch target, or traffic recipient.
+Only `director-seat` generations name one standby profile in
+`RoleGeneration.standby_profile_json`. The configured standby is the exact
+Opus-medium profile, and its provider must differ from the director holder's
+executed provider; a same-provider or missing standby refuses before any
+canonical write. `project-orchestrator` generations must omit a standby. A
+standby is not a role, actor, authority, lease, assignment, dispatch target,
+or traffic recipient.
 
-Pre-existing generations may have no standby because the schema migration does
-not invent provider evidence. Record the standby on the next canonical
-succession, or use the normal receipt-gated succession path to replace the
-generation.
+Pre-existing records are retained as evidence; configuration and future
+succession follow the v17 role-specific rule without inventing provider
+evidence or rewriting historical generations.
 
 ## Triggers
 
@@ -117,9 +117,9 @@ thread's model in place.
 4. Verify the executed profile from native provider events, not spawn flags.
 5. Obtain a bounded comprehension acknowledgement (10 lines or fewer) naming
    the role, epoch, fleet state, next decision, and any contradiction found.
-6. Submit the exact receipt-gated `role_generation_succession` request with
-   the named standby profile. The atomic `RoleGeneration` write is the
-   authority transfer.
+6. Submit the exact receipt-gated `role_generation_succession` request. Name
+   the configured standby only for `director-seat`; omit it for every other
+   role. The atomic `RoleGeneration` write is the authority transfer.
 7. Consumers read the current `RoleGeneration`; do not manually retarget
    watcher or escalation state.
 8. Revoke the predecessor by record. A live predecessor may receive one
@@ -136,10 +136,10 @@ exiting successfully is not proof that the thread is healthy. If the Part 2
 wrongful-idle detector has delivered two ineffective steers, treat the
 condition as a succession trigger and stop nagging the old thread.
 
-Promote the named standby through the same procedure starting at explicit
-successor preparation. The standby receives no traffic before promotion. The
-old generation is revoked by the canonical record even when the dead thread
-cannot receive a tell.
+For a director failure, prepare the configured standby through the same
+procedure. For another role, prepare the successor from that role's exact
+requirement; no standby is configured. The old generation is revoked by the
+canonical record even when the dead thread cannot receive a tell.
 
 ## Audit traps
 
