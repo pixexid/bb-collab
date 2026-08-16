@@ -41,4 +41,10 @@ describe("weekly throughput report", () => {
     expect(report.issueOpenToClose).toEqual({ medianHours: null, completed: 0, unknown: 1 });
     expect(report.reviewLatencyByTier.A).toEqual({ medianHours: null, completed: 0, unknown: 1 });
   });
+
+  it("compares dial guidance in hours on both sides of the benchmark", () => {
+    const facts = { ...empty, issues: [{ id: "issue", openedAtMs: 0, closedAtMs: 2_880_000 }] };
+    expect(weeklyThroughputReport(facts, window).dialGuidance).toContain("at or below");
+    expect(weeklyThroughputReport({ ...facts, issues: [{ ...facts.issues[0], closedAtMs: 2_880_001 }] }, window).dialGuidance).toContain("above");
+  });
 });
