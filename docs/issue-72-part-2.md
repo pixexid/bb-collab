@@ -30,17 +30,13 @@ receipt-gated RoleGeneration succession path described in
 
 ## Director-seat recording gate
 
-The contract-v15 `director-seat` amendment is configuration and preparation
-only. It keeps the existing managed-worktree/source/environment identity gate,
-requires primary `pi/kimi-coding/k3/high`, names Opus-medium as the alternate,
-and has zero writing-lane capacity. Epoch-1 `thr_krqfdv79xw` and epoch-2
-`thr_gsb7m77ciz` service are ratified grandfathered service evidence; the
-unmanaged epoch-2 environment `env_3znzsxb7ce` is not a generation-3 holder.
-The only unmanaged exception is current-generation qualification recording for
-generation 2, holder `thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source
-`src_x8veidmpik`, while the exact current role head and holder execution attempt
-remain bound. It cannot admit writing or succession; every future generation
-requires a managed isolated worktree.
+Contract v17 supersedes this historical v15 director-seat note. `director-seat`
+is the separate `director` role with the same primary `pi/kimi-coding/k3`,
+Opus-medium standby, and zero writing-lane capacity. The only unmanaged
+exception is director generation-1 qualification recording for holder
+`thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source `src_x8veidmpik`;
+it cannot admit writing, foreign or stale contexts, or later generations. Every
+later director generation requires a managed isolated worktree.
 
 The seat-succession recording gate is explicit: preflight the proposed holder
 against the current requirement, executed profile, exact managed environment,
@@ -48,7 +44,7 @@ and generation head plus one. If the preflight refuses, amend the requirement
 through the normal immutable full-config `config_revision` plus exact operator
 receipt before attempting succession. Record the generation before the
 successor takes the seat; operator word or a native witness never establishes
-occupancy. Generation 3 is the first row that may be recorded under this gate.
+occupancy. Director generation 1 is the first row that may be recorded under this gate.
 Future bootstrap briefs report that generation or the typed refusal, not witness
 evidence alone. This lane performs no live spawn, receipt, console approval,
 SQLite write, succession, or handover.

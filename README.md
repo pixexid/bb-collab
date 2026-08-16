@@ -13,14 +13,15 @@ new-thread, search, navigation rows, and the footer.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through contract v16/schema v11: a
+The repository now contains the implemented foundation through contract v17/schema v11: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
 Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
-foundations. New project-orchestrator RoleGenerations carry one named
-receipt-gated standby profile with no authority or traffic; its provider must
-differ from the executed holder. Production RPC/CLI apply require an exact one-request interim
+foundations. The four logical roles are director, project-orchestrator, worker,
+and independent-reviewer. Only `director-seat` carries one named receipt-gated
+standby profile with no authority or traffic; its provider must differ from the
+director holder. Production RPC/CLI apply require an exact one-request interim
 operator receipt bound to project, operation, exact candidate head,
 idempotency key, and request digest; it is consumed atomically and invalid,
 stale, retired, mismatched, or reused receipts refuse before any write. The
@@ -29,7 +30,9 @@ receipt has no local expiry or revocation: it retires only on the host-issued
 confirmed bootstrap operator receipt atomically derives a verified
 `plugin/bb-collab` actor receipt linked to that exact operator receipt; the
 derived actor is not standing authority and apply must provide the same linked
-operator receipt. An adopted `operator_only` Decision registers the exact
+operator receipt. `config_revision` additionally requires the exact current
+`approverAttestation`-derived plugin actor bound to that receipt; a verified
+but unlinked or role actor refuses before any write. An adopted `operator_only` Decision registers the exact
 `orchestrator:bb-collab` approver and ten ratified derived mutation classes,
 including `config_revision` for the existing canonical mutation that replaces
 the full immutable project configuration and its mapped targets, including
@@ -47,7 +50,7 @@ facts through the existing `RoleFactReader` seam before issuing
 foreign facts refuse before write. A ready native managed worktree may have a
 derived path distinct from its canonical source; exact project/host/source
 resolution retains both paths and still refuses unmanaged or ephemeral contexts,
-except for the exact current director-generation qualification exemption below.
+except for the exact director generation-1 qualification exemption below.
 `github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
 reserve/finalize operations refuse before the adapter under this one-request
 seam. The derived actor path is limited to bootstrap, `config_revision` for
@@ -58,7 +61,7 @@ and migration_step; role-based
 and review Decisions remain role-bound. The plugin has not been installed, reloaded, or activated against live
 project authority.
 
-Contract v11 was a contract-only role-capacity amendment: `roleRequirements`
+Historical contract v11 was a contract-only role-capacity amendment: `roleRequirements`
 admits at most three logical roles. `project-orchestrator` is project-scoped;
 `worker` and `independent-reviewer` require the exact repository target used by
 canonical WorkItem writes. All three retain executed-profile qualification and
@@ -72,12 +75,12 @@ runtime path silently raises them. Read-only reviews and probes do not consume
 the writing cap, and the queue exposes up to the configured number of startable
 write lanes.
 
-Contract v13 adds the schema-backed named standby profile for new
+Historical contract v13 added the schema-backed named standby profile for new
 project-orchestrator generations. The standby provider must differ from the
 executed holder and the standby has no authority or traffic; existing receipt,
 qualification, and succession guards remain unchanged.
 
-Contract v14 adds the bounded `director-seat` role-requirement amendment on
+Historical contract v14 added the bounded `director-seat` role-requirement amendment on
 the existing `project-orchestrator` seat. It fixes the primary executed
 profile to `pi/kimi-coding/k3/high` with explicit full/default/visible fields,
 the alternate standby to Opus-medium, retains managed-worktree isolation, and
@@ -88,7 +91,7 @@ must pass a dry-run/preflight and be recorded by the receipt-gated succession
 apply before taking the seat.
 
 The historical contract-v9 eight-class registry was accepted only during the
-one-release v9-to-v10 re-adoption. Contract v15 leaves the exact current
+one-release v9-to-v10 re-adoption. Historical contract v15 left the exact
 ten-class allowlist unchanged; the already-bounded v11 nine-class repair
 remains readable but still refuses `work_item_transition`. Malformed, reordered,
 subset, extra, v9, and other arbitrary sets remain invalid. This is a contract
@@ -96,7 +99,7 @@ bump for the current-generation director-seat exemption: cached consumers must
 reread v15 or refuse v14, with durable rollout evidence; schema and migrations
 remain unchanged.
 
-Contract v15 adds only the current-generation environment exemption required to
+Historical contract v15 added only the current-generation environment exemption required to
 record the grandfathered epoch-2 director qualification: generation 2, holder
 `thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source `src_x8veidmpik`.
 It is valid only while that exact role head and holder execution evidence remain
@@ -108,6 +111,19 @@ a witness before it can supply role qualification or succession holder facts.
 This bounded eligibility gate preserves the existing role, generation, native
 environment/source, and executed-profile checks; schema and migrations remain
 unchanged, and cached consumers reread v16 or refuse v15.
+
+Contract v17 supersedes the v14/v15 director placement and exemption:
+`director-seat` is the only project-scoped `director` requirement, while
+project-orchestrator is a separate project-scoped role and worker and
+independent-reviewer remain repository-target scoped. The director's exact
+Pi/Kimi primary profile, Opus-medium standby, and zero writing-lane capacity
+are unchanged. Only director generation 1 for holder `thr_gsb7m77ciz`,
+environment `env_3znzsxb7ce`, and source `src_x8veidmpik` may use the bounded
+unmanaged qualification exemption; later director generations require the
+existing managed isolated worktree checks. All four cached consumers must
+reread v17 or refuse v16. Rollout success is reported only from a persisted,
+identity-validated receipt with expected=attempted=verified=4; absent or
+invalid evidence is unknown and fail-closed.
 
 The ratified evidence-only MigrationRun shape records the llm-collab fence
 `f988d9711d3778f751e4ec0e32ebbf7b0893c80f` at resource revision 4 and merged

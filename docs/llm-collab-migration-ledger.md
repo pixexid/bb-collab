@@ -381,7 +381,9 @@ reserve/finalize adapter operations refuse before the adapter because one
 receipt cannot authorize multiple writes. This report records those facts; it
 does not change them.
 
-The current contract is v15/schema v11. Its bounded role-capacity seam admits
+This is a historical v15/schema v11 report, not current policy. Contract v17
+and ADR 0002 supersede its director placement, exemption, standby, and
+cached-consumer statements. At the time, its bounded role-capacity seam admitted
 the three project requirements used by the first-adopter request:
 project-orchestrator is project-scoped, while worker and independent-reviewer
 bind to the exact repository target required by canonical WorkItem writes. The
