@@ -20702,6 +20702,10 @@ function createContinuationLedger(persistence) {
 function continuationModeFor(assignmentKind) {
   return assignmentKind === "write" ? "automatic" : assignmentKind === "review" ? "approval" : "tracking";
 }
+function mergeRegisteredWaitState(current, next) {
+  const rank = { fired: 1, pending: 2, unknown: 3 };
+  return !current || current === "none" || rank[next] > rank[current] ? next : current;
+}
 function readLaneStates(db) {
   return db.prepare(
     `SELECT assignments.project_id, assignments.assignment_id, assignments.lane_id,
@@ -20857,19 +20861,19 @@ function createLaneWatcher(options) {
     const events = [];
     for (const wait of waits) {
       if (waitRegistry.state(wait.waitId) === "fired") {
-        if (byWaiter.get(wait.waiterThreadId) !== "pending") byWaiter.set(wait.waiterThreadId, "fired");
+        byWaiter.set(wait.waiterThreadId, mergeRegisteredWaitState(byWaiter.get(wait.waiterThreadId), "fired"));
         continue;
       }
       const source = sourceStates.get(wait.sourceThreadId);
       let reason = null;
       if (now2() >= wait.deadlineAtMs) reason = "deadline_expired";
       else if (!source?.known) {
-        if (byWaiter.get(wait.waiterThreadId) !== "pending") byWaiter.set(wait.waiterThreadId, "unknown");
+        byWaiter.set(wait.waiterThreadId, mergeRegisteredWaitState(byWaiter.get(wait.waiterThreadId), "unknown"));
         continue;
       } else if (wait.sourceEvent === "terminal" && source.terminal) reason = "source_terminal";
       else if (wait.sourceEvent === "failure" && source.failed) reason = "source_failure";
       else {
-        byWaiter.set(wait.waiterThreadId, "pending");
+        byWaiter.set(wait.waiterThreadId, mergeRegisteredWaitState(byWaiter.get(wait.waiterThreadId), "pending"));
         continue;
       }
       let event;
@@ -20879,7 +20883,7 @@ function createLaneWatcher(options) {
         return { known: false, byWaiter: /* @__PURE__ */ new Map(), events: [] };
       }
       if (event) events.push(event);
-      if (byWaiter.get(wait.waiterThreadId) !== "pending") byWaiter.set(wait.waiterThreadId, "fired");
+      byWaiter.set(wait.waiterThreadId, mergeRegisteredWaitState(byWaiter.get(wait.waiterThreadId), "fired"));
     }
     return { known: true, byWaiter, events };
   };
