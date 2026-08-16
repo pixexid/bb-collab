@@ -101,7 +101,7 @@ record the grandfathered epoch-2 director qualification: generation 2, holder
 `thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source `src_x8veidmpik`.
 It is valid only while that exact role head and holder execution evidence remain
 current, only for qualification recording, and never for writing admission or
-succession. Every future generation requires a managed isolated worktree.
+succession. The generation 2 text is director-epoch numbering for this current exemption; canonical `role_generations` numbering is per `(project_id, role_id)`, so this live project-orchestrator head succeeds at generation 3. Every future generation requires a managed isolated worktree.
 
 The ratified evidence-only MigrationRun shape records the llm-collab fence
 `f988d9711d3778f751e4ec0e32ebbf7b0893c80f` at resource revision 4 and merged
