@@ -130,6 +130,11 @@ routed later to `claude-code/opus`; that review is evidence, not authority.
 
 ## Issue lifecycle linkage and #80 audit
 
+This is an external CI/release conformance projection, not a canonical contract
+or authority change. It leaves `CONTRACT_VERSION`, `contractDigest`, schema,
+cached consumers, and rollout receipts untouched; the cached-consumer bump test
+does not apply unless a future change enters that canonical boundary.
+
 Every worker brief and pull request body carries exactly one lifecycle
 disposition line: `Closes #NN` only when that pull request completes the issue
 acceptance and the body declares `Acceptance: complete`; `Related GH-NN`

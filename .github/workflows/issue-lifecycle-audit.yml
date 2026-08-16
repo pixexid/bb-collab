@@ -30,4 +30,7 @@ jobs:
       - name: Collect and report GitHub issue lifecycle facts
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: node scripts/audit-issue-lifecycle.mjs | tee "$GITHUB_STEP_SUMMARY"
+        shell: bash
+        run: |
+          set -o pipefail
+          node scripts/audit-issue-lifecycle.mjs | tee "$GITHUB_STEP_SUMMARY"

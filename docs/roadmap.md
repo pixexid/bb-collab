@@ -37,6 +37,8 @@ GitHub/BB facts remain explicit. Verify linkage and merge comments are
 projection/release evidence only; they do not close or authorize canonical
 work. Its scheduled/manual GitHub API audit fails closed to `unknown` when
 facts cannot be collected and never auto-closes incomplete or unknown issues.
+This slice does not change the canonical contract or schema and does not invoke
+the cached-consumer bump test.
 #79 remains a separate follow-up slice.
 
 ## Founding documentation

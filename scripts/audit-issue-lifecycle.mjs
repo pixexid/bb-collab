@@ -52,12 +52,14 @@ export async function collectGitHubAudit({ apiUrl, repository, token }) {
   return { issues, mergedPullRequests: pullRequests };
 }
 
+export const auditExitCode = (status) => status === "pass" ? 0 : 1;
+
 export async function main() {
   try {
     const facts = await collectGitHubAudit({ apiUrl: process.env.GITHUB_API_URL ?? "https://api.github.com", repository: process.env.GITHUB_REPOSITORY, token: process.env.GITHUB_TOKEN });
     const report = { source: "GitHub API read-only projection", generatedAt: new Date().toISOString(), issueAcceptanceAudit: auditGitHubFacts(facts) };
     console.log(JSON.stringify(report, null, 2));
-    if (report.issueAcceptanceAudit.status === "fail") process.exitCode = 1;
+    process.exitCode = auditExitCode(report.issueAcceptanceAudit.status);
   } catch (error) {
     console.log(JSON.stringify({ source: "GitHub API read-only projection", generatedAt: new Date().toISOString(), issueAcceptanceAudit: { openCompleted: [], openIncomplete: [], unknown: ["github-api-unavailable"], status: "unknown" }, error: error instanceof Error ? error.message : String(error) }, null, 2));
     process.exitCode = 1;

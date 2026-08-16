@@ -147,6 +147,12 @@ cached consumers emit a durable reread/refusal rollout receipt.
   code checked out from `refs/heads/main`; it never executes the PR head or
   merge ref. Its deterministic marker/concurrency path is projection evidence,
   not canonical governance.
+- The lifecycle disposition, Verify, merge-comment, and audit rules above are
+  external CI/release conformance projections. They do not change the
+  canonical contract, `CONTRACT_VERSION`, `contractDigest`, schema, cached
+  consumers, or rollout receipts; this lane therefore does not invoke the
+  cached-consumer bump test. Any future canonical authority or contract change
+  still requires that bump test.
 - Tier-A surfaces include authority/provenance, canonical DDL/lifecycle,
   operator receipts/approval, spend, concurrency/atomicity, migration/cutover,
   review/release policy, and tracked runtime artifacts. The next unrelated

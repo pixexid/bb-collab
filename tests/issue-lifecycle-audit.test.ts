@@ -1,7 +1,8 @@
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { auditGitHubFacts, collectGitHubAudit } from "../scripts/audit-issue-lifecycle.mjs";
+import { auditExitCode, auditGitHubFacts, collectGitHubAudit, main } from "../scripts/audit-issue-lifecycle.mjs";
 
 describe("scheduled issue lifecycle audit", () => {
   it("distinguishes open completed, incomplete, and unknown GitHub evidence", () => {
@@ -30,5 +31,34 @@ describe("scheduled issue lifecycle audit", () => {
     });
     expect(result.status).toBe(1);
     expect(JSON.parse(result.stdout)).toMatchObject({ issueAcceptanceAudit: { unknown: ["github-api-unavailable"], status: "unknown" } });
+  });
+
+  it("exits nonzero for a collected unknown report and requires a fail-closed workflow pipeline", async () => {
+    expect(auditExitCode("unknown")).toBe(1);
+    const workflow = readFileSync(".github/workflows/issue-lifecycle-audit.yml", "utf8");
+    expect(workflow).toContain("shell: bash");
+    expect(workflow).toContain("set -o pipefail");
+
+    const originalFetch = globalThis.fetch;
+    const originalExitCode = process.exitCode;
+    const originalEnvironment = { apiUrl: process.env.GITHUB_API_URL, repository: process.env.GITHUB_REPOSITORY, token: process.env.GITHUB_TOKEN };
+    globalThis.fetch = (async (input) => ({
+      ok: true,
+      json: async () => String(input).includes("/issues?") ? [{ number: 82, state: "open", body: null }] : [],
+    })) as typeof fetch;
+    process.env.GITHUB_API_URL = "https://api.github.test";
+    process.env.GITHUB_REPOSITORY = "acme/repo";
+    process.env.GITHUB_TOKEN = "test-token";
+    process.exitCode = 0;
+    try {
+      await main();
+      expect(process.exitCode).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.exitCode = originalExitCode;
+      if (originalEnvironment.apiUrl === undefined) delete process.env.GITHUB_API_URL; else process.env.GITHUB_API_URL = originalEnvironment.apiUrl;
+      if (originalEnvironment.repository === undefined) delete process.env.GITHUB_REPOSITORY; else process.env.GITHUB_REPOSITORY = originalEnvironment.repository;
+      if (originalEnvironment.token === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = originalEnvironment.token;
+    }
   });
 });
