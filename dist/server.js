@@ -20819,7 +20819,6 @@ function readRoleHolderStates(db) {
         AND generations.holder_execution_attempt_id = attempts.execution_attempt_id
        WHERE attempts.origin = 'role_holder'
          AND attempts.thread_id IS NOT NULL
-        AND attempts.role_id IN (${ROLE_IDS.map((roleId) => `'${roleId}'`).join(", ")})
          AND generations.status = 'active'
        ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`
   ).all();

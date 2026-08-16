@@ -1,10 +1,9 @@
 import type { BbPluginApi, PluginThreadEventPayloads } from "@bb/plugin-sdk";
-import { ROLE_IDS, writingLaneCeilingForProject, type SqliteDatabase } from "./foundation.js";
+import { writingLaneCeilingForProject, type SqliteDatabase } from "./foundation.js";
 
 export const DEFAULT_MAX_CONTINUATIONS = 3;
 export const OPERATOR_WAIT_FYI_THRESHOLD_MS = 15 * 60_000;
 export const WRONGFUL_IDLE_THRESHOLD_MS = 10 * 60_000;
-export const ORCHESTRATOR_ROLE_ID = "project-orchestrator" as const;
 
 export const OPEN_ATTEMPT_STATES: ReadonlySet<string> = new Set([
   "prepared",
@@ -585,7 +584,6 @@ export function readRoleHolderStates(db: SqliteDatabase): RoleHolderState[] {
         AND generations.holder_execution_attempt_id = attempts.execution_attempt_id
        WHERE attempts.origin = 'role_holder'
          AND attempts.thread_id IS NOT NULL
-        AND attempts.role_id IN (${ROLE_IDS.map((roleId) => `'${roleId}'`).join(", ")})
          AND generations.status = 'active'
        ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`,
     )
