@@ -13,7 +13,7 @@ new-thread, search, navigation rows, and the footer.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through contract v15/schema v11: a
+The repository now contains the implemented foundation through contract v16/schema v11: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
@@ -102,6 +102,12 @@ record the grandfathered epoch-2 director qualification: generation 2, holder
 It is valid only while that exact role head and holder execution evidence remain
 current, only for qualification recording, and never for writing admission or
 succession. Every future generation requires a managed isolated worktree.
+
+Contract v16 rejects a native thread whose title or title fallback marks it as
+a witness before it can supply role qualification or succession holder facts.
+This bounded eligibility gate preserves the existing role, generation, native
+environment/source, and executed-profile checks; schema and migrations remain
+unchanged, and cached consumers reread v16 or refuse v15.
 
 The ratified evidence-only MigrationRun shape records the llm-collab fence
 `f988d9711d3778f751e4ec0e32ebbf7b0893c80f` at resource revision 4 and merged

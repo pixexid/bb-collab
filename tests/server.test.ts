@@ -172,6 +172,8 @@ function roleReader(
       projectId: PROJECT_ID,
       environmentId: ROLE_ENVIRONMENT_ID,
       providerId: ROLE_PROFILE.providerId,
+      title: "Managed role holder",
+      titleFallback: "",
       status: "idle",
       visibility: "visible",
     },
@@ -300,9 +302,12 @@ function projectFacts(projectId = PROJECT_ID) {
   };
 }
 
-function hostFor(projectId = PROJECT_ID) {
+function hostFor(
+  projectId = PROJECT_ID,
+  mutateRoleFacts?: (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => void,
+) {
   const project = projectFacts(projectId);
-  const roleFacts = roleReader();
+  const roleFacts = roleReader(mutateRoleFacts);
   return createFakePluginHost({
     pluginId: PLUGIN_ID,
     sdk: {
@@ -338,8 +343,8 @@ function hostFor(projectId = PROJECT_ID) {
           projectId: roleFacts.facts.thread.projectId,
           environmentId: roleFacts.facts.thread.environmentId,
           providerId: roleFacts.facts.thread.providerId,
-          title: null,
-          titleFallback: null,
+          title: roleFacts.facts.thread.title,
+          titleFallback: roleFacts.facts.thread.titleFallback,
           sectionId: null,
           status: roleFacts.facts.thread.status as "idle",
           parentThreadId: null,
@@ -512,8 +517,11 @@ function projectionRequest(
   };
 }
 
-async function loadedHost(projectId = PROJECT_ID) {
-  const host = hostFor(projectId);
+async function loadedHost(
+  projectId = PROJECT_ID,
+  mutateRoleFacts?: (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => void,
+) {
+  const host = hostFor(projectId, mutateRoleFacts);
   await plugin(host.bb);
   return host;
 }
@@ -2904,9 +2912,9 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("appends the v15 current-director exemption contract and rolls every cached consumer forward", () => {
+  it("appends the v16 witness-holder refusal contract and rolls every cached consumer forward", () => {
     expect(SCHEMA_VERSION).toBe(11);
-    expect(CONTRACT_VERSION).toBe(15);
+    expect(CONTRACT_VERSION).toBe(16);
     expect(MIGRATIONS).toHaveLength(24);
     expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("6f9f8b91784b2834d061a68bfe99241f24a93e32e786822894871f601a2f86a7");
     expect(MIGRATIONS.at(-6)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
@@ -2923,35 +2931,35 @@ describe("bb-collab plugin boundary", () => {
     expect(MIGRATION_STEPS).toEqual([
       "record_inventory", "record_quiescence", "freeze", "record_export", "record_import", "record_equivalence", "activate", "record_exercise", "retire", "rollback", "mark_fix_forward_required",
     ]);
-    expect(cachedConsumerRolloutEvidence(11, 14)).toMatchObject({
-      names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 11,
-      newSchemaVersion: 11,
-      oldContractVersion: 14,
-      newContractVersion: 15,
-      action: "refused",
-      expected: 4,
-      attempted: 4,
-      verified: 0,
-    });
-    expect(cachedConsumerRolloutEvidence(10, 15)).toMatchObject({
-      oldSchemaVersion: 11,
-      newSchemaVersion: 11,
-      observedSchemaVersion: 10,
-      oldContractVersion: 14,
-      newContractVersion: 15,
-      observedContractVersion: 15,
-      action: "refused",
-      expected: 4,
-      attempted: 4,
-      verified: 0,
-    });
     expect(cachedConsumerRolloutEvidence(11, 15)).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 11,
       newSchemaVersion: 11,
-      oldContractVersion: 14,
-      newContractVersion: 15,
+      oldContractVersion: 15,
+      newContractVersion: 16,
+      action: "refused",
+      expected: 4,
+      attempted: 4,
+      verified: 0,
+    });
+    expect(cachedConsumerRolloutEvidence(10, 16)).toMatchObject({
+      oldSchemaVersion: 11,
+      newSchemaVersion: 11,
+      observedSchemaVersion: 10,
+      oldContractVersion: 15,
+      newContractVersion: 16,
+      observedContractVersion: 16,
+      action: "refused",
+      expected: 4,
+      attempted: 4,
+      verified: 0,
+    });
+    expect(cachedConsumerRolloutEvidence(11, 16)).toMatchObject({
+      names: [...CACHED_CONSUMERS],
+      oldSchemaVersion: 11,
+      newSchemaVersion: 11,
+      oldContractVersion: 15,
+      newContractVersion: 16,
       action: "reread",
       expected: 4,
       attempted: 4,
@@ -2982,17 +2990,17 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("records the v15 current-director exemption contract and cache bump evidence", () => {
-    expect(CONTRACT_VERSION).toBe(15);
+  it("records the v16 witness-holder refusal contract and cache bump evidence", () => {
+    expect(CONTRACT_VERSION).toBe(16);
     expect(SCHEMA_VERSION).toBe(11);
     expect(MIGRATIONS).toHaveLength(24);
     expect(schemaDigest).toBe("5ee5cd12902e433825558c27b9a20d8bc2e86c5ffe018bf5b59e207d5d2d684e");
-    expect(contractDigest).toBe("804da7efa3c670555606c0c76da6175d3c99cf4e72e275e06fd2d345835c65b6");
+    expect(contractDigest).toBe("862728e18f73aaaa679d25fb092576d671f1e9cc93379546dca016e932e2dc20");
     expect(cachedConsumerRolloutEvidence(SCHEMA_VERSION, CONTRACT_VERSION)).toMatchObject({
       oldSchemaVersion: 11,
       newSchemaVersion: 11,
-      oldContractVersion: 14,
-      newContractVersion: 15,
+      oldContractVersion: 15,
+      newContractVersion: 16,
       action: "reread",
       expected: CACHED_CONSUMERS.length,
       attempted: CACHED_CONSUMERS.length,
@@ -3088,7 +3096,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 11, schemaDigest, contractVersion: 15, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 11, schemaDigest, contractVersion: 16, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -5366,6 +5374,37 @@ describe("bb-collab plugin boundary", () => {
     expect(db.prepare("SELECT COUNT(*) AS count FROM project_config_revisions").get()).toEqual({ count: 0 });
   });
 
+  it("refuses witness threads as role holders without writes and accepts a managed live seat", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    const witness = () => roleReader((facts) => {
+      facts.thread.title = "GH-72 live role handoff witness";
+      facts.thread.titleFallback = "Bounded live role-handoff witness only.";
+    });
+
+    const beforeQualification = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, { idempotencyKey: "witness-qualification" }), null, witness())).toMatchObject({
+      outcome: "ROLE_CONTEXT_WITNESS",
+      attempted: 0,
+      verified: 0,
+    });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeQualification);
+
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, roleReader())).toMatchObject({ outcome: "OK" });
+    const beforeSuccession = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, { idempotencyKey: "witness-succession" }), null, witness())).toMatchObject({
+      outcome: "ROLE_CONTEXT_WITNESS",
+      attempted: 0,
+      verified: 0,
+    });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeSuccession);
+
+    const successor = applyWithFixtureReceipt(db, successionRequest(fenceToken), null, roleReader());
+    expect(successor).toMatchObject({ outcome: "OK", evidence: { holderExecutionAttemptId: expect.any(String) } });
+    const holder = db.prepare("SELECT origin, state FROM execution_attempts").get();
+    expect(holder).toEqual({ origin: "role_holder", state: "done" });
+  });
+
   it("admits only the managed director-seat profile and keeps succession recording-gated", async () => {
     const invalidCases: Array<[string, (requirement: Record<string, unknown>) => void]> = [
       ["provider", (requirement) => { requirement.executedProfile = { ...DIRECTOR_PROFILE, providerId: "codex" }; }],
@@ -5765,6 +5804,36 @@ describe("bb-collab plugin boundary", () => {
     expect(host.harness.inspection.sdk.callsTo("threads.get").length).toBeGreaterThanOrEqual(2);
     expect(host.harness.inspection.sdk.callsTo("threads.events.list").length).toBeGreaterThanOrEqual(2);
     expect(host.harness.inspection.sdk.callsTo("environments.get").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("refuses title-only and fallback-only witness markers through the live SDK reader without writes", async () => {
+    for (const [field, marker] of [["title", "handoff witness"], ["titleFallback", "witness only"]] as const) {
+      const host = await loadedHost(PROJECT_ID, (facts) => {
+        facts.thread.title = null;
+        facts.thread.titleFallback = null;
+        facts.thread[field] = marker;
+      });
+      const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+      const unsigned = { ...qualificationRequest(fenceToken, { idempotencyKey: `live-${field}-witness` }), candidateHead: CANDIDATE_SHA, operatorReceiptId: null };
+      const receipt = persistInterimOperatorReceipt(db, {
+        projectId: PROJECT_ID,
+        mutationClass: unsigned.operationClass,
+        candidateHead: CANDIDATE_SHA,
+        idempotencyKey: unsigned.idempotencyKey,
+        requestDigest: operatorRequestDigest(unsigned),
+        callerThreadId: "live-role-thread",
+        requestedFromBackground: false,
+        callerPluginId: PLUGIN_ID,
+      });
+      const before = exportFoundation(db, PROJECT_ID);
+      expect(await host.harness.callRpc("apply", { ...unsigned, operatorReceiptId: receipt.receiptId })).toMatchObject({
+        outcome: "ROLE_CONTEXT_WITNESS",
+        attempted: 0,
+        verified: 0,
+      });
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+      expect(host.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(1);
+    }
   });
 
   it("issues and consumes derived actor receipts for both live role mutation classes", async () => {
@@ -6288,9 +6357,9 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(11, 14)).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 11, oldContractVersion: 14, newContractVersion: 15, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(10, 15)).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 11, observedSchemaVersion: 10, oldContractVersion: 14, newContractVersion: 15, observedContractVersion: 15, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(11, 15)).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 11, oldContractVersion: 14, newContractVersion: 15, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(11, 15)).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 11, oldContractVersion: 15, newContractVersion: 16, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(10, 16)).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 11, observedSchemaVersion: 10, oldContractVersion: 15, newContractVersion: 16, observedContractVersion: 16, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(11, 16)).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 11, oldContractVersion: 15, newContractVersion: 16, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {
