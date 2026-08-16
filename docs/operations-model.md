@@ -8,6 +8,32 @@ It is an operations model, not a second authority store. Canonical work remains
 the existing WorkItem, Assignment, and ExecutionAttempt state; lane-watcher
 observes that state and native BB thread interactions.
 
+## Supervisor-ratified model-to-role routing
+
+Role names remain logical project roles, not provider, model, harness or thread
+identities. The following matrix governs requested assignment profiles and
+review independence:
+
+| Role or lane | Allowed requested profile | Boundary |
+| --- | --- | --- |
+| Orchestrator | Primary: `codex/gpt-5.6-sol` MEDIUM. Alternate: `claude-code/claude-opus-5[1m]` MEDIUM. | Luna is never an orchestrator profile. |
+| Merge-bound implementer | MEDIUM or HIGH; LOW is prohibited. Routine implementation: `codex/gpt-5.6-luna` MEDIUM. Hard-core implementation: Sol or Opus HIGH. | `glm-5.3` is barred from implementation until a graded qualification probe passes. |
+| Reviewer | Default Codex. Tier-A cold review: Sol HIGH. Tier-B post-merge review: Luna MEDIUM. | Reviewer model must differ from the author; a different provider is preferred. If the author is Sol, use Opus MEDIUM or K3 HIGH. |
+| Mechanical subagent | Luna LOW is permitted for fixtures, sweeps, doc-sync and scaffolds. | Legality follows the artifact scope, not the spawn label. |
+
+The approved default profile for mechanical and documentation engineering is
+`codex/gpt-5.6-luna`; that wording does not make Luna a general implementation
+default or an orchestrator profile. A requested profile is Assignment intent
+only. Eligibility and review routing use the actual provider, model, reasoning,
+permission and visibility recorded by the ExecutionAttempt/provider receipt;
+remembered defaults, labels and plausible output are not executed-profile
+evidence. Unknown or mismatched executed values remain ineligible.
+
+Every new spawn must provide explicit `provider`, `model`, `reasoning`, and
+`visibility: "visible"` flags. A remembered or host-inferred default is not
+evidence of any of those values. This rule selects and records the request; it
+does not turn a requested tuple into proof of execution.
+
 ## Queue and lane state
 
 An open assignment is shown through the existing `lanes` RPC and HTTP path. A
@@ -151,17 +177,16 @@ occupancy. A future successor is first preflighted and then recorded through
 the receipt-gated succession apply; witness evidence and operator word do not
 occupy the seat.
 
-The approved default model for non-visual queue and documentation engineering
-is `codex/gpt-5.6-luna`. On a cheap tier, an omitted reasoning value on a
+The mechanical-subtask cheap-tier behavior remains bounded to the artifact
+scope above: an omitted reasoning value on a
 mechanical subtask (fixtures, sweeps, doc sync, or scaffolds) resolves to LOW
 (`low/full/default/visible`); a parent worker's HIGH or MAX effort must not
 silently escalate it. The hard core may opt into an explicit HIGH or MAX value.
-The spawn brief supplies the cheap-tier classification explicitly; it is not
-inferred from the parent's effort.
+The spawn brief supplies that classification.
 Every spawn brief declares the requested reasoning value, and the existing
 Assignment/ExecutionAttempt receipt comparison records requested versus
 executed reasoning for the conformance audit. An independent cold review is
-routed later to `claude-code/opus`; that review is evidence, not authority.
+evidence, not authority, and must satisfy the model-difference rule above.
 
 ## Dormant supervisor escalation
 
