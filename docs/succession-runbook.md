@@ -5,6 +5,56 @@ Canonical authority remains the receipt-gated `role_generation_succession`
 resolver and its `RoleGeneration` row. This document is guidance, not a
 second role store.
 
+## Prepared director-seat amendment
+
+Contract v14 amends the existing `project-orchestrator` requirement as the
+`director-seat`. The primary executed profile is exactly
+`pi/kimi-coding/k3/high` (`providerId: pi`, `model: kimi-coding/k3`,
+`reasoningLevel: high`, `permissionMode: full`, `serviceTier: default`,
+`visibility: visible`). Its alternate/standby is exactly Opus-medium
+(`claude-code/claude-opus-5[1m]`, `reasoningLevel: medium`, with explicit
+full/default/visible fields). The seat has zero writing-lane capacity and
+retains the existing ready managed-worktree, exact project/source/host, and
+event-correlation checks.
+
+The following is a prepared operator-only Decision payload, not a canonical
+Decision row or a succession apply:
+
+```json
+{
+  "projectId": "proj_a8zzfsx36j",
+  "decisionClass": "operator_only",
+  "decisionId": "director-seat-amendment-prepared",
+  "scope": { "roleRequirementId": "director-seat", "purpose": "succession-rationale" },
+  "options": {
+    "primaryProfile": "pi/kimi-coding/k3/high",
+    "standbyProfile": "claude-code/claude-opus-5[1m]/medium",
+    "writingLaneCapacity": 0,
+    "environment": "managed-worktree-only"
+  },
+  "ratification": {
+    "epoch1": "thr_krqfdv79xw",
+    "epoch2": "thr_gsb7m77ciz",
+    "status": "direct-operator-authority-grandfathered-service"
+  }
+}
+```
+
+The epoch-2 holder `thr_gsb7m77ciz` on unmanaged `env_3znzsxb7ce` is not the
+generation-3 holder. No historical RoleGeneration row is fabricated; generation
+3 is the first recorded director generation. Before any future handover, dry-run
+the proposed holder against the current requirement, exact managed environment
+and executed profile, and generation head plus one. If that preflight predicts a
+refusal, amend the requirement through `config_revision` and its exact operator
+receipt first. Then record the succession through the receipt-gated apply before
+the successor takes the seat. Operator word or witness evidence alone never
+occupies the seat. The current epoch-2 service is grandfathered and remains the
+last succession allowed before this recording gate is enforced.
+
+Future bootstrap briefs must report the holder's recorded generation or the
+typed refusal that prevented recording; a native witness is not proof of a
+seated successor.
+
 ## Standby
 
 Every newly recorded `project-orchestrator` generation names one standby
@@ -108,3 +158,8 @@ receipts were consumed exactly once. The succession path changed only the
 role-generation state: final export counts show two role generations, two
 execution attempts, two qualification observations, zero assignments, and
 one work item.
+
+That live v13 evidence predates the prepared v14 amendment. It records epoch-1
+and epoch-2 service only; this lane performs no live install, reload, Decision,
+receipt, SQLite write, succession, or handover. Generation 3 remains held until
+the managed-worktree preflight and later receipt-gated apply described above.

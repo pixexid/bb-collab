@@ -5,14 +5,31 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 13;
+export const CONTRACT_VERSION = 14;
 export const SCHEMA_VERSION = 11;
-// RoleGeneration standby field and succession rule v12 -> v13 / schema v10 -> v11.
-const PREVIOUS_CONTRACT_VERSION = 12;
+// Director-seat profile and managed-worktree recording rule v13 -> v14.
+const PREVIOUS_CONTRACT_VERSION = 13;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
 const PREVIOUS_SCHEMA_VERSION = 10;
 export const ROLE_IDS = ["project-orchestrator", "worker", "independent-reviewer"] as const;
+export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
+const directorSeatProfile = {
+  providerId: "pi",
+  model: "kimi-coding/k3",
+  reasoningLevel: "high",
+  permissionMode: "full",
+  serviceTier: "default",
+  visibility: "visible" as const,
+};
+const directorSeatStandbyProfile = {
+  providerId: "claude-code",
+  model: "claude-opus-5[1m]",
+  reasoningLevel: "medium",
+  permissionMode: "full",
+  serviceTier: "default",
+  visibility: "visible" as const,
+};
 export const AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab" as const;
 export const AUTHORIZED_APPROVER_PROJECT_ID = "proj_a8zzfsx36j" as const;
 export const LLM_COLLAB_SOURCE_FENCE = "f988d9711d3778f751e4ec0e32ebbf7b0893c80f" as const;
@@ -729,6 +746,15 @@ export const contractDigest = sha256(canonicalJson({
     lowerRequiresExplicitDecision: true,
     readOnlyAssignmentKinds: ["review", "probe"],
   },
+  directorSeatPolicy: {
+    roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+    roleId: "project-orchestrator",
+    executedProfile: directorSeatProfile,
+    standbyProfile: directorSeatStandbyProfile,
+    writingLaneCapacity: 0,
+    environment: "managed-worktree only",
+    assignmentKinds: [],
+  },
   operatorReceiptPolicy: {
     scope: "one_request",
     binding: ["projectId", "operationClass", "candidateHead", "idempotencyKey", "requestDigest"],
@@ -1082,6 +1108,8 @@ const roleRequirementSchema = z
     roleId: roleIdSchema,
     repoTargetId: id.nullable(),
     executedProfile: executionProfileSchema,
+    standbyProfile: executionProfileSchema.optional(),
+    writingLaneCapacity: z.literal(0).optional(),
   })
   .strict()
   .superRefine((requirement, ctx) => {
@@ -1096,6 +1124,26 @@ const roleRequirementSchema = z
     }
     if (requirement.executedProfile.visibility !== "visible") {
       ctx.addIssue({ code: "custom", path: ["executedProfile", "visibility"], message: "active role holders must be visible" });
+    }
+    const isDirectorSeat = requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID;
+    if (isDirectorSeat) {
+      if (requirement.roleId !== "project-orchestrator") {
+        ctx.addIssue({ code: "custom", path: ["roleId"], message: "director-seat must use the project-orchestrator role" });
+      }
+      if (requirement.repoTargetId !== null) {
+        ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "director-seat must be project-scoped" });
+      }
+      if (!requirement.standbyProfile || canonicalJson(requirement.standbyProfile) !== canonicalJson(directorSeatStandbyProfile)) {
+        ctx.addIssue({ code: "custom", path: ["standbyProfile"], message: "director-seat requires the exact Opus-medium standby profile" });
+      }
+      if (requirement.writingLaneCapacity !== 0) {
+        ctx.addIssue({ code: "custom", path: ["writingLaneCapacity"], message: "director-seat has no writing-lane capacity" });
+      }
+      if (canonicalJson(requirement.executedProfile) !== canonicalJson(directorSeatProfile)) {
+        ctx.addIssue({ code: "custom", path: ["executedProfile"], message: "director-seat requires the exact judgment profile" });
+      }
+    } else if (requirement.standbyProfile !== undefined || requirement.writingLaneCapacity !== undefined) {
+      ctx.addIssue({ code: "custom", path: ["roleRequirementId"], message: "standby profile and writing capacity are reserved for director-seat" });
     }
   });
 const roleRequirementsSchema = z.array(roleRequirementSchema).max(ROLE_IDS.length).superRefine((requirements, ctx) => {
@@ -5455,6 +5503,9 @@ function applyRoleGenerationSuccession(
     throw refusal("EXECUTION_PROFILE_MISMATCH", "holder executed profile does not match the role requirement");
   }
   const standbyProfile = request.standbyProfile;
+  if (resolved.requirement.standbyProfile && (!standbyProfile || !profileEquals(standbyProfile, resolved.requirement.standbyProfile))) {
+    throw refusal("ROLE_STANDBY_INVALID", "director-seat succession requires its configured Opus-medium standby profile");
+  }
   if (request.roleId === "project-orchestrator") {
     if (!standbyProfile || standbyProfile.providerId === context.profile.providerId) {
       throw refusal("ROLE_STANDBY_INVALID", "project-orchestrator succession requires a named standby from another provider");

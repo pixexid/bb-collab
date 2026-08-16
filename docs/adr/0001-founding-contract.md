@@ -186,7 +186,7 @@ review Decisions remain role-bound. After the one-time adopted authorizing
 Decision/disposition, caller plugin, and exact request binding, then atomically
 issues a fresh receipt plus the same verified plugin actor without `requestInput`.
 The current exact ten-class allowlist authorizes all current classes. Contract
-v13 leaves that allowlist unchanged; the already-bounded v11 nine-class row
+v14 leaves that allowlist unchanged; the already-bounded v11 nine-class row
 remains readable but still refuses `work_item_transition`. Malformed, reordered,
 subset, extra, v9, and other arbitrary sets refuse at both attestation and apply. A
 later operator revocation or change marks the registry unusable; both registry
@@ -198,10 +198,10 @@ The historical contract-v9 eight-class registry was accepted only during the
 one-release v9-to-v10 re-adoption. Contract v11 required the exact nine-class
 row. Contract v12 added only `work_item_transition`; contract v13 adds the
 bounded writing-lane dial while leaving the exact ten-class allowlist unchanged.
-This is a contract/cache bump: v13 changes `CONTRACT_VERSION` and
+This is a contract/cache bump: v14 changes `CONTRACT_VERSION` and
 `contractDigest`; `SCHEMA_VERSION`, `schemaDigest`, and migrations remain
 unchanged. Cached-consumer evidence records four attempted, four verified
-rereads for v13 and refusal for stale v12 consumers.
+rereads for v14 and refusal for stale v13 consumers.
 
 The contract v11/schema v10 role-capacity amendment remains contract-only.
 Contract v12/schema v10 adds only `work_item_transition` to the derived
@@ -220,9 +220,21 @@ most three logical roles: `project-orchestrator` is project-scoped, while
 `worker` and `independent-reviewer` require the exact repository target used by
 canonical WorkItem writes. Each requirement retains its explicit
 executed-profile qualification. The v10 receipt, approver, derived-actor and
-existing refusal bindings are unchanged; cached consumers reread v13/schema v11
+existing refusal bindings are unchanged; cached consumers reread v14/schema v11
 or refuse the previous versions. Existing generations remain readable without
 fabricated standby evidence.
+
+Contract v14 adds one bounded exception to the project-orchestrator
+role-requirement configuration: the `director-seat` entry fixes the primary
+executed profile to `pi/kimi-coding/k3/high` with explicit full/default/visible
+fields, names the exact Opus-medium alternate/standby profile, retains the
+managed-worktree requirement, and records zero writing-lane capacity. It does
+not add a logical role, assignment kind, dispatch path, or unmanaged-environment
+exception. The epoch-2 director service on `thr_gsb7m77ciz` in
+`env_3znzsxb7ce` is grandfathered preparation evidence only; generation 3 is
+not represented until a later receipt-gated succession apply records it.
+All four cached consumers reread v14 or refuse v13; schema, migrations,
+operator receipts, and approver bindings remain otherwise unchanged.
 
 ## 6. Roles, delegation and execution
 
