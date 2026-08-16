@@ -159,6 +159,66 @@ describe("lane awareness", () => {
     expect(steerRole).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    ["matching", "project-1", "thr_b94i3csnme"],
+    ["foreign", "project-2", "director-1"],
+  ])("selects the %s role observation target", async (_name, dispatcherProjectId, targetThreadId) => {
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    let currentNow = 0;
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => [roleScope("queue-head")],
+      readDispatcherProjectIdentity: async () => dispatcherProjectId,
+      readWorker: async (threadId) => ({ ...roleObservation(0), status: threadId === targetThreadId ? "idle" : "active" }),
+      steerRole,
+      now: () => currentNow,
+    });
+
+    await watcher.poll();
+    currentNow = 10 * 60_000;
+    await watcher.poll();
+
+    expect(steerRole).toHaveBeenCalledWith(expect.objectContaining({ threadId: targetThreadId }));
+  });
+
+  it("suppresses role observation when native dispatcher identity is ambiguous", async () => {
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => [roleScope("queue-head")],
+      readDispatcherProjectIdentity: async () => null,
+      readWorker: async () => roleObservation(0),
+      steerRole,
+      now: () => 10 * 60_000,
+    });
+
+    await watcher.poll();
+
+    expect(steerRole).not.toHaveBeenCalled();
+  });
+
+  it("suppresses role observation when the canonical queue scope is absent", async () => {
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => [],
+      readDispatcherProjectIdentity: async () => "project-1",
+      readWorker: async () => roleObservation(0),
+      steerRole,
+      now: () => 10 * 60_000,
+    });
+
+    await watcher.poll();
+
+    expect(steerRole).not.toHaveBeenCalled();
+  });
+
   it("waits for the exact ten-minute wrongful-idle threshold", async () => {
     let currentNow = 0;
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);

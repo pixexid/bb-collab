@@ -540,6 +540,7 @@ export function createLaneWatcher(options: {
   readOperatorWait?: (threadId: string) => Promise<OperatorWait | null>;
   readRoleHolders?: () => RoleHolderState[];
   readRoleScopes?: () => Promise<RoleQueueScope[]> | RoleQueueScope[];
+  readDispatcherProjectIdentity?: () => Promise<string | null>;
   roleIdlePersistence?: RoleIdlePersistence;
   roleIdleThresholdMs?: number;
   steerRole?: (role: RoleIdleView) => Promise<void>;
@@ -616,12 +617,22 @@ export function createLaneWatcher(options: {
     if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return;
     let holders: RoleHolderState[];
     try {
-      holders = options.readRoleHolders().filter((holder) =>
-        holder.role_id === ORCHESTRATOR_ROLE_ID && (!threadId || holder.thread_id === threadId));
+      holders = options.readRoleHolders().filter((holder) => holder.role_id === ORCHESTRATOR_ROLE_ID);
     } catch {
       return;
     }
     if (holders.length === 0) return;
+    if (threadId && threadId !== supervisorThreadId && !holders.some((holder) => holder.thread_id === threadId)) return;
+
+    let dispatcherProjectId: string | null = null;
+    if (options.readDispatcherProjectIdentity) {
+      try {
+        dispatcherProjectId = await options.readDispatcherProjectIdentity();
+      } catch {
+        return;
+      }
+      if (!dispatcherProjectId) return;
+    }
 
     let scopes = suppliedScopes;
     if (!scopes) {
@@ -633,11 +644,15 @@ export function createLaneWatcher(options: {
     }
 
     for (const holder of holders) {
+      const targetThreadId = options.readDispatcherProjectIdentity && dispatcherProjectId === holder.project_id
+        ? supervisorThreadId
+        : holder.thread_id;
+      if (threadId && targetThreadId !== threadId) continue;
       const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
       const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
       let observation: WorkerObservation;
       try {
-        observation = await options.readWorker(holder.thread_id);
+        observation = await options.readWorker(targetThreadId);
       } catch {
         continue;
       }
@@ -674,7 +689,7 @@ export function createLaneWatcher(options: {
             roleId: holder.role_id,
             roleGeneration: holder.role_generation,
             executionAttemptId: holder.execution_attempt_id,
-            threadId: holder.thread_id,
+            threadId: targetThreadId,
             queueHeadId: scope.queueHeadId,
             idleAgeMs,
           });
@@ -688,7 +703,7 @@ export function createLaneWatcher(options: {
         roleId: holder.role_id,
         roleGeneration: holder.role_generation,
         executionAttemptId: holder.execution_attempt_id,
-        threadId: holder.thread_id,
+        threadId: targetThreadId,
         queueHeadId: scope.queueHeadId,
         idleAgeMs,
       };
@@ -806,9 +821,8 @@ export function createLaneWatcher(options: {
 
   return {
     observe(threadId, status, pendingExternalWait, archived, operatorWait) {
-      if (threadId === supervisorThreadId) return Promise.resolve();
       return enqueue(async () => {
-        await observeNow(threadId, status, pendingExternalWait, archived, operatorWait);
+        if (threadId !== supervisorThreadId) await observeNow(threadId, status, pendingExternalWait, archived, operatorWait);
         await observeRoleNow(threadId);
       });
     },
@@ -846,6 +860,7 @@ export function createLaneWatcher(options: {
           const roleThreadIds = new Set(options.readRoleHolders()
             .map((holder) => holder.thread_id)
             .filter((threadId) => threadId !== supervisorThreadId));
+          if (options.readDispatcherProjectIdentity) roleThreadIds.add(supervisorThreadId);
           let roleScopes: RoleQueueScope[] | null = null;
           if (roleThreadIds.size > 0 && options.readRoleScopes) {
             try {
