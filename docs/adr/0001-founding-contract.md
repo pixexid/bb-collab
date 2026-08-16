@@ -248,6 +248,13 @@ future generations; future generations require managed isolated worktrees.
 operator receipts, and approver bindings remain unchanged. All four cached
 consumers reread v15 or refuse v14.
 
+Contract v16 rejects native threads designated as witnesses by their title or
+title fallback before qualification or succession can materialize a role-holder
+attempt. This is a bounded holder-eligibility check, not a new role identity or
+authority store: role head, generation, managed environment/source, and
+executed-profile checks remain mandatory. Schema and migrations remain
+unchanged; cached consumers reread v16 or refuse v15.
+
 ## 6. Roles, delegation and execution
 
 A logical role is a project-scoped seat such as project-orchestrator, worker or

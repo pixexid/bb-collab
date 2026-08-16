@@ -425,6 +425,8 @@ async function readLiveRoleFactReader(
         projectId: thread.projectId,
         environmentId: thread.environmentId,
         providerId: thread.providerId,
+        title: thread.title,
+        titleFallback: thread.titleFallback,
         status: thread.status,
         visibility: thread.visibility,
       },

@@ -5,10 +5,10 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 15;
+export const CONTRACT_VERSION = 16;
 export const SCHEMA_VERSION = 11;
-// Current-generation director-seat environment exemption v14 -> v15.
-const PREVIOUS_CONTRACT_VERSION = 14;
+// Witness-holder refusal v15 -> v16.
+const PREVIOUS_CONTRACT_VERSION = 15;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
 const PREVIOUS_SCHEMA_VERSION = 11;
@@ -762,6 +762,10 @@ export const contractDigest = sha256(canonicalJson({
     currentGenerationExemption: DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION,
     assignmentKinds: [],
   },
+  roleHolderEligibilityPolicy: {
+    nativeWitnessMarker: "witness",
+    refusal: "ROLE_CONTEXT_WITNESS",
+  },
   operatorReceiptPolicy: {
     scope: "one_request",
     binding: ["projectId", "operationClass", "candidateHead", "idempotencyKey", "requestDigest"],
@@ -1431,6 +1435,8 @@ export interface RoleThreadFact {
   projectId: string;
   environmentId: string | null;
   providerId: string;
+  title: string | null;
+  titleFallback: string | null;
   status: string;
   visibility: "visible" | "hidden";
 }
@@ -1663,6 +1669,9 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
   if (thread.id !== request.roleContext.threadId || thread.projectId !== request.projectId || project.id !== request.projectId) {
     throw refusal("ROLE_CONTEXT_FOREIGN", "thread or project context belongs to another project");
   }
+  if (/\bwitness\b/iu.test(`${thread.title ?? ""}\n${thread.titleFallback ?? ""}`)) {
+    throw refusal("ROLE_CONTEXT_WITNESS", "witness threads cannot hold active roles");
+  }
   if (thread.visibility !== "visible") throw refusal("ROLE_CONTEXT_HIDDEN", "hidden threads cannot hold active roles");
   if (!new Set(["active", "idle"]).has(thread.status)) throw refusal("ROLE_CONTEXT_UNKNOWN", "holder thread is not in a usable execution state");
   if (!thread.environmentId || environment.id !== thread.environmentId || environment.projectId !== request.projectId) {
@@ -1751,7 +1760,7 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
   const source = sources[0]!;
   const baseContext = {
     project: { id: project.id, kind: project.kind, gitRemoteUrl: project.gitRemoteUrl },
-    thread: { id: thread.id, projectId: thread.projectId, providerId: thread.providerId, status: thread.status, visibility: thread.visibility },
+    thread: { id: thread.id, projectId: thread.projectId, providerId: thread.providerId, title: thread.title, titleFallback: thread.titleFallback, status: thread.status, visibility: thread.visibility },
     environment: {
       id: environment.id,
       projectId: environment.projectId,
@@ -1880,6 +1889,7 @@ export type FoundationCode =
   | "ROLE_CONTEXT_UNKNOWN"
   | "ROLE_CONTEXT_FOREIGN"
   | "ROLE_CONTEXT_HIDDEN"
+  | "ROLE_CONTEXT_WITNESS"
   | "ROLE_HOLDER_MISMATCH"
   | "ROLE_STANDBY_INVALID"
   | "EXECUTION_PROFILE_UNKNOWN"

@@ -13786,9 +13786,9 @@ import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 15;
+var CONTRACT_VERSION = 16;
 var SCHEMA_VERSION = 11;
-var PREVIOUS_CONTRACT_VERSION = 14;
+var PREVIOUS_CONTRACT_VERSION = 15;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
 var PREVIOUS_SCHEMA_VERSION = 11;
@@ -14530,6 +14530,10 @@ var contractDigest = sha256(canonicalJson({
     currentGenerationExemption: DIRECTOR_SEAT_CURRENT_GENERATION_EXEMPTION,
     assignmentKinds: []
   },
+  roleHolderEligibilityPolicy: {
+    nativeWitnessMarker: "witness",
+    refusal: "ROLE_CONTEXT_WITNESS"
+  },
   operatorReceiptPolicy: {
     scope: "one_request",
     binding: ["projectId", "operationClass", "candidateHead", "idempotencyKey", "requestDigest"],
@@ -15087,6 +15091,10 @@ function resolveRoleContext(reader, request, allowCurrentDirectorEnvironment = f
   if (thread.id !== request.roleContext.threadId || thread.projectId !== request.projectId || project.id !== request.projectId) {
     throw refusal("ROLE_CONTEXT_FOREIGN", "thread or project context belongs to another project");
   }
+  if (/\bwitness\b/iu.test(`${thread.title ?? ""}
+${thread.titleFallback ?? ""}`)) {
+    throw refusal("ROLE_CONTEXT_WITNESS", "witness threads cannot hold active roles");
+  }
   if (thread.visibility !== "visible") throw refusal("ROLE_CONTEXT_HIDDEN", "hidden threads cannot hold active roles");
   if (!(/* @__PURE__ */ new Set(["active", "idle"])).has(thread.status)) throw refusal("ROLE_CONTEXT_UNKNOWN", "holder thread is not in a usable execution state");
   if (!thread.environmentId || environment.id !== thread.environmentId || environment.projectId !== request.projectId) {
@@ -15165,7 +15173,7 @@ function resolveRoleContext(reader, request, allowCurrentDirectorEnvironment = f
   const source = sources[0];
   const baseContext = {
     project: { id: project.id, kind: project.kind, gitRemoteUrl: project.gitRemoteUrl },
-    thread: { id: thread.id, projectId: thread.projectId, providerId: thread.providerId, status: thread.status, visibility: thread.visibility },
+    thread: { id: thread.id, projectId: thread.projectId, providerId: thread.providerId, title: thread.title, titleFallback: thread.titleFallback, status: thread.status, visibility: thread.visibility },
     environment: {
       id: environment.id,
       projectId: environment.projectId,
@@ -21860,6 +21868,8 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
         projectId: thread.projectId,
         environmentId: thread.environmentId,
         providerId: thread.providerId,
+        title: thread.title,
+        titleFallback: thread.titleFallback,
         status: thread.status,
         visibility: thread.visibility
       },
