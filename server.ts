@@ -584,6 +584,7 @@ export default async function plugin(bb: BbPluginApi) {
     readLanes: () => (db ? readLaneStates(db) : []),
     readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
     readRoleScopes,
+    readDispatcherProjectIdentity: async () => (await bb.sdk.threads.get({ threadId: SUPERVISOR_THREAD_ID })).projectId,
     roleIdlePersistence,
     continuationLedger,
     operatorWaitAlertPersistence,
