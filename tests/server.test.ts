@@ -547,11 +547,14 @@ async function loadedLaneWatcherHost() {
   let roleThread = makeThreadResponse({ id: ROLE_THREAD_ID, projectId: PROJECT_ID, status: "idle", archivedAt: null, deletedAt: null });
   let roleReads = 0;
   let failRoleReadAt: number | null = null;
+  let changeRoleReadAt: number | null = null;
+  let changedRoleThread: Partial<typeof roleThread> = {};
   let pendingExternalWait = false;
   host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => {
     if (threadId !== ROLE_THREAD_ID) return thread;
     roleReads += 1;
     if (roleReads === failRoleReadAt) throw new Error("role thread unavailable");
+    if (roleReads === changeRoleReadAt) roleThread = makeThreadResponse({ ...roleThread, ...changedRoleThread });
     return roleThread;
   }) as never);
   host.harness.sdk.stub("threads.interactions.list", (async () => pendingExternalWait ? [{ status: "pending" }] : []) as never);
@@ -573,6 +576,10 @@ async function loadedLaneWatcherHost() {
     },
     failRoleReadAfter(successfulReads: number) {
       failRoleReadAt = roleReads + successfulReads + 1;
+    },
+    changeRoleThreadAfter(successfulReads: number, next: Partial<typeof roleThread>) {
+      changeRoleReadAt = roleReads + successfulReads + 1;
+      changedRoleThread = next;
     },
   };
 }
@@ -1488,6 +1495,8 @@ describe("bb-collab plugin boundary", () => {
     ["archived", { archivedAt: 1 }, "archivedAt=1 deletedAt=null"],
     ["deleted", { deletedAt: 1 }, "archivedAt=null deletedAt=1"],
     ["foreign-project", { projectId: "other-project" }, "observedProject=other-project"],
+    ["title witness", { title: "handoff witness" }, "witness=true"],
+    ["fallback witness", { titleFallback: "witness only" }, "witness=true"],
   ])("warns once when the current role holder is %s during periodic evaluation", async (_name, roleThread, evidence) => {
     const fixture = await loadedLaneWatcherHost();
     fixture.setLaneState("prepared");
@@ -1507,6 +1516,33 @@ describe("bb-collab plugin boundary", () => {
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")
       .filter(([input]) => (input as { threadId?: string }).threadId === ROLE_THREAD_ID)).toHaveLength(0);
     await fixture.host.harness.lifecycle.dispose();
+  });
+
+  it.each([
+    ["active", { status: "active" as const }, "status=active"],
+    ["title witness", { title: "handoff witness" }, "witness=true"],
+    ["fallback witness", { titleFallback: "witness only" }, "witness=true"],
+  ])("revalidates final role-holder %s eligibility before steering", async (_name, roleThread, evidence) => {
+    let currentNow = 0;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => currentNow);
+    try {
+      const fixture = await loadedLaneWatcherHost();
+      fixture.setLaneState("prepared");
+      await fixture.host.harness.runCli(["wait-validator", "--cycle"]);
+      fixture.changeRoleThreadAfter(1, roleThread);
+      currentNow = 10 * 60_000;
+      await fixture.host.harness.runCli(["wait-validator", "--cycle"]);
+
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")
+        .filter(([input]) => (input as { threadId?: string }).threadId === ROLE_THREAD_ID)).toHaveLength(0);
+      const warnings = fixture.host.harness.inspection.logEntries
+        .filter((entry) => entry.level === "warn" && entry.message.startsWith("role steer refused:"));
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]?.message).toContain(evidence);
+      await fixture.host.harness.lifecycle.dispose();
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it("loads one CLI/RPC seam and refuses production apply before any write", async () => {

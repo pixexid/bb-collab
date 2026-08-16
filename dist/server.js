@@ -22149,6 +22149,12 @@ async function plugin(bb) {
     roleLivenessWarnings.set(key, evidence);
     bb.log.warn(`role steer refused: project=${holder.project_id} role=${holder.role_id}@${holder.role_generation} holder=${holder.execution_attempt_id} thread=${holder.thread_id} ${evidence}`);
   };
+  const roleThreadRefusal = (holder, thread, requireIdle) => {
+    const witness = /\bwitness\b/iu.test(`${thread.title ?? ""}
+${thread.titleFallback ?? ""}`);
+    const usableStatus = requireIdle ? thread.status === "idle" : thread.status === "idle" || thread.status === "active";
+    return thread.projectId === holder.project_id && thread.archivedAt === null && thread.deletedAt === null && !witness && usableStatus ? null : `observedProject=${thread.projectId} archivedAt=${thread.archivedAt ?? "null"} deletedAt=${thread.deletedAt ?? "null"} status=${thread.status} witness=${witness}`;
+  };
   const readRoleScopes = async () => {
     if (!db) return [];
     const operatorWaits = /* @__PURE__ */ new Map();
@@ -22182,14 +22188,17 @@ async function plugin(bb) {
         for (const holder of roleHolders) warnRoleLiveness(holder, `liveness=unknown error=${String(error48)}`);
         throw error48;
       }
-      const archived = thread.archivedAt !== null || thread.deletedAt !== null;
+      let roleThreadRefused = false;
       for (const holder of roleHolders) {
-        if (thread.projectId !== holder.project_id || archived) {
-          warnRoleLiveness(holder, `observedProject=${thread.projectId} archivedAt=${thread.archivedAt ?? "null"} deletedAt=${thread.deletedAt ?? "null"}`);
+        const refusal2 = roleThreadRefusal(holder, thread, false);
+        if (refusal2) {
+          roleThreadRefused = true;
+          warnRoleLiveness(holder, refusal2);
         } else {
           roleLivenessWarnings.delete(roleLivenessKey(holder));
         }
       }
+      const archived = thread.archivedAt !== null || thread.deletedAt !== null || roleThreadRefused;
       let operatorWait = null;
       let operatorWaitKnown = true;
       if (!archived && thread.status === "idle") {
@@ -22239,8 +22248,9 @@ async function plugin(bb) {
         warnRoleLiveness(holders[0], `liveness=unknown error=${String(error48)}`);
         return;
       }
-      if (thread.projectId !== role.projectId || thread.archivedAt !== null || thread.deletedAt !== null) {
-        warnRoleLiveness(holders[0], `observedProject=${thread.projectId} archivedAt=${thread.archivedAt ?? "null"} deletedAt=${thread.deletedAt ?? "null"}`);
+      const refusal2 = roleThreadRefusal(holders[0], thread, true);
+      if (refusal2) {
+        warnRoleLiveness(holders[0], refusal2);
         return;
       }
       roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
