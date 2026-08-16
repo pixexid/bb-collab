@@ -19,24 +19,29 @@ reviewer, orchestrator or routing fallback. The supervisor-ratified matrix is:
 | --- | --- | --- | --- | --- |
 | Director | `pi` | `kimi-coding/k3` | HIGH | K3 is director-only; it is never a review fallback. |
 | Orchestrator primary | Claude harness / `claude-code` | `claude-opus-5` | MEDIUM | Never Luna or below. |
-| Orchestrator alternate | Codex harness / `codex` | `gpt-5.6-sol` | MEDIUM | Standing fallback when the Opus account window saturates. |
-| Orchestrator alternate | Terra harness/provider | `gpt-5.6-terra` | MEDIUM | Alternate; never Luna or below. |
+| Orchestrator alternate | Codex harness / `codex` | `gpt-5.6-sol` | MEDIUM | Standing fallback when the `claude-opus-5` account window saturates. |
+| Orchestrator alternate | Codex harness / `codex` | `gpt-5.6-terra` | MEDIUM | Alternate; never Luna or below. |
 | Merge-bound implementer | Codex harness / `codex` | `gpt-5.6-luna` | MEDIUM or HIGH | Luna is admitted at MEDIUM or above; LOW is prohibited. |
-| Merge-bound implementer | Configured harness/provider | `glm-5.3` | MEDIUM or HIGH | Admitted now at MEDIUM or above. |
-| Merge-bound implementer | Terra harness/provider | Terra | MEDIUM or HIGH | Admitted at MEDIUM or above. Hard core uses Sol HIGH or Opus-5 HIGH. |
-| Reviewer | Codex harness | Configured Codex model | As assigned | Default reviewer model differs from the author. |
-| Tier-A reviewer | Sol harness/provider | Sol | HIGH | Terra HIGH is also acceptable when Sol authored; never the author's model. |
+| Merge-bound implementer | Pi harness / `pi` | `zai/glm-5.3` | MEDIUM or HIGH | Admitted now at MEDIUM or above. |
+| Merge-bound implementer | Codex harness / `codex` | `gpt-5.6-terra` | MEDIUM or HIGH | Admitted at MEDIUM or above. Hard core uses `codex/gpt-5.6-sol` HIGH or `claude-code/claude-opus-5` HIGH. |
+| Tier-A reviewer | Codex harness / `codex` | `gpt-5.6-sol` | HIGH | `gpt-5.6-terra` HIGH is acceptable when `gpt-5.6-sol` authored; never the author's model. |
+| Tier-A reviewer fallback | Codex harness / `codex` | `gpt-5.6-terra` | HIGH | Only when `gpt-5.6-sol` authored; never the author's model. |
 | Tier-B reviewer | Codex harness / `codex` | `gpt-5.6-luna` | MEDIUM | Never the author's model. |
-| Mechanical subagent | Configured harness/provider | `gpt-5.6-luna` | LOW | Fixtures, sweeps, doc-sync and scaffolds only; legality follows artifact scope, not spawn label. |
-| Mechanical probe | Configured harness/provider | `deepseek-v4-flash` or `glm-5-turbo` | LOW | Probe-only; current graded evidence controls admission. |
+| Mechanical subagent | Codex harness / `codex` | `gpt-5.6-luna` | LOW | Fixtures, sweeps, doc-sync and scaffolds only; legality follows artifact scope, not spawn label. |
+| Mechanical probe | Pi harness / `pi` | `deepseek-v4-flash` | LOW | Probe-only; current graded evidence controls admission. |
+| Mechanical probe | Pi harness / `pi` | `glm-5-turbo` | LOW | Probe-only; current graded evidence controls admission. |
+
+Reviewer default harness/provider is Codex; the tier rows name the actual model
+and reasoning tuple.
 
 Watch item: monitor the shared Anthropic account window across the amended
-orchestrator, app-side supervisor wakes, and Opus cold reviews. The amended
+orchestrator, app-side supervisor wakes, and `claude-opus-5` cold reviews. The amended
 orchestrator profile applies only at the next natural
 succession/spawn. The pending epoch-2 orchestrator succession is that natural
 spawn; do not hot-swap a healthy live orchestrator. `claude-opus-5` shares the
-operator Anthropic account window with app-side supervisor wakes and any Opus
-cold reviews. If that window saturates, Sol MEDIUM is the standing fallback,
+operator Anthropic account window with app-side supervisor wakes and any
+`claude-opus-5` cold reviews. If that window saturates, `codex/gpt-5.6-sol`
+MEDIUM is the standing fallback,
 pre-authorized without a new decision.
 
 The approved default profile for mechanical and documentation engineering is
