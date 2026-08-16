@@ -8,6 +8,61 @@ It is an operations model, not a second authority store. Canonical work remains
 the existing WorkItem, Assignment, and ExecutionAttempt state; lane-watcher
 observes that state and native BB thread interactions.
 
+## Supervisor-ratified model-to-role routing
+
+Role names remain logical project roles, not provider, model, harness or thread
+identities. Harness/provider and model are recorded as separate fields. The
+supervisor is dormant and app-side in Fable only; it is not a BB role, worker,
+reviewer, orchestrator or routing fallback. The supervisor-ratified matrix is:
+
+| Role or lane | Harness/provider | Model | Reasoning | Boundary |
+| --- | --- | --- | --- | --- |
+| Director | `pi` | `kimi-coding/k3` | HIGH | K3 is director-only; it is never a review fallback. |
+| Orchestrator primary | Claude harness / `claude-code` | `claude-opus-5` | MEDIUM | Never Luna or below. |
+| Orchestrator alternate | Codex harness / `codex` | `gpt-5.6-sol` | MEDIUM | Standing fallback when the `claude-opus-5` account window saturates. |
+| Orchestrator alternate | Codex harness / `codex` | `gpt-5.6-terra` | MEDIUM | Alternate; never Luna or below. |
+| Merge-bound implementer | Codex harness / `codex` | `gpt-5.6-luna` | MEDIUM or HIGH | Luna is admitted at MEDIUM or above; LOW is prohibited. |
+| Merge-bound implementer | Pi harness / `pi` | `zai/glm-5.3` | MEDIUM or HIGH | Admitted now at MEDIUM or above. |
+| Merge-bound implementer | Codex harness / `codex` | `gpt-5.6-terra` | MEDIUM or HIGH | Admitted at MEDIUM or above. Hard core uses `codex/gpt-5.6-sol` HIGH or `claude-code/claude-opus-5` HIGH. |
+| Tier-A reviewer | Codex harness / `codex` | `gpt-5.6-sol` | HIGH | `gpt-5.6-terra` HIGH is acceptable when `gpt-5.6-sol` authored; never the author's model. |
+| Tier-A reviewer fallback | Codex harness / `codex` | `gpt-5.6-terra` | HIGH | Only when `gpt-5.6-sol` authored; never the author's model. |
+| Tier-B reviewer | Codex harness / `codex` | `gpt-5.6-luna` | MEDIUM | Never the author's model. |
+| Mechanical subagent | Codex harness / `codex` | `gpt-5.6-luna` | LOW | Fixtures, sweeps, doc-sync and scaffolds only; legality follows artifact scope, not spawn label. |
+| Mechanical probe | Pi harness / `pi` | `deepseek-v4-flash` | LOW | Probe-only; current graded evidence controls admission. |
+| Mechanical probe | Pi harness / `pi` | `glm-5-turbo` | LOW | Probe-only; current graded evidence controls admission. |
+
+Reviewer default harness/provider is Codex; the tier rows name the actual model
+and reasoning tuple.
+
+Watch item: monitor the shared Anthropic account window across the amended
+orchestrator, app-side supervisor wakes, and `claude-opus-5` cold reviews. The amended
+orchestrator profile applies only at the next natural
+succession/spawn. The pending epoch-2 orchestrator succession is that natural
+spawn; do not hot-swap a healthy live orchestrator. `claude-opus-5` shares the
+operator Anthropic account window with app-side supervisor wakes and any
+`claude-opus-5` cold reviews. If that window saturates, `codex/gpt-5.6-sol`
+MEDIUM is the standing fallback,
+pre-authorized without a new decision.
+
+The approved default profile for mechanical and documentation engineering is
+`codex/gpt-5.6-luna`; that wording does not make Luna a general implementation
+default or an orchestrator profile. Prior measured-failure exclusions are void:
+only a current graded qualification probe excludes a model. The coding probe for
+`muse-spark-1.2` is [GH-106](https://github.com/pixexid/bb-collab/issues/106);
+the Terra placement probe is
+[GH-105](https://github.com/pixexid/bb-collab/issues/105).
+
+A requested profile is Assignment intent only. Eligibility and review routing
+use the actual harness/provider, model, reasoning, permission and visibility
+recorded by the ExecutionAttempt/provider receipt; remembered defaults, labels
+and plausible output are not executed-profile evidence. Unknown or mismatched
+executed values remain ineligible.
+
+Every new spawn must provide explicit `provider`, `model`, `reasoning`, and
+`visibility: "visible"` flags. A remembered or host-inferred default is not
+evidence of any of those values. This rule selects and records the request; it
+does not turn a requested tuple into proof of execution.
+
 ## Queue and lane state
 
 An open assignment is shown through the existing `lanes` RPC and HTTP path. A
@@ -151,17 +206,16 @@ occupancy. A future successor is first preflighted and then recorded through
 the receipt-gated succession apply; witness evidence and operator word do not
 occupy the seat.
 
-The approved default model for non-visual queue and documentation engineering
-is `codex/gpt-5.6-luna`. On a cheap tier, an omitted reasoning value on a
+The mechanical-subtask cheap-tier behavior remains bounded to the artifact
+scope above: an omitted reasoning value on a
 mechanical subtask (fixtures, sweeps, doc sync, or scaffolds) resolves to LOW
 (`low/full/default/visible`); a parent worker's HIGH or MAX effort must not
 silently escalate it. The hard core may opt into an explicit HIGH or MAX value.
-The spawn brief supplies the cheap-tier classification explicitly; it is not
-inferred from the parent's effort.
+The spawn brief supplies that classification.
 Every spawn brief declares the requested reasoning value, and the existing
 Assignment/ExecutionAttempt receipt comparison records requested versus
 executed reasoning for the conformance audit. An independent cold review is
-routed later to `claude-code/opus`; that review is evidence, not authority.
+evidence, not authority, and must satisfy the model-difference rule above.
 
 ## Dormant supervisor escalation
 
