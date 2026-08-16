@@ -50,13 +50,15 @@ function roleObservation(idleSinceMs: number): { status: "idle"; pendingExternal
   return { status: "idle", pendingExternalWait: false, archived: false, operatorWait: null, operatorWaitKnown: true, idleSinceMs };
 }
 
+const TEST_REGISTERED_WAIT_DEADLINE_AT_MS = 4_000_000_000_000;
+
 function registeredWait(overrides: Partial<RegisteredWait> = {}): RegisteredWait {
   return {
     waitId: "wait-1",
     waiterThreadId: "worker-1",
     sourceThreadId: "source-1",
     sourceEvent: "terminal",
-    deadlineAtMs: Date.now() + 60_000,
+    deadlineAtMs: TEST_REGISTERED_WAIT_DEADLINE_AT_MS,
     ...overrides,
   };
 }
