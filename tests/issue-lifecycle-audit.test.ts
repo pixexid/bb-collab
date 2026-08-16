@@ -1,3 +1,5 @@
+import { spawnSync } from "node:child_process";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { auditGitHubFacts, collectGitHubAudit } from "../scripts/audit-issue-lifecycle.mjs";
 
@@ -19,5 +21,14 @@ describe("scheduled issue lifecycle audit", () => {
 
   it("fails closed when GitHub facts cannot be collected", async () => {
     await expect(collectGitHubAudit({ apiUrl: "https://api.github.test", repository: "acme/repo" })).rejects.toThrow("missing GitHub API identity");
+  });
+
+  it("exits nonzero while retaining an explicit unknown report when the API identity is unavailable", () => {
+    const result = spawnSync(process.execPath, [join(process.cwd(), "scripts/audit-issue-lifecycle.mjs")], {
+      encoding: "utf8",
+      env: { ...process.env, GITHUB_API_URL: "https://api.github.test", GITHUB_REPOSITORY: "", GITHUB_TOKEN: "" },
+    });
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toMatchObject({ issueAcceptanceAudit: { unknown: ["github-api-unavailable"], status: "unknown" } });
   });
 });

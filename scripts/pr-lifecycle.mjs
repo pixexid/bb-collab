@@ -1,6 +1,7 @@
 const dispositionPattern = /^\s*(Closes #[1-9]\d*|Related GH-[1-9]\d*|No issue:\s*\S.*)\s*$/iu;
 const acceptancePattern = /^\s*Acceptance\s*:\s*(complete|incomplete|unknown)\s*$/iu;
 const linkageCandidatePattern = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|related)\b[^\r\n]*(?:#|GH-)\S+/iu;
+const linkageMentionPattern = /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|related)\s+(?:#|GH-)([1-9]\d*)\b/giu;
 
 export function parsePullRequestDisposition({ title = "", body = "" }) {
   const lines = body.split(/\r?\n/u);
@@ -12,20 +13,49 @@ export function parsePullRequestDisposition({ title = "", body = "" }) {
     const match = line.match(acceptancePattern);
     return match ? [match[1].toLowerCase()] : [];
   });
-  const invalidLinkage = lines.filter((line) => linkageCandidatePattern.test(line)
+  const invalidLinkage = `${title}\n${body}`.split(/\r?\n/u).filter((line) => linkageCandidatePattern.test(line)
     && !/^\s*(?:Closes #[1-9]\d*|Related GH-[1-9]\d*)\s*$/iu.test(line));
-  const invalidTitleReference = /\b(?:refs?|references?|fix(?:e[sd])?|resolve[sd]?)\b[^\r\n]*(?:#|GH-)\S+/iu.test(title);
 
-  if (dispositions.length !== 1 || invalidLinkage.length > 0 || invalidTitleReference) {
+  if (dispositions.length !== 1 || invalidLinkage.length > 0) {
     return { ok: false, error: "Every pull request body must contain exactly one unambiguous disposition line: `Closes #NN`, `Related GH-NN`, or `No issue: <rationale>`." };
   }
   if (acceptance.length > 1) return { ok: false, error: "Pull request body must contain at most one `Acceptance: complete|incomplete|unknown` line." };
 
   const disposition = dispositions[0];
   const closes = /^Closes #[1-9]\d*$/iu.test(disposition);
-  const closeMentions = `${title}\n${body}`.match(/\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+(?:#|GH-)[1-9]\d*\b/giu) ?? [];
-  if (closeMentions.length && (!closes || acceptance[0] !== "complete")) {
+  const text = `${title}\n${body}`;
+  const linkageMentions = [...text.matchAll(linkageMentionPattern)].map((match) => {
+    const index = match.index ?? 0;
+    const lineStart = text.lastIndexOf("\n", index) + 1;
+    const lineEnd = text.indexOf("\n", index);
+    return {
+      kind: match[1].toLowerCase(),
+      target: Number(match[2]),
+      line: text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd).trim(),
+    };
+  });
+  const relatedMentions = linkageMentions.filter(({ kind }) => kind === "related");
+  const closeLikeMentions = linkageMentions.filter(({ kind }) => kind !== "related");
+  const target = Number(disposition.match(/[1-9]\d*$/u)?.[0]);
+  if (closes && (closeLikeMentions.length !== 1
+    || closeLikeMentions.some(({ kind, target: mentionedTarget, line }) => kind !== "closes"
+      || mentionedTarget !== target
+      || line !== disposition.trim())
+    || relatedMentions.length > 0)) {
+    return { ok: false, error: "Closes, fix, resolve, and reference linkage must contain exactly one matching target in the disposition line." };
+  }
+  if (closes && acceptance[0] !== "complete") {
     return { ok: false, error: "Close, fix, and resolve keywords require exactly `Closes #NN` plus `Acceptance: complete`; otherwise use `Related GH-NN`." };
+  }
+  if (!closes && closeLikeMentions.length > 0) {
+    return { ok: false, error: "Close, fix, and resolve keywords require exactly `Closes #NN` plus `Acceptance: complete`; otherwise use `Related GH-NN`." };
+  }
+  if (!closes && /^Related GH-/iu.test(disposition)
+    && (relatedMentions.length === 0 || relatedMentions.some(({ target: mentionedTarget }) => mentionedTarget !== target))) {
+    return { ok: false, error: "Every Related GH-NN linkage must name the single disposition target." };
+  }
+  if (!closes && /^No issue:/iu.test(disposition) && relatedMentions.length > 0) {
+    return { ok: false, error: "No-issue dispositions cannot include an issue linkage." };
   }
   if (acceptance[0] === "complete" && !closes) {
     return { ok: false, error: "`Acceptance: complete` requires the single disposition line to be `Closes #NN`." };
@@ -57,7 +87,9 @@ export async function validateIssueTarget(parsed, readIssue) {
   }
 }
 
-export const hasLifecycleMarker = (comments, marker) => comments.some((entry) => typeof entry.body === "string" && entry.body.includes(marker));
+const trustedLifecycleComment = (entry) => entry?.user?.login === "github-actions[bot]" && entry.user.type === "Bot";
+export const hasLifecycleMarker = (comments, marker) => comments.some((entry) => trustedLifecycleComment(entry)
+  && typeof entry.body === "string" && entry.body.includes(marker));
 export const lifecycleMarker = (pullRequestNumber, target, kind) => `<!-- bb-collab:issue-lifecycle:pr-${pullRequestNumber}:${target}:${kind} -->`;
 
 export function planMergedLifecycle({ pullRequestNumber, parsed, issueState, pullRequestComments = [], issueComments = [] }) {

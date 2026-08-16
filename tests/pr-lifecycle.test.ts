@@ -6,7 +6,7 @@ describe("pull-request lifecycle linkage", () => {
   it("accepts one related disposition and a completed close disposition", () => {
     expect(parsePullRequestDisposition({ title: "Related GH-80", body: "Related GH-80\n\nReview tier: A" }).ok).toBe(true);
     expect(parsePullRequestDisposition({ title: "Add weekly metrics for GH-80", body: "Related GH-80" }).ok).toBe(true);
-    expect(parsePullRequestDisposition({ title: "Closes #80", body: "Closes #80\nAcceptance: complete" }).ok).toBe(true);
+    expect(parsePullRequestDisposition({ title: "Complete acceptance", body: "Closes #80\nAcceptance: complete" }).ok).toBe(true);
     expect(parsePullRequestDisposition({ body: "No issue: documentation-only typo with no tracked issue" }).ok).toBe(true);
   });
 
@@ -20,7 +20,11 @@ describe("pull-request lifecycle linkage", () => {
       "Refs #80",
       "Related GH-0",
       "No issue: GH-80 is not tracked",
+      "Closes #80\nRefs #80\nAcceptance: complete",
+      "Closes #80\nFixes #81\nAcceptance: complete",
     ]) expect(parsePullRequestDisposition({ body }).ok, body).toBe(false);
+    expect(parsePullRequestDisposition({ title: "Closes #81", body: "Closes #80\nAcceptance: complete" }).ok).toBe(false);
+    expect(parsePullRequestDisposition({ title: "Related GH-81", body: "Related GH-80" }).ok).toBe(false);
   });
 
   it("fails closed for invalid and uncertain GitHub targets", async () => {
@@ -35,7 +39,8 @@ describe("pull-request lifecycle linkage", () => {
   it("uses one deterministic marker to make merge handling duplicate-safe", () => {
     const marker = lifecycleMarker(87, "issue-80", "related");
     expect(marker).toBe("<!-- bb-collab:issue-lifecycle:pr-87:issue-80:related -->");
-    expect(hasLifecycleMarker([{ body: `status\n${marker}` }], marker)).toBe(true);
+    expect(hasLifecycleMarker([{ body: `status\n${marker}`, user: { login: "github-actions[bot]", type: "Bot" } }], marker)).toBe(true);
+    expect(hasLifecycleMarker([{ body: `status\n${marker}`, user: { login: "attacker", type: "User" } }], marker)).toBe(false);
     expect(hasLifecycleMarker([{ body: "different status" }], marker)).toBe(false);
   });
 
@@ -43,7 +48,8 @@ describe("pull-request lifecycle linkage", () => {
     const related = parsePullRequestDisposition({ body: "Related GH-80" });
     const planned = planMergedLifecycle({ pullRequestNumber: 91, parsed: related, issueState: "open" });
     expect(planned.actions).toMatchObject([{ kind: "comment", target: 80 }]);
-    expect(planMergedLifecycle({ pullRequestNumber: 91, parsed: related, issueState: "open", issueComments: [{ body: planned.marker }] }).actions).toEqual([]);
+    expect(planMergedLifecycle({ pullRequestNumber: 91, parsed: related, issueState: "open", issueComments: [{ body: planned.marker, user: { login: "github-actions[bot]", type: "Bot" } }] }).actions).toEqual([]);
+    expect(planMergedLifecycle({ pullRequestNumber: 91, parsed: related, issueState: "open", issueComments: [{ body: planned.marker, user: { login: "attacker", type: "User" } }] }).actions).toMatchObject([{ kind: "comment", target: 80 }]);
 
     const closes = parsePullRequestDisposition({ body: "Closes #80\nAcceptance: complete" });
     expect(planMergedLifecycle({ pullRequestNumber: 92, parsed: closes, issueState: "open" }).actions.map(({ kind }) => kind)).toEqual(["close", "comment"]);
