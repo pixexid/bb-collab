@@ -116,6 +116,42 @@ evidence. The cap itself is recorded by the existing adopted Decision plus
 operator-authorized `config_revision`; it does not create a second authority
 store.
 
+## Dormant supervisor escalation
+
+The supervisor is above the director but is an escalation-only, dormant seat.
+It is held by the operator's app-side Fable session outside BB. It has no BB
+thread, lane, standing traffic, routine reports, FYIs, or routine decisions;
+the director remains the top standing seat for normal operation. The
+supervisor is not a BB logical role, `RoleGeneration`, actor, or consumer.
+
+The wake classes are exhaustive:
+
+- succession knots or split-authority states;
+- cross-role deadlocks the director cannot break;
+- contradictions between the authority record and live state; or
+- decisions where the director is a conflicted party.
+
+Everything else remains with the director. For one of these classes, the
+director records a decision-class escalation in the canonical store and emits
+one operator FYI through the existing alert seam. The operator deliberately
+wakes the supervisor. There is no automated BB-to-supervisor route, consumer,
+lane, or standing traffic; the operator is the relay that preserves the
+supervisor's dormant-by-default boundary.
+
+When woken, the supervisor decides on the operator's behalf, except for
+credentials, real spend, legal commitments, product direction, and
+destructive-irreversible actions. It issues directives by tell, verifies
+compliance, and then goes dormant. Its rulings bind the director. The Path A
+succession ruling on 2026-08-15 is the precedent instance for this escalation
+boundary.
+
+The director records a tell-received supervisor ruling in the canonical store
+as a Decision attributed `supervisor (operator-delegated)`. The supervisor
+writes nothing directly in bb-collab. This documentation preserves the
+existing director/orchestrator routing and authority seams and adds no route-
+time canonical routing, v14 exemption, receipt, schema, migration, or runtime
+path.
+
 The v14 `director-seat` amendment remains the existing project-orchestrator
 role with primary `pi/kimi-coding/k3/high`, Opus-medium standby, managed-
 worktree-only holder facts, and zero writing-lane capacity. Epoch-2 service on
