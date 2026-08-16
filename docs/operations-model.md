@@ -18,8 +18,9 @@ reviewer, orchestrator or routing fallback. The supervisor-ratified matrix is:
 | Role or lane | Harness/provider | Model | Reasoning | Boundary |
 | --- | --- | --- | --- | --- |
 | Director | `pi` | `kimi-coding/k3` | HIGH | K3 is director-only; it is never a review fallback. |
-| Orchestrator primary | Codex harness / `codex` | `gpt-5.6-sol` | MEDIUM | Never Luna or below. |
-| Orchestrator alternate | Terra harness/provider or Claude harness / `claude-code` | Terra or `claude-opus-5[1m]` | MEDIUM | Both are alternates; never Luna or below. |
+| Orchestrator primary | Claude harness / `claude-code` | `claude-opus-5` | MEDIUM | Never Luna or below. |
+| Orchestrator alternate | Codex harness / `codex` | `gpt-5.6-sol` | MEDIUM | Standing fallback when the Opus account window saturates. |
+| Orchestrator alternate | Terra harness/provider | `gpt-5.6-terra` | MEDIUM | Alternate; never Luna or below. |
 | Merge-bound implementer | Codex harness / `codex` | `gpt-5.6-luna` | MEDIUM or HIGH | Luna is admitted at MEDIUM or above; LOW is prohibited. |
 | Merge-bound implementer | Configured harness/provider | `glm-5.3` | MEDIUM or HIGH | Admitted now at MEDIUM or above. |
 | Merge-bound implementer | Terra harness/provider | Terra | MEDIUM or HIGH | Admitted at MEDIUM or above. Hard core uses Sol HIGH or Opus-5 HIGH. |
@@ -28,6 +29,13 @@ reviewer, orchestrator or routing fallback. The supervisor-ratified matrix is:
 | Tier-B reviewer | Codex harness / `codex` | `gpt-5.6-luna` | MEDIUM | Never the author's model. |
 | Mechanical subagent | Configured harness/provider | `gpt-5.6-luna` | LOW | Fixtures, sweeps, doc-sync and scaffolds only; legality follows artifact scope, not spawn label. |
 | Mechanical probe | Configured harness/provider | `deepseek-v4-flash` or `glm-5-turbo` | LOW | Probe-only; current graded evidence controls admission. |
+
+The amended orchestrator profile applies only at the next natural
+succession/spawn. The pending epoch-2 orchestrator succession is that natural
+spawn; do not hot-swap a healthy live orchestrator. `claude-opus-5` shares the
+operator Anthropic account window with app-side supervisor wakes and any Opus
+cold reviews. If that window saturates, Sol MEDIUM is the standing fallback,
+pre-authorized without a new decision.
 
 The approved default profile for mechanical and documentation engineering is
 `codex/gpt-5.6-luna`; that wording does not make Luna a general implementation
