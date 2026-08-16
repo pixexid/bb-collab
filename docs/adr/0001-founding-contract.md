@@ -299,7 +299,9 @@ facts refuse before canonical state changes. A ready native `managed-worktree`
 may have a derived environment path that differs from the canonical project
 source path: resolution still requires the exact project, host and one unique
 project source on that host, and records both paths separately. Unmanaged,
-non-ready, foreign or ambiguous environments refuse. Fixture readers remain
+non-ready, foreign or ambiguous environments refuse, except the exact v17
+director generation-1 holder/environment/source triple during its bounded
+qualification recording or first-generation creation. Fixture readers remain
 test-only.
 
 An Assignment binds:
