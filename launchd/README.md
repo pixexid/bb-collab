@@ -43,7 +43,7 @@ watcher-of-watchers.
    ```
    mkdir -p ~/.bb/bb-collab
    plutil -lint launchd/com.bbcollab.wait-validator.plist
-   launchctl bootstrap gui/$(id -u) launchd/com.bbcollab.wait-validator.plist
+   launchctl bootstrap "gui/$(id -u)" launchd/com.bbcollab.wait-validator.plist
    ```
 3. Verify the drills from the spec:
    - `kill -9` the validator → launchd restarts it; no wait is lost, no wake
