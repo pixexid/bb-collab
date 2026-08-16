@@ -56,8 +56,9 @@ execution-attempt binding. A stale, foreign, resolved, malformed, or unknown
 interaction remains fail-closed and cannot steer or authorize work.
 
 Pending external waits retain their existing behavior. Archived/deleted
-threads, supervisor work, review approval mode, probe tracking mode, terminal
-attempts, continuation limits, and agent-only continuation sends are unchanged.
+threads, supervisor-thread observer work, review approval mode, probe tracking
+mode, terminal attempts, continuation limits, and agent-only continuation sends
+are unchanged.
 The watcher never writes canonical SQLite tables and never creates a queue,
 bus, or mutable Markdown task database. It reads the canonical config head and
 Assignment/ExecutionAttempt rows only; raw BB task/thread counts cannot bypass
@@ -157,6 +158,47 @@ Every spawn brief declares the requested reasoning value, and the existing
 Assignment/ExecutionAttempt receipt comparison records requested versus
 executed reasoning for the conformance audit. An independent cold review is
 routed later to `claude-code/opus`; that review is evidence, not authority.
+
+## Dormant supervisor escalation
+
+The operator-held supervisor seat described here is distinct from the existing
+BB `SUPERVISOR_THREAD_ID` observer/dispatcher thread and its watcher behavior;
+that BB machinery is unchanged. The supervisor seat is above the director but
+is an escalation-only, dormant seat.
+It is held by the operator's app-side Fable session outside BB. It has no BB
+thread, lane, standing traffic, routine reports, FYIs, or routine decisions;
+the director remains the top standing seat for normal operation. The
+supervisor is not a BB logical role, `RoleGeneration`, actor, or consumer.
+
+The wake classes are exhaustive:
+
+- succession knots or split-authority states;
+- cross-role deadlocks the director cannot break;
+- contradictions between the authority record and live state; or
+- decisions where the director is a conflicted party.
+
+Everything else remains with the director. For one of these classes, the
+director records a decision-class escalation in the canonical store and emits
+one operator FYI through the existing alert seam. The operator deliberately
+wakes the supervisor. There is no automated BB-to-supervisor route, consumer,
+lane, or standing traffic; the operator is the relay that preserves the
+supervisor's dormant-by-default boundary.
+
+When woken, the supervisor decides on the operator's behalf, except for
+credentials, real spend, legal commitments, product direction, and
+destructive-irreversible actions. It issues directives by tell, verifies
+compliance, and then goes dormant. Its rulings bind the director. The Path A
+succession ruling on 2026-08-15 is the precedent instance for this escalation
+boundary.
+
+The director records a tell-received supervisor ruling in the canonical store
+as a Decision attributed `supervisor (operator-delegated)`. The supervisor
+writes nothing directly in bb-collab. This documentation preserves the
+existing director/orchestrator routing and authority seams and adds no route-
+time canonical routing, v14 exemption, receipt, schema, migration, or runtime
+path. `CONTRACT_VERSION`, `contractDigest`, cached-consumer versions, and
+rollout receipts remain unchanged; the cached-consumer bump test does not
+apply.
 
 ## Issue lifecycle linkage and #80 audit
 
