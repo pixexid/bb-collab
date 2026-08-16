@@ -33,10 +33,11 @@ receipt-gated RoleGeneration succession path described in
 Contract v17 supersedes this historical v15 director-seat note. `director-seat`
 is the separate `director` role with the same primary `pi/kimi-coding/k3`,
 Opus-medium standby, and zero writing-lane capacity. The only unmanaged
-exception is director generation-1 qualification recording for holder
-`thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source `src_x8veidmpik`;
-it cannot admit writing, foreign or stale contexts, or later generations. Every
-later director generation requires a managed isolated worktree.
+exception is director generation-1 qualification recording and creation for
+holder `thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source
+`src_x8veidmpik`, receipt-gated with no predecessor and no existing director
+head; it cannot admit writing, foreign or stale contexts, or later generations.
+Every later director generation requires a managed isolated worktree.
 
 The seat-succession recording gate is explicit: preflight the proposed holder
 against the current requirement, executed profile, exact managed environment,

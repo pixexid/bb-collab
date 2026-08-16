@@ -184,7 +184,7 @@ itself. This is an operations-model scope extension only; canonical activation
 still awaits the one exact v8 console approval bound to the project,
 operation, candidate head, idempotency key, and request digest.
 
-Authority-maintenance re-adoption has no human form. Contract v15 leaves the
+Authority-maintenance re-adoption has no human form. Historical contract v15 left the
 exact ten-class registry unchanged; the already-bounded v11 nine-class state
 remains readable but refuses `work_item_transition`. The registry check is exact
 and order-sensitive: malformed, reordered, subset, extra, v9, and arbitrary

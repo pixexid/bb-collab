@@ -385,38 +385,39 @@ This is a historical v15/schema v11 report, not current policy. Contract v17
 and ADR 0002 supersede its director placement, exemption, standby, and
 cached-consumer statements. At the time, its bounded role-capacity seam admitted
 the three project requirements used by the first-adopter request:
-project-orchestrator is project-scoped, while worker and independent-reviewer
-bind to the exact repository target required by canonical WorkItem writes. The
-change preserves the existing qualification, generation, Assignment and
-receipt/approver seams; contract v12 adds only `work_item_transition`, while
-contract v13 adds the named standby profile for new project-orchestrator
+project-orchestrator was project-scoped, while worker and independent-reviewer
+bound to the exact repository target required by canonical WorkItem writes. The
+change preserved the existing qualification, generation, Assignment and
+receipt/approver seams; historical contract v12 added only `work_item_transition`, while
+historical contract v13 added the named standby profile for new project-orchestrator
 generations and the explicit per-orchestrator `writingLaneCeiling` config dial,
 defaulting to 3 for bb-collab, with reviews/probes outside the cap. Canonical
 Assignment admission and lane awareness read the same config head; no capacity
-router, second queue, raw task count, or dispatch bypass is introduced. The cap
-is recorded through the existing adopted Decision and operator-authorized
+router, second queue, raw task count, or dispatch bypass was introduced. The cap
+was recorded through the existing adopted Decision and operator-authorized
 `config_revision` seam. The triggering #31 live evidence is the merged-v10
 deployed resolver's two-role `ROLE_IDS` set and `roleRequirements.max(2)`, which
-cannot represent the ratified three-role request; this amendment records that concrete
+could not represent the ratified three-role request; this amendment recorded that concrete
 representation gap without claiming a live config or first-adopter write.
 
-Contract v14 adds the prepared `director-seat` role-requirement amendment:
+Historical contract v14 added the prepared `director-seat` role-requirement amendment:
 primary `pi/kimi-coding/k3/high`, Opus-medium standby, managed-worktree-only
 holder facts, and zero writing-lane capacity. Epoch-2 service on the unmanaged
 canonical environment is grandfathered evidence, not a generation-3 holder;
-recording remains receipt-gated and no live mutation is claimed. Contract v15
-adds only the exact current-generation qualification exemption for generation 2,
+recording remained receipt-gated and no live mutation is claimed. Historical contract v15
+added only the exact current-generation qualification exemption for generation 2,
 holder `thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source
 `src_x8veidmpik`; future generations require managed isolated worktrees and the
 exemption cannot admit writing or succession.
 
 The historical contract-v9 eight-class registry was accepted only during the
-one-release v9-to-v10 re-adoption. Contract v11 required the exact nine-class
-row; contract v12 added only `work_item_transition`. Contract v13 adds the
+one-release v9-to-v10 re-adoption. Historical contract v11 required the exact nine-class
+row; historical contract v12 added only `work_item_transition`. Historical contract v13 added the
 bounded writing-lane dial while leaving the exact current ten-class allowlist
 unchanged. The already-bounded v11 row remains readable only for its nine
 historical classes. Malformed, reordered, subset, extra, v9, and arbitrary
 other sets remain invalid. This is a contract/cache bump:
-contract v15 consumers reread, stale v14 consumers refuse, and the four-consumer
-rollout receipt records expected=4, attempted=4, verified=4 for the current
-runtime; schema, migrations, and stored authority shape remain unchanged.
+historical contract v15 consumers reread, stale v14 consumers refused, and the
+four-consumer rollout receipt recorded expected=4, attempted=4, verified=4 for
+that historical runtime; schema, migrations, and stored authority shape remained
+unchanged.

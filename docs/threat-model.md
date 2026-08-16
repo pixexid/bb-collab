@@ -26,7 +26,7 @@ requirement and has zero writing-lane capacity. Each role requirement carries
 its executed-profile qualification; this adds no assignment or dispatch
 authority.
 
-The v16/schema v11 contract retains the v10 operator gate, which has a host/UI
+The v17/schema v11 contract retains the v10 operator gate, which has a host/UI
 confirmation boundary only for authorizing or revoking the approver. An adopted
 `operator_only` Decision
 registers `approverId=orchestrator:bb-collab` for the exact project and adopted
@@ -57,25 +57,25 @@ different receipt for an already-committed idempotency key, or any binding
 mismatch refuses before a write. It has no local TTL and retires only on the
 host-issued `get-bb/bb#1541` condition. The historical contract-v9 eight-class
 registry was accepted only during the one-release v9-to-v10 re-adoption.
-Contract v11 required the exact nine-class set; contract v12 adds only
-`work_item_transition`. Contract v14 adds the bounded `director-seat`
+Historical contract v11 required the exact nine-class set; historical contract v12 added only
+`work_item_transition`. Historical contract v14 added the bounded `director-seat`
 requirement with the exact primary `pi/kimi-coding/k3/high` and Opus-medium
 standby profiles, zero writing-lane capacity, and the existing
-managed-worktree/source/environment checks. Contract v15 adds only the exact
+managed-worktree/source/environment checks. Historical contract v15 added only the exact
 current-generation qualification exemption for generation 2, holder
 `thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source `src_x8veidmpik`.
-The current head and holder execution attempt remain required; foreign, stale,
-wrong-profile, future-generation, succession, and writing requests refuse
-before any write. The grandfathered unmanaged epoch-2 service cannot establish
+The current head and holder execution attempt remained required; foreign, stale,
+wrong-profile, future-generation, succession, and writing requests refused
+before any write. The grandfathered unmanaged epoch-2 service could not establish
 generation-3 occupancy without a later receipt-gated succession. Contract v17
 supersedes those historical v13-v15 rules: only director generation 1 uses the
-exact holder/environment/source exemption, only director generations carry the
+exact holder/environment/source qualification-and-creation exemption, only director generations carry the
 named different-provider standby, and project-orchestrator generations omit it.
-Contract v16 additionally rejects a native thread designated as a witness by
-its title or title fallback before qualification or succession can materialize a
-holder attempt; it preserves the existing role/head, environment/source, and
-executed-profile checks. Stale v16
-consumers refuse, current v17 consumers reread, and schema/migrations remain unchanged by this role-policy
+Historical contract v16 additionally rejected a native thread designated as a witness by
+its title or title fallback before qualification or succession could materialize a
+holder attempt; it preserved the existing role/head, environment/source, and
+executed-profile checks. Stale v16 consumers refuse, current v17 consumers reread,
+and schema/migrations remain unchanged by this role-policy
 amendment. The dial is a canonical config revision recorded through the adopted
 Decision and operator-authorized `config_revision` seam; review and probe
 Assignments are excluded from the writing count.

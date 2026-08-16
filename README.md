@@ -50,7 +50,7 @@ facts through the existing `RoleFactReader` seam before issuing
 foreign facts refuse before write. A ready native managed worktree may have a
 derived path distinct from its canonical source; exact project/host/source
 resolution retains both paths and still refuses unmanaged or ephemeral contexts,
-except for the exact director generation-1 qualification exemption below.
+except for the exact director generation-1 qualification-and-creation exemption below.
 `github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
 reserve/finalize operations refuse before the adapter under this one-request
 seam. The derived actor path is limited to bootstrap, `config_revision` for
@@ -62,7 +62,7 @@ and review Decisions remain role-bound. The plugin has not been installed, reloa
 project authority.
 
 Historical contract v11 was a contract-only role-capacity amendment: `roleRequirements`
-admits at most three logical roles. `project-orchestrator` is project-scoped;
+admitted at most three logical roles. `project-orchestrator` was project-scoped;
 `worker` and `independent-reviewer` require the exact repository target used by
 canonical WorkItem writes. All three retain executed-profile qualification and
 the v10 receipt/approver bindings are unchanged. Contract v12 is a contract-only
@@ -76,8 +76,8 @@ the writing cap, and the queue exposes up to the configured number of startable
 write lanes.
 
 Historical contract v13 added the schema-backed named standby profile for new
-project-orchestrator generations. The standby provider must differ from the
-executed holder and the standby has no authority or traffic; existing receipt,
+project-orchestrator generations. The standby provider had to differ from the
+executed holder and the standby had no authority or traffic; existing receipt,
 qualification, and succession guards remain unchanged.
 
 Historical contract v14 added the bounded `director-seat` role-requirement amendment on
@@ -106,11 +106,11 @@ It is valid only while that exact role head and holder execution evidence remain
 current, only for qualification recording, and never for writing admission or
 succession. Every future generation requires a managed isolated worktree.
 
-Contract v16 rejects a native thread whose title or title fallback marks it as
+Historical contract v16 rejected a native thread whose title or title fallback marked it as
 a witness before it can supply role qualification or succession holder facts.
-This bounded eligibility gate preserves the existing role, generation, native
-environment/source, and executed-profile checks; schema and migrations remain
-unchanged, and cached consumers reread v16 or refuse v15.
+This bounded eligibility gate preserved the existing role, generation, native
+environment/source, and executed-profile checks; schema and migrations remained
+unchanged, and cached consumers reread v16 or refused v15.
 
 Contract v17 supersedes the v14/v15 director placement and exemption:
 `director-seat` is the only project-scoped `director` requirement, while
@@ -119,8 +119,9 @@ independent-reviewer remain repository-target scoped. The director's exact
 Pi/Kimi primary profile, Opus-medium standby, and zero writing-lane capacity
 are unchanged. Only director generation 1 for holder `thr_gsb7m77ciz`,
 environment `env_3znzsxb7ce`, and source `src_x8veidmpik` may use the bounded
-unmanaged qualification exemption; later director generations require the
-existing managed isolated worktree checks. All four cached consumers must
+unmanaged qualification-and-creation exemption, receipt-gated with no
+predecessor and no existing director head; later director generations require
+the existing managed isolated worktree checks. All four cached consumers must
 reread v17 or refuse v16. Rollout success is reported only from a persisted,
 identity-validated receipt with expected=attempted=verified=4; absent or
 invalid evidence is unknown and fail-closed.

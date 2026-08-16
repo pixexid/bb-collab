@@ -17,10 +17,11 @@ first-generation environment exemption. The primary executed profile is exactly
 full/default/visible fields). The seat has zero writing-lane capacity and
 retains the existing exact project/source/host and event-correlation checks.
 Only director generation 1 with holder `thr_gsb7m77ciz`, environment
-`env_3znzsxb7ce`, and source `src_x8veidmpik` may record the current
-qualification from that approved unmanaged canonical environment. Every future
-generation requires a ready managed isolated worktree; the exemption is not a
-general unmanaged path.
+`env_3znzsxb7ce`, and source `src_x8veidmpik` may record the fresh
+qualification and create director generation 1, receipt-gated with no
+predecessor and no existing director head, from that approved unmanaged
+canonical environment. Every later director generation requires a ready managed
+isolated worktree; the exemption is not a general unmanaged path.
 
 The following is a prepared operator-only Decision payload, not a canonical
 Decision row or a succession apply:

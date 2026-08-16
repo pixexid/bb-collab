@@ -86,7 +86,7 @@ the two existing role mutation classes. Attestation has no requestInput
 interaction and atomically creates the same exact-bound receipt plus verified
 plugin actor; operator revocation/change marks the registry unusable. The
 historical contract-v9 eight-class registry was accepted only during the
-one-release v9-to-v10 re-adoption. Contract v15 leaves the exact current
+one-release v9-to-v10 re-adoption. Historical contract v15 left the exact
 ten-class allowlist unchanged; the already-bounded v11 nine-class repair
 remains readable for authority maintenance, but does not authorize
 `work_item_transition`. Malformed, reordered, subset, extra, v9, or other
@@ -98,7 +98,8 @@ receipt. `director-seat` is the only `director` requirement, requires the exact
 `pi/kimi-coding/k3/high` primary profile and exact Opus-medium standby, and has
 zero writing-lane capacity. Only director generation 1 / holder
 `thr_gsb7m77ciz` / environment `env_3znzsxb7ce` / source `src_x8veidmpik` may
-record its qualification from the approved unmanaged canonical environment.
+record its qualification and create director generation 1 from the approved
+unmanaged canonical environment.
 Every later director generation requires the existing managed, isolated
 worktree and exact source/environment checks; the exemption is not general,
 cannot admit writing, and future succession remains receipt-gated.
