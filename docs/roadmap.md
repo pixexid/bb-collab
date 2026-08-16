@@ -18,8 +18,8 @@ require PR tier declarations, and keep Tier-B/C review from serializing the
 queue. Issue #78 is the next bounded slice: gate-epics are planning-only, each
 child is mergeable and dependency/readiness-declared, and no child estimate may
 exceed 8 hours. #31 remains the historical counterexample (52 hours across
-four PRs); it is not reopened or mutated. #79 and #80 remain separate
-follow-up slices and are not included.
+four PRs); it is not reopened or mutated. #79 remains a separate follow-up
+slice; the #80 lifecycle slice is defined below.
 
 Issue #78 exit condition: worker/orchestrator briefs reject an unsplit slice
 above the 8-hour ceiling; an epic has at least two mergeable child slices with

@@ -5,6 +5,9 @@ const emptyAudit = () => ({ openCompleted: [], openIncomplete: [], unknown: [], 
 
 export function auditGitHubFacts({ issues, mergedPullRequests }) {
   const audit = emptyAudit();
+  if (mergedPullRequests.some((pullRequest) => pullRequest.merged_at !== null && typeof pullRequest.merged_at !== "string")) {
+    audit.unknown.push("github-merged-pr-state-unknown");
+  }
   for (const issue of issues) {
     if (issue.state === "closed") continue;
     if (issue.state !== "open" || typeof issue.number !== "number") {
@@ -12,6 +15,7 @@ export function auditGitHubFacts({ issues, mergedPullRequests }) {
       continue;
     }
     const related = mergedPullRequests.filter((pullRequest) => {
+      if (typeof pullRequest.merged_at !== "string") return false;
       const parsed = parsePullRequestDisposition({ title: pullRequest.title ?? "", body: pullRequest.body ?? "" });
       return parsed.ok && parsed.issueNumber === issue.number;
     });

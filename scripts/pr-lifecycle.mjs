@@ -3,8 +3,32 @@ const acceptancePattern = /^\s*Acceptance\s*:\s*(complete|incomplete|unknown)\s*
 const linkageCandidatePattern = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|related)\b[^\r\n]*(?:#|GH-)\S+/iu;
 const linkageMentionPattern = /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|related)\s+(?:#|GH-)([1-9]\d*)\b/giu;
 
+function visibleMarkdown(text) {
+  const withoutComments = text.replace(/<!--[\s\S]*?(?:-->|$)/gu, "");
+  let inFence = false;
+  let fenceCharacter = "";
+  let fenceLength = 0;
+  return withoutComments.split(/\r?\n/u).filter((line) => {
+    const opening = line.match(/^\s*(`{3,}|~{3,})/u);
+    if (!inFence && opening) {
+      inFence = true;
+      fenceCharacter = opening[1][0];
+      fenceLength = opening[1].length;
+      return false;
+    }
+    if (inFence) {
+      const closing = new RegExp(`^\\s*${fenceCharacter}{${fenceLength},}\\s*$`, "u").test(line);
+      if (closing) inFence = false;
+      return false;
+    }
+    return true;
+  }).join("\n");
+}
+
 export function parsePullRequestDisposition({ title = "", body = "" }) {
-  const lines = body.split(/\r?\n/u);
+  const visibleTitle = visibleMarkdown(title);
+  const visibleBody = visibleMarkdown(body);
+  const lines = visibleBody.split(/\r?\n/u);
   const dispositions = lines.flatMap((line) => {
     const match = line.match(dispositionPattern);
     return match ? [match[1]] : [];
@@ -13,7 +37,7 @@ export function parsePullRequestDisposition({ title = "", body = "" }) {
     const match = line.match(acceptancePattern);
     return match ? [match[1].toLowerCase()] : [];
   });
-  const invalidLinkage = `${title}\n${body}`.split(/\r?\n/u).filter((line) => linkageCandidatePattern.test(line)
+  const invalidLinkage = `${visibleTitle}\n${visibleBody}`.split(/\r?\n/u).filter((line) => linkageCandidatePattern.test(line)
     && !/^\s*(?:Closes #[1-9]\d*|Related GH-[1-9]\d*)\s*$/iu.test(line));
 
   if (dispositions.length !== 1 || invalidLinkage.length > 0) {
@@ -23,7 +47,7 @@ export function parsePullRequestDisposition({ title = "", body = "" }) {
 
   const disposition = dispositions[0];
   const closes = /^Closes #[1-9]\d*$/iu.test(disposition);
-  const text = `${title}\n${body}`;
+  const text = `${visibleTitle}\n${visibleBody}`;
   const linkageMentions = [...text.matchAll(linkageMentionPattern)].map((match) => {
     const index = match.index ?? 0;
     const lineStart = text.lastIndexOf("\n", index) + 1;
@@ -101,6 +125,7 @@ export function planMergedLifecycle({ pullRequestNumber, parsed, issueState, pul
     return { marker, actions: [{ kind: "comment", target: pullRequestNumber, body: `${marker}\nMerged PR #${pullRequestNumber}: no tracked issue applies. Rationale: ${parsed.disposition.slice("No issue:".length).trim()}` }] };
   }
   if (parsed.kind === "related" && hasLifecycleMarker(issueComments, marker)) return { marker, actions: [] };
+  if (parsed.kind === "related" && issueState !== "open") throw new Error("Related disposition requires an open issue; refusing contradictory GitHub state");
   if (parsed.kind === "closes" && parsed.acceptance !== "complete") throw new Error("Closes disposition lacks Acceptance: complete; refusing auto-close");
   const actions = [];
   if (parsed.kind === "closes" && issueState === "open") actions.push({ kind: "close", target: parsed.issueNumber });

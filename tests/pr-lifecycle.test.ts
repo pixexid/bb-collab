@@ -22,6 +22,8 @@ describe("pull-request lifecycle linkage", () => {
       "No issue: GH-80 is not tracked",
       "Closes #80\nRefs #80\nAcceptance: complete",
       "Closes #80\nFixes #81\nAcceptance: complete",
+      "<!--\nCloses #80\nAcceptance: complete\n-->",
+      "```\nCloses #80\nAcceptance: complete\n```",
     ]) expect(parsePullRequestDisposition({ body }).ok, body).toBe(false);
     expect(parsePullRequestDisposition({ title: "Closes #81", body: "Closes #80\nAcceptance: complete" }).ok).toBe(false);
     expect(parsePullRequestDisposition({ title: "Related GH-81", body: "Related GH-80" }).ok).toBe(false);
@@ -50,6 +52,7 @@ describe("pull-request lifecycle linkage", () => {
     expect(planned.actions).toMatchObject([{ kind: "comment", target: 80 }]);
     expect(planMergedLifecycle({ pullRequestNumber: 91, parsed: related, issueState: "open", issueComments: [{ body: planned.marker, user: { login: "github-actions[bot]", type: "Bot" } }] }).actions).toEqual([]);
     expect(planMergedLifecycle({ pullRequestNumber: 91, parsed: related, issueState: "open", issueComments: [{ body: planned.marker, user: { login: "attacker", type: "User" } }] }).actions).toMatchObject([{ kind: "comment", target: 80 }]);
+    expect(() => planMergedLifecycle({ pullRequestNumber: 91, parsed: related, issueState: "closed" })).toThrow("requires an open issue");
 
     const closes = parsePullRequestDisposition({ body: "Closes #80\nAcceptance: complete" });
     expect(planMergedLifecycle({ pullRequestNumber: 92, parsed: closes, issueState: "open" }).actions.map(({ kind }) => kind)).toEqual(["close", "comment"]);

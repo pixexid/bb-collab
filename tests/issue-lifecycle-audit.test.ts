@@ -18,6 +18,10 @@ describe("scheduled issue lifecycle audit", () => {
         { number: 101, title: "incomplete", body: "Related GH-81", merged_at: "2026-08-15T00:00:00Z" },
       ],
     })).toEqual({ openCompleted: ["80"], openIncomplete: ["81"], unknown: ["82"], status: "fail" });
+    expect(auditGitHubFacts({
+      issues: [{ number: 80, state: "open", body: "acceptance" }],
+      mergedPullRequests: [{ title: "malformed", body: "Closes #80\nAcceptance: complete" }],
+    })).toEqual({ openCompleted: [], openIncomplete: [], unknown: ["github-merged-pr-state-unknown", "80"], status: "unknown" });
   });
 
   it("fails closed when GitHub facts cannot be collected", async () => {
