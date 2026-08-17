@@ -15950,6 +15950,38 @@ function authorizedApproverId(optionsJson) {
   }
   return AUTHORIZED_APPROVER_ID;
 }
+function authorizedApproverMutationClasses(allowedMutationClassesJson) {
+  let allowed;
+  try {
+    allowed = JSON.parse(allowedMutationClassesJson);
+  } catch {
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are malformed");
+  }
+  if (isExactAuthorizedApproverMutationClassSet(allowed, DERIVED_ACTOR_MUTATION_CLASSES)) {
+    return DERIVED_ACTOR_MUTATION_CLASSES;
+  }
+  if (isExactAuthorizedApproverMutationClassSet(allowed, PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES)) {
+    return PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES;
+  }
+  throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current or bump-surviving historical set");
+}
+function consoleAnchoredAuthorizedApproverMutationClasses(db, projectId, approverId) {
+  const anchor = asRow(db.prepare(
+    `SELECT registry.allowed_mutation_classes_json
+     FROM authorized_approvers registry
+     JOIN state_events event
+       ON event.project_id = registry.project_id
+      AND event.aggregate_id = registry.authorizing_decision_id
+      AND event.event_type = 'decision_disposition_appended'
+      AND json_extract(event.event_json, '$.dispositionSequence') = registry.authorizing_disposition_sequence
+     JOIN operator_receipts receipt
+       ON receipt.project_id = event.project_id AND receipt.receipt_id = event.operator_receipt_id
+     WHERE registry.project_id = ? AND registry.approver_id = ? AND receipt.approver_id IS NULL
+     ORDER BY event.event_sequence DESC LIMIT 1`
+  ).get(projectId, approverId));
+  if (!anchor) throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver has no console-anchored mutation classes");
+  return authorizedApproverMutationClasses(anchor.allowed_mutation_classes_json);
+}
 function requireActiveAuthorizedApprover(db, input, transition) {
   if (input.approverId !== AUTHORIZED_APPROVER_ID) {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "approver is not the configured bb-collab approver");
@@ -15966,15 +15998,10 @@ function requireActiveAuthorizedApprover(db, input, transition) {
   if (registry2.retirement_condition !== AUTHORIZED_APPROVER_RETIREMENT_CONDITION) {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver retirement condition is invalid");
   }
-  let allowed;
-  try {
-    allowed = JSON.parse(registry2.allowed_mutation_classes_json);
-  } catch {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are malformed");
-  }
-  const allowedMutationClasses = isExactAuthorizedApproverMutationClassSet(allowed, DERIVED_ACTOR_MUTATION_CLASSES) ? DERIVED_ACTOR_MUTATION_CLASSES : isExactAuthorizedApproverMutationClassSet(allowed, PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES) ? PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES : null;
-  if (!allowedMutationClasses) {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current or bump-surviving historical set");
+  const allowedMutationClasses = authorizedApproverMutationClasses(registry2.allowed_mutation_classes_json);
+  const consoleAnchoredMutationClasses = consoleAnchoredAuthorizedApproverMutationClasses(db, input.projectId, input.approverId);
+  if (canonicalJson(allowedMutationClasses) !== canonicalJson(consoleAnchoredMutationClasses)) {
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "attested authorized approver mutation classes differ from the console-anchored set");
   }
   if (!allowedMutationClasses.includes(input.mutationClass)) {
     throw refusal("AUTHORIZED_APPROVER_INVALID", "mutation class is not authorized by the approver registry");
@@ -17789,7 +17816,7 @@ function applyDecisionMutation(db, request, digest, reader) {
     return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal decision mutation error" });
   }
 }
-function syncAuthorizedApproverRegistry(db, decision, disposition, sequence, createdAtMs) {
+function syncAuthorizedApproverRegistry(db, decision, disposition, sequence, createdAtMs, allowedMutationClasses) {
   if (decision.decision_class !== "operator_only" || !decision.options_json) return;
   const approverId = authorizedApproverId(decision.options_json);
   if (disposition !== "adopted") {
@@ -17799,6 +17826,7 @@ function syncAuthorizedApproverRegistry(db, decision, disposition, sequence, cre
     ).run(createdAtMs, decision.project_id, approverId, decision.decision_id);
     return;
   }
+  if (!allowedMutationClasses) throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver adoption has no mutation classes");
   db.prepare(
     `UPDATE authorized_approvers SET status = 'revoked', revoked_at_ms = ?
      WHERE project_id = ? AND approver_id = ? AND status = 'active'`
@@ -17813,10 +17841,38 @@ function syncAuthorizedApproverRegistry(db, decision, disposition, sequence, cre
     approverId,
     decision.decision_id,
     sequence,
-    canonicalJson(DERIVED_ACTOR_MUTATION_CLASSES),
+    canonicalJson(allowedMutationClasses),
     AUTHORIZED_APPROVER_RETIREMENT_CONDITION,
     createdAtMs
   );
+}
+function authorizedApproverMutationClassesForAdoption(db, request) {
+  const receipt = asRow(db.prepare(
+    `SELECT approver_id, authorizing_decision_id, authorizing_disposition_sequence
+     FROM operator_receipts WHERE project_id = ? AND receipt_id = ?`
+  ).get(request.projectId, request.operatorReceiptId));
+  if (!receipt) throw refusal("OPERATOR_RECEIPT_UNKNOWN", "operator receipt is not known");
+  if (receipt.approver_id === null) return DERIVED_ACTOR_MUTATION_CLASSES;
+  if (!receipt.authorizing_decision_id || receipt.authorizing_disposition_sequence === null) {
+    throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt approver provenance is incomplete");
+  }
+  const registry2 = asRow(db.prepare(
+    `SELECT allowed_mutation_classes_json FROM authorized_approvers
+     WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ?
+       AND authorizing_disposition_sequence = ? AND status = 'active'`
+  ).get(
+    request.projectId,
+    receipt.approver_id,
+    receipt.authorizing_decision_id,
+    receipt.authorizing_disposition_sequence
+  ));
+  if (!registry2) throw refusal("AUTHORIZED_APPROVER_UNKNOWN", "authorized approver registration is not known");
+  const allowedMutationClasses = authorizedApproverMutationClasses(registry2.allowed_mutation_classes_json);
+  const consoleAnchoredMutationClasses = consoleAnchoredAuthorizedApproverMutationClasses(db, request.projectId, receipt.approver_id);
+  if (canonicalJson(allowedMutationClasses) !== canonicalJson(consoleAnchoredMutationClasses)) {
+    throw refusal("AUTHORIZED_APPROVER_INVALID", "attested authorized approver mutation classes differ from the console-anchored set");
+  }
+  return allowedMutationClasses;
 }
 function captureInFlightDecisionDispositionTransition(db, request, decisionId, insertedDispositionSequence) {
   if (request.operationClass !== "decision_disposition" || request.disposition !== "adopted" || !request.operatorReceiptId) return void 0;
@@ -17932,6 +17988,7 @@ function applyDecisionDisposition(db, request, digest) {
   const conditionsJson = canonicalJson(conditions);
   if (Buffer.byteLength(conditionsJson, "utf8") > 16 * 1024) throw refusal("EVIDENCE_REDACTION_INVALID", "decision conditions exceed 16 KiB");
   const nextRevision = decision.current_resource_revision + 1;
+  const allowedMutationClasses = decision.decision_class === "operator_only" && request.disposition === "adopted" ? request.operatorReceiptId ? authorizedApproverMutationClassesForAdoption(db, request) : DERIVED_ACTOR_MUTATION_CLASSES : void 0;
   const inFlightTransition = captureInFlightDecisionDispositionTransition(db, request, decisionId, sequence);
   const update = db.prepare(
     `UPDATE decisions SET current_resource_revision = ?
@@ -18037,7 +18094,7 @@ function applyDecisionDisposition(db, request, digest) {
     void 0,
     inFlightTransition
   );
-  syncAuthorizedApproverRegistry(db, decision, request.disposition, sequence, createdAtMs);
+  syncAuthorizedApproverRegistry(db, decision, request.disposition, sequence, createdAtMs, allowedMutationClasses);
   return output;
 }
 function requireRoleRequirement(db, request, configRevision) {

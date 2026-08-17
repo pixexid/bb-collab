@@ -1604,6 +1604,22 @@ function decisionDispositionRequest(
   };
 }
 
+function applyWithConsoleFixtureReceipt(db: Database.Database, request: ApplyRequest): FoundationResult {
+  const unsigned = { ...request, candidateHead: CANDIDATE_SHA, operatorReceiptId: null };
+  const receipt = persistInterimOperatorReceipt(db, {
+    projectId: unsigned.projectId,
+    mutationClass: unsigned.operationClass,
+    candidateHead: CANDIDATE_SHA,
+    idempotencyKey: unsigned.idempotencyKey,
+    requestDigest: operatorRequestDigest(unsigned),
+    callerThreadId: "console-fixture",
+    requestedFromBackground: false,
+    callerPluginId: PLUGIN_ID,
+    issuanceProvenance: "console",
+  });
+  return applyAuthorizedMutation(db, { ...unsigned, operatorReceiptId: receipt.receiptId });
+}
+
 function decisionArtifact(
   evidenceId: string,
   overrides: Partial<NonNullable<ApplyRequest["decisionEvidence"]>[number]> = {},
@@ -2305,7 +2321,7 @@ describe("bb-collab plugin boundary", () => {
       },
     });
     expect(applyWithFixtureReceipt(db, authorizingCreate)).toMatchObject({ outcome: "OK" });
-    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "authorizing-operator", 1, {
+    expect(applyWithConsoleFixtureReceipt(db, decisionDispositionRequest(fenceToken, "authorizing-operator", 1, {
       actorReceiptId: "operator-authorizer",
       repoTargetId: null,
       idempotencyKey: "adopt-authorizing-operator",
@@ -2587,7 +2603,7 @@ describe("bb-collab plugin boundary", () => {
     expect(revoked).toMatchObject({ outcome: "AUTHORIZED_APPROVER_REVOKED" });
   });
 
-  it("survives the v13 approver bump through exact historical re-adoption", async () => {
+  it("carries a console-anchored historical approver set through attested re-adoption without widening", async () => {
     const { host, db, fenceToken } = await assignmentFixture();
     seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "compat-operator", actorKind: "operator", subjectId: "operator-1" });
     const decisionId = "compat-operator";
@@ -2604,7 +2620,7 @@ describe("bb-collab plugin boundary", () => {
       },
     });
     expect(applyWithFixtureReceipt(db, authorizingCreate)).toMatchObject({ outcome: "OK" });
-    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, decisionId, 1, {
+    expect(applyWithConsoleFixtureReceipt(db, decisionDispositionRequest(fenceToken, decisionId, 1, {
       actorReceiptId: "compat-operator",
       repoTargetId: null,
       idempotencyKey: `${decisionId}-seq1`,
@@ -2728,9 +2744,50 @@ describe("bb-collab plugin boundary", () => {
         authorizing_decision_id: "compat-v12-readopt",
         authorizing_disposition_sequence: 1,
         status: "active",
-        allowed_mutation_classes_json: currentJson,
+        allowed_mutation_classes_json: previousJson,
       },
     ]);
+
+    const wideningDisposition = decisionDispositionRequest(fenceToken, "compat-v12-readopt", 2, {
+      actorReceiptId: null,
+      operatorReceiptId: null,
+      candidateHead: CANDIDATE_SHA,
+      repoTargetId: null,
+      idempotencyKey: "compat-v12-readopt-attempted-widening",
+    });
+    const wideningIssue = await attest(wideningDisposition, "decision_disposition", "compat-v12-readopt");
+    expect(wideningIssue).toMatchObject({ outcome: "OK", actorReceiptId: expect.any(String) });
+    db.prepare(
+      `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
+       WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = 'compat-v12-readopt' AND authorizing_disposition_sequence = 1`,
+    ).run(currentJson, PROJECT_ID, AUTHORIZED_APPROVER_ID);
+    expect(db.prepare(
+      `SELECT receipt.approver_id FROM authorized_approvers registry
+       JOIN state_events event ON event.project_id = registry.project_id
+        AND event.aggregate_id = registry.authorizing_decision_id
+        AND event.event_type = 'decision_disposition_appended'
+        AND json_extract(event.event_json, '$.dispositionSequence') = registry.authorizing_disposition_sequence
+       JOIN operator_receipts receipt ON receipt.project_id = event.project_id AND receipt.receipt_id = event.operator_receipt_id
+       WHERE registry.project_id = ? AND registry.authorizing_decision_id = ?`,
+    ).get(PROJECT_ID, "compat-v12-readopt")).toEqual({ approver_id: AUTHORIZED_APPROVER_ID });
+    expect(db.prepare(
+      `SELECT receipt.approver_id FROM authorized_approvers registry
+       JOIN state_events event ON event.project_id = registry.project_id
+        AND event.aggregate_id = registry.authorizing_decision_id
+        AND event.event_type = 'decision_disposition_appended'
+        AND json_extract(event.event_json, '$.dispositionSequence') = registry.authorizing_disposition_sequence
+       JOIN operator_receipts receipt ON receipt.project_id = event.project_id AND receipt.receipt_id = event.operator_receipt_id
+       WHERE registry.project_id = ? AND registry.authorizing_decision_id = ?`,
+    ).get(PROJECT_ID, decisionId)).toEqual({ approver_id: null });
+    const beforeAttemptedWidening = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", {
+      ...wideningDisposition,
+      actorReceiptId: wideningIssue.actorReceiptId,
+      operatorReceiptId: wideningIssue.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "AUTHORIZED_APPROVER_INVALID", attempted: 0, verified: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeAttemptedWidening);
+    expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(wideningIssue.operatorReceipt!.receiptId)).toEqual({ consumed_at_ms: null });
+    setRegistry(previousJson);
 
     const beforeReuse = exportFoundation(db, PROJECT_ID);
     expect(await host.harness.callRpc("apply", {
@@ -2791,9 +2848,9 @@ describe("bb-collab plugin boundary", () => {
     db.prepare(
       `UPDATE authorized_approvers SET allowed_mutation_classes_json = ?
        WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = 'compat-v12-readopt' AND authorizing_disposition_sequence = 1`,
-    ).run(currentJson, PROJECT_ID, AUTHORIZED_APPROVER_ID);
+    ).run(previousJson, PROJECT_ID, AUTHORIZED_APPROVER_ID);
 
-    for (const mutationClass of DERIVED_ACTOR_MUTATION_CLASSES) {
+    for (const mutationClass of PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES) {
       const currentIssue = await attest(currentRequest(mutationClass, `compat-current-${mutationClass}`), mutationClass, "compat-v12-readopt");
       expect(currentIssue).toMatchObject({ outcome: "OK", actorReceiptId: expect.any(String), operatorReceipt: { mutationClass } });
     }
@@ -2818,7 +2875,7 @@ describe("bb-collab plugin boundary", () => {
       },
     });
     expect(applyWithFixtureReceipt(db, authorizingCreate)).toMatchObject({ outcome: "OK" });
-    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "config-role-approver", 1, {
+    expect(applyWithConsoleFixtureReceipt(db, decisionDispositionRequest(fenceToken, "config-role-approver", 1, {
       actorReceiptId: "config-operator",
       repoTargetId: null,
       idempotencyKey: "adopt-config-role-approver",
@@ -3287,7 +3344,7 @@ describe("bb-collab plugin boundary", () => {
       },
     });
     expect(applyWithFixtureReceipt(db, create).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, decisionId, 1, {
+    expect(applyWithConsoleFixtureReceipt(db, decisionDispositionRequest(fenceToken, decisionId, 1, {
       actorReceiptId: "operator-authorizer",
       repoTargetId: null,
       idempotencyKey: `${decisionId}-seq1`,
@@ -7025,7 +7082,7 @@ describe("bb-collab plugin boundary", () => {
       },
     });
     expect(applyWithFixtureReceipt(db, authorizingCreate)).toMatchObject({ outcome: "OK" });
-    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "live-role-approver", 1, {
+    expect(applyWithConsoleFixtureReceipt(db, decisionDispositionRequest(fenceToken, "live-role-approver", 1, {
       actorReceiptId: "operator-authorizer",
       repoTargetId: null,
       idempotencyKey: "adopt-live-role-approver",
