@@ -87,6 +87,7 @@ describe("path-install server artifact", () => {
       "dist/server.meta.json",
       "dist/app.js",
       "dist/app.meta.json",
+      "dist/role-briefs.json",
     ]));
 
     const appMeta = JSON.parse(readFileSync(join(PROJECT_ROOT, "dist/app.meta.json"), "utf8"));

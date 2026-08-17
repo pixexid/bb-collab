@@ -21555,6 +21555,19 @@ var sidebarReasoningLevelSchema = external_exports.enum(["none", "low", "medium"
 var sidebarThreadExecutionSchema = external_exports.object({ model: external_exports.string(), reasoning: sidebarReasoningLevelSchema }).strict();
 var sidebarCollapseKindSchema = external_exports.enum(["project", "thread"]);
 var sidebarCollapseKey = (kind, id2) => `sidebar.collapse:${kind}:${id2}`;
+var roleBriefRoleSchema = external_exports.enum(["director", "orchestrator", "worker"]);
+var roleBriefBundleSchema = external_exports.object({
+  ponytail: external_exports.string().min(1),
+  roles: external_exports.object({ director: external_exports.string().min(1), orchestrator: external_exports.string().min(1), worker: external_exports.string().min(1) }).strict()
+}).strict();
+var roleBriefSchema = external_exports.object({
+  role: roleBriefRoleSchema,
+  roleContent: external_exports.string().min(1),
+  ponytail: external_exports.string().min(1),
+  project: external_exports.object({ id: projectIdSchema, name: external_exports.string(), sourceIds: external_exports.array(external_exports.string()) }).strict(),
+  pointers: external_exports.object({ canonicalStoreQuery: external_exports.string(), handoffFile: external_exports.string(), currentSeats: external_exports.array(external_exports.object({ roleId: external_exports.string(), generation: external_exports.number().int().positive(), threadId: external_exports.string() }).strict()) }).strict(),
+  prompt: external_exports.string().min(1)
+}).strict();
 var rpcContract = defineRpcContract({
   lanes: {
     input: external_exports.object({}).strict(),
@@ -21613,6 +21626,10 @@ var rpcContract = defineRpcContract({
   cachedConsumerRollout: {
     input: applyRequestSchema,
     output: foundationResultSchema
+  },
+  roleBrief: {
+    input: external_exports.object({ projectId: projectIdSchema, role: roleBriefRoleSchema }).strict(),
+    output: roleBriefSchema
   }
 });
 function jsonResult(result2) {
@@ -21780,6 +21797,41 @@ async function isLiveCachedConsumerRolloutArtifact(moduleUrl, bb) {
   } catch {
     return false;
   }
+}
+function roleBriefBundlePath() {
+  const bundled = fileURLToPath(new URL("./role-briefs.json", import.meta.url));
+  return existsSync2(bundled) ? bundled : fileURLToPath(new URL("./dist/role-briefs.json", import.meta.url));
+}
+function roleForThread(db, projectId, threadId) {
+  const roleId = db ? readRoleHolderStates(db).find((holder) => holder.project_id === projectId && holder.thread_id === threadId)?.role_id : null;
+  return roleId === "director" ? "director" : roleId === "project-orchestrator" ? "orchestrator" : "worker";
+}
+async function composeRoleBrief(bb, db, input) {
+  const bundle = roleBriefBundleSchema.parse(JSON.parse(readFileSync2(roleBriefBundlePath(), "utf8")));
+  const project = await bb.sdk.projects.get({ projectId: input.projectId });
+  const currentSeats = (db ? readRoleHolderStates(db) : []).filter((holder) => holder.project_id === input.projectId).map((holder) => ({ roleId: holder.role_id, generation: holder.role_generation, threadId: holder.thread_id }));
+  const pointers = {
+    canonicalStoreQuery: "role_generation_heads joined to role_generations",
+    handoffFile: "the predecessor handoff file named by the active seat\u2019s handoff location",
+    currentSeats
+  };
+  const prompt = [
+    `# bb-collab ${input.role} brief`,
+    "",
+    "## Ponytail preamble",
+    bundle.ponytail,
+    "",
+    "## Role brief",
+    bundle.roles[input.role],
+    "",
+    "## Live pointers",
+    `Project: ${project.name} (${project.id})`,
+    `Sources: ${project.sources.map((source) => source.id).join(", ") || "none"}`,
+    `Canonical store query: ${pointers.canonicalStoreQuery}`,
+    `Handoff file: ${pointers.handoffFile}`,
+    `Current seats: ${currentSeats.map((seat) => `${seat.roleId}@${seat.generation}:${seat.threadId}`).join(", ") || "none"}`
+  ].join("\n");
+  return { role: input.role, roleContent: bundle.roles[input.role], ponytail: bundle.ponytail, project: { id: project.id, name: project.name, sourceIds: project.sources.map((source) => source.id) }, pointers, prompt };
 }
 function liveCachedConsumerReread(name, result2) {
   const cachedConsumers = result2.evidence?.cachedConsumers;
@@ -22417,6 +22469,18 @@ ${thread.titleFallback ?? ""}`);
     if (!db) return [];
     return openLaneViews(db, Date.now(), /* @__PURE__ */ new Map());
   };
+  bb.events.on("thread.created", async ({ thread }) => {
+    try {
+      const brief = await composeRoleBrief(bb, db, { projectId: thread.projectId, role: roleForThread(db, thread.projectId, thread.id) });
+      await bb.sdk.threads.send({
+        threadId: thread.id,
+        mode: "queue-if-active",
+        input: [{ type: "text", visibility: "agent-only", text: brief.prompt, mentions: [] }]
+      });
+    } catch (error48) {
+      bb.log.warn(`role brief seating failed for thread=${thread.id}: ${String(error48)}`);
+    }
+  });
   bb.http.route(
     "GET",
     "/lanes",
@@ -22507,6 +22571,9 @@ ${thread.titleFallback ?? ""}`);
     },
     async cachedConsumerRollout(input) {
       return applyLiveCachedConsumerRollout(bb, db, input, cliDeps);
+    },
+    async roleBrief(input) {
+      return composeRoleBrief(bb, db, input);
     }
   });
   bb.cli.register({

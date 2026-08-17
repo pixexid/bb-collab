@@ -2224,7 +2224,7 @@ describe("bb-collab plugin boundary", () => {
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "ACTOR_RECEIPT_UNKNOWN" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "sentinel-wake-floor", "thread-archive-sweep"]);
-    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "doctor", "export", "lanes", "registerWait", "reorderPinned", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
+    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "doctor", "export", "lanes", "registerWait", "reorderPinned", "roleBrief", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
   });
 
   it("does not wake a quiet director seat", async () => {
@@ -5611,6 +5611,17 @@ describe("bb-collab plugin boundary", () => {
       verified: 0,
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeProductionRefusal);
+  });
+
+  it("uses the bootstrap exemption without making its non-role actor the holder", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "bootstrap-actor", actorKind: "plugin", subjectId: "bootstrap-subject" });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, { actorReceiptId: "bootstrap-actor" }), null, roleReader()).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, { actorReceiptId: "bootstrap-actor" }), null, roleReader()).outcome).toBe("OK");
+    const holder = db.prepare("SELECT origin, thread_id FROM execution_attempts WHERE origin = 'role_holder'").get() as { origin: string; thread_id: string };
+    expect(holder).toEqual({ origin: "role_holder", thread_id: ROLE_THREAD_ID });
+    expect(holder.thread_id).not.toBe("bootstrap-subject");
   });
 
   it("records one exact director standby and refuses wrong-provider, foreign, stale, and replay paths without writes", async () => {

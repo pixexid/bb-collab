@@ -117,11 +117,20 @@
 }
 @layer utilities {
   @scope ([data-bb-plugin="bb-collab"], [data-bb-plugin-root]:not([data-bb-plugin])) {
+    .collapse {
+      visibility: collapse;
+    }
+    .invisible {
+      visibility: hidden;
+    }
     .visible {
       visibility: visible;
     }
     .absolute {
       position: absolute;
+    }
+    .fixed {
+      position: fixed;
     }
     .relative {
       position: relative;
@@ -256,6 +265,9 @@
     }
     .shrink-0 {
       flex-shrink: 0;
+    }
+    .grow {
+      flex-grow: 1;
     }
     .animate-spin {
       animation: var(--animate-spin);
@@ -430,6 +442,18 @@
       --tw-font-weight: var(--font-weight-semibold);
       font-weight: var(--font-weight-semibold);
     }
+    .text-\[\#6D5DFB\] {
+      color: #6D5DFB;
+    }
+    .text-\[\#111827\] {
+      color: #111827;
+    }
+    .text-\[\#D97757\] {
+      color: #D97757;
+    }
+    .text-\[\#F5F5F5\] {
+      color: #F5F5F5;
+    }
     .text-destructive {
       color: var(--destructive);
     }
@@ -452,6 +476,10 @@
       opacity: 100%;
     }
     .shadow {
+      --tw-shadow: var(--shadow);
+      box-shadow: var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow);
+    }
+    .shadow\/read-only {
       --tw-shadow: var(--shadow);
       box-shadow: var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow);
     }
