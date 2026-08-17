@@ -1679,8 +1679,27 @@ describe("bb-collab plugin boundary", () => {
     expect(cli.exitCode).toBe(2);
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "OPERATOR_RECEIPT_REQUIRED" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["lane-watcher"]);
-    expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "thread-archive-sweep"]);
+    expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "sentinel-wake-floor", "thread-archive-sweep"]);
     expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "approverAttestation", "cachedConsumerRollout", "doctor", "export", "lanes", "operatorPassphraseState", "operatorReceipt", "operatorReceiptDecision", "operatorReceiptRequests", "registerWait", "reorderPinned", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
+  });
+
+  it("registers sentinel-wake-floor with its exact hourly health send", async () => {
+    const host = await loadedHost();
+    host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
+    expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toContain("sentinel-wake-floor");
+    await host.harness.runSchedule("sentinel-wake-floor");
+    expect(host.harness.inspection.sdk.callsTo("threads.send")).toContainEqual([{
+      threadId: "thr_bpzjyqg7ys",
+      mode: "queue-if-active",
+      input: [{ type: "text", visibility: "agent-only", text: "Hourly Sentinel health check: verify the fleet against canonical surfaces and report any drift or blocker.", mentions: [] }],
+    }]);
+  });
+
+  it("logs sentinel-wake-floor send failures without throwing", async () => {
+    const host = await loadedHost();
+    host.harness.sdk.stub("threads.send", (async () => { throw new Error("send unavailable"); }) as never);
+    await expect(host.harness.runSchedule("sentinel-wake-floor")).resolves.toBeUndefined();
+    expect(host.harness.inspection.logEntries.filter((entry) => entry.level === "warn" && entry.message === "sentinel-wake-floor failed: Error: send unavailable")).toHaveLength(1);
   });
 
   it("authorizes exact interim receipts through the same RPC and CLI seam", async () => {

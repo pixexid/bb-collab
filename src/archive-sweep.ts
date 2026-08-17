@@ -6,7 +6,7 @@ const THREAD_LIST_LIMIT = 1000;
 
 // Remove only when GH-104 records every live seat through execution_attempts.
 // A missing project entry is missing live-seat evidence and refuses the sweep.
-const LIVE_SEAT_ALLOWLIST = new Map([["proj_a8zzfsx36j", new Set(["thr_b94i3csnme"])]]);
+const LIVE_SEAT_ALLOWLIST = new Map([["proj_a8zzfsx36j", new Set(["thr_b94i3csnme", "thr_bpzjyqg7ys"])]]);
 
 export type ArchiveSweepResult = {
   outcome: "reported" | "applied" | "refused";
