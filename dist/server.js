@@ -21305,7 +21305,7 @@ function createLaneWatcher(options) {
       );
       return current.length === 1 && current[0]?.role_generation === holder.role_generation && current[0]?.execution_attempt_id === holder.execution_attempt_id && current[0]?.thread_id === holder.thread_id ? current[0] : null;
     } catch {
-      return null;
+      return void 0;
     }
   };
   const escalateRole = async (key, role) => {
@@ -21405,7 +21405,7 @@ function createLaneWatcher(options) {
       } catch {
         failed = true;
       }
-      if (delivered === false) {
+      if (delivered === false || delivered === "error") {
         await roleIdleLedger.clearPrefixExcept(prefix);
         continue;
       }
@@ -21414,7 +21414,7 @@ function createLaneWatcher(options) {
     }
   };
   const wakeRoleNow = async (role) => {
-    if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return { attempted: false, delivered: false };
+    if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return { attempted: false, delivered: false, refusal: "policy" };
     const holder = {
       project_id: role.projectId,
       role_id: role.roleId,
@@ -21422,24 +21422,25 @@ function createLaneWatcher(options) {
       execution_attempt_id: role.executionAttemptId,
       thread_id: role.threadId
     };
-    if (!resolveCurrentCanonicalHolder(holder)) return { attempted: false, delivered: false };
+    const currentHolder = resolveCurrentCanonicalHolder(holder);
+    if (!currentHolder) return { attempted: false, delivered: false, refusal: currentHolder === void 0 ? "error" : "policy" };
     let scopes;
     let observation;
     try {
       scopes = await options.readRoleScopes();
       observation = await options.readWorker(role.threadId);
     } catch {
-      return { attempted: false, delivered: false };
+      return { attempted: false, delivered: false, refusal: "error" };
     }
     const scope = scopes.find((candidate) => candidate.projectId === role.projectId);
-    if (!scope?.nextStartable || scope.queueHeadId !== role.queueHeadId || scope.deferredReason || observation.projectId !== role.projectId || observation.status !== "idle" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) return { attempted: false, delivered: false };
+    if (!scope?.nextStartable || scope.queueHeadId !== role.queueHeadId || scope.deferredReason || observation.projectId !== role.projectId || observation.status !== "idle" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) return { attempted: false, delivered: false, refusal: "policy" };
     const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
     const key = `${prefix}${scope.queueHeadId}`;
     await roleIdleLedger.clearPrefixExcept(prefix, key);
     const currentNow = now2();
     const record2 = await roleIdleLedger.observeIdle(key, observation.idleSinceMs);
     const steerAgeMs = record2.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : Math.max(0, currentNow - record2.lastSteerAtMs);
-    if (record2.escalated || record2.steerCount >= 2 || steerAgeMs < roleIdleThresholdMs) return { attempted: false, delivered: false };
+    if (record2.escalated || record2.steerCount >= 2 || steerAgeMs < roleIdleThresholdMs) return { attempted: false, delivered: false, refusal: "policy" };
     const target = {
       ...role,
       threadId: holder.thread_id,
@@ -21452,9 +21453,10 @@ function createLaneWatcher(options) {
     } catch {
       failed = true;
     }
+    if (delivered === "error") return { attempted: false, delivered: false, refusal: "error" };
     if (delivered === false) {
       await roleIdleLedger.clearPrefixExcept(prefix);
-      return { attempted: false, delivered: false };
+      return { attempted: false, delivered: false, refusal: "policy" };
     }
     const updated = await roleIdleLedger.recordSteer(key, failed, currentNow);
     if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, target);
@@ -21661,6 +21663,24 @@ function stateFromUnknown(value) {
 function snapshot(value) {
   return JSON.stringify(value);
 }
+function priorArtifacts(value) {
+  try {
+    const artifacts = JSON.parse(value);
+    return Array.isArray(artifacts) && artifacts.every((artifact) => artifact && typeof artifact === "object" && typeof artifact.id === "string" && typeof artifact.unavailable === "boolean") ? artifacts : null;
+  } catch {
+    return null;
+  }
+}
+function hasArtifactDelta(previous, current) {
+  const prior = priorArtifacts(previous);
+  if (!prior) return true;
+  const byId = new Map(prior.map((artifact) => [artifact.id, artifact]));
+  if (byId.size !== current.length || current.some((artifact) => !byId.has(artifact.id))) return true;
+  return current.some((artifact) => {
+    const before = byId.get(artifact.id);
+    return before !== void 0 && !artifact.unavailable && !before.unavailable && snapshot(before.value) !== snapshot(artifact.value);
+  });
+}
 function createStallGuardCycle(options) {
   let state = null;
   return {
@@ -21669,13 +21689,22 @@ function createStallGuardCycle(options) {
       const holders = options.readRoleHolders().filter((holder) => projectId === void 0 || holder.project_id === projectId);
       const scopes = await options.readRoleScopes();
       const nextState = structuredClone(state);
+      const artifacts = /* @__PURE__ */ new Map();
+      const readArtifacts = (id2) => {
+        let current = artifacts.get(id2);
+        if (!current) {
+          current = options.readArtifact(id2).catch(() => null);
+          artifacts.set(id2, current);
+        }
+        return current;
+      };
       let changed = 0;
       let attempted = 0;
       let verified = 0;
       let steered = 0;
       for (const holder of holders) {
         const key = `${holder.project_id}:${holder.role_id}`;
-        const current = await options.readArtifact(holder).catch(() => null);
+        const current = await readArtifacts(holder.project_id);
         if (current === null) continue;
         const next = snapshot(current);
         if (nextState[key] === void 0) {
@@ -21684,8 +21713,17 @@ function createStallGuardCycle(options) {
           continue;
         }
         if (nextState[key] === next) continue;
+        if (!hasArtifactDelta(nextState[key], current)) {
+          nextState[key] = next;
+          changed += 1;
+          continue;
+        }
         const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
-        if (!scope?.nextStartable || !scope.queueHeadId || scope.deferredReason) continue;
+        if (!scope?.nextStartable || !scope.queueHeadId || scope.deferredReason) {
+          nextState[key] = next;
+          changed += 1;
+          continue;
+        }
         const role = {
           projectId: holder.project_id,
           roleId: holder.role_id,
@@ -21701,7 +21739,12 @@ function createStallGuardCycle(options) {
         } catch {
           continue;
         }
-        if (!result2.attempted) continue;
+        if (!result2.attempted) {
+          if (result2.refusal !== "policy") continue;
+          nextState[key] = next;
+          changed += 1;
+          continue;
+        }
         attempted += 1;
         if (!result2.delivered) continue;
         nextState[key] = next;
@@ -22946,7 +22989,7 @@ ${thread.titleFallback ?? ""}`);
     );
   };
   const steerRole = async (role) => {
-    if (!db) return false;
+    if (!db) return "error";
     const expectedHolder = {
       project_id: role.projectId,
       role_id: role.roleId,
@@ -22961,7 +23004,7 @@ ${thread.titleFallback ?? ""}`);
       );
     } catch (error48) {
       warnRoleLiveness(expectedHolder, `holder=unknown error=${String(error48)}`);
-      return false;
+      return "error";
     }
     if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) {
       warnRoleLiveness(expectedHolder, `holderMatches=${holders.length} observedThread=${holders[0]?.thread_id ?? "null"}`);
@@ -22972,7 +23015,7 @@ ${thread.titleFallback ?? ""}`);
       thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
     } catch (error48) {
       warnRoleLiveness(holders[0], `liveness=unknown error=${String(error48)}`);
-      return false;
+      return "error";
     }
     const refusal2 = roleThreadRefusal(holders[0], thread, true);
     if (refusal2) {
@@ -23068,11 +23111,23 @@ ${thread.titleFallback ?? ""}`);
   const stallGuardCycle = createStallGuardCycle({
     readRoleHolders: () => db ? readRoleHolderStates(db) : [],
     readRoleScopes,
-    readArtifact: async (holder) => {
-      const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
-      if (thread.projectId !== holder.project_id || !thread.environmentId) return { outcome: "absent" };
-      const result2 = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
-      return result2.outcome === "unavailable" ? null : result2;
+    readArtifact: async (projectId) => {
+      if (!db) return null;
+      const artifacts = [];
+      for (const lane of readLaneStates(db).filter((candidate) => candidate.project_id === projectId && OPEN_ATTEMPT_STATES.has(candidate.attempt_state) && candidate.thread_id !== null)) {
+        try {
+          const thread = await bb.sdk.threads.get({ threadId: lane.thread_id });
+          if (thread.projectId !== projectId || !thread.environmentId) {
+            artifacts.push({ id: lane.execution_attempt_id, unavailable: false, value: { environmentId: null, result: { outcome: "absent" } } });
+            continue;
+          }
+          const result2 = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
+          artifacts.push(result2.outcome === "unavailable" ? { id: lane.execution_attempt_id, unavailable: true, value: null } : { id: lane.execution_attempt_id, unavailable: false, value: { environmentId: thread.environmentId, result: result2 } });
+        } catch {
+          artifacts.push({ id: lane.execution_attempt_id, unavailable: true, value: null });
+        }
+      }
+      return artifacts;
     },
     wakeRole: (role) => watcher.wakeRole(role),
     persistence: {

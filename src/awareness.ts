@@ -177,10 +177,9 @@ export interface RoleIdleView {
   idleAgeMs: number;
 }
 
-export interface RoleWakeResult {
-  attempted: boolean;
-  delivered: boolean;
-}
+export type RoleWakeResult =
+  | { attempted: true; delivered: boolean }
+  | { attempted: false; delivered: false; refusal: "policy" | "error" };
 
 export type LaneQueueState = "ready" | "running" | "deferred";
 
@@ -688,7 +687,7 @@ export function createLaneWatcher(options: {
   readRoleScopes?: () => Promise<RoleQueueScope[]> | RoleQueueScope[];
   roleIdlePersistence?: RoleIdlePersistence;
   roleIdleThresholdMs?: number;
-  steerRole?: (role: RoleIdleView) => Promise<boolean | void>;
+  steerRole?: (role: RoleIdleView) => Promise<boolean | void | "error">;
   onRoleSuccessionRequired?: (role: RoleIdleView) => void;
   now?: () => number;
   maxContinuations?: number;
@@ -834,7 +833,7 @@ export function createLaneWatcher(options: {
     }
   };
 
-  const resolveCurrentCanonicalHolder = (holder: RoleHolderState): RoleHolderState | null => {
+  const resolveCurrentCanonicalHolder = (holder: RoleHolderState): RoleHolderState | null | undefined => {
     if (!options.readRoleHolders) return null;
     try {
       const current = options.readRoleHolders().filter((candidate) =>
@@ -847,7 +846,7 @@ export function createLaneWatcher(options: {
         ? current[0]
         : null;
     } catch {
-      return null;
+      return undefined;
     }
   };
 
@@ -947,14 +946,14 @@ export function createLaneWatcher(options: {
         continue;
       }
       let failed = false;
-      let delivered: boolean | void = undefined;
+      let delivered: boolean | void | "error" = undefined;
       try {
         delivered = await options.steerRole(role);
       } catch {
         // A failed send is itself a failed steer; the second failure escalates once.
         failed = true;
       }
-      if (delivered === false) {
+      if (delivered === false || delivered === "error") {
         await roleIdleLedger.clearPrefixExcept(prefix);
         continue;
       }
@@ -964,7 +963,7 @@ export function createLaneWatcher(options: {
   };
 
   const wakeRoleNow = async (role: RoleIdleView): Promise<RoleWakeResult> => {
-    if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return { attempted: false, delivered: false };
+    if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return { attempted: false, delivered: false, refusal: "policy" };
     const holder: RoleHolderState = {
       project_id: role.projectId,
       role_id: role.roleId,
@@ -972,14 +971,15 @@ export function createLaneWatcher(options: {
       execution_attempt_id: role.executionAttemptId,
       thread_id: role.threadId,
     };
-    if (!resolveCurrentCanonicalHolder(holder)) return { attempted: false, delivered: false };
+    const currentHolder = resolveCurrentCanonicalHolder(holder);
+    if (!currentHolder) return { attempted: false, delivered: false, refusal: currentHolder === undefined ? "error" : "policy" };
     let scopes: RoleQueueScope[];
     let observation: WorkerObservation;
     try {
       scopes = await options.readRoleScopes();
       observation = await options.readWorker(role.threadId);
     } catch {
-      return { attempted: false, delivered: false };
+      return { attempted: false, delivered: false, refusal: "error" };
     }
     const scope = scopes.find((candidate) => candidate.projectId === role.projectId);
     if (
@@ -995,7 +995,7 @@ export function createLaneWatcher(options: {
       observation.idleSinceMs === null ||
       observation.idleSinceMs === undefined ||
       !Number.isFinite(observation.idleSinceMs)
-    ) return { attempted: false, delivered: false };
+    ) return { attempted: false, delivered: false, refusal: "policy" };
 
     const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
     const key = `${prefix}${scope.queueHeadId}`;
@@ -1003,7 +1003,7 @@ export function createLaneWatcher(options: {
     const currentNow = now();
     const record = await roleIdleLedger.observeIdle(key, observation.idleSinceMs);
     const steerAgeMs = record.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : Math.max(0, currentNow - record.lastSteerAtMs);
-    if (record.escalated || record.steerCount >= 2 || steerAgeMs < roleIdleThresholdMs) return { attempted: false, delivered: false };
+    if (record.escalated || record.steerCount >= 2 || steerAgeMs < roleIdleThresholdMs) return { attempted: false, delivered: false, refusal: "policy" };
 
     const target: RoleIdleView = {
       ...role,
@@ -1011,15 +1011,16 @@ export function createLaneWatcher(options: {
       idleAgeMs: Math.max(0, currentNow - (record.idleSinceMs ?? currentNow)),
     };
     let failed = false;
-    let delivered: boolean | void = undefined;
+    let delivered: boolean | void | "error" = undefined;
     try {
       delivered = await options.steerRole(target);
     } catch {
       failed = true;
     }
+    if (delivered === "error") return { attempted: false, delivered: false, refusal: "error" };
     if (delivered === false) {
       await roleIdleLedger.clearPrefixExcept(prefix);
-      return { attempted: false, delivered: false };
+      return { attempted: false, delivered: false, refusal: "policy" };
     }
     const updated = await roleIdleLedger.recordSteer(key, failed, currentNow);
     if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, target);

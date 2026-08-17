@@ -15,9 +15,15 @@ export interface StallGuardPersistence {
   write(state: Record<string, string>): Promise<void>;
 }
 
+export interface StallGuardArtifact {
+  id: string;
+  unavailable: boolean;
+  value: unknown;
+}
+
 export interface StallGuardCycleOptions {
   readRoleHolders: () => RoleHolderState[];
-  readArtifact: (holder: RoleHolderState) => Promise<unknown | null>;
+  readArtifact: (projectId: string) => Promise<StallGuardArtifact[] | null>;
   readRoleScopes: () => Promise<RoleQueueScope[]> | RoleQueueScope[];
   wakeRole: (role: RoleIdleView) => Promise<RoleWakeResult>;
   persistence: StallGuardPersistence;
@@ -42,6 +48,29 @@ function snapshot(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function priorArtifacts(value: string): StallGuardArtifact[] | null {
+  try {
+    const artifacts = JSON.parse(value);
+    return Array.isArray(artifacts) && artifacts.every((artifact) => artifact
+      && typeof artifact === "object"
+      && typeof artifact.id === "string"
+      && typeof artifact.unavailable === "boolean") ? artifacts as StallGuardArtifact[] : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasArtifactDelta(previous: string, current: readonly StallGuardArtifact[]): boolean {
+  const prior = priorArtifacts(previous);
+  if (!prior) return true;
+  const byId = new Map(prior.map((artifact) => [artifact.id, artifact]));
+  if (byId.size !== current.length || current.some((artifact) => !byId.has(artifact.id))) return true;
+  return current.some((artifact) => {
+    const before = byId.get(artifact.id);
+    return before !== undefined && !artifact.unavailable && !before.unavailable && snapshot(before.value) !== snapshot(artifact.value);
+  });
+}
+
 export function createStallGuardCycle(options: StallGuardCycleOptions) {
   let state: Record<string, string> | null = null;
 
@@ -51,6 +80,15 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
       const holders = options.readRoleHolders().filter((holder) => projectId === undefined || holder.project_id === projectId);
       const scopes = await options.readRoleScopes();
       const nextState = structuredClone(state);
+      const artifacts = new Map<string, Promise<StallGuardArtifact[] | null>>();
+      const readArtifacts = (id: string) => {
+        let current = artifacts.get(id);
+        if (!current) {
+          current = options.readArtifact(id).catch(() => null);
+          artifacts.set(id, current);
+        }
+        return current;
+      };
       let changed = 0;
       let attempted = 0;
       let verified = 0;
@@ -58,7 +96,7 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
 
       for (const holder of holders) {
         const key = `${holder.project_id}:${holder.role_id}`;
-        const current = await options.readArtifact(holder).catch(() => null);
+        const current = await readArtifacts(holder.project_id);
         if (current === null) continue;
         const next = snapshot(current);
         if (nextState[key] === undefined) {
@@ -67,9 +105,18 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
           continue;
         }
         if (nextState[key] === next) continue;
+        if (!hasArtifactDelta(nextState[key], current)) {
+          nextState[key] = next;
+          changed += 1;
+          continue;
+        }
 
         const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
-        if (!scope?.nextStartable || !scope.queueHeadId || scope.deferredReason) continue;
+        if (!scope?.nextStartable || !scope.queueHeadId || scope.deferredReason) {
+          nextState[key] = next;
+          changed += 1;
+          continue;
+        }
         const role: RoleIdleView = {
           projectId: holder.project_id,
           roleId: holder.role_id,
@@ -85,7 +132,12 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
         } catch {
           continue;
         }
-        if (!result.attempted) continue;
+        if (!result.attempted) {
+          if (result.refusal !== "policy") continue;
+          nextState[key] = next;
+          changed += 1;
+          continue;
+        }
         attempted += 1;
         if (!result.delivered) continue;
         nextState[key] = next;
