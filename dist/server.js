@@ -15680,7 +15680,7 @@ function operatorReceiptDigest(input) {
 }
 function persistInterimOperatorReceipt(db, input, createdAtMs = now()) {
   const receiptId = `operator-${randomBytes(16).toString("hex")}`;
-  const issuanceProvenance = input.issuanceProvenance ?? "console";
+  const issuanceProvenance = input.issuanceProvenance;
   const bindingDigest = operatorReceiptBindingDigest(input);
   const receiptDigest = operatorReceiptDigest({
     receiptId,
@@ -15754,7 +15754,7 @@ function persistInterimOperatorReceipt(db, input, createdAtMs = now()) {
 function persistOperatorReceiptWithSessionEvidence(db, input, interactionId, createdAtMs = now()) {
   return transaction(db, () => {
     if (operatorReceiptBindingExists(db, input)) return null;
-    const operatorReceipt = persistInterimOperatorReceipt(db, input, createdAtMs);
+    const operatorReceipt = persistInterimOperatorReceipt(db, { ...input, issuanceProvenance: "console" }, createdAtMs);
     const actorReceiptId = isDerivedActorMutationClass(input.mutationClass) ? derivePluginActorReceipt(db, operatorReceipt) : void 0;
     const evidenceId = `operator-session-${operatorReceipt.receiptId}`;
     const redacted = canonicalJson({ source: "connect-session", interactionId, operatorReceiptId: operatorReceipt.receiptId });
@@ -16048,7 +16048,7 @@ function derivePluginActorReceipt(db, operatorReceipt) {
 }
 function persistBootstrapOperatorReceipt(db, input, createdAtMs = now()) {
   return transaction(db, () => {
-    const operatorReceipt = persistInterimOperatorReceipt(db, input, createdAtMs);
+    const operatorReceipt = persistInterimOperatorReceipt(db, { ...input, issuanceProvenance: "console" }, createdAtMs);
     const actorReceiptId = derivePluginActorReceipt(db, operatorReceipt);
     return { operatorReceipt, actorReceiptId };
   });
@@ -22754,7 +22754,7 @@ ${thread.titleFallback ?? ""}`);
           bb.realtime.publish("operator-receipts", { changed: true });
           return operatorReceiptResult(input.projectId, "OK", "interim operator receipt and derived actor receipt persisted", issued);
         }
-        const receipt = persistInterimOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId });
+        const receipt = persistInterimOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId, issuanceProvenance: "console" });
         bb.realtime.publish("operator-receipts", { changed: true });
         return operatorReceiptResult(input.projectId, "OK", "interim operator receipt persisted", { operatorReceipt: receipt });
       } catch {

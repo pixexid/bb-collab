@@ -2552,7 +2552,7 @@ export function persistInterimOperatorReceipt(
   db: SqliteDatabase,
   input: OperatorReceiptRequest & {
     callerPluginId: string;
-    issuanceProvenance?: OperatorReceiptProvenance;
+    issuanceProvenance: OperatorReceiptProvenance;
     approverId?: string | null;
     authorizingDecisionId?: string | null;
     authorizingDispositionSequence?: number | null;
@@ -2560,7 +2560,7 @@ export function persistInterimOperatorReceipt(
   createdAtMs = now(),
 ): OperatorReceipt {
   const receiptId = `operator-${randomBytes(16).toString("hex")}`;
-  const issuanceProvenance = input.issuanceProvenance ?? "console";
+  const issuanceProvenance = input.issuanceProvenance;
   const bindingDigest = operatorReceiptBindingDigest(input);
   const receiptDigest = operatorReceiptDigest({
     receiptId,
@@ -2640,7 +2640,7 @@ export function persistOperatorReceiptWithSessionEvidence(
 ): { operatorReceipt: OperatorReceipt; actorReceiptId?: string; evidenceId: string } | null {
   return transaction(db, () => {
     if (operatorReceiptBindingExists(db, input)) return null;
-    const operatorReceipt = persistInterimOperatorReceipt(db, input, createdAtMs);
+    const operatorReceipt = persistInterimOperatorReceipt(db, { ...input, issuanceProvenance: "console" }, createdAtMs);
     const actorReceiptId = isDerivedActorMutationClass(input.mutationClass)
       ? derivePluginActorReceipt(db, operatorReceipt)
       : undefined;
@@ -3032,7 +3032,7 @@ export function persistBootstrapOperatorReceipt(
   createdAtMs = now(),
 ): { operatorReceipt: OperatorReceipt; actorReceiptId: string } {
   return transaction(db, () => {
-    const operatorReceipt = persistInterimOperatorReceipt(db, input, createdAtMs);
+    const operatorReceipt = persistInterimOperatorReceipt(db, { ...input, issuanceProvenance: "console" }, createdAtMs);
     const actorReceiptId = derivePluginActorReceipt(db, operatorReceipt);
     return { operatorReceipt, actorReceiptId };
   });

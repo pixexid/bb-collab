@@ -1703,6 +1703,7 @@ describe("bb-collab plugin boundary", () => {
       callerThreadId: "operator-thread",
       requestedFromBackground: false,
       callerPluginId: PLUGIN_ID,
+      issuanceProvenance: "console",
     }, 1);
     const authorized = { ...request, operatorReceiptId: receipt.receiptId };
 
@@ -1725,6 +1726,7 @@ describe("bb-collab plugin boundary", () => {
       callerThreadId: "operator-thread-fresh",
       requestedFromBackground: false,
       callerPluginId: PLUGIN_ID,
+      issuanceProvenance: "console",
     }, 2);
     const beforeFreshApply = exportFoundation(db, PROJECT_ID);
     expect(await host.harness.callRpc("apply", { ...authorized, operatorReceiptId: fresh.receiptId })).toMatchObject({ outcome: "OPERATOR_RECEIPT_STALE" });
@@ -2566,6 +2568,7 @@ describe("bb-collab plugin boundary", () => {
         callerThreadId: "config-unlinked-target",
         requestedFromBackground: false,
         callerPluginId: PLUGIN_ID,
+        issuanceProvenance: "console",
       }).receiptId,
     };
     const beforeUnlinkedPlugin = exportFoundation(db, PROJECT_ID);
@@ -2578,7 +2581,7 @@ describe("bb-collab plugin boundary", () => {
     const compatibleRoleReceipt = persistInterimOperatorReceipt(db, {
       projectId: PROJECT_ID, mutationClass: "config_revision", candidateHead: CANDIDATE_SHA,
       idempotencyKey: roleAuthorized.idempotencyKey, requestDigest: operatorRequestDigest(roleAuthorized),
-      callerThreadId: "config-role-attestor", requestedFromBackground: false, callerPluginId: PLUGIN_ID,
+      callerThreadId: "config-role-attestor", requestedFromBackground: false, callerPluginId: PLUGIN_ID, issuanceProvenance: "console",
     });
     const beforeRoleActor = exportFoundation(db, PROJECT_ID);
     expect(await host.harness.callRpc("apply", { ...roleAuthorized, operatorReceiptId: compatibleRoleReceipt.receiptId })).toMatchObject({ outcome: "ACTOR_RECEIPT_UNVERIFIED", attempted: 0, verified: 0 });
@@ -2812,6 +2815,7 @@ describe("bb-collab plugin boundary", () => {
       callerThreadId: "operator-thread",
       requestedFromBackground: false,
       callerPluginId: PLUGIN_ID,
+      issuanceProvenance: "console",
     }, 1);
     const authorized = { ...authorizedRequest, operatorReceiptId: receipt.receiptId };
     expect(await host.harness.callRpc("apply", authorized)).toMatchObject({ outcome: "OK" });
@@ -3087,6 +3091,7 @@ describe("bb-collab plugin boundary", () => {
       callerThreadId: "operator-thread",
       requestedFromBackground: false,
       callerPluginId: PLUGIN_ID,
+      issuanceProvenance: "console",
     }, 1);
     const before = exportFoundation(db, PROJECT_ID);
     const adapter = new DeterministicNativeAssignmentAdapter();
@@ -3115,6 +3120,7 @@ describe("bb-collab plugin boundary", () => {
       callerThreadId: "operator-thread",
       requestedFromBackground: false,
       callerPluginId: PLUGIN_ID,
+      issuanceProvenance: "console",
     }, 1);
     const before = exportFoundation(db, PROJECT_ID);
     const reconcileAdapter = new DeterministicNativeAssignmentAdapter();
@@ -3137,6 +3143,7 @@ describe("bb-collab plugin boundary", () => {
       callerThreadId: "operator-thread",
       requestedFromBackground: false,
       callerPluginId: PLUGIN_ID,
+      issuanceProvenance: "console",
     }, 1);
     const before = exportFoundation(db, PROJECT_ID);
     const adapter = new DeterministicGitHubIssueAdapter();
@@ -3160,6 +3167,7 @@ describe("bb-collab plugin boundary", () => {
       callerThreadId: "operator-thread",
       requestedFromBackground: false,
       callerPluginId: PLUGIN_ID,
+      issuanceProvenance: "console",
     }, 1);
     const beforeEvents = (db.prepare("SELECT COUNT(*) AS count FROM state_events").get() as { count: number }).count;
     const beforeReceipts = (db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts").get() as { count: number }).count;
@@ -3186,6 +3194,7 @@ describe("bb-collab plugin boundary", () => {
       callerThreadId: `thread-${id}`,
       requestedFromBackground: false,
       callerPluginId: PLUGIN_ID,
+      issuanceProvenance: "console",
     }, 1);
 
     expect((await host.harness.callRpc("apply", base) as FoundationResult).outcome).toBe("OPERATOR_RECEIPT_REQUIRED");
@@ -3578,6 +3587,7 @@ describe("bb-collab plugin boundary", () => {
       callerThreadId: "cached-consumer-rollout-dist-thread",
       requestedFromBackground: false,
       callerPluginId: PLUGIN_ID,
+      issuanceProvenance: "console",
     });
     expect(await host.harness.callRpc("cachedConsumerRollout", { ...unsigned, operatorReceiptId: receipt.receiptId })).toMatchObject({
       outcome: "OK",
@@ -3942,6 +3952,7 @@ describe("bb-collab plugin boundary", () => {
         callerThreadId: "foreign-thread",
         requestedFromBackground: false,
         callerPluginId: PLUGIN_ID,
+        issuanceProvenance: "console",
       }, 1);
       expect(applyAuthorizedMutation(db, { ...crossBinding, operatorReceiptId: foreignReceipt.receiptId })).toMatchObject({ outcome: "OPERATOR_RECEIPT_FOREIGN" });
       expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeInvalidRelease);
@@ -3956,6 +3967,7 @@ describe("bb-collab plugin boundary", () => {
         callerThreadId: "release-thread",
         requestedFromBackground: false,
         callerPluginId: PLUGIN_ID,
+        issuanceProvenance: "console",
       }, 2);
       const authorizedRelease = { ...unsignedRelease, candidateHead: CANDIDATE_SHA, operatorReceiptId: receipt.receiptId };
       const released = applyAuthorizedMutation(db, authorizedRelease);
@@ -3995,6 +4007,7 @@ describe("bb-collab plugin boundary", () => {
         callerThreadId: "release-thread-second",
         requestedFromBackground: false,
         callerPluginId: PLUGIN_ID,
+        issuanceProvenance: "console",
       }, 3);
       expect(applyAuthorizedMutation(db, { ...authorizedRelease, operatorReceiptId: secondReceipt.receiptId })).toMatchObject({ outcome: "OPERATOR_RECEIPT_STALE" });
       expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(secondReceipt.receiptId)).toEqual({ consumed_at_ms: null });
@@ -6511,6 +6524,7 @@ describe("bb-collab plugin boundary", () => {
         callerThreadId: "live-role-thread",
         requestedFromBackground: false,
         callerPluginId: PLUGIN_ID,
+        issuanceProvenance: "console",
       });
       return { ...unsigned, operatorReceiptId: receipt.receiptId };
     };
@@ -6544,6 +6558,7 @@ describe("bb-collab plugin boundary", () => {
         callerThreadId: "live-role-thread",
         requestedFromBackground: false,
         callerPluginId: PLUGIN_ID,
+        issuanceProvenance: "console",
       });
       const before = exportFoundation(db, PROJECT_ID);
       expect(await host.harness.callRpc("apply", { ...unsigned, operatorReceiptId: receipt.receiptId })).toMatchObject({

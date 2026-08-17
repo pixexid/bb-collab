@@ -1228,7 +1228,7 @@ export default async function plugin(bb: BbPluginApi) {
           bb.realtime.publish("operator-receipts", { changed: true });
           return operatorReceiptResult(input.projectId, "OK", "interim operator receipt and derived actor receipt persisted", issued);
         }
-        const receipt = persistInterimOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId });
+        const receipt = persistInterimOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId, issuanceProvenance: "console" });
         bb.realtime.publish("operator-receipts", { changed: true });
         return operatorReceiptResult(input.projectId, "OK", "interim operator receipt persisted", { operatorReceipt: receipt });
       } catch {
