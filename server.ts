@@ -427,7 +427,7 @@ async function readLiveRoleFactReader(
       const events = await sdk.threads.events.list({ threadId: request.roleContext!.threadId, afterSeq: String(eventSeq - 1), limit: "1" });
       if (events.length !== 1) throw new Error("exact role event is unavailable");
       const event = events[0]!;
-      if (event.id !== eventId || event.seq !== eventSeq) throw new Error("exact role event identity does not match");
+      // The BB API addresses this read by sequence; the resolver validates eventId too.
       return { id: event.id, seq: event.seq, type: event.type, data: event.data as Record<string, unknown> };
     };
     const [thread, requestEvent, completionEvent] = await Promise.all([

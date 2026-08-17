@@ -279,13 +279,16 @@ evidence is reported as unknown and is not success.
 
 Contract v20 replaces the whole-log role-context read with exact cited-event
 identity reads and a bounded interior correlation slice. The 256-event limit
-is unchanged. The request and completion are independently checked by their
-exact IDs and sequences; the bounded slice retains accepted/start/completion
+is unchanged and applies only to the monotonic span between cited event
+sequences, never to an event-count snapshot. The request and completion are
+independently checked by their exact IDs and sequences; the bounded slice retains accepted/start/completion
 correlation and fallback refusal. Historical global sequence ordering cannot
 be proved by those reads and is not silently assumed: inverted, oversized,
 incomplete, or locally unordered ordering evidence refuses
 `EXECUTION_COMPLETION_AMBIGUOUS` before any canonical write. The director
 first-generation exemption is unchanged.
+No role-holder thread is compacted or otherwise manipulated to satisfy the
+bound.
 Later events for the same provider thread are outside the cited turn and do
 not make its exact completion ambiguous; its exact ID and sequence bind one turn.
 

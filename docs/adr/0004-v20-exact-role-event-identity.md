@@ -9,7 +9,9 @@ with one sequence-addressed BB event read for each cited event. They then read
 only the interior sequence slice, capped at the unchanged
 `MAX_ROLE_CONTEXT_EVENTS = 256`, to preserve accepted/start/completion
 correlation and model-fallback refusal. A long-lived holder's earlier events
-are not enumerated.
+are not enumerated. The cap is the monotonic span between cited event
+sequences, not an event-count snapshot; no role-holder thread is compacted or
+otherwise manipulated to satisfy it.
 
 The old whole-log increasing-sequence sweep is not evidence available from
 identity reads. It is removed as an implicit invariant. Inverted cited

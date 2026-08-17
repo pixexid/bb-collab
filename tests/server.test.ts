@@ -6929,7 +6929,7 @@ describe("bb-collab plugin boundary", () => {
   });
 
   it("refuses hidden, foreign, ephemeral, ambiguous, and incomplete BB holder contexts without mutation", async () => {
-    const cases: Array<[string, (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => void, string, Partial<ApplyRequest>?]> = [
+    const cases: Array<[string, (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => void, string, Partial<ApplyRequest>?, string?]> = [
       ["hidden", (facts) => { facts.thread.visibility = "hidden"; }, "ROLE_CONTEXT_HIDDEN"],
       ["foreign-thread", (facts) => { facts.thread.projectId = FOREIGN_PROJECT_ID; }, "ROLE_CONTEXT_FOREIGN"],
       ["missing-environment", (facts) => { facts.thread.environmentId = null; }, "ROLE_CONTEXT_REQUIRED"],
@@ -6946,14 +6946,14 @@ describe("bb-collab plugin boundary", () => {
         facts.environment.status = "provisioning";
       }, "ROLE_CONTEXT_FOREIGN"],
       ["host-unavailable", (facts) => { facts.host.status = "disconnected"; }, "ROLE_CONTEXT_UNKNOWN"],
-      ["missing-start", (facts) => { facts.events = facts.events.filter((event) => event.type !== "turn/started"); }, "EXECUTION_COMPLETION_AMBIGUOUS"],
+      ["missing-start", (facts) => { facts.events = facts.events.filter((event) => event.type !== "turn/started"); }, "EXECUTION_COMPLETION_AMBIGUOUS", undefined, "bounded correlation slice contains an event outside the cited sequence bounds"],
       ["failed-completion", (facts) => { facts.events[3]!.data.status = "failed"; }, "EXECUTION_PROFILE_UNKNOWN"],
       ["model-fallback", (facts) => {
         facts.events[3]!.seq = 5;
         facts.events.splice(3, 0, { id: "fallback", seq: 4, type: "provider/modelFallback", data: { providerThreadId: "provider-thread-1" } });
       }, "EXECUTION_PROFILE_UNKNOWN", { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 5 } }],
     ];
-    for (const [name, mutate, outcome, requestOverride] of cases) {
+    for (const [name, mutate, outcome, requestOverride, message] of cases) {
       const host = await loadedHost();
       const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
       const before = exportFoundation(db, PROJECT_ID);
@@ -6963,6 +6963,7 @@ describe("bb-collab plugin boundary", () => {
         ...requestOverride,
       }), null, roleReader(mutate));
       expect(result.outcome, name).toBe(outcome);
+      if (message) expect(result.message, name).toBe(message);
       expect(exportFoundation(db, PROJECT_ID), name).toEqual(before);
     }
   });
@@ -7017,18 +7018,21 @@ describe("bb-collab plugin boundary", () => {
 
   it("refuses mismatched or unsupported bounded role-event ordering evidence without mutation", async () => {
     const { db, fenceToken } = seedAndBootstrap(await loadedHost(), PROJECT_ID, { config: roleConfig() });
-    const cases: Array<[string, ReturnType<typeof roleReader>, Partial<ApplyRequest>, string]> = [
+    const cases: Array<[string, ReturnType<typeof roleReader>, Partial<ApplyRequest>, string, string?]> = [
       ["mismatched-sequence", roleReader(), { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 2, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 4 } }, "ROLE_CONTEXT_UNKNOWN"],
-      ["oversized-slice", roleReader((facts) => { facts.events[3]!.seq = 1 + MAX_ROLE_CONTEXT_EVENTS + 1; }), { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 1 + MAX_ROLE_CONTEXT_EVENTS + 1 } }, "EXECUTION_COMPLETION_AMBIGUOUS"],
-      ["locally-unordered-slice", roleReader((facts) => { [facts.events[1], facts.events[2]] = [facts.events[2]!, facts.events[1]!]; }), {}, "EXECUTION_COMPLETION_AMBIGUOUS"],
+      ["inverted-sequences", roleReader((facts) => { facts.events[3]!.seq = 1; }), { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 1 } }, "EXECUTION_COMPLETION_AMBIGUOUS", "completion event sequence does not follow the request event sequence"],
+      ["oversized-slice", roleReader((facts) => { facts.events[3]!.seq = 1 + MAX_ROLE_CONTEXT_EVENTS + 2; }), { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 1 + MAX_ROLE_CONTEXT_EVENTS + 2 } }, "EXECUTION_COMPLETION_AMBIGUOUS", "cited event sequence span exceeds the role-context limit"],
+      ["locally-unordered-slice", roleReader((facts) => { [facts.events[1], facts.events[2]] = [facts.events[2]!, facts.events[1]!]; }), {}, "EXECUTION_COMPLETION_AMBIGUOUS", "bounded correlation slice is not strictly sequence-ordered"],
     ];
-    for (const [name, facts, override, outcome] of cases) {
+    for (const [name, facts, override, outcome, message] of cases) {
       const before = exportFoundation(db, PROJECT_ID);
-      expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      const result = applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
         idempotencyKey: `bounded-order-${name}`,
         qualificationId: `bounded-order-${name}`,
         ...override,
-      }), null, facts)).toMatchObject({ outcome, attempted: 0, verified: 0 });
+      }), null, facts);
+      expect(result).toMatchObject({ outcome, attempted: 0, verified: 0 });
+      if (message) expect(result.message).toBe(message);
       expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
     }
   });

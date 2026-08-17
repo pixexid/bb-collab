@@ -45,7 +45,7 @@ export const EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION =
   "no canonical state existed to migrate; historical archive preserved as evidence, read-only" as const;
 // ponytail: keep exports bounded at 256 rows; add paged/file export before migration or cutover.
 export const MAX_EXPORT_ROWS = 256;
-// Role context may inspect only the cited turn's interior event slice.
+// The cited event-sequence span is monotonic; an event-count snapshot is not.
 export const MAX_ROLE_CONTEXT_EVENTS = 256;
 export const MAX_EXPORT_BYTES = 512 * 1024;
 export const MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 8);
@@ -1847,11 +1847,11 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
     requestEvent = reader.event(request.roleContext.threadId, request.roleContext.requestEventId, request.roleContext.requestEventSeq);
     completion = reader.event(request.roleContext.threadId, request.roleContext.completionEventId, request.roleContext.completionEventSeq);
     if (request.roleContext.completionEventSeq <= request.roleContext.requestEventSeq) {
-      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded event ordering evidence is unavailable");
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion event sequence does not follow the request event sequence");
     }
     const correlationEventCount = request.roleContext.completionEventSeq - request.roleContext.requestEventSeq - 1;
     if (correlationEventCount > MAX_ROLE_CONTEXT_EVENTS) {
-      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded event ordering evidence exceeds the role-context limit");
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "cited event sequence span exceeds the role-context limit");
     }
     correlationEvents = reader.eventsAfter(request.roleContext.threadId, request.roleContext.requestEventSeq, correlationEventCount);
     if (!thread.environmentId) throw refusal("ROLE_CONTEXT_REQUIRED", "holder thread has no environment");
@@ -1912,14 +1912,18 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
   if (completion.id !== request.roleContext.completionEventId || completion.seq !== request.roleContext.completionEventSeq) {
     throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion does not match the exact requested correlation");
   }
-  if (
-    correlationEvents.length !== request.roleContext.completionEventSeq - request.roleContext.requestEventSeq - 1 ||
-    correlationEvents.some((event, index) =>
-      event.seq <= roleContext.requestEventSeq || event.seq >= roleContext.completionEventSeq ||
-      (index > 0 && event.seq <= correlationEvents[index - 1]!.seq),
-    )
-  ) {
-    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded event ordering evidence is incomplete or ambiguous");
+  const expectedCorrelationEventCount = roleContext.completionEventSeq - roleContext.requestEventSeq - 1;
+  if (correlationEvents.length !== expectedCorrelationEventCount) {
+    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded correlation slice is incomplete");
+  }
+  for (let index = 0; index < correlationEvents.length; index += 1) {
+    const event = correlationEvents[index]!;
+    if (event.seq <= roleContext.requestEventSeq || event.seq >= roleContext.completionEventSeq) {
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded correlation slice contains an event outside the cited sequence bounds");
+    }
+    if (index > 0 && event.seq <= correlationEvents[index - 1]!.seq) {
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded correlation slice is not strictly sequence-ordered");
+    }
   }
   const events = [requestEvent, ...correlationEvents, completion];
   const execution = requestEvent.data.execution as Record<string, unknown> | undefined;

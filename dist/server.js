@@ -15211,11 +15211,11 @@ function resolveRoleContext(reader, request, allowFirstDirectorEnvironment = fal
     requestEvent = reader.event(request.roleContext.threadId, request.roleContext.requestEventId, request.roleContext.requestEventSeq);
     completion = reader.event(request.roleContext.threadId, request.roleContext.completionEventId, request.roleContext.completionEventSeq);
     if (request.roleContext.completionEventSeq <= request.roleContext.requestEventSeq) {
-      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded event ordering evidence is unavailable");
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion event sequence does not follow the request event sequence");
     }
     const correlationEventCount = request.roleContext.completionEventSeq - request.roleContext.requestEventSeq - 1;
     if (correlationEventCount > MAX_ROLE_CONTEXT_EVENTS) {
-      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded event ordering evidence exceeds the role-context limit");
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "cited event sequence span exceeds the role-context limit");
     }
     correlationEvents = reader.eventsAfter(request.roleContext.threadId, request.roleContext.requestEventSeq, correlationEventCount);
     if (!thread.environmentId) throw refusal("ROLE_CONTEXT_REQUIRED", "holder thread has no environment");
@@ -15264,10 +15264,18 @@ ${thread.titleFallback ?? ""}`)) {
   if (completion.id !== request.roleContext.completionEventId || completion.seq !== request.roleContext.completionEventSeq) {
     throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion does not match the exact requested correlation");
   }
-  if (correlationEvents.length !== request.roleContext.completionEventSeq - request.roleContext.requestEventSeq - 1 || correlationEvents.some(
-    (event, index) => event.seq <= roleContext.requestEventSeq || event.seq >= roleContext.completionEventSeq || index > 0 && event.seq <= correlationEvents[index - 1].seq
-  )) {
-    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded event ordering evidence is incomplete or ambiguous");
+  const expectedCorrelationEventCount = roleContext.completionEventSeq - roleContext.requestEventSeq - 1;
+  if (correlationEvents.length !== expectedCorrelationEventCount) {
+    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded correlation slice is incomplete");
+  }
+  for (let index = 0; index < correlationEvents.length; index += 1) {
+    const event = correlationEvents[index];
+    if (event.seq <= roleContext.requestEventSeq || event.seq >= roleContext.completionEventSeq) {
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded correlation slice contains an event outside the cited sequence bounds");
+    }
+    if (index > 0 && event.seq <= correlationEvents[index - 1].seq) {
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded correlation slice is not strictly sequence-ordered");
+    }
   }
   const events = [requestEvent, ...correlationEvents, completion];
   const execution = requestEvent.data.execution;
@@ -22263,7 +22271,6 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
       const events = await sdk.threads.events.list({ threadId: request.roleContext.threadId, afterSeq: String(eventSeq - 1), limit: "1" });
       if (events.length !== 1) throw new Error("exact role event is unavailable");
       const event = events[0];
-      if (event.id !== eventId || event.seq !== eventSeq) throw new Error("exact role event identity does not match");
       return { id: event.id, seq: event.seq, type: event.type, data: event.data };
     };
     const [thread, requestEvent, completionEvent] = await Promise.all([
