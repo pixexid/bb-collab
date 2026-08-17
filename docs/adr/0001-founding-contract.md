@@ -305,7 +305,9 @@ This amendment performs no historical backfill. Any later correction must name
 each receipt ID and cite durable console-interaction evidence; it may never use
 a NULL approver, digest, or other predicate. The request digest remains
 head-independent: rebasing changes only the separately exact-bound
-`candidate_head` field.
+`candidate_head` field. The fixture-only apply seam remains test support only;
+v19 provenance and actor-binding assertions enter through the production RPC
+paths, so a fixture actor with a null receipt cannot satisfy a production gate.
 
 ## 6. Roles, delegation and execution
 

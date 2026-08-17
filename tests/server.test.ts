@@ -2523,6 +2523,25 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: issued.actorReceiptId!,
       operatorReceiptId: issued.operatorReceipt!.receiptId,
     };
+    const attestedWrongTargetUnsigned = {
+      ...unsigned,
+      idempotencyKey: "config-attested-wrong-target",
+      actorReceiptId: null,
+      operatorReceiptId: null,
+    };
+    const attestedWrongTarget = await host.harness.callRpc("approverAttestation", {
+      ...attestationInput,
+      idempotencyKey: attestedWrongTargetUnsigned.idempotencyKey,
+      requestDigest: operatorRequestDigest(attestedWrongTargetUnsigned),
+    }) as FoundationResult;
+    expect(attestedWrongTarget).toMatchObject({ outcome: "OK", operatorReceipt: { issuanceProvenance: "attestation" } });
+    const beforeAttestedWrongActor = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", {
+      ...attestedWrongTargetUnsigned,
+      actorReceiptId: issued.actorReceiptId,
+      operatorReceiptId: attestedWrongTarget.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "ACTOR_RECEIPT_UNVERIFIED", attempted: 0, verified: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeAttestedWrongActor);
 
     const unlinkedPluginReceipt = persistBootstrapOperatorReceipt(db, {
       projectId: PROJECT_ID,
