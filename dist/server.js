@@ -21950,7 +21950,7 @@ async function runArchiveSweep(bb, db, projectId, apply = false, now2 = Date.now
 
 // server.ts
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join as join2 } from "node:path";
+import { basename, dirname, join as join2 } from "node:path";
 import { fileURLToPath } from "node:url";
 var projectIdSchema = external_exports.string().trim().min(1).max(256);
 var mutationReceiptSchema = external_exports.object({
@@ -22370,7 +22370,8 @@ function cachedConsumerRolloutRefusal(projectId, message) {
 }
 function isLiveCachedConsumerRolloutArtifact(moduleUrl) {
   try {
-    return fileURLToPath(new URL(moduleUrl)).endsWith(join2("dist", "server.js"));
+    const artifactPath = fileURLToPath(new URL(moduleUrl));
+    return basename(artifactPath) === "server.js" && basename(dirname(artifactPath)) === "dist";
   } catch {
     return false;
   }

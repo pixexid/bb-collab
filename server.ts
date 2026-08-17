@@ -59,7 +59,7 @@ import {
 } from "./src/registered-waits.js";
 import { runArchiveSweep } from "./src/archive-sweep.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const projectIdSchema = z.string().trim().min(1).max(256);
@@ -529,7 +529,8 @@ function cachedConsumerRolloutRefusal(projectId: string, message: string): Found
 
 export function isLiveCachedConsumerRolloutArtifact(moduleUrl: string): boolean {
   try {
-    return fileURLToPath(new URL(moduleUrl)).endsWith(join("dist", "server.js"));
+    const artifactPath = fileURLToPath(new URL(moduleUrl));
+    return basename(artifactPath) === "server.js" && basename(dirname(artifactPath)) === "dist";
   } catch {
     return false;
   }

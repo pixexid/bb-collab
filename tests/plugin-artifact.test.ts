@@ -10,8 +10,10 @@ const ROOT = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = dirname(ROOT);
 
 describe("path-install server artifact", () => {
-  it("accepts the BB reload URL for dist/server.js and refuses source artifacts", () => {
+  it("accepts only dist/server.js artifact paths", () => {
     expect(isLiveCachedConsumerRolloutArtifact("file:///plugin/dist/server.js?bbPluginLoad=7.9#reload")).toBe(true);
+    expect(isLiveCachedConsumerRolloutArtifact("file:///plugin/dist/server.js")).toBe(true);
+    expect(isLiveCachedConsumerRolloutArtifact("file:///tmp/notdist/server.js")).toBe(false);
     expect(isLiveCachedConsumerRolloutArtifact("file:///scratch-clone/server.ts?bbPluginLoad=7.9")).toBe(false);
   });
 
