@@ -516,6 +516,7 @@ export interface LaneWatcher {
     operatorWait?: OperatorWait | null,
   ): Promise<void>;
   poll(): Promise<void>;
+  wakeRole(role: RoleIdleView): Promise<boolean>;
   recover(): Promise<void>;
 }
 
@@ -957,6 +958,69 @@ export function createLaneWatcher(options: {
     }
   };
 
+  const wakeRoleNow = async (role: RoleIdleView): Promise<boolean> => {
+    if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return false;
+    const holder: RoleHolderState = {
+      project_id: role.projectId,
+      role_id: role.roleId,
+      role_generation: role.roleGeneration,
+      execution_attempt_id: role.executionAttemptId,
+      thread_id: role.threadId,
+    };
+    if (!resolveCurrentCanonicalHolder(holder)) return false;
+    let scopes: RoleQueueScope[];
+    let observation: WorkerObservation;
+    try {
+      scopes = await options.readRoleScopes();
+      observation = await options.readWorker(role.threadId);
+    } catch {
+      return false;
+    }
+    const scope = scopes.find((candidate) => candidate.projectId === role.projectId);
+    if (
+      !scope?.nextStartable ||
+      scope.queueHeadId !== role.queueHeadId ||
+      scope.deferredReason ||
+      observation.projectId !== role.projectId ||
+      observation.status !== "idle" ||
+      observation.archived ||
+      observation.pendingExternalWait ||
+      observation.operatorWait ||
+      observation.operatorWaitKnown === false ||
+      observation.idleSinceMs === null ||
+      observation.idleSinceMs === undefined ||
+      !Number.isFinite(observation.idleSinceMs)
+    ) return false;
+
+    const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
+    const key = `${prefix}${scope.queueHeadId}`;
+    await roleIdleLedger.clearPrefixExcept(prefix, key);
+    const currentNow = now();
+    const record = await roleIdleLedger.observeIdle(key, observation.idleSinceMs);
+    const steerAgeMs = record.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : Math.max(0, currentNow - record.lastSteerAtMs);
+    if (record.escalated || record.steerCount >= 2 || steerAgeMs < roleIdleThresholdMs) return false;
+
+    const target: RoleIdleView = {
+      ...role,
+      threadId: holder.thread_id,
+      idleAgeMs: Math.max(0, currentNow - (record.idleSinceMs ?? currentNow)),
+    };
+    let failed = false;
+    let delivered: boolean | void = undefined;
+    try {
+      delivered = await options.steerRole(target);
+    } catch {
+      failed = true;
+    }
+    if (delivered === false) {
+      await roleIdleLedger.clearPrefixExcept(prefix);
+      return false;
+    }
+    const updated = await roleIdleLedger.recordSteer(key, failed, currentNow);
+    if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, target);
+    return true;
+  };
+
   const observeNow = async (
     threadId: string,
     status: ThreadStatus,
@@ -1138,6 +1202,9 @@ export function createLaneWatcher(options: {
           }
         }
       });
+    },
+    wakeRole(role) {
+      return enqueue(() => wakeRoleNow(role));
     },
     recover() {
       return enqueue(async () => {

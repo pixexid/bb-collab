@@ -19,7 +19,7 @@ export interface StallGuardCycleOptions {
   readRoleHolders: () => RoleHolderState[];
   readArtifact: (holder: RoleHolderState) => Promise<unknown | null>;
   readRoleScopes: () => Promise<RoleQueueScope[]> | RoleQueueScope[];
-  steerRole: (role: RoleIdleView) => Promise<boolean | void>;
+  wakeRole: (role: RoleIdleView) => Promise<boolean>;
   persistence: StallGuardPersistence;
 }
 
@@ -77,7 +77,7 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
         };
         let delivered: boolean | void;
         try {
-          delivered = await options.steerRole(role);
+          delivered = await options.wakeRole(role);
         } catch {
           continue;
         }

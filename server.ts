@@ -1112,7 +1112,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       const result = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
       return result.outcome === "unavailable" ? null : result;
     },
-    steerRole,
+    wakeRole: (role) => watcher.wakeRole(role),
     persistence: {
       read: () => bb.storage.kv.get<unknown>(STALL_GUARD_KV_KEY),
       write: (state) => bb.storage.kv.set(STALL_GUARD_KV_KEY, state),

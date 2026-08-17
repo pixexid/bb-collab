@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import plugin from "../server.js";
-import { type RoleHolderState } from "../src/awareness.js";
+import { createLaneWatcher, type RoleHolderState } from "../src/awareness.js";
 import { PLUGIN_ID } from "../src/foundation.js";
 import { createStallGuardCycle } from "../src/stall-guard.js";
 
@@ -17,11 +17,23 @@ function holder(generation: number, threadId: string): RoleHolderState {
   };
 }
 
-function persistence() {
-  let value: unknown;
+function kvPersistence() {
+  const host = createFakePluginHost({
+    pluginId: PLUGIN_ID,
+    sdk: {
+      threads: {
+        get: async () => { throw new Error("not used"); },
+        send: async () => ({ ok: true }),
+        interactions: { list: async () => [] },
+      },
+    },
+  });
   return {
-    read: async () => value,
-    write: async (next: unknown) => { value = structuredClone(next); },
+    host,
+    persistence: {
+      read: () => host.bb.storage.kv.get<unknown>("stall-guard.artifacts"),
+      write: (next: Record<string, string>) => host.bb.storage.kv.set("stall-guard.artifacts", next),
+    },
   };
 }
 
@@ -34,12 +46,13 @@ describe("stall-guard artifact cycle", () => {
     let holders = [holder(1, "old-holder")];
     let currentArtifact: unknown = { outcome: "absent" };
     const steers: unknown[] = [];
+    const store = kvPersistence();
     const cycle = createStallGuardCycle({
       readRoleHolders: () => holders,
       readArtifact: async () => currentArtifact,
       readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
-      steerRole: async (role) => { steers.push(role); return true; },
-      persistence: persistence(),
+      wakeRole: async (role) => { steers.push(role); return true; },
+      persistence: store.persistence,
     });
 
     await cycle.cycle(PROJECT_ID);
@@ -55,30 +68,53 @@ describe("stall-guard artifact cycle", () => {
     ]);
   });
 
-  it("does not tell a retired or archived holder when the existing seam refuses it", async () => {
-    const steerRole = vi.fn().mockResolvedValue(false);
-    const cycle = createStallGuardCycle({
-      readRoleHolders: () => [holder(1, "retired-holder")],
-      readArtifact: async () => artifact("changed"),
+  it.each(["retired", "archived"] as const)("does not tell a %s holder through the real refusal seam", async (kind) => {
+    const store = kvPersistence();
+    let holders = [holder(1, "current-holder")];
+    let currentArtifact: unknown = { outcome: "absent" };
+    const steerRole = vi.fn().mockResolvedValue(true);
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: async () => {},
+      readRoleHolders: () => holders,
       readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
+      readWorker: async () => ({
+        status: "idle",
+        pendingExternalWait: false,
+        archived: kind === "archived",
+        projectId: PROJECT_ID,
+        operatorWait: null,
+        operatorWaitKnown: true,
+        idleSinceMs: 0,
+      }),
       steerRole,
-      persistence: persistence(),
+    });
+    const cycle = createStallGuardCycle({
+      readRoleHolders: () => holders,
+      readArtifact: async () => currentArtifact,
+      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
+      wakeRole: (role) => watcher.wakeRole(role),
+      persistence: store.persistence,
     });
 
     await cycle.cycle(PROJECT_ID);
+    if (kind === "retired") holders = [];
+    currentArtifact = artifact("changed");
+    await cycle.cycle(PROJECT_ID);
+
     expect(steerRole).not.toHaveBeenCalled();
   });
 
   it("persists artifact deltas so a restart does not re-fire them", async () => {
-    const store = persistence();
-    const steerRole = vi.fn().mockResolvedValue(true);
+    const store = kvPersistence();
+    const wakeRole = vi.fn().mockResolvedValue(true);
     let currentArtifact: unknown = { outcome: "absent" };
     const options = {
       readRoleHolders: () => [holder(1, "current-holder")],
       readArtifact: async () => currentArtifact,
       readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
-      steerRole,
-      persistence: store,
+      wakeRole,
+      persistence: store.persistence,
     };
 
     await createStallGuardCycle(options).cycle(PROJECT_ID);
@@ -86,7 +122,48 @@ describe("stall-guard artifact cycle", () => {
     await createStallGuardCycle(options).cycle(PROJECT_ID);
     await createStallGuardCycle(options).cycle(PROJECT_ID);
 
+    expect(wakeRole).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesces the idle-floor and artifact-delta paths through the ledger", async () => {
+    let currentNow = 0;
+    let currentArtifact: unknown = { outcome: "absent" };
+    const store = kvPersistence();
+    const steerRole = vi.fn().mockResolvedValue(true);
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: async () => {},
+      readRoleHolders: () => [holder(1, "current-holder")],
+      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
+      readWorker: async () => ({
+        status: "idle",
+        pendingExternalWait: false,
+        archived: false,
+        projectId: PROJECT_ID,
+        operatorWait: null,
+        operatorWaitKnown: true,
+        idleSinceMs: 0,
+      }),
+      steerRole,
+      now: () => currentNow,
+    });
+    const cycle = createStallGuardCycle({
+      readRoleHolders: () => [holder(1, "current-holder")],
+      readArtifact: async () => currentArtifact,
+      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
+      wakeRole: (role) => watcher.wakeRole(role),
+      persistence: store.persistence,
+    });
+
+    await cycle.cycle(PROJECT_ID);
+    await watcher.poll();
+    currentNow = 10 * 60_000;
+    currentArtifact = artifact("changed");
+    await watcher.poll();
+    const summary = await cycle.cycle(PROJECT_ID);
+
     expect(steerRole).toHaveBeenCalledTimes(1);
+    expect(summary.steered).toBe(0);
   });
 });
 
