@@ -20840,6 +20840,9 @@ function createWaitRegistry(persistence) {
     })
   };
 }
+function roleIdleKey(holder, queueHeadId) {
+  return `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${queueHeadId}`;
+}
 function operatorWaitAlertState(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) return {};
   const state = {};
@@ -20896,10 +20899,11 @@ function roleIdleState(input) {
     const idleSinceMs = typeof record2.idleSinceMs === "number" && Number.isFinite(record2.idleSinceMs) ? record2.idleSinceMs : null;
     const lastSteerAtMs = typeof record2.lastSteerAtMs === "number" && Number.isFinite(record2.lastSteerAtMs) ? record2.lastSteerAtMs : null;
     const awaitingSteerOutcome = record2.awaitingSteerOutcome === true;
-    if (!Number.isInteger(record2.steerCount) || record2.steerCount < 0 || record2.steerCount > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || idleSinceMs !== null && idleSinceMs < 0 || lastSteerAtMs !== null && lastSteerAtMs < 0 || typeof record2.escalated !== "boolean") {
+    const lastWakeAtMs = typeof record2.lastWakeAtMs === "number" && Number.isFinite(record2.lastWakeAtMs) ? record2.lastWakeAtMs : null;
+    if (!Number.isInteger(record2.steerCount) || record2.steerCount < 0 || record2.steerCount > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || idleSinceMs !== null && idleSinceMs < 0 || lastSteerAtMs !== null && lastSteerAtMs < 0 || lastWakeAtMs !== null && lastWakeAtMs < 0 || typeof record2.escalated !== "boolean") {
       throw new Error("invalid role idle state");
     }
-    state[key] = { steerCount: record2.steerCount, failedSteers, escalated: record2.escalated, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome };
+    state[key] = { steerCount: record2.steerCount, failedSteers, escalated: record2.escalated, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastWakeAtMs };
   }
   return state;
 }
@@ -20937,9 +20941,16 @@ function createRoleIdleLedger(persistence) {
         }
         return { ...record2 };
       }
-      state[key] = { ...record2 ?? { steerCount: 0, failedSteers: 0, escalated: false, lastSteerAtMs: null, awaitingSteerOutcome: false }, idleSinceMs, awaitingSteerOutcome: false };
+      state[key] = { ...record2 ?? { steerCount: 0, failedSteers: 0, escalated: false, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null }, idleSinceMs, awaitingSteerOutcome: false };
       await save();
       return { ...state[key] };
+    }),
+    resetIdle: (key) => enqueue(async () => {
+      await load();
+      const record2 = state[key];
+      if (!record2) return;
+      state[key] = { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: record2.lastWakeAtMs };
+      await save();
     }),
     preserveAfterSteerWake: (key) => enqueue(async () => {
       await load();
@@ -20948,7 +20959,7 @@ function createRoleIdleLedger(persistence) {
     }),
     recordSteer: (key, failed, steeredAtMs) => enqueue(async () => {
       await load();
-      const record2 = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false };
+      const record2 = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null };
       record2.steerCount = Math.min(2, record2.steerCount + 1);
       if (failed) record2.failedSteers = Math.min(2, record2.failedSteers + 1);
       record2.lastSteerAtMs = steeredAtMs;
@@ -20959,7 +20970,7 @@ function createRoleIdleLedger(persistence) {
     }),
     markEscalated: (key) => enqueue(async () => {
       await load();
-      const record2 = state[key] ?? { steerCount: 2, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false };
+      const record2 = state[key] ?? { steerCount: 2, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null };
       if (record2.escalated) return false;
       record2.escalated = true;
       state[key] = record2;
@@ -20976,6 +20987,14 @@ function createRoleIdleLedger(persistence) {
         }
       }
       if (changed) await save();
+    }),
+    recordWake: (key, sentAtMs) => enqueue(async () => {
+      await load();
+      const record2 = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null };
+      const next = { ...record2, lastWakeAtMs: sentAtMs };
+      const nextState = { ...state, [key]: next };
+      await persistence?.write(structuredClone(nextState));
+      state = nextState;
     })
   };
 }
@@ -21353,11 +21372,12 @@ function createLaneWatcher(options) {
         await roleIdleLedger.clearPrefixExcept(prefix);
         continue;
       }
-      const key = `${prefix}${scope.queueHeadId}`;
+      const key = roleIdleKey(holder, scope.queueHeadId);
       await roleIdleLedger.clearPrefixExcept(prefix, key);
       if (observation.status !== "idle") {
         if (await roleIdleLedger.preserveAfterSteerWake(key)) continue;
-        await roleIdleLedger.clearPrefixExcept(prefix);
+        await roleIdleLedger.resetIdle(key);
+        await roleIdleLedger.clearPrefixExcept(prefix, key);
         continue;
       }
       if (observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) {
@@ -21622,6 +21642,15 @@ function createLaneWatcher(options) {
         await operatorWaitAlertLedger.recover();
         await roleIdleLedger.recover();
       });
+    },
+    readRoleIdle(key) {
+      return roleIdleLedger.get(key);
+    },
+    observeRoleIdle(key, idleSinceMs) {
+      return roleIdleLedger.observeIdle(key, idleSinceMs);
+    },
+    recordRoleWake(key, sentAtMs) {
+      return roleIdleLedger.recordWake(key, sentAtMs);
     }
   };
 }
@@ -22156,6 +22185,7 @@ function readCheckoutDivergence(checkoutRoot) {
 import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync2, rmSync, statSync as statSync2, writeFileSync } from "node:fs";
 import { basename, dirname as dirname2, isAbsolute, join as join4, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+var SENTINEL_WAKE_FLOOR_MS = 60 * 6e4;
 var projectIdSchema = external_exports.string().trim().min(1).max(256);
 var mutationReceiptSchema = external_exports.object({
   projectId: projectIdSchema,
@@ -22825,13 +22855,7 @@ async function plugin(bb, options = {}) {
     bb.log.error(`canonical store unavailable: ${String(error48)}`);
     db = null;
   }
-  const interactionStateCache = /* @__PURE__ */ new Map();
   const readPendingExternalWait = async (threadId) => {
-    const cached2 = interactionStateCache.get(threadId);
-    if (cached2) {
-      interactionStateCache.delete(threadId);
-      return cached2.pending;
-    }
     try {
       const interactions = await bb.sdk.threads.interactions.list({ threadId });
       return interactions.some((interaction) => interaction.status === "pending");
@@ -22851,8 +22875,6 @@ async function plugin(bb, options = {}) {
       };
       break;
     }
-    if (wait) interactionStateCache.delete(threadId);
-    else interactionStateCache.set(threadId, { pending: pending.length > 0, operatorWait: wait });
     return wait;
   };
   const continuationLedger = createContinuationLedger({
@@ -22933,17 +22955,32 @@ ${thread.titleFallback ?? ""}`);
     const usableStatus = requireIdle ? thread.status === "idle" : thread.status === "idle" || thread.status === "active";
     return thread.projectId === holder.project_id && thread.archivedAt === null && thread.deletedAt === null && !witness && usableStatus ? null : `observedProject=${thread.projectId} archivedAt=${thread.archivedAt ?? "null"} deletedAt=${thread.deletedAt ?? "null"} status=${thread.status} witness=${witness}`;
   };
-  const readRoleScopes = async () => {
-    if (!db) return [];
+  const readOperatorWaits = async () => {
+    if (!db) return /* @__PURE__ */ new Map();
     const operatorWaits = /* @__PURE__ */ new Map();
     const threadIds = [...new Set(readLaneStates(db).filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state)).map((lane) => lane.thread_id).filter((threadId) => threadId !== null))];
     await Promise.all(threadIds.map(async (threadId) => {
-      const wait = await readPendingOperatorWaitForThread(threadId);
-      if (wait) operatorWaits.set(threadId, wait);
+      try {
+        const wait = await readPendingOperatorWaitForThread(threadId);
+        if (wait) operatorWaits.set(threadId, wait);
+      } catch {
+      }
     }));
+    return operatorWaits;
+  };
+  const readRoleScopes = async () => {
+    if (!db) return [];
     return roleQueueScopes(
-      openLaneViews(db, Date.now(), operatorWaits)
+      openLaneViews(db, Date.now(), await readOperatorWaits())
     );
+  };
+  const readUnblockedStartableLanes = async () => {
+    if (!db) return [];
+    const candidates = openLaneViews(db, Date.now(), await readOperatorWaits()).filter((lane) => lane.nextStartable);
+    return (await Promise.all(candidates.map(async (lane) => {
+      if (!lane.threadId || !await readPendingExternalWait(lane.threadId)) return lane;
+      return null;
+    }))).filter((lane) => lane !== null);
   };
   const steerRole = async (role) => {
     if (!db) return false;
@@ -23170,13 +23207,60 @@ ${thread.titleFallback ?? ""}`);
       bb.log.warn(`stall-guard liveness check failed: ${String(error48)}`);
     }
   });
+  const wakeInFlight = /* @__PURE__ */ new Set();
   bb.background.schedule("sentinel-wake-floor", "0 * * * *", async () => {
     try {
-      await bb.sdk.threads.send({
-        threadId: "thr_bpzjyqg7ys",
-        mode: "queue-if-active",
-        input: [{ type: "text", visibility: "agent-only", text: "Hourly Sentinel health check: verify the fleet against canonical surfaces and report any drift or blocker.", mentions: [] }]
-      });
+      if (!db) return;
+      const directorsByProject = /* @__PURE__ */ new Map();
+      for (const holder of readRoleHolderStates(db).filter((candidate) => candidate.role_id === "director")) {
+        const directors = directorsByProject.get(holder.project_id) ?? [];
+        directors.push(holder);
+        directorsByProject.set(holder.project_id, directors);
+      }
+      if (directorsByProject.size === 0) return;
+      const startableLanes = await readUnblockedStartableLanes();
+      for (const [projectId, directors] of directorsByProject) {
+        let wakeInFlightKey = null;
+        try {
+          if (directors.length !== 1) {
+            if (directors.length > 1) bb.log.warn(`sentinel-wake-floor refused: project=${projectId} active director holders=${directors.length}`);
+            continue;
+          }
+          const director = directors[0];
+          const lane = startableLanes.find((candidate) => candidate.projectId === projectId);
+          if (!lane?.nextStartable || !lane.executionAttemptId) continue;
+          const thread = await bb.sdk.threads.get({ threadId: director.thread_id });
+          if (thread.projectId !== projectId || thread.status !== "idle" || thread.archivedAt !== null || thread.deletedAt !== null) continue;
+          if (await readPendingExternalWait(director.thread_id)) continue;
+          const key = roleIdleKey(director, lane.executionAttemptId);
+          const previous = await watcher.readRoleIdle(key);
+          const now2 = Date.now();
+          if (previous?.lastWakeAtMs !== null && previous?.lastWakeAtMs !== void 0 && now2 - previous.lastWakeAtMs < SENTINEL_WAKE_FLOOR_MS) continue;
+          const idle = await watcher.observeRoleIdle(key, now2);
+          if (idle.idleSinceMs === null || now2 - idle.idleSinceMs < SENTINEL_WAKE_FLOOR_MS) continue;
+          if (wakeInFlight.has(key)) continue;
+          wakeInFlight.add(key);
+          wakeInFlightKey = key;
+          const current = readRoleHolderStates(db).filter((candidate) => candidate.project_id === projectId && candidate.role_id === "director");
+          if (current.length !== 1 || current[0].role_generation !== director.role_generation || current[0].execution_attempt_id !== director.execution_attempt_id || current[0].thread_id !== director.thread_id) {
+            if (current.length > 1) bb.log.warn(`sentinel-wake-floor refused: project=${projectId} active director holders=${current.length}`);
+            continue;
+          }
+          const currentPending = await readPendingExternalWait(director.thread_id);
+          const currentThread = await bb.sdk.threads.get({ threadId: director.thread_id });
+          if (currentPending || currentThread.projectId !== projectId || currentThread.status !== "idle" || currentThread.archivedAt !== null || currentThread.deletedAt !== null) continue;
+          await bb.sdk.threads.send({
+            threadId: director.thread_id,
+            mode: "queue-if-active",
+            input: [{ type: "text", visibility: "agent-only", text: "Hourly director health check: inspect canonical surfaces and report any drift or blocker.", mentions: [] }]
+          });
+          await watcher.recordRoleWake(key, Date.now());
+        } catch (error48) {
+          bb.log.warn(`sentinel-wake-floor failed: ${String(error48)}`);
+        } finally {
+          if (wakeInFlightKey) wakeInFlight.delete(wakeInFlightKey);
+        }
+      }
     } catch (error48) {
       bb.log.warn(`sentinel-wake-floor failed: ${String(error48)}`);
     }

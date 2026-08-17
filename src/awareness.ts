@@ -160,6 +160,10 @@ export interface RoleHolderState {
   thread_id: string;
 }
 
+export function roleIdleKey(holder: RoleHolderState, queueHeadId: string): string {
+  return `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${queueHeadId}`;
+}
+
 export interface RoleQueueScope {
   projectId: string;
   nextStartable: boolean;
@@ -232,13 +236,14 @@ export interface RoleIdlePersistence {
   write(state: Record<string, RoleIdleRecord>): Promise<void>;
 }
 
-interface RoleIdleRecord {
+export interface RoleIdleRecord {
   steerCount: number;
   failedSteers: number;
   escalated: boolean;
   idleSinceMs: number | null;
   lastSteerAtMs: number | null;
   awaitingSteerOutcome: boolean;
+  lastWakeAtMs: number | null;
 }
 
 export interface ContinuationClaim {
@@ -327,10 +332,11 @@ function roleIdleState(input: unknown): Record<string, RoleIdleRecord> {
     const idleSinceMs = typeof record.idleSinceMs === "number" && Number.isFinite(record.idleSinceMs) ? record.idleSinceMs : null;
     const lastSteerAtMs = typeof record.lastSteerAtMs === "number" && Number.isFinite(record.lastSteerAtMs) ? record.lastSteerAtMs : null;
     const awaitingSteerOutcome = record.awaitingSteerOutcome === true;
-    if (!Number.isInteger(record.steerCount) || (record.steerCount as number) < 0 || (record.steerCount as number) > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || (idleSinceMs !== null && idleSinceMs < 0) || (lastSteerAtMs !== null && lastSteerAtMs < 0) || typeof record.escalated !== "boolean") {
+    const lastWakeAtMs = typeof record.lastWakeAtMs === "number" && Number.isFinite(record.lastWakeAtMs) ? record.lastWakeAtMs : null;
+    if (!Number.isInteger(record.steerCount) || (record.steerCount as number) < 0 || (record.steerCount as number) > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || (idleSinceMs !== null && idleSinceMs < 0) || (lastSteerAtMs !== null && lastSteerAtMs < 0) || (lastWakeAtMs !== null && lastWakeAtMs < 0) || typeof record.escalated !== "boolean") {
       throw new Error("invalid role idle state");
     }
-    state[key] = { steerCount: record.steerCount as number, failedSteers, escalated: record.escalated as boolean, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome };
+    state[key] = { steerCount: record.steerCount as number, failedSteers, escalated: record.escalated as boolean, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastWakeAtMs };
   }
   return state;
 }
@@ -365,9 +371,16 @@ function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
         }
         return { ...record };
       }
-      state[key] = { ...(record ?? { steerCount: 0, failedSteers: 0, escalated: false, lastSteerAtMs: null, awaitingSteerOutcome: false }), idleSinceMs, awaitingSteerOutcome: false };
+      state[key] = { ...(record ?? { steerCount: 0, failedSteers: 0, escalated: false, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null }), idleSinceMs, awaitingSteerOutcome: false };
       await save();
       return { ...state[key] };
+    }),
+    resetIdle: (key: string) => enqueue(async () => {
+      await load();
+      const record = state[key];
+      if (!record) return;
+      state[key] = { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: record.lastWakeAtMs };
+      await save();
     }),
     preserveAfterSteerWake: (key: string) => enqueue(async () => {
       await load();
@@ -376,7 +389,7 @@ function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
     }),
     recordSteer: (key: string, failed: boolean, steeredAtMs: number) => enqueue(async () => {
       await load();
-      const record = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false };
+      const record = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null };
       record.steerCount = Math.min(2, record.steerCount + 1);
       if (failed) record.failedSteers = Math.min(2, record.failedSteers + 1);
       record.lastSteerAtMs = steeredAtMs;
@@ -387,7 +400,7 @@ function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
     }),
     markEscalated: (key: string) => enqueue(async () => {
       await load();
-      const record = state[key] ?? { steerCount: 2, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false };
+      const record = state[key] ?? { steerCount: 2, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null };
       if (record.escalated) return false;
       record.escalated = true;
       state[key] = record;
@@ -404,6 +417,14 @@ function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
         }
       }
       if (changed) await save();
+    }),
+    recordWake: (key: string, sentAtMs: number) => enqueue(async () => {
+      await load();
+      const record = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null };
+      const next = { ...record, lastWakeAtMs: sentAtMs };
+      const nextState = { ...state, [key]: next };
+      await persistence?.write(structuredClone(nextState));
+      state = nextState;
     }),
   };
 }
@@ -523,6 +544,9 @@ export interface LaneWatcher {
   poll(): Promise<void>;
   wakeRole(role: RoleIdleView): Promise<RoleWakeResult>;
   recover(): Promise<void>;
+  readRoleIdle(key: string): Promise<RoleIdleRecord | null>;
+  observeRoleIdle(key: string, idleSinceMs: number): Promise<RoleIdleRecord>;
+  recordRoleWake(key: string, sentAtMs: number): Promise<void>;
 }
 
 export interface WorkerObservation {
@@ -900,11 +924,12 @@ export function createLaneWatcher(options: {
         await roleIdleLedger.clearPrefixExcept(prefix);
         continue;
       }
-      const key = `${prefix}${scope.queueHeadId}`;
+      const key = roleIdleKey(holder, scope.queueHeadId);
       await roleIdleLedger.clearPrefixExcept(prefix, key);
       if (observation.status !== "idle") {
         if (await roleIdleLedger.preserveAfterSteerWake(key)) continue;
-        await roleIdleLedger.clearPrefixExcept(prefix);
+        await roleIdleLedger.resetIdle(key);
+        await roleIdleLedger.clearPrefixExcept(prefix, key);
         continue;
       }
       if (observation.idleSinceMs === null || observation.idleSinceMs === undefined || !Number.isFinite(observation.idleSinceMs)) {
@@ -1218,6 +1243,15 @@ export function createLaneWatcher(options: {
         await operatorWaitAlertLedger.recover();
         await roleIdleLedger.recover();
       });
+    },
+    readRoleIdle(key) {
+      return roleIdleLedger.get(key);
+    },
+    observeRoleIdle(key, idleSinceMs) {
+      return roleIdleLedger.observeIdle(key, idleSinceMs);
+    },
+    recordRoleWake(key, sentAtMs) {
+      return roleIdleLedger.recordWake(key, sentAtMs);
     },
   };
 }

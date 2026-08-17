@@ -28,6 +28,7 @@ import {
   MAX_ROLE_CONTEXT_EVENTS,
   MIGRATION_STATES,
   MIGRATION_STEPS,
+  OPERATOR_RECEIPT_RETIREMENT_CONDITION,
   PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES,
   PLUGIN_ID,
   SCHEMA_VERSION,
@@ -605,6 +606,141 @@ async function loadedDistHost() {
   const { default: distPlugin } = await import("../dist/server.js?bbPluginLoad=7.9");
   await distPlugin(host.bb);
   return host;
+}
+
+async function sentinelWakeFloorFixture(updatedAt = 1) {
+  const fixture = await assignmentFixture({ directorSeat: true });
+  const holder = fixture.db.prepare(
+    "SELECT thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'director'",
+  ).get() as { thread_id: string };
+  let threadStatus: "idle" | "active" = "idle";
+  let directorPendingInteraction = false;
+  fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) =>
+    threadId === holder.thread_id && directorPendingInteraction ? [{ status: "pending" }] : []) as never);
+  let nativeUpdatedAt = updatedAt;
+  const threadProjects = new Map([[holder.thread_id, PROJECT_ID]]);
+  fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+    id: threadId,
+    projectId: threadProjects.get(threadId) ?? PROJECT_ID,
+    status: threadStatus,
+    updatedAt: nativeUpdatedAt,
+  })) as never);
+  fixture.host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
+  return {
+    ...fixture,
+    directorThreadId: holder.thread_id,
+    setThreadUpdatedAt(value: number) { nativeUpdatedAt = value; },
+    setThreadStatus(value: "idle" | "active") { threadStatus = value; },
+    getThreadStatus() { return threadStatus; },
+    setDirectorPendingInteraction(value: boolean) { directorPendingInteraction = value; },
+    setThreadProject(threadId: string, projectId: string) { threadProjects.set(threadId, projectId); },
+  };
+}
+
+async function addPendingReview(fixture: Awaited<ReturnType<typeof sentinelWakeFloorFixture>>) {
+  activateReviewer(fixture.db, fixture.fenceToken);
+  expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+  const template = assignmentPrepareRequest(fixture.fenceToken, "pending-review");
+  const prepared = applyWithFixtureReceipt(fixture.db, {
+    ...template,
+    actorReceiptId: "role-actor-reviewer",
+    expectedResourceRevision: 3,
+    assignment: {
+      ...template.assignment!,
+      assignmentId: "pending-review",
+      assignmentKind: "review",
+      laneId: "pending-review",
+      roleRequirementId: "reviewer-v1",
+      roleId: "independent-reviewer",
+      roleGeneration: 2,
+      candidateSemantics: "frozen",
+      candidateSha: CANDIDATE_SHA,
+    },
+  }, null, null, new DeterministicNativeAssignmentAdapter());
+  expect(prepared.outcome).toBe("OK");
+  return (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+}
+
+function operatorWaitInteraction(threadId: string) {
+  return {
+    status: "pending",
+    threadId,
+    createdAt: 1,
+    origin: { kind: "plugin", pluginId: PLUGIN_ID, rendererId: "operator-receipt" },
+    payload: {
+      kind: "plugin",
+      data: {
+        kind: "operator_receipt_confirmation",
+        projectId: PROJECT_ID,
+        mutationClass: "bootstrap",
+        candidateHead: "a".repeat(40),
+        idempotencyKey: "waiting-review",
+        requestDigest: "b".repeat(64),
+        callerThreadId: threadId,
+        requestedFromBackground: false,
+        retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
+      },
+    },
+  };
+}
+
+function cloneProject(db: Database.Database, sourceProjectId: string, targetProjectId: string) {
+  const clone = (table: string, where = "", mutate?: (row: Record<string, unknown>) => void) => {
+    const columns = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name);
+    const rows = db.prepare(`SELECT * FROM ${table} WHERE project_id = ?${where}`).all(sourceProjectId) as Record<string, unknown>[];
+    const insert = db.prepare(`INSERT INTO ${table} (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`);
+    for (const row of rows) {
+      row.project_id = targetProjectId;
+      mutate?.(row);
+      insert.run(...columns.map((column) => row[column]));
+    }
+  };
+  clone("project_config_revisions");
+  clone("project_config_heads");
+  clone("repository_targets");
+  clone("work_items");
+  clone("qualification_observations");
+  clone("execution_attempts", " AND origin = 'role_holder'", (row) => {
+    row.thread_id = row.role_id === "director" ? "director-two" : `reviewer-two-${row.role_generation}`;
+  });
+  clone("role_generations");
+  clone("role_generation_heads");
+  clone("assignments");
+  clone("execution_attempts", " AND origin = 'assignment'");
+}
+
+function advanceDirector(db: Database.Database, fenceToken: string) {
+  const roleContext = {
+    threadId: "director-successor",
+    requestEventId: "director-successor-request",
+    requestEventSeq: 1,
+    completionEventId: "director-successor-completion",
+    completionEventSeq: 4,
+  };
+  const facts = directorRoleReader((input) => {
+    input.thread.id = roleContext.threadId;
+    input.thread.environmentId = "director-successor-environment";
+    input.environment.id = "director-successor-environment";
+    input.events[0]!.id = roleContext.requestEventId;
+    input.events[3]!.id = roleContext.completionEventId;
+  });
+  expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+    idempotencyKey: "qualification-director-successor",
+    roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+    qualificationId: "qualification-director-successor",
+    declaredProfile: DIRECTOR_PROFILE,
+    roleContext,
+  }), null, facts).outcome).toBe("OK");
+  expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+    idempotencyKey: "succession-director-successor",
+    roleId: "director",
+    roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+    qualificationId: "qualification-director-successor",
+    profileDigest: DIRECTOR_PROFILE_DIGEST,
+    expectedGeneration: 1,
+    predecessorGeneration: 1,
+    roleContext,
+  }), null, facts).outcome).toBe("OK");
 }
 
 async function loadedLaneWatcherHost() {
@@ -1812,7 +1948,7 @@ describe("bb-collab plugin boundary", () => {
     fixture.setPending(true);
 
     fixture.changed({ entity: "thread", id: "worker-1" });
-    await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.interactions.list")).toHaveLength(1));
+    await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.interactions.list")).toHaveLength(2));
 
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
     await fixture.host.harness.lifecycle.dispose();
@@ -2018,23 +2154,392 @@ describe("bb-collab plugin boundary", () => {
     expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "approverAttestation", "cachedConsumerRollout", "doctor", "export", "lanes", "operatorPassphraseState", "operatorReceipt", "operatorReceiptDecision", "operatorReceiptRequests", "registerWait", "reorderPinned", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
   });
 
-  it("registers sentinel-wake-floor with its exact hourly health send", async () => {
-    const host = await loadedHost();
-    host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
-    expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toContain("sentinel-wake-floor");
-    await host.harness.runSchedule("sentinel-wake-floor");
-    expect(host.harness.inspection.sdk.callsTo("threads.send")).toContainEqual([{
-      threadId: "thr_bpzjyqg7ys",
-      mode: "queue-if-active",
-      input: [{ type: "text", visibility: "agent-only", text: "Hourly Sentinel health check: verify the fleet against canonical surfaces and report any drift or blocker.", mentions: [] }],
-    }]);
+  it("does not wake a quiet director seat", async () => {
+    const fixture = await sentinelWakeFloorFixture();
+    expect(fixture.host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toContain("sentinel-wake-floor");
+    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("wakes a stalled director exactly once for nextStartable work", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await sentinelWakeFloorFixture();
+      await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        {
+          threadId: fixture.directorThreadId,
+          mode: "queue-if-active",
+          input: [{ type: "text", visibility: "agent-only", text: "Hourly director health check: inspect canonical surfaces and report any drift or blocker.", mentions: [] }],
+        },
+      ]]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("preserves the idle anchor across a metadata-only updatedAt bump", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await sentinelWakeFloorFixture(0);
+      await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      fixture.setThreadUpdatedAt(60 * 60_000);
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("does not wake pending work before the director idle floor", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(60 * 60_000);
+    try {
+      const fixture = await sentinelWakeFloorFixture(0);
+      await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      clock.mockReturnValue(90 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("does not wake a lane deferred awaiting_operator", async () => {
+    const fixture = await sentinelWakeFloorFixture();
+    const executionAttemptId = await addPendingReview(fixture);
+    const waitingThreadId = "waiting-review";
+    fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE execution_attempt_id = ?").run(waitingThreadId, executionAttemptId);
+    fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) =>
+      threadId === waitingThreadId ? [operatorWaitInteraction(threadId)] : []) as never);
+    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("does not wake a lane blocked by a pending platform interaction", async () => {
+    const fixture = await sentinelWakeFloorFixture();
+    const executionAttemptId = await addPendingReview(fixture);
+    const waitingThreadId = "platform-waiting-review";
+    fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE execution_attempt_id = ?").run(waitingThreadId, executionAttemptId);
+    fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) =>
+      threadId === waitingThreadId ? [{ status: "pending" }] : []) as never);
+    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("fails closed when a stale false interaction cache meets a failed fresh read", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await sentinelWakeFloorFixture(0);
+      const executionAttemptId = await addPendingReview(fixture);
+      fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE execution_attempt_id = ?").run("stale-cache-thread", executionAttemptId);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      fixture.db.prepare("UPDATE execution_attempts SET state = 'running' WHERE execution_attempt_id = ?").run(executionAttemptId);
+      clock.mockReturnValue(30 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      fixture.db.prepare("UPDATE execution_attempts SET state = 'prepared' WHERE execution_attempt_id = ?").run(executionAttemptId);
+      fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) => {
+        if (threadId === "stale-cache-thread") throw new Error("lane interactions unavailable");
+        return [];
+      }) as never);
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("fails closed when a watcher interaction read writes after the floor read fails", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    let service: { controller: AbortController; done: Promise<void> } | undefined;
+    try {
+      const fixture = await sentinelWakeFloorFixture(0);
+      const executionAttemptId = await addPendingReview(fixture);
+      const laneThreadId = "late-writer-lane";
+      fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE execution_attempt_id = ?").run(laneThreadId, executionAttemptId);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      clock.mockReturnValue(60 * 60_000);
+      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => {
+        if (threadId === laneThreadId) throw new Error("lane thread unavailable");
+        return makeThreadResponse({
+          id: threadId,
+          projectId: PROJECT_ID,
+          status: threadId === fixture.directorThreadId ? "idle" : "active",
+          updatedAt: 0,
+        });
+      }) as never);
+      let laneReads = 0;
+      let releaseWatcherRead!: (interactions: Array<{ status: string }>) => void;
+      const watcherRead = new Promise<Array<{ status: string }>>((resolve) => {
+        releaseWatcherRead = resolve;
+      });
+      fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) => {
+        if (threadId !== laneThreadId) return [];
+        laneReads += 1;
+        if (laneReads === 1) return watcherRead;
+        if (laneReads === 2) {
+          releaseWatcherRead([]);
+          await Promise.resolve();
+          await Promise.resolve();
+        }
+        throw new Error("floor lane interactions unavailable");
+      }) as never);
+      service = fixture.host.harness.behavior.runService("lane-watcher");
+      await vi.waitFor(() => expect(laneReads).toBe(1));
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      service.controller.abort();
+      await service.done;
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")
+        .filter(([input]) => {
+          const send = input as { threadId: string; mode: string };
+          return send.threadId === fixture.directorThreadId && send.mode === "queue-if-active";
+        })).toHaveLength(0);
+    } finally {
+      service?.controller.abort();
+      await service?.done;
+      clock.mockRestore();
+    }
+  });
+
+  it("wakes independent project-scoped director floors", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await sentinelWakeFloorFixture();
+      await addPendingReview(fixture);
+      cloneProject(fixture.db, PROJECT_ID, "project-two");
+      fixture.setThreadProject("director-two", "project-two");
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { threadId: string }).threadId).sort()).toEqual([
+        "director-two",
+        fixture.directorThreadId,
+      ].sort());
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("fails closed and warns on same-project director ambiguity", async () => {
+    const fixture = await sentinelWakeFloorFixture();
+    await addPendingReview(fixture);
+    fixture.db.exec("ALTER TABLE role_generation_heads RENAME TO role_generation_heads_table; CREATE VIEW role_generation_heads AS SELECT * FROM role_generation_heads_table UNION ALL SELECT * FROM role_generation_heads_table WHERE role_id = 'director'");
+    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: "sentinel-wake-floor refused: project=proj_test active director holders=2",
+    }));
+  });
+
+  it("does not wake a stale director after succession during the gate", async () => {
+    const fixture = await sentinelWakeFloorFixture();
+    await addPendingReview(fixture);
+    let succeeded = false;
+    fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) => {
+      if (threadId === fixture.directorThreadId && !succeeded) {
+        advanceDirector(fixture.db, fixture.fenceToken);
+        succeeded = true;
+      }
+      return [];
+    }) as never);
+    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("coalesces a second consecutive floor fire", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await sentinelWakeFloorFixture(0);
+      await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("lane-watcher.role-idle");
+      expect(Object.values(persisted ?? {}).some((record) => record.lastWakeAtMs === 60 * 60_000)).toBe(true);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("retries after a successful send whose wake timestamp was not persisted", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await sentinelWakeFloorFixture(0);
+      await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      let failTimestampWrite = true;
+      const originalSet = fixture.host.bb.storage.kv.set.bind(fixture.host.bb.storage.kv);
+      const setSpy = vi.spyOn(fixture.host.bb.storage.kv, "set").mockImplementation(async (key, value) => {
+        if (key === "lane-watcher.role-idle" && failTimestampWrite && value && typeof value === "object" && !Array.isArray(value)
+          && Object.values(value as Record<string, { lastWakeAtMs?: number | null }>).some((record) => record.lastWakeAtMs === 60 * 60_000)) {
+          failTimestampWrite = false;
+          throw new Error("wake timestamp unavailable");
+        }
+        await originalSet(key, value);
+      });
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
+      setSpy.mockRestore();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("fires after plugin downtime across an active period and legitimate re-stall", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await sentinelWakeFloorFixture(0);
+      await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+      fixture.setThreadStatus("active");
+      const reloaded = await fixture.host.harness.lifecycle.reload((bb) => plugin(bb));
+      reloaded.harness.sdk.stub("threads.interactions.list", (async () => []) as never);
+      reloaded.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+        id: threadId,
+        projectId: PROJECT_ID,
+        status: fixture.getThreadStatus(),
+        updatedAt: 0,
+      })) as never);
+      reloaded.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
+      clock.mockReturnValue(3 * 60 * 60_000);
+      fixture.setThreadStatus("idle");
+      await reloaded.harness.runSchedule("sentinel-wake-floor");
+      expect(reloaded.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("does not send when the director becomes active during the final interaction read", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await sentinelWakeFloorFixture(0);
+      await addPendingReview(fixture);
+      let directorInteractionReads = 0;
+      fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) => {
+        if (threadId === fixture.directorThreadId) {
+          directorInteractionReads += 1;
+          if (directorInteractionReads === 3) fixture.setThreadStatus("active");
+        }
+        return [];
+      }) as never);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("continues processing other projects when one project's interactions read rejects", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await sentinelWakeFloorFixture(0);
+      await addPendingReview(fixture);
+      const projectOneAttemptId = (fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND origin = 'assignment' LIMIT 1").get(PROJECT_ID) as { execution_attempt_id: string }).execution_attempt_id;
+      cloneProject(fixture.db, PROJECT_ID, "project-two");
+      fixture.db.prepare("UPDATE execution_attempts SET execution_attempt_id = ? WHERE project_id = ? AND origin = 'assignment'").run(`${projectOneAttemptId}-project-two`, "project-two");
+      fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE project_id = ? AND execution_attempt_id = ?").run("project-one-review", PROJECT_ID, projectOneAttemptId);
+      fixture.setThreadProject("director-two", "project-two");
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      fixture.db.prepare("UPDATE execution_attempts SET state = 'running' WHERE project_id = ? AND execution_attempt_id = ?").run(PROJECT_ID, projectOneAttemptId);
+      clock.mockReturnValue(30 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      fixture.db.prepare("UPDATE execution_attempts SET state = 'prepared' WHERE project_id = ? AND execution_attempt_id = ?").run(PROJECT_ID, projectOneAttemptId);
+      let projectOneInteractionReads = 0;
+      fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) => {
+        if (threadId === "project-one-review") {
+          projectOneInteractionReads += 1;
+          throw new Error("project A interactions unavailable");
+        }
+        return [];
+      }) as never);
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(projectOneInteractionReads).toBe(2);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { threadId: string }).threadId)).toEqual(["director-two"]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("retains the wake timestamp through active and idle observations", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await sentinelWakeFloorFixture(0);
+      await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      const afterSend = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("lane-watcher.role-idle");
+      expect(Object.values(afterSend ?? {}).some((record) => record.lastWakeAtMs === 60 * 60_000)).toBe(true);
+      fixture.setThreadStatus("active");
+      const executionAttemptId = (fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE origin = 'assignment' LIMIT 1").get() as { execution_attempt_id: string }).execution_attempt_id;
+      expect(Object.keys(await fixture.host.bb.storage.kv.get<Record<string, unknown>>("lane-watcher.role-idle") ?? {}).some((key) => key.endsWith(`:${executionAttemptId}`))).toBe(true);
+      await fixture.host.harness.emitThreadEvent("thread.active", {
+        thread: makeThreadResponse({ id: fixture.directorThreadId, projectId: PROJECT_ID, status: "active" }),
+      });
+      await fixture.host.harness.runCli(["wait-validator", "--cycle"]);
+      const afterActive = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("lane-watcher.role-idle");
+      expect(Object.values(afterActive ?? {}).some((record) => record.lastWakeAtMs === 60 * 60_000)).toBe(true);
+      clock.mockReturnValue(2 * 60 * 60_000);
+      fixture.setThreadStatus("idle");
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+      clock.mockReturnValue(3 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("never wakes the stood-down sentinel thread", async () => {
+    for (const pending of [false, true]) {
+      const fixture = await sentinelWakeFloorFixture();
+      if (pending) await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").some(([input]) => (input as { threadId?: string }).threadId === "thr_bpzjyqg7ys")).toBe(false);
+    }
+  });
+
+  it("does not wake when no director generation exists", async () => {
+    const fixture = await assignmentFixture();
+    fixture.host.harness.sdk.stub("threads.interactions.list", (async () => []) as never);
+    fixture.host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
+    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
   it("logs sentinel-wake-floor send failures without throwing", async () => {
-    const host = await loadedHost();
-    host.harness.sdk.stub("threads.send", (async () => { throw new Error("send unavailable"); }) as never);
-    await expect(host.harness.runSchedule("sentinel-wake-floor")).resolves.toBeUndefined();
-    expect(host.harness.inspection.logEntries.filter((entry) => entry.level === "warn" && entry.message === "sentinel-wake-floor failed: Error: send unavailable")).toHaveLength(1);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await sentinelWakeFloorFixture();
+      await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      clock.mockReturnValue(60 * 60_000);
+      fixture.setThreadUpdatedAt(60 * 60_000);
+      fixture.host.harness.sdk.stub("threads.send", (async () => { throw new Error("send unavailable"); }) as never);
+      await expect(fixture.host.harness.runSchedule("sentinel-wake-floor")).resolves.toBeUndefined();
+      expect(fixture.host.harness.inspection.logEntries.filter((entry) => entry.level === "warn" && entry.message === "sentinel-wake-floor failed: Error: send unavailable")).toHaveLength(1);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("authorizes exact interim receipts through the same RPC and CLI seam", async () => {
