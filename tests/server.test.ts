@@ -807,6 +807,98 @@ while :; do :; done
     }
   });
 
+  it("reaps a clean-exit doctor probe process group", async () => {
+    const fixture = checkoutFixture(true);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-clean-exit-git-"));
+    const pidFile = join(bin, "grandchild.pid");
+    const wrapper = join(bin, "git");
+    writeFileSync(wrapper, `#!/bin/sh
+( exec sleep 300 ) </dev/null >/dev/null 2>&1 &
+child=$!
+printf '%s\\n' "$child" > "${pidFile}"
+printf '1\\n'
+exit 0
+`);
+    chmodSync(wrapper, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    let childPid: number | null = null;
+    try {
+      const result = readCheckoutDivergence(fixture.directory);
+      expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 1, verdict: "diverged", processGroupReap: "reaped" });
+      childPid = Number(readFileSync(pidFile, "utf8").trim());
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        try {
+          process.kill(childPid, 0);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        } catch {
+          break;
+        }
+      }
+      expect(() => process.kill(childPid!, 0)).toThrow();
+    } finally {
+      if (childPid !== null) {
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch {
+          // The process-group assertion may already have reaped it.
+        }
+      }
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(fixture.directory, { recursive: true, force: true });
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("surfaces non-ESRCH doctor probe process-group reap failures", () => {
+    const fixture = checkoutFixture(true);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-failed-reap-git-"));
+    const pidFile = join(bin, "grandchild.pid");
+    const wrapper = join(bin, "git");
+    writeFileSync(wrapper, `#!/bin/sh
+( exec sleep 300 ) </dev/null >/dev/null 2>&1 &
+child=$!
+printf '%s\\n' "$child" > "${pidFile}"
+printf '1\\n'
+exit 0
+`);
+    chmodSync(wrapper, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const realKill = process.kill.bind(process);
+    const killSpy = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (pid < 0) throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+      return realKill(pid, signal);
+    });
+    let childPid: number | null = null;
+    try {
+      const result = readCheckoutDivergence(fixture.directory);
+      expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: null, verdict: "unavailable", processGroupReap: "failed" });
+      childPid = Number(readFileSync(pidFile, "utf8").trim());
+    } finally {
+      killSpy.mockRestore();
+      if (childPid === null) {
+        try {
+          childPid = Number(readFileSync(pidFile, "utf8").trim());
+        } catch {
+          // The wrapper may have failed before recording its child.
+        }
+      }
+      if (childPid !== null) {
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch {
+          // The child may already have exited.
+        }
+      }
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(fixture.directory, { recursive: true, force: true });
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("does not lazy-fetch while counting divergence", () => {
     const fixture = checkoutFixture(true);
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-git-probe-"));

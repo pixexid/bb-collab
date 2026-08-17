@@ -7,6 +7,7 @@ export interface CheckoutDivergence {
   originMainRef: string | null;
   behindCount: number | null;
   verdict: "clean" | "diverged" | "unavailable";
+  processGroupReap: "not-attempted" | "reaped" | "absent" | "failed";
 }
 
 function readRef(gitDirs: string[], ref: string): string | null {
@@ -53,7 +54,7 @@ export function findCheckoutRoot(startPath: string): string | null {
 }
 
 export function readCheckoutDivergence(checkoutRoot: string | null): CheckoutDivergence {
-  const unavailable: CheckoutDivergence = { checkoutHead: null, originMainRef: null, behindCount: null, verdict: "unavailable" };
+  const unavailable: CheckoutDivergence = { checkoutHead: null, originMainRef: null, behindCount: null, verdict: "unavailable", processGroupReap: "not-attempted" };
   if (!checkoutRoot) return unavailable;
   try {
     const gitDir = resolveGitDir(checkoutRoot);
@@ -61,16 +62,22 @@ export function readCheckoutDivergence(checkoutRoot: string | null): CheckoutDiv
     const commonDir = commonGitDir(gitDir);
     const checkoutHead = readHead(gitDir, commonDir);
     const originMainRef = readRef([commonDir, gitDir], "refs/remotes/origin/main");
-    if (!checkoutHead || !originMainRef) return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable" };
+    if (!checkoutHead || !originMainRef) return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable", processGroupReap: "not-attempted" };
     let behindCount: number | null = null;
+    let processGroupReap: CheckoutDivergence["processGroupReap"] = "not-attempted";
     try {
       const options: SpawnSyncOptionsWithStringEncoding & { detached: true } = { cwd: checkoutRoot, encoding: "utf8", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" }, stdio: ["ignore", "pipe", "ignore"], timeout: 1_000, killSignal: "SIGKILL", detached: true };
       const result = spawnSync("git", ["rev-list", "--count", `${checkoutHead}..${originMainRef}`], options);
-      if (result.signal === "SIGKILL" && result.pid !== undefined) {
+      if (typeof result.pid === "number" && result.pid > 0) {
         try {
           process.kill(-result.pid, "SIGKILL");
+          processGroupReap = "reaped";
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+          if ((error as NodeJS.ErrnoException).code === "ESRCH") processGroupReap = "absent";
+          else {
+            processGroupReap = "failed";
+            return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable", processGroupReap };
+          }
         }
       }
       if (result.error) throw result.error;
@@ -79,7 +86,7 @@ export function readCheckoutDivergence(checkoutRoot: string | null): CheckoutDiv
     } catch {
       // Ref comparison remains useful even when the local object graph is incomplete.
     }
-    return { checkoutHead, originMainRef, behindCount, verdict: checkoutHead === originMainRef ? "clean" : "diverged" };
+    return { checkoutHead, originMainRef, behindCount, verdict: checkoutHead === originMainRef ? "clean" : "diverged", processGroupReap };
   } catch {
     return unavailable;
   }
