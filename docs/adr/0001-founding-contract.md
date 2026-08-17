@@ -5,6 +5,9 @@
 - Scope: bb-collab founding documentation and v1 boundary
 - Authority: operator-backed adjudication
 
+Superseded in part by [ADR 0007](0007-v21-authority-ceremony-removal.md) for
+the authority-ceremony machinery it removes. The remaining history is intact.
+
 This ADR is the controlling design decision for issue 1. The GPT-5 Pro
 verdict is advisory evidence. The founder adjudication is the disposition.
 This repository is a distillation from llm-collab, not a fork or a second

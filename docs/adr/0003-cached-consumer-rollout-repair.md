@@ -2,6 +2,9 @@
 
 Status: accepted. Implements GH-122 corrective direction of 2026-08-16.
 
+Superseded by [ADR 0007](0007-v21-authority-ceremony-removal.md), which
+removes the receipt-based cached-consumer machinery this ADR records.
+
 ## Decision
 
 Contract v18 preserves the v17 director/orchestrator policy and schema v11.

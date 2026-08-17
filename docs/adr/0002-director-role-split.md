@@ -5,6 +5,9 @@ director and project-orchestrator are separate roles with independent
 succession; this contract change creates neither a live role holder nor a
 paired succession action.
 
+Superseded in part by [ADR 0007](0007-v21-authority-ceremony-removal.md) for
+the authority-ceremony machinery it removes. The role-split history remains.
+
 Supersedes: the contract v14 director-seat placement under the
 `project-orchestrator` role, the contract v15 current-generation exemption
 attached to that placement, and the already-shipped v16 witness-holder
