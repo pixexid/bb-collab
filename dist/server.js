@@ -13787,11 +13787,11 @@ var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
 var CONTRACT_VERSION = 21;
-var SCHEMA_VERSION = 12;
+var SCHEMA_VERSION = 13;
 var PREVIOUS_CONTRACT_VERSION = 20;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
-var PREVIOUS_SCHEMA_VERSION = 11;
+var PREVIOUS_SCHEMA_VERSION = 12;
 var ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"];
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
 var directorSeatProfile = {
@@ -13835,6 +13835,7 @@ var TABLES = [
   "mutation_receipts",
   "state_events",
   "work_items",
+  "work_item_waits",
   "external_work_refs",
   "qualification_observations",
   "eligibility_projections",
@@ -14388,7 +14389,17 @@ var MIGRATIONS = [
   `ALTER TABLE role_generations ADD COLUMN standby_profile_json TEXT
    CHECK (standby_profile_json IS NULL OR json_valid(standby_profile_json))`,
   `ALTER TABLE operator_receipts ADD COLUMN issuance_provenance TEXT
-   CHECK (issuance_provenance IN ('console', 'attestation') OR issuance_provenance IS NULL)`
+   CHECK (issuance_provenance IN ('console', 'attestation') OR issuance_provenance IS NULL)`,
+  `CREATE TABLE IF NOT EXISTS work_item_waits (
+    project_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    waker TEXT NOT NULL,
+    declared_at_ms INTEGER NOT NULL CHECK (declared_at_ms >= 0),
+    declared_by_seat TEXT NOT NULL,
+    PRIMARY KEY (project_id, work_item_id),
+    FOREIGN KEY (project_id, work_item_id)
+      REFERENCES work_items(project_id, work_item_id)
+  )`
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var CACHED_CONSUMERS = [
@@ -14851,6 +14862,7 @@ var workItemInputSchema = external_exports.object({
   title: external_exports.string().max(4096),
   body: external_exports.string().max(64 * 1024)
 }).strict();
+var workItemWaitSchema = external_exports.object({ waker: id, declaredBySeat: id }).strict();
 var githubMappingSchema = external_exports.object({
   repoTargetId: id,
   owner: id,
@@ -15074,6 +15086,7 @@ var applyRequestSchema = external_exports.object({
   workItem: workItemInputSchema.optional(),
   workItemId: id.optional(),
   lifecycleState: workItemStateSchema.optional(),
+  workItemWait: workItemWaitSchema.nullable().optional(),
   projectionKind: external_exports.literal("github_issue").optional(),
   roleId: roleIdSchema.optional(),
   roleRequirementId: id.optional(),
@@ -15602,6 +15615,7 @@ function normalizeRequest(request) {
     workItem: request.workItem ?? void 0,
     workItemId: request.workItemId ?? void 0,
     lifecycleState: request.lifecycleState ?? void 0,
+    workItemWait: request.workItemWait === void 0 ? void 0 : request.workItemWait,
     projectionKind: request.projectionKind ?? void 0,
     roleId: request.roleId ?? void 0,
     roleRequirementId: request.roleRequirementId ?? void 0,
@@ -15755,7 +15769,7 @@ function requireTargetCollection(request, operation) {
   }
   return targets;
 }
-function requireTarget(db, projectId, configRevision, targetId, allowStaleTarget = false) {
+function requireTarget(db, projectId, configRevision, targetId) {
   const current = db.prepare("SELECT * FROM repository_targets WHERE project_id = ? AND config_revision = ? ORDER BY repo_target_id").all(projectId, configRevision);
   if (!targetId) {
     if (current.length > 1) throw refusal("REPO_TARGET_AMBIGUOUS", "an exact repository target is required");
@@ -15768,9 +15782,8 @@ function requireTarget(db, projectId, configRevision, targetId, allowStaleTarget
   );
   if (found) return found;
   const sameProject = asRow(
-    db.prepare("SELECT * FROM repository_targets WHERE project_id = ? AND repo_target_id = ? ORDER BY config_revision DESC LIMIT 1").get(projectId, targetId)
+    db.prepare("SELECT config_revision FROM repository_targets WHERE project_id = ? AND repo_target_id = ? ORDER BY config_revision DESC LIMIT 1").get(projectId, targetId)
   );
-  if (sameProject && allowStaleTarget) return sameProject;
   if (sameProject) throw refusal("REPO_TARGET_STALE", "repository target is not registered in the expected config revision");
   throw refusal("REPO_TARGET_FOREIGN", "repository target is not registered for this project");
 }
@@ -18012,7 +18025,7 @@ function requireGithubMapping(db, projectId, configRevision, repoTargetId) {
   if (mappings.length !== 1) throw refusal("EXTERNAL_TARGET_REQUIRED", "the exact repository target has no unique GitHub Issues mapping");
   return { github, mapping: mappings[0] };
 }
-function requireWorkItem(db, request, configRevision, expectedRevision = request.expectedResourceRevision, allowStaleConfig = false) {
+function requireWorkItem(db, request, configRevision, expectedRevision = request.expectedResourceRevision) {
   const workItemId = request.workItemId;
   if (!workItemId) throw refusal("WORK_ITEM_UNKNOWN", "work item identity is required");
   const row = asRow(
@@ -18022,7 +18035,7 @@ function requireWorkItem(db, request, configRevision, expectedRevision = request
     const foreign = db.prepare("SELECT 1 FROM work_items WHERE work_item_id = ? LIMIT 1").get(workItemId);
     throw refusal(foreign ? "WORK_ITEM_FOREIGN" : "WORK_ITEM_UNKNOWN", foreign ? "work item belongs to another project" : "work item is not known");
   }
-  if (row.config_revision !== configRevision && !allowStaleConfig) {
+  if (row.config_revision !== configRevision) {
     throw refusal("PROJECT_CONFIG_STALE", "work item is bound to a stale config revision", {
       currentConfigRevision: configRevision,
       expectedConfigRevision: row.config_revision
@@ -18030,7 +18043,7 @@ function requireWorkItem(db, request, configRevision, expectedRevision = request
   }
   if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "work item mutation requires its exact repository target");
   if (request.repoTargetId !== row.repo_target_id) throw refusal("REPO_TARGET_FOREIGN", "work item target does not match the exact repository target");
-  requireTarget(db, request.projectId, configRevision, request.repoTargetId, allowStaleConfig);
+  requireTarget(db, request.projectId, configRevision, request.repoTargetId);
   if (expectedRevision !== row.resource_revision) {
     throw refusal("WORK_ITEM_REVISION_STALE", "work item resource revision is stale", {
       currentResourceRevision: row.resource_revision,
@@ -18044,6 +18057,7 @@ function applyWorkItemCreate(db, request, digest) {
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
   if (!request.workItem) throw refusal("INVALID_INPUT", "work item create requires workItem");
+  if (request.workItemWait !== void 0) throw refusal("WORK_ITEM_STATE_INVALID", "work item wait requires a work item transition");
   if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "work item create requires an exact repository target");
   requireTarget(db, request.projectId, configRevision, request.repoTargetId);
   if (request.workItemId && request.workItemId !== request.workItem.workItemId) {
@@ -18102,16 +18116,67 @@ function applyWorkItemTransition(db, request, digest) {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
+  const workItem = requireWorkItem(db, request, configRevision);
+  const wait = request.workItemWait;
   const nextState = request.lifecycleState;
-  const workItem = requireWorkItem(
-    db,
-    request,
-    configRevision,
-    request.expectedResourceRevision,
-    nextState === "succeeded" || nextState === "failed" || nextState === "cancelled"
-  );
+  if (wait !== void 0 && nextState !== void 0) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work item wait mutation cannot change lifecycle state");
+  }
+  if (wait !== void 0) {
+    if (["succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state)) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "terminal work item cannot carry a wait");
+    }
+    const existing = asRow(db.prepare(
+      "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?"
+    ).get(request.projectId, workItem.work_item_id));
+    if (wait !== null && existing) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
+    if (wait === null && !existing) throw refusal("WORK_ITEM_WAIT_OPEN", "work item carries no open wait");
+    const nextRevision2 = workItem.resource_revision + 1;
+    const updated2 = db.prepare(
+      `UPDATE work_items SET resource_revision = ?, updated_at_ms = ?
+       WHERE project_id = ? AND work_item_id = ? AND resource_revision = ?`
+    ).run(nextRevision2, now(), request.projectId, workItem.work_item_id, workItem.resource_revision);
+    if (updated2.changes !== 1) throw refusal("WORK_ITEM_REVISION_STALE", "work item compare-and-swap failed", {
+      currentResourceRevision: workItem.resource_revision,
+      expectedResourceRevision: request.expectedResourceRevision ?? void 0
+    });
+    if (wait === null) {
+      db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
+    } else {
+      db.prepare(
+        `INSERT INTO work_item_waits (project_id, work_item_id, waker, declared_at_ms, declared_by_seat)
+         VALUES (?, ?, ?, ?, ?)`
+      ).run(request.projectId, workItem.work_item_id, wait.waker, now(), wait.declaredBySeat);
+    }
+    return commitMutation(
+      db,
+      request,
+      digest,
+      actorReceiptId,
+      {
+        aggregateType: "work_item",
+        aggregateId: workItem.work_item_id,
+        aggregateRevision: nextRevision2,
+        eventType: wait === null ? "work_item_wait_cleared" : "work_item_wait_declared",
+        event: { workItemId: workItem.work_item_id, ...wait === null ? {} : { waker: wait.waker, declaredBySeat: wait.declaredBySeat } }
+      },
+      { expected: 1, attempted: 1, verified: 1 },
+      {
+        currentConfigRevision: configRevision,
+        currentGovernanceEpoch: governor.governance_epoch,
+        currentResourceRevision: nextRevision2,
+        expectedResourceRevision: request.expectedResourceRevision ?? void 0,
+        evidence: { workItemId: workItem.work_item_id, wait: wait === null ? null : { waker: wait.waker, declaredBySeat: wait.declaredBySeat } }
+      }
+    );
+  }
   if (!nextState || !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
+  }
+  if (["succeeded", "failed", "cancelled"].includes(nextState) && db.prepare(
+    "SELECT 1 FROM work_item_waits WHERE project_id = ? AND work_item_id = ?"
+  ).get(request.projectId, workItem.work_item_id)) {
+    throw refusal("WORK_ITEM_WAIT_OPEN", "resolve the work item wait before terminalizing it");
   }
   const nextRevision = workItem.resource_revision + 1;
   const updated = db.prepare(
@@ -19565,6 +19630,7 @@ function tableRows(db, table, projectId) {
     mutation_receipts: "idempotency_key",
     state_events: "event_sequence",
     work_items: "work_item_id",
+    work_item_waits: "work_item_id",
     external_work_refs: "work_item_id, provider",
     qualification_observations: "qualification_id",
     eligibility_projections: "role_requirement_id, profile_digest",
@@ -21811,10 +21877,23 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
   if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v21-rollout-receipt")) {
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
+  if (parsed.success && parsed.data.workItemWait !== void 0 && parsed.data.workItemWait !== null) {
+    try {
+      if (!await liveWaker(bb, parsed.data.workItemWait.waker)) {
+        return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: `waker schedule ${parsed.data.workItemWait.waker} is not live: declaration refused` };
+      }
+    } catch {
+      return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: "waker schedule registry is unreadable: declaration refused" };
+    }
+  }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
   const result2 = applyAuthorizedMutation(db, input, null, reader);
   await deliverSucceededSeatBrief(bb, db, input, result2);
   return result2;
+}
+async function liveWaker(bb, schedule) {
+  const plugins = await bb.sdk.plugins.list();
+  return plugins.plugins.some((plugin2) => plugin2.id === bb.pluginId && plugin2.status === "running" && plugin2.schedules.some((candidate) => candidate.name === schedule));
 }
 function cachedConsumerRolloutRefusal(projectId, message) {
   return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message };
@@ -22163,10 +22242,6 @@ async function plugin(bb, options = {}) {
       return waitRegistry.firedList();
     }
   };
-  const liveWaker = async (schedule) => {
-    const plugins = await bb.sdk.plugins.list();
-    return plugins.plugins.some((plugin2) => plugin2.id === bb.pluginId && plugin2.status === "running" && plugin2.schedules.some((candidate) => candidate.name === schedule));
-  };
   const escalationCycle = createWaitEscalationCycle({
     registry: boundedRegistry,
     escalationPersistence: {
@@ -22486,15 +22561,23 @@ ${thread.titleFallback ?? ""}`);
       const floorMs = Number.isFinite(configuredFloorMs) && configuredFloorMs > 0 ? configuredFloorMs : FLEET_WATCHDOG_FLOOR_MS;
       const configuredStaleWaitMs = Number(process.env.BB_COLLAB_FLEET_WATCHDOG_STALE_WAIT_MS);
       const staleWaitMs = Number.isFinite(configuredStaleWaitMs) && configuredStaleWaitMs > 0 ? configuredStaleWaitMs : FLEET_WATCHDOG_STALE_WAIT_MS;
-      const waits = await boundedRegistry.list();
       const holdersByProject = /* @__PURE__ */ new Map();
       for (const holder of readRoleHolderStates(db)) {
         const holders = holdersByProject.get(holder.project_id) ?? [];
         holders.push(holder);
         holdersByProject.set(holder.project_id, holders);
       }
-      const startableLanes = await readUnblockedStartableLanes();
-      const declaredWaitFor = (threadId) => waits.find((wait) => wait.waiterThreadId === threadId && wait.wakerSchedule !== null && wait.declaredAtMs !== null && wait.deadlineAtMs > now2) ?? null;
+      const openWorkItemsByProject = /* @__PURE__ */ new Map();
+      for (const workItem of db.prepare(
+        `SELECT work_items.project_id, work_items.work_item_id, work_item_waits.waker, work_item_waits.declared_at_ms
+         FROM work_items LEFT JOIN work_item_waits
+           ON work_item_waits.project_id = work_items.project_id AND work_item_waits.work_item_id = work_items.work_item_id
+         WHERE work_items.lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')`
+      ).all()) {
+        const workItems = openWorkItemsByProject.get(workItem.project_id) ?? [];
+        workItems.push({ workItemId: workItem.work_item_id, waker: workItem.waker, declaredAtMs: workItem.declared_at_ms });
+        openWorkItemsByProject.set(workItem.project_id, workItems);
+      }
       const isCurrent = (candidate, holder) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
       const wake = async (projectId, holder, key, text, requireIdle) => {
         const previous = await watcher.readRoleIdle(key);
@@ -22533,42 +22616,38 @@ ${thread.titleFallback ?? ""}`);
           }
           const director = directors[0];
           const orchestrator = orchestrators[0];
-          const participantThreadIds = /* @__PURE__ */ new Set([
-            ...holders.map((holder) => holder.thread_id),
-            ...readLaneStates(db).filter((lane2) => lane2.project_id === projectId && OPEN_ATTEMPT_STATES.has(lane2.attempt_state) && lane2.thread_id !== null).map((lane2) => lane2.thread_id)
-          ]);
-          const staleWait = waits.find((wait) => wait.wakerSchedule !== null && wait.declaredAtMs !== null && wait.deadlineAtMs > now2 && now2 - wait.declaredAtMs >= staleWaitMs && participantThreadIds.has(wait.waiterThreadId));
+          const workItems = openWorkItemsByProject.get(projectId) ?? [];
+          const resetIdle = () => Promise.all(holders.flatMap((holder) => workItems.map((workItem) => watcher.resetRoleIdle(roleIdleKey(holder, workItem.workItemId)))));
+          if (workItems.length === 0) continue;
+          const staleWait = workItems.find((workItem) => workItem.declaredAtMs !== null && now2 - workItem.declaredAtMs >= staleWaitMs);
           if (staleWait) {
-            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.waitId), "wait went stale: chase the external or re-plan", false);
+            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), "wait went stale: chase the external or re-plan", false);
             continue;
           }
-          const lane = startableLanes.find((candidate) => candidate.projectId === projectId && (!candidate.threadId || !declaredWaitFor(candidate.threadId)));
-          if (!lane?.nextStartable || !lane.executionAttemptId) continue;
-          const laneIdle = await Promise.all([...participantThreadIds].map(async (threadId) => {
-            if (declaredWaitFor(threadId)) return true;
-            const thread = await bb.sdk.threads.get({ threadId });
-            return thread.projectId === projectId && thread.status === "idle" && thread.archivedAt === null && thread.deletedAt === null && !await readPendingExternalWait(threadId);
-          }));
-          if (!laneIdle.every(Boolean)) continue;
+          const openWorkItem = workItems.find((workItem) => workItem.declaredAtMs === null);
+          if (!openWorkItem) {
+            await resetIdle();
+            continue;
+          }
+          const workKey = openWorkItem.workItemId;
           const idle = await Promise.all(holders.map(async (holder) => {
-            if (declaredWaitFor(holder.thread_id)) return true;
             const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
             if (roleThreadRefusal(holder, thread, true) || await readPendingExternalWait(holder.thread_id)) {
-              await watcher.resetRoleIdle(roleIdleKey(holder, lane.executionAttemptId));
+              await watcher.resetRoleIdle(roleIdleKey(holder, workKey));
               return false;
             }
-            const record2 = await watcher.observeRoleIdle(roleIdleKey(holder, lane.executionAttemptId), now2);
+            const record2 = await watcher.observeRoleIdle(roleIdleKey(holder, workKey), now2);
             return record2.idleSinceMs !== null && now2 - record2.idleSinceMs >= floorMs;
           }));
           if (!idle.every(Boolean)) continue;
-          const orchestratorKey = roleIdleKey(orchestrator, lane.executionAttemptId);
+          const orchestratorKey = roleIdleKey(orchestrator, workKey);
           const orchestratorRecord = await watcher.readRoleIdle(orchestratorKey);
           if (orchestratorRecord?.lastWakeAtMs === null || orchestratorRecord?.lastWakeAtMs === void 0 || orchestratorRecord.lastWakeAtMs < (orchestratorRecord.idleSinceMs ?? now2)) {
             await wake(projectId, orchestrator, orchestratorKey, `fleet quiet with open work since ${new Date(orchestratorRecord?.idleSinceMs ?? now2).toISOString()}`, true);
             continue;
           }
           if (now2 - orchestratorRecord.lastWakeAtMs < floorMs) continue;
-          await wake(projectId, director, roleIdleKey(director, lane.executionAttemptId), `fleet still quiet with open work since ${new Date(orchestratorRecord.idleSinceMs ?? now2).toISOString()}`, true);
+          await wake(projectId, director, roleIdleKey(director, workKey), `fleet still quiet with open work since ${new Date(orchestratorRecord.idleSinceMs ?? now2).toISOString()}`, true);
         } catch (error48) {
           bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
         }
@@ -22620,7 +22699,7 @@ ${thread.titleFallback ?? ""}`);
     registerBoundedWaitForCli: (input, ctxThreadId) => registerBoundedWait({
       registry: boundedRegistry,
       readSource: readThreadObservation,
-      readWaker: liveWaker,
+      readWaker: (schedule) => liveWaker(bb, schedule),
       input,
       ctxThreadId
     }),
@@ -22639,7 +22718,7 @@ ${thread.titleFallback ?? ""}`);
       return readOpenLaneViews();
     },
     async registerWait(input) {
-      if (!await liveWaker(input.wakerSchedule)) throw new Error(`waker schedule ${input.wakerSchedule} is not live: declaration refused`);
+      if (!await liveWaker(bb, input.wakerSchedule)) throw new Error(`waker schedule ${input.wakerSchedule} is not live: declaration refused`);
       await waitRegistry.recover();
       const existing = waitRegistry.list().find((wait2) => wait2.waitId === input.waitId);
       if (existing) {

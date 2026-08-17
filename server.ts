@@ -420,10 +420,24 @@ async function applyLiveAuthorizedMutation(
   if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v21-rollout-receipt")) {
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
+  if (parsed.success && parsed.data.workItemWait !== undefined && parsed.data.workItemWait !== null) {
+    try {
+      if (!await liveWaker(bb, parsed.data.workItemWait.waker)) {
+        return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: `waker schedule ${parsed.data.workItemWait.waker} is not live: declaration refused` };
+      }
+    } catch {
+      return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: "waker schedule registry is unreadable: declaration refused" };
+    }
+  }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
   const result = applyAuthorizedMutation(db, input, null, reader);
   await deliverSucceededSeatBrief(bb, db, input, result);
   return result;
+}
+
+async function liveWaker(bb: BbPluginApi, schedule: string): Promise<boolean> {
+  const plugins = await bb.sdk.plugins.list();
+  return plugins.plugins.some((plugin) => plugin.id === bb.pluginId && plugin.status === "running" && plugin.schedules.some((candidate) => candidate.name === schedule));
 }
 
 function cachedConsumerRolloutRefusal(projectId: string, message: string): FoundationResult {
@@ -842,12 +856,6 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     list: async () => { await waitRegistry.recover(); return waitRegistry.list(); },
     firedWaitIds: async () => { await waitRegistry.recover(); return waitRegistry.firedList() as Array<{ waitId: string; reason: string; waiterThreadId: string }>; },
   };
-  // Resolve at declaration time. The registry is authority here; a copied
-  // inventory would silently accept a schedule that no longer exists.
-  const liveWaker = async (schedule: string) => {
-    const plugins = await bb.sdk.plugins.list();
-    return plugins.plugins.some((plugin) => plugin.id === bb.pluginId && plugin.status === "running" && plugin.schedules.some((candidate) => candidate.name === schedule));
-  };
   const escalationCycle = createWaitEscalationCycle({
     registry: boundedRegistry,
     escalationPersistence: {
@@ -1204,15 +1212,23 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       const floorMs = Number.isFinite(configuredFloorMs) && configuredFloorMs > 0 ? configuredFloorMs : FLEET_WATCHDOG_FLOOR_MS;
       const configuredStaleWaitMs = Number(process.env.BB_COLLAB_FLEET_WATCHDOG_STALE_WAIT_MS);
       const staleWaitMs = Number.isFinite(configuredStaleWaitMs) && configuredStaleWaitMs > 0 ? configuredStaleWaitMs : FLEET_WATCHDOG_STALE_WAIT_MS;
-      const waits = await boundedRegistry.list();
       const holdersByProject = new Map<string, RoleHolderState[]>();
       for (const holder of readRoleHolderStates(db)) {
         const holders = holdersByProject.get(holder.project_id) ?? [];
         holders.push(holder);
         holdersByProject.set(holder.project_id, holders);
       }
-      const startableLanes = await readUnblockedStartableLanes();
-      const declaredWaitFor = (threadId: string) => waits.find((wait) => wait.waiterThreadId === threadId && wait.wakerSchedule !== null && wait.declaredAtMs !== null && wait.deadlineAtMs > now) ?? null;
+      const openWorkItemsByProject = new Map<string, Array<{ workItemId: string; waker: string | null; declaredAtMs: number | null }>>();
+      for (const workItem of db.prepare(
+        `SELECT work_items.project_id, work_items.work_item_id, work_item_waits.waker, work_item_waits.declared_at_ms
+         FROM work_items LEFT JOIN work_item_waits
+           ON work_item_waits.project_id = work_items.project_id AND work_item_waits.work_item_id = work_items.work_item_id
+         WHERE work_items.lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')`,
+      ).all() as Array<{ project_id: string; work_item_id: string; waker: string | null; declared_at_ms: number | null }>) {
+        const workItems = openWorkItemsByProject.get(workItem.project_id) ?? [];
+        workItems.push({ workItemId: workItem.work_item_id, waker: workItem.waker, declaredAtMs: workItem.declared_at_ms });
+        openWorkItemsByProject.set(workItem.project_id, workItems);
+      }
       const isCurrent = (candidate: RoleHolderState, holder: RoleHolderState) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
       const wake = async (projectId: string, holder: RoleHolderState, key: string, text: string, requireIdle: boolean) => {
         const previous = await watcher.readRoleIdle(key);
@@ -1251,42 +1267,38 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           }
           const director = directors[0]!;
           const orchestrator = orchestrators[0]!;
-          const participantThreadIds = new Set([
-            ...holders.map((holder) => holder.thread_id),
-            ...readLaneStates(db).filter((lane) => lane.project_id === projectId && OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.thread_id !== null).map((lane) => lane.thread_id as string),
-          ]);
-          const staleWait = waits.find((wait) => wait.wakerSchedule !== null && wait.declaredAtMs !== null && wait.deadlineAtMs > now && now - wait.declaredAtMs >= staleWaitMs && participantThreadIds.has(wait.waiterThreadId));
+          const workItems = openWorkItemsByProject.get(projectId) ?? [];
+          const resetIdle = () => Promise.all(holders.flatMap((holder) => workItems.map((workItem) => watcher.resetRoleIdle(roleIdleKey(holder, workItem.workItemId)))));
+          if (workItems.length === 0) continue;
+          const staleWait = workItems.find((workItem) => workItem.declaredAtMs !== null && now - workItem.declaredAtMs >= staleWaitMs);
           if (staleWait) {
-            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.waitId), "wait went stale: chase the external or re-plan", false);
+            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), "wait went stale: chase the external or re-plan", false);
             continue;
           }
-          const lane = startableLanes.find((candidate) => candidate.projectId === projectId && (!candidate.threadId || !declaredWaitFor(candidate.threadId)));
-          if (!lane?.nextStartable || !lane.executionAttemptId) continue;
-          const laneIdle = await Promise.all([...participantThreadIds].map(async (threadId) => {
-            if (declaredWaitFor(threadId)) return true;
-            const thread = await bb.sdk.threads.get({ threadId });
-            return thread.projectId === projectId && thread.status === "idle" && thread.archivedAt === null && thread.deletedAt === null && !await readPendingExternalWait(threadId);
-          }));
-          if (!laneIdle.every(Boolean)) continue;
+          const openWorkItem = workItems.find((workItem) => workItem.declaredAtMs === null);
+          if (!openWorkItem) {
+            await resetIdle();
+            continue;
+          }
+          const workKey = openWorkItem.workItemId;
           const idle = await Promise.all(holders.map(async (holder) => {
-            if (declaredWaitFor(holder.thread_id)) return true;
             const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
             if (roleThreadRefusal(holder, thread, true) || await readPendingExternalWait(holder.thread_id)) {
-              await watcher.resetRoleIdle(roleIdleKey(holder, lane.executionAttemptId));
+              await watcher.resetRoleIdle(roleIdleKey(holder, workKey));
               return false;
             }
-            const record = await watcher.observeRoleIdle(roleIdleKey(holder, lane.executionAttemptId), now);
+            const record = await watcher.observeRoleIdle(roleIdleKey(holder, workKey), now);
             return record.idleSinceMs !== null && now - record.idleSinceMs >= floorMs;
           }));
           if (!idle.every(Boolean)) continue;
-          const orchestratorKey = roleIdleKey(orchestrator, lane.executionAttemptId);
+          const orchestratorKey = roleIdleKey(orchestrator, workKey);
           const orchestratorRecord = await watcher.readRoleIdle(orchestratorKey);
           if (orchestratorRecord?.lastWakeAtMs === null || orchestratorRecord?.lastWakeAtMs === undefined || orchestratorRecord.lastWakeAtMs < (orchestratorRecord.idleSinceMs ?? now)) {
             await wake(projectId, orchestrator, orchestratorKey, `fleet quiet with open work since ${new Date(orchestratorRecord?.idleSinceMs ?? now).toISOString()}`, true);
             continue;
           }
           if (now - orchestratorRecord.lastWakeAtMs < floorMs) continue;
-          await wake(projectId, director, roleIdleKey(director, lane.executionAttemptId), `fleet still quiet with open work since ${new Date(orchestratorRecord.idleSinceMs ?? now).toISOString()}`, true);
+          await wake(projectId, director, roleIdleKey(director, workKey), `fleet still quiet with open work since ${new Date(orchestratorRecord.idleSinceMs ?? now).toISOString()}`, true);
         } catch (error) {
           bb.log.warn(`fleet-watchdog failed: ${String(error)}`);
         }
@@ -1349,7 +1361,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     registerBoundedWaitForCli: (input, ctxThreadId) => registerBoundedWait({
       registry: boundedRegistry,
       readSource: readThreadObservation,
-      readWaker: liveWaker,
+      readWaker: (schedule) => liveWaker(bb, schedule),
       input,
       ctxThreadId,
     }),
@@ -1366,7 +1378,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return readOpenLaneViews();
     },
     async registerWait(input) {
-      if (!await liveWaker(input.wakerSchedule)) throw new Error(`waker schedule ${input.wakerSchedule} is not live: declaration refused`);
+      if (!await liveWaker(bb, input.wakerSchedule)) throw new Error(`waker schedule ${input.wakerSchedule} is not live: declaration refused`);
       await waitRegistry.recover();
       const existing = waitRegistry.list().find((wait) => wait.waitId === input.waitId);
       if (existing) {
