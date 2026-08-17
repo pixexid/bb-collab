@@ -20540,7 +20540,7 @@ function decisionDoctorEvidence(db, projectId) {
   }
   return { unresolvedDecisions, issues, derivedHolds, artifactCount: artifacts.length, relationCount };
 }
-async function doctor(db, sdk, projectId) {
+async function doctor(db, sdk, projectId, checkoutDivergence) {
   if (!db) return unavailableResult(projectId, "canonical SQLite store is unavailable");
   if (!sdk) return result("BB_FACTS_UNAVAILABLE", projectId, 1, 0, 0, { message: "BB fact SDK is unavailable" });
   try {
@@ -20736,6 +20736,7 @@ async function doctor(db, sdk, projectId) {
         unresolvedAttempts,
         decisionIntegrity,
         cachedConsumers,
+        ...checkoutDivergence ? { checkoutDivergence } : {},
         schema: { version: SCHEMA_VERSION, migrationStatementIds: MIGRATIONS.map((_, index) => index), digest: schemaDigest, tables: schemaState.map((row) => row.name) }
       }
     });
@@ -21948,9 +21949,89 @@ async function runArchiveSweep(bb, db, projectId, apply = false, now2 = Date.now
   }
 }
 
+// src/checkout-divergence.ts
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { dirname, join as join2, resolve } from "node:path";
+function readRef(gitDirs, ref) {
+  for (const gitDir of gitDirs) {
+    const looseRef = join2(gitDir, ref);
+    if (existsSync(looseRef)) return readFileSync(looseRef, "utf8").trim() || null;
+    const packedRefs = join2(gitDir, "packed-refs");
+    if (!existsSync(packedRefs)) continue;
+    for (const line of readFileSync(packedRefs, "utf8").split("\n")) {
+      const [sha, name] = line.trim().split(" ");
+      if (name === ref) return sha ?? null;
+    }
+  }
+  return null;
+}
+function resolveGitDir(checkoutRoot) {
+  const dotGit = join2(checkoutRoot, ".git");
+  if (!existsSync(dotGit)) return null;
+  if (statSync(dotGit).isDirectory()) return dotGit;
+  const marker = readFileSync(dotGit, "utf8").trim();
+  return marker.startsWith("gitdir:") ? resolve(checkoutRoot, marker.slice("gitdir:".length).trim()) : null;
+}
+function commonGitDir(gitDir) {
+  const commondir = join2(gitDir, "commondir");
+  return existsSync(commondir) ? resolve(gitDir, readFileSync(commondir, "utf8").trim()) : gitDir;
+}
+function readHead(gitDir, commonDir) {
+  const head = readFileSync(join2(gitDir, "HEAD"), "utf8").trim();
+  if (!head.startsWith("ref: ")) return head || null;
+  return readRef([gitDir, commonDir], head.slice("ref: ".length));
+}
+function findCheckoutRoot(startPath) {
+  let current = resolve(startPath);
+  while (true) {
+    if (existsSync(join2(current, ".git"))) return current;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+function readCheckoutDivergence(checkoutRoot) {
+  const unavailable = { checkoutHead: null, originMainRef: null, behindCount: null, verdict: "unavailable", processGroupReap: "not-attempted" };
+  if (!checkoutRoot) return unavailable;
+  try {
+    const gitDir = resolveGitDir(checkoutRoot);
+    if (!gitDir) return unavailable;
+    const commonDir = commonGitDir(gitDir);
+    const checkoutHead = readHead(gitDir, commonDir);
+    const originMainRef = readRef([commonDir, gitDir], "refs/remotes/origin/main");
+    if (!checkoutHead || !originMainRef) return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable", processGroupReap: "not-attempted" };
+    let behindCount = null;
+    let processGroupReap = "not-attempted";
+    try {
+      const options = { cwd: checkoutRoot, encoding: "utf8", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" }, stdio: ["ignore", "pipe", "ignore"], timeout: 1e3, killSignal: "SIGKILL", detached: true };
+      const result2 = spawnSync("git", ["rev-list", "--count", `${checkoutHead}..${originMainRef}`], options);
+      if (typeof result2.pid === "number" && result2.pid > 0) {
+        try {
+          process.kill(-result2.pid, "SIGKILL");
+          processGroupReap = "reaped";
+        } catch (error48) {
+          if (error48.code === "ESRCH") processGroupReap = "absent";
+          else {
+            processGroupReap = "failed";
+            return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable", processGroupReap };
+          }
+        }
+      }
+      if (result2.error) throw result2.error;
+      const count = result2.stdout.trim();
+      if (/^\d+$/u.test(count)) behindCount = Number(count);
+    } catch {
+    }
+    return { checkoutHead, originMainRef, behindCount, verdict: checkoutHead === originMainRef ? "clean" : "diverged", processGroupReap };
+  } catch {
+    return unavailable;
+  }
+}
+
 // server.ts
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, isAbsolute, join as join2, relative, sep } from "node:path";
+import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync2, rmSync, statSync as statSync2, writeFileSync } from "node:fs";
+import { basename, dirname as dirname2, isAbsolute, join as join3, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 var projectIdSchema = external_exports.string().trim().min(1).max(256);
 var mutationReceiptSchema = external_exports.object({
@@ -22380,7 +22461,7 @@ async function isLiveCachedConsumerRolloutArtifact(moduleUrl, bb) {
     if (!pluginRoot || !isAbsolute(pluginRoot)) return false;
     const relativeArtifactPath = relative(pluginRoot, artifactPath);
     if (relativeArtifactPath.length === 0 || relativeArtifactPath === ".." || relativeArtifactPath.startsWith(`..${sep}`) || isAbsolute(relativeArtifactPath)) return false;
-    return basename(artifactPath) === "server.js" && basename(dirname(artifactPath)) === "dist";
+    return basename(artifactPath) === "server.js" && basename(dirname2(artifactPath)) === "dist";
   } catch {
     return false;
   }
@@ -22554,10 +22635,13 @@ async function runCli(db, bb, argv, ctx, deps) {
   }
   const unknown2 = unexpectedFlags(args, ["--project"]);
   if (unknown2) return invalidCli(`unexpected flag ${unknown2}`);
-  if (command === "doctor") return cliResult(await doctor(db, bb.sdk, projectId));
+  if (command === "doctor") return cliResult(await doctor(db, bb.sdk, projectId, deps.readCheckoutDivergence()));
   return cliResult(exportFoundation(db, projectId));
 }
-async function plugin(bb) {
+async function plugin(bb, options = {}) {
+  const readDiagnosticDivergence = () => readCheckoutDivergence(
+    options.checkoutRoot === void 0 ? findCheckoutRoot(dirname2(fileURLToPath(import.meta.url))) : options.checkoutRoot
+  );
   const operatorPassphrase = bb.settings.define({
     operatorPassphrase: {
       type: "string",
@@ -22841,12 +22925,12 @@ ${thread.titleFallback ?? ""}`);
         await watcher.poll().catch((error48) => bb.log.warn(`lane poll failed: ${String(error48)}`));
         await escalationCycle.cycle().catch((error48) => bb.log.warn(`wait escalation failed: ${String(error48)}`));
         if (signal.aborted) break;
-        await new Promise((resolve) => {
+        await new Promise((resolve2) => {
           let timer;
           const done = () => {
             clearTimeout(timer);
             signal.removeEventListener("abort", done);
-            resolve();
+            resolve2();
           };
           timer = setTimeout(done, 1e3);
           signal.addEventListener("abort", done, { once: true });
@@ -22857,18 +22941,18 @@ ${thread.titleFallback ?? ""}`);
   bb.background.schedule("wait-validator-liveness", "*/5 * * * *", async () => {
     try {
       const stateDir = waitValidatorStateDir();
-      const markerPath = join2(stateDir, LIVENESS_MARKER_FILENAME);
-      const flagPath = join2(stateDir, LIVENESS_ALERT_FLAG_FILENAME);
+      const markerPath = join3(stateDir, LIVENESS_MARKER_FILENAME);
+      const flagPath = join3(stateDir, LIVENESS_ALERT_FLAG_FILENAME);
       let markerAtMs = null;
       try {
-        const parsed = Number(readFileSync(markerPath, "utf8").trim());
-        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync(markerPath).mtimeMs;
+        const parsed = Number(readFileSync2(markerPath, "utf8").trim());
+        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync2(markerPath).mtimeMs;
       } catch {
         markerAtMs = null;
       }
       const configuredStaleMs = Number(process.env.BB_COLLAB_LIVENESS_STALE_MS);
       const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
-      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync(flagPath));
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync2(flagPath));
       if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
       if (decision === "alert-once") {
         mkdirSync(stateDir, { recursive: true });
@@ -22955,7 +23039,8 @@ ${thread.titleFallback ?? ""}`);
       return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) }));
     },
     escalationCycle,
-    archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply)
+    archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply),
+    readCheckoutDivergence: readDiagnosticDivergence
   };
   bb.rpc.register(rpcContract, {
     lanes() {
@@ -22976,8 +23061,8 @@ ${thread.titleFallback ?? ""}`);
     async threadModels(input) {
       const entries = await Promise.all(input.threadIds.map(async (threadId) => {
         try {
-          const options = await bb.sdk.threads.defaultExecutionOptions({ threadId });
-          return [threadId, options ? { model: options.model, reasoning: options.reasoningLevel } : null];
+          const options2 = await bb.sdk.threads.defaultExecutionOptions({ threadId });
+          return [threadId, options2 ? { model: options2.model, reasoning: options2.reasoningLevel } : null];
         } catch {
           return [threadId, null];
         }
@@ -23013,7 +23098,7 @@ ${thread.titleFallback ?? ""}`);
       return { ok: true };
     },
     async doctor(input) {
-      return doctor(db, bb.sdk, input.projectId);
+      return doctor(db, bb.sdk, input.projectId, readDiagnosticDivergence());
     },
     async export(input) {
       return exportFoundation(db, input.projectId);

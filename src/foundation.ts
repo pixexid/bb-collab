@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import type Database from "better-sqlite3";
 import { z } from "zod";
+import type { CheckoutDivergence } from "./checkout-divergence.js";
 
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
@@ -8600,6 +8601,7 @@ export async function doctor(
   db: SqliteDatabase | null,
   sdk: DoctorSdk | null,
   projectId: string,
+  checkoutDivergence?: CheckoutDivergence,
 ): Promise<FoundationResult> {
   if (!db) return unavailableResult(projectId, "canonical SQLite store is unavailable");
   if (!sdk) return result("BB_FACTS_UNAVAILABLE", projectId, 1, 0, 0, { message: "BB fact SDK is unavailable" });
@@ -8808,6 +8810,7 @@ export async function doctor(
         unresolvedAttempts,
         decisionIntegrity,
         cachedConsumers,
+        ...(checkoutDivergence ? { checkoutDivergence } : {}),
         schema: { version: SCHEMA_VERSION, migrationStatementIds: MIGRATIONS.map((_, index) => index), digest: schemaDigest, tables: schemaState.map((row) => row.name) },
       },
     });

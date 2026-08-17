@@ -1,4 +1,5 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -66,6 +67,7 @@ import {
   seedFixtureDecision,
   seedVerifiedFixtureReceipt,
 } from "../src/test-support.js";
+import { findCheckoutRoot, readCheckoutDivergence } from "../src/checkout-divergence.js";
 
 const PROJECT_ID = "proj_test";
 const PLUGIN_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -125,6 +127,27 @@ const REVIEW_AUTHORS = [{ name: "Writer", email: "writer@example.test" }];
 const REVIEW_COMMITTERS = [{ name: "Committer", email: "committer@example.test" }];
 const FROZEN_BRIEF = "# Frozen assignment\nImplement the exact bounded change.";
 const FROZEN_BRIEF_DIGEST = sha256(FROZEN_BRIEF);
+
+function checkoutFixture(diverged: boolean) {
+  const directory = mkdtempSync(join(tmpdir(), "bb-collab-checkout-divergence-"));
+  const git = (args: string[]) => execFileSync("git", args, { cwd: directory, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  git(["init", "-q", "-b", "main"]);
+  git(["config", "user.email", "fixture@example.test"]);
+  git(["config", "user.name", "Fixture"]);
+  writeFileSync(join(directory, "README.md"), "base\n");
+  git(["add", "README.md"]);
+  git(["commit", "-q", "-m", "base"]);
+  const base = git(["rev-parse", "HEAD"]);
+  if (diverged) {
+    writeFileSync(join(directory, "README.md"), "origin\n");
+    git(["commit", "-qam", "origin"]);
+    git(["update-ref", "refs/remotes/origin/main", git(["rev-parse", "HEAD"])]);
+    git(["reset", "-q", "--hard", base]);
+  } else {
+    git(["update-ref", "refs/remotes/origin/main", base]);
+  }
+  return { directory, base, origin: git(["show-ref", "--hash", "refs/remotes/origin/main"]) };
+}
 
 function roleConfig(connector: "required" | "optional" | "prohibited" = "optional") {
   const config = structuredClone(bootstrapRequest().config) as {
@@ -673,6 +696,308 @@ function seedAndBootstrap(host: ReturnType<typeof hostFor>, projectId = PROJECT_
     fenceToken: (result.evidence as { fenceToken: string }).fenceToken,
   };
 }
+
+describe("checkout divergence detection", () => {
+  it("plugin-load invariant is true by construction under checkout adversaries", async () => {
+    const fifoCheckout = mkdtempSync(join(tmpdir(), "bb-collab-fifo-checkout-"));
+    mkdirSync(join(fifoCheckout, ".git"));
+    execFileSync("mkfifo", [join(fifoCheckout, ".git", "HEAD")]);
+    const missingGitCheckout = mkdtempSync(join(tmpdir(), "bb-collab-no-git-"));
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-hostile-git-"));
+    const wrapper = join(bin, "git");
+    writeFileSync(wrapper, "#!/bin/sh\n( trap \"\" TERM; while :; do :; done ) &\nchild=$!\nprintf '%s\\n' \"$child\" > \"${HOSTILE_GIT_PID_FILE}\"\ntrap \"\" TERM\nwhile :; do :; done\n");
+    chmodSync(wrapper, 0o755);
+    const originalPath = process.env.PATH;
+    const originalPidFile = process.env.HOSTILE_GIT_PID_FILE;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    process.env.HOSTILE_GIT_PID_FILE = join(bin, "grandchild.pid");
+    const started = Date.now();
+    try {
+      await expect(Promise.all([
+        plugin(hostFor().bb, { checkoutRoot: fifoCheckout }),
+        plugin(hostFor().bb, { checkoutRoot: missingGitCheckout }),
+      ])).resolves.toEqual([undefined, undefined]);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalPidFile === undefined) delete process.env.HOSTILE_GIT_PID_FILE;
+      else process.env.HOSTILE_GIT_PID_FILE = originalPidFile;
+      rmSync(fifoCheckout, { recursive: true, force: true });
+      rmSync(missingGitCheckout, { recursive: true, force: true });
+      rmSync(bin, { recursive: true, force: true });
+    }
+    expect(Date.now() - started).toBeLessThan(2_000);
+  }, 5_000);
+
+  it("reports an unavailable checkout through doctor RPC and CLI", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "bb-collab-no-git-"));
+    try {
+      const host = hostFor();
+      await plugin(host.bb, { checkoutRoot: directory });
+      seedAndBootstrap(host);
+      const expected = { checkoutHead: null, originMainRef: null, behindCount: null, verdict: "unavailable" };
+      const rpc = await host.harness.callRpc("doctor", { projectId: PROJECT_ID }) as FoundationResult;
+      expect(rpc.evidence).toMatchObject({ checkoutDivergence: expected });
+      const cli = await host.harness.runCli(["doctor", "--project", PROJECT_ID]);
+      expect(JSON.parse(cli.stdout).evidence).toMatchObject({ checkoutDivergence: expected });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds the doctor probe against a hostile git on the real checkout geometry", () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-hostile-git-"));
+    const wrapper = join(bin, "git");
+    writeFileSync(wrapper, "#!/bin/sh\ntrap \"\" TERM\nwhile :; do :; done\n");
+    chmodSync(wrapper, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const started = Date.now();
+    try {
+      readCheckoutDivergence(findCheckoutRoot(process.cwd()));
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("kills the complete doctor probe process group", async () => {
+    const fixture = checkoutFixture(true);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-forking-git-"));
+    const pidFile = join(bin, "grandchild.pid");
+    const wrapper = join(bin, "git");
+    writeFileSync(wrapper, `#!/bin/sh
+( trap "" TERM; while :; do :; done ) &
+child=$!
+printf '%s\\n' "$child" > "${pidFile}"
+trap "" TERM
+while :; do :; done
+`);
+    chmodSync(wrapper, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    let childPid: number | null = null;
+    try {
+      const result = readCheckoutDivergence(fixture.directory);
+      expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: null, verdict: "diverged" });
+      childPid = Number(readFileSync(pidFile, "utf8").trim());
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        try {
+          process.kill(childPid, 0);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        } catch {
+          break;
+        }
+      }
+      expect(() => process.kill(childPid!, 0)).toThrow();
+    } finally {
+      if (childPid !== null) {
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch {
+          // The process-group assertion may already have reaped it.
+        }
+      }
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(fixture.directory, { recursive: true, force: true });
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("reaps a clean-exit doctor probe process group", async () => {
+    const fixture = checkoutFixture(true);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-clean-exit-git-"));
+    const pidFile = join(bin, "grandchild.pid");
+    const wrapper = join(bin, "git");
+    writeFileSync(wrapper, `#!/bin/sh
+( exec sleep 300 ) </dev/null >/dev/null 2>&1 &
+child=$!
+printf '%s\\n' "$child" > "${pidFile}"
+printf '1\\n'
+exit 0
+`);
+    chmodSync(wrapper, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    let childPid: number | null = null;
+    try {
+      const result = readCheckoutDivergence(fixture.directory);
+      expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 1, verdict: "diverged", processGroupReap: "reaped" });
+      childPid = Number(readFileSync(pidFile, "utf8").trim());
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        try {
+          process.kill(childPid, 0);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        } catch {
+          break;
+        }
+      }
+      expect(() => process.kill(childPid!, 0)).toThrow();
+    } finally {
+      if (childPid !== null) {
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch {
+          // The process-group assertion may already have reaped it.
+        }
+      }
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(fixture.directory, { recursive: true, force: true });
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("records a setsid escapee without changing the divergence result", async () => {
+    const fixture = checkoutFixture(true);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-setsid-git-"));
+    const pidFile = join(bin, "escapee.pid");
+    const wrapper = join(bin, "git");
+    writeFileSync(wrapper, `#!/bin/sh
+perl -MPOSIX -e 'defined(my $pid = fork()) or die; exit if $pid; POSIX::setsid() or die; open my $file, ">", $ARGV[0] or die; print $file "$$\\n"; close $file or die; $SIG{HUP} = $SIG{TERM} = $SIG{INT} = "IGNORE"; sleep 300' "${pidFile}" </dev/null >/dev/null 2>&1 &
+trap "" TERM
+while :; do :; done
+`);
+    chmodSync(wrapper, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    let childPid: number | null = null;
+    try {
+      const result = readCheckoutDivergence(fixture.directory);
+      expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: null, verdict: "diverged", processGroupReap: "absent" });
+      childPid = Number(readFileSync(pidFile, "utf8").trim());
+      expect(Number.isInteger(childPid)).toBe(true);
+      expect(childPid).toBeGreaterThan(0);
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        try {
+          process.kill(childPid, 0);
+        } catch {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(() => process.kill(childPid!, 0)).not.toThrow();
+    } finally {
+      if (childPid !== null) {
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch {
+          // The escapee may already have exited.
+        }
+      }
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(fixture.directory, { recursive: true, force: true });
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("surfaces non-ESRCH doctor probe process-group reap failures", () => {
+    const fixture = checkoutFixture(true);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-failed-reap-git-"));
+    const pidFile = join(bin, "grandchild.pid");
+    const wrapper = join(bin, "git");
+    writeFileSync(wrapper, `#!/bin/sh
+( exec sleep 300 ) </dev/null >/dev/null 2>&1 &
+child=$!
+printf '%s\\n' "$child" > "${pidFile}"
+printf '1\\n'
+exit 0
+`);
+    chmodSync(wrapper, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const realKill = process.kill.bind(process);
+    const killSpy = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (pid < 0) throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+      return realKill(pid, signal);
+    });
+    let childPid: number | null = null;
+    try {
+      const result = readCheckoutDivergence(fixture.directory);
+      expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: null, verdict: "unavailable", processGroupReap: "failed" });
+      childPid = Number(readFileSync(pidFile, "utf8").trim());
+    } finally {
+      killSpy.mockRestore();
+      if (childPid === null) {
+        try {
+          childPid = Number(readFileSync(pidFile, "utf8").trim());
+        } catch {
+          // The wrapper may have failed before recording its child.
+        }
+      }
+      if (childPid !== null) {
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch {
+          // The child may already have exited.
+        }
+      }
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(fixture.directory, { recursive: true, force: true });
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("does not lazy-fetch while counting divergence", () => {
+    const fixture = checkoutFixture(true);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-git-probe-"));
+    const argsLog = join(bin, "args");
+    const envLog = join(bin, "env");
+    const wrapper = join(bin, "git");
+    const gitPath = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+    writeFileSync(wrapper, `#!/bin/sh\nprintf '%s\\n' "$@" > "${argsLog}"\nprintf '%s\\n' "$GIT_NO_LAZY_FETCH" > "${envLog}"\nexec "${gitPath}" "$@"\n`);
+    chmodSync(wrapper, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      readCheckoutDivergence(fixture.directory);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+    const args = readFileSync(argsLog, "utf8").split("\n");
+    expect(args).toEqual(["rev-list", "--count", expect.stringContaining(".."), ""]);
+    expect(readFileSync(envLog, "utf8")).toBe("1\n");
+    rmSync(bin, { recursive: true, force: true });
+  });
+
+  it("reports a diverged fixture through doctor", async () => {
+    const fixture = checkoutFixture(true);
+    try {
+      const divergence = readCheckoutDivergence(fixture.directory);
+      expect(divergence).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 1, verdict: "diverged" });
+      const host = await loadedHost();
+      seedAndBootstrap(host);
+      const result = await doctor(host.bb.storage.database(), host.bb.sdk, PROJECT_ID, divergence);
+      expect(result.evidence).toMatchObject({ checkoutDivergence: { checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 1, verdict: "diverged" } });
+      const cli = await host.harness.runCli(["doctor", "--project", PROJECT_ID]);
+      const currentCheckout = readCheckoutDivergence(findCheckoutRoot(process.cwd()));
+      expect(JSON.parse(cli.stdout).evidence).toMatchObject({ checkoutDivergence: currentCheckout });
+    } finally {
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("stays silent for a clean fixture and reports a clean doctor verdict", async () => {
+    const fixture = checkoutFixture(false);
+    try {
+      const divergence = readCheckoutDivergence(fixture.directory);
+      expect(divergence).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 0, verdict: "clean" });
+      const host = await loadedHost();
+      seedAndBootstrap(host);
+      const result = await doctor(host.bb.storage.database(), host.bb.sdk, PROJECT_ID, divergence);
+      expect(result.evidence).toMatchObject({ checkoutDivergence: { checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 0, verdict: "clean" } });
+    } finally {
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+});
 
 function directDatabase() {
   const directory = mkdtempSync(join(tmpdir(), "bb-collab-issue3-"));
