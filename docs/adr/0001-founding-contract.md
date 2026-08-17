@@ -244,6 +244,9 @@ unmanaged canonical environment only for generation 2, holder
 while the current role head and holder execution attempt matched those exact
 facts. It did not permit writing, succession, foreign or stale contexts, or
 future generations; future generations required managed isolated worktrees.
+Generation 2 here is director-epoch numbering for the current exemption;
+canonical `role_generations` numbering is per `(project_id, role_id)`; this live
+project-orchestrator head therefore succeeds at generation 3.
 `CONTRACT_VERSION` and `contractDigest` changed, while schema, migrations,
 operator receipts, and approver bindings remained unchanged. All four cached
 consumers reread v15 or refused v14.
