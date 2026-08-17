@@ -13786,9 +13786,9 @@ import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 21;
+var CONTRACT_VERSION = 20;
 var SCHEMA_VERSION = 12;
-var PREVIOUS_CONTRACT_VERSION = 20;
+var PREVIOUS_CONTRACT_VERSION = 19;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
 var PREVIOUS_SCHEMA_VERSION = 11;
@@ -14407,12 +14407,12 @@ var CACHED_CONSUMERS = [
 ];
 var CACHED_CONSUMER_ROLLOUT_POLICY = {
   class: "operator_receipts.consumed_replay_provenance",
-  staleV20Receipt: "unknown",
+  staleV19Receipt: "unknown",
   currentNewLegacyApply: "OPERATOR_RECEIPT_INVALID",
-  requiredV21ConsumedLegacyReplay: "OK",
+  requiredV20ConsumedLegacyReplay: "OK",
   refusal: "OPERATOR_RECEIPT_INVALID"
 };
-async function assembleV21CachedConsumerRolloutEvidence(input) {
+async function assembleV20CachedConsumerRolloutEvidence(input) {
   const probes = [
     ["server.rpcContract", input.rpcContract],
     ["server.collabCli", input.collabCli],
@@ -14420,7 +14420,7 @@ async function assembleV21CachedConsumerRolloutEvidence(input) {
     ["src/foundation.newLegacyApplyProvenanceProbe", input.newLegacyApplyProvenance]
   ];
   if (probes.some(([, probe]) => typeof probe !== "function")) {
-    throw new Error("cached-consumer v21 rollout evidence requires execution from all four consumers");
+    throw new Error("cached-consumer v20 rollout evidence requires execution from all four consumers");
   }
   const executed = await Promise.all(probes.map(async ([name, probe]) => ({
     name,
@@ -14430,10 +14430,10 @@ async function assembleV21CachedConsumerRolloutEvidence(input) {
   const consumedLegacyReplay = executed[2].consumedLegacyReplay;
   const newApply = executed[3].newApplyRefusal;
   if (reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || consumedLegacyReplay?.outcome !== "OK" || newApply?.outcome !== "OPERATOR_RECEIPT_INVALID") {
-    throw new Error("cached-consumer v21 rollout evidence requires four rereads, consumed legacy replay, and the current new-apply refusal");
+    throw new Error("cached-consumer v20 rollout evidence requires four rereads, consumed legacy replay, and the current new-apply refusal");
   }
   const durableRefJson = canonicalJson({
-    kind: "cached_consumer_v21_rollout_receipt",
+    kind: "cached_consumer_v20_rollout_receipt",
     reread,
     consumedLegacyReplay: {
       outcome: consumedLegacyReplay.outcome
@@ -14443,16 +14443,16 @@ async function assembleV21CachedConsumerRolloutEvidence(input) {
     }
   });
   return {
-    evidenceId: "cached-consumer-v21-rollout-receipt",
+    evidenceId: "cached-consumer-v20-rollout-receipt",
     evidenceKind: "release",
     sourceKind: "release",
     sourceRef: "live-plugin:dist/server.js",
     executionAttemptId: null,
     contentDigest: sha256(durableRefJson),
-    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v21-rollout-receipt", redacted: true }),
+    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v20-rollout-receipt", redacted: true }),
     durableRefJson,
     relationKind: "supporting",
-    relation: { purpose: "cached-consumer-v21-rollout" }
+    relation: { purpose: "cached-consumer-v20-rollout" }
   };
 }
 function cachedConsumerRolloutEvidence(observations) {
@@ -14499,7 +14499,7 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
     `SELECT evidence_kind, source_kind, source_ref, execution_attempt_id, content_digest,
             redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest
      FROM evidence_artifacts
-     WHERE project_id = ? AND evidence_id = 'cached-consumer-v21-rollout-receipt'`
+     WHERE project_id = ? AND evidence_id = 'cached-consumer-v20-rollout-receipt'`
   ).get(projectId));
   if (!row) return unknownCachedConsumerRolloutEvidence();
   try {
@@ -14509,7 +14509,7 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
     assertRedactedEvidence(durableRef, "cached-consumer rollout durable reference");
     const expectedIdentity = sha256(canonicalJson({
       projectId,
-      evidenceId: "cached-consumer-v21-rollout-receipt",
+      evidenceId: "cached-consumer-v20-rollout-receipt",
       evidenceKind: row.evidence_kind,
       sourceKind: row.source_kind,
       sourceRef: row.source_ref,
@@ -14522,7 +14522,7 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
     const receipt = durableRef;
     if (!Array.isArray(receipt.reread?.observations)) return unknownCachedConsumerRolloutEvidence();
     const reread = cachedConsumerRolloutEvidence(receipt.reread.observations);
-    if (receipt.kind !== "cached_consumer_v21_rollout_receipt" || receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest || reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || receipt.consumedLegacyReplay?.outcome !== "OK" || receipt.newApplyGuard?.nullProvenance?.outcome !== "OPERATOR_RECEIPT_INVALID") return unknownCachedConsumerRolloutEvidence();
+    if (receipt.kind !== "cached_consumer_v20_rollout_receipt" || receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest || reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || receipt.consumedLegacyReplay?.outcome !== "OK" || receipt.newApplyGuard?.nullProvenance?.outcome !== "OPERATOR_RECEIPT_INVALID") return unknownCachedConsumerRolloutEvidence();
     return reread;
   } catch {
     return unknownCachedConsumerRolloutEvidence();
@@ -14649,7 +14649,7 @@ var contractDigest = sha256(canonicalJson({
     expected: 4,
     attempted: 4,
     verified: 4,
-    staleV20Receipt: CACHED_CONSUMER_ROLLOUT_POLICY
+    staleV19Receipt: CACHED_CONSUMER_ROLLOUT_POLICY
   },
   roleHolderEligibilityPolicy: {
     nativeWitnessMarker: "witness",
@@ -15459,8 +15459,8 @@ function validateConfig(value) {
   if (!["full", "auto", "accept-edits"].includes(config2.permissionMode)) {
     throw refusal("INVALID_INPUT", "config permissionMode is not a BB permission mode");
   }
-  if (config2.visibility !== "visible") {
-    throw refusal("INVALID_INPUT", "config visibility must be explicitly visible");
+  if (!["visible", "hidden"].includes(config2.visibility)) {
+    throw refusal("INVALID_INPUT", "config visibility is not a BB visibility value");
   }
   const extensions = config2.extensions;
   if (extensions !== void 0) {
@@ -15540,7 +15540,7 @@ function newApplyProvenanceRefusal(value) {
     return { outcome: error48 instanceof Refusal ? error48.data.code : "INTERNAL_ERROR" };
   }
 }
-function probeV21ConsumedLegacyReplay(db, projectId) {
+function probeV20ConsumedLegacyReplay(db, projectId) {
   const replay = asRow(db.prepare(
     `SELECT r.consumed_at_ms, r.consumed_event_sequence, m.committed_event_sequence,
             e.operator_receipt_id, m.outcome_json
@@ -15563,7 +15563,7 @@ function probeV21ConsumedLegacyReplay(db, projectId) {
   ).get(projectId));
   const outcome = replay ? JSON.parse(replay.outcome_json) : null;
   if (!replay || outcome?.outcome !== "OK") {
-    throw new Error("cached-consumer v21 replay proof requires an observed consumed legacy receipt");
+    throw new Error("cached-consumer v20 replay proof requires an observed consumed legacy receipt");
   }
   return {
     observedSchemaVersion: SCHEMA_VERSION,
@@ -15571,7 +15571,7 @@ function probeV21ConsumedLegacyReplay(db, projectId) {
     consumedLegacyReplay: { outcome: "OK" }
   };
 }
-function probeV21NewLegacyApplyProvenanceRefusal() {
+function probeV20NewLegacyApplyProvenanceRefusal() {
   const newApplyRefusal = newApplyProvenanceRefusal(null);
   return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION, newApplyRefusal };
 }
@@ -18762,12 +18762,12 @@ function parseSnapshot(value) {
   }
   return parsed.data;
 }
-function observedDigest(snapshot, desired) {
+function observedDigest(snapshot2, desired) {
   return sha256(canonicalJson({
-    title: snapshot.title,
-    body: snapshot.body,
-    state: snapshot.state,
-    managedLabels: snapshot.labels.filter((label) => desired.managedNames.has(label)).sort()
+    title: snapshot2.title,
+    body: snapshot2.body,
+    state: snapshot2.state,
+    managedLabels: snapshot2.labels.filter((label) => desired.managedNames.has(label)).sort()
   }));
 }
 function externalRef(db, projectId, workItemId) {
@@ -18961,7 +18961,7 @@ function recordProjectionState(db, request, digest, context, state, outcome, cou
     );
   });
 }
-function finalizeProjection(db, request, digest, context, adapter, snapshot, mutationKind) {
+function finalizeProjection(db, request, digest, context, adapter, snapshot2, mutationKind) {
   return transaction(db, () => {
     const replay = checkIdempotency(db, request, digest);
     if (replay) return replay;
@@ -18969,13 +18969,13 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot, mut
     if (authority.mapping.connectorHost !== adapter.connectorHost) {
       throw refusal("EXTERNAL_TARGET_MISMATCH", "GitHub mapping changed before projection finalization");
     }
-    if (context.ref.owner !== snapshot.owner || context.ref.repo !== snapshot.repo || context.ref.issue_number !== null && context.ref.issue_number !== snapshot.issueNumber) {
+    if (context.ref.owner !== snapshot2.owner || context.ref.repo !== snapshot2.repo || context.ref.issue_number !== null && context.ref.issue_number !== snapshot2.issueNumber) {
       throw refusal("EXTERNAL_REF_CONFLICT", "external identity changed before projection finalization");
     }
     if (mutationKind === "verify" && context.ref.projection_state !== "current" || mutationKind !== "verify" && (context.ref.projection_state !== "pending" || context.ref.last_idempotency_key !== request.idempotencyKey || context.ref.last_request_digest !== digest)) {
       throw refusal("EXTERNAL_REF_CONFLICT", "external reservation changed before projection finalization");
     }
-    const observed = observedDigest(snapshot, context.desired);
+    const observed = observedDigest(snapshot2, context.desired);
     if (observed !== context.desired.digest) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub read-back does not match the desired projection");
     const updated = db.prepare(
       `UPDATE external_work_refs SET issue_number = ?, projection_state = 'current', attempted_resource_revision = ?,
@@ -18983,11 +18983,11 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot, mut
        observed_external_digest = ?, last_idempotency_key = ?, last_request_digest = ?, updated_at_ms = ?
        WHERE ${EXTERNAL_REF_CAS_WHERE}`
     ).run(
-      snapshot.issueNumber,
+      snapshot2.issueNumber,
       authority.workItem.resource_revision,
       authority.workItem.resource_revision,
       context.desired.digest,
-      snapshot.externalRevision,
+      snapshot2.externalRevision,
       observed,
       request.idempotencyKey,
       digest,
@@ -19005,7 +19005,7 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot, mut
         aggregateId: authority.workItem.work_item_id,
         aggregateRevision: authority.workItem.resource_revision,
         eventType: "github_issue_projected",
-        event: { workItemId: authority.workItem.work_item_id, owner: snapshot.owner, repo: snapshot.repo, issueNumber: snapshot.issueNumber, mutationKind }
+        event: { workItemId: authority.workItem.work_item_id, owner: snapshot2.owner, repo: snapshot2.repo, issueNumber: snapshot2.issueNumber, mutationKind }
       },
       { expected: 1, attempted: 1, verified: 1 },
       {
@@ -19015,12 +19015,12 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot, mut
         expectedResourceRevision: request.expectedResourceRevision ?? void 0,
         evidence: {
           provider: "github",
-          owner: snapshot.owner,
-          repo: snapshot.repo,
-          issueNumber: snapshot.issueNumber,
+          owner: snapshot2.owner,
+          repo: snapshot2.repo,
+          issueNumber: snapshot2.issueNumber,
           desiredDigest: context.desired.digest,
           observedDigest: observed,
-          observedExternalRevision: snapshot.externalRevision,
+          observedExternalRevision: snapshot2.externalRevision,
           mutationKind
         }
       }
@@ -20540,7 +20540,7 @@ function decisionDoctorEvidence(db, projectId) {
   }
   return { unresolvedDecisions, issues, derivedHolds, artifactCount: artifacts.length, relationCount };
 }
-async function doctor(db, sdk, projectId, checkoutDivergence) {
+async function doctor(db, sdk, projectId) {
   if (!db) return unavailableResult(projectId, "canonical SQLite store is unavailable");
   if (!sdk) return result("BB_FACTS_UNAVAILABLE", projectId, 1, 0, 0, { message: "BB fact SDK is unavailable" });
   try {
@@ -20736,7 +20736,6 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
         unresolvedAttempts,
         decisionIntegrity,
         cachedConsumers,
-        ...checkoutDivergence ? { checkoutDivergence } : {},
         schema: { version: SCHEMA_VERSION, migrationStatementIds: MIGRATIONS.map((_, index) => index), digest: schemaDigest, tables: schemaState.map((row) => row.name) }
       }
     });
@@ -21595,10 +21594,78 @@ function subscribeToThreadChanges(sdk, observe) {
   }
 }
 
-// src/registered-waits.ts
-import { createHash as createHash2 } from "node:crypto";
+// src/stall-guard.ts
 import { homedir } from "node:os";
 import { join } from "node:path";
+var STALL_GUARD_KV_KEY = "stall-guard.artifacts";
+var STALL_GUARD_LIVENESS_MARKER_FILENAME = "stall-guard.liveness";
+var STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME = "stall-guard.alerted";
+function stallGuardStateDir() {
+  return process.env.BB_COLLAB_STALL_GUARD_STATE_DIR ?? join(homedir(), ".bb", "bb-collab");
+}
+function stateFromUnknown(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter((entry) => typeof entry[1] === "string"));
+}
+function snapshot(value) {
+  return JSON.stringify(value);
+}
+function createStallGuardCycle(options) {
+  let state = null;
+  return {
+    async cycle(projectId) {
+      state ??= stateFromUnknown(await options.persistence.read());
+      const holders = options.readRoleHolders().filter((holder) => projectId === void 0 || holder.project_id === projectId);
+      const scopes = await options.readRoleScopes();
+      const nextState = structuredClone(state);
+      let changed = 0;
+      let steered = 0;
+      for (const holder of holders) {
+        const key = `${holder.project_id}:${holder.role_id}`;
+        const current = await options.readArtifact(holder).catch(() => null);
+        if (current === null) continue;
+        const next = snapshot(current);
+        if (nextState[key] === void 0) {
+          nextState[key] = next;
+          changed += 1;
+          continue;
+        }
+        if (nextState[key] === next) continue;
+        const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
+        if (!scope?.nextStartable || !scope.queueHeadId || scope.deferredReason) continue;
+        const role = {
+          projectId: holder.project_id,
+          roleId: holder.role_id,
+          roleGeneration: holder.role_generation,
+          executionAttemptId: holder.execution_attempt_id,
+          threadId: holder.thread_id,
+          queueHeadId: scope.queueHeadId,
+          idleAgeMs: 0
+        };
+        let delivered;
+        try {
+          delivered = await options.steerRole(role);
+        } catch {
+          continue;
+        }
+        if (delivered === false) continue;
+        nextState[key] = next;
+        changed += 1;
+        steered += 1;
+      }
+      if (changed > 0) {
+        await options.persistence.write(nextState);
+        state = nextState;
+      }
+      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, steered };
+    }
+  };
+}
+
+// src/registered-waits.ts
+import { createHash as createHash2 } from "node:crypto";
+import { homedir as homedir2 } from "node:os";
+import { join as join2 } from "node:path";
 var DEFAULT_WAIT_DEADLINE_MS = 8 * 60 * 6e4;
 var MAX_WAIT_DEADLINE_MS = 7 * 24 * 60 * 6e4;
 var WAIT_STEER_GRACE_MS = 5 * 6e4;
@@ -21610,7 +21677,7 @@ var WAIT_ESCALATION_KV_KEY = "wait-validator.escalation";
 var LIVENESS_MARKER_FILENAME = "wait-validator.liveness";
 var LIVENESS_ALERT_FLAG_FILENAME = "wait-validator.alerted";
 function waitValidatorStateDir() {
-  return process.env.BB_COLLAB_VALIDATOR_STATE_DIR ?? join(homedir(), ".bb", "bb-collab");
+  return process.env.BB_COLLAB_VALIDATOR_STATE_DIR ?? join2(homedir2(), ".bb", "bb-collab");
 }
 function isPlainObject2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -21949,90 +22016,9 @@ async function runArchiveSweep(bb, db, projectId, apply = false, now2 = Date.now
   }
 }
 
-// src/checkout-divergence.ts
-import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, join as join2, resolve } from "node:path";
-function readRef(gitDirs, ref) {
-  for (const gitDir of gitDirs) {
-    const looseRef = join2(gitDir, ref);
-    if (existsSync(looseRef)) return readFileSync(looseRef, "utf8").trim() || null;
-    const packedRefs = join2(gitDir, "packed-refs");
-    if (!existsSync(packedRefs)) continue;
-    for (const line of readFileSync(packedRefs, "utf8").split("\n")) {
-      const [sha, name] = line.trim().split(" ");
-      if (name === ref) return sha ?? null;
-    }
-  }
-  return null;
-}
-function resolveGitDir(checkoutRoot) {
-  const dotGit = join2(checkoutRoot, ".git");
-  if (!existsSync(dotGit)) return null;
-  if (statSync(dotGit).isDirectory()) return dotGit;
-  const marker = readFileSync(dotGit, "utf8").trim();
-  return marker.startsWith("gitdir:") ? resolve(checkoutRoot, marker.slice("gitdir:".length).trim()) : null;
-}
-function commonGitDir(gitDir) {
-  const commondir = join2(gitDir, "commondir");
-  return existsSync(commondir) ? resolve(gitDir, readFileSync(commondir, "utf8").trim()) : gitDir;
-}
-function readHead(gitDir, commonDir) {
-  const head = readFileSync(join2(gitDir, "HEAD"), "utf8").trim();
-  if (!head.startsWith("ref: ")) return head || null;
-  return readRef([gitDir, commonDir], head.slice("ref: ".length));
-}
-function findCheckoutRoot(startPath) {
-  let current = resolve(startPath);
-  while (true) {
-    if (existsSync(join2(current, ".git"))) return current;
-    const parent = dirname(current);
-    if (parent === current) return null;
-    current = parent;
-  }
-}
-function readCheckoutDivergence(checkoutRoot) {
-  const unavailable = { checkoutHead: null, originMainRef: null, behindCount: null, verdict: "unavailable", processGroupReap: "not-attempted" };
-  if (!checkoutRoot) return unavailable;
-  try {
-    const gitDir = resolveGitDir(checkoutRoot);
-    if (!gitDir) return unavailable;
-    const commonDir = commonGitDir(gitDir);
-    const checkoutHead = readHead(gitDir, commonDir);
-    const originMainRef = readRef([commonDir, gitDir], "refs/remotes/origin/main");
-    if (!checkoutHead || !originMainRef) return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable", processGroupReap: "not-attempted" };
-    let behindCount = null;
-    let processGroupReap = "not-attempted";
-    try {
-      const options = { cwd: checkoutRoot, encoding: "utf8", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" }, stdio: ["ignore", "pipe", "ignore"], timeout: 1e3, killSignal: "SIGKILL", detached: true };
-      const result2 = spawnSync("git", ["rev-list", "--count", `${checkoutHead}..${originMainRef}`], options);
-      if (typeof result2.pid === "number" && result2.pid > 0) {
-        try {
-          process.kill(-result2.pid, "SIGKILL");
-          processGroupReap = "reaped";
-        } catch (error48) {
-          if (error48.code === "ESRCH") processGroupReap = "absent";
-          else {
-            processGroupReap = "failed";
-            return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable", processGroupReap };
-          }
-        }
-      }
-      if (result2.error) throw result2.error;
-      const count = result2.stdout.trim();
-      if (/^\d+$/u.test(count)) behindCount = Number(count);
-    } catch {
-    }
-    return { checkoutHead, originMainRef, behindCount, verdict: checkoutHead === originMainRef ? "clean" : "diverged", processGroupReap };
-  } catch {
-    return unavailable;
-  }
-}
-
 // server.ts
-import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync2, rmSync, statSync as statSync2, writeFileSync } from "node:fs";
-import { basename, dirname as dirname2, isAbsolute, join as join3, relative, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { join as join3 } from "node:path";
 var projectIdSchema = external_exports.string().trim().min(1).max(256);
 var mutationReceiptSchema = external_exports.object({
   projectId: projectIdSchema,
@@ -22440,7 +22426,7 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
 }
 async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false) {
   const parsed = applyRequestSchema.safeParse(input);
-  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v21-rollout-receipt")) {
+  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v20-rollout-receipt")) {
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
@@ -22448,23 +22434,6 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
 }
 function cachedConsumerRolloutRefusal(projectId, message) {
   return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message };
-}
-function resolvedPluginRoot(source) {
-  if (!source.resolved.startsWith("path:")) return null;
-  const root = source.resolved.slice("path:".length);
-  return root.length > 0 ? root : null;
-}
-async function isLiveCachedConsumerRolloutArtifact(moduleUrl, bb) {
-  try {
-    const artifactPath = fileURLToPath(new URL(moduleUrl));
-    const pluginRoot = resolvedPluginRoot(await bb.sdk.plugins.getSource({ pluginId: bb.pluginId }));
-    if (!pluginRoot || !isAbsolute(pluginRoot)) return false;
-    const relativeArtifactPath = relative(pluginRoot, artifactPath);
-    if (relativeArtifactPath.length === 0 || relativeArtifactPath === ".." || relativeArtifactPath.startsWith(`..${sep}`) || isAbsolute(relativeArtifactPath)) return false;
-    return basename(artifactPath) === "server.js" && basename(dirname2(artifactPath)) === "dist";
-  } catch {
-    return false;
-  }
 }
 function liveCachedConsumerReread(name, result2) {
   const cachedConsumers = result2.evidence?.cachedConsumers;
@@ -22480,14 +22449,14 @@ async function applyLiveCachedConsumerRollout(bb, db, input, cliDeps, cliContext
   if (request.operationClass !== "decision_disposition") {
     return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout requires a governed decision_disposition request");
   }
-  if (!await isLiveCachedConsumerRolloutArtifact(import.meta.url, bb)) {
+  if (!import.meta.url.endsWith("/dist/server.js")) {
     return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout requires the running dist/server.js plugin artifact");
   }
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
   try {
     const project = await bb.sdk.projects.get({ projectId: request.projectId });
     if (project.id !== request.projectId) return { outcome: "PROJECT_UNKNOWN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "live project identity does not match the rollout request" };
-    const evidence = await assembleV21CachedConsumerRolloutEvidence({
+    const evidence = await assembleV20CachedConsumerRolloutEvidence({
       rpcContract: async () => liveCachedConsumerReread("server.rpcContract", await bb.sdk.plugins.callRpc({
         pluginId: bb.pluginId,
         method: "doctor",
@@ -22497,8 +22466,8 @@ async function applyLiveCachedConsumerRollout(bb, db, input, cliDeps, cliContext
       collabCli: async () => liveCachedConsumerReread("server.collabCli", foundationResultSchema.parse(JSON.parse(
         (await runCli(db, bb, ["doctor", "--project", request.projectId], cliContext, cliDeps)).stdout
       ))),
-      consumedLegacyReplay: async () => probeV21ConsumedLegacyReplay(db, request.projectId),
-      newLegacyApplyProvenance: async () => probeV21NewLegacyApplyProvenanceRefusal()
+      consumedLegacyReplay: async () => probeV20ConsumedLegacyReplay(db, request.projectId),
+      newLegacyApplyProvenance: async () => probeV20NewLegacyApplyProvenanceRefusal()
     });
     const supplied = (request.decisionEvidence ?? []).filter((item) => item.evidenceId === evidence.evidenceId);
     if (supplied.length !== 1 || canonicalJson(supplied[0]) !== canonicalJson(evidence)) {
@@ -22512,8 +22481,8 @@ async function applyLiveCachedConsumerRollout(bb, db, input, cliDeps, cliContext
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "archive-sweep", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, archive-sweep, cached-consumer-rollout, wait-register, wait-list, or wait-validator");
+  if (!command || !["doctor", "export", "apply", "archive-sweep", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, archive-sweep, cached-consumer-rollout, wait-register, wait-list, wait-validator, or stall-guard");
   }
   if (command === "wait-validator") {
     const unknown3 = args.find((arg) => arg !== "--cycle");
@@ -22535,6 +22504,39 @@ async function runCli(db, bb, argv, ctx, deps) {
       return cliResult({
         outcome: "INTERNAL_ERROR",
         subject: "wait-validator",
+        expected: 1,
+        attempted: 0,
+        verified: 0,
+        message: error48 instanceof Error ? error48.message : String(error48)
+      });
+    }
+  }
+  if (command === "stall-guard") {
+    const projectFlag = args.indexOf("--project");
+    const projectId2 = parseFlag(args, "--project");
+    const expectedLength = projectFlag < 0 ? 1 : 3;
+    const unknown3 = args.find((arg) => arg !== "--cycle" && arg !== "--project" && arg !== projectId2);
+    if (unknown3 || args.filter((arg) => arg === "--cycle").length !== 1 || args.filter((arg) => arg === "--project").length > 1 || args.length !== expectedLength) {
+      return invalidCli(`unexpected argument ${unknown3 ?? "duplicate or malformed flag"}`);
+    }
+    if (!args.includes("--cycle")) return invalidCli("--cycle is required: the stall guard runs exactly one durable cycle per invocation");
+    if (projectId2 === "") return invalidCli("--project PROJECT_ID must be supplied once with a value");
+    try {
+      await deps.watcher.poll();
+      const summary = await deps.stallGuardCycle(projectId2 ?? void 0);
+      return cliResult({
+        outcome: "OK",
+        subject: "stall-guard",
+        expected: summary.observed,
+        attempted: summary.steered,
+        verified: summary.steered,
+        message: "stall-guard cycle complete",
+        evidence: summary
+      });
+    } catch (error48) {
+      return cliResult({
+        outcome: "INTERNAL_ERROR",
+        subject: "stall-guard",
         expected: 1,
         attempted: 0,
         verified: 0,
@@ -22635,13 +22637,10 @@ async function runCli(db, bb, argv, ctx, deps) {
   }
   const unknown2 = unexpectedFlags(args, ["--project"]);
   if (unknown2) return invalidCli(`unexpected flag ${unknown2}`);
-  if (command === "doctor") return cliResult(await doctor(db, bb.sdk, projectId, deps.readCheckoutDivergence()));
+  if (command === "doctor") return cliResult(await doctor(db, bb.sdk, projectId));
   return cliResult(exportFoundation(db, projectId));
 }
-async function plugin(bb, options = {}) {
-  const readDiagnosticDivergence = () => readCheckoutDivergence(
-    options.checkoutRoot === void 0 ? findCheckoutRoot(dirname2(fileURLToPath(import.meta.url))) : options.checkoutRoot
-  );
+async function plugin(bb) {
   const operatorPassphrase = bb.settings.define({
     operatorPassphrase: {
       type: "string",
@@ -22789,6 +22788,55 @@ ${thread.titleFallback ?? ""}`);
       openLaneViews(db, Date.now(), operatorWaits)
     );
   };
+  const steerRole = async (role) => {
+    if (!db) return false;
+    const expectedHolder = {
+      project_id: role.projectId,
+      role_id: role.roleId,
+      role_generation: role.roleGeneration,
+      execution_attempt_id: role.executionAttemptId,
+      thread_id: role.threadId
+    };
+    let holders;
+    try {
+      holders = readRoleHolderStates(db).filter(
+        (holder) => holder.project_id === role.projectId && holder.role_id === role.roleId && holder.role_generation === role.roleGeneration && holder.execution_attempt_id === role.executionAttemptId
+      );
+    } catch (error48) {
+      warnRoleLiveness(expectedHolder, `holder=unknown error=${String(error48)}`);
+      return false;
+    }
+    if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) {
+      warnRoleLiveness(expectedHolder, `holderMatches=${holders.length} observedThread=${holders[0]?.thread_id ?? "null"}`);
+      return false;
+    }
+    let thread;
+    try {
+      thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
+    } catch (error48) {
+      warnRoleLiveness(holders[0], `liveness=unknown error=${String(error48)}`);
+      return false;
+    }
+    const refusal2 = roleThreadRefusal(holders[0], thread, true);
+    if (refusal2) {
+      warnRoleLiveness(holders[0], refusal2);
+      return false;
+    }
+    roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
+    await bb.sdk.threads.send({
+      threadId: holders[0].thread_id,
+      mode: "steer",
+      input: [
+        {
+          type: "text",
+          visibility: "agent-only",
+          text: `Wrongful idle: queue head ${role.queueHeadId} is startable. Inspect the queue and act or record the blocker.`,
+          mentions: []
+        }
+      ]
+    });
+    return true;
+  };
   const watcher = createLaneWatcher({
     readLanes: () => db ? readLaneStates(db) : [],
     readRoleHolders: () => db ? readRoleHolderStates(db) : [],
@@ -22857,57 +22905,24 @@ ${thread.titleFallback ?? ""}`);
         ]
       });
     },
-    steerRole: async (role) => {
-      if (!db) return false;
-      const expectedHolder = {
-        project_id: role.projectId,
-        role_id: role.roleId,
-        role_generation: role.roleGeneration,
-        execution_attempt_id: role.executionAttemptId,
-        thread_id: role.threadId
-      };
-      let holders;
-      try {
-        holders = readRoleHolderStates(db).filter(
-          (holder) => holder.project_id === role.projectId && holder.role_id === role.roleId && holder.role_generation === role.roleGeneration && holder.execution_attempt_id === role.executionAttemptId
-        );
-      } catch (error48) {
-        warnRoleLiveness(expectedHolder, `holder=unknown error=${String(error48)}`);
-        return false;
-      }
-      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) {
-        warnRoleLiveness(expectedHolder, `holderMatches=${holders.length} observedThread=${holders[0]?.thread_id ?? "null"}`);
-        return false;
-      }
-      let thread;
-      try {
-        thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
-      } catch (error48) {
-        warnRoleLiveness(holders[0], `liveness=unknown error=${String(error48)}`);
-        return false;
-      }
-      const refusal2 = roleThreadRefusal(holders[0], thread, true);
-      if (refusal2) {
-        warnRoleLiveness(holders[0], refusal2);
-        return false;
-      }
-      roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
-      await bb.sdk.threads.send({
-        threadId: holders[0].thread_id,
-        mode: "steer",
-        input: [
-          {
-            type: "text",
-            visibility: "agent-only",
-            text: `Wrongful idle: queue head ${role.queueHeadId} is startable. Inspect the queue and act or record the blocker.`,
-            mentions: []
-          }
-        ]
-      });
-      return true;
-    }
+    steerRole
   });
   await watcher.recover().catch((error48) => bb.log.error(`lane continuation recovery failed: ${String(error48)}`));
+  const stallGuardCycle = createStallGuardCycle({
+    readRoleHolders: () => db ? readRoleHolderStates(db) : [],
+    readRoleScopes,
+    readArtifact: async (holder) => {
+      const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
+      if (thread.projectId !== holder.project_id || !thread.environmentId) return { outcome: "absent" };
+      const result2 = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
+      return result2.outcome === "unavailable" ? null : result2;
+    },
+    steerRole,
+    persistence: {
+      read: () => bb.storage.kv.get(STALL_GUARD_KV_KEY),
+      write: (state) => bb.storage.kv.set(STALL_GUARD_KV_KEY, state)
+    }
+  });
   const observe = (payload) => {
     const { id: id2, status } = threadEventStatus(payload);
     return watcher.observe(id2, status);
@@ -22925,12 +22940,12 @@ ${thread.titleFallback ?? ""}`);
         await watcher.poll().catch((error48) => bb.log.warn(`lane poll failed: ${String(error48)}`));
         await escalationCycle.cycle().catch((error48) => bb.log.warn(`wait escalation failed: ${String(error48)}`));
         if (signal.aborted) break;
-        await new Promise((resolve2) => {
+        await new Promise((resolve) => {
           let timer;
           const done = () => {
             clearTimeout(timer);
             signal.removeEventListener("abort", done);
-            resolve2();
+            resolve();
           };
           timer = setTimeout(done, 1e3);
           signal.addEventListener("abort", done, { once: true });
@@ -22945,14 +22960,14 @@ ${thread.titleFallback ?? ""}`);
       const flagPath = join3(stateDir, LIVENESS_ALERT_FLAG_FILENAME);
       let markerAtMs = null;
       try {
-        const parsed = Number(readFileSync2(markerPath, "utf8").trim());
-        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync2(markerPath).mtimeMs;
+        const parsed = Number(readFileSync(markerPath, "utf8").trim());
+        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync(markerPath).mtimeMs;
       } catch {
         markerAtMs = null;
       }
       const configuredStaleMs = Number(process.env.BB_COLLAB_LIVENESS_STALE_MS);
       const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
-      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync2(flagPath));
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync(flagPath));
       if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
       if (decision === "alert-once") {
         mkdirSync(stateDir, { recursive: true });
@@ -22966,6 +22981,36 @@ ${thread.titleFallback ?? ""}`);
       }
     } catch (error48) {
       bb.log.warn(`wait-validator liveness check failed: ${String(error48)}`);
+    }
+  });
+  bb.background.schedule("stall-guard-liveness", "*/5 * * * *", async () => {
+    try {
+      const stateDir = stallGuardStateDir();
+      const markerPath = join3(stateDir, STALL_GUARD_LIVENESS_MARKER_FILENAME);
+      const flagPath = join3(stateDir, STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME);
+      let markerAtMs = null;
+      try {
+        const parsed = Number(readFileSync(markerPath, "utf8").trim());
+        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync(markerPath).mtimeMs;
+      } catch {
+        markerAtMs = null;
+      }
+      const configuredStaleMs = Number(process.env.BB_COLLAB_STALL_GUARD_LIVENESS_STALE_MS);
+      const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync(flagPath));
+      if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
+      if (decision === "alert-once") {
+        mkdirSync(stateDir, { recursive: true });
+        try {
+          writeFileSync(flagPath, String(Date.now()), { flag: "wx" });
+        } catch {
+          return;
+        }
+        bb.log.error("stall-guard liveness marker is stale: host launchd supervision failed; operator attention required");
+        bb.realtime.publish("stall-guard", { liveness: "stale", alert: "operator-once" });
+      }
+    } catch (error48) {
+      bb.log.warn(`stall-guard liveness check failed: ${String(error48)}`);
     }
   });
   bb.background.schedule("sentinel-wake-floor", "0 * * * *", async () => {
@@ -23039,8 +23084,8 @@ ${thread.titleFallback ?? ""}`);
       return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) }));
     },
     escalationCycle,
-    archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply),
-    readCheckoutDivergence: readDiagnosticDivergence
+    stallGuardCycle: (projectId) => stallGuardCycle.cycle(projectId),
+    archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply)
   };
   bb.rpc.register(rpcContract, {
     lanes() {
@@ -23061,8 +23106,8 @@ ${thread.titleFallback ?? ""}`);
     async threadModels(input) {
       const entries = await Promise.all(input.threadIds.map(async (threadId) => {
         try {
-          const options2 = await bb.sdk.threads.defaultExecutionOptions({ threadId });
-          return [threadId, options2 ? { model: options2.model, reasoning: options2.reasoningLevel } : null];
+          const options = await bb.sdk.threads.defaultExecutionOptions({ threadId });
+          return [threadId, options ? { model: options.model, reasoning: options.reasoningLevel } : null];
         } catch {
           return [threadId, null];
         }
@@ -23098,7 +23143,7 @@ ${thread.titleFallback ?? ""}`);
       return { ok: true };
     },
     async doctor(input) {
-      return doctor(db, bb.sdk, input.projectId, readDiagnosticDivergence());
+      return doctor(db, bb.sdk, input.projectId);
     },
     async export(input) {
       return exportFoundation(db, input.projectId);
@@ -23267,7 +23312,7 @@ ${thread.titleFallback ?? ""}`);
       },
       {
         name: "cached-consumer-rollout",
-        summary: "Persist the live v21 cached-consumer rollout receipt (exact one-request receipt required)",
+        summary: "Persist the live v20 cached-consumer rollout receipt (exact one-request receipt required)",
         usage: "bb collab cached-consumer-rollout --project PROJECT_ID --request JSON"
       },
       {
@@ -23280,6 +23325,11 @@ ${thread.titleFallback ?? ""}`);
         name: "wait-validator",
         summary: "Run one durable wait-validator cycle (host-supervised seam)",
         usage: "bb collab wait-validator --cycle"
+      },
+      {
+        name: "stall-guard",
+        summary: "Run one succession-safe stall-guard cycle (host-supervised seam)",
+        usage: "bb collab stall-guard --cycle --project PROJECT_ID"
       },
       {
         name: "archive-sweep",
@@ -23296,7 +23346,6 @@ ${thread.titleFallback ?? ""}`);
 export {
   plugin as default,
   foundationResultSchema,
-  isLiveCachedConsumerRolloutArtifact,
   readLiveRoleFactReader,
   rpcContract
 };
