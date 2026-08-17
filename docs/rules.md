@@ -32,6 +32,12 @@ A WAITING on the same thing past about 24 hours surfaces to the orchestrator as 
 
 When you send another seat a blocking question, set the watch in the same act: run `bb thread wait <their-thread> --status idle --timeout <bounded>`, always with an explicit bounded timeout, then check your own inbound for the answer. If their thread is idle and inbound has no answer, it was never sent or delivered: re-ask once, bundled. After the second watch, if there is still no answer, escalate to the operator or supervisor with `director unresponsive`; do not loop a third time. The same pattern applies downward to every lane blocking on you. It is one wait, one inbox check, and at most one re-ask—no polling and no timers.
 
+## Completion is native; the verdict is ours
+
+bb already tells a parent thread when a child finishes: it emits `child-completed`, `child-failed`, `child-interrupted`, and `child-outcome-batch`, and `threads.childSummary` reads the same ground. Do not build completion notification — wire the native signal.
+
+What the platform does not tell you is the part that matters. bb tells you a child finished; it does not tell you whether the child succeeded. The notification is native; the verdict is ours. That is what the `DONE | BLOCKED | WAITING` return path carries, and why the vocabulary stands on top of a signal we no longer write ourselves.
+
 ## A message is delivered when it lands, consumed when the reply addresses it
 
 A message is delivered when it lands in the recipient's thread, and consumed when their reply addresses it. The sender owns both checks.
