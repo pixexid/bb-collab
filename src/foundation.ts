@@ -2469,8 +2469,8 @@ function actorReceiptDigest(input: {
   roleId: string | null;
   roleGeneration: number | null;
   verificationState: string;
-  operatorReceiptId?: string | null;
-  retirementCondition?: string | null;
+  operatorReceiptId: string | null;
+  retirementCondition: string | null;
 }): string {
   return sha256(canonicalJson({
     projectId: input.projectId,
@@ -2480,9 +2480,8 @@ function actorReceiptDigest(input: {
     roleId: input.roleId,
     roleGeneration: input.roleGeneration,
     verificationState: input.verificationState,
-    ...(input.operatorReceiptId || input.retirementCondition
-      ? { operatorReceiptId: input.operatorReceiptId ?? null, retirementCondition: input.retirementCondition ?? null }
-      : {}),
+    operatorReceiptId: input.operatorReceiptId,
+    retirementCondition: input.retirementCondition,
   }));
 }
 
@@ -2555,9 +2554,11 @@ function requireActor(db: SqliteDatabase, request: ApplyRequest): string {
     role_id: string | null;
     role_generation: number | null;
     verification_state: string;
+    operator_receipt_id: string | null;
+    retirement_condition: string | null;
     receipt_digest: string;
   }>(
-    db.prepare("SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, receipt_digest FROM actor_receipts WHERE receipt_id = ?").get(request.actorReceiptId),
+    db.prepare("SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, receipt_digest FROM actor_receipts WHERE receipt_id = ?").get(request.actorReceiptId),
   );
   if (!row) throw refusal("ACTOR_RECEIPT_UNKNOWN", "actor receipt is not known");
   if (row.project_id !== request.projectId) throw refusal("ACTOR_RECEIPT_FOREIGN", "actor receipt belongs to another project");
@@ -2570,6 +2571,8 @@ function requireActor(db: SqliteDatabase, request: ApplyRequest): string {
     roleId: row.role_id,
     roleGeneration: row.role_generation,
     verificationState: row.verification_state,
+    operatorReceiptId: row.operator_receipt_id,
+    retirementCondition: row.retirement_condition,
   });
   if (row.receipt_digest !== expectedDigest) throw refusal("ACTOR_RECEIPT_UNVERIFIED", "actor receipt digest is invalid");
   return request.actorReceiptId;
@@ -3087,9 +3090,9 @@ function requireAdoptedMigrationDecision(
   }
   const actor = asRow<{
     project_id: string; actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null;
-    verification_state: string; receipt_digest: string;
+    verification_state: string; operator_receipt_id: string | null; retirement_condition: string | null; receipt_digest: string;
   }>(db.prepare(
-    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, receipt_digest FROM actor_receipts WHERE receipt_id = ?",
+    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, receipt_digest FROM actor_receipts WHERE receipt_id = ?",
   ).get(disposition.actor_receipt_id));
   const actorDigest = actor && actorReceiptDigest({
     projectId: actor.project_id,
@@ -3099,6 +3102,8 @@ function requireAdoptedMigrationDecision(
     roleId: actor.role_id,
     roleGeneration: actor.role_generation,
     verificationState: actor.verification_state,
+    operatorReceiptId: actor.operator_receipt_id,
+    retirementCondition: actor.retirement_condition,
   });
   if (!actor || actor.project_id !== projectId || actor.actor_kind !== "role" || actor.verification_state !== "verified" || actor.receipt_digest !== actorDigest) {
     throw refusal("ACTOR_RECEIPT_UNVERIFIED", "authorizing Decision actor receipt is not verified");

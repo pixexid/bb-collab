@@ -15642,7 +15642,8 @@ function actorReceiptDigest(input) {
     roleId: input.roleId,
     roleGeneration: input.roleGeneration,
     verificationState: input.verificationState,
-    ...input.operatorReceiptId || input.retirementCondition ? { operatorReceiptId: input.operatorReceiptId ?? null, retirementCondition: input.retirementCondition ?? null } : {}
+    operatorReceiptId: input.operatorReceiptId,
+    retirementCondition: input.retirementCondition
   }));
 }
 function mutationRequestDigest(_db, request) {
@@ -15699,7 +15700,7 @@ function requireConfig(db, request) {
 function requireActor(db, request) {
   if (!request.actorReceiptId) throw refusal("ACTOR_RECEIPT_REQUIRED", "a typed actor receipt is required");
   const row = asRow(
-    db.prepare("SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, receipt_digest FROM actor_receipts WHERE receipt_id = ?").get(request.actorReceiptId)
+    db.prepare("SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, receipt_digest FROM actor_receipts WHERE receipt_id = ?").get(request.actorReceiptId)
   );
   if (!row) throw refusal("ACTOR_RECEIPT_UNKNOWN", "actor receipt is not known");
   if (row.project_id !== request.projectId) throw refusal("ACTOR_RECEIPT_FOREIGN", "actor receipt belongs to another project");
@@ -15711,7 +15712,9 @@ function requireActor(db, request) {
     subjectId: row.subject_id,
     roleId: row.role_id,
     roleGeneration: row.role_generation,
-    verificationState: row.verification_state
+    verificationState: row.verification_state,
+    operatorReceiptId: row.operator_receipt_id,
+    retirementCondition: row.retirement_condition
   });
   if (row.receipt_digest !== expectedDigest) throw refusal("ACTOR_RECEIPT_UNVERIFIED", "actor receipt digest is invalid");
   return request.actorReceiptId;
@@ -16124,7 +16127,7 @@ function requireAdoptedMigrationDecision(db, projectId, configRevision, decision
     throw refusal("INVALID_INPUT", "migration requires the current adopted Decision disposition");
   }
   const actor = asRow(db.prepare(
-    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, receipt_digest FROM actor_receipts WHERE receipt_id = ?"
+    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, receipt_digest FROM actor_receipts WHERE receipt_id = ?"
   ).get(disposition.actor_receipt_id));
   const actorDigest = actor && actorReceiptDigest({
     projectId: actor.project_id,
@@ -16133,7 +16136,9 @@ function requireAdoptedMigrationDecision(db, projectId, configRevision, decision
     subjectId: actor.subject_id,
     roleId: actor.role_id,
     roleGeneration: actor.role_generation,
-    verificationState: actor.verification_state
+    verificationState: actor.verification_state,
+    operatorReceiptId: actor.operator_receipt_id,
+    retirementCondition: actor.retirement_condition
   });
   if (!actor || actor.project_id !== projectId || actor.actor_kind !== "role" || actor.verification_state !== "verified" || actor.receipt_digest !== actorDigest) {
     throw refusal("ACTOR_RECEIPT_UNVERIFIED", "authorizing Decision actor receipt is not verified");
