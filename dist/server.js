@@ -20899,12 +20899,11 @@ function roleIdleState(input) {
     const idleSinceMs = typeof record2.idleSinceMs === "number" && Number.isFinite(record2.idleSinceMs) ? record2.idleSinceMs : null;
     const lastSteerAtMs = typeof record2.lastSteerAtMs === "number" && Number.isFinite(record2.lastSteerAtMs) ? record2.lastSteerAtMs : null;
     const awaitingSteerOutcome = record2.awaitingSteerOutcome === true;
-    const wakePending = record2.wakePending === true;
-    const wakeDelivered = record2.wakeDelivered === true;
-    if (!Number.isInteger(record2.steerCount) || record2.steerCount < 0 || record2.steerCount > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || idleSinceMs !== null && idleSinceMs < 0 || lastSteerAtMs !== null && lastSteerAtMs < 0 || typeof record2.escalated !== "boolean") {
+    const lastWakeAtMs = typeof record2.lastWakeAtMs === "number" && Number.isFinite(record2.lastWakeAtMs) ? record2.lastWakeAtMs : null;
+    if (!Number.isInteger(record2.steerCount) || record2.steerCount < 0 || record2.steerCount > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || idleSinceMs !== null && idleSinceMs < 0 || lastSteerAtMs !== null && lastSteerAtMs < 0 || lastWakeAtMs !== null && lastWakeAtMs < 0 || typeof record2.escalated !== "boolean") {
       throw new Error("invalid role idle state");
     }
-    state[key] = { steerCount: record2.steerCount, failedSteers, escalated: record2.escalated, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, wakePending, wakeDelivered };
+    state[key] = { steerCount: record2.steerCount, failedSteers, escalated: record2.escalated, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastWakeAtMs };
   }
   return state;
 }
@@ -20926,14 +20925,6 @@ function createRoleIdleLedger(persistence) {
   return {
     recover: () => enqueue(async () => {
       await load();
-      let changed = false;
-      for (const record2 of Object.values(state)) {
-        if (!record2.wakePending) continue;
-        record2.wakePending = false;
-        record2.wakeDelivered = false;
-        changed = true;
-      }
-      if (changed) await save();
     }),
     get: (key) => enqueue(async () => {
       await load();
@@ -20950,9 +20941,16 @@ function createRoleIdleLedger(persistence) {
         }
         return { ...record2 };
       }
-      state[key] = { ...record2 ?? { steerCount: 0, failedSteers: 0, escalated: false, lastSteerAtMs: null, awaitingSteerOutcome: false, wakePending: false, wakeDelivered: false }, idleSinceMs, awaitingSteerOutcome: false };
+      state[key] = { ...record2 ?? { steerCount: 0, failedSteers: 0, escalated: false, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null }, idleSinceMs, awaitingSteerOutcome: false };
       await save();
       return { ...state[key] };
+    }),
+    resetIdle: (key) => enqueue(async () => {
+      await load();
+      const record2 = state[key];
+      if (!record2) return;
+      state[key] = { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: record2.lastWakeAtMs };
+      await save();
     }),
     preserveAfterSteerWake: (key) => enqueue(async () => {
       await load();
@@ -20961,7 +20959,7 @@ function createRoleIdleLedger(persistence) {
     }),
     recordSteer: (key, failed, steeredAtMs) => enqueue(async () => {
       await load();
-      const record2 = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, wakePending: false, wakeDelivered: false };
+      const record2 = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null };
       record2.steerCount = Math.min(2, record2.steerCount + 1);
       if (failed) record2.failedSteers = Math.min(2, record2.failedSteers + 1);
       record2.lastSteerAtMs = steeredAtMs;
@@ -20972,7 +20970,7 @@ function createRoleIdleLedger(persistence) {
     }),
     markEscalated: (key) => enqueue(async () => {
       await load();
-      const record2 = state[key] ?? { steerCount: 2, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, wakePending: false, wakeDelivered: false };
+      const record2 = state[key] ?? { steerCount: 2, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null };
       if (record2.escalated) return false;
       record2.escalated = true;
       state[key] = record2;
@@ -20990,39 +20988,13 @@ function createRoleIdleLedger(persistence) {
       }
       if (changed) await save();
     }),
-    claimWake: (key) => enqueue(async () => {
+    recordWake: (key, sentAtMs) => enqueue(async () => {
       await load();
-      const record2 = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, wakePending: false, wakeDelivered: false };
-      if (record2.wakePending || record2.wakeDelivered) return false;
-      record2.wakePending = true;
-      record2.wakeDelivered = true;
-      state[key] = record2;
-      await save();
-      return true;
-    }),
-    completeWake: (key) => enqueue(async () => {
-      await load();
-      const record2 = state[key];
-      if (!record2?.wakePending) return;
-      record2.wakePending = false;
-      record2.wakeDelivered = true;
-      await save();
-    }),
-    releaseWake: (key) => enqueue(async () => {
-      await load();
-      const record2 = state[key];
-      if (!record2?.wakePending && !record2.wakeDelivered) return;
-      record2.wakePending = false;
-      record2.wakeDelivered = false;
-      await save();
-    }),
-    clearWake: (key) => enqueue(async () => {
-      await load();
-      const record2 = state[key];
-      if (!record2?.wakePending && !record2.wakeDelivered) return;
-      record2.wakePending = false;
-      record2.wakeDelivered = false;
-      await save();
+      const record2 = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null };
+      const next = { ...record2, lastWakeAtMs: sentAtMs };
+      const nextState = { ...state, [key]: next };
+      await persistence?.write(structuredClone(nextState));
+      state = nextState;
     })
   };
 }
@@ -21403,9 +21375,9 @@ function createLaneWatcher(options) {
       const key = roleIdleKey(holder, scope.queueHeadId);
       await roleIdleLedger.clearPrefixExcept(prefix, key);
       if (observation.status !== "idle") {
-        await roleIdleLedger.clearWake(key);
         if (await roleIdleLedger.preserveAfterSteerWake(key)) continue;
-        await roleIdleLedger.clearPrefixExcept(prefix);
+        await roleIdleLedger.resetIdle(key);
+        await roleIdleLedger.clearPrefixExcept(prefix, key);
         continue;
       }
       if (observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) {
@@ -21677,14 +21649,8 @@ function createLaneWatcher(options) {
     observeRoleIdle(key, idleSinceMs) {
       return roleIdleLedger.observeIdle(key, idleSinceMs);
     },
-    claimRoleWake(key) {
-      return roleIdleLedger.claimWake(key);
-    },
-    completeRoleWake(key) {
-      return roleIdleLedger.completeWake(key);
-    },
-    releaseRoleWake(key) {
-      return roleIdleLedger.releaseWake(key);
+    recordRoleWake(key, sentAtMs) {
+      return roleIdleLedger.recordWake(key, sentAtMs);
     }
   };
 }
@@ -23002,8 +22968,11 @@ ${thread.titleFallback ?? ""}`);
     const operatorWaits = /* @__PURE__ */ new Map();
     const threadIds = [...new Set(readLaneStates(db).filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state)).map((lane) => lane.thread_id).filter((threadId) => threadId !== null))];
     await Promise.all(threadIds.map(async (threadId) => {
-      const wait = await readPendingOperatorWaitForThread(threadId);
-      if (wait) operatorWaits.set(threadId, wait);
+      try {
+        const wait = await readPendingOperatorWaitForThread(threadId);
+        if (wait) operatorWaits.set(threadId, wait);
+      } catch {
+      }
     }));
     return operatorWaits;
   };
@@ -23246,6 +23215,7 @@ ${thread.titleFallback ?? ""}`);
       bb.log.warn(`stall-guard liveness check failed: ${String(error48)}`);
     }
   });
+  const wakeInFlight = /* @__PURE__ */ new Set();
   bb.background.schedule("sentinel-wake-floor", "0 * * * *", async () => {
     try {
       if (!db) return;
@@ -23258,7 +23228,7 @@ ${thread.titleFallback ?? ""}`);
       if (directorsByProject.size === 0) return;
       const startableLanes = await readUnblockedStartableLanes();
       for (const [projectId, directors] of directorsByProject) {
-        let claimedKey = null;
+        let wakeInFlightKey = null;
         try {
           if (directors.length !== 1) {
             if (directors.length > 1) bb.log.warn(`sentinel-wake-floor refused: project=${projectId} active director holders=${directors.length}`);
@@ -23272,35 +23242,31 @@ ${thread.titleFallback ?? ""}`);
           if (await readPendingExternalWait(director.thread_id)) continue;
           const key = roleIdleKey(director, lane.executionAttemptId);
           const previous = await watcher.readRoleIdle(key);
-          if (previous?.wakePending || previous?.wakeDelivered) continue;
           const now2 = Date.now();
+          if (previous?.lastWakeAtMs !== null && previous?.lastWakeAtMs !== void 0 && now2 - previous.lastWakeAtMs < SENTINEL_WAKE_FLOOR_MS) continue;
           const idle = await watcher.observeRoleIdle(key, now2);
           if (idle.idleSinceMs === null || now2 - idle.idleSinceMs < SENTINEL_WAKE_FLOOR_MS) continue;
-          if (!await watcher.claimRoleWake(key)) continue;
-          claimedKey = key;
+          if (wakeInFlight.has(key)) continue;
+          wakeInFlight.add(key);
+          wakeInFlightKey = key;
           const current = readRoleHolderStates(db).filter((candidate) => candidate.project_id === projectId && candidate.role_id === "director");
           if (current.length !== 1 || current[0].role_generation !== director.role_generation || current[0].execution_attempt_id !== director.execution_attempt_id || current[0].thread_id !== director.thread_id) {
             if (current.length > 1) bb.log.warn(`sentinel-wake-floor refused: project=${projectId} active director holders=${current.length}`);
-            await watcher.releaseRoleWake(key);
-            claimedKey = null;
             continue;
           }
+          const currentPending = await readPendingExternalWait(director.thread_id);
           const currentThread = await bb.sdk.threads.get({ threadId: director.thread_id });
-          if (currentThread.projectId !== projectId || currentThread.status !== "idle" || currentThread.archivedAt !== null || currentThread.deletedAt !== null || await readPendingExternalWait(director.thread_id)) {
-            await watcher.releaseRoleWake(key);
-            claimedKey = null;
-            continue;
-          }
+          if (currentPending || currentThread.projectId !== projectId || currentThread.status !== "idle" || currentThread.archivedAt !== null || currentThread.deletedAt !== null) continue;
           await bb.sdk.threads.send({
             threadId: director.thread_id,
             mode: "queue-if-active",
             input: [{ type: "text", visibility: "agent-only", text: "Hourly director health check: inspect canonical surfaces and report any drift or blocker.", mentions: [] }]
           });
-          await watcher.completeRoleWake(key);
-          claimedKey = null;
+          await watcher.recordRoleWake(key, Date.now());
         } catch (error48) {
-          if (claimedKey) await watcher.releaseRoleWake(claimedKey).catch(() => void 0);
           bb.log.warn(`sentinel-wake-floor failed: ${String(error48)}`);
+        } finally {
+          if (wakeInFlightKey) wakeInFlight.delete(wakeInFlightKey);
         }
       }
     } catch (error48) {

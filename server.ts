@@ -937,7 +937,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   const roleIdlePersistence = {
     read: () => bb.storage.kv.get<unknown>("lane-watcher.role-idle"),
-    write: (state: Record<string, { steerCount: number; failedSteers: number; escalated: boolean; idleSinceMs: number | null; lastSteerAtMs: number | null; awaitingSteerOutcome: boolean; wakePending: boolean; wakeDelivered: boolean }>) => bb.storage.kv.set("lane-watcher.role-idle", state),
+    write: (state: Record<string, { steerCount: number; failedSteers: number; escalated: boolean; idleSinceMs: number | null; lastSteerAtMs: number | null; awaitingSteerOutcome: boolean; lastWakeAtMs: number | null }>) => bb.storage.kv.set("lane-watcher.role-idle", state),
   };
 
   const roleLivenessWarnings = new Map<string, string>();
@@ -968,8 +968,12 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       .map((lane) => lane.thread_id)
       .filter((threadId): threadId is string => threadId !== null))];
     await Promise.all(threadIds.map(async (threadId) => {
-      const wait = await readPendingOperatorWaitForThread(threadId);
-      if (wait) operatorWaits.set(threadId, wait);
+      try {
+        const wait = await readPendingOperatorWaitForThread(threadId);
+        if (wait) operatorWaits.set(threadId, wait);
+      } catch {
+        // A single project's interaction surface must not abort other projects' floors.
+      }
     }));
     return operatorWaits;
   };
@@ -1235,6 +1239,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     }
   });
 
+  const wakeInFlight = new Set<string>();
   bb.background.schedule("sentinel-wake-floor", "0 * * * *", async () => {
     try {
       if (!db) return;
@@ -1247,7 +1252,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       if (directorsByProject.size === 0) return;
       const startableLanes = await readUnblockedStartableLanes();
       for (const [projectId, directors] of directorsByProject) {
-        let claimedKey: string | null = null;
+        let wakeInFlightKey: string | null = null;
         try {
           if (directors.length !== 1) {
             if (directors.length > 1) bb.log.warn(`sentinel-wake-floor refused: project=${projectId} active director holders=${directors.length}`);
@@ -1261,35 +1266,31 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           if (await readPendingExternalWait(director.thread_id)) continue;
           const key = roleIdleKey(director, lane.executionAttemptId);
           const previous = await watcher.readRoleIdle(key);
-          if (previous?.wakePending || previous?.wakeDelivered) continue;
           const now = Date.now();
+          if (previous?.lastWakeAtMs !== null && previous?.lastWakeAtMs !== undefined && now - previous.lastWakeAtMs < SENTINEL_WAKE_FLOOR_MS) continue;
           const idle = await watcher.observeRoleIdle(key, now);
           if (idle.idleSinceMs === null || now - idle.idleSinceMs < SENTINEL_WAKE_FLOOR_MS) continue;
-          if (!await watcher.claimRoleWake(key)) continue;
-          claimedKey = key;
+          if (wakeInFlight.has(key)) continue;
+          wakeInFlight.add(key);
+          wakeInFlightKey = key;
           const current = readRoleHolderStates(db).filter((candidate) => candidate.project_id === projectId && candidate.role_id === "director");
           if (current.length !== 1 || current[0]!.role_generation !== director.role_generation || current[0]!.execution_attempt_id !== director.execution_attempt_id || current[0]!.thread_id !== director.thread_id) {
             if (current.length > 1) bb.log.warn(`sentinel-wake-floor refused: project=${projectId} active director holders=${current.length}`);
-            await watcher.releaseRoleWake(key);
-            claimedKey = null;
             continue;
           }
+          const currentPending = await readPendingExternalWait(director.thread_id);
           const currentThread = await bb.sdk.threads.get({ threadId: director.thread_id });
-          if (currentThread.projectId !== projectId || currentThread.status !== "idle" || currentThread.archivedAt !== null || currentThread.deletedAt !== null || await readPendingExternalWait(director.thread_id)) {
-            await watcher.releaseRoleWake(key);
-            claimedKey = null;
-            continue;
-          }
+          if (currentPending || currentThread.projectId !== projectId || currentThread.status !== "idle" || currentThread.archivedAt !== null || currentThread.deletedAt !== null) continue;
           await bb.sdk.threads.send({
             threadId: director.thread_id,
             mode: "queue-if-active",
             input: [{ type: "text", visibility: "agent-only", text: "Hourly director health check: inspect canonical surfaces and report any drift or blocker.", mentions: [] }],
           });
-          await watcher.completeRoleWake(key);
-          claimedKey = null;
+          await watcher.recordRoleWake(key, Date.now());
         } catch (error) {
-          if (claimedKey) await watcher.releaseRoleWake(claimedKey).catch(() => undefined);
           bb.log.warn(`sentinel-wake-floor failed: ${String(error)}`);
+        } finally {
+          if (wakeInFlightKey) wakeInFlight.delete(wakeInFlightKey);
         }
       }
     } catch (error) {

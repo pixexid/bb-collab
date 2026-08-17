@@ -631,6 +631,7 @@ async function sentinelWakeFloorFixture(updatedAt = 1) {
     directorThreadId: holder.thread_id,
     setThreadUpdatedAt(value: number) { nativeUpdatedAt = value; },
     setThreadStatus(value: "idle" | "active") { threadStatus = value; },
+    getThreadStatus() { return threadStatus; },
     setDirectorPendingInteraction(value: boolean) { directorPendingInteraction = value; },
     setThreadProject(threadId: string, projectId: string) { threadProjects.set(threadId, projectId); },
   };
@@ -2287,34 +2288,60 @@ describe("bb-collab plugin boundary", () => {
       await fixture.host.harness.runSchedule("sentinel-wake-floor");
       await fixture.host.harness.runSchedule("sentinel-wake-floor");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("lane-watcher.role-idle");
+      expect(Object.values(persisted ?? {}).some((record) => record.lastWakeAtMs === 60 * 60_000)).toBe(true);
     } finally {
       clock.mockRestore();
     }
   });
 
-  it("recovers a persisted pre-send claim after restart", async () => {
+  it("retries after a successful send whose wake timestamp was not persisted", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
       const fixture = await sentinelWakeFloorFixture(0);
       await addPendingReview(fixture);
       await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      const persisted = await fixture.host.bb.storage.kv.get<Record<string, Record<string, unknown>>>("lane-watcher.role-idle");
-      const key = Object.keys(persisted ?? {})[0];
-      expect(key).toBeDefined();
-      await fixture.host.bb.storage.kv.set("lane-watcher.role-idle", {
-        ...persisted,
-        [key!]: { ...persisted![key!]!, wakePending: true, wakeDelivered: true },
+      let failTimestampWrite = true;
+      const originalSet = fixture.host.bb.storage.kv.set.bind(fixture.host.bb.storage.kv);
+      const setSpy = vi.spyOn(fixture.host.bb.storage.kv, "set").mockImplementation(async (key, value) => {
+        if (key === "lane-watcher.role-idle" && failTimestampWrite && value && typeof value === "object" && !Array.isArray(value)
+          && Object.values(value as Record<string, { lastWakeAtMs?: number | null }>).some((record) => record.lastWakeAtMs === 60 * 60_000)) {
+          failTimestampWrite = false;
+          throw new Error("wake timestamp unavailable");
+        }
+        await originalSet(key, value);
       });
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
+      setSpy.mockRestore();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("fires after plugin downtime across an active period and legitimate re-stall", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await sentinelWakeFloorFixture(0);
+      await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+      fixture.setThreadStatus("active");
       const reloaded = await fixture.host.harness.lifecycle.reload((bb) => plugin(bb));
       reloaded.harness.sdk.stub("threads.interactions.list", (async () => []) as never);
       reloaded.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
         id: threadId,
         projectId: PROJECT_ID,
-        status: "idle",
+        status: fixture.getThreadStatus(),
         updatedAt: 0,
       })) as never);
       reloaded.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
-      clock.mockReturnValue(60 * 60_000);
+      clock.mockReturnValue(3 * 60 * 60_000);
+      fixture.setThreadStatus("idle");
       await reloaded.harness.runSchedule("sentinel-wake-floor");
       expect(reloaded.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
     } finally {
@@ -2322,51 +2349,50 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it.each([
-    ["active", (fixture: Awaited<ReturnType<typeof sentinelWakeFloorFixture>>) => fixture.setThreadStatus("active")],
-    ["pending interaction", (fixture: Awaited<ReturnType<typeof sentinelWakeFloorFixture>>) => fixture.setDirectorPendingInteraction(true)],
-  ])("revalidates the director stall facts after claiming when the seat becomes %s", async (_name, changeFacts) => {
+  it("does not send when the director becomes active during the final interaction read", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
       const fixture = await sentinelWakeFloorFixture(0);
       await addPendingReview(fixture);
-      const originalSet = fixture.host.bb.storage.kv.set.bind(fixture.host.bb.storage.kv);
-      const setSpy = vi.spyOn(fixture.host.bb.storage.kv, "set").mockImplementation(async (key, value) => {
-        await originalSet(key, value);
-        if (key !== "lane-watcher.role-idle" || !value || typeof value !== "object" || Array.isArray(value)) return;
-        if (Object.values(value as Record<string, { wakePending?: boolean }>).some((record) => record.wakePending === true)) changeFacts(fixture);
-      });
+      let directorInteractionReads = 0;
+      fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) => {
+        if (threadId === fixture.directorThreadId) {
+          directorInteractionReads += 1;
+          if (directorInteractionReads === 3) fixture.setThreadStatus("active");
+        }
+        return [];
+      }) as never);
       await fixture.host.harness.runSchedule("sentinel-wake-floor");
       clock.mockReturnValue(60 * 60_000);
       await fixture.host.harness.runSchedule("sentinel-wake-floor");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
-      setSpy.mockRestore();
     } finally {
       clock.mockRestore();
     }
   });
 
-  it("continues processing other projects when one floor send fails", async () => {
+  it("continues processing other projects when one project's interactions read rejects", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
       const fixture = await sentinelWakeFloorFixture(0);
       await addPendingReview(fixture);
       cloneProject(fixture.db, PROJECT_ID, "project-two");
+      fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE project_id = ? AND origin = 'assignment'").run("project-one-review", PROJECT_ID);
       fixture.setThreadProject("director-two", "project-two");
-      fixture.host.harness.sdk.stub("threads.send", (async ({ threadId }: { threadId: string }) => {
-        if (threadId === fixture.directorThreadId) throw new Error("project A unavailable");
-        return { ok: true };
+      fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) => {
+        if (threadId === "project-one-review") throw new Error("project A interactions unavailable");
+        return [];
       }) as never);
       await fixture.host.harness.runSchedule("sentinel-wake-floor");
       clock.mockReturnValue(60 * 60_000);
       await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { threadId: string }).threadId)).toEqual([fixture.directorThreadId, "director-two"]);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { threadId: string }).threadId)).toEqual(["director-two"]);
     } finally {
       clock.mockRestore();
     }
   });
 
-  it("fires again after a successful wake followed by active and idle observations", async () => {
+  it("retains the wake timestamp through active and idle observations", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
       const fixture = await sentinelWakeFloorFixture(0);
@@ -2374,8 +2400,8 @@ describe("bb-collab plugin boundary", () => {
       await fixture.host.harness.runSchedule("sentinel-wake-floor");
       clock.mockReturnValue(60 * 60_000);
       await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      const afterSend = await fixture.host.bb.storage.kv.get<Record<string, { wakePending?: boolean; wakeDelivered?: boolean }>>("lane-watcher.role-idle");
-      expect(Object.values(afterSend ?? {}).some((record) => record.wakePending === false && record.wakeDelivered === true)).toBe(true);
+      const afterSend = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("lane-watcher.role-idle");
+      expect(Object.values(afterSend ?? {}).some((record) => record.lastWakeAtMs === 60 * 60_000)).toBe(true);
       fixture.setThreadStatus("active");
       const executionAttemptId = (fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE origin = 'assignment' LIMIT 1").get() as { execution_attempt_id: string }).execution_attempt_id;
       expect(Object.keys(await fixture.host.bb.storage.kv.get<Record<string, unknown>>("lane-watcher.role-idle") ?? {}).some((key) => key.endsWith(`:${executionAttemptId}`))).toBe(true);
@@ -2383,7 +2409,8 @@ describe("bb-collab plugin boundary", () => {
         thread: makeThreadResponse({ id: fixture.directorThreadId, projectId: PROJECT_ID, status: "active" }),
       });
       await fixture.host.harness.runCli(["wait-validator", "--cycle"]);
-      expect(await fixture.host.bb.storage.kv.get("lane-watcher.role-idle")).toEqual({});
+      const afterActive = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("lane-watcher.role-idle");
+      expect(Object.values(afterActive ?? {}).some((record) => record.lastWakeAtMs === 60 * 60_000)).toBe(true);
       clock.mockReturnValue(2 * 60 * 60_000);
       fixture.setThreadStatus("idle");
       await fixture.host.harness.runSchedule("sentinel-wake-floor");
