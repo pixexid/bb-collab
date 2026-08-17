@@ -39,6 +39,7 @@ import {
   doctor,
   explicitExecutionInputSources,
   exportFoundation,
+  operatorReceiptBindingDigest,
   operatorReceiptDigest,
   persistBootstrapOperatorReceipt,
   persistInterimOperatorReceipt,
@@ -2969,6 +2970,19 @@ describe("bb-collab plugin boundary", () => {
     expect(operatorAuthorizationDigestProjection(guarded)).toMatchObject({ expectedConfigRevision: null, expectedGovernanceEpoch: null, expectedFenceToken: null });
     expect(operatorRequestDigest(guarded)).toBe(operatorRequestDigest(omitted));
     expect(operatorRequestDigest(omitted)).toBe(operatorRequestDigest(explicitNull));
+    const rebased = { ...guarded, candidateHead: "a92cc01cea251f9943f0cfa963013b5f286bafa4" };
+    expect(operatorRequestDigest(rebased)).toBe(operatorRequestDigest(guarded));
+    const receiptBinding = (input: typeof guarded) => ({
+      projectId: input.projectId,
+      mutationClass: input.operationClass,
+      candidateHead: input.candidateHead,
+      idempotencyKey: input.idempotencyKey,
+      requestDigest: operatorRequestDigest(input),
+    });
+    expect(Object.keys(receiptBinding(guarded)).filter((key) =>
+      receiptBinding(guarded)[key as keyof ReturnType<typeof receiptBinding>] !== receiptBinding(rebased)[key as keyof ReturnType<typeof receiptBinding>],
+    )).toEqual(["candidateHead"]);
+    expect(operatorReceiptBindingDigest(receiptBinding(rebased))).not.toBe(operatorReceiptBindingDigest(receiptBinding(guarded)));
     expect(operatorRequestDigest(guarded)).toBe("72431ae86639a111e0692ae2c0a8f5d4b638784f7a4d1d980791112d9ffa9ff2");
     expect(operatorRequestDigest({ ...guarded, reason: { ...reason, purpose: "different" } })).not.toBe(operatorRequestDigest(guarded));
 
