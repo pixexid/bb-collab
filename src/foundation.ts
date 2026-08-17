@@ -47,7 +47,7 @@ export const EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION =
 export const MAX_EXPORT_ROWS = 256;
 export const MAX_EXPORT_BYTES = 512 * 1024;
 export const MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 8);
-// ponytail: 8192 covers the known 5413-event director history; raise only with a paged-reader proof.
+// ponytail: 8192 is a deliberate fail-closed cap; contexts beyond it refuse pending a successor complete-bound/citation path and reload/live readback.
 export const MAX_ROLE_CONTEXT_EVENTS = 8192;
 /** Deferred until a later cutover operation; issue #3 has no sanctioned freeze transition. */
 export const DEFERRED_ISSUE_3_OUTCOMES = ["PROJECT_FROZEN"] as const;
