@@ -47,6 +47,8 @@ export const EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION =
 export const MAX_EXPORT_ROWS = 256;
 export const MAX_EXPORT_BYTES = 512 * 1024;
 export const MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 8);
+// ponytail: 8192 covers the known 5413-event director history; raise only with a paged-reader proof.
+export const MAX_ROLE_CONTEXT_EVENTS = 8192;
 /** Deferred until a later cutover operation; issue #3 has no sanctioned freeze transition. */
 export const DEFERRED_ISSUE_3_OUTCOMES = ["PROJECT_FROZEN"] as const;
 
@@ -1875,7 +1877,7 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
     throw refusal("ROLE_CONTEXT_FOREIGN", "first director environment path does not match its canonical source path");
   }
   if (host.id !== environment.hostId || host.status !== "connected") throw refusal("ROLE_CONTEXT_UNKNOWN", "holder host is unavailable");
-  if (!stringField(bbVersion) || !stringField(bbServerId) || events.length === 0 || events.length > 256) {
+  if (!stringField(bbVersion) || !stringField(bbServerId) || events.length === 0 || events.length > MAX_ROLE_CONTEXT_EVENTS) {
     throw refusal("ROLE_CONTEXT_UNKNOWN", "bounded BB version or event facts are unavailable");
   }
   for (let index = 1; index < events.length; index += 1) {

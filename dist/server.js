@@ -13825,6 +13825,7 @@ var EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION = "no canonical state existed to migra
 var MAX_EXPORT_ROWS = 256;
 var MAX_EXPORT_BYTES = 512 * 1024;
 var MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 8);
+var MAX_ROLE_CONTEXT_EVENTS = 8192;
 var TABLES = [
   "project_config_revisions",
   "project_config_heads",
@@ -15235,7 +15236,7 @@ ${thread.titleFallback ?? ""}`)) {
     throw refusal("ROLE_CONTEXT_FOREIGN", "first director environment path does not match its canonical source path");
   }
   if (host.id !== environment.hostId || host.status !== "connected") throw refusal("ROLE_CONTEXT_UNKNOWN", "holder host is unavailable");
-  if (!stringField(bbVersion) || !stringField(bbServerId) || events.length === 0 || events.length > 256) {
+  if (!stringField(bbVersion) || !stringField(bbServerId) || events.length === 0 || events.length > MAX_ROLE_CONTEXT_EVENTS) {
     throw refusal("ROLE_CONTEXT_UNKNOWN", "bounded BB version or event facts are unavailable");
   }
   for (let index = 1; index < events.length; index += 1) {
@@ -21703,6 +21704,7 @@ function livenessDecision(state, alerted) {
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join as join2 } from "node:path";
 var projectIdSchema = external_exports.string().trim().min(1).max(256);
+var ROLE_CONTEXT_EVENT_PAGE_LIMIT = 256;
 var mutationReceiptSchema = external_exports.object({
   projectId: projectIdSchema,
   idempotencyKey: external_exports.string(),
@@ -22020,11 +22022,32 @@ function unavailableRoleFactReader(serverId) {
     version: unavailable
   };
 }
+async function readLiveRoleEvents(sdk, threadId) {
+  const events = [];
+  let afterSeq;
+  while (true) {
+    const page = await sdk.threads.events.list({
+      threadId,
+      limit: String(ROLE_CONTEXT_EVENT_PAGE_LIMIT),
+      ...afterSeq ? { afterSeq } : {}
+    });
+    if (page.length > ROLE_CONTEXT_EVENT_PAGE_LIMIT || events.length + page.length > MAX_ROLE_CONTEXT_EVENTS) {
+      throw new Error("live role event facts exceed the bounded reader limit");
+    }
+    events.push(...page);
+    if (page.length < ROLE_CONTEXT_EVENT_PAGE_LIMIT) return events;
+    const last = page.at(-1);
+    if (!last || !Number.isSafeInteger(last.seq) || afterSeq !== void 0 && last.seq <= Number(afterSeq)) {
+      throw new Error("live role event pagination did not advance");
+    }
+    afterSeq = String(last.seq);
+  }
+}
 async function readLiveRoleFactReader(sdk, serverId, request) {
   if (!isRoleMutation(request) || !request.roleContext) return null;
   try {
     const thread = await sdk.threads.get({ threadId: request.roleContext.threadId });
-    const events = await sdk.threads.events.list({ threadId: request.roleContext.threadId, limit: "257" });
+    const events = await readLiveRoleEvents(sdk, request.roleContext.threadId);
     const environment = thread.environmentId ? await sdk.environments.get({ environmentId: thread.environmentId }) : null;
     const [project, version2, host] = await Promise.all([
       sdk.projects.get({ projectId: request.projectId }),

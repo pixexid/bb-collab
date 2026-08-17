@@ -17,6 +17,7 @@ import {
 import {
   BB_VERSION_RANGE,
   MIGRATIONS,
+  MAX_ROLE_CONTEXT_EVENTS,
   PLUGIN_ID,
   PLUGIN_SDK_VERSION,
   assembleV18CachedConsumerRolloutEvidence,
@@ -60,6 +61,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } 
 import { join } from "node:path";
 
 const projectIdSchema = z.string().trim().min(1).max(256);
+const ROLE_CONTEXT_EVENT_PAGE_LIMIT = 256;
 const mutationReceiptSchema = z
   .object({
     projectId: projectIdSchema,
@@ -412,6 +414,28 @@ function unavailableRoleFactReader(serverId: string): RoleFactReader {
   };
 }
 
+async function readLiveRoleEvents(sdk: BbPluginApi["sdk"], threadId: string) {
+  const events = [];
+  let afterSeq: string | undefined;
+  while (true) {
+    const page = await sdk.threads.events.list({
+      threadId,
+      limit: String(ROLE_CONTEXT_EVENT_PAGE_LIMIT),
+      ...(afterSeq ? { afterSeq } : {}),
+    });
+    if (page.length > ROLE_CONTEXT_EVENT_PAGE_LIMIT || events.length + page.length > MAX_ROLE_CONTEXT_EVENTS) {
+      throw new Error("live role event facts exceed the bounded reader limit");
+    }
+    events.push(...page);
+    if (page.length < ROLE_CONTEXT_EVENT_PAGE_LIMIT) return events;
+    const last = page.at(-1);
+    if (!last || !Number.isSafeInteger(last.seq) || (afterSeq !== undefined && last.seq <= Number(afterSeq))) {
+      throw new Error("live role event pagination did not advance");
+    }
+    afterSeq = String(last.seq);
+  }
+}
+
 async function readLiveRoleFactReader(
   sdk: BbPluginApi["sdk"],
   serverId: string,
@@ -420,7 +444,7 @@ async function readLiveRoleFactReader(
   if (!isRoleMutation(request) || !request.roleContext) return null;
   try {
     const thread = await sdk.threads.get({ threadId: request.roleContext.threadId });
-    const events = await sdk.threads.events.list({ threadId: request.roleContext.threadId, limit: "257" });
+    const events = await readLiveRoleEvents(sdk, request.roleContext.threadId);
     const environment = thread.environmentId ? await sdk.environments.get({ environmentId: thread.environmentId }) : null;
     const [project, version, host] = await Promise.all([
       sdk.projects.get({ projectId: request.projectId }),

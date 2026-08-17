@@ -19,6 +19,7 @@ import {
   LLM_COLLAB_EVIDENCE_RESOURCE_REVISION,
   LLM_COLLAB_MERGED_MAIN_SHA,
   LLM_COLLAB_SOURCE_FENCE,
+  MAX_ROLE_CONTEXT_EVENTS,
   MAX_EXPORT_ROWS,
   MAX_EXPORT_BYTES,
   MAX_SOURCE_EVIDENCE_MANIFEST_BYTES,
@@ -329,6 +330,8 @@ function projectFacts(projectId = PROJECT_ID) {
 function hostFor(
   projectId = PROJECT_ID,
   mutateRoleFacts?: (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => void,
+  onEventsList?: (args: { threadId: string; afterSeq?: string; limit?: string }) => void,
+  ignoreEventPagination = false,
 ) {
   const project = projectFacts(projectId);
   const roleFacts = roleReader(mutateRoleFacts);
@@ -389,15 +392,23 @@ function hostFor(
           canSpawnChild: true,
         }),
         events: {
-          list: async () => roleFacts.facts.events.map((event) => ({
-            id: event.id,
-            threadId: roleFacts.facts.thread.id,
-            seq: event.seq,
-            type: event.type,
-            scope: { kind: "thread" as const },
-            data: event.data,
-            createdAt: event.seq,
-          })),
+          list: async ({ threadId, afterSeq, limit }) => {
+            onEventsList?.({ threadId, afterSeq, limit });
+            const after = afterSeq && !ignoreEventPagination ? Number(afterSeq) : 0;
+            const pageSize = Math.min(Number(limit ?? "256"), 256);
+            return roleFacts.facts.events
+              .filter((event) => event.seq > after)
+              .slice(0, pageSize)
+              .map((event) => ({
+                id: event.id,
+                threadId: roleFacts.facts.thread.id,
+                seq: event.seq,
+                type: event.type,
+                scope: { kind: "thread" as const },
+                data: event.data,
+                createdAt: event.seq,
+              }));
+          },
         },
       },
       environments: {
@@ -544,8 +555,10 @@ function projectionRequest(
 async function loadedHost(
   projectId = PROJECT_ID,
   mutateRoleFacts?: (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => void,
+  onEventsList?: (args: { threadId: string; afterSeq?: string; limit?: string }) => void,
+  ignoreEventPagination = false,
 ) {
-  const host = hostFor(projectId, mutateRoleFacts);
+  const host = hostFor(projectId, mutateRoleFacts, onEventsList, ignoreEventPagination);
   await plugin(host.bb);
   return host;
 }
@@ -6396,6 +6409,103 @@ describe("bb-collab plugin boundary", () => {
     expect(host.harness.inspection.sdk.callsTo("threads.get").length).toBeGreaterThanOrEqual(2);
     expect(host.harness.inspection.sdk.callsTo("threads.events.list").length).toBeGreaterThanOrEqual(2);
     expect(host.harness.inspection.sdk.callsTo("environments.get").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("paginates a complete 257-event live role context without losing exact correlation", async () => {
+    const eventPages: Array<{ threadId: string; afterSeq?: string; limit?: string }> = [];
+    const host = await loadedHost(PROJECT_ID, (facts) => {
+      facts.events.push(...Array.from({ length: 253 }, (_, index) => ({
+        id: `event-overflow-${index + 5}`,
+        seq: index + 5,
+        type: "thread/updated",
+        data: {},
+      })));
+    }, (args) => { eventPages.push(args); });
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    const unsigned = { ...qualificationRequest(fenceToken, { idempotencyKey: "live-role-event-page" }), candidateHead: CANDIDATE_SHA, operatorReceiptId: null };
+    const receipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: unsigned.operationClass,
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: unsigned.idempotencyKey,
+      requestDigest: operatorRequestDigest(unsigned),
+      callerThreadId: "live-role-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    });
+    expect(await host.harness.callRpc("apply", { ...unsigned, operatorReceiptId: receipt.receiptId })).toMatchObject({
+      outcome: "OK",
+    });
+    expect(eventPages).toHaveLength(2);
+    expect(eventPages[0]).toMatchObject({ threadId: ROLE_THREAD_ID, limit: "256" });
+    expect(eventPages[0]?.afterSeq).toBeUndefined();
+    expect(eventPages[1]).toEqual({ threadId: ROLE_THREAD_ID, afterSeq: "256", limit: "256" });
+  });
+
+  it("refuses a repeated live role-event continuation without writes", async () => {
+    const eventPages: Array<{ threadId: string; afterSeq?: string; limit?: string }> = [];
+    const host = await loadedHost(PROJECT_ID, (facts) => {
+      facts.events.push(...Array.from({ length: 253 }, (_, index) => ({
+        id: `event-repeat-${index + 5}`,
+        seq: index + 5,
+        type: "thread/updated",
+        data: {},
+      })));
+    }, (args) => { eventPages.push(args); }, true);
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    const unsigned = { ...qualificationRequest(fenceToken, { idempotencyKey: "live-role-event-repeat" }), candidateHead: CANDIDATE_SHA, operatorReceiptId: null };
+    const receipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: unsigned.operationClass,
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: unsigned.idempotencyKey,
+      requestDigest: operatorRequestDigest(unsigned),
+      callerThreadId: "live-role-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    });
+    const before = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", { ...unsigned, operatorReceiptId: receipt.receiptId })).toMatchObject({
+      outcome: "ROLE_CONTEXT_UNKNOWN",
+      attempted: 0,
+      verified: 0,
+    });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    expect(eventPages).toHaveLength(2);
+    expect(eventPages[1]).toEqual({ threadId: ROLE_THREAD_ID, afterSeq: "256", limit: "256" });
+  });
+
+  it("refuses a nonempty continuation beyond the total role-event cap without writes", async () => {
+    const eventPages: Array<{ threadId: string; afterSeq?: string; limit?: string }> = [];
+    const host = await loadedHost(PROJECT_ID, (facts) => {
+      facts.events.push(...Array.from({ length: MAX_ROLE_CONTEXT_EVENTS - 3 }, (_, index) => ({
+        id: `event-cap-${index + 5}`,
+        seq: index + 5,
+        type: "thread/updated",
+        data: {},
+      })));
+    }, (args) => { eventPages.push(args); });
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    const unsigned = { ...qualificationRequest(fenceToken, { idempotencyKey: "live-role-event-cap" }), candidateHead: CANDIDATE_SHA, operatorReceiptId: null };
+    const receipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: unsigned.operationClass,
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: unsigned.idempotencyKey,
+      requestDigest: operatorRequestDigest(unsigned),
+      callerThreadId: "live-role-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    });
+    const before = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", { ...unsigned, operatorReceiptId: receipt.receiptId })).toMatchObject({
+      outcome: "ROLE_CONTEXT_UNKNOWN",
+      attempted: 0,
+      verified: 0,
+    });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    expect(eventPages).toHaveLength(33);
+    expect(eventPages[32]).toEqual({ threadId: ROLE_THREAD_ID, afterSeq: "8192", limit: "256" });
   });
 
   it("refuses title-only and fallback-only witness markers through the live SDK reader without writes", async () => {

@@ -77,11 +77,10 @@ Contract v17 splits the director into its own logical role.
   is a fresh receipt-gated recording (prior observations expire and expiry
   is inert to existing records — foundation.ts:274/:295, :5610-5613,
   :5687/:5692).
-- Known execution risk for drill zero: the bounded native reader window
-  (256 events) does not cover the director thread's history (5413 events);
-  the evidence path (explicit native event citation vs reader window) must
-  be settled before the receipt boundary, without weakening correlation
-  refusal.
+- The live reader fetches 256-event `afterSeq` pages through a documented
+  8192-event total cap, which covers the 5413-event director history. It
+  refuses non-progressing pagination or a nonempty continuation beyond that
+  total cap; it never treats a truncated first page as exact role context.
 - After revision 4 lands cleanly, the parked `pint_vcs2kjeux3` interaction
   must be explicitly DISMISSED (console action; operator or supervisor).
   The director seat reports when revision 4 is clean; the dismissal itself
