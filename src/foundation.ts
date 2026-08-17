@@ -5,10 +5,10 @@ import { z } from "zod";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 18;
-export const SCHEMA_VERSION = 11;
-// The corrected rollout mechanism follows the v17 director-role split.
-const PREVIOUS_CONTRACT_VERSION = 17;
+export const CONTRACT_VERSION = 19;
+export const SCHEMA_VERSION = 12;
+// v19 adds an explicit operator-receipt provenance marker.
+const PREVIOUS_CONTRACT_VERSION = 18;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
 const PREVIOUS_SCHEMA_VERSION = 11;
@@ -620,21 +620,22 @@ export const MIGRATIONS: string[] = [
   ALTER TABLE operator_receipts ADD COLUMN authorizing_disposition_sequence INTEGER;`,
   `ALTER TABLE role_generations ADD COLUMN standby_profile_json TEXT
    CHECK (standby_profile_json IS NULL OR json_valid(standby_profile_json))`,
+  `ALTER TABLE operator_receipts ADD COLUMN issuance_provenance TEXT
+   CHECK (issuance_provenance IN ('console', 'attestation') OR issuance_provenance IS NULL)`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
 export const CACHED_CONSUMERS = [
   "server.rpcContract",
   "server.collabCli",
-  "src/foundation.staleV17ExemptionProbe",
-  "src/foundation.staleV17PlacementProbe",
+  "src/foundation.staleV18NullProvenanceProbe",
+  "src/foundation.staleV18UnknownProvenanceProbe",
 ] as const;
 const CACHED_CONSUMER_ROLLOUT_POLICY = {
-  class: "roleRequirements.director-seat",
-  staleV17RoleId: "project-orchestrator",
-  requiredV18RoleId: "director",
-  staleV17ExemptionField: "currentGenerationExemption",
-  refusal: "INVALID_INPUT",
+  class: "operator_receipts.issuance_provenance",
+  staleV18Values: [null, "legacy"],
+  requiredV19Values: ["console", "attestation"],
+  refusal: "OPERATOR_RECEIPT_INVALID",
 } as const;
 
 export type CachedConsumerObservation = {
@@ -646,56 +647,56 @@ export type CachedConsumerObservation = {
 type CachedConsumerProbe = () => Promise<{
   observedSchemaVersion: number;
   observedContractVersion: number;
-  staleV17Refusal?: Pick<FoundationResult, "outcome">;
+  staleV18Refusal?: Pick<FoundationResult, "outcome">;
 }>;
 
-export async function assembleV18CachedConsumerRolloutEvidence(input: {
+export async function assembleV19CachedConsumerRolloutEvidence(input: {
   rpcContract?: CachedConsumerProbe;
   collabCli?: CachedConsumerProbe;
-  staleV17Exemption?: CachedConsumerProbe;
-  staleV17Placement?: CachedConsumerProbe;
+  staleV18NullProvenance?: CachedConsumerProbe;
+  staleV18UnknownProvenance?: CachedConsumerProbe;
 }): Promise<NonNullable<ApplyRequest["decisionEvidence"]>[number]> {
   const probes = [
     ["server.rpcContract", input.rpcContract],
     ["server.collabCli", input.collabCli],
-    ["src/foundation.staleV17ExemptionProbe", input.staleV17Exemption],
-    ["src/foundation.staleV17PlacementProbe", input.staleV17Placement],
+    ["src/foundation.staleV18NullProvenanceProbe", input.staleV18NullProvenance],
+    ["src/foundation.staleV18UnknownProvenanceProbe", input.staleV18UnknownProvenance],
   ] as const;
   if (probes.some(([, probe]) => typeof probe !== "function")) {
-    throw new Error("cached-consumer v18 rollout evidence requires execution from all four consumers");
+    throw new Error("cached-consumer v19 rollout evidence requires execution from all four consumers");
   }
   const executed = await Promise.all(probes.map(async ([name, probe]) => ({
     name,
     ...(await probe!()),
   })));
   const reread = cachedConsumerRolloutEvidence(executed);
-  const exemption = executed[2]!.staleV17Refusal;
-  const placement = executed[3]!.staleV17Refusal;
+  const exemption = executed[2]!.staleV18Refusal;
+  const placement = executed[3]!.staleV18Refusal;
   if (
     reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 ||
-    exemption?.outcome !== "INVALID_INPUT" || placement?.outcome !== "INVALID_INPUT"
+    exemption?.outcome !== "OPERATOR_RECEIPT_INVALID" || placement?.outcome !== "OPERATOR_RECEIPT_INVALID"
   ) {
-    throw new Error("cached-consumer v18 rollout evidence requires four rereads and two INVALID_INPUT stale-v17 refusals");
+    throw new Error("cached-consumer v19 rollout evidence requires four rereads and two OPERATOR_RECEIPT_INVALID stale-v18 refusals");
   }
   const durableRefJson = canonicalJson({
-    kind: "cached_consumer_v18_rollout_receipt",
+    kind: "cached_consumer_v19_rollout_receipt",
     reread,
-    staleV17Refusal: {
-      exemption: { outcome: exemption.outcome },
-      placement: { outcome: placement.outcome },
+    staleV18Refusal: {
+      nullProvenance: { outcome: exemption.outcome },
+      unknownProvenance: { outcome: placement.outcome },
     },
   });
   return {
-    evidenceId: "cached-consumer-v18-rollout-receipt",
+    evidenceId: "cached-consumer-v19-rollout-receipt",
     evidenceKind: "release",
     sourceKind: "release",
     sourceRef: "live-plugin:dist/server.js",
     executionAttemptId: null,
     contentDigest: sha256(durableRefJson),
-    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v18-rollout-receipt", redacted: true }),
+    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v19-rollout-receipt", redacted: true }),
     durableRefJson,
     relationKind: "supporting",
-    relation: { purpose: "cached-consumer-v18-rollout" },
+    relation: { purpose: "cached-consumer-v19-rollout" },
   };
 }
 
@@ -758,7 +759,7 @@ function persistedCachedConsumerRolloutEvidence(db: SqliteDatabase, projectId: s
     `SELECT evidence_kind, source_kind, source_ref, execution_attempt_id, content_digest,
             redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest
      FROM evidence_artifacts
-     WHERE project_id = ? AND evidence_id = 'cached-consumer-v18-rollout-receipt'`,
+     WHERE project_id = ? AND evidence_id = 'cached-consumer-v19-rollout-receipt'`,
   ).get(projectId));
   if (!row) return unknownCachedConsumerRolloutEvidence();
   try {
@@ -768,7 +769,7 @@ function persistedCachedConsumerRolloutEvidence(db: SqliteDatabase, projectId: s
     assertRedactedEvidence(durableRef, "cached-consumer rollout durable reference");
     const expectedIdentity = sha256(canonicalJson({
       projectId,
-      evidenceId: "cached-consumer-v18-rollout-receipt",
+      evidenceId: "cached-consumer-v19-rollout-receipt",
       evidenceKind: row.evidence_kind,
       sourceKind: row.source_kind,
       sourceRef: row.source_ref,
@@ -785,19 +786,19 @@ function persistedCachedConsumerRolloutEvidence(db: SqliteDatabase, projectId: s
     const receipt = durableRef as {
       kind?: unknown;
       reread?: { observations?: unknown; rolloutReceiptDigest?: unknown };
-      staleV17Refusal?: {
-        exemption?: { outcome?: unknown };
-        placement?: { outcome?: unknown };
+      staleV18Refusal?: {
+        nullProvenance?: { outcome?: unknown };
+        unknownProvenance?: { outcome?: unknown };
       };
     };
     if (!Array.isArray(receipt.reread?.observations)) return unknownCachedConsumerRolloutEvidence();
     const reread = cachedConsumerRolloutEvidence(receipt.reread.observations as CachedConsumerObservation[]);
     if (
-      receipt.kind !== "cached_consumer_v18_rollout_receipt" ||
+      receipt.kind !== "cached_consumer_v19_rollout_receipt" ||
       receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest ||
       reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 ||
-      receipt.staleV17Refusal?.exemption?.outcome !== "INVALID_INPUT" ||
-      receipt.staleV17Refusal?.placement?.outcome !== "INVALID_INPUT"
+      receipt.staleV18Refusal?.nullProvenance?.outcome !== "OPERATOR_RECEIPT_INVALID" ||
+      receipt.staleV18Refusal?.unknownProvenance?.outcome !== "OPERATOR_RECEIPT_INVALID"
     ) return unknownCachedConsumerRolloutEvidence();
     return reread;
   } catch {
@@ -929,7 +930,7 @@ export const contractDigest = sha256(canonicalJson({
     expected: 4,
     attempted: 4,
     verified: 4,
-    staleV17Refusal: CACHED_CONSUMER_ROLLOUT_POLICY,
+    staleV18Refusal: CACHED_CONSUMER_ROLLOUT_POLICY,
   },
   roleHolderEligibilityPolicy: {
     nativeWitnessMarker: "witness",
@@ -939,12 +940,14 @@ export const contractDigest = sha256(canonicalJson({
     scope: "one_request",
     binding: ["projectId", "operationClass", "candidateHead", "idempotencyKey", "requestDigest"],
     consumption: "atomic",
+    issuanceProvenance: ["console", "attestation"],
+    legacyNullProvenance: "refuse",
   },
   derivedActorReceiptPolicy: {
     operationClasses: [...DERIVED_ACTOR_MUTATION_CLASSES],
     actorKind: "plugin",
     subjectId: PLUGIN_ID,
-    authorization: "operatorReceiptId or active authorized approver attestation",
+    authorization: "operatorReceiptId with explicit issuance provenance",
     requestDigest: "actorReceiptId omitted because it is derived from operatorReceiptId",
     retirementCondition: "host-issued receipt get-bb/bb#1541",
   },
@@ -1415,6 +1418,7 @@ export const approverAttestationRequestSchema = operatorReceiptRequestSchema.ext
 export type OperatorReceiptRequest = z.infer<typeof operatorReceiptRequestSchema>;
 export type OperatorReceiptConfirmation = z.infer<typeof operatorReceiptConfirmationSchema>;
 export type ApproverAttestationRequest = z.infer<typeof approverAttestationRequestSchema>;
+export type OperatorReceiptProvenance = "console" | "attestation";
 
 export interface OperatorReceipt {
   receiptId: string;
@@ -1430,6 +1434,7 @@ export interface OperatorReceipt {
   callerThreadId: string;
   callerPluginId: string;
   requestedFromBackground: boolean;
+  issuanceProvenance: OperatorReceiptProvenance;
   approverId: string | null;
   authorizingDecisionId: string | null;
   authorizingDispositionSequence: number | null;
@@ -2308,47 +2313,29 @@ function roleRequirementsFromJson(configJson: string): RoleRequirement[] {
   return parsed.data;
 }
 
-function liveDirectorSeatConfig(db: SqliteDatabase, projectId: string): Record<string, unknown> {
-  const config = JSON.parse(storedConfigJson(db, projectId, currentConfig(db, projectId)?.config_revision ?? 0)) as Record<string, unknown>;
-  const requirements = (config.extensions as { bbCollab?: { roleRequirements?: unknown } } | undefined)?.bbCollab?.roleRequirements;
-  if (!Array.isArray(requirements)) throw new Error("live project has no cached-consumer v18 role requirements");
-  const directorSeat = requirements.find((requirement) => (
-    requirement !== null && typeof requirement === "object" &&
-    (requirement as Record<string, unknown>).roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID
-  ));
-  if (!directorSeat || typeof directorSeat !== "object") throw new Error("live project has no director-seat role requirement");
-  return config;
+function requireCurrentOperatorReceiptProvenance(value: unknown): asserts value is OperatorReceiptProvenance {
+  if (value !== "console" && value !== "attestation") {
+    throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt issuance provenance is unknown");
+  }
 }
 
-function staleV17RefusalProbe(
-  db: SqliteDatabase,
-  projectId: string,
-  mutate: (requirement: Record<string, unknown>) => void,
-): Pick<FoundationResult, "outcome"> {
-  const candidate = structuredClone(liveDirectorSeatConfig(db, projectId));
-  const candidateRequirements = ((candidate.extensions as { bbCollab?: { roleRequirements?: unknown } }).bbCollab?.roleRequirements) as Record<string, unknown>[];
-  const candidateDirectorSeat = candidateRequirements.find((requirement) => requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID);
-  if (!candidateDirectorSeat) throw new Error("live director-seat role requirement disappeared during probe construction");
-  mutate(candidateDirectorSeat);
+function staleV18ProvenanceRefusal(value: unknown): Pick<FoundationResult, "outcome"> {
   try {
-    validateConfig(candidate);
+    requireCurrentOperatorReceiptProvenance(value);
     return { outcome: "OK" };
   } catch (error) {
     return { outcome: error instanceof Refusal ? error.data.code : "INTERNAL_ERROR" };
   }
 }
 
-export function probeV18StaleExemptionRefusal(db: SqliteDatabase, projectId: string) {
-  const staleV17Refusal = staleV17RefusalProbe(db, projectId, (requirement) => {
-    delete requirement.firstGenerationExemption;
-    requirement.currentGenerationExemption = DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION;
-  });
-  return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION, staleV17Refusal };
+export function probeV19StaleNullProvenanceRefusal() {
+  const staleV18Refusal = staleV18ProvenanceRefusal(null);
+  return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION, staleV18Refusal };
 }
 
-export function probeV18StalePlacementRefusal(db: SqliteDatabase, projectId: string) {
-  const staleV17Refusal = staleV17RefusalProbe(db, projectId, (requirement) => { requirement.roleId = "project-orchestrator"; });
-  return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION, staleV17Refusal };
+export function probeV19StaleUnknownProvenanceRefusal() {
+  const staleV18Refusal = staleV18ProvenanceRefusal("legacy");
+  return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION, staleV18Refusal };
 }
 
 export function writingLaneCeilingFromJson(configJson: string): number {
@@ -2541,6 +2528,7 @@ export function persistInterimOperatorReceipt(
   db: SqliteDatabase,
   input: OperatorReceiptRequest & {
     callerPluginId: string;
+    issuanceProvenance?: OperatorReceiptProvenance;
     approverId?: string | null;
     authorizingDecisionId?: string | null;
     authorizingDispositionSequence?: number | null;
@@ -2548,6 +2536,7 @@ export function persistInterimOperatorReceipt(
   createdAtMs = now(),
 ): OperatorReceipt {
   const receiptId = `operator-${randomBytes(16).toString("hex")}`;
+  const issuanceProvenance = input.issuanceProvenance ?? "console";
   const bindingDigest = operatorReceiptBindingDigest(input);
   const receiptDigest = sha256(canonicalJson({
     receiptId,
@@ -2563,6 +2552,7 @@ export function persistInterimOperatorReceipt(
     callerThreadId: input.callerThreadId,
     callerPluginId: input.callerPluginId,
     requestedFromBackground: input.requestedFromBackground,
+    issuanceProvenance,
     approverId: input.approverId ?? null,
     authorizingDecisionId: input.authorizingDecisionId ?? null,
     authorizingDispositionSequence: input.authorizingDispositionSequence ?? null,
@@ -2574,8 +2564,8 @@ export function persistInterimOperatorReceipt(
       binding_digest, status, retirement_condition, caller_thread_id,
       caller_plugin_id, requested_from_background, receipt_digest, created_at_ms,
       idempotency_key, request_digest, approver_id, authorizing_decision_id,
-      authorizing_disposition_sequence
-    ) VALUES (?, ?, 'operator_confirmation', ?, ?, ?, 'interim', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      authorizing_disposition_sequence, issuance_provenance
+    ) VALUES (?, ?, 'operator_confirmation', ?, ?, ?, 'interim', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     input.projectId,
     receiptId,
@@ -2593,6 +2583,7 @@ export function persistInterimOperatorReceipt(
     input.approverId ?? null,
     input.authorizingDecisionId ?? null,
     input.authorizingDispositionSequence ?? null,
+    issuanceProvenance,
   );
   return {
     receiptId,
@@ -2608,6 +2599,7 @@ export function persistInterimOperatorReceipt(
     callerThreadId: input.callerThreadId,
     callerPluginId: input.callerPluginId,
     requestedFromBackground: input.requestedFromBackground,
+    issuanceProvenance,
     approverId: input.approverId ?? null,
     authorizingDecisionId: input.authorizingDecisionId ?? null,
     authorizingDispositionSequence: input.authorizingDispositionSequence ?? null,
@@ -2699,6 +2691,7 @@ export function readOperatorReceiptWithSessionEvidence(
     caller_thread_id: string;
     caller_plugin_id: string;
     requested_from_background: number;
+    issuance_provenance: OperatorReceiptProvenance | null;
     approver_id: string | null;
     authorizing_decision_id: string | null;
     authorizing_disposition_sequence: number | null;
@@ -2708,11 +2701,12 @@ export function readOperatorReceiptWithSessionEvidence(
     `SELECT receipt_id, project_id, receipt_type, mutation_class, candidate_head,
             idempotency_key, request_digest, binding_digest, status,
             retirement_condition, caller_thread_id, caller_plugin_id,
-            requested_from_background, approver_id, authorizing_decision_id,
+            requested_from_background, issuance_provenance, approver_id, authorizing_decision_id,
             authorizing_disposition_sequence, receipt_digest, created_at_ms
      FROM operator_receipts WHERE project_id = ? AND receipt_id = ?`,
   ).get(input.projectId, operatorReceiptId));
   if (!row || row.caller_plugin_id !== PLUGIN_ID) throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt provenance is invalid");
+  if (row.issuance_provenance !== "console") throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt is not console-issued");
   if (!evidenceId) throw refusal("OPERATOR_RECEIPT_INVALID", "connect-session evidence is missing");
   const evidence = asRow<{ evidence_id: string }>(db.prepare(
     `SELECT evidence_id FROM evidence_artifacts
@@ -2751,6 +2745,7 @@ export function readOperatorReceiptWithSessionEvidence(
     callerThreadId: row.caller_thread_id,
     callerPluginId: row.caller_plugin_id,
     requestedFromBackground: row.requested_from_background === 1,
+    issuanceProvenance: row.issuance_provenance,
     approverId: row.approver_id,
     authorizingDecisionId: row.authorizing_decision_id,
     authorizingDispositionSequence: row.authorizing_disposition_sequence,
@@ -2893,6 +2888,7 @@ export function persistAuthorizedApproverAttestation(
     const operatorReceipt = persistInterimOperatorReceipt(db, {
       ...parsed.data,
       callerPluginId,
+      issuanceProvenance: "attestation",
       approverId: parsed.data.approverId,
       authorizingDecisionId: parsed.data.authorizingDecisionId,
       authorizingDispositionSequence: parsed.data.authorizingDispositionSequence,
@@ -3150,25 +3146,10 @@ function requireAttestedPluginActor(db: SqliteDatabase, request: ApplyRequest, a
     actor.operator_receipt_id === null || actor.operator_receipt_id !== request.operatorReceiptId ||
     actor.retirement_condition !== OPERATOR_RECEIPT_RETIREMENT_CONDITION
   ) {
-    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "config revision requires its attestation-derived plugin actor");
+    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "config revision requires its receipt-bound plugin actor");
   }
-  // requireActor has already verified this exact receipt binding and, when
-  // present, the active approver registry. Config revisions additionally
-  // require that the bound receipt was issued with that provenance.
-  const operator = asRow<{
-    approver_id: string | null;
-    authorizing_decision_id: string | null;
-    authorizing_disposition_sequence: number | null;
-  }>(db.prepare(
-    `SELECT approver_id, authorizing_decision_id, authorizing_disposition_sequence
-     FROM operator_receipts WHERE project_id = ? AND receipt_id = ?`,
-  ).get(request.projectId, request.operatorReceiptId));
-  if (
-    !operator || operator.approver_id !== AUTHORIZED_APPROVER_ID ||
-    operator.authorizing_decision_id === null || operator.authorizing_disposition_sequence === null
-  ) {
-    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "config revision requires its approverAttestation-derived plugin actor");
-  }
+  // requireActor already verifies this actor's exact operator-receipt binding,
+  // including the explicit receipt provenance and any attestation registry.
 }
 
 function mutationRequestDigest(db: SqliteDatabase, request: ApplyRequest): string {
@@ -7898,6 +7879,7 @@ function requireOperatorReceipt(
     caller_thread_id: string;
     caller_plugin_id: string;
     requested_from_background: number;
+    issuance_provenance: string | null;
     receipt_digest: string;
     created_at_ms: number;
     idempotency_key: string | null;
@@ -7907,7 +7889,7 @@ function requireOperatorReceipt(
     authorizing_disposition_sequence: number | null;
     consumed_at_ms: number | null;
     consumed_event_sequence: number | null;
-  }>(db.prepare("SELECT project_id, receipt_id, receipt_type, mutation_class, candidate_head, binding_digest, status, retirement_condition, caller_thread_id, caller_plugin_id, requested_from_background, receipt_digest, created_at_ms, idempotency_key, request_digest, approver_id, authorizing_decision_id, authorizing_disposition_sequence, consumed_at_ms, consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?").get(request.operatorReceiptId));
+  }>(db.prepare("SELECT project_id, receipt_id, receipt_type, mutation_class, candidate_head, binding_digest, status, retirement_condition, caller_thread_id, caller_plugin_id, requested_from_background, issuance_provenance, receipt_digest, created_at_ms, idempotency_key, request_digest, approver_id, authorizing_decision_id, authorizing_disposition_sequence, consumed_at_ms, consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?").get(request.operatorReceiptId));
   if (!row) throw refusal("OPERATOR_RECEIPT_UNKNOWN", "operator receipt is not known");
   if (row.project_id !== request.projectId) throw refusal("OPERATOR_RECEIPT_FOREIGN", "operator receipt belongs to another project");
   if (row.consumed_at_ms !== null) throw refusal("OPERATOR_RECEIPT_REUSED", "operator receipt was already consumed");
@@ -7917,6 +7899,7 @@ function requireOperatorReceipt(
   if (row.receipt_type !== "operator_confirmation" || ![0, 1].includes(row.requested_from_background)) {
     throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt is malformed");
   }
+  requireCurrentOperatorReceiptProvenance(row.issuance_provenance);
   const receiptRequest = operatorReceiptRequestSchema.safeParse({
     projectId: row.project_id,
     mutationClass: row.mutation_class,
@@ -7963,17 +7946,14 @@ function requireOperatorReceipt(
     callerThreadId: row.caller_thread_id,
     callerPluginId: row.caller_plugin_id,
     requestedFromBackground: receiptRequest.data.requestedFromBackground,
+    issuanceProvenance: row.issuance_provenance,
     approverId: row.approver_id,
     authorizingDecisionId: row.authorizing_decision_id,
     authorizingDispositionSequence: row.authorizing_disposition_sequence,
     createdAtMs: row.created_at_ms,
   };
   const expectedReceiptDigest = sha256(canonicalJson(receiptIdentity));
-  const legacyReceiptDigest = sha256(canonicalJson(Object.fromEntries(
-    Object.entries(receiptIdentity).filter(([key]) => !["approverId", "authorizingDecisionId", "authorizingDispositionSequence"].includes(key)),
-  )));
-  if (row.receipt_digest !== expectedReceiptDigest &&
-      !(row.approver_id === null && row.authorizing_decision_id === null && row.authorizing_disposition_sequence === null && row.receipt_digest === legacyReceiptDigest)) {
+  if (row.receipt_digest !== expectedReceiptDigest) {
     throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt digest is invalid");
   }
 }

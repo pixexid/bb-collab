@@ -19,7 +19,7 @@ import {
   MIGRATIONS,
   PLUGIN_ID,
   PLUGIN_SDK_VERSION,
-  assembleV18CachedConsumerRolloutEvidence,
+  assembleV19CachedConsumerRolloutEvidence,
   applyAuthorizedMutation,
   applyRequestSchema,
   approverAttestationRequestSchema,
@@ -35,8 +35,8 @@ import {
   persistBootstrapOperatorReceipt,
   persistInterimOperatorReceipt,
   persistOperatorReceiptWithSessionEvidence,
-  probeV18StaleExemptionRefusal,
-  probeV18StalePlacementRefusal,
+  probeV19StaleNullProvenanceRefusal,
+  probeV19StaleUnknownProvenanceRefusal,
   readOperatorReceiptWithSessionEvidence,
   parseApplyRequest,
   type ApplyRequest,
@@ -138,6 +138,7 @@ export const foundationResultSchema = z
         callerThreadId: z.string(),
         callerPluginId: z.string(),
         requestedFromBackground: z.boolean(),
+        issuanceProvenance: z.enum(["console", "attestation"]),
         approverId: z.string().nullable(),
         authorizingDecisionId: z.string().nullable(),
         authorizingDispositionSequence: z.number().int().positive().nullable(),
@@ -486,7 +487,7 @@ async function applyLiveAuthorizedMutation(
   allowCachedConsumerRollout = false,
 ): Promise<FoundationResult> {
   const parsed = applyRequestSchema.safeParse(input);
-  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v18-rollout-receipt")) {
+  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v19-rollout-receipt")) {
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
@@ -525,7 +526,7 @@ async function applyLiveCachedConsumerRollout(
   try {
     const project = await bb.sdk.projects.get({ projectId: request.projectId });
     if (project.id !== request.projectId) return { outcome: "PROJECT_UNKNOWN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "live project identity does not match the rollout request" };
-    const evidence = await assembleV18CachedConsumerRolloutEvidence({
+    const evidence = await assembleV19CachedConsumerRolloutEvidence({
       rpcContract: async () => liveCachedConsumerReread("server.rpcContract", await bb.sdk.plugins.callRpc({
         pluginId: bb.pluginId,
         method: "doctor",
@@ -535,8 +536,8 @@ async function applyLiveCachedConsumerRollout(
       collabCli: async () => liveCachedConsumerReread("server.collabCli", foundationResultSchema.parse(JSON.parse(
         (await runCli(db, bb, ["doctor", "--project", request.projectId], cliContext, cliDeps)).stdout,
       )) as FoundationResult),
-      staleV17Exemption: async () => probeV18StaleExemptionRefusal(db, request.projectId),
-      staleV17Placement: async () => probeV18StalePlacementRefusal(db, request.projectId),
+      staleV18NullProvenance: async () => probeV19StaleNullProvenanceRefusal(),
+      staleV18UnknownProvenance: async () => probeV19StaleUnknownProvenanceRefusal(),
     });
     const supplied = (request.decisionEvidence ?? []).filter((item) => item.evidenceId === evidence.evidenceId);
     if (supplied.length !== 1 || canonicalJson(supplied[0]) !== canonicalJson(evidence)) {
@@ -1341,7 +1342,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
       {
         name: "cached-consumer-rollout",
-        summary: "Persist the live v18 cached-consumer rollout receipt (exact one-request receipt required)",
+        summary: "Persist the live v19 cached-consumer rollout receipt (exact one-request receipt required)",
         usage: "bb collab cached-consumer-rollout --project PROJECT_ID --request JSON",
       },
       {

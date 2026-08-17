@@ -31,8 +31,9 @@ confirmed bootstrap operator receipt atomically derives a verified
 `plugin/bb-collab` actor receipt linked to that exact operator receipt; the
 derived actor is not standing authority and apply must provide the same linked
 operator receipt. `config_revision` additionally requires the exact current
-`approverAttestation`-derived plugin actor bound to that receipt; a verified
-but unlinked or role actor refuses before any write. An adopted `operator_only` Decision registers the exact
+plugin actor bound to that receipt and its explicit `console` or `attestation`
+issuance provenance; a verified but unlinked or role actor, and legacy NULL
+provenance, refuse before any write. An adopted `operator_only` Decision registers the exact
 `orchestrator:bb-collab` approver and ten ratified derived mutation classes,
 including `config_revision` for the existing canonical mutation that replaces
 the full immutable project configuration and its mapped targets, including

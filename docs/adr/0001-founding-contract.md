@@ -291,6 +291,17 @@ repair is acceptable because otherwise the corrected mechanism cannot land.
 The gate closes only when doctor reports 4/4/4 VERIFIED from LIVE STATE, not
 on merge, suite, or review.
 
+Contract v19/schema v12 adds one nullable-on-migration
+`operator_receipts.issuance_provenance` marker. New console-issued receipts
+persist `console`; authorized-approver issuance persists `attestation`; all
+legacy NULL or unknown markers refuse and are not re-admitted. The
+`config_revision` plugin-actor guard continues to require its exact linked
+operator receipt and retirement condition, but no longer infers
+attestation-only provenance from `approver_id`, authorizing columns, or receipt
+digest shape. The attestation registry remains validated for `attestation`
+rows. All four cached consumers reread v19 or refuse stale v18 NULL or unknown provenance with
+`OPERATOR_RECEIPT_INVALID`; only a persisted v19 4/4/4 rollout receipt is current.
+
 ## 6. Roles, delegation and execution
 
 A logical role is a project-scoped seat such as director or

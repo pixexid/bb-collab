@@ -96,8 +96,9 @@ Contract v17 splits the director into its own logical role.
 
 ## 4. Later corrective history
 
-Contract v18 does not revise this director/orchestrator decision. It corrects
+Contract v18 did not revise this director/orchestrator decision. It corrected
 the rollout assembler so its four consumers are real production paths: the
 registered RPC `doctor` handler, CLI `doctor` dispatcher, and two named
-live-project stale-policy clone validations. The v18 receipt alone is current;
-v17 or missing evidence is unknown. See [ADR 0003](0003-cached-consumer-rollout-repair.md).
+live-project stale-policy clone validations. Contract v19 supersedes its receipt
+currency with the provenance-marker rollout: the v19 receipt alone is current;
+v18 or missing evidence is unknown. See [ADR 0003](0003-cached-consumer-rollout-repair.md).

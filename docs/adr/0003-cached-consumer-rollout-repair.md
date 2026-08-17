@@ -11,10 +11,10 @@ two separately named production live-project stale-policy clone validations.
 All four must reread v18; both stale-v17 clones must refuse with
 `INVALID_INPUT`; expected, attempted, and verified are each 4.
 
-The durable artifact is `cached-consumer-v18-rollout-receipt`. It is accepted
+The durable artifact was `cached-consumer-v18-rollout-receipt`. It was accepted
 only through the running `dist/server.js` rollout caller and the existing
-receipt-gated `decision_disposition` path. Doctor treats that v18 artifact as
-the only current rollout evidence. Missing or v17 evidence is unknown and
+receipt-gated `decision_disposition` path. Under v18, doctor treated that v18 artifact as
+the only current rollout evidence. Missing or v17 evidence was unknown and
 fail-closed. No receipt migration, seeding, or canonical write is introduced.
 
 ## Consequences
