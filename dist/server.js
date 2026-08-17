@@ -21558,12 +21558,14 @@ var sidebarCollapseKey = (kind, id2) => `sidebar.collapse:${kind}:${id2}`;
 var roleBriefRoleSchema = external_exports.enum(["director", "orchestrator", "worker"]);
 var roleBriefBundleSchema = external_exports.object({
   ponytail: external_exports.string().min(1),
+  rules: external_exports.string().min(1),
   roles: external_exports.object({ director: external_exports.string().min(1), orchestrator: external_exports.string().min(1), worker: external_exports.string().min(1) }).strict()
 }).strict();
 var roleBriefSchema = external_exports.object({
   role: roleBriefRoleSchema,
   roleContent: external_exports.string().min(1),
   ponytail: external_exports.string().min(1),
+  rules: external_exports.string().min(1),
   project: external_exports.object({ id: projectIdSchema, name: external_exports.string(), sourceIds: external_exports.array(external_exports.string()) }).strict(),
   pointers: external_exports.object({ canonicalStoreQuery: external_exports.string(), handoffFile: external_exports.string(), currentSeats: external_exports.array(external_exports.object({ roleId: external_exports.string(), generation: external_exports.number().int().positive(), threadId: external_exports.string() }).strict()) }).strict(),
   prompt: external_exports.string().min(1)
@@ -21829,6 +21831,9 @@ async function composeRoleBrief(bb, db, input) {
     "## Role brief",
     bundle.roles[input.role],
     "",
+    "## Working rules",
+    bundle.rules,
+    "",
     "## Live pointers",
     `Project: ${project.name} (${project.id})`,
     `Sources: ${project.sources.map((source) => source.id).join(", ") || "none"}`,
@@ -21836,7 +21841,7 @@ async function composeRoleBrief(bb, db, input) {
     `Handoff file: ${pointers.handoffFile}`,
     `Current seats: ${currentSeats.map((seat) => `${seat.roleId}@${seat.generation}:${seat.threadId}`).join(", ") || "none"}`
   ].join("\n");
-  return { role: input.role, roleContent: bundle.roles[input.role], ponytail: bundle.ponytail, project: { id: project.id, name: project.name, sourceIds: project.sources.map((source) => source.id) }, pointers, prompt };
+  return { role: input.role, roleContent: bundle.roles[input.role], ponytail: bundle.ponytail, rules: bundle.rules, project: { id: project.id, name: project.name, sourceIds: project.sources.map((source) => source.id) }, pointers, prompt };
 }
 async function sendRoleBrief(bb, db, projectId, threadId, role, waitForActive = false) {
   const brief = await composeRoleBrief(bb, db, { projectId, role });

@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const files = {
   ponytail: "docs/ponytail.md",
+  rules: "docs/rules.md",
   roles: {
     director: "docs/roles/director.md",
     orchestrator: "docs/roles/orchestrator.md",
@@ -15,6 +16,7 @@ const files = {
 export function roleBriefBundle(directory = root) {
   return {
     ponytail: readFileSync(join(directory, files.ponytail), "utf8"),
+    rules: readFileSync(join(directory, files.rules), "utf8"),
     roles: Object.fromEntries(Object.entries(files.roles).map(([role, path]) => [role, readFileSync(join(directory, path), "utf8")])),
   };
 }
