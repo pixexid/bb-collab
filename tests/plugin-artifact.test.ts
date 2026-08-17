@@ -3,12 +3,47 @@ import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symli
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
+import { isLiveCachedConsumerRolloutArtifact } from "../server.js";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = dirname(ROOT);
+const sourceDetail = (root: string) => ({
+  requested: `path:${root}`,
+  resolved: `path:${root}`,
+  engines: {},
+  history: [],
+});
+
+async function guardedArtifact(moduleUrl: string, source: ReturnType<typeof sourceDetail> | "throw") {
+  const host = createFakePluginHost({ pluginId: "bb-collab" });
+  host.harness.sdk.stub("plugins.getSource", async ({ pluginId }: { pluginId: string }) => {
+    expect(pluginId).toBe("bb-collab");
+    if (source === "throw") throw new Error("source unavailable");
+    return source;
+  });
+  return isLiveCachedConsumerRolloutArtifact(moduleUrl, host.bb);
+}
 
 describe("path-install server artifact", () => {
+  it("binds artifact paths to the host-resolved plugin root and fails closed", async () => {
+    const liveArtifact = pathToFileURL(join(PROJECT_ROOT, "dist/server.js")).href;
+    const notDistArtifact = pathToFileURL(join(PROJECT_ROOT, "notdist/server.js")).href;
+    expect(await guardedArtifact(`${liveArtifact}?bbPluginLoad=7.9#reload`, sourceDetail(PROJECT_ROOT))).toBe(true);
+    expect(await guardedArtifact(liveArtifact, sourceDetail(PROJECT_ROOT))).toBe(true);
+    expect(await guardedArtifact(notDistArtifact, sourceDetail(PROJECT_ROOT))).toBe(false);
+    expect(await guardedArtifact(liveArtifact, sourceDetail(join(PROJECT_ROOT, "other-root")))).toBe(false);
+    expect(await guardedArtifact(`${liveArtifact}?bbPluginLoad=7.9#reload`, "throw")).toBe(false);
+    expect(await guardedArtifact(`${liveArtifact}?bbPluginLoad=7.9#reload`, sourceDetail("relative-root"))).toBe(false);
+    expect(await guardedArtifact(`${liveArtifact}?bbPluginLoad=7.9#reload`, {
+      requested: "npm:bb-collab",
+      resolved: "npm:bb-collab",
+      engines: {},
+      history: [],
+    })).toBe(false);
+  });
+
   it("loads without a plugin dependency tree", async () => {
     const cleanRoot = mkdtempSync(join(tmpdir(), "bb-collab-artifact-"));
     try {
@@ -28,6 +63,12 @@ describe("path-install server artifact", () => {
 
       const loaded = await import(pathToFileURL(join(artifactRoot, "server.js")).href);
       expect(typeof loaded.default).toBe("function");
+      const scratchHost = createFakePluginHost({ pluginId: "bb-collab" });
+      scratchHost.harness.sdk.stub("plugins.getSource", async () => sourceDetail(PROJECT_ROOT));
+      expect(await loaded.isLiveCachedConsumerRolloutArtifact(
+        pathToFileURL(join(artifactRoot, "server.js")).href,
+        scratchHost.bb,
+      )).toBe(false);
     } finally {
       rmSync(cleanRoot, { recursive: true, force: true });
     }

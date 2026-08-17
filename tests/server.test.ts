@@ -1,6 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { defineRpcContract } from "@bb/plugin-sdk";
 import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing";
 import Database from "better-sqlite3";
@@ -67,6 +68,7 @@ import {
 } from "../src/test-support.js";
 
 const PROJECT_ID = "proj_test";
+const PLUGIN_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const FOREIGN_PROJECT_ID = "proj_foreign";
 const RECEIPT_ID = "receipt-test";
 const TARGET_ID = "target-main";
@@ -359,6 +361,14 @@ function hostFor(
       projects: {
         get: async () => project,
       },
+      plugins: {
+        getSource: async () => ({
+          requested: `path:${PLUGIN_ROOT}`,
+          resolved: `path:${PLUGIN_ROOT}`,
+          engines: {},
+          history: [],
+        }),
+      },
       hosts: {
         get: async () => ({
           id: "host-main",
@@ -569,7 +579,7 @@ async function loadedDistHost() {
   host.harness.sdk.stub("plugins.callRpc", ((input: { method: string; input?: unknown }) =>
     host.harness.callRpc(input.method, input.input)) as never);
   // @ts-expect-error tracked runtime artifact is JavaScript-only by convention.
-  const { default: distPlugin } = await import("../dist/server.js");
+  const { default: distPlugin } = await import("../dist/server.js?bbPluginLoad=7.9");
   await distPlugin(host.bb);
   return host;
 }

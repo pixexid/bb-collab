@@ -59,7 +59,8 @@ import {
 } from "./src/registered-waits.js";
 import { runArchiveSweep } from "./src/archive-sweep.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const projectIdSchema = z.string().trim().min(1).max(256);
 const mutationReceiptSchema = z
@@ -526,6 +527,32 @@ function cachedConsumerRolloutRefusal(projectId: string, message: string): Found
   return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message };
 }
 
+type PluginSource = Awaited<ReturnType<BbPluginApi["sdk"]["plugins"]["getSource"]>>;
+
+function resolvedPluginRoot(source: PluginSource): string | null {
+  if (!source.resolved.startsWith("path:")) return null;
+  const root = source.resolved.slice("path:".length);
+  return root.length > 0 ? root : null;
+}
+
+export async function isLiveCachedConsumerRolloutArtifact(moduleUrl: string, bb: BbPluginApi): Promise<boolean> {
+  try {
+    const artifactPath = fileURLToPath(new URL(moduleUrl));
+    const pluginRoot = resolvedPluginRoot(await bb.sdk.plugins.getSource({ pluginId: bb.pluginId }));
+    if (!pluginRoot || !isAbsolute(pluginRoot)) return false;
+    const relativeArtifactPath = relative(pluginRoot, artifactPath);
+    if (
+      relativeArtifactPath.length === 0
+      || relativeArtifactPath === ".."
+      || relativeArtifactPath.startsWith(`..${sep}`)
+      || isAbsolute(relativeArtifactPath)
+    ) return false;
+    return basename(artifactPath) === "server.js" && basename(dirname(artifactPath)) === "dist";
+  } catch {
+    return false;
+  }
+}
+
 function liveCachedConsumerReread(name: string, result: FoundationResult) {
   const cachedConsumers = (result.evidence as { cachedConsumers?: { newSchemaVersion?: unknown; newContractVersion?: unknown } } | undefined)?.cachedConsumers;
   if (result.outcome !== "OK" || typeof cachedConsumers?.newSchemaVersion !== "number" || typeof cachedConsumers.newContractVersion !== "number") {
@@ -547,7 +574,7 @@ async function applyLiveCachedConsumerRollout(
   if (request.operationClass !== "decision_disposition") {
     return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout requires a governed decision_disposition request");
   }
-  if (!import.meta.url.endsWith("/dist/server.js")) {
+  if (!(await isLiveCachedConsumerRolloutArtifact(import.meta.url, bb))) {
     return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout requires the running dist/server.js plugin artifact");
   }
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
