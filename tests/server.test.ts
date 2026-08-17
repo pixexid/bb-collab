@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -67,7 +67,7 @@ import {
   seedFixtureDecision,
   seedVerifiedFixtureReceipt,
 } from "../src/test-support.js";
-import { findCheckoutRoot, readCheckoutDivergence, reportCheckoutDivergence } from "../src/checkout-divergence.js";
+import { findCheckoutRoot, readCheckoutDivergence } from "../src/checkout-divergence.js";
 
 const PROJECT_ID = "proj_test";
 const PLUGIN_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -698,34 +698,36 @@ function seedAndBootstrap(host: ReturnType<typeof hostFor>, projectId = PROJECT_
 }
 
 describe("checkout divergence detection", () => {
-  it("bounds plugin load when git never exits during divergence detection", async () => {
+  it("plugin-load invariant is true by construction under checkout adversaries", async () => {
+    const fifoCheckout = mkdtempSync(join(tmpdir(), "bb-collab-fifo-checkout-"));
+    mkdirSync(join(fifoCheckout, ".git"));
+    execFileSync("mkfifo", [join(fifoCheckout, ".git", "HEAD")]);
+    const missingGitCheckout = mkdtempSync(join(tmpdir(), "bb-collab-no-git-"));
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-hostile-git-"));
     const wrapper = join(bin, "git");
-    writeFileSync(wrapper, "#!/bin/sh\ntrap \"\" TERM\nwhile :; do :; done\n");
+    writeFileSync(wrapper, "#!/bin/sh\n( trap \"\" TERM; while :; do :; done ) &\nchild=$!\nprintf '%s\\n' \"$child\" > \"${HOSTILE_GIT_PID_FILE}\"\ntrap \"\" TERM\nwhile :; do :; done\n");
     chmodSync(wrapper, 0o755);
     const originalPath = process.env.PATH;
+    const originalPidFile = process.env.HOSTILE_GIT_PID_FILE;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    process.env.HOSTILE_GIT_PID_FILE = join(bin, "grandchild.pid");
     const started = Date.now();
     try {
-      await expect(plugin(hostFor().bb)).resolves.toBeUndefined();
+      await expect(Promise.all([
+        plugin(hostFor().bb, { checkoutRoot: fifoCheckout }),
+        plugin(hostFor().bb, { checkoutRoot: missingGitCheckout }),
+      ])).resolves.toEqual([undefined, undefined]);
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
+      if (originalPidFile === undefined) delete process.env.HOSTILE_GIT_PID_FILE;
+      else process.env.HOSTILE_GIT_PID_FILE = originalPidFile;
+      rmSync(fifoCheckout, { recursive: true, force: true });
+      rmSync(missingGitCheckout, { recursive: true, force: true });
       rmSync(bin, { recursive: true, force: true });
     }
     expect(Date.now() - started).toBeLessThan(2_000);
   }, 5_000);
-
-  it("resolves plugin load when the divergence warning logger throws", async () => {
-    const host = hostFor();
-    const throwingLog = {
-      ...host.bb.log,
-      warn: () => {
-        throw new Error("warn failed");
-      },
-    };
-    await expect(plugin({ ...host.bb, log: throwingLog })).resolves.toBeUndefined();
-  });
 
   it("reports an unavailable checkout through doctor RPC and CLI", async () => {
     const directory = mkdtempSync(join(tmpdir(), "bb-collab-no-git-"));
@@ -743,33 +745,66 @@ describe("checkout divergence detection", () => {
     }
   });
 
-  it("preserves the plugin-load invariant under hostile checkout diagnostics", async () => {
-    const hostileCheckout = checkoutFixture(true);
-    const missingGitCheckout = mkdtempSync(join(tmpdir(), "bb-collab-no-git-"));
+  it("bounds the doctor probe against a hostile git on the real checkout geometry", () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-hostile-git-"));
     const wrapper = join(bin, "git");
     writeFileSync(wrapper, "#!/bin/sh\ntrap \"\" TERM\nwhile :; do :; done\n");
     chmodSync(wrapper, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
-    const host = hostFor();
-    const missingGitHost = hostFor();
-    const throwingLog = { ...host.bb.log, warn: () => { throw new Error("warn failed"); } };
-    const missingGitThrowingLog = { ...missingGitHost.bb.log, warn: () => { throw new Error("warn failed"); } };
     const started = Date.now();
     try {
-      await expect(Promise.all([
-        plugin({ ...host.bb, log: throwingLog }, { checkoutRoot: hostileCheckout.directory }),
-        plugin({ ...missingGitHost.bb, log: missingGitThrowingLog }, { checkoutRoot: missingGitCheckout }),
-      ])).resolves.toEqual([undefined, undefined]);
+      readCheckoutDivergence(findCheckoutRoot(process.cwd()));
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
-      rmSync(hostileCheckout.directory, { recursive: true, force: true });
-      rmSync(missingGitCheckout, { recursive: true, force: true });
       rmSync(bin, { recursive: true, force: true });
     }
     expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("kills the complete doctor probe process group", async () => {
+    const fixture = checkoutFixture(true);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-forking-git-"));
+    const pidFile = join(bin, "grandchild.pid");
+    const wrapper = join(bin, "git");
+    writeFileSync(wrapper, `#!/bin/sh
+( trap "" TERM; while :; do :; done ) &
+child=$!
+printf '%s\\n' "$child" > "${pidFile}"
+trap "" TERM
+while :; do :; done
+`);
+    chmodSync(wrapper, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    let childPid: number | null = null;
+    try {
+      const result = readCheckoutDivergence(fixture.directory);
+      expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: null, verdict: "diverged" });
+      childPid = Number(readFileSync(pidFile, "utf8").trim());
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        try {
+          process.kill(childPid, 0);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        } catch {
+          break;
+        }
+      }
+      expect(() => process.kill(childPid!, 0)).toThrow();
+    } finally {
+      if (childPid !== null) {
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch {
+          // The process-group assertion may already have reaped it.
+        }
+      }
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(fixture.directory, { recursive: true, force: true });
+      rmSync(bin, { recursive: true, force: true });
+    }
   });
 
   it("does not lazy-fetch while counting divergence", () => {
@@ -796,15 +831,11 @@ describe("checkout divergence detection", () => {
     rmSync(bin, { recursive: true, force: true });
   });
 
-  it("warns for a diverged fixture and reports the same doctor evidence", async () => {
+  it("reports a diverged fixture through doctor", async () => {
     const fixture = checkoutFixture(true);
     try {
       const divergence = readCheckoutDivergence(fixture.directory);
       expect(divergence).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 1, verdict: "diverged" });
-      const warnings: string[] = [];
-      reportCheckoutDivergence({ warn: (message: string) => warnings.push(message) }, fixture.directory);
-      expect(warnings).toEqual([`bb-collab checkout diverges from origin/main: checkout-head=${fixture.base} origin/main=${fixture.origin} behind-count=1`]);
-
       const host = await loadedHost();
       seedAndBootstrap(host);
       const result = await doctor(host.bb.storage.database(), host.bb.sdk, PROJECT_ID, divergence);
@@ -822,10 +853,6 @@ describe("checkout divergence detection", () => {
     try {
       const divergence = readCheckoutDivergence(fixture.directory);
       expect(divergence).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 0, verdict: "clean" });
-      const warnings: string[] = [];
-      reportCheckoutDivergence({ warn: (message: string) => warnings.push(message) }, fixture.directory);
-      expect(warnings).toEqual([]);
-
       const host = await loadedHost();
       seedAndBootstrap(host);
       const result = await doctor(host.bb.storage.database(), host.bb.sdk, PROJECT_ID, divergence);

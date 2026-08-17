@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
@@ -8,8 +8,6 @@ export interface CheckoutDivergence {
   behindCount: number | null;
   verdict: "clean" | "diverged" | "unavailable";
 }
-
-type WarningLogger = { warn(message: string): void };
 
 function readRef(gitDirs: string[], ref: string): string | null {
   for (const gitDir of gitDirs) {
@@ -66,7 +64,17 @@ export function readCheckoutDivergence(checkoutRoot: string | null): CheckoutDiv
     if (!checkoutHead || !originMainRef) return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable" };
     let behindCount: number | null = null;
     try {
-      const count = execFileSync("git", ["rev-list", "--count", `${checkoutHead}..${originMainRef}`], { cwd: checkoutRoot, encoding: "utf8", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" }, stdio: ["ignore", "pipe", "ignore"], timeout: 1_000, killSignal: "SIGKILL" }).trim();
+      const options: SpawnSyncOptionsWithStringEncoding & { detached: true } = { cwd: checkoutRoot, encoding: "utf8", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" }, stdio: ["ignore", "pipe", "ignore"], timeout: 1_000, killSignal: "SIGKILL", detached: true };
+      const result = spawnSync("git", ["rev-list", "--count", `${checkoutHead}..${originMainRef}`], options);
+      if (result.signal === "SIGKILL" && result.pid !== undefined) {
+        try {
+          process.kill(-result.pid, "SIGKILL");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        }
+      }
+      if (result.error) throw result.error;
+      const count = result.stdout.trim();
       if (/^\d+$/u.test(count)) behindCount = Number(count);
     } catch {
       // Ref comparison remains useful even when the local object graph is incomplete.
@@ -75,16 +83,4 @@ export function readCheckoutDivergence(checkoutRoot: string | null): CheckoutDiv
   } catch {
     return unavailable;
   }
-}
-
-export function reportCheckoutDivergence(log: WarningLogger, checkoutRoot: string | null): CheckoutDivergence {
-  const divergence = readCheckoutDivergence(checkoutRoot);
-  if (divergence.verdict === "diverged") {
-    try {
-      log.warn(`bb-collab checkout diverges from origin/main: checkout-head=${divergence.checkoutHead} origin/main=${divergence.originMainRef} behind-count=${divergence.behindCount ?? "unknown"}`);
-    } catch {
-      // Diagnostic logging must never prevent the plugin from loading.
-    }
-  }
-  return divergence;
 }
