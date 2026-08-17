@@ -28,6 +28,7 @@ import {
   MAX_ROLE_CONTEXT_EVENTS,
   MIGRATION_STATES,
   MIGRATION_STEPS,
+  OPERATOR_RECEIPT_RETIREMENT_CONDITION,
   PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES,
   PLUGIN_ID,
   SCHEMA_VERSION,
@@ -605,6 +606,69 @@ async function loadedDistHost() {
   const { default: distPlugin } = await import("../dist/server.js?bbPluginLoad=7.9");
   await distPlugin(host.bb);
   return host;
+}
+
+async function sentinelWakeFloorFixture(updatedAt = 1) {
+  const fixture = await assignmentFixture({ directorSeat: true });
+  const holder = fixture.db.prepare(
+    "SELECT thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'director'",
+  ).get() as { thread_id: string };
+  fixture.host.harness.sdk.stub("threads.interactions.list", (async () => []) as never);
+  fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+    id: threadId,
+    projectId: PROJECT_ID,
+    status: "idle",
+    updatedAt,
+  })) as never);
+  fixture.host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
+  return { ...fixture, directorThreadId: holder.thread_id };
+}
+
+async function addPendingReview(fixture: Awaited<ReturnType<typeof sentinelWakeFloorFixture>>) {
+  activateReviewer(fixture.db, fixture.fenceToken);
+  expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+  const template = assignmentPrepareRequest(fixture.fenceToken, "pending-review");
+  const prepared = applyWithFixtureReceipt(fixture.db, {
+    ...template,
+    actorReceiptId: "role-actor-reviewer",
+    expectedResourceRevision: 3,
+    assignment: {
+      ...template.assignment!,
+      assignmentId: "pending-review",
+      assignmentKind: "review",
+      laneId: "pending-review",
+      roleRequirementId: "reviewer-v1",
+      roleId: "independent-reviewer",
+      roleGeneration: 2,
+      candidateSemantics: "frozen",
+      candidateSha: CANDIDATE_SHA,
+    },
+  }, null, null, new DeterministicNativeAssignmentAdapter());
+  expect(prepared.outcome).toBe("OK");
+  return (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+}
+
+function operatorWaitInteraction(threadId: string) {
+  return {
+    status: "pending",
+    threadId,
+    createdAt: 1,
+    origin: { kind: "plugin", pluginId: PLUGIN_ID, rendererId: "operator-receipt" },
+    payload: {
+      kind: "plugin",
+      data: {
+        kind: "operator_receipt_confirmation",
+        projectId: PROJECT_ID,
+        mutationClass: "bootstrap",
+        candidateHead: "a".repeat(40),
+        idempotencyKey: "waiting-review",
+        requestDigest: "b".repeat(64),
+        callerThreadId: threadId,
+        requestedFromBackground: false,
+        retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
+      },
+    },
+  };
 }
 
 async function loadedLaneWatcherHost() {
@@ -2018,23 +2082,67 @@ describe("bb-collab plugin boundary", () => {
     expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "approverAttestation", "cachedConsumerRollout", "doctor", "export", "lanes", "operatorPassphraseState", "operatorReceipt", "operatorReceiptDecision", "operatorReceiptRequests", "registerWait", "reorderPinned", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
   });
 
-  it("registers sentinel-wake-floor with its exact hourly health send", async () => {
-    const host = await loadedHost();
-    host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
-    expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toContain("sentinel-wake-floor");
-    await host.harness.runSchedule("sentinel-wake-floor");
-    expect(host.harness.inspection.sdk.callsTo("threads.send")).toContainEqual([{
-      threadId: "thr_bpzjyqg7ys",
-      mode: "queue-if-active",
-      input: [{ type: "text", visibility: "agent-only", text: "Hourly Sentinel health check: verify the fleet against canonical surfaces and report any drift or blocker.", mentions: [] }],
-    }]);
+  it("does not wake a quiet director seat", async () => {
+    const fixture = await sentinelWakeFloorFixture();
+    expect(fixture.host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toContain("sentinel-wake-floor");
+    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("wakes a stalled director exactly once for nextStartable work", async () => {
+    const fixture = await sentinelWakeFloorFixture();
+    await addPendingReview(fixture);
+    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+      {
+        threadId: fixture.directorThreadId,
+        mode: "queue-if-active",
+        input: [{ type: "text", visibility: "agent-only", text: "Hourly director health check: inspect canonical surfaces and report any drift or blocker.", mentions: [] }],
+      },
+    ]]);
+  });
+
+  it("does not wake pending work before the director idle floor", async () => {
+    const fixture = await sentinelWakeFloorFixture(Date.now() + 60 * 60_000 - 1);
+    await addPendingReview(fixture);
+    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("does not wake a lane deferred awaiting_operator", async () => {
+    const fixture = await sentinelWakeFloorFixture();
+    const executionAttemptId = await addPendingReview(fixture);
+    const waitingThreadId = "waiting-review";
+    fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE execution_attempt_id = ?").run(waitingThreadId, executionAttemptId);
+    fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) =>
+      threadId === waitingThreadId ? [operatorWaitInteraction(threadId)] : []) as never);
+    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("never wakes the stood-down sentinel thread", async () => {
+    for (const pending of [false, true]) {
+      const fixture = await sentinelWakeFloorFixture();
+      if (pending) await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").some(([input]) => (input as { threadId?: string }).threadId === "thr_bpzjyqg7ys")).toBe(false);
+    }
+  });
+
+  it("does not wake when no director generation exists", async () => {
+    const fixture = await assignmentFixture();
+    fixture.host.harness.sdk.stub("threads.interactions.list", (async () => []) as never);
+    fixture.host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
+    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
   it("logs sentinel-wake-floor send failures without throwing", async () => {
-    const host = await loadedHost();
-    host.harness.sdk.stub("threads.send", (async () => { throw new Error("send unavailable"); }) as never);
-    await expect(host.harness.runSchedule("sentinel-wake-floor")).resolves.toBeUndefined();
-    expect(host.harness.inspection.logEntries.filter((entry) => entry.level === "warn" && entry.message === "sentinel-wake-floor failed: Error: send unavailable")).toHaveLength(1);
+    const fixture = await sentinelWakeFloorFixture();
+    await addPendingReview(fixture);
+    fixture.host.harness.sdk.stub("threads.send", (async () => { throw new Error("send unavailable"); }) as never);
+    await expect(fixture.host.harness.runSchedule("sentinel-wake-floor")).resolves.toBeUndefined();
+    expect(fixture.host.harness.inspection.logEntries.filter((entry) => entry.level === "warn" && entry.message === "sentinel-wake-floor failed: Error: send unavailable")).toHaveLength(1);
   });
 
   it("authorizes exact interim receipts through the same RPC and CLI seam", async () => {

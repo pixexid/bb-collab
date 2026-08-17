@@ -72,6 +72,7 @@ import { fileURLToPath } from "node:url";
 
 type PluginOptions = { checkoutRoot?: string | null };
 
+const SENTINEL_WAKE_FLOOR_MS = 60 * 60_000;
 const projectIdSchema = z.string().trim().min(1).max(256);
 const mutationReceiptSchema = z
   .object({
@@ -1221,10 +1222,22 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   bb.background.schedule("sentinel-wake-floor", "0 * * * *", async () => {
     try {
+      if (!db) return;
+      const directors = readRoleHolderStates(db).filter((holder) => holder.role_id === "director");
+      if (directors.length !== 1) return;
+      const director = directors[0]!;
+      const thread = await bb.sdk.threads.get({ threadId: director.thread_id });
+      if (
+        thread.projectId !== director.project_id || thread.status !== "idle" ||
+        thread.archivedAt !== null || thread.deletedAt !== null ||
+        Date.now() - thread.updatedAt < SENTINEL_WAKE_FLOOR_MS
+      ) return;
+      const scopes = await readRoleScopes();
+      if (!scopes.some((scope) => scope.projectId === director.project_id && scope.nextStartable)) return;
       await bb.sdk.threads.send({
-        threadId: "thr_bpzjyqg7ys",
+        threadId: director.thread_id,
         mode: "queue-if-active",
-        input: [{ type: "text", visibility: "agent-only", text: "Hourly Sentinel health check: verify the fleet against canonical surfaces and report any drift or blocker.", mentions: [] }],
+        input: [{ type: "text", visibility: "agent-only", text: "Hourly director health check: inspect canonical surfaces and report any drift or blocker.", mentions: [] }],
       });
     } catch (error) {
       bb.log.warn(`sentinel-wake-floor failed: ${String(error)}`);

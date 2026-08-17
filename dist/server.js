@@ -22156,6 +22156,7 @@ function readCheckoutDivergence(checkoutRoot) {
 import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync2, rmSync, statSync as statSync2, writeFileSync } from "node:fs";
 import { basename, dirname as dirname2, isAbsolute, join as join4, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+var SENTINEL_WAKE_FLOOR_MS = 60 * 6e4;
 var projectIdSchema = external_exports.string().trim().min(1).max(256);
 var mutationReceiptSchema = external_exports.object({
   projectId: projectIdSchema,
@@ -23172,10 +23173,18 @@ ${thread.titleFallback ?? ""}`);
   });
   bb.background.schedule("sentinel-wake-floor", "0 * * * *", async () => {
     try {
+      if (!db) return;
+      const directors = readRoleHolderStates(db).filter((holder) => holder.role_id === "director");
+      if (directors.length !== 1) return;
+      const director = directors[0];
+      const thread = await bb.sdk.threads.get({ threadId: director.thread_id });
+      if (thread.projectId !== director.project_id || thread.status !== "idle" || thread.archivedAt !== null || thread.deletedAt !== null || Date.now() - thread.updatedAt < SENTINEL_WAKE_FLOOR_MS) return;
+      const scopes = await readRoleScopes();
+      if (!scopes.some((scope) => scope.projectId === director.project_id && scope.nextStartable)) return;
       await bb.sdk.threads.send({
-        threadId: "thr_bpzjyqg7ys",
+        threadId: director.thread_id,
         mode: "queue-if-active",
-        input: [{ type: "text", visibility: "agent-only", text: "Hourly Sentinel health check: verify the fleet against canonical surfaces and report any drift or blocker.", mentions: [] }]
+        input: [{ type: "text", visibility: "agent-only", text: "Hourly director health check: inspect canonical surfaces and report any drift or blocker.", mentions: [] }]
       });
     } catch (error48) {
       bb.log.warn(`sentinel-wake-floor failed: ${String(error48)}`);
