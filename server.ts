@@ -1209,6 +1209,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   bb.events.on("thread.created", async ({ thread }) => {
     try {
       const brief = await composeRoleBrief(bb, db, { projectId: thread.projectId, role: roleForThread(db, thread.projectId, thread.id) });
+      await bb.sdk.threads.wait({ threadId: thread.id, status: "active", timeoutMs: 30_000 });
       await bb.sdk.threads.send({
         threadId: thread.id,
         mode: "queue-if-active",

@@ -32,6 +32,7 @@ describe("role briefs", () => {
   it("briefs a created worker through the lifecycle event", async () => {
     const host = createFakePluginHost({ pluginId: "bb-collab" });
     host.harness.sdk.stub("projects.get", (async ({ projectId }: { projectId: string }) => project(projectId)) as never);
+    host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
     host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
     await plugin(host.bb);
 
@@ -39,6 +40,7 @@ describe("role briefs", () => {
     const request = host.harness.inspection.sdk.callsTo("threads.send")[0]?.[0] as { threadId: string; mode: string; input: Array<{ visibility: string; text: string }> };
     expect(request).toMatchObject({ threadId: "worker-brief", mode: "queue-if-active" });
     expect(request.input[0]).toMatchObject({ visibility: "agent-only", text: expect.stringContaining("Does this need to exist at all?") });
+    expect(host.harness.inspection.sdk.callsTo("threads.wait")[0]?.[0]).toMatchObject({ threadId: "worker-brief", status: "active", timeoutMs: 30_000 });
   });
 
   it("rejects a stale generated bundle", () => {
