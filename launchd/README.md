@@ -5,6 +5,33 @@ validator. It is **not installed by any code lane**: loading it is an
 operator act, taken only after the review/CI/release gates for the change
 that introduced it have passed.
 
+## Succession-safe stall guard (GH-112 Option C)
+
+`scripts/stall-guard.mjs` supervises one model-free plugin cycle:
+
+```
+bb plugin run bb-collab stall-guard --cycle
+```
+
+The plugin resolves the canonical role holder on every cycle, polls the
+host's pull-request/check state, and persists artifact snapshots in plugin
+KV. The role idle ledger remains the owner of the ten-minute floor, two-steer
+cap, and escalation behavior. A holder succession therefore retargets the
+next cycle without stopping or restarting the guard.
+
+`com.bbcollab.stall-guard.plist` is not installed by this PR. It retains
+`@@REPO_ROOT@@` and `@@STATE_DIR@@` until an operator substitutes them. The
+repository root must be repointed and the LaunchAgent reloaded whenever that
+checkout moves; otherwise a stale checkout runs stale supervisor code (#125).
+
+The old `bb-collab-stall-guard.sh` is superseded. During the manual install,
+the operator must kill its live processes and must not restart the copy under
+the old thread-storage directory. The merge does not kill any process.
+
+The stall guard has exactly two self-watch mechanisms: launchd `KeepAlive`,
+and the plugin's `stall-guard-liveness` staleness alert, which alerts once per
+episode. There is no watcher-of-watchers.
+
 ## What is supervised
 
 `scripts/wait-validator.mjs` is a pure-code loop — no model, no tokens, no
@@ -61,6 +88,24 @@ watcher-of-watchers.
    ```
    */5 * * * * node @@REPO_ROOT@@/scripts/wait-validator-liveness-check.mjs
    ```
+
+## Stall-guard operator install (manual, after gates pass)
+
+1. Substitute `@@REPO_ROOT@@` with the live checkout and `@@STATE_DIR@@` with
+   the marker/log directory. Create the directory before loading.
+2. Kill the superseded shell-guard PIDs, then verify that no old shell guard
+   is running. Do not perform either action as part of the merge.
+3. Load the new LaunchAgent:
+
+   ```
+   mkdir -p ~/.bb/bb-collab
+   plutil -lint launchd/com.bbcollab.stall-guard.plist
+   launchctl load launchd/com.bbcollab.stall-guard.plist
+   ```
+
+4. If the live checkout moves, substitute the new path and reload the plist.
+   The marker is `@@STATE_DIR@@/stall-guard.liveness`; its freshness proves
+   the host loop is alive even when a plugin cycle fails.
 
 ## Uninstall
 
