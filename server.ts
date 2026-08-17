@@ -46,6 +46,13 @@ import {
   type SqliteDatabase,
 } from "./src/foundation.js";
 import {
+  createStallGuardCycle,
+  STALL_GUARD_KV_KEY,
+  STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME,
+  STALL_GUARD_LIVENESS_MARKER_FILENAME,
+  stallGuardStateDir,
+} from "./src/stall-guard.js";
+import {
   LIVENESS_ALERT_FLAG_FILENAME,
   LIVENESS_MARKER_FILENAME,
   WAIT_ESCALATION_KV_KEY,
@@ -612,6 +619,7 @@ interface WaitValidatorCliDeps {
   registerBoundedWaitForCli: (input: unknown, ctxThreadId?: string) => Promise<import("./src/registered-waits.js").RegisterWaitResult>;
   listWaitsForCli: () => Promise<Array<Record<string, unknown>>>;
   escalationCycle: import("./src/registered-waits.js").WaitEscalationCycle;
+  stallGuardCycle: (projectId?: string) => Promise<import("./src/stall-guard.js").StallGuardCycleSummary>;
   archiveSweep: (projectId: string, apply: boolean) => Promise<import("./src/archive-sweep.js").ArchiveSweepResult>;
   readCheckoutDivergence: () => CheckoutDivergence;
 }
@@ -625,8 +633,8 @@ async function runCli(
 ) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "archive-sweep", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, archive-sweep, cached-consumer-rollout, wait-register, wait-list, or wait-validator");
+  if (!command || !["doctor", "export", "apply", "archive-sweep", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, archive-sweep, cached-consumer-rollout, wait-register, wait-list, wait-validator, or stall-guard");
   }
   if (command === "wait-validator") {
     const unknown = args.find((arg) => arg !== "--cycle");
@@ -651,6 +659,39 @@ async function runCli(
       return cliResult({
         outcome: "INTERNAL_ERROR",
         subject: "wait-validator",
+        expected: 1,
+        attempted: 0,
+        verified: 0,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  if (command === "stall-guard") {
+    const projectFlag = args.indexOf("--project");
+    const projectId = parseFlag(args, "--project");
+    const expectedLength = projectFlag < 0 ? 1 : 3;
+    const unknown = args.find((arg) => arg !== "--cycle" && arg !== "--project" && arg !== projectId);
+    if (unknown || args.filter((arg) => arg === "--cycle").length !== 1 || args.filter((arg) => arg === "--project").length > 1 || args.length !== expectedLength) {
+      return invalidCli(`unexpected argument ${unknown ?? "duplicate or malformed flag"}`);
+    }
+    if (!args.includes("--cycle")) return invalidCli("--cycle is required: the stall guard runs exactly one durable cycle per invocation");
+    if (projectId === "") return invalidCli("--project PROJECT_ID must be supplied once with a value");
+    try {
+      await deps.watcher.poll();
+      const summary = await deps.stallGuardCycle(projectId ?? undefined);
+      return cliResult({
+        outcome: "OK",
+        subject: "stall-guard",
+        expected: summary.observed,
+        attempted: summary.attempted,
+        verified: summary.verified,
+        message: "stall-guard cycle complete",
+        evidence: summary,
+      });
+    } catch (error) {
+      return cliResult({
+        outcome: "INTERNAL_ERROR",
+        subject: "stall-guard",
         expected: 1,
         attempted: 0,
         verified: 0,
@@ -933,6 +974,59 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     );
   };
 
+  const steerRole = async (role: import("./src/awareness.js").RoleIdleView) => {
+    if (!db) return false;
+    const expectedHolder: RoleHolderState = {
+      project_id: role.projectId,
+      role_id: role.roleId,
+      role_generation: role.roleGeneration,
+      execution_attempt_id: role.executionAttemptId,
+      thread_id: role.threadId,
+    };
+    let holders: RoleHolderState[];
+    try {
+      holders = readRoleHolderStates(db).filter((holder) =>
+        holder.project_id === role.projectId &&
+        holder.role_id === role.roleId &&
+        holder.role_generation === role.roleGeneration &&
+        holder.execution_attempt_id === role.executionAttemptId,
+      );
+    } catch (error) {
+      warnRoleLiveness(expectedHolder, `holder=unknown error=${String(error)}`);
+      return false;
+    }
+    if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) {
+      warnRoleLiveness(expectedHolder, `holderMatches=${holders.length} observedThread=${holders[0]?.thread_id ?? "null"}`);
+      return false;
+    }
+    let thread;
+    try {
+      thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
+    } catch (error) {
+      warnRoleLiveness(holders[0], `liveness=unknown error=${String(error)}`);
+      return false;
+    }
+    const refusal = roleThreadRefusal(holders[0], thread, true);
+    if (refusal) {
+      warnRoleLiveness(holders[0], refusal);
+      return false;
+    }
+    roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
+    await bb.sdk.threads.send({
+      threadId: holders[0].thread_id,
+      mode: "steer",
+      input: [
+        {
+          type: "text",
+          visibility: "agent-only",
+          text: `Wrongful idle: queue head ${role.queueHeadId} is startable. Inspect the queue and act or record the blocker.`,
+          mentions: [],
+        },
+      ],
+    });
+    return true;
+  };
+
   const watcher = createLaneWatcher({
     readLanes: () => (db ? readLaneStates(db) : []),
     readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
@@ -1005,60 +1099,25 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         ],
       });
     },
-    steerRole: async (role) => {
-      if (!db) return false;
-      const expectedHolder: RoleHolderState = {
-        project_id: role.projectId,
-        role_id: role.roleId,
-        role_generation: role.roleGeneration,
-        execution_attempt_id: role.executionAttemptId,
-        thread_id: role.threadId,
-      };
-      let holders: RoleHolderState[];
-      try {
-        holders = readRoleHolderStates(db).filter((holder) =>
-          holder.project_id === role.projectId &&
-          holder.role_id === role.roleId &&
-          holder.role_generation === role.roleGeneration &&
-          holder.execution_attempt_id === role.executionAttemptId,
-        );
-      } catch (error) {
-        warnRoleLiveness(expectedHolder, `holder=unknown error=${String(error)}`);
-        return false;
-      }
-      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) {
-        warnRoleLiveness(expectedHolder, `holderMatches=${holders.length} observedThread=${holders[0]?.thread_id ?? "null"}`);
-        return false;
-      }
-      let thread;
-      try {
-        thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
-      } catch (error) {
-        warnRoleLiveness(holders[0], `liveness=unknown error=${String(error)}`);
-        return false;
-      }
-      const refusal = roleThreadRefusal(holders[0], thread, true);
-      if (refusal) {
-        warnRoleLiveness(holders[0], refusal);
-        return false;
-      }
-      roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
-      await bb.sdk.threads.send({
-        threadId: holders[0].thread_id,
-        mode: "steer",
-        input: [
-          {
-            type: "text",
-            visibility: "agent-only",
-            text: `Wrongful idle: queue head ${role.queueHeadId} is startable. Inspect the queue and act or record the blocker.`,
-            mentions: [],
-          },
-        ],
-      });
-      return true;
-    },
+    steerRole,
   });
   await watcher.recover().catch((error) => bb.log.error(`lane continuation recovery failed: ${String(error)}`));
+
+  const stallGuardCycle = createStallGuardCycle({
+    readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
+    readRoleScopes,
+    readArtifact: async (holder) => {
+      const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
+      if (thread.projectId !== holder.project_id || !thread.environmentId) return { outcome: "absent" };
+      const result = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
+      return result.outcome === "unavailable" ? null : result;
+    },
+    wakeRole: (role) => watcher.wakeRole(role),
+    persistence: {
+      read: () => bb.storage.kv.get<unknown>(STALL_GUARD_KV_KEY),
+      write: (state) => bb.storage.kv.set(STALL_GUARD_KV_KEY, state),
+    },
+  });
 
   const observe = (payload: Parameters<typeof threadEventStatus>[0]) => {
     const { id, status } = threadEventStatus(payload);
@@ -1126,6 +1185,37 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       }
     } catch (error) {
       bb.log.warn(`wait-validator liveness check failed: ${String(error)}`);
+    }
+  });
+
+  bb.background.schedule("stall-guard-liveness", "*/5 * * * *", async () => {
+    try {
+      const stateDir = stallGuardStateDir();
+      const markerPath = join(stateDir, STALL_GUARD_LIVENESS_MARKER_FILENAME);
+      const flagPath = join(stateDir, STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME);
+      let markerAtMs: number | null = null;
+      try {
+        const parsed = Number(readFileSync(markerPath, "utf8").trim());
+        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync(markerPath).mtimeMs;
+      } catch {
+        markerAtMs = null;
+      }
+      const configuredStaleMs = Number(process.env.BB_COLLAB_STALL_GUARD_LIVENESS_STALE_MS);
+      const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync(flagPath));
+      if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
+      if (decision === "alert-once") {
+        mkdirSync(stateDir, { recursive: true });
+        try {
+          writeFileSync(flagPath, String(Date.now()), { flag: "wx" });
+        } catch {
+          return;
+        }
+        bb.log.error("stall-guard liveness marker is stale: host launchd supervision failed; operator attention required");
+        bb.realtime.publish("stall-guard", { liveness: "stale", alert: "operator-once" });
+      }
+    } catch (error) {
+      bb.log.warn(`stall-guard liveness check failed: ${String(error)}`);
     }
   });
 
@@ -1208,6 +1298,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     }),
     listWaitsForCli: async () => { await waitRegistry.recover(); return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) })); },
     escalationCycle,
+    stallGuardCycle: (projectId) => stallGuardCycle.cycle(projectId),
     archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply),
     readCheckoutDivergence: readDiagnosticDivergence,
   };
@@ -1465,6 +1556,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         name: "wait-validator",
         summary: "Run one durable wait-validator cycle (host-supervised seam)",
         usage: "bb collab wait-validator --cycle",
+      },
+      {
+        name: "stall-guard",
+        summary: "Run one succession-safe stall-guard cycle (host-supervised seam)",
+        usage: "bb collab stall-guard --cycle --project PROJECT_ID",
       },
       {
         name: "archive-sweep",

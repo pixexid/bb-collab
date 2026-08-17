@@ -18762,12 +18762,12 @@ function parseSnapshot(value) {
   }
   return parsed.data;
 }
-function observedDigest(snapshot, desired) {
+function observedDigest(snapshot2, desired) {
   return sha256(canonicalJson({
-    title: snapshot.title,
-    body: snapshot.body,
-    state: snapshot.state,
-    managedLabels: snapshot.labels.filter((label) => desired.managedNames.has(label)).sort()
+    title: snapshot2.title,
+    body: snapshot2.body,
+    state: snapshot2.state,
+    managedLabels: snapshot2.labels.filter((label) => desired.managedNames.has(label)).sort()
   }));
 }
 function externalRef(db, projectId, workItemId) {
@@ -18961,7 +18961,7 @@ function recordProjectionState(db, request, digest, context, state, outcome, cou
     );
   });
 }
-function finalizeProjection(db, request, digest, context, adapter, snapshot, mutationKind) {
+function finalizeProjection(db, request, digest, context, adapter, snapshot2, mutationKind) {
   return transaction(db, () => {
     const replay = checkIdempotency(db, request, digest);
     if (replay) return replay;
@@ -18969,13 +18969,13 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot, mut
     if (authority.mapping.connectorHost !== adapter.connectorHost) {
       throw refusal("EXTERNAL_TARGET_MISMATCH", "GitHub mapping changed before projection finalization");
     }
-    if (context.ref.owner !== snapshot.owner || context.ref.repo !== snapshot.repo || context.ref.issue_number !== null && context.ref.issue_number !== snapshot.issueNumber) {
+    if (context.ref.owner !== snapshot2.owner || context.ref.repo !== snapshot2.repo || context.ref.issue_number !== null && context.ref.issue_number !== snapshot2.issueNumber) {
       throw refusal("EXTERNAL_REF_CONFLICT", "external identity changed before projection finalization");
     }
     if (mutationKind === "verify" && context.ref.projection_state !== "current" || mutationKind !== "verify" && (context.ref.projection_state !== "pending" || context.ref.last_idempotency_key !== request.idempotencyKey || context.ref.last_request_digest !== digest)) {
       throw refusal("EXTERNAL_REF_CONFLICT", "external reservation changed before projection finalization");
     }
-    const observed = observedDigest(snapshot, context.desired);
+    const observed = observedDigest(snapshot2, context.desired);
     if (observed !== context.desired.digest) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub read-back does not match the desired projection");
     const updated = db.prepare(
       `UPDATE external_work_refs SET issue_number = ?, projection_state = 'current', attempted_resource_revision = ?,
@@ -18983,11 +18983,11 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot, mut
        observed_external_digest = ?, last_idempotency_key = ?, last_request_digest = ?, updated_at_ms = ?
        WHERE ${EXTERNAL_REF_CAS_WHERE}`
     ).run(
-      snapshot.issueNumber,
+      snapshot2.issueNumber,
       authority.workItem.resource_revision,
       authority.workItem.resource_revision,
       context.desired.digest,
-      snapshot.externalRevision,
+      snapshot2.externalRevision,
       observed,
       request.idempotencyKey,
       digest,
@@ -19005,7 +19005,7 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot, mut
         aggregateId: authority.workItem.work_item_id,
         aggregateRevision: authority.workItem.resource_revision,
         eventType: "github_issue_projected",
-        event: { workItemId: authority.workItem.work_item_id, owner: snapshot.owner, repo: snapshot.repo, issueNumber: snapshot.issueNumber, mutationKind }
+        event: { workItemId: authority.workItem.work_item_id, owner: snapshot2.owner, repo: snapshot2.repo, issueNumber: snapshot2.issueNumber, mutationKind }
       },
       { expected: 1, attempted: 1, verified: 1 },
       {
@@ -19015,12 +19015,12 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot, mut
         expectedResourceRevision: request.expectedResourceRevision ?? void 0,
         evidence: {
           provider: "github",
-          owner: snapshot.owner,
-          repo: snapshot.repo,
-          issueNumber: snapshot.issueNumber,
+          owner: snapshot2.owner,
+          repo: snapshot2.repo,
+          issueNumber: snapshot2.issueNumber,
           desiredDigest: context.desired.digest,
           observedDigest: observed,
-          observedExternalRevision: snapshot.externalRevision,
+          observedExternalRevision: snapshot2.externalRevision,
           mutationKind
         }
       }
@@ -21413,6 +21413,53 @@ function createLaneWatcher(options) {
       if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, role);
     }
   };
+  const wakeRoleNow = async (role) => {
+    if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return { attempted: false, delivered: false };
+    const holder = {
+      project_id: role.projectId,
+      role_id: role.roleId,
+      role_generation: role.roleGeneration,
+      execution_attempt_id: role.executionAttemptId,
+      thread_id: role.threadId
+    };
+    if (!resolveCurrentCanonicalHolder(holder)) return { attempted: false, delivered: false };
+    let scopes;
+    let observation;
+    try {
+      scopes = await options.readRoleScopes();
+      observation = await options.readWorker(role.threadId);
+    } catch {
+      return { attempted: false, delivered: false };
+    }
+    const scope = scopes.find((candidate) => candidate.projectId === role.projectId);
+    if (!scope?.nextStartable || scope.queueHeadId !== role.queueHeadId || scope.deferredReason || observation.projectId !== role.projectId || observation.status !== "idle" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) return { attempted: false, delivered: false };
+    const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
+    const key = `${prefix}${scope.queueHeadId}`;
+    await roleIdleLedger.clearPrefixExcept(prefix, key);
+    const currentNow = now2();
+    const record2 = await roleIdleLedger.observeIdle(key, observation.idleSinceMs);
+    const steerAgeMs = record2.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : Math.max(0, currentNow - record2.lastSteerAtMs);
+    if (record2.escalated || record2.steerCount >= 2 || steerAgeMs < roleIdleThresholdMs) return { attempted: false, delivered: false };
+    const target = {
+      ...role,
+      threadId: holder.thread_id,
+      idleAgeMs: Math.max(0, currentNow - (record2.idleSinceMs ?? currentNow))
+    };
+    let failed = false;
+    let delivered = void 0;
+    try {
+      delivered = await options.steerRole(target);
+    } catch {
+      failed = true;
+    }
+    if (delivered === false) {
+      await roleIdleLedger.clearPrefixExcept(prefix);
+      return { attempted: false, delivered: false };
+    }
+    const updated = await roleIdleLedger.recordSteer(key, failed, currentNow);
+    if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, target);
+    return { attempted: true, delivered: !failed };
+  };
   const observeNow = async (threadId, status, pendingExternalWait, archived = false, suppliedOperatorWait, suppliedOperatorWaitKnown = status !== "idle" || suppliedOperatorWait !== void 0 || !options.readOperatorWait, waitContext) => {
     const allLanes = options.readLanes();
     clearResolved(allLanes);
@@ -21565,6 +21612,9 @@ function createLaneWatcher(options) {
         }
       });
     },
+    wakeRole(role) {
+      return enqueue(() => wakeRoleNow(role));
+    },
     recover() {
       return enqueue(async () => {
         await continuationLedger.recover();
@@ -21595,10 +21645,83 @@ function subscribeToThreadChanges(sdk, observe) {
   }
 }
 
-// src/registered-waits.ts
-import { createHash as createHash2 } from "node:crypto";
+// src/stall-guard.ts
 import { homedir } from "node:os";
 import { join } from "node:path";
+var STALL_GUARD_KV_KEY = "stall-guard.artifacts";
+var STALL_GUARD_LIVENESS_MARKER_FILENAME = "stall-guard.liveness";
+var STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME = "stall-guard.alerted";
+function stallGuardStateDir() {
+  return process.env.BB_COLLAB_STALL_GUARD_STATE_DIR ?? join(homedir(), ".bb", "bb-collab");
+}
+function stateFromUnknown(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter((entry) => typeof entry[1] === "string"));
+}
+function snapshot(value) {
+  return JSON.stringify(value);
+}
+function createStallGuardCycle(options) {
+  let state = null;
+  return {
+    async cycle(projectId) {
+      state ??= stateFromUnknown(await options.persistence.read());
+      const holders = options.readRoleHolders().filter((holder) => projectId === void 0 || holder.project_id === projectId);
+      const scopes = await options.readRoleScopes();
+      const nextState = structuredClone(state);
+      let changed = 0;
+      let attempted = 0;
+      let verified = 0;
+      let steered = 0;
+      for (const holder of holders) {
+        const key = `${holder.project_id}:${holder.role_id}`;
+        const current = await options.readArtifact(holder).catch(() => null);
+        if (current === null) continue;
+        const next = snapshot(current);
+        if (nextState[key] === void 0) {
+          nextState[key] = next;
+          changed += 1;
+          continue;
+        }
+        if (nextState[key] === next) continue;
+        const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
+        if (!scope?.nextStartable || !scope.queueHeadId || scope.deferredReason) continue;
+        const role = {
+          projectId: holder.project_id,
+          roleId: holder.role_id,
+          roleGeneration: holder.role_generation,
+          executionAttemptId: holder.execution_attempt_id,
+          threadId: holder.thread_id,
+          queueHeadId: scope.queueHeadId,
+          idleAgeMs: 0
+        };
+        let result2;
+        try {
+          result2 = await options.wakeRole(role);
+        } catch {
+          continue;
+        }
+        if (!result2.attempted) continue;
+        attempted += 1;
+        if (!result2.delivered) continue;
+        nextState[key] = next;
+        changed += 1;
+        verified += 1;
+        steered += 1;
+      }
+      if (changed > 0) {
+        await options.persistence.write(nextState);
+        state = nextState;
+      }
+      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered };
+    }
+  };
+}
+
+// src/registered-waits.ts
+import { createHash as createHash2 } from "node:crypto";
+import { homedir as homedir2 } from "node:os";
+import { join as join2 } from "node:path";
 var DEFAULT_WAIT_DEADLINE_MS = 8 * 60 * 6e4;
 var MAX_WAIT_DEADLINE_MS = 7 * 24 * 60 * 6e4;
 var WAIT_STEER_GRACE_MS = 5 * 6e4;
@@ -21610,7 +21733,7 @@ var WAIT_ESCALATION_KV_KEY = "wait-validator.escalation";
 var LIVENESS_MARKER_FILENAME = "wait-validator.liveness";
 var LIVENESS_ALERT_FLAG_FILENAME = "wait-validator.alerted";
 function waitValidatorStateDir() {
-  return process.env.BB_COLLAB_VALIDATOR_STATE_DIR ?? join(homedir(), ".bb", "bb-collab");
+  return process.env.BB_COLLAB_VALIDATOR_STATE_DIR ?? join2(homedir2(), ".bb", "bb-collab");
 }
 function isPlainObject2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -21952,12 +22075,12 @@ async function runArchiveSweep(bb, db, projectId, apply = false, now2 = Date.now
 // src/checkout-divergence.ts
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, join as join2, resolve } from "node:path";
+import { dirname, join as join3, resolve } from "node:path";
 function readRef(gitDirs, ref) {
   for (const gitDir of gitDirs) {
-    const looseRef = join2(gitDir, ref);
+    const looseRef = join3(gitDir, ref);
     if (existsSync(looseRef)) return readFileSync(looseRef, "utf8").trim() || null;
-    const packedRefs = join2(gitDir, "packed-refs");
+    const packedRefs = join3(gitDir, "packed-refs");
     if (!existsSync(packedRefs)) continue;
     for (const line of readFileSync(packedRefs, "utf8").split("\n")) {
       const [sha, name] = line.trim().split(" ");
@@ -21967,25 +22090,25 @@ function readRef(gitDirs, ref) {
   return null;
 }
 function resolveGitDir(checkoutRoot) {
-  const dotGit = join2(checkoutRoot, ".git");
+  const dotGit = join3(checkoutRoot, ".git");
   if (!existsSync(dotGit)) return null;
   if (statSync(dotGit).isDirectory()) return dotGit;
   const marker = readFileSync(dotGit, "utf8").trim();
   return marker.startsWith("gitdir:") ? resolve(checkoutRoot, marker.slice("gitdir:".length).trim()) : null;
 }
 function commonGitDir(gitDir) {
-  const commondir = join2(gitDir, "commondir");
+  const commondir = join3(gitDir, "commondir");
   return existsSync(commondir) ? resolve(gitDir, readFileSync(commondir, "utf8").trim()) : gitDir;
 }
 function readHead(gitDir, commonDir) {
-  const head = readFileSync(join2(gitDir, "HEAD"), "utf8").trim();
+  const head = readFileSync(join3(gitDir, "HEAD"), "utf8").trim();
   if (!head.startsWith("ref: ")) return head || null;
   return readRef([gitDir, commonDir], head.slice("ref: ".length));
 }
 function findCheckoutRoot(startPath) {
   let current = resolve(startPath);
   while (true) {
-    if (existsSync(join2(current, ".git"))) return current;
+    if (existsSync(join3(current, ".git"))) return current;
     const parent = dirname(current);
     if (parent === current) return null;
     current = parent;
@@ -22031,7 +22154,7 @@ function readCheckoutDivergence(checkoutRoot) {
 
 // server.ts
 import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync2, rmSync, statSync as statSync2, writeFileSync } from "node:fs";
-import { basename, dirname as dirname2, isAbsolute, join as join3, relative, sep } from "node:path";
+import { basename, dirname as dirname2, isAbsolute, join as join4, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 var projectIdSchema = external_exports.string().trim().min(1).max(256);
 var mutationReceiptSchema = external_exports.object({
@@ -22512,8 +22635,8 @@ async function applyLiveCachedConsumerRollout(bb, db, input, cliDeps, cliContext
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "archive-sweep", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, archive-sweep, cached-consumer-rollout, wait-register, wait-list, or wait-validator");
+  if (!command || !["doctor", "export", "apply", "archive-sweep", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, archive-sweep, cached-consumer-rollout, wait-register, wait-list, wait-validator, or stall-guard");
   }
   if (command === "wait-validator") {
     const unknown3 = args.find((arg) => arg !== "--cycle");
@@ -22535,6 +22658,39 @@ async function runCli(db, bb, argv, ctx, deps) {
       return cliResult({
         outcome: "INTERNAL_ERROR",
         subject: "wait-validator",
+        expected: 1,
+        attempted: 0,
+        verified: 0,
+        message: error48 instanceof Error ? error48.message : String(error48)
+      });
+    }
+  }
+  if (command === "stall-guard") {
+    const projectFlag = args.indexOf("--project");
+    const projectId2 = parseFlag(args, "--project");
+    const expectedLength = projectFlag < 0 ? 1 : 3;
+    const unknown3 = args.find((arg) => arg !== "--cycle" && arg !== "--project" && arg !== projectId2);
+    if (unknown3 || args.filter((arg) => arg === "--cycle").length !== 1 || args.filter((arg) => arg === "--project").length > 1 || args.length !== expectedLength) {
+      return invalidCli(`unexpected argument ${unknown3 ?? "duplicate or malformed flag"}`);
+    }
+    if (!args.includes("--cycle")) return invalidCli("--cycle is required: the stall guard runs exactly one durable cycle per invocation");
+    if (projectId2 === "") return invalidCli("--project PROJECT_ID must be supplied once with a value");
+    try {
+      await deps.watcher.poll();
+      const summary = await deps.stallGuardCycle(projectId2 ?? void 0);
+      return cliResult({
+        outcome: "OK",
+        subject: "stall-guard",
+        expected: summary.observed,
+        attempted: summary.attempted,
+        verified: summary.verified,
+        message: "stall-guard cycle complete",
+        evidence: summary
+      });
+    } catch (error48) {
+      return cliResult({
+        outcome: "INTERNAL_ERROR",
+        subject: "stall-guard",
         expected: 1,
         attempted: 0,
         verified: 0,
@@ -22789,6 +22945,55 @@ ${thread.titleFallback ?? ""}`);
       openLaneViews(db, Date.now(), operatorWaits)
     );
   };
+  const steerRole = async (role) => {
+    if (!db) return false;
+    const expectedHolder = {
+      project_id: role.projectId,
+      role_id: role.roleId,
+      role_generation: role.roleGeneration,
+      execution_attempt_id: role.executionAttemptId,
+      thread_id: role.threadId
+    };
+    let holders;
+    try {
+      holders = readRoleHolderStates(db).filter(
+        (holder) => holder.project_id === role.projectId && holder.role_id === role.roleId && holder.role_generation === role.roleGeneration && holder.execution_attempt_id === role.executionAttemptId
+      );
+    } catch (error48) {
+      warnRoleLiveness(expectedHolder, `holder=unknown error=${String(error48)}`);
+      return false;
+    }
+    if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) {
+      warnRoleLiveness(expectedHolder, `holderMatches=${holders.length} observedThread=${holders[0]?.thread_id ?? "null"}`);
+      return false;
+    }
+    let thread;
+    try {
+      thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
+    } catch (error48) {
+      warnRoleLiveness(holders[0], `liveness=unknown error=${String(error48)}`);
+      return false;
+    }
+    const refusal2 = roleThreadRefusal(holders[0], thread, true);
+    if (refusal2) {
+      warnRoleLiveness(holders[0], refusal2);
+      return false;
+    }
+    roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
+    await bb.sdk.threads.send({
+      threadId: holders[0].thread_id,
+      mode: "steer",
+      input: [
+        {
+          type: "text",
+          visibility: "agent-only",
+          text: `Wrongful idle: queue head ${role.queueHeadId} is startable. Inspect the queue and act or record the blocker.`,
+          mentions: []
+        }
+      ]
+    });
+    return true;
+  };
   const watcher = createLaneWatcher({
     readLanes: () => db ? readLaneStates(db) : [],
     readRoleHolders: () => db ? readRoleHolderStates(db) : [],
@@ -22857,57 +23062,24 @@ ${thread.titleFallback ?? ""}`);
         ]
       });
     },
-    steerRole: async (role) => {
-      if (!db) return false;
-      const expectedHolder = {
-        project_id: role.projectId,
-        role_id: role.roleId,
-        role_generation: role.roleGeneration,
-        execution_attempt_id: role.executionAttemptId,
-        thread_id: role.threadId
-      };
-      let holders;
-      try {
-        holders = readRoleHolderStates(db).filter(
-          (holder) => holder.project_id === role.projectId && holder.role_id === role.roleId && holder.role_generation === role.roleGeneration && holder.execution_attempt_id === role.executionAttemptId
-        );
-      } catch (error48) {
-        warnRoleLiveness(expectedHolder, `holder=unknown error=${String(error48)}`);
-        return false;
-      }
-      if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) {
-        warnRoleLiveness(expectedHolder, `holderMatches=${holders.length} observedThread=${holders[0]?.thread_id ?? "null"}`);
-        return false;
-      }
-      let thread;
-      try {
-        thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
-      } catch (error48) {
-        warnRoleLiveness(holders[0], `liveness=unknown error=${String(error48)}`);
-        return false;
-      }
-      const refusal2 = roleThreadRefusal(holders[0], thread, true);
-      if (refusal2) {
-        warnRoleLiveness(holders[0], refusal2);
-        return false;
-      }
-      roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
-      await bb.sdk.threads.send({
-        threadId: holders[0].thread_id,
-        mode: "steer",
-        input: [
-          {
-            type: "text",
-            visibility: "agent-only",
-            text: `Wrongful idle: queue head ${role.queueHeadId} is startable. Inspect the queue and act or record the blocker.`,
-            mentions: []
-          }
-        ]
-      });
-      return true;
-    }
+    steerRole
   });
   await watcher.recover().catch((error48) => bb.log.error(`lane continuation recovery failed: ${String(error48)}`));
+  const stallGuardCycle = createStallGuardCycle({
+    readRoleHolders: () => db ? readRoleHolderStates(db) : [],
+    readRoleScopes,
+    readArtifact: async (holder) => {
+      const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
+      if (thread.projectId !== holder.project_id || !thread.environmentId) return { outcome: "absent" };
+      const result2 = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
+      return result2.outcome === "unavailable" ? null : result2;
+    },
+    wakeRole: (role) => watcher.wakeRole(role),
+    persistence: {
+      read: () => bb.storage.kv.get(STALL_GUARD_KV_KEY),
+      write: (state) => bb.storage.kv.set(STALL_GUARD_KV_KEY, state)
+    }
+  });
   const observe = (payload) => {
     const { id: id2, status } = threadEventStatus(payload);
     return watcher.observe(id2, status);
@@ -22941,8 +23113,8 @@ ${thread.titleFallback ?? ""}`);
   bb.background.schedule("wait-validator-liveness", "*/5 * * * *", async () => {
     try {
       const stateDir = waitValidatorStateDir();
-      const markerPath = join3(stateDir, LIVENESS_MARKER_FILENAME);
-      const flagPath = join3(stateDir, LIVENESS_ALERT_FLAG_FILENAME);
+      const markerPath = join4(stateDir, LIVENESS_MARKER_FILENAME);
+      const flagPath = join4(stateDir, LIVENESS_ALERT_FLAG_FILENAME);
       let markerAtMs = null;
       try {
         const parsed = Number(readFileSync2(markerPath, "utf8").trim());
@@ -22966,6 +23138,36 @@ ${thread.titleFallback ?? ""}`);
       }
     } catch (error48) {
       bb.log.warn(`wait-validator liveness check failed: ${String(error48)}`);
+    }
+  });
+  bb.background.schedule("stall-guard-liveness", "*/5 * * * *", async () => {
+    try {
+      const stateDir = stallGuardStateDir();
+      const markerPath = join4(stateDir, STALL_GUARD_LIVENESS_MARKER_FILENAME);
+      const flagPath = join4(stateDir, STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME);
+      let markerAtMs = null;
+      try {
+        const parsed = Number(readFileSync2(markerPath, "utf8").trim());
+        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync2(markerPath).mtimeMs;
+      } catch {
+        markerAtMs = null;
+      }
+      const configuredStaleMs = Number(process.env.BB_COLLAB_STALL_GUARD_LIVENESS_STALE_MS);
+      const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync2(flagPath));
+      if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
+      if (decision === "alert-once") {
+        mkdirSync(stateDir, { recursive: true });
+        try {
+          writeFileSync(flagPath, String(Date.now()), { flag: "wx" });
+        } catch {
+          return;
+        }
+        bb.log.error("stall-guard liveness marker is stale: host launchd supervision failed; operator attention required");
+        bb.realtime.publish("stall-guard", { liveness: "stale", alert: "operator-once" });
+      }
+    } catch (error48) {
+      bb.log.warn(`stall-guard liveness check failed: ${String(error48)}`);
     }
   });
   bb.background.schedule("sentinel-wake-floor", "0 * * * *", async () => {
@@ -23039,6 +23241,7 @@ ${thread.titleFallback ?? ""}`);
       return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) }));
     },
     escalationCycle,
+    stallGuardCycle: (projectId) => stallGuardCycle.cycle(projectId),
     archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply),
     readCheckoutDivergence: readDiagnosticDivergence
   };
@@ -23280,6 +23483,11 @@ ${thread.titleFallback ?? ""}`);
         name: "wait-validator",
         summary: "Run one durable wait-validator cycle (host-supervised seam)",
         usage: "bb collab wait-validator --cycle"
+      },
+      {
+        name: "stall-guard",
+        summary: "Run one succession-safe stall-guard cycle (host-supervised seam)",
+        usage: "bb collab stall-guard --cycle --project PROJECT_ID"
       },
       {
         name: "archive-sweep",
