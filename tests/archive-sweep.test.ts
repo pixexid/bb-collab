@@ -26,6 +26,7 @@ function fixture({ activateArchiveChildOnSecondList = false } = {}) {
     idle("bound-parent"),
     idle("bound-holder", { parentThreadId: "bound-parent" }),
     idle("thr_b94i3csnme"),
+    idle("thr_bpzjyqg7ys"),
     idle("open-pr", { environmentId: "env-pr" }),
     idle("open-pr-parent"),
     idle("open-pr-child", { parentThreadId: "open-pr-parent", environmentId: "env-pr" }),
@@ -93,6 +94,14 @@ describe("thread archive sweep", () => {
     expect(result.archivableThreadIds).not.toContain("thr_b94i3csnme");
     expect(result.archivedThreadIds).not.toContain("thr_b94i3csnme");
     expect(host.harness.inspection.sdk.callsTo("threads.archive")).not.toContainEqual([{ threadId: "thr_b94i3csnme" }]);
+    db.close();
+  });
+
+  it("seated Sentinel idle past threshold with no attempts is absent from archivableThreadIds", async () => {
+    const { db, host } = fixture();
+    process.env.BB_COLLAB_ARCHIVE_IDLE_H = "24";
+    const result = await runArchiveSweep(host.bb, db, PROJECT_ID, false, now);
+    expect(result.archivableThreadIds).not.toContain("thr_bpzjyqg7ys");
     db.close();
   });
 

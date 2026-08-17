@@ -1095,6 +1095,18 @@ export default async function plugin(bb: BbPluginApi) {
     }
   });
 
+  bb.background.schedule("sentinel-wake-floor", "0 * * * *", async () => {
+    try {
+      await bb.sdk.threads.send({
+        threadId: "thr_bpzjyqg7ys",
+        mode: "queue-if-active",
+        input: [{ type: "text", visibility: "agent-only", text: "Hourly Sentinel health check: verify the fleet against canonical surfaces and report any drift or blocker.", mentions: [] }],
+      });
+    } catch (error) {
+      bb.log.warn(`sentinel-wake-floor failed: ${String(error)}`);
+    }
+  });
+
   // This is deliberately a report-only schedule. Archive is available only
   // through the explicit collab archive-sweep --apply command below.
   bb.background.schedule("thread-archive-sweep", "0 * * * *", async () => {

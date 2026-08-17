@@ -21826,7 +21826,7 @@ function livenessDecision(state, alerted) {
 // src/archive-sweep.ts
 var DEFAULT_ARCHIVE_SWEEP_IDLE_HOURS = 24;
 var THREAD_LIST_LIMIT = 1e3;
-var LIVE_SEAT_ALLOWLIST = /* @__PURE__ */ new Map([["proj_a8zzfsx36j", /* @__PURE__ */ new Set(["thr_b94i3csnme"])]]);
+var LIVE_SEAT_ALLOWLIST = /* @__PURE__ */ new Map([["proj_a8zzfsx36j", /* @__PURE__ */ new Set(["thr_b94i3csnme", "thr_bpzjyqg7ys"])]]);
 function protectedThreadIds(db, projectId) {
   const attemptCount = db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ?").get(projectId)?.count;
   if (!Number.isInteger(attemptCount) || attemptCount === 0) throw new Error("execution attempts are unavailable or empty");
@@ -22864,6 +22864,17 @@ ${thread.titleFallback ?? ""}`);
       }
     } catch (error48) {
       bb.log.warn(`wait-validator liveness check failed: ${String(error48)}`);
+    }
+  });
+  bb.background.schedule("sentinel-wake-floor", "0 * * * *", async () => {
+    try {
+      await bb.sdk.threads.send({
+        threadId: "thr_bpzjyqg7ys",
+        mode: "queue-if-active",
+        input: [{ type: "text", visibility: "agent-only", text: "Hourly Sentinel health check: verify the fleet against canonical surfaces and report any drift or blocker.", mentions: [] }]
+      });
+    } catch (error48) {
+      bb.log.warn(`sentinel-wake-floor failed: ${String(error48)}`);
     }
   });
   bb.background.schedule("thread-archive-sweep", "0 * * * *", async () => {
