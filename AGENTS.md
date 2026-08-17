@@ -1,9 +1,9 @@
 # bb-collab repository contract
 
-CONTRACT_VERSION: 17
+CONTRACT_VERSION: 18
 
 This repository contains the founding contract and the implemented foundation
-through contract v17/schema v11: a single SQLite store with migrations, resolver,
+through contract v18/schema v11: a single SQLite store with migrations, resolver,
 state-event and mutation-receipt, deterministic export, and read-only doctor
 seams, plus WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
 Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
@@ -74,10 +74,13 @@ Changing version text alone is not a migration. A zero-work result is not a
 successful apply unless zero expected work, zero attempted work and zero
 verified work are all proven.
 
-Contract v17/schema v11 requires all four cached consumers to reread the
-one-request receipt, authorized-approver registry/attestation,
-mutation/export/evidence, role IDs/scoping, and refusal contract or refuse
-contract v16/schema v11.
+Contract v18/schema v11 requires exactly four production cached consumers: the
+registered RPC `doctor` handler, the CLI `doctor` dispatcher, and the two named
+production live-project clone validations. Each rereads v18 or refuses the
+stale-v17 policy with `INVALID_INPUT`; expected, attempted, and verified must
+all be 4. The v18 receipt is the only current receipt: missing or v17 receipt
+evidence is unknown and fail-closed, with no automatic v17 receipt migration
+or write.
 An adopted operator_only Decision registers approverId=orchestrator:bb-collab
 with the exact ten derived mutation classes, including config_revision,
 work_item_create, work_item_transition and
@@ -89,7 +92,7 @@ one-release v9-to-v10 re-adoption. Historical contract v15 left the exact
 ten-class allowlist unchanged; the already-bounded v11 nine-class repair
 remains readable for authority maintenance, but does not authorize
 `work_item_transition`. Malformed, reordered, subset, extra, v9, or other
-arbitrary sets refuse at attestation and apply. This v17 change is a semantic
+arbitrary sets refuse at attestation and apply. The v17 change was a semantic
 contract bump for the director/orchestrator split: `CONTRACT_VERSION` and
 `contractDigest` change; `SCHEMA_VERSION`, schemaDigest and migrations remain
 unchanged, and all four cached consumers emit a durable reread/refusal rollout
@@ -102,6 +105,13 @@ unmanaged canonical environment.
 Every later director generation requires the existing managed, isolated
 worktree and exact source/environment checks; the exemption is not general,
 cannot admit writing, and future succession remains receipt-gated.
+
+Contract v18 corrects only the cached-consumer rollout mechanism. Its receipt
+is produced after the v18 `dist` is live through the reloaded plugin under the
+same live provenance; this one self-gating repair is acceptable because no
+prior v18 receipt can exist before the repair lands. Doctor must report
+4/4/4 VERIFIED from LIVE STATE for v18; merge, suite, review, or a v17 receipt
+does not close the gate.
 
 ## Delegation and lane obligations
 

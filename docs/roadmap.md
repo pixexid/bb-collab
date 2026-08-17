@@ -41,6 +41,14 @@ This slice does not change the canonical contract or schema and does not invoke
 the cached-consumer bump test.
 #79 remains a separate follow-up slice.
 
+Issue #122 is the bounded v18 cached-consumer repair. Its exit condition is a
+reloaded v18 plugin whose doctor reports 4/4/4 VERIFIED from LIVE STATE for
+the four corrected production consumers; merge, suite, and review are not
+closure. The v18 receipt is produced after that dist is live under the same
+provenance, with the one self-gating repair accepted because no prior v18
+receipt can establish it. Missing or v17 receipt evidence stays unknown; no
+automatic v17 receipt migration/write is part of this slice.
+
 ## Founding documentation
 
 1. Freeze the contract, threat model, import manifest and evidence links.
