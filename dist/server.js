@@ -22022,10 +22022,15 @@ function unavailableRoleFactReader(serverId) {
     version: unavailable
   };
 }
-function isLiveRoleEvent(value) {
+function isLiveRoleEventScope(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const scope = value;
+  return scope.kind === "thread" || scope.kind === "turn" && typeof scope.turnId === "string";
+}
+function isLiveRoleEvent(value, threadId) {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const event = value;
-  return typeof event.id === "string" && event.id.trim().length > 0 && typeof event.seq === "number" && Number.isSafeInteger(event.seq) && event.seq > 0 && typeof event.type === "string" && event.type.trim().length > 0 && typeof event.data === "object" && event.data !== null && !Array.isArray(event.data);
+  return event.threadId === threadId && typeof event.id === "string" && event.id.trim().length > 0 && typeof event.seq === "number" && Number.isSafeInteger(event.seq) && event.seq > 0 && typeof event.type === "string" && event.type.trim().length > 0 && typeof event.data === "object" && event.data !== null && !Array.isArray(event.data) && isLiveRoleEventScope(event.scope) && typeof event.createdAt === "number" && Number.isSafeInteger(event.createdAt) && event.createdAt >= 0;
 }
 async function readLiveRoleEvents(sdk, threadId) {
   const events = [];
@@ -22036,7 +22041,7 @@ async function readLiveRoleEvents(sdk, threadId) {
       limit: String(ROLE_CONTEXT_EVENT_PAGE_LIMIT),
       ...afterSeq ? { afterSeq } : {}
     });
-    if (!Array.isArray(page) || !page.every(isLiveRoleEvent)) throw new Error("live role event facts are malformed");
+    if (!Array.isArray(page) || !page.every((event) => isLiveRoleEvent(event, threadId))) throw new Error("live role event facts are malformed");
     if (page.length > ROLE_CONTEXT_EVENT_PAGE_LIMIT || events.length + page.length > MAX_ROLE_CONTEXT_EVENTS) {
       throw new Error("live role event facts exceed the bounded reader limit");
     }

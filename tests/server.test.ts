@@ -6442,13 +6442,33 @@ describe("bb-collab plugin boundary", () => {
     expect(eventPages[1]).toEqual({ threadId: ROLE_THREAD_ID, afterSeq: "256", limit: "256" });
   });
 
-  it("refuses a malformed non-final live role event without consuming its receipt", async () => {
-    const host = await loadedHost(PROJECT_ID, (facts) => {
-      facts.events.push(
-        { id: "event-malformed", seq: 5, type: "thread/updated", data: null as never },
-        { id: "event-after-malformed", seq: 6, type: "thread/updated", data: {} },
-      );
-    });
+  it("refuses a malformed non-final live role event envelope without consuming its receipt", async () => {
+    const host = await loadedHost();
+    host.harness.sdk.stub("threads.events.list", (async () => [
+      {
+        id: ROLE_REQUEST_EVENT_ID,
+        threadId: ROLE_THREAD_ID,
+        seq: 1,
+        type: "client/turn/requested",
+        scope: { kind: "thread" },
+        data: {
+          requestId: "request-1",
+          execution: {
+            model: ROLE_PROFILE.model,
+            reasoningLevel: ROLE_PROFILE.reasoningLevel,
+            permissionMode: ROLE_PROFILE.permissionMode,
+            serviceTier: ROLE_PROFILE.serviceTier,
+            source: "client/turn/requested",
+          },
+        },
+        createdAt: 1,
+      },
+      { id: "event-accepted", threadId: ROLE_THREAD_ID, seq: 2, type: "turn/input/accepted", scope: { kind: "thread" }, data: { clientRequestId: "request-1", providerThreadId: "provider-thread-1" }, createdAt: 2 },
+      { id: "event-started", threadId: ROLE_THREAD_ID, seq: 3, type: "turn/started", scope: { kind: "turn", turnId: "turn-1" }, data: { providerThreadId: "provider-thread-1" }, createdAt: 3 },
+      { id: ROLE_COMPLETION_EVENT_ID, threadId: ROLE_THREAD_ID, seq: 4, type: "turn/completed", scope: { kind: "turn", turnId: "turn-1" }, data: { providerThreadId: "provider-thread-1", status: "completed" }, createdAt: 4 },
+      { id: "event-malformed", threadId: "thread-foreign", seq: 5, type: "thread/updated", scope: null, data: {}, createdAt: Number.NaN },
+      { id: "event-after-malformed", threadId: ROLE_THREAD_ID, seq: 6, type: "thread/updated", scope: { kind: "thread" }, data: {}, createdAt: 6 },
+    ]) as never);
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     const unsigned = { ...qualificationRequest(fenceToken, { idempotencyKey: "live-role-event-malformed" }), candidateHead: CANDIDATE_SHA, operatorReceiptId: null };
     const receipt = persistInterimOperatorReceipt(db, {
