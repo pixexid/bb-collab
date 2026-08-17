@@ -28,7 +28,7 @@ legacy NULL marker refuses, while an exact authorized replay of its already
 committed mutation returns the recorded result without revalidating consumed
 receipt provenance. Historical operator-receipt mutation is dead letter: no
 historical receipt row is modified.
-The plugin is activated against live project authority: first activated on 2026-08-15 during the resolver-wiring activation (operator-authorized console exception), reloaded at 2026-08-16T14:06:56-0700 by the sentinel under supervisor authorization (bb plugin reload bb-collab) against merge dff355c3d203 (PR #121, contract v17 director role split), with an earlier same-day reload by the director seat (thr_gsb7m77ciz). This sentence previously stated the plugin had never been installed, reloaded, or activated; that statement was already inaccurate from 2026-08-15 and stood uncorrected for approximately one day. Reload evidence is actor-recorded; bb records no reload history. The complete decision is in
+The GH-145 evidence capture from `bb plugin logs bb-collab` recorded 96 plugin load events from 2026-08-13T22:20:14Z onward, including 69 before 2026-08-15; the command is a rolling surface, so these are the captured historical counts. `activated against live project authority` has no log-readable definition and is restated precisely: 2026-08-15 is the actor-recorded date of the resolver-wiring activation (operator-authorized console exception), not the first load. The plugin was reloaded at 2026-08-16T14:06:56-0700 by the sentinel under supervisor authorization (bb plugin reload bb-collab) against merge dff355c3d203 (PR #121, contract v17 director role split), with an earlier same-day reload by the director seat (thr_gsb7m77ciz); the plugin-log load event at 2026-08-16T21:06:57.608Z corroborates the sentinel reload at the adjacent one-second timestamp. This sentence previously stated the plugin had never been installed, reloaded, or activated (inaccurate from 2026-08-15, uncorrected for approximately one day) and also stated that bb records no reload history; that was false — the plugin-log artifact is reload/load history. Reload authorization and context remain actor-recorded, and a load log proves only that a load happened, never what code loaded: any future reload claim must correlate the load-event timestamp against the checkout SHA and an independent resolver read-back. The complete decision is in
 [ADR 0001](docs/adr/0001-founding-contract.md); the threat boundary is in
 [the threat model](docs/threat-model.md); import and issue disposition are in
 [the import manifest](docs/import-manifest.md); and dependency order is in
@@ -192,6 +192,12 @@ the gate.
   defect follows the existing revert path, otherwise findings become follow-up
   work. Tier-C documentation, mechanical edits and additive tests use local
   verification and CI only.
+- Every reviewer lane dispatch carries an explicit SUPPORTED profile naming
+  provider or harness, model, reasoning level, service tier, permission mode,
+  and visibility. The known-good Tier-A default is
+  `codex/gpt-5.6-sol/high`; a bare model name that resolves to an unsupported
+  tier is a spawn defect, not a review result. If the requested profile cannot
+  execute, stop as BLOCKED and do not claim a review verdict.
 - Every PR body contains one `Review tier: A|B|C` declaration. The tier is
   derived from touched surfaces, and wrong-tiering is a review finding. The
   stateless check in `scripts/check-review-tier.mjs` only validates metadata;
