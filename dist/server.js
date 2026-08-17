@@ -13786,9 +13786,9 @@ import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 20;
+var CONTRACT_VERSION = 21;
 var SCHEMA_VERSION = 12;
-var PREVIOUS_CONTRACT_VERSION = 19;
+var PREVIOUS_CONTRACT_VERSION = 20;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
 var PREVIOUS_SCHEMA_VERSION = 11;
@@ -14407,12 +14407,12 @@ var CACHED_CONSUMERS = [
 ];
 var CACHED_CONSUMER_ROLLOUT_POLICY = {
   class: "operator_receipts.consumed_replay_provenance",
-  staleV19Receipt: "unknown",
+  staleV20Receipt: "unknown",
   currentNewLegacyApply: "OPERATOR_RECEIPT_INVALID",
-  requiredV20ConsumedLegacyReplay: "OK",
+  requiredV21ConsumedLegacyReplay: "OK",
   refusal: "OPERATOR_RECEIPT_INVALID"
 };
-async function assembleV20CachedConsumerRolloutEvidence(input) {
+async function assembleV21CachedConsumerRolloutEvidence(input) {
   const probes = [
     ["server.rpcContract", input.rpcContract],
     ["server.collabCli", input.collabCli],
@@ -14420,7 +14420,7 @@ async function assembleV20CachedConsumerRolloutEvidence(input) {
     ["src/foundation.newLegacyApplyProvenanceProbe", input.newLegacyApplyProvenance]
   ];
   if (probes.some(([, probe]) => typeof probe !== "function")) {
-    throw new Error("cached-consumer v20 rollout evidence requires execution from all four consumers");
+    throw new Error("cached-consumer v21 rollout evidence requires execution from all four consumers");
   }
   const executed = await Promise.all(probes.map(async ([name, probe]) => ({
     name,
@@ -14430,10 +14430,10 @@ async function assembleV20CachedConsumerRolloutEvidence(input) {
   const consumedLegacyReplay = executed[2].consumedLegacyReplay;
   const newApply = executed[3].newApplyRefusal;
   if (reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || consumedLegacyReplay?.outcome !== "OK" || newApply?.outcome !== "OPERATOR_RECEIPT_INVALID") {
-    throw new Error("cached-consumer v20 rollout evidence requires four rereads, consumed legacy replay, and the current new-apply refusal");
+    throw new Error("cached-consumer v21 rollout evidence requires four rereads, consumed legacy replay, and the current new-apply refusal");
   }
   const durableRefJson = canonicalJson({
-    kind: "cached_consumer_v20_rollout_receipt",
+    kind: "cached_consumer_v21_rollout_receipt",
     reread,
     consumedLegacyReplay: {
       outcome: consumedLegacyReplay.outcome
@@ -14443,16 +14443,16 @@ async function assembleV20CachedConsumerRolloutEvidence(input) {
     }
   });
   return {
-    evidenceId: "cached-consumer-v20-rollout-receipt",
+    evidenceId: "cached-consumer-v21-rollout-receipt",
     evidenceKind: "release",
     sourceKind: "release",
     sourceRef: "live-plugin:dist/server.js",
     executionAttemptId: null,
     contentDigest: sha256(durableRefJson),
-    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v20-rollout-receipt", redacted: true }),
+    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v21-rollout-receipt", redacted: true }),
     durableRefJson,
     relationKind: "supporting",
-    relation: { purpose: "cached-consumer-v20-rollout" }
+    relation: { purpose: "cached-consumer-v21-rollout" }
   };
 }
 function cachedConsumerRolloutEvidence(observations) {
@@ -14499,7 +14499,7 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
     `SELECT evidence_kind, source_kind, source_ref, execution_attempt_id, content_digest,
             redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest
      FROM evidence_artifacts
-     WHERE project_id = ? AND evidence_id = 'cached-consumer-v20-rollout-receipt'`
+     WHERE project_id = ? AND evidence_id = 'cached-consumer-v21-rollout-receipt'`
   ).get(projectId));
   if (!row) return unknownCachedConsumerRolloutEvidence();
   try {
@@ -14509,7 +14509,7 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
     assertRedactedEvidence(durableRef, "cached-consumer rollout durable reference");
     const expectedIdentity = sha256(canonicalJson({
       projectId,
-      evidenceId: "cached-consumer-v20-rollout-receipt",
+      evidenceId: "cached-consumer-v21-rollout-receipt",
       evidenceKind: row.evidence_kind,
       sourceKind: row.source_kind,
       sourceRef: row.source_ref,
@@ -14522,7 +14522,7 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
     const receipt = durableRef;
     if (!Array.isArray(receipt.reread?.observations)) return unknownCachedConsumerRolloutEvidence();
     const reread = cachedConsumerRolloutEvidence(receipt.reread.observations);
-    if (receipt.kind !== "cached_consumer_v20_rollout_receipt" || receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest || reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || receipt.consumedLegacyReplay?.outcome !== "OK" || receipt.newApplyGuard?.nullProvenance?.outcome !== "OPERATOR_RECEIPT_INVALID") return unknownCachedConsumerRolloutEvidence();
+    if (receipt.kind !== "cached_consumer_v21_rollout_receipt" || receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest || reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || receipt.consumedLegacyReplay?.outcome !== "OK" || receipt.newApplyGuard?.nullProvenance?.outcome !== "OPERATOR_RECEIPT_INVALID") return unknownCachedConsumerRolloutEvidence();
     return reread;
   } catch {
     return unknownCachedConsumerRolloutEvidence();
@@ -14649,7 +14649,7 @@ var contractDigest = sha256(canonicalJson({
     expected: 4,
     attempted: 4,
     verified: 4,
-    staleV19Receipt: CACHED_CONSUMER_ROLLOUT_POLICY
+    staleV20Receipt: CACHED_CONSUMER_ROLLOUT_POLICY
   },
   roleHolderEligibilityPolicy: {
     nativeWitnessMarker: "witness",
@@ -15459,8 +15459,8 @@ function validateConfig(value) {
   if (!["full", "auto", "accept-edits"].includes(config2.permissionMode)) {
     throw refusal("INVALID_INPUT", "config permissionMode is not a BB permission mode");
   }
-  if (!["visible", "hidden"].includes(config2.visibility)) {
-    throw refusal("INVALID_INPUT", "config visibility is not a BB visibility value");
+  if (config2.visibility !== "visible") {
+    throw refusal("INVALID_INPUT", "config visibility must be explicitly visible");
   }
   const extensions = config2.extensions;
   if (extensions !== void 0) {
@@ -15540,7 +15540,7 @@ function newApplyProvenanceRefusal(value) {
     return { outcome: error48 instanceof Refusal ? error48.data.code : "INTERNAL_ERROR" };
   }
 }
-function probeV20ConsumedLegacyReplay(db, projectId) {
+function probeV21ConsumedLegacyReplay(db, projectId) {
   const replay = asRow(db.prepare(
     `SELECT r.consumed_at_ms, r.consumed_event_sequence, m.committed_event_sequence,
             e.operator_receipt_id, m.outcome_json
@@ -15563,7 +15563,7 @@ function probeV20ConsumedLegacyReplay(db, projectId) {
   ).get(projectId));
   const outcome = replay ? JSON.parse(replay.outcome_json) : null;
   if (!replay || outcome?.outcome !== "OK") {
-    throw new Error("cached-consumer v20 replay proof requires an observed consumed legacy receipt");
+    throw new Error("cached-consumer v21 replay proof requires an observed consumed legacy receipt");
   }
   return {
     observedSchemaVersion: SCHEMA_VERSION,
@@ -15571,7 +15571,7 @@ function probeV20ConsumedLegacyReplay(db, projectId) {
     consumedLegacyReplay: { outcome: "OK" }
   };
 }
-function probeV20NewLegacyApplyProvenanceRefusal() {
+function probeV21NewLegacyApplyProvenanceRefusal() {
   const newApplyRefusal = newApplyProvenanceRefusal(null);
   return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION, newApplyRefusal };
 }
@@ -20540,7 +20540,7 @@ function decisionDoctorEvidence(db, projectId) {
   }
   return { unresolvedDecisions, issues, derivedHolds, artifactCount: artifacts.length, relationCount };
 }
-async function doctor(db, sdk, projectId) {
+async function doctor(db, sdk, projectId, checkoutDivergence) {
   if (!db) return unavailableResult(projectId, "canonical SQLite store is unavailable");
   if (!sdk) return result("BB_FACTS_UNAVAILABLE", projectId, 1, 0, 0, { message: "BB fact SDK is unavailable" });
   try {
@@ -20736,6 +20736,7 @@ async function doctor(db, sdk, projectId) {
         unresolvedAttempts,
         decisionIntegrity,
         cachedConsumers,
+        ...checkoutDivergence ? { checkoutDivergence } : {},
         schema: { version: SCHEMA_VERSION, migrationStatementIds: MIGRATIONS.map((_, index) => index), digest: schemaDigest, tables: schemaState.map((row) => row.name) }
       }
     });
@@ -22071,9 +22072,90 @@ async function runArchiveSweep(bb, db, projectId, apply = false, now2 = Date.now
   }
 }
 
+// src/checkout-divergence.ts
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { dirname, join as join3, resolve } from "node:path";
+function readRef(gitDirs, ref) {
+  for (const gitDir of gitDirs) {
+    const looseRef = join3(gitDir, ref);
+    if (existsSync(looseRef)) return readFileSync(looseRef, "utf8").trim() || null;
+    const packedRefs = join3(gitDir, "packed-refs");
+    if (!existsSync(packedRefs)) continue;
+    for (const line of readFileSync(packedRefs, "utf8").split("\n")) {
+      const [sha, name] = line.trim().split(" ");
+      if (name === ref) return sha ?? null;
+    }
+  }
+  return null;
+}
+function resolveGitDir(checkoutRoot) {
+  const dotGit = join3(checkoutRoot, ".git");
+  if (!existsSync(dotGit)) return null;
+  if (statSync(dotGit).isDirectory()) return dotGit;
+  const marker = readFileSync(dotGit, "utf8").trim();
+  return marker.startsWith("gitdir:") ? resolve(checkoutRoot, marker.slice("gitdir:".length).trim()) : null;
+}
+function commonGitDir(gitDir) {
+  const commondir = join3(gitDir, "commondir");
+  return existsSync(commondir) ? resolve(gitDir, readFileSync(commondir, "utf8").trim()) : gitDir;
+}
+function readHead(gitDir, commonDir) {
+  const head = readFileSync(join3(gitDir, "HEAD"), "utf8").trim();
+  if (!head.startsWith("ref: ")) return head || null;
+  return readRef([gitDir, commonDir], head.slice("ref: ".length));
+}
+function findCheckoutRoot(startPath) {
+  let current = resolve(startPath);
+  while (true) {
+    if (existsSync(join3(current, ".git"))) return current;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+function readCheckoutDivergence(checkoutRoot) {
+  const unavailable = { checkoutHead: null, originMainRef: null, behindCount: null, verdict: "unavailable", processGroupReap: "not-attempted" };
+  if (!checkoutRoot) return unavailable;
+  try {
+    const gitDir = resolveGitDir(checkoutRoot);
+    if (!gitDir) return unavailable;
+    const commonDir = commonGitDir(gitDir);
+    const checkoutHead = readHead(gitDir, commonDir);
+    const originMainRef = readRef([commonDir, gitDir], "refs/remotes/origin/main");
+    if (!checkoutHead || !originMainRef) return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable", processGroupReap: "not-attempted" };
+    let behindCount = null;
+    let processGroupReap = "not-attempted";
+    try {
+      const options = { cwd: checkoutRoot, encoding: "utf8", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" }, stdio: ["ignore", "pipe", "ignore"], timeout: 1e3, killSignal: "SIGKILL", detached: true };
+      const result2 = spawnSync("git", ["rev-list", "--count", `${checkoutHead}..${originMainRef}`], options);
+      if (typeof result2.pid === "number" && result2.pid > 0) {
+        try {
+          process.kill(-result2.pid, "SIGKILL");
+          processGroupReap = "reaped";
+        } catch (error48) {
+          if (error48.code === "ESRCH") processGroupReap = "absent";
+          else {
+            processGroupReap = "failed";
+            return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable", processGroupReap };
+          }
+        }
+      }
+      if (result2.error) throw result2.error;
+      const count = result2.stdout.trim();
+      if (/^\d+$/u.test(count)) behindCount = Number(count);
+    } catch {
+    }
+    return { checkoutHead, originMainRef, behindCount, verdict: checkoutHead === originMainRef ? "clean" : "diverged", processGroupReap };
+  } catch {
+    return unavailable;
+  }
+}
+
 // server.ts
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join as join3 } from "node:path";
+import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync2, rmSync, statSync as statSync2, writeFileSync } from "node:fs";
+import { basename, dirname as dirname2, isAbsolute, join as join4, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 var projectIdSchema = external_exports.string().trim().min(1).max(256);
 var mutationReceiptSchema = external_exports.object({
   projectId: projectIdSchema,
@@ -22481,7 +22563,7 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
 }
 async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false) {
   const parsed = applyRequestSchema.safeParse(input);
-  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v20-rollout-receipt")) {
+  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v21-rollout-receipt")) {
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
@@ -22489,6 +22571,23 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
 }
 function cachedConsumerRolloutRefusal(projectId, message) {
   return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message };
+}
+function resolvedPluginRoot(source) {
+  if (!source.resolved.startsWith("path:")) return null;
+  const root = source.resolved.slice("path:".length);
+  return root.length > 0 ? root : null;
+}
+async function isLiveCachedConsumerRolloutArtifact(moduleUrl, bb) {
+  try {
+    const artifactPath = fileURLToPath(new URL(moduleUrl));
+    const pluginRoot = resolvedPluginRoot(await bb.sdk.plugins.getSource({ pluginId: bb.pluginId }));
+    if (!pluginRoot || !isAbsolute(pluginRoot)) return false;
+    const relativeArtifactPath = relative(pluginRoot, artifactPath);
+    if (relativeArtifactPath.length === 0 || relativeArtifactPath === ".." || relativeArtifactPath.startsWith(`..${sep}`) || isAbsolute(relativeArtifactPath)) return false;
+    return basename(artifactPath) === "server.js" && basename(dirname2(artifactPath)) === "dist";
+  } catch {
+    return false;
+  }
 }
 function liveCachedConsumerReread(name, result2) {
   const cachedConsumers = result2.evidence?.cachedConsumers;
@@ -22504,14 +22603,14 @@ async function applyLiveCachedConsumerRollout(bb, db, input, cliDeps, cliContext
   if (request.operationClass !== "decision_disposition") {
     return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout requires a governed decision_disposition request");
   }
-  if (!import.meta.url.endsWith("/dist/server.js")) {
+  if (!await isLiveCachedConsumerRolloutArtifact(import.meta.url, bb)) {
     return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout requires the running dist/server.js plugin artifact");
   }
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
   try {
     const project = await bb.sdk.projects.get({ projectId: request.projectId });
     if (project.id !== request.projectId) return { outcome: "PROJECT_UNKNOWN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "live project identity does not match the rollout request" };
-    const evidence = await assembleV20CachedConsumerRolloutEvidence({
+    const evidence = await assembleV21CachedConsumerRolloutEvidence({
       rpcContract: async () => liveCachedConsumerReread("server.rpcContract", await bb.sdk.plugins.callRpc({
         pluginId: bb.pluginId,
         method: "doctor",
@@ -22521,8 +22620,8 @@ async function applyLiveCachedConsumerRollout(bb, db, input, cliDeps, cliContext
       collabCli: async () => liveCachedConsumerReread("server.collabCli", foundationResultSchema.parse(JSON.parse(
         (await runCli(db, bb, ["doctor", "--project", request.projectId], cliContext, cliDeps)).stdout
       ))),
-      consumedLegacyReplay: async () => probeV20ConsumedLegacyReplay(db, request.projectId),
-      newLegacyApplyProvenance: async () => probeV20NewLegacyApplyProvenanceRefusal()
+      consumedLegacyReplay: async () => probeV21ConsumedLegacyReplay(db, request.projectId),
+      newLegacyApplyProvenance: async () => probeV21NewLegacyApplyProvenanceRefusal()
     });
     const supplied = (request.decisionEvidence ?? []).filter((item) => item.evidenceId === evidence.evidenceId);
     if (supplied.length !== 1 || canonicalJson(supplied[0]) !== canonicalJson(evidence)) {
@@ -22692,10 +22791,13 @@ async function runCli(db, bb, argv, ctx, deps) {
   }
   const unknown2 = unexpectedFlags(args, ["--project"]);
   if (unknown2) return invalidCli(`unexpected flag ${unknown2}`);
-  if (command === "doctor") return cliResult(await doctor(db, bb.sdk, projectId));
+  if (command === "doctor") return cliResult(await doctor(db, bb.sdk, projectId, deps.readCheckoutDivergence()));
   return cliResult(exportFoundation(db, projectId));
 }
-async function plugin(bb) {
+async function plugin(bb, options = {}) {
+  const readDiagnosticDivergence = () => readCheckoutDivergence(
+    options.checkoutRoot === void 0 ? findCheckoutRoot(dirname2(fileURLToPath(import.meta.url))) : options.checkoutRoot
+  );
   const operatorPassphrase = bb.settings.define({
     operatorPassphrase: {
       type: "string",
@@ -22995,12 +23097,12 @@ ${thread.titleFallback ?? ""}`);
         await watcher.poll().catch((error48) => bb.log.warn(`lane poll failed: ${String(error48)}`));
         await escalationCycle.cycle().catch((error48) => bb.log.warn(`wait escalation failed: ${String(error48)}`));
         if (signal.aborted) break;
-        await new Promise((resolve) => {
+        await new Promise((resolve2) => {
           let timer;
           const done = () => {
             clearTimeout(timer);
             signal.removeEventListener("abort", done);
-            resolve();
+            resolve2();
           };
           timer = setTimeout(done, 1e3);
           signal.addEventListener("abort", done, { once: true });
@@ -23011,18 +23113,18 @@ ${thread.titleFallback ?? ""}`);
   bb.background.schedule("wait-validator-liveness", "*/5 * * * *", async () => {
     try {
       const stateDir = waitValidatorStateDir();
-      const markerPath = join3(stateDir, LIVENESS_MARKER_FILENAME);
-      const flagPath = join3(stateDir, LIVENESS_ALERT_FLAG_FILENAME);
+      const markerPath = join4(stateDir, LIVENESS_MARKER_FILENAME);
+      const flagPath = join4(stateDir, LIVENESS_ALERT_FLAG_FILENAME);
       let markerAtMs = null;
       try {
-        const parsed = Number(readFileSync(markerPath, "utf8").trim());
-        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync(markerPath).mtimeMs;
+        const parsed = Number(readFileSync2(markerPath, "utf8").trim());
+        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync2(markerPath).mtimeMs;
       } catch {
         markerAtMs = null;
       }
       const configuredStaleMs = Number(process.env.BB_COLLAB_LIVENESS_STALE_MS);
       const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
-      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync(flagPath));
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync2(flagPath));
       if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
       if (decision === "alert-once") {
         mkdirSync(stateDir, { recursive: true });
@@ -23041,18 +23143,18 @@ ${thread.titleFallback ?? ""}`);
   bb.background.schedule("stall-guard-liveness", "*/5 * * * *", async () => {
     try {
       const stateDir = stallGuardStateDir();
-      const markerPath = join3(stateDir, STALL_GUARD_LIVENESS_MARKER_FILENAME);
-      const flagPath = join3(stateDir, STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME);
+      const markerPath = join4(stateDir, STALL_GUARD_LIVENESS_MARKER_FILENAME);
+      const flagPath = join4(stateDir, STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME);
       let markerAtMs = null;
       try {
-        const parsed = Number(readFileSync(markerPath, "utf8").trim());
-        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync(markerPath).mtimeMs;
+        const parsed = Number(readFileSync2(markerPath, "utf8").trim());
+        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync2(markerPath).mtimeMs;
       } catch {
         markerAtMs = null;
       }
       const configuredStaleMs = Number(process.env.BB_COLLAB_STALL_GUARD_LIVENESS_STALE_MS);
       const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
-      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync(flagPath));
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync2(flagPath));
       if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
       if (decision === "alert-once") {
         mkdirSync(stateDir, { recursive: true });
@@ -23140,7 +23242,8 @@ ${thread.titleFallback ?? ""}`);
     },
     escalationCycle,
     stallGuardCycle: (projectId) => stallGuardCycle.cycle(projectId),
-    archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply)
+    archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply),
+    readCheckoutDivergence: readDiagnosticDivergence
   };
   bb.rpc.register(rpcContract, {
     lanes() {
@@ -23161,8 +23264,8 @@ ${thread.titleFallback ?? ""}`);
     async threadModels(input) {
       const entries = await Promise.all(input.threadIds.map(async (threadId) => {
         try {
-          const options = await bb.sdk.threads.defaultExecutionOptions({ threadId });
-          return [threadId, options ? { model: options.model, reasoning: options.reasoningLevel } : null];
+          const options2 = await bb.sdk.threads.defaultExecutionOptions({ threadId });
+          return [threadId, options2 ? { model: options2.model, reasoning: options2.reasoningLevel } : null];
         } catch {
           return [threadId, null];
         }
@@ -23198,7 +23301,7 @@ ${thread.titleFallback ?? ""}`);
       return { ok: true };
     },
     async doctor(input) {
-      return doctor(db, bb.sdk, input.projectId);
+      return doctor(db, bb.sdk, input.projectId, readDiagnosticDivergence());
     },
     async export(input) {
       return exportFoundation(db, input.projectId);
@@ -23367,7 +23470,7 @@ ${thread.titleFallback ?? ""}`);
       },
       {
         name: "cached-consumer-rollout",
-        summary: "Persist the live v20 cached-consumer rollout receipt (exact one-request receipt required)",
+        summary: "Persist the live v21 cached-consumer rollout receipt (exact one-request receipt required)",
         usage: "bb collab cached-consumer-rollout --project PROJECT_ID --request JSON"
       },
       {
@@ -23401,6 +23504,7 @@ ${thread.titleFallback ?? ""}`);
 export {
   plugin as default,
   foundationResultSchema,
+  isLiveCachedConsumerRolloutArtifact,
   readLiveRoleFactReader,
   rpcContract
 };
