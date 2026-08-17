@@ -3799,6 +3799,39 @@ describe("bb-collab plugin boundary", () => {
     expect(foreignDb.prepare("SELECT COUNT(*) AS count FROM project_config_heads").get()).toEqual({ count: 0 });
   });
 
+  it("validates historical linked actor receipts for canonical mutations", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
+    const bootstrap = applyWithFixtureReceipt(db, bootstrapRequest());
+    expect(bootstrap.outcome).toBe("OK");
+    const fenceToken = (bootstrap.evidence as { fenceToken: string }).fenceToken;
+    const receiptId = "historical-linked-actor";
+    const operatorReceiptId = "historical-operator-receipt";
+    const retirementCondition = "host-issued receipt get-bb/bb#1541";
+    // Regression gap: every existing test minted fresh receipts with null fields, whose digests validate under either computation; only a historical linked receipt exposes Phase B's omission.
+    const receiptDigest = sha256(canonicalJson({
+      projectId: PROJECT_ID,
+      receiptId,
+      actorKind: "fixture",
+      subjectId: receiptId,
+      roleId: null,
+      roleGeneration: null,
+      verificationState: "verified",
+      operatorReceiptId,
+      retirementCondition,
+    }));
+    db.prepare(
+      `INSERT INTO actor_receipts
+        (project_id, receipt_id, actor_kind, subject_id, role_id, role_generation,
+         verification_state, receipt_digest, issued_at_ms, operator_receipt_id, retirement_condition)
+       VALUES (?, ?, 'fixture', ?, NULL, NULL, 'verified', ?, ?, ?, ?)`,
+    ).run(PROJECT_ID, receiptId, receiptId, receiptDigest, Date.now(), operatorReceiptId, retirementCondition);
+
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, { actorReceiptId: receiptId }))).toMatchObject({ outcome: "OK" });
+    expect(db.prepare("SELECT receipt_digest FROM actor_receipts WHERE receipt_id = ?").get(receiptId)).toEqual({ receipt_digest: receiptDigest });
+  });
+
   it("reports canonical-store unavailability without attempting a write", () => {
     expect(applyFixtureMutation(null, bootstrapRequest())).toMatchObject({
       outcome: "CANONICAL_STORE_UNAVAILABLE",

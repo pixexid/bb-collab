@@ -33,6 +33,8 @@ export function seedVerifiedFixtureReceipt(
     subjectId?: string;
     roleId?: string | null;
     roleGeneration?: number | null;
+    operatorReceiptId?: string | null;
+    retirementCondition?: string | null;
   },
 ): void {
   const actorKind = input.actorKind ?? "fixture";
@@ -46,13 +48,15 @@ export function seedVerifiedFixtureReceipt(
       roleId: input.roleId ?? null,
       roleGeneration: input.roleGeneration ?? null,
       verificationState: "verified",
+      operatorReceiptId: input.operatorReceiptId ?? null,
+      retirementCondition: input.retirementCondition ?? null,
     }),
   );
   db.prepare(
     `INSERT INTO actor_receipts
       (project_id, receipt_id, actor_kind, subject_id, role_id, role_generation,
-       verification_state, receipt_digest, issued_at_ms)
-     VALUES (?, ?, ?, ?, ?, ?, 'verified', ?, ?)`,
+       verification_state, receipt_digest, issued_at_ms, operator_receipt_id, retirement_condition)
+     VALUES (?, ?, ?, ?, ?, ?, 'verified', ?, ?, ?, ?)`,
   ).run(
     input.projectId,
     input.receiptId,
@@ -62,6 +66,8 @@ export function seedVerifiedFixtureReceipt(
     input.roleGeneration ?? null,
     receiptDigest,
     Date.now(),
+    input.operatorReceiptId ?? null,
+    input.retirementCondition ?? null,
   );
 }
 
