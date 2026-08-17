@@ -2,7 +2,6 @@ import type { BbPluginApi } from "@bb/plugin-sdk";
 import { expect, it } from "vitest";
 import { readLiveRoleFactReader } from "../server.js";
 import {
-  DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION,
   MAX_ROLE_CONTEXT_EVENTS,
   resolveRoleContext,
   type ApplyRequest,
@@ -10,7 +9,6 @@ import {
 } from "../src/foundation.js";
 
 const PROJECT_ID = "proj_a8zzfsx36j";
-const THREAD_ID = DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.holderThreadId;
 
 type LiveEvent = RoleEventFact & { scope?: { turnId?: string } };
 
@@ -20,11 +18,11 @@ async function readJson<T>(baseUrl: string, path: string): Promise<T> {
   return await response.json() as T;
 }
 
-async function readAllEvents(baseUrl: string): Promise<LiveEvent[]> {
+async function readAllEvents(baseUrl: string, threadId: string): Promise<LiveEvent[]> {
   const events: LiveEvent[] = [];
   let afterSeq = 0;
   while (true) {
-    const page = await readJson<LiveEvent[]>(baseUrl, `/api/v1/threads/${THREAD_ID}/events?afterSeq=${afterSeq}&limit=256`);
+    const page = await readJson<LiveEvent[]>(baseUrl, `/api/v1/threads/${threadId}/events?afterSeq=${afterSeq}&limit=256`);
     events.push(...page);
     if (page.length < 256) return events;
     afterSeq = page.at(-1)!.seq;
@@ -53,11 +51,13 @@ function liveSdk(baseUrl: string, eventReads: Array<{ afterSeq?: string; limit?:
 // Live-shape assumption: this acceptance test discovers turns from the complete sanctioned
 // SDK surface. It treats sparse sequences and returned delta/compacted events as native facts.
 it.runIf(process.env.BB_LIVE_ROLE_CONTEXT === "1")(
-  "settles exact role contexts on the live long-lived director seat and a busy turn",
+  "settles exact role contexts on a purpose-made live fixture thread",
   async () => {
     const baseUrl = process.env.BB_SERVER_URL;
     if (!baseUrl) throw new Error("BB_SERVER_URL is required for live role-context settling");
-    const events = await readAllEvents(baseUrl);
+    const threadId = process.env.BB_LIVE_ROLE_CONTEXT_THREAD_ID;
+    if (!threadId) throw new Error("BB_LIVE_ROLE_CONTEXT_THREAD_ID must name the purpose-made live fixture thread");
+    const events = await readAllEvents(baseUrl, threadId);
     expect(events.length).toBeGreaterThan(18_238);
 
     const candidates = events.flatMap((request, requestIndex) => {
@@ -103,7 +103,7 @@ it.runIf(process.env.BB_LIVE_ROLE_CONTEXT === "1")(
         projectId: PROJECT_ID,
         operationClass: "qualification_observation_record",
         roleContext: {
-          threadId: THREAD_ID,
+          threadId,
           requestEventId: candidate.request.id,
           requestEventSeq: candidate.request.seq,
           completionEventId: candidate.completion.id,
@@ -112,7 +112,7 @@ it.runIf(process.env.BB_LIVE_ROLE_CONTEXT === "1")(
       } as ApplyRequest;
       const reader = await readLiveRoleFactReader(sdk, baseUrl, request);
       if (!reader) throw new Error("live role fact reader was not constructed");
-      expect(resolveRoleContext(reader, request, true).profile).toEqual({
+      expect(resolveRoleContext(reader, request).profile).toEqual({
         providerId: "pi",
         model: "kimi-coding/k3",
         reasoningLevel: "high",

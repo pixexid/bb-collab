@@ -1,12 +1,9 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import { DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION, type SqliteDatabase } from "./foundation.js";
+import { readRoleHolderStates } from "./awareness.js";
+import type { SqliteDatabase } from "./foundation.js";
 
 export const DEFAULT_ARCHIVE_SWEEP_IDLE_HOURS = 24;
 const THREAD_LIST_LIMIT = 1000;
-
-// Remove only when GH-104 records every live seat through execution_attempts.
-// A missing project entry is missing live-seat evidence and refuses the sweep.
-const LIVE_SEAT_ALLOWLIST = new Map([["proj_a8zzfsx36j", new Set(["thr_b94i3csnme", "thr_bpzjyqg7ys"])]]);
 
 export type ArchiveSweepResult = {
   outcome: "reported" | "applied" | "refused";
@@ -20,19 +17,18 @@ function protectedThreadIds(db: SqliteDatabase, projectId: string): Set<string> 
   const attemptCount = (db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ?").get(projectId) as { count?: unknown } | undefined)?.count;
   if (!Number.isInteger(attemptCount) || attemptCount === 0) throw new Error("execution attempts are unavailable or empty");
   const rows = db.prepare(
-    `SELECT thread_id FROM execution_attempts WHERE project_id = ? AND thread_id IS NOT NULL
-     UNION
-     SELECT attempts.thread_id
+    `SELECT attempts.thread_id
        FROM role_generations AS generations
        JOIN execution_attempts AS attempts
          ON attempts.project_id = generations.project_id
         AND attempts.execution_attempt_id = generations.holder_execution_attempt_id
       WHERE generations.project_id = ? AND attempts.thread_id IS NOT NULL`,
-  ).all(projectId, projectId) as Array<{ thread_id?: unknown }>;
-  const liveSeats = LIVE_SEAT_ALLOWLIST.get(projectId);
-  if (!liveSeats) throw new Error("live-seat allowlist is unavailable for project");
-  const ids = new Set<string>(liveSeats);
-  ids.add(DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.holderThreadId);
+  ).all(projectId) as Array<{ thread_id?: unknown }>;
+  const ids = new Set<string>();
+  for (const holder of readRoleHolderStates(db).filter((holder) => holder.project_id === projectId)) {
+    if (typeof holder.thread_id !== "string" || holder.thread_id === "") throw new Error("live seat thread id is invalid");
+    ids.add(holder.thread_id);
+  }
   for (const row of rows) {
     if (typeof row.thread_id !== "string" || row.thread_id === "") throw new Error("protected thread id is invalid");
     ids.add(row.thread_id);
