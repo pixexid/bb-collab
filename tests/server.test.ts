@@ -2401,6 +2401,7 @@ describe("bb-collab plugin boundary", () => {
       await addPendingReview(fixture);
       const projectOneAttemptId = (fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND origin = 'assignment' LIMIT 1").get(PROJECT_ID) as { execution_attempt_id: string }).execution_attempt_id;
       cloneProject(fixture.db, PROJECT_ID, "project-two");
+      fixture.db.prepare("UPDATE execution_attempts SET execution_attempt_id = ? WHERE project_id = ? AND origin = 'assignment'").run(`${projectOneAttemptId}-project-two`, "project-two");
       fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE project_id = ? AND execution_attempt_id = ?").run("project-one-review", PROJECT_ID, projectOneAttemptId);
       fixture.setThreadProject("director-two", "project-two");
       await fixture.host.harness.runSchedule("sentinel-wake-floor");
