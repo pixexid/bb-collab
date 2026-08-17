@@ -21413,7 +21413,7 @@ function createLaneWatcher(options) {
     }
   };
   const wakeRoleNow = async (role) => {
-    if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return false;
+    if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return { attempted: false, delivered: false };
     const holder = {
       project_id: role.projectId,
       role_id: role.roleId,
@@ -21421,24 +21421,24 @@ function createLaneWatcher(options) {
       execution_attempt_id: role.executionAttemptId,
       thread_id: role.threadId
     };
-    if (!resolveCurrentCanonicalHolder(holder)) return false;
+    if (!resolveCurrentCanonicalHolder(holder)) return { attempted: false, delivered: false };
     let scopes;
     let observation;
     try {
       scopes = await options.readRoleScopes();
       observation = await options.readWorker(role.threadId);
     } catch {
-      return false;
+      return { attempted: false, delivered: false };
     }
     const scope = scopes.find((candidate) => candidate.projectId === role.projectId);
-    if (!scope?.nextStartable || scope.queueHeadId !== role.queueHeadId || scope.deferredReason || observation.projectId !== role.projectId || observation.status !== "idle" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) return false;
+    if (!scope?.nextStartable || scope.queueHeadId !== role.queueHeadId || scope.deferredReason || observation.projectId !== role.projectId || observation.status !== "idle" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) return { attempted: false, delivered: false };
     const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
     const key = `${prefix}${scope.queueHeadId}`;
     await roleIdleLedger.clearPrefixExcept(prefix, key);
     const currentNow = now2();
     const record2 = await roleIdleLedger.observeIdle(key, observation.idleSinceMs);
     const steerAgeMs = record2.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : Math.max(0, currentNow - record2.lastSteerAtMs);
-    if (record2.escalated || record2.steerCount >= 2 || steerAgeMs < roleIdleThresholdMs) return false;
+    if (record2.escalated || record2.steerCount >= 2 || steerAgeMs < roleIdleThresholdMs) return { attempted: false, delivered: false };
     const target = {
       ...role,
       threadId: holder.thread_id,
@@ -21453,11 +21453,11 @@ function createLaneWatcher(options) {
     }
     if (delivered === false) {
       await roleIdleLedger.clearPrefixExcept(prefix);
-      return false;
+      return { attempted: false, delivered: false };
     }
     const updated = await roleIdleLedger.recordSteer(key, failed, currentNow);
     if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, target);
-    return true;
+    return { attempted: true, delivered: !failed };
   };
   const observeNow = async (threadId, status, pendingExternalWait, archived = false, suppliedOperatorWait, suppliedOperatorWaitKnown = status !== "idle" || suppliedOperatorWait !== void 0 || !options.readOperatorWait, waitContext) => {
     const allLanes = options.readLanes();
@@ -21669,6 +21669,8 @@ function createStallGuardCycle(options) {
       const scopes = await options.readRoleScopes();
       const nextState = structuredClone(state);
       let changed = 0;
+      let attempted = 0;
+      let verified = 0;
       let steered = 0;
       for (const holder of holders) {
         const key = `${holder.project_id}:${holder.role_id}`;
@@ -21692,22 +21694,25 @@ function createStallGuardCycle(options) {
           queueHeadId: scope.queueHeadId,
           idleAgeMs: 0
         };
-        let delivered;
+        let result2;
         try {
-          delivered = await options.wakeRole(role);
+          result2 = await options.wakeRole(role);
         } catch {
           continue;
         }
-        if (delivered === false) continue;
+        if (!result2.attempted) continue;
+        attempted += 1;
+        if (!result2.delivered) continue;
         nextState[key] = next;
         changed += 1;
+        verified += 1;
         steered += 1;
       }
       if (changed > 0) {
         await options.persistence.write(nextState);
         state = nextState;
       }
-      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, steered };
+      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered };
     }
   };
 }
@@ -22578,8 +22583,8 @@ async function runCli(db, bb, argv, ctx, deps) {
         outcome: "OK",
         subject: "stall-guard",
         expected: summary.observed,
-        attempted: summary.steered,
-        verified: summary.steered,
+        attempted: summary.attempted,
+        verified: summary.verified,
         message: "stall-guard cycle complete",
         evidence: summary
       });

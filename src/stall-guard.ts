@@ -1,4 +1,4 @@
-import type { RoleHolderState, RoleIdleView, RoleQueueScope } from "./awareness.js";
+import type { RoleHolderState, RoleIdleView, RoleQueueScope, RoleWakeResult } from "./awareness.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -19,7 +19,7 @@ export interface StallGuardCycleOptions {
   readRoleHolders: () => RoleHolderState[];
   readArtifact: (holder: RoleHolderState) => Promise<unknown | null>;
   readRoleScopes: () => Promise<RoleQueueScope[]> | RoleQueueScope[];
-  wakeRole: (role: RoleIdleView) => Promise<boolean>;
+  wakeRole: (role: RoleIdleView) => Promise<RoleWakeResult>;
   persistence: StallGuardPersistence;
 }
 
@@ -28,6 +28,8 @@ export interface StallGuardCycleSummary {
   subject: "stall-guard";
   observed: number;
   changed: number;
+  attempted: number;
+  verified: number;
   steered: number;
 }
 
@@ -50,6 +52,8 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
       const scopes = await options.readRoleScopes();
       const nextState = structuredClone(state);
       let changed = 0;
+      let attempted = 0;
+      let verified = 0;
       let steered = 0;
 
       for (const holder of holders) {
@@ -75,15 +79,18 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
           queueHeadId: scope.queueHeadId,
           idleAgeMs: 0,
         };
-        let delivered: boolean | void;
+        let result: RoleWakeResult;
         try {
-          delivered = await options.wakeRole(role);
+          result = await options.wakeRole(role);
         } catch {
           continue;
         }
-        if (delivered === false) continue;
+        if (!result.attempted) continue;
+        attempted += 1;
+        if (!result.delivered) continue;
         nextState[key] = next;
         changed += 1;
+        verified += 1;
         steered += 1;
       }
 
@@ -91,7 +98,7 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
         await options.persistence.write(nextState);
         state = nextState;
       }
-      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, steered };
+      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered };
     },
   };
 }

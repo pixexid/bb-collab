@@ -683,8 +683,8 @@ async function runCli(
         outcome: "OK",
         subject: "stall-guard",
         expected: summary.observed,
-        attempted: summary.steered,
-        verified: summary.steered,
+        attempted: summary.attempted,
+        verified: summary.verified,
         message: "stall-guard cycle complete",
         evidence: summary,
       });
