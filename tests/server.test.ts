@@ -6442,6 +6442,35 @@ describe("bb-collab plugin boundary", () => {
     expect(eventPages[1]).toEqual({ threadId: ROLE_THREAD_ID, afterSeq: "256", limit: "256" });
   });
 
+  it("refuses a malformed non-final live role event without consuming its receipt", async () => {
+    const host = await loadedHost(PROJECT_ID, (facts) => {
+      facts.events.push(
+        { id: "event-malformed", seq: 5, type: "thread/updated", data: null as never },
+        { id: "event-after-malformed", seq: 6, type: "thread/updated", data: {} },
+      );
+    });
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    const unsigned = { ...qualificationRequest(fenceToken, { idempotencyKey: "live-role-event-malformed" }), candidateHead: CANDIDATE_SHA, operatorReceiptId: null };
+    const receipt = persistInterimOperatorReceipt(db, {
+      projectId: PROJECT_ID,
+      mutationClass: unsigned.operationClass,
+      candidateHead: CANDIDATE_SHA,
+      idempotencyKey: unsigned.idempotencyKey,
+      requestDigest: operatorRequestDigest(unsigned),
+      callerThreadId: "live-role-thread",
+      requestedFromBackground: false,
+      callerPluginId: PLUGIN_ID,
+    });
+    const before = exportFoundation(db, PROJECT_ID);
+    expect(await host.harness.callRpc("apply", { ...unsigned, operatorReceiptId: receipt.receiptId })).toMatchObject({
+      outcome: "ROLE_CONTEXT_UNKNOWN",
+      attempted: 0,
+      verified: 0,
+    });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    expect(db.prepare("SELECT consumed_at_ms FROM operator_receipts WHERE receipt_id = ?").get(receipt.receiptId)).toEqual({ consumed_at_ms: null });
+  });
+
   it("refuses a repeated live role-event continuation without writes", async () => {
     const eventPages: Array<{ threadId: string; afterSeq?: string; limit?: string }> = [];
     const host = await loadedHost(PROJECT_ID, (facts) => {
