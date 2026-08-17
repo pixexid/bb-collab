@@ -2232,6 +2232,29 @@ describe("bb-collab plugin boundary", () => {
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
+  it("fails closed when a stale false interaction cache meets a failed fresh read", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await sentinelWakeFloorFixture(0);
+      const executionAttemptId = await addPendingReview(fixture);
+      fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE execution_attempt_id = ?").run("stale-cache-thread", executionAttemptId);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      fixture.db.prepare("UPDATE execution_attempts SET state = 'running' WHERE execution_attempt_id = ?").run(executionAttemptId);
+      clock.mockReturnValue(30 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      fixture.db.prepare("UPDATE execution_attempts SET state = 'prepared' WHERE execution_attempt_id = ?").run(executionAttemptId);
+      fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) => {
+        if (threadId === "stale-cache-thread") throw new Error("lane interactions unavailable");
+        return [];
+      }) as never);
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it("wakes independent project-scoped director floors", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
@@ -2376,16 +2399,26 @@ describe("bb-collab plugin boundary", () => {
     try {
       const fixture = await sentinelWakeFloorFixture(0);
       await addPendingReview(fixture);
+      const projectOneAttemptId = (fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND origin = 'assignment' LIMIT 1").get(PROJECT_ID) as { execution_attempt_id: string }).execution_attempt_id;
       cloneProject(fixture.db, PROJECT_ID, "project-two");
-      fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE project_id = ? AND origin = 'assignment'").run("project-one-review", PROJECT_ID);
+      fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE project_id = ? AND execution_attempt_id = ?").run("project-one-review", PROJECT_ID, projectOneAttemptId);
       fixture.setThreadProject("director-two", "project-two");
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      fixture.db.prepare("UPDATE execution_attempts SET state = 'running' WHERE project_id = ? AND execution_attempt_id = ?").run(PROJECT_ID, projectOneAttemptId);
+      clock.mockReturnValue(30 * 60_000);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      fixture.db.prepare("UPDATE execution_attempts SET state = 'prepared' WHERE project_id = ? AND execution_attempt_id = ?").run(PROJECT_ID, projectOneAttemptId);
+      let projectOneInteractionReads = 0;
       fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) => {
-        if (threadId === "project-one-review") throw new Error("project A interactions unavailable");
+        if (threadId === "project-one-review") {
+          projectOneInteractionReads += 1;
+          throw new Error("project A interactions unavailable");
+        }
         return [];
       }) as never);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
       clock.mockReturnValue(60 * 60_000);
       await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      expect(projectOneInteractionReads).toBe(2);
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { threadId: string }).threadId)).toEqual(["director-two"]);
     } finally {
       clock.mockRestore();

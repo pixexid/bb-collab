@@ -22984,6 +22984,7 @@ ${thread.titleFallback ?? ""}`);
   };
   const readUnblockedStartableLanes = async () => {
     if (!db) return [];
+    interactionStateCache.clear();
     const candidates = openLaneViews(db, Date.now(), await readOperatorWaits()).filter((lane) => lane.nextStartable);
     return (await Promise.all(candidates.map(async (lane) => {
       if (!lane.threadId || !await readPendingExternalWait(lane.threadId)) return lane;
