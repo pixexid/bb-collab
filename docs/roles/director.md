@@ -16,6 +16,8 @@ Use the [Director row](../operations-model.md#role-matrix). Do not copy its mode
 
 Use BB threads and messages to coordinate, managed environments for work, Git and GitHub for repository evidence, and the plugin’s read-only surfaces for canonical state. Use [Ponytail](../ponytail.md) for implementation choices and the [working rules](../rules.md) for coordination.
 
+Use the canonical [delegation return-path rule](../rules.md#delegation-return-path) for every work order.
+
 ## Live state
 
 Live state is never this page. The canonical store is the bb-collab plugin database: use the `role_generation_heads` current-role query to resolve the current director and orchestrator records. The predecessor handoff file is the file named by the active seat’s handoff location; read that file, not a checked-in copy. Current seat IDs are the values returned by that query—query them when needed and never write them into documentation.

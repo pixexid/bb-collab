@@ -22,6 +22,12 @@
 
 > A question gets an answer; a delegation is a frozen bounded work order with an exact deliverable and no open question. Never both in one message. An acknowledgement is not a deliverable.
 
+## Delegation return path
+
+Every delegation names its return path: `do X, report DONE | BLOCKED | WAITING <what, and what event wakes me> to me`. For example: `WAITING PR-171 review; stall-guard artifact leg wakes me`. The return path makes silence attributable; the [silence/watch rule](#silence-is-a-defect-signal) makes it detectable. Neither is sufficient alone: a missing answer is not a delegation, and a wait cannot say who owes an unreported result without the return path.
+
+A WAITING on the same thing past about 24 hours surfaces to the orchestrator as “wait went stale: chase the external or re-plan.” A WAITING claim without a live waker is a stall from day one. When a worker declares a waker, the orchestrator confirms that the named waker exists at check time before accepting the wait. This matters because WAITING is self-declared by the party who benefits from not being chased; confirmation turns that claim into evidence. Resolve the named waker live—never maintain a list of valid wakers here.
+
 ## Silence is a defect signal
 
 When you send another seat a blocking question, set the watch in the same act: run `bb thread wait <their-thread> --status idle --timeout <bounded>`, always with an explicit bounded timeout, then check your own inbound for the answer. If their thread is idle and inbound has no answer, it was never sent or delivered: re-ask once, bundled. After the second watch, if there is still no answer, escalate to the operator or supervisor with `director unresponsive`; do not loop a third time. The same pattern applies downward to every lane blocking on you. It is one wait, one inbox check, and at most one re-ask—no polling and no timers.

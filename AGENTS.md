@@ -35,5 +35,6 @@ The fleet is a director, an orchestrator, and workers using BB-native threads an
 - [Canonical source, no restated copies](docs/rules.md#canonical-source-no-restated-copies) — point to the definition or query, never cache its value.
 - [Version-bump test](docs/rules.md#version-bump-test) — bump only for a changed running-session obligation.
 - [Question is not delegation](docs/rules.md#question-is-not-delegation) — keep questions and frozen work orders separate.
+- [Delegation return path](docs/rules.md#delegation-return-path) — every delegation says where DONE, BLOCKED, or WAITING returns.
 - [One writer per lane](docs/rules.md#one-writer-per-lane) — one branch and one owner per edit lane.
 - [Blast radius](docs/rules.md#blast-radius) — update affected open artifacts with the decision that invalidates them.
