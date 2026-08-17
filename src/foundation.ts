@@ -7992,10 +7992,11 @@ function authorizedReplay(db: SqliteDatabase, request: ApplyRequest, digest: str
   if (mutation.operator_receipt_id !== request.operatorReceiptId) {
     throw refusal("OPERATOR_RECEIPT_STALE", "idempotency key was already committed under another operator receipt");
   }
-  const receipt = asRow<{ candidate_head: string; idempotency_key: string | null; request_digest: string | null }>(db.prepare(
-    "SELECT candidate_head, idempotency_key, request_digest FROM operator_receipts WHERE project_id = ? AND receipt_id = ?",
+  const receipt = asRow<{ candidate_head: string; idempotency_key: string | null; request_digest: string | null; issuance_provenance: string | null }>(db.prepare(
+    "SELECT candidate_head, idempotency_key, request_digest, issuance_provenance FROM operator_receipts WHERE project_id = ? AND receipt_id = ?",
   ).get(request.projectId, request.operatorReceiptId));
   if (!receipt || receipt.candidate_head !== request.candidateHead || receipt.idempotency_key !== request.idempotencyKey || receipt.request_digest !== digest) return null;
+  requireCurrentOperatorReceiptProvenance(receipt.issuance_provenance);
   return JSON.parse(mutation.outcome_json) as FoundationResult;
 }
 

@@ -53,6 +53,7 @@ import {
   type ExportPayload,
   type FoundationResult,
   type NativeAssignmentInspection,
+  type OperatorReceipt,
 } from "../src/foundation.js";
 import {
   applyWithFixtureReceipt,
@@ -163,6 +164,11 @@ function staleV18Reread(name: (typeof CACHED_CONSUMERS)[number], result: Pick<Fo
   const observation = reread.observations.find((candidate) => candidate.name === name);
   if (!observation) throw new Error(`${name} reread observation is unavailable`);
   return { observedSchemaVersion: observation.observedSchemaVersion, observedContractVersion: observation.observedContractVersion };
+}
+
+function nullProvenanceReceiptDigest(receipt: OperatorReceipt) {
+  const { receiptDigest: _receiptDigest, ...identity } = receipt;
+  return operatorReceiptDigest({ ...identity, issuanceProvenance: null });
 }
 
 function doctorV19Reread(name: "server.rpcContract" | "server.collabCli", result: FoundationResult) {
@@ -2712,6 +2718,15 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: accepted.actorReceiptId,
       operatorReceiptId: accepted.operatorReceipt!.receiptId,
     })).toMatchObject({ outcome: "OK" });
+    db.prepare("UPDATE operator_receipts SET issuance_provenance = NULL, receipt_digest = ? WHERE receipt_id = ?").run(
+      nullProvenanceReceiptDigest(accepted.operatorReceipt!),
+      accepted.operatorReceipt!.receiptId,
+    );
+    expect(await host.harness.callRpc("apply", {
+      ...acceptedUnsigned,
+      actorReceiptId: accepted.actorReceiptId,
+      operatorReceiptId: accepted.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "OPERATOR_RECEIPT_INVALID", attempted: 0, verified: 0 });
 
     const wrongActor = await issueConsoleReceipt(request("console-wrong-actor-source", 2, 3));
     const wrongTargetUnsigned = request("console-wrong-actor-target", 2, 3);
@@ -2723,10 +2738,7 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: wrongActor.actorReceiptId,
       operatorReceiptId: wrongTargetId,
     })).toMatchObject({ outcome: "ACTOR_RECEIPT_UNVERIFIED", attempted: 0, verified: 0 });
-    const wrongActorLegacyDigest = operatorReceiptDigest({
-      ...wrongActor.operatorReceipt!,
-      issuanceProvenance: null,
-    });
+    const wrongActorLegacyDigest = nullProvenanceReceiptDigest(wrongActor.operatorReceipt!);
     db.prepare("UPDATE operator_receipts SET issuance_provenance = NULL, receipt_digest = ? WHERE receipt_id = ?").run(wrongActorLegacyDigest, wrongActorReceiptId);
     expect(await host.harness.callRpc("apply", {
       ...wrongTargetUnsigned,
@@ -2736,10 +2748,7 @@ describe("bb-collab plugin boundary", () => {
 
     const legacyUnsigned = request("legacy-console-binding", 2, 3);
     const legacy = await issueConsoleReceipt(legacyUnsigned);
-    const legacyDigest = operatorReceiptDigest({
-      ...legacy.operatorReceipt!,
-      issuanceProvenance: null,
-    });
+    const legacyDigest = nullProvenanceReceiptDigest(legacy.operatorReceipt!);
     db.prepare("UPDATE operator_receipts SET issuance_provenance = NULL, receipt_digest = ? WHERE receipt_id = ?").run(legacyDigest, legacy.operatorReceipt!.receiptId);
     expect(await host.harness.callRpc("apply", {
       ...legacyUnsigned,
