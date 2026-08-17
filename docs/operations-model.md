@@ -30,7 +30,7 @@ reviewer, orchestrator or routing fallback. The supervisor-ratified matrix is:
 | Mechanical subagent | Codex harness / `codex` | `gpt-5.6-luna` | LOW | Fixtures, sweeps, doc-sync and scaffolds only; legality follows artifact scope, not spawn label. |
 | Mechanical probe | Pi harness / `pi` | `deepseek-v4-flash` | LOW | Probe-only; current graded evidence controls admission. |
 | Mechanical probe | Pi harness / `pi` | `glm-5-turbo` | LOW | Probe-only; current graded evidence controls admission. |
-| Sentinel | Claude harness / `claude-code` | `claude-opus-5` | HIGH | Directs lanes, orders holds, sets acceptance criteria; decides nothing reserved to the operator. Never authors merge-bound code, holds a lane, writes a canonical record, or derives a receipt. Its verification never satisfies a Tier A or Tier B review gate. The `[1m]` context variant is admitted; `execution_attempts` already records it for both orchestrator generations. |
+| Sentinel | Claude harness / `claude-code` | `claude-opus-5` | HIGH | Verifies claims against canonical surfaces and reports findings with the surfaces named. Its findings are recommendations; it does not direct lanes, order holds, set acceptance criteria, or issue frozen specs; the director and operator own calls. Never authors merge-bound code, holds a lane, writes a canonical record, or derives a receipt. Its verification never satisfies a Tier A or Tier B review gate. The `[1m]` context variant is admitted; `execution_attempts` already records it for both orchestrator generations. |
 
 Reviewer default harness/provider is Codex; the tier rows name the actual model
 and reasoning tuple.
@@ -265,11 +265,11 @@ apply.
 
 ## Sentinel supervision
 
-The Sentinel is a standing BB thread that verifies claims against canonical surfaces and directs the fleet on what it finds. It is distinct from the dormant supervisor seat: it is in BB, it is continuous rather than escalation-only, and it is not woken by the operator. It is not a BB logical role, `RoleGeneration`, actor, or consumer, and no generation binds it.
+The Sentinel is a standing BB thread that verifies claims against canonical surfaces and reports findings on what it verifies. It is distinct from the dormant supervisor seat: it is in BB, it is continuous rather than escalation-only, and it is not woken by the operator. It is not a BB logical role, `RoleGeneration`, actor, or consumer, and no generation binds it.
 
 ### What it may do
 
-The Sentinel directs lanes, orders holds and lifts them, sets and withdraws acceptance criteria, and issues frozen specs. Its directives bind the lanes and the director. A supervisor ruling supersedes a Sentinel directive; an operator ruling supersedes both.
+The Sentinel reports findings and recommendations. It holds no directive authority over lanes or the director; operator rulings are supreme.
 
 It decides nothing reserved to the operator: credentials and accounts, real spend, legal or financial commitments, product direction, and destructive or irreversible actions. It surfaces those and never performs them. It never derives, substitutes, or requests a substitute for an operator receipt, and never accepts one from a peer.
 
