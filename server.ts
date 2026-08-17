@@ -56,6 +56,7 @@ import {
   waitValidatorStateDir,
   type SourceObservation,
 } from "./src/registered-waits.js";
+import { runArchiveSweep } from "./src/archive-sweep.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -554,6 +555,7 @@ interface WaitValidatorCliDeps {
   registerBoundedWaitForCli: (input: unknown, ctxThreadId?: string) => Promise<import("./src/registered-waits.js").RegisterWaitResult>;
   listWaitsForCli: () => Promise<Array<Record<string, unknown>>>;
   escalationCycle: import("./src/registered-waits.js").WaitEscalationCycle;
+  archiveSweep: (projectId: string, apply: boolean) => Promise<import("./src/archive-sweep.js").ArchiveSweepResult>;
 }
 
 async function runCli(
@@ -565,8 +567,8 @@ async function runCli(
 ) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, cached-consumer-rollout, wait-register, wait-list, or wait-validator");
+  if (!command || !["doctor", "export", "apply", "archive-sweep", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, archive-sweep, cached-consumer-rollout, wait-register, wait-list, or wait-validator");
   }
   if (command === "wait-validator") {
     const unknown = args.find((arg) => arg !== "--cycle");
@@ -600,6 +602,19 @@ async function runCli(
   }
   const projectId = parseFlag(args, "--project");
   if (!projectId) return invalidCli("--project PROJECT_ID is required; CLI context is never used as a fallback");
+  if (command === "archive-sweep") {
+    if (args.filter((arg) => !["--project", projectId, "--apply"].includes(arg)).length > 0 || args.filter((arg) => arg === "--apply").length > 1) return invalidCli("unexpected archive-sweep argument");
+    const result = await deps.archiveSweep(projectId, args.includes("--apply"));
+    return cliResult({
+      outcome: result.outcome === "refused" ? "INTERNAL_ERROR" : "OK",
+      subject: projectId,
+      expected: result.archivableThreadIds.length,
+      attempted: result.archivedThreadIds.length,
+      verified: result.outcome === "refused" ? 0 : result.archivableThreadIds.length,
+      message: result.message,
+      evidence: result,
+    });
+  }
   if (command === "wait-register") {
     const unknown = unexpectedFlags(args, ["--project", "--request"]);
     if (unknown) return invalidCli(`unexpected flag ${unknown}`);
@@ -1053,6 +1068,26 @@ export default async function plugin(bb: BbPluginApi) {
     }
   });
 
+  // This is deliberately a report-only schedule. Archive is available only
+  // through the explicit collab archive-sweep --apply command below.
+  bb.background.schedule("thread-archive-sweep", "0 * * * *", async () => {
+    let projects: Awaited<ReturnType<typeof bb.sdk.projects.list>>;
+    try {
+      projects = await bb.sdk.projects.list({ includePersonal: true });
+    } catch (error) {
+      const result = { outcome: "refused" as const, message: `project inventory unavailable: ${String(error)}` };
+      bb.log.warn(`thread archive sweep refused: ${result.message}`);
+      bb.realtime.publish("thread-archive-sweep", result);
+      return;
+    }
+    for (const project of projects) {
+      const result = await runArchiveSweep(bb, db, project.id);
+      if (result.outcome === "refused") bb.log.warn(`thread archive sweep refused for project=${project.id}: ${result.message ?? "unknown read failure"}`);
+      else bb.log.info(`thread archive sweep reported ${result.archivableThreadIds.length} archivable threads for project=${project.id}`);
+      bb.realtime.publish("thread-archive-sweep", { projectId: project.id, ...result });
+    }
+  });
+
   const readOpenLaneViews = async () => {
     if (!db) return [];
     const requests = await readOperatorReceiptRequests(bb);
@@ -1100,6 +1135,7 @@ export default async function plugin(bb: BbPluginApi) {
     }),
     listWaitsForCli: async () => { await waitRegistry.recover(); return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) })); },
     escalationCycle,
+    archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply),
   };
 
   bb.rpc.register(rpcContract, {
@@ -1355,6 +1391,11 @@ export default async function plugin(bb: BbPluginApi) {
         name: "wait-validator",
         summary: "Run one durable wait-validator cycle (host-supervised seam)",
         usage: "bb collab wait-validator --cycle",
+      },
+      {
+        name: "archive-sweep",
+        summary: "Report archivable threads; --apply is explicit and opt-in",
+        usage: "bb collab archive-sweep --project PROJECT_ID [--apply]",
       },
     ],
     run(argv, context) {
