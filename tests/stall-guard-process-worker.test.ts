@@ -32,7 +32,7 @@ describe.skipIf(!statePath || !resultPath)("stall-guard process worker", () => {
         execution_attempt_id: "attempt-1",
         thread_id: "current-holder",
       }],
-      readArtifact: async () => ({ outcome: "available", pullRequest: { number: 112, updatedAt: "changed", checks: { state: "passing" } } }),
+      readArtifact: async () => [{ id: "artifact", unavailable: false, value: { outcome: "available", pullRequest: { number: 112, updatedAt: "changed", checks: { state: "passing" } } } }],
       readRoleScopes: () => [{ projectId: "project-1", nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
       wakeRole: async (role) => { sends.push(role); return { attempted: true, delivered: true }; },
       persistence: {

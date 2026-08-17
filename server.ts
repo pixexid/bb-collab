@@ -987,7 +987,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   };
 
   const steerRole = async (role: import("./src/awareness.js").RoleIdleView) => {
-    if (!db) return false;
+    if (!db) return "error" as const;
     const expectedHolder: RoleHolderState = {
       project_id: role.projectId,
       role_id: role.roleId,
@@ -1005,7 +1005,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       );
     } catch (error) {
       warnRoleLiveness(expectedHolder, `holder=unknown error=${String(error)}`);
-      return false;
+      return "error" as const;
     }
     if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) {
       warnRoleLiveness(expectedHolder, `holderMatches=${holders.length} observedThread=${holders[0]?.thread_id ?? "null"}`);
@@ -1016,7 +1016,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
     } catch (error) {
       warnRoleLiveness(holders[0], `liveness=unknown error=${String(error)}`);
-      return false;
+      return "error" as const;
     }
     const refusal = roleThreadRefusal(holders[0], thread, true);
     if (refusal) {
@@ -1118,11 +1118,26 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   const stallGuardCycle = createStallGuardCycle({
     readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
     readRoleScopes,
-    readArtifact: async (holder) => {
-      const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
-      if (thread.projectId !== holder.project_id || !thread.environmentId) return { outcome: "absent" };
-      const result = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
-      return result.outcome === "unavailable" ? null : result;
+    readArtifact: async (projectId) => {
+      if (!db) return null;
+      const artifacts = [];
+      for (const lane of readLaneStates(db)
+        .filter((candidate) => candidate.project_id === projectId && OPEN_ATTEMPT_STATES.has(candidate.attempt_state) && candidate.thread_id !== null)) {
+        try {
+          const thread = await bb.sdk.threads.get({ threadId: lane.thread_id! });
+          if (thread.projectId !== projectId || !thread.environmentId) {
+            artifacts.push({ id: lane.execution_attempt_id, unavailable: false, value: { environmentId: null, result: { outcome: "absent" } } });
+            continue;
+          }
+          const result = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
+          artifacts.push(result.outcome === "unavailable"
+            ? { id: lane.execution_attempt_id, unavailable: true, value: null }
+            : { id: lane.execution_attempt_id, unavailable: false, value: { environmentId: thread.environmentId, result } });
+        } catch {
+          artifacts.push({ id: lane.execution_attempt_id, unavailable: true, value: null });
+        }
+      }
+      return artifacts;
     },
     wakeRole: (role) => watcher.wakeRole(role),
     persistence: {
