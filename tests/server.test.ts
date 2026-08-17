@@ -2224,7 +2224,7 @@ describe("bb-collab plugin boundary", () => {
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "ACTOR_RECEIPT_UNKNOWN" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "sentinel-wake-floor", "thread-archive-sweep"]);
-    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "doctor", "export", "lanes", "registerWait", "reorderPinned", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
+    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "doctor", "export", "lanes", "registerWait", "reorderPinned", "roleBrief", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
   });
 
   it("does not wake a quiet director seat", async () => {
@@ -5611,6 +5611,51 @@ describe("bb-collab plugin boundary", () => {
       verified: 0,
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeProductionRefusal);
+  });
+
+  it("briefs newly created canonical director and orchestrator seats with their own role content", async () => {
+    const scenarios = [
+      {
+        name: "orchestrator",
+        config: roleConfig(),
+        qualification: {},
+        succession: {},
+        facts: roleReader(),
+        heading: "# Orchestrator",
+      },
+      {
+        name: "director",
+        config: directorSeatConfig(),
+        qualification: { roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID, qualificationId: "director-brief-qualification", declaredProfile: DIRECTOR_PROFILE },
+        succession: { roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID, qualificationId: "director-brief-qualification", profileDigest: DIRECTOR_PROFILE_DIGEST, standbyProfile: DIRECTOR_STANDBY_PROFILE },
+        facts: directorRoleReader(),
+        heading: "# Director",
+      },
+    ];
+    for (const scenario of scenarios) {
+      const host = await loadedHost();
+      host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
+      host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
+      const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: scenario.config });
+      expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, scenario.qualification), null, scenario.facts).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, scenario.succession), null, scenario.facts).outcome).toBe("OK");
+
+      await expect(host.harness.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id: ROLE_THREAD_ID, projectId: PROJECT_ID }) })).resolves.toEqual({ errors: [] });
+      const send = host.harness.inspection.sdk.callsTo("threads.send")[0]?.[0] as { input: Array<{ text: string }> };
+      expect(send.input[0]?.text).toContain(scenario.heading);
+      expect(send.input[0]?.text).not.toContain("# Worker");
+    }
+  });
+
+  it("uses the bootstrap exemption without making its non-role actor the holder", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "bootstrap-actor", actorKind: "plugin", subjectId: "bootstrap-subject" });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, { actorReceiptId: "bootstrap-actor" }), null, roleReader()).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, { actorReceiptId: "bootstrap-actor" }), null, roleReader()).outcome).toBe("OK");
+    const holder = db.prepare("SELECT origin, thread_id FROM execution_attempts WHERE origin = 'role_holder'").get() as { origin: string; thread_id: string };
+    expect(holder).toEqual({ origin: "role_holder", thread_id: ROLE_THREAD_ID });
+    expect(holder.thread_id).not.toBe("bootstrap-subject");
   });
 
   it("records one exact director standby and refuses wrong-provider, foreign, stale, and replay paths without writes", async () => {

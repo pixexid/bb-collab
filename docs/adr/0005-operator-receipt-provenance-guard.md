@@ -2,6 +2,9 @@
 
 Status: in flight. Implements GH-133.
 
+Superseded by [ADR 0007](0007-v21-authority-ceremony-removal.md), which
+removes the operator-receipt machinery this ADR records.
+
 ## Decision
 
 Contract v19/schema v12 added `operator_receipts.issuance_provenance`: the

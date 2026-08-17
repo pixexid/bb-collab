@@ -6,6 +6,9 @@
 - Authority: operator adjudication gate recorded; implementation remains gated (see section 8)
 - Linked issue: [GH-104](https://github.com/pixexid/bb-collab/issues/104)
 
+Superseded by [ADR 0007](0007-v21-authority-ceremony-removal.md) for this
+proposal’s removed receipt and approval machinery. It remains historical.
+
 ## 1. Decision direction (Option A adopted; Option B declined)
 
 This ADR records Option A as the adopted direction for a future two-phase

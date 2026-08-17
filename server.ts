@@ -175,6 +175,19 @@ const sidebarThreadExecutionSchema = z
   .strict();
 const sidebarCollapseKindSchema = z.enum(["project", "thread"]);
 const sidebarCollapseKey = (kind: "project" | "thread", id: string) => `sidebar.collapse:${kind}:${id}`;
+const roleBriefRoleSchema = z.enum(["director", "orchestrator", "worker"]);
+const roleBriefBundleSchema = z.object({
+  ponytail: z.string().min(1),
+  roles: z.object({ director: z.string().min(1), orchestrator: z.string().min(1), worker: z.string().min(1) }).strict(),
+}).strict();
+const roleBriefSchema = z.object({
+  role: roleBriefRoleSchema,
+  roleContent: z.string().min(1),
+  ponytail: z.string().min(1),
+  project: z.object({ id: projectIdSchema, name: z.string(), sourceIds: z.array(z.string()) }).strict(),
+  pointers: z.object({ canonicalStoreQuery: z.string(), handoffFile: z.string(), currentSeats: z.array(z.object({ roleId: z.string(), generation: z.number().int().positive(), threadId: z.string() }).strict()) }).strict(),
+  prompt: z.string().min(1),
+}).strict();
 export const rpcContract = defineRpcContract({
   lanes: {
     input: z.object({}).strict(),
@@ -233,6 +246,10 @@ export const rpcContract = defineRpcContract({
   cachedConsumerRollout: {
     input: applyRequestSchema,
     output: foundationResultSchema,
+  },
+  roleBrief: {
+    input: z.object({ projectId: projectIdSchema, role: roleBriefRoleSchema }).strict(),
+    output: roleBriefSchema,
   },
 });
 
@@ -397,7 +414,9 @@ async function applyLiveAuthorizedMutation(
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
-  return applyAuthorizedMutation(db, input, null, reader);
+  const result = applyAuthorizedMutation(db, input, null, reader);
+  await deliverSucceededSeatBrief(bb, db, input, result);
+  return result;
 }
 
 function cachedConsumerRolloutRefusal(projectId: string, message: string): FoundationResult {
@@ -427,6 +446,86 @@ export async function isLiveCachedConsumerRolloutArtifact(moduleUrl: string, bb:
     return basename(artifactPath) === "server.js" && basename(dirname(artifactPath)) === "dist";
   } catch {
     return false;
+  }
+}
+
+function roleBriefBundlePath(): string {
+  const bundled = fileURLToPath(new URL("./role-briefs.json", import.meta.url));
+  return existsSync(bundled) ? bundled : fileURLToPath(new URL("./dist/role-briefs.json", import.meta.url));
+}
+
+function roleForThread(db: SqliteDatabase | null, projectId: string, threadId: string): z.infer<typeof roleBriefRoleSchema> {
+  const roleId = db ? readRoleHolderStates(db).find((holder) => holder.project_id === projectId && holder.thread_id === threadId)?.role_id : null;
+  return roleId === "director" ? "director" : roleId === "project-orchestrator" ? "orchestrator" : "worker";
+}
+
+function roleBriefRole(roleId: string): z.infer<typeof roleBriefRoleSchema> {
+  return roleId === "director" ? "director" : roleId === "project-orchestrator" ? "orchestrator" : "worker";
+}
+
+async function composeRoleBrief(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  input: z.infer<typeof rpcContract["roleBrief"]["input"]>,
+): Promise<z.infer<typeof roleBriefSchema>> {
+  const bundle = roleBriefBundleSchema.parse(JSON.parse(readFileSync(roleBriefBundlePath(), "utf8")));
+  const project = await bb.sdk.projects.get({ projectId: input.projectId });
+  const currentSeats = (db ? readRoleHolderStates(db) : [])
+    .filter((holder) => holder.project_id === input.projectId)
+    .map((holder) => ({ roleId: holder.role_id, generation: holder.role_generation, threadId: holder.thread_id }));
+  const pointers = {
+    canonicalStoreQuery: "role_generation_heads joined to role_generations",
+    handoffFile: "the predecessor handoff file named by the active seat’s handoff location",
+    currentSeats,
+  };
+  const prompt = [
+    `# bb-collab ${input.role} brief`,
+    "",
+    "## Ponytail preamble",
+    bundle.ponytail,
+    "",
+    "## Role brief",
+    bundle.roles[input.role],
+    "",
+    "## Live pointers",
+    `Project: ${project.name} (${project.id})`,
+    `Sources: ${project.sources.map((source) => source.id).join(", ") || "none"}`,
+    `Canonical store query: ${pointers.canonicalStoreQuery}`,
+    `Handoff file: ${pointers.handoffFile}`,
+    `Current seats: ${currentSeats.map((seat) => `${seat.roleId}@${seat.generation}:${seat.threadId}`).join(", ") || "none"}`,
+  ].join("\n");
+  return { role: input.role, roleContent: bundle.roles[input.role], ponytail: bundle.ponytail, project: { id: project.id, name: project.name, sourceIds: project.sources.map((source) => source.id) }, pointers, prompt };
+}
+
+async function sendRoleBrief(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  projectId: string,
+  threadId: string,
+  role: z.infer<typeof roleBriefRoleSchema>,
+  waitForActive = false,
+): Promise<void> {
+  const brief = await composeRoleBrief(bb, db, { projectId, role });
+  if (waitForActive) await bb.sdk.threads.wait({ threadId, status: "active", timeoutMs: 30_000 });
+  await bb.sdk.threads.send({
+    threadId,
+    mode: "queue-if-active",
+    input: [{ type: "text", visibility: "agent-only", text: brief.prompt, mentions: [] }],
+  });
+}
+
+async function deliverSucceededSeatBrief(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  input: unknown,
+  result: FoundationResult,
+): Promise<void> {
+  const request = applyRequestSchema.safeParse(input);
+  if (!request.success || result.outcome !== "OK" || request.data.operationClass !== "role_generation_succession" || !request.data.roleContext || !request.data.roleId) return;
+  try {
+    await sendRoleBrief(bb, db, request.data.projectId, request.data.roleContext.threadId, roleBriefRole(request.data.roleId));
+  } catch (error) {
+    bb.log.warn(`role brief seating failed for thread=${request.data.roleContext.threadId}: ${String(error)}`);
   }
 }
 
@@ -1142,6 +1241,17 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     return openLaneViews(db, Date.now(), new Map());
   };
 
+  // Lifecycle callbacks observe a completed creation; they cannot intercept a
+  // spawn. An unseated thread receives its worker brief here at seating;
+  // successful canonical succession separately delivers the exact seat brief.
+  bb.events.on("thread.created", async ({ thread }) => {
+    try {
+      await sendRoleBrief(bb, db, thread.projectId, thread.id, roleForThread(db, thread.projectId, thread.id), true);
+    } catch (error) {
+      bb.log.warn(`role brief seating failed for thread=${thread.id}: ${String(error)}`);
+    }
+  });
+
   bb.http.route("GET", "/lanes", async () =>
     new Response(JSON.stringify(await readOpenLaneViews()), {
       headers: { "content-type": "application/json" },
@@ -1234,6 +1344,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     },
     async cachedConsumerRollout(input) {
       return applyLiveCachedConsumerRollout(bb, db, input, cliDeps);
+    },
+    async roleBrief(input) {
+      return composeRoleBrief(bb, db, input);
     },
   });
 
