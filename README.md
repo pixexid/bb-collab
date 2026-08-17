@@ -13,7 +13,7 @@ new-thread, search, navigation rows, and the footer.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through contract v17/schema v11: a
+The repository now contains the implemented foundation through contract v19/schema v12: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
@@ -59,8 +59,8 @@ that full project-configuration/target replacement, operator_only Decision
 create/adopted disposition, work_item_create, work_item_transition,
 qualification_observation_record, role_generation_succession, migration_prepare,
 and migration_step; role-based
-and review Decisions remain role-bound. The plugin has not been installed, reloaded, or activated against live
-project authority.
+and review Decisions remain role-bound. The plugin has been activated against live
+project authority; reload evidence is actor-recorded.
 
 Historical contract v11 was a contract-only role-capacity amendment: `roleRequirements`
 admitted at most three logical roles. `project-orchestrator` was project-scoped;

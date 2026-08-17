@@ -2319,6 +2319,24 @@ function requireCurrentOperatorReceiptProvenance(value: unknown): asserts value 
   }
 }
 
+function requireOperatorReceiptProvenanceColumns(
+  issuanceProvenance: unknown,
+  approverId: string | null,
+  authorizingDecisionId: string | null,
+  authorizingDispositionSequence: number | null,
+): asserts issuanceProvenance is OperatorReceiptProvenance {
+  requireCurrentOperatorReceiptProvenance(issuanceProvenance);
+  if (issuanceProvenance === "console") {
+    if (approverId !== null || authorizingDecisionId !== null || authorizingDispositionSequence !== null) {
+      throw refusal("OPERATOR_RECEIPT_INVALID", "console operator receipt has attestation provenance");
+    }
+    return;
+  }
+  if (approverId === null || authorizingDecisionId === null || authorizingDispositionSequence === null) {
+    throw refusal("OPERATOR_RECEIPT_INVALID", "attested operator receipt approver provenance is incomplete");
+  }
+}
+
 function staleV18ProvenanceRefusal(value: unknown): Pick<FoundationResult, "outcome"> {
   try {
     requireCurrentOperatorReceiptProvenance(value);
@@ -7905,7 +7923,12 @@ function requireOperatorReceipt(
   if (row.receipt_type !== "operator_confirmation" || ![0, 1].includes(row.requested_from_background)) {
     throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt is malformed");
   }
-  requireCurrentOperatorReceiptProvenance(row.issuance_provenance);
+  requireOperatorReceiptProvenanceColumns(
+    row.issuance_provenance,
+    row.approver_id,
+    row.authorizing_decision_id,
+    row.authorizing_disposition_sequence,
+  );
   const receiptRequest = operatorReceiptRequestSchema.safeParse({
     projectId: row.project_id,
     mutationClass: row.mutation_class,
@@ -7927,13 +7950,10 @@ function requireOperatorReceipt(
   if (row.binding_digest !== operatorReceiptBindingDigest(receiptRequest.data)) {
     throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt binding digest is invalid");
   }
-  if ((row.approver_id === null) !== (row.authorizing_decision_id === null) || (row.approver_id === null) !== (row.authorizing_disposition_sequence === null)) {
-    throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt approver provenance is incomplete");
-  }
-  if (row.approver_id !== null) {
+  if (row.issuance_provenance === "attestation") {
     requireActiveAuthorizedApprover(db, {
       ...receiptRequest.data,
-      approverId: row.approver_id,
+      approverId: row.approver_id!,
       authorizingDecisionId: row.authorizing_decision_id!,
       authorizingDispositionSequence: row.authorizing_disposition_sequence!,
     }, transition);
@@ -7992,11 +8012,24 @@ function authorizedReplay(db: SqliteDatabase, request: ApplyRequest, digest: str
   if (mutation.operator_receipt_id !== request.operatorReceiptId) {
     throw refusal("OPERATOR_RECEIPT_STALE", "idempotency key was already committed under another operator receipt");
   }
-  const receipt = asRow<{ candidate_head: string; idempotency_key: string | null; request_digest: string | null; issuance_provenance: string | null }>(db.prepare(
-    "SELECT candidate_head, idempotency_key, request_digest, issuance_provenance FROM operator_receipts WHERE project_id = ? AND receipt_id = ?",
+  const receipt = asRow<{
+    candidate_head: string;
+    idempotency_key: string | null;
+    request_digest: string | null;
+    issuance_provenance: string | null;
+    approver_id: string | null;
+    authorizing_decision_id: string | null;
+    authorizing_disposition_sequence: number | null;
+  }>(db.prepare(
+    "SELECT candidate_head, idempotency_key, request_digest, issuance_provenance, approver_id, authorizing_decision_id, authorizing_disposition_sequence FROM operator_receipts WHERE project_id = ? AND receipt_id = ?",
   ).get(request.projectId, request.operatorReceiptId));
   if (!receipt || receipt.candidate_head !== request.candidateHead || receipt.idempotency_key !== request.idempotencyKey || receipt.request_digest !== digest) return null;
-  requireCurrentOperatorReceiptProvenance(receipt.issuance_provenance);
+  requireOperatorReceiptProvenanceColumns(
+    receipt.issuance_provenance,
+    receipt.approver_id,
+    receipt.authorizing_decision_id,
+    receipt.authorizing_disposition_sequence,
+  );
   return JSON.parse(mutation.outcome_json) as FoundationResult;
 }
 

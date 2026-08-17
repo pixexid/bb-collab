@@ -651,8 +651,9 @@ The following remain unresolved until the named proof or operator decision:
   name, checkout possession or thread ID. The narrow exception is the
   explicitly ratified `plugin/bb-collab` derived actor for the bounded
   bootstrap, config-revision, operator-only Decision, work-item, role, and migration mutation
-  classes, which is issued by an active exact authorized-approver attestation and remains bound
-  to its exact operator receipt; other operator actors still wait for a proven
+  classes, which is issued by an exact console receipt or active
+  authorized-approver attestation and remains bound to its exact operator receipt;
+  other operator actors still wait for a proven
   BB-native authenticated subject/receipt or a separately explicit decision.
 - Connector policy per repository. Set required, optional or prohibited only
   after the exact installation and terminal-artifact probe. Capability

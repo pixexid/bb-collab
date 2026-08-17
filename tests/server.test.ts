@@ -166,9 +166,9 @@ function staleV18Reread(name: (typeof CACHED_CONSUMERS)[number], result: Pick<Fo
   return { observedSchemaVersion: observation.observedSchemaVersion, observedContractVersion: observation.observedContractVersion };
 }
 
-function nullProvenanceReceiptDigest(receipt: OperatorReceipt) {
+function receiptProvenanceDigest(receipt: OperatorReceipt, issuanceProvenance: OperatorReceipt["issuanceProvenance"] | null) {
   const { receiptDigest: _receiptDigest, ...identity } = receipt;
-  return operatorReceiptDigest({ ...identity, issuanceProvenance: null });
+  return operatorReceiptDigest({ ...identity, issuanceProvenance });
 }
 
 function doctorV19Reread(name: "server.rpcContract" | "server.collabCli", result: FoundationResult) {
@@ -2719,7 +2719,16 @@ describe("bb-collab plugin boundary", () => {
       operatorReceiptId: accepted.operatorReceipt!.receiptId,
     })).toMatchObject({ outcome: "OK" });
     db.prepare("UPDATE operator_receipts SET issuance_provenance = NULL, receipt_digest = ? WHERE receipt_id = ?").run(
-      nullProvenanceReceiptDigest(accepted.operatorReceipt!),
+      receiptProvenanceDigest(accepted.operatorReceipt!, null),
+      accepted.operatorReceipt!.receiptId,
+    );
+    expect(await host.harness.callRpc("apply", {
+      ...acceptedUnsigned,
+      actorReceiptId: accepted.actorReceiptId,
+      operatorReceiptId: accepted.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "OPERATOR_RECEIPT_INVALID", attempted: 0, verified: 0 });
+    db.prepare("UPDATE operator_receipts SET issuance_provenance = 'attestation', receipt_digest = ? WHERE receipt_id = ?").run(
+      receiptProvenanceDigest(accepted.operatorReceipt!, "attestation"),
       accepted.operatorReceipt!.receiptId,
     );
     expect(await host.harness.callRpc("apply", {
@@ -2738,7 +2747,7 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: wrongActor.actorReceiptId,
       operatorReceiptId: wrongTargetId,
     })).toMatchObject({ outcome: "ACTOR_RECEIPT_UNVERIFIED", attempted: 0, verified: 0 });
-    const wrongActorLegacyDigest = nullProvenanceReceiptDigest(wrongActor.operatorReceipt!);
+    const wrongActorLegacyDigest = receiptProvenanceDigest(wrongActor.operatorReceipt!, null);
     db.prepare("UPDATE operator_receipts SET issuance_provenance = NULL, receipt_digest = ? WHERE receipt_id = ?").run(wrongActorLegacyDigest, wrongActorReceiptId);
     expect(await host.harness.callRpc("apply", {
       ...wrongTargetUnsigned,
@@ -2748,12 +2757,24 @@ describe("bb-collab plugin boundary", () => {
 
     const legacyUnsigned = request("legacy-console-binding", 2, 3);
     const legacy = await issueConsoleReceipt(legacyUnsigned);
-    const legacyDigest = nullProvenanceReceiptDigest(legacy.operatorReceipt!);
+    const legacyDigest = receiptProvenanceDigest(legacy.operatorReceipt!, null);
     db.prepare("UPDATE operator_receipts SET issuance_provenance = NULL, receipt_digest = ? WHERE receipt_id = ?").run(legacyDigest, legacy.operatorReceipt!.receiptId);
     expect(await host.harness.callRpc("apply", {
       ...legacyUnsigned,
       actorReceiptId: legacy.actorReceiptId,
       operatorReceiptId: legacy.operatorReceipt!.receiptId,
+    })).toMatchObject({ outcome: "OPERATOR_RECEIPT_INVALID", attempted: 0, verified: 0 });
+
+    const malformedAttestationUnsigned = request("malformed-attestation-binding", 2, 3);
+    const malformedAttestation = await issueConsoleReceipt(malformedAttestationUnsigned);
+    db.prepare("UPDATE operator_receipts SET issuance_provenance = 'attestation', receipt_digest = ? WHERE receipt_id = ?").run(
+      receiptProvenanceDigest(malformedAttestation.operatorReceipt!, "attestation"),
+      malformedAttestation.operatorReceipt!.receiptId,
+    );
+    expect(await host.harness.callRpc("apply", {
+      ...malformedAttestationUnsigned,
+      actorReceiptId: malformedAttestation.actorReceiptId,
+      operatorReceiptId: malformedAttestation.operatorReceipt!.receiptId,
     })).toMatchObject({ outcome: "OPERATOR_RECEIPT_INVALID", attempted: 0, verified: 0 });
   });
 
