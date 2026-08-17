@@ -301,9 +301,7 @@ attestation-only provenance from `approver_id`, authorizing columns, or receipt
 digest shape. The attestation registry remains validated for `attestation`
 rows. All four cached consumers reread v19 or refuse stale v18 NULL or unknown provenance with
 `OPERATOR_RECEIPT_INVALID`; only a persisted v19 4/4/4 rollout receipt is current.
-This amendment performs no historical backfill. Any later correction must name
-each receipt ID and cite durable console-interaction evidence; it may never use
-a NULL approver, digest, or other predicate. The request digest remains
+No historical operator-receipt row is modified. The request digest remains
 head-independent: rebasing changes only the separately exact-bound
 `candidate_head` field. The fixture-only apply seam remains test support only;
 v19 provenance and actor-binding assertions enter through the production RPC

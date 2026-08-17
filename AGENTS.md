@@ -24,9 +24,8 @@ the same host-issued `get-bb/bb#1541` condition.
 Operator receipts record explicit `issuance_provenance`: new console receipts
 are `console` and authorized-approver receipts are `attestation`; a legacy NULL
 marker is refused and provenance is never inferred from approver columns or a
-digest shape. This v19 change performs no historical backfill; any later
-backfill must enumerate exact receipt IDs and cite durable console-interaction
-evidence.
+digest shape. Historical operator-receipt mutation is dead letter: no
+historical receipt row is modified.
 The plugin is activated against live project authority: first activated on 2026-08-15 during the resolver-wiring activation (operator-authorized console exception), reloaded at 2026-08-16T14:06:56-0700 by the sentinel under supervisor authorization (bb plugin reload bb-collab) against merge dff355c3d203 (PR #121, contract v17 director role split), with an earlier same-day reload by the director seat (thr_gsb7m77ciz). This sentence previously stated the plugin had never been installed, reloaded, or activated; that statement was already inaccurate from 2026-08-15 and stood uncorrected for approximately one day. Reload evidence is actor-recorded; bb records no reload history. The complete decision is in
 [ADR 0001](docs/adr/0001-founding-contract.md); the threat boundary is in
 [the threat model](docs/threat-model.md); import and issue disposition are in
