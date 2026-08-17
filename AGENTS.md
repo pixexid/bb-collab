@@ -149,17 +149,33 @@ not close the gate.
   store.
 - Automated subagents, if introduced later, are depth one and draft-only.
   They do not own writing, authority, merge, release or operator decisions.
+- RULE 0 — VERIFY BEFORE ASSERTING: operator rule, issued directly; every
+  other rule tonight is a special case. Before asserting, NAME THE ARTIFACT
+  THAT WOULD SETTLE IT — the file, diff, row, surface — and READ it; not the
+  report about it. If you cannot read it, UNVERIFIED goes in the claim itself;
+  a flagged unread thing is a promise to read it before anyone acts. My
+  surface shows nothing is not nothing exists — absence of evidence on one
+  surface is evidence about the surface. Where two independent surfaces
+  exist, corroborate across both — trust the agreement, not either surface.
+  Re-verify before restating — a claim true when made goes stale. Escalation
+  pressure is the TRIGGER, not the exception — the urge to warn fast is the
+  signal to verify first. Evidence: failure cases are GH-124 merge-hold on an
+  unopened diff; spec inferred from ack pattern; two-binding-fields
+  assertion; fresh-candidate-thread assertion versus the hardcoded exemption;
+  case-sensitive non-delta count; zero-pending-inputs claim; queue-invisibility
+  defect filed against the platform capability doc. Corroboration cases are
+  SDK-vs-CLI SHA-256 parity; three-thread density; the 40.7 percent span
+  measurement.
 - RULE 1 — BEFORE SENDING TO A LANE, READ ITS QUEUE. If any messages are
   queued: do not append; clear them; deliver ONE bundled superseding message
   as a STEER. Contradiction resolution and moot-item dropping are the
   sender's work. Clarity of authority: prefer one sender per lane; this is a
   practice, not a Rule-1 obligation.
-- RULE 2 STEER VS QUEUE — test: does this make current work wrong or wasted?
-  yes = STEER; shapes a later step = QUEUE. A correction is never queued.
-  Queue only later-step shaping with an explicit precondition; if you cannot
-  state the precondition, it is not queueable. NEVER QUEUE AUTHORIZATION.
-  Worker-brief template: WHEN YOU DRAIN SEVERAL MESSAGES AT ONCE, ENUMERATE
-  THEM AND SAY WHICH YOU ARE ACTING ON.
+- RULE 2 — steer when current work would become wrong or wasted; queue only
+  later-step shaping with an explicit precondition; a correction is never
+  queued; more than one outstanding means bundle and steer; never queue
+  authorization. Worker-brief template: WHEN YOU DRAIN SEVERAL MESSAGES AT
+  ONCE, ENUMERATE THEM AND SAY WHICH YOU ARE ACTING ON.
 
 ## Review and release obligations
 
