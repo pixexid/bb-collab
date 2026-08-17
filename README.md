@@ -13,7 +13,7 @@ new-thread, search, navigation rows, and the footer.
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
-The repository now contains the implemented foundation through contract v17/schema v11: a
+The repository now contains the implemented foundation through contract v19/schema v12: a
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
@@ -31,8 +31,9 @@ confirmed bootstrap operator receipt atomically derives a verified
 `plugin/bb-collab` actor receipt linked to that exact operator receipt; the
 derived actor is not standing authority and apply must provide the same linked
 operator receipt. `config_revision` additionally requires the exact current
-`approverAttestation`-derived plugin actor bound to that receipt; a verified
-but unlinked or role actor refuses before any write. An adopted `operator_only` Decision registers the exact
+plugin actor bound to that receipt and its explicit `console` or `attestation`
+issuance provenance; a verified but unlinked or role actor, and legacy NULL
+provenance, refuse before any write. An adopted `operator_only` Decision registers the exact
 `orchestrator:bb-collab` approver and ten ratified derived mutation classes,
 including `config_revision` for the existing canonical mutation that replaces
 the full immutable project configuration and its mapped targets, including
@@ -58,8 +59,8 @@ that full project-configuration/target replacement, operator_only Decision
 create/adopted disposition, work_item_create, work_item_transition,
 qualification_observation_record, role_generation_succession, migration_prepare,
 and migration_step; role-based
-and review Decisions remain role-bound. The plugin has not been installed, reloaded, or activated against live
-project authority.
+and review Decisions remain role-bound. The plugin has been activated against live
+project authority; reload evidence is actor-recorded.
 
 Historical contract v11 was a contract-only role-capacity amendment: `roleRequirements`
 admitted at most three logical roles. `project-orchestrator` was project-scoped;
