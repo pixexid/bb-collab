@@ -66,7 +66,7 @@ export function readCheckoutDivergence(checkoutRoot: string | null): CheckoutDiv
     if (!checkoutHead || !originMainRef) return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable" };
     let behindCount: number | null = null;
     try {
-      const count = execFileSync("git", ["rev-list", "--count", `${checkoutHead}..${originMainRef}`], { cwd: checkoutRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+      const count = execFileSync("git", ["rev-list", "--count", `${checkoutHead}..${originMainRef}`], { cwd: checkoutRoot, encoding: "utf8", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" }, stdio: ["ignore", "pipe", "ignore"] }).trim();
       if (/^\d+$/u.test(count)) behindCount = Number(count);
     } catch {
       // Ref comparison remains useful even when the local object graph is incomplete.
@@ -80,7 +80,11 @@ export function readCheckoutDivergence(checkoutRoot: string | null): CheckoutDiv
 export function reportCheckoutDivergence(log: WarningLogger, checkoutRoot: string | null): CheckoutDivergence {
   const divergence = readCheckoutDivergence(checkoutRoot);
   if (divergence.verdict === "diverged") {
-    log.warn(`bb-collab checkout diverges from origin/main: checkout-head=${divergence.checkoutHead} origin/main=${divergence.originMainRef} behind-count=${divergence.behindCount ?? "unknown"}`);
+    try {
+      log.warn(`bb-collab checkout diverges from origin/main: checkout-head=${divergence.checkoutHead} origin/main=${divergence.originMainRef} behind-count=${divergence.behindCount ?? "unknown"}`);
+    } catch {
+      // Diagnostic logging must never prevent the plugin from loading.
+    }
   }
   return divergence;
 }

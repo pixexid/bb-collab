@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -67,7 +67,7 @@ import {
   seedFixtureDecision,
   seedVerifiedFixtureReceipt,
 } from "../src/test-support.js";
-import { readCheckoutDivergence, reportCheckoutDivergence } from "../src/checkout-divergence.js";
+import { findCheckoutRoot, readCheckoutDivergence, reportCheckoutDivergence } from "../src/checkout-divergence.js";
 
 const PROJECT_ID = "proj_test";
 const PLUGIN_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -698,6 +698,41 @@ function seedAndBootstrap(host: ReturnType<typeof hostFor>, projectId = PROJECT_
 }
 
 describe("checkout divergence detection", () => {
+  it("resolves plugin load when the divergence warning logger throws", async () => {
+    const host = hostFor();
+    const throwingLog = {
+      ...host.bb.log,
+      warn: () => {
+        throw new Error("warn failed");
+      },
+    };
+    await expect(plugin({ ...host.bb, log: throwingLog })).resolves.toBeUndefined();
+  });
+
+  it("does not lazy-fetch while counting divergence", () => {
+    const fixture = checkoutFixture(true);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-git-probe-"));
+    const argsLog = join(bin, "args");
+    const envLog = join(bin, "env");
+    const wrapper = join(bin, "git");
+    const gitPath = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+    writeFileSync(wrapper, `#!/bin/sh\nprintf '%s\\n' "$@" > "${argsLog}"\nprintf '%s\\n' "$GIT_NO_LAZY_FETCH" > "${envLog}"\nexec "${gitPath}" "$@"\n`);
+    chmodSync(wrapper, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      readCheckoutDivergence(fixture.directory);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+    const args = readFileSync(argsLog, "utf8").split("\n");
+    expect(args).toEqual(["rev-list", "--count", expect.stringContaining(".."), ""]);
+    expect(readFileSync(envLog, "utf8")).toBe("1\n");
+    rmSync(bin, { recursive: true, force: true });
+  });
+
   it("warns for a diverged fixture and reports the same doctor evidence", async () => {
     const fixture = checkoutFixture(true);
     try {
@@ -712,7 +747,8 @@ describe("checkout divergence detection", () => {
       const result = await doctor(host.bb.storage.database(), host.bb.sdk, PROJECT_ID, divergence);
       expect(result.evidence).toMatchObject({ checkoutDivergence: { checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 1, verdict: "diverged" } });
       const cli = await host.harness.runCli(["doctor", "--project", PROJECT_ID]);
-      expect(JSON.parse(cli.stdout).evidence).toMatchObject({ checkoutDivergence: { verdict: "clean" } });
+      const currentCheckout = readCheckoutDivergence(findCheckoutRoot(process.cwd()));
+      expect(JSON.parse(cli.stdout).evidence).toMatchObject({ checkoutDivergence: currentCheckout });
     } finally {
       rmSync(fixture.directory, { recursive: true, force: true });
     }
