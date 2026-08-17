@@ -13786,9 +13786,9 @@ import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 20;
+var CONTRACT_VERSION = 21;
 var SCHEMA_VERSION = 12;
-var PREVIOUS_CONTRACT_VERSION = 19;
+var PREVIOUS_CONTRACT_VERSION = 20;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
 var PREVIOUS_SCHEMA_VERSION = 11;
@@ -14407,12 +14407,12 @@ var CACHED_CONSUMERS = [
 ];
 var CACHED_CONSUMER_ROLLOUT_POLICY = {
   class: "operator_receipts.consumed_replay_provenance",
-  staleV19Receipt: "unknown",
+  staleV20Receipt: "unknown",
   currentNewLegacyApply: "OPERATOR_RECEIPT_INVALID",
-  requiredV20ConsumedLegacyReplay: "OK",
+  requiredV21ConsumedLegacyReplay: "OK",
   refusal: "OPERATOR_RECEIPT_INVALID"
 };
-async function assembleV20CachedConsumerRolloutEvidence(input) {
+async function assembleV21CachedConsumerRolloutEvidence(input) {
   const probes = [
     ["server.rpcContract", input.rpcContract],
     ["server.collabCli", input.collabCli],
@@ -14420,7 +14420,7 @@ async function assembleV20CachedConsumerRolloutEvidence(input) {
     ["src/foundation.newLegacyApplyProvenanceProbe", input.newLegacyApplyProvenance]
   ];
   if (probes.some(([, probe]) => typeof probe !== "function")) {
-    throw new Error("cached-consumer v20 rollout evidence requires execution from all four consumers");
+    throw new Error("cached-consumer v21 rollout evidence requires execution from all four consumers");
   }
   const executed = await Promise.all(probes.map(async ([name, probe]) => ({
     name,
@@ -14430,10 +14430,10 @@ async function assembleV20CachedConsumerRolloutEvidence(input) {
   const consumedLegacyReplay = executed[2].consumedLegacyReplay;
   const newApply = executed[3].newApplyRefusal;
   if (reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || consumedLegacyReplay?.outcome !== "OK" || newApply?.outcome !== "OPERATOR_RECEIPT_INVALID") {
-    throw new Error("cached-consumer v20 rollout evidence requires four rereads, consumed legacy replay, and the current new-apply refusal");
+    throw new Error("cached-consumer v21 rollout evidence requires four rereads, consumed legacy replay, and the current new-apply refusal");
   }
   const durableRefJson = canonicalJson({
-    kind: "cached_consumer_v20_rollout_receipt",
+    kind: "cached_consumer_v21_rollout_receipt",
     reread,
     consumedLegacyReplay: {
       outcome: consumedLegacyReplay.outcome
@@ -14443,16 +14443,16 @@ async function assembleV20CachedConsumerRolloutEvidence(input) {
     }
   });
   return {
-    evidenceId: "cached-consumer-v20-rollout-receipt",
+    evidenceId: "cached-consumer-v21-rollout-receipt",
     evidenceKind: "release",
     sourceKind: "release",
     sourceRef: "live-plugin:dist/server.js",
     executionAttemptId: null,
     contentDigest: sha256(durableRefJson),
-    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v20-rollout-receipt", redacted: true }),
+    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v21-rollout-receipt", redacted: true }),
     durableRefJson,
     relationKind: "supporting",
-    relation: { purpose: "cached-consumer-v20-rollout" }
+    relation: { purpose: "cached-consumer-v21-rollout" }
   };
 }
 function cachedConsumerRolloutEvidence(observations) {
@@ -14499,7 +14499,7 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
     `SELECT evidence_kind, source_kind, source_ref, execution_attempt_id, content_digest,
             redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest
      FROM evidence_artifacts
-     WHERE project_id = ? AND evidence_id = 'cached-consumer-v20-rollout-receipt'`
+     WHERE project_id = ? AND evidence_id = 'cached-consumer-v21-rollout-receipt'`
   ).get(projectId));
   if (!row) return unknownCachedConsumerRolloutEvidence();
   try {
@@ -14509,7 +14509,7 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
     assertRedactedEvidence(durableRef, "cached-consumer rollout durable reference");
     const expectedIdentity = sha256(canonicalJson({
       projectId,
-      evidenceId: "cached-consumer-v20-rollout-receipt",
+      evidenceId: "cached-consumer-v21-rollout-receipt",
       evidenceKind: row.evidence_kind,
       sourceKind: row.source_kind,
       sourceRef: row.source_ref,
@@ -14522,7 +14522,7 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
     const receipt = durableRef;
     if (!Array.isArray(receipt.reread?.observations)) return unknownCachedConsumerRolloutEvidence();
     const reread = cachedConsumerRolloutEvidence(receipt.reread.observations);
-    if (receipt.kind !== "cached_consumer_v20_rollout_receipt" || receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest || reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || receipt.consumedLegacyReplay?.outcome !== "OK" || receipt.newApplyGuard?.nullProvenance?.outcome !== "OPERATOR_RECEIPT_INVALID") return unknownCachedConsumerRolloutEvidence();
+    if (receipt.kind !== "cached_consumer_v21_rollout_receipt" || receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest || reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || receipt.consumedLegacyReplay?.outcome !== "OK" || receipt.newApplyGuard?.nullProvenance?.outcome !== "OPERATOR_RECEIPT_INVALID") return unknownCachedConsumerRolloutEvidence();
     return reread;
   } catch {
     return unknownCachedConsumerRolloutEvidence();
@@ -14649,7 +14649,7 @@ var contractDigest = sha256(canonicalJson({
     expected: 4,
     attempted: 4,
     verified: 4,
-    staleV19Receipt: CACHED_CONSUMER_ROLLOUT_POLICY
+    staleV20Receipt: CACHED_CONSUMER_ROLLOUT_POLICY
   },
   roleHolderEligibilityPolicy: {
     nativeWitnessMarker: "witness",
@@ -15459,8 +15459,8 @@ function validateConfig(value) {
   if (!["full", "auto", "accept-edits"].includes(config2.permissionMode)) {
     throw refusal("INVALID_INPUT", "config permissionMode is not a BB permission mode");
   }
-  if (!["visible", "hidden"].includes(config2.visibility)) {
-    throw refusal("INVALID_INPUT", "config visibility is not a BB visibility value");
+  if (config2.visibility !== "visible") {
+    throw refusal("INVALID_INPUT", "config visibility must be explicitly visible");
   }
   const extensions = config2.extensions;
   if (extensions !== void 0) {
@@ -15540,7 +15540,7 @@ function newApplyProvenanceRefusal(value) {
     return { outcome: error48 instanceof Refusal ? error48.data.code : "INTERNAL_ERROR" };
   }
 }
-function probeV20ConsumedLegacyReplay(db, projectId) {
+function probeV21ConsumedLegacyReplay(db, projectId) {
   const replay = asRow(db.prepare(
     `SELECT r.consumed_at_ms, r.consumed_event_sequence, m.committed_event_sequence,
             e.operator_receipt_id, m.outcome_json
@@ -15563,7 +15563,7 @@ function probeV20ConsumedLegacyReplay(db, projectId) {
   ).get(projectId));
   const outcome = replay ? JSON.parse(replay.outcome_json) : null;
   if (!replay || outcome?.outcome !== "OK") {
-    throw new Error("cached-consumer v20 replay proof requires an observed consumed legacy receipt");
+    throw new Error("cached-consumer v21 replay proof requires an observed consumed legacy receipt");
   }
   return {
     observedSchemaVersion: SCHEMA_VERSION,
@@ -15571,7 +15571,7 @@ function probeV20ConsumedLegacyReplay(db, projectId) {
     consumedLegacyReplay: { outcome: "OK" }
   };
 }
-function probeV20NewLegacyApplyProvenanceRefusal() {
+function probeV21NewLegacyApplyProvenanceRefusal() {
   const newApplyRefusal = newApplyProvenanceRefusal(null);
   return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION, newApplyRefusal };
 }
@@ -22440,7 +22440,7 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
 }
 async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false) {
   const parsed = applyRequestSchema.safeParse(input);
-  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v20-rollout-receipt")) {
+  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v21-rollout-receipt")) {
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
@@ -22487,7 +22487,7 @@ async function applyLiveCachedConsumerRollout(bb, db, input, cliDeps, cliContext
   try {
     const project = await bb.sdk.projects.get({ projectId: request.projectId });
     if (project.id !== request.projectId) return { outcome: "PROJECT_UNKNOWN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "live project identity does not match the rollout request" };
-    const evidence = await assembleV20CachedConsumerRolloutEvidence({
+    const evidence = await assembleV21CachedConsumerRolloutEvidence({
       rpcContract: async () => liveCachedConsumerReread("server.rpcContract", await bb.sdk.plugins.callRpc({
         pluginId: bb.pluginId,
         method: "doctor",
@@ -22497,8 +22497,8 @@ async function applyLiveCachedConsumerRollout(bb, db, input, cliDeps, cliContext
       collabCli: async () => liveCachedConsumerReread("server.collabCli", foundationResultSchema.parse(JSON.parse(
         (await runCli(db, bb, ["doctor", "--project", request.projectId], cliContext, cliDeps)).stdout
       ))),
-      consumedLegacyReplay: async () => probeV20ConsumedLegacyReplay(db, request.projectId),
-      newLegacyApplyProvenance: async () => probeV20NewLegacyApplyProvenanceRefusal()
+      consumedLegacyReplay: async () => probeV21ConsumedLegacyReplay(db, request.projectId),
+      newLegacyApplyProvenance: async () => probeV21NewLegacyApplyProvenanceRefusal()
     });
     const supplied = (request.decisionEvidence ?? []).filter((item) => item.evidenceId === evidence.evidenceId);
     if (supplied.length !== 1 || canonicalJson(supplied[0]) !== canonicalJson(evidence)) {
@@ -23267,7 +23267,7 @@ ${thread.titleFallback ?? ""}`);
       },
       {
         name: "cached-consumer-rollout",
-        summary: "Persist the live v20 cached-consumer rollout receipt (exact one-request receipt required)",
+        summary: "Persist the live v21 cached-consumer rollout receipt (exact one-request receipt required)",
         usage: "bb collab cached-consumer-rollout --project PROJECT_ID --request JSON"
       },
       {

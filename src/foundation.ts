@@ -6,10 +6,10 @@ import type { CheckoutDivergence } from "./checkout-divergence.js";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 20;
+export const CONTRACT_VERSION = 21;
 export const SCHEMA_VERSION = 12;
-// v20 restores the exact committed-result replay seam for consumed legacy receipts.
-const PREVIOUS_CONTRACT_VERSION = 19;
+// v21 makes project configuration visibility explicitly visible-only.
+const PREVIOUS_CONTRACT_VERSION = 20;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
 const PREVIOUS_SCHEMA_VERSION = 11;
@@ -636,9 +636,9 @@ export const CACHED_CONSUMERS = [
 ] as const;
 const CACHED_CONSUMER_ROLLOUT_POLICY = {
   class: "operator_receipts.consumed_replay_provenance",
-  staleV19Receipt: "unknown",
+  staleV20Receipt: "unknown",
   currentNewLegacyApply: "OPERATOR_RECEIPT_INVALID",
-  requiredV20ConsumedLegacyReplay: "OK",
+  requiredV21ConsumedLegacyReplay: "OK",
   refusal: "OPERATOR_RECEIPT_INVALID",
 } as const;
 
@@ -655,7 +655,7 @@ type CachedConsumerProbe = () => Promise<{
   newApplyRefusal?: Pick<FoundationResult, "outcome">;
 }>;
 
-export async function assembleV20CachedConsumerRolloutEvidence(input: {
+export async function assembleV21CachedConsumerRolloutEvidence(input: {
   rpcContract?: CachedConsumerProbe;
   collabCli?: CachedConsumerProbe;
   consumedLegacyReplay?: CachedConsumerProbe;
@@ -668,7 +668,7 @@ export async function assembleV20CachedConsumerRolloutEvidence(input: {
     ["src/foundation.newLegacyApplyProvenanceProbe", input.newLegacyApplyProvenance],
   ] as const;
   if (probes.some(([, probe]) => typeof probe !== "function")) {
-    throw new Error("cached-consumer v20 rollout evidence requires execution from all four consumers");
+    throw new Error("cached-consumer v21 rollout evidence requires execution from all four consumers");
   }
   const executed = await Promise.all(probes.map(async ([name, probe]) => ({
     name,
@@ -681,10 +681,10 @@ export async function assembleV20CachedConsumerRolloutEvidence(input: {
     reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 ||
     consumedLegacyReplay?.outcome !== "OK" || newApply?.outcome !== "OPERATOR_RECEIPT_INVALID"
   ) {
-    throw new Error("cached-consumer v20 rollout evidence requires four rereads, consumed legacy replay, and the current new-apply refusal");
+    throw new Error("cached-consumer v21 rollout evidence requires four rereads, consumed legacy replay, and the current new-apply refusal");
   }
   const durableRefJson = canonicalJson({
-    kind: "cached_consumer_v20_rollout_receipt",
+    kind: "cached_consumer_v21_rollout_receipt",
     reread,
     consumedLegacyReplay: {
       outcome: consumedLegacyReplay.outcome,
@@ -694,16 +694,16 @@ export async function assembleV20CachedConsumerRolloutEvidence(input: {
     },
   });
   return {
-    evidenceId: "cached-consumer-v20-rollout-receipt",
+    evidenceId: "cached-consumer-v21-rollout-receipt",
     evidenceKind: "release",
     sourceKind: "release",
     sourceRef: "live-plugin:dist/server.js",
     executionAttemptId: null,
     contentDigest: sha256(durableRefJson),
-    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v20-rollout-receipt", redacted: true }),
+    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v21-rollout-receipt", redacted: true }),
     durableRefJson,
     relationKind: "supporting",
-    relation: { purpose: "cached-consumer-v20-rollout" },
+    relation: { purpose: "cached-consumer-v21-rollout" },
   };
 }
 
@@ -766,7 +766,7 @@ function persistedCachedConsumerRolloutEvidence(db: SqliteDatabase, projectId: s
     `SELECT evidence_kind, source_kind, source_ref, execution_attempt_id, content_digest,
             redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest
      FROM evidence_artifacts
-     WHERE project_id = ? AND evidence_id = 'cached-consumer-v20-rollout-receipt'`,
+     WHERE project_id = ? AND evidence_id = 'cached-consumer-v21-rollout-receipt'`,
   ).get(projectId));
   if (!row) return unknownCachedConsumerRolloutEvidence();
   try {
@@ -776,7 +776,7 @@ function persistedCachedConsumerRolloutEvidence(db: SqliteDatabase, projectId: s
     assertRedactedEvidence(durableRef, "cached-consumer rollout durable reference");
     const expectedIdentity = sha256(canonicalJson({
       projectId,
-      evidenceId: "cached-consumer-v20-rollout-receipt",
+      evidenceId: "cached-consumer-v21-rollout-receipt",
       evidenceKind: row.evidence_kind,
       sourceKind: row.source_kind,
       sourceRef: row.source_ref,
@@ -801,7 +801,7 @@ function persistedCachedConsumerRolloutEvidence(db: SqliteDatabase, projectId: s
     if (!Array.isArray(receipt.reread?.observations)) return unknownCachedConsumerRolloutEvidence();
     const reread = cachedConsumerRolloutEvidence(receipt.reread.observations as CachedConsumerObservation[]);
     if (
-      receipt.kind !== "cached_consumer_v20_rollout_receipt" ||
+      receipt.kind !== "cached_consumer_v21_rollout_receipt" ||
       receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest ||
       reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 ||
       receipt.consumedLegacyReplay?.outcome !== "OK" ||
@@ -937,7 +937,7 @@ export const contractDigest = sha256(canonicalJson({
     expected: 4,
     attempted: 4,
     verified: 4,
-    staleV19Receipt: CACHED_CONSUMER_ROLLOUT_POLICY,
+    staleV20Receipt: CACHED_CONSUMER_ROLLOUT_POLICY,
   },
   roleHolderEligibilityPolicy: {
     nativeWitnessMarker: "witness",
@@ -2288,8 +2288,8 @@ function validateConfig(value: unknown): string {
   if (!["full", "auto", "accept-edits"].includes(config.permissionMode)) {
     throw refusal("INVALID_INPUT", "config permissionMode is not a BB permission mode");
   }
-  if (!["visible", "hidden"].includes(config.visibility)) {
-    throw refusal("INVALID_INPUT", "config visibility is not a BB visibility value");
+  if (config.visibility !== "visible") {
+    throw refusal("INVALID_INPUT", "config visibility must be explicitly visible");
   }
   const extensions = config.extensions;
   if (extensions !== undefined) {
@@ -2389,7 +2389,7 @@ function newApplyProvenanceRefusal(value: unknown): Pick<FoundationResult, "outc
   }
 }
 
-export function probeV20ConsumedLegacyReplay(db: SqliteDatabase, projectId: string) {
+export function probeV21ConsumedLegacyReplay(db: SqliteDatabase, projectId: string) {
   const replay = asRow<{
     consumed_at_ms: number | null;
     consumed_event_sequence: number | null;
@@ -2418,7 +2418,7 @@ export function probeV20ConsumedLegacyReplay(db: SqliteDatabase, projectId: stri
   ).get(projectId));
   const outcome = replay ? JSON.parse(replay.outcome_json) as { outcome?: unknown } : null;
   if (!replay || outcome?.outcome !== "OK") {
-    throw new Error("cached-consumer v20 replay proof requires an observed consumed legacy receipt");
+    throw new Error("cached-consumer v21 replay proof requires an observed consumed legacy receipt");
   }
   return {
     observedSchemaVersion: SCHEMA_VERSION,
@@ -2427,7 +2427,7 @@ export function probeV20ConsumedLegacyReplay(db: SqliteDatabase, projectId: stri
   };
 }
 
-export function probeV20NewLegacyApplyProvenanceRefusal() {
+export function probeV21NewLegacyApplyProvenanceRefusal() {
   const newApplyRefusal = newApplyProvenanceRefusal(null);
   return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION, newApplyRefusal };
 }

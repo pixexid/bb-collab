@@ -1,9 +1,9 @@
 # bb-collab repository contract
 
-CONTRACT_VERSION: 20
+CONTRACT_VERSION: 21
 
 This repository contains the founding contract and the implemented foundation
-through contract v20/schema v12: a single SQLite store with migrations, resolver,
+through contract v21/schema v12: a single SQLite store with migrations, resolver,
 state-event and mutation-receipt, deterministic export, and read-only doctor
 seams, plus WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
 Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
@@ -65,8 +65,10 @@ field can activate work or authorize a canonical mutation by itself.
   current-directory fallback.
 - Configuration stores secret references, never secret material.
 - Permission and visibility are explicit values in each project-config
-  revision and execution request. Full permission is a possible starter
-  value, never an invisible inherited default.
+  revision and execution request. Project configuration must set
+  `visibility: "visible"`; hidden or omitted defaults refuse before persistence.
+  Full permission is a possible starter value, never an invisible inherited
+  default.
 
 ## Cached-consumer bump test
 
@@ -81,14 +83,14 @@ Changing version text alone is not a migration. A zero-work result is not a
 successful apply unless zero expected work, zero attempted work and zero
 verified work are all proven.
 
-Contract v20/schema v12 requires exactly four production cached consumers: the
+Contract v21/schema v12 requires exactly four production cached consumers: the
 registered RPC `doctor` handler, the CLI `doctor` dispatcher, and the two named
-production replay/new-apply provenance validations. Each rereads v20; the
+production replay/new-apply provenance validations. Each rereads v21; the
 consumed legacy replay returns its recorded `OK` outcome and a fresh NULL or
 unknown provenance apply refuses with `OPERATOR_RECEIPT_INVALID`; expected,
-attempted, and verified must all be 4. The v20 receipt is the only current
-receipt: missing or v19 receipt evidence is unknown and fail-closed, with no
-automatic v19 receipt migration
+attempted, and verified must all be 4. The v21 receipt is the only current
+receipt: missing or v20 receipt evidence is unknown and fail-closed, with no
+automatic v20 receipt migration
 or write. The replay consumer requires a read-only observed chain from the
 consumed legacy receipt through its matching mutation receipt and StateEvent;
 without it, rollout refuses rather than synthesizing success.
