@@ -291,12 +291,12 @@ repair is acceptable because otherwise the corrected mechanism cannot land.
 The gate closes only when doctor reports 4/4/4 VERIFIED from LIVE STATE, not
 on merge, suite, or review.
 
-Contract v16 makes project configuration visibility visible-only. Every
+Contract v21 makes project configuration visibility visible-only. Every
 configuration revision must explicitly set `visibility: "visible"`; omitted
 or `hidden` values refuse before persistence. This prevents a remembered or
 inherited hidden default from becoming canonical configuration. The schema and
-migrations remain unchanged; all four cached consumers reread v16 or refuse
-v15.
+migrations remain unchanged; all four cached consumers reread v21 or refuse
+v20.
 
 ## 6. Roles, delegation and execution
 

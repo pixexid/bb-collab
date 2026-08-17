@@ -32,7 +32,7 @@ import {
   PLUGIN_ID,
   SCHEMA_VERSION,
   TABLES,
-  assembleV20CachedConsumerRolloutEvidence,
+  assembleV21CachedConsumerRolloutEvidence,
   applyFixtureMutation,
   applyAuthorizedMutation,
   cachedConsumerRolloutEvidence,
@@ -48,8 +48,8 @@ import {
   persistInterimOperatorReceipt,
   operatorAuthorizationDigestProjection,
   operatorRequestDigest,
-  probeV20NewLegacyApplyProvenanceRefusal,
-  probeV20ConsumedLegacyReplay,
+  probeV21NewLegacyApplyProvenanceRefusal,
+  probeV21ConsumedLegacyReplay,
   schemaDigest,
   sha256,
   type ApplyRequest,
@@ -186,7 +186,7 @@ function cachedConsumerObservations(observedSchemaVersion: number, observedContr
 function policyProbeReread(name: (typeof CACHED_CONSUMERS)[number], result: Pick<FoundationResult, "outcome">, expectedOutcome: FoundationResult["outcome"]) {
   if (result.outcome !== expectedOutcome) throw new Error(`${name} policy probe did not return ${expectedOutcome}`);
   const reread = cachedConsumerRolloutEvidence(cachedConsumerObservations(SCHEMA_VERSION, CONTRACT_VERSION));
-  if (reread.action !== "reread") throw new Error(`${name} did not reread v20`);
+  if (reread.action !== "reread") throw new Error(`${name} did not reread v21`);
   const observation = reread.observations.find((candidate) => candidate.name === name);
   if (!observation) throw new Error(`${name} reread observation is unavailable`);
   return { observedSchemaVersion: observation.observedSchemaVersion, observedContractVersion: observation.observedContractVersion };
@@ -197,7 +197,7 @@ function receiptProvenanceDigest(receipt: OperatorReceipt, issuanceProvenance: O
   return operatorReceiptDigest({ ...identity, issuanceProvenance });
 }
 
-function doctorV20Reread(name: "server.rpcContract" | "server.collabCli", result: FoundationResult) {
+function doctorV21Reread(name: "server.rpcContract" | "server.collabCli", result: FoundationResult) {
   const cachedConsumers = (result.evidence as { cachedConsumers?: { newSchemaVersion?: unknown; newContractVersion?: unknown } } | undefined)?.cachedConsumers;
   if (result.outcome !== "OK" || typeof cachedConsumers?.newSchemaVersion !== "number" || typeof cachedConsumers.newContractVersion !== "number") {
     throw new Error(`${name} did not return cached-consumer evidence`);
@@ -3160,9 +3160,9 @@ describe("bb-collab plugin boundary", () => {
     );
     const beforeConsumedLegacyReplay = exportFoundation(db, PROJECT_ID);
     expect(db.prepare("SELECT consumed_at_ms, issuance_provenance FROM operator_receipts WHERE receipt_id = ?").get(consumedLegacyFixtureReceiptId)).toEqual({ consumed_at_ms: expect.any(Number), issuance_provenance: null });
-    expect(probeV20ConsumedLegacyReplay(db, PROJECT_ID)).toMatchObject({
+    expect(probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toMatchObject({
       observedSchemaVersion: 12,
-      observedContractVersion: 20,
+      observedContractVersion: 21,
       consumedLegacyReplay: { outcome: "OK" },
     });
     const copiedReceipt = db.prepare("SELECT binding_digest, receipt_digest FROM operator_receipts WHERE receipt_id = ?").get(consumedLegacyFixtureReceiptId) as { binding_digest: string; receipt_digest: string };
@@ -3799,9 +3799,9 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("appends the v20 replay rollout contract and rolls every cached consumer forward", () => {
+  it("appends the v21 visible-configuration contract and rolls every cached consumer forward", () => {
     expect(SCHEMA_VERSION).toBe(12);
-    expect(CONTRACT_VERSION).toBe(20);
+    expect(CONTRACT_VERSION).toBe(21);
     expect(MIGRATIONS).toHaveLength(25);
     expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("5ee5cd12902e433825558c27b9a20d8bc2e86c5ffe018bf5b59e207d5d2d684e");
     expect(MIGRATIONS.at(-7)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
@@ -3823,18 +3823,18 @@ describe("bb-collab plugin boundary", () => {
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 11,
       newSchemaVersion: 12,
-      oldContractVersion: 19,
-      newContractVersion: 20,
+      oldContractVersion: 20,
+      newContractVersion: 21,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 21))).toMatchObject({
       oldSchemaVersion: 11,
       newSchemaVersion: 12,
-      oldContractVersion: 19,
-      newContractVersion: 20,
+      oldContractVersion: 20,
+      newContractVersion: 21,
       action: "reread",
       expected: 4,
       attempted: 4,
@@ -3844,8 +3844,8 @@ describe("bb-collab plugin boundary", () => {
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 11,
       newSchemaVersion: 12,
-      oldContractVersion: 19,
-      newContractVersion: 20,
+      oldContractVersion: 20,
+      newContractVersion: 21,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -3876,33 +3876,33 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("assembles the production v20 cached-consumer rollout receipt with stale-v19 refusal semantics", async () => {
-    expect(CONTRACT_VERSION).toBe(20);
+  it("assembles the production v21 cached-consumer rollout receipt with stale-v20 refusal semantics", async () => {
+    expect(CONTRACT_VERSION).toBe(21);
     expect(SCHEMA_VERSION).toBe(12);
     expect(MIGRATIONS).toHaveLength(25);
     expect(schemaDigest).toBe("eacc300f19723e0fd9dc0345509628569bd40b2d4c7740954bfc7e647aff9640");
-    expect(contractDigest).toBe("25465d4e38bdfdf4a29d57efcd4d15def14fd77aa529a6fdf19ee4b3903d8407");
+    expect(contractDigest).toBe("e36113e445c57e95b7ca24c9fb29814d2abb1425b5d1ba9eb38bd3c10cbbea41");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     const beforeRefusal = exportFoundation(db, PROJECT_ID);
-    const evidence = await assembleV20CachedConsumerRolloutEvidence({
-      rpcContract: async () => doctorV20Reread("server.rpcContract", rpcContract.doctor.output.parse(
+    const evidence = await assembleV21CachedConsumerRolloutEvidence({
+      rpcContract: async () => doctorV21Reread("server.rpcContract", rpcContract.doctor.output.parse(
         await host.harness.callRpc("doctor", { projectId: PROJECT_ID }),
       ) as FoundationResult),
-      collabCli: async () => doctorV20Reread("server.collabCli", JSON.parse(
+      collabCli: async () => doctorV21Reread("server.collabCli", JSON.parse(
         (await host.harness.runCli(["doctor", "--project", PROJECT_ID])).stdout,
       ) as FoundationResult),
       consumedLegacyReplay: async () => ({ ...policyProbeReread("src/foundation.consumedLegacyReplayProbe", { outcome: "OK" }, "OK"), consumedLegacyReplay: { outcome: "OK" } }),
-      newLegacyApplyProvenance: async () => ({ ...policyProbeReread("src/foundation.newLegacyApplyProvenanceProbe", probeV20NewLegacyApplyProvenanceRefusal().newApplyRefusal, "OPERATOR_RECEIPT_INVALID"), newApplyRefusal: probeV20NewLegacyApplyProvenanceRefusal().newApplyRefusal }),
+      newLegacyApplyProvenance: async () => ({ ...policyProbeReread("src/foundation.newLegacyApplyProvenanceProbe", probeV21NewLegacyApplyProvenanceRefusal().newApplyRefusal, "OPERATOR_RECEIPT_INVALID"), newApplyRefusal: probeV21NewLegacyApplyProvenanceRefusal().newApplyRefusal }),
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 12, observedContractVersion: 20 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 12, observedContractVersion: 21 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
     expect(evidence).toMatchObject({
-      evidenceId: "cached-consumer-v20-rollout-receipt",
+      evidenceId: "cached-consumer-v21-rollout-receipt",
       evidenceKind: "release",
       sourceKind: "release",
       sourceRef: "live-plugin:dist/server.js",
@@ -3910,13 +3910,13 @@ describe("bb-collab plugin boundary", () => {
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
   });
 
-  it("refuses v20 rollout evidence when one cached consumer did not execute", async () => {
+  it("refuses v21 rollout evidence when one cached consumer did not execute", async () => {
     const { db, directory } = directDatabase();
     try {
       const rpcContractProbe = vi.fn(async () => ({ observedSchemaVersion: 11, observedContractVersion: 18 }));
       const collabCliProbe = vi.fn(async () => ({ observedSchemaVersion: 11, observedContractVersion: 18 }));
       const serverTestProbe = vi.fn(async () => ({ observedSchemaVersion: 11, observedContractVersion: 18 }));
-      await expect(assembleV20CachedConsumerRolloutEvidence({
+      await expect(assembleV21CachedConsumerRolloutEvidence({
         rpcContract: rpcContractProbe,
         collabCli: collabCliProbe,
         newLegacyApplyProvenance: serverTestProbe,
@@ -3931,15 +3931,15 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("keeps the v20 rollout assembler in production rather than test support", () => {
-    expect(typeof assembleV20CachedConsumerRolloutEvidence).toBe("function");
+  it("keeps the v21 rollout assembler in production rather than test support", () => {
+    expect(typeof assembleV21CachedConsumerRolloutEvidence).toBe("function");
     expect(CACHED_CONSUMERS).toEqual([
       "server.rpcContract",
       "server.collabCli",
       "src/foundation.consumedLegacyReplayProbe",
       "src/foundation.newLegacyApplyProvenanceProbe",
     ]);
-    expect(readFileSync(new URL("../src/test-support.ts", import.meta.url), "utf8")).not.toContain("assembleV20CachedConsumerRolloutEvidence");
+    expect(readFileSync(new URL("../src/test-support.ts", import.meta.url), "utf8")).not.toContain("assembleV21CachedConsumerRolloutEvidence");
     const serverSource = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
     expect(serverSource).toContain("bb.sdk.plugins.callRpc({");
     expect(serverSource).toContain('runCli(db, bb, ["doctor", "--project", request.projectId], cliContext, cliDeps)');
@@ -3951,10 +3951,10 @@ describe("bb-collab plugin boundary", () => {
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
     const before = exportFoundation(db, PROJECT_ID);
-    expect(() => probeV20ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
-    expect(probeV20NewLegacyApplyProvenanceRefusal()).toMatchObject({
+    expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
+    expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
       observedSchemaVersion: 12,
-      observedContractVersion: 20,
+      observedContractVersion: 21,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -3965,14 +3965,14 @@ describe("bb-collab plugin boundary", () => {
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
     const actorReceiptId = "cached-consumer-rollout-source-actor";
     seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: actorReceiptId, actorKind: "operator" });
-    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v20-rollout-decision", {
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v21-rollout-decision", {
       actorReceiptId,
     }))).toMatchObject({ outcome: "OK" });
     const before = exportFoundation(db, PROJECT_ID);
-    for (const sourceRef of ["test:cached-consumer-v20-rollout-receipt", "fixture:cached-consumer-v20-rollout-receipt", "source:server.ts"]) {
-      expect(await host.harness.callRpc("cachedConsumerRollout", decisionDispositionRequest(fenceToken, "cached-consumer-v20-rollout-decision", 1, {
+    for (const sourceRef of ["test:cached-consumer-v21-rollout-receipt", "fixture:cached-consumer-v21-rollout-receipt", "source:server.ts"]) {
+      expect(await host.harness.callRpc("cachedConsumerRollout", decisionDispositionRequest(fenceToken, "cached-consumer-v21-rollout-decision", 1, {
         actorReceiptId,
-        decisionEvidence: [decisionArtifact("cached-consumer-v20-rollout-receipt", {
+        decisionEvidence: [decisionArtifact("cached-consumer-v21-rollout-receipt", {
           evidenceKind: "test",
           sourceKind: "test",
           sourceRef,
@@ -3993,17 +3993,17 @@ describe("bb-collab plugin boundary", () => {
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
     const actorReceiptId = "cached-consumer-rollout-dist-refusal-actor";
     seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: actorReceiptId, actorKind: "operator" });
-    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v20-rollout-dist-refusal", {
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v21-rollout-dist-refusal", {
       actorReceiptId,
     }))).toMatchObject({ outcome: "OK" });
     const before = exportFoundation(db, PROJECT_ID);
-    expect(await host.harness.callRpc("cachedConsumerRollout", decisionDispositionRequest(fenceToken, "cached-consumer-v20-rollout-dist-refusal", 1, {
+    expect(await host.harness.callRpc("cachedConsumerRollout", decisionDispositionRequest(fenceToken, "cached-consumer-v21-rollout-dist-refusal", 1, {
         actorReceiptId,
       }))).toMatchObject({
         outcome: "INVALID_INPUT",
         attempted: 0,
         verified: 0,
-        message: "cached-consumer v20 replay proof requires an observed consumed legacy receipt",
+        message: "cached-consumer v21 replay proof requires an observed consumed legacy receipt",
       });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
   });
@@ -4013,11 +4013,11 @@ describe("bb-collab plugin boundary", () => {
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
     const actorReceiptId = "cached-consumer-rollout-dist-actor";
     seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: actorReceiptId, actorKind: "operator" });
-    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v20-rollout-dist", {
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v21-rollout-dist", {
       actorReceiptId,
     }))).toMatchObject({ outcome: "OK" });
     const unsigned = {
-      ...decisionDispositionRequest(fenceToken, "cached-consumer-v20-rollout-dist", 1, {
+      ...decisionDispositionRequest(fenceToken, "cached-consumer-v21-rollout-dist", 1, {
         actorReceiptId,
       }),
       candidateHead: CANDIDATE_SHA,
@@ -4039,7 +4039,7 @@ describe("bb-collab plugin boundary", () => {
       outcome: "INVALID_INPUT",
       attempted: 0,
       verified: 0,
-      message: "cached-consumer v20 replay proof requires an observed consumed legacy receipt",
+        message: "cached-consumer v21 replay proof requires an observed consumed legacy receipt",
     });
     expect(host.harness.inspection.sdk.callsTo("plugins.callRpc")).toContainEqual([
       expect.objectContaining({ pluginId: PLUGIN_ID, method: "doctor", input: { projectId: PROJECT_ID } }),
@@ -4047,16 +4047,16 @@ describe("bb-collab plugin boundary", () => {
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
   });
 
-  it("treats a persisted v19 rollout receipt as unknown without migrating or requiring it", async () => {
+  it("treats a persisted v20 rollout receipt as unknown without migrating or requiring it", async () => {
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
-    seedEvidenceArtifact(db, "cached-consumer-v19-rollout-receipt");
+    seedEvidenceArtifact(db, "cached-consumer-v20-rollout-receipt");
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
       outcome: "OK",
       evidence: {
         cachedConsumers: {
-          oldContractVersion: 19,
-          newContractVersion: 20,
+          oldContractVersion: 20,
+          newContractVersion: 21,
           action: "unknown",
           expected: 4,
           attempted: 0,
@@ -4071,13 +4071,13 @@ describe("bb-collab plugin boundary", () => {
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
     const actorReceiptId = "cached-consumer-rollout-generic-actor";
     seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: actorReceiptId, actorKind: "operator" });
-    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v20-rollout-generic", {
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v21-rollout-generic", {
       actorReceiptId,
     }))).toMatchObject({ outcome: "OK" });
     const before = exportFoundation(db, PROJECT_ID);
-    expect(await host.harness.callRpc("apply", decisionDispositionRequest(fenceToken, "cached-consumer-v20-rollout-generic", 1, {
+    expect(await host.harness.callRpc("apply", decisionDispositionRequest(fenceToken, "cached-consumer-v21-rollout-generic", 1, {
       actorReceiptId,
-      decisionEvidence: [decisionArtifact("cached-consumer-v20-rollout-receipt", {
+      decisionEvidence: [decisionArtifact("cached-consumer-v21-rollout-receipt", {
         evidenceKind: "release",
         sourceKind: "release",
         sourceRef: "live-plugin:dist/server.js",
@@ -4180,7 +4180,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 12, schemaDigest, contractVersion: 20, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 12, schemaDigest, contractVersion: 21, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -7660,9 +7660,10 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 12, oldContractVersion: 19, newContractVersion: 20, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 12, oldContractVersion: 19, newContractVersion: 20, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 12, oldContractVersion: 19, newContractVersion: 20, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 12, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 12, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 12, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 21))).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 12, oldContractVersion: 20, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {
