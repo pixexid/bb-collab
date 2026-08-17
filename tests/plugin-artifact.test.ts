@@ -4,11 +4,17 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
+import { isLiveCachedConsumerRolloutArtifact } from "../server.js";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = dirname(ROOT);
 
 describe("path-install server artifact", () => {
+  it("accepts the BB reload URL for dist/server.js and refuses source artifacts", () => {
+    expect(isLiveCachedConsumerRolloutArtifact("file:///plugin/dist/server.js?bbPluginLoad=7.9#reload")).toBe(true);
+    expect(isLiveCachedConsumerRolloutArtifact("file:///scratch-clone/server.ts?bbPluginLoad=7.9")).toBe(false);
+  });
+
   it("loads without a plugin dependency tree", async () => {
     const cleanRoot = mkdtempSync(join(tmpdir(), "bb-collab-artifact-"));
     try {

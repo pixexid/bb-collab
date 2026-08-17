@@ -60,6 +60,7 @@ import {
 import { runArchiveSweep } from "./src/archive-sweep.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const projectIdSchema = z.string().trim().min(1).max(256);
 const mutationReceiptSchema = z
@@ -526,6 +527,14 @@ function cachedConsumerRolloutRefusal(projectId: string, message: string): Found
   return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message };
 }
 
+export function isLiveCachedConsumerRolloutArtifact(moduleUrl: string): boolean {
+  try {
+    return fileURLToPath(new URL(moduleUrl)).endsWith(join("dist", "server.js"));
+  } catch {
+    return false;
+  }
+}
+
 function liveCachedConsumerReread(name: string, result: FoundationResult) {
   const cachedConsumers = (result.evidence as { cachedConsumers?: { newSchemaVersion?: unknown; newContractVersion?: unknown } } | undefined)?.cachedConsumers;
   if (result.outcome !== "OK" || typeof cachedConsumers?.newSchemaVersion !== "number" || typeof cachedConsumers.newContractVersion !== "number") {
@@ -547,7 +556,7 @@ async function applyLiveCachedConsumerRollout(
   if (request.operationClass !== "decision_disposition") {
     return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout requires a governed decision_disposition request");
   }
-  if (!import.meta.url.endsWith("/dist/server.js")) {
+  if (!isLiveCachedConsumerRolloutArtifact(import.meta.url)) {
     return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout requires the running dist/server.js plugin artifact");
   }
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };

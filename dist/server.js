@@ -21951,6 +21951,7 @@ async function runArchiveSweep(bb, db, projectId, apply = false, now2 = Date.now
 // server.ts
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join as join2 } from "node:path";
+import { fileURLToPath } from "node:url";
 var projectIdSchema = external_exports.string().trim().min(1).max(256);
 var mutationReceiptSchema = external_exports.object({
   projectId: projectIdSchema,
@@ -22367,6 +22368,13 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
 function cachedConsumerRolloutRefusal(projectId, message) {
   return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message };
 }
+function isLiveCachedConsumerRolloutArtifact(moduleUrl) {
+  try {
+    return fileURLToPath(new URL(moduleUrl)).endsWith(join2("dist", "server.js"));
+  } catch {
+    return false;
+  }
+}
 function liveCachedConsumerReread(name, result2) {
   const cachedConsumers = result2.evidence?.cachedConsumers;
   if (result2.outcome !== "OK" || typeof cachedConsumers?.newSchemaVersion !== "number" || typeof cachedConsumers.newContractVersion !== "number") {
@@ -22381,7 +22389,7 @@ async function applyLiveCachedConsumerRollout(bb, db, input, cliDeps, cliContext
   if (request.operationClass !== "decision_disposition") {
     return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout requires a governed decision_disposition request");
   }
-  if (!import.meta.url.endsWith("/dist/server.js")) {
+  if (!isLiveCachedConsumerRolloutArtifact(import.meta.url)) {
     return cachedConsumerRolloutRefusal(request.projectId, "cached-consumer rollout requires the running dist/server.js plugin artifact");
   }
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
@@ -23193,6 +23201,7 @@ ${thread.titleFallback ?? ""}`);
 export {
   plugin as default,
   foundationResultSchema,
+  isLiveCachedConsumerRolloutArtifact,
   readLiveRoleFactReader,
   rpcContract
 };

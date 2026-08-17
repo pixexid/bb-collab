@@ -569,7 +569,7 @@ async function loadedDistHost() {
   host.harness.sdk.stub("plugins.callRpc", ((input: { method: string; input?: unknown }) =>
     host.harness.callRpc(input.method, input.input)) as never);
   // @ts-expect-error tracked runtime artifact is JavaScript-only by convention.
-  const { default: distPlugin } = await import("../dist/server.js");
+  const { default: distPlugin } = await import("../dist/server.js?bbPluginLoad=7.9");
   await distPlugin(host.bb);
   return host;
 }
