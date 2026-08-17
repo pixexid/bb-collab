@@ -20,7 +20,7 @@ Use the canonical [delegation return-path rule](../rules.md#delegation-return-pa
 
 ## Live state
 
-Live state is never this page. The canonical store is the bb-collab plugin database: use the `role_generation_heads` current-role query to resolve the current director, orchestrator, and worker records. The predecessor handoff file is the file named by the active seat’s handoff location; read that file, not a checked-in copy. Current seat IDs are the values returned by that query—query them when needed and never write them into documentation.
+Live state is never this page. The canonical store is the bb-collab plugin database: use the `role_generation_heads` current-role query to resolve the current director, orchestrator, and worker records. The predecessor handoff is `handoff.md` in the predecessor seat’s thread storage: resolve the predecessor thread id from the same current-role query, then read `handoff.md` under that thread’s storage directory (`~/.bb/thread-storage/<threadId>/`). Read that file, not a checked-in copy. Before retiring, a seat writes its own `handoff.md` into its own thread storage so its successor can follow this same path. Current seat IDs are the values returned by that query—query them when needed and never write them into documentation.
 
 ## First actions
 

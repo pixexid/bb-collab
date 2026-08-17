@@ -21817,7 +21817,7 @@ async function composeRoleBrief(bb, db, input) {
   const currentSeats = (db ? readRoleHolderStates(db) : []).filter((holder) => holder.project_id === input.projectId).map((holder) => ({ roleId: holder.role_id, generation: holder.role_generation, threadId: holder.thread_id }));
   const pointers = {
     canonicalStoreQuery: "role_generation_heads joined to role_generations",
-    handoffFile: "the predecessor handoff file named by the active seat\u2019s handoff location",
+    handoffFile: "handoff.md in the predecessor seat\u2019s thread storage: resolve the predecessor thread id from role_generation_heads joined to role_generations, then read handoff.md under that thread\u2019s storage directory (~/.bb/thread-storage/<threadId>/)",
     currentSeats
   };
   const prompt = [
