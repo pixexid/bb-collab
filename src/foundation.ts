@@ -45,7 +45,7 @@ export const EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION =
   "no canonical state existed to migrate; historical archive preserved as evidence, read-only" as const;
 // ponytail: keep exports bounded at 256 rows; add paged/file export before migration or cutover.
 export const MAX_EXPORT_ROWS = 256;
-// The cited event-sequence span is monotonic; an event-count snapshot is not.
+// Bound only actual correlation events returned after the cited request.
 export const MAX_ROLE_CONTEXT_EVENTS = 256;
 export const MAX_EXPORT_BYTES = 512 * 1024;
 export const MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 8);
@@ -1802,7 +1802,7 @@ export interface NativeAssignmentAdapter {
   reconcile(input: NativeAssignmentInput & { threadId: string | null; nativeRequestId: string | null }): NativeAssignmentEvidence;
 }
 
-interface ResolvedRoleContext {
+export interface ResolvedRoleContext {
   profile: ExecutionProfile;
   profileDigest: string;
   baseContext: Record<string, unknown>;
@@ -1829,7 +1829,7 @@ function stringField(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 && value.length <= 256 ? value : null;
 }
 
-function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest, allowFirstDirectorEnvironment = false): ResolvedRoleContext {
+export function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest, allowFirstDirectorEnvironment = false): ResolvedRoleContext {
   if (!reader || !request.roleContext) throw refusal("ROLE_CONTEXT_REQUIRED", "exact BB role context facts are required");
   const roleContext = request.roleContext;
   let thread: RoleThreadFact;
@@ -1846,14 +1846,10 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
     thread = reader.thread(request.roleContext.threadId);
     requestEvent = reader.event(request.roleContext.threadId, request.roleContext.requestEventId, request.roleContext.requestEventSeq);
     completion = reader.event(request.roleContext.threadId, request.roleContext.completionEventId, request.roleContext.completionEventSeq);
-    if (request.roleContext.completionEventSeq <= request.roleContext.requestEventSeq) {
+    if (roleContext.completionEventSeq <= roleContext.requestEventSeq) {
       throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion event sequence does not follow the request event sequence");
     }
-    const correlationEventCount = request.roleContext.completionEventSeq - request.roleContext.requestEventSeq - 1;
-    if (correlationEventCount > MAX_ROLE_CONTEXT_EVENTS) {
-      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "cited event sequence span exceeds the role-context limit");
-    }
-    correlationEvents = reader.eventsAfter(request.roleContext.threadId, request.roleContext.requestEventSeq, correlationEventCount);
+    correlationEvents = reader.eventsAfter(roleContext.threadId, roleContext.requestEventSeq, MAX_ROLE_CONTEXT_EVENTS + 1);
     if (!thread.environmentId) throw refusal("ROLE_CONTEXT_REQUIRED", "holder thread has no environment");
     environment = reader.environment(thread.environmentId);
     project = reader.project(request.projectId);
@@ -1912,20 +1908,31 @@ function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest
   if (completion.id !== request.roleContext.completionEventId || completion.seq !== request.roleContext.completionEventSeq) {
     throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion does not match the exact requested correlation");
   }
-  const expectedCorrelationEventCount = roleContext.completionEventSeq - roleContext.requestEventSeq - 1;
-  if (correlationEvents.length !== expectedCorrelationEventCount) {
-    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded correlation slice is incomplete");
-  }
-  for (let index = 0; index < correlationEvents.length; index += 1) {
-    const event = correlationEvents[index]!;
-    if (event.seq <= roleContext.requestEventSeq || event.seq >= roleContext.completionEventSeq) {
-      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded correlation slice contains an event outside the cited sequence bounds");
+  const completionIndex = correlationEvents.findIndex(
+    (event) => event.id === roleContext.completionEventId && event.seq === roleContext.completionEventSeq,
+  );
+  if (completionIndex < 0) {
+    const passedCompletion = correlationEvents.some((event) => event.seq >= roleContext.completionEventSeq);
+    if (!passedCompletion && correlationEvents.length > MAX_ROLE_CONTEXT_EVENTS) {
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "cited turn exceeds 256 actual reader-returned correlation events");
     }
-    if (index > 0 && event.seq <= correlationEvents[index - 1]!.seq) {
-      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded correlation slice is not strictly sequence-ordered");
+    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned correlation is not terminated by the exact cited completion");
+  }
+  const linkedEvents = correlationEvents.slice(0, completionIndex + 1);
+  for (let index = 0; index < linkedEvents.length; index += 1) {
+    const event = linkedEvents[index]!;
+    if (event.seq <= roleContext.requestEventSeq || (index > 0 && event.seq <= linkedEvents[index - 1]!.seq)) {
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned correlation events are not strictly ordered after the cited request");
     }
   }
-  const events = [requestEvent, ...correlationEvents, completion];
+  const linkedCorrelationEvents = correlationEvents.slice(0, completionIndex);
+  if (linkedCorrelationEvents.length > MAX_ROLE_CONTEXT_EVENTS) {
+    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "cited turn exceeds 256 actual reader-returned correlation events");
+  }
+  if (correlationEvents[completionIndex]!.id !== completion.id || correlationEvents[completionIndex]!.seq !== completion.seq) {
+    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned completion does not match the exact cited completion");
+  }
+  const events = [requestEvent, ...linkedCorrelationEvents, completion];
   const execution = requestEvent.data.execution as Record<string, unknown> | undefined;
   const requestId = stringField(requestEvent.data.requestId);
   if (!execution || !requestId) throw refusal("EXECUTION_PROFILE_UNKNOWN", "execution request correlation is incomplete");

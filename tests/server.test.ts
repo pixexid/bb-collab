@@ -199,6 +199,8 @@ function directorRoleReader(
 function roleReader(
   mutate?: (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => void,
 ) {
+  // Fixture-shape assumption: facts.events is the ordered reader-return surface.
+  // Sequence gaps are normal; array position models returned linkage, not dense sequence coverage.
   const facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0] = {
     thread: {
       id: ROLE_THREAD_ID,
@@ -6946,7 +6948,7 @@ describe("bb-collab plugin boundary", () => {
         facts.environment.status = "provisioning";
       }, "ROLE_CONTEXT_FOREIGN"],
       ["host-unavailable", (facts) => { facts.host.status = "disconnected"; }, "ROLE_CONTEXT_UNKNOWN"],
-      ["missing-start", (facts) => { facts.events = facts.events.filter((event) => event.type !== "turn/started"); }, "EXECUTION_COMPLETION_AMBIGUOUS", undefined, "bounded correlation slice contains an event outside the cited sequence bounds"],
+      ["missing-start", (facts) => { facts.events = facts.events.filter((event) => event.type !== "turn/started"); }, "EXECUTION_PROFILE_UNKNOWN"],
       ["failed-completion", (facts) => { facts.events[3]!.data.status = "failed"; }, "EXECUTION_PROFILE_UNKNOWN"],
       ["model-fallback", (facts) => {
         facts.events[3]!.seq = 5;
@@ -6984,18 +6986,19 @@ describe("bb-collab plugin boundary", () => {
     const roleContext = {
       threadId: ROLE_THREAD_ID,
       requestEventId: ROLE_REQUEST_EVENT_ID,
-      requestEventSeq: 15_220,
+      requestEventSeq: 150_000,
       completionEventId: ROLE_COMPLETION_EVENT_ID,
-      completionEventSeq: 15_223,
+      completionEventSeq: 165_000,
     };
     const facts = roleReader((input) => {
       const [request, accepted, started, completion] = input.events;
       input.events = [
-        ...Array.from({ length: 15_219 }, (_, index) => ({ id: `history-${index + 1}`, seq: index + 1, type: "agent/delta", data: {} })),
+        ...Array.from({ length: 18_238 }, (_, index) => ({ id: `history-${index + 1}`, seq: (index + 1) * 7, type: "agent/delta", data: {} })),
         { ...request!, seq: roleContext.requestEventSeq },
-        { ...accepted!, seq: roleContext.requestEventSeq + 1 },
-        { ...started!, seq: roleContext.requestEventSeq + 2 },
+        { ...accepted!, seq: roleContext.requestEventSeq + 101 },
+        { ...started!, seq: roleContext.requestEventSeq + 7_001 },
         { ...completion!, seq: roleContext.completionEventSeq },
+        ...Array.from({ length: 400 }, (_, index) => ({ id: `later-${index + 1}`, seq: roleContext.completionEventSeq + (index + 1) * 11, type: "agent/delta", data: {} })),
       ];
     });
     expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
@@ -7006,9 +7009,9 @@ describe("bb-collab plugin boundary", () => {
     expect(facts.readCalls).toEqual([
       "server.id",
       `thread:${ROLE_THREAD_ID}`,
-      `event:${ROLE_THREAD_ID}:${ROLE_REQUEST_EVENT_ID}:15220`,
-      `event:${ROLE_THREAD_ID}:${ROLE_COMPLETION_EVENT_ID}:15223`,
-      `eventsAfter:${ROLE_THREAD_ID}:15220:2`,
+      `event:${ROLE_THREAD_ID}:${ROLE_REQUEST_EVENT_ID}:150000`,
+      `event:${ROLE_THREAD_ID}:${ROLE_COMPLETION_EVENT_ID}:165000`,
+      `eventsAfter:${ROLE_THREAD_ID}:150000:${MAX_ROLE_CONTEXT_EVENTS + 1}`,
       `environment:${ROLE_ENVIRONMENT_ID}`,
       `project:${PROJECT_ID}`,
       "host:host-main",
@@ -7016,13 +7019,64 @@ describe("bb-collab plugin boundary", () => {
     ]);
   });
 
+  it("accepts 256 sparse reader-returned correlation events without a sequence-width assumption", async () => {
+    const { db, fenceToken } = seedAndBootstrap(await loadedHost(), PROJECT_ID, { config: roleConfig() });
+    const roleContext = {
+      threadId: ROLE_THREAD_ID,
+      requestEventId: ROLE_REQUEST_EVENT_ID,
+      requestEventSeq: 10,
+      completionEventId: ROLE_COMPLETION_EVENT_ID,
+      completionEventSeq: 100_000,
+    };
+    const facts = roleReader((input) => {
+      const [request, accepted, started, completion] = input.events;
+      input.events = [
+        { ...request!, seq: roleContext.requestEventSeq },
+        { ...accepted!, seq: 100 },
+        { ...started!, seq: 1_000 },
+        ...Array.from({ length: MAX_ROLE_CONTEXT_EVENTS - 2 }, (_, index) => ({
+          id: `busy-delta-${index + 1}`,
+          seq: 2_000 + index * 300,
+          type: "agent/delta",
+          data: {},
+        })),
+        { ...completion!, seq: roleContext.completionEventSeq },
+      ];
+    });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "sparse-256-returned-events",
+      qualificationId: "sparse-256-returned-events",
+      roleContext,
+    }), null, facts)).toMatchObject({ outcome: "OK", attempted: 1, verified: 1 });
+  });
+
   it("refuses mismatched or unsupported bounded role-event ordering evidence without mutation", async () => {
     const { db, fenceToken } = seedAndBootstrap(await loadedHost(), PROJECT_ID, { config: roleConfig() });
+    const oversized = roleReader((facts) => {
+      const [request, accepted, started, completion] = facts.events;
+      facts.events = [
+        request!,
+        accepted!,
+        started!,
+        ...Array.from({ length: MAX_ROLE_CONTEXT_EVENTS - 1 }, (_, index) => ({
+          id: `oversized-${index + 1}`,
+          seq: 4 + index,
+          type: "agent/delta",
+          data: {},
+        })),
+        { ...completion!, seq: 10_000 },
+      ];
+    });
+    const incomplete = roleReader();
+    const completeEventsAfter = incomplete.eventsAfter.bind(incomplete);
+    incomplete.eventsAfter = (threadId, afterSeq, limit) => completeEventsAfter(threadId, afterSeq, limit)
+      .filter((event) => event.id !== ROLE_COMPLETION_EVENT_ID);
     const cases: Array<[string, ReturnType<typeof roleReader>, Partial<ApplyRequest>, string, string?]> = [
       ["mismatched-sequence", roleReader(), { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 2, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 4 } }, "ROLE_CONTEXT_UNKNOWN"],
       ["inverted-sequences", roleReader((facts) => { facts.events[3]!.seq = 1; }), { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 1 } }, "EXECUTION_COMPLETION_AMBIGUOUS", "completion event sequence does not follow the request event sequence"],
-      ["oversized-slice", roleReader((facts) => { facts.events[3]!.seq = 1 + MAX_ROLE_CONTEXT_EVENTS + 2; }), { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 1 + MAX_ROLE_CONTEXT_EVENTS + 2 } }, "EXECUTION_COMPLETION_AMBIGUOUS", "cited event sequence span exceeds the role-context limit"],
-      ["locally-unordered-slice", roleReader((facts) => { [facts.events[1], facts.events[2]] = [facts.events[2]!, facts.events[1]!]; }), {}, "EXECUTION_COMPLETION_AMBIGUOUS", "bounded correlation slice is not strictly sequence-ordered"],
+      ["oversized-returned-prefix", oversized, { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 10_000 } }, "EXECUTION_COMPLETION_AMBIGUOUS", "cited turn exceeds 256 actual reader-returned correlation events"],
+      ["locally-unordered-prefix", roleReader((facts) => { [facts.events[1], facts.events[2]] = [facts.events[2]!, facts.events[1]!]; }), {}, "EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned correlation events are not strictly ordered after the cited request"],
+      ["completion-missing-from-returned-prefix", incomplete, {}, "EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned correlation is not terminated by the exact cited completion"],
     ];
     for (const [name, facts, override, outcome, message] of cases) {
       const before = exportFoundation(db, PROJECT_ID);
@@ -7117,7 +7171,7 @@ describe("bb-collab plugin boundary", () => {
         `thread:${ROLE_THREAD_ID}`,
         `event:${ROLE_THREAD_ID}:${ROLE_REQUEST_EVENT_ID}:1`,
         `event:${ROLE_THREAD_ID}:${ROLE_COMPLETION_EVENT_ID}:4`,
-        `eventsAfter:${ROLE_THREAD_ID}:1:2`,
+        `eventsAfter:${ROLE_THREAD_ID}:1:${MAX_ROLE_CONTEXT_EVENTS + 1}`,
         `environment:${ROLE_ENVIRONMENT_ID}`,
         `project:${PROJECT_ID}`,
         "host:host-main",
