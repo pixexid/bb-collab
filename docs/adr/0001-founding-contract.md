@@ -291,22 +291,6 @@ repair is acceptable because otherwise the corrected mechanism cannot land.
 The gate closes only when doctor reports 4/4/4 VERIFIED from LIVE STATE, not
 on merge, suite, or review.
 
-Contract v19/schema v12 adds one nullable-on-migration
-`operator_receipts.issuance_provenance` marker. New console-issued receipts
-persist `console`; authorized-approver issuance persists `attestation`; all
-legacy NULL or unknown markers refuse and are not re-admitted. The
-`config_revision` plugin-actor guard continues to require its exact linked
-operator receipt and retirement condition, but no longer infers
-attestation-only provenance from `approver_id`, authorizing columns, or receipt
-digest shape. The attestation registry remains validated for `attestation`
-rows. All four cached consumers reread v19 or refuse stale v18 NULL or unknown provenance with
-`OPERATOR_RECEIPT_INVALID`; only a persisted v19 4/4/4 rollout receipt is current.
-No historical operator-receipt row is modified. The request digest remains
-head-independent: rebasing changes only the separately exact-bound
-`candidate_head` field. The fixture-only apply seam remains test support only;
-v19 provenance and actor-binding assertions enter through the production RPC
-paths, so a fixture actor with a null receipt cannot satisfy a production gate.
-
 ## 6. Roles, delegation and execution
 
 A logical role is a project-scoped seat such as director or
@@ -651,9 +635,8 @@ The following remain unresolved until the named proof or operator decision:
   name, checkout possession or thread ID. The narrow exception is the
   explicitly ratified `plugin/bb-collab` derived actor for the bounded
   bootstrap, config-revision, operator-only Decision, work-item, role, and migration mutation
-  classes, which is issued by an exact console receipt or active
-  authorized-approver attestation and remains bound to its exact operator receipt;
-  other operator actors still wait for a proven
+  classes, which is issued by an active exact authorized-approver attestation and remains bound
+  to its exact operator receipt; other operator actors still wait for a proven
   BB-native authenticated subject/receipt or a separately explicit decision.
 - Connector policy per repository. Set required, optional or prohibited only
   after the exact installation and terminal-artifact probe. Capability
