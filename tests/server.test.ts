@@ -2303,12 +2303,33 @@ describe("bb-collab plugin boundary", () => {
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
-  it("refuses a WorkItem wait declaration whose waker is not live before any write", async () => {
+  it("uses effective live watchdog threshold settings", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      expect(fixture.host.harness.inspection.registrations.settingsDescriptors).toMatchObject({
+        fleetWatchdogFloorMs: { default: "3600000" },
+        fleetWatchdogStaleWaitMs: { default: "86400000" },
+      });
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      await fixture.host.harness.setSettings({ fleetWatchdogFloorMs: "1", fleetWatchdogStaleWaitMs: "2" });
+      clock.mockReturnValue(1);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("refuses a WorkItem wait declaration whose schedule or seat waker is not live before any write", async () => {
     const host = await loadedHost();
     const db = host.bb.storage.database();
     const before = exportFoundation(db, PROJECT_ID);
-    const result = await host.harness.callRpc("apply", workItemWaitRequest("fence", 1, { waker: "phantom-waker", declaredBySeat: "worker-seat" }));
+    const result = await host.harness.callRpc("apply", workItemWaitRequest("fence", 1, { kind: "schedule", schedule: "phantom-waker", declaredBySeat: "worker-seat" }));
     expect(result).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0, message: "waker schedule phantom-waker is not live: declaration refused" });
+    const seat = await host.harness.callRpc("apply", workItemWaitRequest("fence", 1, { kind: "seat", seat: "worker", declaredBySeat: "worker-seat" }));
+    expect(seat).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0, message: "waker seat worker is not live: declaration refused" });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
   });
 
@@ -2370,7 +2391,7 @@ describe("bb-collab plugin boundary", () => {
     try {
       const fixture = await fleetWatchdogFixture(0);
       await addPendingReview(fixture);
-      expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 3, { waker: "stall-guard-liveness", declaredBySeat: "worker-seat" }))).toMatchObject({ outcome: "OK" });
+      expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 3, { kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat" }))).toMatchObject({ outcome: "OK" });
       for (const now of [0, 60 * 60_000, 2 * 60 * 60_000]) {
         clock.mockReturnValue(now);
         await fixture.host.harness.runSchedule("fleet-watchdog");
@@ -2386,11 +2407,66 @@ describe("bb-collab plugin boundary", () => {
     try {
       const fixture = await fleetWatchdogFixture();
       await addPendingReview(fixture);
-      expect(applyWithFixtureReceipt(fixture.db, workItemWaitRequest(fixture.fenceToken, 3, { waker: "stall-guard-liveness", declaredBySeat: "worker-seat" })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, workItemWaitRequest(fixture.fenceToken, 3, { kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat" })).outcome).toBe("OK");
       clock.mockReturnValue(25 * 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
         expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "wait went stale: chase the external or re-plan" })] }),
+      ]]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("surfaces a stale owed act to the orchestrator", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture();
+      await addPendingReview(fixture);
+      expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 3, { kind: "seat", seat: "director", declaredBySeat: "worker-seat" }))).toMatchObject({ outcome: "OK" });
+      clock.mockReturnValue(25 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "owed act went stale" })] }),
+      ]]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("escalates an owing non-director seat to the director", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 3, { kind: "seat", seat: "project-orchestrator", declaredBySeat: "worker-seat" }))).toMatchObject({ outcome: "OK" });
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(2 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([
+        [expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "owed act is quiet with open work since 1970-01-01T00:00:00.000Z" })] })],
+        [expect.objectContaining({ threadId: fixture.directorThreadId, input: [expect.objectContaining({ text: "owed act still quiet with open work since 1970-01-01T00:00:00.000Z" })] })],
+      ]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("wakes the owing director once and leaves its terminal tier to the dead-man surface", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 3, { kind: "seat", seat: "director", declaredBySeat: "worker-seat" }))).toMatchObject({ outcome: "OK" });
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(2 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({ threadId: fixture.directorThreadId, input: [expect.objectContaining({ text: "owed act is quiet with open work since 1970-01-01T00:00:00.000Z" })] }),
       ]]);
     } finally {
       clock.mockRestore();
@@ -3014,12 +3090,13 @@ describe("bb-collab plugin boundary", () => {
   });
 
   it("appends the WorkItem-wait schema without changing the v21 contract", () => {
-    expect(SCHEMA_VERSION).toBe(13);
+    expect(SCHEMA_VERSION).toBe(14);
     expect(CONTRACT_VERSION).toBe(21);
-    expect(MIGRATIONS).toHaveLength(26);
-    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("eacc300f19723e0fd9dc0345509628569bd40b2d4c7740954bfc7e647aff9640");
-    expect(MIGRATIONS.at(-1)).toContain("work_item_waits");
-    expect(MIGRATIONS.at(-1)).toContain("declared_by_seat");
+    expect(MIGRATIONS).toHaveLength(27);
+    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("eacc300f19723e0fd9dc0345509628569bd40b2d4c7740954bfc7e647aff9640");
+    expect(MIGRATIONS.at(-2)).toContain("work_item_waits");
+    expect(MIGRATIONS.at(-2)).toContain("declared_by_seat");
+    expect(MIGRATIONS.at(-1)).toContain("waker_kind");
     expect(TABLES).toContain("migration_runs");
     expect(MIGRATION_STATES).toEqual([
       "prepared", "frozen", "exported", "imported", "equivalent", "target_active", "exercised", "retired", "rolled_back", "fix_forward_required",
@@ -3029,8 +3106,8 @@ describe("bb-collab plugin boundary", () => {
     ]);
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 12,
-      newSchemaVersion: 13,
+      oldSchemaVersion: 13,
+      newSchemaVersion: 14,
       oldContractVersion: 20,
       newContractVersion: 21,
       action: "refused",
@@ -3038,9 +3115,9 @@ describe("bb-collab plugin boundary", () => {
       attempted: 4,
       verified: 0,
     });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(13, 21))).toMatchObject({
-      oldSchemaVersion: 12,
-      newSchemaVersion: 13,
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(14, 21))).toMatchObject({
+      oldSchemaVersion: 13,
+      newSchemaVersion: 14,
       oldContractVersion: 20,
       newContractVersion: 21,
       action: "reread",
@@ -3050,8 +3127,8 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 12,
-      newSchemaVersion: 13,
+      oldSchemaVersion: 13,
+      newSchemaVersion: 14,
       oldContractVersion: 20,
       newContractVersion: 21,
       action: "refused",
@@ -3075,7 +3152,7 @@ describe("bb-collab plugin boundary", () => {
       expect((db.prepare("PRAGMA table_info(mutation_receipts)").all() as Array<{ name: string }>).map((row) => row.name)).toContain("operator_receipt_id");
       expect((db.prepare("PRAGMA table_info(actor_receipts)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual(expect.arrayContaining(["operator_receipt_id", "retirement_condition"]));
       expect((db.prepare("PRAGMA table_info(work_item_waits)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual([
-        "project_id", "work_item_id", "waker", "declared_at_ms", "declared_by_seat",
+        "project_id", "work_item_id", "waker", "declared_at_ms", "declared_by_seat", "waker_kind",
       ]);
       expect((db.prepare("PRAGMA index_list(migration_runs)").all() as Array<{ name: string; unique: number; partial: number }>).filter((row) => row.name.startsWith("migration_runs_"))).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "migration_runs_final_export_identity", unique: 1, partial: 1 }),
@@ -3089,9 +3166,9 @@ describe("bb-collab plugin boundary", () => {
 
   it("assembles the production v21 cached-consumer rollout receipt with stale-v20 refusal semantics", async () => {
     expect(CONTRACT_VERSION).toBe(21);
-    expect(SCHEMA_VERSION).toBe(13);
-    expect(MIGRATIONS).toHaveLength(26);
-    expect(schemaDigest).toBe("f9507fb1608e9bdf5a80750f06d4c646110860fab4830ee067ad8aa3be1827a9");
+    expect(SCHEMA_VERSION).toBe(14);
+    expect(MIGRATIONS).toHaveLength(27);
+    expect(schemaDigest).toBe("19ce4f2a3293379c19fab2280357f2aad408da623d858e34d487332b7a5f31fe");
     expect(contractDigest).toBe("edf0dce5f7650adfd149d340d547a9cb13420202b3c8ce74ca6c8ae436a9f200");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -3108,7 +3185,7 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 13, observedContractVersion: 21 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 14, observedContractVersion: 21 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -3164,7 +3241,7 @@ describe("bb-collab plugin boundary", () => {
     const before = exportFoundation(db, PROJECT_ID);
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
-      observedSchemaVersion: 13,
+      observedSchemaVersion: 14,
       observedContractVersion: 21,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
@@ -3395,7 +3472,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 13, schemaDigest, contractVersion: 21, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 14, schemaDigest, contractVersion: 21, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -5081,8 +5158,8 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 12, newSchemaVersion: 13, action: "unknown", expected: 4, attempted: 0, verified: 0 },
-        schema: { version: 13 },
+        cachedConsumers: { oldSchemaVersion: 13, newSchemaVersion: 14, action: "unknown", expected: 4, attempted: 0, verified: 0 },
+        schema: { version: 14 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -5363,7 +5440,7 @@ describe("bb-collab plugin boundary", () => {
     const created = applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken));
     expect(created).toMatchObject({ outcome: "OK", currentResourceRevision: 1 });
     expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items").get()).toEqual({ lifecycle_state: "proposed", resource_revision: 1 });
-    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, { idempotencyKey: "wait-on-create", workItemWait: { waker: "stall-guard-liveness", declaredBySeat: "worker-seat" } }))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, { idempotencyKey: "wait-on-create", workItemWait: { kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat" } }))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
 
     const beforeInvalid = exportFoundation(db, PROJECT_ID);
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "succeeded", 1))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
@@ -5386,11 +5463,11 @@ describe("bb-collab plugin boundary", () => {
     const { db, fenceToken } = seedAndBootstrap(host);
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 2, { waker: "stall-guard-liveness", declaredBySeat: "worker-seat" }))).toMatchObject({
+    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 2, { kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat" }))).toMatchObject({
       outcome: "OK", currentResourceRevision: 3,
     });
-    expect(db.prepare("SELECT work_item_id, waker, declared_by_seat FROM work_item_waits").get()).toEqual({
-      work_item_id: WORK_ITEM_ID, waker: "stall-guard-liveness", declared_by_seat: "worker-seat",
+    expect(db.prepare("SELECT work_item_id, waker, waker_kind, declared_by_seat FROM work_item_waits").get()).toEqual({
+      work_item_id: WORK_ITEM_ID, waker: "stall-guard-liveness", waker_kind: "schedule", declared_by_seat: "worker-seat",
     });
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "cancelled", 3))).toMatchObject({ outcome: "WORK_ITEM_WAIT_OPEN", attempted: 0 });
     expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 3, null)).outcome).toBe("OK");
@@ -6497,7 +6574,7 @@ describe("bb-collab plugin boundary", () => {
     db.pragma("foreign_keys = OFF");
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
-    db.exec(MIGRATIONS.at(-10)!);
+    db.exec(MIGRATIONS.at(-11)!);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -6517,10 +6594,10 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 12, newSchemaVersion: 13, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 12, newSchemaVersion: 13, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 12, newSchemaVersion: 13, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(13, 21))).toMatchObject({ oldSchemaVersion: 12, newSchemaVersion: 13, oldContractVersion: 20, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 13, newSchemaVersion: 14, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 13, newSchemaVersion: 14, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 13, newSchemaVersion: 14, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(14, 21))).toMatchObject({ oldSchemaVersion: 13, newSchemaVersion: 14, oldContractVersion: 20, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {

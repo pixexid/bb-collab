@@ -7,12 +7,12 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 export const CONTRACT_VERSION = 21;
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 // v21 makes project configuration visibility explicitly visible-only.
 const PREVIOUS_CONTRACT_VERSION = 20;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-const PREVIOUS_SCHEMA_VERSION = 12;
+const PREVIOUS_SCHEMA_VERSION = 13;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatProfile = {
@@ -628,6 +628,8 @@ export const MIGRATIONS: string[] = [
     FOREIGN KEY (project_id, work_item_id)
       REFERENCES work_items(project_id, work_item_id)
   )`,
+  `ALTER TABLE work_item_waits ADD COLUMN waker_kind TEXT NOT NULL DEFAULT 'schedule'
+   CHECK (waker_kind IN ('schedule', 'seat'))`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -1204,9 +1206,10 @@ const workItemInputSchema = z
     body: z.string().max(64 * 1024),
   })
   .strict();
-const workItemWaitSchema = z
-  .object({ waker: id, declaredBySeat: id })
-  .strict();
+const workItemWaitSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("schedule"), schedule: id, declaredBySeat: id }).strict(),
+  z.object({ kind: z.literal("seat"), seat: z.enum(ROLE_IDS), declaredBySeat: id }).strict(),
+]);
 
 const githubMappingSchema = z
   .object({
@@ -5320,6 +5323,7 @@ interface WorkItemWaitRow {
   project_id: string;
   work_item_id: string;
   waker: string;
+  waker_kind: "schedule" | "seat";
   declared_at_ms: number;
   declared_by_seat: string;
 }
@@ -5508,14 +5512,7 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
       db.prepare(
         `INSERT INTO work_item_waits (project_id, work_item_id, waker, waker_kind, declared_at_ms, declared_by_seat)
          VALUES (?, ?, ?, ?, ?, ?)`,
-      ).run(
-        request.projectId,
-        workItem.work_item_id,
-        wait.kind === "schedule" ? wait.schedule : wait.seat,
-        wait.kind,
-        now(),
-        wait.declaredBySeat,
-      );
+      ).run(request.projectId, workItem.work_item_id, wait.kind === "schedule" ? wait.schedule : wait.seat, wait.kind, now(), wait.declaredBySeat);
     }
     return commitMutation(
       db,

@@ -13787,11 +13787,11 @@ var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
 var CONTRACT_VERSION = 21;
-var SCHEMA_VERSION = 13;
+var SCHEMA_VERSION = 14;
 var PREVIOUS_CONTRACT_VERSION = 20;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
-var PREVIOUS_SCHEMA_VERSION = 12;
+var PREVIOUS_SCHEMA_VERSION = 13;
 var ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"];
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
 var directorSeatProfile = {
@@ -14399,7 +14399,9 @@ var MIGRATIONS = [
     PRIMARY KEY (project_id, work_item_id),
     FOREIGN KEY (project_id, work_item_id)
       REFERENCES work_items(project_id, work_item_id)
-  )`
+  )`,
+  `ALTER TABLE work_item_waits ADD COLUMN waker_kind TEXT NOT NULL DEFAULT 'schedule'
+   CHECK (waker_kind IN ('schedule', 'seat'))`
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var CACHED_CONSUMERS = [
@@ -14862,7 +14864,10 @@ var workItemInputSchema = external_exports.object({
   title: external_exports.string().max(4096),
   body: external_exports.string().max(64 * 1024)
 }).strict();
-var workItemWaitSchema = external_exports.object({ waker: id, declaredBySeat: id }).strict();
+var workItemWaitSchema = external_exports.discriminatedUnion("kind", [
+  external_exports.object({ kind: external_exports.literal("schedule"), schedule: id, declaredBySeat: id }).strict(),
+  external_exports.object({ kind: external_exports.literal("seat"), seat: external_exports.enum(ROLE_IDS), declaredBySeat: id }).strict()
+]);
 var githubMappingSchema = external_exports.object({
   repoTargetId: id,
   owner: id,
@@ -18144,9 +18149,9 @@ function applyWorkItemTransition(db, request, digest) {
       db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
     } else {
       db.prepare(
-        `INSERT INTO work_item_waits (project_id, work_item_id, waker, declared_at_ms, declared_by_seat)
-         VALUES (?, ?, ?, ?, ?)`
-      ).run(request.projectId, workItem.work_item_id, wait.waker, now(), wait.declaredBySeat);
+        `INSERT INTO work_item_waits (project_id, work_item_id, waker, waker_kind, declared_at_ms, declared_by_seat)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(request.projectId, workItem.work_item_id, wait.kind === "schedule" ? wait.schedule : wait.seat, wait.kind, now(), wait.declaredBySeat);
     }
     return commitMutation(
       db,
@@ -18158,7 +18163,7 @@ function applyWorkItemTransition(db, request, digest) {
         aggregateId: workItem.work_item_id,
         aggregateRevision: nextRevision2,
         eventType: wait === null ? "work_item_wait_cleared" : "work_item_wait_declared",
-        event: { workItemId: workItem.work_item_id, ...wait === null ? {} : { waker: wait.waker, declaredBySeat: wait.declaredBySeat } }
+        event: { workItemId: workItem.work_item_id, ...wait === null ? {} : { waker: wait, declaredBySeat: wait.declaredBySeat } }
       },
       { expected: 1, attempted: 1, verified: 1 },
       {
@@ -18166,7 +18171,7 @@ function applyWorkItemTransition(db, request, digest) {
         currentGovernanceEpoch: governor.governance_epoch,
         currentResourceRevision: nextRevision2,
         expectedResourceRevision: request.expectedResourceRevision ?? void 0,
-        evidence: { workItemId: workItem.work_item_id, wait: wait === null ? null : { waker: wait.waker, declaredBySeat: wait.declaredBySeat } }
+        evidence: { workItemId: workItem.work_item_id, wait: wait ?? null }
       }
     );
   }
@@ -21879,17 +21884,24 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
   }
   if (parsed.success && parsed.data.workItemWait !== void 0 && parsed.data.workItemWait !== null) {
     try {
-      if (!await liveWaker(bb, parsed.data.workItemWait.waker)) {
-        return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: `waker schedule ${parsed.data.workItemWait.waker} is not live: declaration refused` };
+      if (!await liveWorkItemWaker(bb, db, parsed.data.projectId, parsed.data.workItemWait)) {
+        const waker = parsed.data.workItemWait.kind === "schedule" ? `schedule ${parsed.data.workItemWait.schedule}` : `seat ${parsed.data.workItemWait.seat}`;
+        return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: `waker ${waker} is not live: declaration refused` };
       }
     } catch {
-      return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: "waker schedule registry is unreadable: declaration refused" };
+      return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: `waker ${parsed.data.workItemWait.kind} registry is unreadable: declaration refused` };
     }
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
   const result2 = applyAuthorizedMutation(db, input, null, reader);
   await deliverSucceededSeatBrief(bb, db, input, result2);
   return result2;
+}
+async function liveWorkItemWaker(bb, db, projectId, waker) {
+  if (waker.kind === "seat") {
+    return db !== null && readRoleHolderStates(db).filter((holder) => holder.project_id === projectId && holder.role_id === waker.seat).length === 1;
+  }
+  return liveWaker(bb, waker.schedule);
 }
 async function liveWaker(bb, schedule) {
   const plugins = await bb.sdk.plugins.list();
@@ -22190,6 +22202,20 @@ async function runCli(db, bb, argv, ctx, deps) {
   return cliResult(exportFoundation(db, projectId));
 }
 async function plugin(bb, options = {}) {
+  const fleetWatchdogSettings = bb.settings.define({
+    fleetWatchdogFloorMs: {
+      type: "string",
+      label: "Fleet watchdog floor (ms)",
+      description: "Idle time before quiet open work wakes the orchestrator.",
+      default: String(FLEET_WATCHDOG_FLOOR_MS)
+    },
+    fleetWatchdogStaleWaitMs: {
+      type: "string",
+      label: "Fleet watchdog stale wait (ms)",
+      description: "Declared wait age before it wakes the orchestrator.",
+      default: String(FLEET_WATCHDOG_STALE_WAIT_MS)
+    }
+  });
   const readDiagnosticDivergence = () => readCheckoutDivergence(
     options.checkoutRoot === void 0 ? findCheckoutRoot(dirname2(fileURLToPath(import.meta.url))) : options.checkoutRoot
   );
@@ -22557,10 +22583,12 @@ ${thread.titleFallback ?? ""}`);
     try {
       if (!db) return;
       const now2 = Date.now();
-      const configuredFloorMs = Number(process.env.BB_COLLAB_FLEET_WATCHDOG_FLOOR_MS);
-      const floorMs = Number.isFinite(configuredFloorMs) && configuredFloorMs > 0 ? configuredFloorMs : FLEET_WATCHDOG_FLOOR_MS;
-      const configuredStaleWaitMs = Number(process.env.BB_COLLAB_FLEET_WATCHDOG_STALE_WAIT_MS);
-      const staleWaitMs = Number.isFinite(configuredStaleWaitMs) && configuredStaleWaitMs > 0 ? configuredStaleWaitMs : FLEET_WATCHDOG_STALE_WAIT_MS;
+      const { fleetWatchdogFloorMs, fleetWatchdogStaleWaitMs } = await fleetWatchdogSettings.get();
+      const floorMs = Number(fleetWatchdogFloorMs);
+      const staleWaitMs = Number(fleetWatchdogStaleWaitMs);
+      if (!Number.isSafeInteger(floorMs) || floorMs <= 0 || !Number.isSafeInteger(staleWaitMs) || staleWaitMs <= 0) {
+        throw new Error("watchdog thresholds must be positive integer milliseconds");
+      }
       const holdersByProject = /* @__PURE__ */ new Map();
       for (const holder of readRoleHolderStates(db)) {
         const holders = holdersByProject.get(holder.project_id) ?? [];
@@ -22569,13 +22597,14 @@ ${thread.titleFallback ?? ""}`);
       }
       const openWorkItemsByProject = /* @__PURE__ */ new Map();
       for (const workItem of db.prepare(
-        `SELECT work_items.project_id, work_items.work_item_id, work_item_waits.waker, work_item_waits.declared_at_ms
+        `SELECT work_items.project_id, work_items.work_item_id, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
          FROM work_items LEFT JOIN work_item_waits
            ON work_item_waits.project_id = work_items.project_id AND work_item_waits.work_item_id = work_items.work_item_id
-         WHERE work_items.lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')`
+         WHERE work_items.lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')
+         ORDER BY work_items.created_at_ms, work_items.work_item_id`
       ).all()) {
         const workItems = openWorkItemsByProject.get(workItem.project_id) ?? [];
-        workItems.push({ workItemId: workItem.work_item_id, waker: workItem.waker, declaredAtMs: workItem.declared_at_ms });
+        workItems.push({ workItemId: workItem.work_item_id, waker: workItem.waker, wakerKind: workItem.waker_kind, declaredAtMs: workItem.declared_at_ms });
         openWorkItemsByProject.set(workItem.project_id, workItems);
       }
       const isCurrent = (candidate, holder) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
@@ -22621,7 +22650,28 @@ ${thread.titleFallback ?? ""}`);
           if (workItems.length === 0) continue;
           const staleWait = workItems.find((workItem) => workItem.declaredAtMs !== null && now2 - workItem.declaredAtMs >= staleWaitMs);
           if (staleWait) {
-            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), "wait went stale: chase the external or re-plan", false);
+            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false);
+            continue;
+          }
+          const seatWait = workItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null);
+          if (seatWait) {
+            const owing = holders.find((holder) => holder.role_id === seatWait.waker);
+            if (!owing) continue;
+            const owingKey = roleIdleKey(owing, seatWait.workItemId);
+            const owingThread = await bb.sdk.threads.get({ threadId: owing.thread_id });
+            if (roleThreadRefusal(owing, owingThread, true) || await readPendingExternalWait(owing.thread_id)) {
+              await watcher.resetRoleIdle(owingKey);
+              continue;
+            }
+            const owingRecord = await watcher.observeRoleIdle(owingKey, now2);
+            if (owingRecord.idleSinceMs === null || now2 - owingRecord.idleSinceMs < floorMs) continue;
+            if (owingRecord.lastWakeAtMs === null || owingRecord.lastWakeAtMs < owingRecord.idleSinceMs) {
+              await wake(projectId, owing, owingKey, `owed act is quiet with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true);
+              continue;
+            }
+            if (owing.role_id !== "director" && now2 - owingRecord.lastWakeAtMs >= floorMs) {
+              await wake(projectId, director, roleIdleKey(director, seatWait.workItemId), `owed act still quiet with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true);
+            }
             continue;
           }
           const openWorkItem = workItems.find((workItem) => workItem.declaredAtMs === null);
