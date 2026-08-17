@@ -207,6 +207,7 @@ function roleReader(
         id: ROLE_REQUEST_EVENT_ID,
         seq: 1,
         type: "client/turn/requested",
+        scope: { kind: "thread" },
         data: {
           requestId: "request-1",
           execution: {
@@ -218,9 +219,9 @@ function roleReader(
           },
         },
       },
-      { id: "event-accepted", seq: 2, type: "turn/input/accepted", data: { clientRequestId: "request-1", providerThreadId: "provider-thread-1" } },
-      { id: "event-started", seq: 3, type: "turn/started", data: { providerThreadId: "provider-thread-1" } },
-      { id: ROLE_COMPLETION_EVENT_ID, seq: 4, type: "turn/completed", data: { providerThreadId: "provider-thread-1", status: "completed" } },
+      { id: "event-accepted", seq: 2, type: "turn/input/accepted", scope: { kind: "turn", turnId: "turn-1" }, data: { clientRequestId: "request-1", providerThreadId: "provider-thread-1" } },
+      { id: "event-started", seq: 3, type: "turn/started", scope: { kind: "turn", turnId: "turn-1" }, data: { providerThreadId: "provider-thread-1" } },
+      { id: ROLE_COMPLETION_EVENT_ID, seq: 4, type: "turn/completed", scope: { kind: "turn", turnId: "turn-1" }, data: { providerThreadId: "provider-thread-1", status: "completed" } },
     ],
     environment: {
       id: ROLE_ENVIRONMENT_ID,
@@ -404,7 +405,7 @@ function hostFor(
                 threadId: roleFacts.facts.thread.id,
                 seq: event.seq,
                 type: event.type,
-                scope: { kind: "thread" as const },
+                scope: event.scope,
                 data: event.data,
                 createdAt: event.seq,
               }));
@@ -6414,15 +6415,43 @@ describe("bb-collab plugin boundary", () => {
   it("paginates a complete 257-event live role context without losing exact correlation", async () => {
     const eventPages: Array<{ threadId: string; afterSeq?: string; limit?: string }> = [];
     const host = await loadedHost(PROJECT_ID, (facts) => {
-      facts.events.push(...Array.from({ length: 253 }, (_, index) => ({
-        id: `event-overflow-${index + 5}`,
-        seq: index + 5,
+      facts.events = [
+        ...Array.from({ length: 250 }, (_, index) => ({
+        id: `event-history-${index + 1}`,
+        seq: index + 1,
         type: "thread/updated",
+        scope: { kind: "thread" as const },
         data: {},
-      })));
+        })),
+        { id: "event-history-start", seq: 251, type: "turn/started", scope: { kind: "turn" as const, turnId: "turn-history" }, data: { providerThreadId: "provider-thread-1" } },
+        { id: "event-history-completion", seq: 252, type: "turn/completed", scope: { kind: "turn" as const, turnId: "turn-history" }, data: { providerThreadId: "provider-thread-1", status: "completed" } },
+        { id: "event-history-fallback", seq: 253, type: "provider/modelFallback", scope: { kind: "turn" as const, turnId: "turn-history" }, data: { providerThreadId: "provider-thread-1" } },
+        {
+          id: "event-target-request",
+          seq: 254,
+          type: "client/turn/requested",
+          scope: { kind: "thread" as const },
+          data: {
+            requestId: "request-target",
+            execution: {
+              model: ROLE_PROFILE.model,
+              reasoningLevel: ROLE_PROFILE.reasoningLevel,
+              permissionMode: ROLE_PROFILE.permissionMode,
+              serviceTier: ROLE_PROFILE.serviceTier,
+              source: "client/turn/requested",
+            },
+          },
+        },
+        { id: "event-target-accepted", seq: 255, type: "turn/input/accepted", scope: { kind: "turn" as const, turnId: "turn-target" }, data: { clientRequestId: "request-target", providerThreadId: "provider-thread-1" } },
+        { id: "event-target-start", seq: 256, type: "turn/started", scope: { kind: "turn" as const, turnId: "turn-target" }, data: { providerThreadId: "provider-thread-1" } },
+        { id: "event-target-completion", seq: 257, type: "turn/completed", scope: { kind: "turn" as const, turnId: "turn-target" }, data: { providerThreadId: "provider-thread-1", status: "completed" } },
+      ];
     }, (args) => { eventPages.push(args); });
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
-    const unsigned = { ...qualificationRequest(fenceToken, { idempotencyKey: "live-role-event-page" }), candidateHead: CANDIDATE_SHA, operatorReceiptId: null };
+    const unsigned = { ...qualificationRequest(fenceToken, {
+      idempotencyKey: "live-role-event-page",
+      roleContext: { threadId: ROLE_THREAD_ID, requestEventId: "event-target-request", requestEventSeq: 254, completionEventId: "event-target-completion", completionEventSeq: 257 },
+    }), candidateHead: CANDIDATE_SHA, operatorReceiptId: null };
     const receipt = persistInterimOperatorReceipt(db, {
       projectId: PROJECT_ID,
       mutationClass: unsigned.operationClass,
@@ -6463,7 +6492,7 @@ describe("bb-collab plugin boundary", () => {
         },
         createdAt: 1,
       },
-      { id: "event-accepted", threadId: ROLE_THREAD_ID, seq: 2, type: "turn/input/accepted", scope: { kind: "thread" }, data: { clientRequestId: "request-1", providerThreadId: "provider-thread-1" }, createdAt: 2 },
+      { id: "event-accepted", threadId: ROLE_THREAD_ID, seq: 2, type: "turn/input/accepted", scope: { kind: "turn", turnId: "turn-1" }, data: { clientRequestId: "request-1", providerThreadId: "provider-thread-1" }, createdAt: 2 },
       { id: "event-started", threadId: ROLE_THREAD_ID, seq: 3, type: "turn/started", scope: { kind: "turn", turnId: "turn-1" }, data: { providerThreadId: "provider-thread-1" }, createdAt: 3 },
       { id: ROLE_COMPLETION_EVENT_ID, threadId: ROLE_THREAD_ID, seq: 4, type: "turn/completed", scope: { kind: "turn", turnId: "turn-1" }, data: { providerThreadId: "provider-thread-1", status: "completed" }, createdAt: 4 },
       { id: "event-malformed", threadId: "thread-foreign", seq: 5, type: "thread/updated", scope: null, data: {}, createdAt: Number.NaN },
@@ -6498,6 +6527,7 @@ describe("bb-collab plugin boundary", () => {
         id: `event-repeat-${index + 5}`,
         seq: index + 5,
         type: "thread/updated",
+        scope: { kind: "thread" as const },
         data: {},
       })));
     }, (args) => { eventPages.push(args); }, true);
@@ -6531,6 +6561,7 @@ describe("bb-collab plugin boundary", () => {
         id: `event-cap-${index + 5}`,
         seq: index + 5,
         type: "thread/updated",
+        scope: { kind: "thread" as const },
         data: {},
       })));
     }, (args) => { eventPages.push(args); });
@@ -6883,10 +6914,10 @@ describe("bb-collab plugin boundary", () => {
       ["host-unavailable", (facts) => { facts.host.status = "disconnected"; }, "ROLE_CONTEXT_UNKNOWN"],
       ["missing-start", (facts) => { facts.events = facts.events.filter((event) => event.type !== "turn/started"); }, "EXECUTION_PROFILE_UNKNOWN"],
       ["failed-completion", (facts) => { facts.events[3]!.data.status = "failed"; }, "EXECUTION_PROFILE_UNKNOWN"],
-      ["duplicate-completion", (facts) => { facts.events.push({ id: "completion-2", seq: 5, type: "turn/completed", data: { providerThreadId: "provider-thread-1", status: "completed" } }); }, "EXECUTION_COMPLETION_AMBIGUOUS"],
+      ["duplicate-completion", (facts) => { facts.events.push({ id: "completion-2", seq: 5, type: "turn/completed", scope: { kind: "turn", turnId: "turn-1" }, data: { providerThreadId: "provider-thread-1", status: "completed" } }); }, "EXECUTION_COMPLETION_AMBIGUOUS"],
       ["model-fallback", (facts) => {
         facts.events[3]!.seq = 5;
-        facts.events.splice(3, 0, { id: "fallback", seq: 4, type: "provider/modelFallback", data: { providerThreadId: "provider-thread-1" } });
+        facts.events.splice(3, 0, { id: "fallback", seq: 4, type: "provider/modelFallback", scope: { kind: "turn", turnId: "turn-1" }, data: { providerThreadId: "provider-thread-1" } });
       }, "EXECUTION_PROFILE_UNKNOWN", { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 5 } }],
     ];
     for (const [name, mutate, outcome, requestOverride] of cases) {

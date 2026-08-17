@@ -417,10 +417,10 @@ function unavailableRoleFactReader(serverId: string): RoleFactReader {
 function isLiveRoleEventScope(value: unknown): boolean {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const scope = value as Record<string, unknown>;
-  return scope.kind === "thread" || (scope.kind === "turn" && typeof scope.turnId === "string");
+  return scope.kind === "thread" || (scope.kind === "turn" && typeof scope.turnId === "string" && scope.turnId.length > 0);
 }
 
-function isLiveRoleEvent(value: unknown, threadId: string): value is { id: string; seq: number; type: string; data: Record<string, unknown> } {
+function isLiveRoleEvent(value: unknown, threadId: string): value is { id: string; seq: number; type: string; scope: { kind: "thread" } | { kind: "turn"; turnId: string }; data: Record<string, unknown> } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const event = value as Record<string, unknown>;
   return event.threadId === threadId &&
@@ -482,7 +482,7 @@ async function readLiveRoleFactReader(
         status: thread.status,
         visibility: thread.visibility,
       },
-      events: events.map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data as Record<string, unknown> })),
+      events: events.map((event) => ({ id: event.id, seq: event.seq, type: event.type, scope: event.scope, data: event.data as Record<string, unknown> })),
       environment: {
         id: environment.id,
         projectId: environment.projectId,

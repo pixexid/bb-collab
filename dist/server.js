@@ -15186,6 +15186,9 @@ var reviewFactsSchema = external_exports.object({
 function stringField(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 256 ? value : null;
 }
+function turnScopeId(event) {
+  return event.scope.kind === "turn" && event.scope.turnId.length > 0 ? event.scope.turnId : null;
+}
 function resolveRoleContext(reader, request, allowFirstDirectorEnvironment = false) {
   if (!reader || !request.roleContext) throw refusal("ROLE_CONTEXT_REQUIRED", "exact BB role context facts are required");
   let thread;
@@ -15247,6 +15250,7 @@ ${thread.titleFallback ?? ""}`)) {
   );
   if (requestEvents.length !== 1) throw refusal("EXECUTION_PROFILE_UNKNOWN", "the exact execution-bearing request event is unavailable");
   const requestEvent = requestEvents[0];
+  if (requestEvent.scope.kind !== "thread") throw refusal("EXECUTION_PROFILE_UNKNOWN", "execution request must have thread scope");
   const execution = requestEvent.data.execution;
   const requestId = stringField(requestEvent.data.requestId);
   if (!execution || !requestId) throw refusal("EXECUTION_PROFILE_UNKNOWN", "execution request correlation is incomplete");
@@ -15263,19 +15267,21 @@ ${thread.titleFallback ?? ""}`)) {
   );
   if (accepted.length !== 1) throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "execution input correlation is missing or ambiguous");
   const acceptedEvent = accepted[0];
+  const turnId = turnScopeId(acceptedEvent);
+  if (!turnId) throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "execution input turn scope is missing or invalid");
   const providerThreadId = stringField(acceptedEvent.data.providerThreadId);
   if (!providerThreadId) throw refusal("EXECUTION_PROFILE_UNKNOWN", "provider thread correlation is unavailable");
-  const starts = events.filter((event) => event.type === "turn/started" && event.data.providerThreadId === providerThreadId);
+  const starts = events.filter((event) => event.type === "turn/started" && event.data.providerThreadId === providerThreadId && turnScopeId(event) === turnId);
   if (starts.length !== 1) throw refusal("EXECUTION_PROFILE_UNKNOWN", "correlated execution start is missing or ambiguous");
   const startEvent = starts[0];
-  const completions = events.filter((event) => event.type === "turn/completed" && event.data.providerThreadId === providerThreadId);
+  const completions = events.filter((event) => event.type === "turn/completed" && event.data.providerThreadId === providerThreadId && turnScopeId(event) === turnId);
   if (completions.length !== 1) throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "correlated execution completion is missing or ambiguous");
   const completion = completions[0];
   if (completion.id !== request.roleContext.completionEventId || completion.seq !== request.roleContext.completionEventSeq) {
     throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion does not match the exact requested correlation");
   }
   if (completion.data.status !== "completed") throw refusal("EXECUTION_PROFILE_UNKNOWN", "execution did not complete successfully");
-  if (events.some((event) => event.type === "provider/modelFallback" && event.data.providerThreadId === providerThreadId)) {
+  if (events.some((event) => event.type === "provider/modelFallback" && event.data.providerThreadId === providerThreadId && turnScopeId(event) === turnId)) {
     throw refusal("EXECUTION_PROFILE_UNKNOWN", "model fallback has no final unambiguous executed profile");
   }
   const profile = {
@@ -15313,6 +15319,7 @@ ${thread.titleFallback ?? ""}`)) {
     host: { id: host.id, status: host.status, maxPermissionMode: host.maxPermissionMode },
     execution: {
       providerThreadId,
+      turnId,
       requestId,
       requestEventId: requestEvent.id,
       requestEventSeq: requestEvent.seq,
@@ -15334,6 +15341,7 @@ ${thread.titleFallback ?? ""}`)) {
     threadId: thread.id,
     environmentId: environment.id,
     providerThreadId,
+    turnId,
     requestId,
     requestEventId: requestEvent.id,
     requestEventSeq: requestEvent.seq,
@@ -22025,7 +22033,7 @@ function unavailableRoleFactReader(serverId) {
 function isLiveRoleEventScope(value) {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const scope = value;
-  return scope.kind === "thread" || scope.kind === "turn" && typeof scope.turnId === "string";
+  return scope.kind === "thread" || scope.kind === "turn" && typeof scope.turnId === "string" && scope.turnId.length > 0;
 }
 function isLiveRoleEvent(value, threadId) {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
@@ -22077,7 +22085,7 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
         status: thread.status,
         visibility: thread.visibility
       },
-      events: events.map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data })),
+      events: events.map((event) => ({ id: event.id, seq: event.seq, type: event.type, scope: event.scope, data: event.data })),
       environment: {
         id: environment.id,
         projectId: environment.projectId,
