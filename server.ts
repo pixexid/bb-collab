@@ -178,12 +178,14 @@ const sidebarCollapseKey = (kind: "project" | "thread", id: string) => `sidebar.
 const roleBriefRoleSchema = z.enum(["director", "orchestrator", "worker"]);
 const roleBriefBundleSchema = z.object({
   ponytail: z.string().min(1),
+  rules: z.string().min(1),
   roles: z.object({ director: z.string().min(1), orchestrator: z.string().min(1), worker: z.string().min(1) }).strict(),
 }).strict();
 const roleBriefSchema = z.object({
   role: roleBriefRoleSchema,
   roleContent: z.string().min(1),
   ponytail: z.string().min(1),
+  rules: z.string().min(1),
   project: z.object({ id: projectIdSchema, name: z.string(), sourceIds: z.array(z.string()) }).strict(),
   pointers: z.object({ canonicalStoreQuery: z.string(), handoffFile: z.string(), currentSeats: z.array(z.object({ roleId: z.string(), generation: z.number().int().positive(), threadId: z.string() }).strict()) }).strict(),
   prompt: z.string().min(1),
@@ -487,6 +489,9 @@ async function composeRoleBrief(
     "## Role brief",
     bundle.roles[input.role],
     "",
+    "## Working rules",
+    bundle.rules,
+    "",
     "## Live pointers",
     `Project: ${project.name} (${project.id})`,
     `Sources: ${project.sources.map((source) => source.id).join(", ") || "none"}`,
@@ -494,7 +499,7 @@ async function composeRoleBrief(
     `Handoff file: ${pointers.handoffFile}`,
     `Current seats: ${currentSeats.map((seat) => `${seat.roleId}@${seat.generation}:${seat.threadId}`).join(", ") || "none"}`,
   ].join("\n");
-  return { role: input.role, roleContent: bundle.roles[input.role], ponytail: bundle.ponytail, project: { id: project.id, name: project.name, sourceIds: project.sources.map((source) => source.id) }, pointers, prompt };
+  return { role: input.role, roleContent: bundle.roles[input.role], ponytail: bundle.ponytail, rules: bundle.rules, project: { id: project.id, name: project.name, sourceIds: project.sources.map((source) => source.id) }, pointers, prompt };
 }
 
 async function sendRoleBrief(

@@ -32,6 +32,24 @@ A WAITING on the same thing past about 24 hours surfaces to the orchestrator as 
 
 When you send another seat a blocking question, set the watch in the same act: run `bb thread wait <their-thread> --status idle --timeout <bounded>`, always with an explicit bounded timeout, then check your own inbound for the answer. If their thread is idle and inbound has no answer, it was never sent or delivered: re-ask once, bundled. After the second watch, if there is still no answer, escalate to the operator or supervisor with `director unresponsive`; do not loop a third time. The same pattern applies downward to every lane blocking on you. It is one wait, one inbox check, and at most one re-ask—no polling and no timers.
 
+## A message is delivered when it lands, consumed when the reply addresses it
+
+A message is delivered when it lands in the recipient's thread, and consumed when their reply addresses it. The sender owns both checks.
+
+Delivery is not the same as sending: a transport can accept a message and never deliver it, so confirm at the recipient's log rather than at your own send. Consumption is not the same as delivery: a reply that ignores what was asked — the coalescing shape, where a directive is acknowledged and dismissed — counts as not consumed. Chase it; do not count it.
+
+Any tell requiring action names its expected reply in the `DONE | BLOCKED | WAITING` vocabulary, and the sender carries an open item until that reply arrives. An unanswered directive past the timer floor is chased exactly like any other stall: an owed reply sits alongside an owed `DONE`. No read receipts, no acknowledgement packets, no ceremony — the three-word vocabulary and the timer already close the loop. The only change is that senders track what they are owed.
+
+## Lifecycle disposition
+
+Every pull request carries exactly one disposition line: `Closes #NN` plus `Acceptance: complete`, or `Related GH-NN` naming an OPEN issue, or `No issue:` followed by a reason. `scripts/pr-lifecycle.mjs` is the canonical check — run it against your body before pushing rather than discovering the rule from a red pipeline.
+
+Commit messages carry no linkage at all unless the pull request closes an issue and the commit names that same issue with a closing keyword. A `Related` or `Ref` mention in a commit message fails the gate even when the pull-request body is correct, because the checker treats any commit-side mention that is not an exact closing match as a conflict.
+
+## Platform check before you design
+
+Before writing a coordination rule or a line of coordination code, enumerate what bb natively does in that area — from the actual docs, CLI help, and plugin API, not from memory. A native mechanism replaces building; prose that duplicates a native signal is a stale copy waiting to diverge. This is the ladder's "does the platform already do it" rung, made explicit: the check is step one of designing any coordination mechanism, not a review afterthought.
+
 ## One writer per lane
 
 > One branch, one owner. Stakeholders coordinate by message; nobody opens a parallel edit of the same lane.
