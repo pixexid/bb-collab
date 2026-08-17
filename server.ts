@@ -58,9 +58,12 @@ import {
   type SourceObservation,
 } from "./src/registered-waits.js";
 import { runArchiveSweep } from "./src/archive-sweep.js";
+import { findCheckoutRoot, readCheckoutDivergence, reportCheckoutDivergence, type CheckoutDivergence } from "./src/checkout-divergence.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+
+const checkoutRoot = findCheckoutRoot(dirname(fileURLToPath(import.meta.url)));
 
 const projectIdSchema = z.string().trim().min(1).max(256);
 const mutationReceiptSchema = z
@@ -610,6 +613,7 @@ interface WaitValidatorCliDeps {
   listWaitsForCli: () => Promise<Array<Record<string, unknown>>>;
   escalationCycle: import("./src/registered-waits.js").WaitEscalationCycle;
   archiveSweep: (projectId: string, apply: boolean) => Promise<import("./src/archive-sweep.js").ArchiveSweepResult>;
+  readCheckoutDivergence: () => CheckoutDivergence;
 }
 
 async function runCli(
@@ -747,13 +751,14 @@ async function runCli(
   }
   const unknown = unexpectedFlags(args, ["--project"]);
   if (unknown) return invalidCli(`unexpected flag ${unknown}`);
-  if (command === "doctor") return cliResult(await doctor(db, bb.sdk, projectId));
+  if (command === "doctor") return cliResult(await doctor(db, bb.sdk, projectId, deps.readCheckoutDivergence()));
   return cliResult(exportFoundation(db, projectId));
 }
 
 type OperatorPassphraseRead = { configured: true; secret: string } | { configured: false } | { configured: null };
 
 export default async function plugin(bb: BbPluginApi) {
+  reportCheckoutDivergence(bb.log, checkoutRoot);
   const operatorPassphrase = bb.settings.define({
     operatorPassphrase: {
       type: "string",
@@ -1202,6 +1207,7 @@ export default async function plugin(bb: BbPluginApi) {
     listWaitsForCli: async () => { await waitRegistry.recover(); return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) })); },
     escalationCycle,
     archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply),
+    readCheckoutDivergence: () => readCheckoutDivergence(checkoutRoot),
   };
 
   bb.rpc.register(rpcContract, {
@@ -1262,7 +1268,7 @@ export default async function plugin(bb: BbPluginApi) {
       return { ok: true as const };
     },
     async doctor(input) {
-      return doctor(db, bb.sdk, input.projectId);
+      return doctor(db, bb.sdk, input.projectId, readCheckoutDivergence(checkoutRoot));
     },
     async export(input) {
       return exportFoundation(db, input.projectId);

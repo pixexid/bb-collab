@@ -1,4 +1,5 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -66,6 +67,7 @@ import {
   seedFixtureDecision,
   seedVerifiedFixtureReceipt,
 } from "../src/test-support.js";
+import { readCheckoutDivergence, reportCheckoutDivergence } from "../src/checkout-divergence.js";
 
 const PROJECT_ID = "proj_test";
 const PLUGIN_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -125,6 +127,27 @@ const REVIEW_AUTHORS = [{ name: "Writer", email: "writer@example.test" }];
 const REVIEW_COMMITTERS = [{ name: "Committer", email: "committer@example.test" }];
 const FROZEN_BRIEF = "# Frozen assignment\nImplement the exact bounded change.";
 const FROZEN_BRIEF_DIGEST = sha256(FROZEN_BRIEF);
+
+function checkoutFixture(diverged: boolean) {
+  const directory = mkdtempSync(join(tmpdir(), "bb-collab-checkout-divergence-"));
+  const git = (args: string[]) => execFileSync("git", args, { cwd: directory, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  git(["init", "-q", "-b", "main"]);
+  git(["config", "user.email", "fixture@example.test"]);
+  git(["config", "user.name", "Fixture"]);
+  writeFileSync(join(directory, "README.md"), "base\n");
+  git(["add", "README.md"]);
+  git(["commit", "-q", "-m", "base"]);
+  const base = git(["rev-parse", "HEAD"]);
+  if (diverged) {
+    writeFileSync(join(directory, "README.md"), "origin\n");
+    git(["commit", "-qam", "origin"]);
+    git(["update-ref", "refs/remotes/origin/main", git(["rev-parse", "HEAD"])]);
+    git(["reset", "-q", "--hard", base]);
+  } else {
+    git(["update-ref", "refs/remotes/origin/main", base]);
+  }
+  return { directory, base, origin: git(["show-ref", "--hash", "refs/remotes/origin/main"]) };
+}
 
 function roleConfig(connector: "required" | "optional" | "prohibited" = "optional") {
   const config = structuredClone(bootstrapRequest().config) as {
@@ -673,6 +696,46 @@ function seedAndBootstrap(host: ReturnType<typeof hostFor>, projectId = PROJECT_
     fenceToken: (result.evidence as { fenceToken: string }).fenceToken,
   };
 }
+
+describe("checkout divergence detection", () => {
+  it("warns for a diverged fixture and reports the same doctor evidence", async () => {
+    const fixture = checkoutFixture(true);
+    try {
+      const divergence = readCheckoutDivergence(fixture.directory);
+      expect(divergence).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 1, verdict: "diverged" });
+      const warnings: string[] = [];
+      reportCheckoutDivergence({ warn: (message: string) => warnings.push(message) }, fixture.directory);
+      expect(warnings).toEqual([`bb-collab checkout diverges from origin/main: checkout-head=${fixture.base} origin/main=${fixture.origin} behind-count=1`]);
+
+      const host = await loadedHost();
+      seedAndBootstrap(host);
+      const result = await doctor(host.bb.storage.database(), host.bb.sdk, PROJECT_ID, divergence);
+      expect(result.evidence).toMatchObject({ checkoutDivergence: { checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 1, verdict: "diverged" } });
+      const cli = await host.harness.runCli(["doctor", "--project", PROJECT_ID]);
+      expect(JSON.parse(cli.stdout).evidence).toMatchObject({ checkoutDivergence: { verdict: "clean" } });
+    } finally {
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("stays silent for a clean fixture and reports a clean doctor verdict", async () => {
+    const fixture = checkoutFixture(false);
+    try {
+      const divergence = readCheckoutDivergence(fixture.directory);
+      expect(divergence).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 0, verdict: "clean" });
+      const warnings: string[] = [];
+      reportCheckoutDivergence({ warn: (message: string) => warnings.push(message) }, fixture.directory);
+      expect(warnings).toEqual([]);
+
+      const host = await loadedHost();
+      seedAndBootstrap(host);
+      const result = await doctor(host.bb.storage.database(), host.bb.sdk, PROJECT_ID, divergence);
+      expect(result.evidence).toMatchObject({ checkoutDivergence: { checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 0, verdict: "clean" } });
+    } finally {
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+});
 
 function directDatabase() {
   const directory = mkdtempSync(join(tmpdir(), "bb-collab-issue3-"));
