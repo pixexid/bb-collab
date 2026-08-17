@@ -28,4 +28,4 @@ Live state is never this page. The canonical store is the bb-collab plugin datab
 
 ## Silence is a defect signal
 
-When blocked on another seat’s answer, re-ask after one reasonable interval; silence is a defect signal, not an answer. This applies upward and downward: an answer written in its own thread but never sent, followed by a waiting seat that did not re-ask, idled the fleet until the operator noticed.
+Follow the canonical [silence/watch rule](../rules.md#silence-is-a-defect-signal), upward and downward.
