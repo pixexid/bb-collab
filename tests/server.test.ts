@@ -851,6 +851,50 @@ exit 0
     }
   });
 
+  it("records a setsid escapee without changing the divergence result", async () => {
+    const fixture = checkoutFixture(true);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-setsid-git-"));
+    const pidFile = join(bin, "escapee.pid");
+    const wrapper = join(bin, "git");
+    writeFileSync(wrapper, `#!/bin/sh
+perl -MPOSIX -e 'defined(my $pid = fork()) or die; exit if $pid; POSIX::setsid() or die; open my $file, ">", $ARGV[0] or die; print $file "$$\\n"; close $file or die; $SIG{HUP} = $SIG{TERM} = $SIG{INT} = "IGNORE"; sleep 300' "${pidFile}" </dev/null >/dev/null 2>&1 &
+trap "" TERM
+while :; do :; done
+`);
+    chmodSync(wrapper, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    let childPid: number | null = null;
+    try {
+      const result = readCheckoutDivergence(fixture.directory);
+      expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: null, verdict: "diverged", processGroupReap: "absent" });
+      childPid = Number(readFileSync(pidFile, "utf8").trim());
+      expect(Number.isInteger(childPid)).toBe(true);
+      expect(childPid).toBeGreaterThan(0);
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        try {
+          process.kill(childPid, 0);
+        } catch {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(() => process.kill(childPid!, 0)).not.toThrow();
+    } finally {
+      if (childPid !== null) {
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch {
+          // The escapee may already have exited.
+        }
+      }
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(fixture.directory, { recursive: true, force: true });
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("surfaces non-ESRCH doctor probe process-group reap failures", () => {
     const fixture = checkoutFixture(true);
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-failed-reap-git-"));
