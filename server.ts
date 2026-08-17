@@ -24,22 +24,12 @@ import {
   assembleV21CachedConsumerRolloutEvidence,
   applyAuthorizedMutation,
   applyRequestSchema,
-  approverAttestationRequestSchema,
-  authorizedApproverAttestation,
   databaseIsReady,
   doctor,
   exportFoundation,
   canonicalJson,
-  operatorReceiptConfirmationSchema,
-  operatorReceiptRequestSchema,
-  isDerivedActorMutationClass,
-  OPERATOR_RECEIPT_RETIREMENT_CONDITION,
-  persistBootstrapOperatorReceipt,
-  persistInterimOperatorReceipt,
-  persistOperatorReceiptWithSessionEvidence,
   probeV21NewLegacyApplyProvenanceRefusal,
   probeV21ConsumedLegacyReplay,
-  readOperatorReceiptWithSessionEvidence,
   parseApplyRequest,
   type ApplyRequest,
   type FoundationResult,
@@ -81,7 +71,6 @@ const mutationReceiptSchema = z
     idempotencyKey: z.string(),
     operationClass: z.string(),
     requestDigest: z.string(),
-    operatorReceiptId: z.string().nullable(),
     committedEventSequence: z.number().int().positive(),
     createdAtMs: z.number().int().nonnegative(),
   })
@@ -140,30 +129,6 @@ export const foundationResultSchema = z
     expectedResourceRevision: z.number().int().positive().optional(),
     mutationReceipt: mutationReceiptSchema.optional(),
     actorReceiptId: z.string().optional(),
-    operatorReceipt: z
-      .object({
-        receiptId: z.string(),
-        projectId: projectIdSchema,
-        receiptType: z.literal("operator_confirmation"),
-        mutationClass: z.string(),
-        candidateHead: z.string(),
-        bindingDigest: z.string(),
-        status: z.literal("interim"),
-        retirementCondition: z.literal(OPERATOR_RECEIPT_RETIREMENT_CONDITION),
-        callerThreadId: z.string(),
-        callerPluginId: z.string(),
-        requestedFromBackground: z.boolean(),
-        issuanceProvenance: z.enum(["console", "attestation"]),
-        approverId: z.string().nullable(),
-        authorizingDecisionId: z.string().nullable(),
-        authorizingDispositionSequence: z.number().int().positive().nullable(),
-        idempotencyKey: z.string(),
-        requestDigest: z.string(),
-        receiptDigest: z.string(),
-        createdAtMs: z.number().int().nonnegative(),
-      })
-      .strict()
-      .optional(),
     eventSequence: z.number().int().positive().optional(),
     evidence: z.unknown().optional(),
     export: exportSchema.optional(),
@@ -210,31 +175,6 @@ const sidebarThreadExecutionSchema = z
   .strict();
 const sidebarCollapseKindSchema = z.enum(["project", "thread"]);
 const sidebarCollapseKey = (kind: "project" | "thread", id: string) => `sidebar.collapse:${kind}:${id}`;
-const operatorReceiptInteractionDataSchema = operatorReceiptRequestSchema.extend({
-  kind: z.literal("operator_receipt_confirmation"),
-  retirementCondition: z.literal(OPERATOR_RECEIPT_RETIREMENT_CONDITION),
-}).strict();
-const operatorReceiptRequestViewSchema = z.object({
-  interactionId: sidebarThreadIdSchema,
-  threadId: sidebarThreadIdSchema,
-  projectId: projectIdSchema,
-  mutationClass: z.string().min(1),
-  candidateHead: z.string().regex(/^[0-9a-f]{40,64}$/u),
-  idempotencyKey: z.string().min(1),
-  requestDigest: z.string().regex(/^[0-9a-f]{64}$/u),
-  callerThreadId: sidebarThreadIdSchema,
-  requestedFromBackground: z.boolean(),
-  createdAt: z.number().int().nonnegative(),
-  expiresAt: z.number().int().nonnegative().nullable(),
-  ageMs: z.number().int().nonnegative(),
-}).strict();
-const operatorReceiptDecisionSchema = operatorReceiptRequestViewSchema.extend({
-  decision: z.enum(["approve", "reject"]),
-  passphrase: z.string().optional(),
-  approverThreadId: sidebarThreadIdSchema.nullable(),
-}).strict();
-type OperatorReceiptRequestView = z.infer<typeof operatorReceiptRequestViewSchema>;
-
 export const rpcContract = defineRpcContract({
   lanes: {
     input: z.object({}).strict(),
@@ -290,32 +230,6 @@ export const rpcContract = defineRpcContract({
     input: applyRequestSchema,
     output: foundationResultSchema,
   },
-  operatorReceipt: {
-    input: operatorReceiptRequestSchema,
-    output: foundationResultSchema,
-  },
-  operatorReceiptRequests: {
-    input: z.object({}).strict(),
-    output: z.array(operatorReceiptRequestViewSchema),
-  },
-  // Whether the secret exists, never what it is. `useSettings()` excludes
-  // secret settings, so the console cannot otherwise tell "unset" from
-  // "set but not typed yet" — and only the first of those is an onboarding
-  // problem the operator can fix. `null` is a third answer, not a default:
-  // the read failed, so the console knows nothing rather than accusing the
-  // operator of a setup they did do.
-  operatorPassphraseState: {
-    input: z.object({}).strict(),
-    output: z.object({ configured: z.boolean().nullable() }).strict(),
-  },
-  operatorReceiptDecision: {
-    input: operatorReceiptDecisionSchema,
-    output: foundationResultSchema,
-  },
-  approverAttestation: {
-    input: approverAttestationRequestSchema,
-    output: foundationResultSchema,
-  },
   cachedConsumerRollout: {
     input: applyRequestSchema,
     output: foundationResultSchema,
@@ -342,55 +256,6 @@ function invalidCli(message: string) {
     verified: 0,
     message,
   });
-}
-
-function operatorReceiptResult(
-  projectId: string,
-  outcome: FoundationResult["outcome"],
-  message: string,
-  extra: Pick<FoundationResult, "operatorReceipt" | "actorReceiptId" | "evidence"> = {},
-): FoundationResult {
-  return { outcome, subject: projectId, expected: 1, attempted: extra.operatorReceipt ? 1 : 0, verified: extra.operatorReceipt ? 1 : 0, message, ...extra };
-}
-
-function operatorReceiptInteractionData(interaction: unknown, pluginId: string): z.infer<typeof operatorReceiptInteractionDataSchema> | null {
-  if (!interaction || typeof interaction !== "object") return null;
-  const value = interaction as { status?: unknown; origin?: unknown; payload?: unknown; threadId?: unknown };
-  if (value.status !== "pending" || value.threadId === undefined || !value.origin || typeof value.origin !== "object") return null;
-  const origin = value.origin as { kind?: unknown; pluginId?: unknown; rendererId?: unknown };
-  if (origin.kind !== "plugin" || origin.pluginId !== pluginId || origin.rendererId !== "operator-receipt") return null;
-  if (!value.payload || typeof value.payload !== "object") return null;
-  const payload = value.payload as { kind?: unknown; data?: unknown };
-  if (payload.kind !== "plugin") return null;
-  const parsed = operatorReceiptInteractionDataSchema.safeParse(payload.data);
-  return parsed.success && parsed.data.callerThreadId === value.threadId ? parsed.data : null;
-}
-
-async function readOperatorReceiptRequests(bb: BbPluginApi): Promise<OperatorReceiptRequestView[]> {
-  const threads = await bb.sdk.threads.list({ archived: false, includeHidden: true, limit: 1000 });
-  const pending = await Promise.all(threads.filter((thread) => thread.hasPendingInteraction).map(async (thread) => {
-    const interactions = await bb.sdk.threads.interactions.list({ threadId: thread.id }).catch(() => []);
-    return interactions.flatMap((interaction) => {
-      const data = operatorReceiptInteractionData(interaction, bb.pluginId);
-      if (!data) return [];
-      const createdAt = typeof interaction.createdAt === "number" ? interaction.createdAt : 0;
-      return [{
-        interactionId: interaction.id,
-        threadId: thread.id,
-        projectId: data.projectId,
-        mutationClass: data.mutationClass,
-        candidateHead: data.candidateHead,
-        idempotencyKey: data.idempotencyKey,
-        requestDigest: data.requestDigest,
-        callerThreadId: data.callerThreadId,
-        requestedFromBackground: data.requestedFromBackground,
-        createdAt,
-        expiresAt: typeof interaction.expiresAt === "number" ? interaction.expiresAt : null,
-        ageMs: Math.max(0, Date.now() - createdAt),
-      } satisfies OperatorReceiptRequestView];
-    });
-  }));
-  return pending.flat().sort((left, right) => right.createdAt - left.createdAt);
 }
 
 function parseFlag(args: string[], name: string): string | null {
@@ -691,14 +556,7 @@ async function runCli(
         evidence: summary,
       });
     } catch (error) {
-      return cliResult({
-        outcome: "INTERNAL_ERROR",
-        subject: "stall-guard",
-        expected: 1,
-        attempted: 0,
-        verified: 0,
-        message: error instanceof Error ? error.message : String(error),
-      });
+      return cliResult({ outcome: "INTERNAL_ERROR", subject: "stall-guard", expected: 1, attempted: 0, verified: 0, message: error instanceof Error ? error.message : String(error) });
     }
   }
   const projectId = parseFlag(args, "--project");
@@ -798,36 +656,10 @@ async function runCli(
   return cliResult(exportFoundation(db, projectId));
 }
 
-type OperatorPassphraseRead = { configured: true; secret: string } | { configured: false } | { configured: null };
-
 export default async function plugin(bb: BbPluginApi, options: PluginOptions = {}) {
   const readDiagnosticDivergence = () => readCheckoutDivergence(
     options.checkoutRoot === undefined ? findCheckoutRoot(dirname(fileURLToPath(import.meta.url))) : options.checkoutRoot,
   );
-  const operatorPassphrase = bb.settings.define({
-    operatorPassphrase: {
-      type: "string",
-      label: "Operator approval passphrase",
-      description: "Required by the universal Lanes approval console; stored as a secret.",
-      secret: true,
-    },
-  });
-  // The one place the secret is read. Tri-state by construction: a failed read
-  // is `configured: null`, never `false`, because those are different facts
-  // and only `false` is fixable by the operator. Both refuse an approval —
-  // only `true` carries material, and only `configured` ever leaves the server.
-  const readOperatorPassphrase = async (): Promise<OperatorPassphraseRead> => {
-    let values: { operatorPassphrase?: string };
-    try {
-      values = await operatorPassphrase.get();
-    } catch (error) {
-      bb.log.error(`operator approval passphrase state unreadable: ${String(error)}`);
-      return { configured: null };
-    }
-    return typeof values.operatorPassphrase === "string" && values.operatorPassphrase !== ""
-      ? { configured: true, secret: values.operatorPassphrase }
-      : { configured: false };
-  };
   let db: SqliteDatabase | null = null;
   try {
     db = bb.storage.database();
@@ -840,26 +672,19 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   const readPendingExternalWait = async (threadId: string) => {
     try {
-      const interactions = await bb.sdk.threads.interactions.list({ threadId });
-      return interactions.some((interaction) => interaction.status === "pending");
+      return (await bb.sdk.threads.interactions.list({ threadId })).some((interaction) => interaction.status === "pending");
     } catch {
       return true;
     }
   };
 
   const readPendingOperatorWaitForThread = async (threadId: string): Promise<OperatorWait | null> => {
-    const interactions = await bb.sdk.threads.interactions.list({ threadId });
-    const pending = interactions.filter((interaction) => interaction.status === "pending");
-    let wait: OperatorWait | null = null;
-    for (const interaction of pending) {
-      if (!operatorReceiptInteractionData(interaction, bb.pluginId)) continue;
-      wait = {
-        reason: "awaiting_operator",
-        createdAtMs: typeof interaction.createdAt === "number" && Number.isFinite(interaction.createdAt) ? Math.max(0, interaction.createdAt) : 0,
-      };
-      break;
-    }
-    return wait;
+    const interaction = (await bb.sdk.threads.interactions.list({ threadId })).find((candidate) => candidate.status === "pending");
+    if (!interaction) return null;
+    return {
+      reason: "awaiting_operator",
+      createdAtMs: typeof interaction.createdAt === "number" && Number.isFinite(interaction.createdAt) ? Math.max(0, interaction.createdAt) : 0,
+    };
   };
 
   const continuationLedger = createContinuationLedger({
@@ -972,9 +797,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   const readRoleScopes = async () => {
     if (!db) return [];
-    return roleQueueScopes(
-      openLaneViews(db, Date.now(), await readOperatorWaits()),
-    );
+    return roleQueueScopes(openLaneViews(db, Date.now(), await readOperatorWaits()));
   };
 
   const readUnblockedStartableLanes = async () => {
@@ -1073,24 +896,13 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         }
       }
       const archived = thread.archivedAt !== null || thread.deletedAt !== null || roleThreadRefused;
-      let operatorWait: OperatorWait | null = null;
-      let operatorWaitKnown = true;
-      if (!archived && thread.status === "idle") {
-        try {
-          operatorWait = await readPendingOperatorWaitForThread(threadId);
-        } catch {
-          operatorWaitKnown = false;
-        }
-      }
       return {
         projectId: thread.projectId,
         status: thread.status,
-        pendingExternalWait: archived || !operatorWaitKnown
-          ? true
-          : operatorWait ? true : await readPendingExternalWait(threadId),
+        pendingExternalWait: archived ? true : await readPendingExternalWait(threadId),
         archived,
-        operatorWait,
-        operatorWaitKnown,
+        operatorWait: null,
+        operatorWaitKnown: true,
         // Native ThreadResponse has no idle-since field; the role ledger anchors this proxy on first observation.
         idleSinceMs: thread.status === "idle" ? thread.updatedAt : null,
       };
@@ -1327,12 +1139,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   const readOpenLaneViews = async () => {
     if (!db) return [];
-    const requests = await readOperatorReceiptRequests(bb);
-    return openLaneViews(
-      db,
-      Date.now(),
-      new Map(requests.map((request) => [request.callerThreadId, { reason: "awaiting_operator", createdAtMs: request.createdAt } satisfies OperatorWait])),
-    );
+    return openLaneViews(db, Date.now(), new Map());
   };
 
   bb.http.route("GET", "/lanes", async () =>
@@ -1344,24 +1151,6 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   // Counts only. A sidebar glyph needs how many are waiting and on which
   // thread; it has no use for the project, candidate head, digest or
   // idempotency key those requests carry, so this surface never carries them.
-  bb.http.route("GET", "/operator-receipt-waits", async () => {
-    // An unreadable interaction list is not zero waits. Answering a read
-    // outage with a non-2xx leaves the client on its last known row status
-    // instead of erasing a live approval, and the body carries no read detail.
-    const requests = await readOperatorReceiptRequests(bb).catch(() => null);
-    if (!requests) {
-      return new Response(JSON.stringify({ error: "operator receipt waits unavailable" }), {
-        status: 503,
-        headers: { "content-type": "application/json" },
-      });
-    }
-    const threads: Record<string, number> = {};
-    for (const request of requests) threads[request.threadId] = (threads[request.threadId] ?? 0) + 1;
-    return new Response(JSON.stringify({ total: requests.length, threads }), {
-      headers: { "content-type": "application/json" },
-    });
-  });
-
   const cliDeps: WaitValidatorCliDeps = {
     watcher,
     registerBoundedWaitForCli: (input, ctxThreadId) => registerBoundedWait({
@@ -1446,162 +1235,6 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     async cachedConsumerRollout(input) {
       return applyLiveCachedConsumerRollout(bb, db, input, cliDeps);
     },
-    async operatorReceipt(input) {
-      if (!db) return operatorReceiptResult(input.projectId, "CANONICAL_STORE_UNAVAILABLE", "canonical SQLite store is unavailable");
-      const interactionPromise = bb.ui.requestInput({
-        threadId: input.callerThreadId,
-        rendererId: "operator-receipt",
-        title: "Confirm operator receipt",
-        timeoutMs: 3_600_000,
-        payload: {
-          kind: "operator_receipt_confirmation",
-          projectId: input.projectId,
-          mutationClass: input.mutationClass,
-          candidateHead: input.candidateHead,
-          idempotencyKey: input.idempotencyKey,
-          requestDigest: input.requestDigest,
-          callerThreadId: input.callerThreadId,
-          retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
-          requestedFromBackground: input.requestedFromBackground,
-        },
-      });
-      bb.realtime.publish("operator-receipts", { changed: true });
-      const interaction = await interactionPromise;
-      if (interaction.outcome === "cancelled") {
-        bb.realtime.publish("operator-receipts", { changed: true });
-        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_CANCELLED", `operator confirmation cancelled: ${interaction.reason}`);
-      }
-      const confirmation = operatorReceiptConfirmationSchema.safeParse(interaction.value);
-      if (!confirmation.success) return operatorReceiptResult(input.projectId, "INVALID_INPUT", "operator confirmation form result is invalid");
-      if (!confirmation.data.confirmed) return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_CANCELLED", "operator confirmation was not accepted");
-      if (
-        confirmation.data.projectId !== input.projectId ||
-        confirmation.data.mutationClass !== input.mutationClass ||
-        confirmation.data.candidateHead !== input.candidateHead ||
-        confirmation.data.idempotencyKey !== input.idempotencyKey ||
-        confirmation.data.requestDigest !== input.requestDigest
-      ) {
-        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_STALE", "operator confirmation binding is stale");
-      }
-      try {
-        if (confirmation.data.operatorReceiptId) {
-          const issued = readOperatorReceiptWithSessionEvidence(
-            db,
-            input,
-            confirmation.data.operatorReceiptId,
-            confirmation.data.actorReceiptId,
-            confirmation.data.evidenceId,
-          );
-          const { evidenceId, ...receiptResult } = issued;
-          return operatorReceiptResult(input.projectId, "OK", "operator receipt and connect-session evidence already persisted", {
-            ...receiptResult,
-            evidence: { source: "connect-session", evidenceId, interactionId: confirmation.data.interactionId ?? null, workerThreadId: input.callerThreadId },
-          });
-        }
-        if (isDerivedActorMutationClass(input.mutationClass)) {
-          const issued = persistBootstrapOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId });
-          bb.realtime.publish("operator-receipts", { changed: true });
-          return operatorReceiptResult(input.projectId, "OK", "interim operator receipt and derived actor receipt persisted", issued);
-        }
-        const receipt = persistInterimOperatorReceipt(db, { ...input, callerPluginId: bb.pluginId, issuanceProvenance: "console" });
-        bb.realtime.publish("operator-receipts", { changed: true });
-        return operatorReceiptResult(input.projectId, "OK", "interim operator receipt persisted", { operatorReceipt: receipt });
-      } catch {
-        return operatorReceiptResult(input.projectId, "INTERNAL_ERROR", "interim operator receipt was not persisted");
-      }
-    },
-    async operatorReceiptRequests() {
-      try {
-        return await readOperatorReceiptRequests(bb);
-      } catch {
-        return [];
-      }
-    },
-    async operatorPassphraseState() {
-      return { configured: (await readOperatorPassphrase()).configured };
-    },
-    async operatorReceiptDecision(input) {
-      if (!db) return operatorReceiptResult(input.projectId, "CANONICAL_STORE_UNAVAILABLE", "canonical SQLite store is unavailable");
-      let interaction: Awaited<ReturnType<typeof bb.sdk.threads.interactions.get>>;
-      try {
-        interaction = await bb.sdk.threads.interactions.get({ threadId: input.threadId, interactionId: input.interactionId });
-      } catch {
-        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_UNKNOWN", "pending operator interaction is not known");
-      }
-      if (interaction.id !== input.interactionId || interaction.threadId !== input.threadId) {
-        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_FOREIGN", "operator interaction belongs to another session");
-      }
-      if (interaction.status !== "pending") {
-        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_REUSED", "operator interaction was already resolved");
-      }
-      const data = operatorReceiptInteractionData(interaction, bb.pluginId);
-      if (!data) return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_UNKNOWN", "interaction is not a pending operator receipt request");
-      if (data.projectId !== input.projectId) {
-        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_FOREIGN", "operator receipt belongs to another project");
-      }
-      if (
-        data.mutationClass !== input.mutationClass ||
-        data.candidateHead !== input.candidateHead ||
-        data.idempotencyKey !== input.idempotencyKey ||
-        data.requestDigest !== input.requestDigest ||
-        data.callerThreadId !== input.callerThreadId
-      ) {
-        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_STALE", "operator receipt binding is stale");
-      }
-      if (input.approverThreadId === data.callerThreadId) {
-        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_INVALID", "worker self-approval is not permitted");
-      }
-      const stored = await readOperatorPassphrase();
-      if (!stored.configured || !input.passphrase || input.passphrase !== stored.secret) {
-        return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_INVALID", "operator approval passphrase is missing or incorrect");
-      }
-      const confirmation = {
-        confirmed: input.decision === "approve",
-        projectId: data.projectId,
-        mutationClass: data.mutationClass,
-        candidateHead: data.candidateHead,
-        idempotencyKey: data.idempotencyKey,
-        requestDigest: data.requestDigest,
-      };
-      if (input.decision === "reject") {
-        try {
-          await bb.sdk.threads.interactions.respond({ threadId: input.threadId, interactionId: input.interactionId, value: confirmation });
-          bb.realtime.publish("operator-receipts", { changed: true });
-          return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_CANCELLED", "operator receipt request rejected", {
-            evidence: { source: "connect-session", interactionId: input.interactionId, workerThreadId: data.callerThreadId },
-          });
-        } catch {
-          return operatorReceiptResult(input.projectId, "INTERNAL_ERROR", "operator receipt rejection was not delivered");
-        }
-      }
-      try {
-        const issued = persistOperatorReceiptWithSessionEvidence(
-          db,
-          { ...data, callerThreadId: data.callerThreadId, callerPluginId: bb.pluginId },
-          input.interactionId,
-        );
-        if (!issued) return operatorReceiptResult(input.projectId, "OPERATOR_RECEIPT_REUSED", "operator receipt binding was already issued");
-        const { evidenceId, ...receiptResult } = issued;
-        const response = {
-          ...confirmation,
-          operatorReceiptId: receiptResult.operatorReceipt.receiptId,
-          ...(receiptResult.actorReceiptId ? { actorReceiptId: receiptResult.actorReceiptId } : {}),
-          evidenceId,
-          interactionId: input.interactionId,
-        };
-        await bb.sdk.threads.interactions.respond({ threadId: input.threadId, interactionId: input.interactionId, value: response });
-        bb.realtime.publish("operator-receipts", { changed: true });
-        return operatorReceiptResult(input.projectId, "OK", "operator receipt persisted and worker interaction resolved", {
-          ...receiptResult,
-          evidence: { source: "connect-session", evidenceId, interactionId: input.interactionId, workerThreadId: data.callerThreadId },
-        });
-      } catch {
-        return operatorReceiptResult(input.projectId, "INTERNAL_ERROR", "operator receipt approval was not persisted or delivered");
-      }
-    },
-    approverAttestation(input) {
-      return authorizedApproverAttestation(db, input, bb.pluginId);
-    },
   });
 
   bb.cli.register({
@@ -1612,7 +1245,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       { name: "export", summary: "Deterministic bounded foundation export", usage: "bb collab export --project PROJECT_ID" },
       {
         name: "apply",
-        summary: "Explicit foundation apply (exact one-request receipt required)",
+        summary: "Explicit foundation apply",
         usage: "bb collab apply --project PROJECT_ID --request JSON",
       },
       {

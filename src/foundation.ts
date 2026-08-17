@@ -15,12 +15,6 @@ export const MAX_WRITING_LANE_CEILING = 3;
 const PREVIOUS_SCHEMA_VERSION = 11;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
-export const DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION = {
-  generation: 1,
-  holderThreadId: "thr_gsb7m77ciz",
-  environmentId: "env_3znzsxb7ce",
-  sourceId: "src_x8veidmpik",
-} as const;
 const directorSeatProfile = {
   providerId: "pi",
   model: "kimi-coding/k3",
@@ -37,8 +31,6 @@ const directorSeatStandbyProfile = {
   serviceTier: "default",
   visibility: "visible" as const,
 };
-export const AUTHORIZED_APPROVER_ID = "orchestrator:bb-collab" as const;
-export const AUTHORIZED_APPROVER_PROJECT_ID = "proj_a8zzfsx36j" as const;
 export const LLM_COLLAB_SOURCE_FENCE = "f988d9711d3778f751e4ec0e32ebbf7b0893c80f" as const;
 export const LLM_COLLAB_MERGED_MAIN_SHA = "0686d34" as const;
 export const LLM_COLLAB_EVIDENCE_RESOURCE_REVISION = 4 as const;
@@ -863,36 +855,6 @@ export const MIGRATION_STEPS = [
   "rollback",
   "mark_fix_forward_required",
 ] as const;
-export const DERIVED_ACTOR_MUTATION_CLASSES = [
-  "bootstrap",
-  "config_revision",
-  "decision_create",
-  "decision_disposition",
-  "work_item_create",
-  "work_item_transition",
-  "qualification_observation_record",
-  "role_generation_succession",
-  "migration_prepare",
-  "migration_step",
-] as const;
-/** Historical v11 rows remain readable during the already-bounded authority repair. */
-export const PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES = Object.freeze([
-  "bootstrap",
-  "config_revision",
-  "decision_create",
-  "decision_disposition",
-  "work_item_create",
-  "qualification_observation_record",
-  "role_generation_succession",
-  "migration_prepare",
-  "migration_step",
-] as const);
-export function isDerivedActorMutationClass(operationClass: string): boolean {
-  return (DERIVED_ACTOR_MUTATION_CLASSES as readonly string[]).includes(operationClass);
-}
-function isExactAuthorizedApproverMutationClassSet(value: unknown, expected: readonly string[]): boolean {
-  return canonicalJson(value) === canonicalJson(expected);
-}
 export const contractDigest = sha256(canonicalJson({
   contractVersion: CONTRACT_VERSION,
   operationClasses: ["migration_prepare", "migration_step"],
@@ -928,8 +890,7 @@ export const contractDigest = sha256(canonicalJson({
     executedProfile: directorSeatProfile,
     standbyProfile: directorSeatStandbyProfile,
     writingLaneCapacity: 0,
-    environment: "managed-worktree for later generations; exact first-generation exemption only",
-    firstGenerationExemption: DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION,
+    environment: "managed-worktree",
     assignmentKinds: [],
   },
   cachedConsumerRolloutPolicy: {
@@ -952,7 +913,7 @@ export const contractDigest = sha256(canonicalJson({
     consumedLegacyReplay: "same exact receipt returns the recorded mutation outcome",
   },
   derivedActorReceiptPolicy: {
-    operationClasses: [...DERIVED_ACTOR_MUTATION_CLASSES],
+    operationClasses: ["bootstrap", "config_revision", "decision_create", "decision_disposition", "work_item_create", "work_item_transition", "qualification_observation_record", "role_generation_succession", "migration_prepare", "migration_step"],
     actorKind: "plugin",
     subjectId: PLUGIN_ID,
     authorization: "operatorReceiptId with explicit issuance provenance",
@@ -960,10 +921,10 @@ export const contractDigest = sha256(canonicalJson({
     retirementCondition: "host-issued receipt get-bb/bb#1541",
   },
   authorizedApproverPolicy: {
-    projectId: AUTHORIZED_APPROVER_PROJECT_ID,
-    approverId: AUTHORIZED_APPROVER_ID,
+    projectId: "proj_a8zzfsx36j",
+    approverId: "orchestrator:bb-collab",
     authorization: "one adopted operator_only Decision disposition",
-    mutationClasses: [...DERIVED_ACTOR_MUTATION_CLASSES],
+    mutationClasses: ["bootstrap", "config_revision", "decision_create", "decision_disposition", "work_item_create", "work_item_transition", "qualification_observation_record", "role_generation_succession", "migration_prepare", "migration_step"],
     revocation: "operator Decision disposition marks registry revoked",
   },
 }));
@@ -1293,12 +1254,6 @@ const executionProfileSchema = z
     visibility: z.enum(["visible", "hidden"]),
   })
   .strict();
-const directorSeatFirstGenerationExemptionSchema = z.object({
-  generation: z.literal(DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.generation),
-  holderThreadId: z.literal(DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.holderThreadId),
-  environmentId: z.literal(DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.environmentId),
-  sourceId: z.literal(DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.sourceId),
-}).strict();
 const roleRequirementSchema = z
   .object({
     roleRequirementId: id,
@@ -1307,7 +1262,6 @@ const roleRequirementSchema = z
     executedProfile: executionProfileSchema,
     standbyProfile: executionProfileSchema.optional(),
     writingLaneCapacity: z.literal(0).optional(),
-    firstGenerationExemption: directorSeatFirstGenerationExemptionSchema.optional(),
   })
   .strict()
   .superRefine((requirement, ctx) => {
@@ -1343,10 +1297,7 @@ const roleRequirementSchema = z
       if (canonicalJson(requirement.executedProfile) !== canonicalJson(directorSeatProfile)) {
         ctx.addIssue({ code: "custom", path: ["executedProfile"], message: "director-seat requires the exact judgment profile" });
       }
-      if (!requirement.firstGenerationExemption || canonicalJson(requirement.firstGenerationExemption) !== canonicalJson(DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION)) {
-        ctx.addIssue({ code: "custom", path: ["firstGenerationExemption"], message: "director-seat requires the exact first-generation environment exemption" });
-      }
-    } else if (requirement.standbyProfile !== undefined || requirement.writingLaneCapacity !== undefined || requirement.firstGenerationExemption !== undefined) {
+    } else if (requirement.standbyProfile !== undefined || requirement.writingLaneCapacity !== undefined) {
       ctx.addIssue({ code: "custom", path: ["roleRequirementId"], message: "standby profile and writing capacity are reserved for director-seat" });
     }
   });
@@ -1374,9 +1325,7 @@ const roleContextRefSchema = z
   })
   .strict();
 const gitShaSchema = z.string().regex(/^[0-9a-f]{40,64}$/u);
-const operatorCandidateHeadSchema = z.string().regex(/^[0-9a-f]{40}$/u);
 export const OPERATOR_RECEIPT_RETIREMENT_CONDITION = "host-issued receipt get-bb/bb#1541" as const;
-export const AUTHORIZED_APPROVER_RETIREMENT_CONDITION = OPERATOR_RECEIPT_RETIREMENT_CONDITION;
 export const CANONICAL_MUTATION_CLASSES = [
   "bootstrap",
   "config_revision",
@@ -1395,60 +1344,7 @@ export const CANONICAL_MUTATION_CLASSES = [
   "migration_prepare",
   "migration_step",
 ] as const;
-const operatorMutationClassSchema = z.enum(CANONICAL_MUTATION_CLASSES);
-export const operatorReceiptRequestSchema = z.object({
-  projectId: id,
-  mutationClass: operatorMutationClassSchema,
-  candidateHead: operatorCandidateHeadSchema,
-  idempotencyKey: id,
-  requestDigest: digestSchema,
-  callerThreadId: id,
-  requestedFromBackground: z.boolean(),
-}).strict();
-export const operatorReceiptConfirmationSchema = z.object({
-  confirmed: z.boolean(),
-  projectId: id,
-  mutationClass: operatorMutationClassSchema,
-  candidateHead: operatorCandidateHeadSchema,
-  idempotencyKey: id,
-  requestDigest: digestSchema,
-  operatorReceiptId: id.optional(),
-  actorReceiptId: id.optional(),
-  evidenceId: id.optional(),
-  interactionId: id.optional(),
-}).strict();
-export const approverAttestationRequestSchema = operatorReceiptRequestSchema.extend({
-  approverId: id,
-  authorizingDecisionId: id,
-  authorizingDispositionSequence: z.number().int().positive(),
-}).strict();
-
-export type OperatorReceiptRequest = z.infer<typeof operatorReceiptRequestSchema>;
-export type OperatorReceiptConfirmation = z.infer<typeof operatorReceiptConfirmationSchema>;
-export type ApproverAttestationRequest = z.infer<typeof approverAttestationRequestSchema>;
 export type OperatorReceiptProvenance = "console" | "attestation";
-
-export interface OperatorReceipt {
-  receiptId: string;
-  projectId: string;
-  receiptType: "operator_confirmation";
-  mutationClass: OperatorReceiptRequest["mutationClass"];
-  candidateHead: string;
-  idempotencyKey: string;
-  requestDigest: string;
-  bindingDigest: string;
-  status: "interim";
-  retirementCondition: typeof OPERATOR_RECEIPT_RETIREMENT_CONDITION;
-  callerThreadId: string;
-  callerPluginId: string;
-  requestedFromBackground: boolean;
-  issuanceProvenance: OperatorReceiptProvenance;
-  approverId: string | null;
-  authorizingDecisionId: string | null;
-  authorizingDispositionSequence: number | null;
-  receiptDigest: string;
-  createdAtMs: number;
-}
 
 const assignmentEnvironmentSchema = z
   .object({
@@ -1529,8 +1425,6 @@ export const applyRequestSchema = z
     operationClass: z.enum(CANONICAL_MUTATION_CLASSES),
     idempotencyKey: id,
     actorReceiptId: id.nullable().optional(),
-    operatorReceiptId: id.nullable().optional(),
-    candidateHead: operatorCandidateHeadSchema.nullable().optional(),
     expectedConfigRevision: z.number().int().nonnegative().nullable().optional(),
     configRevision: z.number().int().positive().nullable().optional(),
     expectedGovernanceEpoch: z.number().int().nonnegative().nullable().optional(),
@@ -1830,7 +1724,7 @@ function stringField(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 && value.length <= 256 ? value : null;
 }
 
-export function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest, allowFirstDirectorEnvironment = false): ResolvedRoleContext {
+export function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest): ResolvedRoleContext {
   if (!reader || !request.roleContext) throw refusal("ROLE_CONTEXT_REQUIRED", "exact BB role context facts are required");
   const roleContext = request.roleContext;
   let thread: RoleThreadFact;
@@ -1874,13 +1768,7 @@ export function resolveRoleContext(reader: RoleFactReader | null, request: Apply
   const exactManagedWorktree =
     environment.status === "ready" && !!environment.path && environment.managed && environment.isGitRepo && environment.isWorktree &&
     environment.workspaceProvisionType === "managed-worktree";
-  const exactFirstDirectorEnvironment =
-    allowFirstDirectorEnvironment && environment.status === "ready" && !!environment.path &&
-    environment.id === DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.environmentId &&
-    thread.id === DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.holderThreadId &&
-    !environment.managed && environment.isGitRepo && !environment.isWorktree &&
-    environment.workspaceProvisionType === "unmanaged";
-  if (!exactManagedWorktree && !exactFirstDirectorEnvironment) {
+  if (!exactManagedWorktree) {
     throw refusal("ROLE_CONTEXT_FOREIGN", "holder environment is not an exact ready managed worktree");
   }
   // BB-managed worktrees have a derived execution path, not the canonical source path.
@@ -1890,12 +1778,6 @@ export function resolveRoleContext(reader: RoleFactReader | null, request: Apply
     (source) => source.projectId === request.projectId && source.hostId === environment.hostId,
   );
   if (sources.length !== 1) throw refusal("ROLE_CONTEXT_FOREIGN", "holder environment does not resolve to one exact project source on its host");
-  if (exactFirstDirectorEnvironment && sources[0]!.id !== DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.sourceId) {
-    throw refusal("ROLE_CONTEXT_FOREIGN", "first director environment does not match its exact canonical source");
-  }
-  if (exactFirstDirectorEnvironment && sources[0]!.path !== environment.path) {
-    throw refusal("ROLE_CONTEXT_FOREIGN", "first director environment path does not match its canonical source path");
-  }
   if (host.id !== environment.hostId || host.status !== "connected") throw refusal("ROLE_CONTEXT_UNKNOWN", "holder host is unavailable");
   if (!stringField(bbVersion) || !stringField(bbServerId)) {
     throw refusal("ROLE_CONTEXT_UNKNOWN", "BB version or event facts are unavailable");
@@ -2131,10 +2013,6 @@ export type FoundationCode =
   | "IDEMPOTENCY_KEY_CONFLICT"
   | "CANONICAL_STORE_UNAVAILABLE"
   | "INTERNAL_ERROR"
-  | "OPERATOR_RECEIPT_REQUIRED"
-  | "OPERATOR_RECEIPT_UNKNOWN"
-  | "OPERATOR_RECEIPT_FOREIGN"
-  | "OPERATOR_RECEIPT_RETIRED"
   | "OPERATOR_RECEIPT_INVALID"
   | "CONFIG_SECRET_FORBIDDEN"
   | "MALFORMED_JSON"
@@ -2145,21 +2023,13 @@ export type FoundationCode =
   | "EXPORT_BOUNDED"
   | "SOURCE_FREEZE_UNPROVEN"
   | "IMPORT_EQUIVALENCE_FAILED"
-  | "MIGRATION_FIX_FORWARD_REQUIRED"
-  | "OPERATOR_RECEIPT_CANCELLED"
-  | "OPERATOR_RECEIPT_STALE"
-  | "OPERATOR_RECEIPT_REUSED"
-  | "OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED"
-  | "AUTHORIZED_APPROVER_UNKNOWN"
-  | "AUTHORIZED_APPROVER_REVOKED"
-  | "AUTHORIZED_APPROVER_INVALID";
+  | "MIGRATION_FIX_FORWARD_REQUIRED";
 
 export interface MutationReceipt {
   projectId: string;
   idempotencyKey: string;
   operationClass: string;
   requestDigest: string;
-  operatorReceiptId: string | null;
   committedEventSequence: number;
   createdAtMs: number;
 }
@@ -2180,7 +2050,6 @@ export interface FoundationResult {
   mutationReceipt?: MutationReceipt;
   actorReceiptId?: string;
   eventSequence?: number;
-  operatorReceipt?: OperatorReceipt;
   evidence?: unknown;
   export?: ExportPayload;
 }
@@ -2351,7 +2220,11 @@ function roleRequirementsFromJson(configJson: string): RoleRequirement[] {
   };
   const value = config.extensions?.bbCollab?.roleRequirements;
   if (value === undefined) return [];
-  const parsed = roleRequirementsSchema.safeParse(value);
+  const parsed = roleRequirementsSchema.safeParse(Array.isArray(value) ? value.map((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return candidate;
+    const { firstGenerationExemption: _legacy, ...requirement } = candidate as Record<string, unknown>;
+    return requirement;
+  }) : value);
   if (!parsed.success) throw refusal("INVALID_INPUT", "stored role requirements are invalid");
   return parsed.data;
 }
@@ -2359,24 +2232,6 @@ function roleRequirementsFromJson(configJson: string): RoleRequirement[] {
 function requireCurrentOperatorReceiptProvenance(value: unknown): asserts value is OperatorReceiptProvenance {
   if (value !== "console" && value !== "attestation") {
     throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt issuance provenance is unknown");
-  }
-}
-
-function requireOperatorReceiptProvenanceColumns(
-  issuanceProvenance: unknown,
-  approverId: string | null,
-  authorizingDecisionId: string | null,
-  authorizingDispositionSequence: number | null,
-): asserts issuanceProvenance is OperatorReceiptProvenance {
-  requireCurrentOperatorReceiptProvenance(issuanceProvenance);
-  if (issuanceProvenance === "console") {
-    if (approverId !== null || authorizingDecisionId !== null || authorizingDispositionSequence !== null) {
-      throw refusal("OPERATOR_RECEIPT_INVALID", "console operator receipt has attestation provenance");
-    }
-    return;
-  }
-  if (approverId === null || authorizingDecisionId === null || authorizingDispositionSequence === null) {
-    throw refusal("OPERATOR_RECEIPT_INVALID", "attested operator receipt approver provenance is incomplete");
   }
 }
 
@@ -2542,8 +2397,6 @@ function normalizeRequest(request: ApplyRequest): ApplyRequest {
   return {
     ...request,
     actorReceiptId: request.actorReceiptId ?? null,
-    operatorReceiptId: request.operatorReceiptId ?? null,
-    candidateHead: request.candidateHead ?? null,
     expectedConfigRevision: request.expectedConfigRevision ?? null,
     configRevision: request.configRevision ?? null,
     expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? null,
@@ -2608,425 +2461,6 @@ function result(
   ) as unknown as FoundationResult;
 }
 
-export function operatorReceiptBindingDigest(input: Pick<OperatorReceiptRequest, "projectId" | "mutationClass" | "candidateHead" | "idempotencyKey" | "requestDigest">): string {
-  return sha256(canonicalJson({
-    projectId: input.projectId,
-    mutationClass: input.mutationClass,
-    candidateHead: input.candidateHead,
-    idempotencyKey: input.idempotencyKey,
-    requestDigest: input.requestDigest,
-  }));
-}
-
-export function operatorReceiptDigest(
-  input: Omit<OperatorReceipt, "receiptDigest" | "issuanceProvenance"> & { issuanceProvenance: OperatorReceiptProvenance | null },
-): string {
-  return sha256(canonicalJson(input));
-}
-
-export function persistInterimOperatorReceipt(
-  db: SqliteDatabase,
-  input: OperatorReceiptRequest & {
-    callerPluginId: string;
-    issuanceProvenance: OperatorReceiptProvenance;
-    approverId?: string | null;
-    authorizingDecisionId?: string | null;
-    authorizingDispositionSequence?: number | null;
-  },
-  createdAtMs = now(),
-): OperatorReceipt {
-  requireCurrentOperatorReceiptProvenance(input.issuanceProvenance);
-  const receiptId = `operator-${randomBytes(16).toString("hex")}`;
-  const issuanceProvenance = input.issuanceProvenance;
-  const bindingDigest = operatorReceiptBindingDigest(input);
-  const receiptDigest = operatorReceiptDigest({
-    receiptId,
-    projectId: input.projectId,
-    receiptType: "operator_confirmation",
-    mutationClass: input.mutationClass,
-    candidateHead: input.candidateHead,
-    idempotencyKey: input.idempotencyKey,
-    requestDigest: input.requestDigest,
-    bindingDigest,
-    status: "interim",
-    retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
-    callerThreadId: input.callerThreadId,
-    callerPluginId: input.callerPluginId,
-    requestedFromBackground: input.requestedFromBackground,
-    issuanceProvenance,
-    approverId: input.approverId ?? null,
-    authorizingDecisionId: input.authorizingDecisionId ?? null,
-    authorizingDispositionSequence: input.authorizingDispositionSequence ?? null,
-    createdAtMs,
-  });
-  db.prepare(
-    `INSERT INTO operator_receipts (
-      project_id, receipt_id, receipt_type, mutation_class, candidate_head,
-      binding_digest, status, retirement_condition, caller_thread_id,
-      caller_plugin_id, requested_from_background, receipt_digest, created_at_ms,
-      idempotency_key, request_digest, approver_id, authorizing_decision_id,
-      authorizing_disposition_sequence, issuance_provenance
-    ) VALUES (?, ?, 'operator_confirmation', ?, ?, ?, 'interim', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    input.projectId,
-    receiptId,
-    input.mutationClass,
-    input.candidateHead,
-    bindingDigest,
-    OPERATOR_RECEIPT_RETIREMENT_CONDITION,
-    input.callerThreadId,
-    input.callerPluginId,
-    input.requestedFromBackground ? 1 : 0,
-    receiptDigest,
-    createdAtMs,
-    input.idempotencyKey,
-    input.requestDigest,
-    input.approverId ?? null,
-    input.authorizingDecisionId ?? null,
-    input.authorizingDispositionSequence ?? null,
-    issuanceProvenance,
-  );
-  return {
-    receiptId,
-    projectId: input.projectId,
-    receiptType: "operator_confirmation",
-    mutationClass: input.mutationClass,
-    candidateHead: input.candidateHead,
-    idempotencyKey: input.idempotencyKey,
-    requestDigest: input.requestDigest,
-    bindingDigest,
-    status: "interim",
-    retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
-    callerThreadId: input.callerThreadId,
-    callerPluginId: input.callerPluginId,
-    requestedFromBackground: input.requestedFromBackground,
-    issuanceProvenance,
-    approverId: input.approverId ?? null,
-    authorizingDecisionId: input.authorizingDecisionId ?? null,
-    authorizingDispositionSequence: input.authorizingDispositionSequence ?? null,
-    receiptDigest,
-    createdAtMs,
-  };
-}
-
-export function persistOperatorReceiptWithSessionEvidence(
-  db: SqliteDatabase,
-  input: OperatorReceiptRequest & { callerPluginId: string },
-  interactionId: string,
-  createdAtMs = now(),
-): { operatorReceipt: OperatorReceipt; actorReceiptId?: string; evidenceId: string } | null {
-  return transaction(db, () => {
-    if (operatorReceiptBindingExists(db, input)) return null;
-    const operatorReceipt = persistInterimOperatorReceipt(db, { ...input, issuanceProvenance: "console" }, createdAtMs);
-    const actorReceiptId = isDerivedActorMutationClass(input.mutationClass)
-      ? derivePluginActorReceipt(db, operatorReceipt)
-      : undefined;
-    const evidenceId = `operator-session-${operatorReceipt.receiptId}`;
-    const redacted = canonicalJson({ source: "connect-session", interactionId, operatorReceiptId: operatorReceipt.receiptId });
-    const durableRef = canonicalJson({ kind: "connect-session", operatorReceiptId: operatorReceipt.receiptId });
-    const contentDigest = sha256(canonicalJson({
-      projectId: operatorReceipt.projectId,
-      mutationClass: operatorReceipt.mutationClass,
-      candidateHead: operatorReceipt.candidateHead,
-      idempotencyKey: operatorReceipt.idempotencyKey,
-      requestDigest: operatorReceipt.requestDigest,
-      interactionId,
-    }));
-    const artifactIdentityDigest = sha256(canonicalJson({
-      projectId: operatorReceipt.projectId,
-      evidenceId,
-      evidenceKind: "legacy_claim",
-      sourceKind: "legacy_claim",
-      sourceRef: `operator-receipt:${operatorReceipt.receiptId}`,
-      executionAttemptId: null,
-      contentDigest,
-      redactedDigest: sha256(redacted),
-      durableRef: JSON.parse(durableRef),
-    }));
-    db.prepare(
-      `INSERT INTO evidence_artifacts
-        (project_id, evidence_id, evidence_kind, source_kind, source_ref, execution_attempt_id,
-         content_digest, redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest, created_at_ms)
-       VALUES (?, ?, 'legacy_claim', 'legacy_claim', ?, NULL, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      operatorReceipt.projectId,
-      evidenceId,
-      `operator-receipt:${operatorReceipt.receiptId}`,
-      contentDigest,
-      redacted,
-      sha256(redacted),
-      durableRef,
-      artifactIdentityDigest,
-      createdAtMs,
-    );
-    return { operatorReceipt, ...(actorReceiptId ? { actorReceiptId } : {}), evidenceId };
-  });
-}
-
-export function readOperatorReceiptWithSessionEvidence(
-  db: SqliteDatabase,
-  input: OperatorReceiptRequest,
-  operatorReceiptId: string,
-  actorReceiptId: string | undefined,
-  evidenceId: string | undefined,
-): { operatorReceipt: OperatorReceipt; actorReceiptId?: string; evidenceId: string } {
-  requireOperatorReceipt(db, {
-    projectId: input.projectId,
-    operationClass: input.mutationClass,
-    candidateHead: input.candidateHead,
-    idempotencyKey: input.idempotencyKey,
-    requestDigest: input.requestDigest,
-    operatorReceiptId,
-  } as ApplyRequest, input.requestDigest);
-  const row = asRow<{
-    receipt_id: string;
-    project_id: string;
-    receipt_type: string;
-    mutation_class: string;
-    candidate_head: string;
-    idempotency_key: string;
-    request_digest: string;
-    binding_digest: string;
-    status: string;
-    retirement_condition: string;
-    caller_thread_id: string;
-    caller_plugin_id: string;
-    requested_from_background: number;
-    issuance_provenance: OperatorReceiptProvenance | null;
-    approver_id: string | null;
-    authorizing_decision_id: string | null;
-    authorizing_disposition_sequence: number | null;
-    receipt_digest: string;
-    created_at_ms: number;
-  }>(db.prepare(
-    `SELECT receipt_id, project_id, receipt_type, mutation_class, candidate_head,
-            idempotency_key, request_digest, binding_digest, status,
-            retirement_condition, caller_thread_id, caller_plugin_id,
-            requested_from_background, issuance_provenance, approver_id, authorizing_decision_id,
-            authorizing_disposition_sequence, receipt_digest, created_at_ms
-     FROM operator_receipts WHERE project_id = ? AND receipt_id = ?`,
-  ).get(input.projectId, operatorReceiptId));
-  if (!row || row.caller_plugin_id !== PLUGIN_ID) throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt provenance is invalid");
-  if (row.issuance_provenance !== "console") throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt is not console-issued");
-  if (!evidenceId) throw refusal("OPERATOR_RECEIPT_INVALID", "connect-session evidence is missing");
-  const evidence = asRow<{ evidence_id: string }>(db.prepare(
-    `SELECT evidence_id FROM evidence_artifacts
-     WHERE project_id = ? AND evidence_id = ? AND evidence_kind = 'legacy_claim'
-       AND source_kind = 'legacy_claim' AND source_ref = ?
-       AND durable_ref_json = ?`,
-  ).get(
-    input.projectId,
-    evidenceId,
-    `operator-receipt:${operatorReceiptId}`,
-    canonicalJson({ kind: "connect-session", operatorReceiptId }),
-  ));
-  if (!evidence) throw refusal("OPERATOR_RECEIPT_INVALID", "connect-session evidence is missing or foreign");
-  let verifiedActorReceiptId: string | undefined;
-  if (isDerivedActorMutationClass(input.mutationClass)) {
-    if (!actorReceiptId) throw refusal("OPERATOR_RECEIPT_INVALID", "derived actor receipt is missing");
-    const actor = asRow<{ receipt_id: string }>(db.prepare(
-      `SELECT receipt_id FROM actor_receipts
-       WHERE project_id = ? AND receipt_id = ? AND operator_receipt_id = ?
-         AND actor_kind = 'plugin' AND subject_id = ? AND verification_state = 'verified'`,
-    ).get(input.projectId, actorReceiptId, operatorReceiptId, PLUGIN_ID));
-    if (!actor) throw refusal("OPERATOR_RECEIPT_INVALID", "derived actor receipt is missing or foreign");
-    verifiedActorReceiptId = actor.receipt_id;
-  }
-  const operatorReceipt: OperatorReceipt = {
-    receiptId: row.receipt_id,
-    projectId: row.project_id,
-    receiptType: "operator_confirmation",
-    mutationClass: row.mutation_class as OperatorReceipt["mutationClass"],
-    candidateHead: row.candidate_head,
-    idempotencyKey: row.idempotency_key,
-    requestDigest: row.request_digest,
-    bindingDigest: row.binding_digest,
-    status: "interim",
-    retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
-    callerThreadId: row.caller_thread_id,
-    callerPluginId: row.caller_plugin_id,
-    requestedFromBackground: row.requested_from_background === 1,
-    issuanceProvenance: row.issuance_provenance,
-    approverId: row.approver_id,
-    authorizingDecisionId: row.authorizing_decision_id,
-    authorizingDispositionSequence: row.authorizing_disposition_sequence,
-    receiptDigest: row.receipt_digest,
-    createdAtMs: row.created_at_ms,
-  };
-  return { operatorReceipt, ...(verifiedActorReceiptId ? { actorReceiptId: verifiedActorReceiptId } : {}), evidenceId };
-}
-
-export function operatorReceiptBindingExists(db: SqliteDatabase, input: OperatorReceiptRequest): boolean {
-  return Boolean(db.prepare(
-    `SELECT 1 FROM operator_receipts
-     WHERE project_id = ? AND mutation_class = ? AND candidate_head = ?
-       AND idempotency_key = ? AND request_digest = ?`,
-  ).get(input.projectId, input.mutationClass, input.candidateHead, input.idempotencyKey, input.requestDigest));
-}
-
-function authorizedApproverId(optionsJson: string): string {
-  let options: unknown;
-  try {
-    options = JSON.parse(optionsJson);
-  } catch {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorizing Decision options are malformed");
-  }
-  if (options === null || typeof options !== "object" || Array.isArray(options)) {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorizing Decision options are not an object");
-  }
-  const requested = (options as { approverId?: unknown }).approverId;
-  if (requested !== undefined && requested !== AUTHORIZED_APPROVER_ID) {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorizing Decision names an unsupported approver");
-  }
-  return AUTHORIZED_APPROVER_ID;
-}
-
-interface InFlightDecisionDispositionTransition {
-  requestDecisionId: string;
-  insertedDispositionSequence: number;
-  requestIdempotencyKey: string;
-  priorAuthorizingDispositionWasAdoptedCurrent: boolean;
-  registryWasActive: boolean;
-}
-
-function requireActiveAuthorizedApprover(
-  db: SqliteDatabase,
-  input: ApproverAttestationRequest,
-  transition?: InFlightDecisionDispositionTransition,
-): void {
-  if (input.approverId !== AUTHORIZED_APPROVER_ID) {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "approver is not the configured bb-collab approver");
-  }
-  const registry = asRow<{
-    project_id: string;
-    approver_id: string;
-    authorizing_decision_id: string;
-    authorizing_disposition_sequence: number;
-    status: string;
-    allowed_mutation_classes_json: string;
-    retirement_condition: string;
-  }>(db.prepare(
-    `SELECT project_id, approver_id, authorizing_decision_id, authorizing_disposition_sequence,
-            status, allowed_mutation_classes_json, retirement_condition
-     FROM authorized_approvers
-     WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ?
-       AND authorizing_disposition_sequence = ?`,
-  ).get(input.projectId, input.approverId, input.authorizingDecisionId, input.authorizingDispositionSequence));
-  if (!registry) throw refusal("AUTHORIZED_APPROVER_UNKNOWN", "authorized approver registration is not known");
-  if (registry.status !== "active") throw refusal("AUTHORIZED_APPROVER_REVOKED", "authorized approver registration is revoked");
-  if (registry.retirement_condition !== AUTHORIZED_APPROVER_RETIREMENT_CONDITION) {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver retirement condition is invalid");
-  }
-  let allowed: unknown;
-  try {
-    allowed = JSON.parse(registry.allowed_mutation_classes_json);
-  } catch {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are malformed");
-  }
-  const allowedMutationClasses = isExactAuthorizedApproverMutationClassSet(allowed, DERIVED_ACTOR_MUTATION_CLASSES)
-    ? DERIVED_ACTOR_MUTATION_CLASSES
-    : isExactAuthorizedApproverMutationClassSet(allowed, PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES)
-      ? PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES
-      : null;
-  if (!allowedMutationClasses) {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "authorized approver mutation classes are not an exact current or bump-surviving historical set");
-  }
-  if (!(allowedMutationClasses as readonly string[]).includes(input.mutationClass)) {
-    throw refusal("AUTHORIZED_APPROVER_INVALID", "mutation class is not authorized by the approver registry");
-  }
-  const decision = asRow<{ project_id: string; decision_class: string | null; options_json: string | null }>(db.prepare(
-    "SELECT project_id, decision_class, options_json FROM decisions WHERE decision_id = ?",
-  ).get(input.authorizingDecisionId));
-  const disposition = asRow<{ disposition: string; disposition_sequence: number }>(db.prepare(
-    "SELECT disposition, disposition_sequence FROM decision_dispositions WHERE decision_id = ? AND disposition_sequence = ?",
-  ).get(input.authorizingDecisionId, input.authorizingDispositionSequence));
-  const latest = asRow<{ disposition_sequence: number }>(db.prepare(
-    "SELECT MAX(disposition_sequence) AS disposition_sequence FROM decision_dispositions WHERE decision_id = ?",
-  ).get(input.authorizingDecisionId));
-  const currentAuthorizingDisposition = Boolean(
-    disposition && disposition.disposition === "adopted" && latest?.disposition_sequence === input.authorizingDispositionSequence,
-  );
-  const validInFlightTransition = Boolean(
-    transition &&
-    input.mutationClass === "decision_disposition" &&
-    transition.requestDecisionId === input.authorizingDecisionId &&
-    transition.insertedDispositionSequence === input.authorizingDispositionSequence + 1 &&
-    transition.requestIdempotencyKey === input.idempotencyKey &&
-    transition.priorAuthorizingDispositionWasAdoptedCurrent &&
-    transition.registryWasActive &&
-    db.prepare(
-      `SELECT 1 FROM decision_dispositions
-       WHERE decision_id = ? AND disposition_sequence = ? AND disposition = 'adopted' AND idempotency_key = ?`,
-    ).get(transition.requestDecisionId, transition.insertedDispositionSequence, transition.requestIdempotencyKey) &&
-    asRow<{ disposition_sequence: number }>(db.prepare(
-      "SELECT MAX(disposition_sequence) AS disposition_sequence FROM decision_dispositions WHERE decision_id = ?",
-    ).get(transition.requestDecisionId))?.disposition_sequence === transition.insertedDispositionSequence &&
-    asRow<{ status: string }>(db.prepare(
-      `SELECT status FROM authorized_approvers
-       WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = ?`,
-    ).get(input.projectId, input.approverId, input.authorizingDecisionId, input.authorizingDispositionSequence))?.status === "active",
-  );
-  if (
-    !decision || decision.project_id !== input.projectId || decision.decision_class !== "operator_only" || !decision.options_json ||
-    authorizedApproverId(decision.options_json) !== input.approverId ||
-    (!currentAuthorizingDisposition && !validInFlightTransition)
-  ) {
-    throw refusal("AUTHORIZED_APPROVER_REVOKED", "authorizing Decision or adopted disposition is no longer current");
-  }
-}
-
-export function persistAuthorizedApproverAttestation(
-  db: SqliteDatabase,
-  input: ApproverAttestationRequest & { callerPluginId: string },
-  createdAtMs = now(),
-): { operatorReceipt: OperatorReceipt; actorReceiptId: string } {
-  const { callerPluginId, ...attestationInput } = input;
-  const parsed = approverAttestationRequestSchema.safeParse(attestationInput);
-  if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
-  if (callerPluginId !== PLUGIN_ID) throw refusal("AUTHORIZED_APPROVER_INVALID", "attestation caller plugin is not bb-collab");
-  return transaction(db, () => {
-    requireActiveAuthorizedApprover(db, parsed.data);
-    const operatorReceipt = persistInterimOperatorReceipt(db, {
-      ...parsed.data,
-      callerPluginId,
-      issuanceProvenance: "attestation",
-      approverId: parsed.data.approverId,
-      authorizingDecisionId: parsed.data.authorizingDecisionId,
-      authorizingDispositionSequence: parsed.data.authorizingDispositionSequence,
-    }, createdAtMs);
-    const actorReceiptId = derivePluginActorReceipt(db, operatorReceipt);
-    return { operatorReceipt, actorReceiptId };
-  });
-}
-
-export function authorizedApproverAttestation(
-  db: SqliteDatabase | null,
-  input: unknown,
-  callerPluginId: string,
-): FoundationResult {
-  let request: ApproverAttestationRequest;
-  try {
-    const parsed = approverAttestationRequestSchema.safeParse(input);
-    if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
-    request = parsed.data;
-  } catch (error) {
-    if (error instanceof Refusal) return refusalResult("approverAttestation", error.data);
-    return result("INVALID_INPUT", "approverAttestation", 1, 0, 0, { message: String(error) });
-  }
-  if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  try {
-    const issued = persistAuthorizedApproverAttestation(db, { ...request, callerPluginId });
-    return result("OK", request.projectId, 1, 1, 1, {
-      message: "authorized approver attestation issued an interim operator receipt and verified actor receipt",
-      operatorReceipt: issued.operatorReceipt,
-      actorReceiptId: issued.actorReceiptId,
-    });
-  } catch (error) {
-    if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
-    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "authorized approver attestation was not persisted" });
-  }
-}
-
 function actorReceiptDigest(input: {
   projectId: string;
   receiptId: string;
@@ -3038,7 +2472,7 @@ function actorReceiptDigest(input: {
   operatorReceiptId?: string | null;
   retirementCondition?: string | null;
 }): string {
-  const identity = {
+  return sha256(canonicalJson({
     projectId: input.projectId,
     receiptId: input.receiptId,
     actorKind: input.actorKind,
@@ -3049,70 +2483,11 @@ function actorReceiptDigest(input: {
     ...(input.operatorReceiptId || input.retirementCondition
       ? { operatorReceiptId: input.operatorReceiptId ?? null, retirementCondition: input.retirementCondition ?? null }
       : {}),
-  };
-  return sha256(canonicalJson(identity));
+  }));
 }
 
-export function derivePluginActorReceipt(db: SqliteDatabase, operatorReceipt: OperatorReceipt): string {
-  if (!isDerivedActorMutationClass(operatorReceipt.mutationClass)) {
-    throw refusal("INVALID_INPUT", "derived plugin actor receipts are limited to the ratified mutation classes");
-  }
-  if (operatorReceipt.callerPluginId !== PLUGIN_ID) {
-    throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt caller plugin is not bb-collab");
-  }
-  const request = {
-    projectId: operatorReceipt.projectId,
-    operationClass: operatorReceipt.mutationClass,
-    idempotencyKey: operatorReceipt.idempotencyKey,
-    actorReceiptId: null,
-    operatorReceiptId: operatorReceipt.receiptId,
-    candidateHead: operatorReceipt.candidateHead,
-  } as ApplyRequest;
-  requireOperatorReceipt(db, request, operatorReceipt.requestDigest);
-  if (db.prepare("SELECT 1 FROM actor_receipts WHERE project_id = ? AND operator_receipt_id = ?").get(operatorReceipt.projectId, operatorReceipt.receiptId)) {
-    throw refusal("OPERATOR_RECEIPT_REUSED", "operator receipt already authorizes a derived actor receipt");
-  }
-  const receiptId = `actor-${randomBytes(16).toString("hex")}`;
-  const retirementCondition = OPERATOR_RECEIPT_RETIREMENT_CONDITION;
-  const receiptDigest = actorReceiptDigest({
-    projectId: operatorReceipt.projectId,
-    receiptId,
-    actorKind: "plugin",
-    subjectId: PLUGIN_ID,
-    roleId: null,
-    roleGeneration: null,
-    verificationState: "verified",
-    operatorReceiptId: operatorReceipt.receiptId,
-    retirementCondition,
-  });
-  db.prepare(
-    `INSERT INTO actor_receipts (
-      project_id, receipt_id, actor_kind, subject_id, role_id, role_generation,
-      verification_state, receipt_digest, issued_at_ms, operator_receipt_id,
-      retirement_condition
-    ) VALUES (?, ?, 'plugin', ?, NULL, NULL, 'verified', ?, ?, ?, ?)`,
-  ).run(
-    operatorReceipt.projectId,
-    receiptId,
-    PLUGIN_ID,
-    receiptDigest,
-    operatorReceipt.createdAtMs,
-    operatorReceipt.receiptId,
-    retirementCondition,
-  );
-  return receiptId;
-}
-
-export function persistBootstrapOperatorReceipt(
-  db: SqliteDatabase,
-  input: OperatorReceiptRequest & { callerPluginId: string },
-  createdAtMs = now(),
-): { operatorReceipt: OperatorReceipt; actorReceiptId: string } {
-  return transaction(db, () => {
-    const operatorReceipt = persistInterimOperatorReceipt(db, { ...input, issuanceProvenance: "console" }, createdAtMs);
-    const actorReceiptId = derivePluginActorReceipt(db, operatorReceipt);
-    return { operatorReceipt, actorReceiptId };
-  });
+function mutationRequestDigest(_db: SqliteDatabase, request: ApplyRequest): string {
+  return sha256(canonicalJson(Object.fromEntries(Object.entries(request).filter(([, value]) => value !== undefined))));
 }
 
 function refusalResult(subject: string, data: RefusalData, expected = 1, attempted = 0, verified = 0): FoundationResult {
@@ -3125,20 +2500,6 @@ function refusalResult(subject: string, data: RefusalData, expected = 1, attempt
     ...(data.currentResourceRevision === undefined ? {} : { currentResourceRevision: data.currentResourceRevision }),
     ...(data.expectedResourceRevision === undefined ? {} : { expectedResourceRevision: data.expectedResourceRevision }),
   });
-}
-
-const OPERATOR_DIGEST_GUARDS = new Set(["expectedConfigRevision", "expectedGovernanceEpoch", "expectedFenceToken"]);
-
-export function operatorAuthorizationDigestProjection(input: unknown): Record<string, unknown> {
-  const request = parseApplyRequest(input);
-  return Object.fromEntries(Object.entries(request)
-    .filter(([key]) => !["candidateHead", "operatorReceiptId"].includes(key))
-    .map(([key, value]) => [key, OPERATOR_DIGEST_GUARDS.has(key) ? null : value])
-    .filter(([, value]) => value !== undefined));
-}
-
-export function operatorRequestDigest(input: unknown): string {
-  return sha256(canonicalJson(operatorAuthorizationDigestProjection(input)));
 }
 
 function now(): number {
@@ -3195,33 +2556,12 @@ function requireActor(db: SqliteDatabase, request: ApplyRequest): string {
     role_generation: number | null;
     verification_state: string;
     receipt_digest: string;
-    operator_receipt_id: string | null;
-    retirement_condition: string | null;
   }>(
-    db.prepare("SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, receipt_digest, operator_receipt_id, retirement_condition FROM actor_receipts WHERE receipt_id = ?").get(request.actorReceiptId),
+    db.prepare("SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, receipt_digest FROM actor_receipts WHERE receipt_id = ?").get(request.actorReceiptId),
   );
   if (!row) throw refusal("ACTOR_RECEIPT_UNKNOWN", "actor receipt is not known");
   if (row.project_id !== request.projectId) throw refusal("ACTOR_RECEIPT_FOREIGN", "actor receipt belongs to another project");
   if (row.verification_state !== "verified") throw refusal("ACTOR_RECEIPT_UNVERIFIED", "actor receipt is not verified");
-  if (row.operator_receipt_id !== null || row.retirement_condition !== null) {
-    if (
-      row.actor_kind !== "plugin" ||
-      row.subject_id !== PLUGIN_ID ||
-      row.operator_receipt_id === null ||
-      row.retirement_condition !== OPERATOR_RECEIPT_RETIREMENT_CONDITION ||
-      request.operatorReceiptId !== row.operator_receipt_id ||
-      request.candidateHead === null
-    ) {
-      throw refusal("ACTOR_RECEIPT_UNVERIFIED", "derived actor receipt is not bound to this operator receipt");
-    }
-    const operator = asRow<{ caller_plugin_id: string; mutation_class: string }>(db.prepare(
-      "SELECT caller_plugin_id, mutation_class FROM operator_receipts WHERE project_id = ? AND receipt_id = ?",
-    ).get(row.project_id, row.operator_receipt_id));
-    if (!operator || operator.caller_plugin_id !== PLUGIN_ID || !isDerivedActorMutationClass(operator.mutation_class)) {
-      throw refusal("ACTOR_RECEIPT_UNVERIFIED", "derived actor receipt is not bound to a ratified bb-collab operator receipt");
-    }
-    requireOperatorReceipt(db, request, mutationRequestDigest(db, request));
-  }
   const expectedDigest = actorReceiptDigest({
     projectId: row.project_id,
     receiptId: request.actorReceiptId,
@@ -3230,37 +2570,9 @@ function requireActor(db: SqliteDatabase, request: ApplyRequest): string {
     roleId: row.role_id,
     roleGeneration: row.role_generation,
     verificationState: row.verification_state,
-    operatorReceiptId: row.operator_receipt_id,
-    retirementCondition: row.retirement_condition,
   });
   if (row.receipt_digest !== expectedDigest) throw refusal("ACTOR_RECEIPT_UNVERIFIED", "actor receipt digest is invalid");
   return request.actorReceiptId;
-}
-
-function requireAttestedPluginActor(db: SqliteDatabase, request: ApplyRequest, actorReceiptId: string): void {
-  const actor = asRow<{ actor_kind: string; subject_id: string; operator_receipt_id: string | null; retirement_condition: string | null }>(db.prepare(
-    "SELECT actor_kind, subject_id, operator_receipt_id, retirement_condition FROM actor_receipts WHERE project_id = ? AND receipt_id = ?",
-  ).get(request.projectId, actorReceiptId));
-  if (actor?.actor_kind === "fixture" && request.operatorReceiptId === null) return;
-  if (
-    !actor || actor.actor_kind !== "plugin" || actor.subject_id !== PLUGIN_ID ||
-    actor.operator_receipt_id === null || actor.operator_receipt_id !== request.operatorReceiptId ||
-    actor.retirement_condition !== OPERATOR_RECEIPT_RETIREMENT_CONDITION
-  ) {
-    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "config revision requires its receipt-bound plugin actor");
-  }
-  // requireActor already verifies this actor's exact operator-receipt binding,
-  // including the explicit receipt provenance and any attestation registry.
-}
-
-function mutationRequestDigest(db: SqliteDatabase, request: ApplyRequest): string {
-  const digest = operatorRequestDigest(request);
-  if (!isDerivedActorMutationClass(request.operationClass) || !request.actorReceiptId) return digest;
-  const derived = asRow<{ actor_kind: string; subject_id: string; operator_receipt_id: string | null }>(db.prepare(
-    "SELECT actor_kind, subject_id, operator_receipt_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?",
-  ).get(request.projectId, request.actorReceiptId));
-  if (!derived || derived.actor_kind !== "plugin" || derived.subject_id !== PLUGIN_ID || !derived.operator_receipt_id) return digest;
-  return operatorRequestDigest({ ...request, actorReceiptId: null });
 }
 
 function requireGovernor(db: SqliteDatabase, request: ApplyRequest): { governance_epoch: number; fence_token: string; state: string } {
@@ -3377,16 +2689,14 @@ function appendStateEvent(
   digest: string,
   actorReceiptId: string,
   event: StateEventInput,
-  transition?: InFlightDecisionDispositionTransition,
 ): { eventSequence: number; createdAtMs: number } {
   const eventSequence = nextEventSequence(db, request.projectId);
   const createdAtMs = now();
-  consumeOperatorReceipt(db, request, digest, eventSequence, createdAtMs, transition);
   db.prepare(
     `INSERT INTO state_events (
       project_id, event_sequence, aggregate_type, aggregate_id, aggregate_revision,
       event_type, actor_receipt_id, operator_receipt_id, idempotency_key, event_json, created_at_ms
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
   ).run(
     request.projectId,
     eventSequence,
@@ -3395,7 +2705,6 @@ function appendStateEvent(
     event.aggregateRevision,
     event.eventType,
     actorReceiptId,
-    request.operatorReceiptId,
     request.idempotencyKey,
     canonicalJson(event.event),
     createdAtMs,
@@ -3412,15 +2721,13 @@ function commitMutation(
   counts: { expected: number; attempted: number; verified: number },
   extra: Omit<FoundationResult, "outcome" | "subject" | "expected" | "attempted" | "verified" | "eventSequence" | "mutationReceipt"> = {},
   outcome: FoundationCode = "OK",
-  transition?: InFlightDecisionDispositionTransition,
 ): FoundationResult {
-  const { eventSequence, createdAtMs } = appendStateEvent(db, request, digest, actorReceiptId, event, transition);
+  const { eventSequence, createdAtMs } = appendStateEvent(db, request, digest, actorReceiptId, event);
   const mutationReceipt: MutationReceipt = {
     projectId: request.projectId,
     idempotencyKey: request.idempotencyKey,
     operationClass: request.operationClass,
     requestDigest: digest,
-    operatorReceiptId: request.operatorReceiptId ?? null,
     committedEventSequence: eventSequence,
     createdAtMs,
   };
@@ -3433,7 +2740,7 @@ function commitMutation(
     `INSERT INTO mutation_receipts (
       project_id, idempotency_key, operation_class, request_digest,
       outcome_json, committed_event_sequence, created_at_ms, operator_receipt_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
   ).run(
     request.projectId,
     request.idempotencyKey,
@@ -3442,7 +2749,6 @@ function commitMutation(
     canonicalJson(output),
     eventSequence,
     createdAtMs,
-    request.operatorReceiptId,
   );
   return output;
 }
@@ -3563,7 +2869,6 @@ function applyConfigRevision(db: SqliteDatabase, request: ApplyRequest, digest: 
   const currentRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
-  requireAttestedPluginActor(db, request, actorReceiptId);
   if (!request.config || !request.targets) {
     requireTarget(db, request.projectId, currentRevision, request.repoTargetId);
     throw refusal("INVALID_INPUT", "config revision requires config and target collection");
@@ -3782,9 +3087,9 @@ function requireAdoptedMigrationDecision(
   }
   const actor = asRow<{
     project_id: string; actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null;
-    verification_state: string; receipt_digest: string; operator_receipt_id: string | null; retirement_condition: string | null;
+    verification_state: string; receipt_digest: string;
   }>(db.prepare(
-    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, receipt_digest, operator_receipt_id, retirement_condition FROM actor_receipts WHERE receipt_id = ?",
+    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, receipt_digest FROM actor_receipts WHERE receipt_id = ?",
   ).get(disposition.actor_receipt_id));
   const actorDigest = actor && actorReceiptDigest({
     projectId: actor.project_id,
@@ -3794,19 +3099,11 @@ function requireAdoptedMigrationDecision(
     roleId: actor.role_id,
     roleGeneration: actor.role_generation,
     verificationState: actor.verification_state,
-    operatorReceiptId: actor.operator_receipt_id,
-    retirementCondition: actor.retirement_condition,
   });
-  const linkedReceipt = actor?.operator_receipt_id ? asRow<{ caller_plugin_id: string; mutation_class: string }>(db.prepare(
-    "SELECT caller_plugin_id, mutation_class FROM operator_receipts WHERE project_id = ? AND receipt_id = ?",
-  ).get(projectId, actor.operator_receipt_id)) : undefined;
-  const actorAllowed = actor?.actor_kind === "plugin"
-    ? decision.decision_class === "operator_only" && actor.subject_id === PLUGIN_ID && actor.retirement_condition === OPERATOR_RECEIPT_RETIREMENT_CONDITION &&
-      linkedReceipt?.caller_plugin_id === PLUGIN_ID && linkedReceipt.mutation_class === "decision_disposition"
-    : ["role", "operator"].includes(actor?.actor_kind ?? "");
-  if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || !actorAllowed || actor.receipt_digest !== actorDigest) {
+  if (!actor || actor.project_id !== projectId || actor.actor_kind !== "role" || actor.verification_state !== "verified" || actor.receipt_digest !== actorDigest) {
     throw refusal("ACTOR_RECEIPT_UNVERIFIED", "authorizing Decision actor receipt is not verified");
   }
+  requireRoleActorBinding(db, { projectId, actorReceiptId: disposition.actor_receipt_id } as ApplyRequest);
 }
 
 function rotateMigrationGovernor(
@@ -4024,6 +3321,7 @@ function applyMigrationPrepare(db: SqliteDatabase, request: ApplyRequest, digest
   const head = exactGovernor(db, request);
   if (head.state !== "target_active") throw refusal("PROJECT_FROZEN", "migration prepare requires the current writable target fixture head");
   const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request);
   const migration = request.migration;
   if (!migration || request.migrationStep) throw refusal("INVALID_INPUT", "migration_prepare requires one immutable MigrationRun input");
   if (migration.targetRuntimeId !== PLUGIN_ID || migration.retentionUntilMs <= now()) {
@@ -4103,6 +3401,7 @@ function requireCompleteCanaries(request: ApplyRequest): void {
 function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
   const configRevision = requireConfig(db, request);
   const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request);
   const step = request.migrationStep;
   if (!step || request.migration) throw refusal("INVALID_INPUT", "migration_step requires one closed transition input");
   const run = asRow<MigrationRunRow>(db.prepare("SELECT * FROM migration_runs WHERE project_id = ? AND migration_id = ?").get(request.projectId, step.migrationId));
@@ -4511,24 +3810,16 @@ function storedDecisionIdentityDigest(decision: DecisionRow): string | null {
   }
 }
 
-function requireDecisionActor(db: SqliteDatabase, request: ApplyRequest, decisionClass: string): string {
+function requireDecisionActor(db: SqliteDatabase, request: ApplyRequest, _decisionClass: string): string {
   const actorReceiptId = requireActor(db, request);
   const actor = asRow<{ actor_kind: string; role_id: string | null }>(
     db.prepare("SELECT actor_kind, role_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(request.projectId, actorReceiptId),
   );
-  if (!actor || !["role", "operator", "plugin"].includes(actor.actor_kind)) {
-    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "decision authority requires a verified typed actor receipt");
-  }
-  if (actor.actor_kind === "operator") return actorReceiptId;
-  if (actor.actor_kind === "plugin") {
-    if (decisionClass !== "operator_only" || (request.operationClass === "decision_disposition" && request.disposition !== "adopted")) {
-      throw refusal("ACTOR_RECEIPT_UNVERIFIED", "the plugin actor is limited to operator_only Decision creation and adopted disposition");
-    }
-    return actorReceiptId;
+  if (!actor || actor.actor_kind !== "role") {
+    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "decision authority requires a current role actor");
   }
   requireRoleActorBinding(db, request);
-  const requiredRole = decisionClass === "operator_only" ? null : "project-orchestrator";
-  if (!requiredRole || actor.role_id !== requiredRole) {
+  if (actor.role_id !== "project-orchestrator") {
     throw refusal("ROLE_HOLDER_MISMATCH", "decision class is not authorized by this current role");
   }
   return actorReceiptId;
@@ -5141,80 +4432,6 @@ function applyDecisionMutation(
   }
 }
 
-function syncAuthorizedApproverRegistry(
-  db: SqliteDatabase,
-  decision: DecisionRow,
-  disposition: string,
-  sequence: number,
-  createdAtMs: number,
-): void {
-  if (decision.decision_class !== "operator_only" || !decision.options_json) return;
-  const approverId = authorizedApproverId(decision.options_json);
-  if (disposition !== "adopted") {
-    db.prepare(
-      `UPDATE authorized_approvers SET status = 'revoked', revoked_at_ms = ?
-       WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND status = 'active'`,
-    ).run(createdAtMs, decision.project_id, approverId, decision.decision_id);
-    return;
-  }
-  db.prepare(
-    `UPDATE authorized_approvers SET status = 'revoked', revoked_at_ms = ?
-     WHERE project_id = ? AND approver_id = ? AND status = 'active'`,
-  ).run(createdAtMs, decision.project_id, approverId);
-  db.prepare(
-    `INSERT INTO authorized_approvers (
-       project_id, approver_id, authorizing_decision_id, authorizing_disposition_sequence,
-       status, allowed_mutation_classes_json, retirement_condition, created_at_ms, revoked_at_ms
-     ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, NULL)`,
-  ).run(
-    decision.project_id,
-    approverId,
-    decision.decision_id,
-    sequence,
-    canonicalJson(DERIVED_ACTOR_MUTATION_CLASSES),
-    AUTHORIZED_APPROVER_RETIREMENT_CONDITION,
-    createdAtMs,
-  );
-}
-
-function captureInFlightDecisionDispositionTransition(
-  db: SqliteDatabase,
-  request: ApplyRequest,
-  decisionId: string,
-  insertedDispositionSequence: number,
-): InFlightDecisionDispositionTransition | undefined {
-  if (request.operationClass !== "decision_disposition" || request.disposition !== "adopted" || !request.operatorReceiptId) return undefined;
-  const receipt = asRow<{
-    approver_id: string | null;
-    authorizing_decision_id: string | null;
-    authorizing_disposition_sequence: number | null;
-  }>(db.prepare(
-    `SELECT approver_id, authorizing_decision_id, authorizing_disposition_sequence
-     FROM operator_receipts WHERE project_id = ? AND receipt_id = ?`,
-  ).get(request.projectId, request.operatorReceiptId));
-  const authorizingDecisionId = receipt?.authorizing_decision_id;
-  const authorizingSequence = receipt?.authorizing_disposition_sequence;
-  if (!receipt || !receipt.approver_id || !authorizingDecisionId || authorizingSequence === null) return undefined;
-  const prior = asRow<{ disposition: string }>(db.prepare(
-    "SELECT disposition FROM decision_dispositions WHERE decision_id = ? AND disposition_sequence = ?",
-  ).get(authorizingDecisionId, authorizingSequence));
-  const priorLatest = asRow<{ disposition_sequence: number }>(db.prepare(
-    "SELECT MAX(disposition_sequence) AS disposition_sequence FROM decision_dispositions WHERE decision_id = ?",
-  ).get(authorizingDecisionId));
-  const registry = asRow<{ status: string }>(db.prepare(
-    `SELECT status FROM authorized_approvers
-     WHERE project_id = ? AND approver_id = ? AND authorizing_decision_id = ? AND authorizing_disposition_sequence = ?`,
-  ).get(request.projectId, receipt.approver_id, authorizingDecisionId, authorizingSequence));
-  return {
-    requestDecisionId: decisionId,
-    insertedDispositionSequence: insertedDispositionSequence,
-    requestIdempotencyKey: request.idempotencyKey,
-    priorAuthorizingDispositionWasAdoptedCurrent: authorizingDecisionId === decisionId &&
-      prior?.disposition === "adopted" && priorLatest?.disposition_sequence === authorizingSequence,
-    registryWasActive: registry?.status === "active",
-  };
-}
-
 function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
   const currentRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
@@ -5229,7 +4446,6 @@ function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, dig
   ) {
     throw refusal("DECISION_IDENTITY_CONFLICT", "decision has no valid immutable typed identity");
   }
-  if (decision.decision_class === "operator_only" && decision.options_json) authorizedApproverId(decision.options_json);
   const actorReceiptId = requireDecisionActor(db, request, decision.decision_class);
   if (decision.config_revision !== currentRevision) {
     throw refusal("PROJECT_CONFIG_STALE", "decision is bound to a stale config revision", {
@@ -5311,7 +4527,6 @@ function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, dig
   const conditionsJson = canonicalJson(conditions);
   if (Buffer.byteLength(conditionsJson, "utf8") > 16 * 1024) throw refusal("EVIDENCE_REDACTION_INVALID", "decision conditions exceed 16 KiB");
   const nextRevision = decision.current_resource_revision + 1;
-  const inFlightTransition = captureInFlightDecisionDispositionTransition(db, request, decisionId, sequence);
   const update = db.prepare(
     `UPDATE decisions SET current_resource_revision = ?
      WHERE decision_id = ? AND project_id = ? AND current_resource_revision = ?`,
@@ -5413,10 +4628,7 @@ function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, dig
       expectedResourceRevision,
       evidence: { dispositionSequence: sequence, evidenceIds: preparedEvidence.map((item) => item.input.evidenceId) },
     },
-    undefined,
-    inFlightTransition,
   );
-  syncAuthorizedApproverRegistry(db, decision, request.disposition, sequence, createdAtMs);
   return output;
 }
 
@@ -5443,30 +4655,6 @@ function requireRoleRequirement(db: SqliteDatabase, request: ApplyRequest, confi
   return { requirement, digest: sha256(canonicalJson(requirement)), configRevision };
 }
 
-function firstDirectorGenerationExemptionAllowed(
-  db: SqliteDatabase,
-  request: ApplyRequest,
-  resolved: ResolvedRoleRequirement,
-): boolean {
-  const exemption = resolved.requirement.firstGenerationExemption;
-  if (
-    !["qualification_observation_record", "role_generation_succession"].includes(request.operationClass) ||
-    resolved.requirement.roleRequirementId !== DIRECTOR_SEAT_ROLE_REQUIREMENT_ID ||
-    request.roleId !== "director" ||
-    !request.roleContext ||
-    !exemption ||
-    request.roleContext.threadId !== exemption.holderThreadId ||
-    (request.operationClass === "role_generation_succession" &&
-      (request.expectedGeneration !== null || request.predecessorGeneration !== null))
-  ) {
-    return false;
-  }
-  const head = asRow<{ current_generation: number }>(db.prepare(
-    "SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?",
-  ).get(request.projectId, "director"));
-  return !head;
-}
-
 function requireRoleTargetContext(
   db: SqliteDatabase,
   request: ApplyRequest,
@@ -5485,7 +4673,7 @@ function requireRoleTargetContext(
   }
 }
 
-function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest): void {
+function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest, required = true): void {
   if (!request.actorReceiptId) return;
   const actor = asRow<{ actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null }>(
     db.prepare("SELECT actor_kind, subject_id, role_id, role_generation FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(
@@ -5493,7 +4681,10 @@ function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest): voi
       request.actorReceiptId,
     ),
   );
-  if (!actor || actor.actor_kind !== "role") return;
+  if (!actor || actor.actor_kind !== "role") {
+    if (!required) return;
+    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "current role actor receipt is required");
+  }
   if (!actor.role_id || actor.role_generation === null) throw refusal("ROLE_HOLDER_MISMATCH", "role actor receipt has no exact generation");
   const head = asRow<{ current_generation: number }>(
     db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(request.projectId, actor.role_id),
@@ -5585,7 +4776,7 @@ function applyQualificationObservation(
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
-  requireRoleActorBinding(db, request);
+  requireRoleActorBinding(db, request, false);
   const resolved = requireRoleRequirement(db, request, configRevision);
   requireRoleTargetContext(db, request, resolved, context);
   const qualificationId = request.qualificationId;
@@ -5881,7 +5072,7 @@ function applyRoleGenerationSuccession(
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
-  requireRoleActorBinding(db, request);
+  requireRoleActorBinding(db, request, false);
   if (!request.roleId || !request.qualificationId || !request.profileDigest || !request.fixtureContextDigest) {
     throw refusal("INVALID_INPUT", "role succession requires role, qualification, profile, and fixture context identities");
   }
@@ -6071,34 +5262,12 @@ function applyRoleMutation(
   try {
     const replay = checkIdempotency(db, request, digest);
     if (replay) return replay;
-    const firstDirectorContextCandidate =
-      ["qualification_observation_record", "role_generation_succession"].includes(request.operationClass) &&
-      request.roleId === "director" &&
-      request.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID &&
-      request.roleContext?.threadId === DIRECTOR_SEAT_FIRST_GENERATION_EXEMPTION.holderThreadId;
-    const context = resolveRoleContext(reader, request, firstDirectorContextCandidate);
+    const context = resolveRoleContext(reader, request);
     const configRevision = requireConfig(db, request);
     const resolved = requireRoleRequirement(db, request, configRevision);
-    const allowFirstDirectorEnvironment = firstDirectorGenerationExemptionAllowed(db, request, resolved);
-    const managedDirectorContext =
-      (context.baseContext.environment as { managed?: unknown; workspaceProvisionType?: unknown }).managed === true &&
-      (context.baseContext.environment as { managed?: unknown; workspaceProvisionType?: unknown }).workspaceProvisionType === "managed-worktree";
-    if (firstDirectorContextCandidate && !allowFirstDirectorEnvironment && !managedDirectorContext) {
-      throw refusal("ROLE_CONTEXT_FOREIGN", "director environment is not bound to its first generation");
-    }
-    if (
-      allowFirstDirectorEnvironment &&
-      (!profileEquals(context.profile, resolved.requirement.executedProfile) ||
-        (request.declaredProfile !== undefined && !profileEquals(context.profile, request.declaredProfile)))
-    ) {
-      throw refusal("EXECUTION_PROFILE_MISMATCH", "first director holder executed profile does not match the exact role requirement");
-    }
     return transaction(db, () => {
       const replayInTransaction = checkIdempotency(db, request, digest);
       if (replayInTransaction) return replayInTransaction;
-      if (allowFirstDirectorEnvironment && !firstDirectorGenerationExemptionAllowed(db, request, resolved)) {
-        throw refusal("ROLE_CONTEXT_FOREIGN", "director first generation changed before commit");
-      }
       return request.operationClass === "qualification_observation_record"
         ? applyQualificationObservation(db, request, digest, context)
         : applyRoleGenerationSuccession(db, request, digest, context);
@@ -7960,240 +7129,6 @@ function unavailableResult(subject: string, message: string): FoundationResult {
   return result("CANONICAL_STORE_UNAVAILABLE", subject, 1, 0, 0, { message });
 }
 
-function requireOperatorReceipt(
-  db: SqliteDatabase,
-  request: ApplyRequest,
-  digest: string,
-  transition?: InFlightDecisionDispositionTransition,
-): void {
-  if (!request.operatorReceiptId) throw refusal("OPERATOR_RECEIPT_REQUIRED", "an operator receipt is required");
-  if (!request.candidateHead) throw refusal("OPERATOR_RECEIPT_REQUIRED", "an exact candidate head is required");
-  const row = asRow<{
-    project_id: string;
-    receipt_id: string;
-    receipt_type: string;
-    mutation_class: string;
-    candidate_head: string;
-    binding_digest: string;
-    status: string;
-    retirement_condition: string;
-    caller_thread_id: string;
-    caller_plugin_id: string;
-    requested_from_background: number;
-    issuance_provenance: string | null;
-    receipt_digest: string;
-    created_at_ms: number;
-    idempotency_key: string | null;
-    request_digest: string | null;
-    approver_id: string | null;
-    authorizing_decision_id: string | null;
-    authorizing_disposition_sequence: number | null;
-    consumed_at_ms: number | null;
-    consumed_event_sequence: number | null;
-  }>(db.prepare("SELECT project_id, receipt_id, receipt_type, mutation_class, candidate_head, binding_digest, status, retirement_condition, caller_thread_id, caller_plugin_id, requested_from_background, issuance_provenance, receipt_digest, created_at_ms, idempotency_key, request_digest, approver_id, authorizing_decision_id, authorizing_disposition_sequence, consumed_at_ms, consumed_event_sequence FROM operator_receipts WHERE receipt_id = ?").get(request.operatorReceiptId));
-  if (!row) throw refusal("OPERATOR_RECEIPT_UNKNOWN", "operator receipt is not known");
-  if (row.project_id !== request.projectId) throw refusal("OPERATOR_RECEIPT_FOREIGN", "operator receipt belongs to another project");
-  if (row.consumed_at_ms !== null) throw refusal("OPERATOR_RECEIPT_REUSED", "operator receipt was already consumed");
-  if (row.status !== "interim" || row.retirement_condition !== OPERATOR_RECEIPT_RETIREMENT_CONDITION) {
-    throw refusal("OPERATOR_RECEIPT_RETIRED", "operator receipt is retired");
-  }
-  if (row.receipt_type !== "operator_confirmation" || ![0, 1].includes(row.requested_from_background)) {
-    throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt is malformed");
-  }
-  requireOperatorReceiptProvenanceColumns(
-    row.issuance_provenance,
-    row.approver_id,
-    row.authorizing_decision_id,
-    row.authorizing_disposition_sequence,
-  );
-  const receiptRequest = operatorReceiptRequestSchema.safeParse({
-    projectId: row.project_id,
-    mutationClass: row.mutation_class,
-    candidateHead: row.candidate_head,
-    idempotencyKey: row.idempotency_key,
-    requestDigest: row.request_digest,
-    callerThreadId: row.caller_thread_id,
-    requestedFromBackground: row.requested_from_background === 1,
-  });
-  if (!receiptRequest.success) throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt is malformed");
-  if (
-    row.mutation_class !== request.operationClass ||
-    row.candidate_head !== request.candidateHead ||
-    row.idempotency_key !== request.idempotencyKey ||
-    row.request_digest !== digest
-  ) {
-    throw refusal("OPERATOR_RECEIPT_STALE", "operator receipt binding is stale");
-  }
-  if (row.binding_digest !== operatorReceiptBindingDigest(receiptRequest.data)) {
-    throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt binding digest is invalid");
-  }
-  if (row.issuance_provenance === "attestation") {
-    requireActiveAuthorizedApprover(db, {
-      ...receiptRequest.data,
-      approverId: row.approver_id!,
-      authorizingDecisionId: row.authorizing_decision_id!,
-      authorizingDispositionSequence: row.authorizing_disposition_sequence!,
-    }, transition);
-  }
-  const receiptIdentity: Parameters<typeof operatorReceiptDigest>[0] = {
-    receiptId: row.receipt_id,
-    projectId: row.project_id,
-    receiptType: "operator_confirmation",
-    mutationClass: request.operationClass,
-    candidateHead: row.candidate_head,
-    idempotencyKey: receiptRequest.data.idempotencyKey,
-    requestDigest: receiptRequest.data.requestDigest,
-    bindingDigest: row.binding_digest,
-    status: "interim",
-    retirementCondition: row.retirement_condition,
-    callerThreadId: row.caller_thread_id,
-    callerPluginId: row.caller_plugin_id,
-    requestedFromBackground: receiptRequest.data.requestedFromBackground,
-    issuanceProvenance: row.issuance_provenance,
-    approverId: row.approver_id,
-    authorizingDecisionId: row.authorizing_decision_id,
-    authorizingDispositionSequence: row.authorizing_disposition_sequence,
-    createdAtMs: row.created_at_ms,
-  };
-  const expectedReceiptDigest = operatorReceiptDigest(receiptIdentity);
-  if (row.receipt_digest !== expectedReceiptDigest) {
-    throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt digest is invalid");
-  }
-}
-
-function consumeOperatorReceipt(
-  db: SqliteDatabase,
-  request: ApplyRequest,
-  digest: string,
-  eventSequence: number,
-  consumedAtMs: number,
-  transition?: InFlightDecisionDispositionTransition,
-): void {
-  if (!request.operatorReceiptId) return;
-  requireOperatorReceipt(db, request, digest, transition);
-  const updated = db.prepare(
-    "UPDATE operator_receipts SET consumed_at_ms = ?, consumed_event_sequence = ? WHERE project_id = ? AND receipt_id = ? AND consumed_at_ms IS NULL",
-  ).run(consumedAtMs, eventSequence, request.projectId, request.operatorReceiptId);
-  if (updated.changes !== 1) throw refusal("OPERATOR_RECEIPT_REUSED", "operator receipt was already consumed");
-}
-
-function authorizedReplay(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult | null {
-  if (!request.operatorReceiptId) return null;
-  const mutation = asRow<{ request_digest: string; operator_receipt_id: string | null; outcome_json: string; committed_event_sequence: number }>(db.prepare(
-    "SELECT request_digest, operator_receipt_id, outcome_json, committed_event_sequence FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
-  ).get(request.projectId, request.idempotencyKey));
-  if (!mutation) return null;
-  if (mutation.request_digest !== digest) {
-    throw refusal("IDEMPOTENCY_KEY_CONFLICT", "idempotency key was already used for another request");
-  }
-  if (mutation.operator_receipt_id !== request.operatorReceiptId) {
-    throw refusal("OPERATOR_RECEIPT_STALE", "idempotency key was already committed under another operator receipt");
-  }
-  const receipt = asRow<{
-    receipt_type: string;
-    mutation_class: string;
-    candidate_head: string;
-    binding_digest: string;
-    status: string;
-    retirement_condition: string;
-    caller_thread_id: string;
-    caller_plugin_id: string;
-    requested_from_background: number;
-    issuance_provenance: string | null;
-    receipt_digest: string;
-    created_at_ms: number;
-    idempotency_key: string | null;
-    request_digest: string | null;
-    approver_id: string | null;
-    authorizing_decision_id: string | null;
-    authorizing_disposition_sequence: number | null;
-    consumed_at_ms: number | null;
-    consumed_event_sequence: number | null;
-  }>(db.prepare(
-    `SELECT receipt_type, mutation_class, candidate_head, binding_digest, status,
-            retirement_condition, caller_thread_id, caller_plugin_id,
-            requested_from_background, issuance_provenance, receipt_digest,
-            created_at_ms, idempotency_key, request_digest, approver_id,
-            authorizing_decision_id, authorizing_disposition_sequence,
-            consumed_at_ms, consumed_event_sequence
-       FROM operator_receipts WHERE project_id = ? AND receipt_id = ?`,
-  ).get(request.projectId, request.operatorReceiptId));
-  if (
-    !receipt || !request.candidateHead || receipt.receipt_type !== "operator_confirmation" || receipt.mutation_class !== request.operationClass ||
-    receipt.candidate_head !== request.candidateHead || receipt.idempotency_key !== request.idempotencyKey || receipt.request_digest !== digest ||
-    receipt.binding_digest !== operatorReceiptBindingDigest({
-      projectId: request.projectId,
-      mutationClass: request.operationClass,
-      candidateHead: request.candidateHead,
-      idempotencyKey: request.idempotencyKey,
-      requestDigest: digest,
-    }) ||
-    receipt.receipt_digest !== operatorReceiptDigest({
-      receiptId: request.operatorReceiptId,
-      projectId: request.projectId,
-      receiptType: receipt.receipt_type,
-      mutationClass: receipt.mutation_class,
-      candidateHead: receipt.candidate_head,
-      idempotencyKey: receipt.idempotency_key,
-      requestDigest: receipt.request_digest,
-      bindingDigest: receipt.binding_digest,
-      status: "interim",
-      retirementCondition: OPERATOR_RECEIPT_RETIREMENT_CONDITION,
-      callerThreadId: receipt.caller_thread_id,
-      callerPluginId: receipt.caller_plugin_id,
-      requestedFromBackground: receipt.requested_from_background === 1,
-      issuanceProvenance: receipt.issuance_provenance as OperatorReceipt["issuanceProvenance"],
-      approverId: receipt.approver_id,
-      authorizingDecisionId: receipt.authorizing_decision_id,
-      authorizingDispositionSequence: receipt.authorizing_disposition_sequence,
-      createdAtMs: receipt.created_at_ms,
-    }) ||
-    receipt.consumed_at_ms === null || receipt.consumed_event_sequence !== mutation.committed_event_sequence
-  ) return null;
-  const event = asRow<{ operator_receipt_id: string | null; actor_receipt_id: string }>(db.prepare(
-    "SELECT operator_receipt_id, actor_receipt_id FROM state_events WHERE project_id = ? AND event_sequence = ?",
-  ).get(request.projectId, mutation.committed_event_sequence));
-  if (!event || event.operator_receipt_id !== request.operatorReceiptId || event.actor_receipt_id !== request.actorReceiptId) return null;
-  if (request.actorReceiptId) {
-    const actor = asRow<{
-      project_id: string;
-      actor_kind: string;
-      subject_id: string;
-      role_id: string | null;
-      role_generation: number | null;
-      verification_state: string;
-      receipt_digest: string;
-      operator_receipt_id: string | null;
-      retirement_condition: string | null;
-    }>(db.prepare(
-      `SELECT project_id, actor_kind, subject_id, role_id, role_generation,
-              verification_state, receipt_digest, operator_receipt_id,
-              retirement_condition
-         FROM actor_receipts WHERE project_id = ? AND receipt_id = ?`,
-    ).get(request.projectId, request.actorReceiptId));
-    if (
-      !actor || actor.receipt_digest !== actorReceiptDigest({
-        projectId: actor.project_id,
-        receiptId: request.actorReceiptId,
-        actorKind: actor.actor_kind,
-        subjectId: actor.subject_id,
-        roleId: actor.role_id,
-        roleGeneration: actor.role_generation,
-        verificationState: actor.verification_state,
-        operatorReceiptId: actor.operator_receipt_id,
-        retirementCondition: actor.retirement_condition,
-      }) ||
-      ((request.operationClass === "config_revision" || actor.operator_receipt_id !== null || actor.retirement_condition !== null) && (
-        actor.actor_kind !== "plugin" || actor.subject_id !== PLUGIN_ID ||
-        actor.verification_state !== "verified" ||
-        actor.operator_receipt_id !== request.operatorReceiptId ||
-        actor.retirement_condition !== OPERATOR_RECEIPT_RETIREMENT_CONDITION
-      ))
-    ) return null;
-  }
-  return JSON.parse(mutation.outcome_json) as FoundationResult;
-}
-
 export function applyAuthorizedMutation(
   db: SqliteDatabase | null,
   input: unknown,
@@ -8210,21 +7145,7 @@ export function applyAuthorizedMutation(
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  try {
-    const digest = mutationRequestDigest(db, request);
-    const replay = authorizedReplay(db, request, digest);
-    if (replay) return replay;
-    requireOperatorReceipt(db, request, digest);
-  } catch (error) {
-    if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
-    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "operator receipt validation failed" });
-  }
-  if (request.operationClass === "github_issue_projection" || request.operationClass === "assignment_dispatch" || request.operationClass === "assignment_reconcile") {
-    return result("OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED", request.projectId, 1, 0, 0, {
-      message: "one-request operator receipts do not authorize reserve/finalize adapter operations",
-    });
-  }
-  return applyFixtureMutation(db, input, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader);
 }
 
 export function applyFixtureMutation(

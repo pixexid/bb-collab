@@ -59,7 +59,6 @@ function rpcHandlers(states: Record<string, unknown>, models: Record<string, unk
     doctor: async () => ({}) as never,
     export: async () => ({}) as never,
     apply: async () => ({}) as never,
-    operatorReceipt: async () => ({}) as never,
   } as never;
 }
 

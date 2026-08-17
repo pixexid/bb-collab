@@ -3,7 +3,6 @@ import { definePluginApp, experimental_useSidebarThreadActions, experimental_use
 import type {
   PluginComposerThreadRowStatus,
   PluginNavPanelProps,
-  PluginPendingInteractionProps,
   PluginRpcResult,
   PluginSidebarProject,
   PluginSidebarThread,
@@ -17,7 +16,17 @@ type ThreadStates = PluginRpcResult<typeof rpcContract["threadStates"]>;
 type ThreadModels = PluginRpcResult<typeof rpcContract["threadModels"]>;
 type ThreadExecution = NonNullable<ThreadModels[string]>;
 type SidebarCollapseState = PluginRpcResult<typeof rpcContract["sidebarCollapseState"]>;
-type PendingOperatorReceipt = PluginRpcResult<typeof rpcContract["operatorReceiptRequests"]>[number];
+
+const SETTINGS_ACTION_TITLE = "bb-collab settings";
+
+function age(ms: number): string {
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m`;
+  return `${Math.floor(hours / 24)}d`;
+}
 
 const MAX_VISIBLE_THREADS = 5;
 const RUNNING_INDICATORS = new Set<PluginSidebarThread["indicator"]>([
@@ -576,203 +585,6 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   );
 }
 
-function OperatorReceiptForm({ interaction, submit, cancel }: PluginPendingInteractionProps) {
-  const payload = interaction.payload as {
-    projectId?: unknown;
-    mutationClass?: unknown;
-    candidateHead?: unknown;
-    idempotencyKey?: unknown;
-    requestDigest?: unknown;
-    retirementCondition?: unknown;
-  };
-  const [confirmed, setConfirmed] = useState(false);
-  const valid = [payload.projectId, payload.mutationClass, payload.candidateHead, payload.idempotencyKey, payload.requestDigest].every((value) => typeof value === "string");
-  const projectId = typeof payload.projectId === "string" ? payload.projectId : null;
-  const mutationClass = typeof payload.mutationClass === "string" ? payload.mutationClass : null;
-  const candidateHead = typeof payload.candidateHead === "string" ? payload.candidateHead : null;
-  const idempotencyKey = typeof payload.idempotencyKey === "string" ? payload.idempotencyKey : null;
-  const requestDigest = typeof payload.requestDigest === "string" ? payload.requestDigest : null;
-
-  return (
-    <form
-      className="space-y-4 border-t border-border bg-background p-4"
-      onSubmit={(event) => {
-        event.preventDefault();
-        if (!valid || !confirmed) return;
-        void submit({
-          confirmed: true,
-          projectId,
-          mutationClass,
-          candidateHead,
-          idempotencyKey,
-          requestDigest,
-        });
-      }}
-    >
-      <div>
-        <h2 className="font-semibold">Confirm operator receipt</h2>
-        <p className="text-sm text-muted-foreground">This records an interim confirmation for this exact one-request apply; normal actor and resolver checks still apply.</p>
-      </div>
-      <dl className="grid gap-2 text-sm">
-        <div><dt className="text-muted-foreground">Project</dt><dd className="font-mono">{String(payload.projectId ?? "invalid")}</dd></div>
-        <div><dt className="text-muted-foreground">Mutation</dt><dd className="font-mono">{String(payload.mutationClass ?? "invalid")}</dd></div>
-        <div><dt className="text-muted-foreground">Candidate head</dt><dd className="break-all font-mono">{String(payload.candidateHead ?? "invalid")}</dd></div>
-        <div><dt className="text-muted-foreground">Idempotency key</dt><dd className="break-all font-mono">{String(payload.idempotencyKey ?? "invalid")}</dd></div>
-        <div><dt className="text-muted-foreground">Request digest</dt><dd className="break-all font-mono">{String(payload.requestDigest ?? "invalid")}</dd></div>
-        <div><dt className="text-muted-foreground">Retirement condition</dt><dd>{String(payload.retirementCondition ?? "invalid")}</dd></div>
-      </dl>
-      <label className="flex items-start gap-2 text-sm">
-        <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
-        <span>I confirm this exact project, mutation class, candidate head, idempotency key, and request digest.</span>
-      </label>
-      <div className="flex gap-2">
-        <button className="rounded border border-border px-3 py-1 text-sm" type="button" onClick={() => void cancel()}>Cancel</button>
-        <button className="rounded bg-primary px-3 py-1 text-sm text-primary-foreground disabled:opacity-50" type="submit" disabled={!valid || !confirmed}>Confirm</button>
-      </div>
-    </form>
-  );
-}
-
-function age(ms: number): string {
-  const minutes = Math.floor(ms / 60_000);
-  if (minutes < 1) return "just now";
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ${minutes % 60}m`;
-  return `${Math.floor(hours / 24)}d`;
-}
-
-// The settings affordance is a sidebar footer button, not an in-panel link:
-// `PluginNavPanelProps` is `{ subPath }` and `useBbNavigate()` has no settings
-// route, so `sidebarFooterAction`'s `openSettings()` is the only sanctioned way
-// to reach the passphrase field. Naming it exactly is what makes the copy
-// followable — see docs/issue-63-operator-console.md.
-const SETTINGS_ACTION_TITLE = "bb-collab settings";
-const PASSPHRASE_ONBOARDING = "Set your approval passphrase first";
-const PASSPHRASE_UNREADABLE = "Can't check the approval passphrase";
-
-// Four states, because a failed read is neither "unset" nor "still loading" and
-// telling the operator the wrong one of those is its own defect. Only `set`
-// arms approval; the other three keep the controls closed.
-type PassphraseState = "loading" | "set" | "unset" | "unknown";
-
-function AwaitingOperator({
-  requests,
-  refresh,
-  passphraseState,
-}: {
-  requests: readonly PendingOperatorReceipt[];
-  refresh: () => void;
-  passphraseState: PassphraseState;
-}) {
-  const rpc = useRpc<typeof rpcContract>();
-  const { threadId: approverThreadId } = useBbContext();
-  const [passphrases, setPassphrases] = useState<Record<string, string>>({});
-  const [busyId, setBusyId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const armed = passphraseState === "set";
-  const notice = passphraseState === "unset"
-    ? "awaiting-operator-passphrase-unset"
-    : passphraseState === "unknown" ? "awaiting-operator-passphrase-unknown" : undefined;
-
-  const decide = async (request: PendingOperatorReceipt, decision: "approve" | "reject") => {
-    setBusyId(request.interactionId);
-    setError(null);
-    try {
-      const result = await rpc.call("operatorReceiptDecision", {
-        ...request,
-        decision,
-        passphrase: passphrases[request.interactionId] ?? "",
-        approverThreadId,
-      });
-      if (result.outcome !== "OK" && result.outcome !== "OPERATOR_RECEIPT_CANCELLED") {
-        setError(result.message ?? result.outcome);
-        return;
-      }
-      setPassphrases((current) => {
-        const next = { ...current };
-        delete next[request.interactionId];
-        return next;
-      });
-      refresh();
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setBusyId(null);
-    }
-  };
-
-  return (
-    <section className="mb-6" aria-labelledby="awaiting-operator-heading">
-      <div className="mb-3 flex items-center justify-between">
-        <div>
-          <h2 id="awaiting-operator-heading" className="font-semibold">Awaiting operator</h2>
-          <p className="text-sm text-muted-foreground">Exact receipt requests from connected worker sessions.</p>
-        </div>
-        <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">{requests.length}</span>
-      </div>
-      {error ? <p className="mb-3 text-sm text-destructive" role="alert">{error}</p> : null}
-      {/* Unknown (a failed read) is not unset: the server refuses either way, so
-          a lookup hiccup must not accuse the operator of a setup they did do. */}
-      {passphraseState === "unset" ? (
-        <div id="awaiting-operator-passphrase-unset" className="mb-3 rounded-md border border-border bg-muted/50 p-3 text-sm" role="status">
-          <p className="font-semibold text-foreground">{PASSPHRASE_ONBOARDING}</p>
-          <p className="mt-1 text-muted-foreground">
-            Approvals stay refused until it is set. Open <b className="font-medium text-foreground">{SETTINGS_ACTION_TITLE}</b> in
-            the sidebar footer, then fill in <b className="font-medium text-foreground">Operator approval passphrase</b>.
-          </p>
-        </div>
-      ) : null}
-      {passphraseState === "unknown" ? (
-        <div id="awaiting-operator-passphrase-unknown" className="mb-3 rounded-md border border-border bg-muted/50 p-3 text-sm" role="status">
-          <p className="font-semibold text-foreground">{PASSPHRASE_UNREADABLE}</p>
-          <p className="mt-1 text-muted-foreground">
-            Nothing has changed and nothing needs setting up — the check itself failed. Approval stays disabled until it
-            succeeds. <button className="underline underline-offset-2 hover:text-foreground" type="button" onClick={refresh}>Try again</button>.
-          </p>
-        </div>
-      ) : null}
-      {requests.length === 0 ? <p className="border-y border-border py-3 text-sm text-muted-foreground">No pending receipt requests.</p> : null}
-      <div className="space-y-3">
-        {requests.map((request) => {
-          const busy = busyId === request.interactionId;
-          const passphrase = passphrases[request.interactionId] ?? "";
-          const blocked = busy || !armed || !passphrase;
-          return (
-            <article className="rounded-lg border border-border p-3" key={request.interactionId}>
-              <div className="mb-3 flex items-center justify-between gap-3">
-                <span className="font-medium">{request.mutationClass}</span>
-                <time className="shrink-0 text-xs text-muted-foreground" dateTime={new Date(request.createdAt).toISOString()}>{age(request.ageMs)}</time>
-              </div>
-              <dl className="grid gap-2 text-xs sm:grid-cols-2">
-                <div><dt className="text-muted-foreground">Project</dt><dd className="break-all font-mono">{request.projectId}</dd></div>
-                <div><dt className="text-muted-foreground">Candidate head</dt><dd className="break-all font-mono">{request.candidateHead}</dd></div>
-                <div><dt className="text-muted-foreground">Request digest</dt><dd className="break-all font-mono">{request.requestDigest}</dd></div>
-                <div><dt className="text-muted-foreground">Idempotency key</dt><dd className="break-all font-mono">{request.idempotencyKey}</dd></div>
-              </dl>
-              <div className="mt-3 flex flex-col gap-2 sm:flex-row">
-                <input
-                  className="min-h-9 min-w-0 flex-1 rounded border border-border bg-background px-2 text-sm disabled:opacity-50"
-                  type="password"
-                  value={passphrase}
-                  placeholder="Approval passphrase"
-                  aria-label={`Approval passphrase for ${request.mutationClass}`}
-                  aria-describedby={notice}
-                  autoComplete="current-password"
-                  disabled={!armed}
-                  onChange={(event) => setPassphrases((current) => ({ ...current, [request.interactionId]: event.target.value }))}
-                />
-                <button className="min-h-9 rounded bg-primary px-3 text-sm text-primary-foreground disabled:opacity-50" type="button" disabled={blocked} onClick={() => void decide(request, "approve")}>Approve</button>
-                <button className="min-h-9 rounded border border-border px-3 text-sm disabled:opacity-50" type="button" disabled={blocked} onClick={() => void decide(request, "reject")}>Reject</button>
-              </div>
-            </article>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
 // Issue #61's deferral is a state of the lane, not a gate on it: it leaves
 // `queueBlocked` false and keeps the lane in the same list in the same order,
 // so this only ever changes the status text. Every field comes from the `lanes`
@@ -791,18 +603,10 @@ export function laneQueueLabel(lane: Lane): string {
 function LanesPanel(_props: PluginNavPanelProps) {
   const rpc = useRpc<typeof rpcContract>();
   const [lanes, setLanes] = useState<readonly Lane[]>([]);
-  const [requests, setRequests] = useState<readonly PendingOperatorReceipt[]>([]);
-  const [passphraseState, setPassphraseState] = useState<PassphraseState>("loading");
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(() => {
     void rpc.call("lanes", {}).then((next) => setLanes(next)).catch((reason: unknown) => setError(String(reason)));
-    void rpc.call("operatorReceiptRequests", {}).then((next) => setRequests(next)).catch((reason: unknown) => setError(String(reason)));
-    // A `null` answer and a rejected call are the same fact — the state could
-    // not be read — and neither is a console error: the requests still render.
-    void rpc.call("operatorPassphraseState", {})
-      .then((next) => setPassphraseState(next.configured === null ? "unknown" : next.configured ? "set" : "unset"))
-      .catch(() => setPassphraseState("unknown"));
   }, [rpc]);
 
   useEffect(() => {
@@ -810,7 +614,6 @@ function LanesPanel(_props: PluginNavPanelProps) {
     const timer = window.setInterval(refresh, 5_000);
     return () => window.clearInterval(timer);
   }, [refresh]);
-  useRealtime("operator-receipts", refresh);
 
   return (
     <main className="h-full overflow-y-auto p-5">
@@ -823,7 +626,6 @@ function LanesPanel(_props: PluginNavPanelProps) {
           <button className="text-sm text-muted-foreground hover:text-foreground" onClick={refresh}>Refresh</button>
         </div>
         {error ? <p className="text-sm text-destructive">Unable to read lanes: {error}</p> : null}
-        <AwaitingOperator requests={requests} refresh={refresh} passphraseState={passphraseState} />
         {lanes.length === 0 ? <p className="text-sm text-muted-foreground">No open lanes.</p> : null}
         <div className="divide-y divide-border border-y border-border">
           {lanes.map((lane) => (
@@ -848,35 +650,11 @@ async function readPluginHttp(path: string, signal: AbortSignal): Promise<unknow
   return await response.json();
 }
 
-// Same doctrine as the DTO guards above: a bundle can outlive the server build
-// it was compiled against, so a count that is not a positive number is not a
-// count and drops out rather than reaching a label.
-export function operatorReceiptWaits(value: unknown): { total: number; byThread: [string, number][] } {
-  const source = (value ?? {}) as { total?: unknown; threads?: unknown };
-  const entries = source.threads && typeof source.threads === "object" ? Object.entries(source.threads) : [];
-  return {
-    total: typeof source.total === "number" && source.total > 0 ? source.total : 0,
-    byThread: entries.flatMap(([threadId, count]) =>
-      asText(threadId) && typeof count === "number" && count > 0 ? [[threadId, count] as [string, number]] : []),
-  };
-}
-
-export function awaitingOperatorStatus(count: number, total: number): PluginComposerThreadRowStatus {
-  const here = `${count} approval${count === 1 ? "" : "s"} awaiting operator`;
-  // `PluginComposerThreadRowStatus` is `{ icon, label, tone }` — one glyph and
-  // an accessible name. The count is expressible only in that name, which is
-  // the documented limit of this surface.
-  return { icon: "Bell", label: total > count ? `${here} on this thread (${total} in all lanes)` : here, tone: "running" };
-}
-
 function mountLanePulse({ signal, setStatus }: { signal: AbortSignal; setStatus: (threadId: string, status: PluginComposerThreadRowStatus | null) => void }): () => void {
   let previous = new Set<string>();
   const refresh = async () => {
     try {
-      const [lanes, waits] = await Promise.all([
-        readPluginHttp("lanes", signal) as Promise<Lane[]>,
-        readPluginHttp("operator-receipt-waits", signal).then(operatorReceiptWaits),
-      ]);
+      const lanes = await readPluginHttp("lanes", signal) as Lane[];
       const next = new Set<string>();
       for (const lane of lanes) {
         if (!lane.threadId) continue;
@@ -886,12 +664,6 @@ function mountLanePulse({ signal, setStatus }: { signal: AbortSignal; setStatus:
           label: lane.waitingOn ? `Lane ${lane.laneId}: waiting on ${lane.waitingOn}` : `Lane ${lane.laneId}: open`,
           tone: lane.tone,
         });
-      }
-      // A row carries one status, so waiting on the operator overwrites the
-      // lane pulse: an approval nobody can see is what stalls the lane.
-      for (const [threadId, count] of waits.byThread) {
-        next.add(threadId);
-        setStatus(threadId, awaitingOperatorStatus(count, waits.total));
       }
       for (const threadId of previous) if (!next.has(threadId)) setStatus(threadId, null);
       previous = next;
@@ -911,7 +683,6 @@ export default definePluginApp((app) => {
     description: "Group threads by project with durable bb-collab state.",
     component: SidebarThreadList,
   });
-  app.slots.pendingInteraction({ id: "operator-receipt", component: OperatorReceiptForm });
   app.slots.sidebarFooterAction({
     id: "bb-collab-settings",
     title: SETTINGS_ACTION_TITLE,
