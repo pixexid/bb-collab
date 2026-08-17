@@ -149,21 +149,17 @@ not close the gate.
   store.
 - Automated subagents, if introduced later, are depth one and draft-only.
   They do not own writing, authority, merge, release or operator decisions.
-- RULE 1 BUNDLE AGAINST YOUR OWN OUTSTANDING SENDS — queue contents are
-  invisible (#143); before sending to a lane check your OWN outstanding
-  sends; if any are outstanding, do not send a second — supersede: fold into
-  ONE consolidated steered message; contradictions are the sender's to
-  settle, never the worker's; consolidate at send time. Limit: per-sender;
-  complete only under ONE SENDER PER LANE — worker lanes take instruction
-  from exactly one seat, others route through it; extends
-  one-writer-per-lane from writes to INSTRUCTION. RULE 2 STEER VS QUEUE —
-  test: does this make current work wrong or wasted? yes = STEER; shapes a
-  later step = QUEUE. A correction is never queued. More than one
-  outstanding = bundle and steer. A queued message must remain correct
-  whenever read or carry its own precondition ('only if #140 unmerged'); if
-  you cannot state the precondition it is not queueable. NEVER QUEUE
-  AUTHORIZATION. Worker-brief template: WHEN YOU DRAIN SEVERAL MESSAGES AT
-  ONCE, ENUMERATE THEM AND SAY WHICH YOU ARE ACTING ON.
+- RULE 1 — BEFORE SENDING TO A LANE, READ ITS QUEUE. If any messages are
+  queued: do not append; clear them; deliver ONE bundled superseding message
+  as a STEER. Contradiction resolution and moot-item dropping are the
+  sender's work. Clarity of authority: prefer one sender per lane; this is a
+  practice, not a Rule-1 obligation.
+- RULE 2 STEER VS QUEUE — test: does this make current work wrong or wasted?
+  yes = STEER; shapes a later step = QUEUE. A correction is never queued.
+  Queue only later-step shaping with an explicit precondition; if you cannot
+  state the precondition, it is not queueable. NEVER QUEUE AUTHORIZATION.
+  Worker-brief template: WHEN YOU DRAIN SEVERAL MESSAGES AT ONCE, ENUMERATE
+  THEM AND SAY WHICH YOU ARE ACTING ON.
 
 ## Review and release obligations
 
