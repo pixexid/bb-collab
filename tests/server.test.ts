@@ -1948,7 +1948,7 @@ describe("bb-collab plugin boundary", () => {
     fixture.setPending(true);
 
     fixture.changed({ entity: "thread", id: "worker-1" });
-    await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.interactions.list")).toHaveLength(1));
+    await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.interactions.list")).toHaveLength(2));
 
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
     await fixture.host.harness.lifecycle.dispose();
@@ -2251,6 +2251,58 @@ describe("bb-collab plugin boundary", () => {
       await fixture.host.harness.runSchedule("sentinel-wake-floor");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
     } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("fails closed when a watcher interaction read writes after the floor read fails", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    let service: { controller: AbortController; done: Promise<void> } | undefined;
+    try {
+      const fixture = await sentinelWakeFloorFixture(0);
+      const executionAttemptId = await addPendingReview(fixture);
+      const laneThreadId = "late-writer-lane";
+      fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE execution_attempt_id = ?").run(laneThreadId, executionAttemptId);
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      clock.mockReturnValue(60 * 60_000);
+      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => {
+        if (threadId === laneThreadId) throw new Error("lane thread unavailable");
+        return makeThreadResponse({
+          id: threadId,
+          projectId: PROJECT_ID,
+          status: threadId === fixture.directorThreadId ? "idle" : "active",
+          updatedAt: 0,
+        });
+      }) as never);
+      let laneReads = 0;
+      let releaseWatcherRead!: (interactions: Array<{ status: string }>) => void;
+      const watcherRead = new Promise<Array<{ status: string }>>((resolve) => {
+        releaseWatcherRead = resolve;
+      });
+      fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) => {
+        if (threadId !== laneThreadId) return [];
+        laneReads += 1;
+        if (laneReads === 1) return watcherRead;
+        if (laneReads === 2) {
+          releaseWatcherRead([]);
+          await Promise.resolve();
+          await Promise.resolve();
+        }
+        throw new Error("floor lane interactions unavailable");
+      }) as never);
+      service = fixture.host.harness.behavior.runService("lane-watcher");
+      await vi.waitFor(() => expect(laneReads).toBe(1));
+      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      service.controller.abort();
+      await service.done;
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")
+        .filter(([input]) => {
+          const send = input as { threadId: string; mode: string };
+          return send.threadId === fixture.directorThreadId && send.mode === "queue-if-active";
+        })).toHaveLength(0);
+    } finally {
+      service?.controller.abort();
+      await service?.done;
       clock.mockRestore();
     }
   });

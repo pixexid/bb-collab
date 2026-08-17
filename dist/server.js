@@ -22855,13 +22855,7 @@ async function plugin(bb, options = {}) {
     bb.log.error(`canonical store unavailable: ${String(error48)}`);
     db = null;
   }
-  const interactionStateCache = /* @__PURE__ */ new Map();
   const readPendingExternalWait = async (threadId) => {
-    const cached2 = interactionStateCache.get(threadId);
-    if (cached2) {
-      interactionStateCache.delete(threadId);
-      return cached2.pending;
-    }
     try {
       const interactions = await bb.sdk.threads.interactions.list({ threadId });
       return interactions.some((interaction) => interaction.status === "pending");
@@ -22881,8 +22875,6 @@ async function plugin(bb, options = {}) {
       };
       break;
     }
-    if (wait) interactionStateCache.delete(threadId);
-    else interactionStateCache.set(threadId, { pending: pending.length > 0, operatorWait: wait });
     return wait;
   };
   const continuationLedger = createContinuationLedger({
@@ -22984,7 +22976,6 @@ ${thread.titleFallback ?? ""}`);
   };
   const readUnblockedStartableLanes = async () => {
     if (!db) return [];
-    interactionStateCache.clear();
     const candidates = openLaneViews(db, Date.now(), await readOperatorWaits()).filter((lane) => lane.nextStartable);
     return (await Promise.all(candidates.map(async (lane) => {
       if (!lane.threadId || !await readPendingExternalWait(lane.threadId)) return lane;

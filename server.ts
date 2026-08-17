@@ -838,13 +838,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     db = null;
   }
 
-  const interactionStateCache = new Map<string, { pending: boolean; operatorWait: OperatorWait | null }>();
   const readPendingExternalWait = async (threadId: string) => {
-    const cached = interactionStateCache.get(threadId);
-    if (cached) {
-      interactionStateCache.delete(threadId);
-      return cached.pending;
-    }
     try {
       const interactions = await bb.sdk.threads.interactions.list({ threadId });
       return interactions.some((interaction) => interaction.status === "pending");
@@ -865,8 +859,6 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       };
       break;
     }
-    if (wait) interactionStateCache.delete(threadId);
-    else interactionStateCache.set(threadId, { pending: pending.length > 0, operatorWait: wait });
     return wait;
   };
 
@@ -987,7 +979,6 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   const readUnblockedStartableLanes = async () => {
     if (!db) return [];
-    interactionStateCache.clear();
     const candidates = openLaneViews(db, Date.now(), await readOperatorWaits()).filter((lane) => lane.nextStartable);
     return (await Promise.all(candidates.map(async (lane) => {
       if (!lane.threadId || !(await readPendingExternalWait(lane.threadId))) return lane;
