@@ -15663,11 +15663,14 @@ function operatorReceiptBindingDigest(input) {
     requestDigest: input.requestDigest
   }));
 }
+function operatorReceiptDigest(input) {
+  return sha256(canonicalJson(input));
+}
 function persistInterimOperatorReceipt(db, input, createdAtMs = now()) {
   const receiptId = `operator-${randomBytes(16).toString("hex")}`;
   const issuanceProvenance = input.issuanceProvenance ?? "console";
   const bindingDigest = operatorReceiptBindingDigest(input);
-  const receiptDigest = sha256(canonicalJson({
+  const receiptDigest = operatorReceiptDigest({
     receiptId,
     projectId: input.projectId,
     receiptType: "operator_confirmation",
@@ -15686,7 +15689,7 @@ function persistInterimOperatorReceipt(db, input, createdAtMs = now()) {
     authorizingDecisionId: input.authorizingDecisionId ?? null,
     authorizingDispositionSequence: input.authorizingDispositionSequence ?? null,
     createdAtMs
-  }));
+  });
   db.prepare(
     `INSERT INTO operator_receipts (
       project_id, receipt_id, receipt_type, mutation_class, candidate_head,
@@ -20031,13 +20034,13 @@ function requireOperatorReceipt(db, request, digest, transition) {
   const receiptIdentity = {
     receiptId: row.receipt_id,
     projectId: row.project_id,
-    receiptType: row.receipt_type,
-    mutationClass: row.mutation_class,
+    receiptType: "operator_confirmation",
+    mutationClass: request.operationClass,
     candidateHead: row.candidate_head,
     idempotencyKey: receiptRequest.data.idempotencyKey,
     requestDigest: receiptRequest.data.requestDigest,
     bindingDigest: row.binding_digest,
-    status: row.status,
+    status: "interim",
     retirementCondition: row.retirement_condition,
     callerThreadId: row.caller_thread_id,
     callerPluginId: row.caller_plugin_id,
@@ -20048,7 +20051,7 @@ function requireOperatorReceipt(db, request, digest, transition) {
     authorizingDispositionSequence: row.authorizing_disposition_sequence,
     createdAtMs: row.created_at_ms
   };
-  const expectedReceiptDigest = sha256(canonicalJson(receiptIdentity));
+  const expectedReceiptDigest = operatorReceiptDigest(receiptIdentity);
   if (row.receipt_digest !== expectedReceiptDigest) {
     throw refusal("OPERATOR_RECEIPT_INVALID", "operator receipt digest is invalid");
   }

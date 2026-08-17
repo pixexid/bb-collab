@@ -39,6 +39,7 @@ import {
   doctor,
   explicitExecutionInputSources,
   exportFoundation,
+  operatorReceiptDigest,
   persistBootstrapOperatorReceipt,
   persistInterimOperatorReceipt,
   operatorAuthorizationDigestProjection,
@@ -2721,7 +2722,11 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: wrongActor.actorReceiptId,
       operatorReceiptId: wrongTargetId,
     })).toMatchObject({ outcome: "ACTOR_RECEIPT_UNVERIFIED", attempted: 0, verified: 0 });
-    db.prepare("UPDATE operator_receipts SET issuance_provenance = NULL WHERE receipt_id = ?").run(wrongActorReceiptId);
+    const wrongActorLegacyDigest = operatorReceiptDigest({
+      ...wrongActor.operatorReceipt!,
+      issuanceProvenance: null,
+    });
+    db.prepare("UPDATE operator_receipts SET issuance_provenance = NULL, receipt_digest = ? WHERE receipt_id = ?").run(wrongActorLegacyDigest, wrongActorReceiptId);
     expect(await host.harness.callRpc("apply", {
       ...wrongTargetUnsigned,
       actorReceiptId: wrongActor.actorReceiptId,
@@ -2730,7 +2735,11 @@ describe("bb-collab plugin boundary", () => {
 
     const legacyUnsigned = request("legacy-console-binding", 2, 3);
     const legacy = await issueConsoleReceipt(legacyUnsigned);
-    db.prepare("UPDATE operator_receipts SET issuance_provenance = NULL WHERE receipt_id = ?").run(legacy.operatorReceipt!.receiptId);
+    const legacyDigest = operatorReceiptDigest({
+      ...legacy.operatorReceipt!,
+      issuanceProvenance: null,
+    });
+    db.prepare("UPDATE operator_receipts SET issuance_provenance = NULL, receipt_digest = ? WHERE receipt_id = ?").run(legacyDigest, legacy.operatorReceipt!.receiptId);
     expect(await host.harness.callRpc("apply", {
       ...legacyUnsigned,
       actorReceiptId: legacy.actorReceiptId,
@@ -3514,6 +3523,10 @@ describe("bb-collab plugin boundary", () => {
     expect(host.harness.inspection.sdk.callsTo("plugins.callRpc")).toContainEqual([
       expect.objectContaining({ pluginId: PLUGIN_ID, method: "doctor", input: { projectId: PROJECT_ID } }),
     ]);
+    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
+      outcome: "OK",
+      evidence: { cachedConsumers: { newContractVersion: 19, action: "reread", expected: 4, attempted: 4, verified: 4 } },
+    });
   });
 
   it("treats a persisted v18 rollout receipt as unknown without migrating or requiring it", async () => {
