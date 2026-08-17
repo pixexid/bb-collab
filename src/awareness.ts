@@ -41,6 +41,9 @@ export interface RegisteredWait {
   sourceThreadId: string;
   sourceEvent: RegisteredWaitSourceEvent;
   deadlineAtMs: number;
+  /** Legacy declarations have no verified waker and never suppress the watchdog. */
+  wakerSchedule: string | null;
+  declaredAtMs: number | null;
 }
 
 export interface WaitEvent extends RegisteredWait {
@@ -79,6 +82,8 @@ function normalizeRegisteredWait(input: unknown): RegisteredWait {
     sourceThreadId: value.sourceThreadId,
     sourceEvent: value.sourceEvent,
     deadlineAtMs: value.deadlineAtMs as number,
+    wakerSchedule: typeof value.wakerSchedule === "string" && value.wakerSchedule.length > 0 ? value.wakerSchedule : null,
+    declaredAtMs: Number.isInteger(value.declaredAtMs) && (value.declaredAtMs as number) >= 0 ? value.declaredAtMs as number : null,
   };
 }
 
@@ -545,6 +550,7 @@ export interface LaneWatcher {
   recover(): Promise<void>;
   readRoleIdle(key: string): Promise<RoleIdleRecord | null>;
   observeRoleIdle(key: string, idleSinceMs: number): Promise<RoleIdleRecord>;
+  resetRoleIdle(key: string): Promise<void>;
   recordRoleWake(key: string, sentAtMs: number): Promise<void>;
 }
 
@@ -1250,6 +1256,9 @@ export function createLaneWatcher(options: {
     },
     observeRoleIdle(key, idleSinceMs) {
       return roleIdleLedger.observeIdle(key, idleSinceMs);
+    },
+    resetRoleIdle(key) {
+      return roleIdleLedger.resetIdle(key);
     },
     recordRoleWake(key, sentAtMs) {
       return roleIdleLedger.recordWake(key, sentAtMs);

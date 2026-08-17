@@ -36,12 +36,12 @@ export function waitValidatorStateDir(): string {
 export type SourceObservation = { status: string; archived: boolean } | null;
 
 export type RegisterWaitResult =
-  | { outcome: "registered"; wait: { waitId: string; waiterThreadId: string; sourceThreadId: string; sourceEvent: "terminal" | "failure"; deadlineAtMs: number }; replay: boolean }
+  | { outcome: "registered"; wait: { waitId: string; waiterThreadId: string; sourceThreadId: string; sourceEvent: "terminal" | "failure"; deadlineAtMs: number; wakerSchedule: string | null; declaredAtMs: number | null }; replay: boolean }
   | { outcome: "refused"; message: string };
 
 export interface BoundedWaitRegistry {
-  register(wait: { waitId: string; waiterThreadId: string; sourceThreadId: string; sourceEvent: "terminal" | "failure"; deadlineAtMs: number }): Promise<void>;
-  list(): Promise<Array<{ waitId: string; waiterThreadId: string; sourceThreadId: string; sourceEvent: "terminal" | "failure"; deadlineAtMs: number }>>;
+  register(wait: { waitId: string; waiterThreadId: string; sourceThreadId: string; sourceEvent: "terminal" | "failure"; deadlineAtMs: number; wakerSchedule: string | null; declaredAtMs: number | null }): Promise<void>;
+  list(): Promise<Array<{ waitId: string; waiterThreadId: string; sourceThreadId: string; sourceEvent: "terminal" | "failure"; deadlineAtMs: number; wakerSchedule: string | null; declaredAtMs: number | null }>>;
   firedWaitIds(): Promise<Array<{ waitId: string; reason: string; waiterThreadId: string }>>;
 }
 
@@ -124,6 +124,7 @@ function boundedWaitId(idempotencyKey: string): string {
 export async function registerBoundedWait(options: {
   registry: BoundedWaitRegistry;
   readSource: (threadId: string) => Promise<SourceObservation>;
+  readWaker: (schedule: string) => Promise<boolean>;
   input: unknown;
   ctxThreadId?: string;
   now?: () => number;
@@ -148,6 +149,15 @@ export async function registerBoundedWait(options: {
   if (!nonEmptyString(input.idempotencyKey, 256)) {
     return { outcome: "refused", message: "idempotencyKey is required: every registration names its own key" };
   }
+  const wakerSchedule = nonEmptyString(input.wakerSchedule) ? input.wakerSchedule as string : null;
+  if (!wakerSchedule) return { outcome: "refused", message: "wakerSchedule is required: every wait names its live waking schedule" };
+  try {
+    if (!await options.readWaker(wakerSchedule)) {
+      return { outcome: "refused", message: `waker schedule ${wakerSchedule} is not live: declaration refused` };
+    }
+  } catch {
+    return { outcome: "refused", message: "waker schedule registry is unreadable: declaration refused" };
+  }
 
   // Source-liveness validation: a wait on an unknown, archived, or
   // already-errored source is refused — act on its outcome instead.
@@ -170,7 +180,8 @@ export async function registerBoundedWait(options: {
     return { outcome: "refused", message: `source thread ${sourceThreadId} has already failed: act on its failure instead of waiting` };
   }
 
-  const deadline = resolveWaitDeadline({ deadlineAtMs: input.deadlineAtMs, overrideReason: input.overrideReason, now: now() });
+  const declaredAtMs = now();
+  const deadline = resolveWaitDeadline({ deadlineAtMs: input.deadlineAtMs, overrideReason: input.overrideReason, now: declaredAtMs });
   if (!deadline.ok) return { outcome: "refused", message: deadline.message };
 
   const wait = {
@@ -179,6 +190,8 @@ export async function registerBoundedWait(options: {
     sourceThreadId,
     sourceEvent: sourceEvent as "terminal" | "failure",
     deadlineAtMs: deadline.deadlineAtMs,
+    wakerSchedule,
+    declaredAtMs,
   };
   // A key whose wait already fired is consumed: replaying it would hand the
   // waiter a dead wait with an expired deadline and no further wake (round-2
@@ -198,6 +211,7 @@ export async function registerBoundedWait(options: {
     const same = existing.waiterThreadId === wait.waiterThreadId &&
       existing.sourceThreadId === wait.sourceThreadId &&
       existing.sourceEvent === wait.sourceEvent &&
+      existing.wakerSchedule === wait.wakerSchedule &&
       (!explicitDeadline || existing.deadlineAtMs === wait.deadlineAtMs);
     return same
       ? { outcome: "registered", wait: existing, replay: true }

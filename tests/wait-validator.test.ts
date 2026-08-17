@@ -44,6 +44,9 @@ function hostFixture(): HostFixture {
         },
         interactions: { list: async () => [] },
       },
+      plugins: {
+        list: async () => ({ plugins: [{ id: PLUGIN_ID, status: "running", schedules: [{ name: "wait-validator-liveness" }] }] }) as never,
+      },
     },
   });
   return {
@@ -72,6 +75,7 @@ const waitRequest = (overrides: Record<string, unknown> = {}) => ({
   sourceEvent: "terminal",
   reason: "waiting on the source lane",
   idempotencyKey: "wait-key-1",
+  wakerSchedule: "wait-validator-liveness",
   ...overrides,
 });
 
@@ -121,6 +125,16 @@ describe("durable wait-validator plugin boundary", () => {
     }
     const listed = await fixture.host.harness.runCli(["wait-list", "--project", PROJECT_ID]);
     expect(JSON.parse(listed.stdout).evidence).toHaveLength(0);
+    await fixture.host.harness.lifecycle.dispose();
+  });
+
+  it("refuses a phantom waker at declaration intake", async () => {
+    const fixture = await loadedFixture();
+    fixture.setThread("source-1", { status: "active" });
+    const result = await registerWait(fixture, waitRequest({ wakerSchedule: "missing-schedule" }), "waiter-1");
+    expect(result.exitCode).toBe(2);
+    expect(JSON.parse(result.stdout)).toMatchObject({ outcome: "INVALID_INPUT", message: expect.stringContaining("not live") });
+    expect(JSON.parse((await fixture.host.harness.runCli(["wait-list", "--project", PROJECT_ID])).stdout).evidence).toHaveLength(0);
     await fixture.host.harness.lifecycle.dispose();
   });
 
