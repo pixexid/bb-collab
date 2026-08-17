@@ -698,6 +698,24 @@ function seedAndBootstrap(host: ReturnType<typeof hostFor>, projectId = PROJECT_
 }
 
 describe("checkout divergence detection", () => {
+  it("bounds plugin load when git never exits during divergence detection", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-hostile-git-"));
+    const wrapper = join(bin, "git");
+    writeFileSync(wrapper, "#!/bin/sh\nwhile :; do :; done\n");
+    chmodSync(wrapper, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const started = Date.now();
+    try {
+      await expect(plugin(hostFor().bb)).resolves.toBeUndefined();
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+    expect(Date.now() - started).toBeLessThan(2_000);
+  }, 5_000);
+
   it("resolves plugin load when the divergence warning logger throws", async () => {
     const host = hostFor();
     const throwingLog = {
@@ -707,6 +725,51 @@ describe("checkout divergence detection", () => {
       },
     };
     await expect(plugin({ ...host.bb, log: throwingLog })).resolves.toBeUndefined();
+  });
+
+  it("reports an unavailable checkout through doctor RPC and CLI", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "bb-collab-no-git-"));
+    try {
+      const host = hostFor();
+      await plugin(host.bb, { checkoutRoot: directory });
+      seedAndBootstrap(host);
+      const expected = { checkoutHead: null, originMainRef: null, behindCount: null, verdict: "unavailable" };
+      const rpc = await host.harness.callRpc("doctor", { projectId: PROJECT_ID }) as FoundationResult;
+      expect(rpc.evidence).toMatchObject({ checkoutDivergence: expected });
+      const cli = await host.harness.runCli(["doctor", "--project", PROJECT_ID]);
+      expect(JSON.parse(cli.stdout).evidence).toMatchObject({ checkoutDivergence: expected });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the plugin-load invariant under hostile checkout diagnostics", async () => {
+    const hostileCheckout = checkoutFixture(true);
+    const missingGitCheckout = mkdtempSync(join(tmpdir(), "bb-collab-no-git-"));
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-hostile-git-"));
+    const wrapper = join(bin, "git");
+    writeFileSync(wrapper, "#!/bin/sh\nwhile :; do :; done\n");
+    chmodSync(wrapper, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const host = hostFor();
+    const missingGitHost = hostFor();
+    const throwingLog = { ...host.bb.log, warn: () => { throw new Error("warn failed"); } };
+    const missingGitThrowingLog = { ...missingGitHost.bb.log, warn: () => { throw new Error("warn failed"); } };
+    const started = Date.now();
+    try {
+      await expect(Promise.all([
+        plugin({ ...host.bb, log: throwingLog }, { checkoutRoot: hostileCheckout.directory }),
+        plugin({ ...missingGitHost.bb, log: missingGitThrowingLog }, { checkoutRoot: missingGitCheckout }),
+      ])).resolves.toEqual([undefined, undefined]);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(hostileCheckout.directory, { recursive: true, force: true });
+      rmSync(missingGitCheckout, { recursive: true, force: true });
+      rmSync(bin, { recursive: true, force: true });
+    }
+    expect(Date.now() - started).toBeLessThan(2_000);
   });
 
   it("does not lazy-fetch while counting divergence", () => {

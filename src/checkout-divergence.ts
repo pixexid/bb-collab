@@ -66,7 +66,7 @@ export function readCheckoutDivergence(checkoutRoot: string | null): CheckoutDiv
     if (!checkoutHead || !originMainRef) return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable" };
     let behindCount: number | null = null;
     try {
-      const count = execFileSync("git", ["rev-list", "--count", `${checkoutHead}..${originMainRef}`], { cwd: checkoutRoot, encoding: "utf8", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" }, stdio: ["ignore", "pipe", "ignore"] }).trim();
+      const count = execFileSync("git", ["rev-list", "--count", `${checkoutHead}..${originMainRef}`], { cwd: checkoutRoot, encoding: "utf8", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" }, stdio: ["ignore", "pipe", "ignore"], timeout: 1_000 }).trim();
       if (/^\d+$/u.test(count)) behindCount = Number(count);
     } catch {
       // Ref comparison remains useful even when the local object graph is incomplete.

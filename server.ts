@@ -64,6 +64,7 @@ import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const checkoutRoot = findCheckoutRoot(dirname(fileURLToPath(import.meta.url)));
+type PluginOptions = { checkoutRoot?: string | null };
 
 const projectIdSchema = z.string().trim().min(1).max(256);
 const mutationReceiptSchema = z
@@ -757,8 +758,9 @@ async function runCli(
 
 type OperatorPassphraseRead = { configured: true; secret: string } | { configured: false } | { configured: null };
 
-export default async function plugin(bb: BbPluginApi) {
-  reportCheckoutDivergence(bb.log, checkoutRoot);
+export default async function plugin(bb: BbPluginApi, options: PluginOptions = {}) {
+  const diagnosticRoot = options.checkoutRoot === undefined ? checkoutRoot : options.checkoutRoot;
+  reportCheckoutDivergence(bb.log, diagnosticRoot);
   const operatorPassphrase = bb.settings.define({
     operatorPassphrase: {
       type: "string",
@@ -1207,7 +1209,7 @@ export default async function plugin(bb: BbPluginApi) {
     listWaitsForCli: async () => { await waitRegistry.recover(); return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) })); },
     escalationCycle,
     archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply),
-    readCheckoutDivergence: () => readCheckoutDivergence(checkoutRoot),
+    readCheckoutDivergence: () => readCheckoutDivergence(diagnosticRoot),
   };
 
   bb.rpc.register(rpcContract, {
@@ -1268,7 +1270,7 @@ export default async function plugin(bb: BbPluginApi) {
       return { ok: true as const };
     },
     async doctor(input) {
-      return doctor(db, bb.sdk, input.projectId, readCheckoutDivergence(checkoutRoot));
+      return doctor(db, bb.sdk, input.projectId, readCheckoutDivergence(diagnosticRoot));
     },
     async export(input) {
       return exportFoundation(db, input.projectId);
