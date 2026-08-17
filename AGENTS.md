@@ -1,9 +1,9 @@
 # bb-collab repository contract
 
-CONTRACT_VERSION: 19
+CONTRACT_VERSION: 20
 
 This repository contains the founding contract and the implemented foundation
-through contract v19/schema v12: a single SQLite store with migrations, resolver,
+through contract v20/schema v12: a single SQLite store with migrations, resolver,
 state-event and mutation-receipt, deterministic export, and read-only doctor
 seams, plus WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
 Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
@@ -22,9 +22,11 @@ with `actor_kind=plugin`, `subject_id=bb-collab`, and an exact durable
 supplied with that same operator receipt on apply. Its retirement condition is
 the same host-issued `get-bb/bb#1541` condition.
 Operator receipts record explicit `issuance_provenance`: new console receipts
-are `console` and authorized-approver receipts are `attestation`; a legacy NULL
-marker is refused and provenance is never inferred from approver columns or a
-digest shape. Historical operator-receipt mutation is dead letter: no
+are `console` and authorized-approver receipts are `attestation`; provenance is
+never inferred from approver columns or a digest shape. A fresh apply with a
+legacy NULL marker refuses, while an exact authorized replay of its already
+committed mutation returns the recorded result without revalidating consumed
+receipt provenance. Historical operator-receipt mutation is dead letter: no
 historical receipt row is modified.
 The plugin is activated against live project authority: first activated on 2026-08-15 during the resolver-wiring activation (operator-authorized console exception), reloaded at 2026-08-16T14:06:56-0700 by the sentinel under supervisor authorization (bb plugin reload bb-collab) against merge dff355c3d203 (PR #121, contract v17 director role split), with an earlier same-day reload by the director seat (thr_gsb7m77ciz). This sentence previously stated the plugin had never been installed, reloaded, or activated; that statement was already inaccurate from 2026-08-15 and stood uncorrected for approximately one day. Reload evidence is actor-recorded; bb records no reload history. The complete decision is in
 [ADR 0001](docs/adr/0001-founding-contract.md); the threat boundary is in
@@ -79,13 +81,17 @@ Changing version text alone is not a migration. A zero-work result is not a
 successful apply unless zero expected work, zero attempted work and zero
 verified work are all proven.
 
-Contract v19/schema v12 requires exactly four production cached consumers: the
+Contract v20/schema v12 requires exactly four production cached consumers: the
 registered RPC `doctor` handler, the CLI `doctor` dispatcher, and the two named
-production provenance-refusal validations. Each rereads v19 or refuses stale
-v18 NULL or unknown provenance with `OPERATOR_RECEIPT_INVALID`; expected, attempted, and verified must
-all be 4. The v19 receipt is the only current receipt: missing or v18 receipt
-evidence is unknown and fail-closed, with no automatic v18 receipt migration
-or write.
+production replay/new-apply provenance validations. Each rereads v20; the
+consumed legacy replay returns its recorded `OK` outcome and a fresh NULL or
+unknown provenance apply refuses with `OPERATOR_RECEIPT_INVALID`; expected,
+attempted, and verified must all be 4. The v20 receipt is the only current
+receipt: missing or v19 receipt evidence is unknown and fail-closed, with no
+automatic v19 receipt migration
+or write. The replay consumer requires a read-only observed chain from the
+consumed legacy receipt through its matching mutation receipt and StateEvent;
+without it, rollout refuses rather than synthesizing success.
 An adopted operator_only Decision registers approverId=orchestrator:bb-collab
 with the exact ten derived mutation classes, including config_revision,
 work_item_create, work_item_transition and
@@ -111,13 +117,14 @@ Every later director generation requires the existing managed, isolated
 worktree and exact source/environment checks; the exemption is not general,
 cannot admit writing, and future succession remains receipt-gated.
 
-Contract v19 adds only the explicit operator-receipt provenance guard. A
+Contract v20 repairs only authorized replay of a consumed legacy receipt. A
 `config_revision` plugin actor remains bound to this exact operator receipt;
-both current console and authorized-approver issuance may satisfy that guard,
-but legacy NULL provenance remains refused. The v19 receipt is produced only
-after v19 `dist` is live through the reloaded plugin. Doctor must report 4/4/4
-VERIFIED from LIVE STATE for v19; merge, suite, review, or a v18 receipt does
-not close the gate.
+both current console and authorized-approver issuance remain guarded. Fresh
+legacy NULL provenance remains refused; only an exact replay already bound to
+a committed mutation returns its recorded outcome. The v20 receipt is future
+live evidence only after v20 `dist` is live. Doctor must report 4/4/4 VERIFIED
+from LIVE STATE for v20; merge, suite, review, or a v19 receipt does not close
+the gate.
 
 ## Delegation and lane obligations
 
