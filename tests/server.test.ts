@@ -701,7 +701,7 @@ describe("checkout divergence detection", () => {
   it("bounds plugin load when git never exits during divergence detection", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-hostile-git-"));
     const wrapper = join(bin, "git");
-    writeFileSync(wrapper, "#!/bin/sh\nwhile :; do :; done\n");
+    writeFileSync(wrapper, "#!/bin/sh\ntrap \"\" TERM\nwhile :; do :; done\n");
     chmodSync(wrapper, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -748,7 +748,7 @@ describe("checkout divergence detection", () => {
     const missingGitCheckout = mkdtempSync(join(tmpdir(), "bb-collab-no-git-"));
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-hostile-git-"));
     const wrapper = join(bin, "git");
-    writeFileSync(wrapper, "#!/bin/sh\nwhile :; do :; done\n");
+    writeFileSync(wrapper, "#!/bin/sh\ntrap \"\" TERM\nwhile :; do :; done\n");
     chmodSync(wrapper, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
