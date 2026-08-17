@@ -5613,6 +5613,40 @@ describe("bb-collab plugin boundary", () => {
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeProductionRefusal);
   });
 
+  it("briefs newly created canonical director and orchestrator seats with their own role content", async () => {
+    const scenarios = [
+      {
+        name: "orchestrator",
+        config: roleConfig(),
+        qualification: {},
+        succession: {},
+        facts: roleReader(),
+        heading: "# Orchestrator",
+      },
+      {
+        name: "director",
+        config: directorSeatConfig(),
+        qualification: { roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID, qualificationId: "director-brief-qualification", declaredProfile: DIRECTOR_PROFILE },
+        succession: { roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID, qualificationId: "director-brief-qualification", profileDigest: DIRECTOR_PROFILE_DIGEST, standbyProfile: DIRECTOR_STANDBY_PROFILE },
+        facts: directorRoleReader(),
+        heading: "# Director",
+      },
+    ];
+    for (const scenario of scenarios) {
+      const host = await loadedHost();
+      host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
+      host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
+      const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: scenario.config });
+      expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, scenario.qualification), null, scenario.facts).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, scenario.succession), null, scenario.facts).outcome).toBe("OK");
+
+      await expect(host.harness.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id: ROLE_THREAD_ID, projectId: PROJECT_ID }) })).resolves.toEqual({ errors: [] });
+      const send = host.harness.inspection.sdk.callsTo("threads.send")[0]?.[0] as { input: Array<{ text: string }> };
+      expect(send.input[0]?.text).toContain(scenario.heading);
+      expect(send.input[0]?.text).not.toContain("# Worker");
+    }
+  });
+
   it("uses the bootstrap exemption without making its non-role actor the holder", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });

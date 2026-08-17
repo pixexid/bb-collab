@@ -21776,7 +21776,9 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
-  return applyAuthorizedMutation(db, input, null, reader);
+  const result2 = applyAuthorizedMutation(db, input, null, reader);
+  await deliverSucceededSeatBrief(bb, db, input, result2);
+  return result2;
 }
 function cachedConsumerRolloutRefusal(projectId, message) {
   return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message };
@@ -21806,6 +21808,9 @@ function roleForThread(db, projectId, threadId) {
   const roleId = db ? readRoleHolderStates(db).find((holder) => holder.project_id === projectId && holder.thread_id === threadId)?.role_id : null;
   return roleId === "director" ? "director" : roleId === "project-orchestrator" ? "orchestrator" : "worker";
 }
+function roleBriefRole(roleId) {
+  return roleId === "director" ? "director" : roleId === "project-orchestrator" ? "orchestrator" : "worker";
+}
 async function composeRoleBrief(bb, db, input) {
   const bundle = roleBriefBundleSchema.parse(JSON.parse(readFileSync2(roleBriefBundlePath(), "utf8")));
   const project = await bb.sdk.projects.get({ projectId: input.projectId });
@@ -21832,6 +21837,24 @@ async function composeRoleBrief(bb, db, input) {
     `Current seats: ${currentSeats.map((seat) => `${seat.roleId}@${seat.generation}:${seat.threadId}`).join(", ") || "none"}`
   ].join("\n");
   return { role: input.role, roleContent: bundle.roles[input.role], ponytail: bundle.ponytail, project: { id: project.id, name: project.name, sourceIds: project.sources.map((source) => source.id) }, pointers, prompt };
+}
+async function sendRoleBrief(bb, db, projectId, threadId, role, waitForActive = false) {
+  const brief = await composeRoleBrief(bb, db, { projectId, role });
+  if (waitForActive) await bb.sdk.threads.wait({ threadId, status: "active", timeoutMs: 3e4 });
+  await bb.sdk.threads.send({
+    threadId,
+    mode: "queue-if-active",
+    input: [{ type: "text", visibility: "agent-only", text: brief.prompt, mentions: [] }]
+  });
+}
+async function deliverSucceededSeatBrief(bb, db, input, result2) {
+  const request = applyRequestSchema.safeParse(input);
+  if (!request.success || result2.outcome !== "OK" || request.data.operationClass !== "role_generation_succession" || !request.data.roleContext || !request.data.roleId) return;
+  try {
+    await sendRoleBrief(bb, db, request.data.projectId, request.data.roleContext.threadId, roleBriefRole(request.data.roleId));
+  } catch (error48) {
+    bb.log.warn(`role brief seating failed for thread=${request.data.roleContext.threadId}: ${String(error48)}`);
+  }
 }
 function liveCachedConsumerReread(name, result2) {
   const cachedConsumers = result2.evidence?.cachedConsumers;
@@ -22471,13 +22494,7 @@ ${thread.titleFallback ?? ""}`);
   };
   bb.events.on("thread.created", async ({ thread }) => {
     try {
-      const brief = await composeRoleBrief(bb, db, { projectId: thread.projectId, role: roleForThread(db, thread.projectId, thread.id) });
-      await bb.sdk.threads.wait({ threadId: thread.id, status: "active", timeoutMs: 3e4 });
-      await bb.sdk.threads.send({
-        threadId: thread.id,
-        mode: "queue-if-active",
-        input: [{ type: "text", visibility: "agent-only", text: brief.prompt, mentions: [] }]
-      });
+      await sendRoleBrief(bb, db, thread.projectId, thread.id, roleForThread(db, thread.projectId, thread.id), true);
     } catch (error48) {
       bb.log.warn(`role brief seating failed for thread=${thread.id}: ${String(error48)}`);
     }

@@ -414,7 +414,9 @@ async function applyLiveAuthorizedMutation(
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
-  return applyAuthorizedMutation(db, input, null, reader);
+  const result = applyAuthorizedMutation(db, input, null, reader);
+  await deliverSucceededSeatBrief(bb, db, input, result);
+  return result;
 }
 
 function cachedConsumerRolloutRefusal(projectId: string, message: string): FoundationResult {
@@ -457,6 +459,10 @@ function roleForThread(db: SqliteDatabase | null, projectId: string, threadId: s
   return roleId === "director" ? "director" : roleId === "project-orchestrator" ? "orchestrator" : "worker";
 }
 
+function roleBriefRole(roleId: string): z.infer<typeof roleBriefRoleSchema> {
+  return roleId === "director" ? "director" : roleId === "project-orchestrator" ? "orchestrator" : "worker";
+}
+
 async function composeRoleBrief(
   bb: BbPluginApi,
   db: SqliteDatabase | null,
@@ -489,6 +495,38 @@ async function composeRoleBrief(
     `Current seats: ${currentSeats.map((seat) => `${seat.roleId}@${seat.generation}:${seat.threadId}`).join(", ") || "none"}`,
   ].join("\n");
   return { role: input.role, roleContent: bundle.roles[input.role], ponytail: bundle.ponytail, project: { id: project.id, name: project.name, sourceIds: project.sources.map((source) => source.id) }, pointers, prompt };
+}
+
+async function sendRoleBrief(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  projectId: string,
+  threadId: string,
+  role: z.infer<typeof roleBriefRoleSchema>,
+  waitForActive = false,
+): Promise<void> {
+  const brief = await composeRoleBrief(bb, db, { projectId, role });
+  if (waitForActive) await bb.sdk.threads.wait({ threadId, status: "active", timeoutMs: 30_000 });
+  await bb.sdk.threads.send({
+    threadId,
+    mode: "queue-if-active",
+    input: [{ type: "text", visibility: "agent-only", text: brief.prompt, mentions: [] }],
+  });
+}
+
+async function deliverSucceededSeatBrief(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  input: unknown,
+  result: FoundationResult,
+): Promise<void> {
+  const request = applyRequestSchema.safeParse(input);
+  if (!request.success || result.outcome !== "OK" || request.data.operationClass !== "role_generation_succession" || !request.data.roleContext || !request.data.roleId) return;
+  try {
+    await sendRoleBrief(bb, db, request.data.projectId, request.data.roleContext.threadId, roleBriefRole(request.data.roleId));
+  } catch (error) {
+    bb.log.warn(`role brief seating failed for thread=${request.data.roleContext.threadId}: ${String(error)}`);
+  }
 }
 
 function liveCachedConsumerReread(name: string, result: FoundationResult) {
@@ -1204,17 +1242,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   };
 
   // Lifecycle callbacks observe a completed creation; they cannot intercept a
-  // spawn. A thread created outside this plugin receives the same brief here,
-  // at seating, rather than through a separate spawn path.
+  // spawn. An unseated thread receives its worker brief here at seating;
+  // successful canonical succession separately delivers the exact seat brief.
   bb.events.on("thread.created", async ({ thread }) => {
     try {
-      const brief = await composeRoleBrief(bb, db, { projectId: thread.projectId, role: roleForThread(db, thread.projectId, thread.id) });
-      await bb.sdk.threads.wait({ threadId: thread.id, status: "active", timeoutMs: 30_000 });
-      await bb.sdk.threads.send({
-        threadId: thread.id,
-        mode: "queue-if-active",
-        input: [{ type: "text", visibility: "agent-only", text: brief.prompt, mentions: [] }],
-      });
+      await sendRoleBrief(bb, db, thread.projectId, thread.id, roleForThread(db, thread.projectId, thread.id), true);
     } catch (error) {
       bb.log.warn(`role brief seating failed for thread=${thread.id}: ${String(error)}`);
     }
