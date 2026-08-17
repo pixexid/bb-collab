@@ -26,7 +26,7 @@ requirement and has zero writing-lane capacity. Each role requirement carries
 its executed-profile qualification; this adds no assignment or dispatch
 authority.
 
-The v19/schema v12 contract retains the v10 operator gate, which has a host/UI
+The v20/schema v12 contract retains the v10 operator gate, which has a host/UI
 confirmation boundary only for authorizing or revoking the approver. An adopted
 `operator_only` Decision
 registers `approverId=orchestrator:bb-collab` for the exact project and adopted
@@ -51,11 +51,15 @@ digest. The shared authorization-digest projection normalizes omitted nullable
 fields to `null` and projects expected config/governor/fence guards to `null`;
 apply still validates those live guards separately and fails closed when stale.
 Project, operation class, candidate head, idempotency key, and all other request
-content remain bound. Every v19 receipt also records explicit issuance provenance:
+content remain bound. Every current receipt records explicit issuance provenance:
 console issuance is `console`, authorized-approver issuance is `attestation`,
-and legacy NULL or unknown values refuse; provenance is never inferred from
-approver fields or digest shape. A `config_revision` plugin actor remains bound
-to this exact receipt under either current provenance. Both the registry and interim receipt retain the upstream host-issued
+and provenance is never inferred from approver fields or digest shape. A fresh
+legacy NULL or unknown apply refuses before write. After a mutation receipt
+proves the same exact request and operator receipt already committed, replay
+returns the stored outcome without revalidating that consumed receipt's
+provenance; different receipt or binding values still refuse. A
+`config_revision` plugin actor remains bound to this exact receipt under either
+current provenance. Both the registry and interim receipt retain the upstream host-issued
 `get-bb/bb#1541` retirement condition. The first committed StateEvent consumes it atomically; reuse, a
 different receipt for an already-committed idempotency key, or any binding
 mismatch refuses before a write. It has no local TTL and retires only on the

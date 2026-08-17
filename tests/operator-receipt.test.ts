@@ -34,6 +34,12 @@ function request(overrides: Partial<OperatorReceiptRequest> = {}): OperatorRecei
   };
 }
 
+const issuanceProvenanceMustBeExplicit = () => {
+  // @ts-expect-error receipt minting must name its issuance provenance.
+  persistInterimOperatorReceipt(null as never, { ...request(), callerPluginId: "bb-collab" });
+};
+void issuanceProvenanceMustBeExplicit;
+
 async function loadedHost() {
   const host = createFakePluginHost({ pluginId: "bb-collab" });
   await plugin(host.bb);
@@ -215,7 +221,7 @@ describe("interim operator receipts", () => {
       databaseIsReady(first);
       for (const migration of MIGRATIONS) first.exec(migration);
       const input = request({ requestedFromBackground: true });
-      const receipt = persistInterimOperatorReceipt(first, { ...input, callerPluginId: "bb-collab" }, 123);
+      const receipt = persistInterimOperatorReceipt(first, { ...input, callerPluginId: "bb-collab", issuanceProvenance: "console" }, 123);
       expect(TABLES).toContain("operator_receipts");
       first.close();
 
