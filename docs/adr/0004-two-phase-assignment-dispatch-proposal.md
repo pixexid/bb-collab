@@ -1,24 +1,24 @@
-# ADR 0002: two-phase assignment dispatch and reconcile (proposal, non-adopted)
+# ADR 0004: two-phase assignment dispatch and reconcile (adopted direction)
 
-- Status: proposed — explicitly non-adopted; no disposition exists
+- Status: adopted direction — Option A adopted; Option B declined
 - Date: 2026-08-16
 - Scope: `assignment_dispatch`/`assignment_reconcile` contract amendment options
-- Authority: operator adjudication gate (open; see section 8)
+- Authority: operator adjudication gate recorded; implementation remains gated (see section 8)
 - Linked issue: [GH-104](https://github.com/pixexid/bb-collab/issues/104)
 
-## 1. Decision proposed (none adopted)
+## 1. Decision direction (Option A adopted; Option B declined)
 
-This ADR proposes, and does not adopt, a two-phase amendment to the canonical
-`assignment_dispatch` and `assignment_reconcile` mutation contract so that a
-sanctioned live BB spawn path can exist without weakening the one-request
-interim operator receipt, the derived-actor gates, or the
-requested-versus-executed evidence separation.
+This ADR records Option A as the adopted direction for a future two-phase
+amendment to the canonical `assignment_dispatch` and `assignment_reconcile`
+mutation contract. Option B is declined because it places native effect before
+canonical authorization and leaves orphan and authorization-gap exposure.
+Implementation is not adopted by this document.
 
 Nothing in this document changes `CONTRACT_VERSION` (15), `SCHEMA_VERSION`
 (11), any migration, the resolver, adapter code, `dist`, the live plugin or
 runtime, SQLite, receipts, credentials, or any canonical state. The current
 `OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED` refusal remains fully in force.
-Adoption of any option here requires a separately reviewed Tier-A lane that
+Implementing the adopted direction requires a separately reviewed Tier-A lane that
 performs the cached-consumer bump test, emits rollout/refusal receipts, and
 carries its own adopted disposition; see section 7.
 
@@ -35,9 +35,8 @@ Two candidate shapes are compared:
 
 Option A preserves the founding invariant that canonical authorization
 precedes native effect. Option B inverts it and inherits orphan and
-authorization-gap exposure. This ADR recommends Option A as the only shape
-consistent with the founding contract, but the recommendation is advisory
-evidence for the operator gate, not a disposition.
+authorization-gap exposure. The recorded direction therefore adopts Option A
+and declines Option B; implementation remains subject to the gates below.
 
 ## 2. Problem and proven evidence
 
@@ -315,7 +314,7 @@ implementations:
 Option A keeps authorization before effect, reuses proven machinery, and
 localizes the new surface to: two-receipt cross-binding, the async adapter
 wiring at the plugin boundary, and the finalize class naming. It is the
-recommended shape.
+adopted direction.
 
 ## 5. Option B — record-after-the-fact reconciliation
 
@@ -396,7 +395,7 @@ This proposal changes no version, digest, migration, receipt, or consumer.
 `CONTRACT_VERSION` stays 15 and `SCHEMA_VERSION` stays 11 at this head; no
 cached consumer observes any difference from this document.
 
-Option A adoption would require: a `CONTRACT_VERSION` and `contractDigest`
+Option A implementation would require: a `CONTRACT_VERSION` and `contractDigest`
 bump; either a schema bump with a table-rebuild migration (new receipt class
 names under the `operator_receipts.mutation_class` CHECK) or no DDL (reuse
 with a digest-carried phase discriminator) — where no-DDL holds only under
@@ -406,20 +405,19 @@ counted here; the full cached-consumer bump
 test enumerating all four consumers with reread-or-refuse proof, expected/
 attempted/verified counts, and durable rollout receipts; refusal tests for
 stale-consumer versions; and its own adopted decision/disposition chain.
-Option B adoption carries the same bump-test obligations with likely no DDL
-but larger semantic refusal surface (orphan policy). Neither option may be
-adopted by this ADR; each requires the separately reviewed Tier-A lane
-described in section 1.
+Option B, which is declined, would carry the same bump-test obligations with likely no DDL
+but larger semantic refusal surface (orphan policy). The adopted direction
+still requires the separately reviewed Tier-A implementation lane described
+in section 1.
 
 ## 8. Operator adjudication gate
 
-The open decision is: adopt Option A, adopt Option B, defer pending the
-host-issued receipt condition (`get-bb/bb#1541`), or reject both. Only the
-operator, through a future separately reviewed adoption lane with its own
-ADR/dispositions, bump test, rollout receipts, and confirmation
-interactions, may decide. Until such a disposition is adopted, the
-`OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED` refusal is the controlling
-behavior and must not be relaxed, bypassed, or feature-flagged.
+The direction decision is recorded: implement Option A; Option B is declined.
+Only the operator, through a future separately reviewed Tier-A implementation
+lane with its own ADR/dispositions, bump test, rollout receipts, and
+confirmation interactions, may authorize implementation. Until that lane is
+adopted and complete, the `OPERATOR_RECEIPT_TWO_PHASE_UNSUPPORTED` refusal is
+the controlling behavior and must not be relaxed, bypassed, or feature-flagged.
 
 ## 9. Non-goals
 
