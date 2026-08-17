@@ -117,7 +117,7 @@ Every later director generation requires the existing managed, isolated
 worktree and exact source/environment checks; the exemption is not general,
 cannot admit writing, and future succession remains receipt-gated.
 
-Contract v20 repairs only authorized replay of a consumed legacy receipt. A
+Contract v20 repairs authorized replay of a consumed legacy receipt. A
 `config_revision` plugin actor remains bound to this exact operator receipt;
 both current console and authorized-approver issuance remain guarded. Fresh
 legacy NULL provenance remains refused; only an exact replay already bound to
@@ -125,6 +125,19 @@ a committed mutation returns its recorded outcome. The v20 receipt is future
 live evidence only after v20 `dist` is live. Doctor must report 4/4/4 VERIFIED
 from LIVE STATE for v20; merge, suite, review, or a v19 receipt does not close
 the gate.
+
+Contract v20 also establishes role-holder identity through exact request and
+completion event reads plus one reader-returned prefix after the request. It
+does not enumerate historical holder events, change the director generation-1
+exemption, or assume dense sequence space. Completeness is the linked returned
+prefix ending at the exact cited completion; inverted, over-256-actual-event,
+incomplete, or locally unordered evidence refuses
+`EXECUTION_COMPLETION_AMBIGUOUS` before a canonical write. The unchanged bound
+counts actual correlation events returned before the cited completion, never
+thread lifetime or age. Sparse native sequences are normal. For the measured
+2.2% of cited turns genuinely over that bound, the citer must choose a
+different turn. No role-holder thread is compacted or manipulated to satisfy
+the bound.
 
 ## Delegation and lane obligations
 

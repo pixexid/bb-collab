@@ -198,10 +198,18 @@ export class DeterministicRoleFactReader implements RoleFactReader {
     return structuredClone(this.facts.thread);
   }
 
-  events(threadId: string): RoleEventFact[] {
-    this.readCalls.push(`events:${threadId}`);
+  event(threadId: string, eventId: string, eventSeq: number): RoleEventFact {
+    this.readCalls.push(`event:${threadId}:${eventId}:${eventSeq}`);
     if (this.facts.thread.id !== threadId) throw new Error("unknown thread");
-    return structuredClone(this.facts.events);
+    const events = this.facts.events.filter((event) => event.id === eventId && event.seq === eventSeq);
+    if (events.length !== 1) throw new Error("unknown event");
+    return structuredClone(events[0]!);
+  }
+
+  eventsAfter(threadId: string, afterSeq: number, limit: number): RoleEventFact[] {
+    this.readCalls.push(`eventsAfter:${threadId}:${afterSeq}:${limit}`);
+    if (this.facts.thread.id !== threadId) throw new Error("unknown thread");
+    return structuredClone(this.facts.events.filter((event) => event.seq > afterSeq).slice(0, limit));
   }
 
   environment(environmentId: string): RoleEnvironmentFact {

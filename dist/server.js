@@ -13,7 +13,7 @@ var __export = (target, all) => {
 // server.ts
 import { defineRpcContract } from "@bb/plugin-sdk";
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/classic/external.js
+// node_modules/zod/v4/classic/external.js
 var external_exports = {};
 __export(external_exports, {
   $brand: () => $brand,
@@ -254,7 +254,7 @@ __export(external_exports, {
   xor: () => xor
 });
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/index.js
+// node_modules/zod/v4/core/index.js
 var core_exports2 = {};
 __export(core_exports2, {
   $ZodAny: () => $ZodAny,
@@ -532,7 +532,7 @@ __export(core_exports2, {
   version: () => version
 });
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/core.js
+// node_modules/zod/v4/core/core.js
 var NEVER = Object.freeze({
   status: "aborted"
 });
@@ -607,7 +607,7 @@ function config(newConfig) {
   return globalConfig;
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/util.js
+// node_modules/zod/v4/core/util.js
 var util_exports = {};
 __export(util_exports, {
   BIGINT_FORMAT_RANGES: () => BIGINT_FORMAT_RANGES,
@@ -1286,7 +1286,7 @@ var Class = class {
   }
 };
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/errors.js
+// node_modules/zod/v4/core/errors.js
 var initializer = (inst, def) => {
   inst.name = "$ZodError";
   Object.defineProperty(inst, "_zod", {
@@ -1422,7 +1422,7 @@ function prettifyError(error48) {
   return lines.join("\n");
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/parse.js
+// node_modules/zod/v4/core/parse.js
 var _parse = (_Err) => (schema, value, _ctx, _params) => {
   const ctx = _ctx ? Object.assign(_ctx, { async: false }) : { async: false };
   const result2 = schema._zod.run({ value, issues: [] }, ctx);
@@ -1510,7 +1510,7 @@ var _safeDecodeAsync = (_Err) => async (schema, value, _ctx) => {
 };
 var safeDecodeAsync = /* @__PURE__ */ _safeDecodeAsync($ZodRealError);
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/regexes.js
+// node_modules/zod/v4/core/regexes.js
 var regexes_exports = {};
 __export(regexes_exports, {
   base64: () => base64,
@@ -1667,7 +1667,7 @@ var sha512_hex = /^[0-9a-fA-F]{128}$/;
 var sha512_base64 = /* @__PURE__ */ fixedBase64(86, "==");
 var sha512_base64url = /* @__PURE__ */ fixedBase64url(86);
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/checks.js
+// node_modules/zod/v4/core/checks.js
 var $ZodCheck = /* @__PURE__ */ $constructor("$ZodCheck", (inst, def) => {
   var _a2;
   inst._zod ?? (inst._zod = {});
@@ -2215,7 +2215,7 @@ var $ZodCheckOverwrite = /* @__PURE__ */ $constructor("$ZodCheckOverwrite", (ins
   };
 });
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/doc.js
+// node_modules/zod/v4/core/doc.js
 var Doc = class {
   constructor(args = []) {
     this.content = [];
@@ -2251,14 +2251,14 @@ var Doc = class {
   }
 };
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/versions.js
+// node_modules/zod/v4/core/versions.js
 var version = {
   major: 4,
   minor: 3,
   patch: 6
 };
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/schemas.js
+// node_modules/zod/v4/core/schemas.js
 var $ZodType = /* @__PURE__ */ $constructor("$ZodType", (inst, def) => {
   var _a2;
   inst ?? (inst = {});
@@ -4229,7 +4229,7 @@ function handleRefineResult(result2, payload, input, inst) {
   }
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/index.js
+// node_modules/zod/v4/locales/index.js
 var locales_exports = {};
 __export(locales_exports, {
   ar: () => ar_default,
@@ -4283,7 +4283,7 @@ __export(locales_exports, {
   zhTW: () => zh_TW_default
 });
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/ar.js
+// node_modules/zod/v4/locales/ar.js
 var error = () => {
   const Sizable = {
     string: { unit: "\u062D\u0631\u0641", verb: "\u0623\u0646 \u064A\u062D\u0648\u064A" },
@@ -4390,7 +4390,7 @@ function ar_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/az.js
+// node_modules/zod/v4/locales/az.js
 var error2 = () => {
   const Sizable = {
     string: { unit: "simvol", verb: "olmal\u0131d\u0131r" },
@@ -4496,7 +4496,7 @@ function az_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/be.js
+// node_modules/zod/v4/locales/be.js
 function getBelarusianPlural(count, one, few, many) {
   const absCount = Math.abs(count);
   const lastDigit = absCount % 10;
@@ -4653,7 +4653,7 @@ function be_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/bg.js
+// node_modules/zod/v4/locales/bg.js
 var error4 = () => {
   const Sizable = {
     string: { unit: "\u0441\u0438\u043C\u0432\u043E\u043B\u0430", verb: "\u0434\u0430 \u0441\u044A\u0434\u044A\u0440\u0436\u0430" },
@@ -4774,7 +4774,7 @@ function bg_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/ca.js
+// node_modules/zod/v4/locales/ca.js
 var error5 = () => {
   const Sizable = {
     string: { unit: "car\xE0cters", verb: "contenir" },
@@ -4883,7 +4883,7 @@ function ca_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/cs.js
+// node_modules/zod/v4/locales/cs.js
 var error6 = () => {
   const Sizable = {
     string: { unit: "znak\u016F", verb: "m\xEDt" },
@@ -4995,7 +4995,7 @@ function cs_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/da.js
+// node_modules/zod/v4/locales/da.js
 var error7 = () => {
   const Sizable = {
     string: { unit: "tegn", verb: "havde" },
@@ -5111,7 +5111,7 @@ function da_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/de.js
+// node_modules/zod/v4/locales/de.js
 var error8 = () => {
   const Sizable = {
     string: { unit: "Zeichen", verb: "zu haben" },
@@ -5220,7 +5220,7 @@ function de_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/en.js
+// node_modules/zod/v4/locales/en.js
 var error9 = () => {
   const Sizable = {
     string: { unit: "characters", verb: "to have" },
@@ -5329,7 +5329,7 @@ function en_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/eo.js
+// node_modules/zod/v4/locales/eo.js
 var error10 = () => {
   const Sizable = {
     string: { unit: "karaktrojn", verb: "havi" },
@@ -5439,7 +5439,7 @@ function eo_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/es.js
+// node_modules/zod/v4/locales/es.js
 var error11 = () => {
   const Sizable = {
     string: { unit: "caracteres", verb: "tener" },
@@ -5572,7 +5572,7 @@ function es_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/fa.js
+// node_modules/zod/v4/locales/fa.js
 var error12 = () => {
   const Sizable = {
     string: { unit: "\u06A9\u0627\u0631\u0627\u06A9\u062A\u0631", verb: "\u062F\u0627\u0634\u062A\u0647 \u0628\u0627\u0634\u062F" },
@@ -5687,7 +5687,7 @@ function fa_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/fi.js
+// node_modules/zod/v4/locales/fi.js
 var error13 = () => {
   const Sizable = {
     string: { unit: "merkki\xE4", subject: "merkkijonon" },
@@ -5800,7 +5800,7 @@ function fi_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/fr.js
+// node_modules/zod/v4/locales/fr.js
 var error14 = () => {
   const Sizable = {
     string: { unit: "caract\xE8res", verb: "avoir" },
@@ -5909,7 +5909,7 @@ function fr_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/fr-CA.js
+// node_modules/zod/v4/locales/fr-CA.js
 var error15 = () => {
   const Sizable = {
     string: { unit: "caract\xE8res", verb: "avoir" },
@@ -6017,7 +6017,7 @@ function fr_CA_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/he.js
+// node_modules/zod/v4/locales/he.js
 var error16 = () => {
   const TypeNames = {
     string: { label: "\u05DE\u05D7\u05E8\u05D5\u05D6\u05EA", gender: "f" },
@@ -6212,7 +6212,7 @@ function he_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/hu.js
+// node_modules/zod/v4/locales/hu.js
 var error17 = () => {
   const Sizable = {
     string: { unit: "karakter", verb: "legyen" },
@@ -6321,7 +6321,7 @@ function hu_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/hy.js
+// node_modules/zod/v4/locales/hy.js
 function getArmenianPlural(count, one, many) {
   return Math.abs(count) === 1 ? one : many;
 }
@@ -6469,7 +6469,7 @@ function hy_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/id.js
+// node_modules/zod/v4/locales/id.js
 var error19 = () => {
   const Sizable = {
     string: { unit: "karakter", verb: "memiliki" },
@@ -6576,7 +6576,7 @@ function id_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/is.js
+// node_modules/zod/v4/locales/is.js
 var error20 = () => {
   const Sizable = {
     string: { unit: "stafi", verb: "a\xF0 hafa" },
@@ -6686,7 +6686,7 @@ function is_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/it.js
+// node_modules/zod/v4/locales/it.js
 var error21 = () => {
   const Sizable = {
     string: { unit: "caratteri", verb: "avere" },
@@ -6795,7 +6795,7 @@ function it_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/ja.js
+// node_modules/zod/v4/locales/ja.js
 var error22 = () => {
   const Sizable = {
     string: { unit: "\u6587\u5B57", verb: "\u3067\u3042\u308B" },
@@ -6903,7 +6903,7 @@ function ja_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/ka.js
+// node_modules/zod/v4/locales/ka.js
 var error23 = () => {
   const Sizable = {
     string: { unit: "\u10E1\u10D8\u10DB\u10D1\u10DD\u10DA\u10DD", verb: "\u10E3\u10DC\u10D3\u10D0 \u10E8\u10D4\u10D8\u10EA\u10D0\u10D5\u10D3\u10D4\u10E1" },
@@ -7016,7 +7016,7 @@ function ka_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/km.js
+// node_modules/zod/v4/locales/km.js
 var error24 = () => {
   const Sizable = {
     string: { unit: "\u178F\u17BD\u17A2\u1780\u17D2\u179F\u179A", verb: "\u1782\u17BD\u179A\u1798\u17B6\u1793" },
@@ -7127,12 +7127,12 @@ function km_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/kh.js
+// node_modules/zod/v4/locales/kh.js
 function kh_default() {
   return km_default();
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/ko.js
+// node_modules/zod/v4/locales/ko.js
 var error25 = () => {
   const Sizable = {
     string: { unit: "\uBB38\uC790", verb: "to have" },
@@ -7244,7 +7244,7 @@ function ko_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/lt.js
+// node_modules/zod/v4/locales/lt.js
 var capitalizeFirstCharacter = (text) => {
   return text.charAt(0).toUpperCase() + text.slice(1);
 };
@@ -7448,7 +7448,7 @@ function lt_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/mk.js
+// node_modules/zod/v4/locales/mk.js
 var error27 = () => {
   const Sizable = {
     string: { unit: "\u0437\u043D\u0430\u0446\u0438", verb: "\u0434\u0430 \u0438\u043C\u0430\u0430\u0442" },
@@ -7558,7 +7558,7 @@ function mk_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/ms.js
+// node_modules/zod/v4/locales/ms.js
 var error28 = () => {
   const Sizable = {
     string: { unit: "aksara", verb: "mempunyai" },
@@ -7666,7 +7666,7 @@ function ms_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/nl.js
+// node_modules/zod/v4/locales/nl.js
 var error29 = () => {
   const Sizable = {
     string: { unit: "tekens", verb: "heeft" },
@@ -7777,7 +7777,7 @@ function nl_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/no.js
+// node_modules/zod/v4/locales/no.js
 var error30 = () => {
   const Sizable = {
     string: { unit: "tegn", verb: "\xE5 ha" },
@@ -7886,7 +7886,7 @@ function no_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/ota.js
+// node_modules/zod/v4/locales/ota.js
 var error31 = () => {
   const Sizable = {
     string: { unit: "harf", verb: "olmal\u0131d\u0131r" },
@@ -7996,7 +7996,7 @@ function ota_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/ps.js
+// node_modules/zod/v4/locales/ps.js
 var error32 = () => {
   const Sizable = {
     string: { unit: "\u062A\u0648\u06A9\u064A", verb: "\u0648\u0644\u0631\u064A" },
@@ -8111,7 +8111,7 @@ function ps_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/pl.js
+// node_modules/zod/v4/locales/pl.js
 var error33 = () => {
   const Sizable = {
     string: { unit: "znak\xF3w", verb: "mie\u0107" },
@@ -8221,7 +8221,7 @@ function pl_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/pt.js
+// node_modules/zod/v4/locales/pt.js
 var error34 = () => {
   const Sizable = {
     string: { unit: "caracteres", verb: "ter" },
@@ -8330,7 +8330,7 @@ function pt_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/ru.js
+// node_modules/zod/v4/locales/ru.js
 function getRussianPlural(count, one, few, many) {
   const absCount = Math.abs(count);
   const lastDigit = absCount % 10;
@@ -8487,7 +8487,7 @@ function ru_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/sl.js
+// node_modules/zod/v4/locales/sl.js
 var error36 = () => {
   const Sizable = {
     string: { unit: "znakov", verb: "imeti" },
@@ -8597,7 +8597,7 @@ function sl_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/sv.js
+// node_modules/zod/v4/locales/sv.js
 var error37 = () => {
   const Sizable = {
     string: { unit: "tecken", verb: "att ha" },
@@ -8708,7 +8708,7 @@ function sv_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/ta.js
+// node_modules/zod/v4/locales/ta.js
 var error38 = () => {
   const Sizable = {
     string: { unit: "\u0B8E\u0BB4\u0BC1\u0BA4\u0BCD\u0BA4\u0BC1\u0B95\u0BCD\u0B95\u0BB3\u0BCD", verb: "\u0B95\u0BCA\u0BA3\u0BCD\u0B9F\u0BBF\u0BB0\u0BC1\u0B95\u0BCD\u0B95 \u0BB5\u0BC7\u0BA3\u0BCD\u0B9F\u0BC1\u0BAE\u0BCD" },
@@ -8819,7 +8819,7 @@ function ta_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/th.js
+// node_modules/zod/v4/locales/th.js
 var error39 = () => {
   const Sizable = {
     string: { unit: "\u0E15\u0E31\u0E27\u0E2D\u0E31\u0E01\u0E29\u0E23", verb: "\u0E04\u0E27\u0E23\u0E21\u0E35" },
@@ -8930,7 +8930,7 @@ function th_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/tr.js
+// node_modules/zod/v4/locales/tr.js
 var error40 = () => {
   const Sizable = {
     string: { unit: "karakter", verb: "olmal\u0131" },
@@ -9036,7 +9036,7 @@ function tr_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/uk.js
+// node_modules/zod/v4/locales/uk.js
 var error41 = () => {
   const Sizable = {
     string: { unit: "\u0441\u0438\u043C\u0432\u043E\u043B\u0456\u0432", verb: "\u043C\u0430\u0442\u0438\u043C\u0435" },
@@ -9145,12 +9145,12 @@ function uk_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/ua.js
+// node_modules/zod/v4/locales/ua.js
 function ua_default() {
   return uk_default();
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/ur.js
+// node_modules/zod/v4/locales/ur.js
 var error42 = () => {
   const Sizable = {
     string: { unit: "\u062D\u0631\u0648\u0641", verb: "\u06C1\u0648\u0646\u0627" },
@@ -9261,7 +9261,7 @@ function ur_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/uz.js
+// node_modules/zod/v4/locales/uz.js
 var error43 = () => {
   const Sizable = {
     string: { unit: "belgi", verb: "bo\u2018lishi kerak" },
@@ -9371,7 +9371,7 @@ function uz_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/vi.js
+// node_modules/zod/v4/locales/vi.js
 var error44 = () => {
   const Sizable = {
     string: { unit: "k\xFD t\u1EF1", verb: "c\xF3" },
@@ -9480,7 +9480,7 @@ function vi_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/zh-CN.js
+// node_modules/zod/v4/locales/zh-CN.js
 var error45 = () => {
   const Sizable = {
     string: { unit: "\u5B57\u7B26", verb: "\u5305\u542B" },
@@ -9590,7 +9590,7 @@ function zh_CN_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/zh-TW.js
+// node_modules/zod/v4/locales/zh-TW.js
 var error46 = () => {
   const Sizable = {
     string: { unit: "\u5B57\u5143", verb: "\u64C1\u6709" },
@@ -9698,7 +9698,7 @@ function zh_TW_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/locales/yo.js
+// node_modules/zod/v4/locales/yo.js
 var error47 = () => {
   const Sizable = {
     string: { unit: "\xE0mi", verb: "n\xED" },
@@ -9806,7 +9806,7 @@ function yo_default() {
   };
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/registries.js
+// node_modules/zod/v4/core/registries.js
 var _a;
 var $output = /* @__PURE__ */ Symbol("ZodOutput");
 var $input = /* @__PURE__ */ Symbol("ZodInput");
@@ -9856,7 +9856,7 @@ function registry() {
 (_a = globalThis).__zod_globalRegistry ?? (_a.__zod_globalRegistry = registry());
 var globalRegistry = globalThis.__zod_globalRegistry;
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/api.js
+// node_modules/zod/v4/core/api.js
 // @__NO_SIDE_EFFECTS__
 function _string(Class2, params) {
   return new Class2({
@@ -10895,7 +10895,7 @@ function _stringFormat(Class2, format, fnOrRegex, _params = {}) {
   return inst;
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/to-json-schema.js
+// node_modules/zod/v4/core/to-json-schema.js
 function initializeContext(params) {
   let target = params?.target ?? "draft-2020-12";
   if (target === "draft-4")
@@ -11247,7 +11247,7 @@ var createStandardJSONSchemaMethod = (schema, io, processors = {}) => (params) =
   return finalize(ctx, schema);
 };
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/json-schema-processors.js
+// node_modules/zod/v4/core/json-schema-processors.js
 var formatMap = {
   guid: "uuid",
   url: "uri",
@@ -11798,7 +11798,7 @@ function toJSONSchema(input, params) {
   return finalize(ctx, input);
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/json-schema-generator.js
+// node_modules/zod/v4/core/json-schema-generator.js
 var JSONSchemaGenerator = class {
   /** @deprecated Access via ctx instead */
   get metadataRegistry() {
@@ -11873,10 +11873,10 @@ var JSONSchemaGenerator = class {
   }
 };
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/core/json-schema.js
+// node_modules/zod/v4/core/json-schema.js
 var json_schema_exports = {};
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/classic/schemas.js
+// node_modules/zod/v4/classic/schemas.js
 var schemas_exports2 = {};
 __export(schemas_exports2, {
   ZodAny: () => ZodAny,
@@ -12045,7 +12045,7 @@ __export(schemas_exports2, {
   xor: () => xor
 });
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/classic/checks.js
+// node_modules/zod/v4/classic/checks.js
 var checks_exports2 = {};
 __export(checks_exports2, {
   endsWith: () => _endsWith,
@@ -12079,7 +12079,7 @@ __export(checks_exports2, {
   uppercase: () => _uppercase
 });
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/classic/iso.js
+// node_modules/zod/v4/classic/iso.js
 var iso_exports = {};
 __export(iso_exports, {
   ZodISODate: () => ZodISODate,
@@ -12120,7 +12120,7 @@ function duration2(params) {
   return _isoDuration(ZodISODuration, params);
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/classic/errors.js
+// node_modules/zod/v4/classic/errors.js
 var initializer2 = (inst, issues) => {
   $ZodError.init(inst, issues);
   inst.name = "ZodError";
@@ -12160,7 +12160,7 @@ var ZodRealError = $constructor("ZodError", initializer2, {
   Parent: Error
 });
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/classic/parse.js
+// node_modules/zod/v4/classic/parse.js
 var parse2 = /* @__PURE__ */ _parse(ZodRealError);
 var parseAsync2 = /* @__PURE__ */ _parseAsync(ZodRealError);
 var safeParse2 = /* @__PURE__ */ _safeParse(ZodRealError);
@@ -12174,7 +12174,7 @@ var safeDecode2 = /* @__PURE__ */ _safeDecode(ZodRealError);
 var safeEncodeAsync2 = /* @__PURE__ */ _safeEncodeAsync(ZodRealError);
 var safeDecodeAsync2 = /* @__PURE__ */ _safeDecodeAsync(ZodRealError);
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/classic/schemas.js
+// node_modules/zod/v4/classic/schemas.js
 var ZodType = /* @__PURE__ */ $constructor("ZodType", (inst, def) => {
   $ZodType.init(inst, def);
   Object.assign(inst["~standard"], {
@@ -13253,7 +13253,7 @@ function preprocess(fn, schema) {
   return pipe(transform(fn), schema);
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/classic/compat.js
+// node_modules/zod/v4/classic/compat.js
 var ZodIssueCode = {
   invalid_type: "invalid_type",
   too_big: "too_big",
@@ -13279,7 +13279,7 @@ var ZodFirstPartyTypeKind;
 /* @__PURE__ */ (function(ZodFirstPartyTypeKind2) {
 })(ZodFirstPartyTypeKind || (ZodFirstPartyTypeKind = {}));
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/classic/from-json-schema.js
+// node_modules/zod/v4/classic/from-json-schema.js
 var z = {
   ...schemas_exports2,
   ...checks_exports2,
@@ -13753,7 +13753,7 @@ function fromJSONSchema(schema, params) {
   return convertSchema(schema, ctx);
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/classic/coerce.js
+// node_modules/zod/v4/classic/coerce.js
 var coerce_exports = {};
 __export(coerce_exports, {
   bigint: () => bigint3,
@@ -13778,7 +13778,7 @@ function date4(params) {
   return _coercedDate(ZodDate, params);
 }
 
-// ../../../../Projects/bb-collab/node_modules/zod/v4/classic/external.js
+// node_modules/zod/v4/classic/external.js
 config(en_default());
 
 // src/foundation.ts
@@ -13823,6 +13823,7 @@ var LLM_COLLAB_MERGED_MAIN_SHA = "0686d34";
 var LLM_COLLAB_EVIDENCE_RESOURCE_REVISION = 4;
 var EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION = "no canonical state existed to migrate; historical archive preserved as evidence, read-only";
 var MAX_EXPORT_ROWS = 256;
+var MAX_ROLE_CONTEXT_EVENTS = 256;
 var MAX_EXPORT_BYTES = 512 * 1024;
 var MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 8);
 var TABLES = [
@@ -15194,8 +15195,11 @@ function stringField(value) {
 }
 function resolveRoleContext(reader, request, allowFirstDirectorEnvironment = false) {
   if (!reader || !request.roleContext) throw refusal("ROLE_CONTEXT_REQUIRED", "exact BB role context facts are required");
+  const roleContext = request.roleContext;
   let thread;
-  let events;
+  let requestEvent;
+  let completion;
+  let correlationEvents;
   let environment;
   let project;
   let host;
@@ -15204,7 +15208,12 @@ function resolveRoleContext(reader, request, allowFirstDirectorEnvironment = fal
   try {
     bbServerId = reader.serverId();
     thread = reader.thread(request.roleContext.threadId);
-    events = reader.events(request.roleContext.threadId);
+    requestEvent = reader.event(request.roleContext.threadId, request.roleContext.requestEventId, request.roleContext.requestEventSeq);
+    completion = reader.event(request.roleContext.threadId, request.roleContext.completionEventId, request.roleContext.completionEventSeq);
+    if (roleContext.completionEventSeq <= roleContext.requestEventSeq) {
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion event sequence does not follow the request event sequence");
+    }
+    correlationEvents = reader.eventsAfter(roleContext.threadId, roleContext.requestEventSeq, MAX_ROLE_CONTEXT_EVENTS + 1);
     if (!thread.environmentId) throw refusal("ROLE_CONTEXT_REQUIRED", "holder thread has no environment");
     environment = reader.environment(thread.environmentId);
     project = reader.project(request.projectId);
@@ -15242,17 +15251,40 @@ ${thread.titleFallback ?? ""}`)) {
     throw refusal("ROLE_CONTEXT_FOREIGN", "first director environment path does not match its canonical source path");
   }
   if (host.id !== environment.hostId || host.status !== "connected") throw refusal("ROLE_CONTEXT_UNKNOWN", "holder host is unavailable");
-  if (!stringField(bbVersion) || !stringField(bbServerId) || events.length === 0 || events.length > 256) {
-    throw refusal("ROLE_CONTEXT_UNKNOWN", "bounded BB version or event facts are unavailable");
+  if (!stringField(bbVersion) || !stringField(bbServerId)) {
+    throw refusal("ROLE_CONTEXT_UNKNOWN", "BB version or event facts are unavailable");
   }
-  for (let index = 1; index < events.length; index += 1) {
-    if (events[index].seq <= events[index - 1].seq) throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "BB event ordering is ambiguous");
+  if (requestEvent.id !== request.roleContext.requestEventId || requestEvent.seq !== request.roleContext.requestEventSeq || requestEvent.type !== "client/turn/requested") {
+    throw refusal("EXECUTION_PROFILE_UNKNOWN", "the exact execution-bearing request event is unavailable");
   }
-  const requestEvents = events.filter(
-    (event) => event.id === request.roleContext.requestEventId && event.seq === request.roleContext.requestEventSeq && event.type === "client/turn/requested"
+  if (completion.id !== request.roleContext.completionEventId || completion.seq !== request.roleContext.completionEventSeq) {
+    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion does not match the exact requested correlation");
+  }
+  const completionIndex = correlationEvents.findIndex(
+    (event) => event.id === roleContext.completionEventId && event.seq === roleContext.completionEventSeq
   );
-  if (requestEvents.length !== 1) throw refusal("EXECUTION_PROFILE_UNKNOWN", "the exact execution-bearing request event is unavailable");
-  const requestEvent = requestEvents[0];
+  if (completionIndex < 0) {
+    const passedCompletion = correlationEvents.some((event) => event.seq >= roleContext.completionEventSeq);
+    if (!passedCompletion && correlationEvents.length > MAX_ROLE_CONTEXT_EVENTS) {
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "cited turn exceeds 256 actual reader-returned correlation events");
+    }
+    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned correlation is not terminated by the exact cited completion");
+  }
+  const linkedEvents = correlationEvents.slice(0, completionIndex + 1);
+  for (let index = 0; index < linkedEvents.length; index += 1) {
+    const event = linkedEvents[index];
+    if (event.seq <= roleContext.requestEventSeq || index > 0 && event.seq <= linkedEvents[index - 1].seq) {
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned correlation events are not strictly ordered after the cited request");
+    }
+  }
+  const linkedCorrelationEvents = correlationEvents.slice(0, completionIndex);
+  if (linkedCorrelationEvents.length > MAX_ROLE_CONTEXT_EVENTS) {
+    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "cited turn exceeds 256 actual reader-returned correlation events");
+  }
+  if (correlationEvents[completionIndex].id !== completion.id || correlationEvents[completionIndex].seq !== completion.seq) {
+    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned completion does not match the exact cited completion");
+  }
+  const events = [requestEvent, ...linkedCorrelationEvents, completion];
   const execution = requestEvent.data.execution;
   const requestId = stringField(requestEvent.data.requestId);
   if (!execution || !requestId) throw refusal("EXECUTION_PROFILE_UNKNOWN", "execution request correlation is incomplete");
@@ -15276,8 +15308,8 @@ ${thread.titleFallback ?? ""}`)) {
   const startEvent = starts[0];
   const completions = events.filter((event) => event.type === "turn/completed" && event.data.providerThreadId === providerThreadId);
   if (completions.length !== 1) throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "correlated execution completion is missing or ambiguous");
-  const completion = completions[0];
-  if (completion.id !== request.roleContext.completionEventId || completion.seq !== request.roleContext.completionEventSeq) {
+  const correlatedCompletion = completions[0];
+  if (correlatedCompletion.id !== completion.id || correlatedCompletion.seq !== completion.seq) {
     throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion does not match the exact requested correlation");
   }
   if (completion.data.status !== "completed") throw refusal("EXECUTION_PROFILE_UNKNOWN", "execution did not complete successfully");
@@ -22231,7 +22263,8 @@ function unavailableRoleFactReader(serverId) {
   return {
     serverId: () => serverId,
     thread: unavailable,
-    events: unavailable,
+    event: unavailable,
+    eventsAfter: unavailable,
     environment: unavailable,
     project: unavailable,
     host: unavailable,
@@ -22241,8 +22274,23 @@ function unavailableRoleFactReader(serverId) {
 async function readLiveRoleFactReader(sdk, serverId, request) {
   if (!isRoleMutation(request) || !request.roleContext) return null;
   try {
-    const thread = await sdk.threads.get({ threadId: request.roleContext.threadId });
-    const events = await sdk.threads.events.list({ threadId: request.roleContext.threadId, limit: "257" });
+    const exactEvent = async (eventId, eventSeq) => {
+      const events = await sdk.threads.events.list({ threadId: request.roleContext.threadId, afterSeq: String(eventSeq - 1), limit: "1" });
+      if (events.length !== 1) throw new Error("exact role event is unavailable");
+      const event = events[0];
+      if (event.id !== eventId || event.seq !== eventSeq) throw new Error("exact role event identity does not match");
+      return { id: event.id, seq: event.seq, type: event.type, data: event.data };
+    };
+    const [thread, requestEvent, completionEvent] = await Promise.all([
+      sdk.threads.get({ threadId: request.roleContext.threadId }),
+      exactEvent(request.roleContext.requestEventId, request.roleContext.requestEventSeq),
+      exactEvent(request.roleContext.completionEventId, request.roleContext.completionEventSeq)
+    ]);
+    const correlationEvents = await sdk.threads.events.list({
+      threadId: request.roleContext.threadId,
+      afterSeq: String(request.roleContext.requestEventSeq),
+      limit: String(MAX_ROLE_CONTEXT_EVENTS + 1)
+    });
     const environment = thread.environmentId ? await sdk.environments.get({ environmentId: thread.environmentId }) : null;
     const [project, version2, host] = await Promise.all([
       sdk.projects.get({ projectId: request.projectId }),
@@ -22261,7 +22309,9 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
         status: thread.status,
         visibility: thread.visibility
       },
-      events: events.map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data })),
+      requestEvent,
+      completionEvent,
+      correlationEvents: correlationEvents.map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data })),
       environment: {
         id: environment.id,
         projectId: environment.projectId,
@@ -22290,7 +22340,13 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
     return {
       serverId: () => serverId,
       thread: (threadId) => threadId === facts.thread.id ? structuredClone(facts.thread) : unavailableRoleFactReader(serverId).thread(threadId),
-      events: (threadId) => threadId === facts.thread.id ? structuredClone(facts.events) : unavailableRoleFactReader(serverId).events(threadId),
+      event: (threadId, eventId, eventSeq) => {
+        if (threadId !== facts.thread.id) return unavailableRoleFactReader(serverId).event(threadId, eventId, eventSeq);
+        if (eventId === request.roleContext.requestEventId && eventSeq === request.roleContext.requestEventSeq) return structuredClone(facts.requestEvent);
+        if (eventId === request.roleContext.completionEventId && eventSeq === request.roleContext.completionEventSeq) return structuredClone(facts.completionEvent);
+        return unavailableRoleFactReader(serverId).event(threadId, eventId, eventSeq);
+      },
+      eventsAfter: (threadId, afterSeq, limit) => threadId === facts.thread.id && afterSeq === request.roleContext.requestEventSeq && limit === MAX_ROLE_CONTEXT_EVENTS + 1 ? structuredClone(facts.correlationEvents) : unavailableRoleFactReader(serverId).eventsAfter(threadId, afterSeq, limit),
       environment: (environmentId) => environmentId === facts.environment.id ? structuredClone(facts.environment) : unavailableRoleFactReader(serverId).environment(environmentId),
       project: (projectId) => projectId === facts.project.id ? structuredClone(facts.project) : unavailableRoleFactReader(serverId).project(projectId),
       host: (hostId) => hostId === facts.host.id ? structuredClone(facts.host) : unavailableRoleFactReader(serverId).host(hostId),
@@ -23126,6 +23182,7 @@ ${thread.titleFallback ?? ""}`);
 export {
   plugin as default,
   foundationResultSchema,
+  readLiveRoleFactReader,
   rpcContract
 };
 //# sourceMappingURL=server.js.map
