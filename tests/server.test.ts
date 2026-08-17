@@ -23,6 +23,7 @@ import {
   MAX_EXPORT_BYTES,
   MAX_SOURCE_EVIDENCE_MANIFEST_BYTES,
   MIGRATIONS,
+  MAX_ROLE_CONTEXT_EVENTS,
   MIGRATION_STATES,
   MIGRATION_STEPS,
   PREVIOUS_V11_DERIVED_ACTOR_MUTATION_CLASSES,
@@ -397,7 +398,10 @@ function hostFor(
           canSpawnChild: true,
         }),
         events: {
-          list: async () => roleFacts.facts.events.map((event) => ({
+          list: async ({ afterSeq, limit }) => roleFacts.facts.events
+            .filter((event) => afterSeq === undefined || event.seq > Number(afterSeq))
+            .slice(0, limit === undefined ? undefined : Number(limit))
+            .map((event) => ({
             id: event.id,
             threadId: roleFacts.facts.thread.id,
             seq: event.seq,
@@ -405,7 +409,7 @@ function hostFor(
             scope: { kind: "thread" as const },
             data: event.data,
             createdAt: event.seq,
-          })),
+            })),
         },
       },
       environments: {
@@ -6942,9 +6946,8 @@ describe("bb-collab plugin boundary", () => {
         facts.environment.status = "provisioning";
       }, "ROLE_CONTEXT_FOREIGN"],
       ["host-unavailable", (facts) => { facts.host.status = "disconnected"; }, "ROLE_CONTEXT_UNKNOWN"],
-      ["missing-start", (facts) => { facts.events = facts.events.filter((event) => event.type !== "turn/started"); }, "EXECUTION_PROFILE_UNKNOWN"],
+      ["missing-start", (facts) => { facts.events = facts.events.filter((event) => event.type !== "turn/started"); }, "EXECUTION_COMPLETION_AMBIGUOUS"],
       ["failed-completion", (facts) => { facts.events[3]!.data.status = "failed"; }, "EXECUTION_PROFILE_UNKNOWN"],
-      ["duplicate-completion", (facts) => { facts.events.push({ id: "completion-2", seq: 5, type: "turn/completed", data: { providerThreadId: "provider-thread-1", status: "completed" } }); }, "EXECUTION_COMPLETION_AMBIGUOUS"],
       ["model-fallback", (facts) => {
         facts.events[3]!.seq = 5;
         facts.events.splice(3, 0, { id: "fallback", seq: 4, type: "provider/modelFallback", data: { providerThreadId: "provider-thread-1" } });
@@ -6961,6 +6964,72 @@ describe("bb-collab plugin boundary", () => {
       }), null, roleReader(mutate));
       expect(result.outcome, name).toBe(outcome);
       expect(exportFoundation(db, PROJECT_ID), name).toEqual(before);
+    }
+  });
+
+  it("binds the cited completion without treating later same-provider turns as the cited turn", async () => {
+    const { db, fenceToken } = seedAndBootstrap(await loadedHost(), PROJECT_ID, { config: roleConfig() });
+    const facts = roleReader((input) => {
+      input.events.push({ id: "later-completion", seq: 5, type: "turn/completed", data: { providerThreadId: "provider-thread-1", status: "completed" } });
+    });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "cited-completion-only",
+      qualificationId: "cited-completion-only",
+    }), null, facts)).toMatchObject({ outcome: "OK", attempted: 1, verified: 1 });
+  });
+
+  it("resolves a long-lived holder from exact cited events without enumerating its history", async () => {
+    const { db, fenceToken } = seedAndBootstrap(await loadedHost(), PROJECT_ID, { config: roleConfig() });
+    const roleContext = {
+      threadId: ROLE_THREAD_ID,
+      requestEventId: ROLE_REQUEST_EVENT_ID,
+      requestEventSeq: 15_220,
+      completionEventId: ROLE_COMPLETION_EVENT_ID,
+      completionEventSeq: 15_223,
+    };
+    const facts = roleReader((input) => {
+      const [request, accepted, started, completion] = input.events;
+      input.events = [
+        ...Array.from({ length: 15_219 }, (_, index) => ({ id: `history-${index + 1}`, seq: index + 1, type: "agent/delta", data: {} })),
+        { ...request!, seq: roleContext.requestEventSeq },
+        { ...accepted!, seq: roleContext.requestEventSeq + 1 },
+        { ...started!, seq: roleContext.requestEventSeq + 2 },
+        { ...completion!, seq: roleContext.completionEventSeq },
+      ];
+    });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "long-lived-exact-events",
+      qualificationId: "long-lived-exact-events",
+      roleContext,
+    }), null, facts)).toMatchObject({ outcome: "OK", attempted: 1, verified: 1 });
+    expect(facts.readCalls).toEqual([
+      "server.id",
+      `thread:${ROLE_THREAD_ID}`,
+      `event:${ROLE_THREAD_ID}:${ROLE_REQUEST_EVENT_ID}:15220`,
+      `event:${ROLE_THREAD_ID}:${ROLE_COMPLETION_EVENT_ID}:15223`,
+      `eventsAfter:${ROLE_THREAD_ID}:15220:2`,
+      `environment:${ROLE_ENVIRONMENT_ID}`,
+      `project:${PROJECT_ID}`,
+      "host:host-main",
+      "system.version",
+    ]);
+  });
+
+  it("refuses mismatched or unsupported bounded role-event ordering evidence without mutation", async () => {
+    const { db, fenceToken } = seedAndBootstrap(await loadedHost(), PROJECT_ID, { config: roleConfig() });
+    const cases: Array<[string, ReturnType<typeof roleReader>, Partial<ApplyRequest>, string]> = [
+      ["mismatched-sequence", roleReader(), { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 2, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 4 } }, "ROLE_CONTEXT_UNKNOWN"],
+      ["oversized-slice", roleReader((facts) => { facts.events[3]!.seq = 1 + MAX_ROLE_CONTEXT_EVENTS + 1; }), { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 1 + MAX_ROLE_CONTEXT_EVENTS + 1 } }, "EXECUTION_COMPLETION_AMBIGUOUS"],
+      ["locally-unordered-slice", roleReader((facts) => { [facts.events[1], facts.events[2]] = [facts.events[2]!, facts.events[1]!]; }), {}, "EXECUTION_COMPLETION_AMBIGUOUS"],
+    ];
+    for (const [name, facts, override, outcome] of cases) {
+      const before = exportFoundation(db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+        idempotencyKey: `bounded-order-${name}`,
+        qualificationId: `bounded-order-${name}`,
+        ...override,
+      }), null, facts)).toMatchObject({ outcome, attempted: 0, verified: 0 });
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
     }
   });
 
@@ -7042,7 +7111,9 @@ describe("bb-collab plugin boundary", () => {
       expect(facts.readCalls).toEqual([
         "server.id",
         `thread:${ROLE_THREAD_ID}`,
-        `events:${ROLE_THREAD_ID}`,
+        `event:${ROLE_THREAD_ID}:${ROLE_REQUEST_EVENT_ID}:1`,
+        `event:${ROLE_THREAD_ID}:${ROLE_COMPLETION_EVENT_ID}:4`,
+        `eventsAfter:${ROLE_THREAD_ID}:1:2`,
         `environment:${ROLE_ENVIRONMENT_ID}`,
         `project:${PROJECT_ID}`,
         "host:host-main",

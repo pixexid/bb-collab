@@ -13823,6 +13823,7 @@ var LLM_COLLAB_MERGED_MAIN_SHA = "0686d34";
 var LLM_COLLAB_EVIDENCE_RESOURCE_REVISION = 4;
 var EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION = "no canonical state existed to migrate; historical archive preserved as evidence, read-only";
 var MAX_EXPORT_ROWS = 256;
+var MAX_ROLE_CONTEXT_EVENTS = 256;
 var MAX_EXPORT_BYTES = 512 * 1024;
 var MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 8);
 var TABLES = [
@@ -15194,8 +15195,11 @@ function stringField(value) {
 }
 function resolveRoleContext(reader, request, allowFirstDirectorEnvironment = false) {
   if (!reader || !request.roleContext) throw refusal("ROLE_CONTEXT_REQUIRED", "exact BB role context facts are required");
+  const roleContext = request.roleContext;
   let thread;
-  let events;
+  let requestEvent;
+  let completion;
+  let correlationEvents;
   let environment;
   let project;
   let host;
@@ -15204,7 +15208,16 @@ function resolveRoleContext(reader, request, allowFirstDirectorEnvironment = fal
   try {
     bbServerId = reader.serverId();
     thread = reader.thread(request.roleContext.threadId);
-    events = reader.events(request.roleContext.threadId);
+    requestEvent = reader.event(request.roleContext.threadId, request.roleContext.requestEventId, request.roleContext.requestEventSeq);
+    completion = reader.event(request.roleContext.threadId, request.roleContext.completionEventId, request.roleContext.completionEventSeq);
+    if (request.roleContext.completionEventSeq <= request.roleContext.requestEventSeq) {
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded event ordering evidence is unavailable");
+    }
+    const correlationEventCount = request.roleContext.completionEventSeq - request.roleContext.requestEventSeq - 1;
+    if (correlationEventCount > MAX_ROLE_CONTEXT_EVENTS) {
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded event ordering evidence exceeds the role-context limit");
+    }
+    correlationEvents = reader.eventsAfter(request.roleContext.threadId, request.roleContext.requestEventSeq, correlationEventCount);
     if (!thread.environmentId) throw refusal("ROLE_CONTEXT_REQUIRED", "holder thread has no environment");
     environment = reader.environment(thread.environmentId);
     project = reader.project(request.projectId);
@@ -15242,17 +15255,21 @@ ${thread.titleFallback ?? ""}`)) {
     throw refusal("ROLE_CONTEXT_FOREIGN", "first director environment path does not match its canonical source path");
   }
   if (host.id !== environment.hostId || host.status !== "connected") throw refusal("ROLE_CONTEXT_UNKNOWN", "holder host is unavailable");
-  if (!stringField(bbVersion) || !stringField(bbServerId) || events.length === 0 || events.length > 256) {
-    throw refusal("ROLE_CONTEXT_UNKNOWN", "bounded BB version or event facts are unavailable");
+  if (!stringField(bbVersion) || !stringField(bbServerId)) {
+    throw refusal("ROLE_CONTEXT_UNKNOWN", "BB version or event facts are unavailable");
   }
-  for (let index = 1; index < events.length; index += 1) {
-    if (events[index].seq <= events[index - 1].seq) throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "BB event ordering is ambiguous");
+  if (requestEvent.id !== request.roleContext.requestEventId || requestEvent.seq !== request.roleContext.requestEventSeq || requestEvent.type !== "client/turn/requested") {
+    throw refusal("EXECUTION_PROFILE_UNKNOWN", "the exact execution-bearing request event is unavailable");
   }
-  const requestEvents = events.filter(
-    (event) => event.id === request.roleContext.requestEventId && event.seq === request.roleContext.requestEventSeq && event.type === "client/turn/requested"
-  );
-  if (requestEvents.length !== 1) throw refusal("EXECUTION_PROFILE_UNKNOWN", "the exact execution-bearing request event is unavailable");
-  const requestEvent = requestEvents[0];
+  if (completion.id !== request.roleContext.completionEventId || completion.seq !== request.roleContext.completionEventSeq) {
+    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion does not match the exact requested correlation");
+  }
+  if (correlationEvents.length !== request.roleContext.completionEventSeq - request.roleContext.requestEventSeq - 1 || correlationEvents.some(
+    (event, index) => event.seq <= roleContext.requestEventSeq || event.seq >= roleContext.completionEventSeq || index > 0 && event.seq <= correlationEvents[index - 1].seq
+  )) {
+    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "bounded event ordering evidence is incomplete or ambiguous");
+  }
+  const events = [requestEvent, ...correlationEvents, completion];
   const execution = requestEvent.data.execution;
   const requestId = stringField(requestEvent.data.requestId);
   if (!execution || !requestId) throw refusal("EXECUTION_PROFILE_UNKNOWN", "execution request correlation is incomplete");
@@ -15276,8 +15293,8 @@ ${thread.titleFallback ?? ""}`)) {
   const startEvent = starts[0];
   const completions = events.filter((event) => event.type === "turn/completed" && event.data.providerThreadId === providerThreadId);
   if (completions.length !== 1) throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "correlated execution completion is missing or ambiguous");
-  const completion = completions[0];
-  if (completion.id !== request.roleContext.completionEventId || completion.seq !== request.roleContext.completionEventSeq) {
+  const correlatedCompletion = completions[0];
+  if (correlatedCompletion.id !== completion.id || correlatedCompletion.seq !== completion.seq) {
     throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion does not match the exact requested correlation");
   }
   if (completion.data.status !== "completed") throw refusal("EXECUTION_PROFILE_UNKNOWN", "execution did not complete successfully");
@@ -22231,7 +22248,8 @@ function unavailableRoleFactReader(serverId) {
   return {
     serverId: () => serverId,
     thread: unavailable,
-    events: unavailable,
+    event: unavailable,
+    eventsAfter: unavailable,
     environment: unavailable,
     project: unavailable,
     host: unavailable,
@@ -22241,8 +22259,20 @@ function unavailableRoleFactReader(serverId) {
 async function readLiveRoleFactReader(sdk, serverId, request) {
   if (!isRoleMutation(request) || !request.roleContext) return null;
   try {
-    const thread = await sdk.threads.get({ threadId: request.roleContext.threadId });
-    const events = await sdk.threads.events.list({ threadId: request.roleContext.threadId, limit: "257" });
+    const exactEvent = async (eventId, eventSeq) => {
+      const events = await sdk.threads.events.list({ threadId: request.roleContext.threadId, afterSeq: String(eventSeq - 1), limit: "1" });
+      if (events.length !== 1) throw new Error("exact role event is unavailable");
+      const event = events[0];
+      if (event.id !== eventId || event.seq !== eventSeq) throw new Error("exact role event identity does not match");
+      return { id: event.id, seq: event.seq, type: event.type, data: event.data };
+    };
+    const [thread, requestEvent, completionEvent] = await Promise.all([
+      sdk.threads.get({ threadId: request.roleContext.threadId }),
+      exactEvent(request.roleContext.requestEventId, request.roleContext.requestEventSeq),
+      exactEvent(request.roleContext.completionEventId, request.roleContext.completionEventSeq)
+    ]);
+    const correlationEventCount = request.roleContext.completionEventSeq - request.roleContext.requestEventSeq - 1;
+    const correlationEvents = correlationEventCount > 0 && correlationEventCount <= MAX_ROLE_CONTEXT_EVENTS ? await sdk.threads.events.list({ threadId: request.roleContext.threadId, afterSeq: String(request.roleContext.requestEventSeq), limit: String(correlationEventCount) }) : [];
     const environment = thread.environmentId ? await sdk.environments.get({ environmentId: thread.environmentId }) : null;
     const [project, version2, host] = await Promise.all([
       sdk.projects.get({ projectId: request.projectId }),
@@ -22261,7 +22291,9 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
         status: thread.status,
         visibility: thread.visibility
       },
-      events: events.map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data })),
+      requestEvent,
+      completionEvent,
+      correlationEvents: correlationEvents.map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data })),
       environment: {
         id: environment.id,
         projectId: environment.projectId,
@@ -22290,7 +22322,13 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
     return {
       serverId: () => serverId,
       thread: (threadId) => threadId === facts.thread.id ? structuredClone(facts.thread) : unavailableRoleFactReader(serverId).thread(threadId),
-      events: (threadId) => threadId === facts.thread.id ? structuredClone(facts.events) : unavailableRoleFactReader(serverId).events(threadId),
+      event: (threadId, eventId, eventSeq) => {
+        if (threadId !== facts.thread.id) return unavailableRoleFactReader(serverId).event(threadId, eventId, eventSeq);
+        if (eventId === request.roleContext.requestEventId && eventSeq === request.roleContext.requestEventSeq) return structuredClone(facts.requestEvent);
+        if (eventId === request.roleContext.completionEventId && eventSeq === request.roleContext.completionEventSeq) return structuredClone(facts.completionEvent);
+        return unavailableRoleFactReader(serverId).event(threadId, eventId, eventSeq);
+      },
+      eventsAfter: (threadId, afterSeq, limit) => threadId === facts.thread.id && afterSeq === request.roleContext.requestEventSeq && limit <= MAX_ROLE_CONTEXT_EVENTS ? structuredClone(facts.correlationEvents) : unavailableRoleFactReader(serverId).eventsAfter(threadId, afterSeq, limit),
       environment: (environmentId) => environmentId === facts.environment.id ? structuredClone(facts.environment) : unavailableRoleFactReader(serverId).environment(environmentId),
       project: (projectId) => projectId === facts.project.id ? structuredClone(facts.project) : unavailableRoleFactReader(serverId).project(projectId),
       host: (hostId) => hostId === facts.host.id ? structuredClone(facts.host) : unavailableRoleFactReader(serverId).host(hostId),

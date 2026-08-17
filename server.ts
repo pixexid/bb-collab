@@ -17,6 +17,7 @@ import {
 import {
   BB_VERSION_RANGE,
   MIGRATIONS,
+  MAX_ROLE_CONTEXT_EVENTS,
   PLUGIN_ID,
   PLUGIN_SDK_VERSION,
   assembleV20CachedConsumerRolloutEvidence,
@@ -406,7 +407,8 @@ function unavailableRoleFactReader(serverId: string): RoleFactReader {
   return {
     serverId: () => serverId,
     thread: unavailable,
-    events: unavailable,
+    event: unavailable,
+    eventsAfter: unavailable,
     environment: unavailable,
     project: unavailable,
     host: unavailable,
@@ -421,8 +423,22 @@ async function readLiveRoleFactReader(
 ): Promise<RoleFactReader | null> {
   if (!isRoleMutation(request) || !request.roleContext) return null;
   try {
-    const thread = await sdk.threads.get({ threadId: request.roleContext.threadId });
-    const events = await sdk.threads.events.list({ threadId: request.roleContext.threadId, limit: "257" });
+    const exactEvent = async (eventId: string, eventSeq: number) => {
+      const events = await sdk.threads.events.list({ threadId: request.roleContext!.threadId, afterSeq: String(eventSeq - 1), limit: "1" });
+      if (events.length !== 1) throw new Error("exact role event is unavailable");
+      const event = events[0]!;
+      if (event.id !== eventId || event.seq !== eventSeq) throw new Error("exact role event identity does not match");
+      return { id: event.id, seq: event.seq, type: event.type, data: event.data as Record<string, unknown> };
+    };
+    const [thread, requestEvent, completionEvent] = await Promise.all([
+      sdk.threads.get({ threadId: request.roleContext.threadId }),
+      exactEvent(request.roleContext.requestEventId, request.roleContext.requestEventSeq),
+      exactEvent(request.roleContext.completionEventId, request.roleContext.completionEventSeq),
+    ]);
+    const correlationEventCount = request.roleContext.completionEventSeq - request.roleContext.requestEventSeq - 1;
+    const correlationEvents = correlationEventCount > 0 && correlationEventCount <= MAX_ROLE_CONTEXT_EVENTS
+      ? await sdk.threads.events.list({ threadId: request.roleContext.threadId, afterSeq: String(request.roleContext.requestEventSeq), limit: String(correlationEventCount) })
+      : [];
     const environment = thread.environmentId ? await sdk.environments.get({ environmentId: thread.environmentId }) : null;
     const [project, version, host] = await Promise.all([
       sdk.projects.get({ projectId: request.projectId }),
@@ -441,7 +457,9 @@ async function readLiveRoleFactReader(
         status: thread.status,
         visibility: thread.visibility,
       },
-      events: events.map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data as Record<string, unknown> })),
+      requestEvent,
+      completionEvent,
+      correlationEvents: correlationEvents.map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data as Record<string, unknown> })),
       environment: {
         id: environment.id,
         projectId: environment.projectId,
@@ -470,7 +488,15 @@ async function readLiveRoleFactReader(
     return {
       serverId: () => serverId,
       thread: (threadId) => threadId === facts.thread.id ? structuredClone(facts.thread) : unavailableRoleFactReader(serverId).thread(threadId),
-      events: (threadId) => threadId === facts.thread.id ? structuredClone(facts.events) : unavailableRoleFactReader(serverId).events(threadId),
+      event: (threadId, eventId, eventSeq) => {
+        if (threadId !== facts.thread.id) return unavailableRoleFactReader(serverId).event(threadId, eventId, eventSeq);
+        if (eventId === request.roleContext!.requestEventId && eventSeq === request.roleContext!.requestEventSeq) return structuredClone(facts.requestEvent);
+        if (eventId === request.roleContext!.completionEventId && eventSeq === request.roleContext!.completionEventSeq) return structuredClone(facts.completionEvent);
+        return unavailableRoleFactReader(serverId).event(threadId, eventId, eventSeq);
+      },
+      eventsAfter: (threadId, afterSeq, limit) => threadId === facts.thread.id && afterSeq === request.roleContext!.requestEventSeq && limit <= MAX_ROLE_CONTEXT_EVENTS
+        ? structuredClone(facts.correlationEvents)
+        : unavailableRoleFactReader(serverId).eventsAfter(threadId, afterSeq, limit),
       environment: (environmentId) => environmentId === facts.environment.id ? structuredClone(facts.environment) : unavailableRoleFactReader(serverId).environment(environmentId),
       project: (projectId) => projectId === facts.project.id ? structuredClone(facts.project) : unavailableRoleFactReader(serverId).project(projectId),
       host: (hostId) => hostId === facts.host.id ? structuredClone(facts.host) : unavailableRoleFactReader(serverId).host(hostId),

@@ -277,17 +277,24 @@ only from a persisted receipt with four expected, attempted, and verified
 rereads plus the discriminating stale-v16 refusal; unavailable rollout
 evidence is reported as unknown and is not success.
 
-Contract v18 preserves those director-role semantics and corrects the
-cached-consumer rollout mechanism only. The four production consumers are the
-registered RPC `doctor` handler, CLI `doctor` dispatcher, and separately named
-live-project clone validations for the stale policy. Each must reread v18 or
-the stale-v17 clone must refuse `INVALID_INPUT`; expected, attempted, and
-verified are each 4. Only the v18 receipt is current. Missing or v17 receipt
-evidence is unknown and fail-closed; no automatic v17 receipt migration or
-write occurs.
-The v18 receipt is necessarily produced after the v18 running `dist` is live
-through the reloaded plugin under the same provenance. That one self-gating
-repair is acceptable because otherwise the corrected mechanism cannot land.
+Contract v20 replaces the whole-log role-context read with exact cited-event
+identity reads and a bounded interior correlation slice. The 256-event limit
+is unchanged. The request and completion are independently checked by their
+exact IDs and sequences; the bounded slice retains accepted/start/completion
+correlation and fallback refusal. Historical global sequence ordering cannot
+be proved by those reads and is not silently assumed: inverted, oversized,
+incomplete, or locally unordered ordering evidence refuses
+`EXECUTION_COMPLETION_AMBIGUOUS` before any canonical write. The director
+first-generation exemption is unchanged.
+Later events for the same provider thread are outside the cited turn and do
+not make its exact completion ambiguous; its exact ID and sequence bind one turn.
+
+The four production cached consumers must reread v20; the v20 receipt is the
+only current rollout evidence. Missing or v18 receipt evidence is unknown and
+fail-closed; no automatic receipt migration or write occurs. The receipt is
+necessarily produced after v20 running `dist` is live through the reloaded
+plugin under the same provenance. That one self-gating repair is acceptable
+because otherwise the corrected mechanism cannot land.
 The gate closes only when doctor reports 4/4/4 VERIFIED from LIVE STATE, not
 on merge, suite, or review.
 
