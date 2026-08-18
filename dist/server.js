@@ -14984,6 +14984,16 @@ var MIGRATIONS = [
     FOREIGN KEY (project_id, role_id, current_generation)
       REFERENCES role_generations(project_id, role_id, generation)
   )`,
+  // Retained deliberately, not vestigial. The assignment subsystem was severed in full
+  // (no reads, no writes), but this table cannot be dropped: execution_attempts
+  // declares FOREIGN KEY (project_id, assignment_id) REFERENCES assignments, and SQLite
+  // resolves an FK's parent table when it PREPARES the statement, not when it checks the
+  // value. With foreign_keys=ON, dropping this table makes every execution_attempts insert
+  // fail with "no such table: main.assignments" — including inserts whose assignment_id is
+  // NULL. PRAGMA foreign_key_check comes back clean after the drop, so the damage does not
+  // surface until the next write. Removing it therefore means rebuilding execution_attempts,
+  // which holds live role-holder history, to buy a cosmetic line-count gain. Ruled 2026-08-18:
+  // the table stays. GH-192 carries the reproduction and the ruling.
   `CREATE TABLE IF NOT EXISTS assignments (
     project_id TEXT NOT NULL,
     assignment_id TEXT NOT NULL,
