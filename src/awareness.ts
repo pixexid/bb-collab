@@ -248,6 +248,7 @@ export interface RoleIdleRecord {
   lastSteerAtMs: number | null;
   awaitingSteerOutcome: boolean;
   lastWakeAtMs: number | null;
+  lastEscalationAtMs: number | null;
 }
 
 export interface ContinuationClaim {
@@ -337,10 +338,11 @@ function roleIdleState(input: unknown): Record<string, RoleIdleRecord> {
     const lastSteerAtMs = typeof record.lastSteerAtMs === "number" && Number.isFinite(record.lastSteerAtMs) ? record.lastSteerAtMs : null;
     const awaitingSteerOutcome = record.awaitingSteerOutcome === true;
     const lastWakeAtMs = typeof record.lastWakeAtMs === "number" && Number.isFinite(record.lastWakeAtMs) ? record.lastWakeAtMs : null;
-    if (!Number.isInteger(record.steerCount) || (record.steerCount as number) < 0 || (record.steerCount as number) > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || (idleSinceMs !== null && idleSinceMs < 0) || (lastSteerAtMs !== null && lastSteerAtMs < 0) || (lastWakeAtMs !== null && lastWakeAtMs < 0) || typeof record.escalated !== "boolean") {
+    const lastEscalationAtMs = typeof record.lastEscalationAtMs === "number" && Number.isFinite(record.lastEscalationAtMs) ? record.lastEscalationAtMs : null;
+    if (!Number.isInteger(record.steerCount) || (record.steerCount as number) < 0 || (record.steerCount as number) > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || (idleSinceMs !== null && idleSinceMs < 0) || (lastSteerAtMs !== null && lastSteerAtMs < 0) || (lastWakeAtMs !== null && lastWakeAtMs < 0) || (lastEscalationAtMs !== null && lastEscalationAtMs < 0) || typeof record.escalated !== "boolean") {
       throw new Error("invalid role idle state");
     }
-    state[key] = { steerCount: record.steerCount as number, failedSteers, escalated: record.escalated as boolean, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastWakeAtMs };
+    state[key] = { steerCount: record.steerCount as number, failedSteers, escalated: record.escalated as boolean, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastWakeAtMs, lastEscalationAtMs };
   }
   return state;
 }
@@ -375,7 +377,7 @@ export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
         }
         return { ...record };
       }
-      state[key] = { ...(record ?? { steerCount: 0, failedSteers: 0, escalated: false, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null }), idleSinceMs, awaitingSteerOutcome: false };
+      state[key] = { ...(record ?? { steerCount: 0, failedSteers: 0, escalated: false, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null, lastEscalationAtMs: null }), idleSinceMs, awaitingSteerOutcome: false };
       await save();
       return { ...state[key] };
     }),
@@ -383,7 +385,7 @@ export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
       await load();
       const record = state[key];
       if (!record) return;
-      state[key] = { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: record.lastWakeAtMs };
+      state[key] = { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: record.lastWakeAtMs, lastEscalationAtMs: record.lastEscalationAtMs };
       await save();
     }),
     preserveAfterSteerWake: (key: string) => enqueue(async () => {
@@ -393,7 +395,7 @@ export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
     }),
     recordSteer: (key: string, failed: boolean, steeredAtMs: number) => enqueue(async () => {
       await load();
-      const record = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null };
+      const record = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null, lastEscalationAtMs: null };
       record.steerCount = Math.min(2, record.steerCount + 1);
       if (failed) record.failedSteers = Math.min(2, record.failedSteers + 1);
       record.lastSteerAtMs = steeredAtMs;
@@ -404,7 +406,7 @@ export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
     }),
     markEscalated: (key: string) => enqueue(async () => {
       await load();
-      const record = state[key] ?? { steerCount: 2, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null };
+      const record = state[key] ?? { steerCount: 2, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null, lastEscalationAtMs: null };
       if (record.escalated) return false;
       record.escalated = true;
       state[key] = record;
@@ -424,9 +426,16 @@ export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
     }),
     recordWake: (key: string, sentAtMs: number) => enqueue(async () => {
       await load();
-      const record = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null };
+      const record = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null, lastEscalationAtMs: null };
       const next = { ...record, lastWakeAtMs: sentAtMs };
       const nextState = { ...state, [key]: next };
+      await persistence?.write(structuredClone(nextState));
+      state = nextState;
+    }),
+    recordEscalation: (key: string, sentAtMs: number) => enqueue(async () => {
+      await load();
+      const record = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null, lastEscalationAtMs: null };
+      const nextState = { ...state, [key]: { ...record, lastEscalationAtMs: sentAtMs } };
       await persistence?.write(structuredClone(nextState));
       state = nextState;
     }),

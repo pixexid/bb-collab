@@ -2399,6 +2399,26 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
+  it("escalates unresolved work after the tier-1 receiver becomes active", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      fixture.setThreadStatus("active");
+      clock.mockReturnValue(2 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { threadId: string }).threadId)).toEqual([
+        fixture.orchestratorThreadId,
+        fixture.directorThreadId,
+      ]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it("drives the scheduled watchdog path through one scoped CLI cycle", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
@@ -2714,7 +2734,7 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("does not send when the director becomes active during the final interaction read", async () => {
+  it("escalates persistent unresolved work when the director becomes active during the final interaction read", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
       const fixture = await fleetWatchdogFixture(0);
@@ -2732,7 +2752,7 @@ describe("bb-collab plugin boundary", () => {
       await fixture.host.harness.runSchedule("fleet-watchdog");
       clock.mockReturnValue(2 * 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([input]) => (input as { threadId: string }).threadId === fixture.directorThreadId)).toHaveLength(0);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([input]) => (input as { threadId: string }).threadId === fixture.directorThreadId)).toHaveLength(1);
     } finally {
       clock.mockRestore();
     }
@@ -2784,10 +2804,10 @@ describe("bb-collab plugin boundary", () => {
       clock.mockReturnValue(3 * 60 * 60_000);
       fixture.setThreadStatus("idle");
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(3);
       clock.mockReturnValue(4 * 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(4);
     } finally {
       clock.mockRestore();
     }
