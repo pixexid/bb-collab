@@ -40,6 +40,7 @@ import {
   exportFoundation,
   probeV21NewLegacyApplyProvenanceRefusal,
   probeV21ConsumedLegacyReplay,
+  parseApplyRequest,
   schemaDigest,
   sha256,
   type ApplyRequest,
@@ -7595,6 +7596,97 @@ describe("bb-collab plugin boundary", () => {
     const missingProject = await host.harness.runCli(["doctor"]);
     expect(missingProject.exitCode).toBe(2);
     expect(JSON.parse(missingProject.stdout).outcome).toBe("INVALID_INPUT");
+  });
+
+  it("keeps the documented WorkItem create invocation strict", () => {
+    const request = workItemCreateRequest("fence-token");
+    expect(parseApplyRequest(request)).toMatchObject({
+      projectId: PROJECT_ID,
+      operationClass: "work_item_create",
+      idempotencyKey: "work-item-create-1",
+      actorReceiptId: RECEIPT_ID,
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: "fence-token",
+      repoTargetId: TARGET_ID,
+      expectedResourceRevision: null,
+      workItem: { workItemId: WORK_ITEM_ID, title: "Ship projection", body: "Keep canonical state local." },
+    });
+
+    const workItem = request.workItem!;
+    expect(() => parseApplyRequest({ ...request, workItem: { title: workItem.title, body: workItem.body } })).toThrow(/workItemId/i);
+    expect(() => parseApplyRequest({ ...request, actorReceiptId: { receiptId: RECEIPT_ID } })).toThrow(/actorReceiptId|expected string/i);
+    expect(() => parseApplyRequest({ ...request, idempotencyKey: undefined })).toThrow(/idempotencyKey/i);
+  });
+
+  it("registers a WorkItem through the documented live CLI path and watchdog read path", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const request = workItemCreateRequest(fenceToken, { idempotencyKey: "live-work-item-create" });
+    const cli = await host.harness.runCli(["apply", "--project", PROJECT_ID, "--request", JSON.stringify(request)]);
+    const result = JSON.parse(cli.stdout) as FoundationResult;
+
+    expect(cli.exitCode).toBe(0);
+    expect(result).toMatchObject({
+      outcome: "OK",
+      mutationReceipt: {
+        projectId: PROJECT_ID,
+        idempotencyKey: request.idempotencyKey,
+        operationClass: "work_item_create",
+      },
+    });
+    expect(db.prepare(
+      "SELECT project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?",
+    ).get(PROJECT_ID, WORK_ITEM_ID)).toEqual({
+      project_id: PROJECT_ID,
+      work_item_id: WORK_ITEM_ID,
+      config_revision: 1,
+      repo_target_id: TARGET_ID,
+      title: "Ship projection",
+      body: "Keep canonical state local.",
+      lifecycle_state: "proposed",
+      resource_revision: 1,
+    });
+    expect(db.prepare(
+      "SELECT project_id, idempotency_key, operation_class, request_digest, committed_event_sequence FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
+    ).get(PROJECT_ID, request.idempotencyKey)).toMatchObject({
+      project_id: PROJECT_ID,
+      idempotency_key: request.idempotencyKey,
+      operation_class: "work_item_create",
+      request_digest: result.mutationReceipt?.requestDigest,
+      committed_event_sequence: result.mutationReceipt?.committedEventSequence,
+    });
+
+    const watchdogOpenWorkItems = db.prepare(
+      `SELECT work_items.project_id, work_items.work_item_id, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
+       FROM work_items LEFT JOIN work_item_waits
+         ON work_item_waits.project_id = work_items.project_id AND work_item_waits.work_item_id = work_items.work_item_id
+       WHERE work_items.lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')
+       ORDER BY work_items.created_at_ms, work_items.work_item_id`,
+    ).all() as Array<{ project_id: string; work_item_id: string; waker: string | null; waker_kind: string | null; declared_at_ms: number | null }>;
+    expect(watchdogOpenWorkItems).toContainEqual({
+      project_id: PROJECT_ID,
+      work_item_id: WORK_ITEM_ID,
+      waker: null,
+      waker_kind: null,
+      declared_at_ms: null,
+    });
+  });
+
+  it("refuses an unknown actor before WorkItem or receipt commit", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const request = workItemCreateRequest(fenceToken, {
+      idempotencyKey: "live-work-item-unknown-actor",
+      actorReceiptId: "actor-receipt-not-in-store",
+    });
+    const cli = await host.harness.runCli(["apply", "--project", PROJECT_ID, "--request", JSON.stringify(request)]);
+    const result = JSON.parse(cli.stdout) as FoundationResult;
+
+    expect(cli.exitCode).toBe(2);
+    expect(result).toMatchObject({ outcome: "ACTOR_RECEIPT_UNKNOWN", attempted: 0, verified: 0 });
+    expect(db.prepare("SELECT 1 FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toBeUndefined();
+    expect(db.prepare("SELECT 1 FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?").get(PROJECT_ID, request.idempotencyKey)).toBeUndefined();
   });
 
   it("keeps fixture insertion outside the production RPC/CLI surface", async () => {
