@@ -6003,9 +6003,10 @@ export function exportFoundation(db: SqliteDatabase | null, projectId: string): 
         "records.ndjson": recordsDigest,
       },
     };
-    if (Buffer.byteLength(recordsNdjson, "utf8") + Buffer.byteLength(artifactIndexJson, "utf8") > MAX_EXPORT_BYTES) {
+    if (artifactIndex.length > MAX_EXPORT_ROWS ||
+      Buffer.byteLength(recordsNdjson, "utf8") + Buffer.byteLength(artifactIndexJson, "utf8") > MAX_EXPORT_BYTES) {
       const exportFile = writeFoundationExportFiles(db, projectId, exportPayload);
-      if (!exportFile) return result("EXPORT_BOUNDED", projectId, rowCount, rowCount, 0, { message: "export exceeds the inline byte limit and the canonical store is not file-backed" });
+      if (!exportFile) return result("EXPORT_BOUNDED", projectId, rowCount, rowCount, 0, { message: "export exceeds inline bounds and the canonical store is not file-backed" });
       return result("OK", projectId, rowCount, rowCount, rowCount, { evidence: { exportFile } });
     }
     return result("OK", projectId, rowCount, rowCount, rowCount, { export: exportPayload });

@@ -43,6 +43,7 @@ import {
   schemaDigest,
   sha256,
   type ApplyRequest,
+  type ExportFilePayload,
   type ExportPayload,
   type FoundationResult,
   type NativeAssignmentInspection,
@@ -2897,12 +2898,7 @@ describe("bb-collab plugin boundary", () => {
       expect(exportFoundation(db, PROJECT_ID)).toEqual(result);
       expect(result).toMatchObject({ outcome: "OK", expected: result.attempted, verified: result.attempted });
       expect(result.export).toBeUndefined();
-      const exportFile = (result.evidence as { exportFile: {
-        complete: true;
-        directory: string;
-        manifest: ExportPayload["manifest"];
-        checksums: ExportPayload["checksums"];
-      } }).exportFile;
+      const exportFile = (result.evidence as { exportFile: ExportFilePayload }).exportFile;
       expect(exportFile.complete).toBe(true);
       expect(exportFile.directory).toContain("/complete-");
       expect(readdirSync(dirname(exportFile.directory))).not.toContainEqual(expect.stringContaining(".partial-"));
@@ -2919,6 +2915,49 @@ describe("bb-collab plugin boundary", () => {
     } finally {
       db.close();
       rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("spills an over-cap artifact index and imports its complete file reference", () => {
+    const { db, directory } = directDatabase();
+    try {
+      freezeMigration(db);
+      for (let index = 0; index <= MAX_EXPORT_ROWS; index += 1) {
+        seedEvidenceArtifact(db, `artifact-${String(index).padStart(3, "0")}`);
+      }
+      const result = exportFoundation(db, PROJECT_ID);
+      expect(result).toMatchObject({ outcome: "OK", evidence: { exportFile: { complete: true } } });
+      expect(result.export).toBeUndefined();
+      const exportFile = (result.evidence as { exportFile: ExportFilePayload }).exportFile;
+      const recordsNdjson = readFileSync(join(exportFile.directory, "records.ndjson"), "utf8");
+      const artifactIndexJson = readFileSync(join(exportFile.directory, "artifact-index.json"), "utf8");
+      expect(Buffer.byteLength(recordsNdjson, "utf8") + Buffer.byteLength(artifactIndexJson, "utf8")).toBeLessThanOrEqual(MAX_EXPORT_BYTES);
+      const ceiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
+      expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_export", {
+        sourceEventCeiling: ceiling,
+        sourceSnapshotDigest: SOURCE_SNAPSHOT_DIGEST,
+        export: exportFile,
+      }))).toMatchObject({ outcome: "OK", currentResourceRevision: 5, evidence: { state: "exported" } });
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("refuses a file spill from a non-file-backed canonical store", () => {
+    const db = new Database(":memory:");
+    databaseIsReady(db);
+    try {
+      for (const statement of MIGRATIONS) db.exec(statement);
+      seedMigrationAuthority(db);
+      seedEvidenceArtifact(db, "large-artifact", 270 * 1024);
+      expect(exportFoundation(db, PROJECT_ID)).toMatchObject({
+        outcome: "EXPORT_BOUNDED",
+        verified: 0,
+        message: "export exceeds inline bounds and the canonical store is not file-backed",
+      });
+    } finally {
+      db.close();
     }
   });
 
