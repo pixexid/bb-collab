@@ -798,6 +798,14 @@ function listOperatorMessages(db: SqliteDatabase | null, projectId: string, reci
   return rows.map(operatorMessage);
 }
 
+function markOperatorMessageRead(db: SqliteDatabase | null, projectId: string, messageId: number) {
+  const store = requireRegisteredInboxProject(db, projectId);
+  const result = store.prepare(`UPDATE operator_messages SET read_at_ms = COALESCE(read_at_ms, ?)
+    WHERE project_id = ? AND message_id = ?`).run(Date.now(), projectId, messageId);
+  if (result.changes !== 1) throw new Error("operator message does not exist in the requested project");
+  return readOperatorMessage(store, projectId, messageId);
+}
+
 async function assertSenderProject(bb: BbPluginApi, projectId: string, senderThreadId: string) {
   const thread = await bb.sdk.threads.get({ threadId: senderThreadId });
   if (thread.id !== senderThreadId || thread.projectId !== projectId) {
@@ -1032,9 +1040,20 @@ async function runCli(
     }
   }
   if (command === "inbox") {
-    const unknown = unexpectedFlags(args, ["--project", "--recipient"]);
+    const unknown = unexpectedFlags(args, ["--project", "--recipient", "--mark-read"]);
     if (unknown) return invalidCli(`unexpected flag ${unknown}`);
     const recipient = parseFlag(args, "--recipient");
+    const markRead = parseFlag(args, "--mark-read");
+    if (markRead !== null) {
+      if (recipient !== null) return invalidCli("--recipient cannot be used with --mark-read");
+      const messageId = z.coerce.number().int().positive().safeParse(markRead);
+      if (!messageId.success) return invalidCli(messageId.error.message);
+      try {
+        return { exitCode: 0, stdout: JSON.stringify(markOperatorMessageRead(db, projectId, messageId.data)) };
+      } catch (error) {
+        return invalidCli(error instanceof Error ? error.message : String(error));
+      }
+    }
     const parsedRecipient = recipient === null ? undefined : operatorRecipientSchema.safeParse(recipient);
     if (parsedRecipient && !parsedRecipient.success) return invalidCli(parsedRecipient.error.message);
     try {
@@ -2006,11 +2025,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return listOperatorMessages(db, input.projectId, input.recipient);
     },
     markOperatorMessageRead(input) {
-      const store = requireRegisteredInboxProject(db, input.projectId);
-      const result = store.prepare(`UPDATE operator_messages SET read_at_ms = COALESCE(read_at_ms, ?)
-        WHERE project_id = ? AND message_id = ?`).run(Date.now(), input.projectId, input.messageId);
-      if (result.changes !== 1) throw new Error("operator message does not exist in the requested project");
-      return readOperatorMessage(store, input.projectId, input.messageId);
+      return markOperatorMessageRead(db, input.projectId, input.messageId);
     },
     replyToOperatorMessage(input) {
       return replyToOperatorMessage(db, bb, input.projectId, input.messageId, input.text);
@@ -2078,8 +2093,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       },
       {
         name: "inbox",
-        summary: "Read one exact registered project's operator inbox",
-        usage: "bb collab inbox --project PROJECT_ID [--recipient operator|supervisor]",
+        summary: "Read or mark read in one exact registered project's operator inbox",
+        usage: "bb collab inbox --project PROJECT_ID [--recipient operator|supervisor | --mark-read MESSAGE_ID]",
       },
     ],
     run(argv, context) {

@@ -1932,6 +1932,38 @@ describe("bb-collab plugin boundary", () => {
     expect(message).toMatchObject({ notificationStatus: "failed", notificationError: expect.stringContaining("desktop unavailable") });
   });
 
+  it("marks an inbox message read through the project-exact CLI without moving its timestamp", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    try {
+      const host = hostFor();
+      await plugin(host.bb, { notifyUrgent: async () => undefined });
+      const { db } = seedAndBootstrap(host);
+      const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
+        project_id: PROJECT_ID,
+        recipient: "supervisor",
+        severity: "routine",
+        text: "supervisor pickup",
+      }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
+
+      clock.mockReturnValue(1_100_000);
+      const first = await host.harness.runCli(["inbox", "--project", PROJECT_ID, "--mark-read", String(message.messageId)]);
+      expect(first.exitCode).toBe(0);
+      expect(JSON.parse(first.stdout)).toMatchObject({ projectId: PROJECT_ID, messageId: message.messageId, readAtMs: 1_100_000 });
+
+      clock.mockReturnValue(1_200_000);
+      const second = await host.harness.runCli(["inbox", "--project", PROJECT_ID, "--mark-read", String(message.messageId)]);
+      expect(second.exitCode).toBe(0);
+      expect(JSON.parse(second.stdout)).toMatchObject({ projectId: PROJECT_ID, messageId: message.messageId, readAtMs: 1_100_000 });
+
+      const wrongProject = await host.harness.runCli(["inbox", "--project", FOREIGN_PROJECT_ID, "--mark-read", String(message.messageId)]);
+      expect(wrongProject.exitCode).toBe(2);
+      expect(db.prepare("SELECT read_at_ms FROM operator_messages WHERE project_id = ? AND message_id = ?").get(PROJECT_ID, message.messageId))
+        .toEqual({ read_at_ms: 1_100_000 });
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it("delivers replies through platform steer only after the matching sender event lands", async () => {
     const host = hostFor();
     await plugin(host.bb, { notifyUrgent: async () => undefined });
