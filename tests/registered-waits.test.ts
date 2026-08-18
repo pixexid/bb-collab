@@ -8,7 +8,6 @@ import { describe, expect, it } from "vitest";
 import {
   createLaneWatcher,
   createWaitRegistry,
-  type LaneState,
   type WaitRegistryPersistence,
 } from "../src/awareness.js";
 import {
@@ -30,20 +29,17 @@ interface Harness {
   escalation: ReturnType<typeof createWaitEscalationCycle>;
   sources: Map<string, SourceObservation>;
   waiters: Map<string, SourceObservation>;
-  lanes: LaneState[];
   steers: Array<{ waitId: string; reason: string }>;
-  watcherSteers: string[];
   alerts: Array<{ kind: string; waitId: string }>;
   escalations: Array<{ waitId: string; escalated: boolean }>;
   kv: Map<string, unknown>;
   now: { value: number };
 }
 
-function harness(overrides: { now?: number; graceMs?: number; terminalReceipt?: boolean } = {}): Harness {
+function harness(overrides: { now?: number; graceMs?: number } = {}): Harness {
   const sources = new Map<string, SourceObservation>();
   const waiters = new Map<string, SourceObservation>();
   const steers: Array<{ waitId: string; reason: string }> = [];
-  const watcherSteers: string[] = [];
   const alerts: Array<{ kind: string; waitId: string }> = [];
   const escalations: Array<{ waitId: string; escalated: boolean }> = [];
   const kv = new Map<string, unknown>();
@@ -57,22 +53,8 @@ function harness(overrides: { now?: number; graceMs?: number; terminalReceipt?: 
     return observation === undefined || observation === null ? null : { ...observation };
   };
   const registry = createWaitRegistry(persistence("waits"));
-  const lanes: LaneState[] = [{
-    project_id: "project-1",
-    assignment_id: "assignment-1",
-    lane_id: "lane-1",
-    assignment_kind: "write",
-    work_item_id: "work-1",
-    thread_id: "source-1",
-    execution_attempt_id: "attempt-1",
-    attempt_state: "running",
-    terminal_report_digest: null,
-    created_at_ms: 1,
-  }];
   const watcher = createLaneWatcher({
-    readLanes: () => structuredClone(lanes),
     waitRegistry: registry,
-    steer: async (view) => { watcherSteers.push(view.threadId ?? "null"); },
     readWorker: (async (threadId: string) => {
       const observation = waiters.get(threadId) ?? sources.get(threadId);
       if (!observation) throw new Error(`unknown thread ${threadId}`);
@@ -101,7 +83,7 @@ function harness(overrides: { now?: number; graceMs?: number; terminalReceipt?: 
     now: () => now.value,
     graceMs: overrides.graceMs ?? WAIT_STEER_GRACE_MS,
   });
-  return { registry, watcher, escalation, sources, waiters, lanes, steers, watcherSteers, alerts, escalations, kv, now };
+  return { registry, watcher, escalation, sources, waiters, steers, alerts, escalations, kv, now };
 }
 
 /** Register through the harness clock. */
@@ -251,15 +233,13 @@ describe("firing through the watcher (drill: failure propagates as events, never
     expect(h.steers).toHaveLength(0);
   });
 
-  it("fires within one cycle when the source errors, archives, or reaches a terminal attempt", async () => {
+  it("fires within one cycle when the native source errors or archives", async () => {
     // Every scenario registers against a live source first; the terminal
     // fact then lands and the next cycle fires — failure as events, never
     // silence, and never silence in the refusing direction either.
     const scenarios: Array<{ mutate: (h: Harness) => void; detail: string }> = [
       { mutate: (h) => h.sources.set("source-1", { status: "error", archived: false }), detail: "source error" },
       { mutate: (h) => h.sources.set("source-1", { status: "idle", archived: true }), detail: "source archived" },
-      { mutate: (h) => { h.lanes[0].attempt_state = "blocked"; }, detail: "terminal attempt" },
-      { mutate: (h) => { h.lanes[0].terminal_report_digest = "receipt-digest"; }, detail: "terminal receipt" },
     ];
     for (const { mutate } of scenarios) {
       const h = harness();
@@ -289,19 +269,6 @@ describe("firing through the watcher (drill: failure propagates as events, never
     expect(h.registry.state(h.registry.list()[0].waitId)).toBe("fired");
   });
 
-  it("treats a pending registered wait as a legal idle and steers only without one", async () => {
-    const h = harness();
-    h.sources.set("source-1", { status: "idle", archived: false });
-    h.waiters.set("waiter-1", { status: "idle", archived: false });
-    h.lanes[0].thread_id = "waiter-1"; // the waiter itself is the lane worker
-    await register(h);
-    await h.watcher.observe("waiter-1", "idle");
-    expect(h.watcherSteers).toHaveLength(0); // registered wait: legal idle
-
-    h.now.value += DEFAULT_WAIT_DEADLINE_MS + 1; // wait fires: idle becomes illegal
-    await h.watcher.observe("waiter-1", "idle");
-    expect(h.watcherSteers).toHaveLength(1); // unregistered wait: illegal idle, steered
-  });
 });
 
 describe("escalation ladder (drill: bounded escalation, never a steer loop)", () => {
@@ -401,11 +368,12 @@ describe("escalation ladder (drill: bounded escalation, never a steer loop)", ()
     const h = harness({ graceMs: 10_000 });
     h.sources.set("source-1", { status: "idle", archived: false });
     h.waiters.set("waiter-1", { status: "idle", archived: false });
-    // Fire through a terminal attempt state so the source THREAD stays a
-    // valid live target: only the fired-key guard can explain the refusal.
+    // Fire through native failure, then restore the source so only the
+    // fired-key guard can explain the refusal.
     await boundedRegister(h, waitRequest());
-    h.lanes[0].attempt_state = "done";
+    h.sources.set("source-1", { status: "error", archived: false });
     await h.watcher.poll();
+    h.sources.set("source-1", { status: "idle", archived: false });
     await h.escalation.cycle();
     // The documented recovery move — wait again on the same source — must not
     // hand back the dead wait as a replay (round-2 review finding #1).

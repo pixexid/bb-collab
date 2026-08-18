@@ -641,12 +641,42 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
     threadId === director.thread_id && directorPendingInteraction ? [{ status: "pending" }] : []) as never);
   let nativeUpdatedAt = updatedAt;
   const threadProjects = new Map([[director.thread_id, PROJECT_ID], [orchestrator.thread_id, PROJECT_ID]]);
+  const lanes = new Map<string, ReturnType<typeof makeThreadResponse> & { environmentBranchName: string | null }>();
+  const laneEvents = new Map<string, Array<{ id: string; threadId: string; seq: number; type: "turn/started"; scope: { kind: "thread" }; data: { providerThreadId: string }; createdAt: number }>>();
+  const usageCapped = new Set<string>();
   fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+    ...(lanes.get(threadId) ?? {}),
     id: threadId,
-    projectId: threadProjects.get(threadId) ?? (threadId.includes("two") ? "project-two" : PROJECT_ID),
-    status: threadStatus,
-    updatedAt: nativeUpdatedAt,
+    projectId: lanes.get(threadId)?.projectId ?? threadProjects.get(threadId) ?? (threadId.includes("two") ? "project-two" : PROJECT_ID),
+    status: lanes.get(threadId)?.status ?? threadStatus,
+    parentThreadId: lanes.get(threadId)?.parentThreadId ?? null,
+    updatedAt: lanes.get(threadId)?.updatedAt ?? nativeUpdatedAt,
   })) as never);
+  fixture.host.harness.sdk.stub("threads.list", (async ({ projectId }: { projectId?: string }) =>
+    [...lanes.values()].filter((lane) => projectId === undefined || lane.projectId === projectId)) as never);
+  fixture.host.harness.sdk.stub("threads.spawn", (async ({ projectId, parentThreadId, title }: { projectId: string; parentThreadId?: string; title?: string }) => {
+    const id = `lane-${lanes.size + 1}`;
+    const lane = Object.assign(makeThreadResponse({ id, projectId, parentThreadId: parentThreadId ?? null, title: title ?? null, status: "error", updatedAt: nativeUpdatedAt }), {
+      environmentBranchName: `bb/lane-${lanes.size + 1}`,
+    });
+    lanes.set(id, lane);
+    laneEvents.set(id, [{ id: `event-${id}`, threadId: id, seq: 7, type: "turn/started", scope: { kind: "thread" }, data: { providerThreadId: "provider-thread" }, createdAt: 7 }]);
+    return lane;
+  }) as never);
+  fixture.host.harness.sdk.stub("threads.events.list", (async ({ threadId }: { threadId: string }) => laneEvents.get(threadId) ?? []) as never);
+  fixture.host.harness.sdk.stub("threads.rateLimitRecovery", (async ({ threadId }: { threadId: string }) => usageCapped.has(threadId) ? {
+    reason: "eligible",
+    scopeKey: "test",
+    hostId: "host-main",
+    rateLimits: null,
+    candidate: {
+      failedRequestId: "failed-request",
+      turnId: "failed-turn",
+      automatic: true,
+      resetsAtMs: 9_999_999,
+      rateLimits: { providerId: "codex", status: "blocked", kind: "subscription-window", windows: [], reachedReason: "usage cap", overageStatus: null, overageReason: null },
+    },
+  } : { reason: "no-rate-limit-state", scopeKey: "test", hostId: "host-main", rateLimits: null, candidate: null }) as never);
   fixture.host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
   return {
     ...fixture,
@@ -657,6 +687,7 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
     getThreadStatus() { return threadStatus; },
     setDirectorPendingInteraction(value: boolean) { directorPendingInteraction = value; },
     setThreadProject(threadId: string, projectId: string) { threadProjects.set(threadId, projectId); },
+    setUsageCapped(threadId: string) { usageCapped.add(threadId); },
   };
 }
 
@@ -1957,6 +1988,166 @@ describe("bb-collab plugin boundary", () => {
     }
     await fixture.host.harness.runSchedule("fleet-watchdog");
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "info",
+      message: "fleet-watchdog coverage=visible seats=2 lanes=0 cannotSee=none",
+    }));
+  });
+
+  it("surfaces a platform-parented stranded lane to its dispatcher without recovering it", async () => {
+    const fixture = await fleetWatchdogFixture(7);
+    const lane = await fixture.host.bb.sdk.threads.spawn({
+      projectId: PROJECT_ID,
+      parentThreadId: fixture.orchestratorThreadId,
+      environment: { type: "project-default" },
+      prompt: "frozen work order",
+      title: "issue lane",
+    });
+    expect(lane).toMatchObject({ projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "error" });
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    const sends = fixture.host.harness.inspection.sdk.callsTo("threads.send");
+    expect(sends).toEqual([[
+      {
+        threadId: fixture.orchestratorThreadId,
+        mode: "queue-if-active",
+        input: [{
+          type: "text",
+          visibility: "agent-only",
+          text: expect.stringMatching(new RegExp(`^stranded lane detected at cycle .*: lane=${lane.id} branch=bb/lane-1 lastEvent=turn/started@7 status=error\\. The lane was not recovered; inspect its frozen work order and decide respawn or closure\\.$`)),
+          mentions: [],
+        }],
+      },
+    ]]);
+    expect(sends.some(([request]) => (request as { threadId?: string }).threadId === lane.id)).toBe(false);
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "info",
+      message: "fleet-watchdog coverage=visible seats=2 lanes=1 cannotSee=none",
+    }));
+  });
+
+  it("surfaces a stranded lane to the director when its dispatcher is usage-capped", async () => {
+    const fixture = await fleetWatchdogFixture(7);
+    const lane = await fixture.host.bb.sdk.threads.spawn({
+      projectId: PROJECT_ID,
+      parentThreadId: fixture.orchestratorThreadId,
+      environment: { type: "project-default" },
+      prompt: "frozen work order",
+      title: "issue lane",
+    });
+    fixture.setUsageCapped(fixture.orchestratorThreadId);
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      parentThreadId: threadId === lane.id ? fixture.orchestratorThreadId : null,
+      status: threadId === fixture.orchestratorThreadId || threadId === lane.id ? "error" : "idle",
+      updatedAt: 7,
+    })) as never);
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+      expect.objectContaining({ threadId: fixture.directorThreadId, mode: "queue-if-active" }),
+    ]]);
+  });
+
+  it("still enumerates a lane parented by a retired dispatcher", async () => {
+    const fixture = await fleetWatchdogFixture(7);
+    fixture.db.prepare(`
+      INSERT INTO execution_attempts (
+        project_id, execution_attempt_id, origin, attempt_ordinal, config_revision,
+        governance_epoch, role_id, role_generation, state, bb_server_id,
+        environment_id, source_id, host_id, environment_path, thread_id,
+        environment_digest, created_at_ms, attempt_digest
+      )
+      SELECT project_id, 'retired-dispatcher-attempt', 'role_holder', 1, config_revision,
+        governance_epoch, role_id, role_generation, 'done', bb_server_id,
+        environment_id, source_id, host_id, environment_path, 'retired-dispatcher',
+        environment_digest, created_at_ms, 'retired-dispatcher-digest'
+      FROM execution_attempts WHERE role_id = 'project-orchestrator' LIMIT 1
+    `).run();
+    const lane = await fixture.host.bb.sdk.threads.spawn({
+      projectId: PROJECT_ID,
+      parentThreadId: "retired-dispatcher",
+      environment: { type: "project-default" },
+      prompt: "frozen work order",
+      title: "issue lane",
+    });
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    expect(lane).toMatchObject({ parentThreadId: "retired-dispatcher", status: "error" });
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+      expect.objectContaining({ threadId: fixture.directorThreadId, mode: "queue-if-active" }),
+    ]]);
+  });
+
+  it("reports degraded coverage instead of treating failed parentage enumeration as no lanes", async () => {
+    const fixture = await fleetWatchdogFixture();
+    fixture.host.harness.sdk.stub("threads.list", (async () => { throw new Error("thread inventory unavailable"); }) as never);
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringMatching(/^fleet-watchdog coverage=degraded seats=2 lanes=0 cannotSee=platform-parentage:proj_test:Error: thread inventory unavailable$/),
+    }));
+  });
+
+  it("reports blind coverage when canonical role enumeration is unreadable", async () => {
+    const fixture = await fleetWatchdogFixture();
+    fixture.db.close();
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringMatching(/^fleet-watchdog coverage=blind seats=0 lanes=0 cannotSee=canonical-role-holders:/),
+    }));
+  });
+
+  it("treats a subscription-window-capped seat as scheduled return", async () => {
+    const fixture = await fleetWatchdogFixture();
+    fixture.setUsageCapped(fixture.orchestratorThreadId);
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      status: threadId === fixture.orchestratorThreadId ? "error" : "idle",
+      updatedAt: 1,
+    })) as never);
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "info",
+      message: "fleet-watchdog scheduled return: project=proj_test role=project-orchestrator@1 status=usage-capped",
+    }));
+  });
+
+  it("degrades instead of recovering when provider-cap state is unreadable", async () => {
+    const fixture = await fleetWatchdogFixture();
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      status: threadId === fixture.orchestratorThreadId ? "error" : "idle",
+      updatedAt: 1,
+    })) as never);
+    fixture.host.harness.sdk.stub("threads.rateLimitRecovery", (async () => { throw new Error("rate limit state unavailable"); }) as never);
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringContaining("coverage=degraded"),
+    }));
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringContaining(`cannotSee=platform-rate-limit:${fixture.orchestratorThreadId}:Error: rate limit state unavailable`),
+    }));
   });
 
   it("opens a fresh turn when the current role holder enters error", async () => {
@@ -2176,11 +2367,9 @@ describe("bb-collab plugin boundary", () => {
     const laneIdle = createRoleIdleLedger({ read: async () => laneWatcherState, write: async (state) => { laneWatcherState = state; } });
     await laneIdle.observeIdle(key, 0);
     const laneWatcher = createLaneWatcher({
-      readLanes: () => [],
       readRoleHolders: () => [holder],
       readRoleScopes: () => [],
       readWorker: async () => ({ projectId: PROJECT_ID, status: "idle", pendingExternalWait: false, archived: false, idleSinceMs: 0 }),
-      steer: async () => undefined,
       steerRole: async () => undefined,
       roleIdlePersistence: { read: async () => laneWatcherState, write: async (state) => { laneWatcherState = state; } },
     });

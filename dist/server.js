@@ -13782,16 +13782,7 @@ function date4(params) {
 config(en_default());
 
 // src/awareness.ts
-var DEFAULT_MAX_CONTINUATIONS = 3;
-var OPERATOR_WAIT_FYI_THRESHOLD_MS = 15 * 6e4;
 var WRONGFUL_IDLE_THRESHOLD_MS = 10 * 6e4;
-var OPEN_ATTEMPT_STATES = /* @__PURE__ */ new Set([
-  "prepared",
-  "armed",
-  "content_delivered",
-  "running",
-  "dispatch_unknown"
-]);
 function normalizeRegisteredWait(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid registered wait");
   const value = input;
@@ -13876,52 +13867,6 @@ function createWaitRegistry(persistence) {
 }
 function roleIdleKey(holder, queueHeadId) {
   return `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${queueHeadId}`;
-}
-function operatorWaitAlertState(input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
-  const state = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (value !== true) throw new Error("invalid operator wait alert state");
-    state[key] = true;
-  }
-  return state;
-}
-function createOperatorWaitAlertLedger(persistence) {
-  let state = {};
-  let loaded = false;
-  let queue = Promise.resolve();
-  const enqueue = (work) => {
-    const result2 = queue.then(work);
-    queue = result2.then(() => void 0, () => void 0);
-    return result2;
-  };
-  const load = async () => {
-    if (loaded) return;
-    state = operatorWaitAlertState(persistence ? await persistence.read() : null);
-    loaded = true;
-  };
-  const save = () => persistence?.write(structuredClone(state));
-  return {
-    recover: () => enqueue(async () => {
-      await load();
-    }),
-    notified: (key) => enqueue(async () => {
-      await load();
-      return state[key] === true;
-    }),
-    mark: (key) => enqueue(async () => {
-      await load();
-      if (state[key]) return;
-      state[key] = true;
-      await save();
-    }),
-    clear: (key) => enqueue(async () => {
-      await load();
-      if (!state[key]) return;
-      delete state[key];
-      await save();
-    })
-  };
 }
 function roleIdleState(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) return {};
@@ -14075,97 +14020,6 @@ function createRoleIdleLedger(persistence) {
     })
   };
 }
-function continuationState(input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
-  const state = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid continuation state");
-    const candidate = value;
-    if (candidate.mode !== "automatic" || !["ready", "claimed", "paused", "limit_reached"].includes(candidate.status) || !Number.isInteger(candidate.count) || candidate.count < 0 || !Number.isInteger(candidate.max) || candidate.max < 1 || !(candidate.claimId === null || typeof candidate.claimId === "string")) throw new Error("invalid continuation state");
-    state[key] = {
-      mode: "automatic",
-      status: candidate.status,
-      count: candidate.count,
-      max: candidate.max,
-      claimId: candidate.claimId
-    };
-  }
-  return state;
-}
-function createContinuationLedger(persistence) {
-  let state = {};
-  let loaded = false;
-  let queue = Promise.resolve();
-  const enqueue = (work) => {
-    const result2 = queue.then(work);
-    queue = result2.then(() => void 0, () => void 0);
-    return result2;
-  };
-  const load = async () => {
-    if (loaded) return;
-    state = continuationState(persistence ? await persistence.read() : null);
-    loaded = true;
-  };
-  const save = () => persistence?.write(structuredClone(state));
-  return {
-    recover() {
-      return enqueue(async () => {
-        await load();
-        let changed = false;
-        for (const record2 of Object.values(state)) {
-          if (record2.status !== "claimed") continue;
-          record2.status = "paused";
-          record2.claimId = null;
-          changed = true;
-        }
-        if (changed) await save();
-      });
-    },
-    claim(key, max) {
-      return enqueue(async () => {
-        await load();
-        const existing = state[key];
-        if (existing?.status === "claimed") return { claim: null, reason: "claimed" };
-        if (existing?.status === "paused") return { claim: null, reason: "paused" };
-        if (existing?.status === "limit_reached") return { claim: null, reason: "limit_reached" };
-        const count = existing?.count ?? 0;
-        if (count >= max) {
-          state[key] = { mode: "automatic", status: "limit_reached", count, max, claimId: null };
-          await save();
-          return { claim: null, reason: "limit_reached" };
-        }
-        const claim = { claimId: `${key}:${count + 1}`, count: count + 1, max };
-        state[key] = { mode: "automatic", status: "claimed", count: claim.count, max, claimId: claim.claimId };
-        await save();
-        return { claim };
-      });
-    },
-    complete(key, claimId) {
-      return enqueue(async () => {
-        await load();
-        const record2 = state[key];
-        if (!record2 || record2.status !== "claimed" || record2.claimId !== claimId) throw new Error("continuation claim is not current");
-        record2.status = "ready";
-        record2.claimId = null;
-        await save();
-      });
-    },
-    resume(key, resetCount = false) {
-      return enqueue(async () => {
-        await load();
-        const record2 = state[key];
-        if (!record2 || record2.status === "claimed") throw new Error("continuation is not paused");
-        record2.status = "ready";
-        record2.claimId = null;
-        if (resetCount) record2.count = 0;
-        await save();
-      });
-    }
-  };
-}
-function continuationModeFor(assignmentKind) {
-  return assignmentKind === "write" ? "automatic" : assignmentKind === "review" ? "approval" : "tracking";
-}
 function mergeRegisteredWaitState(current, next) {
   const rank = { fired: 1, pending: 2, unknown: 3 };
   return !current || current === "none" || rank[next] > rank[current] ? next : current;
@@ -14191,17 +14045,12 @@ function readRoleHolderStates(db) {
   ).all();
 }
 function createLaneWatcher(options) {
-  const continuationLedger = options.continuationLedger ?? createContinuationLedger();
   const waitRegistry = options.waitRegistry ?? createWaitRegistry();
-  const operatorWaitAlertLedger = createOperatorWaitAlertLedger(options.operatorWaitAlertPersistence);
   const roleIdleLedger = createRoleIdleLedger(options.roleIdlePersistence);
   const roleIdleThresholdMs = Number.isInteger(options.roleIdleThresholdMs) && (options.roleIdleThresholdMs ?? 0) >= 0 ? options.roleIdleThresholdMs : WRONGFUL_IDLE_THRESHOLD_MS;
   const now2 = options.now ?? Date.now;
-  const operatorWaitFyiThresholdMs = Number.isInteger(options.operatorWaitFyiThresholdMs) && (options.operatorWaitFyiThresholdMs ?? 0) >= 0 ? options.operatorWaitFyiThresholdMs : OPERATOR_WAIT_FYI_THRESHOLD_MS;
-  const maxContinuations = Number.isInteger(options.maxContinuations) && (options.maxContinuations ?? 0) > 0 ? options.maxContinuations : DEFAULT_MAX_CONTINUATIONS;
-  const coalesced = /* @__PURE__ */ new Set();
   let queue = Promise.resolve();
-  const readWaitContext = async (allLanes, suppliedSource) => {
+  const readWaitContext = async (suppliedSource) => {
     let waits;
     try {
       await waitRegistry.recover();
@@ -14213,8 +14062,6 @@ function createLaneWatcher(options) {
     if (waits.length === 0) return { known: true, byWaiter: /* @__PURE__ */ new Map(), events: [] };
     const sourceStates = /* @__PURE__ */ new Map();
     for (const sourceThreadId of new Set(waits.map((wait) => wait.sourceThreadId))) {
-      const sourceLanes = allLanes.filter((lane) => lane.thread_id === sourceThreadId);
-      const terminalFromLane = sourceLanes.some((lane) => lane.terminal_report_digest !== null || !OPEN_ATTEMPT_STATES.has(lane.attempt_state));
       let observation = null;
       if (suppliedSource?.threadId === sourceThreadId) {
         observation = {
@@ -14229,11 +14076,10 @@ function createLaneWatcher(options) {
           observation = null;
         }
       }
-      const failedFromLane = sourceLanes.some((lane) => lane.attempt_state === "failed");
       sourceStates.set(sourceThreadId, {
-        known: terminalFromLane || observation !== null,
-        terminal: terminalFromLane || observation?.archived === true || observation?.status === "error",
-        failed: failedFromLane || observation?.archived === true || observation?.status === "error"
+        known: observation !== null,
+        terminal: observation?.archived === true || observation?.status === "error",
+        failed: observation?.archived === true || observation?.status === "error"
       });
     }
     const byWaiter = /* @__PURE__ */ new Map();
@@ -14266,48 +14112,8 @@ function createLaneWatcher(options) {
     }
     return { known: true, byWaiter, events };
   };
-  const laneKey = (lane) => `${lane.project_id}:${lane.execution_attempt_id}`;
-  const clearResolved = (lanes) => {
-    const unresolved = new Set(
-      lanes.filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.terminal_report_digest === null).map(laneKey)
-    );
-    for (const key of coalesced) {
-      if (!unresolved.has(key)) coalesced.delete(key);
-    }
-  };
-  const viewFor = (lane, status, now3, operatorWait) => ({
-    projectId: lane.project_id,
-    laneId: lane.lane_id,
-    assignmentId: lane.assignment_id,
-    assignmentKind: lane.assignment_kind,
-    workItemId: lane.work_item_id,
-    threadId: lane.thread_id,
-    executionAttemptId: lane.execution_attempt_id,
-    attemptState: lane.attempt_state,
-    workerStatus: status,
-    waitingOn: operatorWait?.reason ?? "terminal receipt",
-    ageMs: Math.max(0, now3 - lane.created_at_ms),
-    tone: "error",
-    queueState: operatorWait ? "deferred" : lane.attempt_state === "running" ? "running" : "ready",
-    queueBlocked: false,
-    nextStartable: false,
-    deferredReason: operatorWait?.reason ?? null,
-    deferredAtMs: operatorWait?.createdAtMs ?? null,
-    deferredAgeMs: operatorWait ? Math.max(0, now3 - operatorWait.createdAtMs) : null
-  });
-  const alert = (kind, lane, count, max) => {
-    options.onAlert?.({ kind, lane, count, max });
-  };
   const roleAlert = (role) => {
     options.onAlert?.({ kind: "wrongful_idle_fyi", lane: null, role, count: 2, max: 2 });
-  };
-  const isCurrentCanonicalHolder = (projectId, threadId) => {
-    if (!options.readRoleHolders) return false;
-    try {
-      return options.readRoleHolders().filter((holder) => holder.project_id === projectId).some((holder) => holder.thread_id === threadId);
-    } catch {
-      return true;
-    }
   };
   const resolveCurrentCanonicalHolder = (holder) => {
     if (!options.readRoleHolders) return null;
@@ -14475,86 +14281,6 @@ function createLaneWatcher(options) {
     if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, target);
     return { attempted: true, delivered: !failed };
   };
-  const observeNow = async (threadId, status, pendingExternalWait, archived = false, suppliedOperatorWait, suppliedOperatorWaitKnown = status !== "idle" || suppliedOperatorWait !== void 0 || !options.readOperatorWait, waitContext) => {
-    const allLanes = options.readLanes();
-    clearResolved(allLanes);
-    const candidates = allLanes.filter(
-      (lane) => lane.thread_id === threadId && (!lane.thread_id || !isCurrentCanonicalHolder(lane.project_id, lane.thread_id)) && OPEN_ATTEMPT_STATES.has(lane.attempt_state)
-    );
-    if (candidates.length === 0) return;
-    const registeredWaitState = waitContext?.byWaiter.get(threadId) ?? "none";
-    if (status === "idle" && (waitContext && (!waitContext.known || registeredWaitState === "pending" || registeredWaitState === "unknown"))) {
-      for (const lane of candidates) coalesced.delete(laneKey(lane));
-      return;
-    }
-    let operatorWait = suppliedOperatorWait ?? null;
-    let operatorWaitKnown = suppliedOperatorWaitKnown;
-    if (!archived && status === "idle" && suppliedOperatorWait === void 0 && options.readOperatorWait) {
-      try {
-        operatorWait = await options.readOperatorWait(threadId);
-      } catch {
-        operatorWait = null;
-        operatorWaitKnown = false;
-      }
-    }
-    let waiting = pendingExternalWait ?? false;
-    if (operatorWait) waiting = true;
-    if (!archived && status === "idle" && pendingExternalWait === void 0 && !operatorWait && options.isExternallyWaiting) {
-      try {
-        waiting = await options.isExternallyWaiting(threadId);
-      } catch {
-        waiting = true;
-      }
-    }
-    const currentNow = now2();
-    if (archived || status !== "idle" || waiting && !operatorWait) {
-      for (const lane of candidates) {
-        const key = laneKey(lane);
-        coalesced.delete(key);
-        if (archived || operatorWaitKnown && !operatorWait) await operatorWaitAlertLedger.clear(key);
-      }
-      return;
-    }
-    for (const lane of candidates) {
-      const key = laneKey(lane);
-      if (lane.terminal_report_digest !== null) {
-        await operatorWaitAlertLedger.clear(key);
-        continue;
-      }
-      if (operatorWait) {
-        coalesced.delete(key);
-        const view2 = viewFor(lane, status, currentNow, operatorWait);
-        if (view2.deferredAgeMs !== null && view2.deferredAgeMs >= operatorWaitFyiThresholdMs && !await operatorWaitAlertLedger.notified(key)) {
-          await operatorWaitAlertLedger.mark(key);
-          alert("operator_wait_fyi", view2, 0, 0);
-        }
-        continue;
-      }
-      await operatorWaitAlertLedger.clear(key);
-      if (coalesced.has(key)) continue;
-      coalesced.add(key);
-      const view = viewFor(lane, status, currentNow, null);
-      const mode = continuationModeFor(lane.assignment_kind);
-      if (mode === "tracking") continue;
-      if (mode === "approval") {
-        alert("approval_required", view, 0, maxContinuations);
-        continue;
-      }
-      const claimed = await continuationLedger.claim(key, maxContinuations);
-      if (!claimed.claim) {
-        if (claimed.reason === "limit_reached") alert("limit_reached", view, maxContinuations, maxContinuations);
-        if (claimed.reason === "paused") alert("restart_review", view, 0, maxContinuations);
-        continue;
-      }
-      try {
-        await options.steer(view);
-        await continuationLedger.complete(key, claimed.claim.claimId);
-      } catch (error48) {
-        alert("delivery_uncertain", view, claimed.claim.count, claimed.claim.max);
-        throw error48;
-      }
-    }
-  };
   const enqueue = (work) => {
     const result2 = queue.then(work);
     queue = result2.then(() => void 0, () => void 0);
@@ -14567,17 +14293,14 @@ function createLaneWatcher(options) {
     registerWait(wait) {
       return waitRegistry.register(wait);
     },
-    observe(threadId, status, pendingExternalWait, archived, operatorWait) {
+    observe(threadId, status, _pendingExternalWait, archived) {
       return enqueue(async () => {
-        const context = await readWaitContext(options.readLanes(), { threadId, status, archived: archived ?? false });
+        const context = await readWaitContext({ threadId, status, archived: archived ?? false });
         await emitWaitEvents(context);
-        await observeNow(threadId, status, pendingExternalWait, archived, operatorWait, void 0, context);
         await observeRoleNow(threadId, void 0, context);
         for (const event of context.events) {
           if (event.waiterThreadId === threadId || !options.readWorker) continue;
           try {
-            const observation = await options.readWorker(event.waiterThreadId);
-            await observeNow(event.waiterThreadId, observation.status, observation.pendingExternalWait, observation.archived, observation.operatorWait, observation.operatorWaitKnown, context);
             await observeRoleNow(event.waiterThreadId, void 0, context);
           } catch {
           }
@@ -14586,31 +14309,9 @@ function createLaneWatcher(options) {
     },
     poll() {
       return enqueue(async () => {
-        const lanes = options.readLanes();
-        clearResolved(lanes);
-        const context = await readWaitContext(lanes);
+        const context = await readWaitContext();
         await emitWaitEvents(context);
         if (!options.readWorker) return;
-        const workerIds = new Set(
-          lanes.filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.thread_id).map((lane) => lane.thread_id)
-        );
-        for (const threadId of workerIds) {
-          let observation;
-          try {
-            observation = await options.readWorker(threadId);
-          } catch {
-            continue;
-          }
-          await observeNow(
-            threadId,
-            observation.status,
-            observation.pendingExternalWait,
-            observation.archived,
-            observation.operatorWait,
-            observation.operatorWaitKnown,
-            context
-          );
-        }
         if (options.readRoleHolders) {
           const roleThreadIds = new Set(options.readRoleHolders().map((holder) => holder.thread_id));
           let roleScopes = null;
@@ -14632,9 +14333,7 @@ function createLaneWatcher(options) {
     },
     recover() {
       return enqueue(async () => {
-        await continuationLedger.recover();
         await waitRegistry.recover();
-        await operatorWaitAlertLedger.recover();
         await roleIdleLedger.recover();
       });
     },
@@ -21161,18 +20860,6 @@ async function plugin(bb, options = {}) {
       return true;
     }
   };
-  const readPendingOperatorWaitForThread = async (threadId) => {
-    const interaction = (await bb.sdk.threads.interactions.list({ threadId })).find((candidate) => candidate.status === "pending");
-    if (!interaction) return null;
-    return {
-      reason: "awaiting_operator",
-      createdAtMs: typeof interaction.createdAt === "number" && Number.isFinite(interaction.createdAt) ? Math.max(0, interaction.createdAt) : 0
-    };
-  };
-  const continuationLedger = createContinuationLedger({
-    read: () => bb.storage.kv.get("lane-watcher.continuations"),
-    write: (state) => bb.storage.kv.set("lane-watcher.continuations", state)
-  });
   const waitRegistry = createWaitRegistry({
     read: () => bb.storage.kv.get("lane-watcher.registered-waits"),
     write: (state) => bb.storage.kv.set("lane-watcher.registered-waits", state)
@@ -21225,10 +20912,6 @@ async function plugin(bb, options = {}) {
     }
   });
   await escalationCycle.recover().catch((error48) => bb.log.error(`wait escalation state is unreadable: ${String(error48)}`));
-  const operatorWaitAlertPersistence = {
-    read: () => bb.storage.kv.get("lane-watcher.operator-wait-fyi"),
-    write: (state) => bb.storage.kv.set("lane-watcher.operator-wait-fyi", state)
-  };
   const roleIdlePersistence = {
     read: () => bb.storage.kv.get("lane-watcher.role-idle"),
     write: (state) => bb.storage.kv.set("lane-watcher.role-idle", state)
@@ -21298,17 +20981,12 @@ ${thread.titleFallback ?? ""}`);
     return true;
   };
   const watcher = createLaneWatcher({
-    readLanes: () => [],
     readRoleHolders: () => db ? readRoleHolderStates(db) : [],
     readRoleScopes,
     roleIdlePersistence,
-    continuationLedger,
     waitRegistry,
-    operatorWaitAlertPersistence,
-    onAlert: (alert) => alert.lane ? bb.log.warn(`lane awareness ${alert.kind}: ${alert.lane.laneId} (${alert.count}/${alert.max})`) : bb.log.warn(`role awareness ${alert.kind}: ${alert.role.roleId}@${alert.role.roleGeneration} queue ${alert.role.queueHeadId}`),
+    onAlert: (alert) => bb.log.warn(`role awareness ${alert.kind}: ${alert.role.roleId}@${alert.role.roleGeneration} queue ${alert.role.queueHeadId}`),
     onRoleSuccessionRequired: (role) => bb.log.warn(`role succession required: ${role.roleId}@${role.roleGeneration}`),
-    isExternallyWaiting: readPendingExternalWait,
-    readOperatorWait: readPendingOperatorWaitForThread,
     readWorker: async (threadId) => {
       const roleHolders = db ? readRoleHolderStates(db).filter((holder) => holder.thread_id === threadId) : [];
       let thread;
@@ -21340,25 +21018,9 @@ ${thread.titleFallback ?? ""}`);
         idleSinceMs: thread.status === "idle" ? thread.updatedAt : null
       };
     },
-    steer: async (lane) => {
-      if (!lane.threadId) return;
-      if (db && readRoleHolderStates(db).some((holder) => holder.project_id === lane.projectId && holder.thread_id === lane.threadId)) return;
-      await bb.sdk.threads.send({
-        threadId: lane.threadId,
-        mode: "steer",
-        input: [
-          {
-            type: "text",
-            visibility: "agent-only",
-            text: `Lane ${lane.laneId} is idle without a terminal receipt or pending external wait. Continue assignment ${lane.assignmentId} and finish with exactly one DONE|BLOCKED terminal receipt.`,
-            mentions: []
-          }
-        ]
-      });
-    },
     steerRole
   });
-  await watcher.recover().catch((error48) => bb.log.error(`lane continuation recovery failed: ${String(error48)}`));
+  await watcher.recover().catch((error48) => bb.log.error(`lane watcher recovery failed: ${String(error48)}`));
   const fleetWatchdogIdle = createRoleIdleLedger({
     read: () => bb.storage.kv.get("fleet-watchdog.role-idle"),
     write: (state) => bb.storage.kv.set("fleet-watchdog.role-idle", state)
@@ -21488,8 +21150,19 @@ ${thread.titleFallback ?? ""}`);
   });
   const wakeInFlight = /* @__PURE__ */ new Set();
   const fleetWatchdogCycle = async (onlyProjectId) => {
+    let coverage = "blind";
+    let visibleSeatCount = 0;
+    let visibleLaneCount = 0;
+    const cannotSee = /* @__PURE__ */ new Set();
+    const degrade = (scope) => {
+      cannotSee.add(scope);
+      if (coverage === "visible") coverage = "degraded";
+    };
     try {
-      if (!db) return;
+      if (!db) {
+        cannotSee.add("canonical-store:unavailable");
+        return;
+      }
       const now2 = Date.now();
       const { fleetWatchdogFloorMs, fleetWatchdogStaleWaitMs } = await fleetWatchdogSettings.get();
       const floorMs = Number(fleetWatchdogFloorMs);
@@ -21497,11 +21170,49 @@ ${thread.titleFallback ?? ""}`);
       if (!Number.isSafeInteger(floorMs) || floorMs <= 0 || !Number.isSafeInteger(staleWaitMs) || staleWaitMs <= 0) {
         throw new Error("watchdog thresholds must be positive integer milliseconds");
       }
+      let roleHolders;
+      try {
+        roleHolders = readRoleHolderStates(db);
+        coverage = "visible";
+        visibleSeatCount = roleHolders.length;
+      } catch (error48) {
+        cannotSee.add(`canonical-role-holders:${String(error48)}`);
+        return;
+      }
       const holdersByProject = /* @__PURE__ */ new Map();
-      for (const holder of readRoleHolderStates(db)) {
+      for (const holder of roleHolders) {
         const holders = holdersByProject.get(holder.project_id) ?? [];
         holders.push(holder);
         holdersByProject.set(holder.project_id, holders);
+      }
+      const dispatcherThreadIdsByProject = /* @__PURE__ */ new Map();
+      for (const row of db.prepare(
+        "SELECT project_id, thread_id FROM execution_attempts WHERE origin = 'role_holder' AND thread_id IS NOT NULL"
+      ).all()) {
+        const threadIds = dispatcherThreadIdsByProject.get(row.project_id) ?? /* @__PURE__ */ new Set();
+        threadIds.add(row.thread_id);
+        dispatcherThreadIdsByProject.set(row.project_id, threadIds);
+      }
+      const projectIds = /* @__PURE__ */ new Set([...holdersByProject.keys(), ...dispatcherThreadIdsByProject.keys()]);
+      const lanesByProject = /* @__PURE__ */ new Map();
+      for (const projectId of projectIds) {
+        if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
+        const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? /* @__PURE__ */ new Set();
+        const threads = [];
+        try {
+          for (let offset = 0; ; offset += 100) {
+            const page = await bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset });
+            threads.push(...page);
+            if (page.length < 100) break;
+          }
+        } catch (error48) {
+          degrade(`platform-parentage:${projectId}:${String(error48)}`);
+        }
+        const lanes = threads.filter(
+          (thread) => thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null
+        );
+        visibleLaneCount += lanes.length;
+        lanesByProject.set(projectId, lanes);
       }
       const openWorkItemsByProject = /* @__PURE__ */ new Map();
       for (const workItem of db.prepare(
@@ -21516,6 +21227,30 @@ ${thread.titleFallback ?? ""}`);
         openWorkItemsByProject.set(workItem.project_id, workItems);
       }
       const isCurrent = (candidate, holder) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
+      const isUsageCapped = async (threadId) => {
+        try {
+          const recovery = await bb.sdk.threads.rateLimitRecovery({ threadId });
+          return recovery.candidate?.rateLimits.status === "blocked" && recovery.candidate.rateLimits.kind === "subscription-window";
+        } catch (error48) {
+          degrade(`platform-rate-limit:${threadId}:${String(error48)}`);
+          return null;
+        }
+      };
+      const lastEvent = async (threadId) => {
+        let latest;
+        try {
+          for (let afterSeq; ; ) {
+            const page = await bb.sdk.threads.events.list({ threadId, ...afterSeq ? { afterSeq } : {}, limit: "1000" });
+            if (page.length === 0) break;
+            latest = page.at(-1);
+            if (page.length < 1e3) break;
+            afterSeq = String(latest.seq);
+          }
+        } catch (error48) {
+          degrade(`platform-events:${threadId}:${String(error48)}`);
+        }
+        return latest ? `${latest.type}@${latest.seq}` : "unknown";
+      };
       const wake = async (projectId, holder, key, text, requireIdle, kind, beforeSend) => {
         if (kind !== "recovery") {
           const previous = await fleetWatchdogIdle.get(key);
@@ -21551,7 +21286,8 @@ ${thread.titleFallback ?? ""}`);
         }
       };
       let brokenWakePath = false;
-      for (const [projectId, holders] of holdersByProject) {
+      for (const projectId of projectIds) {
+        const holders = holdersByProject.get(projectId) ?? [];
         try {
           if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
           const directors = holders.filter((holder) => holder.role_id === "director");
@@ -21559,6 +21295,7 @@ ${thread.titleFallback ?? ""}`);
           if (directors.length !== 1 || orchestrators.length !== 1) {
             if (directors.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active director holders=${directors.length}`);
             if (orchestrators.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active project-orchestrator holders=${orchestrators.length}`);
+            degrade(`routing:${projectId}:directors=${directors.length},orchestrators=${orchestrators.length}`);
             continue;
           }
           const director = directors[0];
@@ -21567,6 +21304,14 @@ ${thread.titleFallback ?? ""}`);
             let thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
             if (thread.status !== "error" && thread.status !== "stopping") continue;
             const observedStatus = thread.status;
+            if (observedStatus === "error") {
+              const usageCapped = await isUsageCapped(holder.thread_id);
+              if (usageCapped === null) continue;
+              if (usageCapped) {
+                bb.log.info(`fleet-watchdog scheduled return: project=${projectId} role=${holder.role_id}@${holder.role_generation} status=usage-capped`);
+                continue;
+              }
+            }
             if (observedStatus === "stopping") {
               await bb.sdk.threads.wait({ threadId: holder.thread_id, status: "idle", timeoutMs: FLEET_WATCHDOG_STOPPING_WAIT_MS }).catch(() => void 0);
               thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
@@ -21575,6 +21320,71 @@ ${thread.titleFallback ?? ""}`);
             brokenWakePath = true;
             const recoverySent = await wake(projectId, holder, roleIdleKey(holder, "wake-path"), `role wake path broken at cycle ${new Date(now2).toISOString()}: ${holder.role_id}@${holder.role_generation} holder status=${observedStatus}; opening a fresh turn`, false, "recovery");
             bb.log.warn(`fleet-watchdog role wake path broken: project=${projectId} role=${holder.role_id}@${holder.role_generation} status=${observedStatus} recovery=${recoverySent ? "sent" : "refused"}`);
+          }
+          for (const lane of lanesByProject.get(projectId) ?? []) {
+            if (lane.status !== "error" && lane.status !== "stopping") continue;
+            const observedStatus = lane.status;
+            if (observedStatus === "error") {
+              const usageCapped = await isUsageCapped(lane.id);
+              if (usageCapped === null) continue;
+              if (usageCapped) {
+                bb.log.info(`fleet-watchdog scheduled return: project=${projectId} lane=${lane.id} status=usage-capped`);
+                continue;
+              }
+            }
+            let currentLane;
+            try {
+              currentLane = await bb.sdk.threads.get({ threadId: lane.id });
+              if (observedStatus === "stopping") {
+                await bb.sdk.threads.wait({ threadId: lane.id, status: "idle", timeoutMs: FLEET_WATCHDOG_STOPPING_WAIT_MS }).catch(() => void 0);
+                currentLane = await bb.sdk.threads.get({ threadId: lane.id });
+              }
+            } catch (error48) {
+              degrade(`platform-lane:${lane.id}:${String(error48)}`);
+              continue;
+            }
+            if (currentLane.archivedAt !== null || currentLane.deletedAt !== null) continue;
+            if (currentLane.status === "active" || currentLane.status === "starting") continue;
+            const dispatcher = holders.find((holder) => holder.thread_id === lane.parentThreadId);
+            let recipient = dispatcher ?? director;
+            if (dispatcher) {
+              try {
+                const dispatcherThread = await bb.sdk.threads.get({ threadId: dispatcher.thread_id });
+                if (dispatcherThread.archivedAt !== null || dispatcherThread.deletedAt !== null || dispatcherThread.status === "error" || dispatcherThread.status === "stopping") recipient = director;
+              } catch (error48) {
+                degrade(`platform-dispatcher:${dispatcher.thread_id}:${String(error48)}`);
+                recipient = director;
+              }
+            }
+            try {
+              const currentRecipients = readRoleHolderStates(db).filter(
+                (candidate) => candidate.project_id === projectId && candidate.role_id === recipient.role_id && isCurrent(candidate, recipient)
+              );
+              if (currentRecipients.length !== 1) {
+                degrade(`dispatcher:${lane.id}:stale-recipient`);
+                continue;
+              }
+              const recipientThread = await bb.sdk.threads.get({ threadId: recipient.thread_id });
+              if (recipientThread.archivedAt !== null || recipientThread.deletedAt !== null || recipientThread.status === "error" || recipientThread.status === "stopping") {
+                degrade(`dispatcher:${lane.id}:unreachable`);
+                continue;
+              }
+              const event = await lastEvent(lane.id);
+              await bb.sdk.threads.send({
+                threadId: recipient.thread_id,
+                mode: "queue-if-active",
+                input: [{
+                  type: "text",
+                  visibility: "agent-only",
+                  text: `stranded lane detected at cycle ${new Date(now2).toISOString()}: lane=${lane.id} branch=${lane.environmentBranchName ?? "unknown"} lastEvent=${event} status=${observedStatus}. The lane was not recovered; inspect its frozen work order and decide respawn or closure.`,
+                  mentions: []
+                }]
+              });
+              brokenWakePath = true;
+              bb.log.warn(`fleet-watchdog stranded lane surfaced: project=${projectId} lane=${lane.id} dispatcher=${recipient.role_id}@${recipient.role_generation} status=${observedStatus}`);
+            } catch (error48) {
+              degrade(`dispatcher:${lane.id}:${String(error48)}`);
+            }
           }
           const workItems = openWorkItemsByProject.get(projectId) ?? [];
           const resetIdle = () => Promise.all(holders.flatMap((holder) => workItems.map((workItem) => fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workItem.workItemId)))));
@@ -21663,12 +21473,18 @@ ${thread.titleFallback ?? ""}`);
             continue;
           }
         } catch (error48) {
+          degrade(`project:${projectId}:${String(error48)}`);
           bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
         }
       }
-      if (!brokenWakePath) bb.log.info("fleet-watchdog healthy cycle");
+      if (!brokenWakePath && coverage === "visible") bb.log.info("fleet-watchdog healthy cycle");
     } catch (error48) {
+      degrade(`cycle:${String(error48)}`);
       bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
+    } finally {
+      const message = `fleet-watchdog coverage=${coverage} seats=${visibleSeatCount} lanes=${visibleLaneCount} cannotSee=${cannotSee.size === 0 ? "none" : [...cannotSee].join("|")}`;
+      if (coverage === "visible") bb.log.info(message);
+      else bb.log.warn(message);
     }
   };
   const resetFleetWatchdog = async (projectId, invokedBy) => {
