@@ -6347,7 +6347,9 @@ export async function doctor(
     const configJson = storedConfigJson(db, projectId, configHead.config_revision);
     const writingLaneCeiling = writingLaneCeilingFromJson(configJson);
     const assignmentAttempts: Array<Record<string, unknown>> = [];
-    const activeWriters: Array<Record<string, unknown>> = [];
+    const activeWriters = db.prepare(
+      "SELECT work_item_id AS lane_id FROM work_items WHERE project_id = ? AND lifecycle_state = 'in_progress' ORDER BY work_item_id",
+    ).all(projectId) as Array<{ lane_id: string }>;
     const unresolvedAttempts: Array<Record<string, unknown>> = [];
     const profileAuditEntries: Array<Record<string, unknown>> = [];
     const profileAudit = {

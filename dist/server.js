@@ -19374,7 +19374,9 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
     const configJson = storedConfigJson(db, projectId, configHead.config_revision);
     const writingLaneCeiling = writingLaneCeilingFromJson(configJson);
     const assignmentAttempts = [];
-    const activeWriters = [];
+    const activeWriters = db.prepare(
+      "SELECT work_item_id AS lane_id FROM work_items WHERE project_id = ? AND lifecycle_state = 'in_progress' ORDER BY work_item_id"
+    ).all(projectId);
     const unresolvedAttempts = [];
     const profileAuditEntries = [];
     const profileAudit = {
