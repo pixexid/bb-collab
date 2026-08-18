@@ -5149,6 +5149,58 @@ describe("bb-collab plugin boundary", () => {
     ]);
   });
 
+  it("retires stale WorkItems but refuses their non-terminal advance", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    const replacementTarget = {
+      ...bootstrapRequest().targets![0]!,
+      repoTargetId: SECOND_TARGET_ID,
+      sourceId: "source-second",
+      path: "/workspace/second",
+    };
+    expect(applyWithFixtureReceipt(db, {
+      ...bootstrapRequest(),
+      operationClass: "config_revision",
+      idempotencyKey: "config-2-after-work-item",
+      expectedConfigRevision: 1,
+      configRevision: 2,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fenceToken,
+      repoTargetId: SECOND_TARGET_ID,
+      config: { permissionMode: "auto", visibility: "visible", repositoryTargets: [SECOND_TARGET_ID] },
+      targets: [replacementTarget],
+    }).outcome).toBe("OK");
+    expect(db.prepare("SELECT repo_target_id FROM repository_targets WHERE config_revision = 2").all()).toEqual([
+      { repo_target_id: SECOND_TARGET_ID },
+    ]);
+
+    // Reproduces the live defect: three config revisions left WorkItems unclosable.
+    const beforeRefusal = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, {
+      idempotencyKey: "stale-work-item-advance",
+      expectedConfigRevision: 2,
+    }))).toMatchObject({ outcome: "PROJECT_CONFIG_STALE", attempted: 0, currentConfigRevision: 2, expectedConfigRevision: 1 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
+
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "cancelled", 1, {
+      idempotencyKey: "stale-work-item-wrong-target",
+      expectedConfigRevision: 2,
+      repoTargetId: SECOND_TARGET_ID,
+    }))).toMatchObject({ outcome: "REPO_TARGET_FOREIGN", attempted: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
+
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "cancelled", 1, {
+      idempotencyKey: "stale-work-item-cancel",
+      expectedConfigRevision: 2,
+    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 2 });
+    expect(db.prepare("SELECT config_revision, lifecycle_state, resource_revision FROM work_items").get()).toEqual({
+      config_revision: 1,
+      lifecycle_state: "cancelled",
+      resource_revision: 2,
+    });
+  });
+
   it("creates multiple targets through the resolver and rejects an ambiguous selector", async () => {
     const { db, path, directory } = directDatabase();
     try {
