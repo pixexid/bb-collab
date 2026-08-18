@@ -174,6 +174,36 @@ describe("replacement thread list", () => {
     expect((reopened.getByLabelText("Recipient") as HTMLSelectElement).value).toBe("supervisor");
   });
 
+  it("falls back to all projects when a persisted project no longer exists", async () => {
+    window.localStorage.setItem("bb-collab.inbox-filters", JSON.stringify({ projectId: "deleted-project", recipient: "" }));
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const operatorMessages = vi.fn(async ({ projectId }: { projectId: string }) => [{
+      messageId: 5,
+      projectId,
+      recipient: "operator" as const,
+      senderThreadId: "sender-thread",
+      senderLaneId: null,
+      severity: "routine" as const,
+      text: "Visible after deletion",
+      createdAtMs: 1,
+      readAtMs: null,
+      repliedAtMs: null,
+      replyText: null,
+      replyDeliveryError: null,
+      notificationStatus: "not-requested" as const,
+      notificationError: null,
+    }]);
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("Visible after deletion")).toBeTruthy());
+    expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a" });
+    expect((rendered.getByLabelText("Project") as HTMLSelectElement).value).toBe("");
+  });
+
   it("navigates the sender thread from its secondary id", async () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
@@ -202,6 +232,34 @@ describe("replacement thread list", () => {
     expect(rendered.getByText("lane-one ·")).toBeTruthy();
     fireEvent.click(sender);
     expect(rendered.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "sender-thread" });
+  });
+
+  it("keeps the inbox mounted when a sender id has a hostile shape", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => [{
+        messageId: 6,
+        projectId: "project-a",
+        recipient: "operator" as const,
+        senderThreadId: { unexpected: true },
+        senderLaneId: null,
+        severity: "routine" as const,
+        text: "Inbox remains mounted",
+        createdAtMs: 1,
+        readAtMs: null,
+        repliedAtMs: null,
+        replyText: null,
+        replyDeliveryError: null,
+        notificationStatus: "not-requested" as const,
+        notificationError: null,
+      } as never] } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("Inbox remains mounted")).toBeTruthy());
+    expect(rendered.queryByRole("link")).toBeNull();
+    expect(rendered.getByText("Sender unavailable")).toBeTruthy();
   });
 
   it("keeps loaded messages visible when another project read fails", async () => {

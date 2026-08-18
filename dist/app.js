@@ -701,7 +701,8 @@ function InboxPanel(_props) {
   const navigate = useBbNavigate();
   const rpc = useRpc();
   const [filters, setFilters] = useState(readInboxFilters);
-  const { projectId, recipient } = filters;
+  const projectId = filters.projectId && sidebar.projects.some((project) => project.id === filters.projectId) ? filters.projectId : "";
+  const { recipient } = filters;
   const [messages, setMessages] = useState([]);
   const [drafts, setDrafts] = useState({});
   const [replyingMessageKey, setReplyingMessageKey] = useState(null);
@@ -785,21 +786,21 @@ function InboxPanel(_props) {
           /* @__PURE__ */ jsx("span", { className: "font-medium text-foreground", children: message.recipient }),
           /* @__PURE__ */ jsx("span", { children: message.severity }),
           /* @__PURE__ */ jsxs("span", { children: [
-            message.senderLaneId ? `${message.senderLaneId} \xB7 ` : "",
-            /* @__PURE__ */ jsx(
+            asText(message.senderLaneId) ? `${asText(message.senderLaneId)} \xB7 ` : "",
+            asText(message.senderThreadId) ? /* @__PURE__ */ jsx(
               "a",
               {
                 href: "#",
                 className: "underline decoration-muted-foreground/50 underline-offset-2 hover:text-foreground",
-                "aria-label": `Open sender session ${message.senderThreadId}`,
-                title: `Open sender session ${message.senderThreadId}`,
+                "aria-label": `Open sender session ${asText(message.senderThreadId)}`,
+                title: `Open sender session ${asText(message.senderThreadId)}`,
                 onClick: (event) => {
                   event.preventDefault();
-                  navigate.toThread(message.senderThreadId);
+                  navigate.toThread(asText(message.senderThreadId));
                 },
-                children: message.senderThreadId
+                children: asText(message.senderThreadId)
               }
-            )
+            ) : /* @__PURE__ */ jsx("span", { children: "Sender unavailable" })
           ] }),
           /* @__PURE__ */ jsx("time", { className: "ml-auto", dateTime: new Date(message.createdAtMs).toISOString(), children: new Date(message.createdAtMs).toLocaleString() })
         ] }),

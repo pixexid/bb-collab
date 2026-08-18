@@ -695,7 +695,8 @@ function InboxPanel(_props: PluginNavPanelProps) {
   const navigate = useBbNavigate();
   const rpc = useRpc<typeof rpcContract>();
   const [filters, setFilters] = useState<InboxFilters>(readInboxFilters);
-  const { projectId, recipient } = filters;
+  const projectId = filters.projectId && sidebar.projects.some((project) => project.id === filters.projectId) ? filters.projectId : "";
+  const { recipient } = filters;
   const [messages, setMessages] = useState<readonly OperatorMessage[]>([]);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [replyingMessageKey, setReplyingMessageKey] = useState<string | null>(null);
@@ -773,16 +774,18 @@ function InboxPanel(_props: PluginNavPanelProps) {
                     <span className="font-medium text-foreground">{message.recipient}</span>
                     <span>{message.severity}</span>
                     <span>
-                      {message.senderLaneId ? `${message.senderLaneId} · ` : ""}
-                      <a
-                        href="#"
-                        className="underline decoration-muted-foreground/50 underline-offset-2 hover:text-foreground"
-                        aria-label={`Open sender session ${message.senderThreadId}`}
-                        title={`Open sender session ${message.senderThreadId}`}
-                        onClick={(event) => { event.preventDefault(); navigate.toThread(message.senderThreadId); }}
-                      >
-                        {message.senderThreadId}
-                      </a>
+                      {asText(message.senderLaneId) ? `${asText(message.senderLaneId)} · ` : ""}
+                      {asText(message.senderThreadId) ? (
+                        <a
+                          href="#"
+                          className="underline decoration-muted-foreground/50 underline-offset-2 hover:text-foreground"
+                          aria-label={`Open sender session ${asText(message.senderThreadId)}`}
+                          title={`Open sender session ${asText(message.senderThreadId)}`}
+                          onClick={(event) => { event.preventDefault(); navigate.toThread(asText(message.senderThreadId)!); }}
+                        >
+                          {asText(message.senderThreadId)}
+                        </a>
+                      ) : <span>Sender unavailable</span>}
                     </span>
                     <time className="ml-auto" dateTime={new Date(message.createdAtMs).toISOString()}>{new Date(message.createdAtMs).toLocaleString()}</time>
                   </div>
