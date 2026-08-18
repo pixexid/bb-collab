@@ -2299,7 +2299,10 @@ describe("bb-collab plugin boundary", () => {
 
   it("does not wake a quiet director seat", async () => {
     const fixture = await fleetWatchdogFixture();
-    expect(fixture.host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toContain("fleet-watchdog");
+    const cron = fixture.host.harness.inspection.registrations.schedules.find((schedule) => schedule.name === "fleet-watchdog")?.cron;
+    if (cron !== "0 * * * *") {
+      throw new Error(`expected registered fleet-watchdog cron "0 * * * *", got "${cron}"\nDRILL BUILD ACTIVE - restore the production cron before merge (teardown item 3)`);
+    }
     await fixture.host.harness.runSchedule("fleet-watchdog");
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });

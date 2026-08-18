@@ -22744,7 +22744,7 @@ ${thread.titleFallback ?? ""}`);
     await fleetWatchdogIdle.clearWakeHistory(`${projectId}:`);
     bb.log.warn(`fleet-watchdog history reset: project=${projectId} invokedBy=${invokedBy} at=${Date.now()}`);
   };
-  bb.background.schedule("fleet-watchdog", "0 * * * *", () => fleetWatchdogCycle());
+  bb.background.schedule("fleet-watchdog", "* * * * *", () => fleetWatchdogCycle());
   bb.background.schedule("thread-archive-sweep", "0 * * * *", async () => {
     let projects;
     try {
