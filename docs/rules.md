@@ -94,6 +94,14 @@ Discovering that a lane ran on an unratified model, or at the wrong reasoning le
 
 This cuts the other way too. "It worked out" is not ratification, and a good outcome from an unplaced model is evidence for a probe to weigh, never a substitute for one.
 
+## A ruling disposes its own subordinate instances
+
+> When the same pattern surfaces again below a ruling that already covers it, apply the ruling. It returns to the deciding seat only when it presents new evidence, or when it resists the ruling's reasoning.
+
+Re-asking a settled question costs a round trip and buys nothing, and it teaches the seat below to stop thinking at the first resemblance. The test is not "is this the same case" but "does the ruling's reasoning reach this one". A model unratified for placement is still unratified when its name appears inside a row about something else; ratification-by-containment does not exist, so that instance is disposed, not escalated.
+
+Two things a seat owes when it disposes rather than escalates: say that it did, and say which ruling it applied. A disposition recorded as if it were a fresh decision is indistinguishable from a seat exceeding its authority.
+
 ## Blast radius
 
 > Every decision sweeps its own blast radius in the same act. Open issues, open PRs, and queued lane specs are caches of older decisions; a decision changing an artifact’s existence, owner, shape, or terminology invalidates them silently. Each affected item gets a one-line update or closure at decision time, not when someone trips over it. A sweep that names artifacts reads them; relayed labels are unverified by definition.
