@@ -653,11 +653,7 @@ function LanesPanel(_props) {
     /* @__PURE__ */ jsx("div", { className: "divide-y divide-border border-y border-border", children: lanes.map((lane) => /* @__PURE__ */ jsxs("div", { className: "grid grid-cols-[minmax(0,1fr)_auto_auto] gap-4 py-3 text-sm", children: [
       /* @__PURE__ */ jsxs("div", { className: "min-w-0", children: [
         /* @__PURE__ */ jsx("div", { className: "truncate font-medium", children: lane.laneId }),
-        /* @__PURE__ */ jsxs("div", { className: "truncate text-xs text-muted-foreground", children: [
-          lane.assignmentKind,
-          " \xB7 ",
-          lane.threadId ?? "worker not attached"
-        ] })
+        /* @__PURE__ */ jsx("div", { className: "truncate text-xs text-muted-foreground", children: lane.threadId ?? "worker not attached" })
       ] }),
       /* @__PURE__ */ jsx("div", { className: "text-muted-foreground", children: laneQueueLabel(lane) }),
       /* @__PURE__ */ jsx("time", { className: "text-muted-foreground", title: `${lane.ageMs}ms old`, children: age(lane.ageMs) })

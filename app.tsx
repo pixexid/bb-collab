@@ -632,7 +632,7 @@ function LanesPanel(_props: PluginNavPanelProps) {
             <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] gap-4 py-3 text-sm" key={lane.executionAttemptId}>
               <div className="min-w-0">
                 <div className="truncate font-medium">{lane.laneId}</div>
-                <div className="truncate text-xs text-muted-foreground">{lane.assignmentKind} · {lane.threadId ?? "worker not attached"}</div>
+                <div className="truncate text-xs text-muted-foreground">{lane.threadId ?? "worker not attached"}</div>
               </div>
               <div className="text-muted-foreground">{laneQueueLabel(lane)}</div>
               <time className="text-muted-foreground" title={`${lane.ageMs}ms old`}>{age(lane.ageMs)}</time>
