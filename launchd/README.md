@@ -19,10 +19,22 @@ KV. The role idle ledger remains the owner of the ten-minute floor, two-steer
 cap, and escalation behavior. A holder succession therefore retargets the
 next cycle without stopping or restarting the guard.
 
-`com.bbcollab.stall-guard.plist` is not installed by this PR. It retains
-`@@REPO_ROOT@@` and `@@STATE_DIR@@` until an operator substitutes them. The
-repository root must be repointed and the LaunchAgent reloaded whenever that
-checkout moves; otherwise a stale checkout runs stale supervisor code (#125).
+`com.bbcollab.stall-guard.plist` is a template. It retains
+`@@REPO_ROOT@@`, `@@STATE_DIR@@`, `@@HOME@@`, `@@NODE_BIN@@`, and `@@BB_BIN@@`
+until the install command substitutes them. The repository root must be
+repointed and the LaunchAgent reloaded whenever that checkout moves; otherwise
+a stale checkout runs stale supervisor code (#125).
+
+The substitutions are required because launchd gives a job a minimal
+environment; it does not inherit an interactive shell's PATH or tilde
+expansion. Derive them from the install shell (`pwd -P`, `printf '%s' "$HOME"`,
+`command -v node`, and `command -v bb`) and write them into a temporary copy of
+the template. `BB_BIN` is deliberately an absolute path, and `~/.local/bin` is
+explicitly included in the job PATH so the installed job can resolve the same
+user-local tooling without relying on login-shell setup. `NODE_BIN` is absolute
+for the same reason; there are no bare command names or relative executable
+paths left in this plist. The state-directory substitution is also exported to
+the script, so its liveness marker and launchd logs use the same directory.
 
 The old `bb-collab-stall-guard.sh` is superseded. During the manual install,
 the operator must kill its live processes and must not restart the copy under
@@ -91,16 +103,34 @@ watcher-of-watchers.
 
 ## Stall-guard operator install (manual, after gates pass)
 
-1. Substitute `@@REPO_ROOT@@` with the live checkout and `@@STATE_DIR@@` with
-   the marker/log directory. Create the directory before loading.
+1. Derive the five substitutions from the live checkout and host, then render
+   a temporary plist; this edits neither the repository template nor the live
+   installed job:
+
+   ```sh
+   repo_root=$(cd /path/to/bb-collab && pwd -P)
+   state_dir="$HOME/.bb/bb-collab"
+   node_bin=$(command -v node)
+   bb_bin=$(command -v bb)
+   sed -e "s|@@REPO_ROOT@@|$repo_root|g" \
+       -e "s|@@STATE_DIR@@|$state_dir|g" \
+       -e "s|@@HOME@@|$HOME|g" \
+       -e "s|@@NODE_BIN@@|$node_bin|g" \
+       -e "s|@@BB_BIN@@|$bb_bin|g" \
+       "$repo_root/launchd/com.bbcollab.stall-guard.plist" \
+       > /tmp/com.bbcollab.stall-guard.plist
+   mkdir -p "$state_dir"
+   ```
+
+   Check that each derived value is non-empty and absolute before loading.
 2. Kill the superseded shell-guard PIDs, then verify that no old shell guard
    is running. Do not perform either action as part of the merge.
 3. Load the new LaunchAgent:
 
    ```
    mkdir -p ~/.bb/bb-collab
-   plutil -lint launchd/com.bbcollab.stall-guard.plist
-   launchctl load launchd/com.bbcollab.stall-guard.plist
+   plutil -lint /tmp/com.bbcollab.stall-guard.plist
+   launchctl load /tmp/com.bbcollab.stall-guard.plist
    ```
 
 4. If the live checkout moves, substitute the new path and reload the plist.

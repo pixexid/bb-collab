@@ -6,14 +6,17 @@
     <string>com.bbcollab.stall-guard</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/env</string>
-        <string>node</string>
+        <string>@@NODE_BIN@@</string>
         <string>@@REPO_ROOT@@/scripts/stall-guard.mjs</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>BB_BIN</key>
+        <string>@@BB_BIN@@</string>
+        <key>BB_COLLAB_STALL_GUARD_STATE_DIR</key>
+        <string>@@STATE_DIR@@</string>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>@@HOME@@/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
