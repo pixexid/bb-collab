@@ -401,6 +401,77 @@ describe("lane awareness", () => {
     expect(succession).toHaveLength(1);
   });
 
+  it("keeps a wait pending through a fired-state write outage and retries exactly once", async () => {
+    let persisted: unknown;
+    let failWrites = false;
+    let writeAttempts = 0;
+    const registry = createWaitRegistry({
+      read: async () => persisted,
+      write: async (state) => {
+        writeAttempts += 1;
+        if (failWrites) throw new Error("awareness storage unavailable");
+        persisted = structuredClone(state);
+      },
+    });
+    await registry.register(registeredWait({ waiterThreadId: "director-1", sourceThreadId: "worker-source" }));
+    expect(registry.state("wait-1")).toBe("pending");
+
+    const onWaitEvent = vi.fn();
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    const watcher = createLaneWatcher({
+      waitRegistry: registry,
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => [roleScope("queue-head")],
+      readWorker: async () => roleObservation(0),
+      steerRole,
+      roleIdleThresholdMs: 0,
+      onWaitEvent,
+      now: () => 1,
+    });
+
+    failWrites = true;
+    await watcher.observe("worker-source", "error");
+    expect(writeAttempts).toBe(2);
+    expect(registry.state("wait-1")).toBe("pending");
+    expect(onWaitEvent).not.toHaveBeenCalled();
+    expect(steerRole).not.toHaveBeenCalled();
+
+    failWrites = false;
+    await watcher.observe("worker-source", "error");
+    await watcher.observe("worker-source", "error");
+    expect(writeAttempts).toBe(3);
+    expect(registry.state("wait-1")).toBe("fired");
+    expect(onWaitEvent).toHaveBeenCalledTimes(1);
+    expect(steerRole).toHaveBeenCalledTimes(1);
+  });
+
+  it("wakes the waiting role holder when a wait event fires", async () => {
+    const registry = createWaitRegistry();
+    await registry.register(registeredWait({ waiterThreadId: "director-1", sourceThreadId: "worker-source" }));
+    expect(registry.state("wait-1")).toBe("pending");
+
+    const onWaitEvent = vi.fn();
+    const readWorker = vi.fn(async () => roleObservation(0));
+    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
+    const watcher = createLaneWatcher({
+      waitRegistry: registry,
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => [roleScope("queue-head")],
+      readWorker,
+      steerRole,
+      roleIdleThresholdMs: 0,
+      onWaitEvent,
+      now: () => 1,
+    });
+
+    await watcher.observe("worker-source", "error");
+
+    expect(registry.state("wait-1")).toBe("fired");
+    expect(onWaitEvent).toHaveBeenCalledTimes(1);
+    expect(readWorker).toHaveBeenCalledWith("director-1");
+    expect(steerRole).toHaveBeenCalledWith(expect.objectContaining({ threadId: "director-1" }));
+  });
+
   it("polls every current canonical role seat during quiet GitHub without targeting historical holders or writing canonical rows", async () => {
     const db = new Database(":memory:");
     db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT, role_id TEXT, role_generation INTEGER)");
