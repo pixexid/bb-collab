@@ -2505,7 +2505,7 @@ function actorReceiptDigest(input: {
   }));
 }
 
-function mutationRequestDigest(_db: SqliteDatabase, request: ApplyRequest): string {
+function mutationRequestDigest(request: ApplyRequest): string {
   return sha256(canonicalJson(Object.fromEntries(Object.entries(request).filter(([, value]) => value !== undefined))));
 }
 
@@ -3837,7 +3837,7 @@ function storedDecisionIdentityDigest(decision: DecisionRow): string | null {
   }
 }
 
-function requireDecisionActor(db: SqliteDatabase, request: ApplyRequest, _decisionClass: string): string {
+function requireDecisionActor(db: SqliteDatabase, request: ApplyRequest): string {
   const actorReceiptId = requireActor(db, request);
   const actor = asRow<{ actor_kind: string; role_id: string | null }>(
     db.prepare("SELECT actor_kind, role_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(request.projectId, actorReceiptId),
@@ -3866,7 +3866,7 @@ function applyDecisionCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
   }
   const identity = decisionIdentity(request.projectId, currentRevision, decision);
   validateReviewDecisionCreate(db, request, decision, identity, currentRevision);
-  const actorReceiptId = requireDecisionActor(db, request, identity.decisionClass);
+  const actorReceiptId = requireDecisionActor(db, request);
   const existing = asRow<DecisionRow>(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decision.decisionId));
   if (existing) {
     if (existing.project_id !== request.projectId || existing.decision_identity_digest !== identity.identityDigest) {
@@ -4220,7 +4220,7 @@ function preflightReviewDisposition(
   if (!decision || decision.project_id !== request.projectId || decision.decision_class !== "review_adjudication" || !decision.options_json) {
     throw refusal("RESOURCE_UNKNOWN", "review Decision is not known in this project");
   }
-  requireDecisionActor(db, request, "review_adjudication");
+  requireDecisionActor(db, request);
   if (decision.config_revision !== configRevision) throw refusal("PROJECT_CONFIG_STALE", "review Decision config revision is stale");
   if (request.expectedResourceRevision !== decision.current_resource_revision) {
     throw refusal("RESOURCE_REVISION_STALE", "review Decision resource revision is stale", {
@@ -4473,7 +4473,7 @@ function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, dig
   ) {
     throw refusal("DECISION_IDENTITY_CONFLICT", "decision has no valid immutable typed identity");
   }
-  const actorReceiptId = requireDecisionActor(db, request, decision.decision_class);
+  const actorReceiptId = requireDecisionActor(db, request);
   if (decision.config_revision !== currentRevision) {
     throw refusal("PROJECT_CONFIG_STALE", "decision is bound to a stale config revision", {
       currentConfigRevision: currentRevision,
@@ -7266,7 +7266,7 @@ export function applyFixtureMutation(
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   try {
-    const digest = mutationRequestDigest(db, request);
+    const digest = mutationRequestDigest(request);
     if (request.operationClass === "github_issue_projection") {
       return applyGithubIssueProjection(db, request, digest, githubAdapter);
     }
