@@ -3370,7 +3370,7 @@ describe("bb-collab plugin boundary", () => {
     expect(SCHEMA_VERSION).toBe(14);
     expect(MIGRATIONS).toHaveLength(27);
     expect(schemaDigest).toBe("19ce4f2a3293379c19fab2280357f2aad408da623d858e34d487332b7a5f31fe");
-    expect(contractDigest).toBe("edf0dce5f7650adfd149d340d547a9cb13420202b3c8ce74ca6c8ae436a9f200");
+    expect(contractDigest).toBe("6df90c4315ca78dacb7043a45d28ccfdd259947d835bce3953d7b4f44b928c9f");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     const beforeRefusal = exportFoundation(db, PROJECT_ID);

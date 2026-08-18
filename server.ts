@@ -1547,7 +1547,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       },
       {
         name: "cached-consumer-rollout",
-        summary: "Persist the live v21 cached-consumer rollout receipt (exact one-request receipt required)",
+        summary: "Persist the live v21 cached-consumer rollout evidence (exact live production evidence required)",
         usage: "bb collab cached-consumer-rollout --project PROJECT_ID --request JSON",
       },
       {
