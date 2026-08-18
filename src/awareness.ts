@@ -248,6 +248,7 @@ export interface RoleIdleRecord {
   lastSteerAtMs: number | null;
   awaitingSteerOutcome: boolean;
   lastFleetWakeAtMs: number | null;
+  lastRecoveryWakeAtMs: number | null;
   lastStartableQueueWakeAtMs: number | null;
   lastStaleWaitWakeAtMs: number | null;
   lastOwedActWakeAtMs: number | null;
@@ -341,20 +342,21 @@ function roleIdleState(input: unknown): Record<string, RoleIdleRecord> {
     const lastSteerAtMs = typeof record.lastSteerAtMs === "number" && Number.isFinite(record.lastSteerAtMs) ? record.lastSteerAtMs : null;
     const awaitingSteerOutcome = record.awaitingSteerOutcome === true;
     const lastFleetWakeAtMs = typeof record.lastFleetWakeAtMs === "number" && Number.isFinite(record.lastFleetWakeAtMs) ? record.lastFleetWakeAtMs : null;
+    const lastRecoveryWakeAtMs = typeof record.lastRecoveryWakeAtMs === "number" && Number.isFinite(record.lastRecoveryWakeAtMs) ? record.lastRecoveryWakeAtMs : null;
     const lastStartableQueueWakeAtMs = typeof record.lastStartableQueueWakeAtMs === "number" && Number.isFinite(record.lastStartableQueueWakeAtMs) ? record.lastStartableQueueWakeAtMs : null;
     const lastStaleWaitWakeAtMs = typeof record.lastStaleWaitWakeAtMs === "number" && Number.isFinite(record.lastStaleWaitWakeAtMs) ? record.lastStaleWaitWakeAtMs : null;
     const lastOwedActWakeAtMs = typeof record.lastOwedActWakeAtMs === "number" && Number.isFinite(record.lastOwedActWakeAtMs) ? record.lastOwedActWakeAtMs : null;
     const lastEscalationAtMs = typeof record.lastEscalationAtMs === "number" && Number.isFinite(record.lastEscalationAtMs) ? record.lastEscalationAtMs : null;
-    if (!Number.isInteger(record.steerCount) || (record.steerCount as number) < 0 || (record.steerCount as number) > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || (idleSinceMs !== null && idleSinceMs < 0) || (lastSteerAtMs !== null && lastSteerAtMs < 0) || (lastFleetWakeAtMs !== null && lastFleetWakeAtMs < 0) || (lastStartableQueueWakeAtMs !== null && lastStartableQueueWakeAtMs < 0) || (lastStaleWaitWakeAtMs !== null && lastStaleWaitWakeAtMs < 0) || (lastOwedActWakeAtMs !== null && lastOwedActWakeAtMs < 0) || (lastEscalationAtMs !== null && lastEscalationAtMs < 0) || typeof record.escalated !== "boolean") {
+    if (!Number.isInteger(record.steerCount) || (record.steerCount as number) < 0 || (record.steerCount as number) > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || (idleSinceMs !== null && idleSinceMs < 0) || (lastSteerAtMs !== null && lastSteerAtMs < 0) || (lastFleetWakeAtMs !== null && lastFleetWakeAtMs < 0) || (lastRecoveryWakeAtMs !== null && lastRecoveryWakeAtMs < 0) || (lastStartableQueueWakeAtMs !== null && lastStartableQueueWakeAtMs < 0) || (lastStaleWaitWakeAtMs !== null && lastStaleWaitWakeAtMs < 0) || (lastOwedActWakeAtMs !== null && lastOwedActWakeAtMs < 0) || (lastEscalationAtMs !== null && lastEscalationAtMs < 0) || typeof record.escalated !== "boolean") {
       throw new Error("invalid role idle state");
     }
-    state[key] = { steerCount: record.steerCount as number, failedSteers, escalated: record.escalated as boolean, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastFleetWakeAtMs, lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs, lastOwedActWakeAtMs, lastEscalationAtMs };
+    state[key] = { steerCount: record.steerCount as number, failedSteers, escalated: record.escalated as boolean, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastFleetWakeAtMs, lastRecoveryWakeAtMs, lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs, lastOwedActWakeAtMs, lastEscalationAtMs };
   }
   return state;
 }
 
 function emptyRoleIdleRecord(): RoleIdleRecord {
-  return { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastFleetWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
+  return { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
 }
 
 export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
@@ -395,7 +397,7 @@ export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
       await load();
       const record = state[key];
       if (!record) return;
-      state[key] = { ...emptyRoleIdleRecord(), lastFleetWakeAtMs: record.lastFleetWakeAtMs, lastStartableQueueWakeAtMs: record.lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs: record.lastStaleWaitWakeAtMs, lastOwedActWakeAtMs: record.lastOwedActWakeAtMs, lastEscalationAtMs: record.lastEscalationAtMs };
+      state[key] = { ...emptyRoleIdleRecord(), lastFleetWakeAtMs: record.lastFleetWakeAtMs, lastRecoveryWakeAtMs: record.lastRecoveryWakeAtMs, lastStartableQueueWakeAtMs: record.lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs: record.lastStaleWaitWakeAtMs, lastOwedActWakeAtMs: record.lastOwedActWakeAtMs, lastEscalationAtMs: record.lastEscalationAtMs };
       await save();
     }),
     preserveAfterSteerWake: (key: string) => enqueue(async () => {
@@ -441,6 +443,12 @@ export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
       await persistence?.write(structuredClone(nextState));
       state = nextState;
     }),
+    recordRecoveryWake: (key: string, sentAtMs: number) => enqueue(async () => {
+      await load();
+      const nextState = { ...state, [key]: { ...(state[key] ?? emptyRoleIdleRecord()), lastRecoveryWakeAtMs: sentAtMs } };
+      await persistence?.write(structuredClone(nextState));
+      state = nextState;
+    }),
     recordStartableQueueWake: (key: string, sentAtMs: number) => enqueue(async () => {
       await load();
       const nextState = { ...state, [key]: { ...(state[key] ?? emptyRoleIdleRecord()), lastStartableQueueWakeAtMs: sentAtMs } };
@@ -468,7 +476,7 @@ export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
     }),
     clearWakeHistory: (prefix: string) => enqueue(async () => {
       await load();
-      for (const key of Object.keys(state)) if (key.startsWith(prefix)) state[key] = { ...state[key]!, idleSinceMs: null, lastFleetWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
+      for (const key of Object.keys(state)) if (key.startsWith(prefix)) state[key] = { ...state[key]!, idleSinceMs: null, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
       await save();
     }),
   };
