@@ -9,15 +9,16 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const stage = mkdtempSync(join(tmpdir(), "bb-collab-build-"));
 
 try {
-  for (const name of ["server.ts", "app.tsx", "tsconfig.json", "src", "types", "vendor", "docs"]) {
+  for (const name of ["server.ts", "app.tsx", "tsconfig.json", "src", "types", "vendor"]) {
     cpSync(join(root, name), join(stage, name), { recursive: true });
   }
-  writeFileSync(join(stage, "role-briefs.json"), JSON.stringify(roleBriefBundle(stage)));
+  writeFileSync(join(stage, "role-briefs.json"), JSON.stringify(roleBriefBundle(root)));
+  writeFileSync(join(stage, ".gitignore"), "role-briefs.json\nserver.ts\ntsconfig.json\ntypes/\nvendor/\n");
   symlinkSync(join(root, "node_modules"), join(stage, "node_modules"), "dir");
   const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
   manifest.bb.server = "./server.ts";
   writeFileSync(join(stage, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
-  execFileSync("bb", ["plugin", "build", stage], { stdio: "inherit" });
+  execFileSync("bb", ["plugin", "build", stage], { cwd: stage, stdio: "inherit" });
   cpSync(join(stage, "dist"), join(root, "dist"), { recursive: true });
   cpSync(join(stage, "role-briefs.json"), join(root, "dist", "role-briefs.json"));
   // Every tracked artifact names its entry through the throwaway staging
@@ -26,11 +27,16 @@ try {
   const stagedEntryComment = /\/\/ .*?bb-collab-build-[^/]+\/(?=(?:server\.ts|app\.tsx|src\/))/gu;
   for (const artifact of ["dist/server.js", "dist/app.js"]) {
     const artifactPath = join(root, artifact);
+    const normalized = readFileSync(artifactPath, "utf8")
+      .replace(stagedEntryComment, "// ")
+      .replace(/^\/\/ .*?\/node_modules\//gmu, "// node_modules/")
+      .replace(/[ \t]+$/gmu, "");
+    if (/^\/\/ .*?\/node_modules\//mu.test(normalized)) {
+      throw new Error(`${artifact} contains an unnormalized node_modules path comment`);
+    }
     writeFileSync(
       artifactPath,
-      readFileSync(artifactPath, "utf8")
-        .replace(stagedEntryComment, "// ")
-        .replace(/[ \t]+$/gmu, ""),
+      normalized,
     );
   }
 } finally {
