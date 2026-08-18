@@ -32,8 +32,13 @@ It returns the input with these removed:
 
 Everything else is preserved. Surviving lines are rejoined with `\n`.
 
-Line splitting accepts both `\n` and `\r\n`, and a trailing carriage return is not
-part of a surviving line. Output always uses `\n`.
+Line splitting accepts both `\n` and `\r\n`. A carriage return is removed only as
+part of a CRLF pair — consumed by the split itself. A lone carriage return, including
+one at the end of the input, is ordinary text and survives in its line. Output always
+uses `\n`.
+
+That distinction is load-bearing and was got wrong once; see the correction note at
+the end of this file.
 
 Fence rules:
 
@@ -68,3 +73,15 @@ The subject also reports its requested versus executed execution profile without
 inferring execution from request flags. Fields that cannot be read from a real
 surface are reported as unknown; see the executed-profile gap tracked in the issue
 queue.
+
+## Correction, 2026-08-18: the reference is authoritative
+
+The CRLF paragraph previously read "a trailing carriage return is not part of a
+surviving line". Both GH-222 subjects implemented that — stripping a lone line-final
+`\r` — and the reference in `scripts/pr-lifecycle.mjs` does not. It was the only
+divergence class between reference and subjects across the grader's fuzz harness.
+
+Two subjects implementing a sentence identically, against the reference, is not
+ambiguity; it is a second authority, and every later probe would have graded against a
+fork. Ruled: the reference is authoritative and the sentence was defective — collateral
+from adding the CRLF rule, never a deliberate requirement.
