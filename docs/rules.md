@@ -226,6 +226,18 @@ A reason may point at a standing one. Restating an unchanged collision map every
 
 What this deliberately does **not** do is encode surface occupancy into the wake condition. That would require the mechanism to know which files a lane holds, which no canonical source can currently claim, and a confident condition on an unverifiable input is exactly how a permanently-true wake and a dead-source counter both happened. A wake that fires slightly too often, answered by a seat that states the map, is cheaper than a mechanism that computes collisions and gets them wrong in silence.
 
+## A ruling names the seat that can perform it
+
+> Before ruling an act executable, name the seat that can perform it. A ruling whose executing surface does not exist routes upward or waits — it never routes to improvisation.
+
+Three times in one evening a ruling named an act no seat could carry out: set the project's sticky spawn default, create a project for a drill, and one deploy that was only executable because a repointable worktree happened to exist. Each was discovered by a seat going to do the thing and finding no way, which is the expensive moment — the work is planned, the lane is dispatched or about to be, and the gap surfaces at execution.
+
+The failure mode is not the missing surface. It is what a seat does next: the improvisation nearest to hand is usually the thing the ruling was trying to prevent. Asked to create a project and unable to, the available shortcut was governing a real one — which that same ruling had explicitly forbidden. The gap and the temptation arrive together.
+
+This is not detectable mechanically and should not be built. A ruling's named act lives in prose, not in canonical or platform state, so identifying it would mean interpreting text, and interpretation needs a model in a path that is deliberately model-free. It is a check made when the ruling is written, by the seat writing it.
+
+Naming the surface is usually one line and sometimes reveals there isn't one, which is the point.
+
 ## Blast radius
 
 > Every decision sweeps its own blast radius in the same act. Open issues, open PRs, and queued lane specs are caches of older decisions; a decision changing an artifact’s existence, owner, shape, or terminology invalidates them silently. Each affected item gets a one-line update or closure at decision time, not when someone trips over it. A sweep that names artifacts reads them; relayed labels are unverified by definition.
