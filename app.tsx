@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { definePluginApp, experimental_useSidebarThreadActions, experimental_useSidebarThreads, useBbContext, useRpc } from "@bb/plugin-sdk/app";
+import { definePluginApp, experimental_useSidebarThreadActions, experimental_useSidebarThreads, useBbContext, useBbNavigate, useRpc } from "@bb/plugin-sdk/app";
 import type {
   PluginComposerThreadRowStatus,
   PluginNavPanelProps,
@@ -34,6 +34,29 @@ const MAX_VISIBLE_THREADS = 5;
 // at that measured display budget and disclose the spill instead of hiding it.
 const MAX_VISIBLE_INBOX_MESSAGES = 256;
 const SIDEBAR_RPC_BATCH_SIZE = 256;
+const INBOX_FILTER_STORAGE_KEY = "bb-collab.inbox-filters";
+
+type InboxFilters = { projectId: string; recipient: "" | OperatorMessage["recipient"] };
+
+function readInboxFilters(): InboxFilters {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(INBOX_FILTER_STORAGE_KEY) ?? "null") as Partial<InboxFilters> | null;
+    return {
+      projectId: typeof value?.projectId === "string" ? value.projectId : "",
+      recipient: value?.recipient === "operator" || value?.recipient === "supervisor" ? value.recipient : "",
+    };
+  } catch {
+    return { projectId: "", recipient: "" };
+  }
+}
+
+function writeInboxFilters(filters: InboxFilters): void {
+  try {
+    window.localStorage.setItem(INBOX_FILTER_STORAGE_KEY, JSON.stringify(filters));
+  } catch {
+    // Browser storage can be disabled; the panel remains usable for this mount.
+  }
+}
 
 export function sidebarRpcBatches(ids: readonly string[]): string[][] {
   const batches: string[][] = [];
@@ -669,9 +692,10 @@ function LanesPanel(_props: PluginNavPanelProps) {
 
 function InboxPanel(_props: PluginNavPanelProps) {
   const sidebar = experimental_useSidebarThreads();
+  const navigate = useBbNavigate();
   const rpc = useRpc<typeof rpcContract>();
-  const [projectId, setProjectId] = useState("");
-  const [recipient, setRecipient] = useState<"" | OperatorMessage["recipient"]>("");
+  const [filters, setFilters] = useState<InboxFilters>(readInboxFilters);
+  const { projectId, recipient } = filters;
   const [messages, setMessages] = useState<readonly OperatorMessage[]>([]);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [replyingMessageKey, setReplyingMessageKey] = useState<string | null>(null);
@@ -681,6 +705,11 @@ function InboxPanel(_props: PluginNavPanelProps) {
   const projectNames = useMemo(() => new Map(sidebar.projects.map((candidate) => [candidate.id, candidate.name])), [sidebar.projects]);
   const messageKey = (message: OperatorMessage) => `${message.projectId}:${message.messageId}`;
   const visibleMessages = messages.slice(0, MAX_VISIBLE_INBOX_MESSAGES);
+
+  const setFiltersAndPersist = (next: InboxFilters) => {
+    setFilters(next);
+    writeInboxFilters(next);
+  };
 
   const refresh = useCallback(() => {
     const sequence = ++refreshSequence.current;
@@ -714,14 +743,14 @@ function InboxPanel(_props: PluginNavPanelProps) {
         <div className="mb-5 flex flex-wrap items-end gap-3">
           <label className="grid gap-1 text-sm">
             <span className="text-muted-foreground">Project</span>
-            <select className="rounded-md border border-border bg-background px-3 py-2" value={projectId} onChange={(event) => setProjectId(event.target.value)}>
+            <select className="rounded-md border border-border bg-background px-3 py-2" value={projectId} onChange={(event) => setFiltersAndPersist({ projectId: event.target.value, recipient })}>
               <option value="">All projects</option>
               {sidebar.projects.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name} · {candidate.id}</option>)}
             </select>
           </label>
           <label className="grid gap-1 text-sm">
             <span className="text-muted-foreground">Recipient</span>
-            <select className="rounded-md border border-border bg-background px-3 py-2" value={recipient} onChange={(event) => setRecipient(event.target.value as typeof recipient)}>
+            <select className="rounded-md border border-border bg-background px-3 py-2" value={recipient} onChange={(event) => setFiltersAndPersist({ projectId, recipient: event.target.value as InboxFilters["recipient"] })}>
               <option value="">All recipients</option>
               <option value="operator">Operator</option>
               <option value="supervisor">Supervisor</option>
@@ -743,7 +772,18 @@ function InboxPanel(_props: PluginNavPanelProps) {
                     <span className="font-medium text-foreground">{projectNames.get(message.projectId) ?? message.projectId} · {message.projectId}</span>
                     <span className="font-medium text-foreground">{message.recipient}</span>
                     <span>{message.severity}</span>
-                    <span>{message.senderLaneId ? `${message.senderLaneId} · ` : ""}{message.senderThreadId}</span>
+                    <span>
+                      {message.senderLaneId ? `${message.senderLaneId} · ` : ""}
+                      <a
+                        href="#"
+                        className="underline decoration-muted-foreground/50 underline-offset-2 hover:text-foreground"
+                        aria-label={`Open sender session ${message.senderThreadId}`}
+                        title={`Open sender session ${message.senderThreadId}`}
+                        onClick={(event) => { event.preventDefault(); navigate.toThread(message.senderThreadId); }}
+                      >
+                        {message.senderThreadId}
+                      </a>
+                    </span>
                     <time className="ml-auto" dateTime={new Date(message.createdAtMs).toISOString()}>{new Date(message.createdAtMs).toLocaleString()}</time>
                   </div>
                   <p className="my-3 whitespace-pre-wrap text-sm">{message.text}</p>

@@ -469,6 +469,18 @@
     .text-primary-foreground {
       color: var(--primary-foreground);
     }
+    .underline {
+      text-decoration-line: underline;
+    }
+    .decoration-muted-foreground\/50 {
+      text-decoration-color: var(--muted-foreground);
+      @supports (color: color-mix(in lab, red, red)) {
+        text-decoration-color: color-mix(in oklab, var(--muted-foreground) 50%, transparent);
+      }
+    }
+    .underline-offset-2 {
+      text-underline-offset: 2px;
+    }
     .opacity-0 {
       opacity: 0%;
     }
