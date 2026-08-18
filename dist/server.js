@@ -15755,7 +15755,7 @@ function requireTargetCollection(request, operation) {
   }
   return targets;
 }
-function requireTarget(db, projectId, configRevision, targetId) {
+function requireTarget(db, projectId, configRevision, targetId, allowStaleTarget = false) {
   const current = db.prepare("SELECT * FROM repository_targets WHERE project_id = ? AND config_revision = ? ORDER BY repo_target_id").all(projectId, configRevision);
   if (!targetId) {
     if (current.length > 1) throw refusal("REPO_TARGET_AMBIGUOUS", "an exact repository target is required");
@@ -15768,8 +15768,9 @@ function requireTarget(db, projectId, configRevision, targetId) {
   );
   if (found) return found;
   const sameProject = asRow(
-    db.prepare("SELECT config_revision FROM repository_targets WHERE project_id = ? AND repo_target_id = ? ORDER BY config_revision DESC LIMIT 1").get(projectId, targetId)
+    db.prepare("SELECT * FROM repository_targets WHERE project_id = ? AND repo_target_id = ? ORDER BY config_revision DESC LIMIT 1").get(projectId, targetId)
   );
+  if (sameProject && allowStaleTarget) return sameProject;
   if (sameProject) throw refusal("REPO_TARGET_STALE", "repository target is not registered in the expected config revision");
   throw refusal("REPO_TARGET_FOREIGN", "repository target is not registered for this project");
 }
@@ -18011,7 +18012,7 @@ function requireGithubMapping(db, projectId, configRevision, repoTargetId) {
   if (mappings.length !== 1) throw refusal("EXTERNAL_TARGET_REQUIRED", "the exact repository target has no unique GitHub Issues mapping");
   return { github, mapping: mappings[0] };
 }
-function requireWorkItem(db, request, configRevision, expectedRevision = request.expectedResourceRevision) {
+function requireWorkItem(db, request, configRevision, expectedRevision = request.expectedResourceRevision, allowStaleConfig = false) {
   const workItemId = request.workItemId;
   if (!workItemId) throw refusal("WORK_ITEM_UNKNOWN", "work item identity is required");
   const row = asRow(
@@ -18021,7 +18022,7 @@ function requireWorkItem(db, request, configRevision, expectedRevision = request
     const foreign = db.prepare("SELECT 1 FROM work_items WHERE work_item_id = ? LIMIT 1").get(workItemId);
     throw refusal(foreign ? "WORK_ITEM_FOREIGN" : "WORK_ITEM_UNKNOWN", foreign ? "work item belongs to another project" : "work item is not known");
   }
-  if (row.config_revision !== configRevision) {
+  if (row.config_revision !== configRevision && !allowStaleConfig) {
     throw refusal("PROJECT_CONFIG_STALE", "work item is bound to a stale config revision", {
       currentConfigRevision: configRevision,
       expectedConfigRevision: row.config_revision
@@ -18029,7 +18030,7 @@ function requireWorkItem(db, request, configRevision, expectedRevision = request
   }
   if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "work item mutation requires its exact repository target");
   if (request.repoTargetId !== row.repo_target_id) throw refusal("REPO_TARGET_FOREIGN", "work item target does not match the exact repository target");
-  requireTarget(db, request.projectId, configRevision, request.repoTargetId);
+  requireTarget(db, request.projectId, configRevision, request.repoTargetId, allowStaleConfig);
   if (expectedRevision !== row.resource_revision) {
     throw refusal("WORK_ITEM_REVISION_STALE", "work item resource revision is stale", {
       currentResourceRevision: row.resource_revision,
@@ -18101,8 +18102,14 @@ function applyWorkItemTransition(db, request, digest) {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
-  const workItem = requireWorkItem(db, request, configRevision);
   const nextState = request.lifecycleState;
+  const workItem = requireWorkItem(
+    db,
+    request,
+    configRevision,
+    request.expectedResourceRevision,
+    nextState === "succeeded" || nextState === "failed" || nextState === "cancelled"
+  );
   if (!nextState || !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
