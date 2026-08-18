@@ -1,16 +1,12 @@
 import { defineRpcContract, type BbPluginApi, type PluginCliContext } from "@bb/plugin-sdk";
 import { z } from "zod";
 import {
-  OPEN_ATTEMPT_STATES,
   createContinuationLedger,
   createLaneWatcher,
   createRoleIdleLedger,
   createWaitRegistry,
-  openLaneViews,
-  readLaneStates,
   readRoleHolderStates,
   roleIdleKey,
-  roleQueueScopes,
   subscribeToThreadChanges,
   threadEventStatus,
   type OperatorWait,
@@ -947,37 +943,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       : `observedProject=${thread.projectId} archivedAt=${thread.archivedAt ?? "null"} deletedAt=${thread.deletedAt ?? "null"} status=${thread.status} witness=${witness}`;
   };
 
-  const readOperatorWaits = async () => {
-    if (!db) return new Map<string, OperatorWait>();
-    const operatorWaits = new Map<string, OperatorWait>();
-    const threadIds = [...new Set(readLaneStates(db)
-      .filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state))
-      .map((lane) => lane.thread_id)
-      .filter((threadId): threadId is string => threadId !== null))];
-    await Promise.all(threadIds.map(async (threadId) => {
-      try {
-        const wait = await readPendingOperatorWaitForThread(threadId);
-        if (wait) operatorWaits.set(threadId, wait);
-      } catch {
-        // A single project's interaction surface must not abort other projects' floors.
-      }
-    }));
-    return operatorWaits;
-  };
-
-  const readRoleScopes = async () => {
-    if (!db) return [];
-    return roleQueueScopes(openLaneViews(db, Date.now(), await readOperatorWaits()));
-  };
-
-  const readUnblockedStartableLanes = async () => {
-    if (!db) return [];
-    const candidates = openLaneViews(db, Date.now(), await readOperatorWaits()).filter((lane) => lane.nextStartable);
-    return (await Promise.all(candidates.map(async (lane) => {
-      if (!lane.threadId || !(await readPendingExternalWait(lane.threadId))) return lane;
-      return null;
-    }))).filter((lane): lane is (typeof candidates)[number] => lane !== null);
-  };
+  const readRoleScopes = async () => [];
 
   const steerRole = async (role: import("./src/awareness.js").RoleIdleView) => {
     if (!db) return "error" as const;
@@ -1033,7 +999,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   };
 
   const watcher = createLaneWatcher({
-    readLanes: () => (db ? readLaneStates(db) : []),
+    readLanes: () => [],
     readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
     readRoleScopes,
     roleIdlePersistence,
@@ -1409,10 +1375,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     bb.log.info("thread-archive-sweep healthy cycle");
   });
 
-  const readOpenLaneViews = async () => {
-    if (!db) return [];
-    return openLaneViews(db, Date.now(), new Map());
-  };
+  const readOpenLaneViews = async () => [];
 
   // Lifecycle callbacks observe a completed creation; they cannot intercept a
   // spawn. An unseated thread receives its worker brief here at seating;
