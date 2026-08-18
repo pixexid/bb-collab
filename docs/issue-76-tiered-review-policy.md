@@ -32,8 +32,12 @@ continues to use the existing exact-head Assignment/ExecutionAttempt path.
 
 Inspection against the fresh #77 base found no canonical store, receipt,
 schema, or cached-consumer contract change required for #76; no contract or
-schema bump is owed. The #77 cap remains the explicit per-orchestrator
-`writingLaneCeiling`, default/max 3, with reviews and probes outside the cap.
+schema bump is owed. The #77 dial remains the canonical per-orchestrator
+`writingLaneCeiling` configuration, validated at config time and honoured by
+seats as dispatch-time policy; no runtime path gates admission or queue
+startability against it. Enforcement ended with the assignment-subsystem
+severance recorded in [issue #192](https://github.com/pixexid/bb-collab/issues/192).
+Reviews and probes do not consume the writing cap.
 
 ## Validation
 

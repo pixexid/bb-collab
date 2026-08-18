@@ -83,10 +83,11 @@ infrastructure, but they must not create duplicate authority concepts.
 
 The project has at most one active writing assignment for a
 project_id/lane_id pair. Contract v13 gives each orchestrator an explicit
-`extensions.bbCollab.writingLaneCeiling` dial, defaulting to 3 for bb-collab
-and bounded at 3; an operator-authorized config revision may lower it but no
-runtime path silently raises it. Read-only work does not consume the writing
-cap, but remains assigned and isolated.
+`extensions.bbCollab.writingLaneCeiling` dial; canonical configuration validates
+it, and seats honour it as dispatch-time policy. No runtime path gates admission
+or queue startability against it. Read-only work does not consume the writing
+cap, but remains assigned and isolated. Enforcement ended with the
+assignment-subsystem severance recorded in [issue #192](https://github.com/pixexid/bb-collab/issues/192).
 
 Exactly one current ProjectGovernorship head exists. A valid canonical write
 requires the current head to name the permitted runtime, be in a writable
@@ -359,16 +360,15 @@ The requested tuple is never copied into executed fields. Unknown executed
 values remain unknown. If the role or gate requires a known value, the attempt
 is ineligible even if its output looks plausible.
 
-One active writer per lane is absolute. A read-only review or probe is
+One active writer per lane is policy. A read-only review or probe is
 explicitly assigned, uses a clean isolated environment bound to the exact
 candidate where applicable, and does not consume the writing cap. An
 automated subagent is not a v1 authority path; if used later it is depth one,
 draft-only and cannot own a write, review, merge, release or operator action.
-Each orchestrator's explicit `writingLaneCeiling` defaults to 3, may be lowered
-by an operator-authorized config revision, and cannot be silently raised. The
-canonical Assignment resolver enforces the cap atomically; lane awareness reads
-the same config head and marks up to the available write lanes startable while
-keeping review/probe lanes outside the cap.
+Each orchestrator's explicit `writingLaneCeiling` is canonical configuration,
+validated at config time and lowerable by an operator-authorized config revision.
+Seats honour it as dispatch-time policy; no runtime path gates admission or
+queue startability against it. Review/probe lanes remain outside the cap.
 
 The sanctioned worker report is a literal terminal DONE|BLOCKED tell. Native
 BB/provider receipts prove lifecycle; silence, a status read, a reaction or an
@@ -478,7 +478,6 @@ second authority.
 | Retired, wrong or mismatched role generation | ROLE_GENERATION_STALE, ROLE_NOT_ACTIVE or ROLE_HOLDER_MISMATCH | No authority action and no provider/thread/display fallback. |
 | Missing, expired or contradictory qualification | ROLE_UNQUALIFIED or CAPABILITY_UNKNOWN | No role activation or review gate. Evidence remains readable. |
 | Stale WorkItem, decision or assignment revision | RESOURCE_REVISION_STALE | No lost update; reread and re-disposition. |
-| Active writer already owns a lane | LANE_WRITER_EXISTS | No second writing assignment or dispatch. Read-only work may remain separate. |
 | Native spawn acknowledged without correlated start/terminal evidence | DISPATCH_UNKNOWN | Emit reconciliation evidence; do not blind-retry. |
 | Actual execution profile missing or mismatched | EXECUTION_PROFILE_UNKNOWN or EXECUTION_PROFILE_MISMATCH | Attempt is truthful evidence but cannot satisfy the required role or assignment. |
 | Worker dies or quota-fails before terminal report | FAILED | Keep WorkItem nonterminal or blocked according to policy. |
