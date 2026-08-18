@@ -82,8 +82,6 @@ describe("stall-guard artifact cycle", () => {
     let currentArtifact = absentArtifact();
     const steerRole = vi.fn().mockResolvedValue(true);
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: async () => {},
       readRoleHolders: () => holders,
       readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "attempt-1", deferredReason: null }],
       readWorker: async () => ({
@@ -158,8 +156,6 @@ describe("stall-guard artifact cycle", () => {
       return true;
     });
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: async () => {},
       readRoleHolders: () => [holder(1, "current-holder")],
       readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "attempt-1", deferredReason: null }],
       readWorker: async () => ({
@@ -261,8 +257,6 @@ describe("stall-guard artifact cycle", () => {
     });
     const succession: unknown[] = [];
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: async () => {},
       readRoleHolders: () => [holder(1, "current-holder")],
       readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "attempt-1", deferredReason: null }],
       readWorker: async () => ({
@@ -326,8 +320,6 @@ describe("stall-guard artifact cycle", () => {
       return [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }];
     });
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: async () => {},
       readRoleHolders: () => [holder(1, "current-holder")],
       readRoleScopes: wakeReadScopes,
       readWorker: async () => ({
@@ -366,8 +358,6 @@ describe("stall-guard artifact cycle", () => {
       return [holder(1, "current-holder")];
     });
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: async () => {},
       readRoleHolders: wakeReadHolders,
       readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "attempt-1", deferredReason: null }],
       readWorker: async () => ({
@@ -402,8 +392,6 @@ describe("stall-guard artifact cycle", () => {
     let currentArtifact = absentArtifact();
     const declinedSteer = vi.fn(async () => false);
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: async () => {},
       readRoleHolders: () => [holder(1, "current-holder")],
       readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "attempt-1", deferredReason: null }],
       readWorker: async () => ({
@@ -457,8 +445,6 @@ describe("stall-guard artifact cycle", () => {
     let status: "active" | "idle" = "active";
     const steerRole = vi.fn().mockResolvedValue(true);
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: async () => {},
       readRoleHolders: () => [holder(1, "current-holder")],
       readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
       readWorker: async () => ({ projectId: PROJECT_ID, status, pendingExternalWait: false, archived: false, operatorWait: null, operatorWaitKnown: true, idleSinceMs: status === "idle" ? 0 : null }),
@@ -482,8 +468,6 @@ describe("stall-guard artifact cycle", () => {
     const store = kvPersistence();
     const steerRole = vi.fn().mockResolvedValue(true);
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: async () => {},
       readRoleHolders: () => [holder(1, "current-holder")],
       readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
       readWorker: async () => ({

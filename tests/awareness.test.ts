@@ -1,8 +1,6 @@
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import {
-  continuationModeFor,
-  createContinuationLedger,
   createLaneWatcher,
   createWaitRegistry,
   type OperatorWait,
@@ -10,24 +8,7 @@ import {
   readRoleHolderStates,
   type RoleHolderState,
   type RoleIdleView,
-  type LaneState,
-  type LaneView,
 } from "../src/awareness.js";
-
-function lane(threadId = "worker-1"): LaneState {
-  return {
-    project_id: "project-1",
-    assignment_id: "assignment-1",
-    lane_id: "lane-1",
-    assignment_kind: "write",
-    work_item_id: "work-1",
-    thread_id: threadId,
-    execution_attempt_id: "attempt-1",
-    attempt_state: "running",
-    terminal_report_digest: null,
-    created_at_ms: 1,
-  };
-}
 
 function roleHolder(threadId = "director-1"): RoleHolderState {
   return {
@@ -68,8 +49,6 @@ describe("lane awareness", () => {
     let scopes = [roleScope(null, "awaiting_operator")];
     let currentNow = 0;
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => scopes,
       readWorker: async () => roleObservation(0),
@@ -92,8 +71,6 @@ describe("lane awareness", () => {
     const readWorker = vi.fn(async (threadId: string) => ({ ...roleObservation(0), status: threadId === "director-1" ? "idle" as const : "active" as const }));
     let currentNow = 0;
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => [roleScope("queue-head")],
       readWorker,
@@ -113,8 +90,6 @@ describe("lane awareness", () => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     let currentNow = 0;
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [{ ...roleHolder("dispatcher-1"), role_id: "worker" }],
       readRoleScopes: () => [roleScope("queue-head")],
       readWorker: async () => roleObservation(0),
@@ -137,8 +112,6 @@ describe("lane awareness", () => {
   it("suppresses role observation when the canonical holder is ambiguous", async () => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder("director-1"), roleHolder("director-2")],
       readRoleScopes: () => [roleScope("queue-head")],
       readWorker: async () => roleObservation(0),
@@ -156,8 +129,6 @@ describe("lane awareness", () => {
   ])("refuses a %s canonical holder", async (_name, holders) => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => holders,
       readRoleScopes: () => [roleScope("queue-head")],
       readWorker: async () => roleObservation(0),
@@ -176,8 +147,6 @@ describe("lane awareness", () => {
   ])("refuses an %s native holder observation", async (_name, observation) => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => [roleScope("queue-head")],
       readWorker: async () => observation,
@@ -194,8 +163,6 @@ describe("lane awareness", () => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     let reads = 0;
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => {
         reads += 1;
         return [roleHolder(reads > 2 ? "successor-1" : "director-1")];
@@ -214,8 +181,6 @@ describe("lane awareness", () => {
   it("suppresses role observation when the canonical queue scope is absent", async () => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => [],
       readWorker: async () => roleObservation(0),
@@ -232,8 +197,6 @@ describe("lane awareness", () => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     let currentNow = 0;
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => [roleScope("queue-head")],
       readWorker: async (threadId) => ({ ...roleObservation(0), status: threadId === "director-1" ? "idle" : "active" }),
@@ -252,8 +215,6 @@ describe("lane awareness", () => {
     let currentNow = 0;
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => [roleScope("queue-head")],
       readWorker: async () => roleObservation(0),
@@ -275,8 +236,6 @@ describe("lane awareness", () => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     let currentNow = 0;
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => [roleScope("queue-head")],
       readWorker: async () => roleObservation(0),
@@ -295,8 +254,6 @@ describe("lane awareness", () => {
     let currentNow = 0;
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<boolean>>().mockResolvedValue(false);
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => [roleScope("queue-head")],
       readWorker: async () => roleObservation(0),
@@ -326,8 +283,6 @@ describe("lane awareness", () => {
       status = "starting";
     });
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => [roleScope("queue-head")],
       readWorker: async () => status === "idle"
@@ -388,8 +343,6 @@ describe("lane awareness", () => {
     };
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     const options = {
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => [roleScope(status === "idle" ? queueHead : null)],
       readWorker: async () => ({ ...roleObservation(0), status, pendingExternalWait: false }),
@@ -426,8 +379,6 @@ describe("lane awareness", () => {
     const succession: RoleIdleView[] = [];
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockRejectedValue(new Error("send failed"));
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => [roleHolder()],
       readRoleScopes: () => [roleScope("queue-head")],
       readWorker: async () => roleObservation(0),
@@ -448,401 +399,6 @@ describe("lane awareness", () => {
     expect(steerRole).toHaveBeenCalledTimes(2);
     expect(alerts).toEqual(["wrongful_idle_fyi"]);
     expect(succession).toHaveLength(1);
-  });
-
-  it("steers on a synthetic idle transition", async () => {
-    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    const watcher = createLaneWatcher({ readLanes: () => [lane()], steer });
-
-    await watcher.observe("worker-1", "idle");
-
-    expect(steer).toHaveBeenCalledTimes(1);
-    expect(steer.mock.calls[0]?.[0]).toMatchObject({ laneId: "lane-1", threadId: "worker-1" });
-  });
-
-  it("coalesces duplicate observations until the worker becomes active", async () => {
-    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    const watcher = createLaneWatcher({
-      readLanes: () => [lane()],
-      steer,
-      readWorker: vi.fn().mockResolvedValue({ status: "idle", pendingExternalWait: false, archived: false }),
-    });
-
-    await watcher.observe("worker-1", "idle");
-    await watcher.poll();
-    await watcher.observe("worker-1", "idle");
-    await watcher.observe("worker-1", "active");
-    await watcher.observe("worker-1", "idle");
-
-    expect(steer).toHaveBeenCalledTimes(2);
-  });
-
-  it("allows only a registered wait to explain an idle worker", async () => {
-    const registered = createWaitRegistry();
-    await registered.register(registeredWait());
-    const readWorker = async (threadId: string) => threadId === "source-1"
-      ? { status: "active" as const, pendingExternalWait: false, archived: false }
-      : { status: "idle" as const, pendingExternalWait: false, archived: false };
-    const registeredSteer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    await createLaneWatcher({ readLanes: () => [lane()], steer: registeredSteer, waitRegistry: registered, readWorker }).observe("worker-1", "idle");
-    expect(registeredSteer).not.toHaveBeenCalled();
-
-    const unregisteredSteer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    await createLaneWatcher({ readLanes: () => [lane()], steer: unregisteredSteer, readWorker }).observe("worker-1", "idle");
-    expect(unregisteredSteer).toHaveBeenCalledTimes(1);
-  });
-
-  it("refuses deadline-less waits and accepts exact duplicate registration only", async () => {
-    const registry = createWaitRegistry();
-    await expect(registry.register({ ...registeredWait(), deadlineAtMs: undefined } as unknown as RegisteredWait)).rejects.toThrow("deadline");
-    await registry.register(registeredWait());
-    await expect(registry.register(registeredWait())).resolves.toBeUndefined();
-    await expect(registry.register(registeredWait({ sourceThreadId: "different-source" }))).rejects.toThrow("conflicting");
-  });
-
-  it("fails closed when a registered wait source is missing or unreadable", async () => {
-    const registry = createWaitRegistry();
-    await registry.register(registeredWait({ sourceThreadId: "missing" }));
-    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    const watcher = createLaneWatcher({
-      readLanes: () => [lane()],
-      steer,
-      waitRegistry: registry,
-      readWorker: async (threadId) => {
-        if (threadId === "missing") throw new Error("thread unknown");
-        return { status: "idle", pendingExternalWait: false, archived: false };
-      },
-    });
-
-    await watcher.observe("worker-1", "idle");
-    expect(steer).not.toHaveBeenCalled();
-  });
-
-  it("keeps mixed registered-wait outcomes fail-closed regardless of registration order", async () => {
-    const run = async (waits: RegisteredWait[]) => {
-      const registry = createWaitRegistry();
-      for (const wait of waits) await registry.register(wait);
-      const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-      await createLaneWatcher({
-        readLanes: () => [lane(), { ...lane("source-done"), terminal_report_digest: "done" }],
-        steer,
-        waitRegistry: registry,
-        readWorker: async (threadId) => {
-          if (threadId === "missing") throw new Error("thread unknown");
-          return { status: "idle" as const, pendingExternalWait: false, archived: false };
-        },
-      }).observe("worker-1", "idle");
-      return steer;
-    };
-    const unknown = registeredWait({ waitId: "unknown", sourceThreadId: "missing" });
-    const fired = registeredWait({ waitId: "fired", sourceThreadId: "source-done" });
-
-    expect((await run([unknown, fired]))).not.toHaveBeenCalled();
-    expect((await run([fired, unknown]))).not.toHaveBeenCalled();
-  });
-
-  it("cascades known terminal and failure source events to waiters", async () => {
-    const registry = createWaitRegistry();
-    await registry.register(registeredWait({ waitId: "terminal-wait", sourceThreadId: "source-terminal" }));
-    await registry.register(registeredWait({ waitId: "failure-wait", waiterThreadId: "worker-2", sourceThreadId: "source-failure", sourceEvent: "failure" }));
-    const events: string[] = [];
-    const steered: string[] = [];
-    const lanes = [lane(), { ...lane("worker-2"), assignment_id: "assignment-2", lane_id: "lane-2", execution_attempt_id: "attempt-2" }, { ...lane("source-terminal"), terminal_report_digest: "done" }];
-    const watcher = createLaneWatcher({
-      readLanes: () => lanes,
-      steer: vi.fn(async (view: LaneView) => { steered.push(view.threadId ?? ""); }),
-      waitRegistry: registry,
-      readWorker: async (threadId) => ({ status: threadId === "source-failure" ? "error" as const : "idle" as const, pendingExternalWait: false, archived: false }),
-      onWaitEvent: (event) => { events.push(`${event.waitId}:${event.reason}`); },
-    });
-
-    await watcher.observe("worker-1", "idle");
-
-    expect(steered.sort()).toEqual(["worker-1", "worker-2"]);
-    expect(events.sort()).toEqual(["failure-wait:source_failure", "terminal-wait:source_terminal"]);
-  });
-
-  it("fires an expired wait immediately and terminally deduplicates replay", async () => {
-    const registry = createWaitRegistry();
-    await registry.register(registeredWait({ deadlineAtMs: 100 }));
-    const events: string[] = [];
-    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    const watcher = createLaneWatcher({
-      readLanes: () => [lane()],
-      steer,
-      waitRegistry: registry,
-      readWorker: async () => ({ status: "active", pendingExternalWait: false, archived: false }),
-      now: () => 100,
-      onWaitEvent: (event) => { events.push(event.waitId); },
-    });
-
-    await watcher.observe("worker-1", "idle");
-    await watcher.observe("worker-1", "idle");
-
-    expect(steer).toHaveBeenCalledTimes(1);
-    expect(events).toEqual(["wait-1"]);
-  });
-
-  it("fails closed on a fired-state persistence outage and retries without phantom dedupe", async () => {
-    let persisted: unknown;
-    let failWrites = false;
-    const registry = createWaitRegistry({
-      read: async () => persisted,
-      write: async (state) => {
-        if (failWrites) throw new Error("awareness storage unavailable");
-        persisted = state;
-      },
-    });
-    await registry.register(registeredWait({ sourceThreadId: "source-1" }));
-    failWrites = true;
-    const events: string[] = [];
-    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    const watcher = createLaneWatcher({
-      readLanes: () => [lane(), { ...lane("source-1"), terminal_report_digest: "done" }],
-      steer,
-      waitRegistry: registry,
-      readWorker: async () => ({ status: "active" as const, pendingExternalWait: false, archived: false }),
-      onWaitEvent: (event) => { events.push(event.waitId); },
-    });
-
-    await watcher.observe("worker-1", "idle");
-    expect(steer).not.toHaveBeenCalled();
-    expect(registry.state("wait-1")).toBe("pending");
-
-    failWrites = false;
-    await watcher.observe("worker-1", "idle");
-    expect(steer).toHaveBeenCalledTimes(1);
-    expect(events).toEqual(["wait-1"]);
-  });
-
-  it("does not self-wake the current canonical holder as an assignment lane", async () => {
-    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    const watcher = createLaneWatcher({
-      readLanes: () => [lane("director-1")],
-      readRoleHolders: () => [roleHolder()],
-      steer,
-    });
-
-    await watcher.observe("director-1", "idle");
-
-    expect(steer).not.toHaveBeenCalled();
-  });
-
-  it("self-watches the director once when its registered source completes", async () => {
-    const registry = createWaitRegistry();
-    await registry.register(registeredWait({ waiterThreadId: "director-1", sourceThreadId: "worker-source" }));
-    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
-    const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
-      waitRegistry: registry,
-      readRoleHolders: () => [roleHolder()],
-      readRoleScopes: () => [roleScope("queue-head")],
-      readWorker: async (threadId) => threadId === "worker-source"
-        ? { status: "error" as const, pendingExternalWait: false, archived: false }
-        : roleObservation(0),
-      steerRole,
-      roleIdleThresholdMs: 0,
-    });
-
-    await watcher.observe("worker-source", "error");
-    await watcher.observe("worker-source", "error");
-
-    expect(steerRole).toHaveBeenCalledTimes(1);
-  });
-
-  it("keeps the director covered: prose-only idle work is not a wait", async () => {
-    const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
-    const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
-      readRoleHolders: () => [roleHolder()],
-      readRoleScopes: () => [roleScope("queue-head")],
-      readWorker: async () => roleObservation(0),
-      steerRole,
-      roleIdleThresholdMs: 0,
-      now: () => 1,
-    });
-
-    await watcher.poll();
-
-    expect(steerRole).toHaveBeenCalledTimes(1);
-  });
-
-  it("stays silent for a genuine pending external wait", async () => {
-    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    const watcher = createLaneWatcher({
-      readLanes: () => [lane()],
-      steer,
-      isExternallyWaiting: vi.fn().mockResolvedValue(true),
-    });
-
-    await watcher.observe("worker-1", "idle");
-    expect(steer).not.toHaveBeenCalled();
-  });
-
-  it("resumes the same lane after its exact operator wait resolves", async () => {
-    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    let operatorWait: OperatorWait | null = { reason: "awaiting_operator", createdAtMs: Date.now() };
-    const watcher = createLaneWatcher({
-      readLanes: () => [lane()],
-      steer,
-      readOperatorWait: async () => operatorWait,
-    });
-
-    await watcher.observe("worker-1", "idle");
-    expect(steer).not.toHaveBeenCalled();
-    operatorWait = null;
-    await watcher.observe("worker-1", "idle");
-
-    expect(steer).toHaveBeenCalledTimes(1);
-    expect(steer.mock.calls[0]?.[0]).toMatchObject({ laneId: "lane-1", assignmentId: "assignment-1", executionAttemptId: "attempt-1" });
-  });
-
-  it("fires one persisted operator-wait FYI across polls and restart", async () => {
-    let persisted: unknown;
-    const persistence = {
-      read: async () => persisted,
-      write: async (state: Record<string, true>) => { persisted = state; },
-    };
-    const operatorWait: OperatorWait = { reason: "awaiting_operator", createdAtMs: 0 };
-    const alerts: string[] = [];
-    const options = {
-      readLanes: () => [lane()],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
-      readOperatorWait: async () => operatorWait,
-      operatorWaitAlertPersistence: persistence,
-      operatorWaitFyiThresholdMs: 0,
-      onAlert: (alert: { kind: string }) => alerts.push(alert.kind),
-    };
-    const watcher = createLaneWatcher(options);
-
-    await watcher.observe("worker-1", "idle");
-    await watcher.observe("worker-1", "idle");
-    const restartedWatcher = createLaneWatcher({ ...options, onAlert: (alert) => alerts.push(alert.kind) });
-    await restartedWatcher.recover();
-    await restartedWatcher.observe("worker-1", "idle");
-
-    expect(alerts).toEqual(["operator_wait_fyi"]);
-  });
-
-  it("fails closed when the operator state cannot be read", async () => {
-    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    const watcher = createLaneWatcher({
-      readLanes: () => [lane()],
-      steer,
-      readOperatorWait: async () => { throw new Error("unknown interaction state"); },
-      isExternallyWaiting: async () => { throw new Error("unknown interaction state"); },
-    });
-
-    await watcher.observe("worker-1", "idle");
-
-    expect(steer).not.toHaveBeenCalled();
-  });
-
-  it("clears an anomaly when the lane becomes terminal or archived", async () => {
-    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    let current = lane();
-    const watcher = createLaneWatcher({ readLanes: () => [current], steer });
-
-    await watcher.observe("worker-1", "idle");
-    current = { ...current, terminal_report_digest: "terminal" };
-    await watcher.observe("worker-1", "idle");
-    current = { ...current, terminal_report_digest: null };
-    await watcher.observe("worker-1", "idle");
-    await watcher.observe("worker-1", "idle", false, true);
-
-    expect(steer).toHaveBeenCalledTimes(2);
-  });
-
-  it("polls worker state through the native read seam", async () => {
-    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    const watcher = createLaneWatcher({
-      readLanes: () => [lane()],
-      steer,
-      readWorker: vi.fn().mockResolvedValue({ status: "idle", pendingExternalWait: false, archived: false }),
-    });
-
-    await watcher.poll();
-
-    expect(steer).toHaveBeenCalledTimes(1);
-    expect(steer.mock.calls[0]?.[0].threadId).toBe("worker-1");
-  });
-
-  it("uses automatic, approval, and tracking modes by lane kind", async () => {
-    expect(continuationModeFor("write")).toBe("automatic");
-    expect(continuationModeFor("review")).toBe("approval");
-    expect(continuationModeFor("probe")).toBe("tracking");
-
-    let current = lane();
-    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    const alerts: string[] = [];
-    const watcher = createLaneWatcher({
-      readLanes: () => [current],
-      steer,
-      onAlert: (alert) => alerts.push(alert.kind),
-    });
-
-    current = { ...current, assignment_kind: "review" };
-    await watcher.observe("worker-1", "idle");
-    current = { ...current, assignment_kind: "probe" };
-    await watcher.observe("worker-1", "active");
-    await watcher.observe("worker-1", "idle");
-
-    expect(steer).not.toHaveBeenCalled();
-    expect(alerts).toEqual(["approval_required"]);
-  });
-
-  it("pauses and alerts at the per-lane continuation limit", async () => {
-    const steer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    const alerts: string[] = [];
-    const watcher = createLaneWatcher({
-      readLanes: () => [lane()],
-      steer,
-      maxContinuations: 1,
-      onAlert: (alert) => alerts.push(alert.kind),
-    });
-
-    await watcher.observe("worker-1", "idle");
-    await watcher.observe("worker-1", "active");
-    await watcher.observe("worker-1", "idle");
-
-    expect(steer).toHaveBeenCalledTimes(1);
-    expect(alerts).toEqual(["limit_reached"]);
-  });
-
-  it("recovers a claimed delivery as paused and cannot double-fire after restart", async () => {
-    let persisted: unknown;
-    const persistence = {
-      read: async () => persisted,
-      write: async (state: Record<string, unknown>) => { persisted = state; },
-    };
-    let release!: () => void;
-    const firstSteer = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
-    const firstWatcher = createLaneWatcher({
-      readLanes: () => [lane()],
-      steer: firstSteer,
-      continuationLedger: createContinuationLedger(persistence),
-    });
-
-    const first = firstWatcher.observe("worker-1", "idle");
-    await vi.waitFor(() => expect(firstSteer).toHaveBeenCalledTimes(1));
-
-    const alerts: string[] = [];
-    const secondSteer = vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined);
-    const restartedWatcher = createLaneWatcher({
-      readLanes: () => [lane()],
-      steer: secondSteer,
-      continuationLedger: createContinuationLedger(persistence),
-      onAlert: (alert) => alerts.push(alert.kind),
-    });
-    await restartedWatcher.recover();
-    await restartedWatcher.observe("worker-1", "idle");
-
-    expect(secondSteer).not.toHaveBeenCalled();
-    expect(alerts).toEqual(["restart_review"]);
-    release();
-    await first;
   });
 
   it("polls every current canonical role seat during quiet GitHub without targeting historical holders or writing canonical rows", async () => {
@@ -874,8 +430,6 @@ describe("lane awareness", () => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     let currentNow = 0;
     const watcher = createLaneWatcher({
-      readLanes: () => [],
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => readRoleHolderStates(db),
       readRoleScopes: () => [roleScope("queue-head")],
       readWorker: async () => roleObservation(0),
