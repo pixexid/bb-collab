@@ -22715,11 +22715,11 @@ ${thread.titleFallback ?? ""}`);
             const owingRecord = await fleetWatchdogIdle.observeIdle(owingKey, now2);
             if (owingRecord.idleSinceMs === null || now2 - owingRecord.idleSinceMs < floorMs) continue;
             if (owingRecord.lastOwedActWakeAtMs === null || owingRecord.lastOwedActWakeAtMs < owingRecord.idleSinceMs) {
-              await wake(projectId, owing, owingKey, `owed act is quiet with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
+              await wake(projectId, owing, owingKey, `owed act quiet at cycle ${new Date(now2).toISOString()} with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
               continue;
             }
             if (owing.role_id !== "director" && now2 - owingRecord.lastOwedActWakeAtMs >= floorMs) {
-              await wake(projectId, director, roleIdleKey(director, seatWait.workItemId), `owed act still quiet with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
+              await wake(projectId, director, roleIdleKey(director, seatWait.workItemId), `owed act still quiet at cycle ${new Date(now2).toISOString()} with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
             }
             continue;
           }
@@ -22732,7 +22732,7 @@ ${thread.titleFallback ?? ""}`);
           const orchestratorKey = roleIdleKey(orchestrator, workKey);
           const priorOrchestratorRecord = await fleetWatchdogIdle.get(orchestratorKey);
           if (priorOrchestratorRecord?.lastFleetWakeAtMs !== null && priorOrchestratorRecord?.lastFleetWakeAtMs !== void 0 && now2 - priorOrchestratorRecord.lastFleetWakeAtMs >= floorMs) {
-            await wake(projectId, director, roleIdleKey(director, workKey), `fleet still quiet with open work since ${new Date(priorOrchestratorRecord.idleSinceMs ?? now2).toISOString()}`, false, "escalation", async () => (await Promise.all(holders.map(async (holder) => {
+            await wake(projectId, director, roleIdleKey(director, workKey), `fleet still quiet at cycle ${new Date(now2).toISOString()} with open work since ${new Date(priorOrchestratorRecord.idleSinceMs ?? now2).toISOString()}`, false, "escalation", async () => (await Promise.all(holders.map(async (holder) => {
               const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
               return !roleThreadRefusal(holder, thread, true) && !await readPendingExternalWait(holder.thread_id);
             }))).every(Boolean));
@@ -22750,7 +22750,7 @@ ${thread.titleFallback ?? ""}`);
           if (!idle.every(Boolean)) continue;
           const orchestratorRecord = await fleetWatchdogIdle.get(orchestratorKey);
           if (orchestratorRecord?.lastFleetWakeAtMs === null || orchestratorRecord?.lastFleetWakeAtMs === void 0 || orchestratorRecord.lastFleetWakeAtMs < (orchestratorRecord.idleSinceMs ?? now2)) {
-            await wake(projectId, orchestrator, orchestratorKey, `fleet quiet with open work since ${new Date(orchestratorRecord?.idleSinceMs ?? now2).toISOString()}`, true, "fleet");
+            await wake(projectId, orchestrator, orchestratorKey, `fleet quiet at cycle ${new Date(now2).toISOString()} with open work since ${new Date(orchestratorRecord?.idleSinceMs ?? now2).toISOString()}`, true, "fleet");
             continue;
           }
         } catch (error48) {

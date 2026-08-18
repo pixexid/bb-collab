@@ -684,6 +684,18 @@ async function addPendingReview(fixture: Awaited<ReturnType<typeof fleetWatchdog
   return (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
 }
 
+// Parses a watchdog quiet line the way a recipient would: every timestamp must
+// name the evidence class that backs it. Quiet is only ever proven at a cycle
+// receipt; only the open-work clause may carry a `since` anchor.
+function parseEmittedQuietClaim(text: string): { subject: string; still: boolean; quietAtMs: number; openSinceMs: number } | null {
+  const match = /^(?<subject>fleet|owed act)(?<still> still)? quiet at cycle (?<cycle>\S+) with open work since (?<anchor>\S+)$/.exec(text);
+  if (!match?.groups) return null;
+  const quietAtMs = Date.parse(match.groups.cycle!);
+  const openSinceMs = Date.parse(match.groups.anchor!);
+  if (Number.isNaN(quietAtMs) || Number.isNaN(openSinceMs)) return null;
+  return { subject: match.groups.subject!, still: match.groups.still !== undefined, quietAtMs, openSinceMs };
+}
+
 function cloneProject(db: Database.Database, sourceProjectId: string, targetProjectId: string) {
   const clone = (table: string, where = "", mutate?: (row: Record<string, unknown>) => void) => {
     const columns = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name);
@@ -2398,7 +2410,7 @@ describe("bb-collab plugin boundary", () => {
         {
           threadId: fixture.directorThreadId,
           mode: "queue-if-active",
-          input: [{ type: "text", visibility: "agent-only", text: "fleet still quiet with open work since 1970-01-01T00:00:00.000Z", mentions: [] }],
+          input: [{ type: "text", visibility: "agent-only", text: "fleet still quiet at cycle 1970-01-01T02:00:00.000Z with open work since 1970-01-01T00:00:00.000Z", mentions: [] }],
         },
       ]]);
     } finally {
@@ -2415,7 +2427,7 @@ describe("bb-collab plugin boundary", () => {
       clock.mockReturnValue(60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
-        expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "fleet quiet with open work since 1970-01-01T00:00:00.000Z" })] }),
+        expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "fleet quiet at cycle 1970-01-01T01:00:00.000Z with open work since 1970-01-01T00:00:00.000Z" })] }),
       ]]);
     } finally {
       clock.mockRestore();
@@ -2540,8 +2552,8 @@ describe("bb-collab plugin boundary", () => {
       clock.mockReturnValue(2 * 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([
-        [expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "owed act is quiet with open work since 1970-01-01T00:00:00.000Z" })] })],
-        [expect.objectContaining({ threadId: fixture.directorThreadId, input: [expect.objectContaining({ text: "owed act still quiet with open work since 1970-01-01T00:00:00.000Z" })] })],
+        [expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "owed act quiet at cycle 1970-01-01T01:00:00.000Z with open work since 1970-01-01T00:00:00.000Z" })] })],
+        [expect.objectContaining({ threadId: fixture.directorThreadId, input: [expect.objectContaining({ text: "owed act still quiet at cycle 1970-01-01T02:00:00.000Z with open work since 1970-01-01T00:00:00.000Z" })] })],
       ]);
     } finally {
       clock.mockRestore();
@@ -2560,7 +2572,7 @@ describe("bb-collab plugin boundary", () => {
       clock.mockReturnValue(2 * 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
-        expect.objectContaining({ threadId: fixture.directorThreadId, input: [expect.objectContaining({ text: "owed act is quiet with open work since 1970-01-01T00:00:00.000Z" })] }),
+        expect.objectContaining({ threadId: fixture.directorThreadId, input: [expect.objectContaining({ text: "owed act quiet at cycle 1970-01-01T01:00:00.000Z with open work since 1970-01-01T00:00:00.000Z" })] }),
       ]]);
     } finally {
       clock.mockRestore();
@@ -2799,7 +2811,97 @@ describe("bb-collab plugin boundary", () => {
       clock.mockReturnValue(2 * 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.getThreadStatus()).toBe("active");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").some(([input]) => (input as { input: Array<{ text: string }> }).input[0]?.text === "fleet still quiet with open work since 1970-01-01T00:00:00.000Z")).toBe(false);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").some(([input]) => (input as { input: Array<{ text: string }> }).input[0]?.text === "fleet still quiet at cycle 1970-01-01T02:00:00.000Z with open work since 1970-01-01T00:00:00.000Z")).toBe(false);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("emits a tier-1 quiet claim proven at the cycle that sends it", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      // Fleet busy at 30min then idle again, wholly between two cycles: no cycle
+      // ever observes it, so the anchor survives but continuous quiet is false.
+      const activityAtMs = 30 * 60_000;
+      fixture.setThreadStatus("active");
+      fixture.setThreadStatus("idle");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      const sends = fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([input]) => (input as { threadId: string }).threadId === fixture.orchestratorThreadId);
+      expect(sends).toHaveLength(1);
+      const claim = parseEmittedQuietClaim((sends[0]![0] as { input: Array<{ text: string }> }).input[0]!.text);
+      expect(claim, "tier-1 line must claim quiet only at its cycle receipt").not.toBeNull();
+      expect(claim!.quietAtMs).toBe(60 * 60_000);
+      expect(claim!.openSinceMs).toBe(0);
+      // Ground truth separates the two timestamps: the unobserved activity sits
+      // after the anchor and before the receipt, so only the split claim is true.
+      expect(claim!.openSinceMs).toBeLessThan(activityAtMs);
+      expect(claim!.quietAtMs).toBeGreaterThan(activityAtMs);
+      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { idleSinceMs: number | null; lastFleetWakeAtMs: number | null }>>("fleet-watchdog.role-idle");
+      expect(Object.values(persisted ?? {}).some((record) => record.lastFleetWakeAtMs === 60 * 60_000 && record.idleSinceMs === claim!.openSinceMs)).toBe(true);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("emits a tier-2 escalation quiet claim proven at the cycle that sends it", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      // Fleet busy at 90min then idle again, wholly between cycles: beforeSend
+      // legitimately passes (every holder idle at emit), the anchor never moved.
+      const activityAtMs = 90 * 60_000;
+      fixture.setThreadStatus("active");
+      fixture.setThreadStatus("idle");
+      clock.mockReturnValue(2 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      const sends = fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([input]) => (input as { threadId: string }).threadId === fixture.directorThreadId);
+      expect(sends).toHaveLength(1);
+      const claim = parseEmittedQuietClaim((sends[0]![0] as { input: Array<{ text: string }> }).input[0]!.text);
+      expect(claim, "tier-2 line must claim quiet only at its cycle receipt").not.toBeNull();
+      expect(claim!.still).toBe(true);
+      expect(claim!.quietAtMs).toBe(2 * 60 * 60_000);
+      expect(claim!.openSinceMs).toBe(0);
+      expect(claim!.openSinceMs).toBeLessThan(activityAtMs);
+      expect(claim!.quietAtMs).toBeGreaterThan(activityAtMs);
+      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { idleSinceMs: number | null; lastEscalationAtMs: number | null }>>("fleet-watchdog.role-idle");
+      expect(Object.values(persisted ?? {}).some((record) => record.lastEscalationAtMs === 2 * 60 * 60_000 && record.idleSinceMs === claim!.openSinceMs)).toBe(true);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("emits an owed-act quiet claim proven at the cycle that sends it", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 3, { kind: "seat", seat: "director", declaredBySeat: "worker-seat" }))).toMatchObject({ outcome: "OK" });
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      // Owing seat busy at 30min then idle again, wholly between cycles.
+      const activityAtMs = 30 * 60_000;
+      fixture.setThreadStatus("active");
+      fixture.setThreadStatus("idle");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      const sends = fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([input]) => (input as { threadId: string }).threadId === fixture.directorThreadId);
+      expect(sends).toHaveLength(1);
+      const claim = parseEmittedQuietClaim((sends[0]![0] as { input: Array<{ text: string }> }).input[0]!.text);
+      expect(claim, "owed-act line must claim quiet only at its cycle receipt").not.toBeNull();
+      expect(claim!.subject).toBe("owed act");
+      expect(claim!.quietAtMs).toBe(60 * 60_000);
+      expect(claim!.openSinceMs).toBe(0);
+      expect(claim!.openSinceMs).toBeLessThan(activityAtMs);
+      expect(claim!.quietAtMs).toBeGreaterThan(activityAtMs);
+      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { idleSinceMs: number | null; lastOwedActWakeAtMs: number | null }>>("fleet-watchdog.role-idle");
+      expect(Object.values(persisted ?? {}).some((record) => record.lastOwedActWakeAtMs === 60 * 60_000 && record.idleSinceMs === claim!.openSinceMs)).toBe(true);
     } finally {
       clock.mockRestore();
     }
@@ -2844,7 +2946,7 @@ describe("bb-collab plugin boundary", () => {
       clock.mockReturnValue(2 * 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
-        expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "fleet quiet with open work since 1970-01-01T00:00:00.000Z" })] }),
+        expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "fleet quiet at cycle 1970-01-01T01:00:00.000Z with open work since 1970-01-01T00:00:00.000Z" })] }),
       ]]);
     } finally {
       clock.mockRestore();
