@@ -228,15 +228,19 @@ What this deliberately does **not** do is encode surface occupancy into the wake
 
 ## A ruling names the seat that can perform it
 
-> Before ruling an act executable, name the seat that can perform it. A ruling whose executing surface does not exist routes upward or waits — it never routes to improvisation.
+> Before ruling an act executable, name both the seat that will perform it and the surface it will perform it through. A ruling missing either routes upward or waits — it never routes to improvisation.
 
-Three times in one evening a ruling named an act no seat could carry out: set the project's sticky spawn default, create a project for a drill, and one deploy that was only executable because a repointable worktree happened to exist. Each was discovered by a seat going to do the thing and finding no way, which is the expensive moment — the work is planned, the lane is dispatched or about to be, and the gap surfaces at execution.
+Naming a seat is not enough on its own: a named seat can lack a usable surface, and a named surface can be held by someone else. The pair is the check.
+
+Twice in one evening a ruling named an act with no surface behind it. Setting the project's sticky spawn default has no command — `bb settings` exposes general preferences, experiments, keyboard, usage, version and reload, and nothing for spawn defaults; the only affordance is the app's model picker. A deploy was executable only because a repointable worktree happened to exist, which is availability rather than design. Both were discovered by a seat going to do the thing and finding no way — the expensive moment, because the work is planned and the lane is dispatched or about to be.
+
+A third apparent instance was not one, and it is the more useful lesson. A ruling to create a project was reported unexecutable because `bb project` seemed to have no create command. It has one; the seat had read a truncated help listing and concluded absence from a list it had cut short. So this rule cuts both ways: name the surface, and establish it is really absent before saying so, because a false absence defers real work and a doctrine written on one carries the error forward.
 
 The failure mode is not the missing surface. It is what a seat does next: the improvisation nearest to hand is usually the thing the ruling was trying to prevent. Asked to create a project and unable to, the available shortcut was governing a real one — which that same ruling had explicitly forbidden. The gap and the temptation arrive together.
 
 This is not detectable mechanically and should not be built. A ruling's named act lives in prose, not in canonical or platform state, so identifying it would mean interpreting text, and interpretation needs a model in a path that is deliberately model-free. It is a check made when the ruling is written, by the seat writing it.
 
-Naming the surface is usually one line and sometimes reveals there isn't one, which is the point.
+Naming the seat and its surface is usually one line, and sometimes reveals that one of them is missing — which is the point, provided the absence is checked rather than assumed.
 
 ## Blast radius
 
