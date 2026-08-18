@@ -273,3 +273,19 @@ A late mechanism is recoverable; a lying one is not. In anything that notifies, 
 ## The ladder applies to operations
 
 > Before ordering the heavy mechanism, ask which lighter one already covers it. Runtime configuration beats a rebuild. Reaching for the largest available action is the same reflex the ladder exists to interrupt, pointed at operations instead of code.
+
+## A spawn's return value is not evidence its order arrived
+
+> [Delivery is confirmed at the recipient's log](#a-message-is-delivered-when-it-lands-consumed-when-the-reply-addresses-it), not at your own send. Spawn is that rule's hardest case and adds two obligations it does not cover. First, prompt loss at spawn is invisible to its victim: the first instruction an agent would ever receive is the one that can vanish, so it has no prior context to notice the gap against, and the thread is alive, idle, producing output on whatever it finds, and indistinguishable on every status surface from one that received its order. Second, delivery is not acceptance. An agent can receive an order, correctly refuse it as malformed, and go idle looking exactly like one that finished — action, but with the delegated work undone. So the check is not that the text arrived, nor merely that the recipient did something, but that a valid order was accepted and its [owed outcome](#delegation-return-path) is pending or reported: `DONE`, `BLOCKED` or `WAITING`. A thread that spent its startup exploring unprompted is not reusable as a cold reviewer; archive it and spawn again.
+
+## A check that agrees with nobody is a plumbing suspect
+
+> When your check contradicts two independent verifications, audit your check's wiring before you report the claim false. Three times in one night the plumbing of a check, not its subject, produced the wrong answer: a test-name filter that selected a different test, a dist comparison that compared two build outputs to each other, and an exit code swallowed by a pipe. Each printed a confident result in the same words a sound check would have used. Disagreement is a triage signal about where to look first; it is not proof either way. Agreement is not proof either — roles can reuse one broken mechanism, and counting how many agreed measures votes rather than evidence. The bar remains [discriminating](#proof-must-discriminate), mechanism-independent evidence.
+
+## A fix to an observable surface verifies itself in production
+
+> Where the surface can be observed safely, with authority, and without provoking the failure, the fix is not confirmed until that surface shows the correction in production. A capacity field that reported hardcoded zeros is confirmed when the deployed system names the real lanes, not when a test asserts it would — one read after deploy, and it is the difference between believing the mechanism works and having watched it work. Where observation would require a destructive act, an external notification, a security-relevant path, or reproducing a rare failure, do not stage it to satisfy this rule: say plainly what was confirmed in test and what remains unobserved in production.
+
+## Label the proof class, because a safety test is not a discrimination test
+
+> A test that passes both before and after a change is not evidence the change did anything — but it can still be worth keeping, as a guard on an invariant that must not later break. Say which one it is. A test written to guard atomicity that also passes against the unfixed code proves the property holds, not that this work established it. Presenting a guard as discrimination inflates the evidence; discarding it because it does not discriminate loses a real check.
