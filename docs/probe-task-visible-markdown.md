@@ -37,10 +37,8 @@ part of a CRLF pair — consumed by the split itself. A lone carriage return, in
 one at the end of the input, is ordinary text and survives in its line. Output always
 uses `\n`.
 
-That distinction is load-bearing and was got wrong once: an earlier wording said "a
-trailing carriage return is not part of a surviving line", which two subjects
-implemented identically and which the reference does not do. See the note at the end
-of this file.
+That distinction is load-bearing and was got wrong once; see the correction note at
+the end of this file.
 
 Fence rules:
 
@@ -78,21 +76,12 @@ queue.
 
 ## Correction, 2026-08-18: the reference is authoritative
 
-The CRLF paragraph above previously read "a trailing carriage return is not part of a
-surviving line". Both GH-222 subjects implemented that sentence — stripping a lone
-line-final `\r` — and each wrote an explicit test for it before checking anything. The
-reference in `scripts/pr-lifecycle.mjs` keeps that carriage return. A differential
-harness over 20,000 fuzz inputs found exactly one divergence class between reference
-and subjects, and every instance of it was this.
+The CRLF paragraph previously read "a trailing carriage return is not part of a
+surviving line". Both GH-222 subjects implemented that — stripping a lone line-final
+`\r` — and the reference in `scripts/pr-lifecycle.mjs` does not. It was the only
+divergence class between reference and subjects across the grader's fuzz harness.
 
 Two subjects implementing a sentence identically, against the reference, is not
-ambiguity. It is a second authority: the spec had begun to specify something the
-system never intended, and every future probe would have graded against a fork.
-
-Ruled: the reference is authoritative and the sentence was defective. The clause was
-collateral from adding the CRLF rule and was never a deliberate requirement. Corrected
-above rather than reinterpreted, so no probe inherits the fork.
-
-A grader keying strictly on the reference would have failed both subjects for obeying
-the specification. That is the cost of leaving the two out of step, and the reason this
-correction carries its provenance rather than arriving as a quiet edit.
+ambiguity; it is a second authority, and every later probe would have graded against a
+fork. Ruled: the reference is authoritative and the sentence was defective — collateral
+from adding the CRLF rule, never a deliberate requirement.
