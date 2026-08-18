@@ -17,7 +17,7 @@ const idle = (id: string, extra: Record<string, unknown> = {}) => makeThreadResp
   ...extra,
 });
 
-function fixture({ activateArchiveChildOnSecondList = false, includeCanonicalSeat = false } = {}) {
+function fixture({ activateArchiveChildOnSecondList = false, includeCanonicalSeat = false, includeUnresolvableEnvironment = false } = {}) {
   const db = new Database(":memory:");
   databaseIsReady(db);
   for (const migration of MIGRATIONS) db.exec(migration);
@@ -31,6 +31,7 @@ function fixture({ activateArchiveChildOnSecondList = false, includeCanonicalSea
     idle("bound-parent"),
     idle("bound-holder", { parentThreadId: "bound-parent" }),
     ...(includeCanonicalSeat ? [idle("canonical-seat")] : []),
+    ...(includeUnresolvableEnvironment ? [idle("unresolvable", { environmentId: "env-missing" })] : []),
     idle("open-pr", { environmentId: "env-pr" }),
     idle("open-pr-parent"),
     idle("open-pr-child", { parentThreadId: "open-pr-parent", environmentId: "env-pr" }),
@@ -69,9 +70,12 @@ function fixture({ activateArchiveChildOnSecondList = false, includeCanonicalSea
         }),
       },
       environments: {
-        pullRequest: (async ({ environmentId }: { environmentId: string }) => environmentId === "env-pr"
-          ? { outcome: "available" as const, pullRequest: { state: "open" } }
-          : { outcome: "absent" as const }) as never,
+        pullRequest: (async ({ environmentId }: { environmentId: string }) => {
+          if (environmentId === "env-missing") throw new Error("Environment unavailable");
+          return environmentId === "env-pr"
+            ? { outcome: "available" as const, pullRequest: { state: "open" } }
+            : { outcome: "absent" as const };
+        }) as never,
       },
     },
   });
@@ -119,6 +123,17 @@ describe("thread archive sweep", () => {
     expect(result.archivableThreadIds).not.toContain("open-pr");
     expect(result.archivedThreadIds).not.toContain("open-pr");
     expect(host.harness.inspection.sdk.callsTo("threads.archive")).not.toContainEqual([{ threadId: "open-pr" }]);
+    db.close();
+  });
+
+  it("isolates an unresolvable environment and protects that thread", async () => {
+    const { db, host } = fixture({ includeUnresolvableEnvironment: true });
+    process.env.BB_COLLAB_ARCHIVE_IDLE_H = "24";
+    const result = await runArchiveSweep(host.bb, db, PROJECT_ID, false, now);
+    expect(result).toMatchObject({ outcome: "reported", unresolvedThreadCount: 1 });
+    expect(result.archivableThreadIds).toContain("ordinary");
+    expect(result.archivableThreadIds).not.toContain("unresolvable");
+    expect(host.harness.inspection.sdk.callsTo("environments.pullRequest")).toContainEqual([{ environmentId: "env-pr" }]);
     db.close();
   });
 
