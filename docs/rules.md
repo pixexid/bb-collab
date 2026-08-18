@@ -273,3 +273,19 @@ A late mechanism is recoverable; a lying one is not. In anything that notifies, 
 ## The ladder applies to operations
 
 > Before ordering the heavy mechanism, ask which lighter one already covers it. Runtime configuration beats a rebuild. Reaching for the largest available action is the same reflex the ladder exists to interrupt, pointed at operations instead of code.
+
+## A spawn's return value is not evidence its order arrived
+
+> Confirm the order text in the new thread's own event log before treating a spawn as done. A spawn can return success and a thread id while its prompt never arrives, and the resulting thread is alive, idle, produces output on whatever it finds, and is indistinguishable on every status surface from one that received its order. Prompt loss at spawn is uniquely invisible to its victim: the first instruction an agent would ever receive is the one that can vanish, so it has no prior context to notice the gap against. This is the sender-owns-both-checks rule carried to its last boundary. A thread that spent its startup exploring unprompted is not reusable as a cold reviewer; archive it and spawn again.
+
+## A check that agrees with nobody is a plumbing suspect
+
+> When your check contradicts two independent verifications, suspect the check before the claim. Three times in one night the plumbing of a check, not its subject, produced the wrong answer: a test-name filter that selected a different test, a dist comparison that compared two build outputs to each other, and an exit code swallowed by a pipe. Each printed a confident result in the same words a sound check would have used. Triple agreement — lane, reviewer, and orchestrator — is the practical test, and a lone dissenting check earns an audit of its own wiring first.
+
+## A fix to an observable surface verifies itself in production
+
+> If the defect was visible on a surface, the fix is not confirmed until that surface shows the correction in production. A capacity field that reported hardcoded zeros is confirmed when the deployed system names the real lanes, not when a test asserts it would. This costs one command after deploy and it is the difference between believing the mechanism works and having watched it work.
+
+## Label the proof class, because a safety test is not a discrimination test
+
+> A test that passes both before and after a change is not evidence the change did anything — but it can still be worth keeping, as a guard on an invariant that must not later break. Say which one it is. A test written to guard atomicity that also passes against the unfixed code proves the property holds, not that this work established it. Presenting a guard as discrimination inflates the evidence; discarding it because it does not discriminate loses a real check.
