@@ -661,28 +661,80 @@ async function fleetWatchdogFixture(updatedAt = 1) {
   };
 }
 
+function insertFixtureAssignment(db: Database.Database, fenceToken: string, options: {
+  assignmentId: string;
+  assignmentKind: "write" | "review" | "probe";
+  laneId: string;
+  roleId: string;
+  roleGeneration: number;
+  roleRequirementId: string;
+  candidateSha: string | null;
+  workItemRevision: number;
+  executionAttemptId: string;
+}) {
+  const template = assignmentPrepareRequest(fenceToken, options.assignmentId);
+  const assignment = {
+    ...template.assignment!,
+    ...options,
+    candidateSemantics: options.candidateSha === null ? "base" as const : "frozen" as const,
+  };
+  const assignmentDigest = sha256(canonicalJson({ assignmentId: assignment.assignmentId, workItemId: assignment.workItemId }));
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO assignments (
+      project_id, assignment_id, work_item_id, assignment_kind, lane_id, role_requirement_id,
+      role_id, role_generation, config_revision, governance_epoch, work_item_revision,
+      repo_target_id, branch_name, base_sha, candidate_semantics, candidate_sha, bb_server_id,
+      environment_id, source_id, host_id, environment_path, environment_mode,
+      frozen_brief_version, frozen_brief_digest, requested_provider_id, requested_model,
+      requested_reasoning_level, requested_permission_mode, requested_service_tier,
+      requested_visibility, requested_profile_digest, dispatch_kind, attach_thread_id,
+      parent_assignment_id, depth, deadline_at_ms, assignment_digest, idempotency_key,
+      creation_event_sequence, created_at_ms
+    ) VALUES (${Array.from({ length: 40 }, () => "?").join(", ")})
+  `).run(
+    PROJECT_ID, assignment.assignmentId, assignment.workItemId, assignment.assignmentKind, assignment.laneId,
+    assignment.roleRequirementId, assignment.roleId, assignment.roleGeneration, 1, 1, options.workItemRevision, TARGET_ID, assignment.branchName,
+    assignment.baseSha, assignment.candidateSemantics, assignment.candidateSha, assignment.environment.bbServerId,
+    assignment.environment.environmentId, assignment.environment.sourceId, assignment.environment.hostId,
+    assignment.environment.path, "managed-worktree", assignment.frozenBriefVersion, assignment.frozenBriefDigest,
+    assignment.requestedProfile.providerId, assignment.requestedProfile.model, assignment.requestedProfile.reasoningLevel,
+    assignment.requestedProfile.permissionMode, assignment.requestedProfile.serviceTier, "visible", ROLE_PROFILE_DIGEST,
+    assignment.dispatchKind, null, null, 0, assignment.deadlineAtMs, assignmentDigest, "prepare-pending-review", 1, now,
+  );
+  db.prepare(`
+    INSERT INTO execution_attempts (
+      project_id, execution_attempt_id, assignment_id, origin, assignment_digest, lane_id,
+      assignment_kind, attempt_ordinal, dispatch_kind, config_revision, governance_epoch,
+      work_item_id, repo_target_id, role_id, role_generation, state, bb_server_id,
+      environment_id, source_id, host_id, environment_path, frozen_brief_digest,
+      branch_name, base_sha, candidate_sha, environment_digest, created_at_ms, attempt_digest
+    ) VALUES (?, ?, ?, 'assignment', ?, ?, ?, 1, ?, 1, 1, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    PROJECT_ID, options.executionAttemptId, assignment.assignmentId, assignmentDigest, assignment.laneId, assignment.assignmentKind,
+    assignment.dispatchKind, assignment.workItemId, TARGET_ID, assignment.roleId, assignment.roleGeneration,
+    assignment.environment.bbServerId, assignment.environment.environmentId, assignment.environment.sourceId,
+    assignment.environment.hostId, assignment.environment.path, assignment.frozenBriefDigest, assignment.branchName,
+    assignment.baseSha, assignment.candidateSha, sha256(canonicalJson(assignment.environment)), now,
+    sha256(canonicalJson({ executionAttemptId: options.executionAttemptId, assignmentDigest, state: "prepared" })),
+  );
+  return options.executionAttemptId;
+}
+
 async function addPendingReview(fixture: Awaited<ReturnType<typeof fleetWatchdogFixture>>) {
   activateReviewer(fixture.db, fixture.fenceToken);
   expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
-  const template = assignmentPrepareRequest(fixture.fenceToken, "pending-review");
-  const prepared = applyWithFixtureReceipt(fixture.db, {
-    ...template,
-    actorReceiptId: "role-actor-reviewer",
-    expectedResourceRevision: 3,
-    assignment: {
-      ...template.assignment!,
-      assignmentId: "pending-review",
-      assignmentKind: "review",
-      laneId: "pending-review",
-      roleRequirementId: "reviewer-v1",
-      roleId: "independent-reviewer",
-      roleGeneration: 2,
-      candidateSemantics: "frozen",
-      candidateSha: CANDIDATE_SHA,
-    },
-  }, null, null, new DeterministicNativeAssignmentAdapter());
-  expect(prepared.outcome).toBe("OK");
-  return (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+  return insertFixtureAssignment(fixture.db, fixture.fenceToken, {
+    assignmentId: "pending-review",
+    assignmentKind: "review",
+    laneId: "pending-review",
+    roleRequirementId: "reviewer-v1",
+    roleId: "independent-reviewer",
+    roleGeneration: 2,
+    candidateSha: CANDIDATE_SHA,
+    workItemRevision: 3,
+    executionAttemptId: "pending-review-attempt",
+  });
 }
 
 // Parses a watchdog quiet line the way a recipient would: every timestamp must
@@ -767,10 +819,17 @@ async function loadedLaneWatcherHost() {
 
   const db = host.bb.storage.database();
   const { fenceToken } = seedAssignmentDatabase(db);
-  const adapter = new DeterministicNativeAssignmentAdapter();
-  const prepared = applyWithFixtureReceipt(db, assignmentPrepareRequest(fenceToken), null, null, adapter);
-  expect(prepared.outcome).toBe("OK");
-  const executionAttemptId = (prepared.evidence as { executionAttemptId: string }).executionAttemptId;
+  const executionAttemptId = insertFixtureAssignment(db, fenceToken, {
+    assignmentId: "assignment-1",
+    assignmentKind: "write",
+    laneId: "lane-main",
+    roleRequirementId: "orchestrator-v1",
+    roleId: "project-orchestrator",
+    roleGeneration: 1,
+    candidateSha: null,
+    workItemRevision: 2,
+    executionAttemptId: "assignment-1-attempt",
+  });
   db.prepare("UPDATE execution_attempts SET thread_id = ?, state = 'running' WHERE execution_attempt_id = ?").run("worker-1", executionAttemptId);
 
   let thread = makeThreadResponse({ id: "worker-1", status: "idle", archivedAt: null, deletedAt: null });
