@@ -86,7 +86,10 @@ function rpcHandlers(states: Record<string, string> = {}, models: Record<string,
 }
 
 describe("replacement thread list", () => {
-  afterEach(() => cleanup());
+  afterEach(() => {
+    cleanup();
+    window.localStorage.clear();
+  });
 
   it("keeps path-install app packaging independent from server imports", async () => {
     const appSource = readFileSync(resolve("app.tsx"), "utf8");
@@ -152,6 +155,111 @@ describe("replacement thread list", () => {
     fireEvent.change(rendered.getByLabelText("Project"), { target: { value: "project-a" } });
     await waitFor(() => expect(rendered.queryByText("unread B")).toBeNull());
     expect(rendered.getByText("read A")).toBeTruthy();
+  });
+
+  it("persists project and recipient filters across panel opens", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const options = {
+      sidebarThreads: { status: "ready" as const, projects: [project("project-a", "Project A")], threads: [] },
+      rpc: rpcHandlers(),
+    };
+    const first = renderSlot(inbox, { subPath: "" }, options);
+    fireEvent.change(first.getByLabelText("Project"), { target: { value: "project-a" } });
+    fireEvent.change(first.getByLabelText("Recipient"), { target: { value: "supervisor" } });
+    first.lifecycle.unmount();
+
+    const reopened = renderSlot(inbox, { subPath: "" }, options);
+    expect((reopened.getByLabelText("Project") as HTMLSelectElement).value).toBe("project-a");
+    expect((reopened.getByLabelText("Recipient") as HTMLSelectElement).value).toBe("supervisor");
+  });
+
+  it("falls back to all projects when a persisted project no longer exists", async () => {
+    window.localStorage.setItem("bb-collab.inbox-filters", JSON.stringify({ projectId: "deleted-project", recipient: "" }));
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const operatorMessages = vi.fn(async ({ projectId }: { projectId: string }) => [{
+      messageId: 5,
+      projectId,
+      recipient: "operator" as const,
+      senderThreadId: "sender-thread",
+      senderLaneId: null,
+      severity: "routine" as const,
+      text: "Visible after deletion",
+      createdAtMs: 1,
+      readAtMs: null,
+      repliedAtMs: null,
+      replyText: null,
+      replyDeliveryError: null,
+      notificationStatus: "not-requested" as const,
+      notificationError: null,
+    }]);
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("Visible after deletion")).toBeTruthy());
+    expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a" });
+    expect((rendered.getByLabelText("Project") as HTMLSelectElement).value).toBe("");
+  });
+
+  it("navigates the sender thread from its secondary id", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => [{
+        messageId: 4,
+        projectId: "project-a",
+        recipient: "operator" as const,
+        senderThreadId: "sender-thread",
+        senderLaneId: "lane-one",
+        severity: "routine" as const,
+        text: "Open my session",
+        createdAtMs: 1,
+        readAtMs: null,
+        repliedAtMs: null,
+        replyText: null,
+        replyDeliveryError: null,
+        notificationStatus: "not-requested" as const,
+        notificationError: null,
+      }] } as never,
+    });
+
+    const sender = await waitFor(() => rendered.getByRole("link", { name: "Open sender session sender-thread" }));
+    expect(sender.textContent).toBe("sender-thread");
+    expect(rendered.getByText("lane-one ·")).toBeTruthy();
+    fireEvent.click(sender);
+    expect(rendered.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "sender-thread" });
+  });
+
+  it("keeps the inbox mounted when a sender id has a hostile shape", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => [{
+        messageId: 6,
+        projectId: "project-a",
+        recipient: "operator" as const,
+        senderThreadId: { unexpected: true },
+        senderLaneId: null,
+        severity: "routine" as const,
+        text: "Inbox remains mounted",
+        createdAtMs: 1,
+        readAtMs: null,
+        repliedAtMs: null,
+        replyText: null,
+        replyDeliveryError: null,
+        notificationStatus: "not-requested" as const,
+        notificationError: null,
+      } as never] } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("Inbox remains mounted")).toBeTruthy());
+    expect(rendered.queryByRole("link")).toBeNull();
+    expect(rendered.getByText("Sender unavailable")).toBeTruthy();
   });
 
   it("keeps loaded messages visible when another project read fails", async () => {

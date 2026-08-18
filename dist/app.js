@@ -142,6 +142,24 @@ function age(ms) {
 var MAX_VISIBLE_THREADS = 5;
 var MAX_VISIBLE_INBOX_MESSAGES = 256;
 var SIDEBAR_RPC_BATCH_SIZE = 256;
+var INBOX_FILTER_STORAGE_KEY = "bb-collab.inbox-filters";
+function readInboxFilters() {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(INBOX_FILTER_STORAGE_KEY) ?? "null");
+    return {
+      projectId: typeof value?.projectId === "string" ? value.projectId : "",
+      recipient: value?.recipient === "operator" || value?.recipient === "supervisor" ? value.recipient : ""
+    };
+  } catch {
+    return { projectId: "", recipient: "" };
+  }
+}
+function writeInboxFilters(filters) {
+  try {
+    window.localStorage.setItem(INBOX_FILTER_STORAGE_KEY, JSON.stringify(filters));
+  } catch {
+  }
+}
 function sidebarRpcBatches(ids) {
   const batches = [];
   for (let index = 0; index < ids.length; index += SIDEBAR_RPC_BATCH_SIZE) batches.push(ids.slice(index, index + SIDEBAR_RPC_BATCH_SIZE));
@@ -680,9 +698,11 @@ function LanesPanel(_props) {
 }
 function InboxPanel(_props) {
   const sidebar = experimental_useSidebarThreads();
+  const navigate = useBbNavigate();
   const rpc = useRpc();
-  const [projectId, setProjectId] = useState("");
-  const [recipient, setRecipient] = useState("");
+  const [filters, setFilters] = useState(readInboxFilters);
+  const projectId = filters.projectId && sidebar.projects.some((project) => project.id === filters.projectId) ? filters.projectId : "";
+  const { recipient } = filters;
   const [messages, setMessages] = useState([]);
   const [drafts, setDrafts] = useState({});
   const [replyingMessageKey, setReplyingMessageKey] = useState(null);
@@ -692,6 +712,10 @@ function InboxPanel(_props) {
   const projectNames = useMemo(() => new Map(sidebar.projects.map((candidate) => [candidate.id, candidate.name])), [sidebar.projects]);
   const messageKey = (message) => `${message.projectId}:${message.messageId}`;
   const visibleMessages = messages.slice(0, MAX_VISIBLE_INBOX_MESSAGES);
+  const setFiltersAndPersist = (next) => {
+    setFilters(next);
+    writeInboxFilters(next);
+  };
   const refresh = useCallback(() => {
     const sequence = ++refreshSequence.current;
     if (projects.length === 0) {
@@ -718,7 +742,7 @@ function InboxPanel(_props) {
     /* @__PURE__ */ jsxs("div", { className: "mb-5 flex flex-wrap items-end gap-3", children: [
       /* @__PURE__ */ jsxs("label", { className: "grid gap-1 text-sm", children: [
         /* @__PURE__ */ jsx("span", { className: "text-muted-foreground", children: "Project" }),
-        /* @__PURE__ */ jsxs("select", { className: "rounded-md border border-border bg-background px-3 py-2", value: projectId, onChange: (event) => setProjectId(event.target.value), children: [
+        /* @__PURE__ */ jsxs("select", { className: "rounded-md border border-border bg-background px-3 py-2", value: projectId, onChange: (event) => setFiltersAndPersist({ projectId: event.target.value, recipient }), children: [
           /* @__PURE__ */ jsx("option", { value: "", children: "All projects" }),
           sidebar.projects.map((candidate) => /* @__PURE__ */ jsxs("option", { value: candidate.id, children: [
             candidate.name,
@@ -729,7 +753,7 @@ function InboxPanel(_props) {
       ] }),
       /* @__PURE__ */ jsxs("label", { className: "grid gap-1 text-sm", children: [
         /* @__PURE__ */ jsx("span", { className: "text-muted-foreground", children: "Recipient" }),
-        /* @__PURE__ */ jsxs("select", { className: "rounded-md border border-border bg-background px-3 py-2", value: recipient, onChange: (event) => setRecipient(event.target.value), children: [
+        /* @__PURE__ */ jsxs("select", { className: "rounded-md border border-border bg-background px-3 py-2", value: recipient, onChange: (event) => setFiltersAndPersist({ projectId, recipient: event.target.value }), children: [
           /* @__PURE__ */ jsx("option", { value: "", children: "All recipients" }),
           /* @__PURE__ */ jsx("option", { value: "operator", children: "Operator" }),
           /* @__PURE__ */ jsx("option", { value: "supervisor", children: "Supervisor" })
@@ -762,8 +786,21 @@ function InboxPanel(_props) {
           /* @__PURE__ */ jsx("span", { className: "font-medium text-foreground", children: message.recipient }),
           /* @__PURE__ */ jsx("span", { children: message.severity }),
           /* @__PURE__ */ jsxs("span", { children: [
-            message.senderLaneId ? `${message.senderLaneId} \xB7 ` : "",
-            message.senderThreadId
+            asText(message.senderLaneId) ? `${asText(message.senderLaneId)} \xB7 ` : "",
+            asText(message.senderThreadId) ? /* @__PURE__ */ jsx(
+              "a",
+              {
+                href: "#",
+                className: "underline decoration-muted-foreground/50 underline-offset-2 hover:text-foreground",
+                "aria-label": `Open sender session ${asText(message.senderThreadId)}`,
+                title: `Open sender session ${asText(message.senderThreadId)}`,
+                onClick: (event) => {
+                  event.preventDefault();
+                  navigate.toThread(asText(message.senderThreadId));
+                },
+                children: asText(message.senderThreadId)
+              }
+            ) : /* @__PURE__ */ jsx("span", { children: "Sender unavailable" })
           ] }),
           /* @__PURE__ */ jsx("time", { className: "ml-auto", dateTime: new Date(message.createdAtMs).toISOString(), children: new Date(message.createdAtMs).toLocaleString() })
         ] }),
