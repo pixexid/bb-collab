@@ -678,7 +678,26 @@ function insertFixtureAssignment(db: Database.Database, fenceToken: string, opti
     ...options,
     candidateSemantics: options.candidateSha === null ? "base" as const : "frozen" as const,
   };
-  const assignmentDigest = sha256(canonicalJson({ assignmentId: assignment.assignmentId, workItemId: assignment.workItemId }));
+  // PR-201: keep this direct fixture independent of the production writer while
+  // reproducing its canonical identity derivation exactly.
+  const {
+    assignmentId: _assignmentId,
+    workItemRevision: _workItemRevision,
+    executionAttemptId: _executionAttemptId,
+    ...intent
+  } = assignment;
+  const assignmentDigest = sha256(canonicalJson({
+    projectId: PROJECT_ID,
+    configRevision: 1,
+    governanceEpoch: 1,
+    workItemRevision: options.workItemRevision,
+    repoTargetId: TARGET_ID,
+    intent,
+  }));
+  const executionAttemptId = sha256(canonicalJson({ projectId: PROJECT_ID, assignmentDigest, attemptOrdinal: 1 }));
+  const creationEventSequence = ((db.prepare(
+    "SELECT COALESCE(MAX(event_sequence), 0) AS ceiling FROM state_events WHERE project_id = ?",
+  ).get(PROJECT_ID) as { ceiling: number }).ceiling) + 1;
   const now = Date.now();
   db.prepare(`
     INSERT INTO assignments (
@@ -700,7 +719,7 @@ function insertFixtureAssignment(db: Database.Database, fenceToken: string, opti
     assignment.environment.path, "managed-worktree", assignment.frozenBriefVersion, assignment.frozenBriefDigest,
     assignment.requestedProfile.providerId, assignment.requestedProfile.model, assignment.requestedProfile.reasoningLevel,
     assignment.requestedProfile.permissionMode, assignment.requestedProfile.serviceTier, "visible", ROLE_PROFILE_DIGEST,
-    assignment.dispatchKind, null, null, 0, assignment.deadlineAtMs, assignmentDigest, "prepare-pending-review", 1, now,
+    assignment.dispatchKind, null, null, 0, assignment.deadlineAtMs, assignmentDigest, template.idempotencyKey, creationEventSequence, now,
   );
   db.prepare(`
     INSERT INTO execution_attempts (
@@ -711,14 +730,14 @@ function insertFixtureAssignment(db: Database.Database, fenceToken: string, opti
       branch_name, base_sha, candidate_sha, environment_digest, created_at_ms, attempt_digest
     ) VALUES (?, ?, ?, 'assignment', ?, ?, ?, 1, ?, 1, 1, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
-    PROJECT_ID, options.executionAttemptId, assignment.assignmentId, assignmentDigest, assignment.laneId, assignment.assignmentKind,
+    PROJECT_ID, executionAttemptId, assignment.assignmentId, assignmentDigest, assignment.laneId, assignment.assignmentKind,
     assignment.dispatchKind, assignment.workItemId, TARGET_ID, assignment.roleId, assignment.roleGeneration,
     assignment.environment.bbServerId, assignment.environment.environmentId, assignment.environment.sourceId,
     assignment.environment.hostId, assignment.environment.path, assignment.frozenBriefDigest, assignment.branchName,
     assignment.baseSha, assignment.candidateSha, sha256(canonicalJson(assignment.environment)), now,
-    sha256(canonicalJson({ executionAttemptId: options.executionAttemptId, assignmentDigest, state: "prepared" })),
+    sha256(canonicalJson({ projectId: PROJECT_ID, executionAttemptId, assignmentDigest, state: "prepared" })),
   );
-  return options.executionAttemptId;
+  return executionAttemptId;
 }
 
 async function addPendingReview(fixture: Awaited<ReturnType<typeof fleetWatchdogFixture>>) {
