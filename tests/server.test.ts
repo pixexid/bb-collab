@@ -1861,7 +1861,9 @@ describe("bb-collab plugin boundary", () => {
       expect(readRoleHolderStates(fixture.db).find((holder) => holder.role_id === "project-orchestrator")?.thread_id).toBe(fixture.orchestratorThreadId);
       expect((await fixture.host.bb.sdk.threads.get({ threadId: fixture.orchestratorThreadId })).status).toBe("error");
 
-      clock.mockReturnValue(60 * 60_000);
+      let recoveryClockReads = 0;
+      clock.mockImplementation(() => recoveryClockReads++ === 0 ? 60 * 60_000 : 60 * 60_000 + 30);
+      const logCount = fixture.host.harness.inspection.logEntries.length;
       await fixture.host.harness.runSchedule("fleet-watchdog");
 
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
@@ -1873,9 +1875,11 @@ describe("bb-collab plugin boundary", () => {
       ]]);
       const persisted = await fixture.host.bb.storage.kv.get<Record<string, RoleIdleRecord>>("fleet-watchdog.role-idle");
       expect(Object.values(persisted ?? {})).toContainEqual(expect.objectContaining({ lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: 60 * 60_000 }));
-      await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
-      clock.mockReturnValue(2 * 60 * 60_000);
+      expect(fixture.host.harness.inspection.logEntries.slice(logCount)).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: "fleet-watchdog role wake path broken: project=proj_test role=project-orchestrator@1 status=error recovery=sent",
+      }));
+      expect(fixture.host.harness.inspection.logEntries.slice(logCount).some((entry) => entry.message === "fleet-watchdog healthy cycle")).toBe(false);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
     } finally {
@@ -1908,6 +1912,27 @@ describe("bb-collab plugin boundary", () => {
     ]]);
   });
 
+  it("does not recover a stopping holder that becomes active during the bounded wait", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    const statuses = new Map([[fixture.orchestratorThreadId, "stopping" as "stopping" | "active"]]);
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      status: statuses.get(threadId) ?? "idle",
+      updatedAt: 1,
+    })) as never);
+    fixture.host.harness.sdk.stub("threads.wait", (async ({ threadId }: { threadId: string }) => {
+      statuses.set(threadId, "active");
+    }) as never);
+    const logCount = fixture.host.harness.inspection.logEntries.length;
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    expect(fixture.host.harness.inspection.logEntries.slice(logCount).some((entry) => entry.message.includes("role wake path broken"))).toBe(false);
+    expect(fixture.host.harness.inspection.logEntries.slice(logCount)).toContainEqual(expect.objectContaining({ level: "info", message: "fleet-watchdog healthy cycle" }));
+  });
+
   it("wakes the orchestrator for a startable GitHub queue without an open WorkItem", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-queue-"));
     const gh = join(bin, "gh");
@@ -1933,6 +1958,47 @@ describe("bb-collab plugin boundary", () => {
       const persisted = await fixture.host.bb.storage.kv.get<Record<string, { lastFleetWakeAtMs: number | null; lastStartableQueueWakeAtMs: number | null }>>("fleet-watchdog.role-idle");
       expect(Object.values(persisted ?? {})).toContainEqual(expect.objectContaining({ lastFleetWakeAtMs: null, lastStartableQueueWakeAtMs: expect.any(Number) }));
       expect(readFileSync(argsLog, "utf8")).toBe("issue\nlist\n--repo\nexample/project\n--label\nqueue:startable\n--state\nopen\n--json\nnumber\n--limit\n1000\n");
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps startable intake running when a holder recovery is refused", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-after-refused-recovery-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":205}]'\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 3))).toMatchObject({ outcome: "OK" });
+      let directorReads = 0;
+      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+        id: threadId,
+        projectId: PROJECT_ID,
+        status: threadId === fixture.directorThreadId && directorReads++ === 0 ? "error" : threadId === fixture.directorThreadId ? "active" : "idle",
+        updatedAt: 1,
+      })) as never);
+      const logCount = fixture.host.harness.inspection.logEntries.length;
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({
+          threadId: fixture.orchestratorThreadId,
+          mode: "queue-if-active",
+          input: [expect.objectContaining({ text: "startable queue has 1 issue with 0/3 writing lanes active" })],
+        }),
+      ]]);
+      expect(fixture.host.harness.inspection.logEntries.slice(logCount)).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: "fleet-watchdog role wake path broken: project=proj_test role=director@1 status=error recovery=refused",
+      }));
+      expect(fixture.host.harness.inspection.logEntries.slice(logCount).some((entry) => entry.message === "fleet-watchdog healthy cycle")).toBe(false);
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;

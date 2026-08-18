@@ -21250,9 +21250,11 @@ ${thread.titleFallback ?? ""}`);
       }
       const isCurrent = (candidate, holder) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
       const wake = async (projectId, holder, key, text, requireIdle, kind, beforeSend) => {
-        const previous = await fleetWatchdogIdle.get(key);
-        const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs : kind === "recovery" ? previous?.lastRecoveryWakeAtMs : kind === "startable-queue" ? previous?.lastStartableQueueWakeAtMs : kind === "stale-wait" ? previous?.lastStaleWaitWakeAtMs : kind === "owed-act" ? previous?.lastOwedActWakeAtMs : previous?.lastEscalationAtMs;
-        if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== void 0 && now2 - lastNotifiedAtMs < floorMs) return false;
+        if (kind !== "recovery") {
+          const previous = await fleetWatchdogIdle.get(key);
+          const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs : kind === "startable-queue" ? previous?.lastStartableQueueWakeAtMs : kind === "stale-wait" ? previous?.lastStaleWaitWakeAtMs : kind === "owed-act" ? previous?.lastOwedActWakeAtMs : previous?.lastEscalationAtMs;
+          if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== void 0 && now2 - lastNotifiedAtMs < floorMs) return false;
+        }
         if (wakeInFlight.has(key)) return false;
         wakeInFlight.add(key);
         try {
@@ -21271,7 +21273,7 @@ ${thread.titleFallback ?? ""}`);
             input: [{ type: "text", visibility: "agent-only", text, mentions: [] }]
           });
           if (kind === "fleet") await fleetWatchdogIdle.recordFleetWake(key, Date.now());
-          else if (kind === "recovery") await fleetWatchdogIdle.recordRecoveryWake(key, Date.now());
+          else if (kind === "recovery") await fleetWatchdogIdle.recordRecoveryWake(key, now2);
           else if (kind === "startable-queue") await fleetWatchdogIdle.recordStartableQueueWake(key, Date.now());
           else if (kind === "stale-wait") await fleetWatchdogIdle.recordStaleWaitWake(key, Date.now());
           else if (kind === "owed-act") await fleetWatchdogIdle.recordOwedActWake(key, Date.now());
@@ -21281,6 +21283,7 @@ ${thread.titleFallback ?? ""}`);
           wakeInFlight.delete(key);
         }
       };
+      let brokenWakePath = false;
       for (const [projectId, holders] of holdersByProject) {
         try {
           if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
@@ -21293,21 +21296,19 @@ ${thread.titleFallback ?? ""}`);
           }
           const director = directors[0];
           const orchestrator = orchestrators[0];
-          let brokenWakePath = false;
           for (const holder of holders) {
             let thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
             if (thread.status !== "error" && thread.status !== "stopping") continue;
-            brokenWakePath = true;
             const observedStatus = thread.status;
-            bb.log.warn(`fleet-watchdog role wake path broken: project=${projectId} role=${holder.role_id}@${holder.role_generation} status=${observedStatus}`);
             if (observedStatus === "stopping") {
               await bb.sdk.threads.wait({ threadId: holder.thread_id, status: "idle", timeoutMs: FLEET_WATCHDOG_STOPPING_WAIT_MS }).catch(() => void 0);
               thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
             }
             if (thread.status === "active" || thread.status === "starting") continue;
-            await wake(projectId, holder, roleIdleKey(holder, "wake-path"), `role wake path broken at cycle ${new Date(now2).toISOString()}: ${holder.role_id}@${holder.role_generation} holder status=${observedStatus}; opening a fresh turn`, false, "recovery");
+            brokenWakePath = true;
+            const recoverySent = await wake(projectId, holder, roleIdleKey(holder, "wake-path"), `role wake path broken at cycle ${new Date(now2).toISOString()}: ${holder.role_id}@${holder.role_generation} holder status=${observedStatus}; opening a fresh turn`, false, "recovery");
+            bb.log.warn(`fleet-watchdog role wake path broken: project=${projectId} role=${holder.role_id}@${holder.role_generation} status=${observedStatus} recovery=${recoverySent ? "sent" : "refused"}`);
           }
-          if (brokenWakePath) continue;
           const workItems = openWorkItemsByProject.get(projectId) ?? [];
           const resetIdle = () => Promise.all(holders.flatMap((holder) => workItems.map((workItem) => fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workItem.workItemId)))));
           const config2 = db.prepare(
@@ -21399,7 +21400,7 @@ ${thread.titleFallback ?? ""}`);
           bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
         }
       }
-      bb.log.info("fleet-watchdog healthy cycle");
+      if (!brokenWakePath) bb.log.info("fleet-watchdog healthy cycle");
     } catch (error48) {
       bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
     }
