@@ -131,6 +131,69 @@ describe("stall-guard artifact cycle", () => {
     expect(wakeRole).toHaveBeenCalledTimes(1);
   });
 
+  it("baselines a first artifact snapshot without waking", async () => {
+    const store = kvPersistence();
+    const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
+    const currentArtifact = absentArtifact();
+    const cycle = createStallGuardCycle({
+      readRoleHolders: () => [holder(1, "current-holder")],
+      readArtifact: async () => currentArtifact,
+      wakeRole,
+      persistence: store.persistence,
+    });
+
+    expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 1, attempted: 0, verified: 0, steered: 0 });
+    expect(wakeRole).not.toHaveBeenCalled();
+    expect(await store.persistence.read()).toEqual({
+      "project-1:project-orchestrator": JSON.stringify(currentArtifact),
+    });
+  });
+
+  it("retries an artifact delta when the final role liveness read fails", async () => {
+    const store = kvPersistence();
+    let currentArtifact = absentArtifact();
+    let failFinalRoleLivenessRead = true;
+    const steerRole = vi.fn(async () => {
+      if (failFinalRoleLivenessRead) throw new Error("final role liveness read failed");
+      return true;
+    });
+    const watcher = createLaneWatcher({
+      readLanes: () => [],
+      steer: async () => {},
+      readRoleHolders: () => [holder(1, "current-holder")],
+      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "attempt-1", deferredReason: null }],
+      readWorker: async () => ({
+        status: "idle",
+        pendingExternalWait: false,
+        archived: false,
+        projectId: PROJECT_ID,
+        operatorWait: null,
+        operatorWaitKnown: true,
+        idleSinceMs: 0,
+      }),
+      steerRole,
+      roleIdleThresholdMs: 0,
+    });
+    const cycle = createStallGuardCycle({
+      readRoleHolders: () => [holder(1, "current-holder")],
+      readArtifact: async () => currentArtifact,
+      wakeRole: (role) => watcher.wakeRole(role),
+      persistence: store.persistence,
+    });
+
+    await cycle.cycle(PROJECT_ID);
+    currentArtifact = artifact("changed");
+    expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 0, attempted: 1, verified: 0, steered: 0 });
+    expect(await store.persistence.read()).toEqual({
+      "project-1:project-orchestrator": JSON.stringify(absentArtifact()),
+    });
+
+    failFinalRoleLivenessRead = false;
+    expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 1, attempted: 1, verified: 1, steered: 1 });
+    expect(steerRole).toHaveBeenCalledTimes(2);
+    expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 0, attempted: 0, verified: 0, steered: 0 });
+  });
+
   it("survives a SIGKILL across supervised processes with the same plugin KV", async () => {
     const root = mkdtempSync(join(tmpdir(), "bb-collab-stall-guard-process-"));
     const statePath = join(root, "plugin-kv.json");
