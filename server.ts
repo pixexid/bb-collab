@@ -621,6 +621,7 @@ interface WaitValidatorCliDeps {
   escalationCycle: import("./src/registered-waits.js").WaitEscalationCycle;
   stallGuardCycle: (projectId?: string) => Promise<import("./src/stall-guard.js").StallGuardCycleSummary>;
   fleetWatchdogCycle: (projectId?: string) => Promise<void>;
+  resetFleetWatchdog: (projectId: string, invokedBy: string) => Promise<void>;
   archiveSweep: (projectId: string, apply: boolean) => Promise<import("./src/archive-sweep.js").ArchiveSweepResult>;
   readCheckoutDivergence: () => CheckoutDivergence;
 }
@@ -697,13 +698,17 @@ async function runCli(
     const projectFlag = args.indexOf("--project");
     const projectId = parseFlag(args, "--project");
     const expectedLength = projectFlag < 0 ? 1 : 3;
-    const unknown = args.find((arg) => arg !== "--cycle" && arg !== "--project" && arg !== projectId);
-    if (unknown || args.filter((arg) => arg === "--cycle").length !== 1 || args.filter((arg) => arg === "--project").length > 1 || args.length !== expectedLength) {
+    const reset = args.includes("--reset");
+    const unknown = args.find((arg) => arg !== "--cycle" && arg !== "--reset" && arg !== "--project" && arg !== projectId);
+    if (unknown || args.filter((arg) => arg === "--cycle").length + args.filter((arg) => arg === "--reset").length !== 1 || args.filter((arg) => arg === "--project").length > 1 || args.length !== expectedLength) {
       return invalidCli(`unexpected argument ${unknown ?? "duplicate or malformed flag"}`);
     }
-    if (!args.includes("--cycle")) return invalidCli("--cycle is required: the fleet watchdog runs exactly one durable cycle per invocation");
     if (!projectId) return invalidCli("--project PROJECT_ID must be supplied once with a value");
     try {
+      if (reset) {
+        await deps.resetFleetWatchdog(projectId, ctx?.threadId ?? "unknown");
+        return cliResult({ outcome: "OK", subject: projectId, expected: 1, attempted: 1, verified: 1, message: "fleet-watchdog history reset" });
+      }
       await deps.fleetWatchdogCycle(projectId);
       return cliResult({ outcome: "OK", subject: projectId, expected: 1, attempted: 1, verified: 1, message: "fleet-watchdog cycle complete" });
     } catch (error) {
@@ -1365,6 +1370,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       bb.log.warn(`fleet-watchdog failed: ${String(error)}`);
     }
   };
+  const resetFleetWatchdog = async (projectId: string, invokedBy: string) => {
+    await fleetWatchdogIdle.clearWakeHistory(`${projectId}:`);
+    bb.log.warn(`fleet-watchdog history reset: project=${projectId} invokedBy=${invokedBy} at=${Date.now()}`);
+  };
   bb.background.schedule("fleet-watchdog", "0 * * * *", () => fleetWatchdogCycle());
 
   // This is deliberately a report-only schedule. Archive is available only
@@ -1426,6 +1435,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     escalationCycle,
     stallGuardCycle: (projectId) => stallGuardCycle.cycle(projectId),
     fleetWatchdogCycle,
+    resetFleetWatchdog,
     archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply),
     readCheckoutDivergence: readDiagnosticDivergence,
   };

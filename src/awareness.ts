@@ -439,6 +439,11 @@ export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
       await persistence?.write(structuredClone(nextState));
       state = nextState;
     }),
+    clearWakeHistory: (prefix: string) => enqueue(async () => {
+      await load();
+      for (const key of Object.keys(state)) if (key.startsWith(prefix)) state[key] = { ...state[key]!, idleSinceMs: null, lastWakeAtMs: null, lastEscalationAtMs: null };
+      await save();
+    }),
   };
 }
 

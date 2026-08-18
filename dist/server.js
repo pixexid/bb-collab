@@ -20328,6 +20328,11 @@ function createRoleIdleLedger(persistence) {
       const nextState = { ...state, [key]: { ...record2, lastEscalationAtMs: sentAtMs } };
       await persistence?.write(structuredClone(nextState));
       state = nextState;
+    }),
+    clearWakeHistory: (prefix) => enqueue(async () => {
+      await load();
+      for (const key of Object.keys(state)) if (key.startsWith(prefix)) state[key] = { ...state[key], idleSinceMs: null, lastWakeAtMs: null, lastEscalationAtMs: null };
+      await save();
     })
   };
 }
@@ -22107,13 +22112,17 @@ async function runCli(db, bb, argv, ctx, deps) {
     const projectFlag = args.indexOf("--project");
     const projectId2 = parseFlag(args, "--project");
     const expectedLength = projectFlag < 0 ? 1 : 3;
-    const unknown3 = args.find((arg) => arg !== "--cycle" && arg !== "--project" && arg !== projectId2);
-    if (unknown3 || args.filter((arg) => arg === "--cycle").length !== 1 || args.filter((arg) => arg === "--project").length > 1 || args.length !== expectedLength) {
+    const reset = args.includes("--reset");
+    const unknown3 = args.find((arg) => arg !== "--cycle" && arg !== "--reset" && arg !== "--project" && arg !== projectId2);
+    if (unknown3 || args.filter((arg) => arg === "--cycle").length + args.filter((arg) => arg === "--reset").length !== 1 || args.filter((arg) => arg === "--project").length > 1 || args.length !== expectedLength) {
       return invalidCli(`unexpected argument ${unknown3 ?? "duplicate or malformed flag"}`);
     }
-    if (!args.includes("--cycle")) return invalidCli("--cycle is required: the fleet watchdog runs exactly one durable cycle per invocation");
     if (!projectId2) return invalidCli("--project PROJECT_ID must be supplied once with a value");
     try {
+      if (reset) {
+        await deps.resetFleetWatchdog(projectId2, ctx?.threadId ?? "unknown");
+        return cliResult({ outcome: "OK", subject: projectId2, expected: 1, attempted: 1, verified: 1, message: "fleet-watchdog history reset" });
+      }
       await deps.fleetWatchdogCycle(projectId2);
       return cliResult({ outcome: "OK", subject: projectId2, expected: 1, attempted: 1, verified: 1, message: "fleet-watchdog cycle complete" });
     } catch (error48) {
@@ -22731,6 +22740,10 @@ ${thread.titleFallback ?? ""}`);
       bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
     }
   };
+  const resetFleetWatchdog = async (projectId, invokedBy) => {
+    await fleetWatchdogIdle.clearWakeHistory(`${projectId}:`);
+    bb.log.warn(`fleet-watchdog history reset: project=${projectId} invokedBy=${invokedBy} at=${Date.now()}`);
+  };
   bb.background.schedule("fleet-watchdog", "0 * * * *", () => fleetWatchdogCycle());
   bb.background.schedule("thread-archive-sweep", "0 * * * *", async () => {
     let projects;
@@ -22784,6 +22797,7 @@ ${thread.titleFallback ?? ""}`);
     escalationCycle,
     stallGuardCycle: (projectId) => stallGuardCycle.cycle(projectId),
     fleetWatchdogCycle,
+    resetFleetWatchdog,
     archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply),
     readCheckoutDivergence: readDiagnosticDivergence
   };
