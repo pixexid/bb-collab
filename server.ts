@@ -1374,7 +1374,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     await fleetWatchdogIdle.clearWakeHistory(`${projectId}:`);
     bb.log.warn(`fleet-watchdog history reset: project=${projectId} invokedBy=${invokedBy} at=${Date.now()}`);
   };
-  bb.background.schedule("fleet-watchdog", "* * * * *", () => fleetWatchdogCycle());
+  bb.background.schedule("fleet-watchdog", "0 * * * *", () => fleetWatchdogCycle());
 
   // This is deliberately a report-only schedule. Archive is available only
   // through the explicit collab archive-sweep --apply command below.
