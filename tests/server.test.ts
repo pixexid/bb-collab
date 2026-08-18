@@ -6406,7 +6406,7 @@ describe("bb-collab plugin boundary", () => {
     const host = await loadedHost();
     const registrations = host.harness.inspection.registrations;
     expect(registrations.rpcMethods).not.toContain("seed-fixture-receipt");
-    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "send-to-operator", "inbox"]);
+    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "worktree-cleanup", "send-to-operator", "inbox"]);
     expect(registrations.httpRoutes.map((route) => route.path)).toEqual(["/lanes"]);
     expect(seedFixtureDecision).toBeTypeOf("function");
   });

@@ -19941,16 +19941,122 @@ async function runArchiveSweep(bb, db, projectId, apply = false, now2 = Date.now
   }
 }
 
+// src/worktree-cleanup.ts
+import { execFileSync } from "node:child_process";
+import { existsSync as existsSync2 } from "node:fs";
+import { isAbsolute as isAbsolute2, resolve } from "node:path";
+var threadPattern = /thr_[a-z0-9]+/u;
+function classifyWorktree(path, home = process.env.HOME ?? "") {
+  const target = resolve(path);
+  const tmp = ["/tmp", "/private/tmp"].map((root) => resolve(root));
+  if (tmp.some((root) => target === root || target.startsWith(`${root}/`))) return "scratch";
+  const managed = resolve(home, ".bb/worktrees");
+  if (target === managed || target.startsWith(`${managed}/`)) return "managed";
+  const candidates = resolve(home, ".bb/thread-storage");
+  if (target === candidates || target.startsWith(`${candidates}/`)) return "candidate";
+  return "unknown";
+}
+function threadIdFromBranch(branch) {
+  return branch?.match(threadPattern)?.[0] ?? null;
+}
+function planWorktreeCleanup(entries, options) {
+  const decisions = [];
+  for (const entry of entries) {
+    const population = entry.population ?? classifyWorktree(entry.path, options.home);
+    const threadId = entry.threadId === void 0 ? threadIdFromBranch(entry.branch) : entry.threadId;
+    if (population === "candidate") {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "per-thread candidate checkout is protected" });
+      continue;
+    }
+    if (threadId && options.liveThreadIds.has(threadId)) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: `live thread ${threadId}` });
+      continue;
+    }
+    if (population === "managed") {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "BB environment record cannot be released by the available SDK" });
+      continue;
+    }
+    if (population === "unknown") {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "worktree is outside the owned scratch/managed populations" });
+      continue;
+    }
+    if (!entry.head) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "worktree HEAD is unavailable" });
+      continue;
+    }
+    if ((options.status?.(entry.path) ?? "") !== "") {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "uncommitted changes" });
+      continue;
+    }
+    if (!options.originMain || !(options.reachable?.(entry.path, entry.head) ?? false)) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "commits are not reachable from origin/main" });
+      continue;
+    }
+    decisions.push({ path: entry.path, population, action: "remove", reason: "clean and fully reachable from origin/main" });
+  }
+  return decisions;
+}
+function runWorktreeCleanup(entries, options) {
+  const decisions = planWorktreeCleanup(entries, options);
+  const removed = [];
+  const refused = decisions.filter((decision) => decision.action === "refuse");
+  if (options.apply) {
+    for (const decision of decisions.filter((item) => item.action === "remove")) {
+      try {
+        options.remove?.(decision.path);
+        removed.push(decision.path);
+      } catch (error48) {
+        refused.push({ ...decision, action: "refuse", reason: `git worktree remove failed: ${error48 instanceof Error ? error48.message : String(error48)}` });
+      }
+    }
+  }
+  return { outcome: refused.length > 0 ? "refused" : options.apply ? "applied" : "reported", removed, refused, environmentRecordsReleased: false };
+}
+function git(args, cwd) {
+  return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } }).trim();
+}
+function listGitWorktrees(repoRoot) {
+  const lines = git(["worktree", "list", "--porcelain"], repoRoot).split("\n");
+  const entries = [];
+  let current = null;
+  for (const line of lines) {
+    if (line.startsWith("worktree ")) {
+      if (current) entries.push(current);
+      current = { path: line.slice("worktree ".length), branch: null, head: null };
+    } else if (current && line.startsWith("HEAD ")) current.head = line.slice("HEAD ".length);
+    else if (current && line.startsWith("branch ")) current.branch = line.slice("branch ".length).replace(/^refs\/heads\//u, "");
+  }
+  if (current) entries.push(current);
+  return entries;
+}
+function cleanupGitWorktrees(repoRoot, liveThreadIds, apply = false) {
+  const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
+  const status = (path) => git(["status", "--porcelain", "--untracked-files=all"], path);
+  const reachable = (path, head) => git(["rev-list", "--not", originMain, head], path) === "";
+  return runWorktreeCleanup(listGitWorktrees(repoRoot), {
+    liveThreadIds,
+    apply,
+    originMain,
+    status,
+    reachable,
+    remove: (path) => {
+      if (!existsSync2(path)) return;
+      if (!isAbsolute2(path)) throw new Error("worktree path is not absolute");
+      execFileSync("git", ["worktree", "remove", path], { cwd: repoRoot, stdio: "pipe" });
+    }
+  });
+}
+
 // src/checkout-divergence.ts
 import { spawnSync } from "node:child_process";
-import { existsSync as existsSync2, readFileSync as readFileSync2, statSync } from "node:fs";
-import { dirname as dirname2, join as join4, resolve } from "node:path";
+import { existsSync as existsSync3, readFileSync as readFileSync2, statSync } from "node:fs";
+import { dirname as dirname2, join as join4, resolve as resolve2 } from "node:path";
 function readRef(gitDirs, ref) {
   for (const gitDir of gitDirs) {
     const looseRef = join4(gitDir, ref);
-    if (existsSync2(looseRef)) return readFileSync2(looseRef, "utf8").trim() || null;
+    if (existsSync3(looseRef)) return readFileSync2(looseRef, "utf8").trim() || null;
     const packedRefs = join4(gitDir, "packed-refs");
-    if (!existsSync2(packedRefs)) continue;
+    if (!existsSync3(packedRefs)) continue;
     for (const line of readFileSync2(packedRefs, "utf8").split("\n")) {
       const [sha, name] = line.trim().split(" ");
       if (name === ref) return sha ?? null;
@@ -19960,14 +20066,14 @@ function readRef(gitDirs, ref) {
 }
 function resolveGitDir(checkoutRoot) {
   const dotGit = join4(checkoutRoot, ".git");
-  if (!existsSync2(dotGit)) return null;
+  if (!existsSync3(dotGit)) return null;
   if (statSync(dotGit).isDirectory()) return dotGit;
   const marker = readFileSync2(dotGit, "utf8").trim();
-  return marker.startsWith("gitdir:") ? resolve(checkoutRoot, marker.slice("gitdir:".length).trim()) : null;
+  return marker.startsWith("gitdir:") ? resolve2(checkoutRoot, marker.slice("gitdir:".length).trim()) : null;
 }
 function commonGitDir(gitDir) {
   const commondir = join4(gitDir, "commondir");
-  return existsSync2(commondir) ? resolve(gitDir, readFileSync2(commondir, "utf8").trim()) : gitDir;
+  return existsSync3(commondir) ? resolve2(gitDir, readFileSync2(commondir, "utf8").trim()) : gitDir;
 }
 function readHead(gitDir, commonDir) {
   const head = readFileSync2(join4(gitDir, "HEAD"), "utf8").trim();
@@ -19975,9 +20081,9 @@ function readHead(gitDir, commonDir) {
   return readRef([gitDir, commonDir], head.slice("ref: ".length));
 }
 function findCheckoutRoot(startPath) {
-  let current = resolve(startPath);
+  let current = resolve2(startPath);
   while (true) {
-    if (existsSync2(join4(current, ".git"))) return current;
+    if (existsSync3(join4(current, ".git"))) return current;
     const parent = dirname2(current);
     if (parent === current) return null;
     current = parent;
@@ -20022,9 +20128,9 @@ function readCheckoutDivergence(checkoutRoot) {
 }
 
 // server.ts
-import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync3, rmSync as rmSync2, statSync as statSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { existsSync as existsSync4, mkdirSync as mkdirSync2, readFileSync as readFileSync3, rmSync as rmSync2, statSync as statSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { execFile, spawnSync as spawnSync2 } from "node:child_process";
-import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute2, join as join5, relative as relative2, sep } from "node:path";
+import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute3, join as join5, relative as relative2, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 function githubRepository(remoteUrl) {
   const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
@@ -20470,9 +20576,9 @@ async function isLiveCachedConsumerRolloutArtifact(moduleUrl, bb) {
   try {
     const artifactPath = fileURLToPath(new URL(moduleUrl));
     const pluginRoot = resolvedPluginRoot(await bb.sdk.plugins.getSource({ pluginId: bb.pluginId }));
-    if (!pluginRoot || !isAbsolute2(pluginRoot)) return false;
+    if (!pluginRoot || !isAbsolute3(pluginRoot)) return false;
     const relativeArtifactPath = relative2(pluginRoot, artifactPath);
-    if (relativeArtifactPath.length === 0 || relativeArtifactPath === ".." || relativeArtifactPath.startsWith(`..${sep}`) || isAbsolute2(relativeArtifactPath)) return false;
+    if (relativeArtifactPath.length === 0 || relativeArtifactPath === ".." || relativeArtifactPath.startsWith(`..${sep}`) || isAbsolute3(relativeArtifactPath)) return false;
     return basename2(artifactPath) === "server.js" && basename2(dirname3(artifactPath)) === "dist";
   } catch {
     return false;
@@ -20480,7 +20586,7 @@ async function isLiveCachedConsumerRolloutArtifact(moduleUrl, bb) {
 }
 function roleBriefBundlePath() {
   const bundled = fileURLToPath(new URL("./role-briefs.json", import.meta.url));
-  return existsSync3(bundled) ? bundled : fileURLToPath(new URL("./dist/role-briefs.json", import.meta.url));
+  return existsSync4(bundled) ? bundled : fileURLToPath(new URL("./dist/role-briefs.json", import.meta.url));
 }
 function roleForThread(db, projectId, threadId) {
   const roleId = db ? readRoleHolderStates(db).find((holder) => holder.project_id === projectId && holder.thread_id === threadId)?.role_id : null;
@@ -20644,8 +20750,8 @@ async function assertSenderProject(bb, projectId, senderThreadId) {
   }
 }
 function runBbCommand(args) {
-  return new Promise((resolve2, reject) => {
-    execFile(process.env.BB_CLI?.trim() || "bb", args, { timeout: 1e4 }, (error48) => error48 ? reject(error48) : resolve2());
+  return new Promise((resolve3, reject) => {
+    execFile(process.env.BB_CLI?.trim() || "bb", args, { timeout: 1e4 }, (error48) => error48 ? reject(error48) : resolve3());
   });
 }
 async function defaultNotifyUrgent(message, senderThreadId, run) {
@@ -20759,8 +20865,8 @@ async function replyToOperatorMessage(db, bb, projectId, messageId, replyText) {
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "archive-sweep", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, archive-sweep, cached-consumer-rollout, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
+  if (!command || !["doctor", "export", "apply", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, archive-sweep, worktree-cleanup, cached-consumer-rollout, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
   }
   if (command === "wait-validator") {
     const unknown3 = args.find((arg) => arg !== "--cycle");
@@ -20890,6 +20996,19 @@ async function runCli(db, bb, argv, ctx, deps) {
       message: result2.message,
       evidence: result2
     });
+  }
+  if (command === "worktree-cleanup") {
+    if (unexpectedFlags(args, ["--project", "--apply"]) || args.filter((arg) => arg === "--apply").length > 1) return invalidCli("unexpected worktree-cleanup argument");
+    try {
+      const project = await bb.sdk.projects.get({ projectId });
+      const source = project.sources.find((item) => item.isDefault) ?? project.sources[0];
+      if (!source) return invalidCli("project has no source checkout");
+      const threads = await bb.sdk.threads.list({ projectId, archived: false, includeHidden: true, limit: 1e3 });
+      const result2 = cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), args.includes("--apply"));
+      return { exitCode: result2.refused.length === 0 ? 0 : 2, stdout: JSON.stringify(result2) };
+    } catch (error48) {
+      return { exitCode: 2, stdout: JSON.stringify({ outcome: "refused", removed: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error48 instanceof Error ? error48.message : String(error48) }], environmentRecordsReleased: false }) };
+    }
   }
   if (command === "wait-register") {
     const unknown3 = unexpectedFlags(args, ["--project", "--request"]);
@@ -21218,12 +21337,12 @@ ${thread.titleFallback ?? ""}`);
         await watcher.poll().catch((error48) => bb.log.warn(`lane poll failed: ${String(error48)}`));
         await escalationCycle.cycle().catch((error48) => bb.log.warn(`wait escalation failed: ${String(error48)}`));
         if (signal.aborted) break;
-        await new Promise((resolve2) => {
+        await new Promise((resolve3) => {
           let timer;
           const done = () => {
             clearTimeout(timer);
             signal.removeEventListener("abort", done);
-            resolve2();
+            resolve3();
           };
           timer = setTimeout(done, 1e3);
           signal.addEventListener("abort", done, { once: true });
@@ -21245,7 +21364,7 @@ ${thread.titleFallback ?? ""}`);
       }
       const configuredStaleMs = Number(process.env.BB_COLLAB_LIVENESS_STALE_MS);
       const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
-      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync3(flagPath));
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync4(flagPath));
       if (decision === "clear-alert-flag") rmSync2(flagPath, { force: true });
       if (decision === "alert-once") {
         mkdirSync2(stateDir, { recursive: true });
@@ -21277,7 +21396,7 @@ ${thread.titleFallback ?? ""}`);
       }
       const configuredStaleMs = Number(process.env.BB_COLLAB_STALL_GUARD_LIVENESS_STALE_MS);
       const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
-      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync3(flagPath));
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync4(flagPath));
       if (decision === "clear-alert-flag") rmSync2(flagPath, { force: true });
       if (decision === "alert-once") {
         mkdirSync2(stateDir, { recursive: true });
@@ -21836,6 +21955,11 @@ ${thread.titleFallback ?? ""}`);
         name: "archive-sweep",
         summary: "Report archivable threads; --apply is explicit and opt-in",
         usage: "bb collab archive-sweep --project PROJECT_ID [--apply]"
+      },
+      {
+        name: "worktree-cleanup",
+        summary: "Report or remove only clean, origin/main-reachable scratch worktrees",
+        usage: "bb collab worktree-cleanup --project PROJECT_ID [--apply]"
       },
       {
         name: "send-to-operator",
