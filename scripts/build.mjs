@@ -19,6 +19,7 @@ try {
   manifest.bb.server = "./server.ts";
   writeFileSync(join(stage, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
   execFileSync("bb", ["plugin", "build", stage], { cwd: stage, stdio: "inherit" });
+  rmSync(join(root, "dist"), { recursive: true, force: true });
   cpSync(join(stage, "dist"), join(root, "dist"), { recursive: true });
   cpSync(join(stage, "role-briefs.json"), join(root, "dist", "role-briefs.json"));
   // Every tracked artifact names its entry through the throwaway staging
