@@ -1469,8 +1469,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   });
 
   const wakeInFlight = new Set<string>();
-  // This model-free detector covers canonical and platform state. Prose rulings
-  // and whether their named acts have an executing surface are intentionally outside mechanical coverage.
+  // This model-free detector covers threads with obligations in canonical and platform state.
+  // Acts named only in prose are outside mechanical coverage because identifying whether they
+  // have an executing surface would require interpreting prose.
   const fleetWatchdogCycle = async (onlyProjectId?: string) => {
     let coverage: "visible" | "degraded" | "blind" = "blind";
     let visibleSeatCount = 0;
