@@ -88,19 +88,25 @@ Check what is already assigned before dispatching. Keeping the fleet busy is not
 
 ## Off-matrix work stands on its evidence
 
-> Finished, reviewed, green work stands on its evidence and is never re-run for provenance alone. The provenance deviation is recorded in the pull-request body as it merged.
+> Off-matrix AUTHORING that later receives a valid matrix-qualified independent review stands on its evidence and is never re-run for provenance alone. The deviation is recorded in the pull-request body as it merged.
 
-Discovering that a lane ran on an unratified model, or at the wrong reasoning level, does not retroactively make its output wrong. Re-running it would cost real work to buy a receipt, and the receipt would say nothing the review and the tests do not already say. Record what actually executed, and judge the work by what it produced.
+Discovering that an implementation lane ran on an unratified model, or at the wrong reasoning level, does not retroactively make its output wrong. The review and the tests still discriminate; re-running would cost real work to buy a receipt that says nothing they do not already say.
+
+The rule stops at the gate. It does NOT extend to a review, a qualification, or a release artifact, because there the off-matrix work IS the gate and no later check stands behind it. An unqualified reviewer's thoroughness is not a substitute for qualification: [absent or contradictory qualification cannot satisfy a review gate](threat-model.md), and an executed-profile mismatch fails closed. A Tier-A review performed by a model the matrix does not admit for review leaves the gate unsatisfied however good the review was, and the remedy is a qualified review, not an argument about quality.
 
 This cuts the other way too. "It worked out" is not ratification, and a good outcome from an unplaced model is evidence for a probe to weigh, never a substitute for one.
 
 ## A ruling disposes its own subordinate instances
 
-> When the same pattern surfaces again below a ruling that already covers it, apply the ruling. It returns to the deciding seat only when it presents new evidence, or when it resists the ruling's reasoning.
+> When the same pattern surfaces again below a ruling that already covers it, apply the ruling — but only when the instance falls inside the ruling's own stated subject AND inside the applying seat's existing authority. Uncertainty about either goes back up.
 
-Re-asking a settled question costs a round trip and buys nothing, and it teaches the seat below to stop thinking at the first resemblance. The test is not "is this the same case" but "does the ruling's reasoning reach this one". A model unratified for placement is still unratified when its name appears inside a row about something else; ratification-by-containment does not exist, so that instance is disposed, not escalated.
+Re-asking a settled question costs a round trip and buys nothing, and it teaches the seat below to stop thinking at the first resemblance. But "the reasoning reaches this case" is the applying seat's own conclusion, and a rule resting on it alone is not a boundary — it is permission to expand quietly. Both conditions are required, and neither is satisfied by the seat finding the new case similar.
 
-Two things a seat owes when it disposes rather than escalates: say that it did, and say which ruling it applied. A disposition recorded as if it were a fresh decision is indistinguishable from a seat exceeding its authority.
+Inside the ruling's stated subject means the instance sits within what the ruling actually addressed, not within an extension the seat infers from its rationale. A model unratified for placement is still unratified when its name appears inside a row about something else — ratification-by-containment does not exist — so that instance is disposed. A question the ruling never reached is escalated even when the same reasoning would plainly settle it.
+
+Inside existing authority means the act is one the seat could already take under its role and its current work order. A ruling does not enlarge a seat; it settles a question a seat was already entitled to act on.
+
+Saying which ruling was applied is disclosure, not a guard — it makes the decision auditable afterwards and does nothing to bound it beforehand. The two conditions bound it; the disclosure records it. A seat owes both.
 
 ## Blast radius
 
