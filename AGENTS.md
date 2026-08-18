@@ -8,7 +8,7 @@ The fleet is a director, an orchestrator, and workers using BB-native threads an
 
 ## Contract
 
-`CONTRACT_VERSION: 21` — apply the [version-bump test](docs/rules.md#version-bump-test) before changing it.
+`CONTRACT_VERSION: 22` — apply the [version-bump test](docs/rules.md#version-bump-test) before changing it.
 
 ## Reading order for a fresh seat
 
@@ -37,4 +37,5 @@ The fleet is a director, an orchestrator, and workers using BB-native threads an
 - [Question is not delegation](docs/rules.md#question-is-not-delegation) — keep questions and frozen work orders separate.
 - [Delegation return path](docs/rules.md#delegation-return-path) — every delegation says where DONE, BLOCKED, or WAITING returns.
 - [One writer per lane](docs/rules.md#one-writer-per-lane) — one branch and one owner per edit lane.
+- [Quiet with startable work is a defect state](docs/rules.md#quiet-with-startable-work-is-a-defect-state) — intake fires on every wake; the check is `startable > 0 AND lanes < cap`.
 - [Blast radius](docs/rules.md#blast-radius) — update affected open artifacts with the decision that invalidates them.
