@@ -27,6 +27,29 @@ project. Do not use the currently running lane's thread as a substitute for a
 verified actor receipt, and do not run this against `proj_a8zzfsx36j` from a
 test or fixture.
 
+Obtain the actor receipt id from the live plugin store with a read-only query;
+use the `receipt_id` from the returned row only when the surrounding columns
+show the current project, `actor_kind = 'plugin'`, the plugin subject, and
+`verification_state = 'verified'` (a NULL `role_id` is expected):
+
+```sh
+export PROJECT_ID="<project-id>"
+sqlite3 -readonly -header -box "$HOME/.bb/plugins/bb-collab/data.db" \
+  "SELECT receipt_id, project_id, actor_kind, subject_id, role_id, verification_state
+     FROM actor_receipts
+    WHERE project_id = '$PROJECT_ID'
+      AND actor_kind = 'plugin'
+      AND subject_id = 'bb-collab'
+      AND role_id IS NULL
+      AND verification_state = 'verified'
+    ORDER BY issued_at_ms DESC
+    LIMIT 1;"
+```
+
+This reads the canonical `actor_receipts.receipt_id` and does not mint or
+write a receipt. If it returns no row, stop and resolve the live store state;
+do not substitute a thread, seat, or unverified receipt.
+
 The request envelope is defined by `applyRequestSchema` in
 `src/foundation.ts`: `projectId`, `operationClass`, and `idempotencyKey` are
 required; `actorReceiptId`, `expectedConfigRevision`, `expectedGovernanceEpoch`,
