@@ -2811,7 +2811,9 @@ describe("bb-collab plugin boundary", () => {
       clock.mockReturnValue(2 * 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.getThreadStatus()).toBe("active");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").some(([input]) => (input as { input: Array<{ text: string }> }).input[0]?.text === "fleet still quiet at cycle 1970-01-01T02:00:00.000Z with open work since 1970-01-01T00:00:00.000Z")).toBe(false);
+      const texts = fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { input: Array<{ text: string }> }).input[0]?.text);
+      expect(texts.some((text) => text === "fleet still quiet at cycle 1970-01-01T02:00:00.000Z with open work since 1970-01-01T00:00:00.000Z")).toBe(false);
+      expect(texts.some((text) => text === "fleet still quiet with open work since 1970-01-01T00:00:00.000Z")).toBe(false);
     } finally {
       clock.mockRestore();
     }
@@ -2834,14 +2836,17 @@ describe("bb-collab plugin boundary", () => {
       expect(sends).toHaveLength(1);
       const claim = parseEmittedQuietClaim((sends[0]![0] as { input: Array<{ text: string }> }).input[0]!.text);
       expect(claim, "tier-1 line must claim quiet only at its cycle receipt").not.toBeNull();
-      expect(claim!.quietAtMs).toBe(60 * 60_000);
-      expect(claim!.openSinceMs).toBe(0);
+      const cycleAtMs = 60 * 60_000;
+      const orchestrator = fixture.db.prepare("SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'project-orchestrator'").get() as Parameters<typeof roleIdleKey>[0];
+      const ledgerKey = roleIdleKey(orchestrator, WORK_ITEM_ID);
+      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { idleSinceMs: number | null; lastFleetWakeAtMs: number | null }>>("fleet-watchdog.role-idle");
+      expect(claim!.quietAtMs).toBe(cycleAtMs);
+      expect(claim!.openSinceMs).toBe(persisted?.[ledgerKey]?.idleSinceMs);
+      expect(persisted?.[ledgerKey]?.lastFleetWakeAtMs).toBe(cycleAtMs);
       // Ground truth separates the two timestamps: the unobserved activity sits
       // after the anchor and before the receipt, so only the split claim is true.
       expect(claim!.openSinceMs).toBeLessThan(activityAtMs);
       expect(claim!.quietAtMs).toBeGreaterThan(activityAtMs);
-      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { idleSinceMs: number | null; lastFleetWakeAtMs: number | null }>>("fleet-watchdog.role-idle");
-      expect(Object.values(persisted ?? {}).some((record) => record.lastFleetWakeAtMs === 60 * 60_000 && record.idleSinceMs === claim!.openSinceMs)).toBe(true);
     } finally {
       clock.mockRestore();
     }
@@ -2867,12 +2872,17 @@ describe("bb-collab plugin boundary", () => {
       const claim = parseEmittedQuietClaim((sends[0]![0] as { input: Array<{ text: string }> }).input[0]!.text);
       expect(claim, "tier-2 line must claim quiet only at its cycle receipt").not.toBeNull();
       expect(claim!.still).toBe(true);
-      expect(claim!.quietAtMs).toBe(2 * 60 * 60_000);
-      expect(claim!.openSinceMs).toBe(0);
+      const cycleAtMs = 2 * 60 * 60_000;
+      const orchestrator = fixture.db.prepare("SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'project-orchestrator'").get() as Parameters<typeof roleIdleKey>[0];
+      const director = fixture.db.prepare("SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'director'").get() as Parameters<typeof roleIdleKey>[0];
+      const anchorKey = roleIdleKey(orchestrator, WORK_ITEM_ID);
+      const wakeKey = roleIdleKey(director, WORK_ITEM_ID);
+      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { idleSinceMs: number | null; lastEscalationAtMs: number | null }>>("fleet-watchdog.role-idle");
+      expect(claim!.quietAtMs).toBe(cycleAtMs);
+      expect(claim!.openSinceMs).toBe(persisted?.[anchorKey]?.idleSinceMs);
+      expect(persisted?.[wakeKey]?.lastEscalationAtMs).toBe(cycleAtMs);
       expect(claim!.openSinceMs).toBeLessThan(activityAtMs);
       expect(claim!.quietAtMs).toBeGreaterThan(activityAtMs);
-      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { idleSinceMs: number | null; lastEscalationAtMs: number | null }>>("fleet-watchdog.role-idle");
-      expect(Object.values(persisted ?? {}).some((record) => record.lastEscalationAtMs === 2 * 60 * 60_000 && record.idleSinceMs === claim!.openSinceMs)).toBe(true);
     } finally {
       clock.mockRestore();
     }
@@ -2896,12 +2906,15 @@ describe("bb-collab plugin boundary", () => {
       const claim = parseEmittedQuietClaim((sends[0]![0] as { input: Array<{ text: string }> }).input[0]!.text);
       expect(claim, "owed-act line must claim quiet only at its cycle receipt").not.toBeNull();
       expect(claim!.subject).toBe("owed act");
-      expect(claim!.quietAtMs).toBe(60 * 60_000);
-      expect(claim!.openSinceMs).toBe(0);
+      const cycleAtMs = 60 * 60_000;
+      const director = fixture.db.prepare("SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'director'").get() as Parameters<typeof roleIdleKey>[0];
+      const ledgerKey = roleIdleKey(director, WORK_ITEM_ID);
+      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { idleSinceMs: number | null; lastOwedActWakeAtMs: number | null }>>("fleet-watchdog.role-idle");
+      expect(claim!.quietAtMs).toBe(cycleAtMs);
+      expect(claim!.openSinceMs).toBe(persisted?.[ledgerKey]?.idleSinceMs);
+      expect(persisted?.[ledgerKey]?.lastOwedActWakeAtMs).toBe(cycleAtMs);
       expect(claim!.openSinceMs).toBeLessThan(activityAtMs);
       expect(claim!.quietAtMs).toBeGreaterThan(activityAtMs);
-      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { idleSinceMs: number | null; lastOwedActWakeAtMs: number | null }>>("fleet-watchdog.role-idle");
-      expect(Object.values(persisted ?? {}).some((record) => record.lastOwedActWakeAtMs === 60 * 60_000 && record.idleSinceMs === claim!.openSinceMs)).toBe(true);
     } finally {
       clock.mockRestore();
     }
