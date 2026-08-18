@@ -30,6 +30,9 @@ function age(ms: number): string {
 }
 
 const MAX_VISIBLE_THREADS = 5;
+// The exact project reader returns at most 256 rows; keep the aggregate panel
+// at that measured display budget and disclose the spill instead of hiding it.
+const MAX_VISIBLE_INBOX_MESSAGES = 256;
 const SIDEBAR_RPC_BATCH_SIZE = 256;
 
 export function sidebarRpcBatches(ids: readonly string[]): string[][] {
@@ -677,6 +680,7 @@ function InboxPanel(_props: PluginNavPanelProps) {
   const projects = useMemo(() => projectId ? sidebar.projects.filter((candidate) => candidate.id === projectId) : sidebar.projects, [projectId, sidebar.projects]);
   const projectNames = useMemo(() => new Map(sidebar.projects.map((candidate) => [candidate.id, candidate.name])), [sidebar.projects]);
   const messageKey = (message: OperatorMessage) => `${message.projectId}:${message.messageId}`;
+  const visibleMessages = messages.slice(0, MAX_VISIBLE_INBOX_MESSAGES);
 
   const refresh = useCallback(() => {
     const sequence = ++refreshSequence.current;
@@ -731,8 +735,9 @@ function InboxPanel(_props: PluginNavPanelProps) {
           <section aria-labelledby="inbox-project-heading">
             <h2 id="inbox-project-heading" className="mb-2 text-sm font-semibold">{projectId ? `${projectNames.get(projectId) ?? projectId} · ${projectId}` : "All projects"}</h2>
             {messages.length === 0 ? <p className="text-sm text-muted-foreground">No messages for this project and recipient filter.</p> : null}
+            {messages.length > MAX_VISIBLE_INBOX_MESSAGES ? <p className="mb-3 text-sm text-muted-foreground">Showing the first {MAX_VISIBLE_INBOX_MESSAGES} of {messages.length} messages; unread messages are first. Select a project to narrow the list.</p> : null}
             <div className="space-y-3">
-              {messages.map((message) => (
+              {visibleMessages.map((message) => (
                 <article key={messageKey(message)} className={`rounded-lg border p-4 ${message.readAtMs === null ? "border-primary/50" : "border-border"}`}>
                   <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                     <span className="font-medium text-foreground">{projectNames.get(message.projectId) ?? message.projectId} · {message.projectId}</span>

@@ -140,6 +140,7 @@ function age(ms) {
   return `${Math.floor(hours / 24)}d`;
 }
 var MAX_VISIBLE_THREADS = 5;
+var MAX_VISIBLE_INBOX_MESSAGES = 256;
 var SIDEBAR_RPC_BATCH_SIZE = 256;
 function sidebarRpcBatches(ids) {
   const batches = [];
@@ -690,6 +691,7 @@ function InboxPanel(_props) {
   const projects = useMemo(() => projectId ? sidebar.projects.filter((candidate) => candidate.id === projectId) : sidebar.projects, [projectId, sidebar.projects]);
   const projectNames = useMemo(() => new Map(sidebar.projects.map((candidate) => [candidate.id, candidate.name])), [sidebar.projects]);
   const messageKey = (message) => `${message.projectId}:${message.messageId}`;
+  const visibleMessages = messages.slice(0, MAX_VISIBLE_INBOX_MESSAGES);
   const refresh = useCallback(() => {
     const sequence = ++refreshSequence.current;
     if (projects.length === 0) {
@@ -743,7 +745,14 @@ function InboxPanel(_props) {
     sidebar.projects.length > 0 ? /* @__PURE__ */ jsxs("section", { "aria-labelledby": "inbox-project-heading", children: [
       /* @__PURE__ */ jsx("h2", { id: "inbox-project-heading", className: "mb-2 text-sm font-semibold", children: projectId ? `${projectNames.get(projectId) ?? projectId} \xB7 ${projectId}` : "All projects" }),
       messages.length === 0 ? /* @__PURE__ */ jsx("p", { className: "text-sm text-muted-foreground", children: "No messages for this project and recipient filter." }) : null,
-      /* @__PURE__ */ jsx("div", { className: "space-y-3", children: messages.map((message) => /* @__PURE__ */ jsxs("article", { className: `rounded-lg border p-4 ${message.readAtMs === null ? "border-primary/50" : "border-border"}`, children: [
+      messages.length > MAX_VISIBLE_INBOX_MESSAGES ? /* @__PURE__ */ jsxs("p", { className: "mb-3 text-sm text-muted-foreground", children: [
+        "Showing the first ",
+        MAX_VISIBLE_INBOX_MESSAGES,
+        " of ",
+        messages.length,
+        " messages; unread messages are first. Select a project to narrow the list."
+      ] }) : null,
+      /* @__PURE__ */ jsx("div", { className: "space-y-3", children: visibleMessages.map((message) => /* @__PURE__ */ jsxs("article", { className: `rounded-lg border p-4 ${message.readAtMs === null ? "border-primary/50" : "border-border"}`, children: [
         /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-center gap-2 text-xs text-muted-foreground", children: [
           /* @__PURE__ */ jsxs("span", { className: "font-medium text-foreground", children: [
             projectNames.get(message.projectId) ?? message.projectId,

@@ -156,6 +156,9 @@
     .mb-2 {
       margin-bottom: calc(var(--spacing) * 2);
     }
+    .mb-3 {
+      margin-bottom: calc(var(--spacing) * 3);
+    }
     .mb-5 {
       margin-bottom: calc(var(--spacing) * 5);
     }
