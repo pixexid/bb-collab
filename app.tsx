@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { definePluginApp, experimental_useSidebarThreadActions, experimental_useSidebarThreads, useBbContext, useRealtime, useRpc } from "@bb/plugin-sdk/app";
+import { definePluginApp, experimental_useSidebarThreadActions, experimental_useSidebarThreads, useBbContext, useRpc } from "@bb/plugin-sdk/app";
 import type {
   PluginComposerThreadRowStatus,
   PluginNavPanelProps,
