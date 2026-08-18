@@ -4,6 +4,7 @@ import {
   OPEN_ATTEMPT_STATES,
   createContinuationLedger,
   createLaneWatcher,
+  createRoleIdleLedger,
   createWaitRegistry,
   openLaneViews,
   readLaneStates,
@@ -1090,6 +1091,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     steerRole,
   });
   await watcher.recover().catch((error) => bb.log.error(`lane continuation recovery failed: ${String(error)}`));
+  const fleetWatchdogIdle = createRoleIdleLedger({
+    read: () => bb.storage.kv.get<unknown>("fleet-watchdog.role-idle"),
+    write: (state) => bb.storage.kv.set("fleet-watchdog.role-idle", state),
+  });
 
   const stallGuardCycle = createStallGuardCycle({
     readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
@@ -1257,7 +1262,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       }
       const isCurrent = (candidate: RoleHolderState, holder: RoleHolderState) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
       const wake = async (projectId: string, holder: RoleHolderState, key: string, text: string, requireIdle: boolean) => {
-        const previous = await watcher.readRoleIdle(key);
+        const previous = await fleetWatchdogIdle.get(key);
         if (previous?.lastWakeAtMs !== null && previous?.lastWakeAtMs !== undefined && now - previous.lastWakeAtMs < floorMs) return false;
         if (wakeInFlight.has(key)) return false;
         wakeInFlight.add(key);
@@ -1275,7 +1280,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             mode: "queue-if-active",
             input: [{ type: "text", visibility: "agent-only", text, mentions: [] }],
           });
-          await watcher.recordRoleWake(key, Date.now());
+          await fleetWatchdogIdle.recordWake(key, Date.now());
           return true;
         } finally {
           wakeInFlight.delete(key);
@@ -1294,7 +1299,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           const director = directors[0]!;
           const orchestrator = orchestrators[0]!;
           const workItems = openWorkItemsByProject.get(projectId) ?? [];
-          const resetIdle = () => Promise.all(holders.flatMap((holder) => workItems.map((workItem) => watcher.resetRoleIdle(roleIdleKey(holder, workItem.workItemId)))));
+          const resetIdle = () => Promise.all(holders.flatMap((holder) => workItems.map((workItem) => fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workItem.workItemId)))));
           if (workItems.length === 0) continue;
           const staleWait = workItems.find((workItem) => workItem.declaredAtMs !== null && now - workItem.declaredAtMs >= staleWaitMs);
           if (staleWait) {
@@ -1308,10 +1313,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             const owingKey = roleIdleKey(owing, seatWait.workItemId);
             const owingThread = await bb.sdk.threads.get({ threadId: owing.thread_id });
             if (roleThreadRefusal(owing, owingThread, true) || await readPendingExternalWait(owing.thread_id)) {
-              await watcher.resetRoleIdle(owingKey);
+              await fleetWatchdogIdle.resetIdle(owingKey);
               continue;
             }
-            const owingRecord = await watcher.observeRoleIdle(owingKey, now);
+            const owingRecord = await fleetWatchdogIdle.observeIdle(owingKey, now);
             if (owingRecord.idleSinceMs === null || now - owingRecord.idleSinceMs < floorMs) continue;
             if (owingRecord.lastWakeAtMs === null || owingRecord.lastWakeAtMs < owingRecord.idleSinceMs) {
               await wake(projectId, owing, owingKey, `owed act is quiet with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true);
@@ -1331,15 +1336,15 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           const idle = await Promise.all(holders.map(async (holder) => {
             const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
             if (roleThreadRefusal(holder, thread, true) || await readPendingExternalWait(holder.thread_id)) {
-              await watcher.resetRoleIdle(roleIdleKey(holder, workKey));
+              await fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workKey));
               return false;
             }
-            const record = await watcher.observeRoleIdle(roleIdleKey(holder, workKey), now);
+            const record = await fleetWatchdogIdle.observeIdle(roleIdleKey(holder, workKey), now);
             return record.idleSinceMs !== null && now - record.idleSinceMs >= floorMs;
           }));
           if (!idle.every(Boolean)) continue;
           const orchestratorKey = roleIdleKey(orchestrator, workKey);
-          const orchestratorRecord = await watcher.readRoleIdle(orchestratorKey);
+          const orchestratorRecord = await fleetWatchdogIdle.get(orchestratorKey);
           if (orchestratorRecord?.lastWakeAtMs === null || orchestratorRecord?.lastWakeAtMs === undefined || orchestratorRecord.lastWakeAtMs < (orchestratorRecord.idleSinceMs ?? now)) {
             await wake(projectId, orchestrator, orchestratorKey, `fleet quiet with open work since ${new Date(orchestratorRecord?.idleSinceMs ?? now).toISOString()}`, true);
             continue;

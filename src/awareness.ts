@@ -345,7 +345,7 @@ function roleIdleState(input: unknown): Record<string, RoleIdleRecord> {
   return state;
 }
 
-function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
+export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
   let state: Record<string, RoleIdleRecord> = {};
   let loaded = false;
   let queue = Promise.resolve();

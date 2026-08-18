@@ -56,6 +56,7 @@ import {
   seedFixtureDecision,
   seedVerifiedFixtureReceipt,
 } from "../src/test-support.js";
+import { createLaneWatcher, createRoleIdleLedger, roleIdleKey } from "../src/awareness.js";
 import { findCheckoutRoot, readCheckoutDivergence } from "../src/checkout-divergence.js";
 
 const PROJECT_ID = "proj_test";
@@ -2322,6 +2323,33 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
+  it("keeps the watchdog idle anchor through lane-watcher cleanup", async () => {
+    const holder = { project_id: PROJECT_ID, role_id: "director", role_generation: 1, execution_attempt_id: "director-attempt", thread_id: "director-thread" };
+    const key = roleIdleKey(holder, WORK_ITEM_ID);
+    let watchdogState: unknown = {};
+    const watchdogIdle = createRoleIdleLedger({ read: async () => watchdogState, write: async (state) => { watchdogState = state; } });
+    await watchdogIdle.observeIdle(key, 0);
+    const anchored = await watchdogIdle.get(key);
+
+    let laneWatcherState: unknown = {};
+    const laneIdle = createRoleIdleLedger({ read: async () => laneWatcherState, write: async (state) => { laneWatcherState = state; } });
+    await laneIdle.observeIdle(key, 0);
+    const laneWatcher = createLaneWatcher({
+      readLanes: () => [],
+      readRoleHolders: () => [holder],
+      readRoleScopes: () => [],
+      readWorker: async () => ({ projectId: PROJECT_ID, status: "idle", pendingExternalWait: false, archived: false, idleSinceMs: 0 }),
+      steer: async () => undefined,
+      steerRole: async () => undefined,
+      roleIdlePersistence: { read: async () => laneWatcherState, write: async (state) => { laneWatcherState = state; } },
+    });
+    await laneWatcher.poll();
+
+    expect(await laneWatcher.readRoleIdle(key)).toBeNull();
+    expect(laneWatcherState).toEqual({});
+    expect(await watchdogIdle.get(key)).toEqual(anchored);
+  });
+
   it("refuses a WorkItem wait declaration whose schedule or seat waker is not live before any write", async () => {
     const host = await loadedHost();
     const db = host.bb.storage.database();
@@ -2625,7 +2653,7 @@ describe("bb-collab plugin boundary", () => {
       await fixture.host.harness.runSchedule("fleet-watchdog");
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
-      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("lane-watcher.role-idle");
+      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("fleet-watchdog.role-idle");
       expect(Object.values(persisted ?? {}).some((record) => record.lastWakeAtMs === 60 * 60_000)).toBe(true);
     } finally {
       clock.mockRestore();
@@ -2641,7 +2669,7 @@ describe("bb-collab plugin boundary", () => {
       let failTimestampWrite = true;
       const originalSet = fixture.host.bb.storage.kv.set.bind(fixture.host.bb.storage.kv);
       const setSpy = vi.spyOn(fixture.host.bb.storage.kv, "set").mockImplementation(async (key, value) => {
-        if (key === "lane-watcher.role-idle" && failTimestampWrite && value && typeof value === "object" && !Array.isArray(value)
+        if (key === "fleet-watchdog.role-idle" && failTimestampWrite && value && typeof value === "object" && !Array.isArray(value)
           && Object.values(value as Record<string, { lastWakeAtMs?: number | null }>).some((record) => record.lastWakeAtMs === 60 * 60_000)) {
           failTimestampWrite = false;
           throw new Error("wake timestamp unavailable");
@@ -2745,13 +2773,13 @@ describe("bb-collab plugin boundary", () => {
       await fixture.host.harness.runSchedule("fleet-watchdog");
       clock.mockReturnValue(60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      const afterSend = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("lane-watcher.role-idle");
+      const afterSend = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("fleet-watchdog.role-idle");
       expect(Object.values(afterSend ?? {}).some((record) => record.lastWakeAtMs === 60 * 60_000)).toBe(true);
       fixture.setThreadStatus("active");
-      expect(Object.keys(await fixture.host.bb.storage.kv.get<Record<string, unknown>>("lane-watcher.role-idle") ?? {}).some((key) => key.endsWith(`:${WORK_ITEM_ID}`))).toBe(true);
+      expect(Object.keys(await fixture.host.bb.storage.kv.get<Record<string, unknown>>("fleet-watchdog.role-idle") ?? {}).some((key) => key.endsWith(`:${WORK_ITEM_ID}`))).toBe(true);
       clock.mockReturnValue(2 * 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      const afterActive = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("lane-watcher.role-idle");
+      const afterActive = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("fleet-watchdog.role-idle");
       expect(Object.values(afterActive ?? {}).some((record) => record.lastWakeAtMs === 60 * 60_000)).toBe(true);
       clock.mockReturnValue(3 * 60 * 60_000);
       fixture.setThreadStatus("idle");
