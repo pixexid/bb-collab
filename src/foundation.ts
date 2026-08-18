@@ -917,29 +917,6 @@ export const contractDigest = sha256(canonicalJson({
     nativeWitnessMarker: "witness",
     refusal: "ROLE_CONTEXT_WITNESS",
   },
-  operatorReceiptPolicy: {
-    scope: "one_request",
-    binding: ["projectId", "operationClass", "candidateHead", "idempotencyKey", "requestDigest"],
-    consumption: "atomic",
-    issuanceProvenance: ["console", "attestation"],
-    legacyNullProvenance: "refuse",
-    consumedLegacyReplay: "same exact receipt returns the recorded mutation outcome",
-  },
-  derivedActorReceiptPolicy: {
-    operationClasses: ["bootstrap", "config_revision", "decision_create", "decision_disposition", "work_item_create", "work_item_transition", "qualification_observation_record", "role_generation_succession", "migration_prepare", "migration_step"],
-    actorKind: "plugin",
-    subjectId: PLUGIN_ID,
-    authorization: "operatorReceiptId with explicit issuance provenance",
-    requestDigest: "actorReceiptId omitted because it is derived from operatorReceiptId",
-    retirementCondition: "host-issued receipt get-bb/bb#1541",
-  },
-  authorizedApproverPolicy: {
-    projectId: "proj_a8zzfsx36j",
-    approverId: "orchestrator:bb-collab",
-    authorization: "one adopted operator_only Decision disposition",
-    mutationClasses: ["bootstrap", "config_revision", "decision_create", "decision_disposition", "work_item_create", "work_item_transition", "qualification_observation_record", "role_generation_succession", "migration_prepare", "migration_step"],
-    revocation: "operator Decision disposition marks registry revoked",
-  },
 }));
 const migrationArtifactSchema = z
   .object({
