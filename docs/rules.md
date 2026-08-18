@@ -10,6 +10,10 @@
 
 > Before citing evidence, ask: could this pass in a world where my claim is false? Silently skipped tests, report-only alerts, and load-lines without content checks are activity, not proof. When a signature changes, “fails against pre-fix source” degrades to a compile error and discriminates nothing.
 
+A mechanism's own status surface outranks any correlation assembled from logs. Before citing a log correlation as proof that something did not happen, name the status surface you checked first; if you cannot name one, you have not checked. A negative result also needs proof the mechanism was live during the window — "nothing was delivered" and "nothing ran" are indistinguishable without receipts.
+
+Apply this to your own evidence, not only to evidence you are reviewing. Verifying that a message was really sent says nothing about whether what it said was true; provenance, delivery and truth are three separate claims. Quote what is there rather than what it means: a paraphrase inside quotation marks is a fabricated citation even when the semantics are right.
+
 ## Canonical source, no restated copies
 
 > Docs point at the one canonical definition; a restated command or value is a cache that goes stale silently. State the rule and the check, never a current runtime value.
@@ -27,6 +31,8 @@
 Every delegation names its return path: `do X, report DONE | BLOCKED | WAITING <what, and what event wakes me> to me`. For example: `WAITING PR-171 review; stall-guard artifact leg wakes me`. The return path makes silence attributable; the [silence/watch rule](#silence-is-a-defect-signal) makes it detectable. Neither is sufficient alone: a missing answer is not a delegation, and a wait cannot say who owes an unreported result without the return path.
 
 A WAITING on the same thing past about 24 hours surfaces to the orchestrator as “wait went stale: chase the external or re-plan.” A WAITING claim without a live waker is a stall from day one. When a worker declares a waker, the orchestrator confirms that the named waker exists at check time before accepting the wait. This matters because WAITING is self-declared by the party who benefits from not being chased; confirmation turns that claim into evidence. Resolve the named waker live—never maintain a list of valid wakers here.
+
+The declarer owes the same check. Before ending a turn in `WAITING`, name the event and confirm it exists; if the next step is yours, or the event has already fired, take it. Orchestrator confirmation catches a phantom wait after it exists, which is one stall too late.
 
 ## Silence is a defect signal
 
@@ -60,8 +66,32 @@ Before writing a coordination rule or a line of coordination code, enumerate wha
 
 > One branch, one owner. Stakeholders coordinate by message; nobody opens a parallel edit of the same lane.
 
+Check what is already assigned before dispatching. Keeping the fleet busy is not a reason to open a second writer on a surface someone already holds; an idle seat is cheaper than duplicated work.
+
 ## Blast radius
 
 > Every decision sweeps its own blast radius in the same act. Open issues, open PRs, and queued lane specs are caches of older decisions; a decision changing an artifact’s existence, owner, shape, or terminology invalidates them silently. Each affected item gets a one-line update or closure at decision time, not when someone trips over it. A sweep that names artifacts reads them; relayed labels are unverified by definition.
 
 Closing an issue is a decision with blast radius: an open PR whose disposition line says `Related GH-N` fails its lifecycle gate the moment N closes.
+
+## A status read is evidence about the moment it was read
+
+> Registry state and live state are different substrates. Before acting on "X is dead", re-read or address X directly — a status field is already history when you read it. The same gap applies to your checkout versus the repo, and to a source file versus the deployed artifact.
+
+## Two notions of one fact
+
+> When one stored value answers two different questions, it will eventually answer one of them wrongly. Split it at the point the second meaning appears, not after the false read. A dead field left in place "but ignored" is a trap for the next reader: ignoring is a property of today's code, not of the data.
+
+## Test the claim, not the routing
+
+> Where a mechanism asserts a condition, assert that the condition is true when asserted. Tests that check the right inputs select the right branch all pass while the emitted sentence is false, and they keep passing if a later path reaches the same output another way.
+
+A late mechanism is recoverable; a lying one is not. In anything that notifies, the failure that matters most is not silence — it is a false assertion at the highest-authority tier, because that tier is trained to act on what arrives.
+
+## A mechanism under investigation stops talking
+
+> Freezing the investigation is not freezing the subject. A mechanism being examined for asserting false conditions is silenced while it is examined, or it keeps emitting into the record you are trying to read.
+
+## The ladder applies to operations
+
+> Before ordering the heavy mechanism, ask which lighter one already covers it. Runtime configuration beats a rebuild. Reaching for the largest available action is the same reflex the ladder exists to interrupt, pointed at operations instead of code.
