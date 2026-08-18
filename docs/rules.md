@@ -10,9 +10,11 @@
 
 > Before citing evidence, ask: could this pass in a world where my claim is false? Silently skipped tests, report-only alerts, and load-lines without content checks are activity, not proof. When a signature changes, “fails against pre-fix source” degrades to a compile error and discriminates nothing.
 
-A mechanism's own status surface outranks any correlation assembled from logs. Before citing a log correlation as proof that something did not happen, name the status surface you checked first; if you cannot name one, you have not checked. A negative result also needs proof the mechanism was live during the window — "nothing was delivered" and "nothing ran" are indistinguishable without receipts.
+A mechanism's own status surface outranks any correlation assembled from logs. Before citing a log correlation as proof that something did not happen, [name the status surface you checked first](#a-status-read-is-evidence-about-the-moment-it-was-read); if you cannot name one, you have not checked. A negative result also needs proof the mechanism was live during the window — "nothing was delivered" and "nothing ran" are indistinguishable without receipts.
 
-Apply this to your own evidence, not only to evidence you are reviewing. Verifying that a message was really sent says nothing about whether what it said was true; provenance, delivery and truth are three separate claims. Quote what is there rather than what it means: a paraphrase inside quotation marks is a fabricated citation even when the semantics are right.
+Apply this to your own evidence, not only to evidence you are reviewing. Verifying that a message was really sent says nothing about whether what it said was true; provenance, delivery and truth are three separate claims.
+
+Quote what is there rather than what it means: a paraphrase inside quotation marks is a fabricated citation even when the semantics are right.
 
 ## Canonical source, no restated copies
 
@@ -76,7 +78,7 @@ Closing an issue is a decision with blast radius: an open PR whose disposition l
 
 ## A status read is evidence about the moment it was read
 
-> Registry state and live state are different substrates. Before acting on "X is dead", re-read or address X directly — a status field is already history when you read it. The same gap applies to your checkout versus the repo, and to a source file versus the deployed artifact.
+> Registry state and live state are different substrates. Before acting on "X is dead", re-read or address X directly — a status field is already history when you read it; [the status surface you cite must be the one you checked](#proof-must-discriminate). The same gap applies to your checkout versus the repo, and to a source file versus the deployed artifact.
 
 ## Two notions of one fact
 
