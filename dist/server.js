@@ -21050,7 +21050,6 @@ function createStallGuardCycle(options) {
     async cycle(projectId) {
       state ??= stateFromUnknown(await options.persistence.read());
       const holders = options.readRoleHolders().filter((holder) => projectId === void 0 || holder.project_id === projectId);
-      const scopes = await options.readRoleScopes();
       const nextState = structuredClone(state);
       const artifacts = /* @__PURE__ */ new Map();
       const readArtifacts = (id2) => {
@@ -21081,19 +21080,13 @@ function createStallGuardCycle(options) {
           changed += 1;
           continue;
         }
-        const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
-        if (!scope?.nextStartable || !scope.queueHeadId || scope.deferredReason) {
-          nextState[key] = next;
-          changed += 1;
-          continue;
-        }
         const role = {
           projectId: holder.project_id,
           roleId: holder.role_id,
           roleGeneration: holder.role_generation,
           executionAttemptId: holder.execution_attempt_id,
           threadId: holder.thread_id,
-          queueHeadId: scope.queueHeadId,
+          queueHeadId: holder.execution_attempt_id,
           idleAgeMs: 0
         };
         let result2;
@@ -22480,26 +22473,28 @@ ${thread.titleFallback ?? ""}`);
   });
   const stallGuardCycle = createStallGuardCycle({
     readRoleHolders: () => db ? readRoleHolderStates(db) : [],
-    readRoleScopes,
     readArtifact: async (projectId) => {
       if (!db) return null;
       const artifacts = [];
-      for (const lane of readLaneStates(db).filter((candidate) => candidate.project_id === projectId && OPEN_ATTEMPT_STATES.has(candidate.attempt_state) && candidate.thread_id !== null)) {
+      for (const holder of readRoleHolderStates(db).filter((candidate) => candidate.project_id === projectId)) {
         try {
-          const thread = await bb.sdk.threads.get({ threadId: lane.thread_id });
+          const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
           if (thread.projectId !== projectId || !thread.environmentId) {
-            artifacts.push({ id: lane.execution_attempt_id, unavailable: false, value: { environmentId: null, result: { outcome: "absent" } } });
+            artifacts.push({ id: holder.execution_attempt_id, unavailable: false, value: { environmentId: null, result: { outcome: "absent" } } });
             continue;
           }
           const result2 = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
-          artifacts.push(result2.outcome === "unavailable" ? { id: lane.execution_attempt_id, unavailable: true, value: null } : { id: lane.execution_attempt_id, unavailable: false, value: { environmentId: thread.environmentId, result: result2 } });
+          artifacts.push(result2.outcome === "unavailable" ? { id: holder.execution_attempt_id, unavailable: true, value: null } : { id: holder.execution_attempt_id, unavailable: false, value: { environmentId: thread.environmentId, result: result2 } });
         } catch {
-          artifacts.push({ id: lane.execution_attempt_id, unavailable: true, value: null });
+          artifacts.push({ id: holder.execution_attempt_id, unavailable: true, value: null });
         }
       }
       return artifacts;
     },
-    wakeRole: (role) => watcher.wakeRole(role),
+    wakeRole: async (role) => {
+      const result2 = await steerRole(role);
+      return result2 === true ? { attempted: true, delivered: true } : { attempted: false, delivered: false, refusal: result2 === "error" ? "error" : "policy" };
+    },
     persistence: {
       read: () => bb.storage.kv.get(STALL_GUARD_KV_KEY),
       write: (state) => bb.storage.kv.set(STALL_GUARD_KV_KEY, state)

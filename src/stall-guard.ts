@@ -1,4 +1,4 @@
-import type { RoleHolderState, RoleIdleView, RoleQueueScope, RoleWakeResult } from "./awareness.js";
+import type { RoleHolderState, RoleIdleView, RoleWakeResult } from "./awareness.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -24,7 +24,6 @@ export interface StallGuardArtifact {
 export interface StallGuardCycleOptions {
   readRoleHolders: () => RoleHolderState[];
   readArtifact: (projectId: string) => Promise<StallGuardArtifact[] | null>;
-  readRoleScopes: () => Promise<RoleQueueScope[]> | RoleQueueScope[];
   wakeRole: (role: RoleIdleView) => Promise<RoleWakeResult>;
   persistence: StallGuardPersistence;
 }
@@ -78,7 +77,6 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
     async cycle(projectId?: string): Promise<StallGuardCycleSummary> {
       state ??= stateFromUnknown(await options.persistence.read());
       const holders = options.readRoleHolders().filter((holder) => projectId === undefined || holder.project_id === projectId);
-      const scopes = await options.readRoleScopes();
       const nextState = structuredClone(state);
       const artifacts = new Map<string, Promise<StallGuardArtifact[] | null>>();
       const readArtifacts = (id: string) => {
@@ -111,19 +109,13 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
           continue;
         }
 
-        const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
-        if (!scope?.nextStartable || !scope.queueHeadId || scope.deferredReason) {
-          nextState[key] = next;
-          changed += 1;
-          continue;
-        }
         const role: RoleIdleView = {
           projectId: holder.project_id,
           roleId: holder.role_id,
           roleGeneration: holder.role_generation,
           executionAttemptId: holder.execution_attempt_id,
           threadId: holder.thread_id,
-          queueHeadId: scope.queueHeadId,
+          queueHeadId: holder.execution_attempt_id,
           idleAgeMs: 0,
         };
         let result: RoleWakeResult;
