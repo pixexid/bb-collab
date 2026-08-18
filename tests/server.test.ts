@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -2864,7 +2864,7 @@ describe("bb-collab plugin boundary", () => {
   });
 
 
-  it("returns a deterministic bounded result past the export row ceiling", () => {
+  it("exports every canonical row past one database page", () => {
     const { db, directory } = directDatabase();
     try {
       for (let index = 0; index <= MAX_EXPORT_ROWS; index += 1) {
@@ -2874,23 +2874,48 @@ describe("bb-collab plugin boundary", () => {
       const second = exportFoundation(db, PROJECT_ID);
       expect(first).toEqual(second);
       expect(first).toMatchObject({
-        outcome: "EXPORT_BOUNDED",
+        outcome: "OK",
         expected: MAX_EXPORT_ROWS + 1,
         attempted: MAX_EXPORT_ROWS + 1,
-        verified: 0,
+        verified: MAX_EXPORT_ROWS + 1,
       });
+      expect(first.export!.manifest.rowCount).toBe(MAX_EXPORT_ROWS + 1);
+      expect(first.export!.recordsNdjson.split("\n")).toHaveLength(MAX_EXPORT_ROWS + 1);
+      expect(first.export!.checksums["records.ndjson"]).toBe(sha256(first.export!.recordsNdjson));
     } finally {
       db.close();
       rmSync(directory, { recursive: true, force: true });
     }
   }, 30_000);
 
-  it("counts the derived artifact index against the existing export byte ceiling", () => {
+  it("atomically spills a complete canonical export past the inline byte ceiling", () => {
     const { db, directory } = directDatabase();
     try {
       seedMigrationAuthority(db);
       seedEvidenceArtifact(db, "large-artifact", 270 * 1024);
-      expect(exportFoundation(db, PROJECT_ID)).toMatchObject({ outcome: "EXPORT_BOUNDED", verified: 0 });
+      const result = exportFoundation(db, PROJECT_ID);
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(result);
+      expect(result).toMatchObject({ outcome: "OK", expected: result.attempted, verified: result.attempted });
+      expect(result.export).toBeUndefined();
+      const exportFile = (result.evidence as { exportFile: {
+        complete: true;
+        directory: string;
+        manifest: ExportPayload["manifest"];
+        checksums: ExportPayload["checksums"];
+      } }).exportFile;
+      expect(exportFile.complete).toBe(true);
+      expect(exportFile.directory).toContain("/complete-");
+      expect(readdirSync(dirname(exportFile.directory))).not.toContainEqual(expect.stringContaining(".partial-"));
+      const recordsNdjson = readFileSync(join(exportFile.directory, "records.ndjson"), "utf8");
+      const artifactIndexJson = readFileSync(join(exportFile.directory, "artifact-index.json"), "utf8");
+      const manifestJson = readFileSync(join(exportFile.directory, "manifest.json"), "utf8");
+      expect(Buffer.byteLength(recordsNdjson, "utf8") + Buffer.byteLength(artifactIndexJson, "utf8")).toBeGreaterThan(MAX_EXPORT_BYTES);
+      expect(JSON.parse(manifestJson)).toEqual(exportFile.manifest);
+      expect(exportFile.checksums).toEqual({
+        "artifact-index.json": sha256(artifactIndexJson),
+        "manifest.json": sha256(manifestJson),
+        "records.ndjson": sha256(recordsNdjson),
+      });
     } finally {
       db.close();
       rmSync(directory, { recursive: true, force: true });
