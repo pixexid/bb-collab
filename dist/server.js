@@ -14373,6 +14373,8 @@ function subscribeToThreadChanges(sdk, observe) {
 
 // src/foundation.ts
 import { createHash, randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
@@ -15263,25 +15265,35 @@ var migrationArtifactSchema = external_exports.object({
   durableRefJson: external_exports.string(),
   artifactIdentityDigest: digestSchema
 }).strict();
-var migrationExportSchema = external_exports.object({
-  manifest: external_exports.object({
-    schemaVersion: external_exports.number().int().positive(),
-    contractVersion: external_exports.number().int().positive(),
-    pluginId: id,
-    projectId: id,
-    migrationStatementIds: external_exports.array(external_exports.number().int().nonnegative()),
-    schemaDigest: digestSchema,
-    contractDigest: digestSchema,
-    rowCount: external_exports.number().int().nonnegative(),
-    tableCounts: external_exports.record(external_exports.string(), external_exports.number().int().nonnegative()),
-    recordsDigest: digestSchema,
-    artifactIndexDigest: digestSchema,
-    exportRootDigest: digestSchema
-  }).strict(),
-  recordsNdjson: external_exports.string().max(MAX_EXPORT_BYTES),
-  artifactIndex: external_exports.array(migrationArtifactSchema).max(MAX_EXPORT_ROWS),
-  checksums: external_exports.record(external_exports.string(), digestSchema)
+var migrationExportManifestSchema = external_exports.object({
+  schemaVersion: external_exports.number().int().positive(),
+  contractVersion: external_exports.number().int().positive(),
+  pluginId: id,
+  projectId: id,
+  migrationStatementIds: external_exports.array(external_exports.number().int().nonnegative()),
+  schemaDigest: digestSchema,
+  contractDigest: digestSchema,
+  rowCount: external_exports.number().int().nonnegative(),
+  tableCounts: external_exports.record(external_exports.string(), external_exports.number().int().nonnegative()),
+  recordsDigest: digestSchema,
+  artifactIndexDigest: digestSchema,
+  exportRootDigest: digestSchema
 }).strict();
+var migrationExportSchema = external_exports.union([
+  external_exports.object({
+    manifest: migrationExportManifestSchema,
+    recordsNdjson: external_exports.string().max(MAX_EXPORT_BYTES),
+    artifactIndex: external_exports.array(migrationArtifactSchema).max(MAX_EXPORT_ROWS),
+    checksums: external_exports.record(external_exports.string(), digestSchema)
+  }).strict(),
+  external_exports.object({
+    kind: external_exports.literal("canonical-export-files"),
+    complete: external_exports.literal(true),
+    directory: external_exports.string().min(1).max(4096),
+    manifest: migrationExportManifestSchema,
+    checksums: external_exports.record(external_exports.string(), digestSchema)
+  }).strict()
+]);
 var migrationPrepareSchema = external_exports.object({
   migrationId: id,
   sourceSystem: external_exports.literal("llm-collab"),
@@ -16825,8 +16837,40 @@ function requireEvidenceOnlyReleaseBinding(run, head, request) {
     throw refusal("IMPORT_EQUIVALENCE_FAILED", "evidence-only governor release requires the exact source and bb-collab runtime binding");
   }
 }
-function validateMigrationExport(payload, projectId) {
-  if (!payload) throw refusal("IMPORT_EQUIVALENCE_FAILED", "migration step requires the deterministic fixture export");
+function exportRootDirectory(db) {
+  const main = db.prepare("PRAGMA database_list").all().find((row) => row.name === "main");
+  return main?.file ? join(dirname(main.file), ".bb-collab-exports") : null;
+}
+function readMigrationExportFiles(db, input) {
+  const root = exportRootDirectory(db);
+  if (!root) throw refusal("IMPORT_EQUIVALENCE_FAILED", "file export requires the exact file-backed canonical store");
+  let directory;
+  try {
+    const resolvedRoot = realpathSync(root);
+    directory = realpathSync(input.directory);
+    const nested = relative(resolvedRoot, directory);
+    if (!nested || nested.startsWith("..") || isAbsolute(nested) || !basename(directory).startsWith("complete-")) throw new Error("foreign path");
+  } catch {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "file export is not a complete export from the exact canonical store");
+  }
+  try {
+    const manifest = migrationExportManifestSchema.parse(JSON.parse(readFileSync(join(directory, "manifest.json"), "utf8")));
+    const artifactIndex = external_exports.array(migrationArtifactSchema).parse(JSON.parse(readFileSync(join(directory, "artifact-index.json"), "utf8")));
+    if (canonicalJson(manifest) !== canonicalJson(input.manifest)) throw new Error("manifest mismatch");
+    return {
+      manifest,
+      recordsNdjson: readFileSync(join(directory, "records.ndjson"), "utf8"),
+      artifactIndex,
+      checksums: input.checksums
+    };
+  } catch {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "file export is incomplete or malformed");
+  }
+}
+function validateMigrationExport(db, input, projectId) {
+  if (!input) throw refusal("IMPORT_EQUIVALENCE_FAILED", "migration step requires the deterministic fixture export");
+  const fromFiles = "kind" in input;
+  const payload = fromFiles ? readMigrationExportFiles(db, input) : input;
   const manifest = payload.manifest;
   const expectedTables = Object.fromEntries(TABLES.map((table) => [table, manifest.tableCounts[table] ?? -1]));
   if (manifest.schemaVersion !== SCHEMA_VERSION || manifest.contractVersion !== CONTRACT_VERSION || manifest.pluginId !== PLUGIN_ID || manifest.projectId !== projectId || canonicalJson(manifest.migrationStatementIds) !== canonicalJson(MIGRATIONS.map((_, index) => index)) || manifest.schemaDigest !== schemaDigest || manifest.contractDigest !== contractDigest || Object.keys(manifest.tableCounts).sort().join("\0") !== [...TABLES].sort().join("\0") || Object.values(expectedTables).some((count) => count < 0)) {
@@ -16889,7 +16933,7 @@ function validateMigrationExport(payload, projectId) {
     "manifest.json": sha256(canonicalJson(manifest)),
     "records.ndjson": recordsDigest
   };
-  if (payload.artifactIndex.length !== manifest.tableCounts.evidence_artifacts || recordsDigest !== manifest.recordsDigest || artifactIndexDigest !== manifest.artifactIndexDigest || sha256(canonicalJson(rootInput)) !== manifest.exportRootDigest || canonicalJson(payload.checksums) !== canonicalJson(expectedChecksums) || Buffer.byteLength(payload.recordsNdjson, "utf8") + Buffer.byteLength(artifactIndexJson, "utf8") > MAX_EXPORT_BYTES) {
+  if (payload.artifactIndex.length !== manifest.tableCounts.evidence_artifacts || recordsDigest !== manifest.recordsDigest || artifactIndexDigest !== manifest.artifactIndexDigest || sha256(canonicalJson(rootInput)) !== manifest.exportRootDigest || canonicalJson(payload.checksums) !== canonicalJson(expectedChecksums) || !fromFiles && Buffer.byteLength(payload.recordsNdjson, "utf8") + Buffer.byteLength(artifactIndexJson, "utf8") > MAX_EXPORT_BYTES) {
     throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export hashes, roots, or bounds do not verify");
   }
   return payload;
@@ -17089,7 +17133,7 @@ function applyMigrationStep(db, request, digest) {
         eventExtra = { sourceExportKind: "non_canonical_source_evidence" };
         break;
       }
-      const exported = validateMigrationExport(step.export, request.projectId);
+      const exported = validateMigrationExport(db, step.export, request.projectId);
       if (run.source_schema_digest !== exported.manifest.schemaDigest || run.source_contract_digest !== exported.manifest.contractDigest) {
         throw refusal("IMPORT_EQUIVALENCE_FAILED", "source schema or contract digest does not match the fixture export");
       }
@@ -17138,7 +17182,7 @@ function applyMigrationStep(db, request, digest) {
       if (step.sourceEvidenceManifest || step.canonicalImport) {
         throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence is not a canonical fixture export");
       }
-      const exported = validateMigrationExport(step.export, request.projectId);
+      const exported = validateMigrationExport(db, step.export, request.projectId);
       const expectedRoot = sha256(canonicalJson({
         sourceExportDigest: run.source_export_digest,
         targetRuntimeId: run.target_runtime_id,
@@ -17191,7 +17235,7 @@ function applyMigrationStep(db, request, digest) {
       if (step.sourceEvidenceManifest || step.canonicalImport || step.equivalenceDisposition) {
         throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence is not a canonical fixture export");
       }
-      const exported = validateMigrationExport(step.export, request.projectId);
+      const exported = validateMigrationExport(db, step.export, request.projectId);
       const expectedDigest = sha256(canonicalJson({
         sourceExportDigest: run.source_export_digest,
         importRootDigest: run.import_root_digest,
@@ -18932,7 +18976,7 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
     return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
   }
 }
-function tableRows(db, table, projectId) {
+function tableRows(db, table, projectId, offset) {
   const orderBy = {
     project_config_revisions: "config_revision",
     project_config_heads: "project_id",
@@ -18962,17 +19006,51 @@ function tableRows(db, table, projectId) {
   };
   const query = table === "decision_dispositions" || table === "decision_evidence" ? `SELECT ${table}.* FROM ${table}
          JOIN decisions ON decisions.decision_id = ${table}.decision_id
-         WHERE decisions.project_id = ? ORDER BY ${orderBy[table]}` : `SELECT * FROM ${table} WHERE project_id = ? ORDER BY ${orderBy[table]}`;
-  return db.prepare(query).all(projectId);
+         WHERE decisions.project_id = ? ORDER BY ${orderBy[table]} LIMIT ? OFFSET ?` : `SELECT * FROM ${table} WHERE project_id = ? ORDER BY ${orderBy[table]} LIMIT ? OFFSET ?`;
+  return db.prepare(query).all(projectId, MAX_EXPORT_ROWS, offset);
+}
+function writeFoundationExportFiles(db, projectId, payload) {
+  const root = exportRootDirectory(db);
+  if (!root) return null;
+  mkdirSync(root, { recursive: true, mode: 448 });
+  const directory = join(root, `complete-${sha256(projectId).slice(0, 12)}-${payload.manifest.exportRootDigest}`);
+  const matches = () => sha256(readFileSync(join(directory, "records.ndjson"), "utf8")) === payload.checksums["records.ndjson"] && sha256(readFileSync(join(directory, "artifact-index.json"), "utf8")) === payload.checksums["artifact-index.json"] && sha256(readFileSync(join(directory, "manifest.json"), "utf8")) === payload.checksums["manifest.json"];
+  if (existsSync(directory)) {
+    if (!matches()) throw new Error("existing canonical export files do not match their export root");
+    return { kind: "canonical-export-files", complete: true, directory, manifest: payload.manifest, checksums: payload.checksums };
+  }
+  const partial2 = mkdtempSync(join(root, `.partial-${sha256(projectId).slice(0, 12)}-`));
+  try {
+    writeFileSync(join(partial2, "records.ndjson"), payload.recordsNdjson, { mode: 384 });
+    writeFileSync(join(partial2, "artifact-index.json"), canonicalJson(payload.artifactIndex), { mode: 384 });
+    writeFileSync(join(partial2, "manifest.json"), canonicalJson(payload.manifest), { mode: 384 });
+    try {
+      renameSync(partial2, directory);
+    } catch (error48) {
+      if (!existsSync(directory) || !matches()) throw error48;
+      rmSync(partial2, { recursive: true, force: true });
+    }
+    return { kind: "canonical-export-files", complete: true, directory, manifest: payload.manifest, checksums: payload.checksums };
+  } catch (error48) {
+    rmSync(partial2, { recursive: true, force: true });
+    throw error48;
+  }
 }
 function exportFoundation(db, projectId) {
   if (!db) return unavailableResult(projectId, "canonical SQLite store is unavailable");
   try {
-    const rowsByTable = Object.fromEntries(TABLES.map((table) => [table, tableRows(db, table, projectId)]));
+    const rowsByTable = db.transaction(() => Object.fromEntries(TABLES.map((table) => {
+      const rows = [];
+      for (let offset = 0; ; offset += MAX_EXPORT_ROWS) {
+        const page = tableRows(db, table, projectId, offset);
+        rows.push(...page);
+        if (page.length < MAX_EXPORT_ROWS) break;
+      }
+      return [table, rows];
+    })))();
     const tableCounts = Object.fromEntries(TABLES.map((table) => [table, rowsByTable[table].length]));
     const rowCount = Object.values(tableCounts).reduce((sum, count) => sum + count, 0);
     if (rowCount === 0) return result("PROJECT_CONFIG_REQUIRED", projectId, 1, 1, 0, { message: "project has no stored foundation" });
-    if (rowCount > MAX_EXPORT_ROWS) return result("EXPORT_BOUNDED", projectId, rowCount, rowCount, 0, { message: "export exceeds the bounded row limit" });
     const recordsNdjson = TABLES.flatMap(
       (table) => rowsByTable[table].map((row) => canonicalJson({ table, row }))
     ).join("\n");
@@ -18989,9 +19067,6 @@ function exportFoundation(db, projectId) {
       artifactIdentityDigest: String(row.artifact_identity_digest)
     }));
     const artifactIndexJson = canonicalJson(artifactIndex);
-    if (Buffer.byteLength(recordsNdjson, "utf8") + Buffer.byteLength(artifactIndexJson, "utf8") > MAX_EXPORT_BYTES) {
-      return result("EXPORT_BOUNDED", projectId, rowCount, rowCount, 0, { message: "export exceeds the bounded byte limit" });
-    }
     const recordsDigest = sha256(recordsNdjson);
     const artifactIndexDigest = sha256(artifactIndexJson);
     const manifestWithoutRoot = {
@@ -19019,6 +19094,11 @@ function exportFoundation(db, projectId) {
         "records.ndjson": recordsDigest
       }
     };
+    if (artifactIndex.length > MAX_EXPORT_ROWS || Buffer.byteLength(recordsNdjson, "utf8") + Buffer.byteLength(artifactIndexJson, "utf8") > MAX_EXPORT_BYTES) {
+      const exportFile = writeFoundationExportFiles(db, projectId, exportPayload);
+      if (!exportFile) return result("EXPORT_BOUNDED", projectId, rowCount, rowCount, 0, { message: "export exceeds inline bounds and the canonical store is not file-backed" });
+      return result("OK", projectId, rowCount, rowCount, rowCount, { evidence: { exportFile } });
+    }
     return result("OK", projectId, rowCount, rowCount, rowCount, { export: exportPayload });
   } catch (error48) {
     return result("CANONICAL_STORE_UNAVAILABLE", projectId, 1, 0, 0, { message: String(error48) });
@@ -19352,12 +19432,12 @@ function databaseIsReady(db) {
 
 // src/stall-guard.ts
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join as join2 } from "node:path";
 var STALL_GUARD_KV_KEY = "stall-guard.artifacts";
 var STALL_GUARD_LIVENESS_MARKER_FILENAME = "stall-guard.liveness";
 var STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME = "stall-guard.alerted";
 function stallGuardStateDir() {
-  return process.env.BB_COLLAB_STALL_GUARD_STATE_DIR ?? join(homedir(), ".bb", "bb-collab");
+  return process.env.BB_COLLAB_STALL_GUARD_STATE_DIR ?? join2(homedir(), ".bb", "bb-collab");
 }
 function stateFromUnknown(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
@@ -19460,7 +19540,7 @@ function createStallGuardCycle(options) {
 // src/registered-waits.ts
 import { createHash as createHash2 } from "node:crypto";
 import { homedir as homedir2 } from "node:os";
-import { join as join2 } from "node:path";
+import { join as join3 } from "node:path";
 var DEFAULT_WAIT_DEADLINE_MS = 8 * 60 * 6e4;
 var MAX_WAIT_DEADLINE_MS = 7 * 24 * 60 * 6e4;
 var WAIT_STEER_GRACE_MS = 5 * 6e4;
@@ -19472,7 +19552,7 @@ var WAIT_ESCALATION_KV_KEY = "wait-validator.escalation";
 var LIVENESS_MARKER_FILENAME = "wait-validator.liveness";
 var LIVENESS_ALERT_FLAG_FILENAME = "wait-validator.alerted";
 function waitValidatorStateDir() {
-  return process.env.BB_COLLAB_VALIDATOR_STATE_DIR ?? join2(homedir2(), ".bb", "bb-collab");
+  return process.env.BB_COLLAB_VALIDATOR_STATE_DIR ?? join3(homedir2(), ".bb", "bb-collab");
 }
 function isPlainObject2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -19834,15 +19914,15 @@ async function runArchiveSweep(bb, db, projectId, apply = false, now2 = Date.now
 
 // src/checkout-divergence.ts
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, join as join3, resolve } from "node:path";
+import { existsSync as existsSync2, readFileSync as readFileSync2, statSync } from "node:fs";
+import { dirname as dirname2, join as join4, resolve } from "node:path";
 function readRef(gitDirs, ref) {
   for (const gitDir of gitDirs) {
-    const looseRef = join3(gitDir, ref);
-    if (existsSync(looseRef)) return readFileSync(looseRef, "utf8").trim() || null;
-    const packedRefs = join3(gitDir, "packed-refs");
-    if (!existsSync(packedRefs)) continue;
-    for (const line of readFileSync(packedRefs, "utf8").split("\n")) {
+    const looseRef = join4(gitDir, ref);
+    if (existsSync2(looseRef)) return readFileSync2(looseRef, "utf8").trim() || null;
+    const packedRefs = join4(gitDir, "packed-refs");
+    if (!existsSync2(packedRefs)) continue;
+    for (const line of readFileSync2(packedRefs, "utf8").split("\n")) {
       const [sha, name] = line.trim().split(" ");
       if (name === ref) return sha ?? null;
     }
@@ -19850,26 +19930,26 @@ function readRef(gitDirs, ref) {
   return null;
 }
 function resolveGitDir(checkoutRoot) {
-  const dotGit = join3(checkoutRoot, ".git");
-  if (!existsSync(dotGit)) return null;
+  const dotGit = join4(checkoutRoot, ".git");
+  if (!existsSync2(dotGit)) return null;
   if (statSync(dotGit).isDirectory()) return dotGit;
-  const marker = readFileSync(dotGit, "utf8").trim();
+  const marker = readFileSync2(dotGit, "utf8").trim();
   return marker.startsWith("gitdir:") ? resolve(checkoutRoot, marker.slice("gitdir:".length).trim()) : null;
 }
 function commonGitDir(gitDir) {
-  const commondir = join3(gitDir, "commondir");
-  return existsSync(commondir) ? resolve(gitDir, readFileSync(commondir, "utf8").trim()) : gitDir;
+  const commondir = join4(gitDir, "commondir");
+  return existsSync2(commondir) ? resolve(gitDir, readFileSync2(commondir, "utf8").trim()) : gitDir;
 }
 function readHead(gitDir, commonDir) {
-  const head = readFileSync(join3(gitDir, "HEAD"), "utf8").trim();
+  const head = readFileSync2(join4(gitDir, "HEAD"), "utf8").trim();
   if (!head.startsWith("ref: ")) return head || null;
   return readRef([gitDir, commonDir], head.slice("ref: ".length));
 }
 function findCheckoutRoot(startPath) {
   let current = resolve(startPath);
   while (true) {
-    if (existsSync(join3(current, ".git"))) return current;
-    const parent = dirname(current);
+    if (existsSync2(join4(current, ".git"))) return current;
+    const parent = dirname2(current);
     if (parent === current) return null;
     current = parent;
   }
@@ -19913,9 +19993,9 @@ function readCheckoutDivergence(checkoutRoot) {
 }
 
 // server.ts
-import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync2, rmSync, statSync as statSync2, writeFileSync } from "node:fs";
+import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync3, rmSync as rmSync2, statSync as statSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { execFile, spawnSync as spawnSync2 } from "node:child_process";
-import { basename, dirname as dirname2, isAbsolute, join as join4, relative, sep } from "node:path";
+import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute2, join as join5, relative as relative2, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 function githubRepository(remoteUrl) {
   const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
@@ -20342,17 +20422,17 @@ async function isLiveCachedConsumerRolloutArtifact(moduleUrl, bb) {
   try {
     const artifactPath = fileURLToPath(new URL(moduleUrl));
     const pluginRoot = resolvedPluginRoot(await bb.sdk.plugins.getSource({ pluginId: bb.pluginId }));
-    if (!pluginRoot || !isAbsolute(pluginRoot)) return false;
-    const relativeArtifactPath = relative(pluginRoot, artifactPath);
-    if (relativeArtifactPath.length === 0 || relativeArtifactPath === ".." || relativeArtifactPath.startsWith(`..${sep}`) || isAbsolute(relativeArtifactPath)) return false;
-    return basename(artifactPath) === "server.js" && basename(dirname2(artifactPath)) === "dist";
+    if (!pluginRoot || !isAbsolute2(pluginRoot)) return false;
+    const relativeArtifactPath = relative2(pluginRoot, artifactPath);
+    if (relativeArtifactPath.length === 0 || relativeArtifactPath === ".." || relativeArtifactPath.startsWith(`..${sep}`) || isAbsolute2(relativeArtifactPath)) return false;
+    return basename2(artifactPath) === "server.js" && basename2(dirname3(artifactPath)) === "dist";
   } catch {
     return false;
   }
 }
 function roleBriefBundlePath() {
   const bundled = fileURLToPath(new URL("./role-briefs.json", import.meta.url));
-  return existsSync2(bundled) ? bundled : fileURLToPath(new URL("./dist/role-briefs.json", import.meta.url));
+  return existsSync3(bundled) ? bundled : fileURLToPath(new URL("./dist/role-briefs.json", import.meta.url));
 }
 function roleForThread(db, projectId, threadId) {
   const roleId = db ? readRoleHolderStates(db).find((holder) => holder.project_id === projectId && holder.thread_id === threadId)?.role_id : null;
@@ -20362,7 +20442,7 @@ function roleBriefRole(roleId) {
   return roleId === "director" ? "director" : roleId === "project-orchestrator" ? "orchestrator" : "worker";
 }
 async function composeRoleBrief(bb, db, input) {
-  const bundle = roleBriefBundleSchema.parse(JSON.parse(readFileSync2(roleBriefBundlePath(), "utf8")));
+  const bundle = roleBriefBundleSchema.parse(JSON.parse(readFileSync3(roleBriefBundlePath(), "utf8")));
   const project = await bb.sdk.projects.get({ projectId: input.projectId });
   const currentSeats = (db ? readRoleHolderStates(db) : []).filter((holder) => holder.project_id === input.projectId).map((holder) => ({ roleId: holder.role_id, generation: holder.role_generation, threadId: holder.thread_id }));
   const pointers = {
@@ -20842,7 +20922,7 @@ async function plugin(bb, options = {}) {
     }
   });
   const readDiagnosticDivergence = () => readCheckoutDivergence(
-    options.checkoutRoot === void 0 ? findCheckoutRoot(dirname2(fileURLToPath(import.meta.url))) : options.checkoutRoot
+    options.checkoutRoot === void 0 ? findCheckoutRoot(dirname3(fileURLToPath(import.meta.url))) : options.checkoutRoot
   );
   let db = null;
   try {
@@ -21087,23 +21167,23 @@ ${thread.titleFallback ?? ""}`);
   bb.background.schedule("wait-validator-liveness", "*/5 * * * *", async () => {
     try {
       const stateDir = waitValidatorStateDir();
-      const markerPath = join4(stateDir, LIVENESS_MARKER_FILENAME);
-      const flagPath = join4(stateDir, LIVENESS_ALERT_FLAG_FILENAME);
+      const markerPath = join5(stateDir, LIVENESS_MARKER_FILENAME);
+      const flagPath = join5(stateDir, LIVENESS_ALERT_FLAG_FILENAME);
       let markerAtMs = null;
       try {
-        const parsed = Number(readFileSync2(markerPath, "utf8").trim());
+        const parsed = Number(readFileSync3(markerPath, "utf8").trim());
         markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync2(markerPath).mtimeMs;
       } catch {
         markerAtMs = null;
       }
       const configuredStaleMs = Number(process.env.BB_COLLAB_LIVENESS_STALE_MS);
       const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
-      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync2(flagPath));
-      if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync3(flagPath));
+      if (decision === "clear-alert-flag") rmSync2(flagPath, { force: true });
       if (decision === "alert-once") {
-        mkdirSync(stateDir, { recursive: true });
+        mkdirSync2(stateDir, { recursive: true });
         try {
-          writeFileSync(flagPath, String(Date.now()), { flag: "wx" });
+          writeFileSync2(flagPath, String(Date.now()), { flag: "wx" });
         } catch {
           bb.log.info("wait-validator-liveness healthy cycle");
           return;
@@ -21119,23 +21199,23 @@ ${thread.titleFallback ?? ""}`);
   bb.background.schedule("stall-guard-liveness", "*/5 * * * *", async () => {
     try {
       const stateDir = stallGuardStateDir();
-      const markerPath = join4(stateDir, STALL_GUARD_LIVENESS_MARKER_FILENAME);
-      const flagPath = join4(stateDir, STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME);
+      const markerPath = join5(stateDir, STALL_GUARD_LIVENESS_MARKER_FILENAME);
+      const flagPath = join5(stateDir, STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME);
       let markerAtMs = null;
       try {
-        const parsed = Number(readFileSync2(markerPath, "utf8").trim());
+        const parsed = Number(readFileSync3(markerPath, "utf8").trim());
         markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync2(markerPath).mtimeMs;
       } catch {
         markerAtMs = null;
       }
       const configuredStaleMs = Number(process.env.BB_COLLAB_STALL_GUARD_LIVENESS_STALE_MS);
       const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
-      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync2(flagPath));
-      if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync3(flagPath));
+      if (decision === "clear-alert-flag") rmSync2(flagPath, { force: true });
       if (decision === "alert-once") {
-        mkdirSync(stateDir, { recursive: true });
+        mkdirSync2(stateDir, { recursive: true });
         try {
-          writeFileSync(flagPath, String(Date.now()), { flag: "wx" });
+          writeFileSync2(flagPath, String(Date.now()), { flag: "wx" });
         } catch {
           bb.log.info("stall-guard-liveness healthy cycle");
           return;

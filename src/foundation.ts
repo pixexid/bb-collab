@@ -1,4 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import type Database from "better-sqlite3";
 import { z } from "zod";
 import type { CheckoutDivergence } from "./checkout-divergence.js";
@@ -36,7 +38,7 @@ export const LLM_COLLAB_MERGED_MAIN_SHA = "0686d34" as const;
 export const LLM_COLLAB_EVIDENCE_RESOURCE_REVISION = 4 as const;
 export const EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION =
   "no canonical state existed to migrate; historical archive preserved as evidence, read-only" as const;
-// ponytail: keep exports bounded at 256 rows; add paged/file export before migration or cutover.
+// ponytail: page database reads at 256 rows; spill responses over 512 KiB to atomic files.
 export const MAX_EXPORT_ROWS = 256;
 // Bound only actual correlation events returned after the cited request.
 export const MAX_ROLE_CONTEXT_EVENTS = 256;
@@ -962,29 +964,37 @@ const migrationArtifactSchema = z
     artifactIdentityDigest: digestSchema,
   })
   .strict();
-const migrationExportSchema = z
+const migrationExportManifestSchema = z
   .object({
-    manifest: z
-      .object({
-        schemaVersion: z.number().int().positive(),
-        contractVersion: z.number().int().positive(),
-        pluginId: id,
-        projectId: id,
-        migrationStatementIds: z.array(z.number().int().nonnegative()),
-        schemaDigest: digestSchema,
-        contractDigest: digestSchema,
-        rowCount: z.number().int().nonnegative(),
-        tableCounts: z.record(z.string(), z.number().int().nonnegative()),
-        recordsDigest: digestSchema,
-        artifactIndexDigest: digestSchema,
-        exportRootDigest: digestSchema,
-      })
-      .strict(),
+    schemaVersion: z.number().int().positive(),
+    contractVersion: z.number().int().positive(),
+    pluginId: id,
+    projectId: id,
+    migrationStatementIds: z.array(z.number().int().nonnegative()),
+    schemaDigest: digestSchema,
+    contractDigest: digestSchema,
+    rowCount: z.number().int().nonnegative(),
+    tableCounts: z.record(z.string(), z.number().int().nonnegative()),
+    recordsDigest: digestSchema,
+    artifactIndexDigest: digestSchema,
+    exportRootDigest: digestSchema,
+  })
+  .strict();
+const migrationExportSchema = z.union([
+  z.object({
+    manifest: migrationExportManifestSchema,
     recordsNdjson: z.string().max(MAX_EXPORT_BYTES),
     artifactIndex: z.array(migrationArtifactSchema).max(MAX_EXPORT_ROWS),
     checksums: z.record(z.string(), digestSchema),
-  })
-  .strict();
+  }).strict(),
+  z.object({
+    kind: z.literal("canonical-export-files"),
+    complete: z.literal(true),
+    directory: z.string().min(1).max(4096),
+    manifest: migrationExportManifestSchema,
+    checksums: z.record(z.string(), digestSchema),
+  }).strict(),
+]);
 const migrationPrepareSchema = z
   .object({
     migrationId: id,
@@ -2105,6 +2115,14 @@ export interface ExportPayload {
     artifactIdentityDigest: string;
   }>;
   checksums: Record<string, string>;
+}
+
+export interface ExportFilePayload {
+  kind: "canonical-export-files";
+  complete: true;
+  directory: string;
+  manifest: ExportPayload["manifest"];
+  checksums: ExportPayload["checksums"];
 }
 
 interface RefusalData {
@@ -3255,8 +3273,46 @@ function requireEvidenceOnlyReleaseBinding(
   }
 }
 
-function validateMigrationExport(payload: NonNullable<ApplyRequest["migrationStep"]>["export"], projectId: string): ExportPayload {
-  if (!payload) throw refusal("IMPORT_EQUIVALENCE_FAILED", "migration step requires the deterministic fixture export");
+function exportRootDirectory(db: SqliteDatabase): string | null {
+  const main = (db.prepare("PRAGMA database_list").all() as Array<{ name: string; file: string }>).find((row) => row.name === "main");
+  return main?.file ? join(dirname(main.file), ".bb-collab-exports") : null;
+}
+
+function readMigrationExportFiles(db: SqliteDatabase, input: ExportFilePayload): ExportPayload {
+  const root = exportRootDirectory(db);
+  if (!root) throw refusal("IMPORT_EQUIVALENCE_FAILED", "file export requires the exact file-backed canonical store");
+  let directory: string;
+  try {
+    const resolvedRoot = realpathSync(root);
+    directory = realpathSync(input.directory);
+    const nested = relative(resolvedRoot, directory);
+    if (!nested || nested.startsWith("..") || isAbsolute(nested) || !basename(directory).startsWith("complete-")) throw new Error("foreign path");
+  } catch {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "file export is not a complete export from the exact canonical store");
+  }
+  try {
+    const manifest = migrationExportManifestSchema.parse(JSON.parse(readFileSync(join(directory, "manifest.json"), "utf8")));
+    const artifactIndex = z.array(migrationArtifactSchema).parse(JSON.parse(readFileSync(join(directory, "artifact-index.json"), "utf8")));
+    if (canonicalJson(manifest) !== canonicalJson(input.manifest)) throw new Error("manifest mismatch");
+    return {
+      manifest,
+      recordsNdjson: readFileSync(join(directory, "records.ndjson"), "utf8"),
+      artifactIndex,
+      checksums: input.checksums,
+    };
+  } catch {
+    throw refusal("IMPORT_EQUIVALENCE_FAILED", "file export is incomplete or malformed");
+  }
+}
+
+function validateMigrationExport(
+  db: SqliteDatabase,
+  input: NonNullable<ApplyRequest["migrationStep"]>["export"],
+  projectId: string,
+): ExportPayload {
+  if (!input) throw refusal("IMPORT_EQUIVALENCE_FAILED", "migration step requires the deterministic fixture export");
+  const fromFiles = "kind" in input;
+  const payload = fromFiles ? readMigrationExportFiles(db, input) : input;
   const manifest = payload.manifest;
   const expectedTables = Object.fromEntries(TABLES.map((table) => [table, manifest.tableCounts[table] ?? -1]));
   if (
@@ -3338,7 +3394,7 @@ function validateMigrationExport(payload: NonNullable<ApplyRequest["migrationSte
     recordsDigest !== manifest.recordsDigest || artifactIndexDigest !== manifest.artifactIndexDigest ||
     sha256(canonicalJson(rootInput)) !== manifest.exportRootDigest ||
     canonicalJson(payload.checksums) !== canonicalJson(expectedChecksums) ||
-    Buffer.byteLength(payload.recordsNdjson, "utf8") + Buffer.byteLength(artifactIndexJson, "utf8") > MAX_EXPORT_BYTES
+    (!fromFiles && Buffer.byteLength(payload.recordsNdjson, "utf8") + Buffer.byteLength(artifactIndexJson, "utf8") > MAX_EXPORT_BYTES)
   ) {
     throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export hashes, roots, or bounds do not verify");
   }
@@ -3518,7 +3574,7 @@ function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: s
         eventExtra = { sourceExportKind: "non_canonical_source_evidence" };
         break;
       }
-      const exported = validateMigrationExport(step.export, request.projectId);
+      const exported = validateMigrationExport(db, step.export, request.projectId);
       if (run.source_schema_digest !== exported.manifest.schemaDigest || run.source_contract_digest !== exported.manifest.contractDigest) {
         throw refusal("IMPORT_EQUIVALENCE_FAILED", "source schema or contract digest does not match the fixture export");
       }
@@ -3567,7 +3623,7 @@ function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: s
       if (step.sourceEvidenceManifest || step.canonicalImport) {
         throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence is not a canonical fixture export");
       }
-      const exported = validateMigrationExport(step.export, request.projectId);
+      const exported = validateMigrationExport(db, step.export, request.projectId);
       const expectedRoot = sha256(canonicalJson({
         sourceExportDigest: run.source_export_digest,
         targetRuntimeId: run.target_runtime_id,
@@ -3620,7 +3676,7 @@ function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: s
       if (step.sourceEvidenceManifest || step.canonicalImport || step.equivalenceDisposition) {
         throw refusal("IMPORT_EQUIVALENCE_FAILED", "source evidence is not a canonical fixture export");
       }
-      const exported = validateMigrationExport(step.export, request.projectId);
+      const exported = validateMigrationExport(db, step.export, request.projectId);
       const expectedDigest = sha256(canonicalJson({
         sourceExportDigest: run.source_export_digest,
         importRootDigest: run.import_root_digest,
@@ -5821,7 +5877,7 @@ export function applyFixtureMutation(
   }
 }
 
-function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId: string): Record<string, unknown>[] {
+function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId: string, offset: number): Record<string, unknown>[] {
   const orderBy: Record<(typeof TABLES)[number], string> = {
     project_config_revisions: "config_revision",
     project_config_heads: "project_id",
@@ -5853,22 +5909,57 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     table === "decision_dispositions" || table === "decision_evidence"
       ? `SELECT ${table}.* FROM ${table}
          JOIN decisions ON decisions.decision_id = ${table}.decision_id
-         WHERE decisions.project_id = ? ORDER BY ${orderBy[table]}`
-      : `SELECT * FROM ${table} WHERE project_id = ? ORDER BY ${orderBy[table]}`;
-  return db.prepare(query).all(projectId) as Record<string, unknown>[];
+         WHERE decisions.project_id = ? ORDER BY ${orderBy[table]} LIMIT ? OFFSET ?`
+      : `SELECT * FROM ${table} WHERE project_id = ? ORDER BY ${orderBy[table]} LIMIT ? OFFSET ?`;
+  return db.prepare(query).all(projectId, MAX_EXPORT_ROWS, offset) as Record<string, unknown>[];
+}
+
+function writeFoundationExportFiles(db: SqliteDatabase, projectId: string, payload: ExportPayload): ExportFilePayload | null {
+  const root = exportRootDirectory(db);
+  if (!root) return null;
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const directory = join(root, `complete-${sha256(projectId).slice(0, 12)}-${payload.manifest.exportRootDigest}`);
+  const matches = () =>
+    sha256(readFileSync(join(directory, "records.ndjson"), "utf8")) === payload.checksums["records.ndjson"] &&
+    sha256(readFileSync(join(directory, "artifact-index.json"), "utf8")) === payload.checksums["artifact-index.json"] &&
+    sha256(readFileSync(join(directory, "manifest.json"), "utf8")) === payload.checksums["manifest.json"];
+  if (existsSync(directory)) {
+    if (!matches()) throw new Error("existing canonical export files do not match their export root");
+    return { kind: "canonical-export-files", complete: true, directory, manifest: payload.manifest, checksums: payload.checksums };
+  }
+  const partial = mkdtempSync(join(root, `.partial-${sha256(projectId).slice(0, 12)}-`));
+  try {
+    writeFileSync(join(partial, "records.ndjson"), payload.recordsNdjson, { mode: 0o600 });
+    writeFileSync(join(partial, "artifact-index.json"), canonicalJson(payload.artifactIndex), { mode: 0o600 });
+    writeFileSync(join(partial, "manifest.json"), canonicalJson(payload.manifest), { mode: 0o600 });
+    try {
+      renameSync(partial, directory);
+    } catch (error) {
+      if (!existsSync(directory) || !matches()) throw error;
+      rmSync(partial, { recursive: true, force: true });
+    }
+    return { kind: "canonical-export-files", complete: true, directory, manifest: payload.manifest, checksums: payload.checksums };
+  } catch (error) {
+    rmSync(partial, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 export function exportFoundation(db: SqliteDatabase | null, projectId: string): FoundationResult {
   if (!db) return unavailableResult(projectId, "canonical SQLite store is unavailable");
   try {
-    const rowsByTable = Object.fromEntries(TABLES.map((table) => [table, tableRows(db, table, projectId)])) as Record<
-      (typeof TABLES)[number],
-      Record<string, unknown>[]
-    >;
+    const rowsByTable = db.transaction(() => Object.fromEntries(TABLES.map((table) => {
+      const rows: Record<string, unknown>[] = [];
+      for (let offset = 0; ; offset += MAX_EXPORT_ROWS) {
+        const page = tableRows(db, table, projectId, offset);
+        rows.push(...page);
+        if (page.length < MAX_EXPORT_ROWS) break;
+      }
+      return [table, rows];
+    })))() as Record<(typeof TABLES)[number], Record<string, unknown>[]>;
     const tableCounts = Object.fromEntries(TABLES.map((table) => [table, rowsByTable[table].length]));
     const rowCount = Object.values(tableCounts).reduce((sum, count) => sum + count, 0);
     if (rowCount === 0) return result("PROJECT_CONFIG_REQUIRED", projectId, 1, 1, 0, { message: "project has no stored foundation" });
-    if (rowCount > MAX_EXPORT_ROWS) return result("EXPORT_BOUNDED", projectId, rowCount, rowCount, 0, { message: "export exceeds the bounded row limit" });
     const recordsNdjson = TABLES.flatMap((table) =>
       rowsByTable[table].map((row) => canonicalJson({ table, row })),
     ).join("\n");
@@ -5885,9 +5976,6 @@ export function exportFoundation(db: SqliteDatabase | null, projectId: string): 
       artifactIdentityDigest: String(row.artifact_identity_digest),
     }));
     const artifactIndexJson = canonicalJson(artifactIndex);
-    if (Buffer.byteLength(recordsNdjson, "utf8") + Buffer.byteLength(artifactIndexJson, "utf8") > MAX_EXPORT_BYTES) {
-      return result("EXPORT_BOUNDED", projectId, rowCount, rowCount, 0, { message: "export exceeds the bounded byte limit" });
-    }
     const recordsDigest = sha256(recordsNdjson);
     const artifactIndexDigest = sha256(artifactIndexJson);
     const manifestWithoutRoot = {
@@ -5915,6 +6003,12 @@ export function exportFoundation(db: SqliteDatabase | null, projectId: string): 
         "records.ndjson": recordsDigest,
       },
     };
+    if (artifactIndex.length > MAX_EXPORT_ROWS ||
+      Buffer.byteLength(recordsNdjson, "utf8") + Buffer.byteLength(artifactIndexJson, "utf8") > MAX_EXPORT_BYTES) {
+      const exportFile = writeFoundationExportFiles(db, projectId, exportPayload);
+      if (!exportFile) return result("EXPORT_BOUNDED", projectId, rowCount, rowCount, 0, { message: "export exceeds inline bounds and the canonical store is not file-backed" });
+      return result("OK", projectId, rowCount, rowCount, rowCount, { evidence: { exportFile } });
+    }
     return result("OK", projectId, rowCount, rowCount, rowCount, { export: exportPayload });
   } catch (error) {
     return result("CANONICAL_STORE_UNAVAILABLE", projectId, 1, 0, 0, { message: String(error) });
