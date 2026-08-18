@@ -16,6 +16,7 @@ type ThreadStates = PluginRpcResult<typeof rpcContract["threadStates"]>;
 type ThreadModels = PluginRpcResult<typeof rpcContract["threadModels"]>;
 type ThreadExecution = NonNullable<ThreadModels[string]>;
 type SidebarCollapseState = PluginRpcResult<typeof rpcContract["sidebarCollapseState"]>;
+type OperatorMessage = PluginRpcResult<typeof rpcContract["operatorMessages"]>[number];
 
 const SETTINGS_ACTION_TITLE = "bb-collab settings";
 
@@ -644,6 +645,109 @@ function LanesPanel(_props: PluginNavPanelProps) {
   );
 }
 
+function InboxPanel(_props: PluginNavPanelProps) {
+  const sidebar = experimental_useSidebarThreads();
+  const rpc = useRpc<typeof rpcContract>();
+  const [projectId, setProjectId] = useState("");
+  const [recipient, setRecipient] = useState<"" | OperatorMessage["recipient"]>("");
+  const [messages, setMessages] = useState<readonly OperatorMessage[]>([]);
+  const [drafts, setDrafts] = useState<Record<number, string>>({});
+  const [replyingMessageId, setReplyingMessageId] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const refreshSequence = useRef(0);
+  const project = sidebar.projects.find((candidate) => candidate.id === projectId);
+
+  const refresh = useCallback(() => {
+    const sequence = ++refreshSequence.current;
+    if (!projectId) {
+      setMessages([]);
+      return;
+    }
+    setError(null);
+    void rpc.call("operatorMessages", { projectId, ...(recipient ? { recipient } : {}) })
+      .then((next) => { if (sequence === refreshSequence.current) setMessages(next); })
+      .catch((reason: unknown) => { if (sequence === refreshSequence.current) setError(String(reason)); });
+  }, [projectId, recipient, rpc]);
+
+  useEffect(refresh, [refresh]);
+
+  const updateMessage = (next: OperatorMessage) => setMessages((current) => current.map((message) => message.messageId === next.messageId ? next : message));
+
+  return (
+    <main className="h-full overflow-y-auto p-5">
+      <div className="mx-auto max-w-4xl">
+        <div className="mb-5 flex flex-wrap items-end gap-3">
+          <label className="grid gap-1 text-sm">
+            <span className="text-muted-foreground">Project</span>
+            <select className="rounded-md border border-border bg-background px-3 py-2" value={projectId} onChange={(event) => setProjectId(event.target.value)}>
+              <option value="">Choose a project</option>
+              {sidebar.projects.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name} · {candidate.id}</option>)}
+            </select>
+          </label>
+          <label className="grid gap-1 text-sm">
+            <span className="text-muted-foreground">Recipient</span>
+            <select className="rounded-md border border-border bg-background px-3 py-2" value={recipient} onChange={(event) => setRecipient(event.target.value as typeof recipient)}>
+              <option value="">All recipients</option>
+              <option value="operator">Operator</option>
+              <option value="supervisor">Supervisor</option>
+            </select>
+          </label>
+          <button type="button" className="rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-muted hover:text-foreground" onClick={refresh}>Refresh</button>
+        </div>
+        {!projectId ? <p className="text-sm text-muted-foreground">Choose a project to read its exact inbox.</p> : null}
+        {error ? <p className="text-sm text-destructive">Unable to read inbox: {error}</p> : null}
+        {projectId ? (
+          <section aria-labelledby="inbox-project-heading">
+            <h2 id="inbox-project-heading" className="mb-2 text-sm font-semibold">{project?.name ?? projectId} <span className="font-normal text-muted-foreground">{projectId}</span></h2>
+            {messages.length === 0 ? <p className="text-sm text-muted-foreground">No messages for this project and recipient filter.</p> : null}
+            <div className="space-y-3">
+              {messages.map((message) => (
+                <article key={message.messageId} className={`rounded-lg border p-4 ${message.readAtMs === null ? "border-primary/50" : "border-border"}`}>
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                    <span className="font-medium text-foreground">{message.recipient}</span>
+                    <span>{message.severity}</span>
+                    <span>{message.senderLaneId ? `${message.senderLaneId} · ` : ""}{message.senderThreadId}</span>
+                    <time className="ml-auto" dateTime={new Date(message.createdAtMs).toISOString()}>{new Date(message.createdAtMs).toLocaleString()}</time>
+                  </div>
+                  <p className="my-3 whitespace-pre-wrap text-sm">{message.text}</p>
+                  {message.notificationError ? <p className="mb-2 text-xs text-destructive">Urgent notification failed: {message.notificationError}</p> : null}
+                  {message.replyDeliveryError ? <p className="mb-2 text-xs text-destructive">Reply delivery failed: {message.replyDeliveryError}</p> : null}
+                  {message.repliedAtMs === null ? (
+                    <div className="grid gap-2">
+                      <label className="text-xs text-muted-foreground" htmlFor={`operator-reply-${message.messageId}`}>Reply</label>
+                      <textarea
+                        id={`operator-reply-${message.messageId}`}
+                        className="min-h-20 rounded-md border border-border bg-background p-2 text-sm"
+                        value={drafts[message.messageId] ?? message.replyText ?? ""}
+                        onChange={(event) => setDrafts((current) => ({ ...current, [message.messageId]: event.target.value }))}
+                      />
+                      <div className="flex gap-2">
+                        <button type="button" disabled={replyingMessageId !== null} className="rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground disabled:opacity-50" onClick={() => {
+                          const text = (drafts[message.messageId] ?? message.replyText ?? "").trim();
+                          if (!text) return;
+                          setError(null);
+                          setReplyingMessageId(message.messageId);
+                          void rpc.call("replyToOperatorMessage", { projectId: message.projectId, messageId: message.messageId, text })
+                            .then(updateMessage)
+                            .catch((reason: unknown) => setError(String(reason)))
+                            .finally(() => setReplyingMessageId(null));
+                        }}>{replyingMessageId === message.messageId ? "Delivering…" : "Reply"}</button>
+                        {message.readAtMs === null ? <button type="button" className="rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-muted" onClick={() => {
+                          void rpc.call("markOperatorMessageRead", { projectId: message.projectId, messageId: message.messageId }).then(updateMessage).catch((reason: unknown) => setError(String(reason)));
+                        }}>Mark read</button> : null}
+                      </div>
+                    </div>
+                  ) : <p className="text-sm text-muted-foreground">Reply delivered: {message.replyText}</p>}
+                </article>
+              ))}
+            </div>
+          </section>
+        ) : null}
+      </div>
+    </main>
+  );
+}
+
 async function readPluginHttp(path: string, signal: AbortSignal): Promise<unknown> {
   const response = await fetch(`/api/v1/plugins/bb-collab/http/${path}`, { credentials: "same-origin", signal });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -695,6 +799,13 @@ export default definePluginApp((app) => {
     icon: "GitBranch",
     path: "lanes",
     component: LanesPanel,
+  });
+  app.slots.navPanel({
+    id: "inbox",
+    title: "Inbox",
+    icon: "Inbox",
+    path: "inbox",
+    component: InboxPanel,
   });
   app.contentScripts.register({
     id: "lane-thread-status",

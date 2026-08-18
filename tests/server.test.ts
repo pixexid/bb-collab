@@ -8,7 +8,7 @@ import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import plugin, { rpcContract } from "../server.js";
+import plugin, { rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
 import {
   DEFERRED_ISSUE_3_OUTCOMES,
   CACHED_CONSUMERS,
@@ -1828,7 +1828,125 @@ describe("bb-collab plugin boundary", () => {
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "ACTOR_RECEIPT_UNKNOWN" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "thread-archive-sweep"]);
-    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "doctor", "export", "lanes", "registerWait", "reorderPinned", "roleBrief", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
+    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "doctor", "export", "lanes", "markOperatorMessageRead", "operatorMessages", "registerWait", "reorderPinned", "replyToOperatorMessage", "roleBrief", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
+    expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["send_to_operator"]);
+  });
+
+  it("stores messages only under the sender's registered project and deduplicates exact urgent content for one hour", async () => {
+    const runBbCommand = vi.fn(async (_args: string[]) => undefined);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    try {
+      const host = hostFor();
+      await plugin(host.bb, { runBbCommand });
+      seedAndBootstrap(host);
+      const context = { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID };
+      const send = (recipient: "operator" | "supervisor", text: string) => host.harness.callAgentTool("send_to_operator", {
+        project_id: PROJECT_ID,
+        recipient,
+        severity: "urgent",
+        text,
+      }, context);
+
+      const first = JSON.parse(await send("operator", "same urgent") as string);
+      const duplicate = JSON.parse(await send("operator", "same urgent") as string);
+      const differentText = JSON.parse(await send("operator", "different urgent") as string);
+      const differentRecipient = JSON.parse(await send("supervisor", "same urgent") as string);
+      clock.mockReturnValue(1_000_000 + URGENT_NOTIFICATION_DEDUP_MS + 1);
+      const afterWindow = JSON.parse(await send("operator", "same urgent") as string);
+
+      expect(first).toMatchObject({ projectId: PROJECT_ID, recipient: "operator", senderThreadId: ROLE_THREAD_ID, notificationStatus: "sent" });
+      expect(duplicate).toMatchObject({ notificationStatus: "deduplicated" });
+      expect(differentText).toMatchObject({ notificationStatus: "sent" });
+      expect(differentRecipient).toMatchObject({ notificationStatus: "sent" });
+      expect(afterWindow).toMatchObject({ notificationStatus: "sent" });
+      expect(runBbCommand).toHaveBeenCalledTimes(8);
+      expect(runBbCommand.mock.calls.filter(([args]) => args[0] === "notify")).toHaveLength(4);
+      expect(runBbCommand.mock.calls.filter(([args]) => args[0] === "push")).toHaveLength(4);
+
+      const cli = await host.harness.runCli([
+        "send-to-operator", "--project", PROJECT_ID, "--recipient", "supervisor", "--severity", "routine", "--message", "supervisor pickup",
+      ], context);
+      expect(cli.exitCode).toBe(0);
+      expect(JSON.parse(cli.stdout)).toMatchObject({ projectId: PROJECT_ID, recipient: "supervisor", notificationStatus: "not-requested" });
+      expect(await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID })).toHaveLength(6);
+      expect(await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, recipient: "supervisor" })).toHaveLength(2);
+      await expect(host.harness.callRpc("operatorMessages", { projectId: FOREIGN_PROJECT_ID })).rejects.toThrow("not registered");
+      await expect(host.harness.callAgentTool("send_to_operator", {
+        project_id: FOREIGN_PROJECT_ID,
+        recipient: "operator",
+        severity: "routine",
+        text: "wrong project",
+      }, context)).rejects.toThrow("project_id must exactly match");
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("attempts both notification channels and leaves a visible failure", async () => {
+    const runBbCommand = vi.fn(async (args: string[]) => {
+      if (args[0] === "notify") throw new Error("desktop unavailable");
+    });
+    const host = hostFor();
+    await plugin(host.bb, { runBbCommand });
+    seedAndBootstrap(host);
+
+    const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
+      project_id: PROJECT_ID,
+      recipient: "operator",
+      severity: "urgent",
+      text: "urgent with one broken channel",
+    }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
+    expect(runBbCommand.mock.calls.map(([args]) => args[0]).sort()).toEqual(["notify", "push"]);
+    expect(message).toMatchObject({ notificationStatus: "failed", notificationError: expect.stringContaining("desktop unavailable") });
+  });
+
+  it("delivers replies through platform steer only after the matching sender event lands", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    const sent: Array<{ mode: string; text: string }> = [];
+    host.harness.sdk.stub("threads.send", (async (input: { mode: string; input: Array<{ text: string }> }) => {
+      sent.push({ mode: input.mode, text: input.input[0]!.text });
+      return { ok: true };
+    }) as never);
+    host.harness.sdk.stub("threads.events.wait", (async ({ threadId }: { threadId: string }) => ({
+      id: "event-delivered",
+      threadId,
+      seq: 99,
+      type: "system/manager/user_message",
+      scope: { kind: "thread" },
+      data: { text: sent.at(-1)!.text },
+      createdAt: 99,
+    })) as never);
+    const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
+      project_id: PROJECT_ID,
+      recipient: "operator",
+      severity: "routine",
+      text: "needs an answer",
+    }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
+
+    const replied = await host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
+    expect(sent).toEqual([{ mode: "steer", text: `[bb-collab inbox reply ${message.messageId} to operator]\nanswer` }]);
+    expect(replied).toMatchObject({ repliedAtMs: expect.any(Number), replyText: "answer", replyDeliveryError: null, readAtMs: expect.any(Number) });
+    await expect(host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "duplicate" }))
+      .rejects.toThrow("already has a delivered reply");
+  });
+
+  it("persists a visible reply failure when the sender environment is gone", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
+      project_id: PROJECT_ID,
+      recipient: "operator",
+      severity: "routine",
+      text: "reply to a dead sender",
+    }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
+    host.harness.sdk.stub("environments.get", (async () => { throw new Error("environment deleted"); }) as never);
+
+    const replied = await host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "cannot vanish" });
+    expect(replied).toMatchObject({ repliedAtMs: null, replyText: "cannot vanish", replyDeliveryError: expect.stringContaining("environment deleted") });
+    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
   it("does not wake a quiet director seat", async () => {
@@ -2779,15 +2897,16 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("appends the WorkItem-wait schema without changing the v21 contract", () => {
-    expect(SCHEMA_VERSION).toBe(14);
+  it("appends the operator inbox schema without changing the v21 foundation contract", () => {
+    expect(SCHEMA_VERSION).toBe(15);
     expect(CONTRACT_VERSION).toBe(21);
-    expect(MIGRATIONS).toHaveLength(27);
-    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("eacc300f19723e0fd9dc0345509628569bd40b2d4c7740954bfc7e647aff9640");
-    expect(MIGRATIONS.at(-2)).toContain("work_item_waits");
-    expect(MIGRATIONS.at(-2)).toContain("declared_by_seat");
-    expect(MIGRATIONS.at(-1)).toContain("waker_kind");
+    expect(MIGRATIONS).toHaveLength(28);
+    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("19ce4f2a3293379c19fab2280357f2aad408da623d858e34d487332b7a5f31fe");
+    expect(MIGRATIONS.at(-1)).toContain("operator_messages");
+    expect(MIGRATIONS.at(-1)).toContain("project_id TEXT NOT NULL");
+    expect(MIGRATIONS.at(-1)).toContain("recipient IN ('operator', 'supervisor')");
     expect(TABLES).toContain("migration_runs");
+    expect(TABLES).toContain("operator_messages");
     expect(MIGRATION_STATES).toEqual([
       "prepared", "frozen", "exported", "imported", "equivalent", "target_active", "exercised", "retired", "rolled_back", "fix_forward_required",
     ]);
@@ -2796,19 +2915,19 @@ describe("bb-collab plugin boundary", () => {
     ]);
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 13,
-      newSchemaVersion: 14,
-      oldContractVersion: 20,
+      oldSchemaVersion: 14,
+      newSchemaVersion: 15,
+      oldContractVersion: 21,
       newContractVersion: 21,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(14, 21))).toMatchObject({
-      oldSchemaVersion: 13,
-      newSchemaVersion: 14,
-      oldContractVersion: 20,
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(15, 21))).toMatchObject({
+      oldSchemaVersion: 14,
+      newSchemaVersion: 15,
+      oldContractVersion: 21,
       newContractVersion: 21,
       action: "reread",
       expected: 4,
@@ -2817,9 +2936,9 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 13,
-      newSchemaVersion: 14,
-      oldContractVersion: 20,
+      oldSchemaVersion: 14,
+      newSchemaVersion: 15,
+      oldContractVersion: 21,
       newContractVersion: 21,
       action: "refused",
       expected: 4,
@@ -2856,9 +2975,9 @@ describe("bb-collab plugin boundary", () => {
 
   it("assembles the production v21 cached-consumer rollout receipt with stale-v20 refusal semantics", async () => {
     expect(CONTRACT_VERSION).toBe(21);
-    expect(SCHEMA_VERSION).toBe(14);
-    expect(MIGRATIONS).toHaveLength(27);
-    expect(schemaDigest).toBe("19ce4f2a3293379c19fab2280357f2aad408da623d858e34d487332b7a5f31fe");
+    expect(SCHEMA_VERSION).toBe(15);
+    expect(MIGRATIONS).toHaveLength(28);
+    expect(schemaDigest).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
     expect(contractDigest).toBe("6df90c4315ca78dacb7043a45d28ccfdd259947d835bce3953d7b4f44b928c9f");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -2875,7 +2994,7 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 14, observedContractVersion: 21 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 15, observedContractVersion: 21 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -2931,7 +3050,7 @@ describe("bb-collab plugin boundary", () => {
     const before = exportFoundation(db, PROJECT_ID);
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
-      observedSchemaVersion: 14,
+      observedSchemaVersion: 15,
       observedContractVersion: 21,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
@@ -3013,7 +3132,7 @@ describe("bb-collab plugin boundary", () => {
       outcome: "OK",
       evidence: {
         cachedConsumers: {
-          oldContractVersion: 20,
+          oldContractVersion: 21,
           newContractVersion: 21,
           action: "unknown",
           expected: 4,
@@ -3162,7 +3281,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 14, schemaDigest, contractVersion: 21, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 15, schemaDigest, contractVersion: 21, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -4218,8 +4337,8 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 13, newSchemaVersion: 14, action: "unknown", expected: 4, attempted: 0, verified: 0 },
-        schema: { version: 14 },
+        cachedConsumers: { oldSchemaVersion: 14, newSchemaVersion: 15, action: "unknown", expected: 4, attempted: 0, verified: 0 },
+        schema: { version: 15 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -5666,7 +5785,7 @@ describe("bb-collab plugin boundary", () => {
     db.pragma("foreign_keys = OFF");
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
-    db.exec(MIGRATIONS.at(-11)!);
+    db.exec(MIGRATIONS.find((statement) => statement.includes("CREATE TABLE IF NOT EXISTS assignments"))!);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -5686,10 +5805,10 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 13, newSchemaVersion: 14, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 13, newSchemaVersion: 14, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 13, newSchemaVersion: 14, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(14, 21))).toMatchObject({ oldSchemaVersion: 13, newSchemaVersion: 14, oldContractVersion: 20, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(15, 21))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 
@@ -5811,7 +5930,7 @@ describe("bb-collab plugin boundary", () => {
     const host = await loadedHost();
     const registrations = host.harness.inspection.registrations;
     expect(registrations.rpcMethods).not.toContain("seed-fixture-receipt");
-    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep"]);
+    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "send-to-operator", "inbox"]);
     expect(registrations.httpRoutes.map((route) => route.path)).toEqual(["/lanes"]);
     expect(seedFixtureDecision).toBeTypeOf("function");
   });

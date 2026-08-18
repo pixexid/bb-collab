@@ -13,7 +13,7 @@ worker.
 | Boundary | Trusted fact or asset | Required behavior |
 | --- | --- | --- |
 | BB core | Native project, source, host, environment, thread, provider and event facts | bb-collab records exact references and receipts; it does not replace BB core authority. |
-| bb-collab plugin database | Project configuration, repository targets, governorship, roles, WorkItems, assignments, decisions, qualifications, evidence, migration and current projections | One transactional canonical store; unavailable or corrupt means governed writes stop. |
+| bb-collab plugin database | Project configuration, repository targets, governorship, roles, WorkItems, assignments, decisions, qualifications, evidence, migration, current projections and operator-inbox messages | One transactional store; unavailable or corrupt means governed writes and inbox delivery stop. Inbox text is communication, never decision authority. |
 | Governorship fence | Current runtime, epoch, token and mutation sequence | Every sanctioned source, target, import and projection mutation presents the same expected epoch/token. |
 | Project repository and worktrees | Versioned project extensions, candidate code and human documentation | Exact target, branch, base and candidate identity are required; a checkout never proves authority. A native ready managed worktree may use a derived path, but its exact project/host/source binding and both source and environment paths are retained. |
 | GitHub, BB Tasks and Markdown | External projections or evidence | They may not activate work, satisfy a gate or close a WorkItem independently. |
@@ -151,6 +151,9 @@ The goals are:
 | Derived actor standing identity | A plugin actor receipt is reused with another authorization or detached from its approver | Bootstrap-only atomic issuance, durable operator receipt linkage, exact linked-receipt check and host-issued retirement condition; ACTOR_RECEIPT_UNVERIFIED or OPERATOR_RECEIPT_STALE. |
 | Authorized approver spoof/revocation | An unregistered, foreign, changed or revoked approver attests a privileged mutation | Exact project/approver/Decision/disposition registry row, exact current ten-class allowlist, caller-plugin check and active-current disposition check; AUTHORIZED_APPROVER_UNKNOWN, AUTHORIZED_APPROVER_INVALID or AUTHORIZED_APPROVER_REVOKED. |
 | Projection drift | External state is used to mutate canonical state for convenience | Projection is rebuildable; canonical state changes only through governed import/adoption. |
+| Cross-project inbox read or send | Ambient thread, checkout or missing project selects another project's message | Required registered `project_id`, exact sender-thread project comparison, and a project predicate on every message read and update. |
+| Ghost reply | Platform send accepts a reply for a thread whose environment is gone | Require a ready project-exact environment and the exact matching post-send user-message event; persist and display delivery failure when either proof is absent. |
+| Urgent notification loop | A repeated condition floods external notification channels | Suppress only an exact `(recipient, sender thread, severity, message text)` repeat inside 60 minutes; different content remains immediately notifiable. |
 
 ## Resolver invariants
 

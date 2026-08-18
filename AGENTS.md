@@ -8,7 +8,7 @@ The fleet is a director, an orchestrator, and workers using BB-native threads an
 
 ## Contract
 
-`CONTRACT_VERSION: 25` — apply the [version-bump test](docs/rules.md#version-bump-test) before changing it.
+`CONTRACT_VERSION: 26` — apply the [version-bump test](docs/rules.md#version-bump-test) before changing it.
 
 ## Reading order for a fresh seat
 
@@ -39,3 +39,5 @@ The fleet is a director, an orchestrator, and workers using BB-native threads an
 - [One writer per lane](docs/rules.md#one-writer-per-lane) — one branch and one owner per edit lane.
 - [Quiet with startable work is a defect state](docs/rules.md#quiet-with-startable-work-is-a-defect-state) — intake fires on every wake; the check is `startable > 0 AND lanes < cap`.
 - [Blast radius](docs/rules.md#blast-radius) — update affected open artifacts with the decision that invalidates them.
+- [External-party content uses the inbox](docs/rules.md#external-party-content-uses-the-inbox) — actionable operator content outside the current conversation goes through the inbox once available.
+- [Project-agnostic by construction](docs/rules.md#project-agnostic-by-construction) — changed project-owned behavior requires an explicit exact `project_id`.
