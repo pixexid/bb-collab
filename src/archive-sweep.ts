@@ -10,6 +10,7 @@ export type ArchiveSweepResult = {
   archivableThreadIds: string[];
   archivedThreadIds: string[];
   protectedThreadCount: number;
+  unresolvedThreadCount: number;
   message?: string;
 };
 
@@ -82,7 +83,7 @@ export async function runArchiveSweep(
   apply = false,
   now = Date.now(),
 ): Promise<ArchiveSweepResult> {
-  if (!db) return { outcome: "refused", archivableThreadIds: [], archivedThreadIds: [], protectedThreadCount: 0, message: "canonical store unavailable" };
+  if (!db) return { outcome: "refused", archivableThreadIds: [], archivedThreadIds: [], protectedThreadCount: 0, unresolvedThreadCount: 0, message: "canonical store unavailable" };
   if (apply) {
     const report = await runArchiveSweep(bb, db, projectId, false, now);
     if (report.outcome !== "reported") return report;
@@ -96,6 +97,7 @@ export async function runArchiveSweep(
             archivableThreadIds: [],
             archivedThreadIds: [...archivedThreadIds],
             protectedThreadCount: freshReport.protectedThreadCount,
+            unresolvedThreadCount: freshReport.unresolvedThreadCount,
             message: `archive candidate changed before apply: ${threadId}`,
           };
         }
@@ -109,6 +111,7 @@ export async function runArchiveSweep(
         archivableThreadIds: [],
         archivedThreadIds: [...archivedThreadIds],
         protectedThreadCount: report.protectedThreadCount,
+        unresolvedThreadCount: report.unresolvedThreadCount,
         message: error instanceof Error ? error.message : String(error),
       };
     }
@@ -125,23 +128,32 @@ export async function runArchiveSweep(
       thread.updatedAt > minimumUpdatedAt ||
       protectedIds.has(thread.id),
     ).map((thread) => thread.id));
+    let unresolvedThreadCount = 0;
     for (const thread of threads) {
       if (thread.environmentId === null) continue;
-      const pullRequest = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
-      if (pullRequest.outcome === "unavailable") throw new Error(`pull request lookup unavailable for ${thread.id}`);
-      if (pullRequest.outcome === "available" && ["open", "draft"].includes(pullRequest.pullRequest.state)) blockedIds.add(thread.id);
+      try {
+        const pullRequest = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
+        if (pullRequest.outcome === "unavailable") {
+          blockedIds.add(thread.id);
+          unresolvedThreadCount += 1;
+        } else if (pullRequest.outcome === "available" && ["open", "draft"].includes(pullRequest.pullRequest.state)) blockedIds.add(thread.id);
+      } catch {
+        blockedIds.add(thread.id);
+        unresolvedThreadCount += 1;
+      }
     }
     const protectedAncestors = ancestorIds(threads, blockedIds);
     const eligibleIds = new Set(threads.filter((thread) => !blockedIds.has(thread.id) && !protectedAncestors.has(thread.id)).map((thread) => thread.id));
     const rootEligibleIds = topLevelIds(threads, eligibleIds);
     const archivableThreadIds = threads.filter((thread) => rootEligibleIds.has(thread.id)).map((thread) => thread.id);
-    return { outcome: "reported", archivableThreadIds, archivedThreadIds: [], protectedThreadCount: protectedIds.size };
+    return { outcome: "reported", archivableThreadIds, archivedThreadIds: [], protectedThreadCount: protectedIds.size, unresolvedThreadCount };
   } catch (error) {
     return {
       outcome: "refused",
       archivableThreadIds: [],
       archivedThreadIds: [],
       protectedThreadCount: 0,
+      unresolvedThreadCount: 0,
       message: error instanceof Error ? error.message : String(error),
     };
   }
