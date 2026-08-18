@@ -4922,6 +4922,29 @@ describe("bb-collab plugin boundary", () => {
     expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE aggregate_type = 'work_item'").get()).toEqual({ count: 2 });
   });
 
+  it("doctor measures in-progress WorkItems as active writing lanes", async () => {
+    const host = await loadedHost();
+    const config = roleConfig();
+    (config.extensions.bbCollab as Record<string, unknown>).writingLaneCeiling = 0;
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config });
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken))).toMatchObject({ outcome: "OK", currentResourceRevision: 1 });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1))).toMatchObject({ outcome: "OK", currentResourceRevision: 2 });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+
+    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
+      outcome: "OK",
+      evidence: {
+        capacity: {
+          writingLaneCeiling: 0,
+          activeWriterCount: 1,
+          activeWriterLaneIds: [WORK_ITEM_ID],
+          duplicateLaneIds: [],
+          ceilingViolated: true,
+        },
+      },
+    });
+  });
+
   it("records one WorkItem wait and refuses terminal transition until it is cleared", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host);
