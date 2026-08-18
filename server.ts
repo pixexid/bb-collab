@@ -924,7 +924,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   const roleIdlePersistence = {
     read: () => bb.storage.kv.get<unknown>("lane-watcher.role-idle"),
-    write: (state: Record<string, { steerCount: number; failedSteers: number; escalated: boolean; idleSinceMs: number | null; lastSteerAtMs: number | null; awaitingSteerOutcome: boolean; lastWakeAtMs: number | null; lastEscalationAtMs: number | null }>) => bb.storage.kv.set("lane-watcher.role-idle", state),
+    write: (state: Record<string, { steerCount: number; failedSteers: number; escalated: boolean; idleSinceMs: number | null; lastSteerAtMs: number | null; awaitingSteerOutcome: boolean; lastFleetWakeAtMs: number | null; lastStaleWaitWakeAtMs: number | null; lastOwedActWakeAtMs: number | null; lastEscalationAtMs: number | null }>) => bb.storage.kv.set("lane-watcher.role-idle", state),
   };
 
   const roleLivenessWarnings = new Map<string, string>();
@@ -1266,9 +1266,12 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         openWorkItemsByProject.set(workItem.project_id, workItems);
       }
       const isCurrent = (candidate: RoleHolderState, holder: RoleHolderState) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
-      const wake = async (projectId: string, holder: RoleHolderState, key: string, text: string, requireIdle: boolean, escalation = false) => {
+      const wake = async (projectId: string, holder: RoleHolderState, key: string, text: string, requireIdle: boolean, kind: "fleet" | "stale-wait" | "owed-act" | "escalation", beforeSend?: () => Promise<boolean>) => {
         const previous = await fleetWatchdogIdle.get(key);
-        const lastNotifiedAtMs = escalation ? previous?.lastEscalationAtMs : previous?.lastWakeAtMs;
+        const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs
+          : kind === "stale-wait" ? previous?.lastStaleWaitWakeAtMs
+            : kind === "owed-act" ? previous?.lastOwedActWakeAtMs
+              : previous?.lastEscalationAtMs;
         if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== undefined && now - lastNotifiedAtMs < floorMs) return false;
         if (wakeInFlight.has(key)) return false;
         wakeInFlight.add(key);
@@ -1281,13 +1284,16 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           if (await readPendingExternalWait(holder.thread_id)) return false;
           const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
           if (roleThreadRefusal(holder, thread, requireIdle)) return false;
+          if (beforeSend && !await beforeSend()) return false;
           await bb.sdk.threads.send({
             threadId: holder.thread_id,
             mode: "queue-if-active",
             input: [{ type: "text", visibility: "agent-only", text, mentions: [] }],
           });
-          if (escalation) await fleetWatchdogIdle.recordEscalation(key, Date.now());
-          else await fleetWatchdogIdle.recordWake(key, Date.now());
+          if (kind === "fleet") await fleetWatchdogIdle.recordFleetWake(key, Date.now());
+          else if (kind === "stale-wait") await fleetWatchdogIdle.recordStaleWaitWake(key, Date.now());
+          else if (kind === "owed-act") await fleetWatchdogIdle.recordOwedActWake(key, Date.now());
+          else await fleetWatchdogIdle.recordEscalation(key, Date.now());
           return true;
         } finally {
           wakeInFlight.delete(key);
@@ -1310,7 +1316,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           if (workItems.length === 0) continue;
           const staleWait = workItems.find((workItem) => workItem.declaredAtMs !== null && now - workItem.declaredAtMs >= staleWaitMs);
           if (staleWait) {
-            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false);
+            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait");
             continue;
           }
           const seatWait = workItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null);
@@ -1325,12 +1331,12 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             }
             const owingRecord = await fleetWatchdogIdle.observeIdle(owingKey, now);
             if (owingRecord.idleSinceMs === null || now - owingRecord.idleSinceMs < floorMs) continue;
-            if (owingRecord.lastWakeAtMs === null || owingRecord.lastWakeAtMs < owingRecord.idleSinceMs) {
-              await wake(projectId, owing, owingKey, `owed act is quiet with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true);
+            if (owingRecord.lastOwedActWakeAtMs === null || owingRecord.lastOwedActWakeAtMs < owingRecord.idleSinceMs) {
+              await wake(projectId, owing, owingKey, `owed act is quiet with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
               continue;
             }
-            if (owing.role_id !== "director" && now - owingRecord.lastWakeAtMs >= floorMs) {
-              await wake(projectId, director, roleIdleKey(director, seatWait.workItemId), `owed act still quiet with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true);
+            if (owing.role_id !== "director" && now - owingRecord.lastOwedActWakeAtMs >= floorMs) {
+              await wake(projectId, director, roleIdleKey(director, seatWait.workItemId), `owed act still quiet with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
             }
             continue;
           }
@@ -1342,8 +1348,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           const workKey = openWorkItem.workItemId;
           const orchestratorKey = roleIdleKey(orchestrator, workKey);
           const priorOrchestratorRecord = await fleetWatchdogIdle.get(orchestratorKey);
-          if (priorOrchestratorRecord?.lastWakeAtMs !== null && priorOrchestratorRecord?.lastWakeAtMs !== undefined && now - priorOrchestratorRecord.lastWakeAtMs >= floorMs) {
-            await wake(projectId, director, roleIdleKey(director, workKey), `fleet still quiet with open work since ${new Date(priorOrchestratorRecord.idleSinceMs ?? now).toISOString()}`, false, true);
+          if (priorOrchestratorRecord?.lastFleetWakeAtMs !== null && priorOrchestratorRecord?.lastFleetWakeAtMs !== undefined && now - priorOrchestratorRecord.lastFleetWakeAtMs >= floorMs) {
+            await wake(projectId, director, roleIdleKey(director, workKey), `fleet still quiet with open work since ${new Date(priorOrchestratorRecord.idleSinceMs ?? now).toISOString()}`, false, "escalation", async () => (await Promise.all(holders.map(async (holder) => {
+              const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
+              return !roleThreadRefusal(holder, thread, true) && !await readPendingExternalWait(holder.thread_id);
+            }))).every(Boolean));
             continue;
           }
           const idle = await Promise.all(holders.map(async (holder) => {
@@ -1357,8 +1366,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           }));
           if (!idle.every(Boolean)) continue;
           const orchestratorRecord = await fleetWatchdogIdle.get(orchestratorKey);
-          if (orchestratorRecord?.lastWakeAtMs === null || orchestratorRecord?.lastWakeAtMs === undefined || orchestratorRecord.lastWakeAtMs < (orchestratorRecord.idleSinceMs ?? now)) {
-            await wake(projectId, orchestrator, orchestratorKey, `fleet quiet with open work since ${new Date(orchestratorRecord?.idleSinceMs ?? now).toISOString()}`, true);
+          if (orchestratorRecord?.lastFleetWakeAtMs === null || orchestratorRecord?.lastFleetWakeAtMs === undefined || orchestratorRecord.lastFleetWakeAtMs < (orchestratorRecord.idleSinceMs ?? now)) {
+            await wake(projectId, orchestrator, orchestratorKey, `fleet quiet with open work since ${new Date(orchestratorRecord?.idleSinceMs ?? now).toISOString()}`, true, "fleet");
             continue;
           }
         } catch (error) {

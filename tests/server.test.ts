@@ -2353,6 +2353,26 @@ describe("bb-collab plugin boundary", () => {
     expect(await watchdogIdle.get(key)).toEqual(anchored);
   });
 
+  it("clears every watchdog wake timestamp on an explicit history reset", async () => {
+    const holder = { project_id: PROJECT_ID, role_id: "director", role_generation: 1, execution_attempt_id: "director-attempt", thread_id: "director-thread" };
+    const key = roleIdleKey(holder, WORK_ITEM_ID);
+    let state: unknown = {};
+    const ledger = createRoleIdleLedger({ read: async () => state, write: async (next) => { state = next; } });
+    await ledger.observeIdle(key, 1);
+    await ledger.recordFleetWake(key, 2);
+    await ledger.recordStaleWaitWake(key, 3);
+    await ledger.recordOwedActWake(key, 4);
+    await ledger.recordEscalation(key, 5);
+    await ledger.clearWakeHistory(`${PROJECT_ID}:`);
+    expect(await ledger.get(key)).toMatchObject({
+      idleSinceMs: null,
+      lastFleetWakeAtMs: null,
+      lastStaleWaitWakeAtMs: null,
+      lastOwedActWakeAtMs: null,
+      lastEscalationAtMs: null,
+    });
+  });
+
   it("refuses a WorkItem wait declaration whose schedule or seat waker is not live before any write", async () => {
     const host = await loadedHost();
     const db = host.bb.storage.database();
@@ -2411,6 +2431,9 @@ describe("bb-collab plugin boundary", () => {
       clock.mockReturnValue(60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       fixture.setThreadStatus("active");
+      clock.mockReturnValue(90 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      fixture.setThreadStatus("idle");
       clock.mockReturnValue(2 * 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { threadId: string }).threadId)).toEqual([
@@ -2460,6 +2483,26 @@ describe("bb-collab plugin boundary", () => {
       await addPendingReview(fixture);
       expect(applyWithFixtureReceipt(fixture.db, workItemWaitRequest(fixture.fenceToken, 3, { kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat" })).outcome).toBe("OK");
       clock.mockReturnValue(25 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "wait went stale: chase the external or re-plan" })] }),
+      ]]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("does not escalate a resolved stale wait while the fleet is busy", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 3, { kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat" }))).toMatchObject({ outcome: "OK" });
+      clock.mockReturnValue(25 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 4, null))).toMatchObject({ outcome: "OK" });
+      fixture.setThreadStatus("active");
+      clock.mockReturnValue(26 * 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
         expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "wait went stale: chase the external or re-plan" })] }),
@@ -2676,8 +2719,8 @@ describe("bb-collab plugin boundary", () => {
       await fixture.host.harness.runSchedule("fleet-watchdog");
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
-      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("fleet-watchdog.role-idle");
-      expect(Object.values(persisted ?? {}).some((record) => record.lastWakeAtMs === 60 * 60_000)).toBe(true);
+      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { lastFleetWakeAtMs?: number | null }>>("fleet-watchdog.role-idle");
+      expect(Object.values(persisted ?? {}).some((record) => record.lastFleetWakeAtMs === 60 * 60_000)).toBe(true);
     } finally {
       clock.mockRestore();
     }
@@ -2693,7 +2736,7 @@ describe("bb-collab plugin boundary", () => {
       const originalSet = fixture.host.bb.storage.kv.set.bind(fixture.host.bb.storage.kv);
       const setSpy = vi.spyOn(fixture.host.bb.storage.kv, "set").mockImplementation(async (key, value) => {
         if (key === "fleet-watchdog.role-idle" && failTimestampWrite && value && typeof value === "object" && !Array.isArray(value)
-          && Object.values(value as Record<string, { lastWakeAtMs?: number | null }>).some((record) => record.lastWakeAtMs === 60 * 60_000)) {
+          && Object.values(value as Record<string, { lastFleetWakeAtMs?: number | null }>).some((record) => record.lastFleetWakeAtMs === 60 * 60_000)) {
           failTimestampWrite = false;
           throw new Error("wake timestamp unavailable");
         }
@@ -2737,7 +2780,7 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("escalates persistent unresolved work when the director becomes active during the final interaction read", async () => {
+  it("asserts tier-2 quietness only when it is true at emit time", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
       const fixture = await fleetWatchdogFixture(0);
@@ -2755,7 +2798,8 @@ describe("bb-collab plugin boundary", () => {
       await fixture.host.harness.runSchedule("fleet-watchdog");
       clock.mockReturnValue(2 * 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([input]) => (input as { threadId: string }).threadId === fixture.directorThreadId)).toHaveLength(1);
+      expect(fixture.getThreadStatus()).toBe("active");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").some(([input]) => (input as { input: Array<{ text: string }> }).input[0]?.text === "fleet still quiet with open work since 1970-01-01T00:00:00.000Z")).toBe(false);
     } finally {
       clock.mockRestore();
     }
@@ -2788,7 +2832,7 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("retains the wake timestamp through active and idle observations", async () => {
+  it("does not escalate a prior fleet wake while any holder is active", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
       const fixture = await fleetWatchdogFixture(0);
@@ -2796,21 +2840,12 @@ describe("bb-collab plugin boundary", () => {
       await fixture.host.harness.runSchedule("fleet-watchdog");
       clock.mockReturnValue(60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      const afterSend = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("fleet-watchdog.role-idle");
-      expect(Object.values(afterSend ?? {}).some((record) => record.lastWakeAtMs === 60 * 60_000)).toBe(true);
       fixture.setThreadStatus("active");
-      expect(Object.keys(await fixture.host.bb.storage.kv.get<Record<string, unknown>>("fleet-watchdog.role-idle") ?? {}).some((key) => key.endsWith(`:${WORK_ITEM_ID}`))).toBe(true);
       clock.mockReturnValue(2 * 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      const afterActive = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("fleet-watchdog.role-idle");
-      expect(Object.values(afterActive ?? {}).some((record) => record.lastWakeAtMs === 60 * 60_000)).toBe(true);
-      clock.mockReturnValue(3 * 60 * 60_000);
-      fixture.setThreadStatus("idle");
-      await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(3);
-      clock.mockReturnValue(4 * 60 * 60_000);
-      await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(4);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "fleet quiet with open work since 1970-01-01T00:00:00.000Z" })] }),
+      ]]);
     } finally {
       clock.mockRestore();
     }
