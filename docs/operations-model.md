@@ -21,6 +21,8 @@ The role matrix reflected pre-ratification model placements from `0b6f3e54` (202
 
 Every new spawn must pass explicit provider, model, reasoning, and `visibility: "visible"` flags; remembered defaults are not evidence.
 
+The project's spawn default is `codex/gpt-5.6-sol` at MEDIUM, ruled 2026-08-18 on the GH-222 placement probe. It governs the unpinned spawn case only; a pinned dispatch follows the matrix above. Sol remains barred from grading or reviewing work of its own class, and the default does not change that. The ruling replaced a silent fallback that nobody selected (GH-149).
+
 ## Review tiers
 
 | Tier | Touched surface | Merge rule |
