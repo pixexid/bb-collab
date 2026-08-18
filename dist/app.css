@@ -138,6 +138,9 @@
     .static {
       position: static;
     }
+    .sticky {
+      position: sticky;
+    }
     .top-7 {
       top: calc(var(--spacing) * 7);
     }
