@@ -670,27 +670,39 @@ function InboxPanel(_props: PluginNavPanelProps) {
   const [projectId, setProjectId] = useState("");
   const [recipient, setRecipient] = useState<"" | OperatorMessage["recipient"]>("");
   const [messages, setMessages] = useState<readonly OperatorMessage[]>([]);
-  const [drafts, setDrafts] = useState<Record<number, string>>({});
-  const [replyingMessageId, setReplyingMessageId] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [replyingMessageKey, setReplyingMessageKey] = useState<string | null>(null);
+  const [errors, setErrors] = useState<readonly string[]>([]);
   const refreshSequence = useRef(0);
-  const project = sidebar.projects.find((candidate) => candidate.id === projectId);
+  const projects = useMemo(() => projectId ? sidebar.projects.filter((candidate) => candidate.id === projectId) : sidebar.projects, [projectId, sidebar.projects]);
+  const projectNames = useMemo(() => new Map(sidebar.projects.map((candidate) => [candidate.id, candidate.name])), [sidebar.projects]);
+  const messageKey = (message: OperatorMessage) => `${message.projectId}:${message.messageId}`;
 
   const refresh = useCallback(() => {
     const sequence = ++refreshSequence.current;
-    if (!projectId) {
+    if (projects.length === 0) {
       setMessages([]);
+      setErrors([]);
       return;
     }
-    setError(null);
-    void rpc.call("operatorMessages", { projectId, ...(recipient ? { recipient } : {}) })
-      .then((next) => { if (sequence === refreshSequence.current) setMessages(next); })
-      .catch((reason: unknown) => { if (sequence === refreshSequence.current) setError(String(reason)); });
-  }, [projectId, recipient, rpc]);
+    void Promise.allSettled(projects.map((project) => rpc.call("operatorMessages", { projectId: project.id, ...(recipient ? { recipient } : {}) })))
+      .then((results) => {
+        if (sequence !== refreshSequence.current) return;
+        const loaded: OperatorMessage[] = [];
+        const failed: string[] = [];
+        results.forEach((result, index) => {
+          if (result.status === "fulfilled") loaded.push(...result.value);
+          else failed.push(`${projects[index]!.name} (${projects[index]!.id}): ${String(result.reason)}`);
+        });
+        loaded.sort((left, right) => Number(left.readAtMs !== null) - Number(right.readAtMs !== null) || right.createdAtMs - left.createdAtMs || right.messageId - left.messageId);
+        setMessages(loaded);
+        setErrors(failed);
+      });
+  }, [projects, projectId, recipient, rpc]);
 
   useEffect(refresh, [refresh]);
 
-  const updateMessage = (next: OperatorMessage) => setMessages((current) => current.map((message) => message.messageId === next.messageId ? next : message));
+  const updateMessage = (next: OperatorMessage) => setMessages((current) => current.map((message) => messageKey(message) === messageKey(next) ? next : message));
 
   return (
     <main className="h-full overflow-y-auto p-5">
@@ -699,7 +711,7 @@ function InboxPanel(_props: PluginNavPanelProps) {
           <label className="grid gap-1 text-sm">
             <span className="text-muted-foreground">Project</span>
             <select className="rounded-md border border-border bg-background px-3 py-2" value={projectId} onChange={(event) => setProjectId(event.target.value)}>
-              <option value="">Choose a project</option>
+              <option value="">All projects</option>
               {sidebar.projects.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name} · {candidate.id}</option>)}
             </select>
           </label>
@@ -713,16 +725,17 @@ function InboxPanel(_props: PluginNavPanelProps) {
           </label>
           <button type="button" className="rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-muted hover:text-foreground" onClick={refresh}>Refresh</button>
         </div>
-        {!projectId ? <p className="text-sm text-muted-foreground">Choose a project to read its exact inbox.</p> : null}
-        {error ? <p className="text-sm text-destructive">Unable to read inbox: {error}</p> : null}
-        {projectId ? (
+        {sidebar.projects.length === 0 ? <p className="text-sm text-muted-foreground">No registered projects.</p> : null}
+        {errors.map((loadError) => <p key={loadError} className="text-sm text-destructive">Unable to read inbox: {loadError}</p>)}
+        {sidebar.projects.length > 0 ? (
           <section aria-labelledby="inbox-project-heading">
-            <h2 id="inbox-project-heading" className="mb-2 text-sm font-semibold">{project?.name ?? projectId} <span className="font-normal text-muted-foreground">{projectId}</span></h2>
+            <h2 id="inbox-project-heading" className="mb-2 text-sm font-semibold">{projectId ? `${projectNames.get(projectId) ?? projectId} · ${projectId}` : "All projects"}</h2>
             {messages.length === 0 ? <p className="text-sm text-muted-foreground">No messages for this project and recipient filter.</p> : null}
             <div className="space-y-3">
               {messages.map((message) => (
-                <article key={message.messageId} className={`rounded-lg border p-4 ${message.readAtMs === null ? "border-primary/50" : "border-border"}`}>
+                <article key={messageKey(message)} className={`rounded-lg border p-4 ${message.readAtMs === null ? "border-primary/50" : "border-border"}`}>
                   <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                    <span className="font-medium text-foreground">{projectNames.get(message.projectId) ?? message.projectId} · {message.projectId}</span>
                     <span className="font-medium text-foreground">{message.recipient}</span>
                     <span>{message.severity}</span>
                     <span>{message.senderLaneId ? `${message.senderLaneId} · ` : ""}{message.senderThreadId}</span>
@@ -733,26 +746,26 @@ function InboxPanel(_props: PluginNavPanelProps) {
                   {message.replyDeliveryError ? <p className="mb-2 text-xs text-destructive">Reply delivery failed: {message.replyDeliveryError}</p> : null}
                   {message.repliedAtMs === null ? (
                     <div className="grid gap-2">
-                      <label className="text-xs text-muted-foreground" htmlFor={`operator-reply-${message.messageId}`}>Reply</label>
+                      <label className="text-xs text-muted-foreground" htmlFor={`operator-reply-${messageKey(message)}`}>Reply</label>
                       <textarea
-                        id={`operator-reply-${message.messageId}`}
+                        id={`operator-reply-${messageKey(message)}`}
                         className="min-h-20 rounded-md border border-border bg-background p-2 text-sm"
-                        value={drafts[message.messageId] ?? message.replyText ?? ""}
-                        onChange={(event) => setDrafts((current) => ({ ...current, [message.messageId]: event.target.value }))}
+                        value={drafts[messageKey(message)] ?? message.replyText ?? ""}
+                        onChange={(event) => setDrafts((current) => ({ ...current, [messageKey(message)]: event.target.value }))}
                       />
                       <div className="flex gap-2">
-                        <button type="button" disabled={replyingMessageId !== null} className="rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground disabled:opacity-50" onClick={() => {
-                          const text = (drafts[message.messageId] ?? message.replyText ?? "").trim();
+                        <button type="button" disabled={replyingMessageKey !== null} className="rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground disabled:opacity-50" onClick={() => {
+                          const text = (drafts[messageKey(message)] ?? message.replyText ?? "").trim();
                           if (!text) return;
-                          setError(null);
-                          setReplyingMessageId(message.messageId);
+                          setErrors([]);
+                          setReplyingMessageKey(messageKey(message));
                           void rpc.call("replyToOperatorMessage", { projectId: message.projectId, messageId: message.messageId, text })
                             .then(updateMessage)
-                            .catch((reason: unknown) => setError(String(reason)))
-                            .finally(() => setReplyingMessageId(null));
-                        }}>{replyingMessageId === message.messageId ? "Delivering…" : "Reply"}</button>
+                            .catch((reason: unknown) => setErrors([String(reason)]))
+                            .finally(() => setReplyingMessageKey(null));
+                        }}>{replyingMessageKey === messageKey(message) ? "Delivering…" : "Reply"}</button>
                         {message.readAtMs === null ? <button type="button" className="rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-muted" onClick={() => {
-                          void rpc.call("markOperatorMessageRead", { projectId: message.projectId, messageId: message.messageId }).then(updateMessage).catch((reason: unknown) => setError(String(reason)));
+                          void rpc.call("markOperatorMessageRead", { projectId: message.projectId, messageId: message.messageId }).then(updateMessage).catch((reason: unknown) => setErrors([String(reason)]));
                         }}>Mark read</button> : null}
                       </div>
                     </div>
