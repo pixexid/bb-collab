@@ -272,6 +272,9 @@
     .animate-spin {
       animation: var(--animate-spin);
     }
+    .resize {
+      resize: both;
+    }
     .grid-cols-\[minmax\(0\,1fr\)_auto_auto\] {
       grid-template-columns: minmax(0,1fr) auto auto;
     }
