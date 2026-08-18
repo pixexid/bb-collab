@@ -10,9 +10,12 @@ The detailed 40-issue source disposition is in the
 ## Throughput directive order
 
 Issue #77 is the first bounded throughput slice: establish the explicit
-per-orchestrator writing-lane cap at 3 for bb-collab, preserve lower canonical
-dials, and expose parallel startable queue lanes while keeping reviews/probes
-outside the cap. It is present on current `origin/main` through merged PR #85.
+per-orchestrator writing-lane dial, preserve lower canonical configuration,
+and have seats honour that policy at dispatch while keeping reviews/probes
+outside the cap. The dial is validated at config time; no runtime path gates
+admission or queue startability against it. Enforcement ended with the
+assignment-subsystem severance recorded in [issue #192](https://github.com/pixexid/bb-collab/issues/192).
+It is present on current `origin/main` through merged PR #85.
 Issue #76 is the next bounded slice: derive Tier A/B/C from touched surfaces,
 require PR tier declarations, and keep Tier-B/C review from serializing the
 queue. Issue #78 is the next bounded slice: gate-epics are planning-only, each
@@ -94,10 +97,11 @@ automatic v17 receipt migration/write is part of this slice.
    use the exact receipt-gated unmanaged qualification-and-creation exception;
    keep leases, heartbeat expiry and automatic failover deferred.
 
-8. **Assignment and ExecutionAttempt.** Enforce one writer per lane and the
-   contract-v13 per-orchestrator `writingLaneCeiling` dial (default 3 for
-   bb-collab, lowerable only through canonical operator-authorized config),
-   exact branch/base/candidate semantics, frozen-brief digest, native BB
+8. **Assignment and ExecutionAttempt.** Preserve one-writer-per-lane policy and
+   the contract-v13 per-orchestrator `writingLaneCeiling` dial, lowerable only
+   through canonical operator-authorized config and honoured by seats at
+   dispatch time; no runtime path gates admission or queue startability against
+   it. Preserve exact branch/base/candidate semantics, frozen-brief digest, native BB
    spawn/attach, actual profile receipt, isolated environment and terminal
    DONE|BLOCKED report. Read-only reviews/probes do not consume the cap.
    Reconcile ambiguous dispatch as DISPATCH_UNKNOWN; do not blind-retry.

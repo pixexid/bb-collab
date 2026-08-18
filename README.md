@@ -73,10 +73,11 @@ allowlist amendment that adds `work_item_transition`; schema and migrations rema
 unchanged, and the existing receipt, actor, config, governor and resource guards
 remain required. Contract v13 replaces the founding hard-2 writing-lane ceiling
 with the explicit `extensions.bbCollab.writingLaneCeiling` per-orchestrator dial,
-defaulting to 3 for bb-collab. Lower values remain canonical configuration; no
-runtime path silently raises them. Read-only reviews and probes do not consume
-the writing cap, and the queue exposes up to the configured number of startable
-write lanes.
+The dial remains canonical configuration and is validated when configuration is
+accepted; seats honour it as policy at dispatch time, but no runtime path gates
+admission or queue startability against it. Enforcement ended with the
+assignment-subsystem severance recorded in [issue #192](https://github.com/pixexid/bb-collab/issues/192).
+Read-only reviews and probes do not consume the writing cap.
 
 Historical contract v13 added the schema-backed named standby profile for new
 project-orchestrator generations. The standby provider had to differ from the

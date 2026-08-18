@@ -134,7 +134,7 @@ The goals are:
 | Missing governorship | A resolver or adapter proceeds when the canonical store is unavailable | Fail closed with GOVERNOR_UNAVAILABLE or CANONICAL_STORE_UNAVAILABLE. |
 | Role succession race | Retired or non-head generation accepts a decision | Current RoleHead, active state, holder receipt and monotonic generation checks; ROLE_GENERATION_STALE. |
 | Unqualified actor | Expired, contradictory or absent qualification satisfies a role or review gate | Immutable observations and derived eligibility; ROLE_UNQUALIFIED or CAPABILITY_UNKNOWN. |
-| Duplicate writer | Two active writers share a project lane | Unique active lane check and project ceiling; LANE_WRITER_EXISTS. |
+| Duplicate writer | Two active writers share a project lane | One-writer-per-lane policy at dispatch; no runtime ceiling enforcement remains after the assignment-subsystem severance. |
 | Requested/executed confusion | Requested profile is reported as actual execution | Separate Assignment and ExecutionAttempt; EXECUTION_PROFILE_UNKNOWN or EXECUTION_PROFILE_MISMATCH. |
 | Dispatch ambiguity | Native spawn is acknowledged but start/terminal evidence is missing | DISPATCH_UNKNOWN; reconcile by native/idempotent identity and do not blind-retry. |
 | Quiet worker failure | Worker dies, hangs or quota-fails without a terminal tell | Native lifecycle and terminal receipt required; FAILED or unresolved dispatch, never success by silence. |
