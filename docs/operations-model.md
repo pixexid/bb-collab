@@ -8,14 +8,14 @@ The role matrix reflected pre-ratification model placements from `0b6f3e54` (202
 
 | Role or lane | Harness/provider | Model | Reasoning | Boundary |
 | --- | --- | --- | --- | --- |
-| Director | `pi` | `kimi-coding/k3` | HIGH | Director-only, except as a Tier-A review fallback at HIGH when Sol authored. |
+| Director | `claude-code` | `claude-opus-5[1m]` | MEDIUM | Ratified successor to `kimi-coding/k3`; k3 is barred from Tier-A review effective 2026-08-18 by operator ruling and is deprecation-bound: no new dependencies, seats, or standing duties. Current placements re-point at this successor; no in-flight non-review k3 work remained. The earlier congestion-window use of k3 was sanctioned when it ran and is not precedent; past k3 reviews were not invalidated. |
 | Orchestrator primary | Codex harness / `codex` | `gpt-5.6-sol` | MEDIUM | Never Luna or below. |
 | Orchestrator alternate | Claude harness / `claude-code` | `claude-opus-5[1m]` | MEDIUM | Standing fallback when the primary account window saturates; never Luna. |
 | Merge-bound worker | Codex harness / `codex` | `gpt-5.6-luna` | MEDIUM | Routine implementation only; LOW and hard-core implementation are prohibited for Luna. |
 | Merge-bound worker | Codex harness / `codex` or Claude harness / `claude-code` | `gpt-5.6-sol` or `claude-opus-5[1m]` | HIGH | Hard-core implementation only. |
 | Merge-bound worker | Pi harness / `pi` | `zai/glm-5.3` | MEDIUM or HIGH | The bar applies only to implementation: no implementation until a graded probe re-qualifies it; a GLM seat doing no implementation is compliant. |
 | Merge-bound worker | Codex harness / `codex` | `gpt-5.6-terra` | MEDIUM only | Merge-bound implementation is admitted by the #105 probe and the director ruling of 2026-08-18; Terra remains unqualified for orchestration. |
-| Tier-A reviewer | Codex harness / `codex` | `gpt-5.6-sol` | HIGH | Cold review is Sol HIGH; reviewer model must differ from the author and a different provider is preferred. If Sol authored, use `claude-code/claude-opus-5[1m]` MEDIUM or `kimi-coding/k3` HIGH. |
+| Tier-A reviewer | Codex harness / `codex` | `gpt-5.6-sol` | HIGH | Cold review is Sol HIGH; reviewer model must differ from the author and a different provider is preferred. If Sol authored, the only remaining non-rival reviewer is `claude-code/claude-opus-5[1m]` MEDIUM. That provider returned repeated overload errors on 2026-08-18; if this review dies on provider congestion, re-route to Tier B for a post-merge review by `gpt-5.6-luna` at MEDIUM, a different model and class that cannot have authored the work, and condition the merge explicitly on that verdict. This holds until a third non-rival is qualified for review-class work. |
 | Tier-B reviewer | Codex harness / `codex` | `gpt-5.6-luna` | MEDIUM | Never the author’s model. |
 | Mechanical subagent | Codex harness / `codex` | `gpt-5.6-luna` | LOW | Fixtures, sweeps, doc sync, and scaffolds only; artifact scope controls legality, not the spawn label. |
 
