@@ -124,12 +124,65 @@ describe("replacement thread list", () => {
       rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages } as never,
     });
 
-    expect(operatorMessages).not.toHaveBeenCalled();
+    await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a" }));
     fireEvent.change(rendered.getByLabelText("Project"), { target: { value: "project-a" } });
     await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a" }));
     expect(rendered.getByText("Need an answer")).toBeTruthy();
     expect(rendered.getByText(/Reply delivery failed: environment deleted/)).toBeTruthy();
-    expect(rendered.getByRole("heading", { name: /Project A project-a/ })).toBeTruthy();
+    expect(rendered.getByRole("heading", { name: /Project A · project-a/ })).toBeTruthy();
+  });
+
+  it("aggregates every project by default, sorts unread first, and filters by project", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const messages = {
+      "project-a": [{ messageId: 1, projectId: "project-a", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "read A", createdAtMs: 30, readAtMs: 40, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null }],
+      "project-b": [{ messageId: 2, projectId: "project-b", recipient: "operator" as const, senderThreadId: "b", senderLaneId: null, severity: "urgent" as const, text: "unread B", createdAtMs: 20, readAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null }],
+    };
+    const operatorMessages = vi.fn(async ({ projectId }: { projectId: string }) => messages[projectId as keyof typeof messages] ?? []);
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A"), project("project-b", "Project B")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("unread B")).toBeTruthy());
+    expect(operatorMessages).toHaveBeenCalledTimes(2);
+    expect(Array.from(rendered.container.querySelectorAll("article p.my-3")).map((row) => row.textContent)).toEqual(["unread B", "read A"]);
+    expect(rendered.getAllByText("Project B · project-b").length).toBeGreaterThan(1);
+    fireEvent.change(rendered.getByLabelText("Project"), { target: { value: "project-a" } });
+    await waitFor(() => expect(rendered.queryByText("unread B")).toBeNull());
+    expect(rendered.getByText("read A")).toBeTruthy();
+  });
+
+  it("keeps loaded messages visible when another project read fails", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const operatorMessages = vi.fn(async ({ projectId }: { projectId: string }) => {
+      if (projectId === "project-b") throw new Error("project unavailable");
+      return [{ messageId: 3, projectId, recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "loaded A", createdAtMs: 1, readAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null }];
+    });
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A"), project("project-b", "Project B")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("loaded A")).toBeTruthy());
+    expect(rendered.getByText(/Unable to read inbox: Project B \(project-b\): Error: project unavailable/)).toBeTruthy();
+  });
+
+  it("discloses and caps the aggregate display spill", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const messages = Array.from({ length: 257 }, (_, index) => ({ messageId: index + 1, projectId: "project-a", recipient: "operator" as const, senderThreadId: "sender", senderLaneId: null, severity: "routine" as const, text: `message ${index + 1}`, createdAtMs: 257 - index, readAtMs: 1, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null }));
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => messages } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("message 1")).toBeTruthy());
+    expect(rendered.container.querySelectorAll("article")).toHaveLength(256);
+    expect(rendered.getByText("Showing the first 256 of 257 messages; unread messages are first. Select a project to narrow the list.")).toBeTruthy();
+    expect(rendered.queryByText("message 257")).toBeNull();
   });
 
   it("groups by stable project id and limits each project to five recent threads", async () => {

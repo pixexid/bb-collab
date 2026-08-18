@@ -140,6 +140,7 @@ function age(ms) {
   return `${Math.floor(hours / 24)}d`;
 }
 var MAX_VISIBLE_THREADS = 5;
+var MAX_VISIBLE_INBOX_MESSAGES = 256;
 var SIDEBAR_RPC_BATCH_SIZE = 256;
 function sidebarRpcBatches(ids) {
   const batches = [];
@@ -684,31 +685,41 @@ function InboxPanel(_props) {
   const [recipient, setRecipient] = useState("");
   const [messages, setMessages] = useState([]);
   const [drafts, setDrafts] = useState({});
-  const [replyingMessageId, setReplyingMessageId] = useState(null);
-  const [error, setError] = useState(null);
+  const [replyingMessageKey, setReplyingMessageKey] = useState(null);
+  const [errors, setErrors] = useState([]);
   const refreshSequence = useRef(0);
-  const project = sidebar.projects.find((candidate) => candidate.id === projectId);
+  const projects = useMemo(() => projectId ? sidebar.projects.filter((candidate) => candidate.id === projectId) : sidebar.projects, [projectId, sidebar.projects]);
+  const projectNames = useMemo(() => new Map(sidebar.projects.map((candidate) => [candidate.id, candidate.name])), [sidebar.projects]);
+  const messageKey = (message) => `${message.projectId}:${message.messageId}`;
+  const visibleMessages = messages.slice(0, MAX_VISIBLE_INBOX_MESSAGES);
   const refresh = useCallback(() => {
     const sequence = ++refreshSequence.current;
-    if (!projectId) {
+    if (projects.length === 0) {
       setMessages([]);
+      setErrors([]);
       return;
     }
-    setError(null);
-    void rpc.call("operatorMessages", { projectId, ...recipient ? { recipient } : {} }).then((next) => {
-      if (sequence === refreshSequence.current) setMessages(next);
-    }).catch((reason) => {
-      if (sequence === refreshSequence.current) setError(String(reason));
+    void Promise.allSettled(projects.map((project) => rpc.call("operatorMessages", { projectId: project.id, ...recipient ? { recipient } : {} }))).then((results) => {
+      if (sequence !== refreshSequence.current) return;
+      const loaded = [];
+      const failed = [];
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled") loaded.push(...result.value);
+        else failed.push(`${projects[index].name} (${projects[index].id}): ${String(result.reason)}`);
+      });
+      loaded.sort((left, right) => Number(left.readAtMs !== null) - Number(right.readAtMs !== null) || right.createdAtMs - left.createdAtMs || right.messageId - left.messageId);
+      setMessages(loaded);
+      setErrors(failed);
     });
-  }, [projectId, recipient, rpc]);
+  }, [projects, projectId, recipient, rpc]);
   useEffect(refresh, [refresh]);
-  const updateMessage = (next) => setMessages((current) => current.map((message) => message.messageId === next.messageId ? next : message));
+  const updateMessage = (next) => setMessages((current) => current.map((message) => messageKey(message) === messageKey(next) ? next : message));
   return /* @__PURE__ */ jsx("main", { className: "h-full overflow-y-auto p-5", children: /* @__PURE__ */ jsxs("div", { className: "mx-auto max-w-4xl", children: [
     /* @__PURE__ */ jsxs("div", { className: "mb-5 flex flex-wrap items-end gap-3", children: [
       /* @__PURE__ */ jsxs("label", { className: "grid gap-1 text-sm", children: [
         /* @__PURE__ */ jsx("span", { className: "text-muted-foreground", children: "Project" }),
         /* @__PURE__ */ jsxs("select", { className: "rounded-md border border-border bg-background px-3 py-2", value: projectId, onChange: (event) => setProjectId(event.target.value), children: [
-          /* @__PURE__ */ jsx("option", { value: "", children: "Choose a project" }),
+          /* @__PURE__ */ jsx("option", { value: "", children: "All projects" }),
           sidebar.projects.map((candidate) => /* @__PURE__ */ jsxs("option", { value: candidate.id, children: [
             candidate.name,
             " \xB7 ",
@@ -726,20 +737,28 @@ function InboxPanel(_props) {
       ] }),
       /* @__PURE__ */ jsx("button", { type: "button", className: "rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-muted hover:text-foreground", onClick: refresh, children: "Refresh" })
     ] }),
-    !projectId ? /* @__PURE__ */ jsx("p", { className: "text-sm text-muted-foreground", children: "Choose a project to read its exact inbox." }) : null,
-    error ? /* @__PURE__ */ jsxs("p", { className: "text-sm text-destructive", children: [
+    sidebar.projects.length === 0 ? /* @__PURE__ */ jsx("p", { className: "text-sm text-muted-foreground", children: "No registered projects." }) : null,
+    errors.map((loadError) => /* @__PURE__ */ jsxs("p", { className: "text-sm text-destructive", children: [
       "Unable to read inbox: ",
-      error
-    ] }) : null,
-    projectId ? /* @__PURE__ */ jsxs("section", { "aria-labelledby": "inbox-project-heading", children: [
-      /* @__PURE__ */ jsxs("h2", { id: "inbox-project-heading", className: "mb-2 text-sm font-semibold", children: [
-        project?.name ?? projectId,
-        " ",
-        /* @__PURE__ */ jsx("span", { className: "font-normal text-muted-foreground", children: projectId })
-      ] }),
+      loadError
+    ] }, loadError)),
+    sidebar.projects.length > 0 ? /* @__PURE__ */ jsxs("section", { "aria-labelledby": "inbox-project-heading", children: [
+      /* @__PURE__ */ jsx("h2", { id: "inbox-project-heading", className: "mb-2 text-sm font-semibold", children: projectId ? `${projectNames.get(projectId) ?? projectId} \xB7 ${projectId}` : "All projects" }),
       messages.length === 0 ? /* @__PURE__ */ jsx("p", { className: "text-sm text-muted-foreground", children: "No messages for this project and recipient filter." }) : null,
-      /* @__PURE__ */ jsx("div", { className: "space-y-3", children: messages.map((message) => /* @__PURE__ */ jsxs("article", { className: `rounded-lg border p-4 ${message.readAtMs === null ? "border-primary/50" : "border-border"}`, children: [
+      messages.length > MAX_VISIBLE_INBOX_MESSAGES ? /* @__PURE__ */ jsxs("p", { className: "mb-3 text-sm text-muted-foreground", children: [
+        "Showing the first ",
+        MAX_VISIBLE_INBOX_MESSAGES,
+        " of ",
+        messages.length,
+        " messages; unread messages are first. Select a project to narrow the list."
+      ] }) : null,
+      /* @__PURE__ */ jsx("div", { className: "space-y-3", children: visibleMessages.map((message) => /* @__PURE__ */ jsxs("article", { className: `rounded-lg border p-4 ${message.readAtMs === null ? "border-primary/50" : "border-border"}`, children: [
         /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-center gap-2 text-xs text-muted-foreground", children: [
+          /* @__PURE__ */ jsxs("span", { className: "font-medium text-foreground", children: [
+            projectNames.get(message.projectId) ?? message.projectId,
+            " \xB7 ",
+            message.projectId
+          ] }),
           /* @__PURE__ */ jsx("span", { className: "font-medium text-foreground", children: message.recipient }),
           /* @__PURE__ */ jsx("span", { children: message.severity }),
           /* @__PURE__ */ jsxs("span", { children: [
@@ -758,33 +777,33 @@ function InboxPanel(_props) {
           message.replyDeliveryError
         ] }) : null,
         message.repliedAtMs === null ? /* @__PURE__ */ jsxs("div", { className: "grid gap-2", children: [
-          /* @__PURE__ */ jsx("label", { className: "text-xs text-muted-foreground", htmlFor: `operator-reply-${message.messageId}`, children: "Reply" }),
+          /* @__PURE__ */ jsx("label", { className: "text-xs text-muted-foreground", htmlFor: `operator-reply-${messageKey(message)}`, children: "Reply" }),
           /* @__PURE__ */ jsx(
             "textarea",
             {
-              id: `operator-reply-${message.messageId}`,
+              id: `operator-reply-${messageKey(message)}`,
               className: "min-h-20 rounded-md border border-border bg-background p-2 text-sm",
-              value: drafts[message.messageId] ?? message.replyText ?? "",
-              onChange: (event) => setDrafts((current) => ({ ...current, [message.messageId]: event.target.value }))
+              value: drafts[messageKey(message)] ?? message.replyText ?? "",
+              onChange: (event) => setDrafts((current) => ({ ...current, [messageKey(message)]: event.target.value }))
             }
           ),
           /* @__PURE__ */ jsxs("div", { className: "flex gap-2", children: [
-            /* @__PURE__ */ jsx("button", { type: "button", disabled: replyingMessageId !== null, className: "rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground disabled:opacity-50", onClick: () => {
-              const text = (drafts[message.messageId] ?? message.replyText ?? "").trim();
+            /* @__PURE__ */ jsx("button", { type: "button", disabled: replyingMessageKey !== null, className: "rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground disabled:opacity-50", onClick: () => {
+              const text = (drafts[messageKey(message)] ?? message.replyText ?? "").trim();
               if (!text) return;
-              setError(null);
-              setReplyingMessageId(message.messageId);
-              void rpc.call("replyToOperatorMessage", { projectId: message.projectId, messageId: message.messageId, text }).then(updateMessage).catch((reason) => setError(String(reason))).finally(() => setReplyingMessageId(null));
-            }, children: replyingMessageId === message.messageId ? "Delivering\u2026" : "Reply" }),
+              setErrors([]);
+              setReplyingMessageKey(messageKey(message));
+              void rpc.call("replyToOperatorMessage", { projectId: message.projectId, messageId: message.messageId, text }).then(updateMessage).catch((reason) => setErrors([String(reason)])).finally(() => setReplyingMessageKey(null));
+            }, children: replyingMessageKey === messageKey(message) ? "Delivering\u2026" : "Reply" }),
             message.readAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", className: "rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-muted", onClick: () => {
-              void rpc.call("markOperatorMessageRead", { projectId: message.projectId, messageId: message.messageId }).then(updateMessage).catch((reason) => setError(String(reason)));
+              void rpc.call("markOperatorMessageRead", { projectId: message.projectId, messageId: message.messageId }).then(updateMessage).catch((reason) => setErrors([String(reason)]));
             }, children: "Mark read" }) : null
           ] })
         ] }) : /* @__PURE__ */ jsxs("p", { className: "text-sm text-muted-foreground", children: [
           "Reply delivered: ",
           message.replyText
         ] })
-      ] }, message.messageId)) })
+      ] }, messageKey(message))) })
     ] }) : null
   ] }) });
 }
