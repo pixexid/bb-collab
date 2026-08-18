@@ -86,6 +86,14 @@ Before writing a coordination rule or a line of coordination code, enumerate wha
 
 Check what is already assigned before dispatching. Keeping the fleet busy is not a reason to open a second writer on a surface someone already holds; an idle seat is cheaper than duplicated work.
 
+## Off-matrix work stands on its evidence
+
+> Finished, reviewed, green work stands on its evidence and is never re-run for provenance alone. The provenance deviation is recorded in the pull-request body as it merged.
+
+Discovering that a lane ran on an unratified model, or at the wrong reasoning level, does not retroactively make its output wrong. Re-running it would cost real work to buy a receipt, and the receipt would say nothing the review and the tests do not already say. Record what actually executed, and judge the work by what it produced.
+
+This cuts the other way too. "It worked out" is not ratification, and a good outcome from an unplaced model is evidence for a probe to weigh, never a substitute for one.
+
 ## Blast radius
 
 > Every decision sweeps its own blast radius in the same act. Open issues, open PRs, and queued lane specs are caches of older decisions; a decision changing an artifact’s existence, owner, shape, or terminology invalidates them silently. Each affected item gets a one-line update or closure at decision time, not when someone trips over it. A sweep that names artifacts reads them; relayed labels are unverified by definition.
