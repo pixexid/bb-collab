@@ -44,7 +44,7 @@ When you send another seat a blocking question, set the watch in the same act: r
 
 Intake is not a thing you do when you think of it. It fires on every wake, and the check is two counts: `startable > 0 AND lanes < cap`. If both hold, the fleet is in a defect state and the wake's first act is a dispatch. Labels are queue truth; an unlabelled issue is not in the queue, so labelling is part of filing.
 
-Silence proves nothing here. On 2026-08-18 the fleet sat idle for four and a half hours with eighteen startable issues, zero lanes, and six hourly watchdog cycles that were all correctly quiet — the ledger was all-terminal, so the watchdog had nothing to see. The state was found by the operator. A mechanism that only watches declared work cannot detect work nobody has declared yet, which is why the check belongs to the seat and not only to the timer.
+Silence proves nothing here. On 2026-08-18 the fleet sat idle for about six hours, silent for the last four and a half, with eighteen startable issues, zero lanes, and six hourly watchdog cycles that were all correctly quiet — the ledger was all-terminal, so the watchdog had nothing to see. The state was found by the operator. A mechanism that only watches declared work cannot detect work nobody has declared yet, which is why the check belongs to the seat and not only to the timer.
 
 Free capacity is a ceiling, not a quota. Dispatching a colliding lane to reach the cap breaks [one writer per lane](#one-writer-per-lane), and that rule wins: an idle seat is cheaper than two writers on one surface. When capacity is free but every remaining item collides, that is the no-dispatch reason — say it.
 
