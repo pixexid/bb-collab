@@ -140,6 +140,12 @@ function age(ms) {
   return `${Math.floor(hours / 24)}d`;
 }
 var MAX_VISIBLE_THREADS = 5;
+var SIDEBAR_RPC_BATCH_SIZE = 256;
+function sidebarRpcBatches(ids) {
+  const batches = [];
+  for (let index = 0; index < ids.length; index += SIDEBAR_RPC_BATCH_SIZE) batches.push(ids.slice(index, index + SIDEBAR_RPC_BATCH_SIZE));
+  return batches;
+}
 var RUNNING_INDICATORS = /* @__PURE__ */ new Set([
   "working-draft",
   "workflow",
@@ -491,13 +497,15 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
   const projectIdsKey = projectIds.join("\0");
   useEffect(() => {
     let mounted = true;
-    void rpc.call("threadStates", { threadIds }).then((states) => {
-      if (mounted) setCustomStates(states);
+    void Promise.all(sidebarRpcBatches(threadIds).map((batch) => rpc.call("threadStates", { threadIds: batch }))).then((states) => {
+      const merged = Object.assign({}, ...states);
+      if (mounted) setCustomStates(merged);
     }).catch(() => {
       if (mounted) setCustomStates({});
     });
-    void rpc.call("threadModels", { threadIds }).then((models) => {
-      if (mounted) setThreadModels(models);
+    void Promise.all(sidebarRpcBatches(threadIds).map((batch) => rpc.call("threadModels", { threadIds: batch }))).then((models) => {
+      const merged = Object.assign({}, ...models);
+      if (mounted) setThreadModels(merged);
     }).catch(() => {
       if (mounted) setThreadModels(Object.fromEntries(threadIds.map((threadId) => [threadId, null])));
     });
@@ -507,7 +515,16 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
   }, [rpc, threadIdsKey]);
   useEffect(() => {
     let mounted = true;
-    void rpc.call("sidebarCollapseState", { projectIds, threadIds }).then((state) => {
+    const projectBatches = sidebarRpcBatches(projectIds);
+    const threadBatches = sidebarRpcBatches(threadIds);
+    void Promise.all(Array.from({ length: Math.max(projectBatches.length, threadBatches.length) }, (_, index) => rpc.call("sidebarCollapseState", {
+      projectIds: projectBatches[index] ?? [],
+      threadIds: threadBatches[index] ?? []
+    }))).then((states) => {
+      const state = {
+        projects: Object.assign({}, ...states.map((result) => result.projects)),
+        threads: Object.assign({}, ...states.map((result) => result.threads))
+      };
       if (!mounted) return;
       setCollapsedProjects(collapseMap(state.projects));
       setCollapsedThreads(collapseMap(state.threads));
@@ -844,6 +861,7 @@ export {
   laneQueueLabel,
   reasoningLetter,
   shortModelName,
+  sidebarRpcBatches,
   signalDotClasses,
   threadSignal
 };

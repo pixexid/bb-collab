@@ -624,4 +624,56 @@ describe("replacement thread list", () => {
     await host.harness.callRpc("reorderPinned", { threadId: "thread-1", previousThreadId: null, nextThreadId: "thread-2" });
     expect(reorderPinned).toHaveBeenCalledWith({ threadId: "thread-1", previousThreadId: null, nextThreadId: "thread-2" });
   });
+
+  it("accepts the live sidebar population across every batched RPC input", async () => {
+    const host = createFakePluginHost({ pluginId: "bb-collab" });
+    await plugin(host.bb);
+    const { sidebarRpcBatches } = await import("../app");
+    const threadIds = Array.from({ length: 829 }, (_, index) => `thread-${index}`);
+    const projectIds = Array.from({ length: 829 }, (_, index) => `project-${index}`);
+    const threadBatches = sidebarRpcBatches(threadIds);
+    const projectBatches = sidebarRpcBatches(projectIds);
+
+    expect(threadBatches.map((batch) => batch.length)).toEqual([256, 256, 256, 61]);
+    expect(projectBatches.map((batch) => batch.length)).toEqual([256, 256, 256, 61]);
+    await expect(Promise.all(threadBatches.map((batch) => host.harness.callRpc("threadStates", { threadIds: batch })))).resolves.toEqual([{}, {}, {}, {}]);
+    await expect(Promise.all(threadBatches.map((batch) => host.harness.callRpc("threadModels", { threadIds: batch })))).resolves.toEqual(threadBatches.map((batch) => Object.fromEntries(batch.map((id) => [id, null]))));
+    await expect(Promise.all(projectBatches.map((batch, index) => host.harness.callRpc("sidebarCollapseState", { projectIds: batch, threadIds: threadBatches[index] })))).resolves.toEqual(projectBatches.map(() => ({ projects: {}, threads: {} })));
+  });
+
+  it("batches SidebarThreadList RPCs and renders merged responses", async () => {
+    const list = await registration();
+    const calls = { threadStates: [] as string[][], threadModels: [] as string[][], collapse: [] as Array<{ projectIds: string[]; threadIds: string[] }> };
+    const threads = Array.from({ length: 829 }, (_, index) => thread(`thread-${index}`, "project-a", index + 1));
+    const rpc = {
+      ...(rpcHandlers() as unknown as Record<string, unknown>),
+      threadStates: async ({ threadIds }: { threadIds: string[] }) => {
+        calls.threadStates.push(threadIds);
+        return threadIds.includes("thread-828") ? { "thread-828": "review" } : {};
+      },
+      threadModels: async ({ threadIds }: { threadIds: string[] }) => {
+        calls.threadModels.push(threadIds);
+        return threadIds.includes("thread-828") ? { "thread-828": { model: "merged-model", reasoning: "high" } } : {};
+      },
+      sidebarCollapseState: async ({ projectIds, threadIds }: { projectIds: string[]; threadIds: string[] }) => {
+        calls.collapse.push({ projectIds, threadIds });
+        return { projects: {}, threads: {} };
+      },
+    } as never;
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads },
+      rpc,
+    });
+
+    await waitFor(() => {
+      expect(calls.threadStates.length).toBe(4);
+      expect(calls.threadModels.length).toBe(4);
+      expect(calls.collapse.length).toBe(4);
+      expect(calls.threadStates.every((batch) => batch.length <= 256)).toBe(true);
+      expect(calls.threadModels.every((batch) => batch.length <= 256)).toBe(true);
+      expect(calls.collapse.every(({ projectIds, threadIds }) => projectIds.length <= 256 && threadIds.length <= 256)).toBe(true);
+      expect(rendered.getByText("review")).toBeTruthy();
+      expect(rendered.getByLabelText("codex · model merged-model · reasoning high")).toBeTruthy();
+    });
+  });
 });

@@ -30,6 +30,14 @@ function age(ms: number): string {
 }
 
 const MAX_VISIBLE_THREADS = 5;
+const SIDEBAR_RPC_BATCH_SIZE = 256;
+
+export function sidebarRpcBatches(ids: readonly string[]): string[][] {
+  const batches: string[][] = [];
+  for (let index = 0; index < ids.length; index += SIDEBAR_RPC_BATCH_SIZE) batches.push(ids.slice(index, index + SIDEBAR_RPC_BATCH_SIZE));
+  return batches;
+}
+
 const RUNNING_INDICATORS = new Set<PluginSidebarThread["indicator"]>([
   "working-draft",
   "workflow",
@@ -451,13 +459,15 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
 
   useEffect(() => {
     let mounted = true;
-    void rpc.call("threadStates", { threadIds }).then((states) => {
-      if (mounted) setCustomStates(states);
+    void Promise.all(sidebarRpcBatches(threadIds).map((batch) => rpc.call("threadStates", { threadIds: batch }))).then((states) => {
+      const merged = Object.assign({}, ...states);
+      if (mounted) setCustomStates(merged);
     }).catch(() => {
       if (mounted) setCustomStates({});
     });
-    void rpc.call("threadModels", { threadIds }).then((models) => {
-      if (mounted) setThreadModels(models);
+    void Promise.all(sidebarRpcBatches(threadIds).map((batch) => rpc.call("threadModels", { threadIds: batch }))).then((models) => {
+      const merged = Object.assign({}, ...models);
+      if (mounted) setThreadModels(merged);
     }).catch(() => {
       if (mounted) setThreadModels(Object.fromEntries(threadIds.map((threadId) => [threadId, null])));
     });
@@ -468,7 +478,16 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
 
   useEffect(() => {
     let mounted = true;
-    void rpc.call("sidebarCollapseState", { projectIds, threadIds }).then((state: SidebarCollapseState) => {
+    const projectBatches = sidebarRpcBatches(projectIds);
+    const threadBatches = sidebarRpcBatches(threadIds);
+    void Promise.all(Array.from({ length: Math.max(projectBatches.length, threadBatches.length) }, (_, index) => rpc.call("sidebarCollapseState", {
+      projectIds: projectBatches[index] ?? [],
+      threadIds: threadBatches[index] ?? [],
+    }))).then((states) => {
+      const state: SidebarCollapseState = {
+        projects: Object.assign({}, ...states.map((result) => result.projects)),
+        threads: Object.assign({}, ...states.map((result) => result.threads)),
+      };
       if (!mounted) return;
       setCollapsedProjects(collapseMap(state.projects));
       setCollapsedThreads(collapseMap(state.threads));
