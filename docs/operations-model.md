@@ -2,20 +2,24 @@
 
 This is the canonical role and review matrix. It describes operating choices, not a second authority store; the decision hierarchy is in the role pages.
 
+The role matrix reflected pre-ratification model placements from `0b6f3e54` (2026-08-15 22:22:46 -0700) through 2026-08-18; this projection now records the ratified policy.
+
 ## Role matrix
 
 | Role or lane | Harness/provider | Model | Reasoning | Boundary |
 | --- | --- | --- | --- | --- |
-| Director | `pi` | `kimi-coding/k3` | HIGH | Director-only; never a review fallback. |
-| Orchestrator primary | Claude harness / `claude-code` | `claude-opus-5` | MEDIUM | Never Luna or below. |
-| Orchestrator alternate | Codex harness / `codex` | `gpt-5.6-sol` | MEDIUM | Standing fallback when the primary account window saturates. |
-| Orchestrator alternate | Codex harness / `codex` | `gpt-5.6-terra` | MEDIUM | Alternate; never Luna or below. |
-| Merge-bound worker | Codex harness / `codex` | `gpt-5.6-luna` | MEDIUM or HIGH | Luna is admitted at MEDIUM or above; LOW is prohibited. |
-| Merge-bound worker | Pi harness / `pi` | `zai/glm-5.3` | MEDIUM or HIGH | Admitted at MEDIUM or above. |
-| Merge-bound worker | Codex harness / `codex` | `gpt-5.6-terra` | MEDIUM or HIGH | Hard work uses `codex/gpt-5.6-sol` HIGH or `claude-code/claude-opus-5` HIGH. |
-| Tier-A reviewer | Codex harness / `codex` | `gpt-5.6-sol` | HIGH | `gpt-5.6-terra` HIGH is acceptable when Sol authored; never the author’s model. |
+| Director | `pi` | `kimi-coding/k3` | HIGH | Director-only, except as a Tier-A review fallback at HIGH when Sol authored. |
+| Orchestrator primary | Codex harness / `codex` | `gpt-5.6-sol` | MEDIUM | Never Luna or below. |
+| Orchestrator alternate | Claude harness / `claude-code` | `claude-opus-5[1m]` | MEDIUM | Standing fallback when the primary account window saturates; never Luna. |
+| Merge-bound worker | Codex harness / `codex` | `gpt-5.6-luna` | MEDIUM | Routine implementation only; LOW and hard-core implementation are prohibited for Luna. |
+| Merge-bound worker | Codex harness / `codex` or Claude harness / `claude-code` | `gpt-5.6-sol` or `claude-opus-5[1m]` | HIGH | Hard-core implementation only. |
+| Merge-bound worker | Pi harness / `pi` | `zai/glm-5.3` | MEDIUM or HIGH | The bar applies only to implementation: no implementation until a graded probe re-qualifies it; a GLM seat doing no implementation is compliant. |
+| Merge-bound worker | Codex harness / `codex` | `gpt-5.6-terra` | MEDIUM only | Merge-bound implementation is admitted by the #105 probe and the director ruling of 2026-08-18; Terra remains unqualified for orchestration. |
+| Tier-A reviewer | Codex harness / `codex` | `gpt-5.6-sol` | HIGH | Cold review is Sol HIGH; reviewer model must differ from the author and a different provider is preferred. If Sol authored, use `claude-code/claude-opus-5[1m]` MEDIUM or `kimi-coding/k3` HIGH. |
 | Tier-B reviewer | Codex harness / `codex` | `gpt-5.6-luna` | MEDIUM | Never the author’s model. |
-| Mechanical subagent | Codex harness / `codex` | `gpt-5.6-luna` | LOW | Fixtures, sweeps, doc sync, and scaffolds only. |
+| Mechanical subagent | Codex harness / `codex` | `gpt-5.6-luna` | LOW | Fixtures, sweeps, doc sync, and scaffolds only; artifact scope controls legality, not the spawn label. |
+
+Every new spawn must pass explicit provider, model, reasoning, and `visibility: "visible"` flags; remembered defaults are not evidence.
 
 ## Review tiers
 
