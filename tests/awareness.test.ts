@@ -5,10 +5,8 @@ import {
   createContinuationLedger,
   createLaneWatcher,
   createWaitRegistry,
-  openLaneViews,
   type OperatorWait,
   type RegisteredWait,
-  readLaneStates,
   readRoleHolderStates,
   type RoleHolderState,
   type RoleIdleView,
@@ -64,94 +62,7 @@ function registeredWait(overrides: Partial<RegisteredWait> = {}): RegisteredWait
   };
 }
 
-function laneConfig(db: Database.Database, writingLaneCeiling = 3) {
-  db.exec("CREATE TABLE project_config_revisions (project_id TEXT, config_revision INTEGER, canonical_config_json TEXT)");
-  db.exec("CREATE TABLE project_config_heads (project_id TEXT, config_revision INTEGER)");
-  db.prepare("INSERT INTO project_config_revisions VALUES (?, ?, ?)").run("project-1", 1, JSON.stringify({ extensions: { bbCollab: { writingLaneCeiling } } }));
-  db.prepare("INSERT INTO project_config_heads VALUES (?, ?)").run("project-1", 1);
-}
-
 describe("lane awareness", () => {
-  it("does not let an awaiting operator lane block the next startable lane", () => {
-    const db = new Database(":memory:");
-    db.exec("CREATE TABLE assignments (project_id TEXT, assignment_id TEXT, lane_id TEXT, assignment_kind TEXT, work_item_id TEXT, created_at_ms INTEGER)");
-    db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT)");
-    laneConfig(db, 2);
-    db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", "deferred", "lane-deferred", "write", "work-deferred", 1);
-    db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", "ready", "lane-ready", "write", "work-ready", 2);
-    db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?)").run("project-1", "deferred", "worker-deferred", "attempt-deferred", "assignment", "prepared", null);
-    db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?)").run("project-1", "ready", "worker-ready", "attempt-ready", "assignment", "prepared", null);
-
-    const views = openLaneViews(db, 1_000, new Map<string, OperatorWait>([
-      ["worker-deferred", { reason: "awaiting_operator", createdAtMs: 900 }],
-    ]));
-
-    expect(views[0]).toMatchObject({
-      laneId: "lane-deferred",
-      queueState: "deferred",
-      queueBlocked: false,
-      nextStartable: false,
-      deferredReason: "awaiting_operator",
-      deferredAtMs: 900,
-      deferredAgeMs: 100,
-    });
-    expect(views[1]).toMatchObject({ laneId: "lane-ready", queueBlocked: false, nextStartable: true });
-    db.prepare("UPDATE project_config_revisions SET canonical_config_json = ?").run(JSON.stringify({ extensions: { bbCollab: { writingLaneCeiling: 1 } } }));
-    expect(openLaneViews(db, 1_000, new Map<string, OperatorWait>([
-      ["worker-deferred", { reason: "awaiting_operator", createdAtMs: 900 }],
-    ]))[1]).toMatchObject({ laneId: "lane-ready", queueBlocked: true, nextStartable: false });
-    db.close();
-  });
-
-  it("marks three writing lanes startable, blocks the fourth, and leaves read-only work outside the cap", () => {
-    const db = new Database(":memory:");
-    db.exec("CREATE TABLE assignments (project_id TEXT, assignment_id TEXT, lane_id TEXT, assignment_kind TEXT, work_item_id TEXT, created_at_ms INTEGER)");
-    db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT)");
-    db.exec("CREATE TABLE tasks (id TEXT); CREATE TABLE threads (id TEXT)");
-    db.prepare("INSERT INTO tasks VALUES ('raw-task-1'), ('raw-task-2'), ('raw-task-3'), ('raw-task-4')").run();
-    db.prepare("INSERT INTO threads VALUES ('raw-thread-1'), ('raw-thread-2'), ('raw-thread-3'), ('raw-thread-4')").run();
-    laneConfig(db);
-    const add = (assignmentId: string, kind: string, state: string, createdAtMs: number) => {
-      db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", assignmentId, `lane-${assignmentId}`, kind, `work-${assignmentId}`, createdAtMs);
-      db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?)").run("project-1", assignmentId, `thread-${assignmentId}`, `attempt-${assignmentId}`, "assignment", state, null);
-    };
-    add("write-1", "write", "prepared", 1);
-    add("write-2", "write", "prepared", 2);
-    add("write-3", "write", "prepared", 3);
-    add("write-4", "write", "prepared", 4);
-    add("review", "review", "prepared", 5);
-
-    expect(openLaneViews(db).map((view) => [view.assignmentId, view.nextStartable, view.queueBlocked])).toEqual([
-      ["write-1", true, false],
-      ["write-2", true, false],
-      ["write-3", true, false],
-      ["write-4", false, true],
-      ["review", true, false],
-    ]);
-    db.close();
-  });
-
-  it("keeps a full writing cap from blocking a read-only lane and respects a lower dial", () => {
-    const db = new Database(":memory:");
-    db.exec("CREATE TABLE assignments (project_id TEXT, assignment_id TEXT, lane_id TEXT, assignment_kind TEXT, work_item_id TEXT, created_at_ms INTEGER)");
-    db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT)");
-    laneConfig(db, 1);
-    const add = (assignmentId: string, kind: string, state: string, createdAtMs: number) => {
-      db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", assignmentId, `lane-${assignmentId}`, kind, `work-${assignmentId}`, createdAtMs);
-      db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?)").run("project-1", assignmentId, `thread-${assignmentId}`, `attempt-${assignmentId}`, "assignment", state, null);
-    };
-    add("running", "write", "running", 1);
-    add("queued-write", "write", "prepared", 2);
-    add("queued-review", "review", "prepared", 3);
-
-    expect(openLaneViews(db).map((view) => [view.assignmentId, view.nextStartable, view.queueBlocked])).toEqual([
-      ["running", false, false],
-      ["queued-write", false, true],
-      ["queued-review", true, false],
-    ]);
-    db.close();
-  });
-
   it("detects only a startable, non-deferred queue for a role", async () => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     let scopes = [roleScope(null, "awaiting_operator")];
@@ -934,54 +845,17 @@ describe("lane awareness", () => {
     await first;
   });
 
-  it("keeps the read seam SQLite-backed", () => {
-    const db = new Database(":memory:");
-    db.exec("CREATE TABLE assignments (project_id TEXT, assignment_id TEXT, lane_id TEXT, assignment_kind TEXT, work_item_id TEXT, created_at_ms INTEGER)");
-    db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT)");
-    db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "lane-1", "write", "work-1", 1);
-    db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "worker-1", "attempt-1", "assignment", "running", null);
-    expect(readLaneStates(db)).toEqual([lane()]);
-    db.close();
-  });
-
-  it("does not mutate canonical lane rows while observing", async () => {
-    const db = new Database(":memory:");
-    db.exec("CREATE TABLE assignments (project_id TEXT, assignment_id TEXT, lane_id TEXT, assignment_kind TEXT, work_item_id TEXT, created_at_ms INTEGER)");
-    db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT)");
-    db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "lane-1", "write", "work-1", 1);
-    db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "worker-1", "attempt-1", "assignment", "prepared", null);
-    const before = { assignments: db.prepare("SELECT * FROM assignments").all(), attempts: db.prepare("SELECT * FROM execution_attempts").all() };
-    const waitRegistry = createWaitRegistry();
-    await waitRegistry.register(registeredWait({ sourceThreadId: "source-1" }));
-    const watcher = createLaneWatcher({
-      readLanes: () => readLaneStates(db),
-      steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
-      waitRegistry,
-      readWorker: async () => ({ status: "active" as const, pendingExternalWait: false, archived: false }),
-      readOperatorWait: async () => ({ reason: "awaiting_operator", createdAtMs: 0 }),
-      operatorWaitFyiThresholdMs: 0,
-    });
-
-    await watcher.observe("worker-1", "idle");
-
-    expect({ assignments: db.prepare("SELECT * FROM assignments").all(), attempts: db.prepare("SELECT * FROM execution_attempts").all() }).toEqual(before);
-    db.close();
-  });
-
   it("polls every current canonical role seat during quiet GitHub without targeting historical holders or writing canonical rows", async () => {
     const db = new Database(":memory:");
-    db.exec("CREATE TABLE assignments (project_id TEXT, assignment_id TEXT, lane_id TEXT, assignment_kind TEXT, work_item_id TEXT, created_at_ms INTEGER)");
     db.exec("CREATE TABLE execution_attempts (project_id TEXT, assignment_id TEXT, thread_id TEXT, execution_attempt_id TEXT, origin TEXT, state TEXT, terminal_report_digest TEXT, role_id TEXT, role_generation INTEGER)");
     db.exec("CREATE TABLE role_generation_heads (project_id TEXT, role_id TEXT, current_generation INTEGER)");
     db.exec("CREATE TABLE role_generations (project_id TEXT, role_id TEXT, generation INTEGER, status TEXT, holder_execution_attempt_id TEXT)");
-    db.prepare("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "lane-1", "write", "work-1", 1);
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "director-1", "role-attempt-3", "role_holder", "done", null, "project-orchestrator", 3);
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "retired-director", "role-attempt-stale", "role_holder", "done", null, "project-orchestrator", 3);
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "previous-director", "role-attempt-2", "role_holder", "done", null, "project-orchestrator", 2);
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "worker-role-1", "worker-role-attempt", "role_holder", "done", null, "worker", 1);
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "reviewer-4", "reviewer-attempt-4", "role_holder", "done", null, "independent-reviewer", 4);
     db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", null, "future-seat-9", "future-seat-attempt-9", "role_holder", "done", null, "role-added-after-watcher-build", 9);
-    db.prepare("INSERT INTO execution_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run("project-1", "assignment-1", "worker-1", "attempt-1", "assignment", "prepared", null, "worker", 1);
     db.prepare("INSERT INTO role_generation_heads VALUES (?, ?, ?)").run("project-1", "project-orchestrator", 3);
     db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?, ?)").run("project-1", "project-orchestrator", 3, "active", "role-attempt-3");
     db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?, ?)").run("project-1", "project-orchestrator", 2, "retired", "role-attempt-2");
@@ -993,7 +867,6 @@ describe("lane awareness", () => {
     db.prepare("INSERT INTO role_generations VALUES (?, ?, ?, ?, ?)").run("project-1", "role-added-after-watcher-build", 9, "active", "future-seat-attempt-9");
     expect(readRoleHolderStates(db).map((holder) => holder.thread_id)).toEqual(["reviewer-4", "director-1", "future-seat-9", "worker-role-1"]);
     const before = {
-      assignments: db.prepare("SELECT * FROM assignments").all(),
       attempts: db.prepare("SELECT * FROM execution_attempts").all(),
       heads: db.prepare("SELECT * FROM role_generation_heads").all(),
       generations: db.prepare("SELECT * FROM role_generations").all(),
@@ -1001,7 +874,7 @@ describe("lane awareness", () => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     let currentNow = 0;
     const watcher = createLaneWatcher({
-      readLanes: () => readLaneStates(db),
+      readLanes: () => [],
       steer: vi.fn<(lane: LaneView) => Promise<void>>().mockResolvedValue(undefined),
       readRoleHolders: () => readRoleHolderStates(db),
       readRoleScopes: () => [roleScope("queue-head")],
@@ -1017,7 +890,6 @@ describe("lane awareness", () => {
     expect(steerRole.mock.calls.map(([role]) => role.threadId).sort()).toEqual(["director-1", "future-seat-9", "reviewer-4", "worker-role-1"]);
 
     expect({
-      assignments: db.prepare("SELECT * FROM assignments").all(),
       attempts: db.prepare("SELECT * FROM execution_attempts").all(),
       heads: db.prepare("SELECT * FROM role_generation_heads").all(),
       generations: db.prepare("SELECT * FROM role_generations").all(),

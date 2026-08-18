@@ -1,5 +1,5 @@
 import type { BbPluginApi, PluginThreadEventPayloads } from "@bb/plugin-sdk";
-import { writingLaneCeilingForProject, type SqliteDatabase } from "./foundation.js";
+import type { SqliteDatabase } from "./foundation.js";
 
 export const DEFAULT_MAX_CONTINUATIONS = 3;
 export const OPERATOR_WAIT_FYI_THRESHOLD_MS = 15 * 60_000;
@@ -616,25 +616,6 @@ interface WaitContext {
   events: readonly WaitEvent[];
 }
 
-export function readLaneStates(db: SqliteDatabase): LaneState[] {
-  return db
-    .prepare(
-      `SELECT assignments.project_id, assignments.assignment_id, assignments.lane_id,
-              assignments.assignment_kind, assignments.work_item_id,
-              execution_attempts.thread_id, execution_attempts.execution_attempt_id,
-              execution_attempts.state AS attempt_state,
-              execution_attempts.terminal_report_digest,
-              assignments.created_at_ms
-       FROM assignments
-       JOIN execution_attempts
-         ON execution_attempts.project_id = assignments.project_id
-        AND execution_attempts.assignment_id = assignments.assignment_id
-       WHERE execution_attempts.origin = 'assignment'
-       ORDER BY assignments.created_at_ms, assignments.assignment_id`,
-    )
-    .all() as LaneState[];
-}
-
 export function readRoleHolderStates(db: SqliteDatabase): RoleHolderState[] {
   return db
     .prepare(
@@ -656,69 +637,6 @@ export function readRoleHolderStates(db: SqliteDatabase): RoleHolderState[] {
        ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`,
     )
     .all() as RoleHolderState[];
-}
-
-export function openLaneViews(
-  db: SqliteDatabase,
-  now = Date.now(),
-  operatorWaits: ReadonlyMap<string, OperatorWait> = new Map(),
-): LaneView[] {
-  const lanes = readLaneStates(db)
-    .filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state))
-    .map((lane) => {
-      const operatorWait = lane.thread_id ? operatorWaits.get(lane.thread_id) ?? null : null;
-      return {
-      projectId: lane.project_id,
-      laneId: lane.lane_id,
-      assignmentId: lane.assignment_id,
-      assignmentKind: lane.assignment_kind,
-      workItemId: lane.work_item_id,
-      threadId: lane.thread_id,
-      executionAttemptId: lane.execution_attempt_id,
-      attemptState: lane.attempt_state,
-      workerStatus: null,
-      waitingOn: operatorWait?.reason ?? (lane.terminal_report_digest === null ? "terminal receipt" : null),
-      ageMs: Math.max(0, now - lane.created_at_ms),
-      tone: lane.attempt_state === "running" ? "running" : "default",
-      queueState: operatorWait ? "deferred" as const : lane.attempt_state === "running" ? "running" as const : "ready" as const,
-      queueBlocked: false,
-      nextStartable: false,
-      deferredReason: operatorWait?.reason ?? null,
-      deferredAtMs: operatorWait?.createdAtMs ?? null,
-      deferredAgeMs: operatorWait ? Math.max(0, now - operatorWait.createdAtMs) : null,
-    } satisfies LaneView;
-    });
-  const startable = new Set<string>();
-  const readyWriterCount = new Map<string, number>();
-  const occupiedWriterCount = new Map<string, number>();
-  const ceilingByProject = new Map<string, number>();
-  for (const lane of lanes) {
-    if (lane.assignmentKind !== "write") continue;
-    if (lane.queueState === "deferred" || lane.queueState === "running" || (lane.attemptState !== "prepared" && lane.attemptState !== "armed")) {
-      occupiedWriterCount.set(lane.projectId, (occupiedWriterCount.get(lane.projectId) ?? 0) + 1);
-    }
-  }
-  for (const lane of lanes) {
-    if (lane.queueState !== "ready" || (lane.attemptState !== "prepared" && lane.attemptState !== "armed") || lane.deferredReason) continue;
-    if (lane.assignmentKind !== "write") {
-      startable.add(lane.executionAttemptId);
-      continue;
-    }
-    const ready = readyWriterCount.get(lane.projectId) ?? 0;
-    const occupied = occupiedWriterCount.get(lane.projectId) ?? 0;
-    const ceiling = ceilingByProject.get(lane.projectId) ?? writingLaneCeilingForProject(db, lane.projectId);
-    ceilingByProject.set(lane.projectId, ceiling);
-    const available = Math.max(0, ceiling - occupied);
-    if (ready < available) {
-      startable.add(lane.executionAttemptId);
-      readyWriterCount.set(lane.projectId, ready + 1);
-    }
-  }
-  return lanes.map((lane) => ({
-    ...lane,
-    queueBlocked: lane.queueState === "ready" && (lane.attemptState === "prepared" || lane.attemptState === "armed") && !startable.has(lane.executionAttemptId),
-    nextStartable: startable.has(lane.executionAttemptId),
-  }));
 }
 
 export function roleQueueScopes(lanes: readonly LaneView[]): RoleQueueScope[] {
