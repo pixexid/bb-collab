@@ -186,11 +186,53 @@ A killed seat cannot observe its own death. A recovered seat remembers working t
 
 This is the [premise rule](#an-escalations-premises-are-checkable-claims) applied where it is hardest to remember it applies. An inference about your own state feels like observation rather than inference, which is what makes it the last premise anyone thinks to check. When the question is whether a seat was reachable, alive, or interrupted, the answer comes from the native record and the seat's narrative is not admitted.
 
+## Write for a stranger
+
+> Every issue, pull request, comment and commit message on a public repository is written for a stranger's eyes. Credentials, private-project internals and personal data stay out of them, along with host details that map an environment rather than describe a reproducible fact.
+
+Operator directive: public repo, write for a stranger.
+
+Credentials means more than values. Locations, key names, shapes, lengths and ports are individually harmless and collectively a map, and the map is the thing worth withholding. Private-project internals means designs, schemas and business content; naming a project is unavoidable and fine. Host details means usernames, home paths and tooling layout — not the operating system, an architecture, a tool version or a loopback binding, which a reproducible bug or deployment record needs and which reveal nothing an attacker could not assume.
+
+Where specifics are genuinely needed, the public artifact carries the abstract record and its disposition, and the specifics live in local durable state, referenced by id. That bound matters: an artifact still has to explain its own decision. An issue that cannot be understood without a credential-adjacent detail is a finding about the issue, not a licence to publish one.
+
+Two techniques worth keeping, because both were learned the hard way. Both narrow a question; neither settles one, and stating which is which is part of using them.
+
+A disclosure claim can be **checked by shape without re-disclosing**. Length distribution, character class and padding report whether *credential-shaped patterns* are present — not whether a secret is. A short passphrase, a PIN, or a value that looks like ordinary text passes a shape check untouched, so a clean result means "no conventionally-shaped credential found", never "no credential". Say which bound your check carried. The value of the method is that an auditor who reads the artifact to verify becomes another copy of the exposure, and shape avoids that.
+
+A **live-versus-fixture** question is narrowed by looking for the value everywhere it would matter, rather than by reading the artifact that mentions it. Absence across the surfaces you searched is evidence about those surfaces at that moment — it does not prove the value is illustrative. It may be revoked, live somewhere you cannot search, or simply unknown. Treat a clean search as shifting the burden, not as a verdict, and name the surfaces per [completeness search](#a-completeness-search-names-its-surfaces) and the moment per [status read](#a-status-read-is-evidence-about-the-moment-it-was-read).
+
+And when reading a credential file for any reason: ask for shape, not contents. A search for key *names* that prints matching *lines* prints the values too.
+
+## Spawn against a fetched ref
+
+> Dispatch against a base whose exact object you have just fetched and verified. A bare local branch name is not that unless you have checked it.
+
+A bare `main` resolves to a local ref that lags silently. Eight merges behind in one evening: a scoping read cited matrix text that no longer existed, and a grader's worktree lacked the specification it was grading against.
+
+The invariant is the object, not the spelling. A local branch fast-forwarded from upstream and confirmed at the exact SHA is a correct base; a remote-tracking ref nobody fetched is not. What the rule forbids is dispatching against a name whose current object you have not established.
+
+A lane on a stale tree does not look stale. It reads files that exist, quotes them accurately, and reports confidently — no refusal, no error, nothing that reads as degraded. That is what makes it worse than a missing file.
+
+This rule is scaffolding, not principle: it describes a workaround for a spawn surface that does not fetch. Delete it when the surface does.
+
+## The no-dispatch reason is the second half of the intake check
+
+> The wake asks whether there is capacity and startable work. The seat answers whether any of it is reachable, and the answer is recorded either way. An unanswered wake is incomplete, not silent.
+
+`startable > 0 AND lanes < cap` is not the condition that decides whether dispatch is possible. Surface collision is, and no canonical source can compute it — the seat holding the lanes is the only party that can. So the collision map in a no-dispatch reason is not courtesy; it is the missing half of the check, supplied where it can be supplied.
+
+A reason may point at a standing one. Restating an unchanged collision map every hour is noise, and this asks for an answer rather than a recital.
+
+What this deliberately does **not** do is encode surface occupancy into the wake condition. That would require the mechanism to know which files a lane holds, which no canonical source can currently claim, and a confident condition on an unverifiable input is exactly how a permanently-true wake and a dead-source counter both happened. A wake that fires slightly too often, answered by a seat that states the map, is cheaper than a mechanism that computes collisions and gets them wrong in silence.
+
 ## Blast radius
 
 > Every decision sweeps its own blast radius in the same act. Open issues, open PRs, and queued lane specs are caches of older decisions; a decision changing an artifact’s existence, owner, shape, or terminology invalidates them silently. Each affected item gets a one-line update or closure at decision time, not when someone trips over it. A sweep that names artifacts reads them; relayed labels are unverified by definition.
 
 Closing an issue is a decision with blast radius: an open PR whose disposition line says `Related GH-N` fails its lifecycle gate the moment N closes.
+
+A governance-level change — a severance, a contract bump, a matrix re-ratification — sweeps **before its pull request merges**, not afterwards. One severance left six issues describing mechanisms that no longer existed, four of them still labelled startable. The sweep is proportional to what the change touches: a bump that renames nothing and removes no mechanism sweeps nothing, and says so.
 
 ## A status read is evidence about the moment it was read
 
