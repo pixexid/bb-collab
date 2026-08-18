@@ -1348,10 +1348,14 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           } catch {
             writingLaneCeiling = null;
           }
+          // Counts every in_progress WorkItem against the writing ceiling. work_items has no kind
+          // column, so this relies on the convention that only writing lanes register WorkItems —
+          // reviews and probes run as dispatched threads without registration. Contract text says
+          // read-only reviews and probes do not consume the cap; if that convention ever breaks,
+          // this suppresses the startable wake silently. See GH-219.
           const activeLaneCount = (db.prepare(
-            `SELECT COUNT(*) AS count FROM execution_attempts
-             WHERE project_id = ? AND origin = 'assignment' AND assignment_kind = 'write'
-               AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')`,
+            `SELECT COUNT(*) AS count FROM work_items
+             WHERE project_id = ? AND lifecycle_state = 'in_progress'`,
           ).get(projectId) as { count: number }).count;
           const repositories = (db.prepare(
             `SELECT targets.remote_url FROM project_config_heads AS heads

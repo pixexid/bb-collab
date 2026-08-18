@@ -21325,9 +21325,8 @@ ${thread.titleFallback ?? ""}`);
             writingLaneCeiling = null;
           }
           const activeLaneCount = db.prepare(
-            `SELECT COUNT(*) AS count FROM execution_attempts
-             WHERE project_id = ? AND origin = 'assignment' AND assignment_kind = 'write'
-               AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')`
+            `SELECT COUNT(*) AS count FROM work_items
+             WHERE project_id = ? AND lifecycle_state = 'in_progress'`
           ).get(projectId).count;
           const repositories = db.prepare(
             `SELECT targets.remote_url FROM project_config_heads AS heads
