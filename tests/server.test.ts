@@ -5519,6 +5519,9 @@ describe("bb-collab plugin boundary", () => {
       });
       expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
       expect(host.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(1);
+      expect(host.harness.inspection.sdk.callsTo("threads.events.list")
+        .map(([input]) => input)
+        .filter((input) => (input as { limit?: string }).limit === "256")).toHaveLength(0);
     }
   });
 
@@ -5767,11 +5770,11 @@ describe("bb-collab plugin boundary", () => {
       `thread:${ROLE_THREAD_ID}`,
       `event:${ROLE_THREAD_ID}:${ROLE_REQUEST_EVENT_ID}:150000`,
       `event:${ROLE_THREAD_ID}:${ROLE_COMPLETION_EVENT_ID}:165000`,
-      `eventsAfter:${ROLE_THREAD_ID}:150000:${ROLE_CONTEXT_EVENT_PAGE_SIZE}`,
       `environment:${ROLE_ENVIRONMENT_ID}`,
       `project:${PROJECT_ID}`,
       "host:host-main",
       "system.version",
+      `eventsAfter:${ROLE_THREAD_ID}:150000:${ROLE_CONTEXT_EVENT_PAGE_SIZE}`,
     ]);
   });
 
@@ -5848,6 +5851,58 @@ describe("bb-collab plugin boundary", () => {
       { threadId: ROLE_THREAD_ID, afterSeq: "1", limit: "256" },
       { threadId: ROLE_THREAD_ID, afterSeq: "257", limit: "256" },
     ]);
+  });
+
+  it("refuses an SDK correlation that exhausts the 2,048-event total-work ceiling", async () => {
+    const host = await loadedHost(PROJECT_ID, (input) => {
+      const [request, accepted, started, completion] = input.events;
+      input.events = [
+        request!,
+        accepted!,
+        started!,
+        ...Array.from({ length: 2_046 }, (_, index) => ({ id: `ceiling-${index + 1}`, seq: index + 4, type: "agent/delta", data: {} })),
+        { ...completion!, seq: 2_050 },
+      ];
+    });
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    const before = exportFoundation(db, PROJECT_ID);
+    const result = await host.harness.callRpc("apply", qualificationRequest(fenceToken, {
+      idempotencyKey: "role-correlation-work-ceiling",
+      qualificationId: "role-correlation-work-ceiling",
+      roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 2_050 },
+    }));
+    expect(result).toMatchObject({ outcome: "EXECUTION_COMPLETION_AMBIGUOUS", attempted: 0, verified: 0 });
+    expect((result as FoundationResult).message).toBe("role context correlation exceeds the 2,048-event total-work ceiling");
+    expect(host.harness.inspection.sdk.callsTo("threads.events.list")
+      .map(([input]) => input)
+      .filter((input) => (input as { limit?: string }).limit === "256")).toHaveLength(8);
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("refuses a foreign SDK role context before reading any correlation page", async () => {
+    const host = await loadedHost(PROJECT_ID, (input) => {
+      const [request, accepted, started, completion] = input.events;
+      input.thread.projectId = FOREIGN_PROJECT_ID;
+      input.events = [
+        request!,
+        accepted!,
+        started!,
+        ...Array.from({ length: 49_998 }, (_, index) => ({ id: `foreign-${index + 1}`, seq: index + 4, type: "agent/delta", data: {} })),
+        { ...completion!, seq: 50_002 },
+      ];
+    });
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    const before = exportFoundation(db, PROJECT_ID);
+    const result = await host.harness.callRpc("apply", qualificationRequest(fenceToken, {
+      idempotencyKey: "foreign-role-context-preflight",
+      qualificationId: "foreign-role-context-preflight",
+      roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 50_002 },
+    }));
+    expect(result).toMatchObject({ outcome: "ROLE_CONTEXT_FOREIGN", attempted: 0, verified: 0 });
+    expect(host.harness.inspection.sdk.callsTo("threads.events.list")
+      .map(([input]) => input)
+      .filter((input) => (input as { limit?: string }).limit === "256")).toHaveLength(0);
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
   });
 
   it("resolves the cited completion immediately after an exact full page", async () => {
@@ -6022,11 +6077,11 @@ describe("bb-collab plugin boundary", () => {
         `thread:${ROLE_THREAD_ID}`,
         `event:${ROLE_THREAD_ID}:${ROLE_REQUEST_EVENT_ID}:1`,
         `event:${ROLE_THREAD_ID}:${ROLE_COMPLETION_EVENT_ID}:4`,
-        `eventsAfter:${ROLE_THREAD_ID}:1:${ROLE_CONTEXT_EVENT_PAGE_SIZE}`,
         `environment:${ROLE_ENVIRONMENT_ID}`,
         `project:${PROJECT_ID}`,
         "host:host-main",
         "system.version",
+        `eventsAfter:${ROLE_THREAD_ID}:1:${ROLE_CONTEXT_EVENT_PAGE_SIZE}`,
       ]);
       expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
       expect(db.prepare("SELECT generation, status, retired_at_ms FROM role_generations ORDER BY generation").all()).toEqual([

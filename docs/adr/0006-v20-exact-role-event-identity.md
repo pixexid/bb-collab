@@ -10,7 +10,21 @@ the sanctioned BB event API by exact identity: `afterSeq = eventSeq - 1`,
 They page the ordered correlation after the request at 256 rows, advancing by
 the last returned sequence until the exact cited completion appears, the read
 passes its sequence, or a short page proves it absent. The page size is not a
-per-turn limit. The holder's earlier history is never read.
+per-turn limit. Total work is limited to 2,048 returned correlation events
+(eight pages): the measured 328-turn sample had a 1,314-event maximum, so the
+ceiling covers that maximum with 734 events (56%) of headroom. A real turn
+exceeding the ceiling refuses `EXECUTION_COMPLETION_AMBIGUOUS`; it is never
+accepted from a truncated prefix. The holder's earlier history is never read.
+
+Exact thread, project, environment, source, host, request/completion identity,
+witness, visibility, and holder-state refusals run before correlation paging.
+They do not depend on the correlation window, so a citation failing one of
+those checks performs no page read. Only accepted/start/completion linkage and
+fallback checks depend on the correlated events. Request profile
+completeness, completion status, and host-permission compatibility remain after
+the atomic read to preserve their existing refusal ordering behind correlation
+ambiguity; moving those checks would change which refusal wins when both facts
+are invalid.
 
 The completeness invariant is atomic event linkage across every page: the
 sanctioned reader's full ordered correlation after the exact request must
@@ -52,7 +66,11 @@ amended candidate, that surface returned 18,428 events over sequence range
 latest eligible turn (7 actual interior events) and a substantive busy turn
 (252 actual interior events); each production read used two exact one-row
 identity reads plus 256-row correlation pages, independent of the seat's total
-history.
+history. Neither live run crossed a page boundary. The multi-page path is
+covered by deterministic harness tests, including the sanctioned SDK adapter,
+exact page boundaries, ceiling exhaustion, missing completion, and atomic
+partial-window refusal. The opt-in live-shape test is skipped by `npm run
+verify` unless `BB_LIVE_ROLE_CONTEXT=1` is explicitly supplied.
 
 Densities carry the argument; absolute counts are snapshots.
 

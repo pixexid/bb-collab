@@ -41,6 +41,8 @@ export const EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION =
 // ponytail: page database reads at 256 rows; spill responses over 512 KiB to atomic files.
 export const MAX_EXPORT_ROWS = 256;
 export const ROLE_CONTEXT_EVENT_PAGE_SIZE = 256;
+// ponytail: 2,048-event ceiling covers the observed 1,314 maximum; remeasure per-turn correlation before raising it.
+export const MAX_ROLE_CONTEXT_CORRELATION_EVENTS = 2_048;
 export const MAX_EXPORT_BYTES = 512 * 1024;
 export const MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 8);
 /** Deferred until a later cutover operation; issue #3 has no sanctioned freeze transition. */
@@ -1754,6 +1756,59 @@ function stringField(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 && value.length <= 256 ? value : null;
 }
 
+export function roleContextPreflightRefusal(
+  facts: {
+    thread: RoleThreadFact;
+    requestEvent: RoleEventFact;
+    completion: RoleEventFact;
+    environment: RoleEnvironmentFact;
+    project: RoleProjectFact;
+    host: RoleHostFact;
+    bbVersion: string;
+    bbServerId: string;
+  },
+  request: ApplyRequest,
+): readonly [FoundationCode, string] | null {
+  const roleContext = request.roleContext;
+  if (!roleContext) return ["ROLE_CONTEXT_REQUIRED", "exact BB role context facts are required"];
+  if (roleContext.completionEventSeq <= roleContext.requestEventSeq) {
+    return ["EXECUTION_COMPLETION_AMBIGUOUS", "completion event sequence does not follow the request event sequence"];
+  }
+  if (facts.thread.id !== roleContext.threadId || facts.thread.projectId !== request.projectId || facts.project.id !== request.projectId) {
+    return ["ROLE_CONTEXT_FOREIGN", "thread or project context belongs to another project"];
+  }
+  if (/\bwitness\b/iu.test(`${facts.thread.title ?? ""}\n${facts.thread.titleFallback ?? ""}`)) {
+    return ["ROLE_CONTEXT_WITNESS", "witness threads cannot hold active roles"];
+  }
+  if (facts.thread.visibility !== "visible") return ["ROLE_CONTEXT_HIDDEN", "hidden threads cannot hold active roles"];
+  if (facts.thread.status !== "active" && facts.thread.status !== "idle") return ["ROLE_CONTEXT_UNKNOWN", "holder thread is not in a usable execution state"];
+  if (facts.environment.id !== facts.thread.environmentId || facts.environment.projectId !== request.projectId) {
+    return ["ROLE_CONTEXT_FOREIGN", "environment context does not match the holder thread and project"];
+  }
+  const exactManagedWorktree =
+    facts.environment.status === "ready" && !!facts.environment.path && facts.environment.managed && facts.environment.isGitRepo && facts.environment.isWorktree &&
+    facts.environment.workspaceProvisionType === "managed-worktree";
+  if (!exactManagedWorktree) return ["ROLE_CONTEXT_FOREIGN", "holder environment is not an exact ready managed worktree"];
+  const sources = facts.project.sources.filter(
+    (source) => source.projectId === request.projectId && source.hostId === facts.environment.hostId,
+  );
+  if (sources.length !== 1) return ["ROLE_CONTEXT_FOREIGN", "holder environment does not resolve to one exact project source on its host"];
+  if (facts.host.id !== facts.environment.hostId || facts.host.status !== "connected") return ["ROLE_CONTEXT_UNKNOWN", "holder host is unavailable"];
+  if (!stringField(facts.bbVersion) || !stringField(facts.bbServerId)) {
+    return ["ROLE_CONTEXT_UNKNOWN", "BB version or event facts are unavailable"];
+  }
+  if (
+    facts.requestEvent.id !== roleContext.requestEventId || facts.requestEvent.seq !== roleContext.requestEventSeq ||
+    facts.requestEvent.type !== "client/turn/requested"
+  ) {
+    return ["EXECUTION_PROFILE_UNKNOWN", "the exact execution-bearing request event is unavailable"];
+  }
+  if (facts.completion.id !== roleContext.completionEventId || facts.completion.seq !== roleContext.completionEventSeq) {
+    return ["EXECUTION_COMPLETION_AMBIGUOUS", "completion does not match the exact requested correlation"];
+  }
+  return null;
+}
+
 export function resolveRoleContext(reader: RoleFactReader | null, request: ApplyRequest): ResolvedRoleContext {
   if (!reader || !request.roleContext) throw refusal("ROLE_CONTEXT_REQUIRED", "exact BB role context facts are required");
   const roleContext = request.roleContext;
@@ -1774,45 +1829,43 @@ export function resolveRoleContext(reader: RoleFactReader | null, request: Apply
     if (roleContext.completionEventSeq <= roleContext.requestEventSeq) {
       throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion event sequence does not follow the request event sequence");
     }
+    if (!thread.environmentId) throw refusal("ROLE_CONTEXT_REQUIRED", "holder thread has no environment");
+    environment = reader.environment(thread.environmentId);
+    project = reader.project(request.projectId);
+    host = reader.host(environment.hostId);
+    bbVersion = reader.version();
+    const preflightRefusal = roleContextPreflightRefusal(
+      { thread, requestEvent, completion, environment, project, host, bbVersion, bbServerId },
+      request,
+    );
+    if (preflightRefusal) throw refusal(...preflightRefusal);
     correlationEvents = [];
     let afterSeq = roleContext.requestEventSeq;
-    while (true) {
+    let correlationReadComplete = false;
+    for (let pageIndex = 0; pageIndex < MAX_ROLE_CONTEXT_CORRELATION_EVENTS / ROLE_CONTEXT_EVENT_PAGE_SIZE; pageIndex += 1) {
       const page = reader.eventsAfter(roleContext.threadId, afterSeq, ROLE_CONTEXT_EVENT_PAGE_SIZE);
       correlationEvents.push(...page);
       if (
         page.some((event) => event.id === roleContext.completionEventId && event.seq === roleContext.completionEventSeq) ||
         page.some((event) => event.seq >= roleContext.completionEventSeq) ||
         page.length < ROLE_CONTEXT_EVENT_PAGE_SIZE
-      ) break;
+      ) {
+        correlationReadComplete = true;
+        break;
+      }
       const nextAfterSeq = page.at(-1)!.seq;
-      if (nextAfterSeq <= afterSeq) break;
+      if (nextAfterSeq <= afterSeq) {
+        correlationReadComplete = true;
+        break;
+      }
       afterSeq = nextAfterSeq;
     }
-    if (!thread.environmentId) throw refusal("ROLE_CONTEXT_REQUIRED", "holder thread has no environment");
-    environment = reader.environment(thread.environmentId);
-    project = reader.project(request.projectId);
-    host = reader.host(environment.hostId);
-    bbVersion = reader.version();
+    if (!correlationReadComplete) {
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "role context correlation exceeds the 2,048-event total-work ceiling");
+    }
   } catch (error) {
     if (error instanceof Refusal) throw error;
     throw refusal("ROLE_CONTEXT_UNKNOWN", "one or more exact BB context facts are unavailable");
-  }
-  if (thread.id !== request.roleContext.threadId || thread.projectId !== request.projectId || project.id !== request.projectId) {
-    throw refusal("ROLE_CONTEXT_FOREIGN", "thread or project context belongs to another project");
-  }
-  if (/\bwitness\b/iu.test(`${thread.title ?? ""}\n${thread.titleFallback ?? ""}`)) {
-    throw refusal("ROLE_CONTEXT_WITNESS", "witness threads cannot hold active roles");
-  }
-  if (thread.visibility !== "visible") throw refusal("ROLE_CONTEXT_HIDDEN", "hidden threads cannot hold active roles");
-  if (!new Set(["active", "idle"]).has(thread.status)) throw refusal("ROLE_CONTEXT_UNKNOWN", "holder thread is not in a usable execution state");
-  if (!thread.environmentId || environment.id !== thread.environmentId || environment.projectId !== request.projectId) {
-    throw refusal("ROLE_CONTEXT_FOREIGN", "environment context does not match the holder thread and project");
-  }
-  const exactManagedWorktree =
-    environment.status === "ready" && !!environment.path && environment.managed && environment.isGitRepo && environment.isWorktree &&
-    environment.workspaceProvisionType === "managed-worktree";
-  if (!exactManagedWorktree) {
-    throw refusal("ROLE_CONTEXT_FOREIGN", "holder environment is not an exact ready managed worktree");
   }
   // BB-managed worktrees have a derived execution path, not the canonical source path.
   // Keep both exact paths in the evidence and resolve the source only through the
@@ -1820,20 +1873,6 @@ export function resolveRoleContext(reader: RoleFactReader | null, request: Apply
   const sources = project.sources.filter(
     (source) => source.projectId === request.projectId && source.hostId === environment.hostId,
   );
-  if (sources.length !== 1) throw refusal("ROLE_CONTEXT_FOREIGN", "holder environment does not resolve to one exact project source on its host");
-  if (host.id !== environment.hostId || host.status !== "connected") throw refusal("ROLE_CONTEXT_UNKNOWN", "holder host is unavailable");
-  if (!stringField(bbVersion) || !stringField(bbServerId)) {
-    throw refusal("ROLE_CONTEXT_UNKNOWN", "BB version or event facts are unavailable");
-  }
-  if (
-    requestEvent.id !== request.roleContext.requestEventId || requestEvent.seq !== request.roleContext.requestEventSeq ||
-    requestEvent.type !== "client/turn/requested"
-  ) {
-    throw refusal("EXECUTION_PROFILE_UNKNOWN", "the exact execution-bearing request event is unavailable");
-  }
-  if (completion.id !== request.roleContext.completionEventId || completion.seq !== request.roleContext.completionEventSeq) {
-    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion does not match the exact requested correlation");
-  }
   const completionIndex = correlationEvents.findIndex(
     (event) => event.id === roleContext.completionEventId && event.seq === roleContext.completionEventSeq,
   );
