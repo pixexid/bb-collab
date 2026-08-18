@@ -627,8 +627,8 @@ async function loadedDistHost() {
   return host;
 }
 
-async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false) {
-  const fixture = await assignmentFixture({ directorSeat: true, orchestratorSeat: true, withoutGithubIssues: true, targetRemoteUrl: includeGithubRemote ? "https://github.com/example/project.git" : undefined });
+async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, writingLaneCeiling?: number) {
+  const fixture = await assignmentFixture({ directorSeat: true, orchestratorSeat: true, withoutGithubIssues: true, targetRemoteUrl: includeGithubRemote ? "https://github.com/example/project.git" : undefined, writingLaneCeiling });
   const director = fixture.db.prepare(
     "SELECT thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'director'",
   ).get() as { thread_id: string };
@@ -1933,7 +1933,7 @@ describe("bb-collab plugin boundary", () => {
     expect(fixture.host.harness.inspection.logEntries.slice(logCount)).toContainEqual(expect.objectContaining({ level: "info", message: "fleet-watchdog healthy cycle" }));
   });
 
-  it("wakes the orchestrator for a startable GitHub queue without an open WorkItem", async () => {
+  it("uses in-progress WorkItems to suppress startable intake at capacity", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-queue-"));
     const gh = join(bin, "gh");
     const argsLog = join(bin, "args");
@@ -1942,17 +1942,20 @@ describe("bb-collab plugin boundary", () => {
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
     try {
-      const fixture = await fleetWatchdogFixture(0, true);
+      const fixture = await fleetWatchdogFixture(0, true, 1);
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state = 'in_progress'").get()).toEqual({ count: 1 });
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 3))).toMatchObject({ outcome: "OK" });
-      expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')").get()).toEqual({ count: 0 });
+      expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state = 'in_progress'").get()).toEqual({ count: 0 });
       await fixture.host.harness.runSchedule("fleet-watchdog");
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
         expect.objectContaining({
           threadId: fixture.orchestratorThreadId,
           mode: "queue-if-active",
-          input: [expect.objectContaining({ text: "startable queue has 1 issue with 0/3 writing lanes active" })],
+          input: [expect.objectContaining({ text: "startable queue has 1 issue with 0/1 writing lanes active" })],
         }),
       ]]);
       const persisted = await fixture.host.bb.storage.kv.get<Record<string, { lastFleetWakeAtMs: number | null; lastStartableQueueWakeAtMs: number | null }>>("fleet-watchdog.role-idle");
