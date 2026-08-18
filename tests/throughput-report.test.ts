@@ -2,26 +2,23 @@ import { describe, expect, it } from "vitest";
 import { renderWeeklyThroughputReport, weeklyThroughputReport, type ThroughputFacts } from "../src/throughput-report.js";
 
 const window = { startAtMs: 0, endAtMs: 7 * 86_400_000 };
-const empty: ThroughputFacts = { dialsLandedAtMs: null, issues: [], merges: [], lanes: [], startableWindows: [], reviews: [], defects: [] };
+const empty: ThroughputFacts = { dialsLandedAtMs: null, issues: [], merges: [], reviews: [], defects: [] };
 
 describe("weekly throughput report", () => {
-  it("defines medians, cadence bins, slot utilization, review latency, and escapes deterministically", () => {
+  it("defines medians, cadence bins, review latency, and escapes deterministically", () => {
     const report = weeklyThroughputReport({
       dialsLandedAtMs: 10,
       issues: [{ id: "i2", openedAtMs: 0, closedAtMs: 3_600_000 }, { id: "i1", openedAtMs: 0, closedAtMs: 7_200_000 }, { id: "missing", openedAtMs: null, closedAtMs: 2_000 }],
       merges: [{ id: "m2", mergedAtMs: 0 }, { id: "m1", mergedAtMs: 86_400_000 }, { id: "m3", mergedAtMs: 4 * 86_400_000 }],
-      lanes: [{ id: "l1", orchestratorId: "o1", startedAtMs: 0, endedAtMs: 3_600_000 }],
-      startableWindows: [{ orchestratorId: "o1", startAtMs: 0, endAtMs: 7_200_000, writingLaneCeiling: 2 }],
       reviews: [{ id: "r1", tier: "B", submittedAtMs: 0, completedAtMs: 3_600_000 }],
       defects: [{ id: "d1", reverted: true, postMergeSeverity: "P0" }, { id: "d2", reverted: false, postMergeSeverity: "P1" }],
     }, window);
     expect(report.issueOpenToClose).toEqual({ medianHours: 1.5, completed: 2, unknown: 1 });
     expect(report.firstReportAtMs).toBe(7 * 86_400_000 + 10);
     expect(report.mergeCadence.histogram).toEqual({ "<1d": 0, "1-3d": 1, "3-7d": 1, ">=7d": 0 });
-    expect(report.laneSlotUtilization.o1.utilization).toBe(0.25);
     expect(report.reviewLatencyByTier.B.medianHours).toBe(1);
     expect(report.defectEscape).toMatchObject({ reverts: 1, postMergeP0s: 1, postMergeP1s: 1 });
-    expect(report.dialGuidance).toContain("underused slots");
+    expect(report.dialGuidance).toContain("above");
     expect(renderWeeklyThroughputReport(report)).toBe(JSON.stringify(report));
   });
 
