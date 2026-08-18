@@ -56,7 +56,7 @@ import {
   seedFixtureDecision,
   seedVerifiedFixtureReceipt,
 } from "../src/test-support.js";
-import { createLaneWatcher, createRoleIdleLedger, roleIdleKey } from "../src/awareness.js";
+import { createLaneWatcher, createRoleIdleLedger, readRoleHolderStates, roleIdleKey, type RoleIdleRecord } from "../src/awareness.js";
 import { findCheckoutRoot, readCheckoutDivergence } from "../src/checkout-divergence.js";
 
 const PROJECT_ID = "proj_test";
@@ -1841,6 +1841,73 @@ describe("bb-collab plugin boundary", () => {
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
+  it("opens a fresh turn when the current role holder enters error", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      const statuses = new Map([[fixture.orchestratorThreadId, "error" as const]]);
+      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+        id: threadId,
+        projectId: PROJECT_ID,
+        status: statuses.get(threadId) ?? "idle",
+        updatedAt: 60 * 60_000,
+      })) as never);
+      await expect(fixture.host.harness.emitThreadEvent("thread.failed", {
+        thread: makeThreadResponse({ id: fixture.orchestratorThreadId, projectId: PROJECT_ID, status: "error", updatedAt: 60 * 60_000 }),
+        error: "network connection lost",
+      })).resolves.toEqual({ errors: [] });
+      expect(readRoleHolderStates(fixture.db).find((holder) => holder.role_id === "project-orchestrator")?.thread_id).toBe(fixture.orchestratorThreadId);
+      expect((await fixture.host.bb.sdk.threads.get({ threadId: fixture.orchestratorThreadId })).status).toBe("error");
+
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        {
+          threadId: fixture.orchestratorThreadId,
+          mode: "start",
+          input: [{ type: "text", visibility: "agent-only", text: "role wake path broken at cycle 1970-01-01T01:00:00.000Z: project-orchestrator@1 holder status=error; opening a fresh turn", mentions: [] }],
+        },
+      ]]);
+      const persisted = await fixture.host.bb.storage.kv.get<Record<string, RoleIdleRecord>>("fleet-watchdog.role-idle");
+      expect(Object.values(persisted ?? {})).toContainEqual(expect.objectContaining({ lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: 60 * 60_000 }));
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+      clock.mockReturnValue(2 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("bounds a stopping holder wait before opening its recovery turn", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    const statuses = new Map([[fixture.orchestratorThreadId, "stopping" as "stopping" | "error"]]);
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      status: statuses.get(threadId) ?? "idle",
+      updatedAt: 1,
+    })) as never);
+    fixture.host.harness.sdk.stub("threads.wait", (async ({ threadId }: { threadId: string }) => {
+      statuses.set(threadId, "error");
+      throw new Error("bounded wait expired");
+    }) as never);
+    expect((await fixture.host.bb.sdk.threads.get({ threadId: fixture.orchestratorThreadId })).status).toBe("stopping");
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.wait")).toEqual([[
+      { threadId: fixture.orchestratorThreadId, status: "idle", timeoutMs: 30_000 },
+    ]]);
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+      expect.objectContaining({ threadId: fixture.orchestratorThreadId, mode: "start", input: [expect.objectContaining({ text: expect.stringContaining("holder status=stopping") })] }),
+    ]]);
+  });
+
   it("wakes the orchestrator for a startable GitHub queue without an open WorkItem", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-queue-"));
     const gh = join(bin, "gh");
@@ -1944,19 +2011,37 @@ describe("bb-collab plugin boundary", () => {
     const ledger = createRoleIdleLedger({ read: async () => state, write: async (next) => { state = next; } });
     await ledger.observeIdle(key, 1);
     await ledger.recordFleetWake(key, 2);
-    await ledger.recordStartableQueueWake(key, 3);
-    await ledger.recordStaleWaitWake(key, 4);
-    await ledger.recordOwedActWake(key, 5);
-    await ledger.recordEscalation(key, 6);
+    await ledger.recordRecoveryWake(key, 3);
+    await ledger.recordStartableQueueWake(key, 4);
+    await ledger.recordStaleWaitWake(key, 5);
+    await ledger.recordOwedActWake(key, 6);
+    await ledger.recordEscalation(key, 7);
+    await ledger.resetIdle(key);
+    expect(await ledger.get(key)).toMatchObject({ lastRecoveryWakeAtMs: 3 });
     await ledger.clearWakeHistory(`${PROJECT_ID}:`);
     expect(await ledger.get(key)).toMatchObject({
       idleSinceMs: null,
       lastFleetWakeAtMs: null,
+      lastRecoveryWakeAtMs: null,
       lastStartableQueueWakeAtMs: null,
       lastStaleWaitWakeAtMs: null,
       lastOwedActWakeAtMs: null,
       lastEscalationAtMs: null,
     });
+  });
+
+  it("loads watchdog state persisted before the recovery wake field existed", async () => {
+    const holder = { project_id: PROJECT_ID, role_id: "director", role_generation: 1, execution_attempt_id: "director-attempt", thread_id: "director-thread" };
+    const key = roleIdleKey(holder, WORK_ITEM_ID);
+    let state: unknown = {};
+    const persistence = { read: async () => state, write: async (next: Record<string, RoleIdleRecord>) => { state = structuredClone(next); } };
+    const oldLedger = createRoleIdleLedger(persistence);
+    await oldLedger.observeIdle(key, 1);
+    delete (state as Record<string, Record<string, unknown>>)[key]!.lastRecoveryWakeAtMs;
+
+    const reloaded = createRoleIdleLedger(persistence);
+    await expect(reloaded.recover()).resolves.toBeUndefined();
+    expect(await reloaded.get(key)).toMatchObject({ idleSinceMs: 1, lastRecoveryWakeAtMs: null });
   });
 
   it("refuses a WorkItem wait declaration whose schedule or seat waker is not live before any write", async () => {
