@@ -144,21 +144,25 @@ State the surfaces and the names. "I searched" is not a finding; "I searched ope
 
 ## A candidate in production is a drill instrument with two stamps
 
-> Unmerged code reaches the production deploy worktree only as a pre-authorized drill instrument, and both the deploy and the restore are reload-stamped in the pull-request body. An exposure window without a documented end is an unaudited window.
+> Unmerged code reaches the production deploy worktree only as a pre-authorized drill instrument, and the pull-request body records both the deploy and the event that ENDED the unmerged exposure. An exposure window without a documented end is an unaudited window.
 
 Installing a candidate to prove it works is legitimate and sometimes the only way to prove it. What is not legitimate is leaving the record with an opening and no closing, because a reader then cannot tell a twenty-five-minute drill from code that quietly stayed.
 
-Both stamps come from the load log, and the restore is worth verifying independently of its own stamp — the deployed revision, the build artifact's mtime, and the absence of a string that exists only in the candidate. A restore claimed by the party that deployed is the claim most worth a second surface.
+A restore is the usual closing event and carries a reload stamp. It is not the only one: a candidate that is reviewed and merged while its exact SHA keeps running has ended its unmerged exposure without anything being reloaded, and that closure is auditable from git containment rather than from a stamp. Record whichever event actually ended it, and say which kind it was — demanding a restore stamp for a window that closed by merge would demand a stamp that does not exist.
+
+Where the closing event is a restore, verify it independently of its own stamp — the deployed revision, the build artifact's mtime, and the absence of a string that exists only in the candidate. A restore claimed by the party that deployed is the claim most worth a second surface.
 
 This says nothing about who may deploy. Host loading is an operator act; this governs what may be installed unmerged, and what the record must show afterwards.
 
-## A drill timebox starts at the observed kill
+## A recovery timebox starts at the observed failure
 
-> The clock starts at the first native observation of the failure, never at a scheduled or presumed start.
+> A clock measuring RECOVERY starts at the first native observation of the failure, never at a scheduled or presumed start.
 
-A timebox counted from when the failure was supposed to happen measures the wrong interval, and when the failure did not happen it manufactures a mechanism failure out of nothing. That reads into the record as "the mechanism did not recover the seat in twenty minutes" when the true statement is "the seat was never in the failure state" — a false negative that looks exactly like a real finding.
+A recovery timebox counted from when the failure was supposed to happen measures the wrong interval, and if the failure never happened it manufactures a mechanism failure out of nothing. That enters the record as "the mechanism did not recover the seat in twenty minutes" when the true statement is "the seat was never in the failure state" — a false negative indistinguishable from a real finding.
 
-The same discipline that keeps a wake from being credited to the wrong signal keeps a clock from being counted against a state that does not exist.
+This binds the recovery clock only. A drill may legitimately run other clocks from a scheduled start: an injection-phase timebox begins when the injector was supposed to fire, and its expiry is a real result — it proves the injection failed. Do not collapse the two. One clock asks whether the mechanism recovered the seat; the other asks whether anything broke it in the first place, and they start at different events because they measure different claims.
+
+The same discipline that keeps a wake from being credited to the wrong signal keeps a clock from being counted against the wrong state.
 
 ## A seat is the worst witness to its own outage
 
