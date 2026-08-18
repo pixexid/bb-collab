@@ -13934,18 +13934,19 @@ function roleIdleState(input) {
     const lastSteerAtMs = typeof record2.lastSteerAtMs === "number" && Number.isFinite(record2.lastSteerAtMs) ? record2.lastSteerAtMs : null;
     const awaitingSteerOutcome = record2.awaitingSteerOutcome === true;
     const lastFleetWakeAtMs = typeof record2.lastFleetWakeAtMs === "number" && Number.isFinite(record2.lastFleetWakeAtMs) ? record2.lastFleetWakeAtMs : null;
+    const lastStartableQueueWakeAtMs = typeof record2.lastStartableQueueWakeAtMs === "number" && Number.isFinite(record2.lastStartableQueueWakeAtMs) ? record2.lastStartableQueueWakeAtMs : null;
     const lastStaleWaitWakeAtMs = typeof record2.lastStaleWaitWakeAtMs === "number" && Number.isFinite(record2.lastStaleWaitWakeAtMs) ? record2.lastStaleWaitWakeAtMs : null;
     const lastOwedActWakeAtMs = typeof record2.lastOwedActWakeAtMs === "number" && Number.isFinite(record2.lastOwedActWakeAtMs) ? record2.lastOwedActWakeAtMs : null;
     const lastEscalationAtMs = typeof record2.lastEscalationAtMs === "number" && Number.isFinite(record2.lastEscalationAtMs) ? record2.lastEscalationAtMs : null;
-    if (!Number.isInteger(record2.steerCount) || record2.steerCount < 0 || record2.steerCount > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || idleSinceMs !== null && idleSinceMs < 0 || lastSteerAtMs !== null && lastSteerAtMs < 0 || lastFleetWakeAtMs !== null && lastFleetWakeAtMs < 0 || lastStaleWaitWakeAtMs !== null && lastStaleWaitWakeAtMs < 0 || lastOwedActWakeAtMs !== null && lastOwedActWakeAtMs < 0 || lastEscalationAtMs !== null && lastEscalationAtMs < 0 || typeof record2.escalated !== "boolean") {
+    if (!Number.isInteger(record2.steerCount) || record2.steerCount < 0 || record2.steerCount > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || idleSinceMs !== null && idleSinceMs < 0 || lastSteerAtMs !== null && lastSteerAtMs < 0 || lastFleetWakeAtMs !== null && lastFleetWakeAtMs < 0 || lastStartableQueueWakeAtMs !== null && lastStartableQueueWakeAtMs < 0 || lastStaleWaitWakeAtMs !== null && lastStaleWaitWakeAtMs < 0 || lastOwedActWakeAtMs !== null && lastOwedActWakeAtMs < 0 || lastEscalationAtMs !== null && lastEscalationAtMs < 0 || typeof record2.escalated !== "boolean") {
       throw new Error("invalid role idle state");
     }
-    state[key] = { steerCount: record2.steerCount, failedSteers, escalated: record2.escalated, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastFleetWakeAtMs, lastStaleWaitWakeAtMs, lastOwedActWakeAtMs, lastEscalationAtMs };
+    state[key] = { steerCount: record2.steerCount, failedSteers, escalated: record2.escalated, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastFleetWakeAtMs, lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs, lastOwedActWakeAtMs, lastEscalationAtMs };
   }
   return state;
 }
 function emptyRoleIdleRecord() {
-  return { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastFleetWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
+  return { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastFleetWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
 }
 function createRoleIdleLedger(persistence) {
   let state = {};
@@ -13989,7 +13990,7 @@ function createRoleIdleLedger(persistence) {
       await load();
       const record2 = state[key];
       if (!record2) return;
-      state[key] = { ...emptyRoleIdleRecord(), lastFleetWakeAtMs: record2.lastFleetWakeAtMs, lastStaleWaitWakeAtMs: record2.lastStaleWaitWakeAtMs, lastOwedActWakeAtMs: record2.lastOwedActWakeAtMs, lastEscalationAtMs: record2.lastEscalationAtMs };
+      state[key] = { ...emptyRoleIdleRecord(), lastFleetWakeAtMs: record2.lastFleetWakeAtMs, lastStartableQueueWakeAtMs: record2.lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs: record2.lastStaleWaitWakeAtMs, lastOwedActWakeAtMs: record2.lastOwedActWakeAtMs, lastEscalationAtMs: record2.lastEscalationAtMs };
       await save();
     }),
     preserveAfterSteerWake: (key) => enqueue(async () => {
@@ -14035,6 +14036,12 @@ function createRoleIdleLedger(persistence) {
       await persistence?.write(structuredClone(nextState));
       state = nextState;
     }),
+    recordStartableQueueWake: (key, sentAtMs) => enqueue(async () => {
+      await load();
+      const nextState = { ...state, [key]: { ...state[key] ?? emptyRoleIdleRecord(), lastStartableQueueWakeAtMs: sentAtMs } };
+      await persistence?.write(structuredClone(nextState));
+      state = nextState;
+    }),
     recordStaleWaitWake: (key, sentAtMs) => enqueue(async () => {
       await load();
       const nextState = { ...state, [key]: { ...state[key] ?? emptyRoleIdleRecord(), lastStaleWaitWakeAtMs: sentAtMs } };
@@ -14056,7 +14063,7 @@ function createRoleIdleLedger(persistence) {
     }),
     clearWakeHistory: (prefix) => enqueue(async () => {
       await load();
-      for (const key of Object.keys(state)) if (key.startsWith(prefix)) state[key] = { ...state[key], idleSinceMs: null, lastFleetWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
+      for (const key of Object.keys(state)) if (key.startsWith(prefix)) state[key] = { ...state[key], idleSinceMs: null, lastFleetWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
       await save();
     })
   };
@@ -20159,8 +20166,36 @@ function readCheckoutDivergence(checkoutRoot) {
 
 // server.ts
 import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync2, rmSync, statSync as statSync2, writeFileSync } from "node:fs";
+import { spawnSync as spawnSync2 } from "node:child_process";
 import { basename, dirname as dirname2, isAbsolute, join as join4, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+function githubRepository(remoteUrl) {
+  const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
+  return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : null;
+}
+function startableQueueDepth(repositories) {
+  try {
+    let count = 0;
+    for (const repository of repositories) {
+      const options = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1e4, killSignal: "SIGKILL", detached: true };
+      const result2 = spawnSync2("gh", ["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number", "--limit", "1000"], options);
+      if (typeof result2.pid === "number" && result2.pid > 0) {
+        try {
+          process.kill(-result2.pid, "SIGKILL");
+        } catch (error48) {
+          if (error48.code !== "ESRCH") return null;
+        }
+      }
+      if (result2.error || result2.status !== 0) return null;
+      const issues = JSON.parse(result2.stdout);
+      if (!Array.isArray(issues) || !issues.every((issue2) => issue2 && typeof issue2 === "object" && !Array.isArray(issue2) && typeof issue2.number === "number")) return null;
+      count += issues.length;
+    }
+    return count;
+  } catch {
+    return null;
+  }
+}
 var FLEET_WATCHDOG_FLOOR_MS = 60 * 6e4;
 var FLEET_WATCHDOG_STALE_WAIT_MS = 24 * 60 * 6e4;
 var projectIdSchema = external_exports.string().trim().min(1).max(256);
@@ -21198,7 +21233,7 @@ ${thread.titleFallback ?? ""}`);
       const isCurrent = (candidate, holder) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
       const wake = async (projectId, holder, key, text, requireIdle, kind, beforeSend) => {
         const previous = await fleetWatchdogIdle.get(key);
-        const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs : kind === "stale-wait" ? previous?.lastStaleWaitWakeAtMs : kind === "owed-act" ? previous?.lastOwedActWakeAtMs : previous?.lastEscalationAtMs;
+        const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs : kind === "startable-queue" ? previous?.lastStartableQueueWakeAtMs : kind === "stale-wait" ? previous?.lastStaleWaitWakeAtMs : kind === "owed-act" ? previous?.lastOwedActWakeAtMs : previous?.lastEscalationAtMs;
         if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== void 0 && now2 - lastNotifiedAtMs < floorMs) return false;
         if (wakeInFlight.has(key)) return false;
         wakeInFlight.add(key);
@@ -21218,6 +21253,7 @@ ${thread.titleFallback ?? ""}`);
             input: [{ type: "text", visibility: "agent-only", text, mentions: [] }]
           });
           if (kind === "fleet") await fleetWatchdogIdle.recordFleetWake(key, Date.now());
+          else if (kind === "startable-queue") await fleetWatchdogIdle.recordStartableQueueWake(key, Date.now());
           else if (kind === "stale-wait") await fleetWatchdogIdle.recordStaleWaitWake(key, Date.now());
           else if (kind === "owed-act") await fleetWatchdogIdle.recordOwedActWake(key, Date.now());
           else await fleetWatchdogIdle.recordEscalation(key, Date.now());
@@ -21240,6 +21276,34 @@ ${thread.titleFallback ?? ""}`);
           const orchestrator = orchestrators[0];
           const workItems = openWorkItemsByProject.get(projectId) ?? [];
           const resetIdle = () => Promise.all(holders.flatMap((holder) => workItems.map((workItem) => fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workItem.workItemId)))));
+          const config2 = db.prepare(
+            `SELECT revisions.canonical_config_json
+             FROM project_config_heads AS heads
+             JOIN project_config_revisions AS revisions
+               ON revisions.project_id = heads.project_id AND revisions.config_revision = heads.config_revision
+             WHERE heads.project_id = ?`
+          ).get(projectId);
+          let writingLaneCeiling = null;
+          try {
+            writingLaneCeiling = config2 ? writingLaneCeilingFromJson(config2.canonical_config_json) : null;
+          } catch {
+            writingLaneCeiling = null;
+          }
+          const activeLaneCount = db.prepare(
+            `SELECT COUNT(*) AS count FROM execution_attempts
+             WHERE project_id = ? AND origin = 'assignment' AND assignment_kind = 'write'
+               AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')`
+          ).get(projectId).count;
+          const repositories = db.prepare(
+            `SELECT targets.remote_url FROM project_config_heads AS heads
+             JOIN repository_targets AS targets
+               ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
+             WHERE heads.project_id = ? ORDER BY targets.repo_target_id`
+          ).all(projectId).map((target) => githubRepository(target.remote_url));
+          const startableCount = repositories.length === 0 || repositories.some((repository) => repository === null) ? null : startableQueueDepth(repositories);
+          if (startableCount !== null && startableCount > 0 && writingLaneCeiling !== null && activeLaneCount < writingLaneCeiling) {
+            await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${startableCount} issue${startableCount === 1 ? "" : "s"} with ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
+          }
           if (workItems.length === 0) continue;
           const staleWait = workItems.find((workItem) => workItem.declaredAtMs !== null && now2 - workItem.declaredAtMs >= staleWaitMs);
           if (staleWait) {

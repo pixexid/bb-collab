@@ -28,6 +28,7 @@ import {
   probeV21NewLegacyApplyProvenanceRefusal,
   probeV21ConsumedLegacyReplay,
   parseApplyRequest,
+  writingLaneCeilingFromJson,
   type ApplyRequest,
   type FoundationResult,
   type RoleFactReader,
@@ -55,11 +56,41 @@ import {
 import { runArchiveSweep } from "./src/archive-sweep.js";
 import { findCheckoutRoot, readCheckoutDivergence, type CheckoutDivergence } from "./src/checkout-divergence.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 type PluginOptions = { checkoutRoot?: string | null };
 type WorkItemWait = NonNullable<ApplyRequest["workItemWait"]>;
+
+function githubRepository(remoteUrl: string | null): string | null {
+  const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
+  return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : null;
+}
+
+function startableQueueDepth(repositories: string[]): number | null {
+  try {
+    let count = 0;
+    for (const repository of repositories) {
+      const options: SpawnSyncOptionsWithStringEncoding & { detached: true } = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000, killSignal: "SIGKILL", detached: true };
+      const result = spawnSync("gh", ["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number", "--limit", "1000"], options);
+      if (typeof result.pid === "number" && result.pid > 0) {
+        try {
+          process.kill(-result.pid, "SIGKILL");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") return null;
+        }
+      }
+      if (result.error || result.status !== 0) return null;
+      const issues = JSON.parse(result.stdout) as unknown;
+      if (!Array.isArray(issues) || !issues.every((issue) => issue && typeof issue === "object" && !Array.isArray(issue) && typeof (issue as { number?: unknown }).number === "number")) return null;
+      count += issues.length;
+    }
+    return count;
+  } catch {
+    return null;
+  }
+}
 
 export const FLEET_WATCHDOG_FLOOR_MS = 60 * 60_000;
 export const FLEET_WATCHDOG_STALE_WAIT_MS = 24 * 60 * 60_000;
@@ -1235,12 +1266,13 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         openWorkItemsByProject.set(workItem.project_id, workItems);
       }
       const isCurrent = (candidate: RoleHolderState, holder: RoleHolderState) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
-      const wake = async (projectId: string, holder: RoleHolderState, key: string, text: string, requireIdle: boolean, kind: "fleet" | "stale-wait" | "owed-act" | "escalation", beforeSend?: () => Promise<boolean>) => {
+      const wake = async (projectId: string, holder: RoleHolderState, key: string, text: string, requireIdle: boolean, kind: "fleet" | "startable-queue" | "stale-wait" | "owed-act" | "escalation", beforeSend?: () => Promise<boolean>) => {
         const previous = await fleetWatchdogIdle.get(key);
         const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs
-          : kind === "stale-wait" ? previous?.lastStaleWaitWakeAtMs
-            : kind === "owed-act" ? previous?.lastOwedActWakeAtMs
-              : previous?.lastEscalationAtMs;
+          : kind === "startable-queue" ? previous?.lastStartableQueueWakeAtMs
+            : kind === "stale-wait" ? previous?.lastStaleWaitWakeAtMs
+              : kind === "owed-act" ? previous?.lastOwedActWakeAtMs
+                : previous?.lastEscalationAtMs;
         if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== undefined && now - lastNotifiedAtMs < floorMs) return false;
         if (wakeInFlight.has(key)) return false;
         wakeInFlight.add(key);
@@ -1260,6 +1292,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             input: [{ type: "text", visibility: "agent-only", text, mentions: [] }],
           });
           if (kind === "fleet") await fleetWatchdogIdle.recordFleetWake(key, Date.now());
+          else if (kind === "startable-queue") await fleetWatchdogIdle.recordStartableQueueWake(key, Date.now());
           else if (kind === "stale-wait") await fleetWatchdogIdle.recordStaleWaitWake(key, Date.now());
           else if (kind === "owed-act") await fleetWatchdogIdle.recordOwedActWake(key, Date.now());
           else await fleetWatchdogIdle.recordEscalation(key, Date.now());
@@ -1282,6 +1315,36 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           const orchestrator = orchestrators[0]!;
           const workItems = openWorkItemsByProject.get(projectId) ?? [];
           const resetIdle = () => Promise.all(holders.flatMap((holder) => workItems.map((workItem) => fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workItem.workItemId)))));
+          const config = db.prepare(
+            `SELECT revisions.canonical_config_json
+             FROM project_config_heads AS heads
+             JOIN project_config_revisions AS revisions
+               ON revisions.project_id = heads.project_id AND revisions.config_revision = heads.config_revision
+             WHERE heads.project_id = ?`,
+          ).get(projectId) as { canonical_config_json: string } | undefined;
+          let writingLaneCeiling: number | null = null;
+          try {
+            writingLaneCeiling = config ? writingLaneCeilingFromJson(config.canonical_config_json) : null;
+          } catch {
+            writingLaneCeiling = null;
+          }
+          const activeLaneCount = (db.prepare(
+            `SELECT COUNT(*) AS count FROM execution_attempts
+             WHERE project_id = ? AND origin = 'assignment' AND assignment_kind = 'write'
+               AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')`,
+          ).get(projectId) as { count: number }).count;
+          const repositories = (db.prepare(
+            `SELECT targets.remote_url FROM project_config_heads AS heads
+             JOIN repository_targets AS targets
+               ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
+             WHERE heads.project_id = ? ORDER BY targets.repo_target_id`,
+          ).all(projectId) as Array<{ remote_url: string | null }>).map((target) => githubRepository(target.remote_url));
+          const startableCount = repositories.length === 0 || repositories.some((repository) => repository === null)
+            ? null
+            : startableQueueDepth(repositories as string[]);
+          if (startableCount !== null && startableCount > 0 && writingLaneCeiling !== null && activeLaneCount < writingLaneCeiling) {
+            await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${startableCount} issue${startableCount === 1 ? "" : "s"} with ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
+          }
           if (workItems.length === 0) continue;
           const staleWait = workItems.find((workItem) => workItem.declaredAtMs !== null && now - workItem.declaredAtMs >= staleWaitMs);
           if (staleWait) {

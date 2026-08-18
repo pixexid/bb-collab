@@ -627,8 +627,8 @@ async function loadedDistHost() {
   return host;
 }
 
-async function fleetWatchdogFixture(updatedAt = 1) {
-  const fixture = await assignmentFixture({ directorSeat: true, orchestratorSeat: true });
+async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false) {
+  const fixture = await assignmentFixture({ directorSeat: true, orchestratorSeat: true, withoutGithubIssues: true, targetRemoteUrl: includeGithubRemote ? "https://github.com/example/project.git" : undefined });
   const director = fixture.db.prepare(
     "SELECT thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'director'",
   ).get() as { thread_id: string };
@@ -1453,6 +1453,8 @@ async function assignmentFixture(options: {
   writingLaneCeiling?: number;
   connectorPolicy?: "required" | "optional" | "prohibited";
   targetDefaultBranch?: string;
+  targetRemoteUrl?: string;
+  withoutGithubIssues?: boolean;
   directorSeat?: boolean;
   orchestratorSeat?: boolean;
 } = {}) {
@@ -1460,11 +1462,12 @@ async function assignmentFixture(options: {
   const directorSeat = options.directorSeat === true;
   const orchestratorSeat = options.orchestratorSeat === true;
   const config = directorSeat ? (orchestratorSeat ? directorAndOrchestratorConfig() : directorSeatConfig()) : roleConfig(options.connectorPolicy);
+  if (options.withoutGithubIssues) delete (config.extensions.bbCollab as Record<string, unknown>).githubIssues;
   if (options.writingLaneCeiling !== undefined) {
     (config.extensions.bbCollab as Record<string, unknown>).writingLaneCeiling = options.writingLaneCeiling;
   }
-  const targets = options.targetDefaultBranch
-    ? bootstrapRequest().targets!.map((target) => ({ ...target, defaultBranch: options.targetDefaultBranch! }))
+  const targets = options.targetDefaultBranch || options.targetRemoteUrl
+    ? bootstrapRequest().targets!.map((target) => ({ ...target, ...(options.targetDefaultBranch ? { defaultBranch: options.targetDefaultBranch } : {}), ...(options.targetRemoteUrl ? { remoteUrl: options.targetRemoteUrl } : {}) }))
     : undefined;
   const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config, ...(targets ? { targets } : {}) });
   expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
@@ -1838,6 +1841,56 @@ describe("bb-collab plugin boundary", () => {
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
+  it("wakes the orchestrator for a startable GitHub queue without an open WorkItem", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-queue-"));
+    const gh = join(bin, "gh");
+    const argsLog = join(bin, "args");
+    writeFileSync(gh, `#!/bin/sh\nprintf '%s\\n' "$@" > "${argsLog}"\nprintf '%s\\n' '[{"number":205}]'\n`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 3))).toMatchObject({ outcome: "OK" });
+      expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')").get()).toEqual({ count: 0 });
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({
+          threadId: fixture.orchestratorThreadId,
+          mode: "queue-if-active",
+          input: [expect.objectContaining({ text: "startable queue has 1 issue with 0/3 writing lanes active" })],
+        }),
+      ]]);
+      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { lastFleetWakeAtMs: number | null; lastStartableQueueWakeAtMs: number | null }>>("fleet-watchdog.role-idle");
+      expect(Object.values(persisted ?? {})).toContainEqual(expect.objectContaining({ lastFleetWakeAtMs: null, lastStartableQueueWakeAtMs: expect.any(Number) }));
+      expect(readFileSync(argsLog, "utf8")).toBe("issue\nlist\n--repo\nexample/project\n--label\nqueue:startable\n--state\nopen\n--json\nnumber\n--limit\n1000\n");
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the watchdog quiet when the startable queue read fails", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-queue-failure-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nexit 1\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true);
+      await expect(fixture.host.harness.runSchedule("fleet-watchdog")).resolves.toBeUndefined();
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("uses effective live watchdog threshold settings", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
@@ -1891,13 +1944,15 @@ describe("bb-collab plugin boundary", () => {
     const ledger = createRoleIdleLedger({ read: async () => state, write: async (next) => { state = next; } });
     await ledger.observeIdle(key, 1);
     await ledger.recordFleetWake(key, 2);
-    await ledger.recordStaleWaitWake(key, 3);
-    await ledger.recordOwedActWake(key, 4);
-    await ledger.recordEscalation(key, 5);
+    await ledger.recordStartableQueueWake(key, 3);
+    await ledger.recordStaleWaitWake(key, 4);
+    await ledger.recordOwedActWake(key, 5);
+    await ledger.recordEscalation(key, 6);
     await ledger.clearWakeHistory(`${PROJECT_ID}:`);
     expect(await ledger.get(key)).toMatchObject({
       idleSinceMs: null,
       lastFleetWakeAtMs: null,
+      lastStartableQueueWakeAtMs: null,
       lastStaleWaitWakeAtMs: null,
       lastOwedActWakeAtMs: null,
       lastEscalationAtMs: null,
