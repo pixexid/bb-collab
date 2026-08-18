@@ -186,6 +186,52 @@ A killed seat cannot observe its own death. A recovered seat remembers working t
 
 This is the [premise rule](#an-escalations-premises-are-checkable-claims) applied where it is hardest to remember it applies. An inference about your own state feels like observation rather than inference, which is what makes it the last premise anyone thinks to check. When the question is whether a seat was reachable, alive, or interrupted, the answer comes from the native record and the seat's narrative is not admitted.
 
+## Write for a stranger
+
+> Every issue, pull request, comment and commit message on a public repository is written for a stranger's eyes. Credentials, host details, private-project internals and personal data stay out of them.
+
+Operator directive: public repo, write for a stranger.
+
+Credentials means more than values. Locations, key names, shapes, lengths and ports are individually harmless and collectively a map, and the map is the thing worth withholding. Private-project internals means designs, schemas and business content; naming a project is unavoidable and fine.
+
+Where specifics are genuinely needed, the public artifact carries the abstract record and its disposition, and the specifics live in local durable state, referenced by id. That bound matters: an artifact still has to explain its own decision. An issue that cannot be understood without a credential-adjacent detail is a finding about the issue, not a licence to publish one.
+
+Two techniques worth keeping, because both were learned the hard way:
+
+A disclosure claim can be **verified by shape without re-disclosing**. Length distribution, character class, padding — you can establish whether a secret is present without ever holding it, and an auditor that reads the artifact to check becomes another copy of the exposure. State the bound of whatever check you run.
+
+A **live-versus-fixture** question is answered by looking for the value everywhere it would matter, not by reading the artifact that mentions it. If it exists nowhere live, it is illustrative regardless of what the surrounding prose says.
+
+And when reading a credential file for any reason: ask for shape, not contents. A search for key *names* that prints matching *lines* prints the values too.
+
+## A governance-level change sweeps the board before it merges
+
+> A severance, a contract bump, or a matrix re-ratification sweeps the open board before its pull request merges — not afterwards, and not when someone trips over it.
+
+The version-bump test governs the contract. Nothing governed the board, and one severance left six issues describing mechanisms that no longer existed, four of them still labelled startable. One nearly received a lane dispatched to rebuild dead machinery.
+
+The sweep is scoped to what the change actually touches. A bump that renames nothing and removes no mechanism sweeps nothing, and says so. The cost is proportional to the removal, not to the version number.
+
+## Spawn against a fetched ref
+
+> Dispatch against an explicitly fetched ref, never a bare local branch name.
+
+A bare `main` resolves to a local ref that lags silently. Four merges behind in one evening: a scoping read cited matrix text that no longer existed, and a grader's worktree lacked the specification it was grading against.
+
+A lane on a stale tree does not look stale. It reads files that exist, quotes them accurately, and reports confidently — no refusal, no error, nothing that reads as degraded. That is what makes it worse than a missing file.
+
+This rule is scaffolding, not principle: it describes a workaround for a spawn surface that does not fetch. Delete it when the surface does.
+
+## The no-dispatch reason is the second half of the intake check
+
+> The wake asks whether there is capacity and startable work. The seat answers whether any of it is reachable, and the answer is recorded either way. An unanswered wake is incomplete, not silent.
+
+`startable > 0 AND lanes < cap` is not the condition that decides whether dispatch is possible. Surface collision is, and no canonical source can compute it — the seat holding the lanes is the only party that can. So the collision map in a no-dispatch reason is not courtesy; it is the missing half of the check, supplied where it can be supplied.
+
+A reason may point at a standing one. Restating an unchanged collision map every hour is noise, and this asks for an answer rather than a recital.
+
+What this deliberately does **not** do is encode surface occupancy into the wake condition. That would require the mechanism to know which files a lane holds, which no canonical source can currently claim, and a confident condition on an unverifiable input is exactly how a permanently-true wake and a dead-source counter both happened. A wake that fires slightly too often, answered by a seat that states the map, is cheaper than a mechanism that computes collisions and gets them wrong in silence.
+
 ## Blast radius
 
 > Every decision sweeps its own blast radius in the same act. Open issues, open PRs, and queued lane specs are caches of older decisions; a decision changing an artifact’s existence, owner, shape, or terminology invalidates them silently. Each affected item gets a one-line update or closure at decision time, not when someone trips over it. A sweep that names artifacts reads them; relayed labels are unverified by definition.
