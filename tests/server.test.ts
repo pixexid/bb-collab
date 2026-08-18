@@ -40,6 +40,7 @@ import {
   exportFoundation,
   probeV21NewLegacyApplyProvenanceRefusal,
   probeV21ConsumedLegacyReplay,
+  parseApplyRequest,
   schemaDigest,
   sha256,
   type ApplyRequest,
@@ -7595,6 +7596,27 @@ describe("bb-collab plugin boundary", () => {
     const missingProject = await host.harness.runCli(["doctor"]);
     expect(missingProject.exitCode).toBe(2);
     expect(JSON.parse(missingProject.stdout).outcome).toBe("INVALID_INPUT");
+  });
+
+  it("keeps the documented WorkItem create invocation strict", () => {
+    const request = workItemCreateRequest("fence-token");
+    expect(parseApplyRequest(request)).toMatchObject({
+      projectId: PROJECT_ID,
+      operationClass: "work_item_create",
+      idempotencyKey: "work-item-create-1",
+      actorReceiptId: RECEIPT_ID,
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: "fence-token",
+      repoTargetId: TARGET_ID,
+      expectedResourceRevision: null,
+      workItem: { workItemId: WORK_ITEM_ID, title: "Ship projection", body: "Keep canonical state local." },
+    });
+
+    const workItem = request.workItem!;
+    expect(() => parseApplyRequest({ ...request, workItem: { title: workItem.title, body: workItem.body } })).toThrow(/workItemId/i);
+    expect(() => parseApplyRequest({ ...request, actorReceiptId: { receiptId: RECEIPT_ID } })).toThrow(/actorReceiptId|expected string/i);
+    expect(() => parseApplyRequest({ ...request, idempotencyKey: undefined })).toThrow(/idempotencyKey/i);
   });
 
   it("keeps fixture insertion outside the production RPC/CLI surface", async () => {
