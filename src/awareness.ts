@@ -41,6 +41,9 @@ export interface RegisteredWait {
   sourceThreadId: string;
   sourceEvent: RegisteredWaitSourceEvent;
   deadlineAtMs: number;
+  /** Legacy declarations have no verified waker and never suppress the watchdog. */
+  wakerSchedule: string | null;
+  declaredAtMs: number | null;
 }
 
 export interface WaitEvent extends RegisteredWait {
@@ -79,6 +82,8 @@ function normalizeRegisteredWait(input: unknown): RegisteredWait {
     sourceThreadId: value.sourceThreadId,
     sourceEvent: value.sourceEvent,
     deadlineAtMs: value.deadlineAtMs as number,
+    wakerSchedule: typeof value.wakerSchedule === "string" && value.wakerSchedule.length > 0 ? value.wakerSchedule : null,
+    declaredAtMs: Number.isInteger(value.declaredAtMs) && (value.declaredAtMs as number) >= 0 ? value.declaredAtMs as number : null,
   };
 }
 
@@ -242,7 +247,10 @@ export interface RoleIdleRecord {
   idleSinceMs: number | null;
   lastSteerAtMs: number | null;
   awaitingSteerOutcome: boolean;
-  lastWakeAtMs: number | null;
+  lastFleetWakeAtMs: number | null;
+  lastStaleWaitWakeAtMs: number | null;
+  lastOwedActWakeAtMs: number | null;
+  lastEscalationAtMs: number | null;
 }
 
 export interface ContinuationClaim {
@@ -331,16 +339,23 @@ function roleIdleState(input: unknown): Record<string, RoleIdleRecord> {
     const idleSinceMs = typeof record.idleSinceMs === "number" && Number.isFinite(record.idleSinceMs) ? record.idleSinceMs : null;
     const lastSteerAtMs = typeof record.lastSteerAtMs === "number" && Number.isFinite(record.lastSteerAtMs) ? record.lastSteerAtMs : null;
     const awaitingSteerOutcome = record.awaitingSteerOutcome === true;
-    const lastWakeAtMs = typeof record.lastWakeAtMs === "number" && Number.isFinite(record.lastWakeAtMs) ? record.lastWakeAtMs : null;
-    if (!Number.isInteger(record.steerCount) || (record.steerCount as number) < 0 || (record.steerCount as number) > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || (idleSinceMs !== null && idleSinceMs < 0) || (lastSteerAtMs !== null && lastSteerAtMs < 0) || (lastWakeAtMs !== null && lastWakeAtMs < 0) || typeof record.escalated !== "boolean") {
+    const lastFleetWakeAtMs = typeof record.lastFleetWakeAtMs === "number" && Number.isFinite(record.lastFleetWakeAtMs) ? record.lastFleetWakeAtMs : null;
+    const lastStaleWaitWakeAtMs = typeof record.lastStaleWaitWakeAtMs === "number" && Number.isFinite(record.lastStaleWaitWakeAtMs) ? record.lastStaleWaitWakeAtMs : null;
+    const lastOwedActWakeAtMs = typeof record.lastOwedActWakeAtMs === "number" && Number.isFinite(record.lastOwedActWakeAtMs) ? record.lastOwedActWakeAtMs : null;
+    const lastEscalationAtMs = typeof record.lastEscalationAtMs === "number" && Number.isFinite(record.lastEscalationAtMs) ? record.lastEscalationAtMs : null;
+    if (!Number.isInteger(record.steerCount) || (record.steerCount as number) < 0 || (record.steerCount as number) > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || (idleSinceMs !== null && idleSinceMs < 0) || (lastSteerAtMs !== null && lastSteerAtMs < 0) || (lastFleetWakeAtMs !== null && lastFleetWakeAtMs < 0) || (lastStaleWaitWakeAtMs !== null && lastStaleWaitWakeAtMs < 0) || (lastOwedActWakeAtMs !== null && lastOwedActWakeAtMs < 0) || (lastEscalationAtMs !== null && lastEscalationAtMs < 0) || typeof record.escalated !== "boolean") {
       throw new Error("invalid role idle state");
     }
-    state[key] = { steerCount: record.steerCount as number, failedSteers, escalated: record.escalated as boolean, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastWakeAtMs };
+    state[key] = { steerCount: record.steerCount as number, failedSteers, escalated: record.escalated as boolean, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastFleetWakeAtMs, lastStaleWaitWakeAtMs, lastOwedActWakeAtMs, lastEscalationAtMs };
   }
   return state;
 }
 
-function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
+function emptyRoleIdleRecord(): RoleIdleRecord {
+  return { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastFleetWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
+}
+
+export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
   let state: Record<string, RoleIdleRecord> = {};
   let loaded = false;
   let queue = Promise.resolve();
@@ -370,7 +385,7 @@ function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
         }
         return { ...record };
       }
-      state[key] = { ...(record ?? { steerCount: 0, failedSteers: 0, escalated: false, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null }), idleSinceMs, awaitingSteerOutcome: false };
+      state[key] = { ...(record ?? emptyRoleIdleRecord()), idleSinceMs, awaitingSteerOutcome: false };
       await save();
       return { ...state[key] };
     }),
@@ -378,7 +393,7 @@ function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
       await load();
       const record = state[key];
       if (!record) return;
-      state[key] = { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: record.lastWakeAtMs };
+      state[key] = { ...emptyRoleIdleRecord(), lastFleetWakeAtMs: record.lastFleetWakeAtMs, lastStaleWaitWakeAtMs: record.lastStaleWaitWakeAtMs, lastOwedActWakeAtMs: record.lastOwedActWakeAtMs, lastEscalationAtMs: record.lastEscalationAtMs };
       await save();
     }),
     preserveAfterSteerWake: (key: string) => enqueue(async () => {
@@ -388,7 +403,7 @@ function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
     }),
     recordSteer: (key: string, failed: boolean, steeredAtMs: number) => enqueue(async () => {
       await load();
-      const record = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null };
+      const record = state[key] ?? emptyRoleIdleRecord();
       record.steerCount = Math.min(2, record.steerCount + 1);
       if (failed) record.failedSteers = Math.min(2, record.failedSteers + 1);
       record.lastSteerAtMs = steeredAtMs;
@@ -399,7 +414,7 @@ function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
     }),
     markEscalated: (key: string) => enqueue(async () => {
       await load();
-      const record = state[key] ?? { steerCount: 2, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null };
+      const record = state[key] ?? { ...emptyRoleIdleRecord(), steerCount: 2 };
       if (record.escalated) return false;
       record.escalated = true;
       state[key] = record;
@@ -417,13 +432,36 @@ function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
       }
       if (changed) await save();
     }),
-    recordWake: (key: string, sentAtMs: number) => enqueue(async () => {
+    recordFleetWake: (key: string, sentAtMs: number) => enqueue(async () => {
       await load();
-      const record = state[key] ?? { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastWakeAtMs: null };
-      const next = { ...record, lastWakeAtMs: sentAtMs };
+      const next = { ...(state[key] ?? emptyRoleIdleRecord()), lastFleetWakeAtMs: sentAtMs };
       const nextState = { ...state, [key]: next };
       await persistence?.write(structuredClone(nextState));
       state = nextState;
+    }),
+    recordStaleWaitWake: (key: string, sentAtMs: number) => enqueue(async () => {
+      await load();
+      const nextState = { ...state, [key]: { ...(state[key] ?? emptyRoleIdleRecord()), lastStaleWaitWakeAtMs: sentAtMs } };
+      await persistence?.write(structuredClone(nextState));
+      state = nextState;
+    }),
+    recordOwedActWake: (key: string, sentAtMs: number) => enqueue(async () => {
+      await load();
+      const nextState = { ...state, [key]: { ...(state[key] ?? emptyRoleIdleRecord()), lastOwedActWakeAtMs: sentAtMs } };
+      await persistence?.write(structuredClone(nextState));
+      state = nextState;
+    }),
+    recordEscalation: (key: string, sentAtMs: number) => enqueue(async () => {
+      await load();
+      const record = state[key] ?? emptyRoleIdleRecord();
+      const nextState = { ...state, [key]: { ...record, lastEscalationAtMs: sentAtMs } };
+      await persistence?.write(structuredClone(nextState));
+      state = nextState;
+    }),
+    clearWakeHistory: (prefix: string) => enqueue(async () => {
+      await load();
+      for (const key of Object.keys(state)) if (key.startsWith(prefix)) state[key] = { ...state[key]!, idleSinceMs: null, lastFleetWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
+      await save();
     }),
   };
 }
@@ -545,6 +583,7 @@ export interface LaneWatcher {
   recover(): Promise<void>;
   readRoleIdle(key: string): Promise<RoleIdleRecord | null>;
   observeRoleIdle(key: string, idleSinceMs: number): Promise<RoleIdleRecord>;
+  resetRoleIdle(key: string): Promise<void>;
   recordRoleWake(key: string, sentAtMs: number): Promise<void>;
 }
 
@@ -1251,8 +1290,11 @@ export function createLaneWatcher(options: {
     observeRoleIdle(key, idleSinceMs) {
       return roleIdleLedger.observeIdle(key, idleSinceMs);
     },
+    resetRoleIdle(key) {
+      return roleIdleLedger.resetIdle(key);
+    },
     recordRoleWake(key, sentAtMs) {
-      return roleIdleLedger.recordWake(key, sentAtMs);
+      return roleIdleLedger.recordFleetWake(key, sentAtMs);
     },
   };
 }

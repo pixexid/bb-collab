@@ -58,6 +58,8 @@ function registeredWait(overrides: Partial<RegisteredWait> = {}): RegisteredWait
     sourceThreadId: "source-1",
     sourceEvent: "terminal",
     deadlineAtMs: TEST_REGISTERED_WAIT_DEADLINE_AT_MS,
+    wakerSchedule: null,
+    declaredAtMs: null,
     ...overrides,
   };
 }

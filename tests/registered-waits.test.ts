@@ -109,6 +109,7 @@ async function boundedRegister(h: Harness, input: unknown, ctxThreadId?: string)
   return registerBoundedWait({
     registry: bounded(h.registry),
     readSource: async (threadId: string) => h.sources.get(threadId) ?? null,
+    readWaker: async (schedule: string) => schedule === "wait-validator-liveness",
     input,
     ctxThreadId,
     now: () => h.now.value,
@@ -128,6 +129,7 @@ const waitRequest = (overrides: Record<string, unknown> = {}) => ({
   sourceEvent: "terminal",
   reason: "waiting for the source lane to finish",
   idempotencyKey: "wait-key-1",
+  wakerSchedule: "wait-validator-liveness",
   ...overrides,
 });
 

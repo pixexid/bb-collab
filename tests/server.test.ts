@@ -56,6 +56,7 @@ import {
   seedFixtureDecision,
   seedVerifiedFixtureReceipt,
 } from "../src/test-support.js";
+import { createLaneWatcher, createRoleIdleLedger, roleIdleKey } from "../src/awareness.js";
 import { findCheckoutRoot, readCheckoutDivergence } from "../src/checkout-divergence.js";
 
 const PROJECT_ID = "proj_test";
@@ -164,6 +165,19 @@ function directorSeatConfig() {
     standbyProfile: DIRECTOR_STANDBY_PROFILE,
     writingLaneCapacity: 0,
   };
+  return config;
+}
+
+function directorAndOrchestratorConfig() {
+  const config = roleConfig();
+  (config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>).unshift({
+    roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+    roleId: "director",
+    repoTargetId: null,
+    executedProfile: DIRECTOR_PROFILE,
+    standbyProfile: DIRECTOR_STANDBY_PROFILE,
+    writingLaneCapacity: 0,
+  });
   return config;
 }
 
@@ -374,6 +388,7 @@ function hostFor(
           engines: {},
           history: [],
         }),
+        list: async () => ({ plugins: [{ id: PLUGIN_ID, status: "running", schedules: [{ name: "fleet-watchdog" }, { name: "stall-guard-liveness" }] }] }) as never,
       },
       hosts: {
         get: async () => ({
@@ -550,6 +565,28 @@ function transitionRequest(
   };
 }
 
+function workItemWaitRequest(
+  fenceToken: string,
+  expectedResourceRevision: number,
+  wait: ApplyRequest["workItemWait"],
+  overrides: Partial<ApplyRequest> = {},
+): ApplyRequest {
+  return {
+    projectId: PROJECT_ID,
+    operationClass: "work_item_transition",
+    idempotencyKey: `work-item-wait-${wait === null ? "clear" : "declare"}-${expectedResourceRevision}`,
+    actorReceiptId: RECEIPT_ID,
+    expectedConfigRevision: 1,
+    expectedGovernanceEpoch: 1,
+    expectedFenceToken: fenceToken,
+    repoTargetId: TARGET_ID,
+    expectedResourceRevision,
+    workItemId: WORK_ITEM_ID,
+    workItemWait: wait,
+    ...overrides,
+  };
+}
+
 function projectionRequest(
   fenceToken: string,
   expectedResourceRevision: number,
@@ -590,27 +627,31 @@ async function loadedDistHost() {
   return host;
 }
 
-async function sentinelWakeFloorFixture(updatedAt = 1) {
-  const fixture = await assignmentFixture({ directorSeat: true });
-  const holder = fixture.db.prepare(
+async function fleetWatchdogFixture(updatedAt = 1) {
+  const fixture = await assignmentFixture({ directorSeat: true, orchestratorSeat: true });
+  const director = fixture.db.prepare(
     "SELECT thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'director'",
+  ).get() as { thread_id: string };
+  const orchestrator = fixture.db.prepare(
+    "SELECT thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'project-orchestrator'",
   ).get() as { thread_id: string };
   let threadStatus: "idle" | "active" = "idle";
   let directorPendingInteraction = false;
   fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) =>
-    threadId === holder.thread_id && directorPendingInteraction ? [{ status: "pending" }] : []) as never);
+    threadId === director.thread_id && directorPendingInteraction ? [{ status: "pending" }] : []) as never);
   let nativeUpdatedAt = updatedAt;
-  const threadProjects = new Map([[holder.thread_id, PROJECT_ID]]);
+  const threadProjects = new Map([[director.thread_id, PROJECT_ID], [orchestrator.thread_id, PROJECT_ID]]);
   fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
     id: threadId,
-    projectId: threadProjects.get(threadId) ?? PROJECT_ID,
+    projectId: threadProjects.get(threadId) ?? (threadId.includes("two") ? "project-two" : PROJECT_ID),
     status: threadStatus,
     updatedAt: nativeUpdatedAt,
   })) as never);
   fixture.host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
   return {
     ...fixture,
-    directorThreadId: holder.thread_id,
+    directorThreadId: director.thread_id,
+    orchestratorThreadId: orchestrator.thread_id,
     setThreadUpdatedAt(value: number) { nativeUpdatedAt = value; },
     setThreadStatus(value: "idle" | "active") { threadStatus = value; },
     getThreadStatus() { return threadStatus; },
@@ -619,7 +660,7 @@ async function sentinelWakeFloorFixture(updatedAt = 1) {
   };
 }
 
-async function addPendingReview(fixture: Awaited<ReturnType<typeof sentinelWakeFloorFixture>>) {
+async function addPendingReview(fixture: Awaited<ReturnType<typeof fleetWatchdogFixture>>) {
   activateReviewer(fixture.db, fixture.fenceToken);
   expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
   const template = assignmentPrepareRequest(fixture.fenceToken, "pending-review");
@@ -660,7 +701,7 @@ function cloneProject(db: Database.Database, sourceProjectId: string, targetProj
   clone("work_items");
   clone("qualification_observations");
   clone("execution_attempts", " AND origin = 'role_holder'", (row) => {
-    row.thread_id = row.role_id === "director" ? "director-two" : `reviewer-two-${row.role_generation}`;
+    row.thread_id = row.role_id === "director" ? "director-two" : row.role_id === "project-orchestrator" ? "orchestrator-two" : `reviewer-two-${row.role_generation}`;
   });
   clone("role_generations");
   clone("role_generation_heads");
@@ -1406,10 +1447,12 @@ async function assignmentFixture(options: {
   connectorPolicy?: "required" | "optional" | "prohibited";
   targetDefaultBranch?: string;
   directorSeat?: boolean;
+  orchestratorSeat?: boolean;
 } = {}) {
   const host = await loadedHost();
   const directorSeat = options.directorSeat === true;
-  const config = directorSeat ? directorSeatConfig() : roleConfig(options.connectorPolicy);
+  const orchestratorSeat = options.orchestratorSeat === true;
+  const config = directorSeat ? (orchestratorSeat ? directorAndOrchestratorConfig() : directorSeatConfig()) : roleConfig(options.connectorPolicy);
   if (options.writingLaneCeiling !== undefined) {
     (config.extensions.bbCollab as Record<string, unknown>).writingLaneCeiling = options.writingLaneCeiling;
   }
@@ -1441,6 +1484,33 @@ async function assignmentFixture(options: {
     roleId: directorSeat ? "director" : "project-orchestrator",
     roleGeneration: 1,
   });
+  if (orchestratorSeat) {
+    const roleContext = {
+      threadId: "thread-fleet-orchestrator",
+      requestEventId: "event-fleet-orchestrator-request",
+      requestEventSeq: 1,
+      completionEventId: "event-fleet-orchestrator-completion",
+      completionEventSeq: 4,
+    };
+    const facts = () => roleReader((input) => {
+      input.thread.id = roleContext.threadId;
+      input.thread.environmentId = "environment-fleet-orchestrator";
+      input.environment.id = "environment-fleet-orchestrator";
+      input.events[0]!.id = roleContext.requestEventId;
+      input.events[3]!.id = roleContext.completionEventId;
+    });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "qualification-fleet-orchestrator",
+      qualificationId: "qualification-fleet-orchestrator",
+      roleContext,
+    }), null, facts()).outcome).toBe("OK");
+    const orchestrator = applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      idempotencyKey: "succession-fleet-orchestrator",
+      qualificationId: "qualification-fleet-orchestrator",
+      roleContext,
+    }), null, facts());
+    expect(orchestrator.outcome).toBe("OK");
+  }
   return { host, db, fenceToken, holderExecutionAttemptId };
 }
 
@@ -2223,32 +2293,291 @@ describe("bb-collab plugin boundary", () => {
     expect(cli.exitCode).toBe(2);
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "ACTOR_RECEIPT_UNKNOWN" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["lane-watcher"]);
-    expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "sentinel-wake-floor", "thread-archive-sweep"]);
+    expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "thread-archive-sweep"]);
     expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "doctor", "export", "lanes", "registerWait", "reorderPinned", "roleBrief", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
   });
 
   it("does not wake a quiet director seat", async () => {
-    const fixture = await sentinelWakeFloorFixture();
-    expect(fixture.host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toContain("sentinel-wake-floor");
-    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    const fixture = await fleetWatchdogFixture();
+    const cron = fixture.host.harness.inspection.registrations.schedules.find((schedule) => schedule.name === "fleet-watchdog")?.cron;
+    if (cron !== "0 * * * *") {
+      throw new Error(`expected registered fleet-watchdog cron "0 * * * *", got "${cron}"\nDRILL BUILD ACTIVE - restore the production cron before merge (teardown item 3)`);
+    }
+    await fixture.host.harness.runSchedule("fleet-watchdog");
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("uses effective live watchdog threshold settings", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      expect(fixture.host.harness.inspection.registrations.settingsDescriptors).toMatchObject({
+        fleetWatchdogFloorMs: { default: "3600000" },
+        fleetWatchdogStaleWaitMs: { default: "86400000" },
+      });
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      await fixture.host.harness.setSettings({ fleetWatchdogFloorMs: "1", fleetWatchdogStaleWaitMs: "2" });
+      clock.mockReturnValue(1);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("keeps the watchdog idle anchor through lane-watcher cleanup", async () => {
+    const holder = { project_id: PROJECT_ID, role_id: "director", role_generation: 1, execution_attempt_id: "director-attempt", thread_id: "director-thread" };
+    const key = roleIdleKey(holder, WORK_ITEM_ID);
+    let watchdogState: unknown = {};
+    const watchdogIdle = createRoleIdleLedger({ read: async () => watchdogState, write: async (state) => { watchdogState = state; } });
+    await watchdogIdle.observeIdle(key, 0);
+    const anchored = await watchdogIdle.get(key);
+
+    let laneWatcherState: unknown = {};
+    const laneIdle = createRoleIdleLedger({ read: async () => laneWatcherState, write: async (state) => { laneWatcherState = state; } });
+    await laneIdle.observeIdle(key, 0);
+    const laneWatcher = createLaneWatcher({
+      readLanes: () => [],
+      readRoleHolders: () => [holder],
+      readRoleScopes: () => [],
+      readWorker: async () => ({ projectId: PROJECT_ID, status: "idle", pendingExternalWait: false, archived: false, idleSinceMs: 0 }),
+      steer: async () => undefined,
+      steerRole: async () => undefined,
+      roleIdlePersistence: { read: async () => laneWatcherState, write: async (state) => { laneWatcherState = state; } },
+    });
+    await laneWatcher.poll();
+
+    expect(await laneWatcher.readRoleIdle(key)).toBeNull();
+    expect(laneWatcherState).toEqual({});
+    expect(await watchdogIdle.get(key)).toEqual(anchored);
+  });
+
+  it("clears every watchdog wake timestamp on an explicit history reset", async () => {
+    const holder = { project_id: PROJECT_ID, role_id: "director", role_generation: 1, execution_attempt_id: "director-attempt", thread_id: "director-thread" };
+    const key = roleIdleKey(holder, WORK_ITEM_ID);
+    let state: unknown = {};
+    const ledger = createRoleIdleLedger({ read: async () => state, write: async (next) => { state = next; } });
+    await ledger.observeIdle(key, 1);
+    await ledger.recordFleetWake(key, 2);
+    await ledger.recordStaleWaitWake(key, 3);
+    await ledger.recordOwedActWake(key, 4);
+    await ledger.recordEscalation(key, 5);
+    await ledger.clearWakeHistory(`${PROJECT_ID}:`);
+    expect(await ledger.get(key)).toMatchObject({
+      idleSinceMs: null,
+      lastFleetWakeAtMs: null,
+      lastStaleWaitWakeAtMs: null,
+      lastOwedActWakeAtMs: null,
+      lastEscalationAtMs: null,
+    });
+  });
+
+  it("refuses a WorkItem wait declaration whose schedule or seat waker is not live before any write", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    const before = exportFoundation(db, PROJECT_ID);
+    const result = await host.harness.callRpc("apply", workItemWaitRequest("fence", 1, { kind: "schedule", schedule: "phantom-waker", declaredBySeat: "worker-seat" }));
+    expect(result).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0, message: "waker schedule phantom-waker is not live: declaration refused" });
+    const seat = await host.harness.callRpc("apply", workItemWaitRequest("fence", 1, { kind: "seat", seat: "worker", declaredBySeat: "worker-seat" }));
+    expect(seat).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0, message: "waker seat worker is not live: declaration refused" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
   });
 
   it("wakes a stalled director exactly once for nextStartable work", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
-      const fixture = await sentinelWakeFloorFixture();
+      const fixture = await fleetWatchdogFixture();
       await addPendingReview(fixture);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       clock.mockReturnValue(60 * 60_000);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(2 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([input]) => (input as { threadId: string }).threadId === fixture.directorThreadId)).toEqual([[
         {
           threadId: fixture.directorThreadId,
           mode: "queue-if-active",
-          input: [{ type: "text", visibility: "agent-only", text: "Hourly director health check: inspect canonical surfaces and report any drift or blocker.", mentions: [] }],
+          input: [{ type: "text", visibility: "agent-only", text: "fleet still quiet with open work since 1970-01-01T00:00:00.000Z", mentions: [] }],
         },
       ]]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("wakes the orchestrator first when the fleet is quietly stalled", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "fleet quiet with open work since 1970-01-01T00:00:00.000Z" })] }),
+      ]]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("escalates unresolved work after the tier-1 receiver becomes active", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      fixture.setThreadStatus("active");
+      clock.mockReturnValue(90 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      fixture.setThreadStatus("idle");
+      clock.mockReturnValue(2 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { threadId: string }).threadId)).toEqual([
+        fixture.orchestratorThreadId,
+        fixture.directorThreadId,
+      ]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("drives the scheduled watchdog path through one scoped CLI cycle", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      expect(JSON.parse((await fixture.host.harness.runCli(["fleet-watchdog", "--cycle", "--project", PROJECT_ID])).stdout)).toMatchObject({ outcome: "OK", subject: PROJECT_ID, message: "fleet-watchdog cycle complete" });
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runCli(["fleet-watchdog", "--cycle", "--project", PROJECT_ID]);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+      expect((await fixture.host.harness.runCli(["fleet-watchdog", "--cycle"])).exitCode).toBe(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("stays silent for an active declared artifact-lane wait", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 3, { kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat" }))).toMatchObject({ outcome: "OK" });
+      for (const now of [0, 60 * 60_000, 2 * 60 * 60_000]) {
+        clock.mockReturnValue(now);
+        await fixture.host.harness.runSchedule("fleet-watchdog");
+      }
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("surfaces a stale declared wait to the orchestrator", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture();
+      await addPendingReview(fixture);
+      expect(applyWithFixtureReceipt(fixture.db, workItemWaitRequest(fixture.fenceToken, 3, { kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat" })).outcome).toBe("OK");
+      clock.mockReturnValue(25 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "wait went stale: chase the external or re-plan" })] }),
+      ]]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("does not escalate a resolved stale wait while the fleet is busy", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 3, { kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat" }))).toMatchObject({ outcome: "OK" });
+      clock.mockReturnValue(25 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 4, null))).toMatchObject({ outcome: "OK" });
+      fixture.setThreadStatus("active");
+      clock.mockReturnValue(26 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "wait went stale: chase the external or re-plan" })] }),
+      ]]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("surfaces a stale owed act to the orchestrator", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture();
+      await addPendingReview(fixture);
+      expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 3, { kind: "seat", seat: "director", declaredBySeat: "worker-seat" }))).toMatchObject({ outcome: "OK" });
+      clock.mockReturnValue(25 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "owed act went stale" })] }),
+      ]]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("escalates an owing non-director seat to the director", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 3, { kind: "seat", seat: "project-orchestrator", declaredBySeat: "worker-seat" }))).toMatchObject({ outcome: "OK" });
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(2 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([
+        [expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "owed act is quiet with open work since 1970-01-01T00:00:00.000Z" })] })],
+        [expect.objectContaining({ threadId: fixture.directorThreadId, input: [expect.objectContaining({ text: "owed act still quiet with open work since 1970-01-01T00:00:00.000Z" })] })],
+      ]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("wakes the owing director once and leaves its terminal tier to the dead-man surface", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 3, { kind: "seat", seat: "director", declaredBySeat: "worker-seat" }))).toMatchObject({ outcome: "OK" });
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(2 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({ threadId: fixture.directorThreadId, input: [expect.objectContaining({ text: "owed act is quiet with open work since 1970-01-01T00:00:00.000Z" })] }),
+      ]]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("stays silent while the fleet is busy", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await addPendingReview(fixture);
+      fixture.setThreadStatus("active");
+      for (const now of [0, 60 * 60_000, 2 * 60 * 60_000]) {
+        clock.mockReturnValue(now);
+        await fixture.host.harness.runSchedule("fleet-watchdog");
+      }
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
     } finally {
       clock.mockRestore();
     }
@@ -2257,12 +2586,12 @@ describe("bb-collab plugin boundary", () => {
   it("preserves the idle anchor across a metadata-only updatedAt bump", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
-      const fixture = await sentinelWakeFloorFixture(0);
+      const fixture = await fleetWatchdogFixture(0);
       await addPendingReview(fixture);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       fixture.setThreadUpdatedAt(60 * 60_000);
       clock.mockReturnValue(60 * 60_000);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
     } finally {
       clock.mockRestore();
@@ -2272,11 +2601,11 @@ describe("bb-collab plugin boundary", () => {
   it("does not wake pending work before the director idle floor", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(60 * 60_000);
     try {
-      const fixture = await sentinelWakeFloorFixture(0);
+      const fixture = await fleetWatchdogFixture(0);
       await addPendingReview(fixture);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       clock.mockReturnValue(90 * 60_000);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
     } finally {
       clock.mockRestore();
@@ -2284,33 +2613,27 @@ describe("bb-collab plugin boundary", () => {
   });
 
   it("does not wake a lane blocked by a pending platform interaction", async () => {
-    const fixture = await sentinelWakeFloorFixture();
+    const fixture = await fleetWatchdogFixture();
     const executionAttemptId = await addPendingReview(fixture);
     const waitingThreadId = "platform-waiting-review";
     fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE execution_attempt_id = ?").run(waitingThreadId, executionAttemptId);
     fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) =>
       threadId === waitingThreadId ? [{ status: "pending" }] : []) as never);
-    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    await fixture.host.harness.runSchedule("fleet-watchdog");
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
   it("fails closed when a stale false interaction cache meets a failed fresh read", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
-      const fixture = await sentinelWakeFloorFixture(0);
-      const executionAttemptId = await addPendingReview(fixture);
-      fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE execution_attempt_id = ?").run("stale-cache-thread", executionAttemptId);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      fixture.db.prepare("UPDATE execution_attempts SET state = 'running' WHERE execution_attempt_id = ?").run(executionAttemptId);
-      clock.mockReturnValue(30 * 60_000);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      fixture.db.prepare("UPDATE execution_attempts SET state = 'prepared' WHERE execution_attempt_id = ?").run(executionAttemptId);
+      const fixture = await fleetWatchdogFixture(0);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) => {
-        if (threadId === "stale-cache-thread") throw new Error("lane interactions unavailable");
+        if (threadId === fixture.orchestratorThreadId) throw new Error("orchestrator interactions unavailable");
         return [];
       }) as never);
       clock.mockReturnValue(60 * 60_000);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
     } finally {
       clock.mockRestore();
@@ -2319,52 +2642,21 @@ describe("bb-collab plugin boundary", () => {
 
   it("fails closed when a watcher interaction read writes after the floor read fails", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
-    let service: { controller: AbortController; done: Promise<void> } | undefined;
     try {
-      const fixture = await sentinelWakeFloorFixture(0);
-      const executionAttemptId = await addPendingReview(fixture);
-      const laneThreadId = "late-writer-lane";
-      fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE execution_attempt_id = ?").run(laneThreadId, executionAttemptId);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      const fixture = await fleetWatchdogFixture(0);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       clock.mockReturnValue(60 * 60_000);
-      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => {
-        if (threadId === laneThreadId) throw new Error("lane thread unavailable");
-        return makeThreadResponse({
-          id: threadId,
-          projectId: PROJECT_ID,
-          status: threadId === fixture.directorThreadId ? "idle" : "active",
-          updatedAt: 0,
-        });
-      }) as never);
-      let laneReads = 0;
-      let releaseWatcherRead!: (interactions: Array<{ status: string }>) => void;
-      const watcherRead = new Promise<Array<{ status: string }>>((resolve) => {
-        releaseWatcherRead = resolve;
-      });
       fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) => {
-        if (threadId !== laneThreadId) return [];
-        laneReads += 1;
-        if (laneReads === 1) return watcherRead;
-        if (laneReads === 2) {
-          releaseWatcherRead([]);
-          await Promise.resolve();
-          await Promise.resolve();
-        }
-        throw new Error("floor lane interactions unavailable");
+        if (threadId === fixture.directorThreadId) throw new Error("director interactions unavailable");
+        return [];
       }) as never);
-      service = fixture.host.harness.behavior.runService("lane-watcher");
-      await vi.waitFor(() => expect(laneReads).toBe(1));
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      service.controller.abort();
-      await service.done;
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")
         .filter(([input]) => {
           const send = input as { threadId: string; mode: string };
           return send.threadId === fixture.directorThreadId && send.mode === "queue-if-active";
         })).toHaveLength(0);
     } finally {
-      service?.controller.abort();
-      await service?.done;
       clock.mockRestore();
     }
   });
@@ -2372,14 +2664,16 @@ describe("bb-collab plugin boundary", () => {
   it("wakes independent project-scoped director floors", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
-      const fixture = await sentinelWakeFloorFixture();
+      const fixture = await fleetWatchdogFixture();
       await addPendingReview(fixture);
       cloneProject(fixture.db, PROJECT_ID, "project-two");
       fixture.setThreadProject("director-two", "project-two");
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       clock.mockReturnValue(60 * 60_000);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { threadId: string }).threadId).sort()).toEqual([
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(2 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { threadId: string }).threadId).filter((threadId) => threadId === "director-two" || threadId === fixture.directorThreadId).sort()).toEqual([
         "director-two",
         fixture.directorThreadId,
       ].sort());
@@ -2389,19 +2683,19 @@ describe("bb-collab plugin boundary", () => {
   });
 
   it("fails closed and warns on same-project director ambiguity", async () => {
-    const fixture = await sentinelWakeFloorFixture();
+    const fixture = await fleetWatchdogFixture();
     await addPendingReview(fixture);
     fixture.db.exec("ALTER TABLE role_generation_heads RENAME TO role_generation_heads_table; CREATE VIEW role_generation_heads AS SELECT * FROM role_generation_heads_table UNION ALL SELECT * FROM role_generation_heads_table WHERE role_id = 'director'");
-    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    await fixture.host.harness.runSchedule("fleet-watchdog");
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
     expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
       level: "warn",
-      message: "sentinel-wake-floor refused: project=proj_test active director holders=2",
+      message: "fleet-watchdog refused: project=proj_test active director holders=2",
     }));
   });
 
   it("does not wake a stale director after succession during the gate", async () => {
-    const fixture = await sentinelWakeFloorFixture();
+    const fixture = await fleetWatchdogFixture();
     await addPendingReview(fixture);
     let succeeded = false;
     fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) => {
@@ -2411,22 +2705,22 @@ describe("bb-collab plugin boundary", () => {
       }
       return [];
     }) as never);
-    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    await fixture.host.harness.runSchedule("fleet-watchdog");
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
   it("coalesces a second consecutive floor fire", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
-      const fixture = await sentinelWakeFloorFixture(0);
+      const fixture = await fleetWatchdogFixture(0);
       await addPendingReview(fixture);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       clock.mockReturnValue(60 * 60_000);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
-      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("lane-watcher.role-idle");
-      expect(Object.values(persisted ?? {}).some((record) => record.lastWakeAtMs === 60 * 60_000)).toBe(true);
+      const persisted = await fixture.host.bb.storage.kv.get<Record<string, { lastFleetWakeAtMs?: number | null }>>("fleet-watchdog.role-idle");
+      expect(Object.values(persisted ?? {}).some((record) => record.lastFleetWakeAtMs === 60 * 60_000)).toBe(true);
     } finally {
       clock.mockRestore();
     }
@@ -2435,22 +2729,22 @@ describe("bb-collab plugin boundary", () => {
   it("retries after a successful send whose wake timestamp was not persisted", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
-      const fixture = await sentinelWakeFloorFixture(0);
+      const fixture = await fleetWatchdogFixture(0);
       await addPendingReview(fixture);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       let failTimestampWrite = true;
       const originalSet = fixture.host.bb.storage.kv.set.bind(fixture.host.bb.storage.kv);
       const setSpy = vi.spyOn(fixture.host.bb.storage.kv, "set").mockImplementation(async (key, value) => {
-        if (key === "lane-watcher.role-idle" && failTimestampWrite && value && typeof value === "object" && !Array.isArray(value)
-          && Object.values(value as Record<string, { lastWakeAtMs?: number | null }>).some((record) => record.lastWakeAtMs === 60 * 60_000)) {
+        if (key === "fleet-watchdog.role-idle" && failTimestampWrite && value && typeof value === "object" && !Array.isArray(value)
+          && Object.values(value as Record<string, { lastFleetWakeAtMs?: number | null }>).some((record) => record.lastFleetWakeAtMs === 60 * 60_000)) {
           failTimestampWrite = false;
           throw new Error("wake timestamp unavailable");
         }
         await originalSet(key, value);
       });
       clock.mockReturnValue(60 * 60_000);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
       setSpy.mockRestore();
     } finally {
@@ -2461,11 +2755,11 @@ describe("bb-collab plugin boundary", () => {
   it("fires after plugin downtime across an active period and legitimate re-stall", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
-      const fixture = await sentinelWakeFloorFixture(0);
+      const fixture = await fleetWatchdogFixture(0);
       await addPendingReview(fixture);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       clock.mockReturnValue(60 * 60_000);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
       fixture.setThreadStatus("active");
       const reloaded = await fixture.host.harness.lifecycle.reload((bb) => plugin(bb));
@@ -2479,17 +2773,17 @@ describe("bb-collab plugin boundary", () => {
       reloaded.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
       clock.mockReturnValue(3 * 60 * 60_000);
       fixture.setThreadStatus("idle");
-      await reloaded.harness.runSchedule("sentinel-wake-floor");
+      await reloaded.harness.runSchedule("fleet-watchdog");
       expect(reloaded.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
     } finally {
       clock.mockRestore();
     }
   });
 
-  it("does not send when the director becomes active during the final interaction read", async () => {
+  it("asserts tier-2 quietness only when it is true at emit time", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
-      const fixture = await sentinelWakeFloorFixture(0);
+      const fixture = await fleetWatchdogFixture(0);
       await addPendingReview(fixture);
       let directorInteractionReads = 0;
       fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) => {
@@ -2499,10 +2793,13 @@ describe("bb-collab plugin boundary", () => {
         }
         return [];
       }) as never);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       clock.mockReturnValue(60 * 60_000);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(2 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.getThreadStatus()).toBe("active");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").some(([input]) => (input as { input: Array<{ text: string }> }).input[0]?.text === "fleet still quiet with open work since 1970-01-01T00:00:00.000Z")).toBe(false);
     } finally {
       clock.mockRestore();
     }
@@ -2511,72 +2808,46 @@ describe("bb-collab plugin boundary", () => {
   it("continues processing other projects when one project's interactions read rejects", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
-      const fixture = await sentinelWakeFloorFixture(0);
-      await addPendingReview(fixture);
-      const projectOneAttemptId = (fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND origin = 'assignment' LIMIT 1").get(PROJECT_ID) as { execution_attempt_id: string }).execution_attempt_id;
+      const fixture = await fleetWatchdogFixture(0);
       cloneProject(fixture.db, PROJECT_ID, "project-two");
-      fixture.db.prepare("UPDATE execution_attempts SET execution_attempt_id = ? WHERE project_id = ? AND origin = 'assignment'").run(`${projectOneAttemptId}-project-two`, "project-two");
-      fixture.db.prepare("UPDATE execution_attempts SET thread_id = ? WHERE project_id = ? AND execution_attempt_id = ?").run("project-one-review", PROJECT_ID, projectOneAttemptId);
       fixture.setThreadProject("director-two", "project-two");
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      fixture.db.prepare("UPDATE execution_attempts SET state = 'running' WHERE project_id = ? AND execution_attempt_id = ?").run(PROJECT_ID, projectOneAttemptId);
-      clock.mockReturnValue(30 * 60_000);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      fixture.db.prepare("UPDATE execution_attempts SET state = 'prepared' WHERE project_id = ? AND execution_attempt_id = ?").run(PROJECT_ID, projectOneAttemptId);
+      fixture.setThreadProject("orchestrator-two", "project-two");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       let projectOneInteractionReads = 0;
       fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) => {
-        if (threadId === "project-one-review") {
+        if (threadId === fixture.directorThreadId) {
           projectOneInteractionReads += 1;
           throw new Error("project A interactions unavailable");
         }
         return [];
       }) as never);
       clock.mockReturnValue(60 * 60_000);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      expect(projectOneInteractionReads).toBe(2);
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { threadId: string }).threadId)).toEqual(["director-two"]);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(2 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(projectOneInteractionReads).toBeGreaterThan(0);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { threadId: string }).threadId).filter((threadId) => threadId === "director-two")).toEqual(["director-two"]);
     } finally {
       clock.mockRestore();
     }
   });
 
-  it("retains the wake timestamp through active and idle observations", async () => {
+  it("does not escalate a prior fleet wake while any holder is active", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
-      const fixture = await sentinelWakeFloorFixture(0);
+      const fixture = await fleetWatchdogFixture(0);
       await addPendingReview(fixture);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       clock.mockReturnValue(60 * 60_000);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      const afterSend = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("lane-watcher.role-idle");
-      expect(Object.values(afterSend ?? {}).some((record) => record.lastWakeAtMs === 60 * 60_000)).toBe(true);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       fixture.setThreadStatus("active");
-      const executionAttemptId = (fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE origin = 'assignment' LIMIT 1").get() as { execution_attempt_id: string }).execution_attempt_id;
-      expect(Object.keys(await fixture.host.bb.storage.kv.get<Record<string, unknown>>("lane-watcher.role-idle") ?? {}).some((key) => key.endsWith(`:${executionAttemptId}`))).toBe(true);
-      await fixture.host.harness.emitThreadEvent("thread.active", {
-        thread: makeThreadResponse({ id: fixture.directorThreadId, projectId: PROJECT_ID, status: "active" }),
-      });
-      await fixture.host.harness.runCli(["wait-validator", "--cycle"]);
-      const afterActive = await fixture.host.bb.storage.kv.get<Record<string, { lastWakeAtMs?: number | null }>>("lane-watcher.role-idle");
-      expect(Object.values(afterActive ?? {}).some((record) => record.lastWakeAtMs === 60 * 60_000)).toBe(true);
       clock.mockReturnValue(2 * 60 * 60_000);
-      fixture.setThreadStatus("idle");
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
-      clock.mockReturnValue(3 * 60 * 60_000);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "fleet quiet with open work since 1970-01-01T00:00:00.000Z" })] }),
+      ]]);
     } finally {
       clock.mockRestore();
-    }
-  });
-
-  it("never wakes the stood-down sentinel thread", async () => {
-    for (const pending of [false, true]) {
-      const fixture = await sentinelWakeFloorFixture();
-      if (pending) await addPendingReview(fixture);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").some(([input]) => (input as { threadId?: string }).threadId === "thr_bpzjyqg7ys")).toBe(false);
     }
   });
 
@@ -2584,7 +2855,7 @@ describe("bb-collab plugin boundary", () => {
     const fixture = await assignmentFixture();
     fixture.host.harness.sdk.stub("threads.interactions.list", (async () => []) as never);
     fixture.host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
-    await fixture.host.harness.runSchedule("sentinel-wake-floor");
+    await fixture.host.harness.runSchedule("fleet-watchdog");
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
@@ -2760,17 +3031,17 @@ describe("bb-collab plugin boundary", () => {
     expect(fixture.pullRequestStarts("b")).toBe(1);
   });
 
-  it("logs sentinel-wake-floor send failures without throwing", async () => {
+  it("logs fleet-watchdog send failures without throwing", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
-      const fixture = await sentinelWakeFloorFixture();
+      const fixture = await fleetWatchdogFixture();
       await addPendingReview(fixture);
-      await fixture.host.harness.runSchedule("sentinel-wake-floor");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
       clock.mockReturnValue(60 * 60_000);
       fixture.setThreadUpdatedAt(60 * 60_000);
       fixture.host.harness.sdk.stub("threads.send", (async () => { throw new Error("send unavailable"); }) as never);
-      await expect(fixture.host.harness.runSchedule("sentinel-wake-floor")).resolves.toBeUndefined();
-      expect(fixture.host.harness.inspection.logEntries.filter((entry) => entry.level === "warn" && entry.message === "sentinel-wake-floor failed: Error: send unavailable")).toHaveLength(1);
+      await expect(fixture.host.harness.runSchedule("fleet-watchdog")).resolves.toBeUndefined();
+      expect(fixture.host.harness.inspection.logEntries.filter((entry) => entry.level === "warn" && entry.message === "fleet-watchdog failed: Error: send unavailable")).toHaveLength(1);
     } finally {
       clock.mockRestore();
     }
@@ -2904,19 +3175,14 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("appends the v21 visible-configuration contract and rolls every cached consumer forward", () => {
-    expect(SCHEMA_VERSION).toBe(12);
+  it("appends the WorkItem-wait schema without changing the v21 contract", () => {
+    expect(SCHEMA_VERSION).toBe(14);
     expect(CONTRACT_VERSION).toBe(21);
-    expect(MIGRATIONS).toHaveLength(25);
-    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("5ee5cd12902e433825558c27b9a20d8bc2e86c5ffe018bf5b59e207d5d2d684e");
-    expect(MIGRATIONS.at(-7)?.match(/CREATE UNIQUE INDEX/gu)).toHaveLength(2);
-    expect(MIGRATIONS.at(-6)?.match(/CREATE TABLE/gu)).toHaveLength(1);
-    expect(MIGRATIONS.at(-6)).toContain("operator_receipts");
-    expect(MIGRATIONS.at(-5)).toContain("operator_receipt_id");
-    expect(MIGRATIONS.at(-4)).toContain("retirement_condition");
-    expect(MIGRATIONS.at(-3)).toContain("authorized_approvers");
-    expect(MIGRATIONS.at(-2)).toContain("standby_profile_json");
-    expect(MIGRATIONS.at(-1)).toContain("issuance_provenance");
+    expect(MIGRATIONS).toHaveLength(27);
+    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("eacc300f19723e0fd9dc0345509628569bd40b2d4c7740954bfc7e647aff9640");
+    expect(MIGRATIONS.at(-2)).toContain("work_item_waits");
+    expect(MIGRATIONS.at(-2)).toContain("declared_by_seat");
+    expect(MIGRATIONS.at(-1)).toContain("waker_kind");
     expect(TABLES).toContain("migration_runs");
     expect(MIGRATION_STATES).toEqual([
       "prepared", "frozen", "exported", "imported", "equivalent", "target_active", "exercised", "retired", "rolled_back", "fix_forward_required",
@@ -2926,8 +3192,8 @@ describe("bb-collab plugin boundary", () => {
     ]);
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 11,
-      newSchemaVersion: 12,
+      oldSchemaVersion: 13,
+      newSchemaVersion: 14,
       oldContractVersion: 20,
       newContractVersion: 21,
       action: "refused",
@@ -2935,9 +3201,9 @@ describe("bb-collab plugin boundary", () => {
       attempted: 4,
       verified: 0,
     });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 21))).toMatchObject({
-      oldSchemaVersion: 11,
-      newSchemaVersion: 12,
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(14, 21))).toMatchObject({
+      oldSchemaVersion: 13,
+      newSchemaVersion: 14,
       oldContractVersion: 20,
       newContractVersion: 21,
       action: "reread",
@@ -2947,8 +3213,8 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 11,
-      newSchemaVersion: 12,
+      oldSchemaVersion: 13,
+      newSchemaVersion: 14,
       oldContractVersion: 20,
       newContractVersion: 21,
       action: "refused",
@@ -2971,6 +3237,9 @@ describe("bb-collab plugin boundary", () => {
       expect((db.prepare("PRAGMA table_info(state_events)").all() as Array<{ name: string }>).map((row) => row.name)).toContain("operator_receipt_id");
       expect((db.prepare("PRAGMA table_info(mutation_receipts)").all() as Array<{ name: string }>).map((row) => row.name)).toContain("operator_receipt_id");
       expect((db.prepare("PRAGMA table_info(actor_receipts)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual(expect.arrayContaining(["operator_receipt_id", "retirement_condition"]));
+      expect((db.prepare("PRAGMA table_info(work_item_waits)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual([
+        "project_id", "work_item_id", "waker", "declared_at_ms", "declared_by_seat", "waker_kind",
+      ]);
       expect((db.prepare("PRAGMA index_list(migration_runs)").all() as Array<{ name: string; unique: number; partial: number }>).filter((row) => row.name.startsWith("migration_runs_"))).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "migration_runs_final_export_identity", unique: 1, partial: 1 }),
         expect.objectContaining({ name: "migration_runs_one_open", unique: 1, partial: 1 }),
@@ -2983,9 +3252,9 @@ describe("bb-collab plugin boundary", () => {
 
   it("assembles the production v21 cached-consumer rollout receipt with stale-v20 refusal semantics", async () => {
     expect(CONTRACT_VERSION).toBe(21);
-    expect(SCHEMA_VERSION).toBe(12);
-    expect(MIGRATIONS).toHaveLength(25);
-    expect(schemaDigest).toBe("eacc300f19723e0fd9dc0345509628569bd40b2d4c7740954bfc7e647aff9640");
+    expect(SCHEMA_VERSION).toBe(14);
+    expect(MIGRATIONS).toHaveLength(27);
+    expect(schemaDigest).toBe("19ce4f2a3293379c19fab2280357f2aad408da623d858e34d487332b7a5f31fe");
     expect(contractDigest).toBe("edf0dce5f7650adfd149d340d547a9cb13420202b3c8ce74ca6c8ae436a9f200");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -3002,7 +3271,7 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 12, observedContractVersion: 21 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 14, observedContractVersion: 21 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -3058,7 +3327,7 @@ describe("bb-collab plugin boundary", () => {
     const before = exportFoundation(db, PROJECT_ID);
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
-      observedSchemaVersion: 12,
+      observedSchemaVersion: 14,
       observedContractVersion: 21,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
@@ -3289,7 +3558,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 12, schemaDigest, contractVersion: 21, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 14, schemaDigest, contractVersion: 21, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -4975,8 +5244,8 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 11, newSchemaVersion: 12, action: "unknown", expected: 4, attempted: 0, verified: 0 },
-        schema: { version: 12 },
+        cachedConsumers: { oldSchemaVersion: 13, newSchemaVersion: 14, action: "unknown", expected: 4, attempted: 0, verified: 0 },
+        schema: { version: 14 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -5201,6 +5470,38 @@ describe("bb-collab plugin boundary", () => {
     });
   });
 
+  it("refuses terminalizing a stale WorkItem with an open wait, then clears and retires it", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 1, {
+      kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat",
+    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 2 });
+    expect(applyWithFixtureReceipt(db, {
+      ...bootstrapRequest(),
+      operationClass: "config_revision",
+      idempotencyKey: "config-2-after-wait",
+      expectedConfigRevision: 1,
+      configRevision: 2,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fenceToken,
+      config: { permissionMode: "auto", visibility: "visible", repositoryTargets: [TARGET_ID] },
+      targets: [{ ...bootstrapRequest().targets![0]!, defaultBranch: "develop" }],
+    }).outcome).toBe("OK");
+
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "cancelled", 2, {
+      idempotencyKey: "stale-wait-terminal-refused",
+      expectedConfigRevision: 2,
+    }))).toMatchObject({ outcome: "WORK_ITEM_WAIT_OPEN", attempted: 0 });
+    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 2, null, {
+      expectedConfigRevision: 2,
+    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "cancelled", 3, {
+      idempotencyKey: "stale-wait-terminal",
+      expectedConfigRevision: 2,
+    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+  });
+
   it("creates multiple targets through the resolver and rejects an ambiguous selector", async () => {
     const { db, path, directory } = directDatabase();
     try {
@@ -5257,6 +5558,7 @@ describe("bb-collab plugin boundary", () => {
     const created = applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken));
     expect(created).toMatchObject({ outcome: "OK", currentResourceRevision: 1 });
     expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items").get()).toEqual({ lifecycle_state: "proposed", resource_revision: 1 });
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, { idempotencyKey: "wait-on-create", workItemWait: { kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat" } }))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
 
     const beforeInvalid = exportFoundation(db, PROJECT_ID);
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "succeeded", 1))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
@@ -5272,6 +5574,22 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(afterWinner);
     expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE aggregate_type = 'work_item'").get()).toEqual({ count: 2 });
+  });
+
+  it("records one WorkItem wait and refuses terminal transition until it is cleared", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 2, { kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat" }))).toMatchObject({
+      outcome: "OK", currentResourceRevision: 3,
+    });
+    expect(db.prepare("SELECT work_item_id, waker, waker_kind, declared_by_seat FROM work_item_waits").get()).toEqual({
+      work_item_id: WORK_ITEM_ID, waker: "stall-guard-liveness", waker_kind: "schedule", declared_by_seat: "worker-seat",
+    });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "cancelled", 3))).toMatchObject({ outcome: "WORK_ITEM_WAIT_OPEN", attempted: 0 });
+    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 3, null)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "cancelled", 4)).outcome).toBe("OK");
   });
 
   it("creates one exact GitHub projection, replays idempotently, and survives plugin reload", async () => {
@@ -6374,7 +6692,7 @@ describe("bb-collab plugin boundary", () => {
     db.pragma("foreign_keys = OFF");
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
-    db.exec(MIGRATIONS.at(-9)!);
+    db.exec(MIGRATIONS.at(-11)!);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -6394,10 +6712,10 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 12, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 12, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 12, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 21))).toMatchObject({ oldSchemaVersion: 11, newSchemaVersion: 12, oldContractVersion: 20, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 13, newSchemaVersion: 14, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 13, newSchemaVersion: 14, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 13, newSchemaVersion: 14, oldContractVersion: 20, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(14, 21))).toMatchObject({ oldSchemaVersion: 13, newSchemaVersion: 14, oldContractVersion: 20, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
   it("reserves before native dispatch and accepts one exact terminal report", async () => {
@@ -7168,7 +7486,7 @@ describe("bb-collab plugin boundary", () => {
     const host = await loadedHost();
     const registrations = host.harness.inspection.registrations;
     expect(registrations.rpcMethods).not.toContain("seed-fixture-receipt");
-    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "archive-sweep"]);
+    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep"]);
     expect(registrations.httpRoutes.map((route) => route.path)).toEqual(["/lanes"]);
     expect(seedFixtureDecision).toBeTypeOf("function");
   });

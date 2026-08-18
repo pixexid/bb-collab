@@ -7,12 +7,12 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 export const CONTRACT_VERSION = 21;
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 14;
 // v21 makes project configuration visibility explicitly visible-only.
 const PREVIOUS_CONTRACT_VERSION = 20;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-const PREVIOUS_SCHEMA_VERSION = 11;
+const PREVIOUS_SCHEMA_VERSION = 13;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatProfile = {
@@ -62,6 +62,7 @@ export const TABLES = [
   "mutation_receipts",
   "state_events",
   "work_items",
+  "work_item_waits",
   "external_work_refs",
   "qualification_observations",
   "eligibility_projections",
@@ -617,6 +618,18 @@ export const MIGRATIONS: string[] = [
    CHECK (standby_profile_json IS NULL OR json_valid(standby_profile_json))`,
   `ALTER TABLE operator_receipts ADD COLUMN issuance_provenance TEXT
    CHECK (issuance_provenance IN ('console', 'attestation') OR issuance_provenance IS NULL)`,
+  `CREATE TABLE IF NOT EXISTS work_item_waits (
+    project_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    waker TEXT NOT NULL,
+    declared_at_ms INTEGER NOT NULL CHECK (declared_at_ms >= 0),
+    declared_by_seat TEXT NOT NULL,
+    PRIMARY KEY (project_id, work_item_id),
+    FOREIGN KEY (project_id, work_item_id)
+      REFERENCES work_items(project_id, work_item_id)
+  )`,
+  `ALTER TABLE work_item_waits ADD COLUMN waker_kind TEXT NOT NULL DEFAULT 'schedule'
+   CHECK (waker_kind IN ('schedule', 'seat'))`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -1193,6 +1206,10 @@ const workItemInputSchema = z
     body: z.string().max(64 * 1024),
   })
   .strict();
+const workItemWaitSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("schedule"), schedule: id, declaredBySeat: id }).strict(),
+  z.object({ kind: z.literal("seat"), seat: z.enum(ROLE_IDS), declaredBySeat: id }).strict(),
+]);
 
 const githubMappingSchema = z
   .object({
@@ -1450,6 +1467,7 @@ export const applyRequestSchema = z
     workItem: workItemInputSchema.optional(),
     workItemId: id.optional(),
     lifecycleState: workItemStateSchema.optional(),
+    workItemWait: workItemWaitSchema.nullable().optional(),
     projectionKind: z.literal("github_issue").optional(),
     roleId: roleIdSchema.optional(),
     roleRequirementId: id.optional(),
@@ -1970,6 +1988,7 @@ export type FoundationCode =
   | "WORK_ITEM_UNKNOWN"
   | "WORK_ITEM_FOREIGN"
   | "WORK_ITEM_STATE_INVALID"
+  | "WORK_ITEM_WAIT_OPEN"
   | "WORK_ITEM_REVISION_STALE"
   | "EXTERNAL_REF_REQUIRED"
   | "EXTERNAL_REF_FOREIGN"
@@ -2420,6 +2439,7 @@ function normalizeRequest(request: ApplyRequest): ApplyRequest {
     workItem: request.workItem ?? undefined,
     workItemId: request.workItemId ?? undefined,
     lifecycleState: request.lifecycleState ?? undefined,
+    workItemWait: request.workItemWait === undefined ? undefined : request.workItemWait,
     projectionKind: request.projectionKind ?? undefined,
     roleId: request.roleId ?? undefined,
     roleRequirementId: request.roleRequirementId ?? undefined,
@@ -5299,6 +5319,15 @@ interface WorkItemRow {
   updated_at_ms: number;
 }
 
+interface WorkItemWaitRow {
+  project_id: string;
+  work_item_id: string;
+  waker: string;
+  waker_kind: "schedule" | "seat";
+  declared_at_ms: number;
+  declared_by_seat: string;
+}
+
 interface ExternalWorkRefRow {
   project_id: string;
   work_item_id: string;
@@ -5386,6 +5415,7 @@ function applyWorkItemCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
   if (!request.workItem) throw refusal("INVALID_INPUT", "work item create requires workItem");
+  if (request.workItemWait !== undefined) throw refusal("WORK_ITEM_STATE_INVALID", "work item wait requires a work item transition");
   if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "work item create requires an exact repository target");
   requireTarget(db, request.projectId, configRevision, request.repoTargetId);
   if (request.workItemId && request.workItemId !== request.workItem.workItemId) {
@@ -5452,10 +5482,67 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
     request,
     configRevision,
     request.expectedResourceRevision,
-    nextState === "succeeded" || nextState === "failed" || nextState === "cancelled",
+    nextState === "succeeded" || nextState === "failed" || nextState === "cancelled" || request.workItemWait === null,
   );
+  const wait = request.workItemWait;
+  if (wait !== undefined && nextState !== undefined) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work item wait mutation cannot change lifecycle state");
+  }
+  if (wait !== undefined) {
+    if (["succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state)) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "terminal work item cannot carry a wait");
+    }
+    const existing = asRow<WorkItemWaitRow>(db.prepare(
+      "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?",
+    ).get(request.projectId, workItem.work_item_id));
+    if (wait !== null && existing) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
+    if (wait === null && !existing) throw refusal("WORK_ITEM_WAIT_OPEN", "work item carries no open wait");
+    const nextRevision = workItem.resource_revision + 1;
+    const updated = db.prepare(
+      `UPDATE work_items SET resource_revision = ?, updated_at_ms = ?
+       WHERE project_id = ? AND work_item_id = ? AND resource_revision = ?`,
+    ).run(nextRevision, now(), request.projectId, workItem.work_item_id, workItem.resource_revision);
+    if (updated.changes !== 1) throw refusal("WORK_ITEM_REVISION_STALE", "work item compare-and-swap failed", {
+      currentResourceRevision: workItem.resource_revision,
+      expectedResourceRevision: request.expectedResourceRevision ?? undefined,
+    });
+    if (wait === null) {
+      db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
+    } else {
+      db.prepare(
+        `INSERT INTO work_item_waits (project_id, work_item_id, waker, waker_kind, declared_at_ms, declared_by_seat)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(request.projectId, workItem.work_item_id, wait.kind === "schedule" ? wait.schedule : wait.seat, wait.kind, now(), wait.declaredBySeat);
+    }
+    return commitMutation(
+      db,
+      request,
+      digest,
+      actorReceiptId,
+      {
+        aggregateType: "work_item",
+        aggregateId: workItem.work_item_id,
+        aggregateRevision: nextRevision,
+        eventType: wait === null ? "work_item_wait_cleared" : "work_item_wait_declared",
+        event: { workItemId: workItem.work_item_id, ...(wait === null ? {} : { waker: wait, declaredBySeat: wait.declaredBySeat }) },
+      },
+      { expected: 1, attempted: 1, verified: 1 },
+      {
+        currentConfigRevision: configRevision,
+        currentGovernanceEpoch: governor.governance_epoch,
+        currentResourceRevision: nextRevision,
+        expectedResourceRevision: request.expectedResourceRevision ?? undefined,
+        evidence: { workItemId: workItem.work_item_id, wait: wait ?? null },
+      },
+    );
+  }
   if (!nextState || !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
+  }
+  if (["succeeded", "failed", "cancelled"].includes(nextState) && db.prepare(
+    "SELECT 1 FROM work_item_waits WHERE project_id = ? AND work_item_id = ?",
+  ).get(request.projectId, workItem.work_item_id)) {
+    throw refusal("WORK_ITEM_WAIT_OPEN", "resolve the work item wait before terminalizing it");
   }
   const nextRevision = workItem.resource_revision + 1;
   const updated = db.prepare(
@@ -7251,6 +7338,7 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     mutation_receipts: "idempotency_key",
     state_events: "event_sequence",
     work_items: "work_item_id",
+    work_item_waits: "work_item_id",
     external_work_refs: "work_item_id, provider",
     qualification_observations: "qualification_id",
     eligibility_projections: "role_requirement_id, profile_digest",
