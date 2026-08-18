@@ -94,4 +94,4 @@ A late mechanism is recoverable; a lying one is not. In anything that notifies, 
 
 ## The ladder applies to operations
 
-> Before ordering the heavy mechanism, ask which lighter one already covers it. Runtime configuration beats a rebuild; a rebuild beats a reinstall. Reaching for the largest available action is the same reflex the ladder exists to interrupt, pointed at operations instead of code.
+> Before ordering the heavy mechanism, ask which lighter one already covers it. Runtime configuration beats a rebuild. Reaching for the largest available action is the same reflex the ladder exists to interrupt, pointed at operations instead of code.
