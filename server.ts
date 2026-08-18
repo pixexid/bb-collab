@@ -100,6 +100,8 @@ function startableQueueDepth(repositories: string[]): number | null {
 export const FLEET_WATCHDOG_FLOOR_MS = 60 * 60_000;
 export const FLEET_WATCHDOG_STALE_WAIT_MS = 24 * 60 * 60_000;
 const FLEET_WATCHDOG_STOPPING_WAIT_MS = 30_000;
+const AUTOMATED_TELL_IDLE_WAIT_MS = 30_000;
+const automatedTellQueues = new Map<string, Promise<void>>();
 const projectIdSchema = z.string().trim().min(1).max(256);
 const mutationReceiptSchema = z
   .object({
@@ -630,15 +632,28 @@ async function sendRoleBrief(
   projectId: string,
   threadId: string,
   role: z.infer<typeof roleBriefRoleSchema>,
-  waitForActive = false,
 ): Promise<void> {
   const brief = await composeRoleBrief(bb, db, { projectId, role });
-  if (waitForActive) await bb.sdk.threads.wait({ threadId, status: "active", timeoutMs: 30_000 });
-  await bb.sdk.threads.send({
+  await sendWhenThreadIdle(bb, {
     threadId,
     mode: "queue-if-active",
     input: [{ type: "text", visibility: "agent-only", text: brief.prompt, mentions: [] }],
   });
+}
+
+async function sendWhenThreadIdle(bb: BbPluginApi, request: Parameters<BbPluginApi["sdk"]["threads"]["send"]>[0]): Promise<void> {
+  // ponytail: this process-local queue covers this plugin's senders; a host atomic send-if-idle API is the cross-process upgrade.
+  const previous = automatedTellQueues.get(request.threadId) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(async () => {
+    await bb.sdk.threads.wait({ threadId: request.threadId, status: "idle", timeoutMs: AUTOMATED_TELL_IDLE_WAIT_MS });
+    await bb.sdk.threads.send(request);
+  });
+  automatedTellQueues.set(request.threadId, current);
+  try {
+    await current;
+  } finally {
+    if (automatedTellQueues.get(request.threadId) === current) automatedTellQueues.delete(request.threadId);
+  }
 }
 
 async function deliverSucceededSeatBrief(
@@ -913,7 +928,7 @@ async function replyToOperatorMessage(db: SqliteDatabase | null, bb: BbPluginApi
     const afterSeq = await latestThreadEventSeq(bb, message.senderThreadId);
     const replyPrefix = `[bb-collab inbox reply ${message.messageId} to ${message.recipient}]\n`;
     const deliveredText = `${replyPrefix}${replyText}`;
-    await bb.sdk.threads.send({
+    await sendWhenThreadIdle(bb, {
       threadId: message.senderThreadId,
       mode: "steer",
       input: [{ type: "text", text: deliveredText, mentions: [] }],
@@ -1315,18 +1330,23 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return false;
     }
     roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
-    await bb.sdk.threads.send({
-      threadId: holders[0].thread_id,
-      mode: "steer",
-      input: [
-        {
-          type: "text",
-          visibility: "agent-only",
-          text: `Wrongful idle: queue head ${role.queueHeadId} is startable. Inspect the queue and act or record the blocker.`,
-          mentions: [],
-        },
-      ],
-    });
+    try {
+      await sendWhenThreadIdle(bb, {
+        threadId: holders[0].thread_id,
+        mode: "steer",
+        input: [
+          {
+            type: "text",
+            visibility: "agent-only",
+            text: `Wrongful idle: queue head ${role.queueHeadId} is startable. Inspect the queue and act or record the blocker.`,
+            mentions: [],
+          },
+        ],
+      });
+    } catch (error) {
+      warnRoleLiveness(holders[0], `idle-wait=failed error=${String(error)}`);
+      return "error" as const;
+    }
     return true;
   };
 
@@ -1904,7 +1924,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   // successful canonical succession separately delivers the exact seat brief.
   bb.events.on("thread.created", async ({ thread }) => {
     try {
-      await sendRoleBrief(bb, db, thread.projectId, thread.id, roleForThread(db, thread.projectId, thread.id), true);
+      await sendRoleBrief(bb, db, thread.projectId, thread.id, roleForThread(db, thread.projectId, thread.id));
     } catch (error) {
       bb.log.warn(`role brief seating failed for thread=${thread.id}: ${String(error)}`);
     }
