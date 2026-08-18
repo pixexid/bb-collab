@@ -7,12 +7,12 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 export const CONTRACT_VERSION = 21;
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 // v21 makes project configuration visibility explicitly visible-only.
-const PREVIOUS_CONTRACT_VERSION = 20;
+const PREVIOUS_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-const PREVIOUS_SCHEMA_VERSION = 13;
+const PREVIOUS_SCHEMA_VERSION = 14;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatProfile = {
@@ -70,6 +70,7 @@ export const TABLES = [
   "execution_attempts",
   "role_generations",
   "role_generation_heads",
+  "operator_messages",
 ] as const;
 
 export const MIGRATIONS: string[] = [
@@ -640,6 +641,25 @@ export const MIGRATIONS: string[] = [
   )`,
   `ALTER TABLE work_item_waits ADD COLUMN waker_kind TEXT NOT NULL DEFAULT 'schedule'
    CHECK (waker_kind IN ('schedule', 'seat'))`,
+  `CREATE TABLE IF NOT EXISTS operator_messages (
+    message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL CHECK (length(project_id) > 0),
+    recipient TEXT NOT NULL CHECK (recipient IN ('operator', 'supervisor')),
+    sender_thread_id TEXT NOT NULL CHECK (length(sender_thread_id) > 0),
+    severity TEXT NOT NULL CHECK (severity IN ('routine', 'needs-decision', 'urgent')),
+    message_text TEXT NOT NULL CHECK (length(trim(message_text)) > 0),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    read_at_ms INTEGER CHECK (read_at_ms IS NULL OR read_at_ms >= created_at_ms),
+    replied_at_ms INTEGER CHECK (replied_at_ms IS NULL OR replied_at_ms >= created_at_ms),
+    reply_text TEXT,
+    reply_delivery_error TEXT,
+    notification_attempted_at_ms INTEGER,
+    notification_error TEXT,
+    FOREIGN KEY (project_id) REFERENCES project_config_heads(project_id),
+    CHECK (reply_text IS NULL OR length(trim(reply_text)) > 0),
+    CHECK (replied_at_ms IS NULL OR reply_text IS NOT NULL),
+    CHECK (reply_delivery_error IS NULL OR (replied_at_ms IS NULL AND reply_text IS NOT NULL))
+  )`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -5827,6 +5847,7 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     execution_attempts: "execution_attempt_id",
     role_generations: "role_id, generation",
     role_generation_heads: "role_id",
+    operator_messages: "message_id",
   };
   const query =
     table === "decision_dispositions" || table === "decision_evidence"

@@ -14678,11 +14678,11 @@ var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
 var CONTRACT_VERSION = 21;
-var SCHEMA_VERSION = 14;
-var PREVIOUS_CONTRACT_VERSION = 20;
+var SCHEMA_VERSION = 15;
+var PREVIOUS_CONTRACT_VERSION = 21;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
-var PREVIOUS_SCHEMA_VERSION = 13;
+var PREVIOUS_SCHEMA_VERSION = 14;
 var ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"];
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
 var directorSeatProfile = {
@@ -14733,7 +14733,8 @@ var TABLES = [
   "assignments",
   "execution_attempts",
   "role_generations",
-  "role_generation_heads"
+  "role_generation_heads",
+  "operator_messages"
 ];
 var MIGRATIONS = [
   `CREATE TABLE IF NOT EXISTS project_config_revisions (
@@ -15302,7 +15303,26 @@ var MIGRATIONS = [
       REFERENCES work_items(project_id, work_item_id)
   )`,
   `ALTER TABLE work_item_waits ADD COLUMN waker_kind TEXT NOT NULL DEFAULT 'schedule'
-   CHECK (waker_kind IN ('schedule', 'seat'))`
+   CHECK (waker_kind IN ('schedule', 'seat'))`,
+  `CREATE TABLE IF NOT EXISTS operator_messages (
+    message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL CHECK (length(project_id) > 0),
+    recipient TEXT NOT NULL CHECK (recipient IN ('operator', 'supervisor')),
+    sender_thread_id TEXT NOT NULL CHECK (length(sender_thread_id) > 0),
+    severity TEXT NOT NULL CHECK (severity IN ('routine', 'needs-decision', 'urgent')),
+    message_text TEXT NOT NULL CHECK (length(trim(message_text)) > 0),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    read_at_ms INTEGER CHECK (read_at_ms IS NULL OR read_at_ms >= created_at_ms),
+    replied_at_ms INTEGER CHECK (replied_at_ms IS NULL OR replied_at_ms >= created_at_ms),
+    reply_text TEXT,
+    reply_delivery_error TEXT,
+    notification_attempted_at_ms INTEGER,
+    notification_error TEXT,
+    FOREIGN KEY (project_id) REFERENCES project_config_heads(project_id),
+    CHECK (reply_text IS NULL OR length(trim(reply_text)) > 0),
+    CHECK (replied_at_ms IS NULL OR reply_text IS NOT NULL),
+    CHECK (reply_delivery_error IS NULL OR (replied_at_ms IS NULL AND reply_text IS NOT NULL))
+  )`
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var CACHED_CONSUMERS = [
@@ -19238,7 +19258,8 @@ function tableRows(db, table, projectId) {
     assignments: "assignment_id",
     execution_attempts: "execution_attempt_id",
     role_generations: "role_id, generation",
-    role_generation_heads: "role_id"
+    role_generation_heads: "role_id",
+    operator_messages: "message_id"
   };
   const query = table === "decision_dispositions" || table === "decision_evidence" ? `SELECT ${table}.* FROM ${table}
          JOIN decisions ON decisions.decision_id = ${table}.decision_id
@@ -20183,7 +20204,7 @@ function readCheckoutDivergence(checkoutRoot) {
 
 // server.ts
 import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync2, rmSync, statSync as statSync2, writeFileSync } from "node:fs";
-import { spawnSync as spawnSync2 } from "node:child_process";
+import { execFile, spawnSync as spawnSync2 } from "node:child_process";
 import { basename, dirname as dirname2, isAbsolute, join as join4, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 function githubRepository(remoteUrl) {
@@ -20330,6 +20351,31 @@ var roleBriefSchema = external_exports.object({
   pointers: external_exports.object({ canonicalStoreQuery: external_exports.string(), handoffFile: external_exports.string(), currentSeats: external_exports.array(external_exports.object({ roleId: external_exports.string(), generation: external_exports.number().int().positive(), threadId: external_exports.string() }).strict()) }).strict(),
   prompt: external_exports.string().min(1)
 }).strict();
+var operatorRecipientSchema = external_exports.enum(["operator", "supervisor"]);
+var operatorSeveritySchema = external_exports.enum(["routine", "needs-decision", "urgent"]);
+var operatorMessageTextSchema = external_exports.string().trim().min(1).max(16e3);
+var operatorMessageSchema = external_exports.object({
+  messageId: external_exports.number().int().positive(),
+  projectId: projectIdSchema,
+  recipient: operatorRecipientSchema,
+  senderThreadId: sidebarThreadIdSchema,
+  senderLaneId: sidebarThreadIdSchema.nullable(),
+  severity: operatorSeveritySchema,
+  text: operatorMessageTextSchema,
+  createdAtMs: external_exports.number().int().nonnegative(),
+  readAtMs: external_exports.number().int().nonnegative().nullable(),
+  repliedAtMs: external_exports.number().int().nonnegative().nullable(),
+  replyText: operatorMessageTextSchema.nullable(),
+  replyDeliveryError: external_exports.string().nullable(),
+  notificationStatus: external_exports.enum(["not-requested", "deduplicated", "sent", "failed"]),
+  notificationError: external_exports.string().nullable()
+}).strict();
+var sendOperatorMessageInputSchema = external_exports.object({
+  project_id: projectIdSchema,
+  recipient: operatorRecipientSchema,
+  severity: operatorSeveritySchema,
+  text: operatorMessageTextSchema
+}).strict();
 var rpcContract = defineRpcContract({
   lanes: {
     input: external_exports.object({}).strict(),
@@ -20392,6 +20438,18 @@ var rpcContract = defineRpcContract({
   roleBrief: {
     input: external_exports.object({ projectId: projectIdSchema, role: roleBriefRoleSchema }).strict(),
     output: roleBriefSchema
+  },
+  operatorMessages: {
+    input: external_exports.object({ projectId: projectIdSchema, recipient: operatorRecipientSchema.optional() }).strict(),
+    output: external_exports.array(operatorMessageSchema)
+  },
+  markOperatorMessageRead: {
+    input: external_exports.object({ projectId: projectIdSchema, messageId: external_exports.number().int().positive() }).strict(),
+    output: operatorMessageSchema
+  },
+  replyToOperatorMessage: {
+    input: external_exports.object({ projectId: projectIdSchema, messageId: external_exports.number().int().positive(), text: operatorMessageTextSchema }).strict(),
+    output: operatorMessageSchema
   }
 });
 function jsonResult(result2) {
@@ -20684,11 +20742,179 @@ async function applyLiveCachedConsumerRollout(bb, db, input, cliDeps, cliContext
     return cachedConsumerRolloutRefusal(request.projectId, error48 instanceof Error ? error48.message : String(error48));
   }
 }
+var URGENT_NOTIFICATION_DEDUP_MS = 60 * 6e4;
+var OPERATOR_MESSAGE_LIMIT = 256;
+var REPLY_DELIVERY_TIMEOUT_MS = 1e4;
+function operatorMessage(row) {
+  return {
+    messageId: row.message_id,
+    projectId: row.project_id,
+    recipient: row.recipient,
+    senderThreadId: row.sender_thread_id,
+    senderLaneId: row.sender_lane_id,
+    severity: row.severity,
+    text: row.message_text,
+    createdAtMs: row.created_at_ms,
+    readAtMs: row.read_at_ms,
+    repliedAtMs: row.replied_at_ms,
+    replyText: row.reply_text,
+    replyDeliveryError: row.reply_delivery_error,
+    notificationStatus: row.severity !== "urgent" ? "not-requested" : row.notification_attempted_at_ms === null ? "deduplicated" : row.notification_error === null ? "sent" : "failed",
+    notificationError: row.notification_error
+  };
+}
+var operatorMessageSelect = `SELECT message.*,
+  (SELECT attempt.lane_id FROM execution_attempts AS attempt
+   WHERE attempt.project_id = message.project_id
+     AND attempt.thread_id = message.sender_thread_id
+     AND attempt.lane_id IS NOT NULL
+   ORDER BY attempt.created_at_ms DESC LIMIT 1) AS sender_lane_id
+  FROM operator_messages AS message`;
+function requireRegisteredInboxProject(db, projectId) {
+  if (!db) throw new Error("operator inbox store is unavailable");
+  if (!db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId)) {
+    throw new Error("operator inbox project is not registered");
+  }
+  return db;
+}
+function readOperatorMessage(db, projectId, messageId) {
+  const store = requireRegisteredInboxProject(db, projectId);
+  const row = store.prepare(`${operatorMessageSelect} WHERE message.project_id = ? AND message.message_id = ?`).get(projectId, messageId);
+  if (!row) throw new Error("operator message does not exist in the requested project");
+  return operatorMessage(row);
+}
+function listOperatorMessages(db, projectId, recipient) {
+  const store = requireRegisteredInboxProject(db, projectId);
+  const recipientClause = recipient === void 0 ? "" : " AND message.recipient = ?";
+  const rows = store.prepare(`${operatorMessageSelect}
+    WHERE message.project_id = ?${recipientClause}
+    ORDER BY (message.read_at_ms IS NULL) DESC, message.created_at_ms DESC, message.message_id DESC
+    LIMIT ${OPERATOR_MESSAGE_LIMIT}`).all(...recipient === void 0 ? [projectId] : [projectId, recipient]);
+  return rows.map(operatorMessage);
+}
+async function assertSenderProject(bb, projectId, senderThreadId) {
+  const thread = await bb.sdk.threads.get({ threadId: senderThreadId });
+  if (thread.id !== senderThreadId || thread.projectId !== projectId) {
+    throw new Error("project_id must exactly match the sender thread project");
+  }
+}
+function runBbCommand(args) {
+  return new Promise((resolve2, reject) => {
+    execFile(process.env.BB_CLI?.trim() || "bb", args, { timeout: 1e4 }, (error48) => error48 ? reject(error48) : resolve2());
+  });
+}
+async function defaultNotifyUrgent(message, senderThreadId, run) {
+  const attempts = await Promise.allSettled([
+    run(["notify", "send", message, "--title", "Urgent bb-collab inbox message", "--thread", senderThreadId]),
+    run(["push", "test", message])
+  ]);
+  const failures = attempts.flatMap((attempt, index) => attempt.status === "rejected" ? [`${index === 0 ? "desktop" : "phone"}: ${String(attempt.reason)}`] : []);
+  if (failures.length > 0) throw new Error(failures.join("; "));
+}
+async function sendOperatorMessage(db, bb, input, senderThreadId, notifyUrgent) {
+  const store = requireRegisteredInboxProject(db, input.project_id);
+  await assertSenderProject(bb, input.project_id, senderThreadId);
+  const now2 = Date.now();
+  const inserted = store.prepare(`INSERT INTO operator_messages (
+      project_id, recipient, sender_thread_id, severity, message_text, created_at_ms, notification_attempted_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, CASE
+      WHEN ? = 'urgent' AND NOT EXISTS (
+        SELECT 1 FROM operator_messages
+        WHERE recipient = ? AND sender_thread_id = ? AND severity = ? AND message_text = ?
+          AND notification_attempted_at_ms IS NOT NULL
+          AND notification_attempted_at_ms >= ?
+      ) THEN ? ELSE NULL END
+    ) RETURNING message_id, notification_attempted_at_ms`).get(
+    input.project_id,
+    input.recipient,
+    senderThreadId,
+    input.severity,
+    input.text,
+    now2,
+    input.severity,
+    input.recipient,
+    senderThreadId,
+    input.severity,
+    input.text,
+    now2 - URGENT_NOTIFICATION_DEDUP_MS,
+    now2
+  );
+  if (inserted.notification_attempted_at_ms !== null) {
+    const notification = `[${input.project_id}] ${input.recipient} message from ${senderThreadId}: ${input.text}`;
+    try {
+      await notifyUrgent(notification, senderThreadId);
+    } catch (error48) {
+      store.prepare("UPDATE operator_messages SET notification_error = ? WHERE project_id = ? AND message_id = ?").run(String(error48).slice(0, 1e3), input.project_id, inserted.message_id);
+    }
+  }
+  return readOperatorMessage(store, input.project_id, inserted.message_id);
+}
+async function latestThreadEventSeq(bb, threadId) {
+  if ((await bb.sdk.threads.events.list({ threadId, afterSeq: "0", limit: "1" })).length === 0) return 0;
+  let low = 0;
+  let high = 1;
+  while ((await bb.sdk.threads.events.list({ threadId, afterSeq: String(high), limit: "1" })).length > 0) {
+    low = high;
+    high *= 2;
+    if (!Number.isSafeInteger(high)) throw new Error("sender event sequence exceeds the safe delivery-check bound");
+  }
+  while (high - low > 1) {
+    const middle = Math.floor((low + high) / 2);
+    if ((await bb.sdk.threads.events.list({ threadId, afterSeq: String(middle), limit: "1" })).length > 0) low = middle;
+    else high = middle;
+  }
+  return high;
+}
+async function confirmReplyDelivery(bb, threadId, afterSeq, text) {
+  const deadline = Date.now() + REPLY_DELIVERY_TIMEOUT_MS;
+  let cursor = afterSeq;
+  while (Date.now() < deadline) {
+    const event = await bb.sdk.threads.events.wait({
+      threadId,
+      afterSeq: String(cursor),
+      type: "system/manager/user_message",
+      waitMs: String(Math.max(1, deadline - Date.now()))
+    });
+    if (!event) break;
+    if (event.type === "system/manager/user_message" && event.data.text === text) return;
+    cursor = event.seq;
+  }
+  throw new Error("platform tell was accepted but no matching sender-thread input event was observed");
+}
+async function replyToOperatorMessage(db, bb, projectId, messageId, replyText) {
+  const store = requireRegisteredInboxProject(db, projectId);
+  const message = readOperatorMessage(store, projectId, messageId);
+  if (message.repliedAtMs !== null) throw new Error("operator message already has a delivered reply");
+  try {
+    const thread = await bb.sdk.threads.get({ threadId: message.senderThreadId });
+    if (thread.projectId !== projectId || !thread.environmentId) throw new Error("sender thread no longer has a project-exact environment");
+    const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
+    if (environment.projectId !== projectId || environment.status !== "ready") throw new Error("sender thread environment is not ready");
+    const afterSeq = await latestThreadEventSeq(bb, message.senderThreadId);
+    const deliveredText = `[bb-collab inbox reply ${message.messageId} to ${message.recipient}]
+${replyText}`;
+    await bb.sdk.threads.send({
+      threadId: message.senderThreadId,
+      mode: "steer",
+      input: [{ type: "text", text: deliveredText, mentions: [] }]
+    });
+    await confirmReplyDelivery(bb, message.senderThreadId, afterSeq, deliveredText);
+    const repliedAtMs = Date.now();
+    store.prepare(`UPDATE operator_messages
+      SET reply_text = ?, replied_at_ms = ?, read_at_ms = COALESCE(read_at_ms, ?), reply_delivery_error = NULL
+      WHERE project_id = ? AND message_id = ?`).run(replyText, repliedAtMs, repliedAtMs, projectId, messageId);
+  } catch (error48) {
+    store.prepare(`UPDATE operator_messages
+      SET reply_text = ?, replied_at_ms = NULL, read_at_ms = COALESCE(read_at_ms, ?), reply_delivery_error = ?
+      WHERE project_id = ? AND message_id = ?`).run(replyText, Date.now(), String(error48).slice(0, 1e3), projectId, messageId);
+  }
+  return readOperatorMessage(store, projectId, messageId);
+}
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "archive-sweep", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, archive-sweep, cached-consumer-rollout, wait-register, wait-list, wait-validator, stall-guard, or fleet-watchdog");
+  if (!command || !["doctor", "export", "apply", "archive-sweep", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, archive-sweep, cached-consumer-rollout, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
   }
   if (command === "wait-validator") {
     const unknown3 = args.find((arg) => arg !== "--cycle");
@@ -20766,6 +20992,35 @@ async function runCli(db, bb, argv, ctx, deps) {
   }
   const projectId = parseFlag(args, "--project");
   if (!projectId) return invalidCli("--project PROJECT_ID is required; CLI context is never used as a fallback");
+  if (command === "send-to-operator") {
+    const unknown3 = unexpectedFlags(args, ["--project", "--recipient", "--severity", "--message"]);
+    if (unknown3) return invalidCli(`unexpected flag ${unknown3}`);
+    if (!ctx?.threadId) return invalidCli("send-to-operator must run from a sender thread");
+    const parsed = sendOperatorMessageInputSchema.safeParse({
+      project_id: projectId,
+      recipient: parseFlag(args, "--recipient"),
+      severity: parseFlag(args, "--severity"),
+      text: parseFlag(args, "--message")
+    });
+    if (!parsed.success) return invalidCli(parsed.error.message);
+    try {
+      return { exitCode: 0, stdout: JSON.stringify(await sendOperatorMessage(db, bb, parsed.data, ctx.threadId, deps.notifyUrgent)) };
+    } catch (error48) {
+      return invalidCli(error48 instanceof Error ? error48.message : String(error48));
+    }
+  }
+  if (command === "inbox") {
+    const unknown3 = unexpectedFlags(args, ["--project", "--recipient"]);
+    if (unknown3) return invalidCli(`unexpected flag ${unknown3}`);
+    const recipient = parseFlag(args, "--recipient");
+    const parsedRecipient = recipient === null ? void 0 : operatorRecipientSchema.safeParse(recipient);
+    if (parsedRecipient && !parsedRecipient.success) return invalidCli(parsedRecipient.error.message);
+    try {
+      return { exitCode: 0, stdout: JSON.stringify(listOperatorMessages(db, projectId, parsedRecipient?.data)) };
+    } catch (error48) {
+      return invalidCli(error48 instanceof Error ? error48.message : String(error48));
+    }
+  }
   if (command === "archive-sweep") {
     if (args.filter((arg) => !["--project", projectId, "--apply"].includes(arg)).length > 0 || args.filter((arg) => arg === "--apply").length > 1) return invalidCli("unexpected archive-sweep argument");
     const result2 = await deps.archiveSweep(projectId, args.includes("--apply"));
@@ -20861,6 +21116,7 @@ async function runCli(db, bb, argv, ctx, deps) {
   return cliResult(exportFoundation(db, projectId));
 }
 async function plugin(bb, options = {}) {
+  const notifyUrgent = options.notifyUrgent ?? ((message, senderThreadId) => defaultNotifyUrgent(message, senderThreadId, options.runBbCommand ?? runBbCommand));
   const fleetWatchdogSettings = bb.settings.define({
     fleetWatchdogFloorMs: {
       type: "string",
@@ -21460,7 +21716,8 @@ ${thread.titleFallback ?? ""}`);
     fleetWatchdogCycle,
     resetFleetWatchdog,
     archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply),
-    readCheckoutDivergence: readDiagnosticDivergence
+    readCheckoutDivergence: readDiagnosticDivergence,
+    notifyUrgent
   };
   bb.rpc.register(rpcContract, {
     lanes() {
@@ -21542,8 +21799,32 @@ ${thread.titleFallback ?? ""}`);
     },
     async roleBrief(input) {
       return composeRoleBrief(bb, db, input);
+    },
+    operatorMessages(input) {
+      return listOperatorMessages(db, input.projectId, input.recipient);
+    },
+    markOperatorMessageRead(input) {
+      const store = requireRegisteredInboxProject(db, input.projectId);
+      const result2 = store.prepare(`UPDATE operator_messages SET read_at_ms = COALESCE(read_at_ms, ?)
+        WHERE project_id = ? AND message_id = ?`).run(Date.now(), input.projectId, input.messageId);
+      if (result2.changes !== 1) throw new Error("operator message does not exist in the requested project");
+      return readOperatorMessage(store, input.projectId, input.messageId);
+    },
+    replyToOperatorMessage(input) {
+      return replyToOperatorMessage(db, bb, input.projectId, input.messageId, input.text);
     }
   });
+  bb.agents.registerTool({
+    name: "send_to_operator",
+    description: "Send a durable project-scoped message to the operator or supervisor without a model relay.",
+    instructions: "Use this for actionable content directed to an external non-bb party. project_id must be the current thread's exact registered project.",
+    parameters: sendOperatorMessageInputSchema,
+    async execute(input, context) {
+      if (input.project_id !== context.projectId) throw new Error("project_id must exactly match the current thread project");
+      return JSON.stringify(await sendOperatorMessage(db, bb, input, context.threadId, notifyUrgent));
+    }
+  });
+  bb.agents.configure(() => ({ tools: ["send_to_operator"], skills: [] }));
   bb.cli.register({
     name: "collab",
     summary: "Inspect the bb-collab foundation and guarded conformance boundary",
@@ -21585,6 +21866,16 @@ ${thread.titleFallback ?? ""}`);
         name: "archive-sweep",
         summary: "Report archivable threads; --apply is explicit and opt-in",
         usage: "bb collab archive-sweep --project PROJECT_ID [--apply]"
+      },
+      {
+        name: "send-to-operator",
+        summary: "Send a durable message to an external non-bb recipient",
+        usage: "bb collab send-to-operator --project PROJECT_ID --recipient operator|supervisor --severity routine|needs-decision|urgent --message TEXT"
+      },
+      {
+        name: "inbox",
+        summary: "Read one exact registered project's operator inbox",
+        usage: "bb collab inbox --project PROJECT_ID [--recipient operator|supervisor]"
       }
     ],
     run(argv, context) {
@@ -21596,6 +21887,7 @@ ${thread.titleFallback ?? ""}`);
 export {
   FLEET_WATCHDOG_FLOOR_MS,
   FLEET_WATCHDOG_STALE_WAIT_MS,
+  URGENT_NOTIFICATION_DEDUP_MS,
   plugin as default,
   foundationResultSchema,
   isLiveCachedConsumerRolloutArtifact,

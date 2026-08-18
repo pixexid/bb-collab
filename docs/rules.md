@@ -70,6 +70,20 @@ Delivery is not the same as sending: a transport can accept a message and never 
 
 Any tell requiring action names its expected reply in the `DONE | BLOCKED | WAITING` vocabulary, and the sender carries an open item until that reply arrives. An unanswered directive past the timer floor is chased exactly like any other stall: an owed reply sits alongside an owed `DONE`. No read receipts, no acknowledgement packets, no ceremony — the three-word vocabulary and the timer already close the loop. The only change is that senders track what they are owed.
 
+## External-party content uses the inbox
+
+> Once the inbox tool is available to the session, actionable content intended for the operator outside the current conversation goes through `send_to_operator`; leaving it only in a turn output is a delivery defect.
+
+The bound is the intended delivery path, not the word “operator.” A direct reply to an operator who is participating in the current conversation stays in that conversation; a lane receipt still goes to its named fleet return path; and decisions and evidence still land in their canonical stores. The same inbox surface carries messages addressed to the supervisor, while the existing `SUPERVISOR-REPORT` marker convention remains in force until its separately governed retirement.
+
+If the tool is absent or refuses the send, report that failure through the existing return path. Printing the intended message and calling it delivered would repeat the defect the inbox exists to remove.
+
+## Project-agnostic by construction
+
+> New or changed surfaces that store, read, or route project-owned data require the exact `project_id` as an explicit dimension and never substitute an ambient, default, or hardcoded project.
+
+Project boundaries apply on every write and read: a missing or null project never matches. The rule does not attach a fake project to genuinely global state, and it does not require a retroactive audit of untouched surfaces. It binds the project-owned behavior introduced or changed by the current work.
+
 ## Lifecycle disposition
 
 Every pull request carries exactly one disposition line: `Closes #NN` plus `Acceptance: complete`, or `Related GH-NN` naming an OPEN issue, or `No issue:` followed by a reason. Run both canonical body gates before pushing: `scripts/pr-lifecycle.mjs` for disposition and `scripts/check-review-tier.mjs` for exactly one line matching its `Review tier` declaration pattern. Tier A is forced by any path matched by that script's `tierA` patterns, including its authority/approval/atomicity/concurrency/cutover/migration/provenance/receipt/spend keyword pattern; Tier C applies only when no Tier-A path matches and every path matches its `tierC` patterns. Because `dist/` is Tier A, a docs-only `docs/rules.md` edit that regenerates `dist/role-briefs.json` requires Tier A.

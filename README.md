@@ -10,6 +10,19 @@ in Settings > Appearance > Sidebar. The built-in list remains the default and
 retains the Lane 1 thread-row pulse fallback; the host continues to render
 new-thread, search, navigation rows, and the footer.
 
+## Operator inbox
+
+The Inbox nav panel is a durable, model-free message surface for `operator` and
+`supervisor` recipients. Seats send with the `send_to_operator` tool or
+`bb collab send-to-operator`; host-side pickup is available through the panel
+or `bb collab inbox`. Every send and read requires an exact registered project
+id. Urgent messages dispatch through the installed desktop and phone
+notification plugins. Exact repeats of recipient, sender thread, severity, and
+message text are suppressed for 60 minutes; different content fires
+immediately. Replies use platform steer and count as delivered only after the
+matching input event appears in the sender thread; failures remain visible and
+retryable in Inbox.
+
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.

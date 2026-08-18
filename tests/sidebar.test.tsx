@@ -76,6 +76,9 @@ function rpcHandlers(states: Record<string, string> = {}, models: Record<string,
     setSidebarCollapse: async (input: { kind: "project" | "thread"; id: string; collapsed: boolean }) => input,
     reorderPinned: async () => ({ ok: true }),
     setThreadState: async (input: { threadId: string; state: string | null }) => ({ state: input.state }),
+    operatorMessages: async () => [],
+    markOperatorMessageRead: async () => ({}),
+    replyToOperatorMessage: async () => ({}),
     doctor: async () => ({}) as never,
     export: async () => ({}) as never,
     apply: async () => ({}) as never,
@@ -95,6 +98,38 @@ describe("replacement thread list", () => {
   it("keeps the Lane 1 content-script fallback registered", async () => {
     const app = await loadedApp();
     expect(app.contentScripts.map((script) => script.id)).toContain("lane-thread-status");
+  });
+
+  it("registers a project-exact Inbox panel and surfaces reply delivery failures", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const operatorMessages = vi.fn(async () => [{
+      messageId: 1,
+      projectId: "project-a",
+      recipient: "operator" as const,
+      senderThreadId: "sender-thread",
+      senderLaneId: "lane-one",
+      severity: "routine" as const,
+      text: "Need an answer",
+      createdAtMs: 1,
+      readAtMs: 2,
+      repliedAtMs: null,
+      replyText: "retry me",
+      replyDeliveryError: "environment deleted",
+      notificationStatus: "not-requested" as const,
+      notificationError: null,
+    }]);
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages } as never,
+    });
+
+    expect(operatorMessages).not.toHaveBeenCalled();
+    fireEvent.change(rendered.getByLabelText("Project"), { target: { value: "project-a" } });
+    await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a" }));
+    expect(rendered.getByText("Need an answer")).toBeTruthy();
+    expect(rendered.getByText(/Reply delivery failed: environment deleted/)).toBeTruthy();
+    expect(rendered.getByRole("heading", { name: /Project A project-a/ })).toBeTruthy();
   });
 
   it("groups by stable project id and limits each project to five recent threads", async () => {
