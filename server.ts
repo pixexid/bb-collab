@@ -875,18 +875,19 @@ async function latestThreadEventSeq(bb: BbPluginApi, threadId: string): Promise<
   return high;
 }
 
-async function confirmReplyDelivery(bb: BbPluginApi, threadId: string, afterSeq: number, text: string): Promise<void> {
+async function confirmReplyDelivery(bb: BbPluginApi, threadId: string, afterSeq: number, prefix: string): Promise<void> {
   const deadline = Date.now() + REPLY_DELIVERY_TIMEOUT_MS;
   let cursor = afterSeq;
   while (Date.now() < deadline) {
     const event = await bb.sdk.threads.events.wait({
       threadId,
       afterSeq: String(cursor),
-      type: "system/manager/user_message",
+      type: "client/turn/requested",
       waitMs: String(Math.max(1, deadline - Date.now())),
     });
     if (!event) break;
-    if (event.type === "system/manager/user_message" && event.data.text === text) return;
+    if (event.type === "client/turn/requested" && event.data.source === "tell" &&
+      event.data.input.some((item) => item.type === "text" && item.text.startsWith(prefix))) return;
     cursor = event.seq;
   }
   throw new Error("platform tell was accepted but no matching sender-thread input event was observed");
@@ -902,13 +903,14 @@ async function replyToOperatorMessage(db: SqliteDatabase | null, bb: BbPluginApi
     const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
     if (environment.projectId !== projectId || environment.status !== "ready") throw new Error("sender thread environment is not ready");
     const afterSeq = await latestThreadEventSeq(bb, message.senderThreadId);
-    const deliveredText = `[bb-collab inbox reply ${message.messageId} to ${message.recipient}]\n${replyText}`;
+    const replyPrefix = `[bb-collab inbox reply ${message.messageId} to ${message.recipient}]\n`;
+    const deliveredText = `${replyPrefix}${replyText}`;
     await bb.sdk.threads.send({
       threadId: message.senderThreadId,
       mode: "steer",
       input: [{ type: "text", text: deliveredText, mentions: [] }],
     });
-    await confirmReplyDelivery(bb, message.senderThreadId, afterSeq, deliveredText);
+    await confirmReplyDelivery(bb, message.senderThreadId, afterSeq, replyPrefix);
     const repliedAtMs = Date.now();
     store.prepare(`UPDATE operator_messages
       SET reply_text = ?, replied_at_ms = ?, read_at_ms = COALESCE(read_at_ms, ?), reply_delivery_error = NULL

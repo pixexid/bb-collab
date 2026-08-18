@@ -1945,9 +1945,9 @@ describe("bb-collab plugin boundary", () => {
       id: "event-delivered",
       threadId,
       seq: 99,
-      type: "system/manager/user_message",
+      type: "client/turn/requested",
       scope: { kind: "thread" },
-      data: { text: sent.at(-1)!.text },
+      data: { source: "tell", input: [{ type: "text", text: `${sent.at(-1)!.text}\n`, mentions: [] }] },
       createdAt: 99,
     })) as never);
     const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
@@ -1962,6 +1962,24 @@ describe("bb-collab plugin boundary", () => {
     expect(replied).toMatchObject({ repliedAtMs: expect.any(Number), replyText: "answer", replyDeliveryError: null, readAtMs: expect.any(Number) });
     await expect(host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "duplicate" }))
       .rejects.toThrow("already has a delivered reply");
+  });
+
+  it("records an accepted reply tell as failed when no matching sender event lands", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
+    host.harness.sdk.stub("threads.events.wait", (async () => null) as never);
+    const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
+      project_id: PROJECT_ID,
+      recipient: "operator",
+      severity: "routine",
+      text: "needs delivery proof",
+    }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
+
+    const replied = await host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "unconfirmed" });
+    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+    expect(replied).toMatchObject({ repliedAtMs: null, replyText: "unconfirmed", replyDeliveryError: expect.stringContaining("no matching sender-thread input event") });
   });
 
   it("persists a visible reply failure when the sender environment is gone", async () => {
