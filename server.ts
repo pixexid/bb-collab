@@ -1,21 +1,6 @@
 import { defineRpcContract, type BbPluginApi, type PluginCliContext } from "@bb/plugin-sdk";
 import { z } from "zod";
-import {
-  OPEN_ATTEMPT_STATES,
-  createContinuationLedger,
-  createLaneWatcher,
-  createRoleIdleLedger,
-  createWaitRegistry,
-  openLaneViews,
-  readLaneStates,
-  readRoleHolderStates,
-  roleIdleKey,
-  roleQueueScopes,
-  subscribeToThreadChanges,
-  threadEventStatus,
-  type OperatorWait,
-  type RoleHolderState,
-} from "./src/awareness.js";
+import { createWaitRegistry, readRoleHolderStates, type RoleHolderState } from "./src/awareness.js";
 import {
   BB_VERSION_RANGE,
   MIGRATIONS,
@@ -37,13 +22,6 @@ import {
   type RoleFactReader,
   type SqliteDatabase,
 } from "./src/foundation.js";
-import {
-  createStallGuardCycle,
-  STALL_GUARD_KV_KEY,
-  STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME,
-  STALL_GUARD_LIVENESS_MARKER_FILENAME,
-  stallGuardStateDir,
-} from "./src/stall-guard.js";
 import {
   LIVENESS_ALERT_FLAG_FILENAME,
   LIVENESS_MARKER_FILENAME,
@@ -138,30 +116,6 @@ export const foundationResultSchema = z
   })
   .strict();
 
-const laneViewSchema = z
-  .object({
-    projectId: projectIdSchema,
-    laneId: projectIdSchema,
-    assignmentId: projectIdSchema,
-    assignmentKind: z.enum(["write", "review", "probe"]),
-    workItemId: projectIdSchema,
-    threadId: projectIdSchema.nullable(),
-    executionAttemptId: projectIdSchema,
-    attemptState: z.string(),
-    workerStatus: z.enum(["active", "idle", "error", "starting", "stopping"]).nullable(),
-    waitingOn: z.string().nullable(),
-    ageMs: z.number().int().nonnegative(),
-    tone: z.enum(["default", "running", "success", "error"]),
-    queueState: z.enum(["ready", "running", "deferred"]),
-    queueBlocked: z.boolean(),
-    nextStartable: z.boolean(),
-    deferredReason: z.literal("awaiting_operator").nullable(),
-    deferredAtMs: z.number().int().nonnegative().nullable(),
-    deferredAgeMs: z.number().int().nonnegative().nullable(),
-  })
-  .strict();
-
-const laneListSchema = z.array(laneViewSchema);
 const sidebarThreadIdSchema = z.string().trim().min(1).max(256);
 const registeredWaitInputSchema = z.object({
   waitId: sidebarThreadIdSchema,
@@ -198,10 +152,6 @@ const roleBriefSchema = z.object({
   prompt: z.string().min(1),
 }).strict();
 export const rpcContract = defineRpcContract({
-  lanes: {
-    input: z.object({}).strict(),
-    output: laneListSchema,
-  },
   registerWait: {
     input: registeredWaitInputSchema,
     output: registeredWaitSchema,
@@ -615,13 +565,11 @@ async function applyLiveCachedConsumerRollout(
 }
 
 interface WaitValidatorCliDeps {
-  watcher: import("./src/awareness.js").LaneWatcher;
+  waitRegistry: import("./src/awareness.js").WaitRegistry;
+  validateWaits: () => Promise<number>;
   registerBoundedWaitForCli: (input: unknown, ctxThreadId?: string) => Promise<import("./src/registered-waits.js").RegisterWaitResult>;
   listWaitsForCli: () => Promise<Array<Record<string, unknown>>>;
   escalationCycle: import("./src/registered-waits.js").WaitEscalationCycle;
-  stallGuardCycle: (projectId?: string) => Promise<import("./src/stall-guard.js").StallGuardCycleSummary>;
-  fleetWatchdogCycle: (projectId?: string) => Promise<void>;
-  resetFleetWatchdog: (projectId: string, invokedBy: string) => Promise<void>;
   archiveSweep: (projectId: string, apply: boolean) => Promise<import("./src/archive-sweep.js").ArchiveSweepResult>;
   readCheckoutDivergence: () => CheckoutDivergence;
 }
@@ -635,8 +583,8 @@ async function runCli(
 ) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "archive-sweep", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, archive-sweep, cached-consumer-rollout, wait-register, wait-list, wait-validator, stall-guard, or fleet-watchdog");
+  if (!command || !["doctor", "export", "apply", "archive-sweep", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, archive-sweep, cached-consumer-rollout, wait-register, wait-list, or wait-validator");
   }
   if (command === "wait-validator") {
     const unknown = args.find((arg) => arg !== "--cycle");
@@ -646,14 +594,14 @@ async function runCli(
       // One cycle = the watcher's own wait firing/validation pass plus the
       // bounded escalation pass over fired waits. Both are read-only on
       // canonical state and act only through sanctioned seams.
-      await deps.watcher.poll();
+      const fired = await deps.validateWaits();
       const summary = await deps.escalationCycle.cycle();
       return cliResult({
         outcome: "OK",
         subject: "wait-validator",
         expected: 1,
-        attempted: summary.fired + summary.steered,
-        verified: summary.fired,
+        attempted: fired + summary.steered,
+        verified: fired,
         message: "durable wait validation cycle complete",
         evidence: summary,
       });
@@ -666,53 +614,6 @@ async function runCli(
         verified: 0,
         message: error instanceof Error ? error.message : String(error),
       });
-    }
-  }
-  if (command === "stall-guard") {
-    const projectFlag = args.indexOf("--project");
-    const projectId = parseFlag(args, "--project");
-    const expectedLength = projectFlag < 0 ? 1 : 3;
-    const unknown = args.find((arg) => arg !== "--cycle" && arg !== "--project" && arg !== projectId);
-    if (unknown || args.filter((arg) => arg === "--cycle").length !== 1 || args.filter((arg) => arg === "--project").length > 1 || args.length !== expectedLength) {
-      return invalidCli(`unexpected argument ${unknown ?? "duplicate or malformed flag"}`);
-    }
-    if (!args.includes("--cycle")) return invalidCli("--cycle is required: the stall guard runs exactly one durable cycle per invocation");
-    if (projectId === "") return invalidCli("--project PROJECT_ID must be supplied once with a value");
-    try {
-      await deps.watcher.poll();
-      const summary = await deps.stallGuardCycle(projectId ?? undefined);
-      return cliResult({
-        outcome: "OK",
-        subject: "stall-guard",
-        expected: summary.observed,
-        attempted: summary.attempted,
-        verified: summary.verified,
-        message: "stall-guard cycle complete",
-        evidence: summary,
-      });
-    } catch (error) {
-      return cliResult({ outcome: "INTERNAL_ERROR", subject: "stall-guard", expected: 1, attempted: 0, verified: 0, message: error instanceof Error ? error.message : String(error) });
-    }
-  }
-  if (command === "fleet-watchdog") {
-    const projectFlag = args.indexOf("--project");
-    const projectId = parseFlag(args, "--project");
-    const expectedLength = projectFlag < 0 ? 1 : 3;
-    const reset = args.includes("--reset");
-    const unknown = args.find((arg) => arg !== "--cycle" && arg !== "--reset" && arg !== "--project" && arg !== projectId);
-    if (unknown || args.filter((arg) => arg === "--cycle").length + args.filter((arg) => arg === "--reset").length !== 1 || args.filter((arg) => arg === "--project").length > 1 || args.length !== expectedLength) {
-      return invalidCli(`unexpected argument ${unknown ?? "duplicate or malformed flag"}`);
-    }
-    if (!projectId) return invalidCli("--project PROJECT_ID must be supplied once with a value");
-    try {
-      if (reset) {
-        await deps.resetFleetWatchdog(projectId, ctx?.threadId ?? "unknown");
-        return cliResult({ outcome: "OK", subject: projectId, expected: 1, attempted: 1, verified: 1, message: "fleet-watchdog history reset" });
-      }
-      await deps.fleetWatchdogCycle(projectId);
-      return cliResult({ outcome: "OK", subject: projectId, expected: 1, attempted: 1, verified: 1, message: "fleet-watchdog cycle complete" });
-    } catch (error) {
-      return cliResult({ outcome: "INTERNAL_ERROR", subject: projectId, expected: 1, attempted: 0, verified: 0, message: error instanceof Error ? error.message : String(error) });
     }
   }
   const projectId = parseFlag(args, "--project");
@@ -840,48 +741,18 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     db = null;
   }
 
-  const readPendingExternalWait = async (threadId: string) => {
-    try {
-      return (await bb.sdk.threads.interactions.list({ threadId })).some((interaction) => interaction.status === "pending");
-    } catch {
-      return true;
-    }
-  };
-
-  const readPendingOperatorWaitForThread = async (threadId: string): Promise<OperatorWait | null> => {
-    const interaction = (await bb.sdk.threads.interactions.list({ threadId })).find((candidate) => candidate.status === "pending");
-    if (!interaction) return null;
-    return {
-      reason: "awaiting_operator",
-      createdAtMs: typeof interaction.createdAt === "number" && Number.isFinite(interaction.createdAt) ? Math.max(0, interaction.createdAt) : 0,
-    };
-  };
-
-  const continuationLedger = createContinuationLedger({
-    read: () => bb.storage.kv.get<unknown>("lane-watcher.continuations"),
-    write: (state) => bb.storage.kv.set("lane-watcher.continuations", state),
-  });
-
   const waitRegistry = createWaitRegistry({
-    read: () => bb.storage.kv.get<unknown>("lane-watcher.registered-waits"),
-    write: (state) => bb.storage.kv.set("lane-watcher.registered-waits", state),
+    read: () => bb.storage.kv.get<unknown>("registered-waits"),
+    write: (state) => bb.storage.kv.set("registered-waits", state),
   });
-
-  // #93 durable wait-validator layer over the one wait registry: the
-  // bounded escalation ladder for fired waits and the host-supervised
-  // liveness rule. Escalation state lives in the plugin KV seam; canonical
-  // SQLite, the resolver, and receipts are never touched.
   const readThreadObservation = async (threadId: string): Promise<SourceObservation> => {
     const thread = await bb.sdk.threads.get({ threadId });
     return thread.archivedAt !== null || thread.deletedAt !== null
       ? { status: thread.status, archived: true }
       : { status: thread.status, archived: false };
   };
-
   const boundedRegistry = {
     register: (wait: Parameters<typeof waitRegistry.register>[0]) => waitRegistry.register(wait),
-    // The store loads lazily; every read recovers first so a cold host never
-    // answers an empty list from a populated registry (round-2 finding #4).
     list: async () => { await waitRegistry.recover(); return waitRegistry.list(); },
     firedWaitIds: async () => { await waitRegistry.recover(); return waitRegistry.firedList() as Array<{ waitId: string; reason: string; waiterThreadId: string }>; },
   };
@@ -896,494 +767,32 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       await bb.sdk.threads.send({
         threadId: target.waiterThreadId,
         mode: "steer",
-        input: [
-          {
-            type: "text",
-            visibility: "agent-only",
-            text: `Registered wait ${target.waitId} fired (${target.reason}). Wake: inspect what you were waiting on, act on it, and record the next step or blocker.`,
-            mentions: [],
-          },
-        ],
+        input: [{ type: "text", visibility: "agent-only", text: `Registered wait ${target.waitId} fired (${target.reason}). Wake and record the next step or blocker.`, mentions: [] }],
       });
     },
-    onFire: (record) => {
-      bb.log.warn(`registered wait fired: ${record.waitId} (${record.reason})`);
-      bb.realtime.publish("wait-validator", { fired: record.waitId, reason: record.reason });
-    },
-    onEscalate: (record) => {
-      bb.log.error(`registered wait escalation: waiter ${record.waiterThreadId} ignored ${record.steers} steers for ${record.waitId}; succession trigger`);
-      bb.realtime.publish("wait-validator", { escalated: record.waitId, waiterThreadId: record.waiterThreadId, successionTrigger: true });
-    },
+    onFire: (record) => bb.log.warn(`registered wait fired: ${record.waitId} (${record.reason})`),
+    onEscalate: (record) => bb.log.error(`registered wait escalation: ${record.waiterThreadId} ignored ${record.steers} steers for ${record.waitId}`),
   });
   await escalationCycle.recover().catch((error) => bb.log.error(`wait escalation state is unreadable: ${String(error)}`));
-
-  const operatorWaitAlertPersistence = {
-    read: () => bb.storage.kv.get<unknown>("lane-watcher.operator-wait-fyi"),
-    write: (state: Record<string, true>) => bb.storage.kv.set("lane-watcher.operator-wait-fyi", state),
-  };
-
-  const roleIdlePersistence = {
-    read: () => bb.storage.kv.get<unknown>("lane-watcher.role-idle"),
-    write: (state: Record<string, { steerCount: number; failedSteers: number; escalated: boolean; idleSinceMs: number | null; lastSteerAtMs: number | null; awaitingSteerOutcome: boolean; lastFleetWakeAtMs: number | null; lastStaleWaitWakeAtMs: number | null; lastOwedActWakeAtMs: number | null; lastEscalationAtMs: number | null }>) => bb.storage.kv.set("lane-watcher.role-idle", state),
-  };
-
-  const roleLivenessWarnings = new Map<string, string>();
-  const roleLivenessKey = (holder: RoleHolderState) => `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${holder.execution_attempt_id}:${holder.thread_id}`;
-  const warnRoleLiveness = (holder: RoleHolderState, evidence: string) => {
-    const key = roleLivenessKey(holder);
-    if (roleLivenessWarnings.get(key) === evidence) return;
-    roleLivenessWarnings.set(key, evidence);
-    bb.log.warn(`role steer refused: project=${holder.project_id} role=${holder.role_id}@${holder.role_generation} holder=${holder.execution_attempt_id} thread=${holder.thread_id} ${evidence}`);
-  };
-  const roleThreadRefusal = (
-    holder: RoleHolderState,
-    thread: Awaited<ReturnType<typeof bb.sdk.threads.get>>,
-    requireIdle: boolean,
-  ) => {
-    const witness = /\bwitness\b/iu.test(`${thread.title ?? ""}\n${thread.titleFallback ?? ""}`);
-    const usableStatus = requireIdle ? thread.status === "idle" : thread.status === "idle" || thread.status === "active";
-    return thread.projectId === holder.project_id && thread.archivedAt === null && thread.deletedAt === null && !witness && usableStatus
-      ? null
-      : `observedProject=${thread.projectId} archivedAt=${thread.archivedAt ?? "null"} deletedAt=${thread.deletedAt ?? "null"} status=${thread.status} witness=${witness}`;
-  };
-
-  const readOperatorWaits = async () => {
-    if (!db) return new Map<string, OperatorWait>();
-    const operatorWaits = new Map<string, OperatorWait>();
-    const threadIds = [...new Set(readLaneStates(db)
-      .filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state))
-      .map((lane) => lane.thread_id)
-      .filter((threadId): threadId is string => threadId !== null))];
-    await Promise.all(threadIds.map(async (threadId) => {
-      try {
-        const wait = await readPendingOperatorWaitForThread(threadId);
-        if (wait) operatorWaits.set(threadId, wait);
-      } catch {
-        // A single project's interaction surface must not abort other projects' floors.
-      }
-    }));
-    return operatorWaits;
-  };
-
-  const readRoleScopes = async () => {
-    if (!db) return [];
-    return roleQueueScopes(openLaneViews(db, Date.now(), await readOperatorWaits()));
-  };
-
-  const readUnblockedStartableLanes = async () => {
-    if (!db) return [];
-    const candidates = openLaneViews(db, Date.now(), await readOperatorWaits()).filter((lane) => lane.nextStartable);
-    return (await Promise.all(candidates.map(async (lane) => {
-      if (!lane.threadId || !(await readPendingExternalWait(lane.threadId))) return lane;
-      return null;
-    }))).filter((lane): lane is (typeof candidates)[number] => lane !== null);
-  };
-
-  const steerRole = async (role: import("./src/awareness.js").RoleIdleView) => {
-    if (!db) return "error" as const;
-    const expectedHolder: RoleHolderState = {
-      project_id: role.projectId,
-      role_id: role.roleId,
-      role_generation: role.roleGeneration,
-      execution_attempt_id: role.executionAttemptId,
-      thread_id: role.threadId,
-    };
-    let holders: RoleHolderState[];
-    try {
-      holders = readRoleHolderStates(db).filter((holder) =>
-        holder.project_id === role.projectId &&
-        holder.role_id === role.roleId &&
-        holder.role_generation === role.roleGeneration &&
-        holder.execution_attempt_id === role.executionAttemptId,
-      );
-    } catch (error) {
-      warnRoleLiveness(expectedHolder, `holder=unknown error=${String(error)}`);
-      return "error" as const;
-    }
-    if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) {
-      warnRoleLiveness(expectedHolder, `holderMatches=${holders.length} observedThread=${holders[0]?.thread_id ?? "null"}`);
-      return false;
-    }
-    let thread;
-    try {
-      thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
-    } catch (error) {
-      warnRoleLiveness(holders[0], `liveness=unknown error=${String(error)}`);
-      return "error" as const;
-    }
-    const refusal = roleThreadRefusal(holders[0], thread, true);
-    if (refusal) {
-      warnRoleLiveness(holders[0], refusal);
-      return false;
-    }
-    roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
-    await bb.sdk.threads.send({
-      threadId: holders[0].thread_id,
-      mode: "steer",
-      input: [
-        {
-          type: "text",
-          visibility: "agent-only",
-          text: `Wrongful idle: queue head ${role.queueHeadId} is startable. Inspect the queue and act or record the blocker.`,
-          mentions: [],
-        },
-      ],
-    });
-    return true;
-  };
-
-  const watcher = createLaneWatcher({
-    readLanes: () => (db ? readLaneStates(db) : []),
-    readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
-    readRoleScopes,
-    roleIdlePersistence,
-    continuationLedger,
-    waitRegistry,
-    operatorWaitAlertPersistence,
-    onAlert: (alert) => alert.lane
-      ? bb.log.warn(`lane awareness ${alert.kind}: ${alert.lane.laneId} (${alert.count}/${alert.max})`)
-      : bb.log.warn(`role awareness ${alert.kind}: ${alert.role.roleId}@${alert.role.roleGeneration} queue ${alert.role.queueHeadId}`),
-    onRoleSuccessionRequired: (role) => bb.log.warn(`role succession required: ${role.roleId}@${role.roleGeneration}`),
-    isExternallyWaiting: readPendingExternalWait,
-    readOperatorWait: readPendingOperatorWaitForThread,
-    readWorker: async (threadId) => {
-      const roleHolders = db ? readRoleHolderStates(db).filter((holder) => holder.thread_id === threadId) : [];
-      let thread;
-      try {
-        thread = await bb.sdk.threads.get({ threadId });
-      } catch (error) {
-        for (const holder of roleHolders) warnRoleLiveness(holder, `liveness=unknown error=${String(error)}`);
-        throw error;
-      }
-      let roleThreadRefused = false;
-      for (const holder of roleHolders) {
-        const refusal = roleThreadRefusal(holder, thread, false);
-        if (refusal) {
-          roleThreadRefused = true;
-          warnRoleLiveness(holder, refusal);
-        } else {
-          roleLivenessWarnings.delete(roleLivenessKey(holder));
-        }
-      }
-      const archived = thread.archivedAt !== null || thread.deletedAt !== null || roleThreadRefused;
-      return {
-        projectId: thread.projectId,
-        status: thread.status,
-        pendingExternalWait: archived ? true : await readPendingExternalWait(threadId),
-        archived,
-        operatorWait: null,
-        operatorWaitKnown: true,
-        // Native ThreadResponse has no idle-since field; the role ledger anchors this proxy on first observation.
-        idleSinceMs: thread.status === "idle" ? thread.updatedAt : null,
-      };
-    },
-    steer: async (lane) => {
-      if (!lane.threadId) return;
-      if (db && readRoleHolderStates(db).some((holder) => holder.project_id === lane.projectId && holder.thread_id === lane.threadId)) return;
-      await bb.sdk.threads.send({
-        threadId: lane.threadId,
-        mode: "steer",
-        input: [
-          {
-            type: "text",
-            visibility: "agent-only",
-            text: `Lane ${lane.laneId} is idle without a terminal receipt or pending external wait. Continue assignment ${lane.assignmentId} and finish with exactly one DONE|BLOCKED terminal receipt.`,
-            mentions: [],
-          },
-        ],
-      });
-    },
-    steerRole,
-  });
-  await watcher.recover().catch((error) => bb.log.error(`lane continuation recovery failed: ${String(error)}`));
-  const fleetWatchdogIdle = createRoleIdleLedger({
-    read: () => bb.storage.kv.get<unknown>("fleet-watchdog.role-idle"),
-    write: (state) => bb.storage.kv.set("fleet-watchdog.role-idle", state),
-  });
-
-  const stallGuardCycle = createStallGuardCycle({
-    readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
-    readRoleScopes,
-    readArtifact: async (projectId) => {
-      if (!db) return null;
-      const artifacts = [];
-      for (const lane of readLaneStates(db)
-        .filter((candidate) => candidate.project_id === projectId && OPEN_ATTEMPT_STATES.has(candidate.attempt_state) && candidate.thread_id !== null)) {
+  const validateWaits = async () => {
+    await waitRegistry.recover();
+    let fired = 0;
+    for (const wait of waitRegistry.list()) {
+      if (waitRegistry.state(wait.waitId) !== "pending") continue;
+      let reason: "source_terminal" | "source_failure" | "deadline_expired" | null = null;
+      if (Date.now() >= wait.deadlineAtMs) reason = "deadline_expired";
+      else {
         try {
-          const thread = await bb.sdk.threads.get({ threadId: lane.thread_id! });
-          if (thread.projectId !== projectId || !thread.environmentId) {
-            artifacts.push({ id: lane.execution_attempt_id, unavailable: false, value: { environmentId: null, result: { outcome: "absent" } } });
-            continue;
-          }
-          const result = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
-          artifacts.push(result.outcome === "unavailable"
-            ? { id: lane.execution_attempt_id, unavailable: true, value: null }
-            : { id: lane.execution_attempt_id, unavailable: false, value: { environmentId: thread.environmentId, result } });
+          const source = await readThreadObservation(wait.sourceThreadId);
+          if (source && (source.archived || source.status === "error")) reason = wait.sourceEvent === "failure" ? "source_failure" : "source_terminal";
         } catch {
-          artifacts.push({ id: lane.execution_attempt_id, unavailable: true, value: null });
+          continue;
         }
       }
-      return artifacts;
-    },
-    wakeRole: (role) => watcher.wakeRole(role),
-    persistence: {
-      read: () => bb.storage.kv.get<unknown>(STALL_GUARD_KV_KEY),
-      write: (state) => bb.storage.kv.set(STALL_GUARD_KV_KEY, state),
-    },
-  });
-
-  const observe = (payload: Parameters<typeof threadEventStatus>[0]) => {
-    const { id, status } = threadEventStatus(payload);
-    return watcher.observe(id, status);
-  };
-  bb.events.on("thread.active", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
-  bb.events.on("thread.idle", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
-  bb.events.on("thread.failed", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
-  bb.events.on("thread.archived", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
-  bb.events.on("thread.deleted", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
-  const unsubscribe = subscribeToThreadChanges(bb.sdk, (threadId, status, archived = false) => watcher.observe(threadId, status, undefined, archived));
-  bb.onDispose(unsubscribe);
-  bb.background.service("lane-watcher", {
-    async start(signal) {
-      while (!signal.aborted) {
-        await watcher.poll().catch((error) => bb.log.warn(`lane poll failed: ${String(error)}`));
-        await escalationCycle.cycle().catch((error) => bb.log.warn(`wait escalation failed: ${String(error)}`));
-        if (signal.aborted) break;
-        await new Promise<void>((resolve) => {
-          let timer: ReturnType<typeof setTimeout>;
-          const done = () => {
-            clearTimeout(timer);
-            signal.removeEventListener("abort", done);
-            resolve();
-          };
-          timer = setTimeout(done, 1_000);
-          signal.addEventListener("abort", done, { once: true });
-        });
-      }
-    },
-  });
-
-  // The self-watch, once: launchd KeepAlive restarts the host-supervised
-  // validator loop on death; this schedule is the trivial second check. It
-  // alerts the operator exactly once when the liveness marker that loop
-  // refreshes every cycle goes stale — meaning launchd itself failed, which
-  // is operator territory. A missing marker is never launchd-failure
-  // evidence (the agent may not be deployed), so it stays silent.
-  bb.background.schedule("wait-validator-liveness", "*/5 * * * *", async () => {
-    try {
-      const stateDir = waitValidatorStateDir();
-      const markerPath = join(stateDir, LIVENESS_MARKER_FILENAME);
-      const flagPath = join(stateDir, LIVENESS_ALERT_FLAG_FILENAME);
-      let markerAtMs: number | null = null;
-      try {
-        const parsed = Number(readFileSync(markerPath, "utf8").trim());
-        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync(markerPath).mtimeMs;
-      } catch {
-        markerAtMs = null;
-      }
-      const configuredStaleMs = Number(process.env.BB_COLLAB_LIVENESS_STALE_MS);
-      const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
-      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync(flagPath));
-      if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
-      if (decision === "alert-once") {
-        mkdirSync(stateDir, { recursive: true });
-        // O_EXCL claim: concurrent checkers cannot both win the one alert.
-        try {
-          writeFileSync(flagPath, String(Date.now()), { flag: "wx" });
-        } catch {
-          bb.log.info("wait-validator-liveness healthy cycle");
-          return; // another checker already claimed this episode's single alert
-        }
-        bb.log.error("wait-validator liveness marker is stale: host launchd supervision failed; operator attention required");
-        bb.realtime.publish("wait-validator", { liveness: "stale", alert: "operator-once" });
-      }
-      bb.log.info("wait-validator-liveness healthy cycle");
-    } catch (error) {
-      bb.log.warn(`wait-validator liveness check failed: ${String(error)}`);
+      if (reason && await waitRegistry.fire(wait.waitId, reason, Date.now())) fired += 1;
     }
-  });
-
-  bb.background.schedule("stall-guard-liveness", "*/5 * * * *", async () => {
-    try {
-      const stateDir = stallGuardStateDir();
-      const markerPath = join(stateDir, STALL_GUARD_LIVENESS_MARKER_FILENAME);
-      const flagPath = join(stateDir, STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME);
-      let markerAtMs: number | null = null;
-      try {
-        const parsed = Number(readFileSync(markerPath, "utf8").trim());
-        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync(markerPath).mtimeMs;
-      } catch {
-        markerAtMs = null;
-      }
-      const configuredStaleMs = Number(process.env.BB_COLLAB_STALL_GUARD_LIVENESS_STALE_MS);
-      const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
-      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync(flagPath));
-      if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
-      if (decision === "alert-once") {
-        mkdirSync(stateDir, { recursive: true });
-        try {
-          writeFileSync(flagPath, String(Date.now()), { flag: "wx" });
-        } catch {
-          bb.log.info("stall-guard-liveness healthy cycle");
-          return;
-        }
-        bb.log.error("stall-guard liveness marker is stale: host launchd supervision failed; operator attention required");
-        bb.realtime.publish("stall-guard", { liveness: "stale", alert: "operator-once" });
-      }
-      bb.log.info("stall-guard-liveness healthy cycle");
-    } catch (error) {
-      bb.log.warn(`stall-guard liveness check failed: ${String(error)}`);
-    }
-  });
-
-  const wakeInFlight = new Set<string>();
-  const fleetWatchdogCycle = async (onlyProjectId?: string) => {
-    try {
-      if (!db) return;
-      const now = Date.now();
-      const { fleetWatchdogFloorMs, fleetWatchdogStaleWaitMs } = await fleetWatchdogSettings.get();
-      const floorMs = Number(fleetWatchdogFloorMs);
-      const staleWaitMs = Number(fleetWatchdogStaleWaitMs);
-      if (!Number.isSafeInteger(floorMs) || floorMs <= 0 || !Number.isSafeInteger(staleWaitMs) || staleWaitMs <= 0) {
-        throw new Error("watchdog thresholds must be positive integer milliseconds");
-      }
-      const holdersByProject = new Map<string, RoleHolderState[]>();
-      for (const holder of readRoleHolderStates(db)) {
-        const holders = holdersByProject.get(holder.project_id) ?? [];
-        holders.push(holder);
-        holdersByProject.set(holder.project_id, holders);
-      }
-      const openWorkItemsByProject = new Map<string, Array<{ workItemId: string; waker: string | null; wakerKind: "schedule" | "seat" | null; declaredAtMs: number | null }>>();
-      for (const workItem of db.prepare(
-        `SELECT work_items.project_id, work_items.work_item_id, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
-         FROM work_items LEFT JOIN work_item_waits
-           ON work_item_waits.project_id = work_items.project_id AND work_item_waits.work_item_id = work_items.work_item_id
-         WHERE work_items.lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')
-         ORDER BY work_items.created_at_ms, work_items.work_item_id`,
-      ).all() as Array<{ project_id: string; work_item_id: string; waker: string | null; waker_kind: "schedule" | "seat" | null; declared_at_ms: number | null }>) {
-        const workItems = openWorkItemsByProject.get(workItem.project_id) ?? [];
-        workItems.push({ workItemId: workItem.work_item_id, waker: workItem.waker, wakerKind: workItem.waker_kind, declaredAtMs: workItem.declared_at_ms });
-        openWorkItemsByProject.set(workItem.project_id, workItems);
-      }
-      const isCurrent = (candidate: RoleHolderState, holder: RoleHolderState) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
-      const wake = async (projectId: string, holder: RoleHolderState, key: string, text: string, requireIdle: boolean, kind: "fleet" | "stale-wait" | "owed-act" | "escalation", beforeSend?: () => Promise<boolean>) => {
-        const previous = await fleetWatchdogIdle.get(key);
-        const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs
-          : kind === "stale-wait" ? previous?.lastStaleWaitWakeAtMs
-            : kind === "owed-act" ? previous?.lastOwedActWakeAtMs
-              : previous?.lastEscalationAtMs;
-        if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== undefined && now - lastNotifiedAtMs < floorMs) return false;
-        if (wakeInFlight.has(key)) return false;
-        wakeInFlight.add(key);
-        try {
-          const current = readRoleHolderStates(db).filter((candidate) => candidate.project_id === projectId && candidate.role_id === holder.role_id);
-          if (current.length !== 1 || !isCurrent(current[0]!, holder)) {
-            if (current.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active ${holder.role_id} holders=${current.length}`);
-            return false;
-          }
-          if (await readPendingExternalWait(holder.thread_id)) return false;
-          const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
-          if (roleThreadRefusal(holder, thread, requireIdle)) return false;
-          if (beforeSend && !await beforeSend()) return false;
-          await bb.sdk.threads.send({
-            threadId: holder.thread_id,
-            mode: "queue-if-active",
-            input: [{ type: "text", visibility: "agent-only", text, mentions: [] }],
-          });
-          if (kind === "fleet") await fleetWatchdogIdle.recordFleetWake(key, Date.now());
-          else if (kind === "stale-wait") await fleetWatchdogIdle.recordStaleWaitWake(key, Date.now());
-          else if (kind === "owed-act") await fleetWatchdogIdle.recordOwedActWake(key, Date.now());
-          else await fleetWatchdogIdle.recordEscalation(key, Date.now());
-          return true;
-        } finally {
-          wakeInFlight.delete(key);
-        }
-      };
-      for (const [projectId, holders] of holdersByProject) {
-        try {
-          if (onlyProjectId !== undefined && projectId !== onlyProjectId) continue;
-          const directors = holders.filter((holder) => holder.role_id === "director");
-          const orchestrators = holders.filter((holder) => holder.role_id === "project-orchestrator");
-          if (directors.length !== 1 || orchestrators.length !== 1) {
-            if (directors.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active director holders=${directors.length}`);
-            if (orchestrators.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active project-orchestrator holders=${orchestrators.length}`);
-            continue;
-          }
-          const director = directors[0]!;
-          const orchestrator = orchestrators[0]!;
-          const workItems = openWorkItemsByProject.get(projectId) ?? [];
-          const resetIdle = () => Promise.all(holders.flatMap((holder) => workItems.map((workItem) => fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workItem.workItemId)))));
-          if (workItems.length === 0) continue;
-          const staleWait = workItems.find((workItem) => workItem.declaredAtMs !== null && now - workItem.declaredAtMs >= staleWaitMs);
-          if (staleWait) {
-            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait");
-            continue;
-          }
-          const seatWait = workItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null);
-          if (seatWait) {
-            const owing = holders.find((holder) => holder.role_id === seatWait.waker);
-            if (!owing) continue;
-            const owingKey = roleIdleKey(owing, seatWait.workItemId);
-            const owingThread = await bb.sdk.threads.get({ threadId: owing.thread_id });
-            if (roleThreadRefusal(owing, owingThread, true) || await readPendingExternalWait(owing.thread_id)) {
-              await fleetWatchdogIdle.resetIdle(owingKey);
-              continue;
-            }
-            const owingRecord = await fleetWatchdogIdle.observeIdle(owingKey, now);
-            if (owingRecord.idleSinceMs === null || now - owingRecord.idleSinceMs < floorMs) continue;
-            if (owingRecord.lastOwedActWakeAtMs === null || owingRecord.lastOwedActWakeAtMs < owingRecord.idleSinceMs) {
-              await wake(projectId, owing, owingKey, `owed act quiet at cycle ${new Date(now).toISOString()} with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
-              continue;
-            }
-            if (owing.role_id !== "director" && now - owingRecord.lastOwedActWakeAtMs >= floorMs) {
-              await wake(projectId, director, roleIdleKey(director, seatWait.workItemId), `owed act still quiet at cycle ${new Date(now).toISOString()} with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
-            }
-            continue;
-          }
-          const openWorkItem = workItems.find((workItem) => workItem.declaredAtMs === null);
-          if (!openWorkItem) {
-            await resetIdle();
-            continue;
-          }
-          const workKey = openWorkItem.workItemId;
-          const orchestratorKey = roleIdleKey(orchestrator, workKey);
-          const priorOrchestratorRecord = await fleetWatchdogIdle.get(orchestratorKey);
-          if (priorOrchestratorRecord?.lastFleetWakeAtMs !== null && priorOrchestratorRecord?.lastFleetWakeAtMs !== undefined && now - priorOrchestratorRecord.lastFleetWakeAtMs >= floorMs) {
-            await wake(projectId, director, roleIdleKey(director, workKey), `fleet still quiet at cycle ${new Date(now).toISOString()} with open work since ${new Date(priorOrchestratorRecord.idleSinceMs ?? now).toISOString()}`, false, "escalation", async () => (await Promise.all(holders.map(async (holder) => {
-              const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
-              return !roleThreadRefusal(holder, thread, true) && !await readPendingExternalWait(holder.thread_id);
-            }))).every(Boolean));
-            continue;
-          }
-          const idle = await Promise.all(holders.map(async (holder) => {
-            const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
-            if (roleThreadRefusal(holder, thread, true) || await readPendingExternalWait(holder.thread_id)) {
-              await fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workKey));
-              return false;
-            }
-            const record = await fleetWatchdogIdle.observeIdle(roleIdleKey(holder, workKey), now);
-            return record.idleSinceMs !== null && now - record.idleSinceMs >= floorMs;
-          }));
-          if (!idle.every(Boolean)) continue;
-          const orchestratorRecord = await fleetWatchdogIdle.get(orchestratorKey);
-          if (orchestratorRecord?.lastFleetWakeAtMs === null || orchestratorRecord?.lastFleetWakeAtMs === undefined || orchestratorRecord.lastFleetWakeAtMs < (orchestratorRecord.idleSinceMs ?? now)) {
-            await wake(projectId, orchestrator, orchestratorKey, `fleet quiet at cycle ${new Date(now).toISOString()} with open work since ${new Date(orchestratorRecord?.idleSinceMs ?? now).toISOString()}`, true, "fleet");
-            continue;
-          }
-        } catch (error) {
-          bb.log.warn(`fleet-watchdog failed: ${String(error)}`);
-        }
-      }
-      bb.log.info("fleet-watchdog healthy cycle");
-    } catch (error) {
-      bb.log.warn(`fleet-watchdog failed: ${String(error)}`);
-    }
+    return fired;
   };
-  const resetFleetWatchdog = async (projectId: string, invokedBy: string) => {
-    await fleetWatchdogIdle.clearWakeHistory(`${projectId}:`);
-    bb.log.warn(`fleet-watchdog history reset: project=${projectId} invokedBy=${invokedBy} at=${Date.now()}`);
-  };
-  bb.background.schedule("fleet-watchdog", "0 * * * *", () => fleetWatchdogCycle());
 
   // This is deliberately a report-only schedule. Archive is available only
   // through the explicit collab archive-sweep --apply command below.
@@ -1406,11 +815,6 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     bb.log.info("thread-archive-sweep healthy cycle");
   });
 
-  const readOpenLaneViews = async () => {
-    if (!db) return [];
-    return openLaneViews(db, Date.now(), new Map());
-  };
-
   // Lifecycle callbacks observe a completed creation; they cannot intercept a
   // spawn. An unseated thread receives its worker brief here at seating;
   // successful canonical succession separately delivers the exact seat brief.
@@ -1422,17 +826,37 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     }
   });
 
-  bb.http.route("GET", "/lanes", async () =>
-    new Response(JSON.stringify(await readOpenLaneViews()), {
-      headers: { "content-type": "application/json" },
-    }),
-  );
+  bb.background.schedule("wait-validator-liveness", "*/5 * * * *", async () => {
+    try {
+      const stateDir = waitValidatorStateDir();
+      const markerPath = join(stateDir, LIVENESS_MARKER_FILENAME);
+      const flagPath = join(stateDir, LIVENESS_ALERT_FLAG_FILENAME);
+      let markerAtMs: number | null = null;
+      try {
+        const parsed = Number(readFileSync(markerPath, "utf8").trim());
+        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync(markerPath).mtimeMs;
+      } catch {}
+      const configuredStaleMs = Number(process.env.BB_COLLAB_LIVENESS_STALE_MS);
+      const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync(flagPath));
+      if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
+      if (decision === "alert-once") {
+        mkdirSync(stateDir, { recursive: true });
+        try { writeFileSync(flagPath, String(Date.now()), { flag: "wx" }); } catch { return; }
+        bb.log.error("wait-validator liveness marker is stale: host supervision failed; operator attention required");
+        bb.realtime.publish("wait-validator", { liveness: "stale", alert: "operator-once" });
+      }
+    } catch (error) {
+      bb.log.warn(`wait-validator liveness check failed: ${String(error)}`);
+    }
+  });
 
   // Counts only. A sidebar glyph needs how many are waiting and on which
   // thread; it has no use for the project, candidate head, digest or
   // idempotency key those requests carry, so this surface never carries them.
   const cliDeps: WaitValidatorCliDeps = {
-    watcher,
+    waitRegistry,
+    validateWaits,
     registerBoundedWaitForCli: (input, ctxThreadId) => registerBoundedWait({
       registry: boundedRegistry,
       readSource: readThreadObservation,
@@ -1442,17 +866,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     }),
     listWaitsForCli: async () => { await waitRegistry.recover(); return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) })); },
     escalationCycle,
-    stallGuardCycle: (projectId) => stallGuardCycle.cycle(projectId),
-    fleetWatchdogCycle,
-    resetFleetWatchdog,
     archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply),
     readCheckoutDivergence: readDiagnosticDivergence,
   };
 
   bb.rpc.register(rpcContract, {
-    lanes() {
-      return readOpenLaneViews();
-    },
     async registerWait(input) {
       if (!await liveWaker(bb, input.wakerSchedule)) throw new Error(`waker schedule ${input.wakerSchedule} is not live: declaration refused`);
       await waitRegistry.recover();
@@ -1465,7 +883,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         return { ...existing, wakerSchedule: existing.wakerSchedule, declaredAtMs: existing.declaredAtMs };
       }
       const wait = { ...input, declaredAtMs: Date.now() };
-      await watcher.registerWait(wait);
+      await waitRegistry.register(wait);
       return wait;
     },
     async threadStates(input) {
@@ -1560,16 +978,6 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         name: "wait-validator",
         summary: "Run one durable wait-validator cycle (host-supervised seam)",
         usage: "bb collab wait-validator --cycle",
-      },
-      {
-        name: "stall-guard",
-        summary: "Run one succession-safe stall-guard cycle (host-supervised seam)",
-        usage: "bb collab stall-guard --cycle --project PROJECT_ID",
-      },
-      {
-        name: "fleet-watchdog",
-        summary: "Run one wait-aware fleet-watchdog cycle",
-        usage: "bb collab fleet-watchdog --cycle --project PROJECT_ID",
       },
       {
         name: "archive-sweep",

@@ -1,4 +1,6 @@
 # ADR 0001: founding contract
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 - Status: accepted with amendments
 - Date: 2026-08-13

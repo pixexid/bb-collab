@@ -1,4 +1,6 @@
 # Route-time canonical holder acceptance
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 This report records the bounded Tier-A routing repair for issue 57. It removes
 the dispatcher/supervisor thread identity dependency from the plugin and makes

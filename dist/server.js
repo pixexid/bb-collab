@@ -13781,6 +13781,110 @@ function date4(params) {
 // node_modules/zod/v4/classic/external.js
 config(en_default());
 
+// src/awareness.ts
+function normalizeRegisteredWait(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid registered wait");
+  const value = input;
+  if (typeof value.waitId !== "string" || value.waitId.length === 0 || typeof value.waiterThreadId !== "string" || value.waiterThreadId.length === 0 || typeof value.sourceThreadId !== "string" || value.sourceThreadId.length === 0 || value.sourceEvent !== "terminal" && value.sourceEvent !== "failure" || !Number.isInteger(value.deadlineAtMs) || value.deadlineAtMs < 0) throw new Error("registered wait requires waiter, source, event, and deadline");
+  return {
+    waitId: value.waitId,
+    waiterThreadId: value.waiterThreadId,
+    sourceThreadId: value.sourceThreadId,
+    sourceEvent: value.sourceEvent,
+    deadlineAtMs: value.deadlineAtMs,
+    wakerSchedule: typeof value.wakerSchedule === "string" && value.wakerSchedule.length > 0 ? value.wakerSchedule : null,
+    declaredAtMs: Number.isInteger(value.declaredAtMs) && value.declaredAtMs >= 0 ? value.declaredAtMs : null
+  };
+}
+function waitRegistryState(input) {
+  if (input === void 0 || input === null) return { waits: [], fired: {} };
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid wait registry state");
+  const value = input;
+  if (!Array.isArray(value.waits) || !value.fired || typeof value.fired !== "object" || Array.isArray(value.fired)) {
+    throw new Error("invalid wait registry state");
+  }
+  const waits = value.waits.map(normalizeRegisteredWait);
+  const byId = /* @__PURE__ */ new Map();
+  for (const wait of waits) {
+    const existing = byId.get(wait.waitId);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(wait)) throw new Error("conflicting registered wait");
+    byId.set(wait.waitId, wait);
+  }
+  const fired = {};
+  for (const [waitId, reason] of Object.entries(value.fired)) {
+    if (!byId.has(waitId) || !["source_terminal", "source_failure", "deadline_expired"].includes(reason)) {
+      throw new Error("invalid fired wait");
+    }
+    fired[waitId] = reason;
+  }
+  return { waits: [...byId.values()], fired };
+}
+function createWaitRegistry(persistence) {
+  let state = { waits: [], fired: {} };
+  let loaded = false;
+  let queue = Promise.resolve();
+  const enqueue = (work) => {
+    const result2 = queue.then(work);
+    queue = result2.then(() => void 0, () => void 0);
+    return result2;
+  };
+  const load = async () => {
+    if (loaded) return;
+    state = waitRegistryState(persistence ? await persistence.read() : null);
+    loaded = true;
+  };
+  return {
+    recover: () => enqueue(async () => {
+      await load();
+    }),
+    register: (input) => enqueue(async () => {
+      await load();
+      const wait = normalizeRegisteredWait(input);
+      const existing = state.waits.find((candidate) => candidate.waitId === wait.waitId);
+      if (existing) {
+        if (JSON.stringify(existing) !== JSON.stringify(wait)) throw new Error("conflicting registered wait");
+        return;
+      }
+      const waits = [...state.waits, wait];
+      await persistence?.write(structuredClone({ waits, fired: state.fired }));
+      state = { waits, fired: state.fired };
+    }),
+    list: () => state.waits.map((wait) => ({ ...wait })),
+    state: (waitId) => state.fired[waitId] ? "fired" : state.waits.some((wait) => wait.waitId === waitId) ? "pending" : "unknown",
+    firedList: () => state.waits.filter((wait) => state.fired[wait.waitId] !== void 0).map((wait) => ({ waitId: wait.waitId, reason: state.fired[wait.waitId], waiterThreadId: wait.waiterThreadId })),
+    fire: (waitId, reason, firedAtMs) => enqueue(async () => {
+      await load();
+      const wait = state.waits.find((candidate) => candidate.waitId === waitId);
+      if (!wait || state.fired[waitId]) return null;
+      const event = { ...wait, reason, firedAtMs };
+      const fired = { ...state.fired, [waitId]: reason };
+      await persistence?.write(structuredClone({ waits: state.waits, fired }));
+      state = { waits: state.waits, fired };
+      return event;
+    })
+  };
+}
+function readRoleHolderStates(db) {
+  return db.prepare(
+    `SELECT attempts.project_id, attempts.role_id, attempts.role_generation,
+              attempts.execution_attempt_id, attempts.thread_id
+       FROM execution_attempts AS attempts
+       JOIN role_generation_heads AS heads
+         ON heads.project_id = attempts.project_id
+        AND heads.role_id = attempts.role_id
+        AND heads.current_generation = attempts.role_generation
+       JOIN role_generations AS generations
+         ON generations.project_id = attempts.project_id
+        AND generations.role_id = attempts.role_id
+        AND generations.generation = attempts.role_generation
+        AND generations.holder_execution_attempt_id = attempts.execution_attempt_id
+       WHERE attempts.origin = 'role_holder'
+         AND attempts.thread_id IS NOT NULL
+         AND generations.status = 'active'
+       ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`
+  ).all();
+}
+
 // src/foundation.ts
 import { createHash, randomBytes } from "node:crypto";
 var PLUGIN_ID = "bb-collab";
@@ -13789,8 +13893,6 @@ var PLUGIN_SDK_VERSION = "0.4.1";
 var CONTRACT_VERSION = 21;
 var SCHEMA_VERSION = 14;
 var PREVIOUS_CONTRACT_VERSION = 20;
-var DEFAULT_WRITING_LANE_CEILING = 3;
-var MAX_WRITING_LANE_CEILING = 3;
 var PREVIOUS_SCHEMA_VERSION = 13;
 var ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"];
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
@@ -13839,7 +13941,6 @@ var TABLES = [
   "external_work_refs",
   "qualification_observations",
   "eligibility_projections",
-  "assignments",
   "execution_attempts",
   "role_generations",
   "role_generation_heads"
@@ -14603,21 +14704,12 @@ var contractDigest = sha256(canonicalJson({
     authority: "none",
     traffic: "none"
   },
-  writingLanePolicy: {
-    configPath: "extensions.bbCollab.writingLaneCeiling",
-    default: DEFAULT_WRITING_LANE_CEILING,
-    maximum: MAX_WRITING_LANE_CEILING,
-    lowerRequiresExplicitDecision: true,
-    readOnlyAssignmentKinds: ["review", "probe"]
-  },
   directorSeatPolicy: {
     roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
     roleId: "director",
     executedProfile: directorSeatProfile,
     standbyProfile: directorSeatStandbyProfile,
-    writingLaneCapacity: 0,
-    environment: "managed-worktree",
-    assignmentKinds: []
+    environment: "managed-worktree"
   },
   cachedConsumerRolloutPolicy: {
     consumers: [...CACHED_CONSUMERS],
@@ -14710,88 +14802,8 @@ var migrationStepSchema = external_exports.object({
 var sortedIdSetSchema = external_exports.array(id).min(1).max(64).refine((values) => new Set(values).size === values.length && canonicalJson(values) === canonicalJson([...values].sort()), {
   message: "values must be sorted and duplicate-free"
 });
-var reviewTargetSchema = external_exports.object({
-  workItemId: id,
-  repoTargetId: id,
-  configRevision: external_exports.number().int().positive(),
-  baseSha: external_exports.string().regex(/^[0-9a-f]{40,64}$/u),
-  h0CandidateSha: external_exports.string().regex(/^[0-9a-f]{40,64}$/u),
-  h0TreeDigest: digestSchema,
-  tierAEntries: sortedIdSetSchema
-}).strict();
-var reviewScopeSchema = external_exports.object({ targets: external_exports.array(reviewTargetSchema).min(1).max(32) }).strict().superRefine((scope, ctx) => {
-  const keys = scope.targets.map((target) => `${target.workItemId}\0${target.repoTargetId}`);
-  if (new Set(scope.targets.map((target) => target.workItemId)).size !== scope.targets.length) {
-    ctx.addIssue({ code: "custom", path: ["targets"], message: "one WorkItem cannot span multiple review targets" });
-  }
-  if (canonicalJson(keys) !== canonicalJson([...keys].sort())) {
-    ctx.addIssue({ code: "custom", path: ["targets"], message: "review targets must be canonically sorted" });
-  }
-});
-var connectorPolicySchema = external_exports.enum(["required", "optional", "prohibited"]);
-var reviewConnectorSchema = external_exports.object({ repoTargetId: id, connectorId: id, policy: connectorPolicySchema }).strict();
-var reviewConnectorsSchema = external_exports.array(reviewConnectorSchema).min(1).max(128).superRefine((connectors, ctx) => {
-  const keys = connectors.map((connector) => `${connector.repoTargetId}\0${connector.connectorId}`);
-  if (new Set(keys).size !== keys.length) {
-    ctx.addIssue({ code: "custom", message: "review connector mappings must be duplicate-free" });
-  }
-  if (canonicalJson(keys) !== canonicalJson([...keys].sort())) {
-    ctx.addIssue({ code: "custom", message: "review connector mappings must be canonically sorted" });
-  }
-});
-var reviewOptionsSchema = external_exports.object({ connectors: reviewConnectorsSchema }).strict();
-var gitIdentitySchema = external_exports.object({ name: id, email: id }).strict();
-var connectorReviewRelationSchema = external_exports.object({
-  relationRole: external_exports.literal("connector_h0"),
-  workItemId: id,
-  repoTargetId: id,
-  h0CandidateSha: external_exports.string().regex(/^[0-9a-f]{40,64}$/u),
-  h0TreeDigest: digestSchema,
-  connectorId: id,
-  state: external_exports.enum(["available", "absent", "degraded", "unknown"]),
-  terminal: external_exports.boolean()
-}).strict();
-var finalReviewRelationSchema = external_exports.object({
-  relationRole: external_exports.literal("final_review"),
-  workItemId: id,
-  repoTargetId: id,
-  configRevision: external_exports.number().int().positive(),
-  baseSha: external_exports.string().regex(/^[0-9a-f]{40,64}$/u),
-  candidateSha: external_exports.string().regex(/^[0-9a-f]{40,64}$/u),
-  treeDigest: digestSchema,
-  changedFiles: sortedIdSetSchema,
-  tierAEntries: sortedIdSetSchema,
-  writeAssignmentId: id,
-  writeExecutionAttemptId: id,
-  authors: external_exports.array(gitIdentitySchema).min(1).max(64),
-  committers: external_exports.array(gitIdentitySchema).min(1).max(64)
-}).strict();
-var amendmentReviewRelationSchema = external_exports.object({
-  relationRole: external_exports.literal("amendment_scope"),
-  workItemId: id,
-  repoTargetId: id,
-  baseSha: external_exports.string().regex(/^[0-9a-f]{40,64}$/u),
-  h0AssignmentId: id,
-  h0CandidateSha: external_exports.string().regex(/^[0-9a-f]{40,64}$/u),
-  h0TreeDigest: digestSchema,
-  h1AssignmentId: id,
-  h1CandidateSha: external_exports.string().regex(/^[0-9a-f]{40,64}$/u),
-  h1TreeDigest: digestSchema,
-  allowedChangedFiles: sortedIdSetSchema,
-  actualChangedFiles: sortedIdSetSchema
-}).strict();
-var decisionSchema = external_exports.object({
-  decisionId: id,
-  repoTargetId: id.nullable(),
-  scope: external_exports.unknown(),
-  decisionClass: id.optional(),
-  options: external_exports.unknown().optional(),
-  resourceRevision: external_exports.number().int().positive().default(1)
-}).strict();
 var DECISION_CLASSES = [
-  "assignment_admission",
   "role_succession",
-  "review_adjudication",
   "legacy_adoption",
   "operator_only"
 ];
@@ -14803,7 +14815,6 @@ var decisionEvidenceSchema = external_exports.object({
   evidenceId: id,
   evidenceKind: external_exports.enum([
     "advisory_read",
-    "delegated_action_receipt",
     "legacy_claim",
     "connector",
     "test",
@@ -14815,7 +14826,6 @@ var decisionEvidenceSchema = external_exports.object({
     "helper",
     "pro",
     "legacy_claim",
-    "delegated_action",
     "connector",
     "test",
     "export",
@@ -14823,16 +14833,12 @@ var decisionEvidenceSchema = external_exports.object({
     "review_ready"
   ]),
   sourceRef: id,
-  assignmentId: id.optional(),
   executionAttemptId: id.nullable().default(null),
   contentDigest: digestSchema,
   redactedJson: external_exports.string(),
   durableRefJson: external_exports.string(),
-  relationKind: external_exports.enum(["advisory_read", "delegated_action_receipt", "legacy_claim", "supporting"]),
-  relation: external_exports.unknown().optional(),
-  terminalReportDigest: digestSchema.optional(),
-  actualProfileDigest: digestSchema.optional(),
-  nativeReceiptDigest: digestSchema.optional()
+  relationKind: external_exports.enum(["advisory_read", "legacy_claim", "supporting"]),
+  relation: external_exports.unknown().optional()
 }).strict();
 var WORK_ITEM_STATES = ["proposed", "ready", "in_progress", "succeeded", "failed", "cancelled"];
 var workItemStateSchema = external_exports.enum(WORK_ITEM_STATES);
@@ -14882,7 +14888,14 @@ var githubIssuesConfigSchema = external_exports.object({
     }
   }
 });
-var reviewPolicySchema = external_exports.object({ connectors: reviewConnectorsSchema }).strict();
+var decisionSchema = external_exports.object({
+  decisionId: id,
+  repoTargetId: id.nullable(),
+  scope: external_exports.unknown(),
+  decisionClass: id.optional(),
+  options: external_exports.unknown().optional(),
+  resourceRevision: external_exports.number().int().positive().default(1)
+}).strict();
 var roleIdSchema = external_exports.enum(ROLE_IDS);
 var executionProfileSchema = external_exports.object({
   providerId: id,
@@ -14897,8 +14910,7 @@ var roleRequirementSchema = external_exports.object({
   roleId: roleIdSchema,
   repoTargetId: id.nullable(),
   executedProfile: executionProfileSchema,
-  standbyProfile: executionProfileSchema.optional(),
-  writingLaneCapacity: external_exports.literal(0).optional()
+  standbyProfile: executionProfileSchema.optional()
 }).strict().superRefine((requirement, ctx) => {
   if (["director", "project-orchestrator"].includes(requirement.roleId) && requirement.repoTargetId !== null) {
     ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "project-orchestrator must be project-scoped" });
@@ -14926,14 +14938,11 @@ var roleRequirementSchema = external_exports.object({
     if (!requirement.standbyProfile || canonicalJson(requirement.standbyProfile) !== canonicalJson(directorSeatStandbyProfile)) {
       ctx.addIssue({ code: "custom", path: ["standbyProfile"], message: "director-seat requires the exact Opus-medium standby profile" });
     }
-    if (requirement.writingLaneCapacity !== 0) {
-      ctx.addIssue({ code: "custom", path: ["writingLaneCapacity"], message: "director-seat has no writing-lane capacity" });
-    }
     if (canonicalJson(requirement.executedProfile) !== canonicalJson(directorSeatProfile)) {
       ctx.addIssue({ code: "custom", path: ["executedProfile"], message: "director-seat requires the exact judgment profile" });
     }
-  } else if (requirement.standbyProfile !== void 0 || requirement.writingLaneCapacity !== void 0) {
-    ctx.addIssue({ code: "custom", path: ["roleRequirementId"], message: "standby profile and writing capacity are reserved for director-seat" });
+  } else if (requirement.standbyProfile !== void 0) {
+    ctx.addIssue({ code: "custom", path: ["roleRequirementId"], message: "standby profile is reserved for director-seat" });
   }
 });
 var roleRequirementsSchema = external_exports.array(roleRequirementSchema).max(ROLE_IDS.length).superRefine((requirements, ctx) => {
@@ -14970,76 +14979,9 @@ var CANONICAL_MUTATION_CLASSES = [
   "github_issue_projection",
   "qualification_observation_record",
   "role_generation_succession",
-  "assignment_prepare",
-  "assignment_dispatch",
-  "assignment_reconcile",
-  "assignment_terminal",
   "migration_prepare",
   "migration_step"
 ];
-var assignmentEnvironmentSchema = external_exports.object({
-  bbServerId: id,
-  environmentId: id,
-  sourceId: id,
-  hostId: id,
-  path: id,
-  mode: external_exports.literal("managed-worktree")
-}).strict();
-var assignmentIntentSchema = external_exports.object({
-  assignmentId: id,
-  workItemId: id,
-  assignmentKind: external_exports.enum(["write", "review", "probe"]),
-  laneId: id,
-  roleRequirementId: id,
-  roleId: roleIdSchema,
-  roleGeneration: external_exports.number().int().positive(),
-  branchName: id,
-  baseSha: gitShaSchema,
-  candidateSemantics: external_exports.enum(["base", "frozen"]),
-  candidateSha: gitShaSchema.nullable(),
-  environment: assignmentEnvironmentSchema,
-  frozenBriefVersion: external_exports.literal(1),
-  frozenBriefDigest: digestSchema,
-  requestedProfile: executionProfileSchema,
-  dispatchKind: external_exports.enum(["spawn", "attach"]),
-  attachThreadId: id.nullable(),
-  parentAssignmentId: id.nullable().default(null),
-  depth: external_exports.literal(0),
-  deadlineAtMs: external_exports.number().int().nonnegative()
-}).strict().superRefine((assignment, ctx) => {
-  if (assignment.candidateSemantics === "base" !== (assignment.candidateSha === null)) {
-    ctx.addIssue({ code: "custom", path: ["candidateSha"], message: "base intent has no candidate; frozen intent requires one" });
-  }
-  if (assignment.dispatchKind === "attach" !== (assignment.attachThreadId !== null)) {
-    ctx.addIssue({ code: "custom", path: ["attachThreadId"], message: "attach requires one exact thread; spawn forbids one" });
-  }
-});
-var terminalEvidenceSchema = external_exports.object({ kind: id, digest: digestSchema, ref: id }).strict();
-var terminalReportSchema = external_exports.object({
-  receiptVersion: external_exports.literal(1),
-  outcome: external_exports.enum(["DONE", "BLOCKED"]),
-  projectId: id,
-  assignmentId: id,
-  executionAttemptId: id,
-  workItemId: id,
-  roleId: roleIdSchema,
-  roleGeneration: external_exports.number().int().positive(),
-  repoTargetId: id,
-  environmentId: id,
-  threadId: id,
-  branchName: id,
-  baseSha: gitShaSchema,
-  candidateSha: gitShaSchema,
-  nativeReceiptDigest: digestSchema,
-  actualProfileDigest: digestSchema,
-  candidateObservationDigest: digestSchema,
-  reasonCode: id,
-  evidence: external_exports.array(terminalEvidenceSchema).min(1).max(64),
-  reportedAtMs: external_exports.number().int().nonnegative(),
-  receiptEventId: id,
-  receiptEventSeq: external_exports.number().int().positive(),
-  receivedAtMs: external_exports.number().int().nonnegative()
-}).strict();
 var applyRequestSchema = external_exports.object({
   projectId: id,
   operationClass: external_exports.enum(CANONICAL_MUTATION_CLASSES),
@@ -15084,27 +15026,8 @@ var applyRequestSchema = external_exports.object({
   fixtureContextDigest: id.optional(),
   declaredProfile: executionProfileSchema.optional(),
   standbyProfile: executionProfileSchema.optional(),
-  assignment: assignmentIntentSchema.optional(),
-  assignmentId: id.optional(),
-  executionAttemptId: id.optional(),
-  frozenBriefContent: external_exports.string().max(256 * 1024).optional(),
-  terminalReport: terminalReportSchema.optional(),
   migration: migrationPrepareSchema.optional(),
   migrationStep: migrationStepSchema.optional()
-}).strict();
-var reviewFactsSchema = external_exports.object({
-  projectId: id,
-  workItemId: id,
-  repoTargetId: id,
-  writeAssignmentId: id,
-  writeExecutionAttemptId: id,
-  branchName: id,
-  baseSha: external_exports.string().regex(/^[0-9a-f]{40,64}$/u),
-  candidateSha: external_exports.string().regex(/^[0-9a-f]{40,64}$/u),
-  treeDigest: digestSchema,
-  changedFiles: sortedIdSetSchema,
-  authors: external_exports.array(gitIdentitySchema).min(1).max(64),
-  committers: external_exports.array(gitIdentitySchema).min(1).max(64)
 }).strict();
 function stringField(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 256 ? value : null;
@@ -15391,15 +15314,6 @@ function validateConfig(value) {
         const parsed = roleRequirementsSchema.safeParse(roleRequirements);
         if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
       }
-      const writingLaneCeiling = bbCollab.writingLaneCeiling;
-      if (writingLaneCeiling !== void 0 && (!Number.isInteger(writingLaneCeiling) || Number(writingLaneCeiling) < 0 || Number(writingLaneCeiling) > MAX_WRITING_LANE_CEILING)) {
-        throw refusal("INVALID_INPUT", `writingLaneCeiling must be an integer from 0 through ${MAX_WRITING_LANE_CEILING}`);
-      }
-      const reviewPolicy = bbCollab.reviewPolicy;
-      if (reviewPolicy !== void 0) {
-        const parsed = reviewPolicySchema.safeParse(reviewPolicy);
-        if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
-      }
     }
   }
   const json2 = canonicalJson(value);
@@ -15476,35 +15390,6 @@ function probeV21NewLegacyApplyProvenanceRefusal() {
   const newApplyRefusal = newApplyProvenanceRefusal(null);
   return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION, newApplyRefusal };
 }
-function writingLaneCeilingFromJson(configJson) {
-  const config2 = JSON.parse(configJson);
-  const value = config2.extensions?.bbCollab?.writingLaneCeiling;
-  if (value === void 0) return DEFAULT_WRITING_LANE_CEILING;
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > MAX_WRITING_LANE_CEILING) {
-    throw refusal("INVALID_INPUT", `stored writingLaneCeiling must be an integer from 0 through ${MAX_WRITING_LANE_CEILING}`);
-  }
-  return value;
-}
-function writingLaneCeilingForProject(db, projectId) {
-  const row = asRow(db.prepare(
-    `SELECT revisions.canonical_config_json
-     FROM project_config_heads AS heads
-     JOIN project_config_revisions AS revisions
-       ON revisions.project_id = heads.project_id
-      AND revisions.config_revision = heads.config_revision
-     WHERE heads.project_id = ?`
-  ).get(projectId));
-  if (!row) throw refusal("PROJECT_CONFIG_REQUIRED", "project config head is unavailable");
-  return writingLaneCeilingFromJson(row.canonical_config_json);
-}
-function reviewPolicyFromJson(configJson) {
-  const config2 = JSON.parse(configJson);
-  const value = config2.extensions?.bbCollab?.reviewPolicy;
-  if (value === void 0) return null;
-  const parsed = reviewPolicySchema.safeParse(value);
-  if (!parsed.success) throw refusal("INVALID_INPUT", "stored review policy is invalid");
-  return parsed.data;
-}
 function requireMappedTargets(configJson, targets) {
   const github = githubConfigFromJson(configJson);
   const targetIds = new Set(targets.map((target) => target.repoTargetId));
@@ -15513,9 +15398,6 @@ function requireMappedTargets(configJson, targets) {
   }
   if (roleRequirementsFromJson(configJson).some((requirement) => requirement.repoTargetId && !targetIds.has(requirement.repoTargetId))) {
     throw refusal("REPO_TARGET_FOREIGN", "role requirement names a target outside the config revision");
-  }
-  if (reviewPolicyFromJson(configJson)?.connectors.some((connector) => !targetIds.has(connector.repoTargetId))) {
-    throw refusal("REPO_TARGET_FOREIGN", "review connector mapping names a target outside the config revision");
   }
 }
 function assertNoSecretValues(value, path = "config") {
@@ -15611,12 +15493,7 @@ function normalizeRequest(request) {
     expiresAtMs: request.expiresAtMs ?? null,
     reasonCode: request.reasonCode ?? void 0,
     fixtureContextDigest: request.fixtureContextDigest ?? void 0,
-    declaredProfile: request.declaredProfile ?? void 0,
-    assignment: request.assignment ?? void 0,
-    assignmentId: request.assignmentId ?? void 0,
-    executionAttemptId: request.executionAttemptId ?? void 0,
-    frozenBriefContent: request.frozenBriefContent ?? void 0,
-    terminalReport: request.terminalReport ?? void 0
+    declaredProfile: request.declaredProfile ?? void 0
   };
 }
 function parseApplyRequest(input) {
@@ -15789,12 +15666,6 @@ function nextEventSequence(db, projectId) {
   );
   return row?.next_sequence ?? 1;
 }
-function nextAggregateRevision(db, projectId, aggregateType, aggregateId) {
-  return asRow(db.prepare(
-    `SELECT COALESCE(MAX(aggregate_revision), 0) + 1 AS next_revision
-     FROM state_events WHERE project_id = ? AND aggregate_type = ? AND aggregate_id = ?`
-  ).get(projectId, aggregateType, aggregateId))?.next_revision ?? 1;
-}
 function appendStateEvent(db, request, digest, actorReceiptId, event) {
   const eventSequence = nextEventSequence(db, request.projectId);
   const createdAtMs = now();
@@ -15913,9 +15784,6 @@ function applyBootstrap(db, request, digest) {
       throw refusal("REPO_TARGET_FOREIGN", "decision target does not match bootstrap target");
     }
     const identity = decisionIdentity(request.projectId, 1, decision);
-    if (identity.decisionClass === "review_adjudication") {
-      throw refusal("WORK_ITEM_UNKNOWN", "review Decisions require an existing exact WorkItem and cannot be bootstrapped");
-    }
     db.prepare(
       `INSERT INTO decisions
         (decision_id, project_id, config_revision, repo_target_id, scope_json, scope_digest,
@@ -16721,16 +16589,6 @@ function applyMigrationStep(db, request, digest) {
     outcome
   );
 }
-function parseReviewIdentity(scopeJson, optionsJson, configRevision) {
-  const scope = reviewScopeSchema.safeParse(JSON.parse(scopeJson));
-  const options = reviewOptionsSchema.safeParse(JSON.parse(optionsJson));
-  if (!scope.success) throw refusal("DECISION_IDENTITY_CONFLICT", scope.error.message);
-  if (!options.success) throw refusal("DECISION_IDENTITY_CONFLICT", options.error.message);
-  if (scope.data.targets.some((target) => target.configRevision !== configRevision)) {
-    throw refusal("PROJECT_CONFIG_STALE", "review target scope must bind the Decision config revision");
-  }
-  return { scope: scope.data, options: options.data };
-}
 function decisionIdentity(projectId, configRevision, decision) {
   if (!decision.decisionClass || !DECISION_CLASSES.includes(decision.decisionClass)) {
     throw refusal("DECISION_CLASS_UNKNOWN", "decision class is not in the bounded v5 class set");
@@ -16738,7 +16596,6 @@ function decisionIdentity(projectId, configRevision, decision) {
   if (decision.options === void 0) throw refusal("DECISION_IDENTITY_CONFLICT", "typed decision options are required");
   const scopeJson = boundedCanonicalObject(decision.scope, "decision scope");
   const optionsJson = boundedCanonicalObject(decision.options, "decision options");
-  if (decision.decisionClass === "review_adjudication") parseReviewIdentity(scopeJson, optionsJson, configRevision);
   const identityDigest = sha256(canonicalJson({
     projectId,
     configRevision,
@@ -16753,36 +16610,6 @@ function decisionIdentity(projectId, configRevision, decision) {
     decisionClass: decision.decisionClass,
     identityDigest
   };
-}
-function validateReviewDecisionCreate(db, request, decision, identity, configRevision) {
-  if (identity.decisionClass !== "review_adjudication") return;
-  const review = parseReviewIdentity(identity.scopeJson, identity.optionsJson, configRevision);
-  const policy = reviewPolicyFromJson(storedConfigJson(db, request.projectId, configRevision));
-  const targetIds = [...new Set(review.scope.targets.map((target) => target.repoTargetId))];
-  if (!policy || review.options.connectors.length !== targetIds.length) {
-    throw refusal("PROJECT_CONFIG_STALE", "review Decision must freeze one connector mapping per exact target");
-  }
-  for (const targetId of targetIds) {
-    const options = review.options.connectors.filter((connector) => connector.repoTargetId === targetId);
-    if (options.length !== 1 || !policy.connectors.some((connector) => canonicalJson(connector) === canonicalJson(options[0]))) {
-      throw refusal("PROJECT_CONFIG_STALE", "review connector mapping must equal the immutable config revision");
-    }
-  }
-  if (decision.repoTargetId !== null) {
-    if (review.scope.targets.length !== 1 || review.scope.targets[0].repoTargetId !== decision.repoTargetId) {
-      throw refusal("REPO_TARGET_FOREIGN", "target-scoped review Decision must contain only its exact target");
-    }
-  }
-  for (const target of review.scope.targets) {
-    requireTarget(db, request.projectId, configRevision, target.repoTargetId);
-    const workItem = asRow(
-      db.prepare("SELECT * FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, target.workItemId)
-    );
-    if (!workItem) throw refusal("WORK_ITEM_UNKNOWN", "review Decision WorkItem is not known");
-    if (workItem.config_revision !== configRevision || workItem.repo_target_id !== target.repoTargetId) {
-      throw refusal("WORK_ITEM_FOREIGN", "review Decision WorkItem does not match its exact config and target");
-    }
-  }
 }
 function storedDecisionIdentityDigest(decision) {
   if (!decision.decision_class || !decision.options_json) return null;
@@ -16826,7 +16653,6 @@ function applyDecisionCreate(db, request, digest) {
     requireTarget(db, request.projectId, currentRevision, decision.repoTargetId);
   }
   const identity = decisionIdentity(request.projectId, currentRevision, decision);
-  validateReviewDecisionCreate(db, request, decision, identity, currentRevision);
   const actorReceiptId = requireDecisionActor(db, request);
   const existing = asRow(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decision.decisionId));
   if (existing) {
@@ -16872,79 +16698,18 @@ function applyDecisionCreate(db, request, digest) {
     }
   );
 }
-function validateDelegatedDecisionEvidence(db, request, governorEpoch, decisionClass, evidence) {
-  if (!evidence.executionAttemptId) throw refusal("EVIDENCE_REQUIRED", "delegated evidence requires an execution attempt");
-  const attempt = asRow(
-    db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(request.projectId, evidence.executionAttemptId)
-  );
-  if (!attempt) throw refusal("RESOURCE_UNKNOWN", "delegated execution attempt is not known in this project");
-  if (attempt.state === "dispatch_unknown") throw refusal("DISPATCH_UNKNOWN", "delegated execution remains dispatch-ambiguous");
-  if (attempt.conflicting_terminal_digest !== null) throw refusal("TERMINAL_REPORT_AMBIGUOUS", "delegated terminal evidence is conflicting");
-  if (attempt.origin !== "assignment" || !attempt.assignment_id) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "evidence does not name an assignment-origin execution attempt");
-  }
-  if (evidence.assignmentId && evidence.assignmentId !== attempt.assignment_id) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "evidence assignment identity does not match the execution attempt");
-  }
-  const assignment = asRow(
-    db.prepare("SELECT * FROM assignments WHERE project_id = ? AND assignment_id = ?").get(request.projectId, attempt.assignment_id)
-  );
-  if (!assignment || attempt.assignment_digest !== assignment.assignment_digest) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "delegated attempt does not bind its immutable Assignment");
-  }
-  if (decisionClass === "review_adjudication" && (assignment.assignment_kind !== "review" || attempt.assignment_kind !== "review")) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "review adjudication requires an exact review Assignment attempt");
-  }
-  const configRevision = currentConfig(db, request.projectId)?.config_revision;
-  if (configRevision !== assignment.config_revision || assignment.config_revision !== attempt.config_revision || governorEpoch !== assignment.governance_epoch || assignment.governance_epoch !== attempt.governance_epoch) {
-    throw refusal("ASSIGNMENT_HEAD_STALE", "delegated assignment config or governorship is stale");
-  }
-  const workItem = asRow(
-    db.prepare("SELECT resource_revision, repo_target_id FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, assignment.work_item_id)
-  );
-  if (!workItem || workItem.resource_revision !== assignment.work_item_revision) {
-    throw refusal("ASSIGNMENT_HEAD_STALE", "delegated Assignment WorkItem revision is stale");
-  }
-  const target = asRow(
-    db.prepare("SELECT source_id, host_id, path FROM repository_targets WHERE project_id = ? AND repo_target_id = ? AND config_revision = ?").get(
-      request.projectId,
-      assignment.repo_target_id,
-      assignment.config_revision
-    )
-  );
-  if (!target || workItem.repo_target_id !== assignment.repo_target_id || attempt.repo_target_id !== assignment.repo_target_id || target.source_id !== assignment.source_id || target.host_id !== assignment.host_id || target.path !== assignment.environment_path || attempt.environment_id !== assignment.environment_id || attempt.source_id !== assignment.source_id || attempt.host_id !== assignment.host_id || attempt.environment_path !== assignment.environment_path || attempt.branch_name !== assignment.branch_name || attempt.base_sha !== assignment.base_sha || attempt.frozen_brief_digest !== assignment.frozen_brief_digest || attempt.content_receipt_digest !== assignment.frozen_brief_digest || attempt.role_id !== assignment.role_id || attempt.role_generation !== assignment.role_generation) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "delegated attempt no longer matches its exact Assignment context");
-  }
-  if (assignment.candidate_semantics === "frozen" && attempt.candidate_sha !== assignment.candidate_sha) {
-    throw refusal("ASSIGNMENT_HEAD_STALE", "delegated frozen candidate does not match its Assignment");
-  }
-  if (attempt.state !== "done" || attempt.terminal_result !== "DONE" || attempt.reported_outcome !== "DONE" || !attempt.terminal_report_digest || !attempt.terminal_event_id || !attempt.native_receipt_digest || !attempt.actual_profile_digest) {
-    throw refusal("TERMINAL_REPORT_REQUIRED", "delegated evidence is not one exact successful terminal attempt");
-  }
-  if (evidence.contentDigest !== attempt.terminal_report_digest || evidence.terminalReportDigest !== attempt.terminal_report_digest) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "delegated terminal digest does not match canonical evidence");
-  }
-  if (evidence.actualProfileDigest !== attempt.actual_profile_digest) {
-    throw refusal("EXECUTION_PROFILE_MISMATCH", "delegated actual profile digest does not match canonical evidence");
-  }
-  if (evidence.nativeReceiptDigest !== attempt.native_receipt_digest) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "delegated native receipt digest does not match canonical evidence");
-  }
-}
-function prepareDecisionEvidence(db, request, governorEpoch, decisionClass) {
+function prepareDecisionEvidence(db, request) {
   const inputs = request.decisionEvidence ?? [];
   if (new Set(inputs.map((item) => item.evidenceId)).size !== inputs.length) {
     throw refusal("EVIDENCE_IDENTITY_CONFLICT", "one disposition cannot repeat an evidence identity");
   }
   return inputs.map((input) => {
-    const delegated = input.evidenceKind === "delegated_action_receipt";
-    const validPair = delegated ? input.sourceKind === "delegated_action" && input.relationKind === "delegated_action_receipt" && input.executionAttemptId !== null : input.evidenceKind === "advisory_read" ? ["helper", "pro"].includes(input.sourceKind) && input.relationKind === "advisory_read" && input.executionAttemptId === null : input.evidenceKind === "legacy_claim" ? input.sourceKind === "legacy_claim" && input.relationKind === "legacy_claim" && input.executionAttemptId === null : input.sourceKind === input.evidenceKind && input.relationKind === "supporting" && input.executionAttemptId === null;
+    const validPair = input.evidenceKind === "advisory_read" ? ["helper", "pro"].includes(input.sourceKind) && input.relationKind === "advisory_read" && input.executionAttemptId === null : input.evidenceKind === "legacy_claim" ? input.sourceKind === "legacy_claim" && input.relationKind === "legacy_claim" && input.executionAttemptId === null : input.sourceKind === input.evidenceKind && input.relationKind === "supporting" && input.executionAttemptId === null;
     if (!validPair) throw refusal("EVIDENCE_REDACTION_INVALID", "evidence kind, source, relation, and execution binding are inconsistent");
     const redacted = parseCanonicalEvidenceJson(input.redactedJson, "evidence redacted metadata");
     const durable = parseCanonicalEvidenceJson(input.durableRefJson, "evidence durable reference");
     const relationJson = boundedCanonicalObject(input.relation ?? {}, "evidence relation");
     assertRedactedEvidence(JSON.parse(relationJson), "evidence relation");
-    if (delegated) validateDelegatedDecisionEvidence(db, request, governorEpoch, decisionClass, input);
     const redactedDigest = sha256(redacted.json);
     const artifactIdentityDigest = sha256(canonicalJson({
       projectId: request.projectId,
@@ -16980,289 +16745,15 @@ function dispositionReference(db, decisionId, sequence) {
     db.prepare("SELECT * FROM decision_dispositions WHERE decision_id = ? AND disposition_sequence = ?").get(decisionId, sequence)
   ) ?? null;
 }
-function reviewRelationRecords(db, request, decisionId) {
-  const stored = db.prepare(
-    `SELECT decision_evidence.evidence_id, decision_evidence.relation_kind,
-            decision_evidence.relation_json, evidence_artifacts.evidence_kind,
-            evidence_artifacts.source_kind, evidence_artifacts.execution_attempt_id,
-            execution_attempts.assignment_id
-     FROM decision_evidence JOIN evidence_artifacts
-       ON evidence_artifacts.project_id = decision_evidence.project_id
-      AND evidence_artifacts.evidence_id = decision_evidence.evidence_id
-     LEFT JOIN execution_attempts
-       ON execution_attempts.project_id = evidence_artifacts.project_id
-      AND execution_attempts.execution_attempt_id = evidence_artifacts.execution_attempt_id
-     WHERE decision_evidence.project_id = ? AND decision_evidence.decision_id = ?
-     ORDER BY decision_evidence.evidence_sequence`
-  ).all(request.projectId, decisionId);
-  const prior = stored.map((row) => ({
-    evidenceId: row.evidence_id,
-    evidenceKind: row.evidence_kind,
-    sourceKind: row.source_kind,
-    relationKind: row.relation_kind,
-    assignmentId: row.assignment_id ?? null,
-    executionAttemptId: row.execution_attempt_id ?? null,
-    relation: JSON.parse(row.relation_json),
-    current: false
-  }));
-  const current = (request.decisionEvidence ?? []).map((evidence) => ({
-    evidenceId: evidence.evidenceId,
-    evidenceKind: evidence.evidenceKind,
-    sourceKind: evidence.sourceKind,
-    relationKind: evidence.relationKind,
-    assignmentId: evidence.assignmentId ?? null,
-    executionAttemptId: evidence.executionAttemptId,
-    relation: evidence.relation ?? {},
-    current: true
-  }));
-  return [...prior, ...current];
-}
-function reviewTargetKey(target) {
-  return `${target.workItemId}\0${target.repoTargetId}`;
-}
-function requireReviewAssignment(db, request, assignmentId, executionAttemptId) {
-  if (!assignmentId || !executionAttemptId) throw refusal("EVIDENCE_REQUIRED", "final review evidence requires exact Assignment and attempt identities");
-  return assignmentRows(db, { ...request, assignmentId, executionAttemptId });
-}
-function requireSuccessfulWrite(db, request, target, assignmentId, executionAttemptId, candidateSha) {
-  const rows = assignmentRows(db, { ...request, assignmentId, executionAttemptId });
-  if (rows.assignment.assignment_kind !== "write" || rows.attempt.assignment_kind !== "write" || rows.assignment.work_item_id !== target.workItemId || rows.assignment.repo_target_id !== target.repoTargetId || rows.assignment.config_revision !== target.configRevision || rows.assignment.base_sha !== target.baseSha || rows.attempt.branch_name !== rows.assignment.branch_name || rows.attempt.base_sha !== target.baseSha || rows.attempt.candidate_sha !== candidateSha || rows.attempt.state !== "done" || rows.attempt.terminal_result !== "DONE" || rows.attempt.reported_outcome !== "DONE") {
-    throw refusal("ASSIGNMENT_HEAD_STALE", "write facts do not bind the exact successful base-to-candidate Assignment range");
-  }
-  revalidateAssignmentReference(db, request, rows.assignment, rows.attempt);
-  return rows;
-}
-function validateAmendmentRelation(db, request, target, amendment) {
-  if (amendment.workItemId !== target.workItemId || amendment.repoTargetId !== target.repoTargetId || amendment.baseSha !== target.baseSha || amendment.h0CandidateSha !== target.h0CandidateSha || amendment.h0TreeDigest !== target.h0TreeDigest || amendment.h1CandidateSha === target.h0CandidateSha || amendment.h1TreeDigest === target.h0TreeDigest) {
-    throw refusal("REVIEW_SCOPE_MISMATCH", "review amendment does not preserve the exact H0 scope and base");
-  }
-  if (amendment.actualChangedFiles.some((file2) => !amendment.allowedChangedFiles.includes(file2))) {
-    throw refusal("REVIEW_SCOPE_MISMATCH", "review amendment changes files outside the adopted findings scope");
-  }
-  const exactReview = (assignmentId, candidateSha) => {
-    const assignment = asRow(db.prepare(
-      "SELECT * FROM assignments WHERE project_id = ? AND assignment_id = ?"
-    ).get(request.projectId, assignmentId));
-    const attempt = asRow(db.prepare(
-      `SELECT * FROM execution_attempts
-       WHERE project_id = ? AND assignment_id = ? AND candidate_sha = ?
-         AND state = 'done' AND terminal_result = 'DONE' AND reported_outcome = 'DONE'`
-    ).get(request.projectId, assignmentId, candidateSha));
-    if (!assignment || !attempt || assignment.assignment_kind !== "review" || assignment.candidate_semantics !== "frozen" || assignment.work_item_id !== target.workItemId || assignment.repo_target_id !== target.repoTargetId || assignment.config_revision !== target.configRevision || assignment.base_sha !== target.baseSha || assignment.candidate_sha !== candidateSha || attempt.assignment_id !== assignment.assignment_id) {
-      throw refusal("ASSIGNMENT_HEAD_STALE", "review amendment does not bind exact successful H0 and H1 review Assignments");
-    }
-    revalidateAssignmentReference(db, request, assignment, attempt);
-    return assignment;
-  };
-  const h0 = exactReview(amendment.h0AssignmentId, amendment.h0CandidateSha);
-  const h1 = exactReview(amendment.h1AssignmentId, amendment.h1CandidateSha);
-  if (h0.governance_epoch !== h1.governance_epoch || h0.work_item_revision !== h1.work_item_revision) {
-    throw refusal("ASSIGNMENT_HEAD_STALE", "review amendment changed governorship or WorkItem revision");
-  }
-}
-function preflightReviewDisposition(db, request, factsByWriter) {
-  const configRevision = requireConfig(db, request);
-  const governor = requireGovernor(db, request);
-  const decisionId = request.decisionId;
-  if (!decisionId || !request.disposition) throw refusal("INVALID_INPUT", "decision disposition requires decisionId and disposition");
-  const decision = asRow(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decisionId));
-  if (!decision || decision.project_id !== request.projectId || decision.decision_class !== "review_adjudication" || !decision.options_json) {
-    throw refusal("RESOURCE_UNKNOWN", "review Decision is not known in this project");
-  }
-  requireDecisionActor(db, request);
-  if (decision.config_revision !== configRevision) throw refusal("PROJECT_CONFIG_STALE", "review Decision config revision is stale");
-  if (request.expectedResourceRevision !== decision.current_resource_revision) {
-    throw refusal("RESOURCE_REVISION_STALE", "review Decision resource revision is stale", {
-      currentResourceRevision: decision.current_resource_revision,
-      expectedResourceRevision: request.expectedResourceRevision ?? void 0
-    });
-  }
-  if (decision.repo_target_id) {
-    if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "review Decision requires its exact target");
-    if (request.repoTargetId !== decision.repo_target_id) throw refusal("REPO_TARGET_FOREIGN", "review Decision target is foreign");
-  } else if (request.repoTargetId) {
-    throw refusal("REPO_TARGET_FOREIGN", "project-scoped review Decision cannot infer one request target");
-  }
-  const review = parseReviewIdentity(decision.scope_json, decision.options_json, configRevision);
-  const policy = reviewPolicyFromJson(storedConfigJson(db, request.projectId, configRevision));
-  if (!policy || review.options.connectors.length !== new Set(review.scope.targets.map((target) => target.repoTargetId)).size || review.options.connectors.some(
-    (option) => !policy.connectors.some((connector) => canonicalJson(connector) === canonicalJson(option))
-  )) {
-    throw refusal("PROJECT_CONFIG_STALE", "review Decision connector mappings no longer match their config revision");
-  }
-  for (const target of review.scope.targets) {
-    requireTarget(db, request.projectId, configRevision, target.repoTargetId);
-    const workItem = asRow(db.prepare("SELECT * FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, target.workItemId));
-    if (!workItem || workItem.config_revision !== configRevision || workItem.repo_target_id !== target.repoTargetId) {
-      throw refusal("WORK_ITEM_FOREIGN", "review scope WorkItem does not match the exact current target");
-    }
-  }
-  const relations = reviewRelationRecords(db, request, decisionId);
-  const suppliedConnectorRecords = relations.filter((record2) => record2.current && record2.evidenceKind === "connector");
-  if (suppliedConnectorRecords.some((record2) => {
-    const relation = connectorReviewRelationSchema.safeParse(record2.relation);
-    const option = relation.success ? review.options.connectors.find((connector) => connector.repoTargetId === relation.data.repoTargetId && connector.connectorId === relation.data.connectorId) : void 0;
-    return !option || option.policy === "prohibited";
-  })) {
-    throw refusal("INVALID_INPUT", "prohibited or unmapped connector material is not accepted");
-  }
-  if (request.disposition !== "adopted") return [];
-  const connectorRecords = relations.filter((record2) => record2.evidenceKind === "connector");
-  const connectors = connectorRecords.map((record2) => {
-    if (record2.evidenceKind !== "connector" || record2.sourceKind !== "connector" || record2.relationKind !== "supporting") {
-      throw refusal("INVALID_INPUT", "connector evidence kind and relation are inconsistent");
-    }
-    const parsed = connectorReviewRelationSchema.safeParse(record2.relation);
-    if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
-    const target = review.scope.targets.find((candidate) => reviewTargetKey(candidate) === reviewTargetKey(parsed.data));
-    const option = review.options.connectors.find(
-      (connector) => connector.repoTargetId === parsed.data.repoTargetId && connector.connectorId === parsed.data.connectorId
-    );
-    if (!target || !option || option.policy === "prohibited" || parsed.data.h0CandidateSha !== target.h0CandidateSha || parsed.data.h0TreeDigest !== target.h0TreeDigest) {
-      throw refusal("INVALID_INPUT", "connector evidence is not bound to the exact H0 target and configured identity");
-    }
-    return { record: record2, relation: parsed.data, target };
-  });
-  for (const target of review.scope.targets) {
-    const matches = connectors.filter((candidate) => reviewTargetKey(candidate.target) === reviewTargetKey(target));
-    if (matches.length > 1) throw refusal("INVALID_INPUT", "review generation permits only one connector pass per target");
-    const option = review.options.connectors.find((connector) => connector.repoTargetId === target.repoTargetId);
-    if (option.policy === "required" && (matches.length !== 1 || matches[0].relation.state !== "available" || !matches[0].relation.terminal)) {
-      throw refusal("EXTERNAL_CAPABILITY_REQUIRED", "required connector lacks exact available terminal H0 evidence");
-    }
-  }
-  const amendmentRecords = relations.filter((record2) => record2.relation.relationRole === "amendment_scope");
-  if (amendmentRecords.length > 1) {
-    throw refusal("REVIEW_AMENDMENT_CAP", "review Decision already consumed its one bounded amendment");
-  }
-  const amendmentByTarget = /* @__PURE__ */ new Map();
-  for (const record2 of amendmentRecords) {
-    if (record2.evidenceKind !== "review_ready" || record2.sourceKind !== "review_ready" || record2.relationKind !== "supporting") {
-      throw refusal("EVIDENCE_REDACTION_INVALID", "amendment scope requires review_ready supporting evidence");
-    }
-    const parsed = amendmentReviewRelationSchema.safeParse(record2.relation);
-    if (!parsed.success) throw refusal("REVIEW_SCOPE_MISMATCH", parsed.error.message);
-    const target = review.scope.targets.find((candidate) => reviewTargetKey(candidate) === reviewTargetKey(parsed.data));
-    if (!target || amendmentByTarget.has(reviewTargetKey(target))) throw refusal("REVIEW_AMENDMENT_CAP", "review target has more than one amendment relation");
-    validateAmendmentRelation(db, request, target, parsed.data);
-    amendmentByTarget.set(reviewTargetKey(target), parsed.data);
-  }
-  const finalRecords = relations.filter((record2) => record2.current && record2.relation.relationRole === "final_review");
-  const requiredEvidence = new Set((request.conditions ?? []).flatMap((condition) => condition.evidenceIds));
-  const prepared = [];
-  for (const target of review.scope.targets) {
-    const matches = finalRecords.filter((record3) => {
-      const parsed = finalReviewRelationSchema.safeParse(record3.relation);
-      return parsed.success && reviewTargetKey(parsed.data) === reviewTargetKey(target);
-    });
-    if (matches.length !== 1) throw refusal("EVIDENCE_REQUIRED", "adopted review requires one exact final review receipt per target");
-    const record2 = matches[0];
-    if (record2.evidenceKind !== "delegated_action_receipt" || record2.sourceKind !== "delegated_action" || record2.relationKind !== "delegated_action_receipt" || !requiredEvidence.has(record2.evidenceId)) {
-      throw refusal("EVIDENCE_REQUIRED", "final review receipt must be a typed required delegated condition");
-    }
-    const relation = finalReviewRelationSchema.parse(record2.relation);
-    const amendment = amendmentByTarget.get(reviewTargetKey(target)) ?? null;
-    const expectedCandidateSha = amendment?.h1CandidateSha ?? target.h0CandidateSha;
-    const expectedTreeDigest = amendment?.h1TreeDigest ?? target.h0TreeDigest;
-    if (relation.configRevision !== target.configRevision || relation.baseSha !== target.baseSha || relation.candidateSha !== expectedCandidateSha || relation.treeDigest !== expectedTreeDigest || canonicalJson(relation.tierAEntries) !== canonicalJson(target.tierAEntries) || amendment && canonicalJson(relation.changedFiles) !== canonicalJson(amendment.actualChangedFiles)) {
-      throw refusal("REVIEW_SCOPE_MISMATCH", "final review relation does not match the exact frozen target and amendment scope");
-    }
-    const evidenceInput = (request.decisionEvidence ?? []).find((evidence) => evidence.evidenceId === record2.evidenceId);
-    validateDelegatedDecisionEvidence(db, request, governor.governance_epoch, "review_adjudication", evidenceInput);
-    const rows = requireReviewAssignment(db, request, record2.assignmentId, record2.executionAttemptId);
-    revalidateAssignmentReference(db, request, rows.assignment, rows.attempt);
-    if (rows.assignment.assignment_kind !== "review" || rows.assignment.role_id !== "independent-reviewer" || rows.assignment.candidate_semantics !== "frozen" || rows.assignment.work_item_id !== target.workItemId || rows.assignment.repo_target_id !== target.repoTargetId || rows.assignment.config_revision !== target.configRevision || rows.assignment.base_sha !== target.baseSha || rows.assignment.candidate_sha !== expectedCandidateSha || rows.assignment.requested_permission_mode !== "full" || rows.assignment.requested_visibility !== "visible" || rows.attempt.actual_permission_mode !== "full" || rows.attempt.actual_visibility !== "visible") {
-      throw refusal("ASSIGNMENT_HEAD_STALE", "final review Assignment is not the exact visible/full frozen target");
-    }
-    requireCanonicalRoleGeneration(db, request.projectId, rows.assignment.role_id, rows.assignment.role_generation, rows.assignment.role_requirement_id);
-    if (amendment && rows.assignment.assignment_id !== amendment.h1AssignmentId) {
-      throw refusal("REVIEW_SCOPE_MISMATCH", "final review does not bind the exact H1 review Assignment");
-    }
-    const writer = requireSuccessfulWrite(
-      db,
-      request,
-      target,
-      relation.writeAssignmentId,
-      relation.writeExecutionAttemptId,
-      expectedCandidateSha
-    );
-    const writers = db.prepare(
-      `SELECT assignments.assignment_id, assignments.lane_id, assignments.role_id, assignments.role_generation,
-              execution_attempts.execution_attempt_id
-       FROM assignments JOIN execution_attempts
-         ON execution_attempts.project_id = assignments.project_id
-        AND execution_attempts.assignment_id = assignments.assignment_id
-       WHERE assignments.project_id = ? AND assignments.work_item_id = ?
-         AND assignments.repo_target_id = ? AND assignments.assignment_kind = 'write'`
-    ).all(request.projectId, target.workItemId, target.repoTargetId);
-    if (writers.length === 0) throw refusal("EVIDENCE_REQUIRED", "review target has no exact recorded write Assignment");
-    if (writers.some(
-      (candidate) => candidate.assignment_id === rows.assignment.assignment_id || candidate.execution_attempt_id === rows.attempt.execution_attempt_id || candidate.lane_id === rows.assignment.lane_id || candidate.role_id === rows.assignment.role_id || candidate.role_generation === rows.assignment.role_generation
-    )) {
-      throw refusal("ROLE_HOLDER_MISMATCH", "review Assignment is not structurally independent from every write Assignment");
-    }
-    prepared.push({ assignment: rows.assignment, attempt: rows.attempt, writer: writer.assignment, writerAttempt: writer.attempt, target, relation, expectedCandidateSha, expectedTreeDigest });
-  }
-  if (!factsByWriter) return prepared;
-  for (const item of prepared) {
-    const parsedFacts = reviewFactsSchema.safeParse(factsByWriter.get(item.writer.assignment_id));
-    if (!parsedFacts.success) throw refusal("BB_FACTS_UNAVAILABLE", "bounded exact review tree, diff, and authorship facts are unavailable");
-    const facts = parsedFacts.data;
-    if (facts.projectId !== request.projectId || facts.workItemId !== item.target.workItemId || facts.repoTargetId !== item.target.repoTargetId || facts.writeAssignmentId !== item.writer.assignment_id || facts.writeExecutionAttemptId !== item.writerAttempt.execution_attempt_id || facts.branchName !== item.writer.branch_name || facts.baseSha !== item.target.baseSha || facts.candidateSha !== item.expectedCandidateSha || facts.treeDigest !== item.expectedTreeDigest || canonicalJson(facts.changedFiles) !== canonicalJson(item.relation.changedFiles) || canonicalJson(facts.authors) !== canonicalJson(item.relation.authors) || canonicalJson(facts.committers) !== canonicalJson(item.relation.committers) || !sortedIdSetSchema.safeParse(facts.changedFiles).success || facts.authors.length === 0 || facts.committers.length === 0) {
-      throw refusal("ASSIGNMENT_HEAD_STALE", "bounded review facts do not match the exact writer range, tree, diff, and Git evidence");
-    }
-  }
-  return prepared;
-}
-function applyDecisionMutation(db, request, digest, reader) {
+function applyDecisionMutation(db, request, digest) {
   try {
-    const replay = checkIdempotency(db, request, digest);
-    if (replay) return replay;
-    const decision = request.decisionId ? asRow(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(request.decisionId)) : void 0;
-    if (decision?.decision_class !== "review_adjudication") {
-      return transaction(db, () => {
-        const replayInTransaction = checkIdempotency(db, request, digest);
-        return replayInTransaction ?? applyDecisionDisposition(db, request, digest);
-      });
-    }
-    const prepared = preflightReviewDisposition(db, request, null);
-    if (request.disposition !== "adopted") {
-      return transaction(db, () => {
-        const replayInTransaction = checkIdempotency(db, request, digest);
-        if (replayInTransaction) return replayInTransaction;
-        preflightReviewDisposition(db, request, null);
-        return applyDecisionDisposition(db, request, digest);
-      });
-    }
-    if (!reader) throw refusal("BB_FACTS_UNAVAILABLE", "review adjudication requires the bounded exact review fact reader");
-    const facts = /* @__PURE__ */ new Map();
-    for (const item of prepared) {
-      let value;
-      try {
-        value = reader.read({
-          projectId: request.projectId,
-          workItemId: item.target.workItemId,
-          repoTargetId: item.target.repoTargetId,
-          writeAssignmentId: item.writer.assignment_id,
-          writeExecutionAttemptId: item.writerAttempt.execution_attempt_id,
-          branchName: item.writer.branch_name,
-          baseSha: item.target.baseSha,
-          candidateSha: item.expectedCandidateSha
-        });
-      } catch {
-        throw refusal("BB_FACTS_UNAVAILABLE", "bounded exact review facts are unavailable");
-      }
-      facts.set(item.writer.assignment_id, value);
-    }
     return transaction(db, () => {
-      const replayInTransaction = checkIdempotency(db, request, digest);
-      if (replayInTransaction) return replayInTransaction;
-      preflightReviewDisposition(db, request, facts);
-      return applyDecisionDisposition(db, request, digest);
+      const replay = checkIdempotency(db, request, digest);
+      return replay ?? applyDecisionDisposition(db, request, digest);
     });
   } catch (error48) {
     if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
-    if (isConstraintError(error48)) return unavailableResult(request.projectId, "canonical review disposition could not be committed unambiguously");
+    if (isConstraintError(error48)) return unavailableResult(request.projectId, "canonical decision disposition could not be committed unambiguously");
     return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal decision mutation error" });
   }
 }
@@ -17326,7 +16817,7 @@ function applyDecisionDisposition(db, request, digest) {
       throw refusal("DECISION_REFERENCE_INVALID", "hold clear must name one active earlier setter for the same code");
     }
   }
-  const preparedEvidence = prepareDecisionEvidence(db, request, governor.governance_epoch, decision.decision_class);
+  const preparedEvidence = prepareDecisionEvidence(db, request);
   const evidenceIds = new Set(preparedEvidence.map((item) => item.input.evidenceId));
   const conditions = request.conditions ?? [];
   for (const condition of conditions) {
@@ -18223,12 +17714,12 @@ function parseSnapshot(value) {
   }
   return parsed.data;
 }
-function observedDigest(snapshot2, desired) {
+function observedDigest(snapshot, desired) {
   return sha256(canonicalJson({
-    title: snapshot2.title,
-    body: snapshot2.body,
-    state: snapshot2.state,
-    managedLabels: snapshot2.labels.filter((label) => desired.managedNames.has(label)).sort()
+    title: snapshot.title,
+    body: snapshot.body,
+    state: snapshot.state,
+    managedLabels: snapshot.labels.filter((label) => desired.managedNames.has(label)).sort()
   }));
 }
 function externalRef(db, projectId, workItemId) {
@@ -18422,7 +17913,7 @@ function recordProjectionState(db, request, digest, context, state, outcome, cou
     );
   });
 }
-function finalizeProjection(db, request, digest, context, adapter, snapshot2, mutationKind) {
+function finalizeProjection(db, request, digest, context, adapter, snapshot, mutationKind) {
   return transaction(db, () => {
     const replay = checkIdempotency(db, request, digest);
     if (replay) return replay;
@@ -18430,13 +17921,13 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot2, mu
     if (authority.mapping.connectorHost !== adapter.connectorHost) {
       throw refusal("EXTERNAL_TARGET_MISMATCH", "GitHub mapping changed before projection finalization");
     }
-    if (context.ref.owner !== snapshot2.owner || context.ref.repo !== snapshot2.repo || context.ref.issue_number !== null && context.ref.issue_number !== snapshot2.issueNumber) {
+    if (context.ref.owner !== snapshot.owner || context.ref.repo !== snapshot.repo || context.ref.issue_number !== null && context.ref.issue_number !== snapshot.issueNumber) {
       throw refusal("EXTERNAL_REF_CONFLICT", "external identity changed before projection finalization");
     }
     if (mutationKind === "verify" && context.ref.projection_state !== "current" || mutationKind !== "verify" && (context.ref.projection_state !== "pending" || context.ref.last_idempotency_key !== request.idempotencyKey || context.ref.last_request_digest !== digest)) {
       throw refusal("EXTERNAL_REF_CONFLICT", "external reservation changed before projection finalization");
     }
-    const observed = observedDigest(snapshot2, context.desired);
+    const observed = observedDigest(snapshot, context.desired);
     if (observed !== context.desired.digest) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub read-back does not match the desired projection");
     const updated = db.prepare(
       `UPDATE external_work_refs SET issue_number = ?, projection_state = 'current', attempted_resource_revision = ?,
@@ -18444,11 +17935,11 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot2, mu
        observed_external_digest = ?, last_idempotency_key = ?, last_request_digest = ?, updated_at_ms = ?
        WHERE ${EXTERNAL_REF_CAS_WHERE}`
     ).run(
-      snapshot2.issueNumber,
+      snapshot.issueNumber,
       authority.workItem.resource_revision,
       authority.workItem.resource_revision,
       context.desired.digest,
-      snapshot2.externalRevision,
+      snapshot.externalRevision,
       observed,
       request.idempotencyKey,
       digest,
@@ -18466,7 +17957,7 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot2, mu
         aggregateId: authority.workItem.work_item_id,
         aggregateRevision: authority.workItem.resource_revision,
         eventType: "github_issue_projected",
-        event: { workItemId: authority.workItem.work_item_id, owner: snapshot2.owner, repo: snapshot2.repo, issueNumber: snapshot2.issueNumber, mutationKind }
+        event: { workItemId: authority.workItem.work_item_id, owner: snapshot.owner, repo: snapshot.repo, issueNumber: snapshot.issueNumber, mutationKind }
       },
       { expected: 1, attempted: 1, verified: 1 },
       {
@@ -18476,12 +17967,12 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot2, mu
         expectedResourceRevision: request.expectedResourceRevision ?? void 0,
         evidence: {
           provider: "github",
-          owner: snapshot2.owner,
-          repo: snapshot2.repo,
-          issueNumber: snapshot2.issueNumber,
+          owner: snapshot.owner,
+          repo: snapshot.repo,
+          issueNumber: snapshot.issueNumber,
           desiredDigest: context.desired.digest,
           observedDigest: observed,
-          observedExternalRevision: snapshot2.externalRevision,
+          observedExternalRevision: snapshot.externalRevision,
           mutationKind
         }
       }
@@ -18595,939 +18086,13 @@ function applyGithubIssueProjection(db, request, digest, adapter) {
     }
   }
 }
-function requireAssignmentWritingCapacity(requirement, assignmentKind) {
-  if (assignmentKind === "write" && requirement.writingLaneCapacity === 0) {
-    throw refusal("LANE_WRITER_EXISTS", "role requirement has no writing-lane capacity", { expected: 0, attempted: 0, verified: 0 });
-  }
-}
-var NATIVE_EVIDENCE_COLUMNS = [
-  "thread_id",
-  "provider_thread_id",
-  "native_request_id",
-  "request_event_id",
-  "request_event_seq",
-  "accepted_event_id",
-  "accepted_event_seq",
-  "first_action_event_id",
-  "first_action_event_seq",
-  "content_event_id",
-  "content_event_seq",
-  "content_receipt_digest",
-  "actual_provider_id",
-  "actual_model",
-  "actual_reasoning_level",
-  "actual_permission_mode",
-  "actual_service_tier",
-  "actual_visibility",
-  "actual_profile_digest",
-  "native_receipt_digest",
-  "last_event_seq"
-];
-var ACTIVE_ASSIGNMENT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
-var ACTIVE_ASSIGNMENT_SQL = "('prepared','armed','content_delivered','running','dispatch_unknown')";
-function requestedProfile(assignment) {
-  return {
-    providerId: assignment.requested_provider_id,
-    model: assignment.requested_model,
-    reasoningLevel: assignment.requested_reasoning_level,
-    permissionMode: assignment.requested_permission_mode,
-    serviceTier: assignment.requested_service_tier,
-    visibility: assignment.requested_visibility
-  };
-}
-function assignmentEnvironmentDigest(assignment) {
-  return sha256(canonicalJson({
-    ...assignment.environment,
-    branchName: assignment.branchName,
-    baseSha: assignment.baseSha,
-    candidateSha: assignment.candidateSha
-  }));
-}
-function immutableAssignmentDigest(assignment, projectId, configRevision, governanceEpoch, workItemRevision, repoTargetId) {
-  const { assignmentId: _assignmentId, ...intent } = assignment;
-  return sha256(canonicalJson({ projectId, configRevision, governanceEpoch, workItemRevision, repoTargetId, intent }));
-}
-function storedAssignmentIntent(assignment) {
-  return {
-    assignmentId: assignment.assignment_id,
-    workItemId: assignment.work_item_id,
-    assignmentKind: assignment.assignment_kind,
-    laneId: assignment.lane_id,
-    roleRequirementId: assignment.role_requirement_id,
-    roleId: assignment.role_id,
-    roleGeneration: assignment.role_generation,
-    branchName: assignment.branch_name,
-    baseSha: assignment.base_sha,
-    candidateSemantics: assignment.candidate_semantics,
-    candidateSha: assignment.candidate_sha,
-    environment: {
-      bbServerId: assignment.bb_server_id,
-      environmentId: assignment.environment_id,
-      sourceId: assignment.source_id,
-      hostId: assignment.host_id,
-      path: assignment.environment_path,
-      mode: assignment.environment_mode
-    },
-    frozenBriefVersion: assignment.frozen_brief_version,
-    frozenBriefDigest: assignment.frozen_brief_digest,
-    requestedProfile: requestedProfile(assignment),
-    dispatchKind: assignment.dispatch_kind,
-    attachThreadId: assignment.attach_thread_id,
-    parentAssignmentId: assignment.parent_assignment_id,
-    depth: assignment.depth,
-    deadlineAtMs: assignment.deadline_at_ms
-  };
-}
-function assignmentRows(db, request) {
-  if (!request.assignmentId || !request.executionAttemptId) throw refusal("INVALID_INPUT", "assignment and execution attempt identities are required");
-  const assignment = asRow(
-    db.prepare("SELECT * FROM assignments WHERE project_id = ? AND assignment_id = ?").get(request.projectId, request.assignmentId)
-  );
-  const attempt = asRow(
-    db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(request.projectId, request.executionAttemptId)
-  );
-  if (!assignment || !attempt || attempt.assignment_id !== assignment.assignment_id) {
-    throw refusal("RESOURCE_UNKNOWN", "assignment or canonical execution attempt is unavailable");
-  }
-  return { assignment, attempt };
-}
-function requireCanonicalRoleGeneration(db, projectId, roleId, roleGeneration, roleRequirementId) {
-  const head = asRow(
-    db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(projectId, roleId)
-  );
-  const generation = asRow(
-    db.prepare("SELECT status, role_requirement_id, holder_execution_attempt_id FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?").get(
-      projectId,
-      roleId,
-      roleGeneration
-    )
-  );
-  if (!head || head.current_generation !== roleGeneration) throw refusal("ROLE_GENERATION_STALE", "assignment role generation is not current");
-  if (!generation || generation.status !== "active") throw refusal("ROLE_NOT_ACTIVE", "assignment role generation is not active");
-  if (generation.role_requirement_id !== roleRequirementId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement does not match its generation");
-  const holder = asRow(
-    db.prepare("SELECT origin, state, native_receipt_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(
-      projectId,
-      generation.holder_execution_attempt_id
-    )
-  );
-  if (!holder || holder.origin !== "role_holder" || holder.state !== "done" || !holder.native_receipt_digest) {
-    throw refusal("ROLE_HOLDER_MISMATCH", "assignment role holder has no complete canonical execution attempt");
-  }
-}
-function revalidateAssignmentReference(db, request, assignment, attempt) {
-  const configRevision = requireConfig(db, request);
-  const governor = requireGovernor(db, request);
-  if (configRevision !== assignment.config_revision || governor.governance_epoch !== assignment.governance_epoch) {
-    throw refusal("ASSIGNMENT_HEAD_STALE", "assignment config or governance head moved");
-  }
-  requireCanonicalRoleGeneration(db, request.projectId, assignment.role_id, assignment.role_generation, assignment.role_requirement_id);
-  const workItem = requireWorkItem(
-    db,
-    { ...request, workItemId: assignment.work_item_id, repoTargetId: assignment.repo_target_id, expectedResourceRevision: assignment.work_item_revision },
-    configRevision,
-    assignment.work_item_revision
-  );
-  const target = requireTarget(db, request.projectId, configRevision, assignment.repo_target_id);
-  if (workItem.repo_target_id !== assignment.repo_target_id || target.source_id !== assignment.source_id || target.host_id !== assignment.host_id || target.path !== assignment.environment_path) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment environment no longer matches its exact target");
-  }
-  const intent = storedAssignmentIntent(assignment);
-  const profileDigest = sha256(canonicalJson(intent.requestedProfile));
-  const assignmentDigest = immutableAssignmentDigest(
-    intent,
-    request.projectId,
-    assignment.config_revision,
-    assignment.governance_epoch,
-    assignment.work_item_revision,
-    assignment.repo_target_id
-  );
-  const executionAttemptId = sha256(canonicalJson({ projectId: request.projectId, assignmentDigest, attemptOrdinal: 1 }));
-  const attemptDigest = sha256(canonicalJson({ projectId: request.projectId, executionAttemptId, assignmentDigest, state: "prepared" }));
-  const requirement = roleRequirementsFromJson(storedConfigJson(db, request.projectId, configRevision)).find((candidate) => candidate.roleRequirementId === assignment.role_requirement_id);
-  if (!requirement || requirement.roleId !== assignment.role_id || requirement.repoTargetId !== null && requirement.repoTargetId !== assignment.repo_target_id || !profileEquals(requirement.executedProfile, intent.requestedProfile)) {
-    throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement or executed profile is no longer canonical");
-  }
-  if (assignment.assignment_digest !== assignmentDigest || assignment.requested_profile_digest !== profileDigest || attempt.execution_attempt_id !== executionAttemptId || attempt.attempt_digest !== attemptDigest || attempt.assignment_id !== assignment.assignment_id || attempt.origin !== "assignment" || attempt.assignment_digest !== assignmentDigest || attempt.attempt_ordinal !== 1 || attempt.lane_id !== assignment.lane_id || attempt.assignment_kind !== assignment.assignment_kind || attempt.dispatch_kind !== assignment.dispatch_kind || attempt.config_revision !== assignment.config_revision || attempt.governance_epoch !== assignment.governance_epoch || attempt.work_item_id !== assignment.work_item_id || attempt.repo_target_id !== assignment.repo_target_id || attempt.role_id !== assignment.role_id || attempt.role_generation !== assignment.role_generation || attempt.bb_server_id !== assignment.bb_server_id || attempt.environment_id !== assignment.environment_id || attempt.source_id !== assignment.source_id || attempt.host_id !== assignment.host_id || attempt.environment_path !== assignment.environment_path || attempt.frozen_brief_digest !== assignment.frozen_brief_digest || attempt.branch_name !== assignment.branch_name || attempt.base_sha !== assignment.base_sha || attempt.environment_digest !== assignmentEnvironmentDigest(intent)) {
-    throw refusal("ASSIGNMENT_HEAD_STALE", "assignment or execution attempt no longer matches its immutable stored intent");
-  }
-  return { governor };
-}
-function requireAssignmentActor(db, request, roleId, roleGeneration) {
-  const actor = asRow(
-    db.prepare("SELECT actor_kind, subject_id, role_id, role_generation FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(
-      request.projectId,
-      request.actorReceiptId
-    )
-  );
-  const generation = asRow(
-    db.prepare("SELECT holder_execution_attempt_id FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?").get(
-      request.projectId,
-      roleId,
-      roleGeneration
-    )
-  );
-  if (!actor || actor.actor_kind !== "role" || actor.role_id !== roleId || actor.role_generation !== roleGeneration || !generation || actor.subject_id !== generation.holder_execution_attempt_id) {
-    throw refusal("ROLE_HOLDER_MISMATCH", "assignment actor is not the exact current role holder");
-  }
-}
-function revalidateAssignmentAuthority(db, request, assignment, attempt) {
-  const actorReceiptId = requireActor(db, request);
-  requireRoleActorBinding(db, request);
-  requireAssignmentActor(db, request, assignment.role_id, assignment.role_generation);
-  const { governor } = revalidateAssignmentReference(db, request, assignment, attempt);
-  return { actorReceiptId, governor };
-}
-function hasUnresolvedWriterTerminalConflict(db, projectId) {
-  return Boolean(db.prepare(
-    `SELECT 1 FROM execution_attempts
-     WHERE project_id = ? AND origin = 'assignment' AND assignment_kind = 'write'
-       AND conflicting_terminal_digest IS NOT NULL LIMIT 1`
-  ).get(projectId));
-}
-function preflightAssignmentPrepare(db, request) {
-  const assignment = request.assignment;
-  if (!assignment) throw refusal("INVALID_INPUT", "assignment_prepare requires immutable assignment intent");
-  const configRevision = requireConfig(db, request);
-  const governor = requireGovernor(db, request);
-  requireActor(db, request);
-  requireRoleActorBinding(db, request);
-  requireAssignmentActor(db, request, assignment.roleId, assignment.roleGeneration);
-  if (assignment.requestedProfile.permissionMode !== "full" || assignment.requestedProfile.visibility !== "visible") {
-    throw refusal("EXECUTION_PROFILE_MISMATCH", "assignment requires explicit full permission and visible execution");
-  }
-  if (assignment.assignmentKind === "write" ? assignment.candidateSemantics !== "base" : assignment.candidateSemantics !== "frozen") {
-    throw refusal("ASSIGNMENT_HEAD_STALE", "assignment candidate semantics do not match its kind");
-  }
-  if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "assignment requires one exact repository target");
-  const workItem = requireWorkItem(db, { ...request, workItemId: assignment.workItemId }, configRevision);
-  if (assignment.assignmentKind === "write" ? !["ready", "in_progress"].includes(workItem.lifecycle_state) : workItem.lifecycle_state !== "in_progress") {
-    throw refusal("WORK_ITEM_STATE_INVALID", "WorkItem state does not permit this assignment kind");
-  }
-  const target = requireTarget(db, request.projectId, configRevision, request.repoTargetId);
-  if (target.source_id !== assignment.environment.sourceId || target.host_id !== assignment.environment.hostId || target.path !== assignment.environment.path) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment environment does not match the exact repository target");
-  }
-  requireCanonicalRoleGeneration(db, request.projectId, assignment.roleId, assignment.roleGeneration, assignment.roleRequirementId);
-  const configJson = storedConfigJson(db, request.projectId, configRevision);
-  const requirement = roleRequirementsFromJson(configJson).find((candidate) => candidate.roleRequirementId === assignment.roleRequirementId);
-  if (!requirement || requirement.roleId !== assignment.roleId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement is not configured");
-  if (requirement.repoTargetId !== null && requirement.repoTargetId !== request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "assignment role requirement targets another repository");
-  if (!profileEquals(requirement.executedProfile, assignment.requestedProfile)) throw refusal("EXECUTION_PROFILE_MISMATCH", "requested assignment profile does not match the role requirement");
-  requireAssignmentWritingCapacity(requirement, assignment.assignmentKind);
-  if (assignment.assignmentKind === "write" && hasUnresolvedWriterTerminalConflict(db, request.projectId)) {
-    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "an unresolved terminal conflict blocks new writing admission");
-  }
-  const activeWriters = asRow(db.prepare(
-    `SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND origin = 'assignment'
-     AND assignment_kind = 'write' AND state IN ${ACTIVE_ASSIGNMENT_SQL}`
-  ).get(request.projectId))?.count ?? 0;
-  const laneOccupied = db.prepare(
-    `SELECT 1 FROM execution_attempts WHERE project_id = ? AND lane_id = ? AND origin = 'assignment'
-     AND assignment_kind = 'write' AND state IN ${ACTIVE_ASSIGNMENT_SQL}`
-  ).get(request.projectId, assignment.laneId);
-  const ceiling = writingLaneCeilingFromJson(configJson);
-  if (assignment.assignmentKind === "write" && (laneOccupied || activeWriters >= ceiling)) {
-    throw refusal("LANE_WRITER_EXISTS", "writing lane or project writing ceiling is occupied", { expected: ceiling, attempted: activeWriters, verified: activeWriters });
-  }
-  const assignmentDigest = immutableAssignmentDigest(
-    assignment,
-    request.projectId,
-    configRevision,
-    governor.governance_epoch,
-    workItem.resource_revision,
-    request.repoTargetId
-  );
-  if (db.prepare(`SELECT 1 FROM execution_attempts WHERE project_id = ? AND assignment_digest = ? AND state IN ${ACTIVE_ASSIGNMENT_SQL}`).get(request.projectId, assignmentDigest)) {
-    throw refusal("LANE_WRITER_EXISTS", "an unresolved attempt already owns this immutable assignment intent");
-  }
-  if (db.prepare("SELECT 1 FROM assignments WHERE project_id = ? AND assignment_id = ?").get(request.projectId, assignment.assignmentId)) {
-    throw refusal("IDEMPOTENCY_KEY_CONFLICT", "assignment identity is immutable and already exists");
-  }
-}
-function requireNativeAssignmentWorkspace(request, assignment, rawInspection, target) {
-  const parsed = external_exports.object({
-    bbServerId: id.nullable(),
-    projectId: id.nullable(),
-    environmentId: id.nullable(),
-    sourceId: id.nullable(),
-    hostId: id.nullable(),
-    environmentPath: id.nullable(),
-    environmentMode: id.nullable(),
-    environmentStatus: id.nullable(),
-    workingTreeState: external_exports.enum(["clean", "dirty", "unknown"]),
-    branchName: id.nullable(),
-    headSha: gitShaSchema.nullable(),
-    baseSha: gitShaSchema.nullable(),
-    candidateSha: gitShaSchema.nullable(),
-    defaultBranchName: id.nullable(),
-    defaultBranchHeadSha: gitShaSchema.nullable(),
-    mergeBaseSha: gitShaSchema.nullable(),
-    threadId: id.nullable(),
-    threadProviderId: id.nullable(),
-    threadVisibility: external_exports.enum(["visible", "hidden"]).nullable()
-  }).strict().safeParse(rawInspection);
-  if (!parsed.success) throw refusal("BB_FACTS_UNAVAILABLE", "exact native BB/Git assignment facts are unavailable");
-  const inspection = parsed.data;
-  if (!inspection.bbServerId || !inspection.projectId || !inspection.environmentId || !inspection.sourceId || !inspection.hostId || !inspection.environmentPath || !inspection.environmentMode || !inspection.environmentStatus || !inspection.branchName || !inspection.headSha || !inspection.baseSha || !inspection.defaultBranchName || !inspection.defaultBranchHeadSha || !inspection.mergeBaseSha || inspection.environmentStatus !== "ready" || inspection.workingTreeState === "unknown") {
-    throw refusal("BB_FACTS_UNAVAILABLE", "native environment identity, readiness, cleanliness, or ancestry is unresolved");
-  }
-  if (inspection.bbServerId !== assignment.environment.bbServerId || inspection.projectId !== request.projectId || inspection.environmentId !== assignment.environment.environmentId || inspection.sourceId !== assignment.environment.sourceId || inspection.hostId !== assignment.environment.hostId || inspection.environmentPath !== assignment.environment.path || inspection.environmentMode !== "managed-worktree" || inspection.workingTreeState !== "clean" || inspection.branchName !== assignment.branchName || inspection.defaultBranchName !== target.default_branch || target.source_id !== assignment.environment.sourceId || target.host_id !== assignment.environment.hostId || target.path !== assignment.environment.path) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "native environment is dirty, moved, foreign, or not the exact managed worktree target");
-  }
-  if (inspection.baseSha !== assignment.baseSha || inspection.candidateSha !== assignment.candidateSha) {
-    throw refusal("ASSIGNMENT_HEAD_STALE", "native branch base or candidate does not match the immutable assignment");
-  }
-  if (assignment.assignmentKind === "write") {
-    if (inspection.headSha !== assignment.baseSha || inspection.mergeBaseSha !== inspection.headSha) {
-      throw refusal("ASSIGNMENT_HEAD_STALE", "writer head is stale, ahead of, or not an ancestor of the current default branch");
-    }
-  } else if (inspection.headSha !== assignment.candidateSha || inspection.mergeBaseSha !== inspection.defaultBranchHeadSha) {
-    throw refusal("ASSIGNMENT_HEAD_STALE", "frozen candidate is not the exact clean head descended from the current default branch");
-  }
-  return inspection;
-}
-function applyAssignmentPrepare(db, request, digest, inspection) {
-  const assignment = request.assignment;
-  if (!assignment) throw refusal("INVALID_INPUT", "assignment_prepare requires immutable assignment intent");
-  const configRevision = requireConfig(db, request);
-  const governor = requireGovernor(db, request);
-  const actorReceiptId = requireActor(db, request);
-  requireRoleActorBinding(db, request);
-  requireAssignmentActor(db, request, assignment.roleId, assignment.roleGeneration);
-  if (assignment.requestedProfile.permissionMode !== "full" || assignment.requestedProfile.visibility !== "visible") {
-    throw refusal("EXECUTION_PROFILE_MISMATCH", "assignment requires explicit full permission and visible execution");
-  }
-  if (assignment.assignmentKind === "write" ? assignment.candidateSemantics !== "base" : assignment.candidateSemantics !== "frozen") {
-    throw refusal("ASSIGNMENT_HEAD_STALE", "assignment candidate semantics do not match its kind");
-  }
-  if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "assignment requires one exact repository target");
-  const target = requireTarget(db, request.projectId, configRevision, request.repoTargetId);
-  inspection = requireNativeAssignmentWorkspace(request, assignment, inspection, target);
-  if (assignment.dispatchKind === "attach" && (inspection.threadId !== assignment.attachThreadId || inspection.threadProviderId !== assignment.requestedProfile.providerId || inspection.threadVisibility !== "visible")) {
-    throw refusal(inspection.threadVisibility === "hidden" ? "ROLE_CONTEXT_HIDDEN" : "EXECUTION_CONTEXT_FOREIGN", "attach thread does not match the exact visible assignment context");
-  }
-  if (assignment.dispatchKind === "spawn" && (inspection.threadId !== null || inspection.threadProviderId !== null || inspection.threadVisibility !== null)) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "spawn preparation cannot adopt an existing thread");
-  }
-  const workItem = requireWorkItem(
-    db,
-    { ...request, workItemId: assignment.workItemId, expectedResourceRevision: request.expectedResourceRevision },
-    configRevision
-  );
-  if (assignment.assignmentKind === "write" && !["ready", "in_progress"].includes(workItem.lifecycle_state)) {
-    throw refusal("WORK_ITEM_STATE_INVALID", "write assignment requires a ready or in-progress WorkItem");
-  }
-  if (assignment.assignmentKind !== "write" && workItem.lifecycle_state !== "in_progress") {
-    throw refusal("WORK_ITEM_STATE_INVALID", "review and probe assignments require an in-progress WorkItem");
-  }
-  requireCanonicalRoleGeneration(db, request.projectId, assignment.roleId, assignment.roleGeneration, assignment.roleRequirementId);
-  const requirements = roleRequirementsFromJson(storedConfigJson(db, request.projectId, configRevision));
-  const requirement = requirements.find((candidate) => candidate.roleRequirementId === assignment.roleRequirementId);
-  if (!requirement || requirement.roleId !== assignment.roleId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "assignment role requirement is not configured");
-  if (requirement.repoTargetId !== null && requirement.repoTargetId !== request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "assignment role requirement targets another repository");
-  if (!profileEquals(requirement.executedProfile, assignment.requestedProfile)) throw refusal("EXECUTION_PROFILE_MISMATCH", "requested assignment profile does not match the role requirement");
-  requireAssignmentWritingCapacity(requirement, assignment.assignmentKind);
-  if (assignment.assignmentKind === "write" && hasUnresolvedWriterTerminalConflict(db, request.projectId)) {
-    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "an unresolved terminal conflict blocks new writing admission");
-  }
-  const configJson = storedConfigJson(db, request.projectId, configRevision);
-  const ceiling = writingLaneCeilingFromJson(configJson);
-  const activeWriterRows = db.prepare(
-    `SELECT execution_attempt_id, lane_id FROM execution_attempts
-     WHERE project_id = ? AND origin = 'assignment' AND assignment_kind = 'write' AND state IN ${ACTIVE_ASSIGNMENT_SQL}
-     ORDER BY lane_id, execution_attempt_id`
-  ).all(request.projectId);
-  const laneHolder = activeWriterRows.find((row) => row.lane_id === assignment.laneId);
-  if (assignment.assignmentKind === "write" && (laneHolder || activeWriterRows.length >= ceiling)) {
-    throw refusal("LANE_WRITER_EXISTS", "writing lane or project writing ceiling is occupied", {
-      expected: ceiling,
-      attempted: activeWriterRows.length,
-      verified: activeWriterRows.length
-    });
-  }
-  const assignmentDigest = immutableAssignmentDigest(
-    assignment,
-    request.projectId,
-    configRevision,
-    governor.governance_epoch,
-    workItem.resource_revision,
-    request.repoTargetId
-  );
-  const unresolvedIntent = asRow(
-    db.prepare(`SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND assignment_digest = ? AND state IN ${ACTIVE_ASSIGNMENT_SQL}`).get(
-      request.projectId,
-      assignmentDigest
-    )
-  );
-  if (unresolvedIntent) throw refusal("LANE_WRITER_EXISTS", "an unresolved attempt already owns this immutable assignment intent");
-  if (db.prepare("SELECT 1 FROM assignments WHERE project_id = ? AND assignment_id = ?").get(request.projectId, assignment.assignmentId)) {
-    throw refusal("IDEMPOTENCY_KEY_CONFLICT", "assignment identity is immutable and already exists");
-  }
-  const executionAttemptId = sha256(canonicalJson({ projectId: request.projectId, assignmentDigest, attemptOrdinal: 1 }));
-  const profileDigest = sha256(canonicalJson(assignment.requestedProfile));
-  const environmentDigest = assignmentEnvironmentDigest(assignment);
-  const eventSequence = nextEventSequence(db, request.projectId);
-  const createdAtMs = now();
-  db.prepare(
-    `INSERT INTO assignments (
-      project_id, assignment_id, work_item_id, assignment_kind, lane_id, role_requirement_id,
-      role_id, role_generation, config_revision, governance_epoch, work_item_revision,
-      repo_target_id, branch_name, base_sha, candidate_semantics, candidate_sha, bb_server_id,
-      environment_id, source_id, host_id, environment_path, environment_mode,
-      frozen_brief_version, frozen_brief_digest, requested_provider_id, requested_model,
-      requested_reasoning_level, requested_permission_mode, requested_service_tier,
-      requested_visibility, requested_profile_digest, dispatch_kind, attach_thread_id,
-      parent_assignment_id, depth, deadline_at_ms, assignment_digest, idempotency_key,
-      creation_event_sequence, created_at_ms
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'managed-worktree',
-      ?, ?, ?, ?, ?, ?, ?, 'visible', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`
-  ).run(
-    request.projectId,
-    assignment.assignmentId,
-    assignment.workItemId,
-    assignment.assignmentKind,
-    assignment.laneId,
-    assignment.roleRequirementId,
-    assignment.roleId,
-    assignment.roleGeneration,
-    configRevision,
-    governor.governance_epoch,
-    workItem.resource_revision,
-    request.repoTargetId,
-    assignment.branchName,
-    assignment.baseSha,
-    assignment.candidateSemantics,
-    assignment.candidateSha,
-    assignment.environment.bbServerId,
-    assignment.environment.environmentId,
-    assignment.environment.sourceId,
-    assignment.environment.hostId,
-    assignment.environment.path,
-    assignment.frozenBriefVersion,
-    assignment.frozenBriefDigest,
-    assignment.requestedProfile.providerId,
-    assignment.requestedProfile.model,
-    assignment.requestedProfile.reasoningLevel,
-    assignment.requestedProfile.permissionMode,
-    assignment.requestedProfile.serviceTier,
-    profileDigest,
-    assignment.dispatchKind,
-    assignment.attachThreadId,
-    assignment.parentAssignmentId,
-    assignment.deadlineAtMs,
-    assignmentDigest,
-    request.idempotencyKey,
-    eventSequence,
-    createdAtMs
-  );
-  const attemptDigest = sha256(canonicalJson({ projectId: request.projectId, executionAttemptId, assignmentDigest, state: "prepared" }));
-  db.prepare(
-    `INSERT INTO execution_attempts (
-      project_id, execution_attempt_id, assignment_id, origin, assignment_digest, lane_id,
-      assignment_kind, attempt_ordinal, dispatch_kind, config_revision, governance_epoch,
-      work_item_id, repo_target_id, role_id, role_generation, state, bb_server_id,
-      environment_id, source_id, host_id, environment_path, thread_id, frozen_brief_digest,
-      branch_name, base_sha, candidate_sha, environment_digest, created_at_ms, attempt_digest
-    ) VALUES (?, ?, ?, 'assignment', ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    request.projectId,
-    executionAttemptId,
-    assignment.assignmentId,
-    assignmentDigest,
-    assignment.laneId,
-    assignment.assignmentKind,
-    assignment.dispatchKind,
-    configRevision,
-    governor.governance_epoch,
-    assignment.workItemId,
-    request.repoTargetId,
-    assignment.roleId,
-    assignment.roleGeneration,
-    assignment.environment.bbServerId,
-    assignment.environment.environmentId,
-    assignment.environment.sourceId,
-    assignment.environment.hostId,
-    assignment.environment.path,
-    assignment.attachThreadId,
-    assignment.frozenBriefDigest,
-    assignment.branchName,
-    assignment.baseSha,
-    assignment.candidateSha,
-    environmentDigest,
-    createdAtMs,
-    attemptDigest
-  );
-  return commitMutation(
-    db,
-    request,
-    digest,
-    actorReceiptId,
-    { aggregateType: "assignment", aggregateId: assignment.assignmentId, aggregateRevision: 1, eventType: "assignment_prepared", event: { assignmentId: assignment.assignmentId, executionAttemptId, assignmentDigest, laneId: assignment.laneId, assignmentKind: assignment.assignmentKind } },
-    { expected: 2, attempted: 2, verified: 2 },
-    { currentConfigRevision: configRevision, currentGovernanceEpoch: governor.governance_epoch, currentResourceRevision: workItem.resource_revision, evidence: { assignmentId: assignment.assignmentId, executionAttemptId, assignmentDigest, requestedProfileDigest: profileDigest, environmentDigest, activeWriterCount: activeWriterRows.length + (assignment.assignmentKind === "write" ? 1 : 0), writingLaneCeiling: ceiling } }
-  );
-}
-function explicitExecutionInputSources(serviceTier) {
-  return {
-    providerId: "explicit",
-    model: "explicit",
-    reasoningLevel: "explicit",
-    permissionMode: "explicit",
-    ...serviceTier ? { serviceTier: "explicit" } : {}
-  };
-}
-function nativeAssignmentInput(assignment, attempt, frozenBriefContent) {
-  const candidateScope = assignment.assignment_kind === "write" ? { mode: "write", candidateSemantics: "base", candidateSha: null } : { mode: "read-only", candidateSemantics: "frozen", candidateSha: assignment.candidate_sha, mutations: "forbidden" };
-  return {
-    projectId: assignment.project_id,
-    assignmentId: assignment.assignment_id,
-    executionAttemptId: attempt.execution_attempt_id,
-    assignmentKind: assignment.assignment_kind,
-    dispatchKind: assignment.dispatch_kind,
-    attachThreadId: assignment.attach_thread_id,
-    repoTargetId: assignment.repo_target_id,
-    branchName: assignment.branch_name,
-    baseSha: assignment.base_sha,
-    candidateSha: assignment.candidate_sha,
-    candidateScope,
-    environment: {
-      bbServerId: assignment.bb_server_id,
-      environmentId: assignment.environment_id,
-      sourceId: assignment.source_id,
-      hostId: assignment.host_id,
-      path: assignment.environment_path,
-      mode: "managed-worktree"
-    },
-    requestedProfile: requestedProfile(assignment),
-    executionInputSources: explicitExecutionInputSources(assignment.requested_service_tier || void 0),
-    frozenBriefContent,
-    frozenBriefDigest: assignment.frozen_brief_digest
-  };
-}
-function nativeContextMatches(assignment, attempt, evidence) {
-  return evidence.assignmentId === assignment.assignment_id && evidence.executionAttemptId === attempt.execution_attempt_id && evidence.bbServerId === assignment.bb_server_id && evidence.projectId === assignment.project_id && evidence.environmentId === assignment.environment_id && evidence.sourceId === assignment.source_id && evidence.hostId === assignment.host_id && evidence.environmentPath === assignment.environment_path && evidence.branchName === assignment.branch_name && evidence.baseSha === assignment.base_sha && evidence.candidateSha === assignment.candidate_sha && (attempt.thread_id === null || evidence.threadId === attempt.thread_id) && (attempt.native_request_id === null || evidence.nativeRequestId === attempt.native_request_id);
-}
-function positiveNativeEvidence(assignment, attempt, evidence) {
-  const requiredStrings = [
-    evidence.assignmentId,
-    evidence.executionAttemptId,
-    evidence.bbServerId,
-    evidence.projectId,
-    evidence.environmentId,
-    evidence.sourceId,
-    evidence.hostId,
-    evidence.environmentPath,
-    evidence.threadId,
-    evidence.providerThreadId,
-    evidence.nativeRequestId,
-    evidence.requestEventId,
-    evidence.acceptedEventId,
-    evidence.firstActionEventId,
-    evidence.contentEventId,
-    evidence.contentDigest,
-    evidence.branchName,
-    evidence.baseSha
-  ];
-  if (requiredStrings.some((value) => !stringField(value)) || !evidence.actualProfile) {
-    throw refusal("DISPATCH_UNKNOWN", "native evidence lacks exact first-action, content, context, or profile facts");
-  }
-  if (!nativeContextMatches(assignment, attempt, evidence)) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "native evidence belongs to another exact execution context");
-  }
-  if (evidence.contentDigest !== assignment.frozen_brief_digest) {
-    throw refusal("DISPATCH_UNKNOWN", "native content receipt does not bind the exact frozen brief");
-  }
-  if (!profileEquals(evidence.actualProfile, requestedProfile(assignment))) {
-    throw refusal("EXECUTION_PROFILE_MISMATCH", "actual execution profile does not match the requested profile");
-  }
-  if (!evidence.requestEventSeq || !evidence.acceptedEventSeq || !evidence.firstActionEventSeq || !evidence.contentEventSeq || !(evidence.requestEventSeq < evidence.acceptedEventSeq && evidence.acceptedEventSeq <= evidence.firstActionEventSeq && evidence.firstActionEventSeq <= evidence.contentEventSeq)) {
-    throw refusal("DISPATCH_UNKNOWN", "native event correlation is absent or ambiguously ordered");
-  }
-  const profileDigest = sha256(canonicalJson(evidence.actualProfile));
-  const nativeReceiptDigest = sha256(canonicalJson({
-    projectId: assignment.project_id,
-    assignmentId: assignment.assignment_id,
-    threadId: evidence.threadId,
-    providerThreadId: evidence.providerThreadId,
-    nativeRequestId: evidence.nativeRequestId,
-    requestEventId: evidence.requestEventId,
-    requestEventSeq: evidence.requestEventSeq,
-    acceptedEventId: evidence.acceptedEventId,
-    acceptedEventSeq: evidence.acceptedEventSeq,
-    firstActionEventId: evidence.firstActionEventId,
-    firstActionEventSeq: evidence.firstActionEventSeq,
-    contentEventId: evidence.contentEventId,
-    contentEventSeq: evidence.contentEventSeq,
-    contentDigest: evidence.contentDigest,
-    actualProfileDigest: profileDigest
-  }));
-  return { profile: evidence.actualProfile, profileDigest, nativeReceiptDigest, state: "content_delivered" };
-}
-function nativeEvidenceSnapshot(attempt) {
-  return Object.fromEntries(NATIVE_EVIDENCE_COLUMNS.map((column) => [column, attempt[column]]));
-}
-function incomingNativeEvidence(evidence, positive) {
-  const profile = positive?.profile ?? evidence.actualProfile ?? null;
-  return {
-    thread_id: evidence.threadId ?? null,
-    provider_thread_id: evidence.providerThreadId ?? null,
-    native_request_id: evidence.nativeRequestId ?? null,
-    request_event_id: evidence.requestEventId ?? null,
-    request_event_seq: evidence.requestEventSeq ?? null,
-    accepted_event_id: evidence.acceptedEventId ?? null,
-    accepted_event_seq: evidence.acceptedEventSeq ?? null,
-    first_action_event_id: evidence.firstActionEventId ?? null,
-    first_action_event_seq: evidence.firstActionEventSeq ?? null,
-    content_event_id: evidence.contentEventId ?? null,
-    content_event_seq: evidence.contentEventSeq ?? null,
-    content_receipt_digest: evidence.contentDigest ?? null,
-    actual_provider_id: profile?.providerId ?? null,
-    actual_model: profile?.model ?? null,
-    actual_reasoning_level: profile?.reasoningLevel ?? null,
-    actual_permission_mode: profile?.permissionMode ?? null,
-    actual_service_tier: profile?.serviceTier ?? null,
-    actual_visibility: profile?.visibility ?? null,
-    actual_profile_digest: positive?.profileDigest ?? (profile ? sha256(canonicalJson(profile)) : null),
-    native_receipt_digest: positive?.nativeReceiptDigest ?? null,
-    last_event_seq: evidence.lastEventSeq ?? evidence.contentEventSeq ?? null
-  };
-}
-function mergeNativeEvidence(retained, incoming) {
-  let contradiction = false;
-  const merged = Object.fromEntries(NATIVE_EVIDENCE_COLUMNS.map((column) => {
-    const current = retained[column];
-    const next = incoming[column];
-    if (current !== null && next !== null && current !== next) contradiction = true;
-    return [column, current ?? next];
-  }));
-  return { merged, contradiction };
-}
-function exactPreEffectRefusal(assignment, attempt, evidence, operation, incoming) {
-  if (!nativeContextMatches(assignment, attempt, evidence)) return false;
-  const effectColumns = [
-    "accepted_event_id",
-    "accepted_event_seq",
-    "first_action_event_id",
-    "first_action_event_seq",
-    "content_event_id",
-    "content_event_seq",
-    "content_receipt_digest",
-    "actual_provider_id",
-    "actual_model",
-    "actual_reasoning_level",
-    "actual_permission_mode",
-    "actual_service_tier",
-    "actual_visibility",
-    "actual_profile_digest",
-    "native_receipt_digest"
-  ];
-  if (effectColumns.some((column) => attempt[column] !== null || incoming[column] !== null)) return false;
-  if (operation === "dispatch") {
-    return NATIVE_EVIDENCE_COLUMNS.every(
-      (column) => attempt[column] === null && incoming[column] === null || incoming[column] === attempt[column]
-    );
-  }
-  if (!attempt.thread_id || !attempt.native_request_id) return false;
-  return NATIVE_EVIDENCE_COLUMNS.every((column) => attempt[column] === null || incoming[column] === attempt[column]);
-}
-function recordNativeEvidence(db, request, digest, assignment, attempt, evidence, operation) {
-  return transaction(db, () => {
-    const replay = checkIdempotency(db, request, digest);
-    if (replay) return replay;
-    const current = assignmentRows(db, request);
-    const retained = nativeEvidenceSnapshot(attempt);
-    const currentRetained = nativeEvidenceSnapshot(current.attempt);
-    if (current.attempt.state !== attempt.state || canonicalJson(currentRetained) !== canonicalJson(retained)) {
-      throw refusal("ASSIGNMENT_HEAD_STALE", "attempt state moved before native evidence was recorded");
-    }
-    const authority = revalidateAssignmentAuthority(db, request, current.assignment, current.attempt);
-    const observedAtMs = evidence.observedAtMs ?? now();
-    let positive = null;
-    let outcome = "DISPATCH_UNKNOWN";
-    let state = "dispatch_unknown";
-    let reasonCode = evidence.reasonCode || "dispatch_unknown";
-    let acceptIncoming = nativeContextMatches(current.assignment, current.attempt, evidence);
-    try {
-      if (evidence.disposition === "confirmed") {
-        positive = positiveNativeEvidence(current.assignment, current.attempt, evidence);
-        outcome = "OK";
-        state = positive.state;
-      }
-    } catch (error48) {
-      if (error48 instanceof Refusal && ["EXECUTION_PROFILE_MISMATCH", "EXECUTION_CONTEXT_FOREIGN"].includes(error48.data.code)) {
-        reasonCode = error48.data.code;
-        outcome = error48.data.code;
-        if (error48.data.code === "EXECUTION_CONTEXT_FOREIGN") acceptIncoming = false;
-      }
-      state = "dispatch_unknown";
-    }
-    const incoming = incomingNativeEvidence(evidence, positive);
-    if (evidence.disposition === "refused") {
-      if (exactPreEffectRefusal(current.assignment, current.attempt, evidence, operation, incoming)) {
-        state = "failed";
-        outcome = "EXECUTION_PROFILE_UNKNOWN";
-      } else {
-        state = "dispatch_unknown";
-        outcome = acceptIncoming ? "DISPATCH_UNKNOWN" : "EXECUTION_CONTEXT_FOREIGN";
-        reasonCode = acceptIncoming ? "refusal_not_proven_pre_effect" : "EXECUTION_CONTEXT_FOREIGN";
-      }
-    }
-    const mergedResult = mergeNativeEvidence(retained, acceptIncoming ? incoming : retained);
-    const missingRetainedConfirmation = positive !== null && NATIVE_EVIDENCE_COLUMNS.some(
-      (column) => retained[column] !== null && incoming[column] !== retained[column]
-    );
-    const evidenceContradiction = mergedResult.contradiction || missingRetainedConfirmation;
-    const merged = evidenceContradiction ? retained : mergedResult.merged;
-    if (evidenceContradiction) {
-      positive = null;
-      state = "dispatch_unknown";
-      outcome = "DISPATCH_UNKNOWN";
-      reasonCode = "retained_native_evidence_contradiction";
-    }
-    const terminalDeadlineReason = observedAtMs > current.assignment.deadline_at_ms ? "assignment_deadline_exceeded" : reasonCode;
-    const setColumns = NATIVE_EVIDENCE_COLUMNS.map((column) => `${column} = ?`).join(", ");
-    const priorPredicate = NATIVE_EVIDENCE_COLUMNS.map((column) => `${column} IS ?`).join(" AND ");
-    const updated = db.prepare(
-      `UPDATE execution_attempts SET state = ?, ${setColumns}, reason_code = ?, observed_at_ms = ?
-       WHERE project_id = ? AND execution_attempt_id = ? AND state = ? AND ${priorPredicate}`
-    ).run(
-      state,
-      ...NATIVE_EVIDENCE_COLUMNS.map((column) => merged[column]),
-      terminalDeadlineReason,
-      observedAtMs,
-      request.projectId,
-      current.attempt.execution_attempt_id,
-      current.attempt.state,
-      ...NATIVE_EVIDENCE_COLUMNS.map((column) => retained[column])
-    );
-    if (updated.changes !== 1) throw refusal("DISPATCH_UNKNOWN", "attempt native-evidence compare-and-swap failed");
-    const aggregateRevision = nextAggregateRevision(db, request.projectId, "execution_attempt", current.attempt.execution_attempt_id);
-    return commitMutation(
-      db,
-      request,
-      digest,
-      authority.actorReceiptId,
-      { aggregateType: "execution_attempt", aggregateId: current.attempt.execution_attempt_id, aggregateRevision, eventType: state === "dispatch_unknown" ? "assignment_dispatch_unknown" : state === "failed" ? "assignment_dispatch_failed" : "assignment_content_delivered", event: { assignmentId: current.assignment.assignment_id, executionAttemptId: current.attempt.execution_attempt_id, operation, state, reasonCode: terminalDeadlineReason, nativeRequestId: merged.native_request_id, threadId: merged.thread_id, lastEventSeq: merged.last_event_seq } },
-      { expected: 1, attempted: 1, verified: outcome === "OK" ? 1 : 0 },
-      { currentConfigRevision: current.assignment.config_revision, currentGovernanceEpoch: authority.governor.governance_epoch, evidence: { assignmentId: current.assignment.assignment_id, executionAttemptId: current.attempt.execution_attempt_id, state, reasonCode: terminalDeadlineReason, nativeReceiptDigest: merged.native_receipt_digest, actualProfileDigest: merged.actual_profile_digest, threadId: merged.thread_id, nativeRequestId: merged.native_request_id, lastEventSeq: merged.last_event_seq } },
-      outcome
-    );
-  });
-}
-function applyAssignmentNative(db, request, digest, adapter, operation) {
-  let possibleNativeEffect = false;
-  try {
-    const replay = checkIdempotency(db, request, digest);
-    if (replay) return replay;
-    if (!adapter) return result("DISPATCH_UNKNOWN", request.projectId, 1, 0, 0, { message: "native assignment adapter is unavailable" });
-    const frozenBriefContent = request.frozenBriefContent;
-    const { assignment, attempt } = transaction(db, () => {
-      const replayInTransaction = checkIdempotency(db, request, digest);
-      if (replayInTransaction) throw refusal("IDEMPOTENCY_KEY_CONFLICT", "assignment operation was concurrently committed");
-      const rows = assignmentRows(db, request);
-      const authority = revalidateAssignmentAuthority(db, request, rows.assignment, rows.attempt);
-      if (!frozenBriefContent || sha256(frozenBriefContent) !== rows.assignment.frozen_brief_digest) {
-        throw refusal("ASSIGNMENT_HEAD_STALE", "exact frozen brief content does not match immutable intent");
-      }
-      if (operation === "dispatch" && rows.attempt.state !== "prepared") {
-        throw refusal(rows.attempt.state === "dispatch_unknown" ? "DISPATCH_UNKNOWN" : "ASSIGNMENT_HEAD_STALE", "assignment attempt is not dispatchable");
-      }
-      if (operation === "reconcile" && rows.attempt.state !== "dispatch_unknown") {
-        throw refusal("ASSIGNMENT_HEAD_STALE", "only an ambiguous dispatch may be reconciled");
-      }
-      if (operation === "reconcile") return rows;
-      const retained = nativeEvidenceSnapshot(rows.attempt);
-      const priorPredicate = NATIVE_EVIDENCE_COLUMNS.map((column) => `${column} IS ?`).join(" AND ");
-      const claimed = db.prepare(
-        `UPDATE execution_attempts SET state = 'dispatch_unknown', reason_code = 'dispatch_claimed', observed_at_ms = ?
-         WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND ${priorPredicate}`
-      ).run(
-        now(),
-        request.projectId,
-        rows.attempt.execution_attempt_id,
-        ...NATIVE_EVIDENCE_COLUMNS.map((column) => retained[column])
-      );
-      if (claimed.changes !== 1) throw refusal("DISPATCH_UNKNOWN", "dispatch claim compare-and-swap failed");
-      const claimIdentity = sha256(canonicalJson({
-        phase: "assignment_dispatch_claim",
-        projectId: request.projectId,
-        executionAttemptId: rows.attempt.execution_attempt_id,
-        requestDigest: digest
-      }));
-      const claimRequest = { ...request, idempotencyKey: `assignment-dispatch-claim-${claimIdentity}` };
-      const claimDigest = sha256(canonicalJson({ claimIdentity, requestDigest: digest }));
-      const aggregateRevision = nextAggregateRevision(db, request.projectId, "execution_attempt", rows.attempt.execution_attempt_id);
-      commitMutation(
-        db,
-        claimRequest,
-        claimDigest,
-        authority.actorReceiptId,
-        { aggregateType: "execution_attempt", aggregateId: rows.attempt.execution_attempt_id, aggregateRevision, eventType: "assignment_dispatch_claimed", event: { assignmentId: rows.assignment.assignment_id, executionAttemptId: rows.attempt.execution_attempt_id, state: "dispatch_unknown", reasonCode: "dispatch_claimed" } },
-        { expected: 1, attempted: 1, verified: 1 },
-        { currentConfigRevision: rows.assignment.config_revision, currentGovernanceEpoch: authority.governor.governance_epoch, evidence: { assignmentId: rows.assignment.assignment_id, executionAttemptId: rows.attempt.execution_attempt_id, state: "dispatch_unknown", reasonCode: "dispatch_claimed" } },
-        "DISPATCH_UNKNOWN"
-      );
-      return assignmentRows(db, request);
-    });
-    const input = nativeAssignmentInput(assignment, attempt, frozenBriefContent);
-    let evidence;
-    possibleNativeEffect = true;
-    try {
-      evidence = operation === "dispatch" ? adapter.dispatch(input) : adapter.reconcile({ ...input, threadId: attempt.thread_id, nativeRequestId: attempt.native_request_id });
-    } catch {
-      evidence = { disposition: "ambiguous", reasonCode: "native_transport_ambiguous", threadId: attempt.thread_id ?? void 0, nativeRequestId: attempt.native_request_id ?? void 0 };
-    }
-    return recordNativeEvidence(db, request, digest, assignment, attempt, evidence, operation);
-  } catch (error48) {
-    if (possibleNativeEffect) return result("DISPATCH_UNKNOWN", request.projectId, 1, 1, 0, { message: "native effect may have occurred; durable dispatch claim remains unresolved" });
-    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
-    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal assignment mutation error" });
-  }
-}
-function terminalCorrelationMatches(assignment, attempt, report) {
-  return report.projectId === assignment.project_id && report.assignmentId === assignment.assignment_id && report.executionAttemptId === attempt.execution_attempt_id && report.workItemId === assignment.work_item_id && report.roleId === assignment.role_id && report.roleGeneration === assignment.role_generation && report.repoTargetId === assignment.repo_target_id && report.environmentId === assignment.environment_id && report.threadId === attempt.thread_id && report.branchName === assignment.branch_name && report.baseSha === assignment.base_sha && report.nativeReceiptDigest === attempt.native_receipt_digest && report.actualProfileDigest === attempt.actual_profile_digest && (assignment.candidate_semantics === "base" || report.candidateSha === assignment.candidate_sha) && report.receiptEventSeq > (attempt.last_event_seq ?? 0) && report.reportedAtMs <= report.receivedAtMs;
-}
-function applyAssignmentTerminal(db, request, digest) {
-  const report = request.terminalReport;
-  if (!report) throw refusal("TERMINAL_REPORT_REQUIRED", "assignment terminal mutation requires one exact versioned report");
-  const { assignment, attempt } = assignmentRows(db, request);
-  const reportDigest = sha256(canonicalJson(report));
-  if (attempt.terminal_report_digest) {
-    if (attempt.terminal_report_digest === reportDigest) {
-      const original = asRow(
-        db.prepare("SELECT outcome_json FROM mutation_receipts WHERE project_id = ? AND operation_class = 'assignment_terminal' AND json_extract(outcome_json, '$.evidence.terminalReportDigest') = ? ORDER BY created_at_ms LIMIT 1").get(
-          request.projectId,
-          reportDigest
-        )
-      );
-      if (original) return JSON.parse(original.outcome_json);
-    }
-    const authority2 = revalidateAssignmentAuthority(db, request, assignment, attempt);
-    if (attempt.conflicting_terminal_digest !== null) {
-      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "a different terminal conflict is already retained");
-    }
-    const updated2 = db.prepare(
-      `UPDATE execution_attempts SET conflicting_terminal_digest = ?, reason_code = 'terminal_report_ambiguous'
-       WHERE project_id = ? AND execution_attempt_id = ? AND state IS ?
-         AND terminal_result IS ? AND reported_outcome IS ? AND terminal_report_digest IS ?
-         AND conflicting_terminal_digest IS ? AND terminal_event_id IS ? AND terminal_event_seq IS ?
-         AND candidate_sha IS ? AND native_receipt_digest IS ? AND actual_profile_digest IS ?
-         AND completed_at_ms IS ? AND reason_code IS ? AND last_event_seq IS ?`
-    ).run(
-      reportDigest,
-      request.projectId,
-      attempt.execution_attempt_id,
-      attempt.state,
-      attempt.terminal_result,
-      attempt.reported_outcome,
-      attempt.terminal_report_digest,
-      attempt.conflicting_terminal_digest,
-      attempt.terminal_event_id,
-      attempt.terminal_event_seq,
-      attempt.candidate_sha,
-      attempt.native_receipt_digest,
-      attempt.actual_profile_digest,
-      attempt.completed_at_ms,
-      attempt.reason_code,
-      attempt.last_event_seq
-    );
-    if (updated2.changes !== 1) throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal conflict compare-and-swap failed");
-    const aggregateRevision2 = nextAggregateRevision(db, request.projectId, "execution_attempt", attempt.execution_attempt_id);
-    return commitMutation(
-      db,
-      request,
-      digest,
-      authority2.actorReceiptId,
-      { aggregateType: "execution_attempt", aggregateId: attempt.execution_attempt_id, aggregateRevision: aggregateRevision2, eventType: "assignment_terminal_ambiguous", event: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, terminalReportDigest: attempt.terminal_report_digest, conflictingTerminalDigest: reportDigest } },
-      { expected: 1, attempted: 1, verified: 0 },
-      { message: "terminal evidence conflicts with the retained report", currentConfigRevision: assignment.config_revision, currentGovernanceEpoch: authority2.governor.governance_epoch, evidence: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, terminalReportDigest: attempt.terminal_report_digest, conflictingTerminalDigest: reportDigest } },
-      "TERMINAL_REPORT_AMBIGUOUS"
-    );
-  }
-  if (attempt.state === "dispatch_unknown") throw refusal("DISPATCH_UNKNOWN", "ambiguous dispatch must be reconciled before terminal evidence");
-  if (!attempt.native_receipt_digest || !attempt.actual_profile_digest || !attempt.thread_id || !terminalCorrelationMatches(assignment, attempt, report)) {
-    throw refusal("EXECUTION_CONTEXT_FOREIGN", "terminal report does not match the exact assignment, native receipt, or executed profile");
-  }
-  if (report.candidateObservationDigest !== sha256(canonicalJson({ branchName: report.branchName, baseSha: report.baseSha, candidateSha: report.candidateSha }))) {
-    throw refusal("ASSIGNMENT_HEAD_STALE", "terminal candidate observation digest is invalid");
-  }
-  const authority = revalidateAssignmentAuthority(db, request, assignment, attempt);
-  const late = report.receivedAtMs > assignment.deadline_at_ms;
-  const state = late || report.outcome === "BLOCKED" ? "blocked" : "done";
-  const terminalResult = late ? "BLOCKED" : report.outcome;
-  const reasonCode = late ? "terminal_report_late" : report.reasonCode;
-  const updated = db.prepare(
-    `UPDATE execution_attempts SET state = ?, terminal_result = ?, reported_outcome = ?, terminal_report_digest = ?,
-     terminal_event_id = ?, terminal_event_seq = ?, candidate_sha = ?, reason_code = ?,
-     completed_at_ms = ?, observed_at_ms = ?, last_event_seq = ?
-     WHERE project_id = ? AND execution_attempt_id = ? AND state IN ('armed', 'content_delivered', 'running', 'failed')
-       AND terminal_report_digest IS NULL`
-  ).run(
-    state,
-    terminalResult,
-    report.outcome,
-    reportDigest,
-    report.receiptEventId,
-    report.receiptEventSeq,
-    report.candidateSha,
-    reasonCode,
-    report.receivedAtMs,
-    report.receivedAtMs,
-    report.receiptEventSeq,
-    request.projectId,
-    attempt.execution_attempt_id
-  );
-  if (updated.changes !== 1) throw refusal("ASSIGNMENT_HEAD_STALE", "terminal attempt compare-and-swap failed");
-  const aggregateRevision = nextAggregateRevision(db, request.projectId, "execution_attempt", attempt.execution_attempt_id);
-  return commitMutation(
-    db,
-    request,
-    digest,
-    authority.actorReceiptId,
-    { aggregateType: "execution_attempt", aggregateId: attempt.execution_attempt_id, aggregateRevision, eventType: "assignment_terminal_reported", event: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, state, terminalResult, reportedOutcome: report.outcome, terminalReportDigest: reportDigest, reasonCode } },
-    { expected: 1, attempted: 1, verified: 1 },
-    { currentConfigRevision: assignment.config_revision, currentGovernanceEpoch: authority.governor.governance_epoch, evidence: { assignmentId: assignment.assignment_id, executionAttemptId: attempt.execution_attempt_id, state, terminalResult, reportedOutcome: report.outcome, terminalReportDigest: reportDigest, reasonCode, deadlineAtMs: assignment.deadline_at_ms, receivedAtMs: report.receivedAtMs } }
-  );
-}
-function applyAssignmentMutation(db, request, digest, adapter) {
-  if (request.operationClass === "assignment_dispatch" || request.operationClass === "assignment_reconcile") {
-    return applyAssignmentNative(db, request, digest, adapter, request.operationClass === "assignment_dispatch" ? "dispatch" : "reconcile");
-  }
-  try {
-    let inspection = null;
-    if (request.operationClass === "assignment_prepare") {
-      const replay = checkIdempotency(db, request, digest);
-      if (replay) return replay;
-      if (!request.assignment || !request.repoTargetId) {
-        throw refusal("EXECUTION_CONTEXT_FOREIGN", "assignment preparation requires immutable intent and one exact target");
-      }
-      if (!adapter) throw refusal("BB_FACTS_UNAVAILABLE", "assignment preparation requires one native BB fact adapter");
-      transaction(db, () => preflightAssignmentPrepare(db, request));
-      try {
-        inspection = adapter.inspect({ projectId: request.projectId, repoTargetId: request.repoTargetId, assignment: request.assignment });
-      } catch {
-        throw refusal("BB_FACTS_UNAVAILABLE", "exact native BB/Git assignment facts are unavailable");
-      }
-    }
-    return transaction(db, () => {
-      const replay = checkIdempotency(db, request, digest);
-      if (replay) return replay;
-      return request.operationClass === "assignment_prepare" ? applyAssignmentPrepare(db, request, digest, inspection) : applyAssignmentTerminal(db, request, digest);
-    });
-  } catch (error48) {
-    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
-    if (isConstraintError(error48)) return unavailableResult(request.projectId, "canonical assignment mutation could not be committed unambiguously");
-    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal assignment mutation error" });
-  }
-}
 function isConstraintError(error48) {
   return error48 instanceof Error && /constraint|unique|busy|locked/iu.test(error48.message);
 }
 function unavailableResult(subject, message) {
   return result("CANONICAL_STORE_UNAVAILABLE", subject, 1, 0, 0, { message });
 }
-function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null) {
+function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader = null) {
   let request;
   try {
     request = parseApplyRequest(input);
@@ -19536,9 +18101,9 @@ function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error48) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader);
 }
-function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null) {
+function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null) {
   let request;
   try {
     request = parseApplyRequest(input);
@@ -19555,11 +18120,8 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
     if (request.operationClass === "qualification_observation_record" || request.operationClass === "role_generation_succession") {
       return applyRoleMutation(db, request, digest, roleFactReader);
     }
-    if (["assignment_prepare", "assignment_dispatch", "assignment_reconcile", "assignment_terminal"].includes(request.operationClass)) {
-      return applyAssignmentMutation(db, request, digest, nativeAssignmentAdapter);
-    }
     if (request.operationClass === "decision_disposition") {
-      return applyDecisionMutation(db, request, digest, reviewFactReader);
+      return applyDecisionMutation(db, request, digest);
     }
     return transaction(db, () => {
       const replay = checkIdempotency(db, request, digest);
@@ -19588,11 +18150,6 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
         case "qualification_observation_record":
         case "role_generation_succession":
           throw refusal("INTERNAL_ERROR", "role fact operations must not run inside the canonical transaction");
-        case "assignment_prepare":
-        case "assignment_dispatch":
-        case "assignment_reconcile":
-        case "assignment_terminal":
-          throw refusal("INTERNAL_ERROR", "assignment operations must use the assignment resolver");
       }
     });
   } catch (error48) {
@@ -19623,7 +18180,6 @@ function tableRows(db, table, projectId) {
     external_work_refs: "work_item_id, provider",
     qualification_observations: "qualification_id",
     eligibility_projections: "role_requirement_id, profile_digest",
-    assignments: "assignment_id",
     execution_attempts: "execution_attempt_id",
     role_generations: "role_id, generation",
     role_generation_heads: "role_id"
@@ -19829,14 +18385,6 @@ function decisionDoctorEvidence(db, projectId) {
     } catch {
       issues.push({ evidenceId, reason: "evidence_artifact_redaction_invalid" });
     }
-    if (artifact.evidence_kind === "delegated_action_receipt") {
-      const attempt = asRow(
-        db.prepare("SELECT state, terminal_result, reported_outcome, terminal_report_digest, native_receipt_digest, actual_profile_digest, conflicting_terminal_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, artifact.execution_attempt_id)
-      );
-      if (!attempt || attempt.state !== "done" || attempt.terminal_result !== "DONE" || attempt.reported_outcome !== "DONE" || attempt.terminal_report_digest !== artifact.content_digest || !attempt.native_receipt_digest || !attempt.actual_profile_digest || attempt.conflicting_terminal_digest !== null) {
-        issues.push({ evidenceId, reason: "delegated_evidence_binding_invalid" });
-      }
-    }
   }
   return { unresolvedDecisions, issues, derivedHolds, artifactCount: artifacts.length, relationCount };
 }
@@ -19959,51 +18507,6 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
       };
     });
     const schemaState = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (" + TABLES.map(() => "?").join(",") + ") ORDER BY name").all(...TABLES);
-    const configJson = storedConfigJson(db, projectId, configHead.config_revision);
-    const writingLaneCeiling = writingLaneCeilingFromJson(configJson);
-    const assignmentAttempts = db.prepare(
-      `SELECT assignments.assignment_id, assignments.assignment_kind, assignments.lane_id,
-              assignments.repo_target_id, assignments.branch_name, assignments.base_sha,
-              assignments.candidate_sha, assignments.environment_id, assignments.deadline_at_ms,
-              assignments.requested_provider_id, assignments.requested_model,
-              assignments.requested_reasoning_level, assignments.requested_permission_mode,
-              assignments.requested_service_tier, assignments.requested_visibility,
-              assignments.requested_profile_digest, execution_attempts.execution_attempt_id,
-              execution_attempts.state, execution_attempts.thread_id, execution_attempts.native_request_id,
-              execution_attempts.actual_provider_id, execution_attempts.actual_model,
-              execution_attempts.actual_reasoning_level, execution_attempts.actual_permission_mode,
-              execution_attempts.actual_service_tier, execution_attempts.actual_visibility,
-              execution_attempts.actual_profile_digest, execution_attempts.native_receipt_digest,
-              execution_attempts.terminal_result, execution_attempts.reported_outcome,
-              execution_attempts.terminal_report_digest, execution_attempts.conflicting_terminal_digest,
-              execution_attempts.reason_code, execution_attempts.last_event_seq
-       FROM assignments JOIN execution_attempts
-         ON execution_attempts.project_id = assignments.project_id
-        AND execution_attempts.assignment_id = assignments.assignment_id
-       WHERE assignments.project_id = ? ORDER BY assignments.assignment_id, execution_attempts.execution_attempt_id`
-    ).all(projectId);
-    const activeWriters = assignmentAttempts.filter(
-      (row) => row.assignment_kind === "write" && (ACTIVE_ASSIGNMENT_STATES.includes(row.state) || row.conflicting_terminal_digest !== null)
-    );
-    const unresolvedAttempts = assignmentAttempts.filter(
-      (row) => row.state === "dispatch_unknown" || row.conflicting_terminal_digest !== null || row.terminal_report_digest === null
-    );
-    const profileAuditEntries = assignmentAttempts.map((row) => ({
-      assignmentId: row.assignment_id,
-      executionAttemptId: row.execution_attempt_id,
-      requestedProfileDigest: row.requested_profile_digest,
-      actualProfileDigest: row.actual_profile_digest,
-      status: row.actual_profile_digest !== null && row.actual_profile_digest !== row.requested_profile_digest ? "mismatch" : row.actual_profile_digest !== null && row.native_receipt_digest !== null ? "compliant" : "unknown",
-      reason: row.actual_profile_digest === null || row.native_receipt_digest === null ? "EXECUTION_PROFILE_UNKNOWN" : void 0
-    }));
-    const profileAudit = {
-      status: assignmentAttempts.length === 0 ? "no_canonical_assignments" : "recorded",
-      total: profileAuditEntries.length,
-      compliant: profileAuditEntries.filter((row) => row.status === "compliant").length,
-      mismatch: profileAuditEntries.filter((row) => row.status === "mismatch").length,
-      unknown: profileAuditEntries.filter((row) => row.status === "unknown").length,
-      entries: profileAuditEntries
-    };
     const unresolvedRoleHolders = roleGenerationHeads.filter((row) => row.holder_attempt_state !== "done" || !row.holder_native_receipt_digest).map((row) => ({ roleId: row.role_id, generation: row.current_generation, holderExecutionAttemptId: row.holder_execution_attempt_id, reason: "ROLE_HOLDER_UNRESOLVED" }));
     const decisionIntegrity = decisionDoctorEvidence(db, projectId);
     const cachedConsumers = persistedCachedConsumerRolloutEvidence(db, projectId);
@@ -20024,16 +18527,6 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
         unresolvedRoleHolders,
         qualificationObservationCount: observationCount,
         eligibility,
-        assignments: assignmentAttempts,
-        profileAudit,
-        capacity: {
-          writingLaneCeiling,
-          activeWriterCount: activeWriters.length,
-          activeWriterLaneIds: activeWriters.map((row) => row.lane_id),
-          duplicateLaneIds: [...new Set(activeWriters.map((row) => row.lane_id).filter((laneId, index, all) => all.indexOf(laneId) !== index))],
-          ceilingViolated: activeWriters.length > writingLaneCeiling
-        },
-        unresolvedAttempts,
         decisionIntegrity,
         cachedConsumers,
         ...checkoutDivergence ? { checkoutDivergence } : {},
@@ -20049,1085 +18542,10 @@ function databaseIsReady(db) {
   db.pragma("busy_timeout = 5000");
 }
 
-// src/awareness.ts
-var DEFAULT_MAX_CONTINUATIONS = 3;
-var OPERATOR_WAIT_FYI_THRESHOLD_MS = 15 * 6e4;
-var WRONGFUL_IDLE_THRESHOLD_MS = 10 * 6e4;
-var OPEN_ATTEMPT_STATES = /* @__PURE__ */ new Set([
-  "prepared",
-  "armed",
-  "content_delivered",
-  "running",
-  "dispatch_unknown"
-]);
-function normalizeRegisteredWait(input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid registered wait");
-  const value = input;
-  if (typeof value.waitId !== "string" || value.waitId.length === 0 || typeof value.waiterThreadId !== "string" || value.waiterThreadId.length === 0 || typeof value.sourceThreadId !== "string" || value.sourceThreadId.length === 0 || value.sourceEvent !== "terminal" && value.sourceEvent !== "failure" || !Number.isInteger(value.deadlineAtMs) || value.deadlineAtMs < 0) throw new Error("registered wait requires waiter, source, event, and deadline");
-  return {
-    waitId: value.waitId,
-    waiterThreadId: value.waiterThreadId,
-    sourceThreadId: value.sourceThreadId,
-    sourceEvent: value.sourceEvent,
-    deadlineAtMs: value.deadlineAtMs,
-    wakerSchedule: typeof value.wakerSchedule === "string" && value.wakerSchedule.length > 0 ? value.wakerSchedule : null,
-    declaredAtMs: Number.isInteger(value.declaredAtMs) && value.declaredAtMs >= 0 ? value.declaredAtMs : null
-  };
-}
-function waitRegistryState(input) {
-  if (input === void 0 || input === null) return { waits: [], fired: {} };
-  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid wait registry state");
-  const value = input;
-  if (!Array.isArray(value.waits) || !value.fired || typeof value.fired !== "object" || Array.isArray(value.fired)) {
-    throw new Error("invalid wait registry state");
-  }
-  const waits = value.waits.map(normalizeRegisteredWait);
-  const byId = /* @__PURE__ */ new Map();
-  for (const wait of waits) {
-    const existing = byId.get(wait.waitId);
-    if (existing && JSON.stringify(existing) !== JSON.stringify(wait)) throw new Error("conflicting registered wait");
-    byId.set(wait.waitId, wait);
-  }
-  const fired = {};
-  for (const [waitId, reason] of Object.entries(value.fired)) {
-    if (!byId.has(waitId) || !["source_terminal", "source_failure", "deadline_expired"].includes(reason)) {
-      throw new Error("invalid fired wait");
-    }
-    fired[waitId] = reason;
-  }
-  return { waits: [...byId.values()], fired };
-}
-function createWaitRegistry(persistence) {
-  let state = { waits: [], fired: {} };
-  let loaded = false;
-  let queue = Promise.resolve();
-  const enqueue = (work) => {
-    const result2 = queue.then(work);
-    queue = result2.then(() => void 0, () => void 0);
-    return result2;
-  };
-  const load = async () => {
-    if (loaded) return;
-    state = waitRegistryState(persistence ? await persistence.read() : null);
-    loaded = true;
-  };
-  return {
-    recover: () => enqueue(async () => {
-      await load();
-    }),
-    register: (input) => enqueue(async () => {
-      await load();
-      const wait = normalizeRegisteredWait(input);
-      const existing = state.waits.find((candidate) => candidate.waitId === wait.waitId);
-      if (existing) {
-        if (JSON.stringify(existing) !== JSON.stringify(wait)) throw new Error("conflicting registered wait");
-        return;
-      }
-      const waits = [...state.waits, wait];
-      await persistence?.write(structuredClone({ waits, fired: state.fired }));
-      state = { waits, fired: state.fired };
-    }),
-    list: () => state.waits.map((wait) => ({ ...wait })),
-    state: (waitId) => state.fired[waitId] ? "fired" : state.waits.some((wait) => wait.waitId === waitId) ? "pending" : "unknown",
-    firedList: () => state.waits.filter((wait) => state.fired[wait.waitId] !== void 0).map((wait) => ({ waitId: wait.waitId, reason: state.fired[wait.waitId], waiterThreadId: wait.waiterThreadId })),
-    fire: (waitId, reason, firedAtMs) => enqueue(async () => {
-      await load();
-      const wait = state.waits.find((candidate) => candidate.waitId === waitId);
-      if (!wait || state.fired[waitId]) return null;
-      const event = { ...wait, reason, firedAtMs };
-      const fired = { ...state.fired, [waitId]: reason };
-      await persistence?.write(structuredClone({ waits: state.waits, fired }));
-      state = { waits: state.waits, fired };
-      return event;
-    })
-  };
-}
-function roleIdleKey(holder, queueHeadId) {
-  return `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${queueHeadId}`;
-}
-function operatorWaitAlertState(input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
-  const state = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (value !== true) throw new Error("invalid operator wait alert state");
-    state[key] = true;
-  }
-  return state;
-}
-function createOperatorWaitAlertLedger(persistence) {
-  let state = {};
-  let loaded = false;
-  let queue = Promise.resolve();
-  const enqueue = (work) => {
-    const result2 = queue.then(work);
-    queue = result2.then(() => void 0, () => void 0);
-    return result2;
-  };
-  const load = async () => {
-    if (loaded) return;
-    state = operatorWaitAlertState(persistence ? await persistence.read() : null);
-    loaded = true;
-  };
-  const save = () => persistence?.write(structuredClone(state));
-  return {
-    recover: () => enqueue(async () => {
-      await load();
-    }),
-    notified: (key) => enqueue(async () => {
-      await load();
-      return state[key] === true;
-    }),
-    mark: (key) => enqueue(async () => {
-      await load();
-      if (state[key]) return;
-      state[key] = true;
-      await save();
-    }),
-    clear: (key) => enqueue(async () => {
-      await load();
-      if (!state[key]) return;
-      delete state[key];
-      await save();
-    })
-  };
-}
-function roleIdleState(input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
-  const state = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid role idle state");
-    const record2 = value;
-    const failedSteers = typeof record2.failedSteers === "number" ? record2.failedSteers : 0;
-    const idleSinceMs = typeof record2.idleSinceMs === "number" && Number.isFinite(record2.idleSinceMs) ? record2.idleSinceMs : null;
-    const lastSteerAtMs = typeof record2.lastSteerAtMs === "number" && Number.isFinite(record2.lastSteerAtMs) ? record2.lastSteerAtMs : null;
-    const awaitingSteerOutcome = record2.awaitingSteerOutcome === true;
-    const lastFleetWakeAtMs = typeof record2.lastFleetWakeAtMs === "number" && Number.isFinite(record2.lastFleetWakeAtMs) ? record2.lastFleetWakeAtMs : null;
-    const lastStaleWaitWakeAtMs = typeof record2.lastStaleWaitWakeAtMs === "number" && Number.isFinite(record2.lastStaleWaitWakeAtMs) ? record2.lastStaleWaitWakeAtMs : null;
-    const lastOwedActWakeAtMs = typeof record2.lastOwedActWakeAtMs === "number" && Number.isFinite(record2.lastOwedActWakeAtMs) ? record2.lastOwedActWakeAtMs : null;
-    const lastEscalationAtMs = typeof record2.lastEscalationAtMs === "number" && Number.isFinite(record2.lastEscalationAtMs) ? record2.lastEscalationAtMs : null;
-    if (!Number.isInteger(record2.steerCount) || record2.steerCount < 0 || record2.steerCount > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || idleSinceMs !== null && idleSinceMs < 0 || lastSteerAtMs !== null && lastSteerAtMs < 0 || lastFleetWakeAtMs !== null && lastFleetWakeAtMs < 0 || lastStaleWaitWakeAtMs !== null && lastStaleWaitWakeAtMs < 0 || lastOwedActWakeAtMs !== null && lastOwedActWakeAtMs < 0 || lastEscalationAtMs !== null && lastEscalationAtMs < 0 || typeof record2.escalated !== "boolean") {
-      throw new Error("invalid role idle state");
-    }
-    state[key] = { steerCount: record2.steerCount, failedSteers, escalated: record2.escalated, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastFleetWakeAtMs, lastStaleWaitWakeAtMs, lastOwedActWakeAtMs, lastEscalationAtMs };
-  }
-  return state;
-}
-function emptyRoleIdleRecord() {
-  return { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastFleetWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
-}
-function createRoleIdleLedger(persistence) {
-  let state = {};
-  let loaded = false;
-  let queue = Promise.resolve();
-  const enqueue = (work) => {
-    const result2 = queue.then(work);
-    queue = result2.then(() => void 0, () => void 0);
-    return result2;
-  };
-  const load = async () => {
-    if (loaded) return;
-    state = roleIdleState(persistence ? await persistence.read() : null);
-    loaded = true;
-  };
-  const save = () => persistence?.write(structuredClone(state));
-  return {
-    recover: () => enqueue(async () => {
-      await load();
-    }),
-    get: (key) => enqueue(async () => {
-      await load();
-      return state[key] ?? null;
-    }),
-    observeIdle: (key, idleSinceMs) => enqueue(async () => {
-      await load();
-      const record2 = state[key];
-      if (record2?.idleSinceMs !== null && record2?.idleSinceMs !== void 0) {
-        if (record2.awaitingSteerOutcome) {
-          record2.awaitingSteerOutcome = false;
-          record2.idleSinceMs = idleSinceMs;
-          await save();
-        }
-        return { ...record2 };
-      }
-      state[key] = { ...record2 ?? emptyRoleIdleRecord(), idleSinceMs, awaitingSteerOutcome: false };
-      await save();
-      return { ...state[key] };
-    }),
-    resetIdle: (key) => enqueue(async () => {
-      await load();
-      const record2 = state[key];
-      if (!record2) return;
-      state[key] = { ...emptyRoleIdleRecord(), lastFleetWakeAtMs: record2.lastFleetWakeAtMs, lastStaleWaitWakeAtMs: record2.lastStaleWaitWakeAtMs, lastOwedActWakeAtMs: record2.lastOwedActWakeAtMs, lastEscalationAtMs: record2.lastEscalationAtMs };
-      await save();
-    }),
-    preserveAfterSteerWake: (key) => enqueue(async () => {
-      await load();
-      const record2 = state[key];
-      return record2?.awaitingSteerOutcome === true;
-    }),
-    recordSteer: (key, failed, steeredAtMs) => enqueue(async () => {
-      await load();
-      const record2 = state[key] ?? emptyRoleIdleRecord();
-      record2.steerCount = Math.min(2, record2.steerCount + 1);
-      if (failed) record2.failedSteers = Math.min(2, record2.failedSteers + 1);
-      record2.lastSteerAtMs = steeredAtMs;
-      record2.awaitingSteerOutcome = !failed;
-      state[key] = record2;
-      await save();
-      return { ...record2 };
-    }),
-    markEscalated: (key) => enqueue(async () => {
-      await load();
-      const record2 = state[key] ?? { ...emptyRoleIdleRecord(), steerCount: 2 };
-      if (record2.escalated) return false;
-      record2.escalated = true;
-      state[key] = record2;
-      await save();
-      return true;
-    }),
-    clearPrefixExcept: (prefix, keepKey) => enqueue(async () => {
-      await load();
-      let changed = false;
-      for (const key of Object.keys(state)) {
-        if (key.startsWith(prefix) && key !== keepKey) {
-          delete state[key];
-          changed = true;
-        }
-      }
-      if (changed) await save();
-    }),
-    recordFleetWake: (key, sentAtMs) => enqueue(async () => {
-      await load();
-      const next = { ...state[key] ?? emptyRoleIdleRecord(), lastFleetWakeAtMs: sentAtMs };
-      const nextState = { ...state, [key]: next };
-      await persistence?.write(structuredClone(nextState));
-      state = nextState;
-    }),
-    recordStaleWaitWake: (key, sentAtMs) => enqueue(async () => {
-      await load();
-      const nextState = { ...state, [key]: { ...state[key] ?? emptyRoleIdleRecord(), lastStaleWaitWakeAtMs: sentAtMs } };
-      await persistence?.write(structuredClone(nextState));
-      state = nextState;
-    }),
-    recordOwedActWake: (key, sentAtMs) => enqueue(async () => {
-      await load();
-      const nextState = { ...state, [key]: { ...state[key] ?? emptyRoleIdleRecord(), lastOwedActWakeAtMs: sentAtMs } };
-      await persistence?.write(structuredClone(nextState));
-      state = nextState;
-    }),
-    recordEscalation: (key, sentAtMs) => enqueue(async () => {
-      await load();
-      const record2 = state[key] ?? emptyRoleIdleRecord();
-      const nextState = { ...state, [key]: { ...record2, lastEscalationAtMs: sentAtMs } };
-      await persistence?.write(structuredClone(nextState));
-      state = nextState;
-    }),
-    clearWakeHistory: (prefix) => enqueue(async () => {
-      await load();
-      for (const key of Object.keys(state)) if (key.startsWith(prefix)) state[key] = { ...state[key], idleSinceMs: null, lastFleetWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
-      await save();
-    })
-  };
-}
-function continuationState(input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
-  const state = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid continuation state");
-    const candidate = value;
-    if (candidate.mode !== "automatic" || !["ready", "claimed", "paused", "limit_reached"].includes(candidate.status) || !Number.isInteger(candidate.count) || candidate.count < 0 || !Number.isInteger(candidate.max) || candidate.max < 1 || !(candidate.claimId === null || typeof candidate.claimId === "string")) throw new Error("invalid continuation state");
-    state[key] = {
-      mode: "automatic",
-      status: candidate.status,
-      count: candidate.count,
-      max: candidate.max,
-      claimId: candidate.claimId
-    };
-  }
-  return state;
-}
-function createContinuationLedger(persistence) {
-  let state = {};
-  let loaded = false;
-  let queue = Promise.resolve();
-  const enqueue = (work) => {
-    const result2 = queue.then(work);
-    queue = result2.then(() => void 0, () => void 0);
-    return result2;
-  };
-  const load = async () => {
-    if (loaded) return;
-    state = continuationState(persistence ? await persistence.read() : null);
-    loaded = true;
-  };
-  const save = () => persistence?.write(structuredClone(state));
-  return {
-    recover() {
-      return enqueue(async () => {
-        await load();
-        let changed = false;
-        for (const record2 of Object.values(state)) {
-          if (record2.status !== "claimed") continue;
-          record2.status = "paused";
-          record2.claimId = null;
-          changed = true;
-        }
-        if (changed) await save();
-      });
-    },
-    claim(key, max) {
-      return enqueue(async () => {
-        await load();
-        const existing = state[key];
-        if (existing?.status === "claimed") return { claim: null, reason: "claimed" };
-        if (existing?.status === "paused") return { claim: null, reason: "paused" };
-        if (existing?.status === "limit_reached") return { claim: null, reason: "limit_reached" };
-        const count = existing?.count ?? 0;
-        if (count >= max) {
-          state[key] = { mode: "automatic", status: "limit_reached", count, max, claimId: null };
-          await save();
-          return { claim: null, reason: "limit_reached" };
-        }
-        const claim = { claimId: `${key}:${count + 1}`, count: count + 1, max };
-        state[key] = { mode: "automatic", status: "claimed", count: claim.count, max, claimId: claim.claimId };
-        await save();
-        return { claim };
-      });
-    },
-    complete(key, claimId) {
-      return enqueue(async () => {
-        await load();
-        const record2 = state[key];
-        if (!record2 || record2.status !== "claimed" || record2.claimId !== claimId) throw new Error("continuation claim is not current");
-        record2.status = "ready";
-        record2.claimId = null;
-        await save();
-      });
-    },
-    resume(key, resetCount = false) {
-      return enqueue(async () => {
-        await load();
-        const record2 = state[key];
-        if (!record2 || record2.status === "claimed") throw new Error("continuation is not paused");
-        record2.status = "ready";
-        record2.claimId = null;
-        if (resetCount) record2.count = 0;
-        await save();
-      });
-    }
-  };
-}
-function continuationModeFor(assignmentKind) {
-  return assignmentKind === "write" ? "automatic" : assignmentKind === "review" ? "approval" : "tracking";
-}
-function mergeRegisteredWaitState(current, next) {
-  const rank = { fired: 1, pending: 2, unknown: 3 };
-  return !current || current === "none" || rank[next] > rank[current] ? next : current;
-}
-function readLaneStates(db) {
-  return db.prepare(
-    `SELECT assignments.project_id, assignments.assignment_id, assignments.lane_id,
-              assignments.assignment_kind, assignments.work_item_id,
-              execution_attempts.thread_id, execution_attempts.execution_attempt_id,
-              execution_attempts.state AS attempt_state,
-              execution_attempts.terminal_report_digest,
-              assignments.created_at_ms
-       FROM assignments
-       JOIN execution_attempts
-         ON execution_attempts.project_id = assignments.project_id
-        AND execution_attempts.assignment_id = assignments.assignment_id
-       WHERE execution_attempts.origin = 'assignment'
-       ORDER BY assignments.created_at_ms, assignments.assignment_id`
-  ).all();
-}
-function readRoleHolderStates(db) {
-  return db.prepare(
-    `SELECT attempts.project_id, attempts.role_id, attempts.role_generation,
-              attempts.execution_attempt_id, attempts.thread_id
-       FROM execution_attempts AS attempts
-       JOIN role_generation_heads AS heads
-         ON heads.project_id = attempts.project_id
-        AND heads.role_id = attempts.role_id
-        AND heads.current_generation = attempts.role_generation
-       JOIN role_generations AS generations
-         ON generations.project_id = attempts.project_id
-        AND generations.role_id = attempts.role_id
-        AND generations.generation = attempts.role_generation
-        AND generations.holder_execution_attempt_id = attempts.execution_attempt_id
-       WHERE attempts.origin = 'role_holder'
-         AND attempts.thread_id IS NOT NULL
-         AND generations.status = 'active'
-       ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`
-  ).all();
-}
-function openLaneViews(db, now2 = Date.now(), operatorWaits = /* @__PURE__ */ new Map()) {
-  const lanes = readLaneStates(db).filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state)).map((lane) => {
-    const operatorWait = lane.thread_id ? operatorWaits.get(lane.thread_id) ?? null : null;
-    return {
-      projectId: lane.project_id,
-      laneId: lane.lane_id,
-      assignmentId: lane.assignment_id,
-      assignmentKind: lane.assignment_kind,
-      workItemId: lane.work_item_id,
-      threadId: lane.thread_id,
-      executionAttemptId: lane.execution_attempt_id,
-      attemptState: lane.attempt_state,
-      workerStatus: null,
-      waitingOn: operatorWait?.reason ?? (lane.terminal_report_digest === null ? "terminal receipt" : null),
-      ageMs: Math.max(0, now2 - lane.created_at_ms),
-      tone: lane.attempt_state === "running" ? "running" : "default",
-      queueState: operatorWait ? "deferred" : lane.attempt_state === "running" ? "running" : "ready",
-      queueBlocked: false,
-      nextStartable: false,
-      deferredReason: operatorWait?.reason ?? null,
-      deferredAtMs: operatorWait?.createdAtMs ?? null,
-      deferredAgeMs: operatorWait ? Math.max(0, now2 - operatorWait.createdAtMs) : null
-    };
-  });
-  const startable = /* @__PURE__ */ new Set();
-  const readyWriterCount = /* @__PURE__ */ new Map();
-  const occupiedWriterCount = /* @__PURE__ */ new Map();
-  const ceilingByProject = /* @__PURE__ */ new Map();
-  for (const lane of lanes) {
-    if (lane.assignmentKind !== "write") continue;
-    if (lane.queueState === "deferred" || lane.queueState === "running" || lane.attemptState !== "prepared" && lane.attemptState !== "armed") {
-      occupiedWriterCount.set(lane.projectId, (occupiedWriterCount.get(lane.projectId) ?? 0) + 1);
-    }
-  }
-  for (const lane of lanes) {
-    if (lane.queueState !== "ready" || lane.attemptState !== "prepared" && lane.attemptState !== "armed" || lane.deferredReason) continue;
-    if (lane.assignmentKind !== "write") {
-      startable.add(lane.executionAttemptId);
-      continue;
-    }
-    const ready = readyWriterCount.get(lane.projectId) ?? 0;
-    const occupied = occupiedWriterCount.get(lane.projectId) ?? 0;
-    const ceiling = ceilingByProject.get(lane.projectId) ?? writingLaneCeilingForProject(db, lane.projectId);
-    ceilingByProject.set(lane.projectId, ceiling);
-    const available = Math.max(0, ceiling - occupied);
-    if (ready < available) {
-      startable.add(lane.executionAttemptId);
-      readyWriterCount.set(lane.projectId, ready + 1);
-    }
-  }
-  return lanes.map((lane) => ({
-    ...lane,
-    queueBlocked: lane.queueState === "ready" && (lane.attemptState === "prepared" || lane.attemptState === "armed") && !startable.has(lane.executionAttemptId),
-    nextStartable: startable.has(lane.executionAttemptId)
-  }));
-}
-function roleQueueScopes(lanes) {
-  const projectIds = new Set(lanes.map((lane) => lane.projectId));
-  return [...projectIds].map((projectId) => {
-    const next = lanes.find((lane) => lane.projectId === projectId && lane.nextStartable);
-    return {
-      projectId,
-      nextStartable: next !== void 0,
-      queueHeadId: next?.executionAttemptId ?? null,
-      deferredReason: next?.deferredReason ?? null
-    };
-  });
-}
-function createLaneWatcher(options) {
-  const continuationLedger = options.continuationLedger ?? createContinuationLedger();
-  const waitRegistry = options.waitRegistry ?? createWaitRegistry();
-  const operatorWaitAlertLedger = createOperatorWaitAlertLedger(options.operatorWaitAlertPersistence);
-  const roleIdleLedger = createRoleIdleLedger(options.roleIdlePersistence);
-  const roleIdleThresholdMs = Number.isInteger(options.roleIdleThresholdMs) && (options.roleIdleThresholdMs ?? 0) >= 0 ? options.roleIdleThresholdMs : WRONGFUL_IDLE_THRESHOLD_MS;
-  const now2 = options.now ?? Date.now;
-  const operatorWaitFyiThresholdMs = Number.isInteger(options.operatorWaitFyiThresholdMs) && (options.operatorWaitFyiThresholdMs ?? 0) >= 0 ? options.operatorWaitFyiThresholdMs : OPERATOR_WAIT_FYI_THRESHOLD_MS;
-  const maxContinuations = Number.isInteger(options.maxContinuations) && (options.maxContinuations ?? 0) > 0 ? options.maxContinuations : DEFAULT_MAX_CONTINUATIONS;
-  const coalesced = /* @__PURE__ */ new Set();
-  let queue = Promise.resolve();
-  const readWaitContext = async (allLanes, suppliedSource) => {
-    let waits;
-    try {
-      await waitRegistry.recover();
-      waits = (options.readRegisteredWaits ? await options.readRegisteredWaits() : waitRegistry.list()).map(normalizeRegisteredWait);
-      if (options.readRegisteredWaits) for (const wait of waits) await waitRegistry.register(wait);
-    } catch {
-      return { known: false, byWaiter: /* @__PURE__ */ new Map(), events: [] };
-    }
-    if (waits.length === 0) return { known: true, byWaiter: /* @__PURE__ */ new Map(), events: [] };
-    const sourceStates = /* @__PURE__ */ new Map();
-    for (const sourceThreadId of new Set(waits.map((wait) => wait.sourceThreadId))) {
-      const sourceLanes = allLanes.filter((lane) => lane.thread_id === sourceThreadId);
-      const terminalFromLane = sourceLanes.some((lane) => lane.terminal_report_digest !== null || !OPEN_ATTEMPT_STATES.has(lane.attempt_state));
-      let observation = null;
-      if (suppliedSource?.threadId === sourceThreadId) {
-        observation = {
-          status: suppliedSource.status,
-          pendingExternalWait: false,
-          archived: suppliedSource.archived
-        };
-      } else if (options.readWorker) {
-        try {
-          observation = await options.readWorker(sourceThreadId);
-        } catch {
-          observation = null;
-        }
-      }
-      const failedFromLane = sourceLanes.some((lane) => lane.attempt_state === "failed");
-      sourceStates.set(sourceThreadId, {
-        known: terminalFromLane || observation !== null,
-        terminal: terminalFromLane || observation?.archived === true || observation?.status === "error",
-        failed: failedFromLane || observation?.archived === true || observation?.status === "error"
-      });
-    }
-    const byWaiter = /* @__PURE__ */ new Map();
-    const events = [];
-    for (const wait of waits) {
-      if (waitRegistry.state(wait.waitId) === "fired") {
-        byWaiter.set(wait.waiterThreadId, mergeRegisteredWaitState(byWaiter.get(wait.waiterThreadId), "fired"));
-        continue;
-      }
-      const source = sourceStates.get(wait.sourceThreadId);
-      let reason = null;
-      if (now2() >= wait.deadlineAtMs) reason = "deadline_expired";
-      else if (!source?.known) {
-        byWaiter.set(wait.waiterThreadId, mergeRegisteredWaitState(byWaiter.get(wait.waiterThreadId), "unknown"));
-        continue;
-      } else if (wait.sourceEvent === "terminal" && source.terminal) reason = "source_terminal";
-      else if (wait.sourceEvent === "failure" && source.failed) reason = "source_failure";
-      else {
-        byWaiter.set(wait.waiterThreadId, mergeRegisteredWaitState(byWaiter.get(wait.waiterThreadId), "pending"));
-        continue;
-      }
-      let event;
-      try {
-        event = await waitRegistry.fire(wait.waitId, reason, now2());
-      } catch {
-        return { known: false, byWaiter: /* @__PURE__ */ new Map(), events: [] };
-      }
-      if (event) events.push(event);
-      byWaiter.set(wait.waiterThreadId, mergeRegisteredWaitState(byWaiter.get(wait.waiterThreadId), "fired"));
-    }
-    return { known: true, byWaiter, events };
-  };
-  const laneKey = (lane) => `${lane.project_id}:${lane.execution_attempt_id}`;
-  const clearResolved = (lanes) => {
-    const unresolved = new Set(
-      lanes.filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.terminal_report_digest === null).map(laneKey)
-    );
-    for (const key of coalesced) {
-      if (!unresolved.has(key)) coalesced.delete(key);
-    }
-  };
-  const viewFor = (lane, status, now3, operatorWait) => ({
-    projectId: lane.project_id,
-    laneId: lane.lane_id,
-    assignmentId: lane.assignment_id,
-    assignmentKind: lane.assignment_kind,
-    workItemId: lane.work_item_id,
-    threadId: lane.thread_id,
-    executionAttemptId: lane.execution_attempt_id,
-    attemptState: lane.attempt_state,
-    workerStatus: status,
-    waitingOn: operatorWait?.reason ?? "terminal receipt",
-    ageMs: Math.max(0, now3 - lane.created_at_ms),
-    tone: "error",
-    queueState: operatorWait ? "deferred" : lane.attempt_state === "running" ? "running" : "ready",
-    queueBlocked: false,
-    nextStartable: false,
-    deferredReason: operatorWait?.reason ?? null,
-    deferredAtMs: operatorWait?.createdAtMs ?? null,
-    deferredAgeMs: operatorWait ? Math.max(0, now3 - operatorWait.createdAtMs) : null
-  });
-  const alert = (kind, lane, count, max) => {
-    options.onAlert?.({ kind, lane, count, max });
-  };
-  const roleAlert = (role) => {
-    options.onAlert?.({ kind: "wrongful_idle_fyi", lane: null, role, count: 2, max: 2 });
-  };
-  const isCurrentCanonicalHolder = (projectId, threadId) => {
-    if (!options.readRoleHolders) return false;
-    try {
-      return options.readRoleHolders().filter((holder) => holder.project_id === projectId).some((holder) => holder.thread_id === threadId);
-    } catch {
-      return true;
-    }
-  };
-  const resolveCurrentCanonicalHolder = (holder) => {
-    if (!options.readRoleHolders) return null;
-    try {
-      const current = options.readRoleHolders().filter(
-        (candidate) => candidate.project_id === holder.project_id && candidate.role_id === holder.role_id
-      );
-      return current.length === 1 && current[0]?.role_generation === holder.role_generation && current[0]?.execution_attempt_id === holder.execution_attempt_id && current[0]?.thread_id === holder.thread_id ? current[0] : null;
-    } catch {
-      return void 0;
-    }
-  };
-  const escalateRole = async (key, role) => {
-    if (!await roleIdleLedger.markEscalated(key)) return;
-    roleAlert(role);
-    options.onRoleSuccessionRequired?.(role);
-  };
-  const observeRoleNow = async (threadId, suppliedScopes, waitContext) => {
-    if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return;
-    let holders;
-    try {
-      holders = options.readRoleHolders();
-    } catch {
-      return;
-    }
-    if (holders.length === 0) return;
-    if (threadId && !holders.some((holder) => holder.thread_id === threadId)) return;
-    let scopes = suppliedScopes;
-    if (!scopes) {
-      try {
-        scopes = await options.readRoleScopes();
-      } catch {
-        return;
-      }
-    }
-    for (const holder of holders) {
-      const projectHolders = holders.filter((candidate) => candidate.project_id === holder.project_id && candidate.role_id === holder.role_id);
-      if (projectHolders.length !== 1 || !holder.thread_id) continue;
-      const targetThreadId = holder.thread_id;
-      if (threadId && targetThreadId !== threadId) continue;
-      const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
-      const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
-      let observation;
-      try {
-        observation = await options.readWorker(targetThreadId);
-      } catch {
-        continue;
-      }
-      const waitState = waitContext?.byWaiter.get(targetThreadId) ?? "none";
-      if (observation.projectId !== holder.project_id || waitContext && !waitContext.known || waitState === "pending" || waitState === "unknown" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || !scope?.nextStartable || scope.deferredReason) {
-        await roleIdleLedger.clearPrefixExcept(prefix);
-        continue;
-      }
-      if (!scope.queueHeadId) {
-        await roleIdleLedger.clearPrefixExcept(prefix);
-        continue;
-      }
-      const key = roleIdleKey(holder, scope.queueHeadId);
-      await roleIdleLedger.clearPrefixExcept(prefix, key);
-      if (observation.status !== "idle") {
-        if (await roleIdleLedger.preserveAfterSteerWake(key)) continue;
-        await roleIdleLedger.resetIdle(key);
-        await roleIdleLedger.clearPrefixExcept(prefix, key);
-        continue;
-      }
-      if (observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) {
-        await roleIdleLedger.clearPrefixExcept(prefix);
-        continue;
-      }
-      const currentNow = now2();
-      const record2 = await roleIdleLedger.observeIdle(key, currentNow);
-      const idleAgeMs = Math.max(0, currentNow - (record2.idleSinceMs ?? currentNow));
-      const steerAgeMs = record2.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : Math.max(0, currentNow - record2.lastSteerAtMs);
-      if (idleAgeMs < roleIdleThresholdMs) continue;
-      if (record2?.escalated) continue;
-      if ((record2?.steerCount ?? 0) >= 2) {
-        if (idleAgeMs >= roleIdleThresholdMs && steerAgeMs >= roleIdleThresholdMs) {
-          await escalateRole(key, {
-            projectId: holder.project_id,
-            roleId: holder.role_id,
-            roleGeneration: holder.role_generation,
-            executionAttemptId: holder.execution_attempt_id,
-            threadId: targetThreadId,
-            queueHeadId: scope.queueHeadId,
-            idleAgeMs
-          });
-        }
-        continue;
-      }
-      if (idleAgeMs < roleIdleThresholdMs || steerAgeMs < roleIdleThresholdMs) continue;
-      const role = {
-        projectId: holder.project_id,
-        roleId: holder.role_id,
-        roleGeneration: holder.role_generation,
-        executionAttemptId: holder.execution_attempt_id,
-        threadId: targetThreadId,
-        queueHeadId: scope.queueHeadId,
-        idleAgeMs
-      };
-      if (!resolveCurrentCanonicalHolder(holder)) {
-        await roleIdleLedger.clearPrefixExcept(prefix);
-        continue;
-      }
-      let failed = false;
-      let delivered = void 0;
-      try {
-        delivered = await options.steerRole(role);
-      } catch {
-        failed = true;
-      }
-      if (delivered === false || delivered === "error") {
-        await roleIdleLedger.clearPrefixExcept(prefix);
-        continue;
-      }
-      const updated = await roleIdleLedger.recordSteer(key, failed, currentNow);
-      if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, role);
-    }
-  };
-  const wakeRoleNow = async (role) => {
-    if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return { attempted: false, delivered: false, refusal: "policy" };
-    const holder = {
-      project_id: role.projectId,
-      role_id: role.roleId,
-      role_generation: role.roleGeneration,
-      execution_attempt_id: role.executionAttemptId,
-      thread_id: role.threadId
-    };
-    const currentHolder = resolveCurrentCanonicalHolder(holder);
-    if (!currentHolder) return { attempted: false, delivered: false, refusal: currentHolder === void 0 ? "error" : "policy" };
-    let scopes;
-    let observation;
-    try {
-      scopes = await options.readRoleScopes();
-      observation = await options.readWorker(role.threadId);
-    } catch {
-      return { attempted: false, delivered: false, refusal: "error" };
-    }
-    const scope = scopes.find((candidate) => candidate.projectId === role.projectId);
-    if (!scope?.nextStartable || scope.queueHeadId !== role.queueHeadId || scope.deferredReason || observation.projectId !== role.projectId || observation.status !== "idle" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) return { attempted: false, delivered: false, refusal: "policy" };
-    const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
-    const key = `${prefix}${scope.queueHeadId}`;
-    await roleIdleLedger.clearPrefixExcept(prefix, key);
-    const currentNow = now2();
-    const record2 = await roleIdleLedger.observeIdle(key, observation.idleSinceMs);
-    const steerAgeMs = record2.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : Math.max(0, currentNow - record2.lastSteerAtMs);
-    if (record2.escalated || record2.steerCount >= 2 || steerAgeMs < roleIdleThresholdMs) return { attempted: false, delivered: false, refusal: "policy" };
-    const target = {
-      ...role,
-      threadId: holder.thread_id,
-      idleAgeMs: Math.max(0, currentNow - (record2.idleSinceMs ?? currentNow))
-    };
-    let failed = false;
-    let delivered = void 0;
-    try {
-      delivered = await options.steerRole(target);
-    } catch {
-      failed = true;
-    }
-    if (delivered === "error") return { attempted: false, delivered: false, refusal: "error" };
-    if (delivered === false) {
-      await roleIdleLedger.clearPrefixExcept(prefix);
-      return { attempted: false, delivered: false, refusal: "policy" };
-    }
-    const updated = await roleIdleLedger.recordSteer(key, failed, currentNow);
-    if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, target);
-    return { attempted: true, delivered: !failed };
-  };
-  const observeNow = async (threadId, status, pendingExternalWait, archived = false, suppliedOperatorWait, suppliedOperatorWaitKnown = status !== "idle" || suppliedOperatorWait !== void 0 || !options.readOperatorWait, waitContext) => {
-    const allLanes = options.readLanes();
-    clearResolved(allLanes);
-    const candidates = allLanes.filter(
-      (lane) => lane.thread_id === threadId && (!lane.thread_id || !isCurrentCanonicalHolder(lane.project_id, lane.thread_id)) && OPEN_ATTEMPT_STATES.has(lane.attempt_state)
-    );
-    if (candidates.length === 0) return;
-    const registeredWaitState = waitContext?.byWaiter.get(threadId) ?? "none";
-    if (status === "idle" && (waitContext && (!waitContext.known || registeredWaitState === "pending" || registeredWaitState === "unknown"))) {
-      for (const lane of candidates) coalesced.delete(laneKey(lane));
-      return;
-    }
-    let operatorWait = suppliedOperatorWait ?? null;
-    let operatorWaitKnown = suppliedOperatorWaitKnown;
-    if (!archived && status === "idle" && suppliedOperatorWait === void 0 && options.readOperatorWait) {
-      try {
-        operatorWait = await options.readOperatorWait(threadId);
-      } catch {
-        operatorWait = null;
-        operatorWaitKnown = false;
-      }
-    }
-    let waiting = pendingExternalWait ?? false;
-    if (operatorWait) waiting = true;
-    if (!archived && status === "idle" && pendingExternalWait === void 0 && !operatorWait && options.isExternallyWaiting) {
-      try {
-        waiting = await options.isExternallyWaiting(threadId);
-      } catch {
-        waiting = true;
-      }
-    }
-    const currentNow = now2();
-    if (archived || status !== "idle" || waiting && !operatorWait) {
-      for (const lane of candidates) {
-        const key = laneKey(lane);
-        coalesced.delete(key);
-        if (archived || operatorWaitKnown && !operatorWait) await operatorWaitAlertLedger.clear(key);
-      }
-      return;
-    }
-    for (const lane of candidates) {
-      const key = laneKey(lane);
-      if (lane.terminal_report_digest !== null) {
-        await operatorWaitAlertLedger.clear(key);
-        continue;
-      }
-      if (operatorWait) {
-        coalesced.delete(key);
-        const view2 = viewFor(lane, status, currentNow, operatorWait);
-        if (view2.deferredAgeMs !== null && view2.deferredAgeMs >= operatorWaitFyiThresholdMs && !await operatorWaitAlertLedger.notified(key)) {
-          await operatorWaitAlertLedger.mark(key);
-          alert("operator_wait_fyi", view2, 0, 0);
-        }
-        continue;
-      }
-      await operatorWaitAlertLedger.clear(key);
-      if (coalesced.has(key)) continue;
-      coalesced.add(key);
-      const view = viewFor(lane, status, currentNow, null);
-      const mode = continuationModeFor(lane.assignment_kind);
-      if (mode === "tracking") continue;
-      if (mode === "approval") {
-        alert("approval_required", view, 0, maxContinuations);
-        continue;
-      }
-      const claimed = await continuationLedger.claim(key, maxContinuations);
-      if (!claimed.claim) {
-        if (claimed.reason === "limit_reached") alert("limit_reached", view, maxContinuations, maxContinuations);
-        if (claimed.reason === "paused") alert("restart_review", view, 0, maxContinuations);
-        continue;
-      }
-      try {
-        await options.steer(view);
-        await continuationLedger.complete(key, claimed.claim.claimId);
-      } catch (error48) {
-        alert("delivery_uncertain", view, claimed.claim.count, claimed.claim.max);
-        throw error48;
-      }
-    }
-  };
-  const enqueue = (work) => {
-    const result2 = queue.then(work);
-    queue = result2.then(() => void 0, () => void 0);
-    return result2;
-  };
-  const emitWaitEvents = async (context) => {
-    for (const event of context.events) await options.onWaitEvent?.(event);
-  };
-  return {
-    registerWait(wait) {
-      return waitRegistry.register(wait);
-    },
-    observe(threadId, status, pendingExternalWait, archived, operatorWait) {
-      return enqueue(async () => {
-        const context = await readWaitContext(options.readLanes(), { threadId, status, archived: archived ?? false });
-        await emitWaitEvents(context);
-        await observeNow(threadId, status, pendingExternalWait, archived, operatorWait, void 0, context);
-        await observeRoleNow(threadId, void 0, context);
-        for (const event of context.events) {
-          if (event.waiterThreadId === threadId || !options.readWorker) continue;
-          try {
-            const observation = await options.readWorker(event.waiterThreadId);
-            await observeNow(event.waiterThreadId, observation.status, observation.pendingExternalWait, observation.archived, observation.operatorWait, observation.operatorWaitKnown, context);
-            await observeRoleNow(event.waiterThreadId, void 0, context);
-          } catch {
-          }
-        }
-      });
-    },
-    poll() {
-      return enqueue(async () => {
-        const lanes = options.readLanes();
-        clearResolved(lanes);
-        const context = await readWaitContext(lanes);
-        await emitWaitEvents(context);
-        if (!options.readWorker) return;
-        const workerIds = new Set(
-          lanes.filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state) && lane.thread_id).map((lane) => lane.thread_id)
-        );
-        for (const threadId of workerIds) {
-          let observation;
-          try {
-            observation = await options.readWorker(threadId);
-          } catch {
-            continue;
-          }
-          await observeNow(
-            threadId,
-            observation.status,
-            observation.pendingExternalWait,
-            observation.archived,
-            observation.operatorWait,
-            observation.operatorWaitKnown,
-            context
-          );
-        }
-        if (options.readRoleHolders) {
-          const roleThreadIds = new Set(options.readRoleHolders().map((holder) => holder.thread_id));
-          let roleScopes = null;
-          if (roleThreadIds.size > 0 && options.readRoleScopes) {
-            try {
-              roleScopes = await options.readRoleScopes();
-            } catch {
-              roleScopes = null;
-            }
-          }
-          if (roleScopes) {
-            for (const threadId of roleThreadIds) await observeRoleNow(threadId, roleScopes, context);
-          }
-        }
-      });
-    },
-    wakeRole(role) {
-      return enqueue(() => wakeRoleNow(role));
-    },
-    recover() {
-      return enqueue(async () => {
-        await continuationLedger.recover();
-        await waitRegistry.recover();
-        await operatorWaitAlertLedger.recover();
-        await roleIdleLedger.recover();
-      });
-    },
-    readRoleIdle(key) {
-      return roleIdleLedger.get(key);
-    },
-    observeRoleIdle(key, idleSinceMs) {
-      return roleIdleLedger.observeIdle(key, idleSinceMs);
-    },
-    resetRoleIdle(key) {
-      return roleIdleLedger.resetIdle(key);
-    },
-    recordRoleWake(key, sentAtMs) {
-      return roleIdleLedger.recordFleetWake(key, sentAtMs);
-    }
-  };
-}
-function threadEventStatus(payload) {
-  return {
-    id: payload.thread.id,
-    status: payload.thread.status
-  };
-}
-function subscribeToThreadChanges(sdk, observe) {
-  try {
-    return sdk.subscribe({
-      event: "thread:changed",
-      callback: (event) => {
-        if (event.entity !== "thread" || !event.id) return;
-        void sdk.threads.get({ threadId: event.id }).then((thread) => thread.archivedAt === null && thread.deletedAt === null ? observe(thread.id, thread.status) : observe(thread.id, thread.status, true)).catch(() => void 0);
-      }
-    });
-  } catch {
-    return () => void 0;
-  }
-}
-
-// src/stall-guard.ts
-import { homedir } from "node:os";
-import { join } from "node:path";
-var STALL_GUARD_KV_KEY = "stall-guard.artifacts";
-var STALL_GUARD_LIVENESS_MARKER_FILENAME = "stall-guard.liveness";
-var STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME = "stall-guard.alerted";
-function stallGuardStateDir() {
-  return process.env.BB_COLLAB_STALL_GUARD_STATE_DIR ?? join(homedir(), ".bb", "bb-collab");
-}
-function stateFromUnknown(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-  return Object.fromEntries(Object.entries(value).filter((entry) => typeof entry[1] === "string"));
-}
-function snapshot(value) {
-  return JSON.stringify(value);
-}
-function priorArtifacts(value) {
-  try {
-    const artifacts = JSON.parse(value);
-    return Array.isArray(artifacts) && artifacts.every((artifact) => artifact && typeof artifact === "object" && typeof artifact.id === "string" && typeof artifact.unavailable === "boolean") ? artifacts : null;
-  } catch {
-    return null;
-  }
-}
-function hasArtifactDelta(previous, current) {
-  const prior = priorArtifacts(previous);
-  if (!prior) return true;
-  const byId = new Map(prior.map((artifact) => [artifact.id, artifact]));
-  if (byId.size !== current.length || current.some((artifact) => !byId.has(artifact.id))) return true;
-  return current.some((artifact) => {
-    const before = byId.get(artifact.id);
-    return before !== void 0 && !artifact.unavailable && !before.unavailable && snapshot(before.value) !== snapshot(artifact.value);
-  });
-}
-function createStallGuardCycle(options) {
-  let state = null;
-  return {
-    async cycle(projectId) {
-      state ??= stateFromUnknown(await options.persistence.read());
-      const holders = options.readRoleHolders().filter((holder) => projectId === void 0 || holder.project_id === projectId);
-      const scopes = await options.readRoleScopes();
-      const nextState = structuredClone(state);
-      const artifacts = /* @__PURE__ */ new Map();
-      const readArtifacts = (id2) => {
-        let current = artifacts.get(id2);
-        if (!current) {
-          current = options.readArtifact(id2).catch(() => null);
-          artifacts.set(id2, current);
-        }
-        return current;
-      };
-      let changed = 0;
-      let attempted = 0;
-      let verified = 0;
-      let steered = 0;
-      for (const holder of holders) {
-        const key = `${holder.project_id}:${holder.role_id}`;
-        const current = await readArtifacts(holder.project_id);
-        if (current === null) continue;
-        const next = snapshot(current);
-        if (nextState[key] === void 0) {
-          nextState[key] = next;
-          changed += 1;
-          continue;
-        }
-        if (nextState[key] === next) continue;
-        if (!hasArtifactDelta(nextState[key], current)) {
-          nextState[key] = next;
-          changed += 1;
-          continue;
-        }
-        const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
-        if (!scope?.nextStartable || !scope.queueHeadId || scope.deferredReason) {
-          nextState[key] = next;
-          changed += 1;
-          continue;
-        }
-        const role = {
-          projectId: holder.project_id,
-          roleId: holder.role_id,
-          roleGeneration: holder.role_generation,
-          executionAttemptId: holder.execution_attempt_id,
-          threadId: holder.thread_id,
-          queueHeadId: scope.queueHeadId,
-          idleAgeMs: 0
-        };
-        let result2;
-        try {
-          result2 = await options.wakeRole(role);
-        } catch {
-          continue;
-        }
-        if (!result2.attempted) {
-          if (result2.refusal !== "policy") continue;
-          nextState[key] = next;
-          changed += 1;
-          continue;
-        }
-        attempted += 1;
-        if (!result2.delivered) continue;
-        nextState[key] = next;
-        changed += 1;
-        verified += 1;
-        steered += 1;
-      }
-      if (changed > 0) {
-        await options.persistence.write(nextState);
-        state = nextState;
-      }
-      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered };
-    }
-  };
-}
-
 // src/registered-waits.ts
 import { createHash as createHash2 } from "node:crypto";
-import { homedir as homedir2 } from "node:os";
-import { join as join2 } from "node:path";
+import { homedir } from "node:os";
+import { join } from "node:path";
 var DEFAULT_WAIT_DEADLINE_MS = 8 * 60 * 6e4;
 var MAX_WAIT_DEADLINE_MS = 7 * 24 * 60 * 6e4;
 var WAIT_STEER_GRACE_MS = 5 * 6e4;
@@ -21139,7 +18557,7 @@ var WAIT_ESCALATION_KV_KEY = "wait-validator.escalation";
 var LIVENESS_MARKER_FILENAME = "wait-validator.liveness";
 var LIVENESS_ALERT_FLAG_FILENAME = "wait-validator.alerted";
 function waitValidatorStateDir() {
-  return process.env.BB_COLLAB_VALIDATOR_STATE_DIR ?? join2(homedir2(), ".bb", "bb-collab");
+  return process.env.BB_COLLAB_VALIDATOR_STATE_DIR ?? join(homedir(), ".bb", "bb-collab");
 }
 function isPlainObject2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -21491,12 +18909,12 @@ async function runArchiveSweep(bb, db, projectId, apply = false, now2 = Date.now
 // src/checkout-divergence.ts
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, join as join3, resolve } from "node:path";
+import { dirname, join as join2, resolve } from "node:path";
 function readRef(gitDirs, ref) {
   for (const gitDir of gitDirs) {
-    const looseRef = join3(gitDir, ref);
+    const looseRef = join2(gitDir, ref);
     if (existsSync(looseRef)) return readFileSync(looseRef, "utf8").trim() || null;
-    const packedRefs = join3(gitDir, "packed-refs");
+    const packedRefs = join2(gitDir, "packed-refs");
     if (!existsSync(packedRefs)) continue;
     for (const line of readFileSync(packedRefs, "utf8").split("\n")) {
       const [sha, name] = line.trim().split(" ");
@@ -21506,25 +18924,25 @@ function readRef(gitDirs, ref) {
   return null;
 }
 function resolveGitDir(checkoutRoot) {
-  const dotGit = join3(checkoutRoot, ".git");
+  const dotGit = join2(checkoutRoot, ".git");
   if (!existsSync(dotGit)) return null;
   if (statSync(dotGit).isDirectory()) return dotGit;
   const marker = readFileSync(dotGit, "utf8").trim();
   return marker.startsWith("gitdir:") ? resolve(checkoutRoot, marker.slice("gitdir:".length).trim()) : null;
 }
 function commonGitDir(gitDir) {
-  const commondir = join3(gitDir, "commondir");
+  const commondir = join2(gitDir, "commondir");
   return existsSync(commondir) ? resolve(gitDir, readFileSync(commondir, "utf8").trim()) : gitDir;
 }
 function readHead(gitDir, commonDir) {
-  const head = readFileSync(join3(gitDir, "HEAD"), "utf8").trim();
+  const head = readFileSync(join2(gitDir, "HEAD"), "utf8").trim();
   if (!head.startsWith("ref: ")) return head || null;
   return readRef([gitDir, commonDir], head.slice("ref: ".length));
 }
 function findCheckoutRoot(startPath) {
   let current = resolve(startPath);
   while (true) {
-    if (existsSync(join3(current, ".git"))) return current;
+    if (existsSync(join2(current, ".git"))) return current;
     const parent = dirname(current);
     if (parent === current) return null;
     current = parent;
@@ -21570,7 +18988,7 @@ function readCheckoutDivergence(checkoutRoot) {
 
 // server.ts
 import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync2, rmSync, statSync as statSync2, writeFileSync } from "node:fs";
-import { basename, dirname as dirname2, isAbsolute, join as join4, relative, sep } from "node:path";
+import { basename, dirname as dirname2, isAbsolute, join as join3, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 var FLEET_WATCHDOG_FLOOR_MS = 60 * 6e4;
 var FLEET_WATCHDOG_STALE_WAIT_MS = 24 * 60 * 6e4;
@@ -21634,27 +19052,6 @@ var foundationResultSchema = external_exports.object({
   evidence: external_exports.unknown().optional(),
   export: exportSchema.optional()
 }).strict();
-var laneViewSchema = external_exports.object({
-  projectId: projectIdSchema,
-  laneId: projectIdSchema,
-  assignmentId: projectIdSchema,
-  assignmentKind: external_exports.enum(["write", "review", "probe"]),
-  workItemId: projectIdSchema,
-  threadId: projectIdSchema.nullable(),
-  executionAttemptId: projectIdSchema,
-  attemptState: external_exports.string(),
-  workerStatus: external_exports.enum(["active", "idle", "error", "starting", "stopping"]).nullable(),
-  waitingOn: external_exports.string().nullable(),
-  ageMs: external_exports.number().int().nonnegative(),
-  tone: external_exports.enum(["default", "running", "success", "error"]),
-  queueState: external_exports.enum(["ready", "running", "deferred"]),
-  queueBlocked: external_exports.boolean(),
-  nextStartable: external_exports.boolean(),
-  deferredReason: external_exports.literal("awaiting_operator").nullable(),
-  deferredAtMs: external_exports.number().int().nonnegative().nullable(),
-  deferredAgeMs: external_exports.number().int().nonnegative().nullable()
-}).strict();
-var laneListSchema = external_exports.array(laneViewSchema);
 var sidebarThreadIdSchema = external_exports.string().trim().min(1).max(256);
 var registeredWaitInputSchema = external_exports.object({
   waitId: sidebarThreadIdSchema,
@@ -21689,10 +19086,6 @@ var roleBriefSchema = external_exports.object({
   prompt: external_exports.string().min(1)
 }).strict();
 var rpcContract = defineRpcContract({
-  lanes: {
-    input: external_exports.object({}).strict(),
-    output: laneListSchema
-  },
   registerWait: {
     input: registeredWaitInputSchema,
     output: registeredWaitSchema
@@ -22045,22 +19438,22 @@ async function applyLiveCachedConsumerRollout(bb, db, input, cliDeps, cliContext
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "archive-sweep", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, archive-sweep, cached-consumer-rollout, wait-register, wait-list, wait-validator, stall-guard, or fleet-watchdog");
+  if (!command || !["doctor", "export", "apply", "archive-sweep", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, archive-sweep, cached-consumer-rollout, wait-register, wait-list, or wait-validator");
   }
   if (command === "wait-validator") {
     const unknown3 = args.find((arg) => arg !== "--cycle");
     if (unknown3) return invalidCli(`unexpected argument ${unknown3}`);
     if (!args.includes("--cycle")) return invalidCli("--cycle is required: the validator runs exactly one durable cycle per invocation");
     try {
-      await deps.watcher.poll();
+      const fired = await deps.validateWaits();
       const summary = await deps.escalationCycle.cycle();
       return cliResult({
         outcome: "OK",
         subject: "wait-validator",
         expected: 1,
-        attempted: summary.fired + summary.steered,
-        verified: summary.fired,
+        attempted: fired + summary.steered,
+        verified: fired,
         message: "durable wait validation cycle complete",
         evidence: summary
       });
@@ -22073,53 +19466,6 @@ async function runCli(db, bb, argv, ctx, deps) {
         verified: 0,
         message: error48 instanceof Error ? error48.message : String(error48)
       });
-    }
-  }
-  if (command === "stall-guard") {
-    const projectFlag = args.indexOf("--project");
-    const projectId2 = parseFlag(args, "--project");
-    const expectedLength = projectFlag < 0 ? 1 : 3;
-    const unknown3 = args.find((arg) => arg !== "--cycle" && arg !== "--project" && arg !== projectId2);
-    if (unknown3 || args.filter((arg) => arg === "--cycle").length !== 1 || args.filter((arg) => arg === "--project").length > 1 || args.length !== expectedLength) {
-      return invalidCli(`unexpected argument ${unknown3 ?? "duplicate or malformed flag"}`);
-    }
-    if (!args.includes("--cycle")) return invalidCli("--cycle is required: the stall guard runs exactly one durable cycle per invocation");
-    if (projectId2 === "") return invalidCli("--project PROJECT_ID must be supplied once with a value");
-    try {
-      await deps.watcher.poll();
-      const summary = await deps.stallGuardCycle(projectId2 ?? void 0);
-      return cliResult({
-        outcome: "OK",
-        subject: "stall-guard",
-        expected: summary.observed,
-        attempted: summary.attempted,
-        verified: summary.verified,
-        message: "stall-guard cycle complete",
-        evidence: summary
-      });
-    } catch (error48) {
-      return cliResult({ outcome: "INTERNAL_ERROR", subject: "stall-guard", expected: 1, attempted: 0, verified: 0, message: error48 instanceof Error ? error48.message : String(error48) });
-    }
-  }
-  if (command === "fleet-watchdog") {
-    const projectFlag = args.indexOf("--project");
-    const projectId2 = parseFlag(args, "--project");
-    const expectedLength = projectFlag < 0 ? 1 : 3;
-    const reset = args.includes("--reset");
-    const unknown3 = args.find((arg) => arg !== "--cycle" && arg !== "--reset" && arg !== "--project" && arg !== projectId2);
-    if (unknown3 || args.filter((arg) => arg === "--cycle").length + args.filter((arg) => arg === "--reset").length !== 1 || args.filter((arg) => arg === "--project").length > 1 || args.length !== expectedLength) {
-      return invalidCli(`unexpected argument ${unknown3 ?? "duplicate or malformed flag"}`);
-    }
-    if (!projectId2) return invalidCli("--project PROJECT_ID must be supplied once with a value");
-    try {
-      if (reset) {
-        await deps.resetFleetWatchdog(projectId2, ctx?.threadId ?? "unknown");
-        return cliResult({ outcome: "OK", subject: projectId2, expected: 1, attempted: 1, verified: 1, message: "fleet-watchdog history reset" });
-      }
-      await deps.fleetWatchdogCycle(projectId2);
-      return cliResult({ outcome: "OK", subject: projectId2, expected: 1, attempted: 1, verified: 1, message: "fleet-watchdog cycle complete" });
-    } catch (error48) {
-      return cliResult({ outcome: "INTERNAL_ERROR", subject: projectId2, expected: 1, attempted: 0, verified: 0, message: error48 instanceof Error ? error48.message : String(error48) });
     }
   }
   const projectId = parseFlag(args, "--project");
@@ -22245,28 +19591,9 @@ async function plugin(bb, options = {}) {
     bb.log.error(`canonical store unavailable: ${String(error48)}`);
     db = null;
   }
-  const readPendingExternalWait = async (threadId) => {
-    try {
-      return (await bb.sdk.threads.interactions.list({ threadId })).some((interaction) => interaction.status === "pending");
-    } catch {
-      return true;
-    }
-  };
-  const readPendingOperatorWaitForThread = async (threadId) => {
-    const interaction = (await bb.sdk.threads.interactions.list({ threadId })).find((candidate) => candidate.status === "pending");
-    if (!interaction) return null;
-    return {
-      reason: "awaiting_operator",
-      createdAtMs: typeof interaction.createdAt === "number" && Number.isFinite(interaction.createdAt) ? Math.max(0, interaction.createdAt) : 0
-    };
-  };
-  const continuationLedger = createContinuationLedger({
-    read: () => bb.storage.kv.get("lane-watcher.continuations"),
-    write: (state) => bb.storage.kv.set("lane-watcher.continuations", state)
-  });
   const waitRegistry = createWaitRegistry({
-    read: () => bb.storage.kv.get("lane-watcher.registered-waits"),
-    write: (state) => bb.storage.kv.set("lane-watcher.registered-waits", state)
+    read: () => bb.storage.kv.get("registered-waits"),
+    write: (state) => bb.storage.kv.set("registered-waits", state)
   });
   const readThreadObservation = async (threadId) => {
     const thread = await bb.sdk.threads.get({ threadId });
@@ -22274,8 +19601,6 @@ async function plugin(bb, options = {}) {
   };
   const boundedRegistry = {
     register: (wait) => waitRegistry.register(wait),
-    // The store loads lazily; every read recovers first so a cold host never
-    // answers an empty list from a populated registry (round-2 finding #4).
     list: async () => {
       await waitRegistry.recover();
       return waitRegistry.list();
@@ -22296,454 +19621,32 @@ async function plugin(bb, options = {}) {
       await bb.sdk.threads.send({
         threadId: target.waiterThreadId,
         mode: "steer",
-        input: [
-          {
-            type: "text",
-            visibility: "agent-only",
-            text: `Registered wait ${target.waitId} fired (${target.reason}). Wake: inspect what you were waiting on, act on it, and record the next step or blocker.`,
-            mentions: []
-          }
-        ]
+        input: [{ type: "text", visibility: "agent-only", text: `Registered wait ${target.waitId} fired (${target.reason}). Wake and record the next step or blocker.`, mentions: [] }]
       });
     },
-    onFire: (record2) => {
-      bb.log.warn(`registered wait fired: ${record2.waitId} (${record2.reason})`);
-      bb.realtime.publish("wait-validator", { fired: record2.waitId, reason: record2.reason });
-    },
-    onEscalate: (record2) => {
-      bb.log.error(`registered wait escalation: waiter ${record2.waiterThreadId} ignored ${record2.steers} steers for ${record2.waitId}; succession trigger`);
-      bb.realtime.publish("wait-validator", { escalated: record2.waitId, waiterThreadId: record2.waiterThreadId, successionTrigger: true });
-    }
+    onFire: (record2) => bb.log.warn(`registered wait fired: ${record2.waitId} (${record2.reason})`),
+    onEscalate: (record2) => bb.log.error(`registered wait escalation: ${record2.waiterThreadId} ignored ${record2.steers} steers for ${record2.waitId}`)
   });
   await escalationCycle.recover().catch((error48) => bb.log.error(`wait escalation state is unreadable: ${String(error48)}`));
-  const operatorWaitAlertPersistence = {
-    read: () => bb.storage.kv.get("lane-watcher.operator-wait-fyi"),
-    write: (state) => bb.storage.kv.set("lane-watcher.operator-wait-fyi", state)
-  };
-  const roleIdlePersistence = {
-    read: () => bb.storage.kv.get("lane-watcher.role-idle"),
-    write: (state) => bb.storage.kv.set("lane-watcher.role-idle", state)
-  };
-  const roleLivenessWarnings = /* @__PURE__ */ new Map();
-  const roleLivenessKey = (holder) => `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${holder.execution_attempt_id}:${holder.thread_id}`;
-  const warnRoleLiveness = (holder, evidence) => {
-    const key = roleLivenessKey(holder);
-    if (roleLivenessWarnings.get(key) === evidence) return;
-    roleLivenessWarnings.set(key, evidence);
-    bb.log.warn(`role steer refused: project=${holder.project_id} role=${holder.role_id}@${holder.role_generation} holder=${holder.execution_attempt_id} thread=${holder.thread_id} ${evidence}`);
-  };
-  const roleThreadRefusal = (holder, thread, requireIdle) => {
-    const witness = /\bwitness\b/iu.test(`${thread.title ?? ""}
-${thread.titleFallback ?? ""}`);
-    const usableStatus = requireIdle ? thread.status === "idle" : thread.status === "idle" || thread.status === "active";
-    return thread.projectId === holder.project_id && thread.archivedAt === null && thread.deletedAt === null && !witness && usableStatus ? null : `observedProject=${thread.projectId} archivedAt=${thread.archivedAt ?? "null"} deletedAt=${thread.deletedAt ?? "null"} status=${thread.status} witness=${witness}`;
-  };
-  const readOperatorWaits = async () => {
-    if (!db) return /* @__PURE__ */ new Map();
-    const operatorWaits = /* @__PURE__ */ new Map();
-    const threadIds = [...new Set(readLaneStates(db).filter((lane) => OPEN_ATTEMPT_STATES.has(lane.attempt_state)).map((lane) => lane.thread_id).filter((threadId) => threadId !== null))];
-    await Promise.all(threadIds.map(async (threadId) => {
-      try {
-        const wait = await readPendingOperatorWaitForThread(threadId);
-        if (wait) operatorWaits.set(threadId, wait);
-      } catch {
-      }
-    }));
-    return operatorWaits;
-  };
-  const readRoleScopes = async () => {
-    if (!db) return [];
-    return roleQueueScopes(openLaneViews(db, Date.now(), await readOperatorWaits()));
-  };
-  const readUnblockedStartableLanes = async () => {
-    if (!db) return [];
-    const candidates = openLaneViews(db, Date.now(), await readOperatorWaits()).filter((lane) => lane.nextStartable);
-    return (await Promise.all(candidates.map(async (lane) => {
-      if (!lane.threadId || !await readPendingExternalWait(lane.threadId)) return lane;
-      return null;
-    }))).filter((lane) => lane !== null);
-  };
-  const steerRole = async (role) => {
-    if (!db) return "error";
-    const expectedHolder = {
-      project_id: role.projectId,
-      role_id: role.roleId,
-      role_generation: role.roleGeneration,
-      execution_attempt_id: role.executionAttemptId,
-      thread_id: role.threadId
-    };
-    let holders;
-    try {
-      holders = readRoleHolderStates(db).filter(
-        (holder) => holder.project_id === role.projectId && holder.role_id === role.roleId && holder.role_generation === role.roleGeneration && holder.execution_attempt_id === role.executionAttemptId
-      );
-    } catch (error48) {
-      warnRoleLiveness(expectedHolder, `holder=unknown error=${String(error48)}`);
-      return "error";
-    }
-    if (holders.length !== 1 || holders[0]?.thread_id !== role.threadId) {
-      warnRoleLiveness(expectedHolder, `holderMatches=${holders.length} observedThread=${holders[0]?.thread_id ?? "null"}`);
-      return false;
-    }
-    let thread;
-    try {
-      thread = await bb.sdk.threads.get({ threadId: holders[0].thread_id });
-    } catch (error48) {
-      warnRoleLiveness(holders[0], `liveness=unknown error=${String(error48)}`);
-      return "error";
-    }
-    const refusal2 = roleThreadRefusal(holders[0], thread, true);
-    if (refusal2) {
-      warnRoleLiveness(holders[0], refusal2);
-      return false;
-    }
-    roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
-    await bb.sdk.threads.send({
-      threadId: holders[0].thread_id,
-      mode: "steer",
-      input: [
-        {
-          type: "text",
-          visibility: "agent-only",
-          text: `Wrongful idle: queue head ${role.queueHeadId} is startable. Inspect the queue and act or record the blocker.`,
-          mentions: []
-        }
-      ]
-    });
-    return true;
-  };
-  const watcher = createLaneWatcher({
-    readLanes: () => db ? readLaneStates(db) : [],
-    readRoleHolders: () => db ? readRoleHolderStates(db) : [],
-    readRoleScopes,
-    roleIdlePersistence,
-    continuationLedger,
-    waitRegistry,
-    operatorWaitAlertPersistence,
-    onAlert: (alert) => alert.lane ? bb.log.warn(`lane awareness ${alert.kind}: ${alert.lane.laneId} (${alert.count}/${alert.max})`) : bb.log.warn(`role awareness ${alert.kind}: ${alert.role.roleId}@${alert.role.roleGeneration} queue ${alert.role.queueHeadId}`),
-    onRoleSuccessionRequired: (role) => bb.log.warn(`role succession required: ${role.roleId}@${role.roleGeneration}`),
-    isExternallyWaiting: readPendingExternalWait,
-    readOperatorWait: readPendingOperatorWaitForThread,
-    readWorker: async (threadId) => {
-      const roleHolders = db ? readRoleHolderStates(db).filter((holder) => holder.thread_id === threadId) : [];
-      let thread;
-      try {
-        thread = await bb.sdk.threads.get({ threadId });
-      } catch (error48) {
-        for (const holder of roleHolders) warnRoleLiveness(holder, `liveness=unknown error=${String(error48)}`);
-        throw error48;
-      }
-      let roleThreadRefused = false;
-      for (const holder of roleHolders) {
-        const refusal2 = roleThreadRefusal(holder, thread, false);
-        if (refusal2) {
-          roleThreadRefused = true;
-          warnRoleLiveness(holder, refusal2);
-        } else {
-          roleLivenessWarnings.delete(roleLivenessKey(holder));
-        }
-      }
-      const archived = thread.archivedAt !== null || thread.deletedAt !== null || roleThreadRefused;
-      return {
-        projectId: thread.projectId,
-        status: thread.status,
-        pendingExternalWait: archived ? true : await readPendingExternalWait(threadId),
-        archived,
-        operatorWait: null,
-        operatorWaitKnown: true,
-        // Native ThreadResponse has no idle-since field; the role ledger anchors this proxy on first observation.
-        idleSinceMs: thread.status === "idle" ? thread.updatedAt : null
-      };
-    },
-    steer: async (lane) => {
-      if (!lane.threadId) return;
-      if (db && readRoleHolderStates(db).some((holder) => holder.project_id === lane.projectId && holder.thread_id === lane.threadId)) return;
-      await bb.sdk.threads.send({
-        threadId: lane.threadId,
-        mode: "steer",
-        input: [
-          {
-            type: "text",
-            visibility: "agent-only",
-            text: `Lane ${lane.laneId} is idle without a terminal receipt or pending external wait. Continue assignment ${lane.assignmentId} and finish with exactly one DONE|BLOCKED terminal receipt.`,
-            mentions: []
-          }
-        ]
-      });
-    },
-    steerRole
-  });
-  await watcher.recover().catch((error48) => bb.log.error(`lane continuation recovery failed: ${String(error48)}`));
-  const fleetWatchdogIdle = createRoleIdleLedger({
-    read: () => bb.storage.kv.get("fleet-watchdog.role-idle"),
-    write: (state) => bb.storage.kv.set("fleet-watchdog.role-idle", state)
-  });
-  const stallGuardCycle = createStallGuardCycle({
-    readRoleHolders: () => db ? readRoleHolderStates(db) : [],
-    readRoleScopes,
-    readArtifact: async (projectId) => {
-      if (!db) return null;
-      const artifacts = [];
-      for (const lane of readLaneStates(db).filter((candidate) => candidate.project_id === projectId && OPEN_ATTEMPT_STATES.has(candidate.attempt_state) && candidate.thread_id !== null)) {
+  const validateWaits = async () => {
+    await waitRegistry.recover();
+    let fired = 0;
+    for (const wait of waitRegistry.list()) {
+      if (waitRegistry.state(wait.waitId) !== "pending") continue;
+      let reason = null;
+      if (Date.now() >= wait.deadlineAtMs) reason = "deadline_expired";
+      else {
         try {
-          const thread = await bb.sdk.threads.get({ threadId: lane.thread_id });
-          if (thread.projectId !== projectId || !thread.environmentId) {
-            artifacts.push({ id: lane.execution_attempt_id, unavailable: false, value: { environmentId: null, result: { outcome: "absent" } } });
-            continue;
-          }
-          const result2 = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
-          artifacts.push(result2.outcome === "unavailable" ? { id: lane.execution_attempt_id, unavailable: true, value: null } : { id: lane.execution_attempt_id, unavailable: false, value: { environmentId: thread.environmentId, result: result2 } });
+          const source = await readThreadObservation(wait.sourceThreadId);
+          if (source && (source.archived || source.status === "error")) reason = wait.sourceEvent === "failure" ? "source_failure" : "source_terminal";
         } catch {
-          artifacts.push({ id: lane.execution_attempt_id, unavailable: true, value: null });
+          continue;
         }
       }
-      return artifacts;
-    },
-    wakeRole: (role) => watcher.wakeRole(role),
-    persistence: {
-      read: () => bb.storage.kv.get(STALL_GUARD_KV_KEY),
-      write: (state) => bb.storage.kv.set(STALL_GUARD_KV_KEY, state)
+      if (reason && await waitRegistry.fire(wait.waitId, reason, Date.now())) fired += 1;
     }
-  });
-  const observe = (payload) => {
-    const { id: id2, status } = threadEventStatus(payload);
-    return watcher.observe(id2, status);
+    return fired;
   };
-  bb.events.on("thread.active", (payload) => void observe(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
-  bb.events.on("thread.idle", (payload) => void observe(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
-  bb.events.on("thread.failed", (payload) => void observe(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
-  bb.events.on("thread.archived", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
-  bb.events.on("thread.deleted", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
-  const unsubscribe = subscribeToThreadChanges(bb.sdk, (threadId, status, archived = false) => watcher.observe(threadId, status, void 0, archived));
-  bb.onDispose(unsubscribe);
-  bb.background.service("lane-watcher", {
-    async start(signal) {
-      while (!signal.aborted) {
-        await watcher.poll().catch((error48) => bb.log.warn(`lane poll failed: ${String(error48)}`));
-        await escalationCycle.cycle().catch((error48) => bb.log.warn(`wait escalation failed: ${String(error48)}`));
-        if (signal.aborted) break;
-        await new Promise((resolve2) => {
-          let timer;
-          const done = () => {
-            clearTimeout(timer);
-            signal.removeEventListener("abort", done);
-            resolve2();
-          };
-          timer = setTimeout(done, 1e3);
-          signal.addEventListener("abort", done, { once: true });
-        });
-      }
-    }
-  });
-  bb.background.schedule("wait-validator-liveness", "*/5 * * * *", async () => {
-    try {
-      const stateDir = waitValidatorStateDir();
-      const markerPath = join4(stateDir, LIVENESS_MARKER_FILENAME);
-      const flagPath = join4(stateDir, LIVENESS_ALERT_FLAG_FILENAME);
-      let markerAtMs = null;
-      try {
-        const parsed = Number(readFileSync2(markerPath, "utf8").trim());
-        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync2(markerPath).mtimeMs;
-      } catch {
-        markerAtMs = null;
-      }
-      const configuredStaleMs = Number(process.env.BB_COLLAB_LIVENESS_STALE_MS);
-      const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
-      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync2(flagPath));
-      if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
-      if (decision === "alert-once") {
-        mkdirSync(stateDir, { recursive: true });
-        try {
-          writeFileSync(flagPath, String(Date.now()), { flag: "wx" });
-        } catch {
-          bb.log.info("wait-validator-liveness healthy cycle");
-          return;
-        }
-        bb.log.error("wait-validator liveness marker is stale: host launchd supervision failed; operator attention required");
-        bb.realtime.publish("wait-validator", { liveness: "stale", alert: "operator-once" });
-      }
-      bb.log.info("wait-validator-liveness healthy cycle");
-    } catch (error48) {
-      bb.log.warn(`wait-validator liveness check failed: ${String(error48)}`);
-    }
-  });
-  bb.background.schedule("stall-guard-liveness", "*/5 * * * *", async () => {
-    try {
-      const stateDir = stallGuardStateDir();
-      const markerPath = join4(stateDir, STALL_GUARD_LIVENESS_MARKER_FILENAME);
-      const flagPath = join4(stateDir, STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME);
-      let markerAtMs = null;
-      try {
-        const parsed = Number(readFileSync2(markerPath, "utf8").trim());
-        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync2(markerPath).mtimeMs;
-      } catch {
-        markerAtMs = null;
-      }
-      const configuredStaleMs = Number(process.env.BB_COLLAB_STALL_GUARD_LIVENESS_STALE_MS);
-      const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
-      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync2(flagPath));
-      if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
-      if (decision === "alert-once") {
-        mkdirSync(stateDir, { recursive: true });
-        try {
-          writeFileSync(flagPath, String(Date.now()), { flag: "wx" });
-        } catch {
-          bb.log.info("stall-guard-liveness healthy cycle");
-          return;
-        }
-        bb.log.error("stall-guard liveness marker is stale: host launchd supervision failed; operator attention required");
-        bb.realtime.publish("stall-guard", { liveness: "stale", alert: "operator-once" });
-      }
-      bb.log.info("stall-guard-liveness healthy cycle");
-    } catch (error48) {
-      bb.log.warn(`stall-guard liveness check failed: ${String(error48)}`);
-    }
-  });
-  const wakeInFlight = /* @__PURE__ */ new Set();
-  const fleetWatchdogCycle = async (onlyProjectId) => {
-    try {
-      if (!db) return;
-      const now2 = Date.now();
-      const { fleetWatchdogFloorMs, fleetWatchdogStaleWaitMs } = await fleetWatchdogSettings.get();
-      const floorMs = Number(fleetWatchdogFloorMs);
-      const staleWaitMs = Number(fleetWatchdogStaleWaitMs);
-      if (!Number.isSafeInteger(floorMs) || floorMs <= 0 || !Number.isSafeInteger(staleWaitMs) || staleWaitMs <= 0) {
-        throw new Error("watchdog thresholds must be positive integer milliseconds");
-      }
-      const holdersByProject = /* @__PURE__ */ new Map();
-      for (const holder of readRoleHolderStates(db)) {
-        const holders = holdersByProject.get(holder.project_id) ?? [];
-        holders.push(holder);
-        holdersByProject.set(holder.project_id, holders);
-      }
-      const openWorkItemsByProject = /* @__PURE__ */ new Map();
-      for (const workItem of db.prepare(
-        `SELECT work_items.project_id, work_items.work_item_id, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
-         FROM work_items LEFT JOIN work_item_waits
-           ON work_item_waits.project_id = work_items.project_id AND work_item_waits.work_item_id = work_items.work_item_id
-         WHERE work_items.lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')
-         ORDER BY work_items.created_at_ms, work_items.work_item_id`
-      ).all()) {
-        const workItems = openWorkItemsByProject.get(workItem.project_id) ?? [];
-        workItems.push({ workItemId: workItem.work_item_id, waker: workItem.waker, wakerKind: workItem.waker_kind, declaredAtMs: workItem.declared_at_ms });
-        openWorkItemsByProject.set(workItem.project_id, workItems);
-      }
-      const isCurrent = (candidate, holder) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
-      const wake = async (projectId, holder, key, text, requireIdle, kind, beforeSend) => {
-        const previous = await fleetWatchdogIdle.get(key);
-        const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs : kind === "stale-wait" ? previous?.lastStaleWaitWakeAtMs : kind === "owed-act" ? previous?.lastOwedActWakeAtMs : previous?.lastEscalationAtMs;
-        if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== void 0 && now2 - lastNotifiedAtMs < floorMs) return false;
-        if (wakeInFlight.has(key)) return false;
-        wakeInFlight.add(key);
-        try {
-          const current = readRoleHolderStates(db).filter((candidate) => candidate.project_id === projectId && candidate.role_id === holder.role_id);
-          if (current.length !== 1 || !isCurrent(current[0], holder)) {
-            if (current.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active ${holder.role_id} holders=${current.length}`);
-            return false;
-          }
-          if (await readPendingExternalWait(holder.thread_id)) return false;
-          const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
-          if (roleThreadRefusal(holder, thread, requireIdle)) return false;
-          if (beforeSend && !await beforeSend()) return false;
-          await bb.sdk.threads.send({
-            threadId: holder.thread_id,
-            mode: "queue-if-active",
-            input: [{ type: "text", visibility: "agent-only", text, mentions: [] }]
-          });
-          if (kind === "fleet") await fleetWatchdogIdle.recordFleetWake(key, Date.now());
-          else if (kind === "stale-wait") await fleetWatchdogIdle.recordStaleWaitWake(key, Date.now());
-          else if (kind === "owed-act") await fleetWatchdogIdle.recordOwedActWake(key, Date.now());
-          else await fleetWatchdogIdle.recordEscalation(key, Date.now());
-          return true;
-        } finally {
-          wakeInFlight.delete(key);
-        }
-      };
-      for (const [projectId, holders] of holdersByProject) {
-        try {
-          if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
-          const directors = holders.filter((holder) => holder.role_id === "director");
-          const orchestrators = holders.filter((holder) => holder.role_id === "project-orchestrator");
-          if (directors.length !== 1 || orchestrators.length !== 1) {
-            if (directors.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active director holders=${directors.length}`);
-            if (orchestrators.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active project-orchestrator holders=${orchestrators.length}`);
-            continue;
-          }
-          const director = directors[0];
-          const orchestrator = orchestrators[0];
-          const workItems = openWorkItemsByProject.get(projectId) ?? [];
-          const resetIdle = () => Promise.all(holders.flatMap((holder) => workItems.map((workItem) => fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workItem.workItemId)))));
-          if (workItems.length === 0) continue;
-          const staleWait = workItems.find((workItem) => workItem.declaredAtMs !== null && now2 - workItem.declaredAtMs >= staleWaitMs);
-          if (staleWait) {
-            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait");
-            continue;
-          }
-          const seatWait = workItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null);
-          if (seatWait) {
-            const owing = holders.find((holder) => holder.role_id === seatWait.waker);
-            if (!owing) continue;
-            const owingKey = roleIdleKey(owing, seatWait.workItemId);
-            const owingThread = await bb.sdk.threads.get({ threadId: owing.thread_id });
-            if (roleThreadRefusal(owing, owingThread, true) || await readPendingExternalWait(owing.thread_id)) {
-              await fleetWatchdogIdle.resetIdle(owingKey);
-              continue;
-            }
-            const owingRecord = await fleetWatchdogIdle.observeIdle(owingKey, now2);
-            if (owingRecord.idleSinceMs === null || now2 - owingRecord.idleSinceMs < floorMs) continue;
-            if (owingRecord.lastOwedActWakeAtMs === null || owingRecord.lastOwedActWakeAtMs < owingRecord.idleSinceMs) {
-              await wake(projectId, owing, owingKey, `owed act quiet at cycle ${new Date(now2).toISOString()} with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
-              continue;
-            }
-            if (owing.role_id !== "director" && now2 - owingRecord.lastOwedActWakeAtMs >= floorMs) {
-              await wake(projectId, director, roleIdleKey(director, seatWait.workItemId), `owed act still quiet at cycle ${new Date(now2).toISOString()} with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
-            }
-            continue;
-          }
-          const openWorkItem = workItems.find((workItem) => workItem.declaredAtMs === null);
-          if (!openWorkItem) {
-            await resetIdle();
-            continue;
-          }
-          const workKey = openWorkItem.workItemId;
-          const orchestratorKey = roleIdleKey(orchestrator, workKey);
-          const priorOrchestratorRecord = await fleetWatchdogIdle.get(orchestratorKey);
-          if (priorOrchestratorRecord?.lastFleetWakeAtMs !== null && priorOrchestratorRecord?.lastFleetWakeAtMs !== void 0 && now2 - priorOrchestratorRecord.lastFleetWakeAtMs >= floorMs) {
-            await wake(projectId, director, roleIdleKey(director, workKey), `fleet still quiet at cycle ${new Date(now2).toISOString()} with open work since ${new Date(priorOrchestratorRecord.idleSinceMs ?? now2).toISOString()}`, false, "escalation", async () => (await Promise.all(holders.map(async (holder) => {
-              const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
-              return !roleThreadRefusal(holder, thread, true) && !await readPendingExternalWait(holder.thread_id);
-            }))).every(Boolean));
-            continue;
-          }
-          const idle = await Promise.all(holders.map(async (holder) => {
-            const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
-            if (roleThreadRefusal(holder, thread, true) || await readPendingExternalWait(holder.thread_id)) {
-              await fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workKey));
-              return false;
-            }
-            const record2 = await fleetWatchdogIdle.observeIdle(roleIdleKey(holder, workKey), now2);
-            return record2.idleSinceMs !== null && now2 - record2.idleSinceMs >= floorMs;
-          }));
-          if (!idle.every(Boolean)) continue;
-          const orchestratorRecord = await fleetWatchdogIdle.get(orchestratorKey);
-          if (orchestratorRecord?.lastFleetWakeAtMs === null || orchestratorRecord?.lastFleetWakeAtMs === void 0 || orchestratorRecord.lastFleetWakeAtMs < (orchestratorRecord.idleSinceMs ?? now2)) {
-            await wake(projectId, orchestrator, orchestratorKey, `fleet quiet at cycle ${new Date(now2).toISOString()} with open work since ${new Date(orchestratorRecord?.idleSinceMs ?? now2).toISOString()}`, true, "fleet");
-            continue;
-          }
-        } catch (error48) {
-          bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
-        }
-      }
-      bb.log.info("fleet-watchdog healthy cycle");
-    } catch (error48) {
-      bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
-    }
-  };
-  const resetFleetWatchdog = async (projectId, invokedBy) => {
-    await fleetWatchdogIdle.clearWakeHistory(`${projectId}:`);
-    bb.log.warn(`fleet-watchdog history reset: project=${projectId} invokedBy=${invokedBy} at=${Date.now()}`);
-  };
-  bb.background.schedule("fleet-watchdog", "0 * * * *", () => fleetWatchdogCycle());
   bb.background.schedule("thread-archive-sweep", "0 * * * *", async () => {
     let projects;
     try {
@@ -22762,10 +19665,6 @@ ${thread.titleFallback ?? ""}`);
     }
     bb.log.info("thread-archive-sweep healthy cycle");
   });
-  const readOpenLaneViews = async () => {
-    if (!db) return [];
-    return openLaneViews(db, Date.now(), /* @__PURE__ */ new Map());
-  };
   bb.events.on("thread.created", async ({ thread }) => {
     try {
       await sendRoleBrief(bb, db, thread.projectId, thread.id, roleForThread(db, thread.projectId, thread.id), true);
@@ -22773,15 +19672,38 @@ ${thread.titleFallback ?? ""}`);
       bb.log.warn(`role brief seating failed for thread=${thread.id}: ${String(error48)}`);
     }
   });
-  bb.http.route(
-    "GET",
-    "/lanes",
-    async () => new Response(JSON.stringify(await readOpenLaneViews()), {
-      headers: { "content-type": "application/json" }
-    })
-  );
+  bb.background.schedule("wait-validator-liveness", "*/5 * * * *", async () => {
+    try {
+      const stateDir = waitValidatorStateDir();
+      const markerPath = join3(stateDir, LIVENESS_MARKER_FILENAME);
+      const flagPath = join3(stateDir, LIVENESS_ALERT_FLAG_FILENAME);
+      let markerAtMs = null;
+      try {
+        const parsed = Number(readFileSync2(markerPath, "utf8").trim());
+        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync2(markerPath).mtimeMs;
+      } catch {
+      }
+      const configuredStaleMs = Number(process.env.BB_COLLAB_LIVENESS_STALE_MS);
+      const staleMs = Number.isFinite(configuredStaleMs) && configuredStaleMs > 0 ? configuredStaleMs : LIVENESS_STALE_MS;
+      const decision = livenessDecision(livenessState(markerAtMs, Date.now(), staleMs), existsSync2(flagPath));
+      if (decision === "clear-alert-flag") rmSync(flagPath, { force: true });
+      if (decision === "alert-once") {
+        mkdirSync(stateDir, { recursive: true });
+        try {
+          writeFileSync(flagPath, String(Date.now()), { flag: "wx" });
+        } catch {
+          return;
+        }
+        bb.log.error("wait-validator liveness marker is stale: host supervision failed; operator attention required");
+        bb.realtime.publish("wait-validator", { liveness: "stale", alert: "operator-once" });
+      }
+    } catch (error48) {
+      bb.log.warn(`wait-validator liveness check failed: ${String(error48)}`);
+    }
+  });
   const cliDeps = {
-    watcher,
+    waitRegistry,
+    validateWaits,
     registerBoundedWaitForCli: (input, ctxThreadId) => registerBoundedWait({
       registry: boundedRegistry,
       readSource: readThreadObservation,
@@ -22794,16 +19716,10 @@ ${thread.titleFallback ?? ""}`);
       return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) }));
     },
     escalationCycle,
-    stallGuardCycle: (projectId) => stallGuardCycle.cycle(projectId),
-    fleetWatchdogCycle,
-    resetFleetWatchdog,
     archiveSweep: (projectId, apply) => runArchiveSweep(bb, db, projectId, apply),
     readCheckoutDivergence: readDiagnosticDivergence
   };
   bb.rpc.register(rpcContract, {
-    lanes() {
-      return readOpenLaneViews();
-    },
     async registerWait(input) {
       if (!await liveWaker(bb, input.wakerSchedule)) throw new Error(`waker schedule ${input.wakerSchedule} is not live: declaration refused`);
       await waitRegistry.recover();
@@ -22816,7 +19732,7 @@ ${thread.titleFallback ?? ""}`);
         return { ...existing, wakerSchedule: existing.wakerSchedule, declaredAtMs: existing.declaredAtMs };
       }
       const wait = { ...input, declaredAtMs: Date.now() };
-      await watcher.registerWait(wait);
+      await waitRegistry.register(wait);
       return wait;
     },
     async threadStates(input) {
@@ -22908,16 +19824,6 @@ ${thread.titleFallback ?? ""}`);
         name: "wait-validator",
         summary: "Run one durable wait-validator cycle (host-supervised seam)",
         usage: "bb collab wait-validator --cycle"
-      },
-      {
-        name: "stall-guard",
-        summary: "Run one succession-safe stall-guard cycle (host-supervised seam)",
-        usage: "bb collab stall-guard --cycle --project PROJECT_ID"
-      },
-      {
-        name: "fleet-watchdog",
-        summary: "Run one wait-aware fleet-watchdog cycle",
-        usage: "bb collab fleet-watchdog --cycle --project PROJECT_ID"
       },
       {
         name: "archive-sweep",

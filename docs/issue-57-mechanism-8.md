@@ -1,4 +1,6 @@
 # Issue #57 mechanism 8: registered waits
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 The plugin-side lane watcher treats a wait as legal idle state only when the
 wait registry contains a declarative record with a waiter thread, source

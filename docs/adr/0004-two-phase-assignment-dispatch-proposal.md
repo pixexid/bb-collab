@@ -1,4 +1,6 @@
 # ADR 0004: two-phase assignment dispatch and reconcile (adopted direction)
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 - Status: adopted direction — Option A adopted; Option B declined
 - Date: 2026-08-16

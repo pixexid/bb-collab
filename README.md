@@ -1,4 +1,6 @@
 # bb-collab
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 BB-native project governance, work lifecycle, and collaboration runtime.
 
@@ -17,8 +19,9 @@ The repository now contains the implemented foundation through contract v20/sche
 single SQLite store with migrations, resolver, state-event and
 mutation-receipt, deterministic export, and read-only doctor seams, plus
 WorkItem/ExternalWorkRef, role qualification/RoleGeneration,
-Assignment/ExecutionAttempt, and typed Decision/EvidenceArtifact/DecisionEvidence
-foundations. The four logical roles are director, project-orchestrator, worker,
+role-holder ExecutionAttempt evidence, and typed Decision/EvidenceArtifact/DecisionEvidence
+foundations. Assignment dispatch and lane awareness were removed; the empty
+assignments table remains only as a tracked schema vestige. The four logical roles are director, project-orchestrator, worker,
 and independent-reviewer. Only `director-seat` carries one named receipt-gated
 standby profile with no authority or traffic; its provider must differ from the
 director holder. Production RPC/CLI apply require an exact one-request interim
@@ -54,9 +57,8 @@ foreign facts refuse before write. A ready native managed worktree may have a
 derived path distinct from its canonical source; exact project/host/source
 resolution retains both paths and still refuses unmanaged or ephemeral contexts,
 except for the exact director generation-1 qualification-and-creation exemption below.
-`github_issue_projection`, `assignment_dispatch`, and `assignment_reconcile`
-reserve/finalize operations refuse before the adapter under this one-request
-seam. The derived actor path is limited to bootstrap, `config_revision` for
+`github_issue_projection` remains the supported projection path under this
+one-request seam. The derived actor path is limited to bootstrap, `config_revision` for
 that full project-configuration/target replacement, operator_only Decision
 create/adopted disposition, work_item_create, work_item_transition,
 qualification_observation_record, role_generation_succession, migration_prepare,
@@ -202,9 +204,8 @@ The first release is complete only when it can provide:
    eligibility evidence needed for the director, project-orchestrator, worker
    and independent-reviewer roles; only director generation 1 may use the
    exact receipt-gated unmanaged qualification-and-creation exception.
-7. One sanctioned native BB assignment path with separate Assignment and
-   ExecutionAttempt records, exact executed-profile receipts, isolated
-   environments and terminal reports.
+7. Role-holder execution evidence with exact executed-profile receipts and
+   isolated environments.
 8. Decisions, dispositions, evidence artifacts and operator holds, with
    consults explicitly advisory.
 9. Tiered review, release and environment-safety gates with Tier-A exact-head
@@ -253,13 +254,13 @@ conformance, governorship and resolver seams exist.
 Founding work proceeds in this order: contract and source evidence; plugin
 storage/export; project configuration and repository targets; conformance
 doctor/apply; project governorship and resolver; WorkItem and GitHub
-projection; role generations and qualification; assignment and execution;
+projection; role generations and qualification; execution evidence;
 decision/disposition/evidence; review, release and environment safety;
 migration/cutover; adversarial fixtures; one quiet first-adopter lane.
 
 ## Adoption target
 
-A standard one- or two-repository project must reach one routine closed lane in
+A standard one- or two-repository project must reach one routine closed work item in
 at most four operator hours, without shared code edits, manual database edits,
 manual label loops, watcher processes or one-off spawn exceptions. Doctor,
 explicit apply and post-apply doctor must converge idempotently, and wrong

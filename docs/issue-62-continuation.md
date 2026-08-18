@@ -1,4 +1,6 @@
 # Issue 62 continuation mechanism
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 `lane-watcher` uses the native `bb.sdk.threads.send` steer surface with the
 text input marked `visibility: "agent-only"`. The host still owns the normal

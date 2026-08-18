@@ -49,7 +49,6 @@ function hostile(id: string, projectId: string, overrides: Record<string, unknow
 
 function rpcHandlers(states: Record<string, unknown>, models: Record<string, unknown>) {
   return {
-    lanes: async () => [],
     threadStates: async () => states,
     threadModels: async () => models,
     sidebarCollapseState: async () => ({ projects: {}, threads: {} }),

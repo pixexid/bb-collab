@@ -1,4 +1,6 @@
 # Issue #57 mechanism 1: turn-terminal discipline
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 The lane watcher treats an open assignment lane as anomalous when its worker
 is idle without a canonical terminal receipt and without a pending SDK

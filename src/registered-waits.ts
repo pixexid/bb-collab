@@ -1,7 +1,7 @@
 // Durable wait-validator layer (#93) on top of the #57 mechanism-8
 // registered-wait substrate (PR #95, src/awareness.ts). The wait store is
-// exactly one: the lane watcher's KV registry (`lane-watcher.registered-
-// waits`), written by the waiter through the sanctioned seams. This module
+// exactly one: the registered-waits KV registry, written through the
+// sanctioned seams. This module
 // adds the operator-approved #93 requirements around that store — mandatory
 // bounded deadlines with a default and override discipline, fail-closed
 // source-liveness validation at registration, a bounded escalation ladder

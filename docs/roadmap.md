@@ -1,4 +1,6 @@
 # bb-collab roadmap
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 The roadmap is dependency-ordered. Each step has an observable exit
 condition; a later step must not smuggle authority into an earlier one.

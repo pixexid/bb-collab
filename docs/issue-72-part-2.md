@@ -1,4 +1,6 @@
 # Issue #72 Part 2: wrongful-idle detector
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 The existing `lane-watcher` observes the current active `project-orchestrator`
 RoleGeneration and the existing `openLaneViews` queue. It reports a wrongful

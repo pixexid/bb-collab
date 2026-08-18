@@ -9,12 +9,6 @@ import {
   type GitHubIssueAdapter,
   type GitHubIssueMutation,
   type GitHubIssueSnapshot,
-  type NativeAssignmentAdapter,
-  type NativeAssignmentEvidence,
-  type NativeAssignmentInput,
-  type NativeAssignmentInspection,
-  type ReviewFactReader,
-  type ReviewFacts,
   type RoleEnvironmentFact,
   type RoleEventFact,
   type RoleFactReader,
@@ -79,13 +73,13 @@ export function seedFixtureDecision(
     configRevision?: number;
     repoTargetId?: string | null;
     scope?: unknown;
-    decisionClass?: "assignment_admission" | "role_succession" | "review_adjudication" | "legacy_adoption" | "operator_only";
+    decisionClass?: "role_succession" | "legacy_adoption" | "operator_only";
     options?: Record<string, unknown>;
     resourceRevision?: number;
   },
 ): void {
   const scopeJson = canonicalJson(input.scope ?? { fixture: true });
-  const decisionClass = input.decisionClass ?? "assignment_admission";
+  const decisionClass = input.decisionClass ?? "role_succession";
   const optionsJson = canonicalJson(input.options ?? {});
   const identityDigest = sha256(canonicalJson({
     projectId: input.projectId,
@@ -242,112 +236,11 @@ export class DeterministicRoleFactReader implements RoleFactReader {
   }
 }
 
-export class DeterministicNativeAssignmentAdapter implements NativeAssignmentAdapter {
-  readonly inspectCalls: Array<{ projectId: string; repoTargetId: string; assignment: ApplyRequest["assignment"] }> = [];
-  readonly dispatchCalls: NativeAssignmentInput[] = [];
-  readonly reconcileCalls: Array<NativeAssignmentInput & { threadId: string | null; nativeRequestId: string | null }> = [];
-  nextEvidence: Partial<NativeAssignmentEvidence> | null = null;
-  nextInspection: Partial<NativeAssignmentInspection> | null = null;
-  onInspect: ((input: { projectId: string; repoTargetId: string; assignment: NonNullable<ApplyRequest["assignment"]> }) => void) | null = null;
-  onDispatch: ((input: NativeAssignmentInput) => void) | null = null;
-
-  inspect(input: { projectId: string; repoTargetId: string; assignment: NonNullable<ApplyRequest["assignment"]> }): NativeAssignmentInspection {
-    this.inspectCalls.push(structuredClone(input));
-    this.onInspect?.(input);
-    const override = this.nextInspection;
-    this.nextInspection = null;
-    return {
-      bbServerId: input.assignment.environment.bbServerId,
-      projectId: input.projectId,
-      environmentId: input.assignment.environment.environmentId,
-      sourceId: input.assignment.environment.sourceId,
-      hostId: input.assignment.environment.hostId,
-      environmentPath: input.assignment.environment.path,
-      environmentMode: input.assignment.environment.mode,
-      environmentStatus: "ready",
-      workingTreeState: "clean",
-      branchName: input.assignment.branchName,
-      headSha: input.assignment.candidateSha ?? input.assignment.baseSha,
-      baseSha: input.assignment.baseSha,
-      candidateSha: input.assignment.candidateSha,
-      defaultBranchName: "main",
-      defaultBranchHeadSha: input.assignment.baseSha,
-      mergeBaseSha: input.assignment.baseSha,
-      threadId: input.assignment.attachThreadId,
-      threadProviderId: input.assignment.attachThreadId ? input.assignment.requestedProfile.providerId : null,
-      threadVisibility: input.assignment.attachThreadId ? input.assignment.requestedProfile.visibility : null,
-      ...override,
-    };
-  }
-
-  private evidence(input: NativeAssignmentInput): NativeAssignmentEvidence {
-    const override = this.nextEvidence;
-    this.nextEvidence = null;
-    return {
-      disposition: "confirmed",
-      reasonCode: "exact_content_receipt",
-      assignmentId: input.assignmentId,
-      executionAttemptId: input.executionAttemptId,
-      bbServerId: input.environment.bbServerId,
-      projectId: input.projectId,
-      environmentId: input.environment.environmentId,
-      sourceId: input.environment.sourceId,
-      hostId: input.environment.hostId,
-      environmentPath: input.environment.path,
-      threadId: input.attachThreadId ?? `thread-${input.assignmentId}`,
-      providerThreadId: `provider-${input.executionAttemptId}`,
-      nativeRequestId: `request-${input.executionAttemptId}`,
-      requestEventId: `request-event-${input.executionAttemptId}`,
-      requestEventSeq: 1,
-      acceptedEventId: `accepted-event-${input.executionAttemptId}`,
-      acceptedEventSeq: 2,
-      firstActionEventId: `first-action-${input.executionAttemptId}`,
-      firstActionEventSeq: 3,
-      contentEventId: `content-event-${input.executionAttemptId}`,
-      contentEventSeq: 4,
-      contentDigest: input.frozenBriefDigest,
-      actualProfile: structuredClone(input.requestedProfile),
-      branchName: input.branchName,
-      baseSha: input.baseSha,
-      candidateSha: input.candidateSha,
-      lastEventSeq: 4,
-      observedAtMs: Date.now(),
-      ...override,
-    };
-  }
-
-  dispatch(input: NativeAssignmentInput): NativeAssignmentEvidence {
-    this.dispatchCalls.push(structuredClone(input));
-    this.onDispatch?.(input);
-    return this.evidence(input);
-  }
-
-  reconcile(input: NativeAssignmentInput & { threadId: string | null; nativeRequestId: string | null }): NativeAssignmentEvidence {
-    this.reconcileCalls.push(structuredClone(input));
-    return this.evidence(input);
-  }
-}
-
-export class DeterministicReviewFactReader implements ReviewFactReader {
-  readonly readCalls: Parameters<ReviewFactReader["read"]>[0][] = [];
-  facts: ReviewFacts | null = null;
-  onRead: ((input: Parameters<ReviewFactReader["read"]>[0]) => void) | null = null;
-
-  read(input: Parameters<ReviewFactReader["read"]>[0]): ReviewFacts {
-    this.readCalls.push(structuredClone(input));
-    this.onRead?.(input);
-    if (!this.facts) throw new Error("review facts unavailable");
-    return structuredClone(this.facts);
-  }
-}
-
 export function applyWithFixtureReceipt(
   db: Database.Database,
   request: ApplyRequest,
   githubAdapter: GitHubIssueAdapter | null = null,
   roleFactReader: RoleFactReader | null = null,
-  nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
-  reviewFactReader: ReviewFactReader | null = null,
 ): FoundationResult {
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader);
 }

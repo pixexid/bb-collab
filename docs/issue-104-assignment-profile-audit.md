@@ -1,4 +1,6 @@
 # GH-104: Assignment profile audit
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 The existing canonical resolver is the recording seam. `assignment_prepare`
 stores the immutable requested profile on `Assignment`; `assignment_dispatch`

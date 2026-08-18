@@ -1,4 +1,6 @@
 # Import manifest and surviving issue ledger
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 This manifest records what is carried from the llm-collab evidence into
 bb-collab. It preserves invariants and evidence, not legacy implementation,

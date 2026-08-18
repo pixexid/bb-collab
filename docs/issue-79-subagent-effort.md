@@ -1,4 +1,6 @@
 # Issue #79: subagent effort audit and default
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 ## Audit
 

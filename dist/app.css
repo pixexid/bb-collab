@@ -7,16 +7,11 @@
     --font-serif: var(--font-serif);
     --font-mono: var(--font-mono);
     --spacing: 0.25rem;
-    --container-4xl: 56rem;
     --text-xs: 0.75rem;
     --text-xs--line-height: calc(1 / 0.75);
     --text-sm: 0.8125rem;
     --text-sm--line-height: calc(1.25 / 0.875);
-    --text-lg: 1.125rem;
-    --text-lg--line-height: calc(1.75 / 1.125);
     --font-weight-normal: 400;
-    --font-weight-medium: 500;
-    --font-weight-semibold: 600;
     --shadow-2xs: var(--shadow-2xs);
     --shadow-xs: var(--shadow-xs);
     --shadow-sm: var(--shadow-sm);
@@ -171,17 +166,11 @@
         max-width: 96rem;
       }
     }
-    .mx-auto {
-      margin-inline: auto;
-    }
     .my-1 {
       margin-block: calc(var(--spacing) * 1);
     }
     .mt-0\.5 {
       margin-top: calc(var(--spacing) * 0.5);
-    }
-    .mb-5 {
-      margin-bottom: calc(var(--spacing) * 5);
     }
     .ml-auto {
       margin-left: auto;
@@ -245,9 +234,6 @@
     .w-full {
       width: 100%;
     }
-    .max-w-4xl {
-      max-width: var(--container-4xl);
-    }
     .max-w-\[45\%\] {
       max-width: 45%;
     }
@@ -272,17 +258,14 @@
     .animate-spin {
       animation: var(--animate-spin);
     }
-    .grid-cols-\[minmax\(0\,1fr\)_auto_auto\] {
-      grid-template-columns: minmax(0,1fr) auto auto;
+    .resize {
+      resize: both;
     }
     .flex-col {
       flex-direction: column;
     }
     .items-center {
       align-items: center;
-    }
-    .justify-between {
-      justify-content: space-between;
     }
     .justify-center {
       justify-content: center;
@@ -296,9 +279,6 @@
     .gap-1\.5 {
       gap: calc(var(--spacing) * 1.5);
     }
-    .gap-4 {
-      gap: calc(var(--spacing) * 4);
-    }
     .space-y-3 {
       :where(& > :not(:last-child)) {
         --tw-space-y-reverse: 0;
@@ -311,20 +291,6 @@
         --tw-space-y-reverse: 0;
         margin-block-start: calc(1px * var(--tw-space-y-reverse));
         margin-block-end: calc(1px * calc(1 - var(--tw-space-y-reverse)));
-      }
-    }
-    .divide-y {
-      :where(& > :not(:last-child)) {
-        --tw-divide-y-reverse: 0;
-        border-bottom-style: var(--tw-border-style);
-        border-top-style: var(--tw-border-style);
-        border-top-width: calc(1px * var(--tw-divide-y-reverse));
-        border-bottom-width: calc(1px * calc(1 - var(--tw-divide-y-reverse)));
-      }
-    }
-    .divide-border {
-      :where(& > :not(:last-child)) {
-        border-color: var(--border);
       }
     }
     .truncate {
@@ -347,10 +313,6 @@
     .border {
       border-style: var(--tw-border-style);
       border-width: 1px;
-    }
-    .border-y {
-      border-block-style: var(--tw-border-style);
-      border-block-width: 1px;
     }
     .border-t {
       border-top-style: var(--tw-border-style);
@@ -383,17 +345,11 @@
     .p-3 {
       padding: calc(var(--spacing) * 3);
     }
-    .p-5 {
-      padding: calc(var(--spacing) * 5);
-    }
     .px-1 {
       padding-inline: calc(var(--spacing) * 1);
     }
     .px-2 {
       padding-inline: calc(var(--spacing) * 2);
-    }
-    .py-3 {
-      padding-block: calc(var(--spacing) * 3);
     }
     .pr-1 {
       padding-right: calc(var(--spacing) * 1);
@@ -403,10 +359,6 @@
     }
     .text-left {
       text-align: left;
-    }
-    .text-lg {
-      font-size: var(--text-lg);
-      line-height: var(--tw-leading, var(--text-lg--line-height));
     }
     .text-sm {
       font-size: var(--text-sm);
@@ -430,17 +382,9 @@
       --tw-leading: 1;
       line-height: 1;
     }
-    .font-medium {
-      --tw-font-weight: var(--font-weight-medium);
-      font-weight: var(--font-weight-medium);
-    }
     .font-normal {
       --tw-font-weight: var(--font-weight-normal);
       font-weight: var(--font-weight-normal);
-    }
-    .font-semibold {
-      --tw-font-weight: var(--font-weight-semibold);
-      font-weight: var(--font-weight-semibold);
     }
     .text-\[\#6D5DFB\] {
       color: #6D5DFB;
@@ -617,11 +561,6 @@
   inherits: false;
   initial-value: 0;
 }
-@property --tw-divide-y-reverse {
-  syntax: "*";
-  inherits: false;
-  initial-value: 0;
-}
 @property --tw-border-style {
   syntax: "*";
   inherits: false;
@@ -783,7 +722,6 @@
       --tw-exit-translate-x: 0;
       --tw-exit-translate-y: 0;
       --tw-space-y-reverse: 0;
-      --tw-divide-y-reverse: 0;
       --tw-border-style: solid;
       --tw-leading: initial;
       --tw-font-weight: initial;

@@ -1,4 +1,6 @@
 # bb-collab threat model
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 This document defines the threats the founding contract must fail closed
 against and the boundary it cannot honestly enforce. The full schema and

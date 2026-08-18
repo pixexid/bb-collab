@@ -1,4 +1,6 @@
 # Issue #76: tiered review policy
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 Status: adopted process policy on top of the existing review and Assignment
 evidence seams. This is the fresh replacement for the blocked dependency lane.

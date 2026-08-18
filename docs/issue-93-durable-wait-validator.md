@@ -1,4 +1,6 @@
 # Issue #93 / #57 mechanism 8: durable registered-wait validator
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 Status: implemented on top of the merged mechanism-8 substrate; host
 LaunchAgent **not installed** (operator act after review/CI/release gates).

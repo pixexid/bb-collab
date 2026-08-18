@@ -1,4 +1,6 @@
 # bb-collab / llm-collab migration ledger
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 Audit date: 2026-08-13 (America/Los_Angeles). This is a read-only disposition
 report. No GitHub issue, task, repository document, branch, PR, or project state

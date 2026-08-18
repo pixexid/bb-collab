@@ -1,4 +1,6 @@
 # Issue #63 operator console
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 The `Lanes` `navPanel` is the universal approval surface, including connected
 phone web clients. Its `Awaiting operator` section reads only live BB plugin

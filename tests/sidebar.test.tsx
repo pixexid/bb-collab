@@ -69,7 +69,6 @@ type ThreadExecution = { model: string; reasoning: string };
 
 function rpcHandlers(states: Record<string, string> = {}, models: Record<string, ThreadExecution | null> = {}) {
   return {
-    lanes: async () => [],
     threadStates: async () => states,
     threadModels: async () => models,
     sidebarCollapseState: async () => ({ projects: {}, threads: {} }),
@@ -90,11 +89,6 @@ describe("replacement thread list", () => {
     expect(appSource).toMatch(/import\s+type\s+\{\s*rpcContract\s*\}\s+from\s+["']\.\/server["']/);
     expect(appSource).not.toMatch(/import\s+\{[^}]*rpcContract[^}]*\}\s+from\s+["']\.\/server["']/);
     await loadedApp();
-  });
-
-  it("keeps the Lane 1 content-script fallback registered", async () => {
-    const app = await loadedApp();
-    expect(app.contentScripts.map((script) => script.id)).toContain("lane-thread-status");
   });
 
   it("groups by stable project id and limits each project to five recent threads", async () => {

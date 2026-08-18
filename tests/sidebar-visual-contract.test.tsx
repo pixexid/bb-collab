@@ -47,7 +47,6 @@ const PROJECT: PluginSidebarProject = { id: "project-a", name: "Project A", isPe
 
 function rpcHandlers() {
   return {
-    lanes: async () => [],
     threadStates: async () => ({}),
     threadModels: async () => ({}),
     sidebarCollapseState: async () => ({ projects: {}, threads: {} }),

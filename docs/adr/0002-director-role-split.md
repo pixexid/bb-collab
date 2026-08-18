@@ -1,4 +1,6 @@
 # ADR 0002: Contract v17 — director/orchestrator role split
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 Status: accepted. Implements stated operator direction of 2026-08-16. The
 director and project-orchestrator are separate roles with independent

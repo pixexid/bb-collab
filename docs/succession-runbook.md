@@ -1,4 +1,6 @@
 # Role succession runbook
+> Status: The assignment subsystem and lane watcher contract were removed. The assignments table remains as a schema vestige pending consumer enumeration in #192; execution_attempts remains unchanged.
+
 
 This is the operational runbook for the director/project-orchestrator seat.
 Canonical authority remains the receipt-gated `role_generation_succession`
