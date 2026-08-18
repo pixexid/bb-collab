@@ -22,7 +22,7 @@ import {
   MAX_EXPORT_BYTES,
   MAX_SOURCE_EVIDENCE_MANIFEST_BYTES,
   MIGRATIONS,
-  MAX_ROLE_CONTEXT_EVENTS,
+  ROLE_CONTEXT_EVENT_PAGE_SIZE,
   MIGRATION_STATES,
   MIGRATION_STEPS,
   PLUGIN_ID,
@@ -5767,7 +5767,7 @@ describe("bb-collab plugin boundary", () => {
       `thread:${ROLE_THREAD_ID}`,
       `event:${ROLE_THREAD_ID}:${ROLE_REQUEST_EVENT_ID}:150000`,
       `event:${ROLE_THREAD_ID}:${ROLE_COMPLETION_EVENT_ID}:165000`,
-      `eventsAfter:${ROLE_THREAD_ID}:150000:${MAX_ROLE_CONTEXT_EVENTS + 1}`,
+      `eventsAfter:${ROLE_THREAD_ID}:150000:${ROLE_CONTEXT_EVENT_PAGE_SIZE}`,
       `environment:${ROLE_ENVIRONMENT_ID}`,
       `project:${PROJECT_ID}`,
       "host:host-main",
@@ -5790,7 +5790,7 @@ describe("bb-collab plugin boundary", () => {
         { ...request!, seq: roleContext.requestEventSeq },
         { ...accepted!, seq: 100 },
         { ...started!, seq: 1_000 },
-        ...Array.from({ length: MAX_ROLE_CONTEXT_EVENTS - 2 }, (_, index) => ({
+        ...Array.from({ length: ROLE_CONTEXT_EVENT_PAGE_SIZE - 2 }, (_, index) => ({
           id: `busy-delta-${index + 1}`,
           seq: 2_000 + index * 300,
           type: "agent/delta",
@@ -5806,23 +5806,119 @@ describe("bb-collab plugin boundary", () => {
     }), null, facts)).toMatchObject({ outcome: "OK", attempted: 1, verified: 1 });
   });
 
-  it("refuses mismatched or unsupported bounded role-event ordering evidence without mutation", async () => {
+  it("resolves a cited turn whose correlation spans multiple reader pages", async () => {
     const { db, fenceToken } = seedAndBootstrap(await loadedHost(), PROJECT_ID, { config: roleConfig() });
-    const oversized = roleReader((facts) => {
-      const [request, accepted, started, completion] = facts.events;
-      facts.events = [
+    const facts = roleReader((input) => {
+      const [request, accepted, started, completion] = input.events;
+      input.events = [
         request!,
         accepted!,
         started!,
-        ...Array.from({ length: MAX_ROLE_CONTEXT_EVENTS - 1 }, (_, index) => ({
-          id: `oversized-${index + 1}`,
-          seq: 4 + index,
-          type: "agent/delta",
-          data: {},
-        })),
-        { ...completion!, seq: 10_000 },
+        ...Array.from({ length: 298 }, (_, index) => ({ id: `paged-${index + 1}`, seq: index + 4, type: "agent/delta", data: {} })),
+        { ...completion!, seq: 302 },
       ];
     });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "paged-role-correlation",
+      qualificationId: "paged-role-correlation",
+      roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 302 },
+    }), null, facts)).toMatchObject({ outcome: "OK", attempted: 1, verified: 1 });
+  });
+
+  it("pages the sanctioned SDK correlation read until the exact cited completion", async () => {
+    const host = await loadedHost(PROJECT_ID, (input) => {
+      const [request, accepted, started, completion] = input.events;
+      input.events = [
+        request!,
+        accepted!,
+        started!,
+        ...Array.from({ length: 298 }, (_, index) => ({ id: `sdk-page-${index + 1}`, seq: index + 4, type: "agent/delta", data: {} })),
+        { ...completion!, seq: 302 },
+      ];
+    });
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    expect(await host.harness.callRpc("apply", qualificationRequest(fenceToken, {
+      idempotencyKey: "paged-sdk-role-correlation",
+      qualificationId: "paged-sdk-role-correlation",
+      roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 302 },
+    }))).toMatchObject({ outcome: "OK", attempted: 1, verified: 1 });
+    expect(host.harness.inspection.sdk.callsTo("threads.events.list")
+      .map(([input]) => input)
+      .filter((input) => (input as { limit?: string }).limit === "256")).toEqual([
+      { threadId: ROLE_THREAD_ID, afterSeq: "1", limit: "256" },
+      { threadId: ROLE_THREAD_ID, afterSeq: "257", limit: "256" },
+    ]);
+  });
+
+  it("resolves the cited completion immediately after an exact full page", async () => {
+    const { db, fenceToken } = seedAndBootstrap(await loadedHost(), PROJECT_ID, { config: roleConfig() });
+    const facts = roleReader((input) => {
+      const [request, accepted, started, completion] = input.events;
+      input.events = [
+        request!,
+        accepted!,
+        started!,
+        ...Array.from({ length: 254 }, (_, index) => ({ id: `boundary-${index + 1}`, seq: index + 4, type: "agent/delta", data: {} })),
+        { ...completion!, seq: 258 },
+      ];
+    });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "page-boundary-role-correlation",
+      qualificationId: "page-boundary-role-correlation",
+      roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 258 },
+    }), null, facts)).toMatchObject({ outcome: "OK", attempted: 1, verified: 1 });
+    expect(facts.readCalls.filter((call) => call.startsWith("eventsAfter:"))).toEqual([
+      `eventsAfter:${ROLE_THREAD_ID}:1:256`,
+      `eventsAfter:${ROLE_THREAD_ID}:257:256`,
+    ]);
+  });
+
+  it("refuses a paged correlation whose exact cited completion never appears", async () => {
+    const { db, fenceToken } = seedAndBootstrap(await loadedHost(), PROJECT_ID, { config: roleConfig() });
+    const facts = roleReader();
+    const eventsAfter = facts.eventsAfter.bind(facts);
+    facts.eventsAfter = (threadId, afterSeq, limit) => eventsAfter(threadId, afterSeq, limit)
+      .filter((event) => event.id !== ROLE_COMPLETION_EVENT_ID);
+    const before = exportFoundation(db, PROJECT_ID);
+    const result = applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "paged-completion-missing",
+      qualificationId: "paged-completion-missing",
+    }), null, facts);
+    expect(result).toMatchObject({ outcome: "EXECUTION_COMPLETION_AMBIGUOUS", attempted: 0, verified: 0 });
+    expect(result.message).toBe("reader-returned correlation is not terminated by the exact cited completion");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("refuses an atomic paged read instead of accepting a self-consistent partial window", async () => {
+    const { db, fenceToken } = seedAndBootstrap(await loadedHost(), PROJECT_ID, { config: roleConfig() });
+    const facts = roleReader((input) => {
+      const [request, accepted, started, completion] = input.events;
+      input.events = [
+        request!,
+        accepted!,
+        started!,
+        { id: "partial-completion", seq: 4, type: "turn/completed", data: { providerThreadId: "provider-thread-1", status: "completed" } },
+        ...Array.from({ length: 253 }, (_, index) => ({ id: `partial-${index + 1}`, seq: index + 5, type: "agent/delta", data: {} })),
+        { ...completion!, seq: 300 },
+      ];
+    });
+    const eventsAfter = facts.eventsAfter.bind(facts);
+    facts.eventsAfter = (threadId, afterSeq, limit) => afterSeq === 1
+      ? eventsAfter(threadId, afterSeq, limit).filter((event) => event.id !== ROLE_COMPLETION_EVENT_ID).slice(0, 256)
+      : [];
+    const before = exportFoundation(db, PROJECT_ID);
+    const result = applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "partial-window-refusal",
+      qualificationId: "partial-window-refusal",
+      roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 300 },
+    }), null, facts);
+    expect(result).toMatchObject({ outcome: "EXECUTION_COMPLETION_AMBIGUOUS", attempted: 0, verified: 0 });
+    expect(result.message).toBe("reader-returned correlation is not terminated by the exact cited completion");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("refuses mismatched or unsupported paged role-event ordering evidence without mutation", async () => {
+    const { db, fenceToken } = seedAndBootstrap(await loadedHost(), PROJECT_ID, { config: roleConfig() });
     const incomplete = roleReader();
     const completeEventsAfter = incomplete.eventsAfter.bind(incomplete);
     incomplete.eventsAfter = (threadId, afterSeq, limit) => completeEventsAfter(threadId, afterSeq, limit)
@@ -5830,7 +5926,6 @@ describe("bb-collab plugin boundary", () => {
     const cases: Array<[string, ReturnType<typeof roleReader>, Partial<ApplyRequest>, string, string?]> = [
       ["mismatched-sequence", roleReader(), { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 2, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 4 } }, "ROLE_CONTEXT_UNKNOWN"],
       ["inverted-sequences", roleReader((facts) => { facts.events[3]!.seq = 1; }), { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 1 } }, "EXECUTION_COMPLETION_AMBIGUOUS", "completion event sequence does not follow the request event sequence"],
-      ["oversized-returned-prefix", oversized, { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 10_000 } }, "EXECUTION_COMPLETION_AMBIGUOUS", "cited turn exceeds 256 actual reader-returned correlation events"],
       ["locally-unordered-prefix", roleReader((facts) => { [facts.events[1], facts.events[2]] = [facts.events[2]!, facts.events[1]!]; }), {}, "EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned correlation events are not strictly ordered after the cited request"],
       ["completion-missing-from-returned-prefix", incomplete, {}, "EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned correlation is not terminated by the exact cited completion"],
     ];
@@ -5927,7 +6022,7 @@ describe("bb-collab plugin boundary", () => {
         `thread:${ROLE_THREAD_ID}`,
         `event:${ROLE_THREAD_ID}:${ROLE_REQUEST_EVENT_ID}:1`,
         `event:${ROLE_THREAD_ID}:${ROLE_COMPLETION_EVENT_ID}:4`,
-        `eventsAfter:${ROLE_THREAD_ID}:1:${MAX_ROLE_CONTEXT_EVENTS + 1}`,
+        `eventsAfter:${ROLE_THREAD_ID}:1:${ROLE_CONTEXT_EVENT_PAGE_SIZE}`,
         `environment:${ROLE_ENVIRONMENT_ID}`,
         `project:${PROJECT_ID}`,
         "host:host-main",

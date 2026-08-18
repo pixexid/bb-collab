@@ -40,8 +40,7 @@ export const EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION =
   "no canonical state existed to migrate; historical archive preserved as evidence, read-only" as const;
 // ponytail: page database reads at 256 rows; spill responses over 512 KiB to atomic files.
 export const MAX_EXPORT_ROWS = 256;
-// Bound only actual correlation events returned after the cited request.
-export const MAX_ROLE_CONTEXT_EVENTS = 256;
+export const ROLE_CONTEXT_EVENT_PAGE_SIZE = 256;
 export const MAX_EXPORT_BYTES = 512 * 1024;
 export const MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 8);
 /** Deferred until a later cutover operation; issue #3 has no sanctioned freeze transition. */
@@ -1775,7 +1774,20 @@ export function resolveRoleContext(reader: RoleFactReader | null, request: Apply
     if (roleContext.completionEventSeq <= roleContext.requestEventSeq) {
       throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion event sequence does not follow the request event sequence");
     }
-    correlationEvents = reader.eventsAfter(roleContext.threadId, roleContext.requestEventSeq, MAX_ROLE_CONTEXT_EVENTS + 1);
+    correlationEvents = [];
+    let afterSeq = roleContext.requestEventSeq;
+    while (true) {
+      const page = reader.eventsAfter(roleContext.threadId, afterSeq, ROLE_CONTEXT_EVENT_PAGE_SIZE);
+      correlationEvents.push(...page);
+      if (
+        page.some((event) => event.id === roleContext.completionEventId && event.seq === roleContext.completionEventSeq) ||
+        page.some((event) => event.seq >= roleContext.completionEventSeq) ||
+        page.length < ROLE_CONTEXT_EVENT_PAGE_SIZE
+      ) break;
+      const nextAfterSeq = page.at(-1)!.seq;
+      if (nextAfterSeq <= afterSeq) break;
+      afterSeq = nextAfterSeq;
+    }
     if (!thread.environmentId) throw refusal("ROLE_CONTEXT_REQUIRED", "holder thread has no environment");
     environment = reader.environment(thread.environmentId);
     project = reader.project(request.projectId);
@@ -1826,10 +1838,6 @@ export function resolveRoleContext(reader: RoleFactReader | null, request: Apply
     (event) => event.id === roleContext.completionEventId && event.seq === roleContext.completionEventSeq,
   );
   if (completionIndex < 0) {
-    const passedCompletion = correlationEvents.some((event) => event.seq >= roleContext.completionEventSeq);
-    if (!passedCompletion && correlationEvents.length > MAX_ROLE_CONTEXT_EVENTS) {
-      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "cited turn exceeds 256 actual reader-returned correlation events");
-    }
     throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned correlation is not terminated by the exact cited completion");
   }
   const linkedEvents = correlationEvents.slice(0, completionIndex + 1);
@@ -1840,9 +1848,6 @@ export function resolveRoleContext(reader: RoleFactReader | null, request: Apply
     }
   }
   const linkedCorrelationEvents = correlationEvents.slice(0, completionIndex);
-  if (linkedCorrelationEvents.length > MAX_ROLE_CONTEXT_EVENTS) {
-    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "cited turn exceeds 256 actual reader-returned correlation events");
-  }
   if (correlationEvents[completionIndex]!.id !== completion.id || correlationEvents[completionIndex]!.seq !== completion.seq) {
     throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned completion does not match the exact cited completion");
   }

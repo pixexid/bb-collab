@@ -14407,7 +14407,7 @@ var LLM_COLLAB_MERGED_MAIN_SHA = "0686d34";
 var LLM_COLLAB_EVIDENCE_RESOURCE_REVISION = 4;
 var EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION = "no canonical state existed to migrate; historical archive preserved as evidence, read-only";
 var MAX_EXPORT_ROWS = 256;
-var MAX_ROLE_CONTEXT_EVENTS = 256;
+var ROLE_CONTEXT_EVENT_PAGE_SIZE = 256;
 var MAX_EXPORT_BYTES = 512 * 1024;
 var MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 8);
 var TABLES = [
@@ -15757,7 +15757,16 @@ function resolveRoleContext(reader, request) {
     if (roleContext.completionEventSeq <= roleContext.requestEventSeq) {
       throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion event sequence does not follow the request event sequence");
     }
-    correlationEvents = reader.eventsAfter(roleContext.threadId, roleContext.requestEventSeq, MAX_ROLE_CONTEXT_EVENTS + 1);
+    correlationEvents = [];
+    let afterSeq = roleContext.requestEventSeq;
+    while (true) {
+      const page = reader.eventsAfter(roleContext.threadId, afterSeq, ROLE_CONTEXT_EVENT_PAGE_SIZE);
+      correlationEvents.push(...page);
+      if (page.some((event) => event.id === roleContext.completionEventId && event.seq === roleContext.completionEventSeq) || page.some((event) => event.seq >= roleContext.completionEventSeq) || page.length < ROLE_CONTEXT_EVENT_PAGE_SIZE) break;
+      const nextAfterSeq = page.at(-1).seq;
+      if (nextAfterSeq <= afterSeq) break;
+      afterSeq = nextAfterSeq;
+    }
     if (!thread.environmentId) throw refusal("ROLE_CONTEXT_REQUIRED", "holder thread has no environment");
     environment = reader.environment(thread.environmentId);
     project = reader.project(request.projectId);
@@ -15801,10 +15810,6 @@ ${thread.titleFallback ?? ""}`)) {
     (event) => event.id === roleContext.completionEventId && event.seq === roleContext.completionEventSeq
   );
   if (completionIndex < 0) {
-    const passedCompletion = correlationEvents.some((event) => event.seq >= roleContext.completionEventSeq);
-    if (!passedCompletion && correlationEvents.length > MAX_ROLE_CONTEXT_EVENTS) {
-      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "cited turn exceeds 256 actual reader-returned correlation events");
-    }
     throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned correlation is not terminated by the exact cited completion");
   }
   const linkedEvents = correlationEvents.slice(0, completionIndex + 1);
@@ -15815,9 +15820,6 @@ ${thread.titleFallback ?? ""}`)) {
     }
   }
   const linkedCorrelationEvents = correlationEvents.slice(0, completionIndex);
-  if (linkedCorrelationEvents.length > MAX_ROLE_CONTEXT_EVENTS) {
-    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "cited turn exceeds 256 actual reader-returned correlation events");
-  }
   if (correlationEvents[completionIndex].id !== completion.id || correlationEvents[completionIndex].seq !== completion.seq) {
     throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned completion does not match the exact cited completion");
   }
@@ -20312,11 +20314,20 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
       exactEvent(request.roleContext.requestEventId, request.roleContext.requestEventSeq),
       exactEvent(request.roleContext.completionEventId, request.roleContext.completionEventSeq)
     ]);
-    const correlationEvents = await sdk.threads.events.list({
-      threadId: request.roleContext.threadId,
-      afterSeq: String(request.roleContext.requestEventSeq),
-      limit: String(MAX_ROLE_CONTEXT_EVENTS + 1)
-    });
+    const correlationPages = /* @__PURE__ */ new Map();
+    let afterSeq = request.roleContext.requestEventSeq;
+    while (true) {
+      const page = (await sdk.threads.events.list({
+        threadId: request.roleContext.threadId,
+        afterSeq: String(afterSeq),
+        limit: String(ROLE_CONTEXT_EVENT_PAGE_SIZE)
+      })).map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data }));
+      correlationPages.set(afterSeq, page);
+      if (page.some((event) => event.id === request.roleContext.completionEventId && event.seq === request.roleContext.completionEventSeq) || page.some((event) => event.seq >= request.roleContext.completionEventSeq) || page.length < ROLE_CONTEXT_EVENT_PAGE_SIZE) break;
+      const nextAfterSeq = page.at(-1).seq;
+      if (nextAfterSeq <= afterSeq) break;
+      afterSeq = nextAfterSeq;
+    }
     const environment = thread.environmentId ? await sdk.environments.get({ environmentId: thread.environmentId }) : null;
     const [project, version2, host] = await Promise.all([
       sdk.projects.get({ projectId: request.projectId }),
@@ -20337,7 +20348,6 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
       },
       requestEvent,
       completionEvent,
-      correlationEvents: correlationEvents.map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data })),
       environment: {
         id: environment.id,
         projectId: environment.projectId,
@@ -20372,7 +20382,7 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
         if (eventId === request.roleContext.completionEventId && eventSeq === request.roleContext.completionEventSeq) return structuredClone(facts.completionEvent);
         return unavailableRoleFactReader(serverId).event(threadId, eventId, eventSeq);
       },
-      eventsAfter: (threadId, afterSeq, limit) => threadId === facts.thread.id && afterSeq === request.roleContext.requestEventSeq && limit === MAX_ROLE_CONTEXT_EVENTS + 1 ? structuredClone(facts.correlationEvents) : unavailableRoleFactReader(serverId).eventsAfter(threadId, afterSeq, limit),
+      eventsAfter: (threadId, afterSeq2, limit) => threadId === facts.thread.id && limit === ROLE_CONTEXT_EVENT_PAGE_SIZE && correlationPages.has(afterSeq2) ? structuredClone(correlationPages.get(afterSeq2)) : unavailableRoleFactReader(serverId).eventsAfter(threadId, afterSeq2, limit),
       environment: (environmentId) => environmentId === facts.environment.id ? structuredClone(facts.environment) : unavailableRoleFactReader(serverId).environment(environmentId),
       project: (projectId) => projectId === facts.project.id ? structuredClone(facts.project) : unavailableRoleFactReader(serverId).project(projectId),
       host: (hostId) => hostId === facts.host.id ? structuredClone(facts.host) : unavailableRoleFactReader(serverId).host(hostId),
