@@ -13,8 +13,9 @@ import {
 } from "./src/awareness.js";
 import {
   BB_VERSION_RANGE,
+  MAX_ROLE_CONTEXT_CORRELATION_EVENTS,
   MIGRATIONS,
-  MAX_ROLE_CONTEXT_EVENTS,
+  ROLE_CONTEXT_EVENT_PAGE_SIZE,
   PLUGIN_ID,
   PLUGIN_SDK_VERSION,
   assembleV21CachedConsumerRolloutEvidence,
@@ -27,6 +28,7 @@ import {
   probeV21NewLegacyApplyProvenanceRefusal,
   probeV21ConsumedLegacyReplay,
   parseApplyRequest,
+  roleContextPreflightRefusal,
   writingLaneCeilingFromJson,
   type ApplyRequest,
   type FoundationResult,
@@ -407,11 +409,6 @@ export async function readLiveRoleFactReader(
       exactEvent(request.roleContext.requestEventId, request.roleContext.requestEventSeq),
       exactEvent(request.roleContext.completionEventId, request.roleContext.completionEventSeq),
     ]);
-    const correlationEvents = await sdk.threads.events.list({
-      threadId: request.roleContext.threadId,
-      afterSeq: String(request.roleContext.requestEventSeq),
-      limit: String(MAX_ROLE_CONTEXT_EVENTS + 1),
-    });
     const environment = thread.environmentId ? await sdk.environments.get({ environmentId: thread.environmentId }) : null;
     const [project, version, host] = await Promise.all([
       sdk.projects.get({ projectId: request.projectId }),
@@ -432,7 +429,6 @@ export async function readLiveRoleFactReader(
       },
       requestEvent,
       completionEvent,
-      correlationEvents: correlationEvents.map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data as Record<string, unknown> })),
       environment: {
         id: environment.id,
         projectId: environment.projectId,
@@ -458,6 +454,35 @@ export async function readLiveRoleFactReader(
       host: { id: host.id, status: host.status, maxPermissionMode: host.maxPermissionMode },
       version: version.currentVersion,
     };
+    const correlationPages = new Map<number, Array<{ id: string; seq: number; type: string; data: Record<string, unknown> }>>();
+    if (!roleContextPreflightRefusal({
+      thread: facts.thread,
+      requestEvent: facts.requestEvent,
+      completion: facts.completionEvent,
+      environment: facts.environment,
+      project: facts.project,
+      host: facts.host,
+      bbVersion: facts.version,
+      bbServerId: serverId,
+    }, request)) {
+      let afterSeq = request.roleContext.requestEventSeq;
+      for (let pageIndex = 0; pageIndex < MAX_ROLE_CONTEXT_CORRELATION_EVENTS / ROLE_CONTEXT_EVENT_PAGE_SIZE; pageIndex += 1) {
+        const page = (await sdk.threads.events.list({
+          threadId: request.roleContext.threadId,
+          afterSeq: String(afterSeq),
+          limit: String(ROLE_CONTEXT_EVENT_PAGE_SIZE),
+        })).map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data as Record<string, unknown> }));
+        correlationPages.set(afterSeq, page);
+        if (
+          page.some((event) => event.id === request.roleContext!.completionEventId && event.seq === request.roleContext!.completionEventSeq) ||
+          page.some((event) => event.seq >= request.roleContext!.completionEventSeq) ||
+          page.length < ROLE_CONTEXT_EVENT_PAGE_SIZE
+        ) break;
+        const nextAfterSeq = page.at(-1)!.seq;
+        if (nextAfterSeq <= afterSeq) break;
+        afterSeq = nextAfterSeq;
+      }
+    }
     return {
       serverId: () => serverId,
       thread: (threadId) => threadId === facts.thread.id ? structuredClone(facts.thread) : unavailableRoleFactReader(serverId).thread(threadId),
@@ -467,8 +492,8 @@ export async function readLiveRoleFactReader(
         if (eventId === request.roleContext!.completionEventId && eventSeq === request.roleContext!.completionEventSeq) return structuredClone(facts.completionEvent);
         return unavailableRoleFactReader(serverId).event(threadId, eventId, eventSeq);
       },
-      eventsAfter: (threadId, afterSeq, limit) => threadId === facts.thread.id && afterSeq === request.roleContext!.requestEventSeq && limit === MAX_ROLE_CONTEXT_EVENTS + 1
-        ? structuredClone(facts.correlationEvents)
+      eventsAfter: (threadId, afterSeq, limit) => threadId === facts.thread.id && limit === ROLE_CONTEXT_EVENT_PAGE_SIZE && correlationPages.has(afterSeq)
+        ? structuredClone(correlationPages.get(afterSeq)!)
         : unavailableRoleFactReader(serverId).eventsAfter(threadId, afterSeq, limit),
       environment: (environmentId) => environmentId === facts.environment.id ? structuredClone(facts.environment) : unavailableRoleFactReader(serverId).environment(environmentId),
       project: (projectId) => projectId === facts.project.id ? structuredClone(facts.project) : unavailableRoleFactReader(serverId).project(projectId),

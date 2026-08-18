@@ -2,7 +2,7 @@ import type { BbPluginApi } from "@bb/plugin-sdk";
 import { expect, it } from "vitest";
 import { readLiveRoleFactReader } from "../server.js";
 import {
-  MAX_ROLE_CONTEXT_EVENTS,
+  ROLE_CONTEXT_EVENT_PAGE_SIZE,
   resolveRoleContext,
   type ApplyRequest,
   type RoleEventFact,
@@ -90,9 +90,8 @@ it.runIf(process.env.BB_LIVE_ROLE_CONTEXT === "1")(
       ) return [];
       return [{ request, completion, interiorCount: returned.length - 1 }];
     });
-    const eligible = candidates.filter((candidate) => candidate.interiorCount <= MAX_ROLE_CONTEXT_EVENTS);
-    const latest = [...eligible].sort((left, right) => right.request.seq - left.request.seq)[0];
-    const busy = [...eligible].sort((left, right) => right.interiorCount - left.interiorCount)[0];
+    const latest = [...candidates].sort((left, right) => right.request.seq - left.request.seq)[0];
+    const busy = [...candidates].sort((left, right) => right.interiorCount - left.interiorCount)[0];
     if (!latest || !busy) throw new Error("no live director role-context candidate is available");
     expect(busy.interiorCount).toBeGreaterThanOrEqual(100);
 
@@ -121,10 +120,14 @@ it.runIf(process.env.BB_LIVE_ROLE_CONTEXT === "1")(
         visibility: "visible",
       });
     }
-    expect(eventReads).toHaveLength(6);
+    const correlationPageCount = [latest, busy].reduce(
+      (count, candidate) => count + Math.ceil((candidate.interiorCount + 1) / ROLE_CONTEXT_EVENT_PAGE_SIZE),
+      0,
+    );
+    expect(eventReads).toHaveLength(4 + correlationPageCount);
     expect(eventReads.filter((read) => read.limit === "1")).toHaveLength(4);
-    expect(eventReads.filter((read) => read.limit === String(MAX_ROLE_CONTEXT_EVENTS + 1))).toHaveLength(2);
-    expect(eventReads.every((read) => Number(read.limit) <= MAX_ROLE_CONTEXT_EVENTS + 1)).toBe(true);
+    expect(eventReads.filter((read) => read.limit === String(ROLE_CONTEXT_EVENT_PAGE_SIZE))).toHaveLength(correlationPageCount);
+    expect(eventReads.every((read) => Number(read.limit) <= ROLE_CONTEXT_EVENT_PAGE_SIZE)).toBe(true);
 
     const firstSeq = events[0]!.seq;
     const lastSeq = events.at(-1)!.seq;

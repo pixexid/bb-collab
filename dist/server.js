@@ -14407,7 +14407,8 @@ var LLM_COLLAB_MERGED_MAIN_SHA = "0686d34";
 var LLM_COLLAB_EVIDENCE_RESOURCE_REVISION = 4;
 var EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION = "no canonical state existed to migrate; historical archive preserved as evidence, read-only";
 var MAX_EXPORT_ROWS = 256;
-var MAX_ROLE_CONTEXT_EVENTS = 256;
+var ROLE_CONTEXT_EVENT_PAGE_SIZE = 256;
+var MAX_ROLE_CONTEXT_CORRELATION_EVENTS = 2048;
 var MAX_EXPORT_BYTES = 512 * 1024;
 var MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 8);
 var TABLES = [
@@ -15737,6 +15738,42 @@ var reviewFactsSchema = external_exports.object({
 function stringField(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 256 ? value : null;
 }
+function roleContextPreflightRefusal(facts, request) {
+  const roleContext = request.roleContext;
+  if (!roleContext) return ["ROLE_CONTEXT_REQUIRED", "exact BB role context facts are required"];
+  if (roleContext.completionEventSeq <= roleContext.requestEventSeq) {
+    return ["EXECUTION_COMPLETION_AMBIGUOUS", "completion event sequence does not follow the request event sequence"];
+  }
+  if (facts.thread.id !== roleContext.threadId || facts.thread.projectId !== request.projectId || facts.project.id !== request.projectId) {
+    return ["ROLE_CONTEXT_FOREIGN", "thread or project context belongs to another project"];
+  }
+  if (/\bwitness\b/iu.test(`${facts.thread.title ?? ""}
+${facts.thread.titleFallback ?? ""}`)) {
+    return ["ROLE_CONTEXT_WITNESS", "witness threads cannot hold active roles"];
+  }
+  if (facts.thread.visibility !== "visible") return ["ROLE_CONTEXT_HIDDEN", "hidden threads cannot hold active roles"];
+  if (facts.thread.status !== "active" && facts.thread.status !== "idle") return ["ROLE_CONTEXT_UNKNOWN", "holder thread is not in a usable execution state"];
+  if (facts.environment.id !== facts.thread.environmentId || facts.environment.projectId !== request.projectId) {
+    return ["ROLE_CONTEXT_FOREIGN", "environment context does not match the holder thread and project"];
+  }
+  const exactManagedWorktree = facts.environment.status === "ready" && !!facts.environment.path && facts.environment.managed && facts.environment.isGitRepo && facts.environment.isWorktree && facts.environment.workspaceProvisionType === "managed-worktree";
+  if (!exactManagedWorktree) return ["ROLE_CONTEXT_FOREIGN", "holder environment is not an exact ready managed worktree"];
+  const sources = facts.project.sources.filter(
+    (source) => source.projectId === request.projectId && source.hostId === facts.environment.hostId
+  );
+  if (sources.length !== 1) return ["ROLE_CONTEXT_FOREIGN", "holder environment does not resolve to one exact project source on its host"];
+  if (facts.host.id !== facts.environment.hostId || facts.host.status !== "connected") return ["ROLE_CONTEXT_UNKNOWN", "holder host is unavailable"];
+  if (!stringField(facts.bbVersion) || !stringField(facts.bbServerId)) {
+    return ["ROLE_CONTEXT_UNKNOWN", "BB version or event facts are unavailable"];
+  }
+  if (facts.requestEvent.id !== roleContext.requestEventId || facts.requestEvent.seq !== roleContext.requestEventSeq || facts.requestEvent.type !== "client/turn/requested") {
+    return ["EXECUTION_PROFILE_UNKNOWN", "the exact execution-bearing request event is unavailable"];
+  }
+  if (facts.completion.id !== roleContext.completionEventId || facts.completion.seq !== roleContext.completionEventSeq) {
+    return ["EXECUTION_COMPLETION_AMBIGUOUS", "completion does not match the exact requested correlation"];
+  }
+  return null;
+}
 function resolveRoleContext(reader, request) {
   if (!reader || !request.roleContext) throw refusal("ROLE_CONTEXT_REQUIRED", "exact BB role context facts are required");
   const roleContext = request.roleContext;
@@ -15757,54 +15794,47 @@ function resolveRoleContext(reader, request) {
     if (roleContext.completionEventSeq <= roleContext.requestEventSeq) {
       throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion event sequence does not follow the request event sequence");
     }
-    correlationEvents = reader.eventsAfter(roleContext.threadId, roleContext.requestEventSeq, MAX_ROLE_CONTEXT_EVENTS + 1);
     if (!thread.environmentId) throw refusal("ROLE_CONTEXT_REQUIRED", "holder thread has no environment");
     environment = reader.environment(thread.environmentId);
     project = reader.project(request.projectId);
     host = reader.host(environment.hostId);
     bbVersion = reader.version();
+    const preflightRefusal = roleContextPreflightRefusal(
+      { thread, requestEvent, completion, environment, project, host, bbVersion, bbServerId },
+      request
+    );
+    if (preflightRefusal) throw refusal(...preflightRefusal);
+    correlationEvents = [];
+    let afterSeq = roleContext.requestEventSeq;
+    let correlationReadComplete = false;
+    for (let pageIndex = 0; pageIndex < MAX_ROLE_CONTEXT_CORRELATION_EVENTS / ROLE_CONTEXT_EVENT_PAGE_SIZE; pageIndex += 1) {
+      const page = reader.eventsAfter(roleContext.threadId, afterSeq, ROLE_CONTEXT_EVENT_PAGE_SIZE);
+      correlationEvents.push(...page);
+      if (page.some((event) => event.id === roleContext.completionEventId && event.seq === roleContext.completionEventSeq) || page.some((event) => event.seq >= roleContext.completionEventSeq) || page.length < ROLE_CONTEXT_EVENT_PAGE_SIZE) {
+        correlationReadComplete = true;
+        break;
+      }
+      const nextAfterSeq = page.at(-1).seq;
+      if (nextAfterSeq <= afterSeq) {
+        correlationReadComplete = true;
+        break;
+      }
+      afterSeq = nextAfterSeq;
+    }
+    if (!correlationReadComplete) {
+      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "role context correlation exceeds the 2,048-event total-work ceiling");
+    }
   } catch (error48) {
     if (error48 instanceof Refusal) throw error48;
     throw refusal("ROLE_CONTEXT_UNKNOWN", "one or more exact BB context facts are unavailable");
   }
-  if (thread.id !== request.roleContext.threadId || thread.projectId !== request.projectId || project.id !== request.projectId) {
-    throw refusal("ROLE_CONTEXT_FOREIGN", "thread or project context belongs to another project");
-  }
-  if (/\bwitness\b/iu.test(`${thread.title ?? ""}
-${thread.titleFallback ?? ""}`)) {
-    throw refusal("ROLE_CONTEXT_WITNESS", "witness threads cannot hold active roles");
-  }
-  if (thread.visibility !== "visible") throw refusal("ROLE_CONTEXT_HIDDEN", "hidden threads cannot hold active roles");
-  if (!(/* @__PURE__ */ new Set(["active", "idle"])).has(thread.status)) throw refusal("ROLE_CONTEXT_UNKNOWN", "holder thread is not in a usable execution state");
-  if (!thread.environmentId || environment.id !== thread.environmentId || environment.projectId !== request.projectId) {
-    throw refusal("ROLE_CONTEXT_FOREIGN", "environment context does not match the holder thread and project");
-  }
-  const exactManagedWorktree = environment.status === "ready" && !!environment.path && environment.managed && environment.isGitRepo && environment.isWorktree && environment.workspaceProvisionType === "managed-worktree";
-  if (!exactManagedWorktree) {
-    throw refusal("ROLE_CONTEXT_FOREIGN", "holder environment is not an exact ready managed worktree");
-  }
   const sources = project.sources.filter(
     (source2) => source2.projectId === request.projectId && source2.hostId === environment.hostId
   );
-  if (sources.length !== 1) throw refusal("ROLE_CONTEXT_FOREIGN", "holder environment does not resolve to one exact project source on its host");
-  if (host.id !== environment.hostId || host.status !== "connected") throw refusal("ROLE_CONTEXT_UNKNOWN", "holder host is unavailable");
-  if (!stringField(bbVersion) || !stringField(bbServerId)) {
-    throw refusal("ROLE_CONTEXT_UNKNOWN", "BB version or event facts are unavailable");
-  }
-  if (requestEvent.id !== request.roleContext.requestEventId || requestEvent.seq !== request.roleContext.requestEventSeq || requestEvent.type !== "client/turn/requested") {
-    throw refusal("EXECUTION_PROFILE_UNKNOWN", "the exact execution-bearing request event is unavailable");
-  }
-  if (completion.id !== request.roleContext.completionEventId || completion.seq !== request.roleContext.completionEventSeq) {
-    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "completion does not match the exact requested correlation");
-  }
   const completionIndex = correlationEvents.findIndex(
     (event) => event.id === roleContext.completionEventId && event.seq === roleContext.completionEventSeq
   );
   if (completionIndex < 0) {
-    const passedCompletion = correlationEvents.some((event) => event.seq >= roleContext.completionEventSeq);
-    if (!passedCompletion && correlationEvents.length > MAX_ROLE_CONTEXT_EVENTS) {
-      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "cited turn exceeds 256 actual reader-returned correlation events");
-    }
     throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned correlation is not terminated by the exact cited completion");
   }
   const linkedEvents = correlationEvents.slice(0, completionIndex + 1);
@@ -15815,9 +15845,6 @@ ${thread.titleFallback ?? ""}`)) {
     }
   }
   const linkedCorrelationEvents = correlationEvents.slice(0, completionIndex);
-  if (linkedCorrelationEvents.length > MAX_ROLE_CONTEXT_EVENTS) {
-    throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "cited turn exceeds 256 actual reader-returned correlation events");
-  }
   if (correlationEvents[completionIndex].id !== completion.id || correlationEvents[completionIndex].seq !== completion.seq) {
     throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned completion does not match the exact cited completion");
   }
@@ -20312,11 +20339,6 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
       exactEvent(request.roleContext.requestEventId, request.roleContext.requestEventSeq),
       exactEvent(request.roleContext.completionEventId, request.roleContext.completionEventSeq)
     ]);
-    const correlationEvents = await sdk.threads.events.list({
-      threadId: request.roleContext.threadId,
-      afterSeq: String(request.roleContext.requestEventSeq),
-      limit: String(MAX_ROLE_CONTEXT_EVENTS + 1)
-    });
     const environment = thread.environmentId ? await sdk.environments.get({ environmentId: thread.environmentId }) : null;
     const [project, version2, host] = await Promise.all([
       sdk.projects.get({ projectId: request.projectId }),
@@ -20337,7 +20359,6 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
       },
       requestEvent,
       completionEvent,
-      correlationEvents: correlationEvents.map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data })),
       environment: {
         id: environment.id,
         projectId: environment.projectId,
@@ -20363,6 +20384,31 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
       host: { id: host.id, status: host.status, maxPermissionMode: host.maxPermissionMode },
       version: version2.currentVersion
     };
+    const correlationPages = /* @__PURE__ */ new Map();
+    if (!roleContextPreflightRefusal({
+      thread: facts.thread,
+      requestEvent: facts.requestEvent,
+      completion: facts.completionEvent,
+      environment: facts.environment,
+      project: facts.project,
+      host: facts.host,
+      bbVersion: facts.version,
+      bbServerId: serverId
+    }, request)) {
+      let afterSeq = request.roleContext.requestEventSeq;
+      for (let pageIndex = 0; pageIndex < MAX_ROLE_CONTEXT_CORRELATION_EVENTS / ROLE_CONTEXT_EVENT_PAGE_SIZE; pageIndex += 1) {
+        const page = (await sdk.threads.events.list({
+          threadId: request.roleContext.threadId,
+          afterSeq: String(afterSeq),
+          limit: String(ROLE_CONTEXT_EVENT_PAGE_SIZE)
+        })).map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data }));
+        correlationPages.set(afterSeq, page);
+        if (page.some((event) => event.id === request.roleContext.completionEventId && event.seq === request.roleContext.completionEventSeq) || page.some((event) => event.seq >= request.roleContext.completionEventSeq) || page.length < ROLE_CONTEXT_EVENT_PAGE_SIZE) break;
+        const nextAfterSeq = page.at(-1).seq;
+        if (nextAfterSeq <= afterSeq) break;
+        afterSeq = nextAfterSeq;
+      }
+    }
     return {
       serverId: () => serverId,
       thread: (threadId) => threadId === facts.thread.id ? structuredClone(facts.thread) : unavailableRoleFactReader(serverId).thread(threadId),
@@ -20372,7 +20418,7 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
         if (eventId === request.roleContext.completionEventId && eventSeq === request.roleContext.completionEventSeq) return structuredClone(facts.completionEvent);
         return unavailableRoleFactReader(serverId).event(threadId, eventId, eventSeq);
       },
-      eventsAfter: (threadId, afterSeq, limit) => threadId === facts.thread.id && afterSeq === request.roleContext.requestEventSeq && limit === MAX_ROLE_CONTEXT_EVENTS + 1 ? structuredClone(facts.correlationEvents) : unavailableRoleFactReader(serverId).eventsAfter(threadId, afterSeq, limit),
+      eventsAfter: (threadId, afterSeq, limit) => threadId === facts.thread.id && limit === ROLE_CONTEXT_EVENT_PAGE_SIZE && correlationPages.has(afterSeq) ? structuredClone(correlationPages.get(afterSeq)) : unavailableRoleFactReader(serverId).eventsAfter(threadId, afterSeq, limit),
       environment: (environmentId) => environmentId === facts.environment.id ? structuredClone(facts.environment) : unavailableRoleFactReader(serverId).environment(environmentId),
       project: (projectId) => projectId === facts.project.id ? structuredClone(facts.project) : unavailableRoleFactReader(serverId).project(projectId),
       host: (hostId) => hostId === facts.host.id ? structuredClone(facts.host) : unavailableRoleFactReader(serverId).host(hostId),
