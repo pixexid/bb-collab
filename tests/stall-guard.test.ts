@@ -59,7 +59,6 @@ describe("stall-guard artifact cycle", () => {
     const cycle = createStallGuardCycle({
       readRoleHolders: () => holders,
       readArtifact: async () => currentArtifact,
-      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
       wakeRole: async (role) => { steers.push(role); return { attempted: true, delivered: true }; },
       persistence: store.persistence,
     });
@@ -86,7 +85,7 @@ describe("stall-guard artifact cycle", () => {
       readLanes: () => [],
       steer: async () => {},
       readRoleHolders: () => holders,
-      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
+      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "attempt-1", deferredReason: null }],
       readWorker: async () => ({
         status: "idle",
         pendingExternalWait: false,
@@ -101,7 +100,6 @@ describe("stall-guard artifact cycle", () => {
     const cycle = createStallGuardCycle({
       readRoleHolders: () => holders,
       readArtifact: async () => currentArtifact,
-      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
       wakeRole: (role) => watcher.wakeRole(role),
       persistence: store.persistence,
     });
@@ -121,7 +119,6 @@ describe("stall-guard artifact cycle", () => {
     const options = {
       readRoleHolders: () => [holder(1, "current-holder")],
       readArtifact: async () => currentArtifact,
-      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
       wakeRole,
       persistence: store.persistence,
     };
@@ -204,7 +201,7 @@ describe("stall-guard artifact cycle", () => {
       readLanes: () => [],
       steer: async () => {},
       readRoleHolders: () => [holder(1, "current-holder")],
-      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
+      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "attempt-1", deferredReason: null }],
       readWorker: async () => ({
         status: "idle",
         pendingExternalWait: false,
@@ -222,7 +219,6 @@ describe("stall-guard artifact cycle", () => {
     const cycle = createStallGuardCycle({
       readRoleHolders: () => [holder(1, "current-holder")],
       readArtifact: async () => currentArtifact,
-      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
       wakeRole: (role) => watcher.wakeRole(role),
       persistence: store.persistence,
     });
@@ -247,7 +243,6 @@ describe("stall-guard artifact cycle", () => {
     const cycle = createStallGuardCycle({
       readRoleHolders: () => [holder(1, "current-holder")],
       readArtifact: async () => currentArtifact,
-      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
       wakeRole,
       persistence: store.persistence,
     });
@@ -287,7 +282,6 @@ describe("stall-guard artifact cycle", () => {
     const cycle = createStallGuardCycle({
       readRoleHolders: () => [holder(1, "current-holder")],
       readArtifact: async () => currentArtifact,
-      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
       wakeRole: (role) => watcher.wakeRole(role),
       persistence: store.persistence,
     });
@@ -312,7 +306,7 @@ describe("stall-guard artifact cycle", () => {
       readLanes: () => [],
       steer: async () => {},
       readRoleHolders: wakeReadHolders,
-      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
+      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "attempt-1", deferredReason: null }],
       readWorker: async () => ({
         status: "idle",
         pendingExternalWait: false,
@@ -328,7 +322,6 @@ describe("stall-guard artifact cycle", () => {
     const cycle = createStallGuardCycle({
       readRoleHolders: () => [holder(1, "current-holder")],
       readArtifact: async () => currentArtifact,
-      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
       wakeRole: (role) => watcher.wakeRole(role),
       persistence: store.persistence,
     });
@@ -349,7 +342,7 @@ describe("stall-guard artifact cycle", () => {
       readLanes: () => [],
       steer: async () => {},
       readRoleHolders: () => [holder(1, "current-holder")],
-      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
+      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "attempt-1", deferredReason: null }],
       readWorker: async () => ({
         status: "idle",
         pendingExternalWait: false,
@@ -365,7 +358,6 @@ describe("stall-guard artifact cycle", () => {
     const cycle = createStallGuardCycle({
       readRoleHolders: () => [holder(1, "current-holder")],
       readArtifact: async () => currentArtifact,
-      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
       wakeRole: (role) => watcher.wakeRole(role),
       persistence: store.persistence,
     });
@@ -385,7 +377,6 @@ describe("stall-guard artifact cycle", () => {
     const cycle = createStallGuardCycle({
       readRoleHolders: () => [holder(1, "current-holder")],
       readArtifact: async () => currentArtifact,
-      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
       wakeRole,
       persistence: store.persistence,
     });
@@ -447,7 +438,6 @@ describe("stall-guard artifact cycle", () => {
     const cycle = createStallGuardCycle({
       readRoleHolders: () => [holder(1, "current-holder")],
       readArtifact: async () => currentArtifact,
-      readRoleScopes: () => [{ projectId: PROJECT_ID, nextStartable: true, queueHeadId: "queue-head", deferredReason: null }],
       wakeRole: (role) => watcher.wakeRole(role),
       persistence: store.persistence,
     });
