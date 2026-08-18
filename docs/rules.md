@@ -108,6 +108,32 @@ Inside existing authority means the act is one the seat could already take under
 
 Saying which ruling was applied is disclosure, not a guard — it makes the decision auditable afterwards and does nothing to bound it beforehand. The two conditions bound it; the disclosure records it. A seat owes both.
 
+## Merge is not deploy is not reload
+
+> A governance change is not live until the deploy worktree and host supervision both match `main`. The deploy layer is part of the change, not a step after it.
+
+A merged PR changes what the repository says. It changes nothing about what is running until the deployed plugin is rebuilt from that commit and whatever supervises it on the host is reloaded against it. Those are three states, and reporting the first as though it were the third is the most comfortable error available, because every artifact you can see says done.
+
+The check is cheap: name the deployed revision and compare it to `main` before claiming a change is in effect. When they differ, say so — "merged, not deployed" is a complete and honest status, and a fleet can act on it.
+
+## An escalation's premises are checkable claims
+
+> Verify the premises before executing on them. A request to act carries facts, and those facts are claims like any other.
+
+An escalation arrives with urgency attached, and urgency is exactly what makes its premises feel settled. They are not. A seat that executes on a relayed fact inherits it: if the fact was wrong, the act was wrong, and the seat that acted owns the outcome regardless of who supplied the premise.
+
+This binds hardest downward, where a frozen work order carries facts a lane cannot easily question, and it binds on the seat writing the order to have checked them first. It binds upward too: a premise handed to a deciding seat determines what it decides, so handing up an unchecked fact is the same defect wearing a different hat.
+
+## A completeness search names its surfaces
+
+> A search that covers only live surfaces is not a completeness search, and a completeness claim states which surfaces it searched and under which names.
+
+Fleet history lives in threads, and threads archive. Issues and documents are the surfaces a seat reaches for first, and they are the ones least likely to hold the thing that already happened. Work that ran, decided something, and finished leaves its record where nobody is looking.
+
+Search the concept's names, not one spelling. A thing renamed between its introduction and your search hides its own introduction: searching for the current name finds where it was made explicit, not where it began, and the gap is invisible because the search returns results.
+
+State the surfaces and the names. "I searched" is not a finding; "I searched open issues, docs, and archived threads, for both X and its earlier bare form" is one a reader can check and extend.
+
 ## Blast radius
 
 > Every decision sweeps its own blast radius in the same act. Open issues, open PRs, and queued lane specs are caches of older decisions; a decision changing an artifact’s existence, owner, shape, or terminology invalidates them silently. Each affected item gets a one-line update or closure at decision time, not when someone trips over it. A sweep that names artifacts reads them; relayed labels are unverified by definition.
