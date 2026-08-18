@@ -226,7 +226,7 @@ A reason may point at a standing one. Restating an unchanged collision map every
 
 What this deliberately does **not** do is encode surface occupancy into the wake condition. That would require the mechanism to know which files a lane holds, which no canonical source can currently claim, and a confident condition on an unverifiable input is exactly how a permanently-true wake and a dead-source counter both happened. A wake that fires slightly too often, answered by a seat that states the map, is cheaper than a mechanism that computes collisions and gets them wrong in silence.
 
-## A ruling names the seat that can perform it
+## A ruling names its seat and its surface
 
 > Before ruling an act executable, name both the seat that will perform it and the surface it will perform it through. A ruling missing either routes upward or waits — it never routes to improvisation.
 
@@ -236,7 +236,9 @@ Twice in one evening a ruling named an act with no surface behind it. Setting th
 
 A third apparent instance was not one, and it is the more useful lesson. A ruling to create a project was reported unexecutable because `bb project` seemed to have no create command. It has one; the seat had read a truncated help listing and concluded absence from a list it had cut short. So this rule cuts both ways: name the surface, and establish it is really absent before saying so, because a false absence defers real work and a doctrine written on one carries the error forward.
 
-The failure mode is not the missing surface. It is what a seat does next: the improvisation nearest to hand is usually the thing the ruling was trying to prevent. Asked to create a project and unable to, the available shortcut was governing a real one — which that same ruling had explicitly forbidden. The gap and the temptation arrive together.
+The failure mode is not the missing surface. It is what a seat does next: the improvisation nearest to hand is usually the thing the ruling was trying to prevent, and it presents itself as the pragmatic option.
+
+This rule met its first real case within the hour. A ruling to bootstrap a project into governance turned out to need an actor receipt that no shipped surface can mint — every production reference reads, only test fixtures write, and the ceremony that once minted them was deliberately removed. The improvisation available was inserting a receipt into the store by hand, which would have fabricated exactly the authority the resolver exists to verify and would have passed every check the system has. The gap and the temptation arrived together, and the temptation was the more dangerous half.
 
 This is not detectable mechanically and should not be built. A ruling's named act lives in prose, not in canonical or platform state, so identifying it would mean interpreting text, and interpretation needs a model in a path that is deliberately model-free. It is a check made when the ruling is written, by the seat writing it.
 
