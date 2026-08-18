@@ -1969,6 +1969,7 @@ describe("bb-collab plugin boundary", () => {
     await plugin(host.bb, { notifyUrgent: async () => undefined });
     seedAndBootstrap(host);
     const sent: Array<{ mode: string; text: string }> = [];
+    host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
     host.harness.sdk.stub("threads.send", (async (input: { mode: string; input: Array<{ text: string }> }) => {
       sent.push({ mode: input.mode, text: input.input[0]!.text });
       return { ok: true };
@@ -1996,10 +1997,71 @@ describe("bb-collab plugin boundary", () => {
       .rejects.toThrow("already has a delivered reply");
   });
 
+  it("waits for the inbox sender thread to become idle before delivering its reply", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    let releaseIdle!: () => void;
+    const idle = new Promise<void>((resolve) => { releaseIdle = resolve; });
+    host.harness.sdk.stub("threads.wait", (async () => { await idle; return { matched: true }; }) as never);
+    host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
+    host.harness.sdk.stub("threads.events.wait", (async ({ threadId }: { threadId: string }) => ({
+      id: "event-delivered",
+      threadId,
+      seq: 99,
+      type: "client/turn/requested",
+      scope: { kind: "thread" },
+      data: { source: "tell", input: [{ type: "text", text: "[bb-collab inbox reply 1 to operator]\nanswer", mentions: [] }] },
+      createdAt: 99,
+    })) as never);
+    const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
+      project_id: PROJECT_ID,
+      recipient: "operator",
+      severity: "routine",
+      text: "reply while active",
+    }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
+
+    const delivery = host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
+    await vi.waitFor(() => expect(
+      host.harness.inspection.sdk.callsTo("threads.wait").length + host.harness.inspection.sdk.callsTo("threads.send").length,
+    ).toBeGreaterThan(0));
+    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    releaseIdle();
+    await expect(delivery).resolves.toMatchObject({ repliedAtMs: expect.any(Number), replyDeliveryError: null });
+    expect(host.harness.inspection.sdk.callsTo("threads.wait")).toEqual([[
+      { threadId: ROLE_THREAD_ID, status: "idle", timeoutMs: 30_000 },
+    ]]);
+    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+  });
+
+  it("persists an inbox reply failure when the sender never becomes idle", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    host.harness.sdk.stub("threads.wait", (async () => { throw new Error("idle wait timed out"); }) as never);
+    host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
+    const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
+      project_id: PROJECT_ID,
+      recipient: "operator",
+      severity: "routine",
+      text: "reply while never idle",
+    }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
+
+    const replied = await host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
+    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    expect(replied).toMatchObject({
+      readAtMs: expect.any(Number),
+      repliedAtMs: null,
+      replyText: "answer",
+      replyDeliveryError: "Error: idle wait timed out",
+    });
+  });
+
   it("records an accepted reply tell as failed when no matching sender event lands", async () => {
     const host = hostFor();
     await plugin(host.bb, { notifyUrgent: async () => undefined });
     seedAndBootstrap(host);
+    host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
     host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
     host.harness.sdk.stub("threads.events.wait", (async () => null) as never);
     const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
@@ -2043,6 +2105,72 @@ describe("bb-collab plugin boundary", () => {
       level: "info",
       message: "fleet-watchdog coverage=visible seats=2 lanes=0 cannotSee=none",
     }));
+  });
+
+  it("waits for a wrongful-idle target to become idle before steering it", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    let artifact = "before";
+    fixture.host.harness.sdk.stub("environments.pullRequest", (async () => artifact === "before"
+      ? { outcome: "absent" }
+      : { outcome: "available", pullRequest: { updatedAt: artifact } }) as never);
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      status: "idle",
+      environmentId: `environment-${threadId}`,
+      updatedAt: 0,
+    })) as never);
+    let releaseIdle!: () => void;
+    const idle = new Promise<void>((resolve) => { releaseIdle = resolve; });
+    fixture.host.harness.sdk.stub("threads.wait", (async () => { await idle; return { matched: true }; }) as never);
+
+    expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
+    artifact = "after";
+    const cycle = fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID]);
+    await vi.waitFor(() => expect(
+      fixture.host.harness.inspection.sdk.callsTo("threads.wait").length + fixture.host.harness.inspection.sdk.callsTo("threads.send").length,
+    ).toBeGreaterThan(0));
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    releaseIdle();
+    await expect(cycle).resolves.toMatchObject({ exitCode: 0 });
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.wait").length).toBeGreaterThan(0);
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").length).toBeGreaterThan(0);
+  });
+
+  it("records a wrongful-idle timeout and retries its unchanged artifact later", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    let artifact = "before";
+    fixture.host.harness.sdk.stub("environments.pullRequest", (async () => artifact === "before"
+      ? { outcome: "absent" }
+      : { outcome: "available", pullRequest: { updatedAt: artifact } }) as never);
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      status: "idle",
+      environmentId: `environment-${threadId}`,
+      updatedAt: 0,
+    })) as never);
+    let timeout = true;
+    fixture.host.harness.sdk.stub("threads.wait", (async () => {
+      if (timeout) throw new Error("idle wait timed out");
+      return { matched: true };
+    }) as never);
+
+    expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
+    const baseline = await fixture.host.bb.storage.kv.get("stall-guard.artifacts");
+    artifact = "after";
+    expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    expect(await fixture.host.bb.storage.kv.get("stall-guard.artifacts")).toEqual(baseline);
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringContaining("idle-wait=failed error=Error: idle wait timed out"),
+    }));
+
+    timeout = false;
+    expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").length).toBeGreaterThan(0);
+    expect(await fixture.host.bb.storage.kv.get("stall-guard.artifacts")).not.toEqual(baseline);
   });
 
   it("surfaces a platform-parented stranded lane to its dispatcher without recovering it", async () => {

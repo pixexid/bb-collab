@@ -20056,6 +20056,8 @@ function startableQueueDepth(repositories) {
 var FLEET_WATCHDOG_FLOOR_MS = 60 * 6e4;
 var FLEET_WATCHDOG_STALE_WAIT_MS = 24 * 60 * 6e4;
 var FLEET_WATCHDOG_STOPPING_WAIT_MS = 3e4;
+var AUTOMATED_TELL_IDLE_WAIT_MS = 3e4;
+var automatedTellQueues = /* @__PURE__ */ new Map();
 var projectIdSchema = external_exports.string().trim().min(1).max(256);
 var mutationReceiptSchema = external_exports.object({
   projectId: projectIdSchema,
@@ -20519,14 +20521,26 @@ async function composeRoleBrief(bb, db, input) {
   ].join("\n");
   return { role: input.role, roleContent: bundle.roles[input.role], ponytail: bundle.ponytail, rules: bundle.rules, project: { id: project.id, name: project.name, sourceIds: project.sources.map((source) => source.id) }, pointers, prompt };
 }
-async function sendRoleBrief(bb, db, projectId, threadId, role, waitForActive = false) {
+async function sendRoleBrief(bb, db, projectId, threadId, role) {
   const brief = await composeRoleBrief(bb, db, { projectId, role });
-  if (waitForActive) await bb.sdk.threads.wait({ threadId, status: "active", timeoutMs: 3e4 });
-  await bb.sdk.threads.send({
+  await sendWhenThreadIdle(bb, {
     threadId,
     mode: "queue-if-active",
     input: [{ type: "text", visibility: "agent-only", text: brief.prompt, mentions: [] }]
   });
+}
+async function sendWhenThreadIdle(bb, request) {
+  const previous = automatedTellQueues.get(request.threadId) ?? Promise.resolve();
+  const current = previous.catch(() => void 0).then(async () => {
+    await bb.sdk.threads.wait({ threadId: request.threadId, status: "idle", timeoutMs: AUTOMATED_TELL_IDLE_WAIT_MS });
+    await bb.sdk.threads.send(request);
+  });
+  automatedTellQueues.set(request.threadId, current);
+  try {
+    await current;
+  } finally {
+    if (automatedTellQueues.get(request.threadId) === current) automatedTellQueues.delete(request.threadId);
+  }
 }
 async function deliverSucceededSeatBrief(bb, db, input, result2) {
   const request = applyRequestSchema.safeParse(input);
@@ -20739,7 +20753,7 @@ async function replyToOperatorMessage(db, bb, projectId, messageId, replyText) {
     const replyPrefix = `[bb-collab inbox reply ${message.messageId} to ${message.recipient}]
 `;
     const deliveredText = `${replyPrefix}${replyText}`;
-    await bb.sdk.threads.send({
+    await sendWhenThreadIdle(bb, {
       threadId: message.senderThreadId,
       mode: "steer",
       input: [{ type: "text", text: deliveredText, mentions: [] }]
@@ -21113,18 +21127,23 @@ ${thread.titleFallback ?? ""}`);
       return false;
     }
     roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
-    await bb.sdk.threads.send({
-      threadId: holders[0].thread_id,
-      mode: "steer",
-      input: [
-        {
-          type: "text",
-          visibility: "agent-only",
-          text: `Wrongful idle: queue head ${role.queueHeadId} is startable. Inspect the queue and act or record the blocker.`,
-          mentions: []
-        }
-      ]
-    });
+    try {
+      await sendWhenThreadIdle(bb, {
+        threadId: holders[0].thread_id,
+        mode: "steer",
+        input: [
+          {
+            type: "text",
+            visibility: "agent-only",
+            text: `Wrongful idle: queue head ${role.queueHeadId} is startable. Inspect the queue and act or record the blocker.`,
+            mentions: []
+          }
+        ]
+      });
+    } catch (error48) {
+      warnRoleLiveness(holders[0], `idle-wait=failed error=${String(error48)}`);
+      return "error";
+    }
     return true;
   };
   const watcher = createLaneWatcher({
@@ -21660,7 +21679,7 @@ ${thread.titleFallback ?? ""}`);
   const readOpenLaneViews = async () => [];
   bb.events.on("thread.created", async ({ thread }) => {
     try {
-      await sendRoleBrief(bb, db, thread.projectId, thread.id, roleForThread(db, thread.projectId, thread.id), true);
+      await sendRoleBrief(bb, db, thread.projectId, thread.id, roleForThread(db, thread.projectId, thread.id));
     } catch (error48) {
       bb.log.warn(`role brief seating failed for thread=${thread.id}: ${String(error48)}`);
     }
