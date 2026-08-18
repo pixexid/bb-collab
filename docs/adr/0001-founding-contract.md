@@ -478,7 +478,6 @@ second authority.
 | Retired, wrong or mismatched role generation | ROLE_GENERATION_STALE, ROLE_NOT_ACTIVE or ROLE_HOLDER_MISMATCH | No authority action and no provider/thread/display fallback. |
 | Missing, expired or contradictory qualification | ROLE_UNQUALIFIED or CAPABILITY_UNKNOWN | No role activation or review gate. Evidence remains readable. |
 | Stale WorkItem, decision or assignment revision | RESOURCE_REVISION_STALE | No lost update; reread and re-disposition. |
-| Active writer already owns a lane | LANE_WRITER_EXISTS | No second writing assignment or dispatch. Read-only work may remain separate. |
 | Native spawn acknowledged without correlated start/terminal evidence | DISPATCH_UNKNOWN | Emit reconciliation evidence; do not blind-retry. |
 | Actual execution profile missing or mismatched | EXECUTION_PROFILE_UNKNOWN or EXECUTION_PROFILE_MISMATCH | Attempt is truthful evidence but cannot satisfy the required role or assignment. |
 | Worker dies or quota-fails before terminal report | FAILED | Keep WorkItem nonterminal or blocked according to policy. |

@@ -167,7 +167,8 @@ The resolver rejects:
 - retired, wrong or mismatched role;
 - absent, expired or contradictory qualification;
 - stale resource revision or conflicting idempotency reuse; and
-- an already occupied writing lane.
+- a writing-lane policy conflict at dispatch; no runtime occupied-lane refusal
+  remains after the assignment-subsystem severance recorded in [issue #192](https://github.com/pixexid/bb-collab/issues/192).
 
 It commits the aggregate change, append-only StateEvent, evidence references
 and revision together or commits none. No projection, wrapper, retry helper or

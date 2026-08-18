@@ -28,11 +28,10 @@ Issue #78 exit condition: worker/orchestrator briefs reject an unsplit slice
 above the 8-hour ceiling; an epic has at least two mergeable child slices with
 explicit `sliceId`, `dependsOn`, `readiness`, and `estimateHours`; only a child
 whose dependencies are merged and readiness is true is startable; and a
-deferred/operator-wait child remains `queueBlocked: false` while its writer
-reservation can queue-block ready writing lanes beyond the remaining cap, never
-read-only lanes. This reuses the existing WorkItem, Assignment,
-ExecutionAttempt, and `lanes` queue;
-it adds no queue, task database, SQLite mutation, or receipt seam.
+deferred/operator-wait child remains `queueBlocked: false`. No runtime
+reservation or cap-based queue blocking exists after the assignment-subsystem
+severance recorded in [issue #192](https://github.com/pixexid/bb-collab/issues/192);
+any future capacity mechanism is a separate requirement.
 
 Issue #80 adds the pure weekly report and its lifecycle audit: open completed
 work is reported for operator disposition, while incomplete or unknown
