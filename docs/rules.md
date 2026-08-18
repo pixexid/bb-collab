@@ -289,3 +289,19 @@ A late mechanism is recoverable; a lying one is not. In anything that notifies, 
 ## Label the proof class, because a safety test is not a discrimination test
 
 > A test that passes both before and after a change is not evidence the change did anything — but it can still be worth keeping, as a guard on an invariant that must not later break. Say which one it is. A test written to guard atomicity that also passes against the unfixed code proves the property holds, not that this work established it. Presenting a guard as discrimination inflates the evidence; discarding it because it does not discriminate loses a real check.
+
+## A fix must not weaken the check it fixes
+
+> Do not remove the bound the check enforced, do not write a guard that sees only the instance you were shown, and do not drop the cap the spill path was meant to replace. The cleanest phrasing came from a reviewer: *half the [#237](https://github.com/pixexid/bb-collab/pull/237) precedent — spill path added, cap dropped.* Three lanes in one night produced the same shape in three forms: array bounds deleted rather than the caller chunked, a leak guard hardcoded to the single word it had been shown, and a trust-boundary cap removed alongside the pagination that replaced it. Each fixed the symptom the test could see and weakened the check the test could not. When a bound is genuinely wrong, replace it with a stricter mechanism and say so; do not delete it as a side effect of fixing what it failed to catch.
+
+## An order's optional constraint on caller-supplied input is a gap in the order
+
+> The author-side of the rule above. A brief that calls a total-work ceiling "fine and probably wanted" has made mandatory protection optional on input the caller controls, and the lane that omits it has followed the order. When the input crosses a trust boundary, the constraint is required and the order says so in those words. If a lane's defect traces to a permissive brief, name which part is the order's fault before asking for the fix — it is not a moved goalpost when the order admits its own error.
+
+## A constraint is not a bound until you check the path that would violate it
+
+> Finding a real constraint and reasoning from it to a limit is not the same as establishing the limit. A cited completion event must exist and must follow the request, which is true — but nothing required it to be *that request's* completion, so a citation naming two real far-apart events walked hundreds of pages the constraint appeared to forbid. Check the constraint against the code path that would violate it, and match the flagging language to what was established: "implicit and fragile" reads as established-then-worried when the honest state was unestablished-and-worried.
+
+## A check written against an assumed shape has never been tested
+
+> A guard is only as good as the mechanism it actually observes. A reply-delivery confirmation waited for an event type that the transport never emits, so it recorded every successful delivery as a failure; a CSS leak guard matched an assumed substring rather than an observed class token, so it passed leaks whose names collided with unrelated source text. Both were written from a plausible model of the mechanism instead of a captured example of it. Before trusting a check, make it fire once against a real instance of the thing it is meant to catch — and once against a real instance of the thing it must not.
