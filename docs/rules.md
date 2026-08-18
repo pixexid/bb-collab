@@ -40,6 +40,22 @@ The declarer owes the same check. Before ending a turn in `WAITING`, name the ev
 
 When you send another seat a blocking question, set the watch in the same act: run `bb thread wait <their-thread> --status idle --timeout <bounded>`, always with an explicit bounded timeout, then check your own inbound for the answer. If their thread is idle and inbound has no answer, it was never sent or delivered: re-ask once, bundled. After the second watch, if there is still no answer, escalate to the operator or supervisor with `director unresponsive`; do not loop a third time. The same pattern applies downward to every lane blocking on you. It is one wait, one inbox check, and at most one re-ask—no polling and no timers.
 
+## Quiet with startable work is a defect state
+
+Intake is not a thing you do when you think of it. It fires on every wake, and the check is two counts: `startable > 0 AND lanes < cap`. If both hold, the fleet is in a defect state and the wake's first act is a dispatch. Labels are queue truth; an unlabelled issue is not in the queue, so labelling is part of filing.
+
+Silence proves nothing here. On 2026-08-18 the fleet sat idle for four and a half hours with eighteen startable issues, zero lanes, and six hourly watchdog cycles that were all correctly quiet — the ledger was all-terminal, so the watchdog had nothing to see. The state was found by the operator. A mechanism that only watches declared work cannot detect work nobody has declared yet, which is why the check belongs to the seat and not only to the timer.
+
+Free capacity is a ceiling, not a quota. Dispatching a colliding lane to reach the cap breaks [one writer per lane](#one-writer-per-lane), and that rule wins: an idle seat is cheaper than two writers on one surface. When capacity is free but every remaining item collides, that is the no-dispatch reason — say it.
+
+This rule exists in the repository because the same rule lived in chat first and evaporated with the context that held it. A rule in a conversation is a cache with no source.
+
+## A lane-completion turn ends with a dispatch or a reason
+
+> An orchestrator's turn that reports a lane finishing never ends there. It ends with the next dispatch, or with the explicit reason there is none.
+
+A bare completion reads as progress while leaving the fleet stopped, and it hides the intake check rather than failing it. The reason, when there is one, is a specific claim someone can check — every startable item collides with a held surface, the board is empty, capacity is full — never "nothing obvious right now".
+
 ## Completion is native; the verdict is ours
 
 bb already tells a parent thread when a child finishes: it emits `child-completed`, `child-failed`, `child-interrupted`, and `child-outcome-batch`, and `threads.childSummary` reads the same ground. Do not build completion notification — wire the native signal.
