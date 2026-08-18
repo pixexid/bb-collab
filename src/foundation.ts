@@ -5482,7 +5482,7 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
     request,
     configRevision,
     request.expectedResourceRevision,
-    nextState === "succeeded" || nextState === "failed" || nextState === "cancelled",
+    nextState === "succeeded" || nextState === "failed" || nextState === "cancelled" || request.workItemWait === null,
   );
   const wait = request.workItemWait;
   if (wait !== undefined && nextState !== undefined) {

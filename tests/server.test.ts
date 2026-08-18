@@ -5384,6 +5384,38 @@ describe("bb-collab plugin boundary", () => {
     });
   });
 
+  it("refuses terminalizing a stale WorkItem with an open wait, then clears and retires it", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 1, {
+      kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat",
+    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 2 });
+    expect(applyWithFixtureReceipt(db, {
+      ...bootstrapRequest(),
+      operationClass: "config_revision",
+      idempotencyKey: "config-2-after-wait",
+      expectedConfigRevision: 1,
+      configRevision: 2,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fenceToken,
+      config: { permissionMode: "auto", visibility: "visible", repositoryTargets: [TARGET_ID] },
+      targets: [{ ...bootstrapRequest().targets![0]!, defaultBranch: "develop" }],
+    }).outcome).toBe("OK");
+
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "cancelled", 2, {
+      idempotencyKey: "stale-wait-terminal-refused",
+      expectedConfigRevision: 2,
+    }))).toMatchObject({ outcome: "WORK_ITEM_WAIT_OPEN", attempted: 0 });
+    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 2, null, {
+      expectedConfigRevision: 2,
+    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "cancelled", 3, {
+      idempotencyKey: "stale-wait-terminal",
+      expectedConfigRevision: 2,
+    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+  });
+
   it("creates multiple targets through the resolver and rejects an ambiguous selector", async () => {
     const { db, path, directory } = directDatabase();
     try {
