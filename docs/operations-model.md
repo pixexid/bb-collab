@@ -16,6 +16,12 @@ This is the canonical role and review matrix. It describes operating choices, no
 | Tier-B reviewer | `codex` | `gpt-5.6-luna` | Any |
 | Mechanical subagent | `codex` | `gpt-5.6-luna` | LOW |
 
+A reviewer must use a different model from the author; a different provider is preferred. This rule is currently unverifiable after the fact: execution_attempts records requested, not executed, models (GH-228), so a reviewer seat that inherited the same execution default as its author is indistinguishable from one that genuinely differed. Until get-bb/bb#1946 (strict spawn mode) or #1787 (executed-profile readback) lands, this line binds at DISPATCH TIME ONLY — the orchestrator names the reviewer's provider/model in the routing line when assigning review, and the reviewer seat echoes its executed profile in its verdict.
+
+When the diversity line and the Tier-A reviewer row conflict — sol-authored work requiring Tier-A review — the diversity line governs: the reviewer is claude-code/claude-opus-5[1m] MEDIUM, named in the dispatch routing line.
+
+The diversity line governs at every tier; where a tier's designated reviewer shares the author's model, the dispatcher names a differing seat in the routing line.
+
 The `kimi-coding/k3` deprecation applies only to review placement; it remains the director default.
 
 `zai/glm-5.3` is temporarily withdrawn from non-director placement to conserve peak-hour usage; the resulting one-provider worker spread is accepted for peak hours as the priced-in cost of the withdrawal; Codex is therefore the only worker provider, and Codex saturation escalates to the operator with usage data rather than re-seating on GLM.
