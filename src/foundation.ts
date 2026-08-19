@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import type Database from "better-sqlite3";
 import { z } from "zod";
@@ -3326,6 +3326,21 @@ function exportRootDirectory(db: SqliteDatabase): string | null {
   return main?.file ? join(dirname(main.file), ".bb-collab-exports") : null;
 }
 
+const activeExportPartials = new Set<string>();
+
+function sweepPartialExportDirectories(root: string): void {
+  try {
+    if (!lstatSync(root).isDirectory()) return;
+  } catch {
+    return;
+  }
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.startsWith(".partial-")) continue;
+    const partial = join(root, entry.name);
+    if (!activeExportPartials.has(partial)) rmSync(partial, { recursive: true, force: true });
+  }
+}
+
 function readMigrationExportFiles(db: SqliteDatabase, input: ExportFileInput): ExportPayload {
   const root = exportRootDirectory(db);
   if (!root) throw refusal("IMPORT_EQUIVALENCE_FAILED", "file export requires the exact file-backed canonical store");
@@ -5992,6 +6007,7 @@ function writeFoundationExportFiles(db: SqliteDatabase, projectId: string, paylo
     return result();
   }
   const partial = mkdtempSync(join(root, `.partial-${sha256(projectId).slice(0, 12)}-`));
+  activeExportPartials.add(partial);
   try {
     writeFileSync(join(partial, "records.ndjson"), payload.recordsNdjson, { mode: 0o600 });
     writeFileSync(join(partial, "artifact-index.json"), canonicalJson(payload.artifactIndex), { mode: 0o600 });
@@ -6006,6 +6022,8 @@ function writeFoundationExportFiles(db: SqliteDatabase, projectId: string, paylo
   } catch (error) {
     rmSync(partial, { recursive: true, force: true });
     throw error;
+  } finally {
+    activeExportPartials.delete(partial);
   }
 }
 
@@ -6470,4 +6488,6 @@ export async function doctor(
 export function databaseIsReady(db: SqliteDatabase): void {
   db.pragma("foreign_keys = ON");
   db.pragma("busy_timeout = 5000");
+  const root = exportRootDirectory(db);
+  if (root) sweepPartialExportDirectories(root);
 }

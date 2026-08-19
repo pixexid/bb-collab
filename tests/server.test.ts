@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -3312,6 +3312,45 @@ describe("bb-collab plugin boundary", () => {
     } finally {
       db.close();
       rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("sweeps startup debris without touching complete exports or outside paths", () => {
+    const { db, directory } = directDatabase();
+    const root = join(directory, ".bb-collab-exports");
+    const stale = join(root, ".partial-crashed");
+    const complete = join(root, "complete-kept");
+    const outside = join(directory, ".partial-outside");
+    try {
+      mkdirSync(stale, { recursive: true });
+      mkdirSync(complete, { recursive: true });
+      mkdirSync(outside, { recursive: true });
+      writeFileSync(join(root, ".partial-file"), "keep");
+      databaseIsReady(db);
+      expect(existsSync(stale)).toBe(false);
+      expect(existsSync(complete)).toBe(true);
+      expect(existsSync(outside)).toBe(true);
+      expect(existsSync(join(root, ".partial-file"))).toBe(true);
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("skips a symlinked export root", () => {
+    const { db, directory } = directDatabase();
+    const root = join(directory, ".bb-collab-exports");
+    const outside = mkdtempSync(join(tmpdir(), "bb-collab-export-root-target-"));
+    const victim = join(outside, ".partial-victim");
+    try {
+      mkdirSync(victim);
+      symlinkSync(outside, root, "dir");
+      databaseIsReady(db);
+      expect(existsSync(victim)).toBe(true);
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 
