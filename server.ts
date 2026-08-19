@@ -1598,7 +1598,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   bb.onDispose(unsubscribe);
   bb.background.service("lane-watcher", {
     async start(signal) {
-      await reconcileErrorRecovery();
+      void reconcileErrorRecovery().catch((error) => bb.log.warn(`error-recovery reconcile failed: ${String(error)}`));
       while (!signal.aborted) {
         await watcher.poll().catch((error) => bb.log.warn(`lane poll failed: ${String(error)}`));
         await escalationCycle.cycle().catch((error) => bb.log.warn(`wait escalation failed: ${String(error)}`));

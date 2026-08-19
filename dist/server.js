@@ -21530,7 +21530,7 @@ ${thread.titleFallback ?? ""}`);
   bb.onDispose(unsubscribe);
   bb.background.service("lane-watcher", {
     async start(signal) {
-      await reconcileErrorRecovery();
+      void reconcileErrorRecovery().catch((error48) => bb.log.warn(`error-recovery reconcile failed: ${String(error48)}`));
       while (!signal.aborted) {
         await watcher.poll().catch((error48) => bb.log.warn(`lane poll failed: ${String(error48)}`));
         await escalationCycle.cycle().catch((error48) => bb.log.warn(`wait escalation failed: ${String(error48)}`));
