@@ -14408,7 +14408,6 @@ var LLM_COLLAB_EVIDENCE_RESOURCE_REVISION = 4;
 var EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION = "no canonical state existed to migrate; historical archive preserved as evidence, read-only";
 var MAX_EXPORT_ROWS = 256;
 var ROLE_CONTEXT_EVENT_PAGE_SIZE = 256;
-var MAX_ROLE_CONTEXT_CORRELATION_EVENTS = 2048;
 var MAX_EXPORT_BYTES = 512 * 1024;
 var MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 8);
 var TABLES = [
@@ -15807,23 +15806,17 @@ function resolveRoleContext(reader, request) {
     if (preflightRefusal) throw refusal(...preflightRefusal);
     correlationEvents = [];
     let afterSeq = roleContext.requestEventSeq;
-    let correlationReadComplete = false;
-    for (let pageIndex = 0; pageIndex < MAX_ROLE_CONTEXT_CORRELATION_EVENTS / ROLE_CONTEXT_EVENT_PAGE_SIZE; pageIndex += 1) {
+    while (true) {
       const page = reader.eventsAfter(roleContext.threadId, afterSeq, ROLE_CONTEXT_EVENT_PAGE_SIZE);
       correlationEvents.push(...page);
       if (page.some((event) => event.id === roleContext.completionEventId && event.seq === roleContext.completionEventSeq) || page.some((event) => event.seq >= roleContext.completionEventSeq) || page.length < ROLE_CONTEXT_EVENT_PAGE_SIZE) {
-        correlationReadComplete = true;
         break;
       }
       const nextAfterSeq = page.at(-1).seq;
       if (nextAfterSeq <= afterSeq) {
-        correlationReadComplete = true;
         break;
       }
       afterSeq = nextAfterSeq;
-    }
-    if (!correlationReadComplete) {
-      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "role context correlation exceeds the 2,048-event total-work ceiling");
     }
   } catch (error48) {
     if (error48 instanceof Refusal) throw error48;
@@ -20573,7 +20566,7 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
       bbServerId: serverId
     }, request)) {
       let afterSeq = request.roleContext.requestEventSeq;
-      for (let pageIndex = 0; pageIndex < MAX_ROLE_CONTEXT_CORRELATION_EVENTS / ROLE_CONTEXT_EVENT_PAGE_SIZE; pageIndex += 1) {
+      while (true) {
         const page = (await sdk.threads.events.list({
           threadId: request.roleContext.threadId,
           afterSeq: String(afterSeq),

@@ -13,7 +13,6 @@ import {
 } from "./src/awareness.js";
 import {
   BB_VERSION_RANGE,
-  MAX_ROLE_CONTEXT_CORRELATION_EVENTS,
   MIGRATIONS,
   ROLE_CONTEXT_EVENT_PAGE_SIZE,
   PLUGIN_ID,
@@ -476,7 +475,7 @@ export async function readLiveRoleFactReader(
       bbServerId: serverId,
     }, request)) {
       let afterSeq = request.roleContext.requestEventSeq;
-      for (let pageIndex = 0; pageIndex < MAX_ROLE_CONTEXT_CORRELATION_EVENTS / ROLE_CONTEXT_EVENT_PAGE_SIZE; pageIndex += 1) {
+      while (true) {
         const page = (await sdk.threads.events.list({
           threadId: request.roleContext.threadId,
           afterSeq: String(afterSeq),
