@@ -53,12 +53,42 @@ the file's bytes **retained in memory** and the hash embedded in the URL as
 no `stat`, no revalidation. So the mechanism is not merely slow to notice a
 rewrite; it never looks again.
 
-This also corrects two earlier readings. `isPluginOwnedIconPath` is
-`icon.startsWith("./")`, but the manifest validator separately requires a
-`.svg`, `.png`, or `.webp` extension and, for `icon`, that the SVG pass
-`assertValidPluginCompactIconSvg` — so the extension constraint is real, just
-enforced elsewhere. And `faviconColor` is browser-tab chrome tied to the
-webmanifest; no plugin can drive it.
+## The manifest rules, from `pluginBrandingSchema` itself
+
+Three readings circulated during this lane. The schema settles all of them:
+
+```js
+pluginBrandingSchema = z.object({
+  icon: requiredManifestString.optional(),
+  logo: z.object({ light: requiredManifestString, dark: requiredManifestString.optional() })
+         .strict().optional(),
+}).strict().superRefine((branding, context) => {
+  if (branding.icon !== undefined && isPluginOwnedIconPath(branding.icon)
+      && !branding.icon.toLowerCase().endsWith(".svg")) {
+    context.addIssue({ code: "custom", path: ["icon"],
+      message: 'plugin-owned branding.icon paths must point at an .svg file (…)' });
+  }
+}).refine((branding) => branding.icon !== undefined || branding.logo !== undefined,
+  { message: "must declare at least branding.icon or branding.logo.light" });
+```
+
+- **A plugin-owned `icon` must be both `./`-prefixed and `.svg`-suffixed.**
+  `isPluginOwnedIconPath` really is just `icon.startsWith("./")`, but it is one
+  half of a condition, not the rule. Checking the helper is not checking the
+  constraint. `.png` and `.webp` are accepted for `logo` only — the wider
+  `/\.(svg|png|webp)$/i` in `validatePluginBuildManifest` is a second, looser
+  gate applied to all three paths, and the icon-specific `.svg` rule above wins.
+- **`icon` and `logo` are additive, not either-or.** The final `refine` is an
+  inclusive or — an *at-least-one* requirement, which its own message states:
+  "must declare at least branding.icon or branding.logo.light". Nothing forbids
+  declaring both. The probe is the proof: `iconprobe` shipped `icon` **and**
+  `logo.{light,dark}` in one manifest, installed without complaint, and the
+  registry returned non-null `iconUrl`, `logoUrl`, and `logoDarkUrl`
+  simultaneously. An either-or rule would have rejected that manifest at install.
+  This matters for the test plan: the two surfaces were exercised together in a
+  single probe, not as alternative runs, so the T1 negative covers both at once.
+- **`faviconColor` is out of reach.** It is browser-tab chrome tied to the
+  webmanifest; no plugin can drive it.
 
 ## What `agent-proxy` actually does
 
