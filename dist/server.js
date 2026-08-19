@@ -14373,7 +14373,7 @@ function subscribeToThreadChanges(sdk, observe) {
 
 // src/foundation.ts
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
@@ -16871,7 +16871,11 @@ function exportRootDirectory(db) {
 }
 var activeExportPartials = /* @__PURE__ */ new Set();
 function sweepPartialExportDirectories(root) {
-  if (!existsSync(root)) return;
+  try {
+    if (!lstatSync(root).isDirectory()) return;
+  } catch {
+    return;
+  }
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     if (!entry.isDirectory() || !entry.name.startsWith(".partial-")) continue;
     const partial2 = join(root, entry.name);

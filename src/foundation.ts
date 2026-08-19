@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import type Database from "better-sqlite3";
 import { z } from "zod";
@@ -3329,7 +3329,11 @@ function exportRootDirectory(db: SqliteDatabase): string | null {
 const activeExportPartials = new Set<string>();
 
 function sweepPartialExportDirectories(root: string): void {
-  if (!existsSync(root)) return;
+  try {
+    if (!lstatSync(root).isDirectory()) return;
+  } catch {
+    return;
+  }
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     if (!entry.isDirectory() || !entry.name.startsWith(".partial-")) continue;
     const partial = join(root, entry.name);

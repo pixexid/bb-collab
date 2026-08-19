@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -3304,6 +3304,23 @@ describe("bb-collab plugin boundary", () => {
     } finally {
       db.close();
       rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("skips a symlinked export root", () => {
+    const { db, directory } = directDatabase();
+    const root = join(directory, ".bb-collab-exports");
+    const outside = mkdtempSync(join(tmpdir(), "bb-collab-export-root-target-"));
+    const victim = join(outside, ".partial-victim");
+    try {
+      mkdirSync(victim);
+      symlinkSync(outside, root, "dir");
+      databaseIsReady(db);
+      expect(existsSync(victim)).toBe(true);
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 
