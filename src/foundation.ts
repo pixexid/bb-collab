@@ -6111,6 +6111,14 @@ export interface DoctorSdk {
     status: string;
     maxPermissionMode: string;
   }> };
+  plugins: {
+    list(args?: { signal?: AbortSignal }): Promise<{
+      plugins: Array<{ id: string; name: string | null; version: string; status: string }>;
+    }>;
+    getSource(args: { pluginId: string; signal?: AbortSignal }): Promise<{
+      engines: { bb?: string };
+    }>;
+  };
 }
 
 function versionAtLeast037(version: string): boolean {
@@ -6439,14 +6447,41 @@ export async function doctor(
       .map((row) => ({ roleId: row.role_id, generation: row.current_generation, holderExecutionAttemptId: row.holder_execution_attempt_id, reason: "ROLE_HOLDER_UNRESOLVED" }));
     const decisionIntegrity = decisionDoctorEvidence(db, projectId);
     const cachedConsumers = persistedCachedConsumerRolloutEvidence(db, projectId);
+    const installedPlugins = await sdk.plugins.list();
+    const incompatiblePlugins = await Promise.all(installedPlugins.plugins
+      .filter((plugin) => plugin.status === "incompatible")
+      .map(async (plugin) => {
+        const source = await sdk.plugins.getSource({ pluginId: plugin.id });
+        const name = plugin.name ?? plugin.id;
+        const requiredBbRange = source.engines.bb ?? null;
+        return {
+          id: plugin.id,
+          name,
+          pluginVersion: plugin.version,
+          requiredBbRange,
+          bbVersion: version.currentVersion,
+          loaded: false,
+          message: requiredBbRange === null
+            ? `plugin "${name}" ${plugin.version} is not loaded: its declared BB range is unavailable`
+            : `plugin "${name}" ${plugin.version} is not loaded: declared BB range ${requiredBbRange} excludes running BB ${version.currentVersion}`,
+        };
+      }));
+    const pluginCompatibilityMessage = incompatiblePlugins.length === 0
+      ? undefined
+      : incompatiblePlugins.map((plugin) => plugin.message).join("; ");
     const expected = targets.length + 1;
     return result("OK", projectId, expected, expected, expected, {
       currentConfigRevision: configHead.config_revision,
       currentGovernanceEpoch: governor ? Number(governor.governance_epoch) : undefined,
+      message: pluginCompatibilityMessage,
       evidence: {
         bbVersion: version.currentVersion,
         pluginSdkVersion: PLUGIN_SDK_VERSION,
-        compatibility: { bb: BB_VERSION_RANGE, bbPluginSdk: `^${PLUGIN_SDK_VERSION}` },
+        compatibility: {
+          bb: BB_VERSION_RANGE,
+          bbPluginSdk: `^${PLUGIN_SDK_VERSION}`,
+          plugins: { checked: installedPlugins.plugins.length, incompatible: incompatiblePlugins },
+        },
         project: { id: project.id, kind: project.kind, name: project.name, gitRemoteUrl: project.gitRemoteUrl },
         targets: targetEvidence,
         governorshipHead: governor ?? null,

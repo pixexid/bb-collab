@@ -1194,6 +1194,52 @@ exit 0
       rmSync(fixture.directory, { recursive: true, force: true });
     }
   });
+
+  it("reports an incompatible installed plugin as not loaded without failing doctor", async () => {
+    const host = await loadedHost();
+    seedAndBootstrap(host);
+    host.harness.sdk.stub("system.version", (async () => ({
+      currentVersion: "0.39.0",
+      latestVersion: "0.39.0",
+      source: "npm" as const,
+      updateAvailable: false,
+      isDevelopment: false,
+      upgradeCommand: "npx bb-app@latest",
+    })) as never);
+    host.harness.sdk.stub("plugins.list", (async () => ({
+      plugins: [{ id: "agent-proxy", name: "Agent Proxy", version: "0.2.1", status: "incompatible" }],
+    })) as never);
+    host.harness.sdk.stub("plugins.getSource", (async ({ pluginId }: { pluginId: string }) => {
+      expect(pluginId).toBe("agent-proxy");
+      return {
+        requested: "git:https://example.test/agent-proxy",
+        resolved: "git:https://example.test/agent-proxy@0.2.1",
+        engines: { bb: ">=0.38.0 <0.39.0" },
+        history: [],
+      };
+    }) as never);
+
+    const result = await host.harness.callRpc("doctor", { projectId: PROJECT_ID }) as FoundationResult;
+    expect(result).toMatchObject({
+      outcome: "OK",
+      message: 'plugin "Agent Proxy" 0.2.1 is not loaded: declared BB range >=0.38.0 <0.39.0 excludes running BB 0.39.0',
+      evidence: {
+        compatibility: {
+          plugins: {
+            checked: 1,
+            incompatible: [{
+              id: "agent-proxy",
+              name: "Agent Proxy",
+              pluginVersion: "0.2.1",
+              requiredBbRange: ">=0.38.0 <0.39.0",
+              bbVersion: "0.39.0",
+              loaded: false,
+            }],
+          },
+        },
+      },
+    });
+  });
 });
 
 function directDatabase() {
@@ -4702,6 +4748,7 @@ describe("bb-collab plugin boundary", () => {
             }),
           },
           projects: { get: async () => { throw new Error("unknown project"); } },
+          plugins: { list: async () => ({ plugins: [] }), getSource: async () => ({ engines: {} }) },
           hosts: { get: async () => { throw new Error("not reached"); } },
         },
         PROJECT_ID,
