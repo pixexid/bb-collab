@@ -30,6 +30,26 @@ describe("host plugin-nav region capability", () => {
     }
   });
 
+  // Tripwire for docs/nav-icon-unread-signal.md. Branding assets are read once
+  // at plugin load, so an icon cannot carry live unread state; the only fix is
+  // a host-side surface (get-bb/bb#1852). These fail when one lands.
+  it("gives a nav panel no badge, count, or attention field", () => {
+    const registration = /interface PluginNavPanelRegistration \{[\s\S]*?\n\}/u.exec(appTypes)?.[0] ?? "";
+    expect(registration).not.toBe("");
+    // Match declared fields only: the doc comment already says "a count".
+    const fields = registration.replace(/\/\*[\s\S]*?\*\//gu, "");
+    for (const symbol of ["badge", "count", "unread", "attention", "indicator"]) {
+      expect(fields, `nav panel gained ${symbol}`).not.toMatch(new RegExp(`\\b${symbol}\\b\\??:`, "iu"));
+    }
+  });
+
+  it("exposes no runtime branding setter", () => {
+    for (const symbol of ["setBranding", "updateBranding", "brandingAssets", "compactIconUrl"]) {
+      expect(appTypes, `app SDK gained ${symbol}`).not.toContain(symbol);
+      expect(serverTypes, `server SDK gained ${symbol}`).not.toContain(symbol);
+    }
+  });
+
   it("gives a content script no nav-region handle", () => {
     const context = /interface PluginContentScriptContext \{[\s\S]*?\n\}/u.exec(appTypes)?.[0] ?? "";
     expect(context).not.toBe("");

@@ -68,6 +68,11 @@ attention field — and `PluginContentScriptContext` exposes no nav-region handl
 region, and `tests/sidebar-nav-capability.test.ts` is its standing tripwire. The
 refused workarounds are unchanged and listed there: host `data-testid`
 selectors, `nth-child` position, and writing `bb.sidebar.*` client storage.
+Rewriting the plugin's own `branding.icon` or `branding.logo` file to carry the
+signal is refused too, and for a stronger reason: it does not work.
+`docs/nav-icon-unread-signal.md` measures it — branding assets are read once at
+plugin load and served from memory, so a runtime rewrite is invisible until the
+plugin reloads.
 
 What *is* supported is the sanctioned thread-row status surface the lane pulse
 already uses, `PluginContentScriptContext.experimental_setThreadRowStatus`. The
