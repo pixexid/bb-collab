@@ -9,7 +9,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const stage = mkdtempSync(join(tmpdir(), "bb-collab-build-"));
 
 try {
-  for (const name of ["server.ts", "app.tsx", "tsconfig.json", "src", "types", "vendor"]) {
+  for (const name of ["server.ts", "app.tsx", "tsconfig.json", "assets", "src", "types", "vendor"]) {
     cpSync(join(root, name), join(stage, name), { recursive: true });
   }
   writeFileSync(join(stage, "role-briefs.json"), JSON.stringify(roleBriefBundle(root)));
