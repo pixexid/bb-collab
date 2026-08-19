@@ -11,11 +11,14 @@ This is the canonical role and review matrix. It describes operating choices, no
 | Orchestrator alternate | `codex` | `gpt-5.6-sol` | MEDIUM |
 | Merge-bound worker (routine) | `codex` | `gpt-5.6-luna` | Any, up to MAX |
 | Merge-bound worker (hard) | `codex` | `gpt-5.6-sol` | MEDIUM to LOW |
-| Merge-bound worker | `pi` | `zai/glm-5.3` | MEDIUM or HIGH |
 | Operator-facing UI/UX lane | `claude-code` | `claude-opus-5[1m]` | MEDIUM only |
 | Tier-A reviewer | `codex` | `gpt-5.6-sol` | MEDIUM only |
 | Tier-B reviewer | `codex` | `gpt-5.6-luna` | Any |
 | Mechanical subagent | `codex` | `gpt-5.6-luna` | LOW |
+
+`zai/glm-5.3` is temporarily withdrawn from non-director placement to conserve peak-hour usage; the resulting one-provider worker spread is accepted for peak hours as the priced-in cost of the withdrawal; Codex is therefore the only worker provider, and Codex saturation escalates to the operator with usage data rather than re-seating on GLM.
+
+[GH-314](https://github.com/pixexid/bb-collab/issues/314)'s routing-uniformity mirror should report any GLM worker routing as a violation while this withdrawal is in force.
 
 Every new spawn should pass explicit provider, model, reasoning, and `visibility: "visible"` flags; remembered defaults are not evidence.
 
