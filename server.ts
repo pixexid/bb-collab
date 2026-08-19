@@ -2149,18 +2149,22 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   const archiveSweepRefusalCounter = createArchiveSweepRefusalCounter();
   bb.background.schedule("thread-archive-sweep", "0 * * * *", async () => {
     archiveSweepRefusalCounter.beginCycle();
-    const refusalsThisCycle = new Map<string, ArchiveSweepRefusalAggregate>();
+    const refusalsThisCycle = new Map<string, { aggregate: ArchiveSweepRefusalAggregate; firstSighting: boolean }>();
+    const refusalMessage = (aggregate: ArchiveSweepRefusalAggregate) => `${ARCHIVE_SWEEP_GUARD} coverage=degraded guard=${aggregate.guard} reason=${aggregate.reason} occurrencesSinceReload=${aggregate.occurrencesSinceReload} cyclesSinceReload=${aggregate.cyclesSinceReload} projectsSinceReload=${aggregate.projectsSinceReload} sinceReloadAt=${new Date(aggregate.sinceReloadAtMs).toISOString()}`;
     const recordRefusal = (reason: string, projectId: string | null) => {
       const aggregate = archiveSweepRefusalCounter.observe(reason, projectId);
-      refusalsThisCycle.set(aggregate.reason, aggregate);
+      const firstSighting = aggregate.occurrencesSinceReload === 1;
+      if (firstSighting) bb.log.warn(refusalMessage(aggregate));
+      refusalsThisCycle.set(aggregate.reason, { aggregate, firstSighting });
     };
     const reportRefusals = () => {
       if (refusalsThisCycle.size === 0) {
         bb.log.info("thread-archive-sweep healthy cycle");
         return;
       }
-      for (const aggregate of refusalsThisCycle.values()) {
-        bb.log.warn(`${ARCHIVE_SWEEP_GUARD} coverage=degraded guard=${aggregate.guard} reason=${aggregate.reason} occurrencesSinceReload=${aggregate.occurrencesSinceReload} cyclesSinceReload=${aggregate.cyclesSinceReload} projectsSinceReload=${aggregate.projectsSinceReload} sinceReloadAt=${new Date(aggregate.sinceReloadAtMs).toISOString()}`);
+      for (const { aggregate, firstSighting } of refusalsThisCycle.values()) {
+        if (firstSighting && aggregate.occurrencesSinceReload === 1) continue;
+        bb.log.warn(refusalMessage(aggregate));
       }
     };
     let projects: Awaited<ReturnType<typeof bb.sdk.projects.list>>;

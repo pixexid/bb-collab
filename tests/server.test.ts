@@ -2421,18 +2421,17 @@ describe("bb-collab plugin boundary", () => {
     expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
-  it("emits the first archive refusal as a visible warning", async () => {
+  it("emits the first archive refusal before folding a same-key second project", async () => {
     const host = hostFor();
-    host.harness.sdk.stub("projects.list", (async () => { throw new Error("constructed archive refusal"); }) as never);
+    host.harness.sdk.stub("projects.list", (async () => [projectFacts(PROJECT_ID), projectFacts("project-two")]) as never);
     await plugin(host.bb);
 
     await host.harness.runSchedule("thread-archive-sweep");
 
-    expect(host.harness.inspection.logEntries.filter((entry) => entry.level === "warn" && entry.message.startsWith("thread-archive-sweep coverage=degraded"))).toEqual([
-      expect.objectContaining({
-        message: expect.stringContaining("reason=project inventory unavailable: Error: constructed archive refusal occurrencesSinceReload=1"),
-      }),
-    ]);
+    const warnings = host.harness.inspection.logEntries.filter((entry) => entry.level === "warn" && entry.message.startsWith("thread-archive-sweep coverage=degraded"));
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]?.message).toMatch(/reason=execution attempts are unavailable or empty occurrencesSinceReload=1 cyclesSinceReload=1 projectsSinceReload=1 /u);
+    expect(warnings[1]?.message).toMatch(/reason=execution attempts are unavailable or empty occurrencesSinceReload=2 cyclesSinceReload=1 projectsSinceReload=2 /u);
   });
 
   it("discloses archive refusal counts since plugin reload", async () => {
