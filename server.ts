@@ -103,6 +103,8 @@ function startableQueueDepth(repositories: string[]): number | null {
 
 export const FLEET_WATCHDOG_FLOOR_MS = 5 * 60_000;
 export const FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS = 60 * 60_000;
+const FLEET_WATCHDOG_LEGACY_FLOOR_MS = 60 * 60_000;
+const FLEET_WATCHDOG_FLOOR_MIGRATION_KEY = "fleet-watchdog.floor-default-v2-migrated";
 export const FLEET_WATCHDOG_STALE_WAIT_MS = 24 * 60 * 60_000;
 const FLEET_WATCHDOG_STOPPING_WAIT_MS = 30_000;
 const AUTOMATED_TELL_IDLE_WAIT_MS = 30_000;
@@ -1339,6 +1341,36 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       default: String(FLEET_WATCHDOG_STALE_WAIT_MS),
     },
   });
+  let fleetWatchdogFloorMigration: Promise<void> | null = null;
+  const ensureFleetWatchdogFloorMigrated = () => {
+    if (fleetWatchdogFloorMigration) return fleetWatchdogFloorMigration;
+    fleetWatchdogFloorMigration = (async () => {
+      const marker = await bb.storage.kv.get<unknown>(FLEET_WATCHDOG_FLOOR_MIGRATION_KEY);
+      if (marker === true) {
+        bb.log.info("fleet-watchdog floor setting preserved: already migrated");
+        return;
+      }
+      if (marker !== undefined) throw new Error("fleet watchdog floor migration marker is malformed");
+      const current = await fleetWatchdogSettings.get();
+      if (current.fleetWatchdogFloorMs === String(FLEET_WATCHDOG_LEGACY_FLOOR_MS)) {
+        const updated = await bb.sdk.plugins.updateSettings({
+          pluginId: PLUGIN_ID,
+          values: { fleetWatchdogFloorMs: String(FLEET_WATCHDOG_FLOOR_MS) },
+        });
+        if (updated.values.fleetWatchdogFloorMs !== String(FLEET_WATCHDOG_FLOOR_MS)) {
+          throw new Error("fleet watchdog floor migration did not persist the five-minute value");
+        }
+        bb.log.warn(`fleet-watchdog floor setting migrated: ${FLEET_WATCHDOG_LEGACY_FLOOR_MS} -> ${FLEET_WATCHDOG_FLOOR_MS}`);
+      } else {
+        bb.log.info(`fleet-watchdog floor setting preserved: explicit value ${String(current.fleetWatchdogFloorMs)}`);
+      }
+      await bb.storage.kv.set(FLEET_WATCHDOG_FLOOR_MIGRATION_KEY, true);
+    })().catch((error) => {
+      fleetWatchdogFloorMigration = null;
+      throw error;
+    });
+    return fleetWatchdogFloorMigration;
+  };
   const readDiagnosticDivergence = () => readCheckoutDivergence(
     options.checkoutRoot === undefined ? findCheckoutRoot(dirname(fileURLToPath(import.meta.url))) : options.checkoutRoot,
   );
@@ -1794,6 +1826,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         cannotSee.add("canonical-store:unavailable");
         return;
       }
+      await ensureFleetWatchdogFloorMigrated();
       const now = Date.now();
       const { fleetWatchdogFloorMs, fleetWatchdogStaleWaitMs } = await fleetWatchdogSettings.get();
       const floorMs = Number(fleetWatchdogFloorMs);
@@ -1915,15 +1948,14 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         return latest ? `${latest.type}@${latest.seq}` : "unknown";
       };
       const wake = async (projectId: string, holder: RoleHolderState, key: string, text: string, requireIdle: boolean, kind: "fleet" | "recovery" | "startable-queue" | "stale-wait" | "owed-act" | "escalation", beforeSend?: () => Promise<boolean>) => {
-        if (kind !== "recovery") {
-          const previous = await fleetWatchdogIdle.get(key);
-          const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs
+        const previous = await fleetWatchdogIdle.get(key);
+        const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs
+          : kind === "recovery" ? previous?.lastRecoveryWakeAtMs
             : kind === "startable-queue" ? previous?.lastStartableQueueWakeAtMs
               : kind === "stale-wait" ? previous?.lastStaleWaitWakeAtMs
                 : kind === "owed-act" ? previous?.lastOwedActWakeAtMs
                   : previous?.lastEscalationAtMs;
-          if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== undefined && now - lastNotifiedAtMs < FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) return false;
-        }
+        if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== undefined && now - lastNotifiedAtMs < FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) return false;
         if (wakeInFlight.has(key)) return false;
         wakeInFlight.add(key);
         try {
@@ -2040,6 +2072,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
                 continue;
               }
               const event = await lastEvent(lane.id);
+              const strandedKey = `stranded:${projectId}:${lane.id}:${recipient.execution_attempt_id}`;
+              const previous = await fleetWatchdogIdle.get(strandedKey);
+              if (previous?.lastRecoveryWakeAtMs !== null && previous?.lastRecoveryWakeAtMs !== undefined && now - previous.lastRecoveryWakeAtMs < FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) continue;
               await bb.sdk.threads.send({
                 threadId: recipient.thread_id,
                 mode: "queue-if-active",
@@ -2050,6 +2085,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
                   mentions: [],
                 }],
               });
+              await fleetWatchdogIdle.recordRecoveryWake(strandedKey, now);
               brokenWakePath = true;
               bb.log.warn(`fleet-watchdog stranded lane surfaced: project=${projectId} lane=${lane.id} dispatcher=${recipient.role_id}@${recipient.role_generation} status=${observedStatus}`);
             } catch (error) {
@@ -2114,7 +2150,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               await wake(projectId, owing, owingKey, `owed act quiet at cycle ${new Date(now).toISOString()} with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
               continue;
             }
-            if (owing.role_id !== "director" && now - owingRecord.lastOwedActWakeAtMs >= floorMs) {
+            if (owing.role_id !== "director" && now - owingRecord.lastOwedActWakeAtMs >= FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) {
               await wake(projectId, director, roleIdleKey(director, seatWait.workItemId), `owed act still quiet at cycle ${new Date(now).toISOString()} with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
             }
             continue;
@@ -2127,7 +2163,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           const workKey = openWorkItem.workItemId;
           const orchestratorKey = roleIdleKey(orchestrator, workKey);
           const priorOrchestratorRecord = await fleetWatchdogIdle.get(orchestratorKey);
-          if (priorOrchestratorRecord?.lastFleetWakeAtMs !== null && priorOrchestratorRecord?.lastFleetWakeAtMs !== undefined && now - priorOrchestratorRecord.lastFleetWakeAtMs >= floorMs) {
+          if (priorOrchestratorRecord?.lastFleetWakeAtMs !== null && priorOrchestratorRecord?.lastFleetWakeAtMs !== undefined && now - priorOrchestratorRecord.lastFleetWakeAtMs >= FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) {
             await wake(projectId, director, roleIdleKey(director, workKey), `fleet still quiet at cycle ${new Date(now).toISOString()} with open work since ${new Date(priorOrchestratorRecord.idleSinceMs ?? now).toISOString()}`, false, "escalation", async () => (await Promise.all(holders.map(async (holder) => {
               const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
               return !roleThreadRefusal(holder, thread, true) && !await readPendingExternalWait(holder.thread_id);
