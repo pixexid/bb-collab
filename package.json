@@ -24,7 +24,7 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "throughput-report": "node scripts/weekly-throughput-report.mjs",
-    "verify": "npm run typecheck && npm test && npm run build && node scripts/check-css-bundle.mjs && node scripts/role-brief-bundle.mjs"
+    "verify": "npm run typecheck && npm test && npm run build && node scripts/check-css-bundle.mjs && node scripts/role-brief-bundle.mjs && node scripts/check-dist.mjs"
   },
   "dependencies": {
     "zod": "4.3.6"
