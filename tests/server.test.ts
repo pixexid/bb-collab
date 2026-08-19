@@ -7653,17 +7653,38 @@ exit 1
     }), null, facts).outcome).toBe("OK");
   });
 
-  it("accepts pi/kimi-coding/k3/high as new director config with either ratified standby", async () => {
-    for (const standbyProfile of [DIRECTOR_PROFILE, DIRECTOR_STANDBY_PROFILE]) {
-      const host = await loadedHost();
-      const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, {
-        config: directorSeatConfig(DIRECTOR_K3_PROFILE, standbyProfile),
-      });
-      expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
-        roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
-        declaredProfile: DIRECTOR_K3_PROFILE,
-      }), null, directorRoleReader(undefined, DIRECTOR_K3_PROFILE)).outcome).toBe("OK");
-    }
+  it("accepts pi/kimi-coding/k3/high with opus-medium through qualification and succession states", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, {
+      config: directorSeatConfig(DIRECTOR_K3_PROFILE, DIRECTOR_PROFILE),
+    });
+    const facts = directorRoleReader(undefined, DIRECTOR_K3_PROFILE);
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      declaredProfile: DIRECTOR_K3_PROFILE,
+    }), null, facts).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      profileDigest: sha256(canonicalJson(DIRECTOR_K3_PROFILE)),
+      standbyProfile: DIRECTOR_PROFILE,
+    }), null, facts).outcome).toBe("OK");
+  });
+
+  it("refuses pi/kimi-coding/k3/high with glm-high at succession after qualification succeeds", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, {
+      config: directorSeatConfig(DIRECTOR_K3_PROFILE, DIRECTOR_STANDBY_PROFILE),
+    });
+    const facts = directorRoleReader(undefined, DIRECTOR_K3_PROFILE);
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      declaredProfile: DIRECTOR_K3_PROFILE,
+    }), null, facts).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      profileDigest: sha256(canonicalJson(DIRECTOR_K3_PROFILE)),
+      standbyProfile: DIRECTOR_STANDBY_PROFILE,
+    }), null, facts).outcome).toBe("ROLE_STANDBY_INVALID");
   });
 
   it("refuses pi/kimi-coding/k3-256k/high as new director config by exact model string", async () => {
