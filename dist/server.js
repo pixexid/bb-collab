@@ -20049,7 +20049,6 @@ function listGitWorktrees(repoRoot) {
 function cleanupGitWorktrees(repoRoot, liveThreadIds, liveWorktreeThreadIds = /* @__PURE__ */ new Map()) {
   const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
   const status = (path) => git(["status", "--porcelain", "--untracked-files=all"], path);
-  const reachable = (path, head) => git(["rev-list", "--not", originMain, head], path) === "";
   return runWorktreeCleanup(listGitWorktrees(repoRoot), {
     liveThreadIds,
     liveWorktreeThreadIds,

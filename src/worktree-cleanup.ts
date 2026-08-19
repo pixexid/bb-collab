@@ -147,7 +147,6 @@ export function listGitWorktrees(repoRoot: string): WorktreeEntry[] {
 export function cleanupGitWorktrees(repoRoot: string, liveThreadIds: ReadonlySet<string>, liveWorktreeThreadIds: ReadonlyMap<string, ReadonlySet<string>> = new Map()): WorktreeCleanupReport {
   const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
   const status = (path: string) => git(["status", "--porcelain", "--untracked-files=all"], path);
-  const reachable = (path: string, head: string) => git(["rev-list", "--not", originMain, head], path) === "";
   return runWorktreeCleanup(listGitWorktrees(repoRoot), {
     liveThreadIds,
     liveWorktreeThreadIds,
