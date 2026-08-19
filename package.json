@@ -10,7 +10,7 @@
     "name": "bb-collab",
     "description": "BB-native project governance storage and conformance boundary.",
     "branding": {
-      "icon": "Database"
+      "icon": "GitBranch"
     },
     "server": "./dist/server.js",
     "app": "./app.tsx",
