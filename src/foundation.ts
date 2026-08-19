@@ -991,10 +991,11 @@ const migrationExportSchema = z.union([
   z.object({
     kind: z.literal("canonical-export-files"),
     complete: z.literal(true),
-    directory: z.string().min(1).max(4096),
+    directory: z.string().min(1).max(4096).optional(),
+    displayDirectory: z.string().min(1).max(4096).optional(),
     manifest: migrationExportManifestSchema,
     checksums: z.record(z.string(), digestSchema),
-  }).strict(),
+  }).strict().refine((value) => value.directory !== undefined || value.displayDirectory !== undefined, { message: "file export directory is required" }),
 ]);
 const migrationPrepareSchema = z
   .object({
@@ -2165,9 +2166,12 @@ export interface ExportFilePayload {
   kind: "canonical-export-files";
   complete: true;
   directory: string;
+  displayDirectory?: string;
   manifest: ExportPayload["manifest"];
   checksums: ExportPayload["checksums"];
 }
+
+type ExportFileInput = Omit<ExportFilePayload, "directory"> & { directory?: string };
 
 interface RefusalData {
   code: FoundationCode;
@@ -3322,13 +3326,15 @@ function exportRootDirectory(db: SqliteDatabase): string | null {
   return main?.file ? join(dirname(main.file), ".bb-collab-exports") : null;
 }
 
-function readMigrationExportFiles(db: SqliteDatabase, input: ExportFilePayload): ExportPayload {
+function readMigrationExportFiles(db: SqliteDatabase, input: ExportFileInput): ExportPayload {
   const root = exportRootDirectory(db);
   if (!root) throw refusal("IMPORT_EQUIVALENCE_FAILED", "file export requires the exact file-backed canonical store");
   let directory: string;
   try {
     const resolvedRoot = realpathSync(root);
-    directory = realpathSync(input.directory);
+    const inputDirectory = input.directory ?? input.displayDirectory;
+    if (!inputDirectory) throw new Error("missing path");
+    directory = realpathSync(isAbsolute(inputDirectory) ? inputDirectory : join(dirname(root), inputDirectory));
     const nested = relative(resolvedRoot, directory);
     if (!nested || nested.startsWith("..") || isAbsolute(nested) || !basename(directory).startsWith("complete-")) throw new Error("foreign path");
   } catch {
@@ -5967,9 +5973,23 @@ function writeFoundationExportFiles(db: SqliteDatabase, projectId: string, paylo
     sha256(readFileSync(join(directory, "records.ndjson"), "utf8")) === payload.checksums["records.ndjson"] &&
     sha256(readFileSync(join(directory, "artifact-index.json"), "utf8")) === payload.checksums["artifact-index.json"] &&
     sha256(readFileSync(join(directory, "manifest.json"), "utf8")) === payload.checksums["manifest.json"];
+  const result = () => {
+    const displayDirectory = relative(dirname(root), directory);
+    const exportFile = { kind: "canonical-export-files", complete: true, displayDirectory, manifest: payload.manifest, checksums: payload.checksums } as ExportFilePayload;
+    Object.defineProperties(exportFile, {
+      directory: { value: directory },
+      toJSON: {
+        value: () => {
+          const { displayDirectory: serializedDirectory, ...serialized } = exportFile;
+          return { ...serialized, directory: serializedDirectory };
+        },
+      },
+    });
+    return exportFile;
+  };
   if (existsSync(directory)) {
     if (!matches()) throw new Error("existing canonical export files do not match their export root");
-    return { kind: "canonical-export-files", complete: true, directory, manifest: payload.manifest, checksums: payload.checksums };
+    return result();
   }
   const partial = mkdtempSync(join(root, `.partial-${sha256(projectId).slice(0, 12)}-`));
   try {
@@ -5982,7 +6002,7 @@ function writeFoundationExportFiles(db: SqliteDatabase, projectId: string, paylo
       if (!existsSync(directory) || !matches()) throw error;
       rmSync(partial, { recursive: true, force: true });
     }
-    return { kind: "canonical-export-files", complete: true, directory, manifest: payload.manifest, checksums: payload.checksums };
+    return result();
   } catch (error) {
     rmSync(partial, { recursive: true, force: true });
     throw error;
