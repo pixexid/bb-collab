@@ -643,8 +643,7 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
   let nativeUpdatedAt = updatedAt;
   const threadProjects = new Map([[director.thread_id, PROJECT_ID], [orchestrator.thread_id, PROJECT_ID]]);
   const lanes = new Map<string, ReturnType<typeof makeThreadResponse> & { environmentBranchName: string | null }>();
-  const laneEvents = new Map<string, Array<{ id: string; threadId: string; seq: number; type: "turn/started"; scope: { kind: "thread" }; data: { providerThreadId: string }; createdAt: number }>>();
-  const usageCapped = new Set<string>();
+  const laneEvents = new Map<string, Array<{ id: string; threadId: string; seq: number; type: string; scope: { kind: "thread" }; data: unknown; createdAt: number }>>();
   fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
     ...(lanes.get(threadId) ?? {}),
     id: threadId,
@@ -662,22 +661,23 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
     });
     lanes.set(id, lane);
     laneEvents.set(id, [{ id: `event-${id}`, threadId: id, seq: 7, type: "turn/started", scope: { kind: "thread" }, data: { providerThreadId: "provider-thread" }, createdAt: 7 }]);
+    // A lane that has taken a turn has reported its rate limits at least once, so the default
+    // fixture lane is not silently exercising the never-observed path.
+    recordRateLimits(id, { providerId: "codex", status: "allowed", kind: "credits", windows: [], reachedReason: null, overageStatus: null, overageReason: null });
     return lane;
   }) as never);
-  fixture.host.harness.sdk.stub("threads.events.list", (async ({ threadId }: { threadId: string }) => laneEvents.get(threadId) ?? []) as never);
-  fixture.host.harness.sdk.stub("threads.rateLimitRecovery", (async ({ threadId }: { threadId: string }) => usageCapped.has(threadId) ? {
-    reason: "eligible",
-    scopeKey: "test",
-    hostId: "host-main",
-    rateLimits: null,
-    candidate: {
-      failedRequestId: "failed-request",
-      turnId: "failed-turn",
-      automatic: true,
-      resetsAtMs: 9_999_999,
-      rateLimits: { providerId: "codex", status: "blocked", kind: "subscription-window", windows: [], reachedReason: "usage cap", overageStatus: null, overageReason: null },
-    },
-  } : { reason: "no-rate-limit-state", scopeKey: "test", hostId: "host-main", rateLimits: null, candidate: null }) as never);
+  const recordRateLimits = (threadId: string, rateLimits: Record<string, unknown>) => {
+    const events = laneEvents.get(threadId) ?? [];
+    events.push({ id: `rate-limit-${threadId}-${events.length}`, threadId, seq: events.length + 1, type: "provider/rateLimits/updated", scope: { kind: "thread" }, data: { providerThreadId: "provider-thread", rateLimits }, createdAt: 8 });
+    laneEvents.set(threadId, events);
+  };
+  // Mirrors the durable event log the watchdog now reads its cap state from, including the
+  // type filter and descending order, so a stub that ignored either would not pass for one.
+  fixture.host.harness.sdk.stub("threads.events.list", (async ({ threadId, types, order, limit }: { threadId: string; types?: readonly string[]; order?: "asc" | "desc"; limit?: string }) => {
+    const events = (laneEvents.get(threadId) ?? []).filter((event) => types === undefined || types.includes(event.type)).sort((left, right) => left.seq - right.seq);
+    const ordered = order === "desc" ? events.reverse() : events;
+    return limit === undefined ? ordered : ordered.slice(0, Number(limit));
+  }) as never);
   fixture.host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
   return {
     ...fixture,
@@ -688,7 +688,10 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
     getThreadStatus() { return threadStatus; },
     setDirectorPendingInteraction(value: boolean) { directorPendingInteraction = value; },
     setThreadProject(threadId: string, projectId: string) { threadProjects.set(threadId, projectId); },
-    setUsageCapped(threadId: string) { usageCapped.add(threadId); },
+    recordRateLimits,
+    setUsageCapped(threadId: string, resetsAtMs: number | null = 9_999_999_999_999) {
+      recordRateLimits(threadId, { providerId: "codex", status: "blocked", kind: "subscription-window", windows: [{ label: "Five-hour limit", providerKey: "five_hour", status: "blocked", resetsAtMs }], reachedReason: "usage cap", overageStatus: null, overageReason: null });
+    },
   };
 }
 
@@ -2458,7 +2461,10 @@ describe("bb-collab plugin boundary", () => {
       status: threadId === fixture.orchestratorThreadId ? "error" : "idle",
       updatedAt: 1,
     })) as never);
-    fixture.host.harness.sdk.stub("threads.rateLimitRecovery", (async () => { throw new Error("rate limit state unavailable"); }) as never);
+    fixture.host.harness.sdk.stub("threads.events.list", (async ({ types }: { types?: readonly string[] }) => {
+      if (types?.includes("provider/rateLimits/updated")) throw new Error("rate limit state unavailable");
+      return [];
+    }) as never);
 
     await fixture.host.harness.runSchedule("fleet-watchdog");
 
@@ -2470,6 +2476,90 @@ describe("bb-collab plugin boundary", () => {
     expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
       level: "warn",
       message: expect.stringContaining(`cannotSee=platform-rate-limit:${fixture.orchestratorThreadId}:Error: rate limit state unavailable`),
+    }));
+  });
+
+  it("records the gap and still recovers when no rate-limit event has ever been observed", async () => {
+    const fixture = await fleetWatchdogFixture();
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      status: threadId === fixture.orchestratorThreadId ? "error" : "idle",
+      updatedAt: 1,
+    })) as never);
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringContaining(`platform-rate-limit:${fixture.orchestratorThreadId}:no-rate-limit-event-observed`),
+    }));
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+      expect.objectContaining({ threadId: fixture.orchestratorThreadId, mode: "start" }),
+    ]]);
+  });
+
+  it("stops honouring a subscription-window cap once every blocked window has reset", async () => {
+    const fixture = await fleetWatchdogFixture();
+    fixture.setUsageCapped(fixture.orchestratorThreadId, Date.now() - 1);
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      status: threadId === fixture.orchestratorThreadId ? "error" : "idle",
+      updatedAt: 1,
+    })) as never);
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    expect(fixture.host.harness.inspection.logEntries).not.toContainEqual(expect.objectContaining({
+      message: "fleet-watchdog scheduled return: project=proj_test role=project-orchestrator@1 status=usage-capped",
+    }));
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+      expect.objectContaining({ threadId: fixture.orchestratorThreadId, mode: "start" }),
+    ]]);
+  });
+
+  it("records the gap and still recovers when the provider reports its cap state as unknown", async () => {
+    const fixture = await fleetWatchdogFixture();
+    // The one status that is neither a cap nor a denial of one. It must not reach a caller
+    // as a quiet negative just because it is not the string "blocked".
+    fixture.recordRateLimits(fixture.orchestratorThreadId, { providerId: "codex", status: "unknown", kind: "unknown", windows: [], reachedReason: null, overageStatus: null, overageReason: null });
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      status: threadId === fixture.orchestratorThreadId ? "error" : "idle",
+      updatedAt: 1,
+    })) as never);
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringContaining(`platform-rate-limit:${fixture.orchestratorThreadId}:provider-reports-unknown-rate-limit-state`),
+    }));
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+      expect.objectContaining({ threadId: fixture.orchestratorThreadId, mode: "start" }),
+    ]]);
+  });
+
+  it("records the unbounded hold when a blocked window carries no reset time", async () => {
+    const fixture = await fleetWatchdogFixture();
+    fixture.setUsageCapped(fixture.orchestratorThreadId, null);
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      status: threadId === fixture.orchestratorThreadId ? "error" : "idle",
+      updatedAt: 1,
+    })) as never);
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    // The hold itself is correct and stays; without the degrade it is indistinguishable from
+    // a seat waiting out a dated cap, and nothing in the tick would ever bound it.
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringContaining(`platform-rate-limit:${fixture.orchestratorThreadId}:blocked-without-a-reset-time`),
     }));
   });
 

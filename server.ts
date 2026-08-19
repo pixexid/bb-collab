@@ -1728,14 +1728,43 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         openWorkItemsByProject.set(workItem.project_id, workItems);
       }
       const isCurrent = (candidate: RoleHolderState, holder: RoleHolderState) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
-      const isUsageCapped = async (threadId: string) => {
+      // 0.39.0 removed the rateLimitRecovery point query; provider/rateLimits/updated events
+      // replace it. Those events are persisted in the durable thread event log, so the newest
+      // one IS the cache -- there is no listener to attach or detach, and nothing to re-arm
+      // after a daemon restart, because the log outlives the daemon that wrote it.
+      const isUsageCapped = async (threadId: string): Promise<"capped" | "not-capped" | "unobserved" | "unreadable"> => {
+        let latest;
         try {
-          const recovery = await bb.sdk.threads.rateLimitRecovery({ threadId });
-          return recovery.candidate?.rateLimits.status === "blocked" && recovery.candidate.rateLimits.kind === "subscription-window";
+          [latest] = await bb.sdk.threads.events.list({ threadId, types: ["provider/rateLimits/updated"], order: "desc", limit: "1" });
         } catch (error) {
           degrade(`platform-rate-limit:${threadId}:${String(error)}`);
-          return null;
+          return "unreadable";
         }
+        const rateLimits = latest?.type === "provider/rateLimits/updated" ? latest.data.rateLimits : undefined;
+        // The schema's status is a four-value enum, and the provider's own "unknown" is an
+        // absent cap signal exactly like a missing event -- not a negative. Both answer
+        // "unobserved" so neither can reach a caller without also reaching the record.
+        if (rateLimits === undefined || rateLimits.status === "unknown") {
+          degrade(`platform-rate-limit:${threadId}:${rateLimits === undefined ? "no-rate-limit-event-observed" : "provider-reports-unknown-rate-limit-state"}`);
+          return "unobserved";
+        }
+        if (rateLimits.status !== "blocked" || rateLimits.kind !== "subscription-window") return "not-capped";
+        // The provider emits nothing until the thread runs again, so a block we keep honouring
+        // past its reset would idle the thread forever waiting for an event that our own
+        // refusal to wake it prevents. Lift only on positive evidence that every blocked
+        // window has already reset.
+        const blocked = rateLimits.windows.filter((window) => window.status === "blocked");
+        const resetsAtMs = blocked.flatMap((window) => window.resetsAtMs ?? []);
+        // A block with no dated window can never lift on its own: the reset that would clear
+        // it arrives on an event only the thread's next turn produces, and this hold is why
+        // there is no next turn. Keep honouring it -- lifting would wake a genuinely blocked
+        // seat every tick against a provider already refusing us -- but record the unbounded
+        // hold so it is distinguishable from a seat correctly waiting out a dated cap.
+        if (blocked.length === 0 || resetsAtMs.length !== blocked.length) {
+          degrade(`platform-rate-limit:${threadId}:blocked-without-a-reset-time`);
+          return "capped";
+        }
+        return resetsAtMs.every((resets) => resets <= now) ? "not-capped" : "capped";
       };
       const lastEvent = async (threadId: string) => {
         let latest: Awaited<ReturnType<typeof bb.sdk.threads.events.list>>[number] | undefined;
@@ -1810,9 +1839,12 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             if (thread.status !== "error" && thread.status !== "stopping") continue;
             const observedStatus = thread.status;
             if (observedStatus === "error") {
-              const usageCapped = await isUsageCapped(holder.thread_id);
-              if (usageCapped === null) continue;
-              if (usageCapped) {
+              // "unobserved" is already on the degrade record and deliberately falls through to
+              // recovery: never-idle outranks an absent cap signal, and skipping on it would
+              // strand the thread on the one failure mode the watchdog exists to repair.
+              const usageCap = await isUsageCapped(holder.thread_id);
+              if (usageCap === "unreadable") continue;
+              if (usageCap === "capped") {
                 bb.log.info(`fleet-watchdog scheduled return: project=${projectId} role=${holder.role_id}@${holder.role_generation} status=usage-capped`);
                 continue;
               }
@@ -1830,9 +1862,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             if (lane.status !== "error" && lane.status !== "stopping") continue;
             const observedStatus = lane.status;
             if (observedStatus === "error") {
-              const usageCapped = await isUsageCapped(lane.id);
-              if (usageCapped === null) continue;
-              if (usageCapped) {
+              const usageCap = await isUsageCapped(lane.id);
+              if (usageCap === "unreadable") continue;
+              if (usageCap === "capped") {
                 bb.log.info(`fleet-watchdog scheduled return: project=${projectId} lane=${lane.id} status=usage-capped`);
                 continue;
               }

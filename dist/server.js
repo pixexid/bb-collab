@@ -21638,13 +21638,26 @@ ${thread.titleFallback ?? ""}`);
       }
       const isCurrent = (candidate, holder) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
       const isUsageCapped = async (threadId) => {
+        let latest;
         try {
-          const recovery = await bb.sdk.threads.rateLimitRecovery({ threadId });
-          return recovery.candidate?.rateLimits.status === "blocked" && recovery.candidate.rateLimits.kind === "subscription-window";
+          [latest] = await bb.sdk.threads.events.list({ threadId, types: ["provider/rateLimits/updated"], order: "desc", limit: "1" });
         } catch (error48) {
           degrade(`platform-rate-limit:${threadId}:${String(error48)}`);
-          return null;
+          return "unreadable";
         }
+        const rateLimits = latest?.type === "provider/rateLimits/updated" ? latest.data.rateLimits : void 0;
+        if (rateLimits === void 0 || rateLimits.status === "unknown") {
+          degrade(`platform-rate-limit:${threadId}:${rateLimits === void 0 ? "no-rate-limit-event-observed" : "provider-reports-unknown-rate-limit-state"}`);
+          return "unobserved";
+        }
+        if (rateLimits.status !== "blocked" || rateLimits.kind !== "subscription-window") return "not-capped";
+        const blocked = rateLimits.windows.filter((window) => window.status === "blocked");
+        const resetsAtMs = blocked.flatMap((window) => window.resetsAtMs ?? []);
+        if (blocked.length === 0 || resetsAtMs.length !== blocked.length) {
+          degrade(`platform-rate-limit:${threadId}:blocked-without-a-reset-time`);
+          return "capped";
+        }
+        return resetsAtMs.every((resets) => resets <= now2) ? "not-capped" : "capped";
       };
       const lastEvent = async (threadId) => {
         let latest;
@@ -21715,9 +21728,9 @@ ${thread.titleFallback ?? ""}`);
             if (thread.status !== "error" && thread.status !== "stopping") continue;
             const observedStatus = thread.status;
             if (observedStatus === "error") {
-              const usageCapped = await isUsageCapped(holder.thread_id);
-              if (usageCapped === null) continue;
-              if (usageCapped) {
+              const usageCap = await isUsageCapped(holder.thread_id);
+              if (usageCap === "unreadable") continue;
+              if (usageCap === "capped") {
                 bb.log.info(`fleet-watchdog scheduled return: project=${projectId} role=${holder.role_id}@${holder.role_generation} status=usage-capped`);
                 continue;
               }
@@ -21735,9 +21748,9 @@ ${thread.titleFallback ?? ""}`);
             if (lane.status !== "error" && lane.status !== "stopping") continue;
             const observedStatus = lane.status;
             if (observedStatus === "error") {
-              const usageCapped = await isUsageCapped(lane.id);
-              if (usageCapped === null) continue;
-              if (usageCapped) {
+              const usageCap = await isUsageCapped(lane.id);
+              if (usageCap === "unreadable") continue;
+              if (usageCap === "capped") {
                 bb.log.info(`fleet-watchdog scheduled return: project=${projectId} lane=${lane.id} status=usage-capped`);
                 continue;
               }

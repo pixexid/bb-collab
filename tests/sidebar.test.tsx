@@ -51,6 +51,9 @@ function props(overrides: Partial<PluginThreadListProps> = {}): PluginThreadList
     isCompactViewport: false,
     onNavigate: vi.fn(),
     searchQuery: "",
+    // bb-app 0.39.0 made experimental_Original required: the host's own thread
+    // list, which a plugin may render to defer to default behaviour.
+    experimental_Original: () => null,
     ...overrides,
   };
 }
