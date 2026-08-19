@@ -14485,11 +14485,11 @@ var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
 var CONTRACT_VERSION = 21;
-var SCHEMA_VERSION = 16;
+var SCHEMA_VERSION = 17;
 var PREVIOUS_CONTRACT_VERSION = 21;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
-var PREVIOUS_SCHEMA_VERSION = 15;
+var PREVIOUS_SCHEMA_VERSION = 16;
 var ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"];
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
 var directorSeatProfile = {
@@ -15261,7 +15261,35 @@ var MIGRATIONS = [
     ON execution_attempts(bb_server_id, thread_id, native_request_id)
     WHERE thread_id IS NOT NULL AND native_request_id IS NOT NULL;
   CREATE INDEX IF NOT EXISTS execution_attempts_project_state
-    ON execution_attempts(project_id, state, assignment_kind, lane_id)`
+    ON execution_attempts(project_id, state, assignment_kind, lane_id)`,
+  `PRAGMA defer_foreign_keys = ON;
+  CREATE TABLE work_items_gh295 (
+    project_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    config_revision INTEGER NOT NULL,
+    repo_target_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    lifecycle_state TEXT NOT NULL
+      CHECK (lifecycle_state IN ('proposed', 'ready', 'in_progress', 'review_pending', 'succeeded', 'failed', 'cancelled')),
+    resource_revision INTEGER NOT NULL CHECK (resource_revision > 0),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (project_id, work_item_id),
+    FOREIGN KEY (project_id, config_revision)
+      REFERENCES project_config_revisions(project_id, config_revision),
+    FOREIGN KEY (project_id, repo_target_id, config_revision)
+      REFERENCES repository_targets(project_id, repo_target_id, config_revision)
+  );
+  INSERT INTO work_items_gh295 (
+    project_id, work_item_id, config_revision, repo_target_id, title, body,
+    lifecycle_state, resource_revision, created_at_ms, updated_at_ms
+  ) SELECT
+    project_id, work_item_id, config_revision, repo_target_id, title, body,
+    lifecycle_state, resource_revision, created_at_ms, updated_at_ms
+  FROM work_items;
+  DROP TABLE work_items;
+  ALTER TABLE work_items_gh295 RENAME TO work_items`
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var CACHED_CONSUMERS = [
@@ -15705,7 +15733,45 @@ var decisionEvidenceSchema = external_exports.object({
   actualProfileDigest: digestSchema.optional(),
   nativeReceiptDigest: digestSchema.optional()
 }).strict();
-var WORK_ITEM_STATES = ["proposed", "ready", "in_progress", "succeeded", "failed", "cancelled"];
+var WORK_ITEM_STATES = ["proposed", "ready", "in_progress", "review_pending", "succeeded", "failed", "cancelled"];
+var WORK_ITEM_NON_TERMINAL_STATES = ["proposed", "ready", "in_progress", "review_pending"];
+var WORK_ITEM_CAPACITY_LIFECYCLE_STATES = ["in_progress"];
+var WORK_ITEM_CAPACITY_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
+var WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running"];
+var WORK_ITEM_IDLE_BLIND_ATTEMPT_STATES = ["dispatch_unknown"];
+function workItemCapacityLaneEvidence(db, projectId) {
+  const lanes = db.prepare(
+    `SELECT execution_attempts.lane_id, execution_attempts.thread_id, execution_attempts.state, execution_attempts.observed_at_ms
+     FROM execution_attempts
+     JOIN work_items ON work_items.project_id = execution_attempts.project_id
+       AND work_items.work_item_id = execution_attempts.work_item_id
+     WHERE execution_attempts.project_id = ?
+       AND execution_attempts.origin = 'work_item'
+       AND execution_attempts.assignment_kind = 'write'
+       AND work_items.lifecycle_state IN (${WORK_ITEM_CAPACITY_LIFECYCLE_STATES.map(() => "?").join(", ")})
+       AND execution_attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+     ORDER BY execution_attempts.lane_id, execution_attempts.execution_attempt_id`
+  ).all(projectId, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES).map((row) => ({
+    ...row,
+    idle_kind: WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES.includes(row.state) ? "active" : "blind"
+  }));
+  const unboundWorkItemIds = db.prepare(
+    `SELECT work_items.work_item_id
+     FROM work_items
+     WHERE work_items.project_id = ?
+       AND work_items.lifecycle_state IN (${WORK_ITEM_CAPACITY_LIFECYCLE_STATES.map(() => "?").join(", ")})
+       AND NOT EXISTS (
+         SELECT 1 FROM execution_attempts
+         WHERE execution_attempts.project_id = work_items.project_id
+           AND execution_attempts.work_item_id = work_items.work_item_id
+           AND execution_attempts.origin = 'work_item'
+           AND execution_attempts.assignment_kind = 'write'
+           AND execution_attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+       )
+     ORDER BY work_items.work_item_id`
+  ).all(projectId, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES).map((row) => row.work_item_id);
+  return { lanes, unboundWorkItemIds };
+}
 var workItemStateSchema = external_exports.enum(WORK_ITEM_STATES);
 var workItemInputSchema = external_exports.object({
   workItemId: id,
@@ -18439,6 +18505,16 @@ function applyRoleGenerationSuccession(db, request, digest, context) {
   }
   if (observation.outcome === "unknown" || projection.effective_status === "unknown") throw refusal("CAPABILITY_UNKNOWN", "qualification outcome is unknown");
   if (observation.outcome !== "qualified" || projection.effective_status !== "eligible") throw refusal("ROLE_UNQUALIFIED", "qualification is not eligible");
+  if (request.roleId === "project-orchestrator") {
+    const reconciliationIssues = workItemReconciliationIssues(db, request.projectId);
+    if (reconciliationIssues.length > 0) {
+      throw refusal(
+        "WORK_ITEM_STATE_INVALID",
+        `orchestrator handoff reconciliation refused: ${canonicalJson(reconciliationIssues)}`,
+        { expected: 0, attempted: reconciliationIssues.length, verified: 0 }
+      );
+    }
+  }
   const head = asRow(
     db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(request.projectId, request.roleId)
   );
@@ -18577,7 +18653,7 @@ function applyRoleMutation(db, request, digest, reader) {
     return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
   }
 }
-var ACTIVE_WORK_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
+var ACTIVE_WORK_ATTEMPT_STATES = WORK_ITEM_CAPACITY_ATTEMPT_STATES;
 var WORK_ITEM_THREAD_TOKEN = /thr_[A-Za-z0-9]+/gu;
 var WORK_ITEM_LANE_SENTENCE = /^(?:Lane|Writing lane) (thr_[A-Za-z0-9]+)(?:[,.!?])?(?:[ \t]+|\r?\n|$)/u;
 function parseBackfillLane(body) {
@@ -18663,7 +18739,7 @@ function backfillWorkItemAttempts(db) {
         counts.residualProposed += 1;
         continue;
       }
-      const state = row.lifecycle_state === "succeeded" ? "done" : row.lifecycle_state === "in_progress" ? "running" : row.lifecycle_state === "failed" || row.lifecycle_state === "cancelled" ? "failed" : null;
+      const state = row.lifecycle_state === "succeeded" ? "done" : row.lifecycle_state === "in_progress" ? "running" : row.lifecycle_state === "review_pending" ? "done" : row.lifecycle_state === "failed" || row.lifecycle_state === "cancelled" ? "failed" : null;
       if (!parsed || state === null) {
         counts.unresolved += 1;
         continue;
@@ -18712,16 +18788,17 @@ function nextWorkAttemptOrdinal(db, projectId, workItemId) {
     "SELECT COALESCE(MAX(attempt_ordinal), 0) AS next_attempt_ordinal FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'"
   ).get(projectId, workItemId).next_attempt_ordinal + 1;
 }
-function activeWorkItemAttempt(db, projectId, workItemId) {
+function activeWorkItemAttempt(db, projectId, workItemId, assignmentKind) {
+  const assignmentFilter = assignmentKind === void 0 ? "" : " AND assignment_kind = ?";
   return asRow(db.prepare(
     `SELECT execution_attempt_id FROM execution_attempts
      WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
-       AND state IN (${ACTIVE_WORK_ATTEMPT_STATES.map(() => "?").join(", ")})
+       AND state IN (${ACTIVE_WORK_ATTEMPT_STATES.map(() => "?").join(", ")})${assignmentFilter}
      ORDER BY attempt_ordinal DESC LIMIT 1`
-  ).get(projectId, workItemId, ...ACTIVE_WORK_ATTEMPT_STATES));
+  ).get(projectId, workItemId, ...ACTIVE_WORK_ATTEMPT_STATES, ...assignmentKind === void 0 ? [] : [assignmentKind]));
 }
-function terminalizeWorkItemAttempt(db, projectId, workItemId, state) {
-  const active = activeWorkItemAttempt(db, projectId, workItemId);
+function terminalizeWorkItemAttempt(db, projectId, workItemId, state, assignmentKind) {
+  const active = activeWorkItemAttempt(db, projectId, workItemId, assignmentKind);
   if (!active) return null;
   const completedAtMs = now();
   db.prepare(
@@ -18731,6 +18808,49 @@ function terminalizeWorkItemAttempt(db, projectId, workItemId, state) {
      WHERE project_id = ? AND execution_attempt_id = ?`
   ).run(state, completedAtMs, completedAtMs, projectId, active.execution_attempt_id);
   return active.execution_attempt_id;
+}
+function workItemReconciliationIssues(db, projectId) {
+  const issues = [];
+  const rows = db.prepare(
+    `SELECT work_items.work_item_id, work_items.lifecycle_state,
+       SUM(CASE WHEN execution_attempts.origin = 'work_item'
+          AND execution_attempts.assignment_kind = 'write'
+          AND execution_attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")}) THEN 1 ELSE 0 END) AS writer_count,
+       SUM(CASE WHEN execution_attempts.origin = 'work_item'
+          AND execution_attempts.assignment_kind = 'review'
+          AND execution_attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")}) THEN 1 ELSE 0 END) AS review_count
+     FROM work_items
+     LEFT JOIN execution_attempts ON execution_attempts.project_id = work_items.project_id
+       AND execution_attempts.work_item_id = work_items.work_item_id
+     WHERE work_items.project_id = ?
+     GROUP BY work_items.work_item_id, work_items.lifecycle_state
+     ORDER BY work_items.work_item_id`
+  ).all(...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES, projectId);
+  for (const row of rows) {
+    const writerCount = Number(row.writer_count);
+    const reviewCount = Number(row.review_count);
+    const nonTerminal = WORK_ITEM_NON_TERMINAL_STATES.includes(row.lifecycle_state);
+    if (!nonTerminal && (writerCount !== 0 || reviewCount !== 0)) {
+      issues.push({ kind: "terminal_attempt", workItemId: row.work_item_id, lifecycleState: row.lifecycle_state, count: writerCount + reviewCount });
+      continue;
+    }
+    const expectedWriterCount = WORK_ITEM_CAPACITY_LIFECYCLE_STATES.includes(row.lifecycle_state) ? 1 : 0;
+    if (writerCount !== expectedWriterCount) {
+      issues.push({ kind: "authoring_attempt_count", workItemId: row.work_item_id, lifecycleState: row.lifecycle_state, count: writerCount });
+    }
+    if (row.lifecycle_state === "review_pending" ? reviewCount > 1 : reviewCount !== 0) {
+      issues.push({ kind: "review_attempt_count", workItemId: row.work_item_id, lifecycleState: row.lifecycle_state, count: reviewCount });
+    }
+  }
+  for (const row of db.prepare(
+    `SELECT lane_id, COUNT(*) AS count FROM execution_attempts
+     WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
+       AND state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+     GROUP BY lane_id HAVING COUNT(*) > 1 ORDER BY lane_id`
+  ).all(projectId, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES)) {
+    issues.push({ kind: "duplicate_writer_lane", laneId: row.lane_id, count: Number(row.count) });
+  }
+  return issues;
 }
 var githubSnapshotSchema = external_exports.object({
   owner: id,
@@ -18838,7 +18958,8 @@ function applyWorkItemCreate(db, request, digest) {
 var WORK_ITEM_TRANSITIONS = {
   proposed: ["ready", "cancelled"],
   ready: ["in_progress", "cancelled"],
-  in_progress: ["succeeded", "failed", "cancelled"],
+  in_progress: ["review_pending", "failed", "cancelled"],
+  review_pending: ["in_progress", "succeeded", "failed", "cancelled"],
   succeeded: [],
   failed: [],
   cancelled: []
@@ -18908,12 +19029,24 @@ function applyWorkItemTransition(db, request, digest) {
       }
     );
   }
-  if (workAttempt !== void 0 && nextState !== void 0 && nextState !== "in_progress") {
-    throw refusal("WORK_ITEM_STATE_INVALID", "work attempts may only accompany an in-progress transition");
+  if (workAttempt !== void 0 && nextState !== void 0 && nextState !== "in_progress" && nextState !== "review_pending") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work attempts may only accompany in-progress or review-pending transitions");
+  }
+  if (workAttempt?.assignmentKind === "probe") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "probe attempts cannot hold a work item lifecycle state");
+  }
+  if (nextState === "in_progress" && workAttempt?.assignmentKind !== "write") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "in-progress requires a writing attempt");
+  }
+  if (nextState === "review_pending" && workAttempt?.assignmentKind !== void 0 && workAttempt.assignmentKind !== "review") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "review-pending may only register a review attempt");
   }
   if (workAttempt !== void 0 && nextState === void 0) {
     if (workItem.lifecycle_state !== "in_progress") {
       throw refusal("WORK_ITEM_STATE_INVALID", "replacement work attempts require an in-progress work item");
+    }
+    if (workAttempt.assignmentKind !== "write") {
+      throw refusal("WORK_ITEM_STATE_INVALID", "replacement work attempts must be writing attempts");
     }
     const prior = activeWorkItemAttempt(db, request.projectId, workItem.work_item_id);
     const nextRevision2 = workItem.resource_revision + 1;
@@ -18977,6 +19110,12 @@ function applyWorkItemTransition(db, request, digest) {
   if (nextState === "in_progress" && workAttempt === void 0) {
     throw refusal("WORK_ITEM_STATE_INVALID", "entering in-progress requires a work attempt");
   }
+  if (nextState === "review_pending" && !activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "review-pending requires an active writing attempt to close");
+  }
+  if (workItem.lifecycle_state === "review_pending" && activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "review-pending cannot carry an active writing attempt");
+  }
   if (["succeeded", "failed", "cancelled"].includes(nextState) && db.prepare(
     "SELECT 1 FROM work_item_waits WHERE project_id = ? AND work_item_id = ?"
   ).get(request.projectId, workItem.work_item_id)) {
@@ -18993,28 +19132,58 @@ function applyWorkItemTransition(db, request, digest) {
       expectedResourceRevision: request.expectedResourceRevision ?? void 0
     });
   }
-  const executionAttemptId = nextState === "in_progress" ? insertWorkItemAttempt(db, {
-    projectId: request.projectId,
-    workItemId: workItem.work_item_id,
-    configRevision: workItem.config_revision,
-    repoTargetId: workItem.repo_target_id,
-    laneId: workAttempt.laneId,
-    threadId: workAttempt.threadId ?? null,
-    leaseOwnerThreadId: workAttempt.threadId ?? null,
-    assignmentKind: workAttempt.assignmentKind,
-    attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
-    state: "running",
-    reasonCode: "work_item_dispatch",
-    createdAtMs: now(),
-    observedAtMs: now(),
-    completedAtMs: null,
-    continuationOfAttemptId: null
-  }) : terminalizeWorkItemAttempt(
-    db,
-    request.projectId,
-    workItem.work_item_id,
-    nextState === "succeeded" ? "done" : nextState === "failed" || nextState === "cancelled" ? "failed" : "failed"
-  );
+  let executionAttemptId = null;
+  let reviewExecutionAttemptId = null;
+  if (nextState === "in_progress") {
+    const prior = workItem.lifecycle_state === "review_pending" ? activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "review") : void 0;
+    if (prior) terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded", "review");
+    executionAttemptId = insertWorkItemAttempt(db, {
+      projectId: request.projectId,
+      workItemId: workItem.work_item_id,
+      configRevision: workItem.config_revision,
+      repoTargetId: workItem.repo_target_id,
+      laneId: workAttempt.laneId,
+      threadId: workAttempt.threadId ?? null,
+      leaseOwnerThreadId: workAttempt.threadId ?? null,
+      assignmentKind: workAttempt.assignmentKind,
+      attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
+      state: "running",
+      reasonCode: "work_item_dispatch",
+      createdAtMs: now(),
+      observedAtMs: now(),
+      completedAtMs: null,
+      continuationOfAttemptId: prior?.execution_attempt_id ?? null
+    });
+  } else if (nextState === "review_pending") {
+    executionAttemptId = terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "done", "write");
+    if (workAttempt) {
+      reviewExecutionAttemptId = insertWorkItemAttempt(db, {
+        projectId: request.projectId,
+        workItemId: workItem.work_item_id,
+        configRevision: workItem.config_revision,
+        repoTargetId: workItem.repo_target_id,
+        laneId: workAttempt.laneId,
+        threadId: workAttempt.threadId ?? null,
+        leaseOwnerThreadId: workAttempt.threadId ?? null,
+        assignmentKind: "review",
+        attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
+        state: "running",
+        reasonCode: "work_item_review",
+        createdAtMs: now(),
+        observedAtMs: now(),
+        completedAtMs: null,
+        continuationOfAttemptId: executionAttemptId
+      });
+    }
+  } else {
+    executionAttemptId = terminalizeWorkItemAttempt(
+      db,
+      request.projectId,
+      workItem.work_item_id,
+      nextState === "succeeded" ? "done" : "failed",
+      workItem.lifecycle_state === "review_pending" ? "review" : void 0
+    );
+  }
   return commitMutation(
     db,
     request,
@@ -19030,7 +19199,8 @@ function applyWorkItemTransition(db, request, digest) {
         from: workItem.lifecycle_state,
         to: nextState,
         ...executionAttemptId === null ? {} : { executionAttemptId },
-        ...nextState === "in_progress" ? { workAttempt } : {}
+        ...reviewExecutionAttemptId === null ? {} : { reviewExecutionAttemptId },
+        ...workAttempt === void 0 ? {} : { workAttempt }
       }
     },
     { expected: 1, attempted: 1, verified: 1 },
@@ -19039,7 +19209,12 @@ function applyWorkItemTransition(db, request, digest) {
       currentGovernanceEpoch: governor.governance_epoch,
       currentResourceRevision: nextRevision,
       expectedResourceRevision: request.expectedResourceRevision ?? void 0,
-      evidence: { workItemId: workItem.work_item_id, lifecycleState: nextState, ...executionAttemptId === null ? {} : { executionAttemptId } }
+      evidence: {
+        workItemId: workItem.work_item_id,
+        lifecycleState: nextState,
+        ...executionAttemptId === null ? {} : { executionAttemptId },
+        ...reviewExecutionAttemptId === null ? {} : { reviewExecutionAttemptId }
+      }
     }
   );
 }
@@ -20011,12 +20186,10 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
     const configJson = storedConfigJson(db, projectId, configHead.config_revision);
     const writingLaneCeiling = writingLaneCeilingFromJson(configJson);
     const assignmentAttempts = [];
-    const activeWriters = db.prepare(
-      `SELECT lane_id FROM execution_attempts
-       WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
-         AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')
-       ORDER BY lane_id`
-    ).all(projectId);
+    const capacityEvidence = workItemCapacityLaneEvidence(db, projectId);
+    const activeWriters = capacityEvidence.lanes;
+    const idleActiveWriters = activeWriters.filter((row) => row.idle_kind === "active");
+    const blindWriters = activeWriters.filter((row) => row.idle_kind === "blind");
     const unresolvedAttempts = [];
     const profileAuditEntries = [];
     const profileAudit = {
@@ -20075,10 +20248,22 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
         profileAudit,
         capacity: {
           writingLaneCeiling,
+          lifecycleStates: [...WORK_ITEM_CAPACITY_LIFECYCLE_STATES],
+          attemptStates: [...WORK_ITEM_CAPACITY_ATTEMPT_STATES],
           activeWriterCount: activeWriters.length,
           activeWriterLaneIds: activeWriters.map((row) => row.lane_id),
+          blindWriterLaneIds: blindWriters.map((row) => row.lane_id),
           duplicateLaneIds: [...new Set(activeWriters.map((row) => row.lane_id).filter((laneId, index, all) => all.indexOf(laneId) !== index))],
           ceilingViolated: activeWriters.length > writingLaneCeiling
+        },
+        idleEnforcer: {
+          activeStates: [...WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES],
+          blindStates: [...WORK_ITEM_IDLE_BLIND_ATTEMPT_STATES],
+          status: blindWriters.length > 0 ? "blind" : idleActiveWriters.length > 0 ? "active" : "idle",
+          activeLaneCount: idleActiveWriters.length,
+          activeLaneIds: idleActiveWriters.map((row) => row.lane_id),
+          blindLaneCount: blindWriters.length,
+          blindLaneIds: blindWriters.map((row) => row.lane_id)
         },
         unresolvedAttempts,
         decisionIntegrity,
@@ -20957,34 +21142,54 @@ function githubRepository(remoteUrl) {
   const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
   return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : null;
 }
-function startableQueueState(repositories) {
+function githubJson(args) {
   try {
-    let count = 0;
-    const heads = [];
-    for (const repository of repositories) {
-      const options = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1e4, killSignal: "SIGKILL", detached: true };
-      const result2 = spawnSync2("gh", ["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number", "--limit", "1000"], options);
-      if (typeof result2.pid === "number" && result2.pid > 0) {
-        try {
-          process.kill(-result2.pid, "SIGKILL");
-        } catch (error48) {
-          if (error48.code !== "ESRCH") return null;
-        }
+    const options = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1e4, killSignal: "SIGKILL", detached: true };
+    const result2 = spawnSync2("gh", args, options);
+    if (typeof result2.pid === "number" && result2.pid > 0) {
+      try {
+        process.kill(-result2.pid, "SIGKILL");
+      } catch (error48) {
+        if (error48.code !== "ESRCH") return null;
       }
-      if (result2.error || result2.status !== 0) return null;
-      const issues = JSON.parse(result2.stdout);
-      if (!Array.isArray(issues) || !issues.every((issue2) => issue2 && typeof issue2 === "object" && !Array.isArray(issue2) && typeof issue2.number === "number")) return null;
-      count += issues.length;
-      const numbers = issues.map((issue2) => issue2.number);
-      if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
     }
-    return { count, head: heads.sort()[0] ?? null };
+    if (result2.error || result2.status !== 0) return null;
+    return JSON.parse(result2.stdout);
   } catch {
     return null;
   }
 }
+function startableQueueState(repositories) {
+  let count = 0;
+  const heads = [];
+  for (const repository of repositories) {
+    const issues = githubJson(["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number", "--limit", "1000"]);
+    if (!Array.isArray(issues) || !issues.every((issue2) => issue2 && typeof issue2 === "object" && !Array.isArray(issue2) && typeof issue2.number === "number")) return null;
+    count += issues.length;
+    const numbers = issues.map((issue2) => issue2.number);
+    if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
+  }
+  return { count, head: heads.sort()[0] ?? null };
+}
 function startableQueueDepth(repositories) {
   return startableQueueState(repositories)?.count ?? null;
+}
+function linkedGithubObservation(owner, repo, issueNumber) {
+  const pullRequest = githubJson(["pr", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,mergedAt"]);
+  let pullRequestMerged = false;
+  let pullRequestClosed = false;
+  if (pullRequest && typeof pullRequest === "object" && !Array.isArray(pullRequest)) {
+    const state = pullRequest.state;
+    const mergedAt = pullRequest.mergedAt;
+    pullRequestMerged = mergedAt !== null && mergedAt !== void 0 || state === "MERGED";
+    pullRequestClosed = state === "CLOSED";
+  }
+  const issue2 = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state"]);
+  const issueClosed = Boolean(issue2 && typeof issue2 === "object" && !Array.isArray(issue2) && issue2.state === "CLOSED");
+  const issueOpen = Boolean(issue2 && typeof issue2 === "object" && !Array.isArray(issue2) && issue2.state === "OPEN");
+  if (!pullRequest && !issue2) return null;
+  const status = pullRequestMerged || pullRequestClosed || issueClosed ? pullRequestMerged ? "merged" : "closed" : issueOpen ? "open" : null;
+  return status === null ? null : { status, pullRequestMerged, issueClosed };
 }
 var FLEET_WATCHDOG_FLOOR_MS = 5 * 6e4;
 var FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS = 60 * 6e4;
@@ -22397,30 +22602,16 @@ ${thread.titleFallback ?? ""}`);
   const readIdleFleetActiveLanes = async (projectId) => {
     if (!db) return { known: false, reason: "canonical-store-unavailable" };
     try {
-      const unbound = db.prepare(
-        `SELECT 1 FROM work_items
-         WHERE project_id = ? AND lifecycle_state = 'in_progress'
-           AND NOT EXISTS (
-             SELECT 1 FROM execution_attempts
-             WHERE execution_attempts.project_id = work_items.project_id
-               AND execution_attempts.work_item_id = work_items.work_item_id
-               AND execution_attempts.origin = 'work_item'
-           ) LIMIT 1`
-      ).get(projectId);
-      if (unbound) return { known: false, reason: "work-items-have-no-thread-binding:GH-300" };
-      const rows = db.prepare(
-        `SELECT lane_id, thread_id, state, observed_at_ms FROM execution_attempts
-         WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
-           AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')`
-      ).all(projectId);
+      const capacityEvidence = workItemCapacityLaneEvidence(db, projectId);
+      if (capacityEvidence.unboundWorkItemIds.length > 0) return { known: false, reason: "work-items-have-no-thread-binding:GH-300" };
       const laneIds = /* @__PURE__ */ new Set();
       const now2 = Date.now();
-      for (const row of rows) {
-        if (row.state === "dispatch_unknown") return { known: false, reason: "dispatch-unknown-attempt" };
-        if (typeof row.lane_id !== "string" || row.lane_id.length === 0 || typeof row.thread_id !== "string" || row.thread_id.length === 0) {
+      for (const row of capacityEvidence.lanes) {
+        if (row.idle_kind === "blind") return { known: false, reason: "dispatch-unknown-attempt" };
+        if (row.lane_id.length === 0 || typeof row.thread_id !== "string" || row.thread_id.length === 0) {
           return { known: false, reason: "work-item-attempt-has-no-thread-binding:GH-300" };
         }
-        if (!Number.isSafeInteger(row.observed_at_ms) || row.observed_at_ms < 0 || now2 - row.observed_at_ms > IDLE_FLEET_ATTEMPT_STALE_MS) {
+        if (typeof row.observed_at_ms !== "number" || !Number.isSafeInteger(row.observed_at_ms) || row.observed_at_ms < 0 || now2 - row.observed_at_ms > IDLE_FLEET_ATTEMPT_STALE_MS) {
           return { known: false, reason: "stale-active-attempt" };
         }
         laneIds.add(row.lane_id);
@@ -22752,6 +22943,14 @@ ${thread.titleFallback ?? ""}`);
         dispatcherThreadIdsByProject.set(row.project_id, threadIds);
       }
       const projectIds = /* @__PURE__ */ new Set([...holdersByProject.keys(), ...dispatcherThreadIdsByProject.keys()]);
+      for (const row of db.prepare(
+        `SELECT DISTINCT work_items.project_id FROM work_items JOIN external_work_refs
+           ON external_work_refs.project_id = work_items.project_id
+          AND external_work_refs.work_item_id = work_items.work_item_id
+          AND external_work_refs.provider = 'github'
+         WHERE work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
+           AND external_work_refs.issue_number IS NOT NULL`
+      ).all(...WORK_ITEM_NON_TERMINAL_STATES)) projectIds.add(row.project_id);
       const lanesByProject = /* @__PURE__ */ new Map();
       for (const projectId of projectIds) {
         if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
@@ -22777,9 +22976,9 @@ ${thread.titleFallback ?? ""}`);
         `SELECT work_items.project_id, work_items.work_item_id, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
          FROM work_items LEFT JOIN work_item_waits
            ON work_item_waits.project_id = work_items.project_id AND work_item_waits.work_item_id = work_items.work_item_id
-         WHERE work_items.lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')
+         WHERE work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
          ORDER BY work_items.created_at_ms, work_items.work_item_id`
-      ).all()) {
+      ).all(...WORK_ITEM_NON_TERMINAL_STATES)) {
         const workItems = openWorkItemsByProject.get(workItem.project_id) ?? [];
         workItems.push({ workItemId: workItem.work_item_id, waker: workItem.waker, wakerKind: workItem.waker_kind, declaredAtMs: workItem.declared_at_ms });
         openWorkItemsByProject.set(workItem.project_id, workItems);
@@ -22854,11 +23053,97 @@ ${thread.titleFallback ?? ""}`);
           wakeInFlight.delete(key);
         }
       };
+      const inspectLinkedWorkItems = (projectId) => {
+        const linkedWorkItems = db.prepare(
+          `SELECT work_items.work_item_id, external_work_refs.owner, external_work_refs.repo, external_work_refs.issue_number
+           FROM work_items JOIN external_work_refs
+             ON external_work_refs.project_id = work_items.project_id
+            AND external_work_refs.work_item_id = work_items.work_item_id
+            AND external_work_refs.provider = 'github'
+           WHERE work_items.project_id = ?
+             AND work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
+             AND external_work_refs.issue_number IS NOT NULL
+           ORDER BY work_items.work_item_id`
+        ).all(projectId, ...WORK_ITEM_NON_TERMINAL_STATES);
+        for (const linked of linkedWorkItems) {
+          const observation = linkedGithubObservation(linked.owner, linked.repo, linked.issue_number);
+          if (observation === null) {
+            degrade(`github-work-item-status:${projectId}:${linked.work_item_id}`);
+            continue;
+          }
+          if (observation.status !== "open") {
+            bb.log.warn(`fleet-watchdog stale-terminal work item: project=${projectId} workItem=${linked.work_item_id} linked=${linked.owner}/${linked.repo}#${linked.issue_number} status=${observation.status}`);
+          }
+          if (!observation.pullRequestMerged || !observation.issueClosed) continue;
+          const actor = db.prepare(
+            `SELECT receipt_id FROM actor_receipts
+             WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
+               AND verification_state = 'verified'
+             ORDER BY issued_at_ms DESC LIMIT 1`
+          ).get(projectId, PLUGIN_ID);
+          const governor = db.prepare(
+            "SELECT governance_epoch, fence_token FROM project_governorship_heads WHERE project_id = ?"
+          ).get(projectId);
+          const config2 = db.prepare(
+            "SELECT config_revision FROM project_config_heads WHERE project_id = ?"
+          ).get(projectId);
+          const workItem = db.prepare(
+            `SELECT repo_target_id, resource_revision, lifecycle_state
+             FROM work_items WHERE project_id = ? AND work_item_id = ?`
+          ).get(projectId, linked.work_item_id);
+          if (!actor || !governor || !config2 || !workItem) {
+            degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
+            bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} reason=authority-or-work-item-unavailable`);
+            continue;
+          }
+          const transition = (state, expectedResourceRevision) => applyAuthorizedMutation(db, {
+            projectId,
+            operationClass: "work_item_transition",
+            idempotencyKey: `fleet-watchdog:merge-close:${linked.work_item_id}:${state}`,
+            actorReceiptId: actor.receipt_id,
+            expectedConfigRevision: config2.config_revision,
+            expectedGovernanceEpoch: governor.governance_epoch,
+            expectedFenceToken: governor.fence_token,
+            repoTargetId: workItem.repo_target_id,
+            expectedResourceRevision,
+            workItemId: linked.work_item_id,
+            lifecycleState: state
+          });
+          let result2;
+          if (workItem.lifecycle_state === "in_progress") {
+            result2 = transition("review_pending", workItem.resource_revision);
+            if (result2.outcome === "OK") {
+              const current = db.prepare(
+                "SELECT resource_revision, lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?"
+              ).get(projectId, linked.work_item_id);
+              result2 = current?.lifecycle_state === "review_pending" ? transition("succeeded", current.resource_revision) : {
+                outcome: "WORK_ITEM_REVISION_STALE",
+                subject: linked.work_item_id,
+                expected: 1,
+                attempted: 1,
+                verified: 0,
+                message: "work item changed before merge-close terminalization"
+              };
+            }
+          } else if (workItem.lifecycle_state === "review_pending") {
+            result2 = transition("succeeded", workItem.resource_revision);
+          } else {
+            result2 = { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close automation requires in_progress or review_pending, found ${workItem.lifecycle_state}` };
+          }
+          if (result2.outcome === "OK") {
+            bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=review_pending`);
+          } else {
+            degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
+            bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result2.outcome}`);
+          }
+        }
+      };
       let brokenWakePath = false;
       for (const projectId of projectIds) {
         const holders = holdersByProject.get(projectId) ?? [];
         try {
           if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
+          inspectLinkedWorkItems(projectId);
           const directors = holders.filter((holder) => holder.role_id === "director");
           const orchestrators = holders.filter((holder) => holder.role_id === "project-orchestrator");
           if (directors.length !== 1 || orchestrators.length !== 1) {
@@ -22974,11 +23259,13 @@ ${thread.titleFallback ?? ""}`);
           } catch {
             writingLaneCeiling = null;
           }
-          const activeLaneCount = db.prepare(
-            `SELECT COUNT(*) AS count FROM execution_attempts
-             WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
-               AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')`
-          ).get(projectId).count;
+          const capacityEvidence = workItemCapacityLaneEvidence(db, projectId);
+          const activeLaneCount = capacityEvidence.lanes.length;
+          const idleActiveLaneCount = capacityEvidence.lanes.filter((lane) => lane.idle_kind === "active").length;
+          const blindLaneCount = capacityEvidence.lanes.filter((lane) => lane.idle_kind === "blind").length;
+          if (blindLaneCount > 0) {
+            bb.log.warn(`fleet-watchdog idle enforcer activeLanes=blind project=${projectId} visible=${idleActiveLaneCount} dispatchUnknown=${blindLaneCount}`);
+          }
           const repositories = db.prepare(
             `SELECT targets.remote_url FROM project_config_heads AS heads
              JOIN repository_targets AS targets
