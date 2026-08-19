@@ -74,6 +74,35 @@ var {
   useSettings
 } = mod2;
 
+// src/inbox-nav-indicator.ts
+var INBOX_NAV_REGION_SELECTOR = '[data-testid="plugin-nav-sidebar-items"]';
+var INBOX_NAV_ROW_TITLE = "Inbox";
+var INBOX_UNREAD_MARKER = "data-bb-collab-inbox-unread";
+var INBOX_INDICATOR_BROKEN_TITLE = "Inbox unread indicator broken";
+var DOT_STYLE = "margin-left:auto;flex:0 0 auto;width:0.5rem;height:0.5rem;border-radius:9999px;background-color:currentColor";
+function paintInboxNavUnread(root, unread) {
+  const region = root.querySelector(INBOX_NAV_REGION_SELECTOR);
+  if (region === null) {
+    return { matched: false, reason: `no element matches ${INBOX_NAV_REGION_SELECTOR}` };
+  }
+  const rows = Array.from(region.querySelectorAll("button"));
+  const row = rows.find((candidate) => candidate.textContent?.trim() === INBOX_NAV_ROW_TITLE);
+  if (row === void 0) {
+    return { matched: false, reason: `no row of the ${rows.length} in ${INBOX_NAV_REGION_SELECTOR} is titled ${JSON.stringify(INBOX_NAV_ROW_TITLE)}` };
+  }
+  const existing = row.querySelector(`[${INBOX_UNREAD_MARKER}]`);
+  if (unread < 1) {
+    existing?.remove();
+    return { matched: true };
+  }
+  const dot = existing ?? row.appendChild(row.ownerDocument.createElement("span"));
+  dot.setAttribute(INBOX_UNREAD_MARKER, String(unread));
+  dot.setAttribute("aria-hidden", "true");
+  dot.setAttribute("title", `${unread} unread operator ${unread === 1 ? "message" : "messages"}`);
+  dot.setAttribute("style", DOT_STYLE);
+  return { matched: true };
+}
+
 // src/provider-marks.ts
 var MARKS = {
   "codex": {
@@ -143,10 +172,7 @@ var MAX_VISIBLE_THREADS = 5;
 var MAX_VISIBLE_INBOX_MESSAGES = 256;
 var SIDEBAR_RPC_BATCH_SIZE = 256;
 var INBOX_FILTER_STORAGE_KEY = "bb-collab.inbox-filters";
-var UNREGISTERED_INBOX_PROJECT = "operator inbox project is not registered";
-function isUnregisteredInboxProject(reason) {
-  return reason instanceof Error && reason.message === UNREGISTERED_INBOX_PROJECT;
-}
+var INBOX_UNREAD_POLL_MS = 3e4;
 function readInboxFilters() {
   try {
     const value = JSON.parse(window.localStorage.getItem(INBOX_FILTER_STORAGE_KEY) ?? "null");
@@ -513,6 +539,7 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
   const draggingThreadId = useRef(null);
   const dragTargetId = useRef(null);
   const [customStates, setCustomStates] = useState({});
+  const [indicatorBroken, setIndicatorBroken] = useState(null);
   const [threadModels, setThreadModels] = useState({});
   const threadIds = useMemo(() => sidebar.threads.map((thread) => thread.id), [sidebar.threads]);
   const threadIdsKey = threadIds.join("\0");
@@ -556,10 +583,48 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
       mounted = false;
     };
   }, [projectIdsKey, rpc, threadIdsKey]);
+  useEffect(() => {
+    let cancelled = false;
+    const paint = async () => {
+      const results = await Promise.allSettled(projectIds.map((projectId) => rpc.call("operatorMessages", { projectId })));
+      if (cancelled) return;
+      const unread = results.reduce((total, result) => result.status === "fulfilled" ? total + result.value.filter((message) => message.readAtMs === null).length : total, 0);
+      const painted = paintInboxNavUnread(document, unread);
+      if (painted.matched) {
+        setIndicatorBroken(null);
+        return;
+      }
+      console.error(`[bb-collab] ${INBOX_INDICATOR_BROKEN_TITLE}: ${painted.reason}`);
+      setIndicatorBroken(painted.reason);
+    };
+    void paint();
+    const timer = window.setInterval(() => {
+      void paint();
+    }, INBOX_UNREAD_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      paintInboxNavUnread(document, 0);
+    };
+  }, [projectIdsKey, rpc]);
+  const indicatorAlert = indicatorBroken === null ? null : /* @__PURE__ */ jsxs("p", { role: "alert", className: "p-3 text-sm text-destructive", children: [
+    INBOX_INDICATOR_BROKEN_TITLE,
+    " \u2014 open Inbox to check for unread messages. Cause: ",
+    indicatorBroken
+  ] });
   const groups = groupThreads(sidebar.projects, sidebar.threads, searchQuery);
-  if (sidebar.status === "loading") return /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-muted-foreground", children: "Loading threads\u2026" });
-  if (sidebar.status === "error") return /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-destructive", children: "Unable to load threads." });
-  if (groups.length === 0) return /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-muted-foreground", children: "No matching threads." });
+  if (sidebar.status === "loading") return /* @__PURE__ */ jsxs(Fragment2, { children: [
+    indicatorAlert,
+    /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-muted-foreground", children: "Loading threads\u2026" })
+  ] });
+  if (sidebar.status === "error") return /* @__PURE__ */ jsxs(Fragment2, { children: [
+    indicatorAlert,
+    /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-destructive", children: "Unable to load threads." })
+  ] });
+  if (groups.length === 0) return /* @__PURE__ */ jsxs(Fragment2, { children: [
+    indicatorAlert,
+    /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-muted-foreground", children: "No matching threads." })
+  ] });
   const toggleProject = (projectId) => {
     const collapsed = !collapsedProjects.has(projectId);
     setCollapsedProjects((current) => {
@@ -624,38 +689,41 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
       !childrenCollapsed ? node.children.map((child) => renderNode(child, threadModels[child.thread.id] ?? null, depth + 1)) : null
     ] }, node.thread.id);
   };
-  return /* @__PURE__ */ jsx("div", { className: "h-full space-y-3 overflow-y-auto p-1", children: groups.map(({ project, threads }) => {
-    const tree = buildThreadTree(threads);
-    const collapsed = collapsedProjects.has(project.id);
-    const expanded = expandedProjects.has(project.id);
-    const visibleThreads = expanded ? tree : tree.slice(0, MAX_VISIBLE_THREADS);
-    const projectName = asText(project.name) ?? asText(project.id) ?? "Untitled project";
-    return /* @__PURE__ */ jsxs("section", { "aria-labelledby": `project-${project.id}`, children: [
-      /* @__PURE__ */ jsxs("div", { className: "flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-normal text-muted-foreground", children: [
-        /* @__PURE__ */ jsx("span", { className: "flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground", "aria-hidden": "true", children: projectAvatar(projectName) }),
-        /* @__PURE__ */ jsx("span", { id: `project-${project.id}`, className: "min-w-0 truncate", children: projectName }),
-        /* @__PURE__ */ jsx("span", { className: "ml-auto shrink-0", "data-project-thread-count": "", children: threads.length }),
-        /* @__PURE__ */ jsx("button", { type: "button", className: "inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none", "aria-label": `${collapsed ? "Expand" : "Collapse"} ${projectName} section`, "aria-expanded": !collapsed, onClick: () => toggleProject(project.id), children: collapsed ? "\u203A" : "\u2304" })
-      ] }),
-      !collapsed ? /* @__PURE__ */ jsxs("div", { className: "mt-0.5 space-y-px", children: [
-        visibleThreads.map((node) => renderNode(node, threadModels[node.thread.id] ?? null, 0)),
-        tree.length > MAX_VISIBLE_THREADS ? /* @__PURE__ */ jsx(
-          "button",
-          {
-            type: "button",
-            className: "flex h-6 w-full items-center rounded-md pl-2 text-left text-xs text-muted-foreground transition-colors duration-150 hover:bg-muted/50 hover:text-foreground motion-reduce:transition-none",
-            onClick: () => setExpandedProjects((current) => {
-              const updated = new Set(current);
-              if (expanded) updated.delete(project.id);
-              else updated.add(project.id);
-              return updated;
-            }),
-            children: expanded ? "Show less" : `Show more (${tree.length - MAX_VISIBLE_THREADS})`
-          }
-        ) : null
-      ] }) : null
-    ] }, project.id);
-  }) });
+  return /* @__PURE__ */ jsxs("div", { className: "h-full space-y-3 overflow-y-auto p-1", children: [
+    indicatorAlert,
+    groups.map(({ project, threads }) => {
+      const tree = buildThreadTree(threads);
+      const collapsed = collapsedProjects.has(project.id);
+      const expanded = expandedProjects.has(project.id);
+      const visibleThreads = expanded ? tree : tree.slice(0, MAX_VISIBLE_THREADS);
+      const projectName = asText(project.name) ?? asText(project.id) ?? "Untitled project";
+      return /* @__PURE__ */ jsxs("section", { "aria-labelledby": `project-${project.id}`, children: [
+        /* @__PURE__ */ jsxs("div", { className: "flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-normal text-muted-foreground", children: [
+          /* @__PURE__ */ jsx("span", { className: "flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground", "aria-hidden": "true", children: projectAvatar(projectName) }),
+          /* @__PURE__ */ jsx("span", { id: `project-${project.id}`, className: "min-w-0 truncate", children: projectName }),
+          /* @__PURE__ */ jsx("span", { className: "ml-auto shrink-0", "data-project-thread-count": "", children: threads.length }),
+          /* @__PURE__ */ jsx("button", { type: "button", className: "inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none", "aria-label": `${collapsed ? "Expand" : "Collapse"} ${projectName} section`, "aria-expanded": !collapsed, onClick: () => toggleProject(project.id), children: collapsed ? "\u203A" : "\u2304" })
+        ] }),
+        !collapsed ? /* @__PURE__ */ jsxs("div", { className: "mt-0.5 space-y-px", children: [
+          visibleThreads.map((node) => renderNode(node, threadModels[node.thread.id] ?? null, 0)),
+          tree.length > MAX_VISIBLE_THREADS ? /* @__PURE__ */ jsx(
+            "button",
+            {
+              type: "button",
+              className: "flex h-6 w-full items-center rounded-md pl-2 text-left text-xs text-muted-foreground transition-colors duration-150 hover:bg-muted/50 hover:text-foreground motion-reduce:transition-none",
+              onClick: () => setExpandedProjects((current) => {
+                const updated = new Set(current);
+                if (expanded) updated.delete(project.id);
+                else updated.add(project.id);
+                return updated;
+              }),
+              children: expanded ? "Show less" : `Show more (${tree.length - MAX_VISIBLE_THREADS})`
+            }
+          ) : null
+        ] }) : null
+      ] }, project.id);
+    })
+  ] });
 }
 function laneQueueLabel(lane) {
   if (lane.queueState !== "deferred" && !lane.deferredReason) {
@@ -711,7 +779,6 @@ function InboxPanel(_props) {
   const [drafts, setDrafts] = useState({});
   const [replyingMessageKey, setReplyingMessageKey] = useState(null);
   const [errors, setErrors] = useState([]);
-  const [notice, setNotice] = useState(null);
   const refreshSequence = useRef(0);
   const projects = useMemo(() => projectId ? sidebar.projects.filter((candidate) => candidate.id === projectId) : sidebar.projects, [projectId, sidebar.projects]);
   const projectNames = useMemo(() => new Map(sidebar.projects.map((candidate) => [candidate.id, candidate.name])), [sidebar.projects]);
@@ -723,7 +790,6 @@ function InboxPanel(_props) {
   };
   const refresh = useCallback(() => {
     const sequence = ++refreshSequence.current;
-    setNotice(null);
     if (projects.length === 0) {
       setMessages([]);
       setErrors([]);
@@ -735,7 +801,7 @@ function InboxPanel(_props) {
       const failed = [];
       results.forEach((result, index) => {
         if (result.status === "fulfilled") loaded.push(...result.value);
-        else if (projectId !== "" || !isUnregisteredInboxProject(result.reason)) failed.push(`${projects[index].name} (${projects[index].id}): ${String(result.reason)}`);
+        else failed.push(`${projects[index].name} (${projects[index].id}): ${String(result.reason)}`);
       });
       loaded.sort((left, right) => Number(left.readAtMs !== null) - Number(right.readAtMs !== null) || right.createdAtMs - left.createdAtMs || right.messageId - left.messageId);
       setMessages(loaded);
@@ -772,9 +838,8 @@ function InboxPanel(_props) {
       "Unable to read inbox: ",
       loadError
     ] }, loadError)),
-    notice ? /* @__PURE__ */ jsx("p", { role: "status", className: "text-sm text-primary", children: notice }) : null,
     sidebar.projects.length > 0 ? /* @__PURE__ */ jsxs("section", { "aria-labelledby": "inbox-project-heading", children: [
-      /* @__PURE__ */ jsx("h2", { id: "inbox-project-heading", className: "mb-2 text-sm font-semibold", children: projectId ? projectNames.get(projectId) ?? projectId : "All projects" }),
+      /* @__PURE__ */ jsx("h2", { id: "inbox-project-heading", className: "mb-2 text-sm font-semibold", children: projectId ? `${projectNames.get(projectId) ?? projectId} \xB7 ${projectId}` : "All projects" }),
       messages.length === 0 ? /* @__PURE__ */ jsx("p", { className: "text-sm text-muted-foreground", children: "No messages for this project and recipient filter." }) : null,
       messages.length > MAX_VISIBLE_INBOX_MESSAGES ? /* @__PURE__ */ jsxs("p", { className: "mb-3 text-sm text-muted-foreground", children: [
         "Showing the first ",
@@ -785,7 +850,11 @@ function InboxPanel(_props) {
       ] }) : null,
       /* @__PURE__ */ jsx("div", { className: "space-y-3", children: visibleMessages.map((message) => /* @__PURE__ */ jsxs("article", { className: `rounded-lg border p-4 ${message.readAtMs === null ? "border-primary/50" : "border-border"}`, children: [
         /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-center gap-2 text-xs text-muted-foreground", children: [
-          /* @__PURE__ */ jsx("span", { className: "font-medium text-foreground", children: projectNames.get(message.projectId) ?? message.projectId }),
+          /* @__PURE__ */ jsxs("span", { className: "font-medium text-foreground", children: [
+            projectNames.get(message.projectId) ?? message.projectId,
+            " \xB7 ",
+            message.projectId
+          ] }),
           /* @__PURE__ */ jsx("span", { className: "font-medium text-foreground", children: message.recipient }),
           /* @__PURE__ */ jsx("span", { children: message.severity }),
           /* @__PURE__ */ jsxs("span", { children: [
@@ -832,20 +901,11 @@ function InboxPanel(_props) {
               const text = (drafts[messageKey(message)] ?? message.replyText ?? "").trim();
               if (!text) return;
               setErrors([]);
-              setNotice(null);
               setReplyingMessageKey(messageKey(message));
-              void rpc.call("replyToOperatorMessage", { projectId: message.projectId, messageId: message.messageId, text }).then((replied) => {
-                updateMessage(replied);
-                setNotice("Reply delivered.");
-              }).catch((reason) => setErrors([String(reason)])).finally(() => setReplyingMessageKey(null));
+              void rpc.call("replyToOperatorMessage", { projectId: message.projectId, messageId: message.messageId, text }).then(updateMessage).catch((reason) => setErrors([String(reason)])).finally(() => setReplyingMessageKey(null));
             }, children: replyingMessageKey === messageKey(message) ? "Delivering\u2026" : "Reply" }),
             message.readAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", className: "rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-muted", onClick: () => {
-              setErrors([]);
-              setNotice(null);
-              void rpc.call("markOperatorMessageRead", { projectId: message.projectId, messageId: message.messageId }).then((read) => {
-                updateMessage(read);
-                setNotice("Marked read.");
-              }).catch((reason) => setErrors([String(reason)]));
+              void rpc.call("markOperatorMessageRead", { projectId: message.projectId, messageId: message.messageId }).then(updateMessage).catch((reason) => setErrors([String(reason)]));
             }, children: "Mark read" }) : null
           ] })
         ] }) : /* @__PURE__ */ jsxs("p", { className: "text-sm text-muted-foreground", children: [

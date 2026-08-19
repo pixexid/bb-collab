@@ -76,6 +76,34 @@ narrow-viewport default. Both are host-owned.
   authority, cannot remove the host rows it duplicates, and doubles the
   keyboard/focus surface. Refused.
 
+## Narrow exception: the inbox unread indicator
+
+One use, and one only, is exempted from the refusals above. The operator ruled
+that the Inbox nav row must carry unread state before the panel is opened;
+`PluginNavPanelRegistration` still has no badge, count, or attention field, and
+the gap is filed upstream as get-bb/bb#1852. `src/inbox-nav-indicator.ts`
+therefore matches the host `data-testid` region and the row's visible title, and
+paints a dot on it.
+
+**SCOPE: the inbox unread indicator only. The refusal remains doctrine
+everywhere else.** Ordering, visibility, collapse, and every other row stay
+blocked on host support; nothing above is relaxed.
+
+The exception exists because of one property, and it is the mandatory
+condition attached to it: **a coupling that announces its own death is the
+difference between this exception and the agent-proxy version the doctrine
+refuses.** `paintInboxNavUnread` returns `{ matched: false, reason }` when the
+region selector or the row title stops matching. The sidebar poll turns that
+into a visible `Inbox unread indicator broken` alert in the thread list — the
+one plugin surface that is on screen without opening a panel — and a recorded
+`console.error` carrying the reason. Zero-match is never silently nothing.
+`tests/inbox-nav-indicator.test.tsx` fires the switch both ways, by renaming the
+test id and by relabelling the row.
+
+**RETIREMENT: when get-bb/bb#1852 is resolved upstream, replace this with the
+real affordance and re-close the exception.** Delete `src/inbox-nav-indicator.ts`,
+its test, the poll in `SidebarThreadList`, and this section.
+
 ## Smallest host support that unblocks this
 
 Preferred, and smallest overall — extend the mechanism the host already has,

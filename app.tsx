@@ -8,6 +8,7 @@ import type {
   PluginSidebarThread,
   PluginThreadListProps,
 } from "@bb/plugin-sdk/app";
+import { INBOX_INDICATOR_BROKEN_TITLE, paintInboxNavUnread } from "./src/inbox-nav-indicator";
 import { providerMark, providerMarkKey } from "./src/provider-marks";
 import type { rpcContract } from "./server";
 
@@ -47,6 +48,8 @@ const UNREGISTERED_INBOX_PROJECT = "operator inbox project is not registered";
 function isUnregisteredInboxProject(reason: unknown): boolean {
   return reason instanceof Error && reason.message === UNREGISTERED_INBOX_PROJECT;
 }
+
+const INBOX_UNREAD_POLL_MS = 30_000;
 
 type InboxFilters = { projectId: string; recipient: "" | OperatorMessage["recipient"] };
 
@@ -489,6 +492,7 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   const draggingThreadId = useRef<string | null>(null);
   const dragTargetId = useRef<string | null>(null);
   const [customStates, setCustomStates] = useState<ThreadStates>({});
+  const [indicatorBroken, setIndicatorBroken] = useState<string | null>(null);
   const [threadModels, setThreadModels] = useState<ThreadModels>({});
   const threadIds = useMemo(() => sidebar.threads.map((thread) => thread.id), [sidebar.threads]);
   const threadIdsKey = threadIds.join("\u0000");
@@ -533,10 +537,45 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     return () => { mounted = false; };
   }, [projectIdsKey, rpc, threadIdsKey]);
 
+  // The nav row is host-rendered and carries no plugin-facing badge surface
+  // (get-bb/bb#1852), so the count is painted onto it directly under the narrow
+  // exception in docs/sidebar-plugin-nav-collapse.md. A zero-match is the
+  // coupling breaking, and it is reported rather than swallowed.
+  useEffect(() => {
+    let cancelled = false;
+    const paint = async () => {
+      const results = await Promise.allSettled(projectIds.map((projectId) => rpc.call("operatorMessages", { projectId })));
+      if (cancelled) return;
+      const unread = results.reduce((total, result) => result.status === "fulfilled"
+        ? total + result.value.filter((message) => message.readAtMs === null).length
+        : total, 0);
+      const painted = paintInboxNavUnread(document, unread);
+      if (painted.matched) {
+        setIndicatorBroken(null);
+        return;
+      }
+      console.error(`[bb-collab] ${INBOX_INDICATOR_BROKEN_TITLE}: ${painted.reason}`);
+      setIndicatorBroken(painted.reason);
+    };
+    void paint();
+    const timer = window.setInterval(() => { void paint(); }, INBOX_UNREAD_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      paintInboxNavUnread(document, 0);
+    };
+  }, [projectIdsKey, rpc]);
+
+  const indicatorAlert = indicatorBroken === null ? null : (
+    <p role="alert" className="p-3 text-sm text-destructive">
+      {INBOX_INDICATOR_BROKEN_TITLE} — open Inbox to check for unread messages. Cause: {indicatorBroken}
+    </p>
+  );
+
   const groups = groupThreads(sidebar.projects, sidebar.threads, searchQuery);
-  if (sidebar.status === "loading") return <p className="p-3 text-sm text-muted-foreground">Loading threads…</p>;
-  if (sidebar.status === "error") return <p className="p-3 text-sm text-destructive">Unable to load threads.</p>;
-  if (groups.length === 0) return <p className="p-3 text-sm text-muted-foreground">No matching threads.</p>;
+  if (sidebar.status === "loading") return <>{indicatorAlert}<p className="p-3 text-sm text-muted-foreground">Loading threads…</p></>;
+  if (sidebar.status === "error") return <>{indicatorAlert}<p className="p-3 text-sm text-destructive">Unable to load threads.</p></>;
+  if (groups.length === 0) return <>{indicatorAlert}<p className="p-3 text-sm text-muted-foreground">No matching threads.</p></>;
 
   const toggleProject = (projectId: string) => {
     const collapsed = !collapsedProjects.has(projectId);
@@ -603,6 +642,7 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
 
   return (
     <div className="h-full space-y-3 overflow-y-auto p-1">
+      {indicatorAlert}
       {groups.map(({ project, threads }) => {
         const tree = buildThreadTree(threads);
         const collapsed = collapsedProjects.has(project.id);
