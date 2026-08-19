@@ -20226,6 +20226,7 @@ var FLEET_WATCHDOG_STALE_WAIT_MS = 24 * 60 * 6e4;
 var FLEET_WATCHDOG_STOPPING_WAIT_MS = 3e4;
 var AUTOMATED_TELL_IDLE_WAIT_MS = 3e4;
 var automatedTellQueues = /* @__PURE__ */ new Map();
+var operatorRepliesInFlight = /* @__PURE__ */ new Set();
 var projectIdSchema = external_exports.string().trim().min(1).max(256);
 var mutationReceiptSchema = external_exports.object({
   projectId: projectIdSchema,
@@ -20356,6 +20357,7 @@ var operatorMessageSchema = external_exports.object({
   repliedAtMs: external_exports.number().int().nonnegative().nullable(),
   replyText: operatorMessageTextSchema.nullable(),
   replyDeliveryError: external_exports.string().nullable(),
+  replyInProgress: external_exports.boolean(),
   notificationStatus: external_exports.enum(["not-requested", "deduplicated", "sent", "failed"]),
   notificationError: external_exports.string().nullable()
 }).strict();
@@ -20779,6 +20781,7 @@ function operatorMessage(row) {
     repliedAtMs: row.replied_at_ms,
     replyText: row.reply_text,
     replyDeliveryError: row.reply_delivery_error,
+    replyInProgress: false,
     notificationStatus: row.severity !== "urgent" ? "not-requested" : row.notification_attempted_at_ms === null ? "deduplicated" : row.notification_error === null ? "sent" : "failed",
     notificationError: row.notification_error
   };
@@ -20912,6 +20915,9 @@ async function replyToOperatorMessage(db, bb, projectId, messageId, replyText) {
   const store = requireRegisteredInboxProject(db, projectId);
   const message = readOperatorMessage(store, projectId, messageId);
   if (message.repliedAtMs !== null) throw new Error("operator message already has a delivered reply");
+  const claimKey = JSON.stringify([projectId, messageId]);
+  if (operatorRepliesInFlight.has(claimKey)) return { ...message, replyInProgress: true };
+  operatorRepliesInFlight.add(claimKey);
   try {
     const thread = await bb.sdk.threads.get({ threadId: message.senderThreadId });
     if (thread.projectId !== projectId || !thread.environmentId) throw new Error("sender thread no longer has a project-exact environment");
@@ -20935,6 +20941,8 @@ async function replyToOperatorMessage(db, bb, projectId, messageId, replyText) {
     store.prepare(`UPDATE operator_messages
       SET reply_text = ?, replied_at_ms = NULL, read_at_ms = COALESCE(read_at_ms, ?), reply_delivery_error = ?
       WHERE project_id = ? AND message_id = ?`).run(replyText, Date.now(), String(error48).slice(0, 1e3), projectId, messageId);
+  } finally {
+    operatorRepliesInFlight.delete(claimKey);
   }
   return readOperatorMessage(store, projectId, messageId);
 }
