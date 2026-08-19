@@ -10,7 +10,7 @@ export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 export const CONTRACT_VERSION = 22;
 export const SCHEMA_VERSION = 20;
-// v22 replaces the director's single k3 profile with the ratified Opus/GLM pair.
+// v22 establishes the director's exact accepted-profile set.
 const PREVIOUS_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
@@ -33,8 +33,7 @@ const directorSeatSecondaryProfile = {
   serviceTier: "default",
   visibility: "visible" as const,
 };
-const directorSeatProfiles = [directorSeatPrimaryProfile, directorSeatSecondaryProfile] as const;
-const legacyDirectorSeatProfile = {
+const directorSeatK3Profile = {
   providerId: "pi",
   model: "kimi-coding/k3",
   reasoningLevel: "high",
@@ -42,6 +41,7 @@ const legacyDirectorSeatProfile = {
   serviceTier: "default",
   visibility: "visible" as const,
 };
+const directorSeatProfiles = [directorSeatPrimaryProfile, directorSeatSecondaryProfile, directorSeatK3Profile] as const;
 export const LLM_COLLAB_SOURCE_FENCE = "f988d9711d3778f751e4ec0e32ebbf7b0893c80f" as const;
 export const LLM_COLLAB_MERGED_MAIN_SHA = "0686d34" as const;
 export const LLM_COLLAB_EVIDENCE_RESOURCE_REVISION = 4 as const;
@@ -1114,10 +1114,6 @@ export const contractDigest = sha256(canonicalJson({
     roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
     roleId: "director",
     profiles: directorSeatProfiles,
-    legacyStoredPair: {
-      executedProfile: legacyDirectorSeatProfile,
-      standbyProfile: directorSeatPrimaryProfile,
-    },
     writingLaneCapacity: 0,
     environment: "managed-worktree",
     assignmentKinds: [],
@@ -1559,16 +1555,6 @@ function profileIsOneOf(profile: unknown, profiles: readonly unknown[]): boolean
   return profiles.some((candidate) => value === canonicalJson(candidate));
 }
 
-function isLegacyDirectorSeatRequirement(requirement: {
-  roleRequirementId: string;
-  executedProfile: unknown;
-  standbyProfile?: unknown;
-}): boolean {
-  return requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID &&
-    canonicalJson(requirement.executedProfile) === canonicalJson(legacyDirectorSeatProfile) &&
-    canonicalJson(requirement.standbyProfile) === canonicalJson(directorSeatPrimaryProfile);
-}
-
 function isRatifiedDirectorSeatRequirement(requirement: {
   roleRequirementId: string;
   executedProfile: unknown;
@@ -1617,7 +1603,7 @@ const roleRequirementSchema = z
       if (requirement.writingLaneCapacity !== 0) {
         ctx.addIssue({ code: "custom", path: ["writingLaneCapacity"], message: "director-seat has no writing-lane capacity" });
       }
-      if (!isRatifiedDirectorSeatRequirement(requirement) && !isLegacyDirectorSeatRequirement(requirement)) {
+      if (!isRatifiedDirectorSeatRequirement(requirement)) {
         ctx.addIssue({ code: "custom", path: ["executedProfile"], message: "director-seat requires the exact ratified profile pair" });
       }
     } else if (requirement.standbyProfile !== undefined || requirement.writingLaneCapacity !== undefined) {
@@ -2554,9 +2540,6 @@ function validateConfig(value: unknown): string {
       if (roleRequirements !== undefined) {
         const parsed = roleRequirementsSchema.safeParse(roleRequirements);
         if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
-        if (parsed.data.some(isLegacyDirectorSeatRequirement)) {
-          throw refusal("INVALID_INPUT", "new config cannot declare the legacy director-seat profile");
-        }
       }
       const writingLaneCeiling = (bbCollab as Record<string, unknown>).writingLaneCeiling;
       if (writingLaneCeiling !== undefined && (!Number.isInteger(writingLaneCeiling) || Number(writingLaneCeiling) < 0 || Number(writingLaneCeiling) > MAX_WRITING_LANE_CEILING)) {
@@ -4729,10 +4712,7 @@ function profileEquals(left: ExecutionProfile, right: ExecutionProfile): boolean
 
 function roleRequirementProfileMatches(requirement: RoleRequirement, profile: ExecutionProfile): boolean {
   if (requirement.roleRequirementId !== DIRECTOR_SEAT_ROLE_REQUIREMENT_ID) return profileEquals(profile, requirement.executedProfile);
-  const profiles = isLegacyDirectorSeatRequirement(requirement)
-    ? [legacyDirectorSeatProfile, ...directorSeatProfiles]
-    : directorSeatProfiles;
-  return profileIsOneOf(profile, profiles);
+  return profileIsOneOf(profile, directorSeatProfiles);
 }
 
 function qualificationContextDigest(

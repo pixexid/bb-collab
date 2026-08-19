@@ -14508,8 +14508,7 @@ var directorSeatSecondaryProfile = {
   serviceTier: "default",
   visibility: "visible"
 };
-var directorSeatProfiles = [directorSeatPrimaryProfile, directorSeatSecondaryProfile];
-var legacyDirectorSeatProfile = {
+var directorSeatK3Profile = {
   providerId: "pi",
   model: "kimi-coding/k3",
   reasoningLevel: "high",
@@ -14517,6 +14516,7 @@ var legacyDirectorSeatProfile = {
   serviceTier: "default",
   visibility: "visible"
 };
+var directorSeatProfiles = [directorSeatPrimaryProfile, directorSeatSecondaryProfile, directorSeatK3Profile];
 var LLM_COLLAB_SOURCE_FENCE = "f988d9711d3778f751e4ec0e32ebbf7b0893c80f";
 var LLM_COLLAB_MERGED_MAIN_SHA = "0686d34";
 var LLM_COLLAB_EVIDENCE_RESOURCE_REVISION = 4;
@@ -15527,10 +15527,6 @@ var contractDigest = sha256(canonicalJson({
     roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
     roleId: "director",
     profiles: directorSeatProfiles,
-    legacyStoredPair: {
-      executedProfile: legacyDirectorSeatProfile,
-      standbyProfile: directorSeatPrimaryProfile
-    },
     writingLaneCapacity: 0,
     environment: "managed-worktree",
     assignmentKinds: []
@@ -15878,9 +15874,6 @@ function profileIsOneOf(profile, profiles) {
   const value = canonicalJson(profile);
   return profiles.some((candidate) => value === canonicalJson(candidate));
 }
-function isLegacyDirectorSeatRequirement(requirement) {
-  return requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID && canonicalJson(requirement.executedProfile) === canonicalJson(legacyDirectorSeatProfile) && canonicalJson(requirement.standbyProfile) === canonicalJson(directorSeatPrimaryProfile);
-}
 function isRatifiedDirectorSeatRequirement(requirement) {
   return requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID && profileIsOneOf(requirement.executedProfile, directorSeatProfiles) && profileIsOneOf(requirement.standbyProfile, directorSeatProfiles) && canonicalJson(requirement.executedProfile) !== canonicalJson(requirement.standbyProfile);
 }
@@ -15918,7 +15911,7 @@ var roleRequirementSchema = external_exports.object({
     if (requirement.writingLaneCapacity !== 0) {
       ctx.addIssue({ code: "custom", path: ["writingLaneCapacity"], message: "director-seat has no writing-lane capacity" });
     }
-    if (!isRatifiedDirectorSeatRequirement(requirement) && !isLegacyDirectorSeatRequirement(requirement)) {
+    if (!isRatifiedDirectorSeatRequirement(requirement)) {
       ctx.addIssue({ code: "custom", path: ["executedProfile"], message: "director-seat requires the exact ratified profile pair" });
     }
   } else if (requirement.standbyProfile !== void 0 || requirement.writingLaneCapacity !== void 0) {
@@ -16398,9 +16391,6 @@ function validateConfig(value) {
       if (roleRequirements !== void 0) {
         const parsed = roleRequirementsSchema.safeParse(roleRequirements);
         if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
-        if (parsed.data.some(isLegacyDirectorSeatRequirement)) {
-          throw refusal("INVALID_INPUT", "new config cannot declare the legacy director-seat profile");
-        }
       }
       const writingLaneCeiling = bbCollab.writingLaneCeiling;
       if (writingLaneCeiling !== void 0 && (!Number.isInteger(writingLaneCeiling) || Number(writingLaneCeiling) < 0 || Number(writingLaneCeiling) > MAX_WRITING_LANE_CEILING)) {
@@ -18240,8 +18230,7 @@ function profileEquals(left, right) {
 }
 function roleRequirementProfileMatches(requirement, profile) {
   if (requirement.roleRequirementId !== DIRECTOR_SEAT_ROLE_REQUIREMENT_ID) return profileEquals(profile, requirement.executedProfile);
-  const profiles = isLegacyDirectorSeatRequirement(requirement) ? [legacyDirectorSeatProfile, ...directorSeatProfiles] : directorSeatProfiles;
-  return profileIsOneOf(profile, profiles);
+  return profileIsOneOf(profile, directorSeatProfiles);
 }
 function qualificationContextDigest(context, resolved, request) {
   return sha256(canonicalJson({
