@@ -8,27 +8,36 @@ import type { CheckoutDivergence } from "./checkout-divergence.js";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 21;
+export const CONTRACT_VERSION = 22;
 export const SCHEMA_VERSION = 20;
-// v21 makes project configuration visibility explicitly visible-only.
+// v22 replaces the director's single k3 profile with the ratified Opus/GLM pair.
 const PREVIOUS_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
 const PREVIOUS_SCHEMA_VERSION = 19;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
-const directorSeatProfile = {
+const directorSeatPrimaryProfile = {
+  providerId: "claude-code",
+  model: "claude-opus-5[1m]",
+  reasoningLevel: "medium",
+  permissionMode: "full",
+  serviceTier: "default",
+  visibility: "visible" as const,
+};
+const directorSeatSecondaryProfile = {
   providerId: "pi",
-  model: "kimi-coding/k3",
+  model: "zai/glm-5.3",
   reasoningLevel: "high",
   permissionMode: "full",
   serviceTier: "default",
   visibility: "visible" as const,
 };
-const directorSeatStandbyProfile = {
-  providerId: "claude-code",
-  model: "claude-opus-5[1m]",
-  reasoningLevel: "medium",
+const directorSeatProfiles = [directorSeatPrimaryProfile, directorSeatSecondaryProfile] as const;
+const legacyDirectorSeatProfile = {
+  providerId: "pi",
+  model: "kimi-coding/k3",
+  reasoningLevel: "high",
   permissionMode: "full",
   serviceTier: "default",
   visibility: "visible" as const,
@@ -864,7 +873,7 @@ type CachedConsumerProbe = () => Promise<{
   newApplyRefusal?: Pick<FoundationResult, "outcome">;
 }>;
 
-export async function assembleV21CachedConsumerRolloutEvidence(input: {
+export async function assembleV22CachedConsumerRolloutEvidence(input: {
   rpcContract?: CachedConsumerProbe;
   collabCli?: CachedConsumerProbe;
   consumedLegacyReplay?: CachedConsumerProbe;
@@ -877,7 +886,7 @@ export async function assembleV21CachedConsumerRolloutEvidence(input: {
     ["src/foundation.newLegacyApplyProvenanceProbe", input.newLegacyApplyProvenance],
   ] as const;
   if (probes.some(([, probe]) => typeof probe !== "function")) {
-    throw new Error("cached-consumer v21 rollout evidence requires execution from all four consumers");
+    throw new Error("cached-consumer v22 rollout evidence requires execution from all four consumers");
   }
   const executed = await Promise.all(probes.map(async ([name, probe]) => ({
     name,
@@ -890,10 +899,10 @@ export async function assembleV21CachedConsumerRolloutEvidence(input: {
     reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 ||
     consumedLegacyReplay?.outcome !== "OK" || newApply?.outcome !== "OPERATOR_RECEIPT_INVALID"
   ) {
-    throw new Error("cached-consumer v21 rollout evidence requires four rereads, consumed legacy replay, and the current new-apply refusal");
+    throw new Error("cached-consumer v22 rollout evidence requires four rereads, consumed legacy replay, and the current new-apply refusal");
   }
   const durableRefJson = canonicalJson({
-    kind: "cached_consumer_v21_rollout_receipt",
+    kind: "cached_consumer_v22_rollout_receipt",
     reread,
     consumedLegacyReplay: {
       outcome: consumedLegacyReplay.outcome,
@@ -903,16 +912,16 @@ export async function assembleV21CachedConsumerRolloutEvidence(input: {
     },
   });
   return {
-    evidenceId: "cached-consumer-v21-rollout-receipt",
+    evidenceId: "cached-consumer-v22-rollout-receipt",
     evidenceKind: "release",
     sourceKind: "release",
     sourceRef: "live-plugin:dist/server.js",
     executionAttemptId: null,
     contentDigest: sha256(durableRefJson),
-    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v21-rollout-receipt", redacted: true }),
+    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v22-rollout-receipt", redacted: true }),
     durableRefJson,
     relationKind: "supporting",
-    relation: { purpose: "cached-consumer-v21-rollout" },
+    relation: { purpose: "cached-consumer-v22-rollout" },
   };
 }
 
@@ -975,7 +984,7 @@ function persistedCachedConsumerRolloutEvidence(db: SqliteDatabase, projectId: s
     `SELECT evidence_kind, source_kind, source_ref, execution_attempt_id, content_digest,
             redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest
      FROM evidence_artifacts
-     WHERE project_id = ? AND evidence_id = 'cached-consumer-v21-rollout-receipt'`,
+     WHERE project_id = ? AND evidence_id = 'cached-consumer-v22-rollout-receipt'`,
   ).get(projectId));
   if (!row) return unknownCachedConsumerRolloutEvidence();
   try {
@@ -985,7 +994,7 @@ function persistedCachedConsumerRolloutEvidence(db: SqliteDatabase, projectId: s
     assertRedactedEvidence(durableRef, "cached-consumer rollout durable reference");
     const expectedIdentity = sha256(canonicalJson({
       projectId,
-      evidenceId: "cached-consumer-v21-rollout-receipt",
+      evidenceId: "cached-consumer-v22-rollout-receipt",
       evidenceKind: row.evidence_kind,
       sourceKind: row.source_kind,
       sourceRef: row.source_ref,
@@ -1010,7 +1019,7 @@ function persistedCachedConsumerRolloutEvidence(db: SqliteDatabase, projectId: s
     if (!Array.isArray(receipt.reread?.observations)) return unknownCachedConsumerRolloutEvidence();
     const reread = cachedConsumerRolloutEvidence(receipt.reread.observations as CachedConsumerObservation[]);
     if (
-      receipt.kind !== "cached_consumer_v21_rollout_receipt" ||
+      receipt.kind !== "cached_consumer_v22_rollout_receipt" ||
       receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest ||
       reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 ||
       receipt.consumedLegacyReplay?.outcome !== "OK" ||
@@ -1104,8 +1113,11 @@ export const contractDigest = sha256(canonicalJson({
   directorSeatPolicy: {
     roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
     roleId: "director",
-    executedProfile: directorSeatProfile,
-    standbyProfile: directorSeatStandbyProfile,
+    profiles: directorSeatProfiles,
+    legacyStoredPair: {
+      executedProfile: legacyDirectorSeatProfile,
+      standbyProfile: directorSeatPrimaryProfile,
+    },
     writingLaneCapacity: 0,
     environment: "managed-worktree",
     assignmentKinds: [],
@@ -1542,6 +1554,32 @@ const executionProfileSchema = z
     visibility: z.enum(["visible", "hidden"]),
   })
   .strict();
+function profileIsOneOf(profile: unknown, profiles: readonly unknown[]): boolean {
+  const value = canonicalJson(profile);
+  return profiles.some((candidate) => value === canonicalJson(candidate));
+}
+
+function isLegacyDirectorSeatRequirement(requirement: {
+  roleRequirementId: string;
+  executedProfile: unknown;
+  standbyProfile?: unknown;
+}): boolean {
+  return requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID &&
+    canonicalJson(requirement.executedProfile) === canonicalJson(legacyDirectorSeatProfile) &&
+    canonicalJson(requirement.standbyProfile) === canonicalJson(directorSeatPrimaryProfile);
+}
+
+function isRatifiedDirectorSeatRequirement(requirement: {
+  roleRequirementId: string;
+  executedProfile: unknown;
+  standbyProfile?: unknown;
+}): boolean {
+  return requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID &&
+    profileIsOneOf(requirement.executedProfile, directorSeatProfiles) &&
+    profileIsOneOf(requirement.standbyProfile, directorSeatProfiles) &&
+    canonicalJson(requirement.executedProfile) !== canonicalJson(requirement.standbyProfile);
+}
+
 const roleRequirementSchema = z
   .object({
     roleRequirementId: id,
@@ -1576,14 +1614,11 @@ const roleRequirementSchema = z
       if (requirement.repoTargetId !== null) {
         ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "director-seat must be project-scoped" });
       }
-      if (!requirement.standbyProfile || canonicalJson(requirement.standbyProfile) !== canonicalJson(directorSeatStandbyProfile)) {
-        ctx.addIssue({ code: "custom", path: ["standbyProfile"], message: "director-seat requires the exact Opus-medium standby profile" });
-      }
       if (requirement.writingLaneCapacity !== 0) {
         ctx.addIssue({ code: "custom", path: ["writingLaneCapacity"], message: "director-seat has no writing-lane capacity" });
       }
-      if (canonicalJson(requirement.executedProfile) !== canonicalJson(directorSeatProfile)) {
-        ctx.addIssue({ code: "custom", path: ["executedProfile"], message: "director-seat requires the exact judgment profile" });
+      if (!isRatifiedDirectorSeatRequirement(requirement) && !isLegacyDirectorSeatRequirement(requirement)) {
+        ctx.addIssue({ code: "custom", path: ["executedProfile"], message: "director-seat requires the exact ratified profile pair" });
       }
     } else if (requirement.standbyProfile !== undefined || requirement.writingLaneCapacity !== undefined) {
       ctx.addIssue({ code: "custom", path: ["roleRequirementId"], message: "standby profile and writing capacity are reserved for director-seat" });
@@ -2519,6 +2554,9 @@ function validateConfig(value: unknown): string {
       if (roleRequirements !== undefined) {
         const parsed = roleRequirementsSchema.safeParse(roleRequirements);
         if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
+        if (parsed.data.some(isLegacyDirectorSeatRequirement)) {
+          throw refusal("INVALID_INPUT", "new config cannot declare the legacy director-seat profile");
+        }
       }
       const writingLaneCeiling = (bbCollab as Record<string, unknown>).writingLaneCeiling;
       if (writingLaneCeiling !== undefined && (!Number.isInteger(writingLaneCeiling) || Number(writingLaneCeiling) < 0 || Number(writingLaneCeiling) > MAX_WRITING_LANE_CEILING)) {
@@ -4689,6 +4727,14 @@ function profileEquals(left: ExecutionProfile, right: ExecutionProfile): boolean
   return canonicalJson(left) === canonicalJson(right);
 }
 
+function roleRequirementProfileMatches(requirement: RoleRequirement, profile: ExecutionProfile): boolean {
+  if (requirement.roleRequirementId !== DIRECTOR_SEAT_ROLE_REQUIREMENT_ID) return profileEquals(profile, requirement.executedProfile);
+  const profiles = isLegacyDirectorSeatRequirement(requirement)
+    ? [legacyDirectorSeatProfile, ...directorSeatProfiles]
+    : directorSeatProfiles;
+  return profileIsOneOf(profile, profiles);
+}
+
 function qualificationContextDigest(
   context: ResolvedRoleContext,
   resolved: ResolvedRoleRequirement,
@@ -4732,7 +4778,7 @@ function applyQualificationObservation(
     throw refusal("IDEMPOTENCY_KEY_CONFLICT", "qualification identity is immutable and already exists");
   }
   const contextDigest = qualificationContextDigest(context, resolved, request);
-  const requiredMatch = profileEquals(context.profile, resolved.requirement.executedProfile);
+  const requiredMatch = roleRequirementProfileMatches(resolved.requirement, context.profile);
   const declaredMatch = request.declaredProfile === undefined || profileEquals(context.profile, request.declaredProfile);
   const mismatch = !requiredMatch || !declaredMatch;
   const observationOutcome = mismatch ? "unqualified" : requestedOutcome;
@@ -5016,12 +5062,12 @@ function applyRoleGenerationSuccession(
   }
   const resolved = requireRoleRequirement(db, request, configRevision);
   requireRoleTargetContext(db, request, resolved, context);
-  if (!profileEquals(context.profile, resolved.requirement.executedProfile) || request.profileDigest !== context.profileDigest) {
+  if (!roleRequirementProfileMatches(resolved.requirement, context.profile) || request.profileDigest !== context.profileDigest) {
     throw refusal("EXECUTION_PROFILE_MISMATCH", "holder executed profile does not match the role requirement");
   }
   const standbyProfile = request.standbyProfile;
-  if (resolved.requirement.standbyProfile && (!standbyProfile || !profileEquals(standbyProfile, resolved.requirement.standbyProfile))) {
-    throw refusal("ROLE_STANDBY_INVALID", "director-seat succession requires its configured Opus-medium standby profile");
+  if (resolved.requirement.standbyProfile && (!standbyProfile || !roleRequirementProfileMatches(resolved.requirement, standbyProfile))) {
+    throw refusal("ROLE_STANDBY_INVALID", "director-seat succession requires another allowed profile from its configured pair");
   }
   if (request.roleId === "director") {
     if (!standbyProfile || standbyProfile.providerId === context.profile.providerId) {

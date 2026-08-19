@@ -9,6 +9,10 @@ import {
 } from "../src/foundation.js";
 
 const PROJECT_ID = "proj_a8zzfsx36j";
+const DIRECTOR_PROFILES = [
+  { providerId: "claude-code", model: "claude-opus-5[1m]", reasoningLevel: "medium" },
+  { providerId: "pi", model: "zai/glm-5.3", reasoningLevel: "high" },
+] as const;
 
 type LiveEvent = RoleEventFact & { scope?: { turnId?: string } };
 
@@ -63,10 +67,13 @@ it.runIf(process.env.BB_LIVE_ROLE_CONTEXT === "1")(
     const candidates = events.flatMap((request, requestIndex) => {
       const execution = request.data.execution as Record<string, unknown> | undefined;
       const requestId = request.data.requestId;
+      const profile = DIRECTOR_PROFILES.find((candidate) =>
+        execution?.model === candidate.model && execution.reasoningLevel === candidate.reasoningLevel,
+      );
       if (
         request.type !== "client/turn/requested" || typeof requestId !== "string" ||
-        execution?.model !== "kimi-coding/k3" || execution.reasoningLevel !== "high" ||
-        execution.permissionMode !== "full" || execution.serviceTier !== "default"
+        !profile ||
+        execution?.permissionMode !== "full" || execution?.serviceTier !== "default"
       ) return [];
       const acceptedIndex = events.findIndex((event, index) =>
         index > requestIndex && event.type === "turn/input/accepted" && event.data.clientRequestId === requestId,
@@ -88,7 +95,7 @@ it.runIf(process.env.BB_LIVE_ROLE_CONTEXT === "1")(
         returned.filter((event) => event.type === "turn/completed" && event.data.providerThreadId === providerThreadId).length !== 1 ||
         returned.some((event) => event.type === "provider/modelFallback" && event.data.providerThreadId === providerThreadId)
       ) return [];
-      return [{ request, completion, interiorCount: returned.length - 1 }];
+      return [{ request, completion, interiorCount: returned.length - 1, profile }];
     });
     const latest = [...candidates].sort((left, right) => right.request.seq - left.request.seq)[0];
     const busy = [...candidates].sort((left, right) => right.interiorCount - left.interiorCount)[0];
@@ -112,9 +119,7 @@ it.runIf(process.env.BB_LIVE_ROLE_CONTEXT === "1")(
       const reader = await readLiveRoleFactReader(sdk, baseUrl, request);
       if (!reader) throw new Error("live role fact reader was not constructed");
       expect(resolveRoleContext(reader, request).profile).toEqual({
-        providerId: "pi",
-        model: "kimi-coding/k3",
-        reasoningLevel: "high",
+        ...candidate.profile,
         permissionMode: "full",
         serviceTier: "default",
         visibility: "visible",

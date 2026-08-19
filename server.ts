@@ -25,7 +25,7 @@ import {
   ROLE_CONTEXT_EVENT_PAGE_SIZE,
   PLUGIN_ID,
   PLUGIN_SDK_VERSION,
-  assembleV21CachedConsumerRolloutEvidence,
+  assembleV22CachedConsumerRolloutEvidence,
   applyAuthorizedMutation,
   applyRequestSchema,
   databaseIsReady,
@@ -659,7 +659,7 @@ async function applyLiveAuthorizedMutation(
   allowCachedConsumerRollout = false,
 ): Promise<FoundationResult> {
   const parsed = applyRequestSchema.safeParse(input);
-  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v21-rollout-receipt")) {
+  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v22-rollout-receipt")) {
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
   if (parsed.success && parsed.data.workItemWait !== undefined && parsed.data.workItemWait !== null) {
@@ -844,7 +844,7 @@ async function applyLiveCachedConsumerRollout(
   try {
     const project = await bb.sdk.projects.get({ projectId: request.projectId });
     if (project.id !== request.projectId) return { outcome: "PROJECT_UNKNOWN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "live project identity does not match the rollout request" };
-    const evidence = await assembleV21CachedConsumerRolloutEvidence({
+    const evidence = await assembleV22CachedConsumerRolloutEvidence({
       rpcContract: async () => liveCachedConsumerReread("server.rpcContract", await bb.sdk.plugins.callRpc({
         pluginId: bb.pluginId,
         method: "doctor",
@@ -2856,7 +2856,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       },
       {
         name: "cached-consumer-rollout",
-        summary: "Persist the live v21 cached-consumer rollout evidence (exact live production evidence required)",
+        summary: "Persist the live v22 cached-consumer rollout evidence (exact live production evidence required)",
         usage: "bb collab cached-consumer-rollout --project PROJECT_ID --request JSON",
       },
       { name: "role-list", summary: "List exact current active role bindings (read-only)", usage: "bb collab role-list --project PROJECT_ID" },
