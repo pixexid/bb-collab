@@ -3904,7 +3904,7 @@ describe("bb-collab plugin boundary", () => {
     const items = [
       { id: "backfill-succeeded", body: "Writing lane thr_succeeded. Ship it", state: "succeeded", created: 101, updated: 202 },
       { id: "backfill-running", body: "Lane thr_running. Keep going", state: "in_progress", created: 303, updated: 404 },
-      { id: "backfill-failed", body: "Writing lane thr_failed. Nope", state: "cancelled", created: 505, updated: 606 },
+      { id: "backfill-failed", body: "Writing lane thr_failed, Nope", state: "cancelled", created: 505, updated: 606 },
       { id: "backfill-wildcard", body: "Writing lane thrXnot-a-token. No real thread", state: "succeeded", created: 707, updated: 808 },
     ] as const;
     for (const item of items) {

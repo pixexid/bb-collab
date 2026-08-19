@@ -5127,7 +5127,7 @@ type WorkAttempt = z.infer<typeof workAttemptSchema>;
 type WorkAttemptState = "running" | "done" | "failed";
 const ACTIVE_WORK_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"] as const;
 const WORK_ITEM_THREAD_TOKEN = /thr_[A-Za-z0-9]+/gu;
-const WORK_ITEM_LANE_SENTENCE = /^(?:Lane|Writing lane) (thr_[A-Za-z0-9]+)(?:[.!?])?(?:[ \t]+|\r?\n|$)/u;
+const WORK_ITEM_LANE_SENTENCE = /^(?:Lane|Writing lane) (thr_[A-Za-z0-9]+)(?:[,.!?])?(?:[ \t]+|\r?\n|$)/u;
 
 export interface WorkItemBackfillCounts {
   candidates: number;

@@ -18470,7 +18470,7 @@ function applyRoleMutation(db, request, digest, reader) {
 }
 var ACTIVE_WORK_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
 var WORK_ITEM_THREAD_TOKEN = /thr_[A-Za-z0-9]+/gu;
-var WORK_ITEM_LANE_SENTENCE = /^(?:Lane|Writing lane) (thr_[A-Za-z0-9]+)(?:[.!?])?(?:[ \t]+|\r?\n|$)/u;
+var WORK_ITEM_LANE_SENTENCE = /^(?:Lane|Writing lane) (thr_[A-Za-z0-9]+)(?:[,.!?])?(?:[ \t]+|\r?\n|$)/u;
 function parseBackfillLane(body) {
   const tokens = [...body.matchAll(WORK_ITEM_THREAD_TOKEN)].map((match) => match[0]);
   const distinctTokens = new Set(tokens);
