@@ -9,12 +9,12 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 export const CONTRACT_VERSION = 21;
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 // v21 makes project configuration visibility explicitly visible-only.
 const PREVIOUS_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-const PREVIOUS_SCHEMA_VERSION = 16;
+const PREVIOUS_SCHEMA_VERSION = 17;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatProfile = {
@@ -65,6 +65,7 @@ export const TABLES = [
   "work_items",
   "work_item_waits",
   "external_work_refs",
+  "work_item_github_backfills",
   "qualification_observations",
   "eligibility_projections",
   "assignments",
@@ -821,6 +822,14 @@ export const MIGRATIONS: string[] = [
   FROM work_items;
   DROP TABLE work_items;
   ALTER TABLE work_items_gh295 RENAME TO work_items`,
+  `CREATE TABLE IF NOT EXISTS work_item_github_backfills (
+    project_id TEXT PRIMARY KEY,
+    epoch_created_at_ms INTEGER NOT NULL CHECK (epoch_created_at_ms >= 0),
+    state TEXT NOT NULL CHECK (state IN ('attempted', 'completed', 'degraded')),
+    result_json TEXT NOT NULL CHECK (json_valid(result_json)),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+  )`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -1436,11 +1445,17 @@ export function workItemCapacityLaneEvidence(db: SqliteDatabase, projectId: stri
 }
 
 const workItemStateSchema = z.enum(WORK_ITEM_STATES);
+const githubIssueBindingSchema = z
+  .object({
+    issueNumber: z.number().int().positive().refine(Number.isSafeInteger, "issueNumber must be a safe integer"),
+  })
+  .strict();
 const workItemInputSchema = z
   .object({
     workItemId: id,
     title: z.string().max(4096),
     body: z.string().max(64 * 1024),
+    githubIssue: githubIssueBindingSchema.optional(),
   })
   .strict();
 const workItemWaitSchema = z.discriminatedUnion("kind", [
@@ -1767,6 +1782,8 @@ export interface GitHubIssueAdapter {
   read(owner: string, repo: string, issueNumber: number): GitHubIssueSnapshot | null;
   mutate(input: GitHubIssueMutation): GitHubIssueSnapshot;
 }
+
+export type GitHubIssueReader = (owner: string, repo: string, issueNumber: number) => GitHubIssueSnapshot | null;
 
 export interface RoleThreadFact {
   id: string;
@@ -5615,6 +5632,10 @@ function applyWorkItemCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
   if (db.prepare("SELECT 1 FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, request.workItem.workItemId)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item already exists");
   }
+  const githubIssue = request.workItem.githubIssue;
+  const githubBinding = githubIssue === undefined
+    ? null
+    : requireGithubMapping(db, request.projectId, configRevision, request.repoTargetId);
   const createdAtMs = now();
   db.prepare(
     `INSERT INTO work_items
@@ -5631,6 +5652,29 @@ function applyWorkItemCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
     createdAtMs,
     createdAtMs,
   );
+  const workItem = {
+    project_id: request.projectId,
+    work_item_id: request.workItem.workItemId,
+    config_revision: configRevision,
+    repo_target_id: request.repoTargetId,
+    title: request.workItem.title,
+    body: request.workItem.body,
+    lifecycle_state: "proposed" as const,
+    resource_revision: 1,
+    created_at_ms: createdAtMs,
+    updated_at_ms: createdAtMs,
+  } satisfies WorkItemRow;
+  const boundGithubIssue = githubIssue === undefined || githubBinding === null
+    ? null
+    : bindExistingGithubIssue(db, {
+      projectId: request.projectId,
+      workItem,
+      github: githubBinding.github,
+      mapping: githubBinding.mapping,
+      issueNumber: githubIssue.issueNumber,
+      idempotencyKey: request.idempotencyKey,
+      requestDigest: digest,
+    });
   return commitMutation(
     db,
     request,
@@ -5641,14 +5685,38 @@ function applyWorkItemCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
       aggregateId: request.workItem.workItemId,
       aggregateRevision: 1,
       eventType: "work_item_created",
-      event: { workItemId: request.workItem.workItemId, repoTargetId: request.repoTargetId, lifecycleState: "proposed" },
+      event: {
+        workItemId: request.workItem.workItemId,
+        repoTargetId: request.repoTargetId,
+        lifecycleState: "proposed",
+        ...(boundGithubIssue === null ? {} : {
+          githubIssue: {
+            owner: boundGithubIssue.owner,
+            repo: boundGithubIssue.repo,
+            issueNumber: boundGithubIssue.issue_number,
+            projectionState: boundGithubIssue.projection_state,
+          },
+        }),
+      },
     },
     { expected: 1, attempted: 1, verified: 1 },
     {
       currentConfigRevision: configRevision,
       currentGovernanceEpoch: governor.governance_epoch,
       currentResourceRevision: 1,
-      evidence: { workItemId: request.workItem.workItemId, repoTargetId: request.repoTargetId, lifecycleState: "proposed" },
+      evidence: {
+        workItemId: request.workItem.workItemId,
+        repoTargetId: request.repoTargetId,
+        lifecycleState: "proposed",
+        ...(boundGithubIssue === null ? {} : {
+          githubIssue: {
+            owner: boundGithubIssue.owner,
+            repo: boundGithubIssue.repo,
+            issueNumber: boundGithubIssue.issue_number,
+            projectionState: boundGithubIssue.projection_state,
+          },
+        }),
+      },
     },
   );
 }
@@ -5963,10 +6031,259 @@ function observedDigest(snapshot: GitHubIssueSnapshot, desired: DesiredProjectio
   }));
 }
 
+function bindExistingGithubIssue(
+  db: SqliteDatabase,
+  input: {
+    projectId: string;
+    workItem: WorkItemRow;
+    github: GithubIssuesConfig;
+    mapping: z.infer<typeof githubMappingSchema>;
+    issueNumber: number;
+    idempotencyKey: string;
+    requestDigest: string;
+    observed?: GitHubIssueSnapshot;
+  },
+): ExternalWorkRefRow {
+  const existing = externalRef(db, input.projectId, input.workItem.work_item_id);
+  if (existing) {
+    if (
+      existing.owner !== input.mapping.owner ||
+      existing.repo !== input.mapping.repo ||
+      existing.issue_number !== input.issueNumber
+    ) {
+      throw refusal("EXTERNAL_REF_CONFLICT", "work item already has a different GitHub issue binding");
+    }
+    return existing;
+  }
+  const collision = asRow<{ work_item_id: string }>(db.prepare(
+    `SELECT work_item_id FROM external_work_refs
+     WHERE provider = 'github' AND owner = ? AND repo = ? AND issue_number = ?
+     LIMIT 1`,
+  ).get(input.mapping.owner, input.mapping.repo, input.issueNumber));
+  if (collision && collision.work_item_id !== input.workItem.work_item_id) {
+    throw refusal("EXTERNAL_REF_CONFLICT", "GitHub issue is already bound to another work item");
+  }
+  const desired = desiredProjection(input.workItem, input.github);
+  const observed = input.observed;
+  const createdAtMs = now();
+  db.prepare(
+    `INSERT INTO external_work_refs
+      (project_id, work_item_id, provider, owner, repo, issue_number, projection_state,
+       attempted_resource_revision, projected_resource_revision, desired_digest,
+       observed_external_revision, observed_external_digest, last_idempotency_key,
+       last_request_digest, created_at_ms, updated_at_ms)
+     VALUES (?, ?, 'github', ?, ?, ?, 'pending', ?, NULL, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    input.projectId,
+    input.workItem.work_item_id,
+    input.mapping.owner,
+    input.mapping.repo,
+    input.issueNumber,
+    input.workItem.resource_revision,
+    desired.digest,
+    observed?.externalRevision ?? null,
+    observed ? observedDigest(observed, desired) : null,
+    input.idempotencyKey,
+    input.requestDigest,
+    createdAtMs,
+    createdAtMs,
+  );
+  return externalRef(db, input.projectId, input.workItem.work_item_id)!;
+}
+
 function externalRef(db: SqliteDatabase, projectId: string, workItemId: string): ExternalWorkRefRow | undefined {
   return asRow<ExternalWorkRefRow>(
     db.prepare("SELECT * FROM external_work_refs WHERE project_id = ? AND work_item_id = ? AND provider = 'github'").get(projectId, workItemId),
   );
+}
+
+const WORK_ITEM_GITHUB_ID = /^wi-gh-([1-9][0-9]*)$/u;
+
+export type WorkItemGithubBackfillState = "attempted" | "completed" | "degraded";
+
+export interface WorkItemGithubBackfillOutcome {
+  workItemId: string;
+  status: "bound" | "already_bound" | "unresolved";
+  reason: string;
+  issueNumber?: number;
+}
+
+export interface WorkItemGithubBackfillResult {
+  projectId: string;
+  epochCreatedAtMs: number;
+  state: WorkItemGithubBackfillState;
+  candidates: number;
+  bound: number;
+  alreadyBound: number;
+  unresolved: number;
+  outcomes: WorkItemGithubBackfillOutcome[];
+}
+
+function parseGithubIssueCandidate(workItemId: string): number | null {
+  const match = WORK_ITEM_GITHUB_ID.exec(workItemId);
+  if (!match) return null;
+  const issueNumber = Number(match[1]);
+  return Number.isSafeInteger(issueNumber) && issueNumber > 0 ? issueNumber : null;
+}
+
+function readGithubBackfillRun(db: SqliteDatabase, projectId: string): WorkItemGithubBackfillResult | null {
+  const row = asRow<{ result_json: string }>(db.prepare(
+    "SELECT result_json FROM work_item_github_backfills WHERE project_id = ?",
+  ).get(projectId));
+  if (!row) return null;
+  try {
+    const result = JSON.parse(row.result_json) as WorkItemGithubBackfillResult;
+    if (
+      result.projectId !== projectId ||
+      !Number.isSafeInteger(result.epochCreatedAtMs) ||
+      !["attempted", "completed", "degraded"].includes(result.state) ||
+      !Array.isArray(result.outcomes)
+    ) throw new Error("invalid backfill result");
+    return result;
+  } catch {
+    throw new Error("GitHub WorkItem backfill marker is malformed");
+  }
+}
+
+function persistGithubBackfillRun(db: SqliteDatabase, result: WorkItemGithubBackfillResult): void {
+  transaction(db, () => {
+    const updated = db.prepare(
+      `UPDATE work_item_github_backfills
+       SET state = ?, result_json = ?, updated_at_ms = ?
+       WHERE project_id = ?`,
+    ).run(result.state, canonicalJson(result), now(), result.projectId);
+    if (updated.changes !== 1) throw new Error("GitHub WorkItem backfill marker disappeared");
+  });
+}
+
+function unresolvedBackfillOutcome(workItemId: string, reason: string, issueNumber?: number): WorkItemGithubBackfillOutcome {
+  return { workItemId, status: "unresolved", reason, ...(issueNumber === undefined ? {} : { issueNumber }) };
+}
+
+export function backfillWorkItemGithubIssues(
+  db: SqliteDatabase,
+  projectId: string,
+  reader: GitHubIssueReader,
+  epochCreatedAtMs = now(),
+): WorkItemGithubBackfillResult {
+  if (!Number.isSafeInteger(epochCreatedAtMs) || epochCreatedAtMs < 0) {
+    throw new Error("GitHub WorkItem backfill epoch must be a non-negative safe integer");
+  }
+  const prepared = transaction(db, () => {
+    const existing = readGithubBackfillRun(db, projectId);
+    if (existing) return { result: existing, rows: null as WorkItemRow[] | null };
+    const rows = db.prepare(
+      `SELECT project_id, work_item_id, config_revision, repo_target_id, title, body,
+              lifecycle_state, resource_revision, created_at_ms, updated_at_ms
+       FROM work_items
+       WHERE project_id = ? AND created_at_ms <= ?
+       ORDER BY work_item_id`,
+    ).all(projectId, epochCreatedAtMs) as WorkItemRow[];
+    const result: WorkItemGithubBackfillResult = {
+      projectId,
+      epochCreatedAtMs,
+      state: "attempted",
+      candidates: rows.length,
+      bound: 0,
+      alreadyBound: 0,
+      unresolved: 0,
+      outcomes: [],
+    };
+    const timestamp = now();
+    db.prepare(
+      `INSERT INTO work_item_github_backfills
+        (project_id, epoch_created_at_ms, state, result_json, created_at_ms, updated_at_ms)
+       VALUES (?, ?, 'attempted', ?, ?, ?)`,
+    ).run(projectId, epochCreatedAtMs, canonicalJson(result), timestamp, timestamp);
+    return { result, rows };
+  });
+  if (prepared.rows === null) return prepared.result;
+
+  let result = prepared.result;
+  for (const row of prepared.rows) {
+    const issueNumber = parseGithubIssueCandidate(row.work_item_id);
+    if (issueNumber === null) {
+      const outcome = unresolvedBackfillOutcome(row.work_item_id, "work_item_id_not_github_issue");
+      result = { ...result, unresolved: result.unresolved + 1, outcomes: [...result.outcomes, outcome] };
+      persistGithubBackfillRun(db, result);
+      continue;
+    }
+
+    let mapping: ReturnType<typeof requireGithubMapping>;
+    try {
+      mapping = requireGithubMapping(db, row.project_id, row.config_revision, row.repo_target_id);
+    } catch (error) {
+      const reason = error instanceof Refusal ? error.data.code.toLowerCase() : "github_mapping_unreadable";
+      const outcome = unresolvedBackfillOutcome(row.work_item_id, reason, issueNumber);
+      result = { ...result, unresolved: result.unresolved + 1, outcomes: [...result.outcomes, outcome] };
+      persistGithubBackfillRun(db, result);
+      continue;
+    }
+
+    const existing = externalRef(db, row.project_id, row.work_item_id);
+    if (existing) {
+      const matches = existing.owner === mapping.mapping.owner && existing.repo === mapping.mapping.repo && existing.issue_number === issueNumber;
+      const outcome = matches
+        ? { workItemId: row.work_item_id, status: "already_bound" as const, reason: "existing_exact_binding", issueNumber }
+        : unresolvedBackfillOutcome(row.work_item_id, "external_ref_conflict", issueNumber);
+      result = matches
+        ? { ...result, alreadyBound: result.alreadyBound + 1, outcomes: [...result.outcomes, outcome] }
+        : { ...result, unresolved: result.unresolved + 1, outcomes: [...result.outcomes, outcome] };
+      persistGithubBackfillRun(db, result);
+      continue;
+    }
+
+    let snapshot: GitHubIssueSnapshot | null;
+    try {
+      snapshot = reader(mapping.mapping.owner, mapping.mapping.repo, issueNumber);
+    } catch {
+      const outcome = unresolvedBackfillOutcome(row.work_item_id, "github_issue_unreadable", issueNumber);
+      result = { ...result, unresolved: result.unresolved + 1, outcomes: [...result.outcomes, outcome] };
+      persistGithubBackfillRun(db, result);
+      continue;
+    }
+    if (snapshot === null) {
+      const outcome = unresolvedBackfillOutcome(row.work_item_id, "github_issue_missing", issueNumber);
+      result = { ...result, unresolved: result.unresolved + 1, outcomes: [...result.outcomes, outcome] };
+      persistGithubBackfillRun(db, result);
+      continue;
+    }
+    if (
+      snapshot.owner !== mapping.mapping.owner ||
+      snapshot.repo !== mapping.mapping.repo ||
+      snapshot.issueNumber !== issueNumber
+    ) {
+      const outcome = unresolvedBackfillOutcome(row.work_item_id, "github_issue_identity_mismatch", issueNumber);
+      result = { ...result, unresolved: result.unresolved + 1, outcomes: [...result.outcomes, outcome] };
+      persistGithubBackfillRun(db, result);
+      continue;
+    }
+
+    try {
+      transaction(db, () => {
+        bindExistingGithubIssue(db, {
+          projectId: row.project_id,
+          workItem: row,
+          github: mapping.github,
+          mapping: mapping.mapping,
+          issueNumber,
+          idempotencyKey: `github-issue-backfill:${projectId}:${row.work_item_id}`,
+          requestDigest: sha256(canonicalJson({ projectId, workItemId: row.work_item_id, epochCreatedAtMs: result.epochCreatedAtMs })),
+          observed: snapshot!,
+        });
+      });
+      const outcome: WorkItemGithubBackfillOutcome = { workItemId: row.work_item_id, status: "bound", reason: "verified_existing_issue", issueNumber };
+      result = { ...result, bound: result.bound + 1, outcomes: [...result.outcomes, outcome] };
+    } catch (error) {
+      const reason = error instanceof Refusal ? error.data.code.toLowerCase() : "external_ref_bind_failed";
+      const outcome = unresolvedBackfillOutcome(row.work_item_id, reason, issueNumber);
+      result = { ...result, unresolved: result.unresolved + 1, outcomes: [...result.outcomes, outcome] };
+    }
+    persistGithubBackfillRun(db, result);
+  }
+  result = { ...result, state: result.unresolved === 0 ? "completed" : "degraded" };
+  persistGithubBackfillRun(db, result);
+  return result;
 }
 
 const EXTERNAL_REF_CAS_WHERE = `project_id = ? AND work_item_id = ? AND provider = 'github'
@@ -6050,7 +6367,7 @@ function prepareProjection(
       if (ref.owner !== mapping.owner || ref.repo !== mapping.repo) {
         throw refusal("EXTERNAL_REF_CONFLICT", "external ref conflicts with the exact repository mapping");
       }
-      if (ref.projection_state === "pending" || ref.projection_state === "delivery_ambiguous") {
+      if ((ref.projection_state === "pending" && ref.issue_number === null) || ref.projection_state === "delivery_ambiguous") {
         throw refusal("EXTERNAL_DELIVERY_AMBIGUOUS", "external delivery is durably fenced", { expected: 1, attempted: 0, verified: 0 });
       }
       if (ref.projection_state === "drifted") {
@@ -6224,7 +6541,7 @@ function finalizeProjection(
       throw refusal("EXTERNAL_REF_CONFLICT", "external identity changed before projection finalization");
     }
     if (
-      (mutationKind === "verify" && context.ref.projection_state !== "current") ||
+      (mutationKind === "verify" && !["current", "pending"].includes(context.ref.projection_state)) ||
       (mutationKind !== "verify" &&
         (context.ref.projection_state !== "pending" ||
           context.ref.last_idempotency_key !== request.idempotencyKey ||
@@ -6335,7 +6652,8 @@ function applyGithubIssueProjection(
     if (current.owner !== context.mapping.owner || current.repo !== context.mapping.repo || current.issueNumber !== context.ref.issue_number) {
       return result("EXTERNAL_TARGET_MISMATCH", request.projectId, 1, 1, 0, { message: "the GitHub issue response has the wrong exact identity" });
     }
-    if (!context.ref.observed_external_digest || observedDigest(current, context.desired) !== context.ref.observed_external_digest) {
+    const initialBinding = context.ref.projection_state === "pending" && context.ref.issue_number !== null && context.ref.observed_external_digest === null;
+    if (!initialBinding && (!context.ref.observed_external_digest || observedDigest(current, context.desired) !== context.ref.observed_external_digest)) {
       try {
         return recordProjectionState(db, request, digest, context, "drifted", "EXTERNAL_DIVERGED", { expected: 1, attempted: 1, verified: 0 }, "the GitHub issue diverged from its last verified projection");
       } catch {
@@ -6633,6 +6951,7 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     work_items: "work_item_id",
     work_item_waits: "work_item_id",
     external_work_refs: "work_item_id, provider",
+    work_item_github_backfills: "project_id",
     qualification_observations: "qualification_id",
     eligibility_projections: "role_requirement_id, profile_digest",
     assignments: "assignment_id",
