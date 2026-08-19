@@ -135,6 +135,55 @@ renamed test id, relabelled row, duplicate row, and collapsed glyph.
 real affordance and re-close the exception.** Delete `src/inbox-nav-indicator.ts`,
 its test, the poll in `SidebarThreadList`, and this section.
 
+## Why this plugin declares no `branding.icon`
+
+**If the sidebar logo looks wrong to you and you are about to add
+`branding.icon` to `package.json`: don't. It will collapse `Lanes` and `Inbox`
+to a single glyph and fire the dead-man switch above.** That is the precedence
+collapse the previous section detects but does not explain, so it is explained
+here.
+
+**Precedence is form-independent.** A plugin's manifest `branding.icon`
+overrides every one of its contributions' own icons — whether it is a
+plugin-owned `./assets/*.svg` path or a plain BB icon name. The server's
+`/api/v1/plugins` row emits the raw manifest string with no path-versus-name
+filtering (the path case has its own `iconUrl` field), and the app's icon
+component resolves, after the plugin-owned mask branch, with `o?.icon ?? r` —
+`o.icon` the manifest string, `r` the contribution's own. A plain nullish
+coalesce with no `"./"` test, so the contribution's icon is reached *only when
+the manifest declares none*. Every nav row of a plugin renders through that one
+component and passes the same plugin id, so every row resolves to the same
+glyph. It is not compact-chrome-specific; it is every glyph the plugin draws,
+the sidebar footer action and the Extensions detail included.
+
+Measured with a throwaway plugin declaring two nav panels, `Mail` and
+`GitBranch`, one install, rows read out of the rendered DOM. The app bundle was
+byte-identical across both rows; only the manifest changed:
+
+| `branding.icon` | ProbeAlpha (`Mail`) | ProbeBeta (`GitBranch`) |
+| --- | --- | --- |
+| absent (`logo.light` only) | Mail glyph | GitBranch glyph — **distinct** |
+| `"Toolbox"` | Toolbox glyph | Toolbox glyph — **collapsed** |
+
+So **changing the value does not help** — it moves every row to the new glyph.
+The only thing that restores per-row icons is an *absent* `branding.icon`, and
+that is why `package.json` declares `branding.logo.light: "./assets/logo.svg"`
+and nothing else: `pluginBrandingSchema`'s final `refine` requires at least one
+of `icon` and `logo.light`, so dropping the icon obliges shipping a real logo
+asset. The two are additive rather than either-or, which is exactly the trap —
+adding an icon beside the logo is legal, installs clean, and silently collapses
+the rows.
+
+One rule if a future change does reintroduce one: a plugin-owned `icon` must be
+both `./`-prefixed **and** `.svg`-suffixed. `isPluginOwnedIconPath` is only
+`icon.startsWith("./")`, one half of a `superRefine` condition rather than the
+constraint itself; `.png` and `.webp` are accepted for `logo` only.
+
+Reload-scope is the companion finding and lives upstream on get-bb/bb#1852:
+branding assets are read once at plugin load and served from memory, so
+rewriting the file at runtime changes nothing until the plugin reloads. An icon
+cannot carry live state even when it is not collapsing anything.
+
 ## Smallest host support that unblocks this
 
 Preferred, and smallest overall — extend the mechanism the host already has,
