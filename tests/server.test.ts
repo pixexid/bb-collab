@@ -6162,30 +6162,27 @@ describe("bb-collab plugin boundary", () => {
     ]);
   });
 
-  it("refuses an SDK correlation that exhausts the 2,048-event total-work ceiling", async () => {
+  it("resolves the measured 4,394-event SDK correlation to its exact cited completion", async () => {
     const host = await loadedHost(PROJECT_ID, (input) => {
       const [request, accepted, started, completion] = input.events;
       input.events = [
         request!,
         accepted!,
         started!,
-        ...Array.from({ length: 2_046 }, (_, index) => ({ id: `ceiling-${index + 1}`, seq: index + 4, type: "agent/delta", data: {} })),
-        { ...completion!, seq: 2_050 },
+        ...Array.from({ length: 4_391 }, (_, index) => ({ id: `measured-span-${index + 1}`, seq: index + 4, type: "agent/delta", data: {} })),
+        { ...completion!, seq: 4_395 },
       ];
     });
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
-    const before = exportFoundation(db, PROJECT_ID);
     const result = await host.harness.callRpc("apply", qualificationRequest(fenceToken, {
-      idempotencyKey: "role-correlation-work-ceiling",
-      qualificationId: "role-correlation-work-ceiling",
-      roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 2_050 },
+      idempotencyKey: "measured-role-correlation",
+      qualificationId: "measured-role-correlation",
+      roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 4_395 },
     }));
-    expect(result).toMatchObject({ outcome: "EXECUTION_COMPLETION_AMBIGUOUS", attempted: 0, verified: 0 });
-    expect((result as FoundationResult).message).toBe("role context correlation exceeds the 2,048-event total-work ceiling");
+    expect(result).toMatchObject({ outcome: "OK", attempted: 1, verified: 1 });
     expect(host.harness.inspection.sdk.callsTo("threads.events.list")
       .map(([input]) => input)
-      .filter((input) => (input as { limit?: string }).limit === "256")).toHaveLength(8);
-    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+      .filter((input) => (input as { limit?: string }).limit === "256")).toHaveLength(18);
   });
 
   it("refuses a foreign SDK role context before reading any correlation page", async () => {
@@ -6237,9 +6234,18 @@ describe("bb-collab plugin boundary", () => {
     ]);
   });
 
-  it("refuses a paged correlation whose exact cited completion never appears", async () => {
+  it("refuses the measured 4,394-event correlation when its exact cited completion never appears", async () => {
     const { db, fenceToken } = seedAndBootstrap(await loadedHost(), PROJECT_ID, { config: roleConfig() });
-    const facts = roleReader();
+    const facts = roleReader((input) => {
+      const [request, accepted, started, completion] = input.events;
+      input.events = [
+        request!,
+        accepted!,
+        started!,
+        ...Array.from({ length: 4_391 }, (_, index) => ({ id: `missing-termination-${index + 1}`, seq: index + 4, type: "agent/delta", data: {} })),
+        { ...completion!, seq: 4_395 },
+      ];
+    });
     const eventsAfter = facts.eventsAfter.bind(facts);
     facts.eventsAfter = (threadId, afterSeq, limit) => eventsAfter(threadId, afterSeq, limit)
       .filter((event) => event.id !== ROLE_COMPLETION_EVENT_ID);
@@ -6247,9 +6253,11 @@ describe("bb-collab plugin boundary", () => {
     const result = applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
       idempotencyKey: "paged-completion-missing",
       qualificationId: "paged-completion-missing",
+      roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 4_395 },
     }), null, facts);
     expect(result).toMatchObject({ outcome: "EXECUTION_COMPLETION_AMBIGUOUS", attempted: 0, verified: 0 });
     expect(result.message).toBe("reader-returned correlation is not terminated by the exact cited completion");
+    expect(facts.readCalls.filter((call) => call.startsWith("eventsAfter:"))).toHaveLength(18);
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
   });
 

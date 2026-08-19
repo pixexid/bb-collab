@@ -41,8 +41,6 @@ export const EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION =
 // ponytail: page database reads at 256 rows; spill responses over 512 KiB to atomic files.
 export const MAX_EXPORT_ROWS = 256;
 export const ROLE_CONTEXT_EVENT_PAGE_SIZE = 256;
-// ponytail: 2,048-event ceiling covers the observed 1,314 maximum; remeasure per-turn correlation before raising it.
-export const MAX_ROLE_CONTEXT_CORRELATION_EVENTS = 2_048;
 export const MAX_EXPORT_BYTES = 512 * 1024;
 export const MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 8);
 /** Deferred until a later cutover operation; issue #3 has no sanctioned freeze transition. */
@@ -1842,8 +1840,7 @@ export function resolveRoleContext(reader: RoleFactReader | null, request: Apply
     if (preflightRefusal) throw refusal(...preflightRefusal);
     correlationEvents = [];
     let afterSeq = roleContext.requestEventSeq;
-    let correlationReadComplete = false;
-    for (let pageIndex = 0; pageIndex < MAX_ROLE_CONTEXT_CORRELATION_EVENTS / ROLE_CONTEXT_EVENT_PAGE_SIZE; pageIndex += 1) {
+    while (true) {
       const page = reader.eventsAfter(roleContext.threadId, afterSeq, ROLE_CONTEXT_EVENT_PAGE_SIZE);
       correlationEvents.push(...page);
       if (
@@ -1851,18 +1848,13 @@ export function resolveRoleContext(reader: RoleFactReader | null, request: Apply
         page.some((event) => event.seq >= roleContext.completionEventSeq) ||
         page.length < ROLE_CONTEXT_EVENT_PAGE_SIZE
       ) {
-        correlationReadComplete = true;
         break;
       }
       const nextAfterSeq = page.at(-1)!.seq;
       if (nextAfterSeq <= afterSeq) {
-        correlationReadComplete = true;
         break;
       }
       afterSeq = nextAfterSeq;
-    }
-    if (!correlationReadComplete) {
-      throw refusal("EXECUTION_COMPLETION_AMBIGUOUS", "role context correlation exceeds the 2,048-event total-work ceiling");
     }
   } catch (error) {
     if (error instanceof Refusal) throw error;
