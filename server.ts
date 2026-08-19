@@ -1474,7 +1474,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     db = bb.storage.database();
     databaseIsReady(db);
     bb.storage.migrate(db, MIGRATIONS);
-    backfillWorkItemAttempts(db);
+    try {
+      backfillWorkItemAttempts(db);
+    } catch (error) {
+      bb.log.error(`GH300 backfill degraded; canonical store remains available: ${String(error)}`);
+    }
   } catch (error) {
     bb.log.error(`canonical store unavailable: ${String(error)}`);
     db = null;
@@ -2838,5 +2842,5 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     },
   });
 
-  bb.log.info(`${PLUGIN_ID} loaded for BB ${BB_VERSION_RANGE}; plugin SDK ${PLUGIN_SDK_VERSION}`);
+  bb.log.info(`${PLUGIN_ID} loaded for BB ${BB_VERSION_RANGE}; plugin SDK ${PLUGIN_SDK_VERSION}; canonicalStore=${db === null ? "unavailable" : "available"}`);
 }

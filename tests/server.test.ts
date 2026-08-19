@@ -16,6 +16,7 @@ import {
   CONTRACT_VERSION,
   DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
   EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION,
+  GH300_BACKFILL_MIGRATION_ID,
   LLM_COLLAB_EVIDENCE_RESOURCE_REVISION,
   LLM_COLLAB_MERGED_MAIN_SHA,
   LLM_COLLAB_SOURCE_FENCE,
@@ -1354,7 +1355,7 @@ function directDatabase() {
   db.transaction(() => {
     for (const statement of MIGRATIONS) db.exec(statement);
   })();
-  backfillWorkItemAttempts(db);
+  backfillWorkItemAttempts(db, Number.MAX_SAFE_INTEGER);
   return { db, path, directory };
 }
 
@@ -2022,6 +2023,34 @@ describe("bb-collab plugin boundary", () => {
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "thread-archive-sweep"]);
     expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "doctor", "export", "lanes", "markOperatorMessageRead", "operatorMessages", "registerWait", "reorderPinned", "replyToOperatorMessage", "roleBrief", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
     expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["send_to_operator"]);
+  });
+
+  it("keeps the canonical store available when historical backfill refuses", async () => {
+    const projectId = "proj_gh300_backfill_degraded";
+    const host = hostFor(projectId);
+    const db = host.bb.storage.database();
+    databaseIsReady(db);
+    host.bb.storage.migrate(db, MIGRATIONS);
+    seedVerifiedFixtureReceipt(db, { projectId, receiptId: RECEIPT_ID });
+    const bootstrap = applyFixtureMutation(db, bootstrapRequest(projectId));
+    expect(bootstrap.outcome).toBe("OK");
+    const fenceToken = (bootstrap.evidence as { fenceToken: string }).fenceToken;
+    expect(applyFixtureMutation(db, workItemCreateRequest(fenceToken, {
+      projectId,
+      idempotencyKey: "gh300-degraded-ambiguous",
+      workItemId: "gh300-degraded-ambiguous",
+      workItem: { workItemId: "gh300-degraded-ambiguous", title: "ambiguous", body: "Writing lane thr_one. Also thr_two" },
+    })).outcome).toBe("OK");
+    const epoch = (db.prepare("SELECT applied_at FROM _bb_migrations WHERE id = ?").get(GH300_BACKFILL_MIGRATION_ID) as { applied_at: number }).applied_at;
+    db.prepare("UPDATE work_items SET created_at_ms = ?, updated_at_ms = ? WHERE project_id = ? AND work_item_id = ?").run(epoch - 1, epoch - 1, projectId, "gh300-degraded-ambiguous");
+
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+
+    expect(await host.harness.callRpc("doctor", { projectId })).toMatchObject({ outcome: "OK", subject: projectId });
+    expect(host.harness.inspection.logEntries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ level: "error", message: expect.stringContaining("GH300 backfill degraded; canonical store remains available") }),
+      expect.objectContaining({ level: "info", message: expect.stringContaining("canonicalStore=available") }),
+    ]));
   });
 
   it("stores messages only under the sender's registered project and deduplicates exact urgent content for one hour", async () => {
@@ -4588,7 +4617,7 @@ exit 1
       db.transaction(() => {
         for (const statement of MIGRATIONS) db.exec(statement);
       })();
-      backfillWorkItemAttempts(db);
+      backfillWorkItemAttempts(db, Number.MAX_SAFE_INTEGER);
       seedMigrationAuthority(db);
       seedEvidenceArtifact(db, "large-artifact", 270 * 1024);
       expect(exportFoundation(db, PROJECT_ID)).toMatchObject({
@@ -4774,6 +4803,7 @@ exit 1
     const projectId = "proj_gh300_backfill";
     const host = await loadedHost(projectId);
     const { db, fenceToken } = seedAndBootstrap(host, projectId);
+    const migrationEpoch = (db.prepare("SELECT applied_at FROM _bb_migrations WHERE id = ?").get(GH300_BACKFILL_MIGRATION_ID) as { applied_at: number }).applied_at;
     const items = [
       { id: "backfill-succeeded", body: "Writing lane thr_succeeded. Ship it", state: "succeeded", created: 101, updated: 202 },
       { id: "backfill-running", body: "Lane thr_running. Keep going", state: "in_progress", created: 303, updated: 404 },
@@ -4830,6 +4860,8 @@ exit 1
         { body: "Writing lane thrXnot-a-token. No real thread" },
     ]);
 
+    expect(backfillWorkItemAttempts(db)).toEqual({ candidates: 0, attributable: 0, inserted: 0, alreadyBound: 0, residualProposed: 0, unresolved: 0 });
+
     const proposedId = "backfill-proposed";
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
       projectId,
@@ -4837,9 +4869,25 @@ exit 1
       workItemId: proposedId,
       workItem: { workItemId: proposedId, title: proposedId, body: "Writing lane thr_proposed. Planned reference" },
     })).outcome).toBe("OK");
+    db.prepare("UPDATE work_items SET created_at_ms = ?, updated_at_ms = ? WHERE project_id = ? AND work_item_id = ?").run(migrationEpoch - 1, migrationEpoch - 1, projectId, proposedId);
     expect(backfillWorkItemAttempts(db)).toEqual({ candidates: 1, attributable: 0, inserted: 0, alreadyBound: 0, residualProposed: 1, unresolved: 0 });
     expect(db.prepare("SELECT body FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, proposedId)).toEqual({ body: "Writing lane thr_proposed. Planned reference" });
     expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(projectId, proposedId)).toEqual({ count: 0 });
+
+    for (const item of [
+      { id: "backfill-ready-new-state", state: "ready", body: "Writing lane thr_ready_new_state" },
+      { id: "backfill-review-pending-new-state", state: "review_pending", body: "Writing lane thr_review_pending_new_state" },
+    ] as const) {
+      expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+        projectId,
+        idempotencyKey: `backfill-create-${item.id}`,
+        workItemId: item.id,
+        workItem: { workItemId: item.id, title: item.id, body: item.body },
+      })).outcome).toBe("OK");
+      db.prepare("UPDATE work_items SET lifecycle_state = ?, created_at_ms = ?, updated_at_ms = ? WHERE project_id = ? AND work_item_id = ?").run(item.state, migrationEpoch + 1, migrationEpoch + 1, projectId, item.id);
+      expect(backfillWorkItemAttempts(db)).toEqual({ candidates: 1, attributable: 0, inserted: 0, alreadyBound: 0, residualProposed: 1, unresolved: 0 });
+      expect(db.prepare("SELECT lifecycle_state, body FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, item.id)).toEqual({ lifecycle_state: item.state, body: item.body });
+    }
 
     const ambiguousId = "backfill-ambiguous";
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
@@ -4848,6 +4896,7 @@ exit 1
       workItemId: ambiguousId,
       workItem: { workItemId: ambiguousId, title: ambiguousId, body: "Writing lane thr_one. Also thr_two" },
     })).outcome).toBe("OK");
+    db.prepare("UPDATE work_items SET created_at_ms = ?, updated_at_ms = ? WHERE project_id = ? AND work_item_id = ?").run(migrationEpoch - 1, migrationEpoch - 1, projectId, ambiguousId);
     expect(() => backfillWorkItemAttempts(db)).toThrow("1 thr_ work item(s) were not attributable");
     expect(db.prepare("SELECT body FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, ambiguousId)).toEqual({ body: "Writing lane thr_one. Also thr_two" });
     expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(projectId, ambiguousId)).toEqual({ count: 0 });
@@ -4859,7 +4908,7 @@ exit 1
       workItemId: malformedId,
       workItem: { workItemId: malformedId, title: malformedId, body: "Writing lane thr_bad-token. Must refuse" },
     })).outcome).toBe("OK");
-    db.prepare("UPDATE work_items SET lifecycle_state = 'succeeded' WHERE project_id = ? AND work_item_id = ?").run(projectId, malformedId);
+    db.prepare("UPDATE work_items SET lifecycle_state = 'succeeded', created_at_ms = ?, updated_at_ms = ? WHERE project_id = ? AND work_item_id = ?").run(migrationEpoch - 1, migrationEpoch - 1, projectId, malformedId);
     expect(() => backfillWorkItemAttempts(db)).toThrow("2 thr_ work item(s) were not attributable");
     expect(db.prepare("SELECT body FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, malformedId)).toEqual({ body: "Writing lane thr_bad-token. Must refuse" });
     expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(projectId, malformedId)).toEqual({ count: 0 });
@@ -6241,7 +6290,7 @@ exit 1
       db.transaction(() => {
         for (const statement of MIGRATIONS) db.exec(statement);
       })();
-      backfillWorkItemAttempts(db);
+      backfillWorkItemAttempts(db, Number.MAX_SAFE_INTEGER);
       seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
       const bootstrap = applyFixtureMutation(db, bootstrapRequest());
       const fenceToken = (bootstrap.evidence as { fenceToken: string }).fenceToken;

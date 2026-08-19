@@ -74,7 +74,7 @@ var {
   useSettings
 } = mod2;
 
-// src/inbox-nav-indicator.ts
+// .bb/worktrees/env_m9a8fm56ha/bb-collab/src/inbox-nav-indicator.ts
 var INBOX_NAV_REGION_SELECTOR = '[data-testid="plugin-nav-sidebar-items"]';
 var INBOX_NAV_ROW_TITLE = "Inbox";
 var LANES_NAV_ROW_TITLE = "Lanes";
@@ -160,7 +160,7 @@ function inspectInboxNavGlyph(root) {
   return { matched: false, reason: `the ${INBOX_NAV_ROW_TITLE} and ${LANES_NAV_ROW_TITLE} rows draw the same glyph (${inboxGlyph}) though they declare different icons` };
 }
 
-// src/provider-marks.ts
+// .bb/worktrees/env_m9a8fm56ha/bb-collab/src/provider-marks.ts
 var MARKS = {
   "codex": {
     title: "OpenAI",
@@ -215,7 +215,7 @@ var {
   jsxs
 } = mod3;
 
-// app.tsx
+// .bb/worktrees/env_m9a8fm56ha/bb-collab/app.tsx
 var SETTINGS_ACTION_TITLE = "bb-collab settings";
 function age(ms) {
   const minutes = Math.floor(ms / 6e4);
