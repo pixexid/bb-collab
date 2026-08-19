@@ -4,6 +4,7 @@ import {
   createLaneWatcher,
   createRoleIdleLedger,
   createWaitRegistry,
+  readCurrentRoleBindings,
   readRoleHolderStates,
   roleIdleKey,
   subscribeToThreadChanges,
@@ -1040,8 +1041,8 @@ async function runCli(
 ) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, archive-sweep, worktree-cleanup, cached-consumer-rollout, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
+  if (!command || !["doctor", "export", "apply", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, archive-sweep, worktree-cleanup, cached-consumer-rollout, role-list, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
   }
   if (command === "wait-validator") {
     const unknown = args.find((arg) => arg !== "--cycle");
@@ -1214,6 +1215,30 @@ async function runCli(
     } catch (error) {
       return { exitCode: 2, stdout: JSON.stringify({ outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error instanceof Error ? error.message : String(error) }], environmentRecordsReleased: false }) };
     }
+  }
+  if (command === "role-list") {
+    const unknown = unexpectedFlags(args, ["--project"]);
+    if (unknown) return invalidCli(`unexpected flag ${unknown}`);
+    const current = readCurrentRoleBindings(db, projectId);
+    if (current.status === "unknown") {
+      return cliResult({
+        outcome: current.reason === "project-unknown" ? "PROJECT_UNKNOWN" : "CANONICAL_STORE_UNAVAILABLE",
+        subject: projectId,
+        expected: 1,
+        attempted: 0,
+        verified: 0,
+        message: `current role standing is unknown: ${current.reason}`,
+      });
+    }
+    return cliResult({
+      outcome: "OK",
+      subject: projectId,
+      expected: current.bindings.length,
+      attempted: current.bindings.length,
+      verified: current.bindings.length,
+      message: `${current.bindings.length} current role bindings`,
+      evidence: current.bindings,
+    });
   }
   if (command === "wait-register") {
     const unknown = unexpectedFlags(args, ["--project", "--request"]);
@@ -2349,6 +2374,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         summary: "Persist the live v21 cached-consumer rollout evidence (exact live production evidence required)",
         usage: "bb collab cached-consumer-rollout --project PROJECT_ID --request JSON",
       },
+      { name: "role-list", summary: "List exact current active role bindings (read-only)", usage: "bb collab role-list --project PROJECT_ID" },
       {
         name: "wait-register",
         summary: "Register one bounded durable wait (deadline mandatory, fail closed)",
