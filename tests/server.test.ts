@@ -3111,7 +3111,8 @@ describe("bb-collab plugin boundary", () => {
     expect(fixture.host.harness.inspection.logEntries.slice(logCount)).toContainEqual(expect.objectContaining({ level: "info", message: "fleet-watchdog healthy cycle" }));
   });
 
-  it("uses in-progress WorkItems to suppress startable intake at capacity", async () => {
+  it("uses in-progress WorkItems for capacity and suppresses repeat intake wakes for one hour", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-queue-"));
     const gh = join(bin, "gh");
     const argsLog = join(bin, "args");
@@ -3128,6 +3129,7 @@ describe("bb-collab plugin boundary", () => {
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 3))).toMatchObject({ outcome: "OK" });
       expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state = 'in_progress'").get()).toEqual({ count: 0 });
       await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(5 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
         expect.objectContaining({
@@ -3140,6 +3142,7 @@ describe("bb-collab plugin boundary", () => {
       expect(Object.values(persisted ?? {})).toContainEqual(expect.objectContaining({ lastFleetWakeAtMs: null, lastStartableQueueWakeAtMs: expect.any(Number) }));
       expect(readFileSync(argsLog, "utf8")).toBe("issue\nlist\n--repo\nexample/project\n--label\nqueue:startable\n--state\nopen\n--json\nnumber\n--limit\n1000\n");
     } finally {
+      clock.mockRestore();
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
       rmSync(bin, { recursive: true, force: true });
@@ -3205,13 +3208,13 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("uses effective live watchdog threshold settings", async () => {
+  it("uses the five-minute default and effective live watchdog threshold settings", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
       const fixture = await fleetWatchdogFixture(0);
       await addPendingReview(fixture);
       expect(fixture.host.harness.inspection.registrations.settingsDescriptors).toMatchObject({
-        fleetWatchdogFloorMs: { default: "3600000" },
+        fleetWatchdogFloorMs: { default: "300000" },
         fleetWatchdogStaleWaitMs: { default: "86400000" },
       });
       await fixture.host.harness.runSchedule("fleet-watchdog");
@@ -3514,15 +3517,18 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("does not wake pending work before the director idle floor", async () => {
-    const clock = vi.spyOn(Date, "now").mockReturnValue(60 * 60_000);
+  it("wakes pending work at the five-minute director idle floor, not before", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
       const fixture = await fleetWatchdogFixture(0);
       await addPendingReview(fixture);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      clock.mockReturnValue(90 * 60_000);
+      clock.mockReturnValue(5 * 60_000 - 1);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      clock.mockReturnValue(5 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
     } finally {
       clock.mockRestore();
     }

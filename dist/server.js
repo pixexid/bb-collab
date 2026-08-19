@@ -20425,7 +20425,8 @@ function startableQueueDepth(repositories) {
     return null;
   }
 }
-var FLEET_WATCHDOG_FLOOR_MS = 60 * 6e4;
+var FLEET_WATCHDOG_FLOOR_MS = 5 * 6e4;
+var FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS = 60 * 6e4;
 var FLEET_WATCHDOG_STALE_WAIT_MS = 24 * 60 * 6e4;
 var FLEET_WATCHDOG_STOPPING_WAIT_MS = 3e4;
 var AUTOMATED_TELL_IDLE_WAIT_MS = 3e4;
@@ -22003,7 +22004,7 @@ ${thread.titleFallback ?? ""}`);
         if (kind !== "recovery") {
           const previous = await fleetWatchdogIdle.get(key);
           const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs : kind === "startable-queue" ? previous?.lastStartableQueueWakeAtMs : kind === "stale-wait" ? previous?.lastStaleWaitWakeAtMs : kind === "owed-act" ? previous?.lastOwedActWakeAtMs : previous?.lastEscalationAtMs;
-          if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== void 0 && now2 - lastNotifiedAtMs < floorMs) return false;
+          if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== void 0 && now2 - lastNotifiedAtMs < FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) return false;
         }
         if (wakeInFlight.has(key)) return false;
         wakeInFlight.add(key);
@@ -22484,6 +22485,7 @@ ${thread.titleFallback ?? ""}`);
 }
 export {
   FLEET_WATCHDOG_FLOOR_MS,
+  FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS,
   FLEET_WATCHDOG_STALE_WAIT_MS,
   URGENT_NOTIFICATION_DEDUP_MS,
   plugin as default,

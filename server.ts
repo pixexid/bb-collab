@@ -101,7 +101,8 @@ function startableQueueDepth(repositories: string[]): number | null {
   }
 }
 
-export const FLEET_WATCHDOG_FLOOR_MS = 60 * 60_000;
+export const FLEET_WATCHDOG_FLOOR_MS = 5 * 60_000;
+export const FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS = 60 * 60_000;
 export const FLEET_WATCHDOG_STALE_WAIT_MS = 24 * 60 * 60_000;
 const FLEET_WATCHDOG_STOPPING_WAIT_MS = 30_000;
 const AUTOMATED_TELL_IDLE_WAIT_MS = 30_000;
@@ -1921,7 +1922,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               : kind === "stale-wait" ? previous?.lastStaleWaitWakeAtMs
                 : kind === "owed-act" ? previous?.lastOwedActWakeAtMs
                   : previous?.lastEscalationAtMs;
-          if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== undefined && now - lastNotifiedAtMs < floorMs) return false;
+          if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== undefined && now - lastNotifiedAtMs < FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) return false;
         }
         if (wakeInFlight.has(key)) return false;
         wakeInFlight.add(key);
