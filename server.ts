@@ -133,7 +133,18 @@ type LinkedGithubObservation = {
 };
 
 function linkedGithubObservation(owner: string, repo: string, issueNumber: number): LinkedGithubObservation | null {
-  const pullRequest = githubJson(["pr", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,mergedAt"]);
+  const issue = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,closedByPullRequestsReferences"]);
+  if (!issue || typeof issue !== "object" || Array.isArray(issue)) return null;
+  const issueState = (issue as { state?: unknown }).state;
+  const closingPullRequests = (issue as { closedByPullRequestsReferences?: unknown }).closedByPullRequestsReferences;
+  if ((issueState !== "OPEN" && issueState !== "CLOSED") || !Array.isArray(closingPullRequests)) return null;
+  const closingPullRequest = closingPullRequests[0];
+  if (closingPullRequest !== undefined && (!closingPullRequest || typeof closingPullRequest !== "object" || Array.isArray(closingPullRequest)
+    || typeof (closingPullRequest as { number?: unknown }).number !== "number"
+    || !Number.isSafeInteger((closingPullRequest as { number: number }).number))) return null;
+  const pullRequest = closingPullRequest === undefined
+    ? null
+    : githubJson(["pr", "view", String((closingPullRequest as { number: number }).number), "--repo", `${owner}/${repo}`, "--json", "state,mergedAt"]);
   let pullRequestMerged = false;
   let pullRequestClosed = false;
   if (pullRequest && typeof pullRequest === "object" && !Array.isArray(pullRequest)) {
@@ -142,10 +153,8 @@ function linkedGithubObservation(owner: string, repo: string, issueNumber: numbe
     pullRequestMerged = (mergedAt !== null && mergedAt !== undefined) || state === "MERGED";
     pullRequestClosed = state === "CLOSED";
   }
-  const issue = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state"]);
-  const issueClosed = Boolean(issue && typeof issue === "object" && !Array.isArray(issue) && (issue as { state?: unknown }).state === "CLOSED");
-  const issueOpen = Boolean(issue && typeof issue === "object" && !Array.isArray(issue) && (issue as { state?: unknown }).state === "OPEN");
-  if (!pullRequest && !issue) return null;
+  const issueClosed = issueState === "CLOSED";
+  const issueOpen = issueState === "OPEN";
   const status = pullRequestMerged || pullRequestClosed || issueClosed
     ? pullRequestMerged ? "merged" : "closed"
     : issueOpen ? "open" : null;
