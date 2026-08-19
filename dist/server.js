@@ -19405,7 +19405,16 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
        LEFT JOIN execution_attempts ON execution_attempts.project_id = role_generations.project_id
          AND execution_attempts.execution_attempt_id = role_generations.holder_execution_attempt_id
        WHERE role_generation_heads.project_id = ? ORDER BY role_generation_heads.role_id`
-    ).all(projectId);
+    ).all(projectId).map((row) => {
+      const { standby_profile_json: standbyProfileJson, ...head } = row;
+      return {
+        ...head,
+        standby: {
+          declaration: standbyProfileJson === null ? "UNDECLARED" : "DECLARED",
+          coverage: "NOT_CLAIMED"
+        }
+      };
+    });
     const observationCount = asRow(
       db.prepare("SELECT COUNT(*) AS count FROM qualification_observations WHERE project_id = ?").get(projectId)
     )?.count ?? 0;

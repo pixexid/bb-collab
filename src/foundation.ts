@@ -6392,7 +6392,7 @@ export async function doctor(
       return { ...run, state, retentionExpired: Number(run.retention_until_ms) <= now(), unresolvedProof };
     });
     const activeMigrationRun = migrationRuns.find((run) => !["retired", "rolled_back"].includes(String(run.state))) ?? null;
-    const roleGenerationHeads = db.prepare(
+    const roleGenerationHeads = (db.prepare(
       `SELECT role_generation_heads.role_id, role_generation_heads.current_generation,
               role_generations.status, role_generations.qualification_id,
               role_generations.holder_execution_attempt_id,
@@ -6406,7 +6406,16 @@ export async function doctor(
        LEFT JOIN execution_attempts ON execution_attempts.project_id = role_generations.project_id
          AND execution_attempts.execution_attempt_id = role_generations.holder_execution_attempt_id
        WHERE role_generation_heads.project_id = ? ORDER BY role_generation_heads.role_id`,
-    ).all(projectId) as Array<Record<string, unknown>>;
+    ).all(projectId) as Array<Record<string, unknown>>).map((row): Record<string, unknown> => {
+      const { standby_profile_json: standbyProfileJson, ...head } = row;
+      return {
+        ...head,
+        standby: {
+          declaration: standbyProfileJson === null ? "UNDECLARED" : "DECLARED",
+          coverage: "NOT_CLAIMED",
+        },
+      };
+    });
     const observationCount = asRow<{ count: number }>(
       db.prepare("SELECT COUNT(*) AS count FROM qualification_observations WHERE project_id = ?").get(projectId),
     )?.count ?? 0;

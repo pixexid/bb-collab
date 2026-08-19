@@ -6295,6 +6295,47 @@ describe("bb-collab plugin boundary", () => {
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeWrongProvider);
   });
 
+  it("reports standby declaration without claiming behavioral coverage", async () => {
+    const scenarios = [
+      {
+        config: roleConfig(),
+        expectedRoleId: "project-orchestrator",
+        qualification: {},
+        succession: {},
+        facts: roleReader(),
+        declaration: "UNDECLARED",
+      },
+      {
+        config: directorSeatConfig(),
+        expectedRoleId: "director",
+        qualification: { roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID, qualificationId: "standby-doctor-qualification", declaredProfile: DIRECTOR_PROFILE },
+        succession: { roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID, qualificationId: "standby-doctor-qualification", profileDigest: DIRECTOR_PROFILE_DIGEST, standbyProfile: DIRECTOR_STANDBY_PROFILE },
+        facts: directorRoleReader(),
+        declaration: "DECLARED",
+      },
+    ] as const;
+
+    for (const scenario of scenarios) {
+      const host = await loadedHost();
+      const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: scenario.config });
+      expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, scenario.qualification), null, scenario.facts).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, scenario.succession), null, scenario.facts).outcome).toBe("OK");
+
+      const doctorResult = await host.harness.callRpc("doctor", { projectId: PROJECT_ID });
+      expect(doctorResult).toMatchObject({
+        outcome: "OK",
+        evidence: {
+          roleGenerationHeads: [{
+            role_id: scenario.expectedRoleId,
+            standby: { declaration: scenario.declaration, coverage: "NOT_CLAIMED" },
+          }],
+        },
+      });
+      const heads = (doctorResult as { evidence: { roleGenerationHeads: Array<Record<string, unknown>> } }).evidence.roleGenerationHeads;
+      expect(heads[0]).not.toHaveProperty("standby_profile_json");
+    }
+  });
+
   it("routes live RPC and CLI role facts into the existing qualification and succession resolvers", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
