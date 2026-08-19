@@ -6189,6 +6189,7 @@ async function routingDoctorEvidence(
   for (const bucket of buckets.values()) bucket.threadIds.sort();
   const workerBuckets = [...buckets.values()].sort((left, right) =>
     `${left.providerId}/${left.model}/${left.reasoningLevel}`.localeCompare(`${right.providerId}/${right.model}/${right.reasoningLevel}`));
+  const workerProviderCount = new Set(workerBuckets.map((bucket) => bucket.providerId)).size;
   const unresolvedWorkerThreadIds = workerProfiles.filter(({ profile }) => !profile).map(({ thread }) => thread.id).sort();
   const complete = unresolvedWorkerThreadIds.length === 0;
   const workerMessage = !complete
@@ -6199,6 +6200,8 @@ async function routingDoctorEvidence(
         ? `1 active worker seat is on ${workerBuckets[0]!.providerId}/${workerBuckets[0]!.model}/${workerBuckets[0]!.reasoningLevel}`
         : workerBuckets.length === 1
           ? `All ${workerThreads.length} active worker seats are on ${workerBuckets[0]!.providerId}/${workerBuckets[0]!.model}/${workerBuckets[0]!.reasoningLevel}`
+          : workerProviderCount === 1
+            ? `${workerThreads.length} active worker seats are all on provider ${workerBuckets[0]!.providerId} (${workerBuckets.length} triples): ${workerBuckets.map((bucket) => `${bucket.count} on ${bucket.providerId}/${bucket.model}/${bucket.reasoningLevel}`).join(", ")}`
           : `${workerThreads.length} active worker seats span ${workerBuckets.length} routing triples: ${workerBuckets.map((bucket) => `${bucket.count} on ${bucket.providerId}/${bucket.model}/${bucket.reasoningLevel}`).join(", ")}`;
   const threadById = new Map(threads.map((thread) => [thread.id, thread]));
   const resolvedEscalationSeats = await Promise.all(escalationHeads.map(async (head) => {

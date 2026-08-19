@@ -1302,6 +1302,7 @@ exit 0
     const directorThreadId = roleThreads.find((row) => row.role_id === "director")!.thread_id;
     const orchestratorThreadId = roleThreads.find((row) => row.role_id === "project-orchestrator")!.thread_id;
     let secondWorkerProvider = "luna";
+    let secondWorkerModel = "gpt-5.6-luna";
     let rejectSecondWorkerFacts = false;
     host.harness.sdk.stub("threads.list", (async ({ offset }: { offset: number }) => offset === 0 ? [
       makeThreadResponse({ id: directorThreadId, projectId: PROJECT_ID, providerId: "pi", status: "idle" }),
@@ -1313,7 +1314,7 @@ exit 0
       if (rejectSecondWorkerFacts && threadId === "worker-two") throw new Error("routing facts unavailable");
       return {
         providerId: threadId === directorThreadId ? "pi" : threadId === orchestratorThreadId || secondWorkerProvider === "codex" && threadId === "worker-two" ? "codex" : "luna",
-        model: threadId === directorThreadId ? "kimi-coding/k3" : threadId === orchestratorThreadId || secondWorkerProvider === "codex" && threadId === "worker-two" ? "gpt-5.6-sol" : "gpt-5.6-luna",
+        model: threadId === directorThreadId ? "kimi-coding/k3" : threadId === orchestratorThreadId ? "gpt-5.6-sol" : threadId === "worker-two" ? secondWorkerModel : "gpt-5.6-luna",
         reasoningLevel: threadId === "worker-one" || threadId === "worker-two" ? "max" : "high",
         permissionMode: "full",
         serviceTier: "default",
@@ -1341,6 +1342,10 @@ exit 0
         },
       },
     });
+
+    secondWorkerModel = "gpt-5.6-sol";
+    const oneProvider = await host.harness.callRpc("doctor", { projectId: PROJECT_ID }) as FoundationResult;
+    expect(oneProvider.message).toBe("2 active worker seats are all on provider luna (2 triples): 1 on luna/gpt-5.6-luna/max, 1 on luna/gpt-5.6-sol/max; the orchestrator uses provider codex with 0 of 2 active worker seats; the director uses provider pi with 0 of 2 active worker seats");
 
     secondWorkerProvider = "codex";
     const distributed = await host.harness.callRpc("doctor", { projectId: PROJECT_ID }) as FoundationResult;
