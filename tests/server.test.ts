@@ -2157,6 +2157,7 @@ describe("bb-collab plugin boundary", () => {
       environmentId: `environment-${threadId}`,
       updatedAt: 0,
     })) as never);
+    fixture.host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
 
     expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
     artifact = "after";
