@@ -1,4 +1,7 @@
 export type ReportTier = "A" | "B" | "C";
+export type CadenceBin = "<1h" | "1-3h" | "3-6h" | ">=6h";
+
+type UnknownMetric = { status: "unknown"; reason: string };
 
 export type ThroughputFacts = {
   dialsLandedAtMs: number | null;
@@ -10,7 +13,7 @@ export type ThroughputFacts = {
     acceptance?: "complete" | "incomplete" | "unknown";
     mergedWorkCount?: number | null;
   }>;
-  merges: Array<{ id: string; mergedAtMs: number | null }>;
+  merges: Array<{ id: string; mergedAtMs: number | null; tier?: ReportTier | null; title?: string }>;
   reviews: Array<{
     id: string;
     tier: ReportTier | null;
@@ -22,17 +25,34 @@ export type ThroughputFacts = {
     reverted: boolean | null;
     postMergeSeverity: "P0" | "P1" | null;
   }>;
+  outlierCohorts?: Array<{ label: string; startAtMs: number; endAtMs: number }>;
+  unknownReasons?: Partial<Record<"laneSlotUtilization" | "reviewLatency" | "reverts" | "postMergeSeverity", string>>;
+  sourceCommands?: Partial<Record<"issues" | "merges" | "reviewTiers" | "reviewLatency" | "laneSlotUtilization" | "defectEscape", string>>;
 };
 
 export type WeeklyThroughputReport = {
   window: { startAtMs: number; endAtMs: number };
   firstReportAtMs: number | null;
   benchmark: { issueOpenToCloseMedianHours: 0.8 };
-  issueOpenToClose: { medianHours: number | null; completed: number; unknown: number };
+  issueOpenToClose: { medianHours: number | null; maximumHours: number | null; completed: number; unknown: number };
   issueAcceptanceAudit: { openCompleted: string[]; openIncomplete: string[]; unknown: string[]; status: "pass" | "fail" | "unknown" };
-  mergeCadence: { histogram: Record<"<1d" | "1-3d" | "3-7d" | ">=7d", number>; knownMerges: number; unknown: number };
-  reviewLatencyByTier: Record<ReportTier, { medianHours: number | null; completed: number; unknown: number }>;
-  defectEscape: { reverts: number | null; postMergeP0s: number | null; postMergeP1s: number | null; unknown: number };
+  mergeCadence: { histogram: Record<CadenceBin, number>; maximumGapHours: number | null; knownMerges: number; unknown: number };
+  reviewTierDeclarations: Record<ReportTier | "unknown", number>;
+  laneSlotUtilization: UnknownMetric;
+  reviewLatencyByTier: Record<ReportTier, UnknownMetric | { status: "known" | "partial"; medianHours: number | null; completed: number; unknown: number }>;
+  defectEscape: {
+    reverts: UnknownMetric & { total: null; observedExplicitRevertIds: string[] } | { status: "known"; total: number; observedExplicitRevertIds: string[] };
+    postMergeP0s: UnknownMetric & { count: null } | { status: "known"; count: number };
+    postMergeP1s: UnknownMetric & { count: null } | { status: "known"; count: number };
+  };
+  outlierCohorts: Array<{
+    label: string;
+    window: { startAtMs: number; endAtMs: number };
+    issueOpenToClose: { maximumHours: number | null; completed: number; unknown: number };
+    mergeCadence: { maximumGapHours: number | null; knownMerges: number };
+    reviewRounds: UnknownMetric;
+  }>;
+  sourceCommands: ThroughputFacts["sourceCommands"];
   dialGuidance: string;
 };
 
@@ -74,19 +94,53 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
       : "pass";
 
   const mergeTimes = facts.merges.filter((merge) => merge.mergedAtMs !== null).map((merge) => merge.mergedAtMs!).sort((a, b) => a - b);
-  const histogram = { "<1d": 0, "1-3d": 0, "3-7d": 0, ">=7d": 0 } as Record<"<1d" | "1-3d" | "3-7d" | ">=7d", number>;
+  const histogram: Record<CadenceBin, number> = { "<1h": 0, "1-3h": 0, "3-6h": 0, ">=6h": 0 };
+  const mergeGaps: number[] = [];
   for (let i = 1; i < mergeTimes.length; i += 1) {
     if (!inWindow(mergeTimes[i], window.startAtMs, window.endAtMs)) continue;
-    const days = (mergeTimes[i] - mergeTimes[i - 1]) / 86_400_000;
-    histogram[days < 1 ? "<1d" : days < 3 ? "1-3d" : days < 7 ? "3-7d" : ">=7d"] += 1;
+    const gap = hours(mergeTimes[i] - mergeTimes[i - 1]);
+    mergeGaps.push(gap);
+    histogram[gap < 1 ? "<1h" : gap < 3 ? "1-3h" : gap < 6 ? "3-6h" : ">=6h"] += 1;
   }
 
   const reviewLatencyByTier = Object.fromEntries((["A", "B", "C"] as const).map((tier) => {
+    if (facts.unknownReasons?.reviewLatency) return [tier, { status: "unknown", reason: facts.unknownReasons.reviewLatency }];
     const reviews = facts.reviews.filter((review) => review.tier === tier && (inWindow(review.submittedAtMs, window.startAtMs, window.endAtMs) || inWindow(review.completedAtMs, window.startAtMs, window.endAtMs)));
+    if (reviews.length === 0) return [tier, { status: "unknown", reason: `no canonically linked Tier ${tier} review observations` }];
     const completed = reviews.filter((review) => inWindow(review.completedAtMs, window.startAtMs, window.endAtMs) && review.submittedAtMs !== null);
-    return [tier, { medianHours: median(completed.map((review) => hours(review.completedAtMs! - review.submittedAtMs!))), completed: completed.length, unknown: reviews.length - completed.length }];
+    const unknown = reviews.length - completed.length;
+    return [tier, { status: unknown === 0 ? "known" : "partial", medianHours: median(completed.map((review) => hours(review.completedAtMs! - review.submittedAtMs!))), completed: completed.length, unknown }];
   })) as WeeklyThroughputReport["reviewLatencyByTier"];
   const defects = facts.defects;
+  const explicitRevertIds = defects.filter((defect) => defect.reverted === true).map((defect) => defect.id);
+  const reverts = facts.unknownReasons?.reverts || defects.length === 0 || defects.some((defect) => defect.reverted === null)
+    ? { status: "unknown" as const, total: null, observedExplicitRevertIds: explicitRevertIds, reason: facts.unknownReasons?.reverts ?? "revert coverage is incomplete" }
+    : { status: "known" as const, total: explicitRevertIds.length, observedExplicitRevertIds: explicitRevertIds };
+  const severityUnknown = facts.unknownReasons?.postMergeSeverity || defects.length === 0 || defects.some((defect) => defect.postMergeSeverity === null);
+  const postMergeP0s = severityUnknown
+    ? { status: "unknown" as const, count: null, reason: facts.unknownReasons?.postMergeSeverity ?? "post-merge P0 linkage is incomplete" }
+    : { status: "known" as const, count: defects.filter((defect) => defect.postMergeSeverity === "P0").length };
+  const postMergeP1s = severityUnknown
+    ? { status: "unknown" as const, count: null, reason: facts.unknownReasons?.postMergeSeverity ?? "post-merge P1 linkage is incomplete" }
+    : { status: "known" as const, count: defects.filter((defect) => defect.postMergeSeverity === "P1").length };
+  const reviewTierDeclarations = { A: 0, B: 0, C: 0, unknown: 0 };
+  for (const merge of facts.merges) {
+    if (!inWindow(merge.mergedAtMs, window.startAtMs, window.endAtMs)) continue;
+    reviewTierDeclarations[merge.tier ?? "unknown"] += 1;
+  }
+  const outlierCohorts = (facts.outlierCohorts ?? []).map((cohort) => {
+    const issues = facts.issues.filter((issue) => inWindow(issue.closedAtMs, cohort.startAtMs, cohort.endAtMs));
+    const durations = issues.filter((issue) => issue.openedAtMs !== null).map((issue) => issue.closedAtMs! - issue.openedAtMs!);
+    const cohortMerges = mergeTimes.filter((mergedAtMs) => inWindow(mergedAtMs, cohort.startAtMs, cohort.endAtMs));
+    const gaps = cohortMerges.slice(1).map((mergedAtMs, index) => mergedAtMs - cohortMerges[index]);
+    return {
+      label: cohort.label,
+      window: { startAtMs: cohort.startAtMs, endAtMs: cohort.endAtMs },
+      issueOpenToClose: { maximumHours: durations.length ? hours(Math.max(...durations)) : null, completed: durations.length, unknown: issues.length - durations.length },
+      mergeCadence: { maximumGapHours: gaps.length ? hours(Math.max(...gaps)) : null, knownMerges: cohortMerges.length },
+      reviewRounds: { status: "unknown" as const, reason: facts.unknownReasons?.reviewLatency ?? "BB review threads are not canonically linked to pull requests" },
+    };
+  });
   const issueMedian = median(issueDurations);
   const issueMedianHours = issueMedian === null ? null : issueMedian / 3_600_000;
   const dialGuidance = issueMedianHours === null
@@ -99,11 +153,15 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
     window,
     firstReportAtMs: facts.dialsLandedAtMs === null ? null : facts.dialsLandedAtMs + 7 * 86_400_000,
     benchmark: { issueOpenToCloseMedianHours: 0.8 },
-    issueOpenToClose: { medianHours: issueMedian === null ? null : hours(issueMedian), completed: issueDurations.length, unknown: issueUnknown },
+    issueOpenToClose: { medianHours: issueMedian === null ? null : hours(issueMedian), maximumHours: issueDurations.length ? hours(Math.max(...issueDurations)) : null, completed: issueDurations.length, unknown: issueUnknown },
     issueAcceptanceAudit,
-    mergeCadence: { histogram, knownMerges: mergeTimes.filter((merge) => inWindow(merge, window.startAtMs, window.endAtMs)).length, unknown: facts.merges.filter((merge) => merge.mergedAtMs === null).length },
+    mergeCadence: { histogram, maximumGapHours: mergeGaps.length ? Math.max(...mergeGaps) : null, knownMerges: mergeTimes.filter((merge) => inWindow(merge, window.startAtMs, window.endAtMs)).length, unknown: facts.merges.filter((merge) => merge.mergedAtMs === null).length },
+    reviewTierDeclarations,
+    laneSlotUtilization: { status: "unknown", reason: facts.unknownReasons?.laneSlotUtilization ?? "PR #338 does not persist full-cap intervals; startability must not be recomputed" },
     reviewLatencyByTier,
-    defectEscape: { reverts: defects.some((defect) => defect.reverted === null) ? null : defects.filter((defect) => defect.reverted).length, postMergeP0s: defects.some((defect) => defect.postMergeSeverity === null) ? null : defects.filter((defect) => defect.postMergeSeverity === "P0").length, postMergeP1s: defects.some((defect) => defect.postMergeSeverity === null) ? null : defects.filter((defect) => defect.postMergeSeverity === "P1").length, unknown: defects.filter((defect) => defect.reverted === null || defect.postMergeSeverity === null).length },
+    defectEscape: { reverts, postMergeP0s, postMergeP1s },
+    outlierCohorts,
+    sourceCommands: facts.sourceCommands,
     dialGuidance,
   };
 }
