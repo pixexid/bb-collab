@@ -7454,6 +7454,33 @@ describe("bb-collab plugin boundary", () => {
     expect(JSON.parse(missingProject.stdout).outcome).toBe("INVALID_INPUT");
   });
 
+  it("emits complete WorkItem registration facts from doctor --json", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "plugin-actor", actorKind: "plugin", subjectId: PLUGIN_ID });
+
+    const cli = await host.harness.runCli(["doctor", "--project", PROJECT_ID, "--json"]);
+    const output = JSON.parse(cli.stdout);
+    expect(cli.exitCode).toBe(0);
+    expect(output).toMatchObject({
+      outcome: "OK",
+      subject: PROJECT_ID,
+      evidence: {
+        workItemRegistrations: [{
+          projectId: PROJECT_ID,
+          operationClass: "work_item_create",
+          actorReceiptId: "plugin-actor",
+          expectedConfigRevision: 1,
+          expectedGovernanceEpoch: 1,
+          expectedFenceToken: fenceToken,
+          repoTargetId: TARGET_ID,
+          expectedResourceRevision: null,
+        }],
+      },
+    });
+    expect(cli.stdout).not.toContain("/workspace/project");
+  });
+
   it("keeps the documented WorkItem create invocation strict", () => {
     const request = workItemCreateRequest("fence-token");
     expect(parseApplyRequest(request)).toMatchObject({

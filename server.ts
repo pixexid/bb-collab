@@ -379,6 +379,41 @@ function invalidCli(message: string, outcome: FoundationCode = "INVALID_INPUT") 
   });
 }
 
+function workItemRegistrationDoctorResult(db: SqliteDatabase, projectId: string, doctorResult: FoundationResult): FoundationResult {
+  const actor = db.prepare(
+    `SELECT receipt_id FROM actor_receipts
+     WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ?
+       AND role_id IS NULL AND verification_state = 'verified'
+     ORDER BY issued_at_ms DESC LIMIT 1`,
+  ).get(projectId, PLUGIN_ID) as { receipt_id: string } | undefined;
+  if (!actor) return { outcome: "ACTOR_RECEIPT_UNKNOWN", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "no current verified plugin actor receipt is available" };
+
+  const config = db.prepare("SELECT config_revision FROM project_config_heads WHERE project_id = ?").get(projectId) as { config_revision: number } | undefined;
+  const governor = db.prepare("SELECT governance_epoch, fence_token FROM project_governorship_heads WHERE project_id = ?").get(projectId) as { governance_epoch: number; fence_token: string } | undefined;
+  const targets = config ? db.prepare(
+    "SELECT repo_target_id FROM repository_targets WHERE project_id = ? AND config_revision = ? ORDER BY repo_target_id",
+  ).all(projectId, config.config_revision) as Array<{ repo_target_id: string }> : [];
+  if (!config) return { outcome: "PROJECT_CONFIG_REQUIRED", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "project has no stored config revision" };
+  if (!governor) return { outcome: "GOVERNOR_UNAVAILABLE", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "project governorship head is unavailable" };
+  if (targets.length === 0) return { outcome: "REPO_TARGET_REQUIRED", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "stored config has no exact repository target" };
+
+  return {
+    ...doctorResult,
+    evidence: {
+      workItemRegistrations: targets.map((target) => ({
+        projectId,
+        operationClass: "work_item_create",
+        actorReceiptId: actor.receipt_id,
+        expectedConfigRevision: config.config_revision,
+        expectedGovernanceEpoch: governor.governance_epoch,
+        expectedFenceToken: governor.fence_token,
+        repoTargetId: target.repo_target_id,
+        expectedResourceRevision: null,
+      })),
+    },
+  };
+}
+
 function parseFlag(args: string[], name: string): string | null {
   const index = args.indexOf(name);
   if (index < 0) return null;
@@ -1319,9 +1354,19 @@ async function runCli(
       return invalidCli(error instanceof Error ? error.message : String(error));
     }
   }
-  const unknown = unexpectedFlags(args, ["--project"]);
+  const json = command === "doctor" && args.includes("--json");
+  const unknown = unexpectedFlags(json ? args.filter((arg) => arg !== "--json") : args, ["--project"]);
   if (unknown) return invalidCli(`unexpected flag ${unknown}`);
-  if (command === "doctor") return cliResult(await doctor(db, bb.sdk, projectId, deps.readCheckoutDivergence()));
+  if (command === "doctor") {
+    if (args.filter((arg) => arg === "--json").length > 1) return invalidCli("--json must be supplied at most once");
+    const result = await doctor(db, bb.sdk, projectId, deps.readCheckoutDivergence());
+    if (!json || result.outcome !== "OK" || !db) return cliResult(result);
+    try {
+      return cliResult(workItemRegistrationDoctorResult(db, projectId, result));
+    } catch (error) {
+      return cliResult({ outcome: "INTERNAL_ERROR", subject: projectId, expected: 1, attempted: 0, verified: 0, message: error instanceof Error ? error.message : String(error) });
+    }
+  }
   return cliResult(exportFoundation(db, projectId));
 }
 
@@ -2399,7 +2444,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     name: "collab",
     summary: "Inspect the bb-collab foundation and guarded conformance boundary",
     commands: [
-      { name: "doctor", summary: "Read-only project/store conformance check", usage: "bb collab doctor --project PROJECT_ID" },
+      { name: "doctor", summary: "Read-only project/store conformance check", usage: "bb collab doctor --project PROJECT_ID [--json]" },
       { name: "export", summary: "Deterministic bounded foundation export", usage: "bb collab export --project PROJECT_ID" },
       {
         name: "apply",

@@ -20681,6 +20681,38 @@ function invalidCli(message, outcome = "INVALID_INPUT") {
     message
   });
 }
+function workItemRegistrationDoctorResult(db, projectId, doctorResult) {
+  const actor = db.prepare(
+    `SELECT receipt_id FROM actor_receipts
+     WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ?
+       AND role_id IS NULL AND verification_state = 'verified'
+     ORDER BY issued_at_ms DESC LIMIT 1`
+  ).get(projectId, PLUGIN_ID);
+  if (!actor) return { outcome: "ACTOR_RECEIPT_UNKNOWN", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "no current verified plugin actor receipt is available" };
+  const config2 = db.prepare("SELECT config_revision FROM project_config_heads WHERE project_id = ?").get(projectId);
+  const governor = db.prepare("SELECT governance_epoch, fence_token FROM project_governorship_heads WHERE project_id = ?").get(projectId);
+  const targets = config2 ? db.prepare(
+    "SELECT repo_target_id FROM repository_targets WHERE project_id = ? AND config_revision = ? ORDER BY repo_target_id"
+  ).all(projectId, config2.config_revision) : [];
+  if (!config2) return { outcome: "PROJECT_CONFIG_REQUIRED", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "project has no stored config revision" };
+  if (!governor) return { outcome: "GOVERNOR_UNAVAILABLE", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "project governorship head is unavailable" };
+  if (targets.length === 0) return { outcome: "REPO_TARGET_REQUIRED", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "stored config has no exact repository target" };
+  return {
+    ...doctorResult,
+    evidence: {
+      workItemRegistrations: targets.map((target) => ({
+        projectId,
+        operationClass: "work_item_create",
+        actorReceiptId: actor.receipt_id,
+        expectedConfigRevision: config2.config_revision,
+        expectedGovernanceEpoch: governor.governance_epoch,
+        expectedFenceToken: governor.fence_token,
+        repoTargetId: target.repo_target_id,
+        expectedResourceRevision: null
+      }))
+    }
+  };
+}
 function parseFlag(args, name) {
   const index = args.indexOf(name);
   if (index < 0) return null;
@@ -21472,9 +21504,19 @@ async function runCli(db, bb, argv, ctx, deps) {
       return invalidCli(error48 instanceof Error ? error48.message : String(error48));
     }
   }
-  const unknown2 = unexpectedFlags(args, ["--project"]);
+  const json2 = command === "doctor" && args.includes("--json");
+  const unknown2 = unexpectedFlags(json2 ? args.filter((arg) => arg !== "--json") : args, ["--project"]);
   if (unknown2) return invalidCli(`unexpected flag ${unknown2}`);
-  if (command === "doctor") return cliResult(await doctor(db, bb.sdk, projectId, deps.readCheckoutDivergence()));
+  if (command === "doctor") {
+    if (args.filter((arg) => arg === "--json").length > 1) return invalidCli("--json must be supplied at most once");
+    const result2 = await doctor(db, bb.sdk, projectId, deps.readCheckoutDivergence());
+    if (!json2 || result2.outcome !== "OK" || !db) return cliResult(result2);
+    try {
+      return cliResult(workItemRegistrationDoctorResult(db, projectId, result2));
+    } catch (error48) {
+      return cliResult({ outcome: "INTERNAL_ERROR", subject: projectId, expected: 1, attempted: 0, verified: 0, message: error48 instanceof Error ? error48.message : String(error48) });
+    }
+  }
   return cliResult(exportFoundation(db, projectId));
 }
 async function plugin(bb, options = {}) {
@@ -22458,7 +22500,7 @@ ${thread.titleFallback ?? ""}`);
     name: "collab",
     summary: "Inspect the bb-collab foundation and guarded conformance boundary",
     commands: [
-      { name: "doctor", summary: "Read-only project/store conformance check", usage: "bb collab doctor --project PROJECT_ID" },
+      { name: "doctor", summary: "Read-only project/store conformance check", usage: "bb collab doctor --project PROJECT_ID [--json]" },
       { name: "export", summary: "Deterministic bounded foundation export", usage: "bb collab export --project PROJECT_ID" },
       {
         name: "apply",
