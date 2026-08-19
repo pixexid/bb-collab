@@ -457,20 +457,6 @@ export function readCurrentRoleBindings(db: SqliteDatabase | null, projectId: st
   }
 }
 
-export function resolveCurrentRoleBinding(
-  db: SqliteDatabase | null,
-  projectId: string,
-  roleId: string,
-  threadId: string,
-): CurrentRoleBindingResolution {
-  const current = readCurrentRoleBindings(db, projectId);
-  if (current.status === "unknown") return { standing: "unknown", reason: current.reason };
-  const matches = current.bindings.filter((binding) => binding.roleId === roleId && binding.threadId === threadId);
-  if (matches.length === 0) return { standing: "unseated" };
-  if (matches.length > 1) return { standing: "refused", reason: "multiple-active-bindings" };
-  return { standing: "active", binding: matches[0]! };
-}
-
 export function createLaneWatcher(options: {
   readWorker?: (threadId: string) => Promise<WorkerObservation>;
   waitRegistry?: WaitRegistry;

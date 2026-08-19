@@ -10,12 +10,9 @@ ExecutionAttempt stores the native actual reasoning value. The dispatch path
 also rejects an executed profile that differs from the requested profile.
 
 The current authoritative default model is `codex/gpt-5.6-luna` in
-`docs/operations-model.md`. Before this issue, that default did not state the
-mechanical-subtask reasoning level. The shared `resolveSubagentReasoningLevel`
-helper now supplies LOW when a mechanical task omits effort; the cheap-tier
-caller selects this default for the mechanical lane. Explicit values, including
-HIGH/MAX, remain authoritative, and a hard-core task retains its parent
-deliberate level when no override is given.
+`docs/operations-model.md`; that matrix states LOW for mechanical subagents.
+Explicit values, including HIGH/MAX, remain authoritative, and a hard-core task
+retains its parent deliberate level when no override is given.
 The brief supplies the cheap-tier classification explicitly; parent effort
 does not determine it.
 
@@ -32,6 +29,5 @@ install/reload is required. Issues #78 and #80 are outside scope.
 
 ## Validation
 
-`tests/subagent-effort.test.ts` covers omitted mechanical LOW, explicit
-hard-core HIGH/MAX, explicit mechanical overrides, and the negative case where
-an unrelated parent HIGH level cannot escalate mechanical work.
+There is no in-repo spawn implementation or consumer to test; the normative
+rule remains in `docs/operations-model.md` and BB core owns native spawn.
