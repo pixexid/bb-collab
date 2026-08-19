@@ -6,7 +6,7 @@ This is the canonical role and review matrix. It describes operating choices, no
 
 | Role or lane | Harness/provider | Model | Reasoning |
 | --- | --- | --- | --- |
-| Director | `claude-code` or `pi` | `kimi-coding/k3`, `claude-opus-5[1m]`, or `zai/glm-5.3` | MEDIUM / HIGH |
+| Director | `claude-code` or `pi` | `claude-opus-5[1m]` or `zai/glm-5.3` | MEDIUM / HIGH |
 | Orchestrator primary | `claude-code` | `claude-opus-5[1m]` | MEDIUM |
 | Orchestrator alternate | `codex` | `gpt-5.6-sol` | MEDIUM |
 | Merge-bound worker (routine) | `codex` | `gpt-5.6-luna` | Any, up to MAX |
@@ -16,13 +16,13 @@ This is the canonical role and review matrix. It describes operating choices, no
 | Tier-B reviewer | `codex` | `gpt-5.6-luna` | Any |
 | Mechanical subagent | `codex` | `gpt-5.6-luna` | LOW |
 
-A reviewer must use a different model from the author; a different provider is preferred. This rule is currently unverifiable after the fact: execution_attempts records requested, not executed, models (GH-228), so a reviewer seat that inherited the same execution default as its author is indistinguishable from one that genuinely differed. Until get-bb/bb#1946 (strict spawn mode) or #1787 (executed-profile readback) lands, this line binds at DISPATCH TIME ONLY — the orchestrator names the reviewer's provider/model in the routing line when assigning review, and the reviewer seat echoes its executed profile in its verdict.
+A reviewer must use a different model from the author. This rule is currently unverifiable after the fact: execution_attempts records requested, not executed, models (GH-228), so a reviewer seat that inherited the same execution default as its author is indistinguishable from one that genuinely differed. Until get-bb/bb#1946 (strict spawn mode) or #1787 (executed-profile readback) lands, this line binds at DISPATCH TIME ONLY — the orchestrator names the reviewer's provider/model in the routing line when assigning review, and the reviewer seat echoes its executed profile in its verdict.
 
-When the diversity line and the Tier-A reviewer row conflict — sol-authored work requiring Tier-A review — the diversity line governs: the reviewer is claude-code/claude-opus-5[1m] MEDIUM, named in the dispatch routing line.
+When the diversity line and the Tier-A reviewer row conflict — sol-authored work requiring Tier-A review — the reviewer stays on the matrix row: `codex/gpt-5.6-sol` MEDIUM in a fresh session, named in the dispatch routing line. Opus is not a review-tier seat. Prefer a different model; when blocked, fall back to a different provider variant, then the same model at a different reasoning level, then the same model in a fresh session. A fresh session is not the same seat that authored the work and still catches the authoring session's mistakes.
 
 The diversity line governs at every tier; where a tier's designated reviewer shares the author's model, the dispatcher names a differing seat in the routing line.
 
-The `kimi-coding/k3` deprecation applies only to review placement; it remains the director default.
+The former deprecated profile is dropped from the director seat entirely by operator decision for latency.
 
 `zai/glm-5.3` is temporarily withdrawn from non-director placement to conserve peak-hour usage; the resulting one-provider worker spread is accepted for peak hours as the priced-in cost of the withdrawal; Codex is therefore the only worker provider, and Codex saturation escalates to the operator with usage data rather than re-seating on GLM.
 

@@ -10,10 +10,10 @@ second role store.
 Contract v17 moves `director-seat` to the separate `director` role and
 supersedes the v15 current-generation exemption with one exact
 first-generation environment exemption. The primary executed profile is exactly
-`pi/kimi-coding/k3/high` (`providerId: pi`, `model: kimi-coding/k3`,
-`reasoningLevel: high`, `permissionMode: full`, `serviceTier: default`,
-`visibility: visible`). Its alternate/standby is exactly Opus-medium
-(`claude-code/claude-opus-5[1m]`, `reasoningLevel: medium`, with explicit
+`claude-code/claude-opus-5[1m]/medium` (`providerId: claude-code`,
+`model: claude-opus-5[1m]`, `reasoningLevel: medium`, `permissionMode: full`,
+`serviceTier: default`, `visibility: visible`). Its alternate/standby is exactly
+GLM-high (`pi/zai/glm-5.3`, `reasoningLevel: high`, with explicit
 full/default/visible fields). The seat has zero writing-lane capacity and
 retains the existing exact project/source/host and event-correlation checks.
 Only director generation 1 with holder `thr_gsb7m77ciz`, environment
@@ -33,8 +33,8 @@ Decision row or a succession apply:
   "decisionId": "director-seat-amendment-prepared",
   "scope": { "roleRequirementId": "director-seat", "purpose": "succession-rationale" },
   "options": {
-    "primaryProfile": "pi/kimi-coding/k3/high",
-    "standbyProfile": "claude-code/claude-opus-5[1m]/medium",
+    "primaryProfile": "claude-code/claude-opus-5[1m]/medium",
+    "standbyProfile": "pi/zai/glm-5.3/high",
     "writingLaneCapacity": 0,
     "environment": "managed-worktree-for-future-generations",
     "firstGenerationExemption": {
@@ -76,13 +76,13 @@ seat from `director-seat`. Its actual executed profile is the exact profile in
 the canonical requirement and native execution evidence; the repository's
 current generic fixture is `codex/gpt-5.6-sol/high/full/default/visible`. It
 does not inherit the director primary or standby profile. A director seat
-must use `pi/kimi-coding/k3/high` with Opus-medium standby as stated above.
+must use Opus-medium with GLM-high standby as stated above.
 
 ## Standby
 
 Only `director-seat` generations name one standby profile in
 `RoleGeneration.standby_profile_json`. The configured standby is the exact
-Opus-medium profile, and its provider must differ from the director holder's
+GLM-high profile, and its provider must differ from the director holder's
 executed provider; a same-provider or missing standby refuses before any
 canonical write. `project-orchestrator` generations must omit a standby. A
 standby is not a role, actor, authority, lease, assignment, dispatch target,
