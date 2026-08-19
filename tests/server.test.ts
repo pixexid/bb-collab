@@ -410,6 +410,7 @@ function hostFor(
       },
       projects: {
         get: async () => project,
+        list: async () => [project],
       },
       plugins: {
         getSource: async () => ({
@@ -2418,6 +2419,33 @@ describe("bb-collab plugin boundary", () => {
     const replied = await host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "cannot vanish" });
     expect(replied).toMatchObject({ repliedAtMs: null, replyText: "cannot vanish", replyDeliveryError: expect.stringContaining("environment deleted") });
     expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("emits the first archive refusal as a visible warning", async () => {
+    const host = hostFor();
+    host.harness.sdk.stub("projects.list", (async () => { throw new Error("constructed archive refusal"); }) as never);
+    await plugin(host.bb);
+
+    await host.harness.runSchedule("thread-archive-sweep");
+
+    expect(host.harness.inspection.logEntries.filter((entry) => entry.level === "warn" && entry.message.startsWith("thread-archive-sweep coverage=degraded"))).toEqual([
+      expect.objectContaining({
+        message: expect.stringContaining("reason=project inventory unavailable: Error: constructed archive refusal occurrencesSinceReload=1"),
+      }),
+    ]);
+  });
+
+  it("discloses archive refusal counts since plugin reload", async () => {
+    const host = hostFor();
+    host.harness.sdk.stub("projects.list", (async () => { throw new Error("constructed archive refusal"); }) as never);
+    await plugin(host.bb);
+
+    await host.harness.runSchedule("thread-archive-sweep");
+    await host.harness.runSchedule("thread-archive-sweep");
+
+    const warnings = host.harness.inspection.logEntries.filter((entry) => entry.level === "warn" && entry.message.startsWith("thread-archive-sweep coverage=degraded"));
+    expect(warnings).toHaveLength(2);
+    expect(warnings.at(-1)?.message).toMatch(/occurrencesSinceReload=2 cyclesSinceReload=2 projectsSinceReload=0 sinceReloadAt=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u);
   });
 
   it("does not wake a quiet director seat", async () => {
