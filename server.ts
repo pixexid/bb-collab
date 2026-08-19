@@ -247,6 +247,7 @@ const operatorMessageSchema = z.object({
   text: operatorMessageTextSchema,
   createdAtMs: z.number().int().nonnegative(),
   readAtMs: z.number().int().nonnegative().nullable(),
+  senderTitle: z.string().nullable(),
   repliedAtMs: z.number().int().nonnegative().nullable(),
   replyText: operatorMessageTextSchema.nullable(),
   replyDeliveryError: z.string().nullable(),
@@ -324,7 +325,11 @@ export const rpcContract = defineRpcContract({
     output: roleBriefSchema,
   },
   operatorMessages: {
-    input: z.object({ projectId: projectIdSchema, recipient: operatorRecipientSchema.optional() }).strict(),
+    input: z.object({
+      projectId: projectIdSchema,
+      recipient: operatorRecipientSchema.optional(),
+      withSenderTitles: z.boolean().optional(),
+    }).strict(),
     output: z.array(operatorMessageSchema),
   },
   markOperatorMessageRead: {
@@ -770,6 +775,7 @@ function operatorMessage(row: OperatorMessageRow) {
     text: row.message_text,
     createdAtMs: row.created_at_ms,
     readAtMs: row.read_at_ms,
+    senderTitle: null,
     repliedAtMs: row.replied_at_ms,
     replyText: row.reply_text,
     replyDeliveryError: row.reply_delivery_error,
@@ -807,22 +813,43 @@ function readOperatorMessage(db: SqliteDatabase | null, projectId: string, messa
   return operatorMessage(row);
 }
 
-function listOperatorMessages(db: SqliteDatabase | null, projectId: string, recipient?: z.infer<typeof operatorRecipientSchema>) {
+async function resolveSenderTitles(bb: BbPluginApi, messages: ReturnType<typeof operatorMessage>[]) {
+  const senderProjects = new Map(messages.map((message) => [message.senderThreadId, message.projectId]));
+  const titles = new Map(await Promise.all([...senderProjects].map(async ([senderThreadId, projectId]) => {
+    try {
+      const thread = await bb.sdk.threads.get({ threadId: senderThreadId });
+      const title = thread.id === senderThreadId && thread.projectId === projectId ? thread.title?.trim() : null;
+      return [senderThreadId, title || null] as const;
+    } catch {
+      return [senderThreadId, null] as const;
+    }
+  })));
+  return messages.map((message) => ({ ...message, senderTitle: titles.get(message.senderThreadId) ?? null }));
+}
+
+async function listOperatorMessages(
+  db: SqliteDatabase | null,
+  bb: BbPluginApi,
+  projectId: string,
+  recipient?: z.infer<typeof operatorRecipientSchema>,
+  withSenderTitles = false,
+) {
   const store = requireRegisteredInboxProject(db, projectId);
   const recipientClause = recipient === undefined ? "" : " AND message.recipient = ?";
   const rows = store.prepare(`${operatorMessageSelect}
     WHERE message.project_id = ?${recipientClause}
     ORDER BY (message.read_at_ms IS NULL) DESC, message.created_at_ms DESC, message.message_id DESC
     LIMIT ${OPERATOR_MESSAGE_LIMIT}`).all(...(recipient === undefined ? [projectId] : [projectId, recipient])) as OperatorMessageRow[];
-  return rows.map(operatorMessage);
+  const messages = rows.map(operatorMessage);
+  return withSenderTitles ? resolveSenderTitles(bb, messages) : messages;
 }
 
-function markOperatorMessageRead(db: SqliteDatabase | null, projectId: string, messageId: number) {
+async function markOperatorMessageRead(db: SqliteDatabase | null, bb: BbPluginApi, projectId: string, messageId: number) {
   const store = requireRegisteredInboxProject(db, projectId);
   const result = store.prepare(`UPDATE operator_messages SET read_at_ms = COALESCE(read_at_ms, ?)
     WHERE project_id = ? AND message_id = ?`).run(Date.now(), projectId, messageId);
   if (result.changes !== 1) throw new Error("operator message does not exist in the requested project");
-  return readOperatorMessage(store, projectId, messageId);
+  return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0]!;
 }
 
 async function assertSenderProject(bb: BbPluginApi, projectId: string, senderThreadId: string) {
@@ -926,7 +953,9 @@ async function replyToOperatorMessage(db: SqliteDatabase | null, bb: BbPluginApi
   if (message.repliedAtMs !== null) throw new Error("operator message already has a delivered reply");
   // ponytail: this process-local guard covers every current RPC caller; a host atomic primitive is the cross-process upgrade.
   const claimKey = JSON.stringify([projectId, messageId]);
-  if (operatorRepliesInFlight.has(claimKey)) return { ...message, replyInProgress: true };
+  if (operatorRepliesInFlight.has(claimKey)) {
+    return { ...(await resolveSenderTitles(bb, [message]))[0]!, replyInProgress: true };
+  }
   operatorRepliesInFlight.add(claimKey);
   try {
     const thread = await bb.sdk.threads.get({ threadId: message.senderThreadId });
@@ -953,7 +982,7 @@ async function replyToOperatorMessage(db: SqliteDatabase | null, bb: BbPluginApi
   } finally {
     operatorRepliesInFlight.delete(claimKey);
   }
-  return readOperatorMessage(store, projectId, messageId);
+  return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0]!;
 }
 
 async function runCli(
@@ -1074,7 +1103,7 @@ async function runCli(
       const messageId = z.coerce.number().int().positive().safeParse(markRead);
       if (!messageId.success) return invalidCli(messageId.error.message);
       try {
-        return { exitCode: 0, stdout: JSON.stringify(markOperatorMessageRead(db, projectId, messageId.data)) };
+        return { exitCode: 0, stdout: JSON.stringify(await markOperatorMessageRead(db, bb, projectId, messageId.data)) };
       } catch (error) {
         return invalidCli(error instanceof Error ? error.message : String(error));
       }
@@ -1082,7 +1111,7 @@ async function runCli(
     const parsedRecipient = recipient === null ? undefined : operatorRecipientSchema.safeParse(recipient);
     if (parsedRecipient && !parsedRecipient.success) return invalidCli(parsedRecipient.error.message);
     try {
-      return { exitCode: 0, stdout: JSON.stringify(listOperatorMessages(db, projectId, parsedRecipient?.data)) };
+      return { exitCode: 0, stdout: JSON.stringify(await listOperatorMessages(db, bb, projectId, parsedRecipient?.data)) };
     } catch (error) {
       return invalidCli(error instanceof Error ? error.message : String(error));
     }
@@ -2090,10 +2119,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return composeRoleBrief(bb, db, input);
     },
     operatorMessages(input) {
-      return listOperatorMessages(db, input.projectId, input.recipient);
+      return listOperatorMessages(db, bb, input.projectId, input.recipient, input.withSenderTitles);
     },
     markOperatorMessageRead(input) {
-      return markOperatorMessageRead(db, input.projectId, input.messageId);
+      return markOperatorMessageRead(db, bb, input.projectId, input.messageId);
     },
     replyToOperatorMessage(input) {
       return replyToOperatorMessage(db, bb, input.projectId, input.messageId, input.text);

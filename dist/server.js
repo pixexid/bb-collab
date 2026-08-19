@@ -20354,6 +20354,7 @@ var operatorMessageSchema = external_exports.object({
   text: operatorMessageTextSchema,
   createdAtMs: external_exports.number().int().nonnegative(),
   readAtMs: external_exports.number().int().nonnegative().nullable(),
+  senderTitle: external_exports.string().nullable(),
   repliedAtMs: external_exports.number().int().nonnegative().nullable(),
   replyText: operatorMessageTextSchema.nullable(),
   replyDeliveryError: external_exports.string().nullable(),
@@ -20431,7 +20432,11 @@ var rpcContract = defineRpcContract({
     output: roleBriefSchema
   },
   operatorMessages: {
-    input: external_exports.object({ projectId: projectIdSchema, recipient: operatorRecipientSchema.optional() }).strict(),
+    input: external_exports.object({
+      projectId: projectIdSchema,
+      recipient: operatorRecipientSchema.optional(),
+      withSenderTitles: external_exports.boolean().optional()
+    }).strict(),
     output: external_exports.array(operatorMessageSchema)
   },
   markOperatorMessageRead: {
@@ -20778,6 +20783,7 @@ function operatorMessage(row) {
     text: row.message_text,
     createdAtMs: row.created_at_ms,
     readAtMs: row.read_at_ms,
+    senderTitle: null,
     repliedAtMs: row.replied_at_ms,
     replyText: row.reply_text,
     replyDeliveryError: row.reply_delivery_error,
@@ -20806,21 +20812,35 @@ function readOperatorMessage(db, projectId, messageId) {
   if (!row) throw new Error("operator message does not exist in the requested project");
   return operatorMessage(row);
 }
-function listOperatorMessages(db, projectId, recipient) {
+async function resolveSenderTitles(bb, messages) {
+  const senderProjects = new Map(messages.map((message) => [message.senderThreadId, message.projectId]));
+  const titles = new Map(await Promise.all([...senderProjects].map(async ([senderThreadId, projectId]) => {
+    try {
+      const thread = await bb.sdk.threads.get({ threadId: senderThreadId });
+      const title = thread.id === senderThreadId && thread.projectId === projectId ? thread.title?.trim() : null;
+      return [senderThreadId, title || null];
+    } catch {
+      return [senderThreadId, null];
+    }
+  })));
+  return messages.map((message) => ({ ...message, senderTitle: titles.get(message.senderThreadId) ?? null }));
+}
+async function listOperatorMessages(db, bb, projectId, recipient, withSenderTitles = false) {
   const store = requireRegisteredInboxProject(db, projectId);
   const recipientClause = recipient === void 0 ? "" : " AND message.recipient = ?";
   const rows = store.prepare(`${operatorMessageSelect}
     WHERE message.project_id = ?${recipientClause}
     ORDER BY (message.read_at_ms IS NULL) DESC, message.created_at_ms DESC, message.message_id DESC
     LIMIT ${OPERATOR_MESSAGE_LIMIT}`).all(...recipient === void 0 ? [projectId] : [projectId, recipient]);
-  return rows.map(operatorMessage);
+  const messages = rows.map(operatorMessage);
+  return withSenderTitles ? resolveSenderTitles(bb, messages) : messages;
 }
-function markOperatorMessageRead(db, projectId, messageId) {
+async function markOperatorMessageRead(db, bb, projectId, messageId) {
   const store = requireRegisteredInboxProject(db, projectId);
   const result2 = store.prepare(`UPDATE operator_messages SET read_at_ms = COALESCE(read_at_ms, ?)
     WHERE project_id = ? AND message_id = ?`).run(Date.now(), projectId, messageId);
   if (result2.changes !== 1) throw new Error("operator message does not exist in the requested project");
-  return readOperatorMessage(store, projectId, messageId);
+  return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0];
 }
 async function assertSenderProject(bb, projectId, senderThreadId) {
   const thread = await bb.sdk.threads.get({ threadId: senderThreadId });
@@ -20916,7 +20936,9 @@ async function replyToOperatorMessage(db, bb, projectId, messageId, replyText) {
   const message = readOperatorMessage(store, projectId, messageId);
   if (message.repliedAtMs !== null) throw new Error("operator message already has a delivered reply");
   const claimKey = JSON.stringify([projectId, messageId]);
-  if (operatorRepliesInFlight.has(claimKey)) return { ...message, replyInProgress: true };
+  if (operatorRepliesInFlight.has(claimKey)) {
+    return { ...(await resolveSenderTitles(bb, [message]))[0], replyInProgress: true };
+  }
   operatorRepliesInFlight.add(claimKey);
   try {
     const thread = await bb.sdk.threads.get({ threadId: message.senderThreadId });
@@ -20944,7 +20966,7 @@ async function replyToOperatorMessage(db, bb, projectId, messageId, replyText) {
   } finally {
     operatorRepliesInFlight.delete(claimKey);
   }
-  return readOperatorMessage(store, projectId, messageId);
+  return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0];
 }
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];
@@ -21055,7 +21077,7 @@ async function runCli(db, bb, argv, ctx, deps) {
       const messageId = external_exports.coerce.number().int().positive().safeParse(markRead);
       if (!messageId.success) return invalidCli(messageId.error.message);
       try {
-        return { exitCode: 0, stdout: JSON.stringify(markOperatorMessageRead(db, projectId, messageId.data)) };
+        return { exitCode: 0, stdout: JSON.stringify(await markOperatorMessageRead(db, bb, projectId, messageId.data)) };
       } catch (error48) {
         return invalidCli(error48 instanceof Error ? error48.message : String(error48));
       }
@@ -21063,7 +21085,7 @@ async function runCli(db, bb, argv, ctx, deps) {
     const parsedRecipient = recipient === null ? void 0 : operatorRecipientSchema.safeParse(recipient);
     if (parsedRecipient && !parsedRecipient.success) return invalidCli(parsedRecipient.error.message);
     try {
-      return { exitCode: 0, stdout: JSON.stringify(listOperatorMessages(db, projectId, parsedRecipient?.data)) };
+      return { exitCode: 0, stdout: JSON.stringify(await listOperatorMessages(db, bb, projectId, parsedRecipient?.data)) };
     } catch (error48) {
       return invalidCli(error48 instanceof Error ? error48.message : String(error48));
     }
@@ -22006,10 +22028,10 @@ ${thread.titleFallback ?? ""}`);
       return composeRoleBrief(bb, db, input);
     },
     operatorMessages(input) {
-      return listOperatorMessages(db, input.projectId, input.recipient);
+      return listOperatorMessages(db, bb, input.projectId, input.recipient, input.withSenderTitles);
     },
     markOperatorMessageRead(input) {
-      return markOperatorMessageRead(db, input.projectId, input.messageId);
+      return markOperatorMessageRead(db, bb, input.projectId, input.messageId);
     },
     replyToOperatorMessage(input) {
       return replyToOperatorMessage(db, bb, input.projectId, input.messageId, input.text);
