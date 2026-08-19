@@ -126,4 +126,48 @@ esac
       rmSync(directory, { recursive: true, force: true });
     }
   });
+
+  it("computes linked done-review latency from canonical export and preserves unknown for empty export", () => {
+    const directory = mkdtempSync(join(tmpdir(), "bb-collab-linked-review-"));
+    const gh = join(directory, "gh");
+    const bb = join(directory, "bb");
+    writeFileSync(gh, `#!/bin/sh
+case "$1 $2" in
+  "issue list") printf '%s' '[]' ;;
+  "pr list") printf '%s' '[{"number":338,"mergedAt":"2026-08-13T00:00:00Z","body":"Review tier: B","title":"review target"}]' ;;
+  "label list") printf '%s' '[]' ;;
+  *) exit 2 ;;
+esac
+`);
+    const writeBb = (recordsNdjson: string) => {
+      const payload = JSON.stringify({ evidence: { export: { recordsNdjson } } });
+      writeFileSync(bb, `#!/bin/sh
+case "$1 $2" in
+  "project list") printf '%s' '[{"id":"project-test","gitRemoteUrl":"https://github.com/pixexid/bb-collab.git"}]' ;;
+  "collab export") printf '%s' '${payload}' ;;
+  *) exit 2 ;;
+esac
+`);
+      chmodSync(bb, 0o755);
+    };
+    const { BB_CLI: _bbCli, ...testEnv } = process.env;
+    const run = () => JSON.parse(execFileSync(process.execPath, [
+      join(process.cwd(), "scripts", "weekly-throughput-report.mjs"),
+      "--repo", "pixexid/bb-collab", "--start", "2026-08-12T00:00:00Z", "--end", "2026-08-20T00:00:00Z", "--dials-landed-at", "2026-08-13T00:00:00Z",
+    ], { encoding: "utf8", env: { ...testEnv, PATH: `${directory}:${process.env.PATH ?? ""}` } }));
+    chmodSync(gh, 0o755);
+    try {
+      writeBb('{"table":"execution_attempts","row":{"execution_attempt_id":"review-1","review_pr_number":338,"created_at_ms":1786579200000,"completed_at_ms":1786584600000,"state":"done"}}');
+      const known = run().reviewLatencyByTier;
+      expect(known.B).toEqual({ status: "known", medianHours: 1.5, completed: 1, unknown: 0 });
+      expect(known.B).not.toHaveProperty("reason");
+
+      writeBb("");
+      const unknown = run().reviewLatencyByTier;
+      expect(unknown.B.status).toBe("unknown");
+      expect(unknown.B).toHaveProperty("reason", "no canonically linked Tier B review observations");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
 });

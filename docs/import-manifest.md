@@ -11,6 +11,14 @@ The llm-collab source fence is
 [f988d9711d3778f751e4ec0e32ebbf7b0893c80f](https://github.com/pixexid/llm-collab/tree/f988d9711d3778f751e4ec0e32ebbf7b0893c80f).
 The complete 40-issue disposition is in the [migration ledger](llm-collab-migration-ledger.md).
 
+## Schema-version rule
+
+Every append-only migration that changes the canonical schema, including
+adding columns to an exported table, increments `SCHEMA_VERSION` and updates
+`PREVIOUS_SCHEMA_VERSION`. Changes limited to migration-time bookkeeping do
+not require a schema-version increment; `schemaDigest` still changes whenever
+`MIGRATIONS` changes.
+
 ## Import boundary
 
 The logical export is versioned and deterministic:
