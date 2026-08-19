@@ -208,15 +208,7 @@ And when reading a credential file for any reason: ask for shape, not contents. 
 
 ## Spawn against a fetched ref
 
-> Dispatch against a base whose exact object you have just fetched and verified. A bare local branch name is not that unless you have checked it.
-
-A bare `main` resolves to a local ref that lags silently. Eight merges behind in one evening: a scoping read cited matrix text that no longer existed, and a grader's worktree lacked the specification it was grading against.
-
-The invariant is the object, not the spelling. A local branch fast-forwarded from upstream and confirmed at the exact SHA is a correct base; a remote-tracking ref nobody fetched is not. What the rule forbids is dispatching against a name whose current object you have not established.
-
-A lane on a stale tree does not look stale. It reads files that exist, quotes them accurately, and reports confidently — no refusal, no error, nothing that reads as degraded. That is what makes it worse than a missing file.
-
-This rule is scaffolding, not principle: it describes a workaround for a spawn surface that does not fetch. Delete it when the surface does.
+> Fleet spawns pass `--base-branch origin/main`; never bare `main`, which silently resolves the stale local ref. The trap is silent, material, and recurring: measured 2026-08-19, local `main` was `aea7054933e08bddc16fef2f2ef9386f93c04645` while `origin/main` was `c513770a2c3647c7ab40686600326da5282027b6` (14 commits behind). Until [get-bb/bb#1917](https://github.com/get-bb/bb/issues/1917) lands, refresh a stale base with `git fetch origin main:main`; if `main` is checked out and that refuses by design, use `git pull --ff-only` instead.
 
 ## The no-dispatch reason is the second half of the intake check
 
