@@ -4,13 +4,15 @@ BB-native project governance, work lifecycle, and collaboration runtime.
 
 ## Deployed artifact check
 
-After `bb plugin reload bb-collab`, run
+The recurring `fleet-watchdog` schedule runs
+`npm run --silent check:deployed-dist`'s underlying read-only check every five
+minutes while the plugin is loaded. You can also run
 `npm run --silent check:deployed-dist` from any checkout. It resolves the
 installed `bb-collab` path through bb and refuses an absent or non-path source.
 It is silent when tracked `dist/` there matches the deployed commit; otherwise
-it exits nonzero, names every divergent artifact, and warns that the running
-plugin no longer matches that commit. This detects divergence after reload; it
-does not stop bb from rebuilding the frontend first.
+it exits nonzero and names every divergent artifact against the deployed
+commit. The scheduled check reports divergence;
+it never rebuilds, repairs, or commits the deployed checkout.
 
 ## Sidebar thread list
 

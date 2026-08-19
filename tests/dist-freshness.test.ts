@@ -27,7 +27,8 @@ describe("dist freshness gate", () => {
       writeFileSync(join(root, "dist/app.js"), "divergent\n");
       const result = spawnSync("npm", ["run", "verify"], { cwd: root, encoding: "utf8" });
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain("fresh build diverged from committed dist: dist/app.js");
+      expect(result.stderr).toContain("working tree dist/ differs from commit");
+      expect(result.stderr).toContain("dist/app.js");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -57,7 +58,7 @@ describe("dist freshness gate", () => {
 
       const honest = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
       expect(honest.status).toBe(0);
-      expect(honest.stdout).toContain("committed dist matches fresh build");
+      expect(honest.stdout).toContain("working tree dist/ matches commit");
 
       const deployedHonest = spawnSync(process.execPath, [script, "--deployed"], { cwd: sourceRoot, encoding: "utf8", env: deployedEnvironment });
       expect(deployedHonest.status).toBe(0);
@@ -72,8 +73,8 @@ describe("dist freshness gate", () => {
       execFileSync("git", ["add", "dist/server.js"], { cwd: root });
       const deployedStale = spawnSync(process.execPath, [script, "--deployed"], { cwd: sourceRoot, encoding: "utf8", env: deployedEnvironment });
       expect(deployedStale.status).toBe(1);
-      expect(deployedStale.stderr).toContain(`deployed dist at ${root} diverges from committed dist: dist/server.js`);
-      expect(deployedStale.stderr).toContain("running plugin no longer matches commit");
+      expect(deployedStale.stderr).toContain(`deployed working tree dist/ at ${root} differs from commit`);
+      expect(deployedStale.stderr).toContain("dist/server.js");
 
       writePluginList([]);
       const unresolved = spawnSync(process.execPath, [script, "--deployed"], { cwd: sourceRoot, encoding: "utf8", env: deployedEnvironment });

@@ -2647,7 +2647,29 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     await fleetWatchdogIdle.clearWakeHistory(`${projectId}:`);
     bb.log.warn(`fleet-watchdog history reset: project=${projectId} invokedBy=${invokedBy} at=${Date.now()}`);
   };
-  bb.background.schedule("fleet-watchdog", "*/5 * * * *", () => fleetWatchdogCycle());
+  const checkDeployedDist = () => {
+    const root = findCheckoutRoot(dirname(fileURLToPath(import.meta.url)));
+    if (!root) {
+      bb.log.error("deployed-dist automatic check failed: cannot find plugin checkout root");
+      return;
+    }
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "BB_CLI"));
+    const result = spawnSync(process.execPath, [join(root, "scripts", "check-dist.mjs"), "--deployed"], {
+      cwd: root,
+      encoding: "utf8",
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10_000,
+    });
+    if (result.status === 0 && !result.error) return;
+    const detail = [result.error?.message, result.stderr?.trim(), result.stdout?.trim()].filter(Boolean).join(" ");
+    bb.log.error(`deployed-dist automatic check failed: ${detail || `exit ${String(result.status)}`}`);
+  };
+  // Report-only: this never rebuilds, writes, or repairs the deployed checkout.
+  bb.background.schedule("fleet-watchdog", "*/5 * * * *", () => {
+    checkDeployedDist();
+    return fleetWatchdogCycle();
+  });
 
   // This is deliberately a report-only schedule. Archive is available only
   // through the explicit collab archive-sweep --apply command below.
