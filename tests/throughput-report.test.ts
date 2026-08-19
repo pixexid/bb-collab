@@ -41,6 +41,14 @@ describe("weekly throughput report", () => {
     expect(report.dialGuidance).toContain("unknown");
   });
 
+  it("describes absent review observations without claiming the linkage mechanism is missing", () => {
+    const report = weeklyThroughputReport(empty, window);
+    expect(report.outlierCohorts).toEqual([]);
+    const reason = weeklyThroughputReport({ ...empty, outlierCohorts: [{ label: "empty", startAtMs: 0, endAtMs: 1 }] }, window).outlierCohorts[0].reviewRounds.reason;
+    expect(reason).toBe("no canonically linked review observations");
+    expect(reason).not.toMatch(/not .*linked|linkage .*missing|not .*exist/iu);
+  });
+
   it("keeps partial issue and review windows explicit", () => {
     const report = weeklyThroughputReport({
       ...empty,
