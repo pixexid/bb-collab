@@ -9,12 +9,12 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 export const CONTRACT_VERSION = 21;
-export const SCHEMA_VERSION = 18;
+export const SCHEMA_VERSION = 19;
 // v21 makes project configuration visibility explicitly visible-only.
 const PREVIOUS_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-const PREVIOUS_SCHEMA_VERSION = 17;
+const PREVIOUS_SCHEMA_VERSION = 18;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatProfile = {
@@ -830,6 +830,10 @@ export const MIGRATIONS: string[] = [
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL
   )`,
+  `ALTER TABLE work_item_github_backfills
+     ADD COLUMN config_revision INTEGER CHECK (config_revision IS NULL OR config_revision > 0);
+   ALTER TABLE work_item_github_backfills
+     ADD COLUMN attempt_reason TEXT CHECK (attempt_reason IS NULL OR attempt_reason IN ('initial', 'config_revision_changed'))`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -6100,6 +6104,14 @@ function externalRef(db: SqliteDatabase, projectId: string, workItemId: string):
 const WORK_ITEM_GITHUB_ID = /^wi-gh-([1-9][0-9]*)$/u;
 
 export type WorkItemGithubBackfillState = "attempted" | "completed" | "degraded";
+const githubBackfillAttemptReasonSchema = z
+  .object({
+    kind: z.enum(["initial", "config_revision_changed"]),
+    previousConfigRevision: z.number().int().positive().refine(Number.isSafeInteger).nullable(),
+  })
+  .strict();
+
+export type WorkItemGithubBackfillAttemptReason = z.infer<typeof githubBackfillAttemptReasonSchema>;
 
 export interface WorkItemGithubBackfillOutcome {
   workItemId: string;
@@ -6111,12 +6123,25 @@ export interface WorkItemGithubBackfillOutcome {
 export interface WorkItemGithubBackfillResult {
   projectId: string;
   epochCreatedAtMs: number;
+  configRevision: number;
+  attemptReason: WorkItemGithubBackfillAttemptReason;
   state: WorkItemGithubBackfillState;
   candidates: number;
   bound: number;
   alreadyBound: number;
   unresolved: number;
   outcomes: WorkItemGithubBackfillOutcome[];
+}
+
+type StoredWorkItemGithubBackfillResult = Omit<WorkItemGithubBackfillResult, "configRevision" | "attemptReason"> & {
+  configRevision?: number;
+  attemptReason?: WorkItemGithubBackfillAttemptReason;
+};
+
+interface StoredWorkItemGithubBackfillRun {
+  result: StoredWorkItemGithubBackfillResult;
+  configRevision: number | null;
+  attemptReason: "initial" | "config_revision_changed" | null;
 }
 
 function parseGithubIssueCandidate(workItemId: string): number | null {
@@ -6126,20 +6151,26 @@ function parseGithubIssueCandidate(workItemId: string): number | null {
   return Number.isSafeInteger(issueNumber) && issueNumber > 0 ? issueNumber : null;
 }
 
-function readGithubBackfillRun(db: SqliteDatabase, projectId: string): WorkItemGithubBackfillResult | null {
-  const row = asRow<{ result_json: string }>(db.prepare(
-    "SELECT result_json FROM work_item_github_backfills WHERE project_id = ?",
+function readGithubBackfillRun(db: SqliteDatabase, projectId: string): StoredWorkItemGithubBackfillRun | null {
+  const row = asRow<{ result_json: string; config_revision: number | null; attempt_reason: string | null }>(db.prepare(
+    "SELECT result_json, config_revision, attempt_reason FROM work_item_github_backfills WHERE project_id = ?",
   ).get(projectId));
   if (!row) return null;
   try {
-    const result = JSON.parse(row.result_json) as WorkItemGithubBackfillResult;
+    const result = JSON.parse(row.result_json) as StoredWorkItemGithubBackfillResult;
     if (
       result.projectId !== projectId ||
       !Number.isSafeInteger(result.epochCreatedAtMs) ||
       !["attempted", "completed", "degraded"].includes(result.state) ||
-      !Array.isArray(result.outcomes)
+      !Array.isArray(result.outcomes) ||
+      (result.configRevision !== undefined && (!Number.isSafeInteger(result.configRevision) || result.configRevision < 1)) ||
+      (result.attemptReason !== undefined && !githubBackfillAttemptReasonSchema.safeParse(result.attemptReason).success) ||
+      (row.config_revision !== null && (!Number.isSafeInteger(row.config_revision) || row.config_revision < 1)) ||
+      (row.attempt_reason !== null && !["initial", "config_revision_changed"].includes(row.attempt_reason)) ||
+      (result.configRevision !== undefined && result.configRevision !== row.config_revision) ||
+      (result.attemptReason !== undefined && result.attemptReason.kind !== row.attempt_reason)
     ) throw new Error("invalid backfill result");
-    return result;
+    return { result, configRevision: row.config_revision, attemptReason: row.attempt_reason as StoredWorkItemGithubBackfillRun["attemptReason"] };
   } catch {
     throw new Error("GitHub WorkItem backfill marker is malformed");
   }
@@ -6149,9 +6180,9 @@ function persistGithubBackfillRun(db: SqliteDatabase, result: WorkItemGithubBack
   transaction(db, () => {
     const updated = db.prepare(
       `UPDATE work_item_github_backfills
-       SET state = ?, result_json = ?, updated_at_ms = ?
+       SET config_revision = ?, attempt_reason = ?, state = ?, result_json = ?, updated_at_ms = ?
        WHERE project_id = ?`,
-    ).run(result.state, canonicalJson(result), now(), result.projectId);
+    ).run(result.configRevision, result.attemptReason.kind, result.state, canonicalJson(result), now(), result.projectId);
     if (updated.changes !== 1) throw new Error("GitHub WorkItem backfill marker disappeared");
   });
 }
@@ -6170,18 +6201,32 @@ export function backfillWorkItemGithubIssues(
     throw new Error("GitHub WorkItem backfill epoch must be a non-negative safe integer");
   }
   const prepared = transaction(db, () => {
+    const config = currentConfig(db, projectId);
+    if (!config) throw refusal("PROJECT_CONFIG_REQUIRED", "project has no stored config revision");
     const existing = readGithubBackfillRun(db, projectId);
-    if (existing) return { result: existing, rows: null as WorkItemRow[] | null };
+    if (
+      existing?.configRevision === config.config_revision &&
+      existing.result.configRevision === config.config_revision &&
+      existing.result.attemptReason !== undefined
+    ) {
+      return { result: existing.result as WorkItemGithubBackfillResult, rows: null as WorkItemRow[] | null };
+    }
+    const epoch = existing?.result.epochCreatedAtMs ?? epochCreatedAtMs;
     const rows = db.prepare(
       `SELECT project_id, work_item_id, config_revision, repo_target_id, title, body,
               lifecycle_state, resource_revision, created_at_ms, updated_at_ms
        FROM work_items
        WHERE project_id = ? AND created_at_ms <= ?
        ORDER BY work_item_id`,
-    ).all(projectId, epochCreatedAtMs) as WorkItemRow[];
+    ).all(projectId, epoch) as WorkItemRow[];
+    const attemptReason: WorkItemGithubBackfillAttemptReason = existing === null
+      ? { kind: "initial", previousConfigRevision: null }
+      : { kind: "config_revision_changed", previousConfigRevision: existing.configRevision };
     const result: WorkItemGithubBackfillResult = {
       projectId,
-      epochCreatedAtMs,
+      epochCreatedAtMs: epoch,
+      configRevision: config.config_revision,
+      attemptReason,
       state: "attempted",
       candidates: rows.length,
       bound: 0,
@@ -6190,11 +6235,19 @@ export function backfillWorkItemGithubIssues(
       outcomes: [],
     };
     const timestamp = now();
-    db.prepare(
-      `INSERT INTO work_item_github_backfills
-        (project_id, epoch_created_at_ms, state, result_json, created_at_ms, updated_at_ms)
-       VALUES (?, ?, 'attempted', ?, ?, ?)`,
-    ).run(projectId, epochCreatedAtMs, canonicalJson(result), timestamp, timestamp);
+    if (existing === null) {
+      db.prepare(
+        `INSERT INTO work_item_github_backfills
+          (project_id, epoch_created_at_ms, config_revision, attempt_reason, state, result_json, created_at_ms, updated_at_ms)
+         VALUES (?, ?, ?, ?, 'attempted', ?, ?, ?)`,
+      ).run(projectId, epoch, result.configRevision, result.attemptReason.kind, canonicalJson(result), timestamp, timestamp);
+    } else {
+      db.prepare(
+        `UPDATE work_item_github_backfills
+         SET config_revision = ?, attempt_reason = ?, state = 'attempted', result_json = ?, updated_at_ms = ?
+         WHERE project_id = ?`,
+      ).run(result.configRevision, result.attemptReason.kind, canonicalJson(result), timestamp, projectId);
+    }
     return { result, rows };
   });
   if (prepared.rows === null) return prepared.result;
@@ -6211,7 +6264,7 @@ export function backfillWorkItemGithubIssues(
 
     let mapping: ReturnType<typeof requireGithubMapping>;
     try {
-      mapping = requireGithubMapping(db, row.project_id, row.config_revision, row.repo_target_id);
+      mapping = requireGithubMapping(db, row.project_id, result.configRevision, row.repo_target_id);
     } catch (error) {
       const reason = error instanceof Refusal ? error.data.code.toLowerCase() : "github_mapping_unreadable";
       const outcome = unresolvedBackfillOutcome(row.work_item_id, reason, issueNumber);
@@ -6268,7 +6321,7 @@ export function backfillWorkItemGithubIssues(
           mapping: mapping.mapping,
           issueNumber,
           idempotencyKey: `github-issue-backfill:${projectId}:${row.work_item_id}`,
-          requestDigest: sha256(canonicalJson({ projectId, workItemId: row.work_item_id, epochCreatedAtMs: result.epochCreatedAtMs })),
+          requestDigest: sha256(canonicalJson({ projectId, workItemId: row.work_item_id, epochCreatedAtMs: result.epochCreatedAtMs, configRevision: result.configRevision })),
           observed: snapshot!,
         });
       });
