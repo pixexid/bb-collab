@@ -13,10 +13,12 @@ The complete 40-issue disposition is in the [migration ledger](llm-collab-migrat
 
 ## Schema-version rule
 
-Every append-only migration that changes the canonical schema, including
-adding columns to an exported table, increments `SCHEMA_VERSION` and updates
-`PREVIOUS_SCHEMA_VERSION`. Changes limited to migration-time bookkeeping do
-not require a schema-version increment; `schemaDigest` still changes whenever
+Every appended `MIGRATIONS` entry increments `SCHEMA_VERSION` and updates
+`PREVIOUS_SCHEMA_VERSION`; there is no migration-time-bookkeeping exception.
+The repository's historical offset is 13, so the invariant is
+`MIGRATIONS.length === SCHEMA_VERSION + 13`. This applies to DDL, backfills,
+indexes, and tables whether or not they are exported, because each can change
+canonical schema or state. `schemaDigest` still changes whenever
 `MIGRATIONS` changes.
 
 ## Import boundary

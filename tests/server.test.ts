@@ -4649,6 +4649,8 @@ exit 1
     expect(SCHEMA_VERSION).toBe(20);
     expect(CONTRACT_VERSION).toBe(21);
     expect(MIGRATIONS).toHaveLength(33);
+    // Historical migration entries predate the schema-version counter by 13.
+    expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
     expect(MIGRATIONS.slice(0, -5).map(sha256)).toEqual([
       "2ac2daf5e9bedfefdc007f0ff150814dace6938963b214c463dba8f66332d708",
       "e55c1268522fb2a3c42670c6565376860731de77b7afc8f122755db613d92967",
@@ -4683,6 +4685,8 @@ exit 1
     expect(sha256(MIGRATIONS.slice(0, -4).join("\n"))).toBe("4051aa08e489728a2b752340ad979716de7a2a1df9fdd46d2c4b8ccc86d9f5d2");
     expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("7d9d30ecaf897f87b32f0da787366e67ee44194ad9fcd8fd3b33a2ca14eec221");
     expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("3aafb2d48eb7560b5ce2a61b7611b34c9fb52e6dfe063f7e37f6782fe822f652");
+    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("cdb3f0e553be06e6405f2c1040ed08043accdc506d0ffecc0fd8fc0df9e69591");
+    expect(schemaDigest).toBe("e2572f2cf4f06f0cf3e98db9bfa097903acdc6af37983acfb40416c1a9d6d9ee");
     expect(MIGRATIONS.at(-6)).toContain("operator_messages");
     expect(MIGRATIONS.at(-6)).toContain("project_id TEXT NOT NULL");
     expect(MIGRATIONS.at(-6)).toContain("recipient IN ('operator', 'supervisor')");
