@@ -1904,14 +1904,17 @@ describe("bb-collab plugin boundary", () => {
       expect(cli.exitCode).toBe(0);
       expect(JSON.parse(cli.stdout)).toMatchObject({ projectId: PROJECT_ID, recipient: "supervisor", notificationStatus: "not-requested" });
       const titleReadsBeforeList = host.harness.inspection.sdk.callsTo("threads.get").length;
-      expect(await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID })).toHaveLength(6);
+      expect((await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID }) as { messages: unknown[] }).messages).toHaveLength(6);
       expect(host.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(titleReadsBeforeList);
-      expect(await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, withSenderTitles: true })).toEqual(
+      expect((await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, withSenderTitles: true }) as { messages: unknown[] }).messages).toEqual(
         expect.arrayContaining([expect.objectContaining({ senderThreadId: ROLE_THREAD_ID, senderTitle: "Managed role holder" })]),
       );
       expect(host.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(titleReadsBeforeList + 1);
-      expect(await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, recipient: "supervisor" })).toHaveLength(2);
-      await expect(host.harness.callRpc("operatorMessages", { projectId: FOREIGN_PROJECT_ID })).rejects.toThrow("not registered");
+      expect((await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, recipient: "supervisor" }) as { messages: unknown[] }).messages).toHaveLength(2);
+      // #280: the unregistered project is an outcome code, not a rejection. The
+      // exact project match still gates the read — no foreign row is returned.
+      expect(await host.harness.callRpc("operatorMessages", { projectId: FOREIGN_PROJECT_ID }))
+        .toEqual({ outcome: "PROJECT_CONFIG_REQUIRED", message: "operator inbox project is not registered", messages: [] });
       await expect(host.harness.callAgentTool("send_to_operator", {
         project_id: FOREIGN_PROJECT_ID,
         recipient: "operator",
@@ -1935,9 +1938,10 @@ describe("bb-collab plugin boundary", () => {
     }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID });
     host.harness.sdk.stub("threads.get", async () => { throw new Error("thread no longer exists"); });
 
-    await expect(host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, withSenderTitles: true })).resolves.toEqual([
-      expect.objectContaining({ senderThreadId: ROLE_THREAD_ID, senderTitle: null }),
-    ]);
+    await expect(host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, withSenderTitles: true })).resolves.toEqual({
+      outcome: "OK",
+      messages: [expect.objectContaining({ senderThreadId: ROLE_THREAD_ID, senderTitle: null })],
+    });
   });
 
   it("attempts both notification channels and leaves a visible failure", async () => {
@@ -1988,6 +1992,31 @@ describe("bb-collab plugin boundary", () => {
     } finally {
       clock.mockRestore();
     }
+  });
+
+  it("refuses an unregistered project on the CLI inbox list rather than printing an empty one", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    await host.harness.callAgentTool("send_to_operator", {
+      project_id: PROJECT_ID,
+      recipient: "supervisor",
+      severity: "routine",
+      text: "supervisor pickup",
+    }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID });
+
+    // #280 moved the unregistered refusal into the reader's result, so the CLI now
+    // refuses on its own account. This is the surface where a seat reads its durable
+    // inbox: printing `[]` at exit 0 would tell it "no messages" when the true answer
+    // is "this project has no inbox". The registered read is the positive control —
+    // without it a CLI that refused everything would pass.
+    const registered = await host.harness.runCli(["inbox", "--project", PROJECT_ID]);
+    expect(registered.exitCode).toBe(0);
+    expect(JSON.parse(registered.stdout)).toHaveLength(1);
+
+    const unregistered = await host.harness.runCli(["inbox", "--project", FOREIGN_PROJECT_ID]);
+    expect(unregistered.exitCode).toBe(2);
+    expect(JSON.parse(unregistered.stdout)).toMatchObject({ outcome: "INVALID_INPUT" });
   });
 
   it("delivers replies through platform steer only after the matching sender event lands", async () => {

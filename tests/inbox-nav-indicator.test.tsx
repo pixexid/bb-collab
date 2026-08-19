@@ -59,7 +59,11 @@ function message(messageId: number, readAtMs: number | null) {
   };
 }
 
-function rpcHandlers(operatorMessages: () => Promise<ReturnType<typeof message>[]>) {
+type InboxReply = ReturnType<typeof message>[] | { outcome: string; message?: string; messages: ReturnType<typeof message>[] };
+
+// Most cases only care about the rows, so an array is wrapped in the OK
+// outcome here; a case that cares about the outcome code returns the result.
+function rpcHandlers(operatorMessages: (input: { projectId: string }) => Promise<InboxReply>) {
   return {
     lanes: async () => [],
     threadStates: async () => ({}),
@@ -68,7 +72,10 @@ function rpcHandlers(operatorMessages: () => Promise<ReturnType<typeof message>[
     setSidebarCollapse: async () => ({}),
     reorderPinned: async () => ({ ok: true }),
     setThreadState: async () => ({ state: null }),
-    operatorMessages,
+    operatorMessages: async (input: { projectId: string }) => {
+      const reply = await operatorMessages(input);
+      return Array.isArray(reply) ? { outcome: "OK", messages: reply } : reply;
+    },
     markOperatorMessageRead: async () => ({}),
     replyToOperatorMessage: async () => ({}),
   } as never;
@@ -84,7 +91,7 @@ async function threadList() {
   return app.threadLists[0]!;
 }
 
-function renderList(operatorMessages: () => Promise<ReturnType<typeof message>[]>) {
+function renderList(operatorMessages: (input: { projectId: string }) => Promise<InboxReply>) {
   return renderSlot(threadListRegistration!, props(), {
     sidebarThreads: { status: "ready", projects: [{ id: "project-a", name: "Project A", isPersonal: false }], threads: [] },
     rpc: rpcHandlers(operatorMessages),
@@ -270,6 +277,33 @@ describe("inbox unread nav indicator", () => {
     // #then the proven count survives the failure rather than reading as zero
     expect(call).toBeGreaterThan(1);
     expect(inboxDot()?.getAttribute(INBOX_UNREAD_MARKER)).toBe("2");
+  });
+
+  it("counts the unregistered outcome as a proven zero rather than retaining the last count", async () => {
+    // #280: an answered read is a proven count. The unregistered outcome carries
+    // no rows, so it proves zero without the poll reading any sentence — the
+    // message is reworded between polls to make that plain.
+    threadListRegistration = await threadList();
+    navRegion();
+    vi.useFakeTimers();
+    const sentences = ["operator inbox project is not registered", "aucune boîte de réception"];
+    let call = 0;
+    renderList(async () => {
+      call += 1;
+      if (call === 1) return [message(1, null), message(2, null)];
+      return { outcome: "PROJECT_CONFIG_REQUIRED", message: sentences[call % 2]!, messages: [] };
+    });
+
+    // #when a proven 2 is followed by two unregistered answers
+    await vi.advanceTimersByTimeAsync(1);
+    expect(inboxDot()?.getAttribute(INBOX_UNREAD_MARKER)).toBe("2");
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    // #then the dot is gone, and stays gone when the sentence changes
+    expect(inboxDot()).toBeNull();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(call).toBeGreaterThan(2);
+    expect(inboxDot()).toBeNull();
   });
 
   it("records the break once rather than on every poll", async () => {

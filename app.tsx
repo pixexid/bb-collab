@@ -17,7 +17,8 @@ type ThreadStates = PluginRpcResult<typeof rpcContract["threadStates"]>;
 type ThreadModels = PluginRpcResult<typeof rpcContract["threadModels"]>;
 type ThreadExecution = NonNullable<ThreadModels[string]>;
 type SidebarCollapseState = PluginRpcResult<typeof rpcContract["sidebarCollapseState"]>;
-type OperatorMessage = PluginRpcResult<typeof rpcContract["operatorMessages"]>[number];
+type OperatorMessagesResult = PluginRpcResult<typeof rpcContract["operatorMessages"]>;
+type OperatorMessage = OperatorMessagesResult["messages"][number];
 
 const SETTINGS_ACTION_TITLE = "bb-collab settings";
 
@@ -38,15 +39,17 @@ const SIDEBAR_RPC_BATCH_SIZE = 256;
 const INBOX_FILTER_STORAGE_KEY = "bb-collab.inbox-filters";
 // The host lists every BB project while inbox registration lives in
 // `project_config_heads`, so the aggregate fan-out necessarily reads projects
-// that have no inbox. That rejection is the normal case there and is skipped.
-// It is skipped ONLY there: picking one project by name is a question about
-// that project, and it is owed the answer. There is no typed error on this
-// path yet, so the match is exact-message equality against the sentence
-// server.ts throws — a wrapped or quoted failure stays visible.
-const UNREGISTERED_INBOX_PROJECT = "operator inbox project is not registered";
+// that have no inbox. The reader answers that benign condition with a
+// foundation code in its result, and this is the only thing either consumer
+// branches on: the accompanying human sentence can be reworded or localised
+// without moving the behaviour (#280). It is skipped ONLY in aggregate mode —
+// picking one project by name is a question about that project, and it is
+// owed the answer. A rejection is a failed read and stays visible whatever it
+// says.
+const UNREGISTERED_INBOX_PROJECT = "PROJECT_CONFIG_REQUIRED" satisfies OperatorMessagesResult["outcome"];
 
-function isUnregisteredInboxProject(reason: unknown): boolean {
-  return reason instanceof Error && reason.message === UNREGISTERED_INBOX_PROJECT;
+function isUnregisteredInboxProject(result: OperatorMessagesResult): boolean {
+  return result.outcome === UNREGISTERED_INBOX_PROJECT;
 }
 
 const INBOX_UNREAD_POLL_MS = 30_000;
@@ -550,17 +553,15 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
       if (cancelled) return;
       const unread = results.reduce((total, result, index) => {
         const projectId = projectIds[index]!;
+        // An answered read is a proven count, including the unregistered
+        // outcome, which carries no rows and so proves zero — no sentence is
+        // consulted to reach that (#280). A rejection is a failed read, and a
+        // failed read is not an empty inbox: keep the count that project did
+        // prove rather than erasing it.
         if (result.status === "fulfilled") {
-          const count = result.value.filter((message) => message.readAtMs === null).length;
+          const count = result.value.messages.filter((message) => message.readAtMs === null).length;
           provenUnread.current.set(projectId, count);
           return total + count;
-        }
-        // A project with no inbox registered has proven zero unread; anything
-        // else is a failed read, and a failed read is not an empty inbox. Keep
-        // the last count that project did prove rather than erasing it.
-        if (isUnregisteredInboxProject(result.reason)) {
-          provenUnread.current.set(projectId, 0);
-          return total;
         }
         return total + (provenUnread.current.get(projectId) ?? 0);
       }, 0);
@@ -808,8 +809,10 @@ function InboxPanel(_props: PluginNavPanelProps) {
         const loaded: OperatorMessage[] = [];
         const failed: string[] = [];
         results.forEach((result, index) => {
-          if (result.status === "fulfilled") loaded.push(...result.value);
-          else if (projectId !== "" || !isUnregisteredInboxProject(result.reason)) failed.push(`${projects[index]!.name} (${projects[index]!.id}): ${String(result.reason)}`);
+          const label = `${projects[index]!.name} (${projects[index]!.id})`;
+          if (result.status === "rejected") failed.push(`${label}: ${String(result.reason)}`);
+          else if (!isUnregisteredInboxProject(result.value)) loaded.push(...result.value.messages);
+          else if (projectId !== "") failed.push(`${label}: ${result.value.outcome}`);
         });
         loaded.sort((left, right) => Number(left.readAtMs !== null) - Number(right.readAtMs !== null) || right.createdAtMs - left.createdAtMs || right.messageId - left.messageId);
         setMessages(loaded);

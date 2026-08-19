@@ -30,6 +30,7 @@ import {
   roleContextPreflightRefusal,
   writingLaneCeilingFromJson,
   type ApplyRequest,
+  type FoundationCode,
   type FoundationResult,
   type RoleFactReader,
   type SqliteDatabase,
@@ -254,6 +255,15 @@ const operatorMessageSchema = z.object({
   notificationStatus: z.enum(["not-requested", "deduplicated", "sent", "failed"]),
   notificationError: z.string().nullable(),
 }).strict();
+// #280: the inbox reader's outcome is a foundation code, not a sentence. The
+// codes are the repo's existing vocabulary — `satisfies` is the standing proof
+// that this is not a parallel error scheme invented at the app boundary.
+const OPERATOR_MESSAGES_OUTCOMES = ["OK", "PROJECT_CONFIG_REQUIRED"] as const satisfies readonly FoundationCode[];
+const operatorMessagesResultSchema = z.object({
+  outcome: z.enum(OPERATOR_MESSAGES_OUTCOMES),
+  message: z.string().optional(),
+  messages: z.array(operatorMessageSchema),
+}).strict();
 const sendOperatorMessageInputSchema = z.object({
   project_id: projectIdSchema,
   recipient: operatorRecipientSchema,
@@ -329,7 +339,7 @@ export const rpcContract = defineRpcContract({
       recipient: operatorRecipientSchema.optional(),
       withSenderTitles: z.boolean().optional(),
     }).strict(),
-    output: z.array(operatorMessageSchema),
+    output: operatorMessagesResultSchema,
   },
   markOperatorMessageRead: {
     input: z.object({ projectId: projectIdSchema, messageId: z.number().int().positive() }).strict(),
@@ -796,12 +806,21 @@ const operatorMessageSelect = `SELECT message.*,
    ORDER BY attempt.created_at_ms DESC LIMIT 1) AS sender_lane_id
   FROM operator_messages AS message`;
 
-function requireRegisteredInboxProject(db: SqliteDatabase | null, projectId: string) {
+const UNREGISTERED_INBOX_MESSAGE = "operator inbox project is not registered";
+
+function inboxProjectIsRegistered(db: SqliteDatabase, projectId: string): boolean {
+  return db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId) !== undefined;
+}
+
+function requireInboxStore(db: SqliteDatabase | null): SqliteDatabase {
   if (!db) throw new Error("operator inbox store is unavailable");
-  if (!db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId)) {
-    throw new Error("operator inbox project is not registered");
-  }
   return db;
+}
+
+function requireRegisteredInboxProject(db: SqliteDatabase | null, projectId: string) {
+  const store = requireInboxStore(db);
+  if (!inboxProjectIsRegistered(store, projectId)) throw new Error(UNREGISTERED_INBOX_MESSAGE);
+  return store;
 }
 
 function readOperatorMessage(db: SqliteDatabase | null, projectId: string, messageId: number) {
@@ -832,15 +851,24 @@ async function listOperatorMessages(
   projectId: string,
   recipient?: z.infer<typeof operatorRecipientSchema>,
   withSenderTitles = false,
-) {
-  const store = requireRegisteredInboxProject(db, projectId);
+): Promise<z.infer<typeof operatorMessagesResultSchema>> {
+  const store = requireInboxStore(db);
+  // The unregistered-inbox condition is an answer, not a rejection: the app's
+  // aggregate fan-out reads every BB project while inbox registration lives in
+  // `project_config_heads`, so it must tell that benign condition from a failed
+  // read. It travels as a code in the result because the SDK reduces every
+  // thrown handler error to `{ code: "handler_error", message }` — a code on
+  // the error would not survive the boundary, and the message is prose (#280).
+  if (!inboxProjectIsRegistered(store, projectId)) {
+    return { outcome: "PROJECT_CONFIG_REQUIRED", message: UNREGISTERED_INBOX_MESSAGE, messages: [] };
+  }
   const recipientClause = recipient === undefined ? "" : " AND message.recipient = ?";
   const rows = store.prepare(`${operatorMessageSelect}
     WHERE message.project_id = ?${recipientClause}
     ORDER BY (message.read_at_ms IS NULL) DESC, message.created_at_ms DESC, message.message_id DESC
     LIMIT ${OPERATOR_MESSAGE_LIMIT}`).all(...(recipient === undefined ? [projectId] : [projectId, recipient])) as OperatorMessageRow[];
   const messages = rows.map(operatorMessage);
-  return withSenderTitles ? resolveSenderTitles(bb, messages) : messages;
+  return { outcome: "OK", messages: withSenderTitles ? await resolveSenderTitles(bb, messages) : messages };
 }
 
 async function markOperatorMessageRead(db: SqliteDatabase | null, bb: BbPluginApi, projectId: string, messageId: number) {
@@ -1110,7 +1138,12 @@ async function runCli(
     const parsedRecipient = recipient === null ? undefined : operatorRecipientSchema.safeParse(recipient);
     if (parsedRecipient && !parsedRecipient.success) return invalidCli(parsedRecipient.error.message);
     try {
-      return { exitCode: 0, stdout: JSON.stringify(await listOperatorMessages(db, bb, projectId, parsedRecipient?.data)) };
+      const listed = await listOperatorMessages(db, bb, projectId, parsedRecipient?.data);
+      // The reader answers a refusal instead of throwing it (#280), so the CLI has
+      // to refuse on its own account. The code is the fallback because `message` is
+      // optional on the result and a future outcome could arrive without one.
+      if (listed.outcome !== "OK") return invalidCli(listed.message ?? listed.outcome);
+      return { exitCode: 0, stdout: JSON.stringify(listed.messages) };
     } catch (error) {
       return invalidCli(error instanceof Error ? error.message : String(error));
     }
