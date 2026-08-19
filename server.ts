@@ -1266,6 +1266,81 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     db = null;
   }
 
+  const recoveryInFlight = new Set<string>();
+  const isCurrentRoleHolder = (holder: RoleHolderState) => db !== null && readRoleHolderStates(db).some((candidate) =>
+    candidate.project_id === holder.project_id &&
+    candidate.role_id === holder.role_id &&
+    candidate.role_generation === holder.role_generation &&
+    candidate.execution_attempt_id === holder.execution_attempt_id &&
+    candidate.thread_id === holder.thread_id,
+  );
+  const recoverErroredThread = async (threadId: string, projectId: string, holder?: RoleHolderState) => {
+    if (recoveryInFlight.has(threadId) || db === null) return false;
+    recoveryInFlight.add(threadId);
+    try {
+      if (!db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId)) return false;
+      const thread = await bb.sdk.threads.get({ threadId });
+      if (
+        thread.id !== threadId || thread.projectId !== projectId || thread.status !== "error" ||
+        thread.archivedAt !== null || thread.deletedAt !== null || (holder !== undefined && !isCurrentRoleHolder(holder))
+      ) return false;
+
+      let head = "unavailable (re-fetch before continuing)";
+      if (thread.environmentId !== null) {
+        try {
+          const status = await bb.sdk.environments.status({ environmentId: thread.environmentId });
+          if (status.outcome === "available") {
+            const checkout = status.workspace.checkout;
+            if (checkout.kind === "branch" || checkout.kind === "detached") head = checkout.headSha ?? `${checkout.kind} checkout with no HEAD`;
+            else head = checkout.kind === "unborn" ? "unborn checkout" : `unknown (${checkout.reason})`;
+          }
+        } catch (error) {
+          bb.log.warn(`error-recovery head unavailable: thread=${threadId} ${String(error)}`);
+        }
+      }
+      await bb.sdk.threads.send({
+        threadId,
+        mode: "auto",
+        input: [{
+          type: "text",
+          visibility: "agent-only",
+          text: `RECOVERY WAKE — reconcile state before resuming. The workspace and recorded conversation survived the daemon interruption, but the interrupted turn may have half-applied intent and a composed instruction may not have been delivered. Observed checkout head: ${head}. Re-fetch and confirm the current head, reconcile the frozen work order and canonical state against the conversation, identify any half-applied mutation or lost delivery, and re-run every pre-crash measurement whose command and output are not visible before continuing.`,
+          mentions: [],
+        }],
+      });
+      bb.log.warn(`error-recovery wake sent: project=${projectId} thread=${threadId} mode=auto head=${head}`);
+      return true;
+    } catch (error) {
+      bb.log.warn(`error-recovery wake failed: project=${projectId} thread=${threadId} ${String(error)}`);
+      return null;
+    } finally {
+      recoveryInFlight.delete(threadId);
+    }
+  };
+  const reconcileErrorRecovery = async () => {
+    if (db === null) {
+      bb.log.error("error-recovery coverage=blind event=blind roleRestart=blind roles=unknown laneRestart=blind unboundOpenWorkItems=unknown reason=canonical-store-unreadable;work-items-have-no-thread-binding:GH-300");
+      return;
+    }
+    let holders: RoleHolderState[];
+    let openWorkItems: number;
+    try {
+      holders = readRoleHolderStates(db);
+      openWorkItems = (db.prepare(
+        "SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')",
+      ).get() as { count: number }).count;
+    } catch (error) {
+      bb.log.error(`error-recovery coverage=blind event=armed roleRestart=blind roles=unknown laneRestart=blind unboundOpenWorkItems=unknown reason=role-inventory-unreadable:${String(error)};work-items-have-no-thread-binding:GH-300`);
+      return;
+    }
+    let failedRoles = 0;
+    for (const holder of holders) {
+      if (await recoverErroredThread(holder.thread_id, holder.project_id, holder) === null) failedRoles += 1;
+    }
+    const roleRestart = failedRoles === 0 ? "armed" : "degraded";
+    bb.log.error(`error-recovery coverage=blind event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=blind unboundOpenWorkItems=${openWorkItems} reason=work-items-have-no-thread-binding:GH-300`);
+  };
+
   const readPendingExternalWait = async (threadId: string) => {
     try {
       return (await bb.sdk.threads.interactions.list({ threadId })).some((interaction) => interaction.status === "pending");
@@ -1512,13 +1587,18 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   };
   bb.events.on("thread.active", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
   bb.events.on("thread.idle", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
-  bb.events.on("thread.failed", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
+  bb.events.on("thread.failed", async (payload) => {
+    await observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`));
+    const { id, status } = threadEventStatus(payload);
+    if (status === "error") await recoverErroredThread(id, payload.thread.projectId);
+  });
   bb.events.on("thread.archived", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
   bb.events.on("thread.deleted", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
   const unsubscribe = subscribeToThreadChanges(bb.sdk, (threadId, status, archived = false) => watcher.observe(threadId, status, undefined, archived));
   bb.onDispose(unsubscribe);
   bb.background.service("lane-watcher", {
     async start(signal) {
+      await reconcileErrorRecovery();
       while (!signal.aborted) {
         await watcher.poll().catch((error) => bb.log.warn(`lane poll failed: ${String(error)}`));
         await escalationCycle.cycle().catch((error) => bb.log.warn(`wait escalation failed: ${String(error)}`));
