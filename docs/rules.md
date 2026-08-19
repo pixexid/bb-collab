@@ -328,7 +328,7 @@ Keep unobserved, unreadable, and known outcomes distinct. A partial detector nam
 
 > When the caller controls every input a check uses, it cannot establish the property it claims to check.
 
-`receipt_digest` is SHA-256 over public row fields, so a sanctioned writer can choose every field and compute the digest that `requireActor` accepts. A mint endpoint callable from inside the system would make `requireActor` decorative while the tests stayed green. This is the third appearance of the same shape, after stubbed guards and a standby profile reporting coverage that nothing consumed.
+`receipt_digest` is SHA-256 over public row fields, so a sanctioned writer that controls every checked public row field can choose them all and compute the digest that `requireActor` accepts. A mint endpoint would make `requireActor` decorative only if its caller likewise controlled every checked field or the endpoint added no independent authority; being callable from inside the system alone proves neither. This is the third appearance of the same shape, after stubbed guards and a standby profile reporting coverage that nothing consumed.
 
 ## Fallback-only routing observability is blind to uniformity
 
