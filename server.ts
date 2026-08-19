@@ -56,7 +56,7 @@ import {
   waitValidatorStateDir,
   type SourceObservation,
 } from "./src/registered-waits.js";
-import { runArchiveSweep } from "./src/archive-sweep.js";
+import { ARCHIVE_SWEEP_GUARD, createArchiveSweepRefusalCounter, runArchiveSweep, type ArchiveSweepRefusalAggregate } from "./src/archive-sweep.js";
 import { canonicalWorktreePath, cleanupGitWorktrees, listAllProjectThreads } from "./src/worktree-cleanup.js";
 import { findCheckoutRoot, readCheckoutDivergence, type CheckoutDivergence } from "./src/checkout-divergence.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -2146,23 +2146,44 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   // This is deliberately a report-only schedule. Archive is available only
   // through the explicit collab archive-sweep --apply command below.
+  const archiveSweepRefusalCounter = createArchiveSweepRefusalCounter();
   bb.background.schedule("thread-archive-sweep", "0 * * * *", async () => {
+    archiveSweepRefusalCounter.beginCycle();
+    const refusalsThisCycle = new Map<string, { aggregate: ArchiveSweepRefusalAggregate; firstSighting: boolean }>();
+    const refusalMessage = (aggregate: ArchiveSweepRefusalAggregate) => `${ARCHIVE_SWEEP_GUARD} coverage=degraded guard=${aggregate.guard} reason=${aggregate.reason} occurrencesSinceReload=${aggregate.occurrencesSinceReload} cyclesSinceReload=${aggregate.cyclesSinceReload} projectsSinceReload=${aggregate.projectsSinceReload} sinceReloadAt=${new Date(aggregate.sinceReloadAtMs).toISOString()}`;
+    const recordRefusal = (reason: string, projectId: string | null) => {
+      const aggregate = archiveSweepRefusalCounter.observe(reason, projectId);
+      const firstSighting = aggregate.occurrencesSinceReload === 1;
+      if (firstSighting) bb.log.warn(refusalMessage(aggregate));
+      refusalsThisCycle.set(aggregate.reason, { aggregate, firstSighting });
+    };
+    const reportRefusals = () => {
+      if (refusalsThisCycle.size === 0) {
+        bb.log.info("thread-archive-sweep healthy cycle");
+        return;
+      }
+      for (const { aggregate, firstSighting } of refusalsThisCycle.values()) {
+        if (firstSighting && aggregate.occurrencesSinceReload === 1) continue;
+        bb.log.warn(refusalMessage(aggregate));
+      }
+    };
     let projects: Awaited<ReturnType<typeof bb.sdk.projects.list>>;
     try {
       projects = await bb.sdk.projects.list({ includePersonal: true });
     } catch (error) {
       const result = { outcome: "refused" as const, message: `project inventory unavailable: ${String(error)}` };
-      bb.log.warn(`thread archive sweep refused: ${result.message}`);
+      recordRefusal(result.message, null);
       bb.realtime.publish("thread-archive-sweep", result);
+      reportRefusals();
       return;
     }
     for (const project of projects) {
       const result = await runArchiveSweep(bb, db, project.id);
-      if (result.outcome === "refused") bb.log.warn(`thread archive sweep refused for project=${project.id}: ${result.message ?? "unknown read failure"}`);
+      if (result.outcome === "refused") recordRefusal(result.message ?? "unknown read failure", project.id);
       else bb.log.info(`thread archive sweep reported ${result.archivableThreadIds.length} archivable threads for project=${project.id}`);
       bb.realtime.publish("thread-archive-sweep", { projectId: project.id, ...result });
     }
-    bb.log.info("thread-archive-sweep healthy cycle");
+    reportRefusals();
   });
 
   const readOpenLaneViews = async () => [];

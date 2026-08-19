@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing";
 import { MIGRATIONS, databaseIsReady, PLUGIN_ID } from "../src/foundation.js";
 import * as awareness from "../src/awareness.js";
-import { runArchiveSweep } from "../src/archive-sweep.js";
+import { createArchiveSweepRefusalCounter, runArchiveSweep } from "../src/archive-sweep.js";
 
 const now = 48 * 60 * 60 * 1000;
 const PROJECT_ID = "proj_a8zzfsx36j";
@@ -88,6 +88,36 @@ afterEach(() => {
 });
 
 describe("thread archive sweep", () => {
+  it("folds exact archive refusal keys across projects and cycles", () => {
+    const counter = createArchiveSweepRefusalCounter(1234);
+    counter.beginCycle();
+    expect(counter.observe("constructed refusal", "project-a")).toMatchObject({
+      guard: "thread-archive-sweep",
+      reason: "constructed refusal",
+      occurrencesSinceReload: 1,
+      cyclesSinceReload: 1,
+      projectsSinceReload: 1,
+      sinceReloadAtMs: 1234,
+    });
+    expect(counter.observe("constructed refusal", "project-b")).toMatchObject({
+      occurrencesSinceReload: 2,
+      cyclesSinceReload: 1,
+      projectsSinceReload: 2,
+    });
+    counter.beginCycle();
+    expect(counter.observe("constructed refusal", "project-a")).toMatchObject({
+      occurrencesSinceReload: 3,
+      cyclesSinceReload: 2,
+      projectsSinceReload: 2,
+    });
+    expect(counter.observe("different refusal", "project-a")).toMatchObject({
+      reason: "different refusal",
+      occurrencesSinceReload: 1,
+      cyclesSinceReload: 1,
+      projectsSinceReload: 1,
+    });
+  });
+
   it("bound role-holder idle past floor is not archived", async () => {
     const { db, host } = fixture();
     process.env.BB_COLLAB_ARCHIVE_IDLE_H = "24";

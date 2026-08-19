@@ -19950,6 +19950,48 @@ function livenessDecision(state, alerted) {
 // src/archive-sweep.ts
 var DEFAULT_ARCHIVE_SWEEP_IDLE_HOURS = 24;
 var THREAD_LIST_LIMIT = 1e3;
+var ARCHIVE_SWEEP_GUARD = "thread-archive-sweep";
+function createArchiveSweepRefusalCounter(sinceReloadAtMs = Date.now()) {
+  let cycle = 0;
+  const states = /* @__PURE__ */ new Map();
+  return {
+    beginCycle() {
+      cycle += 1;
+    },
+    observe(reason, projectId) {
+      if (cycle === 0) throw new Error("archive refusal counter cycle has not started");
+      const key = `${ARCHIVE_SWEEP_GUARD}\0${reason}`;
+      const existing = states.get(key) ?? {
+        guard: ARCHIVE_SWEEP_GUARD,
+        reason,
+        occurrencesSinceReload: 0,
+        cyclesSinceReload: 0,
+        projectsSinceReload: 0,
+        sinceReloadAtMs,
+        lastCycle: 0,
+        projectIds: /* @__PURE__ */ new Set()
+      };
+      existing.occurrencesSinceReload += 1;
+      if (existing.lastCycle !== cycle) {
+        existing.cyclesSinceReload += 1;
+        existing.lastCycle = cycle;
+      }
+      if (projectId !== null && !existing.projectIds.has(projectId)) {
+        existing.projectIds.add(projectId);
+        existing.projectsSinceReload = existing.projectIds.size;
+      }
+      states.set(key, existing);
+      return {
+        guard: existing.guard,
+        reason: existing.reason,
+        occurrencesSinceReload: existing.occurrencesSinceReload,
+        cyclesSinceReload: existing.cyclesSinceReload,
+        projectsSinceReload: existing.projectsSinceReload,
+        sinceReloadAtMs: existing.sinceReloadAtMs
+      };
+    }
+  };
+}
 function protectedThreadIds(db, projectId) {
   const attemptCount = db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ?").get(projectId)?.count;
   if (!Number.isInteger(attemptCount) || attemptCount === 0) throw new Error("execution attempts are unavailable or empty");
@@ -22155,23 +22197,44 @@ ${thread.titleFallback ?? ""}`);
     bb.log.warn(`fleet-watchdog history reset: project=${projectId} invokedBy=${invokedBy} at=${Date.now()}`);
   };
   bb.background.schedule("fleet-watchdog", "0 * * * *", () => fleetWatchdogCycle());
+  const archiveSweepRefusalCounter = createArchiveSweepRefusalCounter();
   bb.background.schedule("thread-archive-sweep", "0 * * * *", async () => {
+    archiveSweepRefusalCounter.beginCycle();
+    const refusalsThisCycle = /* @__PURE__ */ new Map();
+    const refusalMessage = (aggregate) => `${ARCHIVE_SWEEP_GUARD} coverage=degraded guard=${aggregate.guard} reason=${aggregate.reason} occurrencesSinceReload=${aggregate.occurrencesSinceReload} cyclesSinceReload=${aggregate.cyclesSinceReload} projectsSinceReload=${aggregate.projectsSinceReload} sinceReloadAt=${new Date(aggregate.sinceReloadAtMs).toISOString()}`;
+    const recordRefusal = (reason, projectId) => {
+      const aggregate = archiveSweepRefusalCounter.observe(reason, projectId);
+      const firstSighting = aggregate.occurrencesSinceReload === 1;
+      if (firstSighting) bb.log.warn(refusalMessage(aggregate));
+      refusalsThisCycle.set(aggregate.reason, { aggregate, firstSighting });
+    };
+    const reportRefusals = () => {
+      if (refusalsThisCycle.size === 0) {
+        bb.log.info("thread-archive-sweep healthy cycle");
+        return;
+      }
+      for (const { aggregate, firstSighting } of refusalsThisCycle.values()) {
+        if (firstSighting && aggregate.occurrencesSinceReload === 1) continue;
+        bb.log.warn(refusalMessage(aggregate));
+      }
+    };
     let projects;
     try {
       projects = await bb.sdk.projects.list({ includePersonal: true });
     } catch (error48) {
       const result2 = { outcome: "refused", message: `project inventory unavailable: ${String(error48)}` };
-      bb.log.warn(`thread archive sweep refused: ${result2.message}`);
+      recordRefusal(result2.message, null);
       bb.realtime.publish("thread-archive-sweep", result2);
+      reportRefusals();
       return;
     }
     for (const project of projects) {
       const result2 = await runArchiveSweep(bb, db, project.id);
-      if (result2.outcome === "refused") bb.log.warn(`thread archive sweep refused for project=${project.id}: ${result2.message ?? "unknown read failure"}`);
+      if (result2.outcome === "refused") recordRefusal(result2.message ?? "unknown read failure", project.id);
       else bb.log.info(`thread archive sweep reported ${result2.archivableThreadIds.length} archivable threads for project=${project.id}`);
       bb.realtime.publish("thread-archive-sweep", { projectId: project.id, ...result2 });
     }
-    bb.log.info("thread-archive-sweep healthy cycle");
+    reportRefusals();
   });
   const readOpenLaneViews = async () => [];
   bb.events.on("thread.created", async ({ thread }) => {

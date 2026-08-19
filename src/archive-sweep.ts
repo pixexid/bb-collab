@@ -4,6 +4,66 @@ import type { SqliteDatabase } from "./foundation.js";
 
 export const DEFAULT_ARCHIVE_SWEEP_IDLE_HOURS = 24;
 const THREAD_LIST_LIMIT = 1000;
+export const ARCHIVE_SWEEP_GUARD = "thread-archive-sweep";
+
+export type ArchiveSweepRefusalAggregate = {
+  guard: typeof ARCHIVE_SWEEP_GUARD;
+  reason: string;
+  occurrencesSinceReload: number;
+  cyclesSinceReload: number;
+  projectsSinceReload: number;
+  sinceReloadAtMs: number;
+};
+
+type ArchiveSweepRefusalState = ArchiveSweepRefusalAggregate & {
+  lastCycle: number;
+  projectIds: Set<string>;
+};
+
+export function createArchiveSweepRefusalCounter(sinceReloadAtMs = Date.now()) {
+  let cycle = 0;
+  const states = new Map<string, ArchiveSweepRefusalState>();
+  return {
+    beginCycle(): void {
+      cycle += 1;
+    },
+    observe(reason: string, projectId: string | null): ArchiveSweepRefusalAggregate {
+      if (cycle === 0) throw new Error("archive refusal counter cycle has not started");
+      // This exact prose is the aggregation key, not control flow: rewording it
+      // splits the signal, while normalization would merge distinct failures.
+      // Project id is intentionally excluded from the key.
+      const key = `${ARCHIVE_SWEEP_GUARD}\u0000${reason}`;
+      const existing = states.get(key) ?? {
+        guard: ARCHIVE_SWEEP_GUARD,
+        reason,
+        occurrencesSinceReload: 0,
+        cyclesSinceReload: 0,
+        projectsSinceReload: 0,
+        sinceReloadAtMs,
+        lastCycle: 0,
+        projectIds: new Set<string>(),
+      };
+      existing.occurrencesSinceReload += 1;
+      if (existing.lastCycle !== cycle) {
+        existing.cyclesSinceReload += 1;
+        existing.lastCycle = cycle;
+      }
+      if (projectId !== null && !existing.projectIds.has(projectId)) {
+        existing.projectIds.add(projectId);
+        existing.projectsSinceReload = existing.projectIds.size;
+      }
+      states.set(key, existing);
+      return {
+        guard: existing.guard,
+        reason: existing.reason,
+        occurrencesSinceReload: existing.occurrencesSinceReload,
+        cyclesSinceReload: existing.cyclesSinceReload,
+        projectsSinceReload: existing.projectsSinceReload,
+        sinceReloadAtMs: existing.sinceReloadAtMs,
+      };
+    },
+  };
+}
 
 export type ArchiveSweepResult = {
   outcome: "reported" | "applied" | "refused";

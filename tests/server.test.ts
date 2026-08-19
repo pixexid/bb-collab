@@ -410,6 +410,7 @@ function hostFor(
       },
       projects: {
         get: async () => project,
+        list: async () => [project],
       },
       plugins: {
         getSource: async () => ({
@@ -2491,6 +2492,32 @@ describe("bb-collab plugin boundary", () => {
     const replied = await host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "cannot vanish" });
     expect(replied).toMatchObject({ repliedAtMs: null, replyText: "cannot vanish", replyDeliveryError: expect.stringContaining("environment deleted") });
     expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("emits the first archive refusal before folding a same-key second project", async () => {
+    const host = hostFor();
+    host.harness.sdk.stub("projects.list", (async () => [projectFacts(PROJECT_ID), projectFacts("project-two")]) as never);
+    await plugin(host.bb);
+
+    await host.harness.runSchedule("thread-archive-sweep");
+
+    const warnings = host.harness.inspection.logEntries.filter((entry) => entry.level === "warn" && entry.message.startsWith("thread-archive-sweep coverage=degraded"));
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]?.message).toMatch(/reason=execution attempts are unavailable or empty occurrencesSinceReload=1 cyclesSinceReload=1 projectsSinceReload=1 /u);
+    expect(warnings[1]?.message).toMatch(/reason=execution attempts are unavailable or empty occurrencesSinceReload=2 cyclesSinceReload=1 projectsSinceReload=2 /u);
+  });
+
+  it("discloses archive refusal counts since plugin reload", async () => {
+    const host = hostFor();
+    host.harness.sdk.stub("projects.list", (async () => { throw new Error("constructed archive refusal"); }) as never);
+    await plugin(host.bb);
+
+    await host.harness.runSchedule("thread-archive-sweep");
+    await host.harness.runSchedule("thread-archive-sweep");
+
+    const warnings = host.harness.inspection.logEntries.filter((entry) => entry.level === "warn" && entry.message.startsWith("thread-archive-sweep coverage=degraded"));
+    expect(warnings).toHaveLength(2);
+    expect(warnings.at(-1)?.message).toMatch(/occurrencesSinceReload=2 cyclesSinceReload=2 projectsSinceReload=0 sinceReloadAt=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u);
   });
 
   it("does not wake a quiet director seat", async () => {
