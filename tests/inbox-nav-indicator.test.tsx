@@ -9,13 +9,28 @@ import {
   INBOX_NAV_REGION_SELECTOR,
   INBOX_NAV_ROW_TITLE,
   INBOX_UNREAD_MARKER,
+  inspectInboxNavGlyph,
   paintInboxNavUnread,
 } from "../src/inbox-nav-indicator";
 
-function navRegion({ testid = "plugin-nav-sidebar-items", inboxLabel = INBOX_NAV_ROW_TITLE } = {}): HTMLElement {
+const MAIL = "M7 8.5L9.94 10.24a4 4 0 0 0 4.11 0L17 8.5";
+const GIT_BRANCH = "M7 19h6a3 3 0 0 0 3-3v-6";
+
+function row(label: string, path: string | null): string {
+  const glyph = path === null ? "" : `<svg><path d="${path}"/></svg>`;
+  return `<button type="button">${glyph}<span>${label}</span></button>`;
+}
+
+function navRegion({
+  testid = "plugin-nav-sidebar-items",
+  inboxLabel = INBOX_NAV_ROW_TITLE,
+  inboxGlyph = null as string | null,
+  lanesGlyph = null as string | null,
+  extraRows = "",
+} = {}): HTMLElement {
   const region = document.createElement("div");
   region.setAttribute("data-testid", testid);
-  region.innerHTML = `<button type="button"><span>Lanes</span></button><button type="button"><span>${inboxLabel}</span></button>`;
+  region.innerHTML = `${row("Lanes", lanesGlyph)}${row(inboxLabel, inboxGlyph)}${extraRows}`;
   document.body.append(region);
   return region;
 }
@@ -122,7 +137,7 @@ describe("inbox unread nav indicator", () => {
 
     // #then
     expect(painted.matched).toBe(false);
-    expect(painted.matched === false ? painted.reason : "").toContain("no row of the 2");
+    expect(painted.matched === false ? painted.reason : "").toContain("0 of the 2 rows");
     expect(inboxDot()).toBeNull();
   });
 
@@ -166,5 +181,60 @@ describe("inbox unread nav indicator", () => {
     await waitFor(() => expect(rendered.getByRole("alert").textContent).toContain(INBOX_INDICATOR_BROKEN_TITLE));
     expect(recorded).toHaveBeenCalledWith(expect.stringContaining(INBOX_INDICATOR_BROKEN_TITLE));
     expect(inboxDot()).toBeNull();
+  });
+  it("reports broken when a second row is also titled Inbox", () => {
+    // #given a valid-but-wrong match: the dot would land on someone else's row
+    navRegion({ extraRows: `<button type="button"><span>${INBOX_NAV_ROW_TITLE}</span></button>` });
+
+    // #when
+    const painted = paintInboxNavUnread(document, 3);
+
+    // #then
+    expect(painted.matched).toBe(false);
+    expect(painted.matched === false ? painted.reason : "").toContain("2 of the 3 rows");
+    expect(inboxDot()).toBeNull();
+  });
+
+  it("accepts distinct row geometry", () => {
+    // #given
+    navRegion({ inboxGlyph: MAIL, lanesGlyph: GIT_BRANCH });
+
+    // #when / #then
+    expect(inspectInboxNavGlyph(document)).toEqual({ matched: true });
+  });
+
+  it("reports broken when both rows fall back to the same glyph", () => {
+    // #given the failure the icon probe hit: unknown names collapsing onto one default
+    navRegion({ inboxGlyph: GIT_BRANCH, lanesGlyph: GIT_BRANCH });
+
+    // #when
+    const inspected = inspectInboxNavGlyph(document);
+
+    // #then
+    expect(inspected?.matched).toBe(false);
+    expect(inspected?.matched === false ? inspected.reason : "").toContain("draw the same glyph");
+  });
+
+  it("judges nothing when the rows carry no readable geometry", () => {
+    // #given
+    navRegion();
+
+    // #when / #then
+    expect(inspectInboxNavGlyph(document)).toBeNull();
+  });
+
+  it("surfaces the collapsed-glyph death through the live poll", async () => {
+    // #given
+    threadListRegistration = await threadList();
+    navRegion({ inboxGlyph: GIT_BRANCH, lanesGlyph: GIT_BRANCH });
+    const recorded = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    // #when
+    const rendered = renderList(async () => [message(1, null)]);
+
+    // #then
+    await waitFor(() => expect(rendered.getByRole("alert").textContent).toContain("draw the same glyph"));
+    expect(recorded).toHaveBeenCalledWith(expect.stringContaining(INBOX_INDICATOR_BROKEN_TITLE));
+    expect(inboxDot()?.getAttribute(INBOX_UNREAD_MARKER)).toBe("1");
   });
 });

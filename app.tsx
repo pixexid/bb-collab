@@ -8,7 +8,7 @@ import type {
   PluginSidebarThread,
   PluginThreadListProps,
 } from "@bb/plugin-sdk/app";
-import { INBOX_INDICATOR_BROKEN_TITLE, paintInboxNavUnread } from "./src/inbox-nav-indicator";
+import { INBOX_INDICATOR_BROKEN_TITLE, inspectInboxNavGlyph, paintInboxNavUnread } from "./src/inbox-nav-indicator";
 import { providerMark, providerMarkKey } from "./src/provider-marks";
 import type { rpcContract } from "./server";
 
@@ -549,13 +549,17 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
       const unread = results.reduce((total, result) => result.status === "fulfilled"
         ? total + result.value.filter((message) => message.readAtMs === null).length
         : total, 0);
+      // Two deaths, not one: the row goes missing, or the row is there and the
+      // glyph beside it is the wrong one. The second returns null when it
+      // cannot be judged, which is not a failure and must not read as one.
       const painted = paintInboxNavUnread(document, unread);
-      if (painted.matched) {
+      const broken = painted.matched === false ? painted : inspectInboxNavGlyph(document);
+      if (broken === null || broken.matched) {
         setIndicatorBroken(null);
         return;
       }
-      console.error(`[bb-collab] ${INBOX_INDICATOR_BROKEN_TITLE}: ${painted.reason}`);
-      setIndicatorBroken(painted.reason);
+      console.error(`[bb-collab] ${INBOX_INDICATOR_BROKEN_TITLE}: ${broken.reason}`);
+      setIndicatorBroken(broken.reason);
     };
     void paint();
     const timer = window.setInterval(() => { void paint(); }, INBOX_UNREAD_POLL_MS);

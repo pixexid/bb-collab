@@ -77,19 +77,28 @@ var {
 // src/inbox-nav-indicator.ts
 var INBOX_NAV_REGION_SELECTOR = '[data-testid="plugin-nav-sidebar-items"]';
 var INBOX_NAV_ROW_TITLE = "Inbox";
+var LANES_NAV_ROW_TITLE = "Lanes";
 var INBOX_UNREAD_MARKER = "data-bb-collab-inbox-unread";
 var INBOX_INDICATOR_BROKEN_TITLE = "Inbox unread indicator broken";
 var DOT_STYLE = "margin-left:auto;flex:0 0 auto;width:0.5rem;height:0.5rem;border-radius:9999px;background-color:currentColor";
-function paintInboxNavUnread(root, unread) {
+var GEOMETRY_ATTRIBUTES = ["d", "points", "cx", "cy", "r", "rx", "ry", "x", "y", "x1", "y1", "x2", "y2", "width", "height"];
+function navRows(root) {
   const region = root.querySelector(INBOX_NAV_REGION_SELECTOR);
-  if (region === null) {
+  return region === null ? null : Array.from(region.querySelectorAll("button"));
+}
+function rowsTitled(rows, title) {
+  return rows.filter((row) => row.textContent?.trim() === title);
+}
+function paintInboxNavUnread(root, unread) {
+  const rows = navRows(root);
+  if (rows === null) {
     return { matched: false, reason: `no element matches ${INBOX_NAV_REGION_SELECTOR}` };
   }
-  const rows = Array.from(region.querySelectorAll("button"));
-  const row = rows.find((candidate) => candidate.textContent?.trim() === INBOX_NAV_ROW_TITLE);
-  if (row === void 0) {
-    return { matched: false, reason: `no row of the ${rows.length} in ${INBOX_NAV_REGION_SELECTOR} is titled ${JSON.stringify(INBOX_NAV_ROW_TITLE)}` };
+  const matches = rowsTitled(rows, INBOX_NAV_ROW_TITLE);
+  if (matches.length !== 1) {
+    return { matched: false, reason: `${matches.length} of the ${rows.length} rows in ${INBOX_NAV_REGION_SELECTOR} are titled ${JSON.stringify(INBOX_NAV_ROW_TITLE)}, expected exactly 1` };
   }
+  const row = matches[0];
   const existing = row.querySelector(`[${INBOX_UNREAD_MARKER}]`);
   if (unread < 1) {
     existing?.remove();
@@ -101,6 +110,30 @@ function paintInboxNavUnread(root, unread) {
   dot.setAttribute("title", `${unread} unread operator ${unread === 1 ? "message" : "messages"}`);
   dot.setAttribute("style", DOT_STYLE);
   return { matched: true };
+}
+function glyphFingerprint(row) {
+  const asset = row.querySelector("[data-plugin-icon-asset]");
+  if (asset !== null) return `asset:${asset.getAttribute("data-plugin-icon-asset") ?? ""}`;
+  const shapes = Array.from(row.querySelectorAll("svg *")).map((node) => {
+    const geometry = GEOMETRY_ATTRIBUTES.flatMap((name) => {
+      const value = node.getAttribute(name);
+      return value === null ? [] : [`${name}=${value}`];
+    });
+    return geometry.length === 0 ? "" : `${node.tagName}[${geometry.join(",")}]`;
+  }).filter((shape) => shape !== "");
+  return shapes.length === 0 ? null : shapes.join("|");
+}
+function inspectInboxNavGlyph(root) {
+  const rows = navRows(root);
+  if (rows === null) return null;
+  const inbox = rowsTitled(rows, INBOX_NAV_ROW_TITLE);
+  const lanes = rowsTitled(rows, LANES_NAV_ROW_TITLE);
+  if (inbox.length !== 1 || lanes.length !== 1) return null;
+  const inboxGlyph = glyphFingerprint(inbox[0]);
+  const lanesGlyph = glyphFingerprint(lanes[0]);
+  if (inboxGlyph === null || lanesGlyph === null) return null;
+  if (inboxGlyph !== lanesGlyph) return { matched: true };
+  return { matched: false, reason: `the ${INBOX_NAV_ROW_TITLE} and ${LANES_NAV_ROW_TITLE} rows draw the same glyph (${inboxGlyph}) though they declare different icons` };
 }
 
 // src/provider-marks.ts
@@ -590,12 +623,13 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
       if (cancelled) return;
       const unread = results.reduce((total, result) => result.status === "fulfilled" ? total + result.value.filter((message) => message.readAtMs === null).length : total, 0);
       const painted = paintInboxNavUnread(document, unread);
-      if (painted.matched) {
+      const broken = painted.matched === false ? painted : inspectInboxNavGlyph(document);
+      if (broken === null || broken.matched) {
         setIndicatorBroken(null);
         return;
       }
-      console.error(`[bb-collab] ${INBOX_INDICATOR_BROKEN_TITLE}: ${painted.reason}`);
-      setIndicatorBroken(painted.reason);
+      console.error(`[bb-collab] ${INBOX_INDICATOR_BROKEN_TITLE}: ${broken.reason}`);
+      setIndicatorBroken(broken.reason);
     };
     void paint();
     const timer = window.setInterval(() => {

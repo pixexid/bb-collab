@@ -97,8 +97,35 @@ region selector or the row title stops matching. The sidebar poll turns that
 into a visible `Inbox unread indicator broken` alert in the thread list — the
 one plugin surface that is on screen without opening a panel — and a recorded
 `console.error` carrying the reason. Zero-match is never silently nothing.
-`tests/inbox-nav-indicator.test.tsx` fires the switch both ways, by renaming the
-test id and by relabelling the row.
+
+The switch covers two deaths, because the indicator has two:
+
+- **Zero-match.** The region test id is renamed, or the row is relabelled, and
+  nothing matches. `paintInboxNavUnread` reports it.
+- **Valid but wrong.** Something plausible is still drawn and the operator reads
+  it as truth. Two shapes of it are detectable, and both report broken: a
+  *second* row also titled `Inbox`, where the dot would land on a row that is not
+  ours; and the two rows of this plugin drawing the *same* glyph though they
+  declare different icons, which is the precedence collapse and the
+  unknown-name-falls-back-to-default case at once. `inspectInboxNavGlyph` reads
+  drawn geometry rather than class names — a minified host class says nothing
+  about which glyph it is — and compares `Inbox` against the `Lanes` control,
+  because a control row is the only thing that tells a collapse apart from a
+  fallback.
+
+**What cannot be detected from inside the plugin, stated plainly:** whether the
+glyph drawn beside `Inbox` is the one `Inbox` *declared*. The host owns the icon
+registry, exposes no "which glyph did I get" reading, and renders an unknown
+name as a default with no error. Comparing against a hardcoded expected path
+would only trade this blind spot for a coupling that breaks — loudly and
+falsely — the next time the host redraws its icon set. So the check answers the
+narrower question it can answer honestly: *did two rows that declare different
+icons end up identical.* A single row drawing a wrong-but-unique glyph is not
+caught, and `inspectInboxNavGlyph` returns `null` rather than a verdict whenever
+the control row or the geometry is unreadable.
+
+`tests/inbox-nav-indicator.test.tsx` fires the switch on every detectable mode:
+renamed test id, relabelled row, duplicate row, and collapsed glyph.
 
 **RETIREMENT: when get-bb/bb#1852 is resolved upstream, replace this with the
 real affordance and re-close the exception.** Delete `src/inbox-nav-indicator.ts`,
