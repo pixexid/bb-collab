@@ -6,7 +6,7 @@ This is the canonical role and review matrix. It describes operating choices, no
 
 | Role or lane | Harness/provider | Model | Reasoning |
 | --- | --- | --- | --- |
-| Director | `claude-code` or `pi` | `claude-opus-5[1m]` or `zai/glm-5.3` | MEDIUM / HIGH |
+| Director | `claude-code` or `pi` | `kimi-coding/k3`, `claude-opus-5[1m]`, or `zai/glm-5.3` | MEDIUM / HIGH |
 | Orchestrator primary | `claude-code` | `claude-opus-5[1m]` | MEDIUM |
 | Orchestrator alternate | `codex` | `gpt-5.6-sol` | MEDIUM |
 | Merge-bound worker (routine) | `codex` | `gpt-5.6-luna` | Any, up to MAX |
@@ -22,7 +22,9 @@ When the diversity line and the Tier-A reviewer row conflict — sol-authored wo
 
 The diversity line governs at every tier. Where a tier's designated reviewer shares the author's model, the dispatcher either names a differing seat in the routing line, or applies the fallback ladder and names which rung it used.
 
-The former deprecated profile is dropped from the director seat entirely by operator decision for latency.
+The director standby must use a different provider from the holder; same-provider pairings are refused with `ROLE_STANDBY_INVALID`.
+
+`k3` names a decision; `kimi-coding/k3` names a SKU; `kimi-coding/k3-256k` names a different SKU and is refused by exact string. The canonical store compares exact strings, so every profile-deciding surface writes the full `provider/model` string, such as `pi/kimi-coding/k3`.
 
 `zai/glm-5.3` is temporarily withdrawn from non-director placement to conserve peak-hour usage; the resulting one-provider worker spread is accepted for peak hours as the priced-in cost of the withdrawal; Codex is therefore the only worker provider, and Codex saturation escalates to the operator with usage data rather than re-seating on GLM.
 
