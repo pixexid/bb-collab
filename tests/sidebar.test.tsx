@@ -76,13 +76,20 @@ function rpcHandlers(states: Record<string, string> = {}, models: Record<string,
     setSidebarCollapse: async (input: { kind: "project" | "thread"; id: string; collapsed: boolean }) => input,
     reorderPinned: async () => ({ ok: true }),
     setThreadState: async (input: { threadId: string; state: string | null }) => ({ state: input.state }),
-    operatorMessages: async () => [],
+    operatorMessages: async () => ({ outcome: "OK", messages: [] }),
     markOperatorMessageRead: async () => ({}),
     replyToOperatorMessage: async () => ({}),
     doctor: async () => ({}) as never,
     export: async () => ({}) as never,
     apply: async () => ({}) as never,
   } as never;
+}
+
+// #280: the reader answers { outcome, messages }. Cases that only vary the rows
+// keep returning arrays and are wrapped in the OK outcome here; a case about the
+// outcome itself returns the result directly.
+function okMessages<A>(handler: (input: A) => Promise<unknown[]>) {
+  return async (input: A) => ({ outcome: "OK", messages: await handler(input) });
 }
 
 describe("replacement thread list", () => {
@@ -124,7 +131,7 @@ describe("replacement thread list", () => {
     }]);
     const rendered = renderSlot(inbox, { subPath: "" }, {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
-      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages } as never,
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(operatorMessages) } as never,
     });
 
     await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a", withSenderTitles: true }));
@@ -145,7 +152,7 @@ describe("replacement thread list", () => {
     const operatorMessages = vi.fn(async ({ projectId }: { projectId: string }) => messages[projectId as keyof typeof messages] ?? []);
     const rendered = renderSlot(inbox, { subPath: "" }, {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A"), project("project-b", "Project B")], threads: [] },
-      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages } as never,
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(operatorMessages) } as never,
     });
 
     await waitFor(() => expect(rendered.getByText("unread B")).toBeTruthy());
@@ -196,7 +203,7 @@ describe("replacement thread list", () => {
     }]);
     const rendered = renderSlot(inbox, { subPath: "" }, {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
-      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages } as never,
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(operatorMessages) } as never,
     });
 
     await waitFor(() => expect(rendered.getByText("Visible after deletion")).toBeTruthy());
@@ -209,7 +216,7 @@ describe("replacement thread list", () => {
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
     const rendered = renderSlot(inbox, { subPath: "" }, {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
-      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => [{
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(async () => [{
         messageId: 4,
         projectId: "project-a",
         recipient: "operator" as const,
@@ -225,7 +232,7 @@ describe("replacement thread list", () => {
         replyDeliveryError: null,
         notificationStatus: "not-requested" as const,
         notificationError: null,
-      }] } as never,
+      }]) } as never,
     });
 
     const sender = await waitFor(() => rendered.getByRole("link", { name: "Open sender session sender-thread" }));
@@ -270,7 +277,7 @@ describe("replacement thread list", () => {
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
     const rendered = renderSlot(inbox, { subPath: "" }, {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
-      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => [{
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(async () => [{
         messageId: 6,
         projectId: "project-a",
         recipient: "operator" as const,
@@ -285,7 +292,7 @@ describe("replacement thread list", () => {
         replyDeliveryError: null,
         notificationStatus: "not-requested" as const,
         notificationError: null,
-      } as never] } as never,
+      } as never]) } as never,
     });
 
     await waitFor(() => expect(rendered.getByText("Inbox remains mounted")).toBeTruthy());
@@ -302,7 +309,7 @@ describe("replacement thread list", () => {
     });
     const rendered = renderSlot(inbox, { subPath: "" }, {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A"), project("project-b", "Project B")], threads: [] },
-      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages } as never,
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(operatorMessages) } as never,
     });
 
     await waitFor(() => expect(rendered.getByText("loaded A")).toBeTruthy());
@@ -313,9 +320,9 @@ describe("replacement thread list", () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
     const operatorMessages = vi.fn(async ({ projectId }: { projectId: string }) => {
-      if (projectId === "project-b") throw new Error("operator inbox project is not registered");
+      if (projectId === "project-b") return { outcome: "PROJECT_CONFIG_REQUIRED", message: "operator inbox project is not registered", messages: [] };
       if (projectId === "project-c") throw new Error("project unavailable");
-      return [{ messageId: 7, projectId, recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "loaded A", createdAtMs: 1, readAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null }];
+      return { outcome: "OK", messages: [{ messageId: 7, projectId, recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "loaded A", createdAtMs: 1, readAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null }] };
     });
     const rendered = renderSlot(inbox, { subPath: "" }, {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A"), project("project-b", "Project B"), project("project-c", "Project C")], threads: [] },
@@ -324,30 +331,24 @@ describe("replacement thread list", () => {
 
     await waitFor(() => expect(rendered.getByText("loaded A")).toBeTruthy());
     expect(rendered.getByText(/Unable to read inbox: Project C \(project-c\): Error: project unavailable/)).toBeTruthy();
-    expect(rendered.queryByText(/not registered/)).toBeNull();
     expect(rendered.queryByText(/Unable to read inbox: Project B/)).toBeNull();
     expect(rendered.container.querySelectorAll("p.text-destructive")).toHaveLength(1);
   });
 
-  it("binds the skip to the rejection the server itself produces, and only in aggregate mode", async () => {
+  it("binds the skip to the outcome code the server itself produces, and only in aggregate mode", async () => {
     const host = createFakePluginHost({ pluginId: "bb-collab" });
     await plugin(host.bb);
-    // The rejection is taken from the running server rather than authored here:
-    // reword the throw at server.ts:794, or wrap the sentinel as the cause of
-    // another Error, and this stops matching — the error becomes visible
-    // instead of the skip silently over-reaching. A change of THROWN TYPE does
-    // not break it: createFakePluginHost canonicalises every handler rejection
-    // through errorMessage() and rethrows a new Error, so a non-Error throw
-    // reaches the panel as an Error carrying the sentinel. Closing that case
-    // needs a domain code rather than a message (#280).
-    const serverRejection = await host.harness.callRpc("operatorMessages", { projectId: "project-b" }).then(() => null, (error: unknown) => error);
-    expect(serverRejection).toBeInstanceOf(Error);
+    // The result is taken from the running server rather than authored here, so
+    // a server that stopped answering PROJECT_CONFIG_REQUIRED for this
+    // condition breaks the test rather than the operator's screen.
+    const serverResult = await host.harness.callRpc("operatorMessages", { projectId: "project-b" }) as { outcome: string; message?: string };
+    expect(serverResult.outcome).toBe("PROJECT_CONFIG_REQUIRED");
 
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
     const options = {
       sidebarThreads: { status: "ready" as const, projects: [project("project-b", "Project B")], threads: [] },
-      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => { throw serverRejection; } } as never,
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => serverResult } as never,
     };
 
     const aggregate = renderSlot(inbox, { subPath: "" }, options);
@@ -355,7 +356,46 @@ describe("replacement thread list", () => {
     expect(aggregate.container.querySelectorAll("p.text-destructive")).toHaveLength(0);
 
     fireEvent.change(aggregate.getByLabelText("Project"), { target: { value: "project-b" } });
-    await waitFor(() => expect(aggregate.getByText(/Unable to read inbox: Project B \(project-b\): Error: operator inbox project is not registered/)).toBeTruthy());
+    await waitFor(() => expect(aggregate.getByText("Unable to read inbox: Project B (project-b): PROJECT_CONFIG_REQUIRED")).toBeTruthy());
+  });
+
+  it("branches on the outcome code alone, so rewording the human sentence moves nothing", async () => {
+    // #280's whole point, read in scoped mode because that is where skipping and
+    // loading-zero-rows look different: the code must produce the refusal row
+    // for every sentence, including the one the panel used to match on, a
+    // localised one, and none at all.
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+
+    for (const message of ["operator inbox project is not registered", "le projet n'a pas de boîte de réception", undefined]) {
+      const rendered = renderSlot(inbox, { subPath: "" }, {
+        sidebarThreads: { status: "ready" as const, projects: [project("project-b", "Project B")], threads: [] },
+        rpc: {
+          ...(rpcHandlers() as unknown as Record<string, unknown>),
+          operatorMessages: async () => ({ outcome: "PROJECT_CONFIG_REQUIRED", ...(message === undefined ? {} : { message }), messages: [] }),
+        } as never,
+      });
+
+      await waitFor(() => expect(rendered.getByText("No messages for this project and recipient filter.")).toBeTruthy());
+      expect(rendered.container.querySelectorAll("p.text-destructive")).toHaveLength(0);
+      fireEvent.change(rendered.getByLabelText("Project"), { target: { value: "project-b" } });
+      await waitFor(() => expect(rendered.getByText("Unable to read inbox: Project B (project-b): PROJECT_CONFIG_REQUIRED")).toBeTruthy());
+      cleanup();
+      window.localStorage.clear();
+    }
+  });
+
+  it("treats a rejection carrying the old sentence as the failed read it is", async () => {
+    // The inverse direction: the exact sentence the panel used to branch on now
+    // buys nothing, because a rejection is a failed read whatever it says.
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-b", "Project B")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => { throw new Error("operator inbox project is not registered"); } } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText(/Unable to read inbox: Project B \(project-b\): Error: operator inbox project is not registered/)).toBeTruthy());
   });
 
   it("keeps a failure that merely quotes the unregistered sentence visible", async () => {
@@ -374,7 +414,7 @@ describe("replacement thread list", () => {
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
     const rendered = renderSlot(inbox, { subPath: "" }, {
       sidebarThreads: { status: "ready", projects: [project("proj_a8zzfsx36j", "bb-collab")], threads: [] },
-      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => [{ messageId: 8, projectId: "proj_a8zzfsx36j", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "header check", createdAtMs: 1, readAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null }] } as never,
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(async () => [{ messageId: 8, projectId: "proj_a8zzfsx36j", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "header check", createdAtMs: 1, readAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null }]) } as never,
     });
 
     await waitFor(() => expect(rendered.getByText("header check")).toBeTruthy());
@@ -392,7 +432,7 @@ describe("replacement thread list", () => {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
       rpc: {
         ...(rpcHandlers() as unknown as Record<string, unknown>),
-        operatorMessages: async () => [message],
+        operatorMessages: okMessages(async () => [message]),
         markOperatorMessageRead: async () => ({ ...message, readAtMs: 5 }),
         replyToOperatorMessage: async () => ({ ...message, readAtMs: 5, repliedAtMs: 6, replyText: "on it" }),
       } as never,
@@ -413,7 +453,7 @@ describe("replacement thread list", () => {
     const messages = Array.from({ length: 257 }, (_, index) => ({ messageId: index + 1, projectId: "project-a", recipient: "operator" as const, senderThreadId: "sender", senderLaneId: null, severity: "routine" as const, text: `message ${index + 1}`, createdAtMs: 257 - index, readAtMs: 1, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null }));
     const rendered = renderSlot(inbox, { subPath: "" }, {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
-      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => messages } as never,
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(async () => messages) } as never,
     });
 
     await waitFor(() => expect(rendered.getByText("message 1")).toBeTruthy());

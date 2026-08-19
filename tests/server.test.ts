@@ -1904,14 +1904,17 @@ describe("bb-collab plugin boundary", () => {
       expect(cli.exitCode).toBe(0);
       expect(JSON.parse(cli.stdout)).toMatchObject({ projectId: PROJECT_ID, recipient: "supervisor", notificationStatus: "not-requested" });
       const titleReadsBeforeList = host.harness.inspection.sdk.callsTo("threads.get").length;
-      expect(await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID })).toHaveLength(6);
+      expect((await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID }) as { messages: unknown[] }).messages).toHaveLength(6);
       expect(host.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(titleReadsBeforeList);
-      expect(await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, withSenderTitles: true })).toEqual(
+      expect((await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, withSenderTitles: true }) as { messages: unknown[] }).messages).toEqual(
         expect.arrayContaining([expect.objectContaining({ senderThreadId: ROLE_THREAD_ID, senderTitle: "Managed role holder" })]),
       );
       expect(host.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(titleReadsBeforeList + 1);
-      expect(await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, recipient: "supervisor" })).toHaveLength(2);
-      await expect(host.harness.callRpc("operatorMessages", { projectId: FOREIGN_PROJECT_ID })).rejects.toThrow("not registered");
+      expect((await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, recipient: "supervisor" }) as { messages: unknown[] }).messages).toHaveLength(2);
+      // #280: the unregistered project is an outcome code, not a rejection. The
+      // exact project match still gates the read — no foreign row is returned.
+      expect(await host.harness.callRpc("operatorMessages", { projectId: FOREIGN_PROJECT_ID }))
+        .toEqual({ outcome: "PROJECT_CONFIG_REQUIRED", message: "operator inbox project is not registered", messages: [] });
       await expect(host.harness.callAgentTool("send_to_operator", {
         project_id: FOREIGN_PROJECT_ID,
         recipient: "operator",

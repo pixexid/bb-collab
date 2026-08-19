@@ -229,9 +229,9 @@ var MAX_VISIBLE_THREADS = 5;
 var MAX_VISIBLE_INBOX_MESSAGES = 256;
 var SIDEBAR_RPC_BATCH_SIZE = 256;
 var INBOX_FILTER_STORAGE_KEY = "bb-collab.inbox-filters";
-var UNREGISTERED_INBOX_PROJECT = "operator inbox project is not registered";
-function isUnregisteredInboxProject(reason) {
-  return reason instanceof Error && reason.message === UNREGISTERED_INBOX_PROJECT;
+var UNREGISTERED_INBOX_PROJECT = "PROJECT_CONFIG_REQUIRED";
+function isUnregisteredInboxProject(result) {
+  return result.outcome === UNREGISTERED_INBOX_PROJECT;
 }
 var INBOX_UNREAD_POLL_MS = 3e4;
 function readInboxFilters() {
@@ -654,13 +654,9 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
       const unread = results.reduce((total, result, index) => {
         const projectId = projectIds[index];
         if (result.status === "fulfilled") {
-          const count = result.value.filter((message) => message.readAtMs === null).length;
+          const count = result.value.messages.filter((message) => message.readAtMs === null).length;
           provenUnread.current.set(projectId, count);
           return total + count;
-        }
-        if (isUnregisteredInboxProject(result.reason)) {
-          provenUnread.current.set(projectId, 0);
-          return total;
         }
         return total + (provenUnread.current.get(projectId) ?? 0);
       }, 0);
@@ -886,8 +882,10 @@ function InboxPanel(_props) {
       const loaded = [];
       const failed = [];
       results.forEach((result, index) => {
-        if (result.status === "fulfilled") loaded.push(...result.value);
-        else if (projectId !== "" || !isUnregisteredInboxProject(result.reason)) failed.push(`${projects[index].name} (${projects[index].id}): ${String(result.reason)}`);
+        const label = `${projects[index].name} (${projects[index].id})`;
+        if (result.status === "rejected") failed.push(`${label}: ${String(result.reason)}`);
+        else if (!isUnregisteredInboxProject(result.value)) loaded.push(...result.value.messages);
+        else if (projectId !== "") failed.push(`${label}: ${result.value.outcome}`);
       });
       loaded.sort((left, right) => Number(left.readAtMs !== null) - Number(right.readAtMs !== null) || right.createdAtMs - left.createdAtMs || right.messageId - left.messageId);
       setMessages(loaded);
