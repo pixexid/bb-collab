@@ -19046,7 +19046,7 @@ function applyWorkItemTransition(db, request, digest) {
     request,
     configRevision,
     request.expectedResourceRevision,
-    nextState === "succeeded" || nextState === "failed" || nextState === "cancelled" || request.workItemWait === null
+    nextState !== void 0 || request.workItemWait === null
   );
   const wait = request.workItemWait;
   const workAttempt = request.workAttempt;

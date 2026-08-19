@@ -5729,7 +5729,7 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
     request,
     configRevision,
     request.expectedResourceRevision,
-    nextState === "succeeded" || nextState === "failed" || nextState === "cancelled" || request.workItemWait === null,
+    nextState !== undefined || request.workItemWait === null,
   );
   const wait = request.workItemWait;
   const workAttempt = request.workAttempt;
