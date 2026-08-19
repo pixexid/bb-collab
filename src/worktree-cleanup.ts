@@ -120,6 +120,8 @@ export function planWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeC
     // A detached scratch checkout records no thread id anywhere -- not in the path, the
     // gitdir, or the reflog -- so ownership can only be resolved affirmatively: the live
     // environment inventory was enumerated in full and no environment claims this path.
+    // GH-302 ruled that absence is report-only evidence: an apply mode must require a positive
+    // bb provenance marker instead. Ruling, measurement, and cost are in that issue's close comment.
     if (threadId === null) {
       if (entry.branch !== null) {
         decisions.push({ path: entry.path, population, action: "refuse", reason: `thread ownership unresolved for worktree on branch ${entry.branch}` });
