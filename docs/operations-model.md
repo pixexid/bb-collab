@@ -20,6 +20,8 @@ A reviewer must use a different model from the author; a different provider is p
 
 When the diversity line and the Tier-A reviewer row conflict — sol-authored work requiring Tier-A review — the diversity line governs: the reviewer is claude-code/claude-opus-5[1m] MEDIUM, named in the dispatch routing line.
 
+The diversity line governs at every tier; where a tier's designated reviewer shares the author's model, the dispatcher names a differing seat in the routing line.
+
 The `kimi-coding/k3` deprecation applies only to review placement; it remains the director default.
 
 `zai/glm-5.3` is temporarily withdrawn from non-director placement to conserve peak-hour usage; the resulting one-provider worker spread is accepted for peak hours as the priced-in cost of the withdrawal; Codex is therefore the only worker provider, and Codex saturation escalates to the operator with usage data rather than re-seating on GLM.
