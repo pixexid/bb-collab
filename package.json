@@ -18,6 +18,7 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "check:deployed-dist": "node scripts/check-dist.mjs --deployed",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "verify": "npm run typecheck && npm test && npm run build && node scripts/check-css-bundle.mjs && node scripts/role-brief-bundle.mjs"

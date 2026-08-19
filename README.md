@@ -2,6 +2,16 @@
 
 BB-native project governance, work lifecycle, and collaboration runtime.
 
+## Deployed artifact check
+
+After `bb plugin reload bb-collab`, run
+`npm run --silent check:deployed-dist` from any checkout. It resolves the
+installed `bb-collab` path through bb and refuses an absent or non-path source.
+It is silent when tracked `dist/` there matches the deployed commit; otherwise
+it exits nonzero, names every divergent artifact, and warns that the running
+plugin no longer matches that commit. This detects divergence after reload; it
+does not stop bb from rebuilding the frontend first.
+
 ## Sidebar thread list
 
 The optional `bb-collab thread list` provider groups live threads by stable
