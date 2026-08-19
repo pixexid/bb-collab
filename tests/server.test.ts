@@ -2107,7 +2107,7 @@ describe("bb-collab plugin boundary", () => {
     }));
   });
 
-  it("waits for a wrongful-idle target to become idle before steering it", async () => {
+  it("waits for a wrongful-idle target to become idle and names its canonical startable WorkItem", async () => {
     const fixture = await fleetWatchdogFixture(0);
     let artifact = "before";
     fixture.host.harness.sdk.stub("environments.pullRequest", (async () => artifact === "before"
@@ -2134,7 +2134,36 @@ describe("bb-collab plugin boundary", () => {
     releaseIdle();
     await expect(cycle).resolves.toMatchObject({ exitCode: 0 });
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.wait").length).toBeGreaterThan(0);
-    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").length).toBeGreaterThan(0);
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual(expect.arrayContaining([[
+      expect.objectContaining({
+        input: [expect.objectContaining({
+          text: `Wrongful idle: queue head ${WORK_ITEM_ID} is startable. Inspect the queue and act or record the blocker.`,
+        })],
+      }),
+    ]]));
+  });
+
+  it("does not fire wrongful-idle when canonical WorkItems are only in progress", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+    let artifact = "before";
+    fixture.host.harness.sdk.stub("environments.pullRequest", (async () => artifact === "before"
+      ? { outcome: "absent" }
+      : { outcome: "available", pullRequest: { updatedAt: artifact } }) as never);
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      status: "idle",
+      environmentId: `environment-${threadId}`,
+      updatedAt: 0,
+    })) as never);
+
+    expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
+    artifact = "after";
+    const cycle = await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID]);
+
+    expect(JSON.parse(cycle.stdout)).toMatchObject({ attempted: 0, verified: 0 });
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
   it("records a wrongful-idle timeout and retries its unchanged artifact later", async () => {

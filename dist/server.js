@@ -21302,6 +21302,17 @@ ${thread.titleFallback ?? ""}`);
       return false;
     }
     roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
+    let startable;
+    try {
+      startable = db.prepare(
+        `SELECT work_item_id FROM work_items
+         WHERE project_id = ? AND lifecycle_state IN ('proposed', 'ready')
+         ORDER BY created_at_ms, work_item_id LIMIT 1`
+      ).get(role.projectId);
+    } catch {
+      return "error";
+    }
+    if (!startable) return false;
     try {
       await sendWhenThreadIdle(bb, {
         threadId: holders[0].thread_id,
@@ -21310,7 +21321,7 @@ ${thread.titleFallback ?? ""}`);
           {
             type: "text",
             visibility: "agent-only",
-            text: `Wrongful idle: queue head ${role.queueHeadId} is startable. Inspect the queue and act or record the blocker.`,
+            text: `Wrongful idle: queue head ${startable.work_item_id} is startable. Inspect the queue and act or record the blocker.`,
             mentions: []
           }
         ]
