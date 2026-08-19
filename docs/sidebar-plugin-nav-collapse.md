@@ -76,6 +76,65 @@ narrow-viewport default. Both are host-owned.
   authority, cannot remove the host rows it duplicates, and doubles the
   keyboard/focus surface. Refused.
 
+## Narrow exception: the inbox unread indicator
+
+One use, and one only, is exempted from the refusals above. The operator ruled
+that the Inbox nav row must carry unread state before the panel is opened;
+`PluginNavPanelRegistration` still has no badge, count, or attention field, and
+the gap is filed upstream as get-bb/bb#1852. `src/inbox-nav-indicator.ts`
+therefore matches the host `data-testid` region and the row's visible title, and
+paints a dot on it.
+
+**SCOPE: the inbox unread indicator only. The refusal remains doctrine
+everywhere else.** Ordering, visibility, collapse, and every other row stay
+blocked on host support; nothing above is relaxed.
+
+The exception exists because of one property, and it is the mandatory
+condition attached to it: **a coupling that announces its own death is the
+difference between this exception and the agent-proxy version the doctrine
+refuses.** `paintInboxNavUnread` returns `{ matched: false, reason }` when the
+region selector or the row title stops matching. The sidebar poll turns that
+into a visible `Inbox unread indicator broken` alert in the thread list — the
+one plugin surface that is on screen without opening a panel — and a recorded
+`console.error` carrying the reason. Zero-match is never silently nothing.
+
+The switch covers two deaths, because the indicator has two:
+
+- **Zero-match.** The region test id is renamed, or the row is relabelled, and
+  nothing matches. `paintInboxNavUnread` reports it.
+- **Valid but wrong.** Something plausible is still drawn and the operator reads
+  it as truth. Two shapes of it are detectable, and both report broken: a
+  *second* row also titled `Inbox`, where the dot would land on a row that is not
+  ours; and the two rows of this plugin drawing the *same* glyph though they
+  declare different icons, which is the precedence collapse and the
+  unknown-name-falls-back-to-default case at once. `inspectInboxNavGlyph` reads
+  drawn geometry rather than class names — a minified host class says nothing
+  about which glyph it is — and compares `Inbox` against the `Lanes` control,
+  because a control row is the only thing that tells a collapse apart from a
+  fallback. "Geometry" is everything that moves pixels, `transform` and the
+  root `viewBox` included, not just `d`: the same path data rotated is a
+  different glyph, and a fingerprint blind to that would raise a false alarm on
+  a legitimate re-theme. This switch is the retirement signal for
+  get-bb/bb#1852, and a signal that fires on noise gets muted.
+
+**What cannot be detected from inside the plugin, stated plainly:** whether the
+glyph drawn beside `Inbox` is the one `Inbox` *declared*. The host owns the icon
+registry, exposes no "which glyph did I get" reading, and renders an unknown
+name as a default with no error. Comparing against a hardcoded expected path
+would only trade this blind spot for a coupling that breaks — loudly and
+falsely — the next time the host redraws its icon set. So the check answers the
+narrower question it can answer honestly: *did two rows that declare different
+icons end up identical.* A single row drawing a wrong-but-unique glyph is not
+caught, and `inspectInboxNavGlyph` returns `null` rather than a verdict whenever
+the control row or the geometry is unreadable.
+
+`tests/inbox-nav-indicator.test.tsx` fires the switch on every detectable mode:
+renamed test id, relabelled row, duplicate row, and collapsed glyph.
+
+**RETIREMENT: when get-bb/bb#1852 is resolved upstream, replace this with the
+real affordance and re-close the exception.** Delete `src/inbox-nav-indicator.ts`,
+its test, the poll in `SidebarThreadList`, and this section.
+
 ## Smallest host support that unblocks this
 
 Preferred, and smallest overall — extend the mechanism the host already has,

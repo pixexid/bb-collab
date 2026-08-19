@@ -66,8 +66,11 @@ Changing that title without changing the copy breaks a followable instruction;
 attention field — and `PluginContentScriptContext` exposes no nav-region handle.
 `docs/sidebar-plugin-nav-collapse.md` records the same boundary for the same
 region, and `tests/sidebar-nav-capability.test.ts` is its standing tripwire. The
-refused workarounds are unchanged and listed there: host `data-testid`
-selectors, `nth-child` position, and writing `bb.sidebar.*` client storage.
+refused workarounds are listed there: host `data-testid` selectors, `nth-child`
+position, and writing `bb.sidebar.*` client storage. One narrow exception has
+since been granted to the first of those — the inbox unread indicator, and
+nothing else — under the dead-man condition in that document's "Narrow
+exception" section. It does not extend to this waiting state.
 
 What *is* supported is the sanctioned thread-row status surface the lane pulse
 already uses, `PluginContentScriptContext.experimental_setThreadRowStatus`. The

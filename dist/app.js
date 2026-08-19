@@ -74,6 +74,92 @@ var {
   useSettings
 } = mod2;
 
+// src/inbox-nav-indicator.ts
+var INBOX_NAV_REGION_SELECTOR = '[data-testid="plugin-nav-sidebar-items"]';
+var INBOX_NAV_ROW_TITLE = "Inbox";
+var LANES_NAV_ROW_TITLE = "Lanes";
+var INBOX_UNREAD_MARKER = "data-bb-collab-inbox-unread";
+var INBOX_INDICATOR_BROKEN_TITLE = "Inbox unread indicator broken";
+var DOT_STYLE = "margin-left:auto;flex:0 0 auto;width:0.5rem;height:0.5rem;border-radius:9999px;background-color:currentColor";
+var RENDERING_ATTRIBUTES = [
+  "d",
+  "points",
+  "cx",
+  "cy",
+  "r",
+  "rx",
+  "ry",
+  "x",
+  "y",
+  "x1",
+  "y1",
+  "x2",
+  "y2",
+  "width",
+  "height",
+  "transform",
+  "transform-origin",
+  "style",
+  "viewBox",
+  "preserveAspectRatio",
+  "href",
+  "xlink:href",
+  "offset"
+];
+function navRows(root) {
+  const region = root.querySelector(INBOX_NAV_REGION_SELECTOR);
+  return region === null ? null : Array.from(region.querySelectorAll("button"));
+}
+function rowsTitled(rows, title) {
+  return rows.filter((row) => row.textContent?.trim() === title);
+}
+function paintInboxNavUnread(root, unread) {
+  const rows = navRows(root);
+  if (rows === null) {
+    return { matched: false, reason: `no element matches ${INBOX_NAV_REGION_SELECTOR}` };
+  }
+  const matches = rowsTitled(rows, INBOX_NAV_ROW_TITLE);
+  if (matches.length !== 1) {
+    return { matched: false, reason: `${matches.length} of the ${rows.length} rows in ${INBOX_NAV_REGION_SELECTOR} are titled ${JSON.stringify(INBOX_NAV_ROW_TITLE)}, expected exactly 1` };
+  }
+  const row = matches[0];
+  const existing = row.querySelector(`[${INBOX_UNREAD_MARKER}]`);
+  if (unread < 1) {
+    existing?.remove();
+    return { matched: true };
+  }
+  const dot = existing ?? row.appendChild(row.ownerDocument.createElement("span"));
+  dot.setAttribute(INBOX_UNREAD_MARKER, String(unread));
+  dot.setAttribute("aria-hidden", "true");
+  dot.setAttribute("title", `${unread} unread operator ${unread === 1 ? "message" : "messages"}`);
+  dot.setAttribute("style", DOT_STYLE);
+  return { matched: true };
+}
+function glyphFingerprint(row) {
+  const asset = row.querySelector("[data-plugin-icon-asset]");
+  if (asset !== null) return `asset:${asset.getAttribute("data-plugin-icon-asset") ?? ""}`;
+  const shapes = Array.from(row.querySelectorAll("svg, svg *")).map((node) => {
+    const geometry = RENDERING_ATTRIBUTES.flatMap((name) => {
+      const value = node.getAttribute(name);
+      return value === null ? [] : [`${name}=${value}`];
+    });
+    return geometry.length === 0 ? "" : `${node.tagName}[${geometry.join(",")}]`;
+  }).filter((shape) => shape !== "");
+  return shapes.length === 0 ? null : shapes.join("|");
+}
+function inspectInboxNavGlyph(root) {
+  const rows = navRows(root);
+  if (rows === null) return null;
+  const inbox = rowsTitled(rows, INBOX_NAV_ROW_TITLE);
+  const lanes = rowsTitled(rows, LANES_NAV_ROW_TITLE);
+  if (inbox.length !== 1 || lanes.length !== 1) return null;
+  const inboxGlyph = glyphFingerprint(inbox[0]);
+  const lanesGlyph = glyphFingerprint(lanes[0]);
+  if (inboxGlyph === null || lanesGlyph === null) return null;
+  if (inboxGlyph !== lanesGlyph) return { matched: true };
+  return { matched: false, reason: `the ${INBOX_NAV_ROW_TITLE} and ${LANES_NAV_ROW_TITLE} rows draw the same glyph (${inboxGlyph}) though they declare different icons` };
+}
+
 // src/provider-marks.ts
 var MARKS = {
   "codex": {
@@ -147,6 +233,7 @@ var UNREGISTERED_INBOX_PROJECT = "operator inbox project is not registered";
 function isUnregisteredInboxProject(reason) {
   return reason instanceof Error && reason.message === UNREGISTERED_INBOX_PROJECT;
 }
+var INBOX_UNREAD_POLL_MS = 3e4;
 function readInboxFilters() {
   try {
     const value = JSON.parse(window.localStorage.getItem(INBOX_FILTER_STORAGE_KEY) ?? "null");
@@ -511,8 +598,11 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
   const [collapsedProjects, setCollapsedProjects] = useState(() => /* @__PURE__ */ new Set());
   const [collapsedThreads, setCollapsedThreads] = useState(() => /* @__PURE__ */ new Set());
   const draggingThreadId = useRef(null);
+  const provenUnread = useRef(/* @__PURE__ */ new Map());
+  const reportedBreak = useRef(null);
   const dragTargetId = useRef(null);
   const [customStates, setCustomStates] = useState({});
+  const [indicatorBroken, setIndicatorBroken] = useState(null);
   const [threadModels, setThreadModels] = useState({});
   const threadIds = useMemo(() => sidebar.threads.map((thread) => thread.id), [sidebar.threads]);
   const threadIdsKey = threadIds.join("\0");
@@ -556,10 +646,65 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
       mounted = false;
     };
   }, [projectIdsKey, rpc, threadIdsKey]);
+  useEffect(() => {
+    let cancelled = false;
+    const paint = async () => {
+      const results = await Promise.allSettled(projectIds.map((projectId) => rpc.call("operatorMessages", { projectId })));
+      if (cancelled) return;
+      const unread = results.reduce((total, result, index) => {
+        const projectId = projectIds[index];
+        if (result.status === "fulfilled") {
+          const count = result.value.filter((message) => message.readAtMs === null).length;
+          provenUnread.current.set(projectId, count);
+          return total + count;
+        }
+        if (isUnregisteredInboxProject(result.reason)) {
+          provenUnread.current.set(projectId, 0);
+          return total;
+        }
+        return total + (provenUnread.current.get(projectId) ?? 0);
+      }, 0);
+      const painted = paintInboxNavUnread(document, unread);
+      const broken = painted.matched === false ? painted : inspectInboxNavGlyph(document);
+      if (broken === null || broken.matched) {
+        reportedBreak.current = null;
+        setIndicatorBroken(null);
+        return;
+      }
+      if (reportedBreak.current !== broken.reason) {
+        console.error(`[bb-collab] ${INBOX_INDICATOR_BROKEN_TITLE}: ${broken.reason}`);
+        reportedBreak.current = broken.reason;
+      }
+      setIndicatorBroken(broken.reason);
+    };
+    void paint();
+    const timer = window.setInterval(() => {
+      void paint();
+    }, INBOX_UNREAD_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      paintInboxNavUnread(document, 0);
+    };
+  }, [projectIdsKey, rpc]);
+  const indicatorAlert = indicatorBroken === null ? null : /* @__PURE__ */ jsxs("p", { role: "alert", className: "p-3 text-sm text-destructive", children: [
+    INBOX_INDICATOR_BROKEN_TITLE,
+    " \u2014 open Inbox to check for unread messages. Cause: ",
+    indicatorBroken
+  ] });
   const groups = groupThreads(sidebar.projects, sidebar.threads, searchQuery);
-  if (sidebar.status === "loading") return /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-muted-foreground", children: "Loading threads\u2026" });
-  if (sidebar.status === "error") return /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-destructive", children: "Unable to load threads." });
-  if (groups.length === 0) return /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-muted-foreground", children: "No matching threads." });
+  if (sidebar.status === "loading") return /* @__PURE__ */ jsxs(Fragment2, { children: [
+    indicatorAlert,
+    /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-muted-foreground", children: "Loading threads\u2026" })
+  ] });
+  if (sidebar.status === "error") return /* @__PURE__ */ jsxs(Fragment2, { children: [
+    indicatorAlert,
+    /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-destructive", children: "Unable to load threads." })
+  ] });
+  if (groups.length === 0) return /* @__PURE__ */ jsxs(Fragment2, { children: [
+    indicatorAlert,
+    /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-muted-foreground", children: "No matching threads." })
+  ] });
   const toggleProject = (projectId) => {
     const collapsed = !collapsedProjects.has(projectId);
     setCollapsedProjects((current) => {
@@ -624,38 +769,41 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
       !childrenCollapsed ? node.children.map((child) => renderNode(child, threadModels[child.thread.id] ?? null, depth + 1)) : null
     ] }, node.thread.id);
   };
-  return /* @__PURE__ */ jsx("div", { className: "h-full space-y-3 overflow-y-auto p-1", children: groups.map(({ project, threads }) => {
-    const tree = buildThreadTree(threads);
-    const collapsed = collapsedProjects.has(project.id);
-    const expanded = expandedProjects.has(project.id);
-    const visibleThreads = expanded ? tree : tree.slice(0, MAX_VISIBLE_THREADS);
-    const projectName = asText(project.name) ?? asText(project.id) ?? "Untitled project";
-    return /* @__PURE__ */ jsxs("section", { "aria-labelledby": `project-${project.id}`, children: [
-      /* @__PURE__ */ jsxs("div", { className: "flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-normal text-muted-foreground", children: [
-        /* @__PURE__ */ jsx("span", { className: "flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground", "aria-hidden": "true", children: projectAvatar(projectName) }),
-        /* @__PURE__ */ jsx("span", { id: `project-${project.id}`, className: "min-w-0 truncate", children: projectName }),
-        /* @__PURE__ */ jsx("span", { className: "ml-auto shrink-0", "data-project-thread-count": "", children: threads.length }),
-        /* @__PURE__ */ jsx("button", { type: "button", className: "inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none", "aria-label": `${collapsed ? "Expand" : "Collapse"} ${projectName} section`, "aria-expanded": !collapsed, onClick: () => toggleProject(project.id), children: collapsed ? "\u203A" : "\u2304" })
-      ] }),
-      !collapsed ? /* @__PURE__ */ jsxs("div", { className: "mt-0.5 space-y-px", children: [
-        visibleThreads.map((node) => renderNode(node, threadModels[node.thread.id] ?? null, 0)),
-        tree.length > MAX_VISIBLE_THREADS ? /* @__PURE__ */ jsx(
-          "button",
-          {
-            type: "button",
-            className: "flex h-6 w-full items-center rounded-md pl-2 text-left text-xs text-muted-foreground transition-colors duration-150 hover:bg-muted/50 hover:text-foreground motion-reduce:transition-none",
-            onClick: () => setExpandedProjects((current) => {
-              const updated = new Set(current);
-              if (expanded) updated.delete(project.id);
-              else updated.add(project.id);
-              return updated;
-            }),
-            children: expanded ? "Show less" : `Show more (${tree.length - MAX_VISIBLE_THREADS})`
-          }
-        ) : null
-      ] }) : null
-    ] }, project.id);
-  }) });
+  return /* @__PURE__ */ jsxs("div", { className: "h-full space-y-3 overflow-y-auto p-1", children: [
+    indicatorAlert,
+    groups.map(({ project, threads }) => {
+      const tree = buildThreadTree(threads);
+      const collapsed = collapsedProjects.has(project.id);
+      const expanded = expandedProjects.has(project.id);
+      const visibleThreads = expanded ? tree : tree.slice(0, MAX_VISIBLE_THREADS);
+      const projectName = asText(project.name) ?? asText(project.id) ?? "Untitled project";
+      return /* @__PURE__ */ jsxs("section", { "aria-labelledby": `project-${project.id}`, children: [
+        /* @__PURE__ */ jsxs("div", { className: "flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-normal text-muted-foreground", children: [
+          /* @__PURE__ */ jsx("span", { className: "flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground", "aria-hidden": "true", children: projectAvatar(projectName) }),
+          /* @__PURE__ */ jsx("span", { id: `project-${project.id}`, className: "min-w-0 truncate", children: projectName }),
+          /* @__PURE__ */ jsx("span", { className: "ml-auto shrink-0", "data-project-thread-count": "", children: threads.length }),
+          /* @__PURE__ */ jsx("button", { type: "button", className: "inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none", "aria-label": `${collapsed ? "Expand" : "Collapse"} ${projectName} section`, "aria-expanded": !collapsed, onClick: () => toggleProject(project.id), children: collapsed ? "\u203A" : "\u2304" })
+        ] }),
+        !collapsed ? /* @__PURE__ */ jsxs("div", { className: "mt-0.5 space-y-px", children: [
+          visibleThreads.map((node) => renderNode(node, threadModels[node.thread.id] ?? null, 0)),
+          tree.length > MAX_VISIBLE_THREADS ? /* @__PURE__ */ jsx(
+            "button",
+            {
+              type: "button",
+              className: "flex h-6 w-full items-center rounded-md pl-2 text-left text-xs text-muted-foreground transition-colors duration-150 hover:bg-muted/50 hover:text-foreground motion-reduce:transition-none",
+              onClick: () => setExpandedProjects((current) => {
+                const updated = new Set(current);
+                if (expanded) updated.delete(project.id);
+                else updated.add(project.id);
+                return updated;
+              }),
+              children: expanded ? "Show less" : `Show more (${tree.length - MAX_VISIBLE_THREADS})`
+            }
+          ) : null
+        ] }) : null
+      ] }, project.id);
+    })
+  ] });
 }
 function laneQueueLabel(lane) {
   if (lane.queueState !== "deferred" && !lane.deferredReason) {
