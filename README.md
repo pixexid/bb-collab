@@ -54,7 +54,15 @@ Shipped operational surfaces include:
   [#333](https://github.com/pixexid/bb-collab/pull/333), and
   [#336](https://github.com/pixexid/bb-collab/pull/336));
 - the `fleet-watchdog` no-seat floor, queue-intake, liveness, and recovery checks;
-  and
+- exact current role binding lookup with
+  `bb collab role-list --project PROJECT_ID`
+  ([#330](https://github.com/pixexid/bb-collab/pull/330));
+- the weekly GitHub-backed throughput report, invoked with
+  `npm run throughput-report -- --repo OWNER/REPO --start START_ISO --end END_ISO --dials-landed-at DIALS_ISO`
+  ([#342](https://github.com/pixexid/bb-collab/pull/342));
+- the report-only static production reachability check, invoked with
+  `node scripts/check-production-reachability.mjs`
+  ([#347](https://github.com/pixexid/bb-collab/pull/347)); and
 - the `review_pending` WorkItem lifecycle state, which separates completed
   authorship from work awaiting review
   ([#295](https://github.com/pixexid/bb-collab/issues/295)).
