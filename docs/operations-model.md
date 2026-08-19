@@ -45,10 +45,17 @@ Escalation is the director's, held directly. There is no named escalation seat: 
 
 The floor is the part that is easy to miss. `fleet-watchdog` subsumed the retired `sentinel-wake-floor` schedule, so escalation coverage was never lost when the seat stood down — it **relocated from a seat to a schedule**. That relocation was not written down, and on 2026-08-19 two seats independently concluded coverage was missing before checking. It is written down here so the next reader inherits the decision rather than the silence.
 
-### Role state is canonical in the role definition, not in thread surfaces
+### A role's definition and a seat's standing are different questions
 
 A thread's title, status, and pinned flag say nothing about whether it still holds its role. A stood-down or re-scoped seat keeps its original title, still reports `active`, and still errors and recovers like any other — so every surface a dispatcher naturally reads will describe a role the seat may no longer hold.
 
-Canonical role state lives in the role definitions under `docs/roles/` and in the role facts in `src/foundation.ts`. **A dispatcher reading thread surfaces is reading titles, not roles.**
+Two different things are canonical in two different places, and conflating them is how this goes wrong:
+
+| Question | Canonical source |
+| --- | --- |
+| What is this role, normatively? | the role definition under `docs/roles/` |
+| Who currently holds it, and do they still? | the `role_generation_heads` current-role query in the plugin database |
+
+The role pages say so themselves — "Live state is never this page" — and a checked-in file cannot answer a question whose answer changes without a commit. **A dispatcher reading thread surfaces is reading titles, not roles; a dispatcher reading `docs/roles/` is reading the definition, not the standing.**
 
 Inferring a recipient's role from surface attributes is the same error as reading a mounted worktree instead of the branch head, one level up. On 2026-08-19 a recovery wake ordered a seat to resume a duty it had not held for two days; the seat declining is the only thing that stopped it, which means the control was the recipient's judgement rather than anything the sender consulted.
