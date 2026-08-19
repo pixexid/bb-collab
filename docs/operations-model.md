@@ -6,7 +6,7 @@ This is the canonical role and review matrix. It describes operating choices, no
 
 | Role or lane | Harness/provider | Model | Reasoning |
 | --- | --- | --- | --- |
-| Director | `claude-code` or `pi` | `kimi-coding/k3`, `claude-opus-5[1m]`, or `zai/glm-5.3` | MEDIUM / HIGH |
+| Director | `claude-code` or `pi` (standby must use a different provider from the executed holder) | `pi/kimi-coding/k3`, `claude-code/claude-opus-5[1m]`, or `pi/zai/glm-5.3` | MEDIUM / HIGH |
 | Orchestrator primary | `claude-code` | `claude-opus-5[1m]` | MEDIUM |
 | Orchestrator alternate | `codex` | `gpt-5.6-sol` | MEDIUM |
 | Merge-bound worker (routine) | `codex` | `gpt-5.6-luna` | Any, up to MAX |
