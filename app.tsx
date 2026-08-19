@@ -490,6 +490,8 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set());
   const [collapsedThreads, setCollapsedThreads] = useState<Set<string>>(() => new Set());
   const draggingThreadId = useRef<string | null>(null);
+  const provenUnread = useRef(new Map<string, number>());
+  const reportedBreak = useRef<string | null>(null);
   const dragTargetId = useRef<string | null>(null);
   const [customStates, setCustomStates] = useState<ThreadStates>({});
   const [indicatorBroken, setIndicatorBroken] = useState<string | null>(null);
@@ -546,19 +548,38 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     const paint = async () => {
       const results = await Promise.allSettled(projectIds.map((projectId) => rpc.call("operatorMessages", { projectId })));
       if (cancelled) return;
-      const unread = results.reduce((total, result) => result.status === "fulfilled"
-        ? total + result.value.filter((message) => message.readAtMs === null).length
-        : total, 0);
+      const unread = results.reduce((total, result, index) => {
+        const projectId = projectIds[index]!;
+        if (result.status === "fulfilled") {
+          const count = result.value.filter((message) => message.readAtMs === null).length;
+          provenUnread.current.set(projectId, count);
+          return total + count;
+        }
+        // A project with no inbox registered has proven zero unread; anything
+        // else is a failed read, and a failed read is not an empty inbox. Keep
+        // the last count that project did prove rather than erasing it.
+        if (isUnregisteredInboxProject(result.reason)) {
+          provenUnread.current.set(projectId, 0);
+          return total;
+        }
+        return total + (provenUnread.current.get(projectId) ?? 0);
+      }, 0);
       // Two deaths, not one: the row goes missing, or the row is there and the
       // glyph beside it is the wrong one. The second returns null when it
       // cannot be judged, which is not a failure and must not read as one.
       const painted = paintInboxNavUnread(document, unread);
       const broken = painted.matched === false ? painted : inspectInboxNavGlyph(document);
       if (broken === null || broken.matched) {
+        reportedBreak.current = null;
         setIndicatorBroken(null);
         return;
       }
-      console.error(`[bb-collab] ${INBOX_INDICATOR_BROKEN_TITLE}: ${broken.reason}`);
+      // The alert is the standing report; the error records the transition, so
+      // a break that lasts an hour does not write 120 identical lines.
+      if (reportedBreak.current !== broken.reason) {
+        console.error(`[bb-collab] ${INBOX_INDICATOR_BROKEN_TITLE}: ${broken.reason}`);
+        reportedBreak.current = broken.reason;
+      }
       setIndicatorBroken(broken.reason);
     };
     void paint();

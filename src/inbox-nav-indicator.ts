@@ -18,7 +18,15 @@ const DOT_STYLE = "margin-left:auto;flex:0 0 auto;width:0.5rem;height:0.5rem;bor
 
 // Geometry, never class names: two host icons differ by the shape they draw,
 // and the minified class of a host row tells us nothing about which glyph it is.
-const GEOMETRY_ATTRIBUTES = ["d", "points", "cx", "cy", "r", "rx", "ry", "x", "y", "x1", "y1", "x2", "y2", "width", "height"];
+// "Shape" is everything that moves pixels, not just `d` — the same path data
+// rotated, translated, scaled or re-framed draws a different glyph, and a
+// fingerprint blind to that raises a false alarm on a legitimate re-theme. This
+// switch may not cry wolf: it is the retirement signal for get-bb/bb#1852, and
+// a signal that fires on noise gets muted.
+const RENDERING_ATTRIBUTES = [
+  "d", "points", "cx", "cy", "r", "rx", "ry", "x", "y", "x1", "y1", "x2", "y2", "width", "height",
+  "transform", "transform-origin", "style", "viewBox", "preserveAspectRatio", "href", "xlink:href", "offset",
+];
 
 export type InboxNavPaint = { matched: true } | { matched: false; reason: string };
 
@@ -59,9 +67,10 @@ export function paintInboxNavUnread(root: ParentNode, unread: number): InboxNavP
 function glyphFingerprint(row: Element): string | null {
   const asset = row.querySelector("[data-plugin-icon-asset]");
   if (asset !== null) return `asset:${asset.getAttribute("data-plugin-icon-asset") ?? ""}`;
-  const shapes = Array.from(row.querySelectorAll("svg *"))
+  // The root svg counts: its viewBox and transform re-frame everything under it.
+  const shapes = Array.from(row.querySelectorAll("svg, svg *"))
     .map((node) => {
-      const geometry = GEOMETRY_ATTRIBUTES.flatMap((name) => {
+      const geometry = RENDERING_ATTRIBUTES.flatMap((name) => {
         const value = node.getAttribute(name);
         return value === null ? [] : [`${name}=${value}`];
       });

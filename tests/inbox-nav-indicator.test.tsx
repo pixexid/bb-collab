@@ -16,8 +16,8 @@ import {
 const MAIL = "M7 8.5L9.94 10.24a4 4 0 0 0 4.11 0L17 8.5";
 const GIT_BRANCH = "M7 19h6a3 3 0 0 0 3-3v-6";
 
-function row(label: string, path: string | null): string {
-  const glyph = path === null ? "" : `<svg><path d="${path}"/></svg>`;
+function row(label: string, path: string | null, transform?: string): string {
+  const glyph = path === null ? "" : `<svg><path d="${path}"${transform === undefined ? "" : ` transform="${transform}"`}/></svg>`;
   return `<button type="button">${glyph}<span>${label}</span></button>`;
 }
 
@@ -26,11 +26,12 @@ function navRegion({
   inboxLabel = INBOX_NAV_ROW_TITLE,
   inboxGlyph = null as string | null,
   lanesGlyph = null as string | null,
+  inboxTransform = undefined as string | undefined,
   extraRows = "",
 } = {}): HTMLElement {
   const region = document.createElement("div");
   region.setAttribute("data-testid", testid);
-  region.innerHTML = `${row("Lanes", lanesGlyph)}${row(inboxLabel, inboxGlyph)}${extraRows}`;
+  region.innerHTML = `${row("Lanes", lanesGlyph)}${row(inboxLabel, inboxGlyph, inboxTransform)}${extraRows}`;
   document.body.append(region);
   return region;
 }
@@ -94,6 +95,7 @@ let threadListRegistration: Awaited<ReturnType<typeof threadList>> | null = null
 
 describe("inbox unread nav indicator", () => {
   afterEach(() => {
+    vi.useRealTimers();
     cleanup();
     document.body.innerHTML = "";
     vi.restoreAllMocks();
@@ -236,5 +238,54 @@ describe("inbox unread nav indicator", () => {
     await waitFor(() => expect(rendered.getByRole("alert").textContent).toContain("draw the same glyph"));
     expect(recorded).toHaveBeenCalledWith(expect.stringContaining(INBOX_INDICATOR_BROKEN_TITLE));
     expect(inboxDot()?.getAttribute(INBOX_UNREAD_MARKER)).toBe("1");
+  });
+  it("stays healthy when the same path data is drawn under a different transform", () => {
+    // #given a legitimate re-theme: identical `d`, rotated 90 degrees
+    navRegion({ inboxGlyph: GIT_BRANCH, lanesGlyph: GIT_BRANCH, inboxTransform: "rotate(90 12 12)" });
+
+    // #when
+    const inspected = inspectInboxNavGlyph(document);
+
+    // #then the switch must not cry wolf
+    expect(inspected).toEqual({ matched: true });
+  });
+
+  it("keeps a project's last proven unread count when its read fails", async () => {
+    // #given a project that answers once and then rejects
+    threadListRegistration = await threadList();
+    navRegion();
+    vi.useFakeTimers();
+    let call = 0;
+    renderList(async () => {
+      call += 1;
+      if (call === 1) return [message(1, null), message(2, null)];
+      throw new Error("transient");
+    });
+
+    // #when the first poll proves 2 unread and the next one fails
+    await vi.advanceTimersByTimeAsync(1);
+    expect(inboxDot()?.getAttribute(INBOX_UNREAD_MARKER)).toBe("2");
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    // #then the proven count survives the failure rather than reading as zero
+    expect(call).toBeGreaterThan(1);
+    expect(inboxDot()?.getAttribute(INBOX_UNREAD_MARKER)).toBe("2");
+  });
+
+  it("records the break once rather than on every poll", async () => {
+    // #given
+    threadListRegistration = await threadList();
+    navRegion({ inboxLabel: "Messages" });
+    const recorded = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.useFakeTimers();
+
+    // #when the same break is observed on three consecutive polls
+    renderList(async () => [message(1, null)]);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    // #then only the transition is recorded
+    expect(recorded).toHaveBeenCalledTimes(1);
   });
 });

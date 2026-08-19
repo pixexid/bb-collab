@@ -111,7 +111,11 @@ The switch covers two deaths, because the indicator has two:
   drawn geometry rather than class names — a minified host class says nothing
   about which glyph it is — and compares `Inbox` against the `Lanes` control,
   because a control row is the only thing that tells a collapse apart from a
-  fallback.
+  fallback. "Geometry" is everything that moves pixels, `transform` and the
+  root `viewBox` included, not just `d`: the same path data rotated is a
+  different glyph, and a fingerprint blind to that would raise a false alarm on
+  a legitimate re-theme. This switch is the retirement signal for
+  get-bb/bb#1852, and a signal that fires on noise gets muted.
 
 **What cannot be detected from inside the plugin, stated plainly:** whether the
 glyph drawn beside `Inbox` is the one `Inbox` *declared*. The host owns the icon
