@@ -1,0 +1,178 @@
+import { execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
+
+export type WorktreePopulation = "scratch" | "managed" | "candidate" | "unknown";
+
+export type WorktreeEntry = {
+  path: string;
+  branch: string | null;
+  head: string | null;
+  population?: WorktreePopulation;
+  threadId?: string | null;
+};
+
+export type WorktreeDecision = {
+  path: string;
+  population: WorktreePopulation;
+  action: "remove" | "refuse";
+  reason: string;
+};
+
+export type WorktreeCleanupReport = {
+  outcome: "reported" | "refused";
+  wouldRemove: WorktreeDecision[];
+  refused: WorktreeDecision[];
+  environmentRecordsReleased: false;
+};
+
+export type WorktreeCleanupOptions = {
+  liveThreadIds: ReadonlySet<string>;
+  liveWorktreeThreadIds?: ReadonlyMap<string, ReadonlySet<string>>;
+  home?: string;
+  originMain?: string;
+  status?: (path: string) => string;
+  reachable?: (path: string, head: string) => boolean;
+};
+
+const threadPattern = /thr_[a-z0-9]+/u;
+
+export function canonicalWorktreePath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+export function classifyWorktree(path: string, home = process.env.HOME ?? ""): WorktreePopulation {
+  const target = canonicalWorktreePath(path);
+  const managed = resolve(home, ".bb/worktrees");
+  if (target === managed || target.startsWith(`${managed}/`)) return "managed";
+  const candidates = resolve(home, ".bb/thread-storage");
+  if (target === candidates || target.startsWith(`${candidates}/`)) return "candidate";
+  const tmp = ["/tmp", "/private/tmp"].map((root) => resolve(root));
+  if (tmp.some((root) => target === root || target.startsWith(`${root}/`))) return "scratch";
+  return "unknown";
+}
+
+export function threadIdFromBranch(branch: string | null): string | null {
+  return branch?.match(threadPattern)?.[0] ?? null;
+}
+
+export function planWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeCleanupOptions): WorktreeDecision[] {
+  const decisions: WorktreeDecision[] = [];
+  for (const entry of entries) {
+    const population = entry.population ?? classifyWorktree(entry.path, options.home);
+    const threadId = entry.threadId === undefined ? threadIdFromBranch(entry.branch) : entry.threadId;
+    if (population === "candidate") {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "per-thread candidate checkout is protected" });
+      continue;
+    }
+    const associatedLiveThreads = options.liveWorktreeThreadIds?.get(canonicalWorktreePath(entry.path));
+    if ((threadId && options.liveThreadIds.has(threadId)) || (associatedLiveThreads && associatedLiveThreads.size > 0)) {
+      const owners = threadId && options.liveThreadIds.has(threadId) ? [threadId] : [...associatedLiveThreads!];
+      decisions.push({ path: entry.path, population, action: "refuse", reason: `live thread ${owners.join(",")}` });
+      continue;
+    }
+    if (population === "managed") {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "BB environment record cannot be released by the available SDK" });
+      continue;
+    }
+    if (population === "unknown") {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "worktree is outside the owned scratch/managed populations" });
+      continue;
+    }
+    if (!entry.head) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "worktree HEAD is unavailable" });
+      continue;
+    }
+    if (threadId === null && associatedLiveThreads === undefined) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "thread ownership unresolved for detached worktree" });
+      continue;
+    }
+    let status = "";
+    try {
+      status = options.status?.(entry.path) ?? "";
+    } catch (error) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: `git status failed for ${entry.path}: ${error instanceof Error ? error.message : String(error)}` });
+      continue;
+    }
+    if (status !== "") {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "uncommitted changes" });
+      continue;
+    }
+    let reachable = false;
+    try {
+      reachable = Boolean(options.originMain && options.reachable?.(entry.path, entry.head));
+    } catch (error) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: `reachability check failed for ${entry.path}: ${error instanceof Error ? error.message : String(error)}` });
+      continue;
+    }
+    if (!reachable) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "commits are not reachable from origin/main" });
+      continue;
+    }
+    decisions.push({ path: entry.path, population, action: "remove", reason: "clean and fully reachable from origin/main" });
+  }
+  return decisions;
+}
+
+export function runWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeCleanupOptions): WorktreeCleanupReport {
+  const decisions = planWorktreeCleanup(entries, options);
+  const wouldRemove = decisions.filter((decision) => decision.action === "remove");
+  const refused = decisions.filter((decision) => decision.action === "refuse");
+  return { outcome: refused.length > 0 ? "refused" : "reported", wouldRemove, refused, environmentRecordsReleased: false };
+}
+
+function git(args: string[], cwd: string): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } }).trim();
+}
+
+export function listGitWorktrees(repoRoot: string): WorktreeEntry[] {
+  const lines = git(["worktree", "list", "--porcelain"], repoRoot).split("\n");
+  const entries: WorktreeEntry[] = [];
+  let current: WorktreeEntry | null = null;
+  for (const line of lines) {
+    if (line.startsWith("worktree ")) {
+      if (current) entries.push(current);
+      current = { path: canonicalWorktreePath(line.slice("worktree ".length)), branch: null, head: null };
+    } else if (current && line.startsWith("HEAD ")) current.head = line.slice("HEAD ".length);
+    else if (current && line.startsWith("branch ")) current.branch = line.slice("branch ".length).replace(/^refs\/heads\//u, "");
+  }
+  if (current) entries.push(current);
+  return entries;
+}
+
+export function cleanupGitWorktrees(repoRoot: string, liveThreadIds: ReadonlySet<string>, liveWorktreeThreadIds: ReadonlyMap<string, ReadonlySet<string>> = new Map()): WorktreeCleanupReport {
+  const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
+  const status = (path: string) => git(["status", "--porcelain", "--untracked-files=all"], path);
+  return runWorktreeCleanup(listGitWorktrees(repoRoot), {
+    liveThreadIds,
+    liveWorktreeThreadIds,
+    originMain,
+    status,
+    reachable: (path, head) => {
+      try {
+        execFileSync("git", ["merge-base", "--is-ancestor", head, originMain], { cwd: path, stdio: "pipe", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  });
+}
+
+export async function listAllProjectThreads<T extends { id: string }>(
+  list: (args: { projectId: string; archived: false; includeHidden: true; limit: number; offset: number }) => Promise<T[]>,
+  projectId: string,
+  pageSize = 1000,
+): Promise<T[]> {
+  const threads: T[] = [];
+  for (let offset = 0; ; offset += pageSize) {
+    const page = await list({ projectId, archived: false, includeHidden: true, limit: pageSize, offset });
+    threads.push(...page);
+    if (page.length < pageSize) return threads;
+    if (offset >= 100_000) throw new Error("thread inventory exceeded bounded pagination");
+  }
+}

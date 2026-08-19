@@ -55,6 +55,7 @@ import {
   type SourceObservation,
 } from "./src/registered-waits.js";
 import { runArchiveSweep } from "./src/archive-sweep.js";
+import { canonicalWorktreePath, cleanupGitWorktrees, listAllProjectThreads } from "./src/worktree-cleanup.js";
 import { findCheckoutRoot, readCheckoutDivergence, type CheckoutDivergence } from "./src/checkout-divergence.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFile, spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
@@ -955,8 +956,8 @@ async function runCli(
 ) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "archive-sweep", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, archive-sweep, cached-consumer-rollout, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
+  if (!command || !["doctor", "export", "apply", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, archive-sweep, worktree-cleanup, cached-consumer-rollout, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
   }
   if (command === "wait-validator") {
     const unknown = args.find((arg) => arg !== "--cycle");
@@ -1089,6 +1090,33 @@ async function runCli(
       message: result.message,
       evidence: result,
     });
+  }
+  if (command === "worktree-cleanup") {
+    if (unexpectedFlags(args, ["--project"])) return invalidCli("unexpected worktree-cleanup argument; report-only command has no apply mode");
+    try {
+      const project = await bb.sdk.projects.get({ projectId });
+      const source = project.sources.find((item) => item.isDefault) ?? project.sources[0];
+      if (!source) return invalidCli("project has no source checkout");
+      const threads = await listAllProjectThreads((request) => bb.sdk.threads.list(request), projectId);
+      const liveWorktreeThreadIds = new Map<string, Set<string>>();
+      for (const thread of threads) {
+        if (thread.environmentId === null) continue;
+        try {
+          const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
+          if (!environment.path) continue;
+          const owners = liveWorktreeThreadIds.get(canonicalWorktreePath(environment.path)) ?? new Set<string>();
+          owners.add(thread.id);
+          liveWorktreeThreadIds.set(canonicalWorktreePath(environment.path), owners);
+        } catch {
+          // An unresolved environment leaves detached ownership unresolved; the
+          // cleanup planner refuses that path instead of guessing.
+        }
+      }
+      const result = cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds);
+      return { exitCode: result.refused.length === 0 ? 0 : 2, stdout: JSON.stringify(result) };
+    } catch (error) {
+      return { exitCode: 2, stdout: JSON.stringify({ outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error instanceof Error ? error.message : String(error) }], environmentRecordsReleased: false }) };
+    }
   }
   if (command === "wait-register") {
     const unknown = unexpectedFlags(args, ["--project", "--request"]);
@@ -2105,6 +2133,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         name: "archive-sweep",
         summary: "Report archivable threads; --apply is explicit and opt-in",
         usage: "bb collab archive-sweep --project PROJECT_ID [--apply]",
+      },
+      {
+        name: "worktree-cleanup",
+        summary: "Report clean, origin/main-reachable scratch worktrees and refusals",
+        usage: "bb collab worktree-cleanup --project PROJECT_ID",
       },
       {
         name: "send-to-operator",
