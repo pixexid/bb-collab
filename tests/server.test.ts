@@ -103,7 +103,7 @@ const DIRECTOR_STANDBY_PROFILE = {
   serviceTier: "default",
   visibility: "visible" as const,
 };
-const LEGACY_DIRECTOR_PROFILE = {
+const DIRECTOR_K3_PROFILE = {
   providerId: "pi",
   model: "kimi-coding/k3",
   reasoningLevel: "high",
@@ -111,6 +111,7 @@ const LEGACY_DIRECTOR_PROFILE = {
   serviceTier: "default",
   visibility: "visible" as const,
 };
+const DIRECTOR_K3_256K_PROFILE = { ...DIRECTOR_K3_PROFILE, model: "kimi-coding/k3-256k" };
 const DIRECTOR_PROFILE_DIGEST = sha256(canonicalJson(DIRECTOR_PROFILE));
 const STANDBY_PROFILE = {
   providerId: "luna",
@@ -4654,7 +4655,7 @@ exit 1
     }
   });
 
-  it("appends no migration while advancing the director profile contract to v22", () => {
+  it("keeps contract v22 and appends no migration for the amended director profile set", () => {
     expect(SCHEMA_VERSION).toBe(20);
     expect(CONTRACT_VERSION).toBe(22);
     expect(MIGRATIONS).toHaveLength(33);
@@ -4879,7 +4880,7 @@ exit 1
     expect(CONTRACT_VERSION).toBe(22);
     expect(SCHEMA_VERSION).toBe(20);
     expect(MIGRATIONS).toHaveLength(33);
-    expect(contractDigest).toBe("5a7c560aa6176b15c9ed5dcf0be25aa20a1028a1ec7d97a519e6c70193db0d6c");
+    expect(contractDigest).toBe("f6b0ecbda7e8afd986d46e0eda77662815a737dadc94e268ef00b7d74ba18ed4");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     const beforeRefusal = exportFoundation(db, PROJECT_ID);
@@ -7626,7 +7627,7 @@ exit 1
     expect(holder.thread_id).not.toBe("bootstrap-subject");
   });
 
-  it("accepts the ratified primary director profile", async () => {
+  it("still accepts claude-code/claude-opus-5[1m]/medium as new director config", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
     expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
@@ -7635,7 +7636,7 @@ exit 1
     }), null, directorRoleReader()).outcome).toBe("OK");
   });
 
-  it("accepts the ratified secondary director profile with the primary as standby", async () => {
+  it("still accepts pi/zai/glm-5.3/high as new director config with opus-medium standby", async () => {
     const host = await loadedHost();
     const config = directorSeatConfig(DIRECTOR_STANDBY_PROFILE, DIRECTOR_PROFILE);
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config });
@@ -7652,75 +7653,44 @@ exit 1
     }), null, facts).outcome).toBe("OK");
   });
 
-  it("keeps only the exact legacy tuple readable and bridges legacy and ratified holders until the head advances", async () => {
-    const host = await loadedHost();
-    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
-    const legacyConfig = directorSeatConfig(LEGACY_DIRECTOR_PROFILE, DIRECTOR_PROFILE);
-    const configJson = canonicalJson(legacyConfig);
-    db.prepare(
-      "UPDATE project_config_revisions SET canonical_config_json = ?, config_digest = ? WHERE project_id = ? AND config_revision = 1",
-    ).run(configJson, sha256(configJson), PROJECT_ID);
-
-    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({ outcome: "OK" });
-    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
-      idempotencyKey: "legacy-director-qualification",
-      qualificationId: "legacy-director-qualification",
-      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
-      declaredProfile: LEGACY_DIRECTOR_PROFILE,
-    }), null, directorRoleReader(undefined, LEGACY_DIRECTOR_PROFILE)).outcome).toBe("OK");
-
-    const secondaryDigest = sha256(canonicalJson(DIRECTOR_STANDBY_PROFILE));
-    const secondaryFacts = directorRoleReader(undefined, DIRECTOR_STANDBY_PROFILE);
-    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
-      idempotencyKey: "bridged-director-qualification",
-      qualificationId: "bridged-director-qualification",
-      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
-      declaredProfile: DIRECTOR_STANDBY_PROFILE,
-    }), null, secondaryFacts).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
-      idempotencyKey: "bridged-director-succession",
-      qualificationId: "bridged-director-qualification",
-      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
-      profileDigest: secondaryDigest,
-      standbyProfile: DIRECTOR_PROFILE,
-    }), null, secondaryFacts).outcome).toBe("OK");
-
-    const nearMissHost = await loadedHost();
-    const { db: nearMissDb } = seedAndBootstrap(nearMissHost, PROJECT_ID, { config: directorSeatConfig() });
-    const nearMissConfig = canonicalJson(directorSeatConfig(LEGACY_DIRECTOR_PROFILE, DIRECTOR_STANDBY_PROFILE));
-    nearMissDb.prepare(
-      "UPDATE project_config_revisions SET canonical_config_json = ?, config_digest = ? WHERE project_id = ? AND config_revision = 1",
-    ).run(nearMissConfig, sha256(nearMissConfig), PROJECT_ID);
-    await expect(nearMissHost.harness.callRpc("doctor", { projectId: PROJECT_ID })).resolves.toMatchObject({
-      outcome: "BB_FACTS_UNAVAILABLE",
-      message: "Refusal: stored role requirements are invalid",
-      attempted: 0,
-      verified: 0,
-    });
+  it("accepts pi/kimi-coding/k3/high as new director config with either ratified standby", async () => {
+    for (const standbyProfile of [DIRECTOR_PROFILE, DIRECTOR_STANDBY_PROFILE]) {
+      const host = await loadedHost();
+      const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, {
+        config: directorSeatConfig(DIRECTOR_K3_PROFILE, standbyProfile),
+      });
+      expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+        roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+        declaredProfile: DIRECTOR_K3_PROFILE,
+      }), null, directorRoleReader(undefined, DIRECTOR_K3_PROFILE)).outcome).toBe("OK");
+    }
   });
 
-  it("refuses the legacy director profile in new config without writing", async () => {
+  it("refuses pi/kimi-coding/k3-256k/high as new director config by exact model string", async () => {
     const host = await loadedHost();
     const db = host.bb.storage.database();
     seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
     expect(applyWithFixtureReceipt(db, bootstrapRequest(PROJECT_ID, {
-      config: directorSeatConfig(LEGACY_DIRECTOR_PROFILE, DIRECTOR_PROFILE),
+      config: directorSeatConfig(DIRECTOR_K3_256K_PROFILE, DIRECTOR_PROFILE),
     }))).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
     expect(db.prepare("SELECT COUNT(*) AS count FROM project_config_revisions").get()).toEqual({ count: 0 });
   });
 
-  it("refuses legacy and arbitrary director bindings under the ratified head", async () => {
+  it("keeps the stored historical k3-with-opus tuple readable without a legacy bridge", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
+    const historicalConfig = canonicalJson(directorSeatConfig(DIRECTOR_K3_PROFILE, DIRECTOR_PROFILE));
+    db.prepare(
+      "UPDATE project_config_revisions SET canonical_config_json = ?, config_digest = ? WHERE project_id = ? AND config_revision = 1",
+    ).run(historicalConfig, sha256(historicalConfig), PROJECT_ID);
+    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({ outcome: "OK" });
     expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
       roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
-      declaredProfile: LEGACY_DIRECTOR_PROFILE,
-    }), null, directorRoleReader(undefined, LEGACY_DIRECTOR_PROFILE))).toMatchObject({
-      outcome: "EXECUTION_PROFILE_MISMATCH",
-      verified: 1,
-      evidence: { reasonCode: "execution_profile_mismatch" },
-    });
+      declaredProfile: DIRECTOR_K3_PROFILE,
+    }), null, directorRoleReader(undefined, DIRECTOR_K3_PROFILE)).outcome).toBe("OK");
+  });
 
+  it("still refuses an arbitrary unapproved director profile as new config", async () => {
     const arbitrary = { ...DIRECTOR_STANDBY_PROFILE, model: "unapproved/director" };
     const arbitraryHost = await loadedHost();
     const arbitraryDb = arbitraryHost.bb.storage.database();
