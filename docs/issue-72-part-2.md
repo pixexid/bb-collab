@@ -30,7 +30,7 @@ receipt-gated RoleGeneration succession path described in
 
 ## Director-seat recording gate
 
-> Superseded 2026-08-19 by contract v22: the current `director-seat` requirement uses the symmetric ratified pair `claude-code/claude-opus-5[1m]/medium` and `pi/zai/glm-5.3/high`; either may hold the seat with the other as standby. The historical text below is retained as issue-record history and is not current operational instruction.
+> Current 2026-08-19 contract v22: the `director-seat` requirement uses `pi/kimi-coding/k3/high` with `claude-code/claude-opus-5[1m]/medium` standby. The pair remains symmetric: either ratified profile may hold the seat with the other as standby, subject to the rule that standby and holder providers must differ. The historical text below is retained as issue-record history and is not current operational instruction.
 
 Contract v17 supersedes this historical v15 director-seat note. `director-seat`
 is the separate `director` role with the same primary `pi/kimi-coding/k3`,

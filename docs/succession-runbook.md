@@ -10,10 +10,10 @@ second role store.
 Contract v17 moves `director-seat` to the separate `director` role and
 supersedes the v15 current-generation exemption with one exact
 first-generation environment exemption. The primary executed profile is exactly
-`claude-code/claude-opus-5[1m]/medium` (`providerId: claude-code`,
-`model: claude-opus-5[1m]`, `reasoningLevel: medium`, `permissionMode: full`,
-`serviceTier: default`, `visibility: visible`). Its alternate/standby is exactly
-GLM-high (`pi/zai/glm-5.3`, `reasoningLevel: high`, with explicit
+`pi/kimi-coding/k3/high` (`providerId: pi`, `model: kimi-coding/k3`,
+`reasoningLevel: high`, `permissionMode: full`, `serviceTier: default`,
+`visibility: visible`). Its alternate/standby is exactly
+`claude-code/claude-opus-5[1m]/medium` (`providerId: claude-code`, with explicit
 full/default/visible fields). The seat has zero writing-lane capacity and
 retains the existing exact project/source/host and event-correlation checks.
 Only director generation 1 with holder `thr_gsb7m77ciz`, environment
@@ -33,8 +33,8 @@ Decision row or a succession apply:
   "decisionId": "director-seat-amendment-prepared",
   "scope": { "roleRequirementId": "director-seat", "purpose": "succession-rationale" },
   "options": {
-    "primaryProfile": "claude-code/claude-opus-5[1m]/medium",
-    "standbyProfile": "pi/zai/glm-5.3/high",
+    "primaryProfile": "pi/kimi-coding/k3/high",
+    "standbyProfile": "claude-code/claude-opus-5[1m]/medium",
     "writingLaneCapacity": 0,
     "environment": "managed-worktree-for-future-generations",
     "firstGenerationExemption": {
@@ -76,21 +76,25 @@ seat from `director-seat`. Its actual executed profile is the exact profile in
 the canonical requirement and native execution evidence; the repository's
 current generic fixture is `codex/gpt-5.6-sol/high/full/default/visible`. It
 does not inherit the director primary or standby profile. The prepared
-amendment uses Opus-medium with GLM-high standby as stated above, but the
-ratified director pair is symmetric: either profile may hold the seat with
-the other as standby. If the configured standby is promoted after a director
-failure, reverse the pair explicitly: the promoted former standby becomes the
-holder and the former primary becomes the standby.
+current director configuration uses `pi/kimi-coding/k3/high` with
+`claude-code/claude-opus-5[1m]/medium` standby as stated above, but the ratified
+director pair is symmetric: either profile may hold the seat with the other as
+standby, subject to the different-provider rule. If the
+configured standby is promoted after a director failure, reverse the pair
+explicitly: the promoted former standby becomes the holder and the former
+primary becomes the standby.
 
 ## Standby
 
 Only `director-seat` generations name one standby profile in
 `RoleGeneration.standby_profile_json`. The configured standby is the exact
-GLM-high profile for the prepared Opus-primary amendment, and its provider
-must differ from the director holder's executed provider; a same-provider or
-missing standby refuses before any canonical write. The pair is symmetric:
-either ratified profile may be the holder and the other the standby. When the
-standby is promoted, the former holder's profile becomes the standby. `project-orchestrator`
+`claude-code/claude-opus-5[1m]/medium` profile for the
+`pi/kimi-coding/k3`-primary amendment,
+and its provider must differ from the director holder's executed provider; a
+same-provider or missing standby refuses before any canonical write. The pair
+is symmetric: either ratified profile may be the holder and the other the
+standby, subject to the different-provider rule. When the standby is promoted,
+the former holder's profile becomes the standby. `project-orchestrator`
 generations must omit a standby. A standby is not a role, actor, authority,
 lease, assignment, dispatch target, or traffic recipient.
 
@@ -123,7 +127,8 @@ thread's model in place.
 4. Verify the executed profile from native provider events, not spawn flags.
    If promoting the director standby, reverse the ratified pair in the
    succession request: the promoted former standby is the holder and the
-   former primary is the standby.
+   former primary is the standby. Confirm that the standby provider differs
+   from the holder provider before submitting the request.
 5. Obtain a bounded comprehension acknowledgement (10 lines or fewer) naming
    the role, epoch, fleet state, next decision, and any contradiction found.
 6. Submit the exact receipt-gated `role_generation_succession` request. Name
@@ -136,11 +141,11 @@ thread's model in place.
    wait for acknowledgement. Stale generations refuse further authority.
 9. Do not archive the predecessor until its environment is proven disposable.
 
-## K3 wrongful-idle or death response
+## `pi/kimi-coding/k3` wrongful-idle or death response
 
-For a K3-like death, work may have completed while the provider failed before
-reporting. `thread output` can therefore show the previous clean result. Read
-the thread status and native event log directly; `thread wait --status idle`
+For a `pi/kimi-coding/k3` death, work may have completed while the provider
+failed before reporting. `thread output` can therefore show the previous clean
+result. Read the thread status and native event log directly; `thread wait --status idle`
 exiting successfully is not proof that the thread is healthy. If the Part 2
 wrongful-idle detector has delivered two ineffective steers, treat the
 condition as a succession trigger and stop nagging the old thread.
