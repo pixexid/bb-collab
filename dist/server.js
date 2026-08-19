@@ -15290,10 +15290,11 @@ var migrationExportSchema = external_exports.union([
   external_exports.object({
     kind: external_exports.literal("canonical-export-files"),
     complete: external_exports.literal(true),
-    directory: external_exports.string().min(1).max(4096),
+    directory: external_exports.string().min(1).max(4096).optional(),
+    displayDirectory: external_exports.string().min(1).max(4096).optional(),
     manifest: migrationExportManifestSchema,
     checksums: external_exports.record(external_exports.string(), digestSchema)
-  }).strict()
+  }).strict().refine((value) => value.directory !== void 0 || value.displayDirectory !== void 0, { message: "file export directory is required" })
 ]);
 var migrationPrepareSchema = external_exports.object({
   migrationId: id,
@@ -16874,7 +16875,9 @@ function readMigrationExportFiles(db, input) {
   let directory;
   try {
     const resolvedRoot = realpathSync(root);
-    directory = realpathSync(input.directory);
+    const inputDirectory = input.directory ?? input.displayDirectory;
+    if (!inputDirectory) throw new Error("missing path");
+    directory = realpathSync(isAbsolute(inputDirectory) ? inputDirectory : join(dirname(root), inputDirectory));
     const nested = relative(resolvedRoot, directory);
     if (!nested || nested.startsWith("..") || isAbsolute(nested) || !basename(directory).startsWith("complete-")) throw new Error("foreign path");
   } catch {
@@ -19042,9 +19045,23 @@ function writeFoundationExportFiles(db, projectId, payload) {
   mkdirSync(root, { recursive: true, mode: 448 });
   const directory = join(root, `complete-${sha256(projectId).slice(0, 12)}-${payload.manifest.exportRootDigest}`);
   const matches = () => sha256(readFileSync(join(directory, "records.ndjson"), "utf8")) === payload.checksums["records.ndjson"] && sha256(readFileSync(join(directory, "artifact-index.json"), "utf8")) === payload.checksums["artifact-index.json"] && sha256(readFileSync(join(directory, "manifest.json"), "utf8")) === payload.checksums["manifest.json"];
+  const result2 = () => {
+    const displayDirectory = relative(dirname(root), directory);
+    const exportFile = { kind: "canonical-export-files", complete: true, displayDirectory, manifest: payload.manifest, checksums: payload.checksums };
+    Object.defineProperties(exportFile, {
+      directory: { value: directory },
+      toJSON: {
+        value: () => {
+          const { displayDirectory: serializedDirectory, ...serialized } = exportFile;
+          return { ...serialized, directory: serializedDirectory };
+        }
+      }
+    });
+    return exportFile;
+  };
   if (existsSync(directory)) {
     if (!matches()) throw new Error("existing canonical export files do not match their export root");
-    return { kind: "canonical-export-files", complete: true, directory, manifest: payload.manifest, checksums: payload.checksums };
+    return result2();
   }
   const partial2 = mkdtempSync(join(root, `.partial-${sha256(projectId).slice(0, 12)}-`));
   try {
@@ -19057,7 +19074,7 @@ function writeFoundationExportFiles(db, projectId, payload) {
       if (!existsSync(directory) || !matches()) throw error48;
       rmSync(partial2, { recursive: true, force: true });
     }
-    return { kind: "canonical-export-files", complete: true, directory, manifest: payload.manifest, checksums: payload.checksums };
+    return result2();
   } catch (error48) {
     rmSync(partial2, { recursive: true, force: true });
     throw error48;
