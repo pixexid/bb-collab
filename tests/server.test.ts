@@ -6655,7 +6655,15 @@ exit 1
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3, {
       idempotencyKey: "stale-work-item-review",
       expectedConfigRevision: 2,
+      workAttempt: { laneId: "lane-review-item-1", threadId: "thread-review-item-1", assignmentKind: "review", reviewPrNumber: 338, reviewPrHeadSha: CANDIDATE_SHA },
     }))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(db.prepare("SELECT review_pr_number, review_pr_head_sha, config_revision FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'review'").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({
+      review_pr_number: 338,
+      review_pr_head_sha: CANDIDATE_SHA,
+      config_revision: 1,
+    });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND COALESCE(assignment_kind, '') <> 'review' AND (review_pr_number IS NOT NULL OR review_pr_head_sha IS NOT NULL)").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ count: 0 });
+    expect(db.prepare("SELECT config_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ config_revision: 1 });
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 4, {
       idempotencyKey: "stale-work-item-reenter",
       expectedConfigRevision: 2,
