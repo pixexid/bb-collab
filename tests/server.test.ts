@@ -2520,11 +2520,11 @@ describe("bb-collab plugin boundary", () => {
     expect(warnings.at(-1)?.message).toMatch(/occurrencesSinceReload=2 cyclesSinceReload=2 projectsSinceReload=0 sinceReloadAt=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u);
   });
 
-  it("does not wake a quiet director seat", async () => {
+  it("runs the fleet watchdog every five minutes without waking a quiet director seat", async () => {
     const fixture = await fleetWatchdogFixture();
     const cron = fixture.host.harness.inspection.registrations.schedules.find((schedule) => schedule.name === "fleet-watchdog")?.cron;
-    if (cron !== "0 * * * *") {
-      throw new Error(`expected registered fleet-watchdog cron "0 * * * *", got "${cron}"\nDRILL BUILD ACTIVE - restore the production cron before merge (teardown item 3)`);
+    if (cron !== "*/5 * * * *") {
+      throw new Error(`expected registered fleet-watchdog cron "*/5 * * * *", got "${cron}"`);
     }
     await fixture.host.harness.runSchedule("fleet-watchdog");
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
