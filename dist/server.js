@@ -20362,6 +20362,12 @@ var operatorMessageSchema = external_exports.object({
   notificationStatus: external_exports.enum(["not-requested", "deduplicated", "sent", "failed"]),
   notificationError: external_exports.string().nullable()
 }).strict();
+var OPERATOR_MESSAGES_OUTCOMES = ["OK", "PROJECT_CONFIG_REQUIRED"];
+var operatorMessagesResultSchema = external_exports.object({
+  outcome: external_exports.enum(OPERATOR_MESSAGES_OUTCOMES),
+  message: external_exports.string().optional(),
+  messages: external_exports.array(operatorMessageSchema)
+}).strict();
 var sendOperatorMessageInputSchema = external_exports.object({
   project_id: projectIdSchema,
   recipient: operatorRecipientSchema,
@@ -20437,7 +20443,7 @@ var rpcContract = defineRpcContract({
       recipient: operatorRecipientSchema.optional(),
       withSenderTitles: external_exports.boolean().optional()
     }).strict(),
-    output: external_exports.array(operatorMessageSchema)
+    output: operatorMessagesResultSchema
   },
   markOperatorMessageRead: {
     input: external_exports.object({ projectId: projectIdSchema, messageId: external_exports.number().int().positive() }).strict(),
@@ -20799,12 +20805,18 @@ var operatorMessageSelect = `SELECT message.*,
      AND attempt.lane_id IS NOT NULL
    ORDER BY attempt.created_at_ms DESC LIMIT 1) AS sender_lane_id
   FROM operator_messages AS message`;
-function requireRegisteredInboxProject(db, projectId) {
+var UNREGISTERED_INBOX_MESSAGE = "operator inbox project is not registered";
+function inboxProjectIsRegistered(db, projectId) {
+  return db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId) !== void 0;
+}
+function requireInboxStore(db) {
   if (!db) throw new Error("operator inbox store is unavailable");
-  if (!db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId)) {
-    throw new Error("operator inbox project is not registered");
-  }
   return db;
+}
+function requireRegisteredInboxProject(db, projectId) {
+  const store = requireInboxStore(db);
+  if (!inboxProjectIsRegistered(store, projectId)) throw new Error(UNREGISTERED_INBOX_MESSAGE);
+  return store;
 }
 function readOperatorMessage(db, projectId, messageId) {
   const store = requireRegisteredInboxProject(db, projectId);
@@ -20826,14 +20838,17 @@ async function resolveSenderTitles(bb, messages) {
   return messages.map((message) => ({ ...message, senderTitle: titles.get(message.senderThreadId) ?? null }));
 }
 async function listOperatorMessages(db, bb, projectId, recipient, withSenderTitles = false) {
-  const store = requireRegisteredInboxProject(db, projectId);
+  const store = requireInboxStore(db);
+  if (!inboxProjectIsRegistered(store, projectId)) {
+    return { outcome: "PROJECT_CONFIG_REQUIRED", message: UNREGISTERED_INBOX_MESSAGE, messages: [] };
+  }
   const recipientClause = recipient === void 0 ? "" : " AND message.recipient = ?";
   const rows = store.prepare(`${operatorMessageSelect}
     WHERE message.project_id = ?${recipientClause}
     ORDER BY (message.read_at_ms IS NULL) DESC, message.created_at_ms DESC, message.message_id DESC
     LIMIT ${OPERATOR_MESSAGE_LIMIT}`).all(...recipient === void 0 ? [projectId] : [projectId, recipient]);
   const messages = rows.map(operatorMessage);
-  return withSenderTitles ? resolveSenderTitles(bb, messages) : messages;
+  return { outcome: "OK", messages: withSenderTitles ? await resolveSenderTitles(bb, messages) : messages };
 }
 async function markOperatorMessageRead(db, bb, projectId, messageId) {
   const store = requireRegisteredInboxProject(db, projectId);
@@ -21085,7 +21100,9 @@ async function runCli(db, bb, argv, ctx, deps) {
     const parsedRecipient = recipient === null ? void 0 : operatorRecipientSchema.safeParse(recipient);
     if (parsedRecipient && !parsedRecipient.success) return invalidCli(parsedRecipient.error.message);
     try {
-      return { exitCode: 0, stdout: JSON.stringify(await listOperatorMessages(db, bb, projectId, parsedRecipient?.data)) };
+      const listed = await listOperatorMessages(db, bb, projectId, parsedRecipient?.data);
+      if (listed.outcome !== "OK") return invalidCli(listed.message ?? listed.outcome);
+      return { exitCode: 0, stdout: JSON.stringify(listed.messages) };
     } catch (error48) {
       return invalidCli(error48 instanceof Error ? error48.message : String(error48));
     }

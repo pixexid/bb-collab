@@ -1938,9 +1938,10 @@ describe("bb-collab plugin boundary", () => {
     }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID });
     host.harness.sdk.stub("threads.get", async () => { throw new Error("thread no longer exists"); });
 
-    await expect(host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, withSenderTitles: true })).resolves.toEqual([
-      expect.objectContaining({ senderThreadId: ROLE_THREAD_ID, senderTitle: null }),
-    ]);
+    await expect(host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, withSenderTitles: true })).resolves.toEqual({
+      outcome: "OK",
+      messages: [expect.objectContaining({ senderThreadId: ROLE_THREAD_ID, senderTitle: null })],
+    });
   });
 
   it("attempts both notification channels and leaves a visible failure", async () => {

@@ -247,7 +247,7 @@ describe("replacement thread list", () => {
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
     const rendered = renderSlot(inbox, { subPath: "" }, {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
-      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => [{
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(async () => [{
         messageId: 5,
         projectId: "project-a",
         recipient: "operator" as const,
@@ -263,7 +263,7 @@ describe("replacement thread list", () => {
         replyDeliveryError: null,
         notificationStatus: "not-requested" as const,
         notificationError: null,
-      }] } as never,
+      }]) } as never,
     });
 
     const sender = await waitFor(() => rendered.getByRole("link", { name: "Open sender session missing-sender-thread" }));
