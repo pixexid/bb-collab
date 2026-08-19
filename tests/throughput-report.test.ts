@@ -46,7 +46,15 @@ describe("weekly throughput report", () => {
     expect(report.outlierCohorts).toEqual([]);
     const reason = weeklyThroughputReport({ ...empty, outlierCohorts: [{ label: "empty", startAtMs: 0, endAtMs: 1 }] }, window).outlierCohorts[0].reviewRounds.reason;
     expect(reason).toBe("no canonically linked review observations");
-    expect(reason).not.toMatch(/not .*linked|linkage .*missing|not .*exist/iu);
+  });
+
+  it("grounds cohort review rounds in reviews inside the cohort window", () => {
+    const report = weeklyThroughputReport({
+      ...empty,
+      reviews: [{ id: "inside", tier: "B", submittedAtMs: 2, completedAtMs: 3 }],
+      outlierCohorts: [{ label: "cohort", startAtMs: 0, endAtMs: 4 }],
+    }, window);
+    expect(report.outlierCohorts[0].reviewRounds).toEqual({ status: "known" });
   });
 
   it("keeps partial issue and review windows explicit", () => {
