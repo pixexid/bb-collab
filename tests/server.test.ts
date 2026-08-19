@@ -59,7 +59,7 @@ import {
   seedFixtureDecision,
   seedVerifiedFixtureReceipt,
 } from "../src/test-support.js";
-import { createLaneWatcher, createRoleIdleLedger, readRoleHolderStates, resolveCurrentRoleBinding, roleIdleKey, type RoleIdleRecord } from "../src/awareness.js";
+import { createLaneWatcher, createRoleIdleLedger, IDLE_FLEET_DEBOUNCE_MS, readRoleHolderStates, resolveCurrentRoleBinding, roleIdleKey, type RoleIdleRecord } from "../src/awareness.js";
 import { findCheckoutRoot, readCheckoutDivergence } from "../src/checkout-divergence.js";
 
 const PROJECT_ID = "proj_test";
@@ -3152,6 +3152,111 @@ describe("bb-collab plugin boundary", () => {
       expect(readFileSync(argsLog, "utf8")).toBe("issue\nlist\n--repo\nexample/project\n--label\nqueue:startable\n--state\nopen\n--json\nnumber\n--limit\n1000\n");
     } finally {
       clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("wakes the exact idle orchestrator from a real idle event after the debounce", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-queue-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(1, true);
+      fixture.host.harness.sdk.stub("threads.wait", (async () => undefined) as never);
+      vi.useFakeTimers();
+      try {
+        await fixture.host.harness.emitThreadEvent("thread.idle", {
+          thread: makeThreadResponse({ id: fixture.orchestratorThreadId, projectId: PROJECT_ID, status: "idle", updatedAt: 1 }),
+          lastAssistantText: null,
+        });
+        await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+
+        expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+          expect.objectContaining({
+            threadId: fixture.orchestratorThreadId,
+            mode: "steer",
+            input: [expect.objectContaining({ text: expect.stringContaining("example/project#305") })],
+          }),
+        ]]);
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["active orchestrator", "one active writing lane", "zero startable issues"])("stays silent for %s", async (scenario) => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-false-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh\nprintf '%s\\n' '${scenario === "zero startable issues" ? "[]" : "[{\"number\":305}]"}'\n`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(1, true);
+      fixture.host.harness.sdk.stub("threads.wait", (async () => undefined) as never);
+      if (scenario === "active orchestrator") fixture.setThreadStatus("active");
+      if (scenario === "one active writing lane") {
+        expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+      }
+      vi.useFakeTimers();
+      try {
+        await fixture.host.harness.emitThreadEvent("thread.idle", {
+          thread: makeThreadResponse({ id: fixture.orchestratorThreadId, projectId: PROJECT_ID, status: "idle", updatedAt: 1 }),
+          lastAssistantText: null,
+        });
+        await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+        expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed and names the active-lane reader when that conjunct is unreadable", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-blind-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(1, true);
+      fixture.host.harness.sdk.stub("threads.wait", (async () => undefined) as never);
+      const originalPrepare = fixture.db.prepare.bind(fixture.db);
+      vi.spyOn(fixture.db, "prepare").mockImplementation(((sql: string) => {
+        if (sql.includes("COUNT(DISTINCT lane_id)")) throw new Error("lane read failed");
+        return originalPrepare(sql);
+      }) as never);
+      vi.useFakeTimers();
+      try {
+        await fixture.host.harness.emitThreadEvent("thread.idle", {
+          thread: makeThreadResponse({ id: fixture.orchestratorThreadId, projectId: PROJECT_ID, status: "idle", updatedAt: 1 }),
+          lastAssistantText: null,
+        });
+        await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+
+        expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+        expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+          level: "warn",
+          message: "idle-fleet coverage=blind orchestrator=known activeLanes=blind startable=known reason=active-lanes-unreadable:Error: lane read failed",
+        }));
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
       rmSync(bin, { recursive: true, force: true });

@@ -869,3 +869,134 @@ export function subscribeToThreadChanges(
     return () => undefined;
   }
 }
+
+export const IDLE_FLEET_DEBOUNCE_MS = 2 * 60_000;
+
+export interface IdleFleetProbe {
+  projectId: string;
+  threadId: string;
+  idleEpisode: string;
+}
+
+export interface IdleFleetReady {
+  probe: IdleFleetProbe;
+  episodeKey: string;
+  role: RoleIdleView;
+  message: string;
+}
+
+export type IdleFleetDecision =
+  | { kind: "silent" }
+  | { kind: "blind"; message: string }
+  | { kind: "ready"; episodeKey: string; role: RoleIdleView; message: string };
+
+export interface IdleFleetPersistence {
+  read(): Promise<unknown>;
+  write(state: Record<string, string>): Promise<void>;
+}
+
+function idleFleetWakeState(input: unknown): Record<string, string> {
+  if (input === undefined || input === null) return {};
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid idle-fleet wake state");
+  const state: Record<string, string> = {};
+  for (const [projectId, episodeKey] of Object.entries(input)) {
+    if (typeof episodeKey !== "string" || episodeKey.length === 0) throw new Error("invalid idle-fleet wake episode");
+    state[projectId] = episodeKey;
+  }
+  return state;
+}
+
+export function createIdleFleetDetector(options: {
+  read: (probe: IdleFleetProbe) => Promise<IdleFleetDecision>;
+  readRearmProbes: () => Promise<IdleFleetProbe[]>;
+  wake: (ready: IdleFleetReady) => Promise<boolean>;
+  onBlind: (message: string) => void;
+  persistence?: IdleFleetPersistence;
+  debounceMs?: number;
+}): {
+  arm(probe: IdleFleetProbe): void;
+  rearm(): Promise<void>;
+  stop(): void;
+} {
+  const debounceMs = Number.isInteger(options.debounceMs) && (options.debounceMs ?? 0) >= 0
+    ? options.debounceMs as number
+    : IDLE_FLEET_DEBOUNCE_MS;
+  const timers = new Map<string, ReturnType<typeof setTimeout>>();
+  let state: Record<string, string> = {};
+  let loaded = false;
+  let stopped = false;
+  const probeKey = (probe: IdleFleetProbe) => `${probe.projectId}:${probe.threadId}`;
+
+  const load = async () => {
+    if (loaded) return;
+    state = idleFleetWakeState(options.persistence ? await options.persistence.read() : null);
+    loaded = true;
+  };
+  const save = () => options.persistence?.write(structuredClone(state));
+  const reportBlind = (message: string) => {
+    try {
+      options.onBlind(message);
+    } catch {
+      // Coverage reporting cannot keep the detector from re-arming.
+    }
+  };
+
+  const evaluate = async (probe: IdleFleetProbe) => {
+    try {
+      await load();
+      const decision = await options.read(probe);
+      const key = probeKey(probe);
+      if (decision.kind === "silent") {
+        if (state[key] !== undefined) {
+          delete state[key];
+          await save();
+        }
+        return;
+      }
+      if (decision.kind === "blind") {
+        if (state[key] !== undefined) {
+          delete state[key];
+          await save();
+        }
+        reportBlind(decision.message);
+        return;
+      }
+      if (state[key] === decision.episodeKey) return;
+      if (!await options.wake({ ...decision, probe })) return;
+      state[key] = decision.episodeKey;
+      await save();
+    } catch (error) {
+      reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=detector-unreadable:${String(error)}`);
+    }
+  };
+
+  const arm = (probe: IdleFleetProbe) => {
+    if (stopped) return;
+    const key = probeKey(probe);
+    const existing = timers.get(key);
+    if (existing !== undefined) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      timers.delete(key);
+      void evaluate(probe);
+    }, debounceMs);
+    timers.set(key, timer);
+  };
+
+  return {
+    arm,
+    async rearm() {
+      if (stopped) return;
+      try {
+        const probes = await options.readRearmProbes();
+        for (const probe of probes) arm(probe);
+      } catch (error) {
+        reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=restart-rearm-unreadable:${String(error)}`);
+      }
+    },
+    stop() {
+      stopped = true;
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
+    },
+  };
+}
