@@ -18545,11 +18545,15 @@ function backfillWorkItemAttempts(db) {
         counts.alreadyBound += 1;
         continue;
       }
+      const parsed = parseBackfillLane(row.body);
       if (row.lifecycle_state === "proposed") {
+        if (!parsed) {
+          counts.unresolved += 1;
+          continue;
+        }
         counts.residualProposed += 1;
         continue;
       }
-      const parsed = parseBackfillLane(row.body);
       const state = row.lifecycle_state === "succeeded" ? "done" : row.lifecycle_state === "in_progress" ? "running" : row.lifecycle_state === "failed" || row.lifecycle_state === "cancelled" ? "failed" : null;
       if (!parsed || state === null) {
         counts.unresolved += 1;

@@ -5240,11 +5240,15 @@ export function backfillWorkItemAttempts(db: SqliteDatabase): WorkItemBackfillCo
         counts.alreadyBound += 1;
         continue;
       }
+      const parsed = parseBackfillLane(row.body);
       if (row.lifecycle_state === "proposed") {
+        if (!parsed) {
+          counts.unresolved += 1;
+          continue;
+        }
         counts.residualProposed += 1;
         continue;
       }
-      const parsed = parseBackfillLane(row.body);
       const state: WorkAttemptState | null = row.lifecycle_state === "succeeded"
         ? "done"
         : row.lifecycle_state === "in_progress"

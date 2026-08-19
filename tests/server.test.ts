@@ -3975,10 +3975,21 @@ describe("bb-collab plugin boundary", () => {
       workItemId: ambiguousId,
       workItem: { workItemId: ambiguousId, title: ambiguousId, body: "Writing lane thr_one. Also thr_two" },
     })).outcome).toBe("OK");
-    db.prepare("UPDATE work_items SET lifecycle_state = 'succeeded' WHERE project_id = ? AND work_item_id = ?").run(projectId, ambiguousId);
     expect(() => backfillWorkItemAttempts(db)).toThrow("1 thr_ work item(s) were not attributable");
     expect(db.prepare("SELECT body FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, ambiguousId)).toEqual({ body: "Writing lane thr_one. Also thr_two" });
     expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(projectId, ambiguousId)).toEqual({ count: 0 });
+
+    const malformedId = "backfill-malformed-token";
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      projectId,
+      idempotencyKey: "backfill-create-malformed-token",
+      workItemId: malformedId,
+      workItem: { workItemId: malformedId, title: malformedId, body: "Writing lane thr_bad-token. Must refuse" },
+    })).outcome).toBe("OK");
+    db.prepare("UPDATE work_items SET lifecycle_state = 'succeeded' WHERE project_id = ? AND work_item_id = ?").run(projectId, malformedId);
+    expect(() => backfillWorkItemAttempts(db)).toThrow("2 thr_ work item(s) were not attributable");
+    expect(db.prepare("SELECT body FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, malformedId)).toEqual({ body: "Writing lane thr_bad-token. Must refuse" });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(projectId, malformedId)).toEqual({ count: 0 });
   });
 
   it("rebuilds execution_attempts with scoped nullability and active work indexes", () => {
