@@ -22,6 +22,7 @@ function insertAttempt(
   db: SqliteDatabase,
   input: {
     id: string;
+    projectId?: string;
     origin: "role_holder" | "work_item";
     threadId: string | null;
     roleId?: string;
@@ -37,7 +38,7 @@ function insertAttempt(
      ) VALUES (?, ?, ?, 1, 1, 1, ?, ?, ?, ?, 1, 'done', 'server', 'env', 'source',
                'host', 'path', ?, 'environment', 1, ?)`,
   ).run(
-    PROJECT_ID,
+    input.projectId ?? PROJECT_ID,
     input.id,
     input.origin,
     input.workItemId ?? null,
@@ -74,6 +75,8 @@ function fixture(options: {
   includeUnknownPullRequest?: boolean;
   includeUnreadableArchiveState?: boolean;
   activateArchiveChildOnSecondReport?: boolean;
+  includeLegacyArchiveCoverage?: boolean;
+  includeForeignProject?: boolean;
   throwOnList?: boolean;
 } = {}) {
   const db = new Database(":memory:");
@@ -88,6 +91,7 @@ function fixture(options: {
   insertAttempt(db, { id: "director-holder", origin: "role_holder", threadId: "director-exemption", roleId: "director" });
   insertAttempt(db, { id: "orchestrator-holder", origin: "role_holder", threadId: "orchestrator-seat", roleId: "project-orchestrator" });
   insertAttempt(db, { id: "work-item", origin: "work_item", threadId: "work-item-bound", workItemId: "work-item-1" });
+  if (options.includeForeignProject) insertAttempt(db, { id: "foreign-bound", origin: "role_holder", threadId: "foreign-bound", projectId: "project-2" });
   insertGeneration(db, "worker", "worker-v1", "role-holder", "retired");
   insertGeneration(db, "director", "director-seat", "director-holder");
   insertGeneration(db, "project-orchestrator", "orchestrator-v1", "orchestrator-holder");
@@ -95,7 +99,7 @@ function fixture(options: {
   db.pragma("foreign_keys = ON");
 
   const threads = [
-    idle("role-holder"),
+    idle("role-holder", options.includeLegacyArchiveCoverage ? { parentThreadId: "bound-parent" } : {}),
     idle("work-item-bound"),
     idle("director-exemption"),
     idle("orchestrator-seat"),
@@ -108,12 +112,25 @@ function fixture(options: {
     makeThreadResponse({ id: "starting", projectId: PROJECT_ID, status: "starting", archivedAt: null, deletedAt: null, updatedAt: 0 }),
     idle("fresh", { updatedAt: now }),
     idle("fallback-boundary", { updatedAt: now - 12 * 60 * 60 * 1000 }),
+    ...(options.includeLegacyArchiveCoverage ? [
+      idle("bound-parent"),
+      idle("open-pr-parent"),
+      idle("open-pr-child", { parentThreadId: "open-pr-parent", environmentId: "env-pr" }),
+      idle("ancestor"),
+      idle("middle", { parentThreadId: "ancestor" }),
+      makeThreadResponse({ id: "grandchild", projectId: PROJECT_ID, status: "active", archivedAt: null, deletedAt: null, parentThreadId: "middle", updatedAt: now }),
+      idle("fresh-parent"),
+      idle("fresh-child", { parentThreadId: "fresh-parent", updatedAt: now }),
+      idle("archive-parent"),
+      idle("archive-child", { parentThreadId: "archive-parent" }),
+    ] : []),
     idle("ordinary"),
     idle("archived-thread", { archivedAt: now }),
     ...(options.includeUnknownStatus ? [makeThreadResponse({ id: "unknown-status", projectId: PROJECT_ID, status: "unknown" as never, archivedAt: null, deletedAt: null, updatedAt: 0 })] : []),
     ...(options.includeUnresolvableEnvironment ? [idle("unresolvable-environment", { environmentId: "env-missing" })] : []),
     ...(options.includeUnknownPullRequest ? [idle("unknown-pull-request", { environmentId: "env-unknown" })] : []),
     ...(options.includeUnresolvableChild ? [idle("unresolvable-child", { parentThreadId: "missing-parent" })] : []),
+    ...(options.includeForeignProject ? [idle("foreign", { projectId: "project-2" }), idle("foreign-bound", { projectId: "project-2" })] : []),
   ];
 
   let unarchivedListCalls = 0;
@@ -136,7 +153,15 @@ function fixture(options: {
               : thread)
             .slice(offset, offset + limit);
         },
-        archive: async ({ threadId }: { threadId: string }) => ({ ok: true as const, archivedThreadIds: [threadId] }),
+        archive: async ({ threadId }: { threadId: string }) => ({
+          ok: true as const,
+          archivedThreadIds: {
+            "bound-parent": ["bound-parent", "role-holder"],
+            "archive-parent": ["archive-parent", "archive-child"],
+            parent: ["parent", "live-child"],
+            "source-root": ["source-root", "hidden-fork"],
+          }[threadId] ?? [threadId],
+        }),
       },
       environments: {
         pullRequest: (async ({ environmentId }: { environmentId: string }) => {
@@ -191,10 +216,12 @@ describe("thread archive sweep", () => {
     expect(host.harness.inspection.sdk.callsTo("threads.archive")).toEqual([]);
   });
 
-  it("protects a role-generation holder thread", async () => {
-    const { db, host } = fixture();
-    const result = await report(host, db);
-    expect(result.archivableThreadIds).not.toContain("role-holder");
+  it("does not archive a bound role-holder through its eligible parent", async () => {
+    const { db, host } = fixture({ includeLegacyArchiveCoverage: true });
+    const result = await runArchiveSweep(host.bb, db, PROJECT_ID, true, now);
+    expect(result.archivableThreadIds).not.toContain("bound-parent");
+    expect(result.archivedThreadIds).not.toContain("role-holder");
+    expect(host.harness.inspection.sdk.callsTo("threads.archive")).not.toContainEqual([{ threadId: "bound-parent" }]);
   });
 
   it("protects the director first-generation exemption holder", async () => {
@@ -203,24 +230,33 @@ describe("thread archive sweep", () => {
     expect(result.archivableThreadIds).not.toContain("director-exemption");
   });
 
-  it("protects the live orchestrator seat from canonical role state", async () => {
+  it("protects the live orchestrator seat from canonical role state during apply", async () => {
     const { db, host } = fixture();
-    const result = await report(host, db);
+    const result = await runArchiveSweep(host.bb, db, PROJECT_ID, true, now);
     expect(result.archivableThreadIds).not.toContain("orchestrator-seat");
+    expect(result.archivedThreadIds).not.toContain("orchestrator-seat");
+    expect(host.harness.inspection.sdk.callsTo("threads.archive")).not.toContainEqual([{ threadId: "orchestrator-seat" }]);
   });
 
-  it("protects open and draft pull-request threads", async () => {
-    const { db, host } = fixture();
-    const result = await report(host, db);
+  it("protects open and draft pull-request threads during apply", async () => {
+    const { db, host } = fixture({ includeLegacyArchiveCoverage: true });
+    const result = await runArchiveSweep(host.bb, db, PROJECT_ID, true, now);
     expect(result.archivableThreadIds).not.toContain("open-pr");
     expect(result.archivableThreadIds).not.toContain("draft-pr");
+    expect(result.archivedThreadIds).not.toContain("open-pr");
+    expect(result.archivedThreadIds).not.toContain("draft-pr");
+    expect(host.harness.inspection.sdk.callsTo("threads.archive")).not.toContainEqual([{ threadId: "open-pr" }]);
   });
 
-  it("protects a parent with a live child and a source root with a live fork", async () => {
+  it("protects a parent with a live child and a source root with a live fork during apply", async () => {
     const { db, host } = fixture();
-    const result = await report(host, db);
+    const result = await runArchiveSweep(host.bb, db, PROJECT_ID, true, now);
     expect(result.archivableThreadIds).not.toContain("parent");
     expect(result.archivableThreadIds).not.toContain("source-root");
+    expect(result.archivedThreadIds).not.toContain("parent");
+    expect(result.archivedThreadIds).not.toContain("source-root");
+    expect(host.harness.inspection.sdk.callsTo("threads.archive")).not.toContainEqual([{ threadId: "parent" }]);
+    expect(host.harness.inspection.sdk.callsTo("threads.archive")).not.toContainEqual([{ threadId: "source-root" }]);
   });
 
   it("protects active, starting, fresh, and already archived threads", async () => {
@@ -255,6 +291,17 @@ describe("thread archive sweep", () => {
     expect(host.harness.inspection.sdk.callsTo("threads.archive")).toEqual([[{ threadId: "ordinary" }]]);
   });
 
+  it("collapses eligible child roots and aggregates cascaded archive ids", async () => {
+    const { db, host } = fixture({ includeLegacyArchiveCoverage: true });
+    const result = await runArchiveSweep(host.bb, db, PROJECT_ID, true, now);
+    expect(result).toMatchObject({
+      outcome: "applied",
+      archivableThreadIds: ["archive-parent", "ordinary"],
+      archivedThreadIds: ["archive-parent", "archive-child", "ordinary"],
+    });
+    expect(host.harness.inspection.sdk.callsTo("threads.archive")).toEqual([[{ threadId: "archive-parent" }], [{ threadId: "ordinary" }]]);
+  });
+
   it("refuses explicit apply when a candidate changes after the report", async () => {
     const { db, host } = fixture({ activateArchiveChildOnSecondReport: true });
     const result = await runArchiveSweep(host.bb, db, PROJECT_ID, true, now);
@@ -282,6 +329,7 @@ describe("thread archive sweep", () => {
     expect(result).toMatchObject({ outcome: "reported", unresolvedThreadCount: 1 });
     expect(result.archivableThreadIds).toContain("ordinary");
     expect(result.archivableThreadIds).not.toContain("unresolvable-environment");
+    expect(host.harness.inspection.sdk.callsTo("environments.pullRequest")).toContainEqual([{ environmentId: "env-pr" }]);
   });
 
   it("protects an unknown pull-request result", async () => {
@@ -346,6 +394,13 @@ describe("thread archive sweep", () => {
     const { host } = fixture();
     const result = await report(host, null);
     expect(result).toMatchObject({ outcome: "refused", message: "canonical store unavailable" });
+    expect(host.harness.inspection.sdk.callsTo("threads.archive")).toEqual([]);
+  });
+
+  it("scopes an unbound thread to a project with independent attempt evidence", async () => {
+    const { db, host } = fixture({ includeForeignProject: true });
+    const result = await runArchiveSweep(host.bb, db, "project-2", false, now);
+    expect(result).toMatchObject({ outcome: "reported", archivableThreadIds: ["foreign"] });
     expect(host.harness.inspection.sdk.callsTo("threads.archive")).toEqual([]);
   });
 });
