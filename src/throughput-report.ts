@@ -50,7 +50,7 @@ export type WeeklyThroughputReport = {
     window: { startAtMs: number; endAtMs: number };
     issueOpenToClose: { maximumHours: number | null; completed: number; unknown: number };
     mergeCadence: { maximumGapHours: number | null; knownMerges: number };
-    reviewRounds: UnknownMetric;
+    reviewRounds: UnknownMetric | { status: "known"; reason?: never };
   }>;
   sourceCommands: ThroughputFacts["sourceCommands"];
   dialGuidance: string;
@@ -114,14 +114,14 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
   const defects = facts.defects;
   const explicitRevertIds = defects.filter((defect) => defect.reverted === true).map((defect) => defect.id);
   const reverts = facts.unknownReasons?.reverts || defects.length === 0 || defects.some((defect) => defect.reverted === null)
-    ? { status: "unknown" as const, total: null, observedExplicitRevertIds: explicitRevertIds, reason: facts.unknownReasons?.reverts ?? "revert coverage is incomplete" }
+    ? { status: "unknown" as const, total: null, observedExplicitRevertIds: explicitRevertIds, reason: facts.unknownReasons?.reverts ?? "revert coverage is unavailable" }
     : { status: "known" as const, total: explicitRevertIds.length, observedExplicitRevertIds: explicitRevertIds };
   const severityUnknown = facts.unknownReasons?.postMergeSeverity || defects.length === 0 || defects.some((defect) => defect.postMergeSeverity === null);
   const postMergeP0s = severityUnknown
-    ? { status: "unknown" as const, count: null, reason: facts.unknownReasons?.postMergeSeverity ?? "post-merge P0 linkage is incomplete" }
+    ? { status: "unknown" as const, count: null, reason: facts.unknownReasons?.postMergeSeverity ?? "post-merge severity coverage is unavailable" }
     : { status: "known" as const, count: defects.filter((defect) => defect.postMergeSeverity === "P0").length };
   const postMergeP1s = severityUnknown
-    ? { status: "unknown" as const, count: null, reason: facts.unknownReasons?.postMergeSeverity ?? "post-merge P1 linkage is incomplete" }
+    ? { status: "unknown" as const, count: null, reason: facts.unknownReasons?.postMergeSeverity ?? "post-merge severity coverage is unavailable" }
     : { status: "known" as const, count: defects.filter((defect) => defect.postMergeSeverity === "P1").length };
   const reviewTierDeclarations = { A: 0, B: 0, C: 0, unknown: 0 };
   for (const merge of facts.merges) {
@@ -133,12 +133,15 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
     const durations = issues.filter((issue) => issue.openedAtMs !== null).map((issue) => issue.closedAtMs! - issue.openedAtMs!);
     const cohortMerges = mergeTimes.filter((mergedAtMs) => inWindow(mergedAtMs, cohort.startAtMs, cohort.endAtMs));
     const gaps = cohortMerges.slice(1).map((mergedAtMs, index) => mergedAtMs - cohortMerges[index]);
+    const cohortReviews = facts.reviews.filter((review) => inWindow(review.submittedAtMs, cohort.startAtMs, cohort.endAtMs) || inWindow(review.completedAtMs, cohort.startAtMs, cohort.endAtMs));
     return {
       label: cohort.label,
       window: { startAtMs: cohort.startAtMs, endAtMs: cohort.endAtMs },
       issueOpenToClose: { maximumHours: durations.length ? hours(Math.max(...durations)) : null, completed: durations.length, unknown: issues.length - durations.length },
       mergeCadence: { maximumGapHours: gaps.length ? hours(Math.max(...gaps)) : null, knownMerges: cohortMerges.length },
-      reviewRounds: { status: "unknown" as const, reason: facts.unknownReasons?.reviewLatency ?? "no canonically linked review observations" },
+      reviewRounds: cohortReviews.length === 0
+        ? { status: "unknown" as const, reason: facts.unknownReasons?.reviewLatency ?? "no canonically linked review observations" }
+        : { status: "known" as const },
     };
   });
   const issueMedian = median(issueDurations);
@@ -157,7 +160,7 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
     issueAcceptanceAudit,
     mergeCadence: { histogram, maximumGapHours: mergeGaps.length ? Math.max(...mergeGaps) : null, knownMerges: mergeTimes.filter((merge) => inWindow(merge, window.startAtMs, window.endAtMs)).length, unknown: facts.merges.filter((merge) => merge.mergedAtMs === null).length },
     reviewTierDeclarations,
-    laneSlotUtilization: { status: "unknown", reason: facts.unknownReasons?.laneSlotUtilization ?? "PR #338 does not persist full-cap intervals; startability must not be recomputed" },
+    laneSlotUtilization: { status: "unknown", reason: facts.unknownReasons?.laneSlotUtilization ?? "lane slot utilization is unavailable" },
     reviewLatencyByTier,
     defectEscape: { reverts, postMergeP0s, postMergeP1s },
     outlierCohorts,
