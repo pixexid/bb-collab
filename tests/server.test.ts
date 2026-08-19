@@ -2023,6 +2023,51 @@ describe("bb-collab plugin boundary", () => {
     expect(JSON.parse(unregistered.stdout)).toMatchObject({ outcome: "INVALID_INPUT" });
   });
 
+  it("preserves the registered-project refusal code through the CLI send catch", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+
+    const result = await host.harness.runCli([
+      "send-to-operator", "--project", FOREIGN_PROJECT_ID, "--recipient", "operator", "--severity", "routine", "--message", "wrong project",
+    ], { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID });
+    expect(result.exitCode).toBe(2);
+    expect(JSON.parse(result.stdout)).toMatchObject({ outcome: "PROJECT_CONFIG_REQUIRED", message: "operator inbox project is not registered" });
+  });
+
+  it("preserves the unknown-message refusal code through the CLI mark-read catch", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+
+    const result = await host.harness.runCli(["inbox", "--project", PROJECT_ID, "--mark-read", "999999"]);
+    expect(result.exitCode).toBe(2);
+    expect(JSON.parse(result.stdout)).toMatchObject({ outcome: "RESOURCE_UNKNOWN", message: "operator message does not exist in the requested project" });
+  });
+
+  it("preserves the foreign-execution-context refusal code through the CLI send catch", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    host.harness.sdk.stub("threads.get", (async () => makeThreadResponse({ id: ROLE_THREAD_ID, projectId: FOREIGN_PROJECT_ID })) as never);
+
+    const result = await host.harness.runCli([
+      "send-to-operator", "--project", PROJECT_ID, "--recipient", "operator", "--severity", "routine", "--message", "wrong thread project",
+    ], { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID });
+    expect(result.exitCode).toBe(2);
+    expect(JSON.parse(result.stdout)).toMatchObject({ outcome: "EXECUTION_CONTEXT_FOREIGN", message: "project_id must exactly match the sender thread project" });
+  });
+
+  it("preserves canonical-store unavailability through the CLI inbox catch", async () => {
+    const host = hostFor();
+    vi.spyOn(host.bb.storage, "database").mockImplementation(() => { throw new Error("database unavailable"); });
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+
+    const result = await host.harness.runCli(["inbox", "--project", PROJECT_ID]);
+    expect(result.exitCode).toBe(2);
+    expect(JSON.parse(result.stdout)).toMatchObject({ outcome: "CANONICAL_STORE_UNAVAILABLE", message: "operator inbox store is unavailable" });
+  });
+
   it("delivers replies through platform steer only after the matching sender event lands", async () => {
     const host = hostFor();
     await plugin(host.bb, { notifyUrgent: async () => undefined });

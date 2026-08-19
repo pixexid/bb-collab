@@ -102,7 +102,7 @@ describe("durable wait-validator plugin boundary", () => {
 
     const foreign = await registerWait(fixture, waitRequest({ idempotencyKey: "wait-key-2" }), "waiter-2");
     expect(foreign.exitCode).toBe(2);
-    expect(JSON.parse(foreign.stdout)).toMatchObject({ outcome: "INVALID_INPUT", message: expect.stringContaining("calling thread") });
+    expect(JSON.parse(foreign.stdout)).toMatchObject({ outcome: "INVALID_INPUT" });
 
     const listed = await fixture.host.harness.runCli(["wait-list", "--project", PROJECT_ID]);
     expect(JSON.parse(listed.stdout).evidence).toHaveLength(1);
@@ -133,7 +133,7 @@ describe("durable wait-validator plugin boundary", () => {
     fixture.setThread("source-1", { status: "active" });
     const result = await registerWait(fixture, waitRequest({ wakerSchedule: "missing-schedule" }), "waiter-1");
     expect(result.exitCode).toBe(2);
-    expect(JSON.parse(result.stdout)).toMatchObject({ outcome: "INVALID_INPUT", message: expect.stringContaining("not live") });
+    expect(JSON.parse(result.stdout)).toMatchObject({ outcome: "INVALID_INPUT" });
     expect(JSON.parse((await fixture.host.harness.runCli(["wait-list", "--project", PROJECT_ID])).stdout).evidence).toHaveLength(0);
     await fixture.host.harness.lifecycle.dispose();
   });
@@ -168,7 +168,7 @@ describe("durable wait-validator plugin boundary", () => {
     const fixture = await loadedFixture();
     const bad = await fixture.host.harness.runCli(["wait-validator", "--cycle", "--extra"]);
     expect(bad.exitCode).toBe(2);
-    expect(JSON.parse(bad.stdout)).toMatchObject({ outcome: "INVALID_INPUT", message: expect.stringContaining("unexpected") });
+    expect(JSON.parse(bad.stdout)).toMatchObject({ outcome: "INVALID_INPUT" });
     const missing = await fixture.host.harness.runCli(["wait-validator"]);
     expect(missing.exitCode).toBe(2);
     await fixture.host.harness.lifecycle.dispose();

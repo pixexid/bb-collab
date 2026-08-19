@@ -33,6 +33,10 @@ immediately. Replies use platform steer and count as delivered only after the
 matching input event appears in the sender thread; failures remain visible and
 retryable in Inbox.
 
+CLI consumers branch on `outcome`; `message` is prose and never a branch key.
+Use only codes in the ADR 0001 table; a code absent from that table is not to be
+invented at a call site.
+
 ## Founding status
 
 Issue 1 freezes the contract and v1 boundary before implementation begins.
