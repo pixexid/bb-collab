@@ -144,5 +144,8 @@ describe("worktree cleanup", () => {
     expect(result).not.toHaveProperty("removed");
     expect(result.environmentRecordsReleased).toBe(false);
     expect(result.wouldRemove).toEqual([]);
+    // An empty wouldRemove alone cannot tell the inventory gate from the quiet floor, which
+    // also refuses this fixture. Only the reason distinguishes the default under test.
+    expect(result.refused).toContainEqual(expect.objectContaining({ reason: "bb environment inventory is incomplete; detached ownership unresolved" }));
   });
 });

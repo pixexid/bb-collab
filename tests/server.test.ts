@@ -6711,7 +6711,14 @@ describe("bb-collab plugin boundary", () => {
       const unresolved = JSON.parse((await host.harness.runCli(["worktree-cleanup", "--project", PROJECT_ID])).stdout) as { wouldRemove: unknown[]; refused: { path: string; reason: string }[] };
       expect(unresolved.wouldRemove).toEqual([]);
       expect(unresolved.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(orphan), reason: "bb environment inventory is incomplete; detached ownership unresolved" }));
-      console.log(`inventory discrimination: ${JSON.stringify({ resolved: resolved.wouldRemove.map(({ reason }) => reason), unresolved: unresolved.refused.map(({ reason }) => reason) })}`);
+
+      // A record that reads fine but carries no path is the other half of an incomplete
+      // enumeration: it claims nothing, and treating that as "claims no worktree" would
+      // turn an environment we cannot place into evidence that nobody owns the orphan.
+      host.harness.sdk.stub("environments.get", (async () => ({ path: null })) as never);
+      const pathless = JSON.parse((await host.harness.runCli(["worktree-cleanup", "--project", PROJECT_ID])).stdout) as { wouldRemove: unknown[]; refused: { path: string; reason: string }[] };
+      expect(pathless.wouldRemove).toEqual([]);
+      expect(pathless.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(orphan), reason: "bb environment inventory is incomplete; detached ownership unresolved" }));
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
