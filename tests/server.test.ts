@@ -29,7 +29,7 @@ import {
   PLUGIN_ID,
   SCHEMA_VERSION,
   TABLES,
-  assembleV21CachedConsumerRolloutEvidence,
+  assembleV22CachedConsumerRolloutEvidence,
   applyFixtureMutation,
   applyAuthorizedMutation,
   backfillWorkItemGithubIssues,
@@ -88,17 +88,25 @@ const ROLE_PROFILE = {
 };
 const ROLE_PROFILE_DIGEST = sha256(canonicalJson(ROLE_PROFILE));
 const DIRECTOR_PROFILE = {
-  providerId: "pi",
-  model: "kimi-coding/k3",
-  reasoningLevel: "high",
+  providerId: "claude-code",
+  model: "claude-opus-5[1m]",
+  reasoningLevel: "medium",
   permissionMode: "full",
   serviceTier: "default",
   visibility: "visible" as const,
 };
 const DIRECTOR_STANDBY_PROFILE = {
-  providerId: "claude-code",
-  model: "claude-opus-5[1m]",
-  reasoningLevel: "medium",
+  providerId: "pi",
+  model: "zai/glm-5.3",
+  reasoningLevel: "high",
+  permissionMode: "full",
+  serviceTier: "default",
+  visibility: "visible" as const,
+};
+const LEGACY_DIRECTOR_PROFILE = {
+  providerId: "pi",
+  model: "kimi-coding/k3",
+  reasoningLevel: "high",
   permissionMode: "full",
   serviceTier: "default",
   visibility: "visible" as const,
@@ -197,15 +205,15 @@ function roleConfig(connector: "required" | "optional" | "prohibited" = "optiona
   return config;
 }
 
-function directorSeatConfig() {
+function directorSeatConfig(executedProfile = DIRECTOR_PROFILE, standbyProfile = DIRECTOR_STANDBY_PROFILE) {
   const config = roleConfig();
   const requirements = config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>;
   requirements[0] = {
     roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
     roleId: "director",
     repoTargetId: null,
-    executedProfile: DIRECTOR_PROFILE,
-    standbyProfile: DIRECTOR_STANDBY_PROFILE,
+    executedProfile,
+    standbyProfile,
     writingLaneCapacity: 0,
   };
   return config;
@@ -231,13 +239,13 @@ function cachedConsumerObservations(observedSchemaVersion: number, observedContr
 function policyProbeReread(name: (typeof CACHED_CONSUMERS)[number], result: Pick<FoundationResult, "outcome">, expectedOutcome: FoundationResult["outcome"]) {
   if (result.outcome !== expectedOutcome) throw new Error(`${name} policy probe did not return ${expectedOutcome}`);
   const reread = cachedConsumerRolloutEvidence(cachedConsumerObservations(SCHEMA_VERSION, CONTRACT_VERSION));
-  if (reread.action !== "reread") throw new Error(`${name} did not reread v21`);
+  if (reread.action !== "reread") throw new Error(`${name} did not reread v22`);
   const observation = reread.observations.find((candidate) => candidate.name === name);
   if (!observation) throw new Error(`${name} reread observation is unavailable`);
   return { observedSchemaVersion: observation.observedSchemaVersion, observedContractVersion: observation.observedContractVersion };
 }
 
-function doctorV21Reread(name: "server.rpcContract" | "server.collabCli", result: FoundationResult) {
+function doctorV22Reread(name: "server.rpcContract" | "server.collabCli", result: FoundationResult) {
   const cachedConsumers = (result.evidence as { cachedConsumers?: { newSchemaVersion?: unknown; newContractVersion?: unknown } } | undefined)?.cachedConsumers;
   if (result.outcome !== "OK" || typeof cachedConsumers?.newSchemaVersion !== "number" || typeof cachedConsumers.newContractVersion !== "number") {
     throw new Error(`${name} did not return cached-consumer evidence`);
@@ -247,15 +255,16 @@ function doctorV21Reread(name: "server.rpcContract" | "server.collabCli", result
 
 function directorRoleReader(
   mutate?: (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => void,
+  profile = DIRECTOR_PROFILE,
 ) {
   return roleReader((facts) => {
-    facts.thread.providerId = DIRECTOR_PROFILE.providerId;
+    facts.thread.providerId = profile.providerId;
     facts.events[0]!.data.execution = {
       ...facts.events[0]!.data.execution as Record<string, unknown>,
-      model: DIRECTOR_PROFILE.model,
-      reasoningLevel: DIRECTOR_PROFILE.reasoningLevel,
-      permissionMode: DIRECTOR_PROFILE.permissionMode,
-      serviceTier: DIRECTOR_PROFILE.serviceTier,
+      model: profile.model,
+      reasoningLevel: profile.reasoningLevel,
+      permissionMode: profile.permissionMode,
+      serviceTier: profile.serviceTier,
     };
     mutate?.(facts);
   });
@@ -1290,7 +1299,7 @@ exit 0
       if (rejectSecondWorkerFacts && threadId === "worker-two") throw new Error("routing facts unavailable");
       return {
         providerId: threadId === directorThreadId ? "pi" : threadId === orchestratorThreadId || secondWorkerProvider === "codex" && threadId === "worker-two" ? "codex" : "luna",
-        model: threadId === directorThreadId ? "kimi-coding/k3" : threadId === orchestratorThreadId ? "gpt-5.6-sol" : threadId === "worker-two" ? secondWorkerModel : "gpt-5.6-luna",
+        model: threadId === directorThreadId ? "zai/glm-5.3" : threadId === orchestratorThreadId ? "gpt-5.6-sol" : threadId === "worker-two" ? secondWorkerModel : "gpt-5.6-luna",
         reasoningLevel: threadId === "worker-one" || threadId === "worker-two" ? "max" : "high",
         permissionMode: "full",
         serviceTier: "default",
@@ -4645,9 +4654,9 @@ exit 1
     }
   });
 
-  it("appends the operator inbox schema while preserving the v21 foundation contract", () => {
+  it("appends no migration while advancing the director profile contract to v22", () => {
     expect(SCHEMA_VERSION).toBe(20);
-    expect(CONTRACT_VERSION).toBe(21);
+    expect(CONTRACT_VERSION).toBe(22);
     expect(MIGRATIONS).toHaveLength(33);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
@@ -4708,17 +4717,17 @@ exit 1
       oldSchemaVersion: 19,
       newSchemaVersion: 20,
       oldContractVersion: 21,
-      newContractVersion: 21,
+      newContractVersion: 22,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(20, 21))).toMatchObject({
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(20, 22))).toMatchObject({
       oldSchemaVersion: 19,
       newSchemaVersion: 20,
       oldContractVersion: 21,
-      newContractVersion: 21,
+      newContractVersion: 22,
       action: "reread",
       expected: 4,
       attempted: 4,
@@ -4729,7 +4738,7 @@ exit 1
       oldSchemaVersion: 19,
       newSchemaVersion: 20,
       oldContractVersion: 21,
-      newContractVersion: 21,
+      newContractVersion: 22,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -4866,19 +4875,19 @@ exit 1
     }
   });
 
-  it("assembles the production v21 cached-consumer rollout receipt with stale-v19 refusal semantics", async () => {
-    expect(CONTRACT_VERSION).toBe(21);
+  it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
+    expect(CONTRACT_VERSION).toBe(22);
     expect(SCHEMA_VERSION).toBe(20);
     expect(MIGRATIONS).toHaveLength(33);
-    expect(contractDigest).toBe("6df90c4315ca78dacb7043a45d28ccfdd259947d835bce3953d7b4f44b928c9f");
+    expect(contractDigest).toBe("5a7c560aa6176b15c9ed5dcf0be25aa20a1028a1ec7d97a519e6c70193db0d6c");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     const beforeRefusal = exportFoundation(db, PROJECT_ID);
-    const evidence = await assembleV21CachedConsumerRolloutEvidence({
-      rpcContract: async () => doctorV21Reread("server.rpcContract", rpcContract.doctor.output.parse(
+    const evidence = await assembleV22CachedConsumerRolloutEvidence({
+      rpcContract: async () => doctorV22Reread("server.rpcContract", rpcContract.doctor.output.parse(
         await host.harness.callRpc("doctor", { projectId: PROJECT_ID }),
       ) as FoundationResult),
-      collabCli: async () => doctorV21Reread("server.collabCli", JSON.parse(
+      collabCli: async () => doctorV22Reread("server.collabCli", JSON.parse(
         (await host.harness.runCli(["doctor", "--project", PROJECT_ID])).stdout,
       ) as FoundationResult),
       consumedLegacyReplay: async () => ({ ...policyProbeReread("src/foundation.consumedLegacyReplayProbe", { outcome: "OK" }, "OK"), consumedLegacyReplay: { outcome: "OK" } }),
@@ -4886,12 +4895,12 @@ exit 1
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 20, observedContractVersion: 21 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 20, observedContractVersion: 22 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
     expect(evidence).toMatchObject({
-      evidenceId: "cached-consumer-v21-rollout-receipt",
+      evidenceId: "cached-consumer-v22-rollout-receipt",
       evidenceKind: "release",
       sourceKind: "release",
       sourceRef: "live-plugin:dist/server.js",
@@ -5113,13 +5122,13 @@ exit 1
     }
   });
 
-  it("refuses v21 rollout evidence when one cached consumer did not execute", async () => {
+  it("refuses v22 rollout evidence when one cached consumer did not execute", async () => {
     const { db, directory } = directDatabase();
     try {
       const rpcContractProbe = vi.fn(async () => ({ observedSchemaVersion: 11, observedContractVersion: 18 }));
       const collabCliProbe = vi.fn(async () => ({ observedSchemaVersion: 11, observedContractVersion: 18 }));
       const serverTestProbe = vi.fn(async () => ({ observedSchemaVersion: 11, observedContractVersion: 18 }));
-      await expect(assembleV21CachedConsumerRolloutEvidence({
+      await expect(assembleV22CachedConsumerRolloutEvidence({
         rpcContract: rpcContractProbe,
         collabCli: collabCliProbe,
         newLegacyApplyProvenance: serverTestProbe,
@@ -5134,15 +5143,15 @@ exit 1
     }
   });
 
-  it("keeps the v21 rollout assembler in production rather than test support", () => {
-    expect(typeof assembleV21CachedConsumerRolloutEvidence).toBe("function");
+  it("keeps the v22 rollout assembler in production rather than test support", () => {
+    expect(typeof assembleV22CachedConsumerRolloutEvidence).toBe("function");
     expect(CACHED_CONSUMERS).toEqual([
       "server.rpcContract",
       "server.collabCli",
       "src/foundation.consumedLegacyReplayProbe",
       "src/foundation.newLegacyApplyProvenanceProbe",
     ]);
-    expect(readFileSync(new URL("../src/test-support.ts", import.meta.url), "utf8")).not.toContain("assembleV21CachedConsumerRolloutEvidence");
+    expect(readFileSync(new URL("../src/test-support.ts", import.meta.url), "utf8")).not.toContain("assembleV22CachedConsumerRolloutEvidence");
     const serverSource = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
     expect(serverSource).toContain("bb.sdk.plugins.callRpc({");
     expect(serverSource).toContain('runCli(db, bb, ["doctor", "--project", request.projectId], cliContext, cliDeps)');
@@ -5157,7 +5166,7 @@ exit 1
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
       observedSchemaVersion: 20,
-      observedContractVersion: 21,
+      observedContractVersion: 22,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -5167,14 +5176,14 @@ exit 1
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     const actorReceiptId = seedCurrentOrchestratorActor(db, fenceToken);
-    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v21-rollout-decision", {
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v22-rollout-decision", {
       actorReceiptId,
     }))).toMatchObject({ outcome: "OK" });
     const before = exportFoundation(db, PROJECT_ID);
-    for (const sourceRef of ["test:cached-consumer-v21-rollout-receipt", "fixture:cached-consumer-v21-rollout-receipt", "source:server.ts"]) {
-      expect(await host.harness.callRpc("cachedConsumerRollout", decisionDispositionRequest(fenceToken, "cached-consumer-v21-rollout-decision", 1, {
+    for (const sourceRef of ["test:cached-consumer-v22-rollout-receipt", "fixture:cached-consumer-v22-rollout-receipt", "source:server.ts"]) {
+      expect(await host.harness.callRpc("cachedConsumerRollout", decisionDispositionRequest(fenceToken, "cached-consumer-v22-rollout-decision", 1, {
         actorReceiptId,
-        decisionEvidence: [decisionArtifact("cached-consumer-v21-rollout-receipt", {
+        decisionEvidence: [decisionArtifact("cached-consumer-v22-rollout-receipt", {
           evidenceKind: "test",
           sourceKind: "test",
           sourceRef,
@@ -5194,11 +5203,11 @@ exit 1
     const host = await loadedDistHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     const actorReceiptId = seedCurrentOrchestratorActor(db, fenceToken);
-    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v21-rollout-dist-refusal", {
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v22-rollout-dist-refusal", {
       actorReceiptId,
     }))).toMatchObject({ outcome: "OK" });
     const before = exportFoundation(db, PROJECT_ID);
-    expect(await host.harness.callRpc("cachedConsumerRollout", decisionDispositionRequest(fenceToken, "cached-consumer-v21-rollout-dist-refusal", 1, {
+    expect(await host.harness.callRpc("cachedConsumerRollout", decisionDispositionRequest(fenceToken, "cached-consumer-v22-rollout-dist-refusal", 1, {
         actorReceiptId,
       }))).toMatchObject({
         outcome: "INVALID_INPUT",
@@ -5213,10 +5222,10 @@ exit 1
     const host = await loadedDistHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     const actorReceiptId = seedCurrentOrchestratorActor(db, fenceToken);
-    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v21-rollout-dist", {
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v22-rollout-dist", {
       actorReceiptId,
     }))).toMatchObject({ outcome: "OK" });
-    const request = decisionDispositionRequest(fenceToken, "cached-consumer-v21-rollout-dist", 1, { actorReceiptId });
+    const request = decisionDispositionRequest(fenceToken, "cached-consumer-v22-rollout-dist", 1, { actorReceiptId });
     const before = exportFoundation(db, PROJECT_ID);
     expect(await host.harness.callRpc("cachedConsumerRollout", request)).toMatchObject({
       outcome: "INVALID_INPUT",
@@ -5230,16 +5239,16 @@ exit 1
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
   });
 
-  it("treats a persisted v20 rollout receipt as unknown without migrating or requiring it", async () => {
+  it("treats a persisted v21 rollout receipt as unknown without migrating or requiring it", async () => {
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
-    seedEvidenceArtifact(db, "cached-consumer-v20-rollout-receipt");
+    seedEvidenceArtifact(db, "cached-consumer-v21-rollout-receipt");
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
       outcome: "OK",
       evidence: {
         cachedConsumers: {
           oldContractVersion: 21,
-          newContractVersion: 21,
+          newContractVersion: 22,
           action: "unknown",
           expected: 4,
           attempted: 0,
@@ -5253,13 +5262,13 @@ exit 1
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     const actorReceiptId = seedCurrentOrchestratorActor(db, fenceToken);
-    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v21-rollout-generic", {
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cached-consumer-v22-rollout-generic", {
       actorReceiptId,
     }))).toMatchObject({ outcome: "OK" });
     const before = exportFoundation(db, PROJECT_ID);
-    expect(await host.harness.callRpc("apply", decisionDispositionRequest(fenceToken, "cached-consumer-v21-rollout-generic", 1, {
+    expect(await host.harness.callRpc("apply", decisionDispositionRequest(fenceToken, "cached-consumer-v22-rollout-generic", 1, {
       actorReceiptId,
-      decisionEvidence: [decisionArtifact("cached-consumer-v21-rollout-receipt", {
+      decisionEvidence: [decisionArtifact("cached-consumer-v22-rollout-receipt", {
         evidenceKind: "release",
         sourceKind: "release",
         sourceRef: "live-plugin:dist/server.js",
@@ -5387,7 +5396,7 @@ exit 1
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 20, schemaDigest: "abf83bf6369c9f5acc8e58a7365c89524f5a32c6ab0ab5c5c3729b0d969e1810", contractVersion: 21, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 20, schemaDigest: "abf83bf6369c9f5acc8e58a7365c89524f5a32c6ab0ab5c5c3729b0d969e1810", contractVersion: 22, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -7595,6 +7604,111 @@ exit 1
     expect(holder.thread_id).not.toBe("bootstrap-subject");
   });
 
+  it("accepts the ratified primary director profile", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      declaredProfile: DIRECTOR_PROFILE,
+    }), null, directorRoleReader()).outcome).toBe("OK");
+  });
+
+  it("accepts the ratified secondary director profile with the primary as standby", async () => {
+    const host = await loadedHost();
+    const config = directorSeatConfig(DIRECTOR_STANDBY_PROFILE, DIRECTOR_PROFILE);
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config });
+    const profileDigest = sha256(canonicalJson(DIRECTOR_STANDBY_PROFILE));
+    const facts = directorRoleReader(undefined, DIRECTOR_STANDBY_PROFILE);
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      declaredProfile: DIRECTOR_STANDBY_PROFILE,
+    }), null, facts).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      profileDigest,
+      standbyProfile: DIRECTOR_PROFILE,
+    }), null, facts).outcome).toBe("OK");
+  });
+
+  it("keeps only the exact legacy tuple readable and bridges legacy and ratified holders until the head advances", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
+    const legacyConfig = directorSeatConfig(LEGACY_DIRECTOR_PROFILE, DIRECTOR_PROFILE);
+    const configJson = canonicalJson(legacyConfig);
+    db.prepare(
+      "UPDATE project_config_revisions SET canonical_config_json = ?, config_digest = ? WHERE project_id = ? AND config_revision = 1",
+    ).run(configJson, sha256(configJson), PROJECT_ID);
+
+    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "legacy-director-qualification",
+      qualificationId: "legacy-director-qualification",
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      declaredProfile: LEGACY_DIRECTOR_PROFILE,
+    }), null, directorRoleReader(undefined, LEGACY_DIRECTOR_PROFILE)).outcome).toBe("OK");
+
+    const secondaryDigest = sha256(canonicalJson(DIRECTOR_STANDBY_PROFILE));
+    const secondaryFacts = directorRoleReader(undefined, DIRECTOR_STANDBY_PROFILE);
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "bridged-director-qualification",
+      qualificationId: "bridged-director-qualification",
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      declaredProfile: DIRECTOR_STANDBY_PROFILE,
+    }), null, secondaryFacts).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      idempotencyKey: "bridged-director-succession",
+      qualificationId: "bridged-director-qualification",
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      profileDigest: secondaryDigest,
+      standbyProfile: DIRECTOR_PROFILE,
+    }), null, secondaryFacts).outcome).toBe("OK");
+
+    const nearMissHost = await loadedHost();
+    const { db: nearMissDb } = seedAndBootstrap(nearMissHost, PROJECT_ID, { config: directorSeatConfig() });
+    const nearMissConfig = canonicalJson(directorSeatConfig(LEGACY_DIRECTOR_PROFILE, DIRECTOR_STANDBY_PROFILE));
+    nearMissDb.prepare(
+      "UPDATE project_config_revisions SET canonical_config_json = ?, config_digest = ? WHERE project_id = ? AND config_revision = 1",
+    ).run(nearMissConfig, sha256(nearMissConfig), PROJECT_ID);
+    await expect(nearMissHost.harness.callRpc("doctor", { projectId: PROJECT_ID })).resolves.toMatchObject({
+      outcome: "BB_FACTS_UNAVAILABLE",
+      message: "Refusal: stored role requirements are invalid",
+      attempted: 0,
+      verified: 0,
+    });
+  });
+
+  it("refuses the legacy director profile in new config without writing", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
+    expect(applyWithFixtureReceipt(db, bootstrapRequest(PROJECT_ID, {
+      config: directorSeatConfig(LEGACY_DIRECTOR_PROFILE, DIRECTOR_PROFILE),
+    }))).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM project_config_revisions").get()).toEqual({ count: 0 });
+  });
+
+  it("refuses legacy and arbitrary director bindings under the ratified head", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
+      declaredProfile: LEGACY_DIRECTOR_PROFILE,
+    }), null, directorRoleReader(undefined, LEGACY_DIRECTOR_PROFILE))).toMatchObject({
+      outcome: "EXECUTION_PROFILE_MISMATCH",
+      verified: 1,
+      evidence: { reasonCode: "execution_profile_mismatch" },
+    });
+
+    const arbitrary = { ...DIRECTOR_STANDBY_PROFILE, model: "unapproved/director" };
+    const arbitraryHost = await loadedHost();
+    const arbitraryDb = arbitraryHost.bb.storage.database();
+    seedVerifiedFixtureReceipt(arbitraryDb, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
+    expect(applyWithFixtureReceipt(arbitraryDb, bootstrapRequest(PROJECT_ID, {
+      config: directorSeatConfig(arbitrary, DIRECTOR_PROFILE),
+    }))).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
+    expect(arbitraryDb.prepare("SELECT COUNT(*) AS count FROM project_config_revisions").get()).toEqual({ count: 0 });
+  });
+
   it("records one exact director standby and refuses wrong-provider, foreign, stale, and replay paths without writes", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: directorSeatConfig() });
@@ -8445,10 +8559,10 @@ exit 1
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 19, newSchemaVersion: 20, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 19, newSchemaVersion: 20, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 19, newSchemaVersion: 20, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(20, 21))).toMatchObject({ oldSchemaVersion: 19, newSchemaVersion: 20, oldContractVersion: 21, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 19, newSchemaVersion: 20, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 19, newSchemaVersion: 20, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 19, newSchemaVersion: 20, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(20, 22))).toMatchObject({ oldSchemaVersion: 19, newSchemaVersion: 20, oldContractVersion: 21, newContractVersion: 22, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 

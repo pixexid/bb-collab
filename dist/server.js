@@ -14484,7 +14484,7 @@ import { basename, dirname, isAbsolute, join, relative } from "node:path";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 21;
+var CONTRACT_VERSION = 22;
 var SCHEMA_VERSION = 20;
 var PREVIOUS_CONTRACT_VERSION = 21;
 var DEFAULT_WRITING_LANE_CEILING = 3;
@@ -14492,18 +14492,27 @@ var MAX_WRITING_LANE_CEILING = 3;
 var PREVIOUS_SCHEMA_VERSION = 19;
 var ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"];
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
-var directorSeatProfile = {
+var directorSeatPrimaryProfile = {
+  providerId: "claude-code",
+  model: "claude-opus-5[1m]",
+  reasoningLevel: "medium",
+  permissionMode: "full",
+  serviceTier: "default",
+  visibility: "visible"
+};
+var directorSeatSecondaryProfile = {
   providerId: "pi",
-  model: "kimi-coding/k3",
+  model: "zai/glm-5.3",
   reasoningLevel: "high",
   permissionMode: "full",
   serviceTier: "default",
   visibility: "visible"
 };
-var directorSeatStandbyProfile = {
-  providerId: "claude-code",
-  model: "claude-opus-5[1m]",
-  reasoningLevel: "medium",
+var directorSeatProfiles = [directorSeatPrimaryProfile, directorSeatSecondaryProfile];
+var legacyDirectorSeatProfile = {
+  providerId: "pi",
+  model: "kimi-coding/k3",
+  reasoningLevel: "high",
   permissionMode: "full",
   serviceTier: "default",
   visibility: "visible"
@@ -15321,7 +15330,7 @@ var CACHED_CONSUMER_ROLLOUT_POLICY = {
   requiredV21ConsumedLegacyReplay: "OK",
   refusal: "OPERATOR_RECEIPT_INVALID"
 };
-async function assembleV21CachedConsumerRolloutEvidence(input) {
+async function assembleV22CachedConsumerRolloutEvidence(input) {
   const probes = [
     ["server.rpcContract", input.rpcContract],
     ["server.collabCli", input.collabCli],
@@ -15329,7 +15338,7 @@ async function assembleV21CachedConsumerRolloutEvidence(input) {
     ["src/foundation.newLegacyApplyProvenanceProbe", input.newLegacyApplyProvenance]
   ];
   if (probes.some(([, probe]) => typeof probe !== "function")) {
-    throw new Error("cached-consumer v21 rollout evidence requires execution from all four consumers");
+    throw new Error("cached-consumer v22 rollout evidence requires execution from all four consumers");
   }
   const executed = await Promise.all(probes.map(async ([name, probe]) => ({
     name,
@@ -15339,10 +15348,10 @@ async function assembleV21CachedConsumerRolloutEvidence(input) {
   const consumedLegacyReplay = executed[2].consumedLegacyReplay;
   const newApply = executed[3].newApplyRefusal;
   if (reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || consumedLegacyReplay?.outcome !== "OK" || newApply?.outcome !== "OPERATOR_RECEIPT_INVALID") {
-    throw new Error("cached-consumer v21 rollout evidence requires four rereads, consumed legacy replay, and the current new-apply refusal");
+    throw new Error("cached-consumer v22 rollout evidence requires four rereads, consumed legacy replay, and the current new-apply refusal");
   }
   const durableRefJson = canonicalJson({
-    kind: "cached_consumer_v21_rollout_receipt",
+    kind: "cached_consumer_v22_rollout_receipt",
     reread,
     consumedLegacyReplay: {
       outcome: consumedLegacyReplay.outcome
@@ -15352,16 +15361,16 @@ async function assembleV21CachedConsumerRolloutEvidence(input) {
     }
   });
   return {
-    evidenceId: "cached-consumer-v21-rollout-receipt",
+    evidenceId: "cached-consumer-v22-rollout-receipt",
     evidenceKind: "release",
     sourceKind: "release",
     sourceRef: "live-plugin:dist/server.js",
     executionAttemptId: null,
     contentDigest: sha256(durableRefJson),
-    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v21-rollout-receipt", redacted: true }),
+    redactedJson: canonicalJson({ evidenceId: "cached-consumer-v22-rollout-receipt", redacted: true }),
     durableRefJson,
     relationKind: "supporting",
-    relation: { purpose: "cached-consumer-v21-rollout" }
+    relation: { purpose: "cached-consumer-v22-rollout" }
   };
 }
 function cachedConsumerRolloutEvidence(observations) {
@@ -15408,7 +15417,7 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
     `SELECT evidence_kind, source_kind, source_ref, execution_attempt_id, content_digest,
             redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest
      FROM evidence_artifacts
-     WHERE project_id = ? AND evidence_id = 'cached-consumer-v21-rollout-receipt'`
+     WHERE project_id = ? AND evidence_id = 'cached-consumer-v22-rollout-receipt'`
   ).get(projectId));
   if (!row) return unknownCachedConsumerRolloutEvidence();
   try {
@@ -15418,7 +15427,7 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
     assertRedactedEvidence(durableRef, "cached-consumer rollout durable reference");
     const expectedIdentity = sha256(canonicalJson({
       projectId,
-      evidenceId: "cached-consumer-v21-rollout-receipt",
+      evidenceId: "cached-consumer-v22-rollout-receipt",
       evidenceKind: row.evidence_kind,
       sourceKind: row.source_kind,
       sourceRef: row.source_ref,
@@ -15431,7 +15440,7 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
     const receipt = durableRef;
     if (!Array.isArray(receipt.reread?.observations)) return unknownCachedConsumerRolloutEvidence();
     const reread = cachedConsumerRolloutEvidence(receipt.reread.observations);
-    if (receipt.kind !== "cached_consumer_v21_rollout_receipt" || receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest || reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || receipt.consumedLegacyReplay?.outcome !== "OK" || receipt.newApplyGuard?.nullProvenance?.outcome !== "OPERATOR_RECEIPT_INVALID") return unknownCachedConsumerRolloutEvidence();
+    if (receipt.kind !== "cached_consumer_v22_rollout_receipt" || receipt.reread.rolloutReceiptDigest !== reread.rolloutReceiptDigest || reread.action !== "reread" || reread.expected !== 4 || reread.attempted !== 4 || reread.verified !== 4 || receipt.consumedLegacyReplay?.outcome !== "OK" || receipt.newApplyGuard?.nullProvenance?.outcome !== "OPERATOR_RECEIPT_INVALID") return unknownCachedConsumerRolloutEvidence();
     return reread;
   } catch {
     return unknownCachedConsumerRolloutEvidence();
@@ -15517,8 +15526,11 @@ var contractDigest = sha256(canonicalJson({
   directorSeatPolicy: {
     roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
     roleId: "director",
-    executedProfile: directorSeatProfile,
-    standbyProfile: directorSeatStandbyProfile,
+    profiles: directorSeatProfiles,
+    legacyStoredPair: {
+      executedProfile: legacyDirectorSeatProfile,
+      standbyProfile: directorSeatPrimaryProfile
+    },
     writingLaneCapacity: 0,
     environment: "managed-worktree",
     assignmentKinds: []
@@ -15862,6 +15874,16 @@ var executionProfileSchema = external_exports.object({
   serviceTier: id,
   visibility: external_exports.enum(["visible", "hidden"])
 }).strict();
+function profileIsOneOf(profile, profiles) {
+  const value = canonicalJson(profile);
+  return profiles.some((candidate) => value === canonicalJson(candidate));
+}
+function isLegacyDirectorSeatRequirement(requirement) {
+  return requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID && canonicalJson(requirement.executedProfile) === canonicalJson(legacyDirectorSeatProfile) && canonicalJson(requirement.standbyProfile) === canonicalJson(directorSeatPrimaryProfile);
+}
+function isRatifiedDirectorSeatRequirement(requirement) {
+  return requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID && profileIsOneOf(requirement.executedProfile, directorSeatProfiles) && profileIsOneOf(requirement.standbyProfile, directorSeatProfiles) && canonicalJson(requirement.executedProfile) !== canonicalJson(requirement.standbyProfile);
+}
 var roleRequirementSchema = external_exports.object({
   roleRequirementId: id,
   roleId: roleIdSchema,
@@ -15893,14 +15915,11 @@ var roleRequirementSchema = external_exports.object({
     if (requirement.repoTargetId !== null) {
       ctx.addIssue({ code: "custom", path: ["repoTargetId"], message: "director-seat must be project-scoped" });
     }
-    if (!requirement.standbyProfile || canonicalJson(requirement.standbyProfile) !== canonicalJson(directorSeatStandbyProfile)) {
-      ctx.addIssue({ code: "custom", path: ["standbyProfile"], message: "director-seat requires the exact Opus-medium standby profile" });
-    }
     if (requirement.writingLaneCapacity !== 0) {
       ctx.addIssue({ code: "custom", path: ["writingLaneCapacity"], message: "director-seat has no writing-lane capacity" });
     }
-    if (canonicalJson(requirement.executedProfile) !== canonicalJson(directorSeatProfile)) {
-      ctx.addIssue({ code: "custom", path: ["executedProfile"], message: "director-seat requires the exact judgment profile" });
+    if (!isRatifiedDirectorSeatRequirement(requirement) && !isLegacyDirectorSeatRequirement(requirement)) {
+      ctx.addIssue({ code: "custom", path: ["executedProfile"], message: "director-seat requires the exact ratified profile pair" });
     }
   } else if (requirement.standbyProfile !== void 0 || requirement.writingLaneCapacity !== void 0) {
     ctx.addIssue({ code: "custom", path: ["roleRequirementId"], message: "standby profile and writing capacity are reserved for director-seat" });
@@ -16379,6 +16398,9 @@ function validateConfig(value) {
       if (roleRequirements !== void 0) {
         const parsed = roleRequirementsSchema.safeParse(roleRequirements);
         if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
+        if (parsed.data.some(isLegacyDirectorSeatRequirement)) {
+          throw refusal("INVALID_INPUT", "new config cannot declare the legacy director-seat profile");
+        }
       }
       const writingLaneCeiling = bbCollab.writingLaneCeiling;
       if (writingLaneCeiling !== void 0 && (!Number.isInteger(writingLaneCeiling) || Number(writingLaneCeiling) < 0 || Number(writingLaneCeiling) > MAX_WRITING_LANE_CEILING)) {
@@ -18216,6 +18238,11 @@ function requireRoleActorBinding(db, request, required2 = true) {
 function profileEquals(left, right) {
   return canonicalJson(left) === canonicalJson(right);
 }
+function roleRequirementProfileMatches(requirement, profile) {
+  if (requirement.roleRequirementId !== DIRECTOR_SEAT_ROLE_REQUIREMENT_ID) return profileEquals(profile, requirement.executedProfile);
+  const profiles = isLegacyDirectorSeatRequirement(requirement) ? [legacyDirectorSeatProfile, ...directorSeatProfiles] : directorSeatProfiles;
+  return profileIsOneOf(profile, profiles);
+}
 function qualificationContextDigest(context, resolved, request) {
   return sha256(canonicalJson({
     ...context.baseContext,
@@ -18249,7 +18276,7 @@ function applyQualificationObservation(db, request, digest, context) {
     throw refusal("IDEMPOTENCY_KEY_CONFLICT", "qualification identity is immutable and already exists");
   }
   const contextDigest = qualificationContextDigest(context, resolved, request);
-  const requiredMatch = profileEquals(context.profile, resolved.requirement.executedProfile);
+  const requiredMatch = roleRequirementProfileMatches(resolved.requirement, context.profile);
   const declaredMatch = request.declaredProfile === void 0 || profileEquals(context.profile, request.declaredProfile);
   const mismatch = !requiredMatch || !declaredMatch;
   const observationOutcome = mismatch ? "unqualified" : requestedOutcome;
@@ -18493,12 +18520,12 @@ function applyRoleGenerationSuccession(db, request, digest, context) {
   }
   const resolved = requireRoleRequirement(db, request, configRevision);
   requireRoleTargetContext(db, request, resolved, context);
-  if (!profileEquals(context.profile, resolved.requirement.executedProfile) || request.profileDigest !== context.profileDigest) {
+  if (!roleRequirementProfileMatches(resolved.requirement, context.profile) || request.profileDigest !== context.profileDigest) {
     throw refusal("EXECUTION_PROFILE_MISMATCH", "holder executed profile does not match the role requirement");
   }
   const standbyProfile = request.standbyProfile;
-  if (resolved.requirement.standbyProfile && (!standbyProfile || !profileEquals(standbyProfile, resolved.requirement.standbyProfile))) {
-    throw refusal("ROLE_STANDBY_INVALID", "director-seat succession requires its configured Opus-medium standby profile");
+  if (resolved.requirement.standbyProfile && (!standbyProfile || !roleRequirementProfileMatches(resolved.requirement, standbyProfile))) {
+    throw refusal("ROLE_STANDBY_INVALID", "director-seat succession requires another allowed profile from its configured pair");
   }
   if (request.roleId === "director") {
     if (!standbyProfile || standbyProfile.providerId === context.profile.providerId) {
@@ -21939,7 +21966,7 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
 }
 async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false) {
   const parsed = applyRequestSchema.safeParse(input);
-  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v21-rollout-receipt")) {
+  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v22-rollout-receipt")) {
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
   if (parsed.success && parsed.data.workItemWait !== void 0 && parsed.data.workItemWait !== null) {
@@ -22079,7 +22106,7 @@ async function applyLiveCachedConsumerRollout(bb, db, input, cliDeps, cliContext
   try {
     const project = await bb.sdk.projects.get({ projectId: request.projectId });
     if (project.id !== request.projectId) return { outcome: "PROJECT_UNKNOWN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "live project identity does not match the rollout request" };
-    const evidence = await assembleV21CachedConsumerRolloutEvidence({
+    const evidence = await assembleV22CachedConsumerRolloutEvidence({
       rpcContract: async () => liveCachedConsumerReread("server.rpcContract", await bb.sdk.plugins.callRpc({
         pluginId: bb.pluginId,
         method: "doctor",
@@ -23895,7 +23922,7 @@ ${thread.titleFallback ?? ""}`);
       },
       {
         name: "cached-consumer-rollout",
-        summary: "Persist the live v21 cached-consumer rollout evidence (exact live production evidence required)",
+        summary: "Persist the live v22 cached-consumer rollout evidence (exact live production evidence required)",
         usage: "bb collab cached-consumer-rollout --project PROJECT_ID --request JSON"
       },
       { name: "role-list", summary: "List exact current active role bindings (read-only)", usage: "bb collab role-list --project PROJECT_ID" },
