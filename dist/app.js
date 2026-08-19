@@ -877,7 +877,11 @@ function InboxPanel(_props) {
       setErrors([]);
       return;
     }
-    void Promise.allSettled(projects.map((project) => rpc.call("operatorMessages", { projectId: project.id, ...recipient ? { recipient } : {} }))).then((results) => {
+    void Promise.allSettled(projects.map((project) => rpc.call("operatorMessages", {
+      projectId: project.id,
+      ...recipient ? { recipient } : {},
+      withSenderTitles: true
+    }))).then((results) => {
       if (sequence !== refreshSequence.current) return;
       const loaded = [];
       const failed = [];

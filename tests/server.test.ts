@@ -1901,7 +1901,9 @@ describe("bb-collab plugin boundary", () => {
       expect(cli.exitCode).toBe(0);
       expect(JSON.parse(cli.stdout)).toMatchObject({ projectId: PROJECT_ID, recipient: "supervisor", notificationStatus: "not-requested" });
       const titleReadsBeforeList = host.harness.inspection.sdk.callsTo("threads.get").length;
-      expect(await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID })).toEqual(
+      expect(await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID })).toHaveLength(6);
+      expect(host.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(titleReadsBeforeList);
+      expect(await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, withSenderTitles: true })).toEqual(
         expect.arrayContaining([expect.objectContaining({ senderThreadId: ROLE_THREAD_ID, senderTitle: "Managed role holder" })]),
       );
       expect(host.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(titleReadsBeforeList + 1);
@@ -1930,7 +1932,7 @@ describe("bb-collab plugin boundary", () => {
     }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID });
     host.harness.sdk.stub("threads.get", async () => { throw new Error("thread no longer exists"); });
 
-    await expect(host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID })).resolves.toEqual([
+    await expect(host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, withSenderTitles: true })).resolves.toEqual([
       expect.objectContaining({ senderThreadId: ROLE_THREAD_ID, senderTitle: null }),
     ]);
   });

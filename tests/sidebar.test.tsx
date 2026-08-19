@@ -127,9 +127,9 @@ describe("replacement thread list", () => {
       rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages } as never,
     });
 
-    await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a" }));
+    await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a", withSenderTitles: true }));
     fireEvent.change(rendered.getByLabelText("Project"), { target: { value: "project-a" } });
-    await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a" }));
+    await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a", withSenderTitles: true }));
     expect(rendered.getByText("Need an answer")).toBeTruthy();
     expect(rendered.getByText(/Reply delivery failed: environment deleted/)).toBeTruthy();
     expect(rendered.getByRole("heading", { name: "Project A" })).toBeTruthy();
@@ -200,7 +200,7 @@ describe("replacement thread list", () => {
     });
 
     await waitFor(() => expect(rendered.getByText("Visible after deletion")).toBeTruthy());
-    expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a" });
+    expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a", withSenderTitles: true });
     expect((rendered.getByLabelText("Project") as HTMLSelectElement).value).toBe("");
   });
 

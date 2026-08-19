@@ -20432,7 +20432,11 @@ var rpcContract = defineRpcContract({
     output: roleBriefSchema
   },
   operatorMessages: {
-    input: external_exports.object({ projectId: projectIdSchema, recipient: operatorRecipientSchema.optional() }).strict(),
+    input: external_exports.object({
+      projectId: projectIdSchema,
+      recipient: operatorRecipientSchema.optional(),
+      withSenderTitles: external_exports.boolean().optional()
+    }).strict(),
     output: external_exports.array(operatorMessageSchema)
   },
   markOperatorMessageRead: {
@@ -20821,14 +20825,15 @@ async function resolveSenderTitles(bb, messages) {
   })));
   return messages.map((message) => ({ ...message, senderTitle: titles.get(message.senderThreadId) ?? null }));
 }
-async function listOperatorMessages(db, bb, projectId, recipient) {
+async function listOperatorMessages(db, bb, projectId, recipient, withSenderTitles = false) {
   const store = requireRegisteredInboxProject(db, projectId);
   const recipientClause = recipient === void 0 ? "" : " AND message.recipient = ?";
   const rows = store.prepare(`${operatorMessageSelect}
     WHERE message.project_id = ?${recipientClause}
     ORDER BY (message.read_at_ms IS NULL) DESC, message.created_at_ms DESC, message.message_id DESC
     LIMIT ${OPERATOR_MESSAGE_LIMIT}`).all(...recipient === void 0 ? [projectId] : [projectId, recipient]);
-  return resolveSenderTitles(bb, rows.map(operatorMessage));
+  const messages = rows.map(operatorMessage);
+  return withSenderTitles ? resolveSenderTitles(bb, messages) : messages;
 }
 async function markOperatorMessageRead(db, bb, projectId, messageId) {
   const store = requireRegisteredInboxProject(db, projectId);
@@ -22023,7 +22028,7 @@ ${thread.titleFallback ?? ""}`);
       return composeRoleBrief(bb, db, input);
     },
     operatorMessages(input) {
-      return listOperatorMessages(db, bb, input.projectId, input.recipient);
+      return listOperatorMessages(db, bb, input.projectId, input.recipient, input.withSenderTitles);
     },
     markOperatorMessageRead(input) {
       return markOperatorMessageRead(db, bb, input.projectId, input.messageId);

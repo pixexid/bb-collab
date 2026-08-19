@@ -325,7 +325,11 @@ export const rpcContract = defineRpcContract({
     output: roleBriefSchema,
   },
   operatorMessages: {
-    input: z.object({ projectId: projectIdSchema, recipient: operatorRecipientSchema.optional() }).strict(),
+    input: z.object({
+      projectId: projectIdSchema,
+      recipient: operatorRecipientSchema.optional(),
+      withSenderTitles: z.boolean().optional(),
+    }).strict(),
     output: z.array(operatorMessageSchema),
   },
   markOperatorMessageRead: {
@@ -823,14 +827,21 @@ async function resolveSenderTitles(bb: BbPluginApi, messages: ReturnType<typeof 
   return messages.map((message) => ({ ...message, senderTitle: titles.get(message.senderThreadId) ?? null }));
 }
 
-async function listOperatorMessages(db: SqliteDatabase | null, bb: BbPluginApi, projectId: string, recipient?: z.infer<typeof operatorRecipientSchema>) {
+async function listOperatorMessages(
+  db: SqliteDatabase | null,
+  bb: BbPluginApi,
+  projectId: string,
+  recipient?: z.infer<typeof operatorRecipientSchema>,
+  withSenderTitles = false,
+) {
   const store = requireRegisteredInboxProject(db, projectId);
   const recipientClause = recipient === undefined ? "" : " AND message.recipient = ?";
   const rows = store.prepare(`${operatorMessageSelect}
     WHERE message.project_id = ?${recipientClause}
     ORDER BY (message.read_at_ms IS NULL) DESC, message.created_at_ms DESC, message.message_id DESC
     LIMIT ${OPERATOR_MESSAGE_LIMIT}`).all(...(recipient === undefined ? [projectId] : [projectId, recipient])) as OperatorMessageRow[];
-  return resolveSenderTitles(bb, rows.map(operatorMessage));
+  const messages = rows.map(operatorMessage);
+  return withSenderTitles ? resolveSenderTitles(bb, messages) : messages;
 }
 
 async function markOperatorMessageRead(db: SqliteDatabase | null, bb: BbPluginApi, projectId: string, messageId: number) {
@@ -2108,7 +2119,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return composeRoleBrief(bb, db, input);
     },
     operatorMessages(input) {
-      return listOperatorMessages(db, bb, input.projectId, input.recipient);
+      return listOperatorMessages(db, bb, input.projectId, input.recipient, input.withSenderTitles);
     },
     markOperatorMessageRead(input) {
       return markOperatorMessageRead(db, bb, input.projectId, input.messageId);
