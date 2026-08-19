@@ -2589,13 +2589,18 @@ describe("bb-collab plugin boundary", () => {
       const logCount = fixture.host.harness.inspection.logEntries.length;
       await fixture.host.harness.runSchedule("fleet-watchdog");
 
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
-        {
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([
+        [expect.objectContaining({
+          threadId: fixture.orchestratorThreadId,
+          mode: "auto",
+          input: [expect.objectContaining({ text: expect.stringContaining("RECOVERY WAKE — reconcile state before resuming") })],
+        })],
+        [{
           threadId: fixture.orchestratorThreadId,
           mode: "start",
           input: [{ type: "text", visibility: "agent-only", text: "role wake path broken at cycle 1970-01-01T01:00:00.000Z: project-orchestrator@1 holder status=error; opening a fresh turn", mentions: [] }],
-        },
-      ]]);
+        }],
+      ]);
       const persisted = await fixture.host.bb.storage.kv.get<Record<string, RoleIdleRecord>>("fleet-watchdog.role-idle");
       expect(Object.values(persisted ?? {})).toContainEqual(expect.objectContaining({ lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: 60 * 60_000 }));
       expect(fixture.host.harness.inspection.logEntries.slice(logCount)).toContainEqual(expect.objectContaining({
@@ -2604,9 +2609,150 @@ describe("bb-collab plugin boundary", () => {
       }));
       expect(fixture.host.harness.inspection.logEntries.slice(logCount).some((entry) => entry.message === "fleet-watchdog healthy cycle")).toBe(false);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(3);
     } finally {
       clock.mockRestore();
+    }
+  });
+
+  it("wakes a genuinely errored thread through auto mode and carries recovery reconciliation", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    const threadId = "lane-genuinely-errored";
+    let status: "error" | "active" = "error";
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId: requestedId }: { threadId: string }) => makeThreadResponse({
+      id: requestedId,
+      projectId: PROJECT_ID,
+      environmentId: `environment-${requestedId}`,
+      status: requestedId === threadId ? status : "idle",
+      updatedAt: 1,
+    })) as never);
+    fixture.host.harness.sdk.stub("environments.status", (async () => ({
+      outcome: "available",
+      workspace: { checkout: { kind: "branch", branchName: "bb/recovery-test", headSha: "35703f72-recovery-head" } },
+    })) as never);
+    fixture.host.harness.sdk.stub("threads.send", (async ({ mode }: { mode: string }) => {
+      if (status === "error" && mode !== "auto") throw new Error("HTTP 409: Thread is not active");
+      status = "active";
+      return { ok: true };
+    }) as never);
+
+    expect((await fixture.host.bb.sdk.threads.get({ threadId })).status).toBe("error");
+    await expect(fixture.host.bb.sdk.threads.send({
+      threadId,
+      mode: "steer",
+      input: [{ type: "text", text: "control", mentions: [] }],
+    })).rejects.toThrow("HTTP 409: Thread is not active");
+    await expect(fixture.host.harness.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: threadId, projectId: PROJECT_ID, status: "error", updatedAt: 1 }),
+      error: "daemon connection lost",
+    })).resolves.toEqual({ errors: [] });
+
+    expect(status).toBe("active");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([
+      [expect.objectContaining({ threadId, mode: "steer" })],
+      [expect.objectContaining({
+        threadId,
+        mode: "auto",
+        input: [expect.objectContaining({ text: expect.stringMatching(/reconcile state before resuming[\s\S]*35703f72-recovery-head[\s\S]*re-run every pre-crash measurement/u) })],
+      })],
+    ]);
+  });
+
+  it("refuses recovery when an error event resolves to a healthy or foreign-project thread", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: threadId === "foreign-error" ? "project-two" : PROJECT_ID,
+      status: threadId === "foreign-error" ? "error" : "idle",
+      updatedAt: 1,
+    })) as never);
+
+    for (const threadId of ["healthy-after-event", "foreign-error"]) {
+      await fixture.host.harness.emitThreadEvent("thread.failed", {
+        thread: makeThreadResponse({ id: threadId, projectId: PROJECT_ID, status: "error", updatedAt: 1 }),
+        error: "daemon connection lost",
+      });
+    }
+
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("re-arms role recovery on service restart and loudly reports blind lane coverage", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    const statuses = new Map([[fixture.orchestratorThreadId, "error" as "error" | "active"]]);
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      environmentId: `environment-${threadId}`,
+      status: statuses.get(threadId) ?? "idle",
+      updatedAt: 1,
+    })) as never);
+    fixture.host.harness.sdk.stub("environments.status", (async () => ({
+      outcome: "available",
+      workspace: { checkout: { kind: "detached", headSha: "rearmed-head" } },
+    })) as never);
+    fixture.host.harness.sdk.stub("threads.send", (async ({ threadId, mode }: { threadId: string; mode: string }) => {
+      if (statuses.get(threadId) === "error" && mode !== "auto") throw new Error("HTTP 409: Thread is not active");
+      statuses.set(threadId, "active");
+      return { ok: true };
+    }) as never);
+    const openWorkItems = (fixture.db.prepare(
+      "SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')",
+    ).get() as { count: number }).count;
+
+    for (let start = 1; start <= 2; start += 1) {
+      statuses.set(fixture.orchestratorThreadId, "error");
+      const service = fixture.host.harness.runService("lane-watcher");
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(start));
+      service.controller.abort();
+      await service.done;
+    }
+
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([
+      [expect.objectContaining({ threadId: fixture.orchestratorThreadId, mode: "auto" })],
+      [expect.objectContaining({ threadId: fixture.orchestratorThreadId, mode: "auto" })],
+    ]);
+    expect(fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.startsWith("error-recovery coverage="))).toEqual([
+      {
+        level: "error",
+        message: `error-recovery coverage=blind event=armed roleRestart=armed roles=2 failedRoles=0 laneRestart=blind unboundOpenWorkItems=${openWorkItems} reason=work-items-have-no-thread-binding:GH-300`,
+      },
+      {
+        level: "error",
+        message: `error-recovery coverage=blind event=armed roleRestart=armed roles=2 failedRoles=0 laneRestart=blind unboundOpenWorkItems=${openWorkItems} reason=work-items-have-no-thread-binding:GH-300`,
+      },
+    ]);
+  });
+
+  it("starts and stops the lane watcher whether restart reconciliation resolves or hangs", async () => {
+    for (const firstRecoveryReadHangs of [false, true]) {
+      const fixture = await fleetWatchdogFixture(0);
+      let threadReads = 0;
+      let firstReadSettled = false;
+      let interactionReads = 0;
+      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => {
+        threadReads += 1;
+        if (threadReads === 1 && firstRecoveryReadHangs) await new Promise<never>(() => undefined);
+        if (threadReads === 1) firstReadSettled = true;
+        return makeThreadResponse({ id: threadId, projectId: PROJECT_ID, status: "idle", updatedAt: 1 });
+      }) as never);
+      fixture.host.harness.sdk.stub("threads.interactions.list", (async () => {
+        interactionReads += 1;
+        return [];
+      }) as never);
+
+      const service = fixture.host.harness.runService("lane-watcher");
+      const loopStarted = await vi.waitFor(() => expect(interactionReads).toBeGreaterThan(0), { timeout: 100 })
+        .then(() => true, () => false);
+      service.controller.abort();
+      const shutdown = await Promise.race([
+        service.done.then(() => "shutdown-completed" as const),
+        new Promise<"still-hung-after-abort">((resolve) => setTimeout(() => resolve("still-hung-after-abort"), 100)),
+      ]);
+
+      expect({ loopStarted, shutdown }).toEqual({ loopStarted: true, shutdown: "shutdown-completed" });
+      expect(threadReads).toBeGreaterThan(firstRecoveryReadHangs ? 1 : 0);
+      expect(firstReadSettled).toBe(!firstRecoveryReadHangs);
     }
   });
 

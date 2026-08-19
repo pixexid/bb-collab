@@ -317,3 +317,9 @@ A late mechanism is recoverable; a lying one is not. In anything that notifies, 
 ## A test that injects a guard's answer does not cover that guard
 
 > Injection is ordinary and often proves plenty — a test that supplies page responses while executing the real pagination loop is genuine evidence about that loop. The narrow failure is injecting the answer of the very guard whose correctness is being claimed. A destructive tool passed its suite while every safety guard was dead in production: an inverted reachability command that would delete a worktree ahead of `origin/main`, a live-thread check that could not resolve its own target population, and an inventory bounded to one page. Each fixture supplied that guard's verdict directly, so the suite exercised the fixture instead. Before citing a green test as coverage of a guard, name the guard's own code path and say whether the test executed it.
+
+## Coverage is an epistemic state
+
+Do not report armed until the persisted eligible-thread inventory has been reconciled; unreadable inventory is blind and loud.
+
+Keep unobserved, unreadable, and known outcomes distinct. A partial detector names the population it cannot cover and why instead of presenting partial coverage as fleet-wide certainty.

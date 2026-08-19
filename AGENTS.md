@@ -8,7 +8,7 @@ The fleet is a director, an orchestrator, and workers using BB-native threads an
 
 ## Contract
 
-`CONTRACT_VERSION: 31` — apply the [version-bump test](docs/rules.md#version-bump-test) before changing it.
+`CONTRACT_VERSION: 32` — apply the [version-bump test](docs/rules.md#version-bump-test) before changing it.
 
 ## Reading order for a fresh seat
 
