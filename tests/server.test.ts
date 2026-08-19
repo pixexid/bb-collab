@@ -434,6 +434,8 @@ function hostFor(
         }),
       },
       threads: {
+        list: async () => [],
+        defaultExecutionOptions: async () => null,
         get: async () => ({
           id: roleFacts.facts.thread.id,
           projectId: roleFacts.facts.thread.projectId,
@@ -1272,7 +1274,7 @@ exit 0
     const result = await host.harness.callRpc("doctor", { projectId: PROJECT_ID }) as FoundationResult;
     expect(result).toMatchObject({
       outcome: "OK",
-      message: 'plugin "Agent Proxy" 0.2.1 is not loaded: declared BB range >=0.38.0 <0.39.0 excludes running BB 0.39.0',
+      message: 'plugin "Agent Proxy" 0.2.1 is not loaded: declared BB range >=0.38.0 <0.39.0 excludes running BB 0.39.0; No active worker seats are running',
       evidence: {
         compatibility: {
           plugins: {
@@ -1286,6 +1288,77 @@ exit 0
               loaded: false,
             }],
           },
+        },
+      },
+    });
+  });
+
+  it("reports worker routing uniformity, escalation independence, and rejected seat facts", async () => {
+    const { host, db } = await assignmentFixture({ directorSeat: true, orchestratorSeat: true });
+    const roleThreads = db.prepare(
+      "SELECT role_id, thread_id FROM execution_attempts WHERE origin = 'role_holder' ORDER BY role_id",
+    ).all() as Array<{ role_id: string; thread_id: string }>;
+    const directorThreadId = roleThreads.find((row) => row.role_id === "director")!.thread_id;
+    const orchestratorThreadId = roleThreads.find((row) => row.role_id === "project-orchestrator")!.thread_id;
+    let secondWorkerProvider = "luna";
+    let rejectSecondWorkerFacts = false;
+    host.harness.sdk.stub("threads.list", (async ({ offset }: { offset: number }) => offset === 0 ? [
+      makeThreadResponse({ id: directorThreadId, projectId: PROJECT_ID, providerId: "pi", status: "idle" }),
+      makeThreadResponse({ id: orchestratorThreadId, projectId: PROJECT_ID, providerId: "codex", status: "idle" }),
+      makeThreadResponse({ id: "worker-one", projectId: PROJECT_ID, providerId: "luna", status: "active" }),
+      makeThreadResponse({ id: "worker-two", projectId: PROJECT_ID, providerId: secondWorkerProvider, status: "active" }),
+    ] : []) as never);
+    host.harness.sdk.stub("threads.defaultExecutionOptions", (async ({ threadId }: { threadId: string }) => {
+      if (rejectSecondWorkerFacts && threadId === "worker-two") throw new Error("routing facts unavailable");
+      return {
+        providerId: threadId === directorThreadId ? "pi" : threadId === orchestratorThreadId || secondWorkerProvider === "codex" && threadId === "worker-two" ? "codex" : "luna",
+        model: threadId === directorThreadId ? "kimi-coding/k3" : threadId === orchestratorThreadId || secondWorkerProvider === "codex" && threadId === "worker-two" ? "gpt-5.6-sol" : "gpt-5.6-luna",
+        reasoningLevel: threadId === "worker-one" || threadId === "worker-two" ? "max" : "high",
+        permissionMode: "full",
+        serviceTier: "default",
+      };
+    }) as never);
+
+    const uniform = await host.harness.callRpc("doctor", { projectId: PROJECT_ID }) as FoundationResult;
+    expect(uniform).toMatchObject({
+      outcome: "OK",
+      message: "All 2 active worker seats are on luna/gpt-5.6-luna/max; the orchestrator uses provider codex with 0 of 2 active worker seats; the director uses provider pi with 0 of 2 active worker seats",
+      evidence: {
+        routing: {
+          activeWorkerSeatCount: 2,
+          workerBuckets: [{ providerId: "luna", model: "gpt-5.6-luna", reasoningLevel: "max", count: 2, threadIds: ["worker-one", "worker-two"] }],
+          unresolvedWorkerThreadIds: [],
+          unresolvedEscalationRoleIds: [],
+          escalationSeats: expect.arrayContaining([
+            expect.objectContaining({ roleId: "director", threadId: directorThreadId, providerId: "pi" }),
+            expect.objectContaining({ roleId: "project-orchestrator", threadId: orchestratorThreadId, providerId: "codex" }),
+          ]),
+          providerComparisons: expect.arrayContaining([
+            expect.objectContaining({ providerId: "codex", roleIds: ["project-orchestrator"], workerSeatCount: 0, workerSeatTotal: 2 }),
+            expect.objectContaining({ providerId: "pi", roleIds: ["director"], workerSeatCount: 0, workerSeatTotal: 2 }),
+          ]),
+        },
+      },
+    });
+
+    secondWorkerProvider = "codex";
+    const distributed = await host.harness.callRpc("doctor", { projectId: PROJECT_ID }) as FoundationResult;
+    expect(distributed.message).toBe("2 active worker seats span 2 routing triples: 1 on codex/gpt-5.6-sol/max, 1 on luna/gpt-5.6-luna/max; the orchestrator uses provider codex with 1 of 2 active worker seats; the director uses provider pi with 0 of 2 active worker seats");
+
+    rejectSecondWorkerFacts = true;
+    const unresolved = await host.harness.callRpc("doctor", { projectId: PROJECT_ID }) as FoundationResult;
+    expect(unresolved).toMatchObject({
+      outcome: "OK",
+      message: "2 active worker seats include 1 with unresolved routing profiles; the orchestrator uses provider codex; comparison with 2 active worker seats is unresolved because 1 routing profiles are unavailable; the director uses provider pi; comparison with 2 active worker seats is unresolved because 1 routing profiles are unavailable",
+      evidence: {
+        routing: {
+          activeWorkerSeatCount: 2,
+          workerBuckets: [{ providerId: "luna", model: "gpt-5.6-luna", reasoningLevel: "max", count: 1, threadIds: ["worker-one"] }],
+          unresolvedWorkerThreadIds: ["worker-two"],
+          providerComparisons: expect.arrayContaining([
+            expect.objectContaining({ providerId: "codex", workerSeatCount: null, workerSeatTotal: 2 }),
+            expect.objectContaining({ providerId: "pi", workerSeatCount: null, workerSeatTotal: 2 }),
+          ]),
         },
       },
     });
@@ -4913,6 +4986,7 @@ describe("bb-collab plugin boundary", () => {
           projects: { get: async () => { throw new Error("unknown project"); } },
           plugins: { list: async () => ({ plugins: [] }), getSource: async () => ({ engines: {} }) },
           hosts: { get: async () => { throw new Error("not reached"); } },
+          threads: { list: async () => [], defaultExecutionOptions: async () => null },
         },
         PROJECT_ID,
       );

@@ -6123,6 +6123,124 @@ export interface DoctorSdk {
       engines: { bb?: string };
     }>;
   };
+  threads: {
+    list(args: { projectId: string; archived: false; includeHidden: true; limit: number; offset: number }): Promise<Array<{
+      id: string;
+      providerId: string;
+      status: string;
+    }>>;
+    defaultExecutionOptions(args: { threadId: string }): Promise<{
+      model: string;
+      reasoningLevel: string;
+    } | null>;
+  };
+}
+
+type RoutingProfile = { providerId: string; model: string; reasoningLevel: string };
+
+async function listDoctorThreads(sdk: DoctorSdk, projectId: string): Promise<Array<{ id: string; providerId: string; status: string }>> {
+  const threads: Array<{ id: string; providerId: string; status: string }> = [];
+  for (let offset = 0; ; offset += 1000) {
+    const page = await sdk.threads.list({ projectId, archived: false, includeHidden: true, limit: 1000, offset });
+    threads.push(...page);
+    if (page.length < 1000) return threads;
+    if (offset >= 100_000) throw new Error("thread inventory exceeded bounded pagination");
+  }
+}
+
+async function routingDoctorEvidence(
+  sdk: DoctorSdk,
+  projectId: string,
+  roleGenerationHeads: Array<Record<string, unknown>>,
+): Promise<{
+  messages: string[];
+  activeWorkerSeatCount: number;
+  workerBuckets: Array<RoutingProfile & { count: number; threadIds: string[] }>;
+  unresolvedWorkerThreadIds: string[];
+  escalationSeats: Array<RoutingProfile & { roleId: string; threadId: string }>;
+  unresolvedEscalationRoleIds: string[];
+  providerComparisons: Array<{ providerId: string; roleIds: string[]; workerSeatCount: number | null; workerSeatTotal: number; message: string }>;
+}> {
+  const threads = await listDoctorThreads(sdk, projectId);
+  const escalationHeads = roleGenerationHeads.filter((row) =>
+    row.status === "active" && (row.role_id === "director" || row.role_id === "project-orchestrator"));
+  const escalationThreadIds = new Set(escalationHeads.map((row) => String(row.holder_thread_id)));
+  const workerThreads = threads.filter((thread) => thread.status === "active" && !escalationThreadIds.has(thread.id));
+  const profileFor = async (thread: { id: string; providerId: string }): Promise<RoutingProfile | null> => {
+    try {
+      const options = await sdk.threads.defaultExecutionOptions({ threadId: thread.id });
+      return options && typeof thread.providerId === "string" && typeof options.model === "string" && typeof options.reasoningLevel === "string"
+        ? { providerId: thread.providerId, model: options.model, reasoningLevel: options.reasoningLevel }
+        : null;
+    } catch {
+      return null;
+    }
+  };
+  const workerProfiles = await Promise.all(workerThreads.map(async (thread) => ({ thread, profile: await profileFor(thread) })));
+  const buckets = new Map<string, RoutingProfile & { count: number; threadIds: string[] }>();
+  for (const { thread, profile } of workerProfiles) {
+    if (!profile) continue;
+    const key = `${profile.providerId}\0${profile.model}\0${profile.reasoningLevel}`;
+    const bucket = buckets.get(key) ?? { ...profile, count: 0, threadIds: [] };
+    bucket.count += 1;
+    bucket.threadIds.push(thread.id);
+    buckets.set(key, bucket);
+  }
+  for (const bucket of buckets.values()) bucket.threadIds.sort();
+  const workerBuckets = [...buckets.values()].sort((left, right) =>
+    `${left.providerId}/${left.model}/${left.reasoningLevel}`.localeCompare(`${right.providerId}/${right.model}/${right.reasoningLevel}`));
+  const unresolvedWorkerThreadIds = workerProfiles.filter(({ profile }) => !profile).map(({ thread }) => thread.id).sort();
+  const complete = unresolvedWorkerThreadIds.length === 0;
+  const workerMessage = !complete
+    ? `${workerThreads.length} active worker seats include ${unresolvedWorkerThreadIds.length} with unresolved routing profiles`
+    : workerThreads.length === 0
+      ? "No active worker seats are running"
+      : workerThreads.length === 1
+        ? `1 active worker seat is on ${workerBuckets[0]!.providerId}/${workerBuckets[0]!.model}/${workerBuckets[0]!.reasoningLevel}`
+        : workerBuckets.length === 1
+          ? `All ${workerThreads.length} active worker seats are on ${workerBuckets[0]!.providerId}/${workerBuckets[0]!.model}/${workerBuckets[0]!.reasoningLevel}`
+          : `${workerThreads.length} active worker seats span ${workerBuckets.length} routing triples: ${workerBuckets.map((bucket) => `${bucket.count} on ${bucket.providerId}/${bucket.model}/${bucket.reasoningLevel}`).join(", ")}`;
+  const threadById = new Map(threads.map((thread) => [thread.id, thread]));
+  const resolvedEscalationSeats = await Promise.all(escalationHeads.map(async (head) => {
+    const roleId = String(head.role_id);
+    const threadId = String(head.holder_thread_id);
+    const thread = threadById.get(threadId);
+    const profile = thread ? await profileFor(thread) : null;
+    return { roleId, threadId, profile };
+  }));
+  const escalationSeats = resolvedEscalationSeats
+    .filter((seat): seat is typeof seat & { profile: RoutingProfile } => seat.profile !== null)
+    .map(({ roleId, threadId, profile }) => ({ roleId, threadId, ...profile }));
+  const unresolvedEscalationRoleIds = resolvedEscalationSeats.filter((seat) => !seat.profile).map((seat) => seat.roleId).sort();
+  const escalationByProvider = new Map<string, typeof escalationSeats>();
+  for (const seat of escalationSeats) {
+    const seats = escalationByProvider.get(seat.providerId) ?? [];
+    seats.push(seat);
+    escalationByProvider.set(seat.providerId, seats);
+  }
+  const providerComparisons = [...escalationByProvider].sort(([left], [right]) => left.localeCompare(right)).map(([providerId, seats]) => {
+    const roleIds = seats.map((seat) => seat.roleId).sort();
+    const labels = roleIds.map((roleId) => roleId === "project-orchestrator" ? "the orchestrator" : `the ${roleId}`);
+    const subjects = labels.length === 2 ? `${labels[0]} and ${labels[1]}` : labels[0]!;
+    const workerSeatCount = complete ? workerProfiles.filter(({ profile }) => profile?.providerId === providerId).length : null;
+    const message = workerSeatCount === null
+      ? `${subjects} ${labels.length === 1 ? "uses" : "share"} provider ${providerId}; comparison with ${workerThreads.length} active worker seats is unresolved because ${unresolvedWorkerThreadIds.length} routing profiles are unavailable`
+      : `${subjects} ${labels.length === 1 ? "uses" : "share"} provider ${providerId} with ${workerSeatCount} of ${workerThreads.length} active worker seats`;
+    return { providerId, roleIds, workerSeatCount, workerSeatTotal: workerThreads.length, message };
+  });
+  return {
+    messages: [
+      workerMessage,
+      ...providerComparisons.map((comparison) => comparison.message),
+      ...(unresolvedEscalationRoleIds.length === 0 ? [] : [`Escalation routing is unresolved for ${unresolvedEscalationRoleIds.join(", ")}`]),
+    ],
+    activeWorkerSeatCount: workerThreads.length,
+    workerBuckets,
+    unresolvedWorkerThreadIds,
+    escalationSeats,
+    unresolvedEscalationRoleIds,
+    providerComparisons,
+  };
 }
 
 function versionAtLeast037(version: string): boolean {
@@ -6398,7 +6516,8 @@ export async function doctor(
               role_generations.holder_execution_attempt_id,
               role_generations.standby_profile_json,
               execution_attempts.state AS holder_attempt_state,
-              execution_attempts.native_receipt_digest AS holder_native_receipt_digest
+              execution_attempts.native_receipt_digest AS holder_native_receipt_digest,
+              execution_attempts.thread_id AS holder_thread_id
        FROM role_generation_heads
        JOIN role_generations ON role_generations.project_id = role_generation_heads.project_id
          AND role_generations.role_id = role_generation_heads.role_id
@@ -6482,11 +6601,13 @@ export async function doctor(
     const pluginCompatibilityMessage = incompatiblePlugins.length === 0
       ? undefined
       : incompatiblePlugins.map((plugin) => plugin.message).join("; ");
+    const routing = await routingDoctorEvidence(sdk, projectId, roleGenerationHeads);
+    const doctorMessage = [pluginCompatibilityMessage, ...routing.messages].filter(Boolean).join("; ");
     const expected = targets.length + 1;
     return result("OK", projectId, expected, expected, expected, {
       currentConfigRevision: configHead.config_revision,
       currentGovernanceEpoch: governor ? Number(governor.governance_epoch) : undefined,
-      message: pluginCompatibilityMessage,
+      message: doctorMessage,
       evidence: {
         bbVersion: version.currentVersion,
         pluginSdkVersion: PLUGIN_SDK_VERSION,
@@ -6502,6 +6623,7 @@ export async function doctor(
         activeMigrationRun,
         roleGenerationHeads,
         unresolvedRoleHolders,
+        routing,
         qualificationObservationCount: observationCount,
         eligibility,
         assignments: assignmentAttempts,
