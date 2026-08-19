@@ -19,6 +19,7 @@ import {
 } from "./src/awareness.js";
 import {
   BB_VERSION_RANGE,
+  backfillWorkItemGithubIssues,
   backfillWorkItemAttempts,
   MIGRATIONS,
   ROLE_CONTEXT_EVENT_PAGE_SIZE,
@@ -43,6 +44,7 @@ import {
   type ApplyRequest,
   type FoundationCode,
   type FoundationResult,
+  type GitHubIssueSnapshot,
   type RoleFactReader,
   type SqliteDatabase,
 } from "./src/foundation.js";
@@ -148,6 +150,32 @@ function linkedGithubObservation(owner: string, repo: string, issueNumber: numbe
     ? pullRequestMerged ? "merged" : "closed"
     : issueOpen ? "open" : null;
   return status === null ? null : { status, pullRequestMerged, issueClosed };
+}
+
+function readGithubIssueForBackfill(owner: string, repo: string, issueNumber: number): GitHubIssueSnapshot {
+  const value = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,labels,updatedAt"]);
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
+  const record = value as { number?: unknown; title?: unknown; body?: unknown; state?: unknown; labels?: unknown; updatedAt?: unknown };
+  if (
+    typeof record.number !== "number" ||
+    !Number.isSafeInteger(record.number) ||
+    typeof record.title !== "string" ||
+    (record.body !== null && typeof record.body !== "string") ||
+    (record.state !== "OPEN" && record.state !== "CLOSED") ||
+    !Array.isArray(record.labels) ||
+    !record.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof (label as { name?: unknown }).name === "string") ||
+    typeof record.updatedAt !== "string"
+  ) throw new Error("GitHub issue response is invalid");
+  return {
+    owner,
+    repo,
+    issueNumber: record.number,
+    title: record.title,
+    body: record.body ?? "",
+    state: record.state === "OPEN" ? "open" : "closed",
+    labels: record.labels.map((label) => (label as { name: string }).name),
+    externalRevision: record.updatedAt,
+  };
 }
 
 export const FLEET_WATCHDOG_FLOOR_MS = 5 * 60_000;
@@ -1129,8 +1157,8 @@ async function runCli(
 ) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, archive-sweep, worktree-cleanup, cached-consumer-rollout, role-list, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
+  if (!command || !["doctor", "export", "apply", "github-issue-backfill", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, github-issue-backfill, archive-sweep, worktree-cleanup, cached-consumer-rollout, role-list, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
   }
   if (command === "wait-validator") {
     const unknown = args.find((arg) => arg !== "--cycle");
@@ -1389,6 +1417,29 @@ async function runCli(
       return cliResult(await applyLiveAuthorizedMutation(bb, db, rawRequest));
     } catch (error) {
       return invalidCli(error instanceof Error ? error.message : String(error));
+    }
+  }
+  if (command === "github-issue-backfill") {
+    const unknown = unexpectedFlags(args, ["--project"]);
+    const projectId = parseFlag(args, "--project");
+    if (unknown || args.filter((arg) => arg === "--project").length !== 1 || projectId === null || projectId === "") {
+      return invalidCli(`unexpected argument ${unknown ?? "--project PROJECT_ID is required"}`);
+    }
+    if (!db) return cliResult({ outcome: "CANONICAL_STORE_UNAVAILABLE", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" });
+    try {
+      const backfill = backfillWorkItemGithubIssues(db, projectId, readGithubIssueForBackfill);
+      const complete = backfill.state === "completed";
+      return cliResult({
+        outcome: complete ? "OK" : "EXTERNAL_UNAVAILABLE",
+        subject: projectId,
+        expected: backfill.candidates,
+        attempted: backfill.candidates,
+        verified: backfill.bound + backfill.alreadyBound,
+        message: complete ? "GitHub WorkItem backfill complete" : `GitHub WorkItem backfill ${backfill.state}; canonical store remains available`,
+        evidence: backfill,
+      });
+    } catch (error) {
+      return cliResult({ outcome: "INTERNAL_ERROR", subject: projectId, expected: 1, attempted: 0, verified: 0, message: error instanceof Error ? error.message : String(error) });
     }
   }
   if (command === "cached-consumer-rollout") {
@@ -2788,6 +2839,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         name: "apply",
         summary: "Explicit foundation apply",
         usage: "bb collab apply --project PROJECT_ID --request JSON",
+      },
+      {
+        name: "github-issue-backfill",
+        summary: "One-shot, epoch-bounded existing GitHub issue binding",
+        usage: "bb collab github-issue-backfill --project PROJECT_ID",
       },
       {
         name: "cached-consumer-rollout",

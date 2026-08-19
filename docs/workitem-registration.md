@@ -17,7 +17,8 @@ bb collab apply --project "$PROJECT_ID" --request '{
   "workItem": {
     "workItemId": "<new-work-item-id>",
     "title": "<lane title>",
-    "body": "<frozen lane brief>"
+    "body": "<frozen lane brief>",
+    "githubIssue": { "issueNumber": <existing-issue-number> }
   }
 }'
 ```
@@ -46,15 +47,34 @@ substitute a thread, seat, stale target, or unverified receipt.
 do not belong in doctor because they are caller-created values for the new
 registration, not current store facts.
 
+For a WorkItem that tracks an existing GitHub issue, include the typed
+`workItem.githubIssue.issueNumber`. The exact owner/repository comes from the
+stored `repoTargetId` mapping; registration validates that mapping and writes
+the WorkItem and its `external_work_refs` identity in one transaction. The
+binding remains `projection_state: "pending"` until a projection is separately
+verified, and registration never invokes GitHub or creates an issue.
+
+Historical rows are handled only by the explicit, one-shot command below. It
+does not run during plugin load, and an unresolved row leaves no binding:
+
+```sh
+bb collab github-issue-backfill --project "$PROJECT_ID"
+```
+
+The command bounds candidates to its persisted epoch, accepts only an exact
+`wi-gh-NNN` candidate plus a read-only exact-repository issue check, and records
+`completed` or `degraded` results without retrying automatically on later
+loads.
+
 The request envelope is defined by `applyRequestSchema` in
 `src/foundation.ts`: `projectId`, `operationClass`, and `idempotencyKey` are
 required; `actorReceiptId`, `expectedConfigRevision`, `expectedGovernanceEpoch`,
 `expectedFenceToken`, `repoTargetId`, and `expectedResourceRevision` carry the
 authorization and compare-and-set guards; `workItem` must contain exactly
-`workItemId`, `title`, and `body`. `parseApplyRequest` rejects unknown or
-mis-shaped fields. The resolver computes `mutationRequestDigest` from the
-normalized request and records it with the mutation receipt; there is no
-caller-supplied `digest` field.
+`workItemId`, `title`, `body`, and optional `githubIssue.issueNumber`.
+`parseApplyRequest` rejects unknown or mis-shaped fields. The resolver computes
+`mutationRequestDigest` from the normalized request and records it with the
+mutation receipt; there is no caller-supplied `digest` field.
 
 The live CLI parses the JSON, requires `--project` to equal `request.projectId`,
 then calls `applyLiveAuthorizedMutation` in `server.ts`. The create resolver
