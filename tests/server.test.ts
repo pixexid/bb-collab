@@ -1993,6 +1993,31 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
+  it("refuses an unregistered project on the CLI inbox list rather than printing an empty one", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    await host.harness.callAgentTool("send_to_operator", {
+      project_id: PROJECT_ID,
+      recipient: "supervisor",
+      severity: "routine",
+      text: "supervisor pickup",
+    }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID });
+
+    // #280 moved the unregistered refusal into the reader's result, so the CLI now
+    // refuses on its own account. This is the surface where a seat reads its durable
+    // inbox: printing `[]` at exit 0 would tell it "no messages" when the true answer
+    // is "this project has no inbox". The registered read is the positive control —
+    // without it a CLI that refused everything would pass.
+    const registered = await host.harness.runCli(["inbox", "--project", PROJECT_ID]);
+    expect(registered.exitCode).toBe(0);
+    expect(JSON.parse(registered.stdout)).toHaveLength(1);
+
+    const unregistered = await host.harness.runCli(["inbox", "--project", FOREIGN_PROJECT_ID]);
+    expect(unregistered.exitCode).toBe(2);
+    expect(JSON.parse(unregistered.stdout)).toMatchObject({ outcome: "INVALID_INPUT" });
+  });
+
   it("delivers replies through platform steer only after the matching sender event lands", async () => {
     const host = hostFor();
     await plugin(host.bb, { notifyUrgent: async () => undefined });

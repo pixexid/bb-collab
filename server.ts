@@ -1140,7 +1140,10 @@ async function runCli(
     if (parsedRecipient && !parsedRecipient.success) return invalidCli(parsedRecipient.error.message);
     try {
       const listed = await listOperatorMessages(db, bb, projectId, parsedRecipient?.data);
-      if (listed.outcome !== "OK") throw new Error(listed.message);
+      // The reader answers a refusal instead of throwing it (#280), so the CLI has
+      // to refuse on its own account. The code is the fallback because `message` is
+      // optional on the result and a future outcome could arrive without one.
+      if (listed.outcome !== "OK") return invalidCli(listed.message ?? listed.outcome);
       return { exitCode: 0, stdout: JSON.stringify(listed.messages) };
     } catch (error) {
       return invalidCli(error instanceof Error ? error.message : String(error));
