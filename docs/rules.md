@@ -323,3 +323,57 @@ A late mechanism is recoverable; a lying one is not. In anything that notifies, 
 Do not report armed until the persisted eligible-thread inventory has been reconciled; unreadable inventory is blind and loud.
 
 Keep unobserved, unreadable, and known outcomes distinct. A partial detector names the population it cannot cover and why instead of presenting partial coverage as fleet-wide certainty.
+
+## A caller-controlled check is not a check
+
+> When the caller controls every input a check uses, it cannot establish the property it claims to check.
+
+`receipt_digest` is SHA-256 over public row fields, so a sanctioned writer that controls every checked public row field can choose them all and compute the digest that `requireActor` accepts. A mint endpoint would make `requireActor` decorative only if its caller likewise controlled every checked field or the endpoint added no independent authority; being callable from inside the system alone proves neither. This is the third appearance of the same shape, after stubbed guards and a standby profile reporting coverage that nothing consumed.
+
+## Fallback-only routing observability is blind to uniformity
+
+> A routing signal that only records fallback cannot observe a path where no decision was made.
+
+The tier note fired zero times during the cap storm, correctly: no fallback happened, and no routing decision happened either. The instrument and the failure were disjoint.
+
+## Spawn flags are a choice, not a template
+
+> Spawn flags record a routing choice, not a reusable template. If the note explaining them is hard to write, the routing is wrong.
+
+Copied flags hide whether the selected route was actually considered. The note is the evidence that the flags express a choice rather than inherited defaults.
+
+## A rebase invalidates a head-bound approval
+
+> An approval bound to a pre-rebase head is evidence about a head that no longer exists.
+
+Both #289 and #321 rebased onto merged work touching the same surfaces. In #289, the first post-rebase verify was red in two tests that had auto-merged without a conflict and were still semantically wrong. Re-run the checks that exercise the changed surface; a clean merge is not semantic equivalence.
+
+## A reconstructed mutant head is evidence-class reduced
+
+> A head rebuilt from context after a self-reverted mutant proves the reconstruction is self-consistent, not that it is the work.
+
+In #320, `git checkout HEAD --` was used against uncommitted work while restoring a mutant. Keep scratch commits or a stash as mutant restore points so the tested head remains identifiable.
+
+## A migration cannot pin a live population
+
+> A migration that pins a population number is wrong about the population by the time it runs.
+
+The measured population changed from 38 of 42 at filing to 37 of 41 at dry-run because the fleet was live. A count copied from an earlier read is not the population at migration time.
+
+## An active-thread tell is not a durable send
+
+> A tell into an active thread is not durable delivery merely because the send returned success.
+
+An active-thread tell returned success while the message landed in neither the event log nor the queue. Verify delivery at the recipient's log, never at the sender's send result.
+
+## An unexercisable capability is an unexploded claim
+
+> A capability that cannot be exercised through a sanctioned path is not dormant value; it is an unexploded claim on the record.
+
+An API or field is not evidence of coverage when no sanctioned path can exercise it. Its existence records a claim the system cannot currently substantiate.
+
+## Report the term that governs the latency
+
+> When two terms govern a latency, changing the minor one and reporting the major one's units is the same shape as a check answering the wrong question.
+
+The watchdog cadence change moved worst-case notice only from about 65 to about 61 minutes because the floor was the dominant term. Report and change the term that governs the observed latency, not merely the term that is easiest to edit.
