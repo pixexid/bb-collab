@@ -1,5 +1,5 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -139,6 +139,34 @@ function checkoutFixture(diverged: boolean) {
     git(["update-ref", "refs/remotes/origin/main", base]);
   }
   return { directory, base, origin: git(["show-ref", "--hash", "refs/remotes/origin/main"]) };
+}
+
+function runCheckoutProbe(checkoutRoot: string, resultPath: string): ChildProcess {
+  return spawn(process.execPath, [join(process.cwd(), "node_modules/vitest/vitest.mjs"), "run", "tests/checkout-divergence-process-worker.test.ts", "--reporter=dot"], {
+    cwd: process.cwd(),
+    env: { ...process.env, CHECKOUT_DIVERGENCE_ROOT: checkoutRoot, CHECKOUT_DIVERGENCE_RESULT: resultPath },
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+}
+
+async function waitForCheckoutSentinel(child: ChildProcess, sentinelPath: string) {
+  while (!existsSync(sentinelPath)) {
+    if (child.exitCode !== null) throw new Error(`checkout probe exited before writing ${sentinelPath}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function readCheckoutProbeResult(child: ChildProcess, resultPath: string): Promise<ReturnType<typeof readCheckoutDivergence>> {
+  const exitCode = await new Promise<number>((resolve, reject) => {
+    if (child.exitCode !== null) {
+      resolve(child.exitCode);
+      return;
+    }
+    child.once("error", reject);
+    child.once("close", (code) => resolve(code ?? 1));
+  });
+  if (exitCode !== 0) throw new Error(`checkout probe worker exited ${exitCode}`);
+  return JSON.parse(readFileSync(resultPath, "utf8")) as ReturnType<typeof readCheckoutDivergence>;
 }
 
 function roleConfig(connector: "required" | "optional" | "prohibited" = "optional") {
@@ -964,6 +992,7 @@ describe("checkout divergence detection", () => {
     const fixture = checkoutFixture(true);
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-forking-git-"));
     const pidFile = join(bin, "grandchild.pid");
+    const resultPath = join(bin, "result.json");
     const wrapper = join(bin, "git");
     writeFileSync(wrapper, `#!/bin/sh
 ( trap "" TERM; while :; do :; done ) &
@@ -976,8 +1005,11 @@ while :; do :; done
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
     let childPid: number | null = null;
+    let probe: ChildProcess | null = null;
     try {
-      const result = readCheckoutDivergence(fixture.directory);
+      probe = runCheckoutProbe(fixture.directory, resultPath);
+      await waitForCheckoutSentinel(probe, pidFile);
+      const result = await readCheckoutProbeResult(probe, resultPath);
       expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: null, verdict: "diverged" });
       childPid = Number(readFileSync(pidFile, "utf8").trim());
       for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -990,6 +1022,7 @@ while :; do :; done
       }
       expect(() => process.kill(childPid!, 0)).toThrow();
     } finally {
+      if (probe && probe.exitCode === null) probe.kill("SIGKILL");
       if (childPid !== null) {
         try {
           process.kill(childPid, "SIGKILL");
@@ -1008,6 +1041,7 @@ while :; do :; done
     const fixture = checkoutFixture(true);
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-clean-exit-git-"));
     const pidFile = join(bin, "grandchild.pid");
+    const resultPath = join(bin, "result.json");
     const wrapper = join(bin, "git");
     writeFileSync(wrapper, `#!/bin/sh
 ( exec sleep 300 ) </dev/null >/dev/null 2>&1 &
@@ -1020,8 +1054,11 @@ exit 0
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
     let childPid: number | null = null;
+    let probe: ChildProcess | null = null;
     try {
-      const result = readCheckoutDivergence(fixture.directory);
+      probe = runCheckoutProbe(fixture.directory, resultPath);
+      await waitForCheckoutSentinel(probe, pidFile);
+      const result = await readCheckoutProbeResult(probe, resultPath);
       expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 1, verdict: "diverged", processGroupReap: "reaped" });
       childPid = Number(readFileSync(pidFile, "utf8").trim());
       for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -1034,6 +1071,7 @@ exit 0
       }
       expect(() => process.kill(childPid!, 0)).toThrow();
     } finally {
+      if (probe && probe.exitCode === null) probe.kill("SIGKILL");
       if (childPid !== null) {
         try {
           process.kill(childPid, "SIGKILL");
@@ -1041,6 +1079,38 @@ exit 0
           // The process-group assertion may already have reaped it.
         }
       }
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(fixture.directory, { recursive: true, force: true });
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("reaps a deliberate slow doctor probe before its wrapper writes a sentinel", async () => {
+    const fixture = checkoutFixture(true);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-slow-git-"));
+    const pidFile = join(bin, "grandchild.pid");
+    const resultPath = join(bin, "result.json");
+    const wrapper = join(bin, "git");
+    writeFileSync(wrapper, `#!/bin/sh
+( exec sleep 300 ) </dev/null >/dev/null 2>&1 &
+child=$!
+sleep 2
+printf '%s\\n' "$child" > "${pidFile}"
+printf '1\\n'
+exit 0
+`);
+    chmodSync(wrapper, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    let probe: ChildProcess | null = null;
+    try {
+      probe = runCheckoutProbe(fixture.directory, resultPath);
+      const result = await readCheckoutProbeResult(probe, resultPath);
+      expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: null, verdict: "diverged", processGroupReap: "reaped" });
+      expect(existsSync(pidFile)).toBe(false);
+    } finally {
+      if (probe && probe.exitCode === null) probe.kill("SIGKILL");
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
       rmSync(fixture.directory, { recursive: true, force: true });
@@ -1095,12 +1165,8 @@ while :; do :; done
   it("surfaces non-ESRCH doctor probe process-group reap failures", () => {
     const fixture = checkoutFixture(true);
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-failed-reap-git-"));
-    const pidFile = join(bin, "grandchild.pid");
     const wrapper = join(bin, "git");
     writeFileSync(wrapper, `#!/bin/sh
-( exec sleep 300 ) </dev/null >/dev/null 2>&1 &
-child=$!
-printf '%s\\n' "$child" > "${pidFile}"
 printf '1\\n'
 exit 0
 `);
@@ -1112,27 +1178,11 @@ exit 0
       if (pid < 0) throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
       return realKill(pid, signal);
     });
-    let childPid: number | null = null;
     try {
       const result = readCheckoutDivergence(fixture.directory);
       expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: null, verdict: "unavailable", processGroupReap: "failed" });
-      childPid = Number(readFileSync(pidFile, "utf8").trim());
     } finally {
       killSpy.mockRestore();
-      if (childPid === null) {
-        try {
-          childPid = Number(readFileSync(pidFile, "utf8").trim());
-        } catch {
-          // The wrapper may have failed before recording its child.
-        }
-      }
-      if (childPid !== null) {
-        try {
-          process.kill(childPid, "SIGKILL");
-        } catch {
-          // The child may already have exited.
-        }
-      }
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
       rmSync(fixture.directory, { recursive: true, force: true });
