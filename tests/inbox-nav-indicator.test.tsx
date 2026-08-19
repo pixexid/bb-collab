@@ -75,7 +75,16 @@ function rpcHandlers(operatorMessages: () => Promise<ReturnType<typeof message>[
 }
 
 function props(): PluginThreadListProps {
-  return { activeThreadId: null, activeProjectId: null, isCompactViewport: false, onNavigate: vi.fn(), searchQuery: "" };
+  return {
+    activeThreadId: null,
+    activeProjectId: null,
+    isCompactViewport: false,
+    onNavigate: vi.fn(),
+    searchQuery: "",
+    // bb-app 0.39.0 made experimental_Original required: the host's own thread
+    // list, which a plugin may render to defer to default behaviour.
+    experimental_Original: () => null,
+  };
 }
 
 async function threadList() {

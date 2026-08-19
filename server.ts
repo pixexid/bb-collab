@@ -1667,14 +1667,30 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         openWorkItemsByProject.set(workItem.project_id, workItems);
       }
       const isCurrent = (candidate: RoleHolderState, holder: RoleHolderState) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
-      const isUsageCapped = async (threadId: string) => {
+      // 0.39.0 removed the rateLimitRecovery point query; provider/rateLimits/updated events
+      // replace it. Those events are persisted in the durable thread event log, so the newest
+      // one IS the cache -- there is no listener to attach or detach, and nothing to re-arm
+      // after a daemon restart, because the log outlives the daemon that wrote it.
+      const isUsageCapped = async (threadId: string): Promise<"capped" | "not-capped" | "unobserved" | "unreadable"> => {
+        let latest;
         try {
-          const recovery = await bb.sdk.threads.rateLimitRecovery({ threadId });
-          return recovery.candidate?.rateLimits.status === "blocked" && recovery.candidate.rateLimits.kind === "subscription-window";
+          [latest] = await bb.sdk.threads.events.list({ threadId, types: ["provider/rateLimits/updated"], order: "desc", limit: "1" });
         } catch (error) {
           degrade(`platform-rate-limit:${threadId}:${String(error)}`);
-          return null;
+          return "unreadable";
         }
+        if (latest?.type !== "provider/rateLimits/updated") {
+          degrade(`platform-rate-limit:${threadId}:no-rate-limit-event-observed`);
+          return "unobserved";
+        }
+        const { rateLimits } = latest.data;
+        if (rateLimits.status !== "blocked" || rateLimits.kind !== "subscription-window") return "not-capped";
+        // The provider emits nothing until the thread runs again, so a block we keep honouring
+        // past its reset would idle the thread forever waiting for an event that our own
+        // refusal to wake it prevents. Lift only on positive evidence that every blocked
+        // window has already reset; an unknown reset stays capped.
+        const blocked = rateLimits.windows.filter((window) => window.status === "blocked");
+        return blocked.length > 0 && blocked.every((window) => window.resetsAtMs !== null && window.resetsAtMs <= now) ? "not-capped" : "capped";
       };
       const lastEvent = async (threadId: string) => {
         let latest: Awaited<ReturnType<typeof bb.sdk.threads.events.list>>[number] | undefined;
@@ -1749,9 +1765,12 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             if (thread.status !== "error" && thread.status !== "stopping") continue;
             const observedStatus = thread.status;
             if (observedStatus === "error") {
-              const usageCapped = await isUsageCapped(holder.thread_id);
-              if (usageCapped === null) continue;
-              if (usageCapped) {
+              // "unobserved" is already on the degrade record and deliberately falls through to
+              // recovery: never-idle outranks an absent cap signal, and skipping on it would
+              // strand the thread on the one failure mode the watchdog exists to repair.
+              const usageCap = await isUsageCapped(holder.thread_id);
+              if (usageCap === "unreadable") continue;
+              if (usageCap === "capped") {
                 bb.log.info(`fleet-watchdog scheduled return: project=${projectId} role=${holder.role_id}@${holder.role_generation} status=usage-capped`);
                 continue;
               }
@@ -1769,9 +1788,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             if (lane.status !== "error" && lane.status !== "stopping") continue;
             const observedStatus = lane.status;
             if (observedStatus === "error") {
-              const usageCapped = await isUsageCapped(lane.id);
-              if (usageCapped === null) continue;
-              if (usageCapped) {
+              const usageCap = await isUsageCapped(lane.id);
+              if (usageCap === "unreadable") continue;
+              if (usageCap === "capped") {
                 bb.log.info(`fleet-watchdog scheduled return: project=${projectId} lane=${lane.id} status=usage-capped`);
                 continue;
               }

@@ -13,7 +13,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 // reports.
 
 function props(overrides: Partial<PluginThreadListProps> = {}): PluginThreadListProps {
-  return { activeThreadId: null, activeProjectId: null, isCompactViewport: false, onNavigate: vi.fn(), searchQuery: "", ...overrides };
+  // bb-app 0.39.0 made experimental_Original required: the host's own thread
+  // list, which a plugin may render to defer to default behaviour.
+  return {
+    activeThreadId: null,
+    activeProjectId: null,
+    isCompactViewport: false,
+    onNavigate: vi.fn(),
+    searchQuery: "",
+    experimental_Original: () => null,
+    ...overrides,
+  };
 }
 
 function thread(id: string, providerId = "codex"): PluginSidebarThread {

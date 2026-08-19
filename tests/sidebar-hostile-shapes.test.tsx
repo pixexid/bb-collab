@@ -12,7 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 // the component shapes its types rule out and assert it still renders.
 
 function props(overrides: Partial<PluginThreadListProps> = {}): PluginThreadListProps {
-  return { activeThreadId: null, activeProjectId: null, isCompactViewport: false, onNavigate: vi.fn(), searchQuery: "", ...overrides };
+  return { activeThreadId: null, activeProjectId: null, isCompactViewport: false, onNavigate: vi.fn(), searchQuery: "", experimental_Original: () => null, ...overrides };
 }
 
 function baseThread(id: string, projectId: string): PluginSidebarThread {
