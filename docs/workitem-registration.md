@@ -65,3 +65,22 @@ then calls `applyLiveAuthorizedMutation` in `server.ts`. The create resolver
 requires the current config, governor, verified actor receipt, exact repository
 target, and `expectedResourceRevision: null`; it creates the WorkItem in
 `proposed` state and returns the canonical mutation receipt.
+
+## Dispatch records the lane thread (GH-300)
+
+`work_items.lane_thread_id` is the canonical binding between an item and the BB
+thread doing the work. It is recorded by the dispatch transition — the
+`ready` → `in_progress` `work_item_transition` — which MUST carry `laneThreadId`
+matching `thr_[a-z0-9]+` (the dispatched lane's own thread id) and is refused
+without it. Only the dispatch transition may carry the field; it is preserved
+through terminal transitions as the historical record of who held the work.
+
+A create whose `body` contains a `thr_` id is refused: the thread identity
+lives in the column, and a body sentence naming it is the retired prose
+workaround (two sources of truth that can disagree). Existing prose was
+backfilled into the column at schema-v16 adoption — bounded and stripped from
+the leading `Lane thr_…`/`Writing lane thr_…` sentence; a `thr_` mention that
+is not that leading sentence (for example a dispatcher to reply to) is left
+in place and counted, never guessed at. `doctor` reports unbound in-progress
+items as `capacity.unboundActiveWriterCount`, and the error-recovery reconcile
+counts `unboundOpenWorkItems`, so a binding gap is visible rather than silent.

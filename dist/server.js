@@ -14379,11 +14379,11 @@ var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
 var CONTRACT_VERSION = 21;
-var SCHEMA_VERSION = 15;
+var SCHEMA_VERSION = 16;
 var PREVIOUS_CONTRACT_VERSION = 21;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
-var PREVIOUS_SCHEMA_VERSION = 14;
+var PREVIOUS_SCHEMA_VERSION = 15;
 var ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"];
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
 var directorSeatProfile = {
@@ -15023,7 +15023,11 @@ var MIGRATIONS = [
     CHECK (reply_text IS NULL OR length(trim(reply_text)) > 0),
     CHECK (replied_at_ms IS NULL OR reply_text IS NOT NULL),
     CHECK (reply_delivery_error IS NULL OR (replied_at_ms IS NULL AND reply_text IS NOT NULL))
-  )`
+  )`,
+  // v16 (GH-300): append-only. Binds a work item to the BB thread doing the work.
+  // NULL means the item claims no live lane thread (never dispatched, or pre-v16
+  // prose the adoption backfill could not attribute unambiguously).
+  `ALTER TABLE work_items ADD COLUMN lane_thread_id TEXT`
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var CACHED_CONSUMERS = [
@@ -15474,6 +15478,8 @@ var workItemInputSchema = external_exports.object({
   title: external_exports.string().max(4096),
   body: external_exports.string().max(64 * 1024)
 }).strict();
+var LANE_THREAD_ID_PATTERN = /^thr_[a-z0-9]+$/;
+var LANE_BODY_PREFIX_PATTERN = /^(?:writing )?lane (thr_[a-z0-9]+)[.,]\s+/i;
 var workItemWaitSchema = external_exports.discriminatedUnion("kind", [
   external_exports.object({ kind: external_exports.literal("schedule"), schedule: id, declaredBySeat: id }).strict(),
   external_exports.object({ kind: external_exports.literal("seat"), seat: external_exports.enum(ROLE_IDS), declaredBySeat: id }).strict()
@@ -15697,6 +15703,7 @@ var applyRequestSchema = external_exports.object({
   workItem: workItemInputSchema.optional(),
   workItemId: id.optional(),
   lifecycleState: workItemStateSchema.optional(),
+  laneThreadId: external_exports.string().regex(LANE_THREAD_ID_PATTERN).nullable().optional(),
   workItemWait: workItemWaitSchema.nullable().optional(),
   projectionKind: external_exports.literal("github_issue").optional(),
   roleId: roleIdSchema.optional(),
@@ -16234,6 +16241,9 @@ function normalizeRequest(request) {
     workItem: request.workItem ?? void 0,
     workItemId: request.workItemId ?? void 0,
     lifecycleState: request.lifecycleState ?? void 0,
+    // Stays undefined (not null) when absent so historical mutation-request digests replay
+    // byte-identically; the binding is a new field, not a renormalized old one.
+    laneThreadId: request.laneThreadId ?? void 0,
     workItemWait: request.workItemWait === void 0 ? void 0 : request.workItemWait,
     projectionKind: request.projectionKind ?? void 0,
     roleId: request.roleId ?? void 0,
@@ -18395,6 +18405,9 @@ function applyWorkItemCreate(db, request, digest) {
   if (db.prepare("SELECT 1 FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, request.workItem.workItemId)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item already exists");
   }
+  if (/thr_[a-z0-9]/.test(request.workItem.body)) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work item body must not carry a lane thread id; record it with laneThreadId on the in_progress transition");
+  }
   const createdAtMs = now();
   db.prepare(
     `INSERT INTO work_items
@@ -18507,6 +18520,12 @@ function applyWorkItemTransition(db, request, digest) {
   if (!nextState || !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
+  if (nextState === "in_progress" && request.laneThreadId == null) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work item dispatch must record its lane thread id");
+  }
+  if (nextState !== "in_progress" && request.laneThreadId != null) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "lane thread id is recorded by the in_progress dispatch transition only");
+  }
   if (["succeeded", "failed", "cancelled"].includes(nextState) && db.prepare(
     "SELECT 1 FROM work_item_waits WHERE project_id = ? AND work_item_id = ?"
   ).get(request.projectId, workItem.work_item_id)) {
@@ -18514,9 +18533,9 @@ function applyWorkItemTransition(db, request, digest) {
   }
   const nextRevision = workItem.resource_revision + 1;
   const updated = db.prepare(
-    `UPDATE work_items SET lifecycle_state = ?, resource_revision = ?, updated_at_ms = ?
+    `UPDATE work_items SET lifecycle_state = ?, lane_thread_id = COALESCE(?, lane_thread_id), resource_revision = ?, updated_at_ms = ?
      WHERE project_id = ? AND work_item_id = ? AND resource_revision = ? AND lifecycle_state = ?`
-  ).run(nextState, nextRevision, now(), request.projectId, workItem.work_item_id, workItem.resource_revision, workItem.lifecycle_state);
+  ).run(nextState, request.laneThreadId ?? null, nextRevision, now(), request.projectId, workItem.work_item_id, workItem.resource_revision, workItem.lifecycle_state);
   if (updated.changes !== 1) {
     throw refusal("WORK_ITEM_REVISION_STALE", "work item compare-and-swap failed", {
       currentResourceRevision: workItem.resource_revision,
@@ -18533,7 +18552,7 @@ function applyWorkItemTransition(db, request, digest) {
       aggregateId: workItem.work_item_id,
       aggregateRevision: nextRevision,
       eventType: "work_item_transitioned",
-      event: { workItemId: workItem.work_item_id, from: workItem.lifecycle_state, to: nextState }
+      event: { workItemId: workItem.work_item_id, from: workItem.lifecycle_state, to: nextState, ...request.laneThreadId != null ? { laneThreadId: request.laneThreadId } : {} }
     },
     { expected: 1, attempted: 1, verified: 1 },
     {
@@ -18541,7 +18560,7 @@ function applyWorkItemTransition(db, request, digest) {
       currentGovernanceEpoch: governor.governance_epoch,
       currentResourceRevision: nextRevision,
       expectedResourceRevision: request.expectedResourceRevision ?? void 0,
-      evidence: { workItemId: workItem.work_item_id, lifecycleState: nextState }
+      evidence: { workItemId: workItem.work_item_id, lifecycleState: nextState, ...request.laneThreadId != null ? { laneThreadId: request.laneThreadId } : {} }
     }
   );
 }
@@ -19428,8 +19447,11 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
     const writingLaneCeiling = writingLaneCeilingFromJson(configJson);
     const assignmentAttempts = [];
     const activeWriters = db.prepare(
-      "SELECT work_item_id AS lane_id FROM work_items WHERE project_id = ? AND lifecycle_state = 'in_progress' ORDER BY work_item_id"
+      "SELECT lane_thread_id AS lane_id FROM work_items WHERE project_id = ? AND lifecycle_state = 'in_progress' AND lane_thread_id IS NOT NULL ORDER BY lane_thread_id"
     ).all(projectId);
+    const unboundActiveWriterCount = db.prepare(
+      "SELECT COUNT(*) AS count FROM work_items WHERE project_id = ? AND lifecycle_state = 'in_progress' AND lane_thread_id IS NULL"
+    ).get(projectId).count;
     const unresolvedAttempts = [];
     const profileAuditEntries = [];
     const profileAudit = {
@@ -19467,7 +19489,8 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
           activeWriterCount: activeWriters.length,
           activeWriterLaneIds: activeWriters.map((row) => row.lane_id),
           duplicateLaneIds: [...new Set(activeWriters.map((row) => row.lane_id).filter((laneId, index, all) => all.indexOf(laneId) !== index))],
-          ceilingViolated: activeWriters.length > writingLaneCeiling
+          ceilingViolated: activeWriters.length > writingLaneCeiling,
+          unboundActiveWriterCount
         },
         unresolvedAttempts,
         decisionIntegrity,
@@ -19479,6 +19502,31 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
   } catch (error48) {
     return result("BB_FACTS_UNAVAILABLE", projectId, 1, 0, 0, { message: String(error48) });
   }
+}
+function backfillWorkItemLaneThreads(db) {
+  const rows = db.prepare(
+    "SELECT project_id, work_item_id, body FROM work_items WHERE lane_thread_id IS NULL"
+  ).all();
+  let bound = 0;
+  let skipped = 0;
+  const update = db.prepare(
+    "UPDATE work_items SET lane_thread_id = ?, body = ? WHERE project_id = ? AND work_item_id = ? AND lane_thread_id IS NULL"
+  );
+  db.transaction(() => {
+    for (const row of rows) {
+      const tokens = [...new Set(row.body.match(/thr_[a-z0-9]+/g) ?? [])];
+      const prefix = LANE_BODY_PREFIX_PATTERN.exec(row.body);
+      if (tokens.length !== 1 || prefix?.[1] !== tokens[0]) {
+        if (tokens.length > 0) skipped += 1;
+        continue;
+      }
+      if (update.run(tokens[0], row.body.replace(LANE_BODY_PREFIX_PATTERN, ""), row.project_id, row.work_item_id).changes !== 1) {
+        throw refusal("WORK_ITEM_STATE_INVALID", "work item lane backfill compare-and-swap failed");
+      }
+      bound += 1;
+    }
+  })();
+  return { bound, skipped };
 }
 function databaseIsReady(db) {
   db.pragma("foreign_keys = ON");
@@ -21286,6 +21334,16 @@ async function plugin(bb, options = {}) {
     bb.log.error(`canonical store unavailable: ${String(error48)}`);
     db = null;
   }
+  if (db !== null) {
+    try {
+      const backfill = backfillWorkItemLaneThreads(db);
+      if (backfill.bound > 0 || backfill.skipped > 0) {
+        bb.log.warn(`work-item lane binding backfill: bound=${backfill.bound} skipped=${backfill.skipped}`);
+      }
+    } catch (error48) {
+      bb.log.error(`work-item lane binding backfill failed: ${String(error48)}`);
+    }
+  }
   const recoveryInFlight = /* @__PURE__ */ new Set();
   const isCurrentRoleHolder = (holder) => db !== null && readRoleHolderStates(db).some(
     (candidate) => candidate.project_id === holder.project_id && candidate.role_id === holder.role_id && candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id
@@ -21331,26 +21389,36 @@ async function plugin(bb, options = {}) {
   };
   const reconcileErrorRecovery = async () => {
     if (db === null) {
-      bb.log.error("error-recovery coverage=blind event=blind roleRestart=blind roles=unknown laneRestart=blind unboundOpenWorkItems=unknown reason=canonical-store-unreadable;work-items-have-no-thread-binding:GH-300");
+      bb.log.error("error-recovery coverage=blind event=blind roleRestart=blind roles=unknown laneRestart=blind lanes=unknown failedLanes=unknown unboundOpenWorkItems=unknown reason=canonical-store-unreadable");
       return;
     }
     let holders;
-    let openWorkItems;
+    let openLanes;
+    let unboundOpenWorkItems;
     try {
       holders = readRoleHolderStates(db);
-      openWorkItems = db.prepare(
-        "SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')"
+      openLanes = db.prepare(
+        "SELECT DISTINCT project_id, lane_thread_id FROM work_items WHERE lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled') AND lane_thread_id IS NOT NULL"
+      ).all();
+      unboundOpenWorkItems = db.prepare(
+        "SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled') AND lane_thread_id IS NULL"
       ).get().count;
     } catch (error48) {
-      bb.log.error(`error-recovery coverage=blind event=armed roleRestart=blind roles=unknown laneRestart=blind unboundOpenWorkItems=unknown reason=role-inventory-unreadable:${String(error48)};work-items-have-no-thread-binding:GH-300`);
+      bb.log.error(`error-recovery coverage=blind event=armed roleRestart=blind roles=unknown laneRestart=blind lanes=unknown failedLanes=unknown unboundOpenWorkItems=unknown reason=role-inventory-unreadable:${String(error48)}`);
       return;
     }
     let failedRoles = 0;
     for (const holder of holders) {
       if (await recoverErroredThread(holder.thread_id, holder.project_id, holder) === null) failedRoles += 1;
     }
+    let failedLanes = 0;
+    for (const lane of openLanes) {
+      if (await recoverErroredThread(lane.lane_thread_id, lane.project_id) === null) failedLanes += 1;
+    }
     const roleRestart = failedRoles === 0 ? "armed" : "degraded";
-    bb.log.error(`error-recovery coverage=blind event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=blind unboundOpenWorkItems=${openWorkItems} reason=work-items-have-no-thread-binding:GH-300`);
+    const laneRestart = failedLanes === 0 ? "armed" : "degraded";
+    const coverage = unboundOpenWorkItems > 0 ? "degraded" : "armed";
+    bb.log.error(`error-recovery coverage=${coverage} event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=${laneRestart} lanes=${openLanes.length} failedLanes=${failedLanes} unboundOpenWorkItems=${unboundOpenWorkItems}`);
   };
   const readPendingExternalWait = async (threadId) => {
     try {

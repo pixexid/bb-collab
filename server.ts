@@ -20,6 +20,7 @@ import {
   assembleV21CachedConsumerRolloutEvidence,
   applyAuthorizedMutation,
   applyRequestSchema,
+  backfillWorkItemLaneThreads,
   databaseIsReady,
   doctor,
   exportFoundation,
@@ -1304,6 +1305,19 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     bb.log.error(`canonical store unavailable: ${String(error)}`);
     db = null;
   }
+  if (db !== null) {
+    // GH-300 adoption: one-time, idempotent move of the lane-thread prose into
+    // work_items.lane_thread_id. Runs in its own act so a backfill defect cannot
+    // blind the whole store; a gap here surfaces as unbound counters, not silence.
+    try {
+      const backfill = backfillWorkItemLaneThreads(db);
+      if (backfill.bound > 0 || backfill.skipped > 0) {
+        bb.log.warn(`work-item lane binding backfill: bound=${backfill.bound} skipped=${backfill.skipped}`);
+      }
+    } catch (error) {
+      bb.log.error(`work-item lane binding backfill failed: ${String(error)}`);
+    }
+  }
 
   const recoveryInFlight = new Set<string>();
   const isCurrentRoleHolder = (holder: RoleHolderState) => db !== null && readRoleHolderStates(db).some((candidate) =>
@@ -1358,26 +1372,36 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   };
   const reconcileErrorRecovery = async () => {
     if (db === null) {
-      bb.log.error("error-recovery coverage=blind event=blind roleRestart=blind roles=unknown laneRestart=blind unboundOpenWorkItems=unknown reason=canonical-store-unreadable;work-items-have-no-thread-binding:GH-300");
+      bb.log.error("error-recovery coverage=blind event=blind roleRestart=blind roles=unknown laneRestart=blind lanes=unknown failedLanes=unknown unboundOpenWorkItems=unknown reason=canonical-store-unreadable");
       return;
     }
     let holders: RoleHolderState[];
-    let openWorkItems: number;
+    let openLanes: Array<{ project_id: string; lane_thread_id: string }>;
+    let unboundOpenWorkItems: number;
     try {
       holders = readRoleHolderStates(db);
-      openWorkItems = (db.prepare(
-        "SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')",
+      openLanes = db.prepare(
+        "SELECT DISTINCT project_id, lane_thread_id FROM work_items WHERE lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled') AND lane_thread_id IS NOT NULL",
+      ).all() as Array<{ project_id: string; lane_thread_id: string }>;
+      unboundOpenWorkItems = (db.prepare(
+        "SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled') AND lane_thread_id IS NULL",
       ).get() as { count: number }).count;
     } catch (error) {
-      bb.log.error(`error-recovery coverage=blind event=armed roleRestart=blind roles=unknown laneRestart=blind unboundOpenWorkItems=unknown reason=role-inventory-unreadable:${String(error)};work-items-have-no-thread-binding:GH-300`);
+      bb.log.error(`error-recovery coverage=blind event=armed roleRestart=blind roles=unknown laneRestart=blind lanes=unknown failedLanes=unknown unboundOpenWorkItems=unknown reason=role-inventory-unreadable:${String(error)}`);
       return;
     }
     let failedRoles = 0;
     for (const holder of holders) {
       if (await recoverErroredThread(holder.thread_id, holder.project_id, holder) === null) failedRoles += 1;
     }
+    let failedLanes = 0;
+    for (const lane of openLanes) {
+      if (await recoverErroredThread(lane.lane_thread_id, lane.project_id) === null) failedLanes += 1;
+    }
     const roleRestart = failedRoles === 0 ? "armed" : "degraded";
-    bb.log.error(`error-recovery coverage=blind event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=blind unboundOpenWorkItems=${openWorkItems} reason=work-items-have-no-thread-binding:GH-300`);
+    const laneRestart = failedLanes === 0 ? "armed" : "degraded";
+    const coverage = unboundOpenWorkItems > 0 ? "degraded" : "armed";
+    bb.log.error(`error-recovery coverage=${coverage} event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=${laneRestart} lanes=${openLanes.length} failedLanes=${failedLanes} unboundOpenWorkItems=${unboundOpenWorkItems}`);
   };
 
   const readPendingExternalWait = async (threadId: string) => {

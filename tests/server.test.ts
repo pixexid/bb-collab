@@ -32,6 +32,7 @@ import {
   assembleV21CachedConsumerRolloutEvidence,
   applyFixtureMutation,
   applyAuthorizedMutation,
+  backfillWorkItemLaneThreads,
   cachedConsumerRolloutEvidence,
   canonicalJson,
   contractDigest,
@@ -563,6 +564,8 @@ function transitionRequest(
     expectedResourceRevision,
     workItemId: WORK_ITEM_ID,
     lifecycleState: state,
+    // Every dispatch records its lane thread (GH-300); tests override for the refusal cases.
+    ...(state === "in_progress" ? { laneThreadId: "thr_fixturelane01" } : {}),
     ...overrides,
   };
 }
@@ -2677,7 +2680,7 @@ describe("bb-collab plugin boundary", () => {
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
-  it("re-arms role recovery on service restart and loudly reports blind lane coverage", async () => {
+  it("re-arms role recovery on service restart and counts unbound open work items", async () => {
     const fixture = await fleetWatchdogFixture(0);
     const statuses = new Map([[fixture.orchestratorThreadId, "error" as "error" | "active"]]);
     fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
@@ -2715,11 +2718,11 @@ describe("bb-collab plugin boundary", () => {
     expect(fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.startsWith("error-recovery coverage="))).toEqual([
       {
         level: "error",
-        message: `error-recovery coverage=blind event=armed roleRestart=armed roles=2 failedRoles=0 laneRestart=blind unboundOpenWorkItems=${openWorkItems} reason=work-items-have-no-thread-binding:GH-300`,
+        message: `error-recovery coverage=degraded event=armed roleRestart=armed roles=2 failedRoles=0 laneRestart=armed lanes=0 failedLanes=0 unboundOpenWorkItems=${openWorkItems}`,
       },
       {
         level: "error",
-        message: `error-recovery coverage=blind event=armed roleRestart=armed roles=2 failedRoles=0 laneRestart=blind unboundOpenWorkItems=${openWorkItems} reason=work-items-have-no-thread-binding:GH-300`,
+        message: `error-recovery coverage=degraded event=armed roleRestart=armed roles=2 failedRoles=0 laneRestart=armed lanes=0 failedLanes=0 unboundOpenWorkItems=${openWorkItems}`,
       },
     ]);
   });
@@ -3748,14 +3751,15 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("appends the operator inbox schema without changing the v21 foundation contract", () => {
-    expect(SCHEMA_VERSION).toBe(15);
+  it("appends migrations without changing prior statements or the v21 foundation contract", () => {
+    expect(SCHEMA_VERSION).toBe(16);
     expect(CONTRACT_VERSION).toBe(21);
-    expect(MIGRATIONS).toHaveLength(28);
-    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("19ce4f2a3293379c19fab2280357f2aad408da623d858e34d487332b7a5f31fe");
-    expect(MIGRATIONS.at(-1)).toContain("operator_messages");
-    expect(MIGRATIONS.at(-1)).toContain("project_id TEXT NOT NULL");
-    expect(MIGRATIONS.at(-1)).toContain("recipient IN ('operator', 'supervisor')");
+    expect(MIGRATIONS).toHaveLength(29);
+    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
+    expect(MIGRATIONS.at(-1)).toContain("ALTER TABLE work_items ADD COLUMN lane_thread_id");
+    expect(MIGRATIONS[27]).toContain("operator_messages");
+    expect(MIGRATIONS[27]).toContain("project_id TEXT NOT NULL");
+    expect(MIGRATIONS[27]).toContain("recipient IN ('operator', 'supervisor')");
     expect(TABLES).toContain("migration_runs");
     expect(TABLES).toContain("operator_messages");
     expect(MIGRATION_STATES).toEqual([
@@ -3766,8 +3770,8 @@ describe("bb-collab plugin boundary", () => {
     ]);
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 14,
-      newSchemaVersion: 15,
+      oldSchemaVersion: 15,
+      newSchemaVersion: 16,
       oldContractVersion: 21,
       newContractVersion: 21,
       action: "refused",
@@ -3775,9 +3779,9 @@ describe("bb-collab plugin boundary", () => {
       attempted: 4,
       verified: 0,
     });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(15, 21))).toMatchObject({
-      oldSchemaVersion: 14,
-      newSchemaVersion: 15,
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(16, 21))).toMatchObject({
+      oldSchemaVersion: 15,
+      newSchemaVersion: 16,
       oldContractVersion: 21,
       newContractVersion: 21,
       action: "reread",
@@ -3787,8 +3791,8 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 14,
-      newSchemaVersion: 15,
+      oldSchemaVersion: 15,
+      newSchemaVersion: 16,
       oldContractVersion: 21,
       newContractVersion: 21,
       action: "refused",
@@ -3826,9 +3830,10 @@ describe("bb-collab plugin boundary", () => {
 
   it("assembles the production v21 cached-consumer rollout receipt with stale-v20 refusal semantics", async () => {
     expect(CONTRACT_VERSION).toBe(21);
-    expect(SCHEMA_VERSION).toBe(15);
-    expect(MIGRATIONS).toHaveLength(28);
-    expect(schemaDigest).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
+    expect(SCHEMA_VERSION).toBe(16);
+    expect(MIGRATIONS).toHaveLength(29);
+    expect(sha256(MIGRATIONS.slice(0, 28).join("\n"))).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
+    expect(schemaDigest).toBe(sha256(MIGRATIONS.join("\n")));
     expect(contractDigest).toBe("6df90c4315ca78dacb7043a45d28ccfdd259947d835bce3953d7b4f44b928c9f");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -3845,7 +3850,7 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 15, observedContractVersion: 21 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -3901,7 +3906,7 @@ describe("bb-collab plugin boundary", () => {
     const before = exportFoundation(db, PROJECT_ID);
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
-      observedSchemaVersion: 15,
+      observedSchemaVersion: SCHEMA_VERSION,
       observedContractVersion: 21,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
@@ -4132,7 +4137,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 15, schemaDigest, contractVersion: 21, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: SCHEMA_VERSION, schemaDigest, contractVersion: 21, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -5188,8 +5193,8 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 14, newSchemaVersion: 15, action: "unknown", expected: 4, attempted: 0, verified: 0 },
-        schema: { version: 15 },
+        cachedConsumers: { oldSchemaVersion: 15, newSchemaVersion: 16, action: "unknown", expected: 4, attempted: 0, verified: 0 },
+        schema: { version: SCHEMA_VERSION },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -5527,7 +5532,7 @@ describe("bb-collab plugin boundary", () => {
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config });
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken))).toMatchObject({ outcome: "OK", currentResourceRevision: 1 });
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1))).toMatchObject({ outcome: "OK", currentResourceRevision: 2 });
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2, { laneThreadId: "thr_doctorcapacity1" }))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
 
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
       outcome: "OK",
@@ -5535,12 +5540,195 @@ describe("bb-collab plugin boundary", () => {
         capacity: {
           writingLaneCeiling: 0,
           activeWriterCount: 1,
-          activeWriterLaneIds: [WORK_ITEM_ID],
+          activeWriterLaneIds: ["thr_doctorcapacity1"],
           duplicateLaneIds: [],
           ceilingViolated: true,
+          unboundActiveWriterCount: 0,
         },
       },
     });
+  });
+
+  // Per-statement sha256 digests of main's 28 shipped migration statements, captured at
+  // aea7054. The append-only proof: the head's first 28 per-statement digests equal these,
+  // and the head's first-28 joined digest equals main's full schema digest — so no shipped
+  // statement was edited, reordered, or reflowed, and exactly one statement was appended.
+  const BASE_MIGRATION_STATEMENT_DIGESTS = [
+    "2ac2daf5e9bedfefdc007f0ff150814dace6938963b214c463dba8f66332d708",
+    "e55c1268522fb2a3c42670c6565376860731de77b7afc8f122755db613d92967",
+    "e1901bbaa8edfcb325f3007617b4cda0e07e0c56ab4c970ce778d1fd33c732ab",
+    "cb9c1cb6f5de495b994207c606acb5cd05c99e65a7cb846a6dd0b444e8799431",
+    "2f9812b3d46d3b6421362e6c9340c19ae431580f4a8a396624c31c9333a1ab63",
+    "7c46d4dbc7eb02431fd31d0b654b8f6081ca3321a9b022ee09c649d5759eb149",
+    "e74da80858b74279ded398e6ef183ac1941937811317555e4143f0925c102ffa",
+    "c10bff0e093349ebabda3c1503487f2b75ee5a549b26e281da1f7abfcc192aeb",
+    "06b71decee834f117cc891ae0c6a06d87625b525999c529baa7e12ae66cef33b",
+    "c11496414ffc8ff89f96aedc8842f74fe0f5e4e6760106169c7da8ad7dddd0f6",
+    "b33f3a978ecb368e2ae9b2ef8a25be61c752417049ba92d498241b2991e0100c",
+    "a270c7c2d80840d232ceb199c5a26bbd0408d133d7e3a7fb2a95c6e98dbc33b9",
+    "8a1a6c407747597452c5bccca820fc948f37976f37a59ed57228d380dfb57035",
+    "f62da821948fe6a3f72d1dcaf83beca0ddde903e972fe3e517cbd9cd00924024",
+    "6cc060ff5c1af083d2f7fe3cda9cf22a6ceaffeb893822295782123ac4692283",
+    "a2c6cf993d5a3e807d0b230f0f64cd82b52ad445aa055c1266cab937f8757969",
+    "42b02c91a397eb72dcdc4cf0398eda1887c07c730b10650a6502fbcccd44f79b",
+    "6a7baeb209e8384d90fca3a2ed6feda7c56bc8f6a38b1bf134cdf9e39938a5b8",
+    "1bf8d7bbd5a5edea82328913e6fbac68593f12d28361a37d1e824fd3356a0d9e",
+    "90e21329defdacd9aa3556c01eb6906720aded15187e003df95b538e8c717709",
+    "6d0aee69a7a8253242f41825a2232c83f8699ef68b3e93640fd2dd28f12003f2",
+    "f957f5e7ffea61194f5dc7efc23e66d67e12eed0d5796a287d975d9189a187d1",
+    "369e873385598500cc3a0867a70a9426ec652eab5a82d327a192bc4e40d8f042",
+    "0ff825bd1749c3a6e4beb27493ed9769c4bc4169ce590fea11fbfe3cb2bab36f",
+    "3c919b39021adf2ba9d01f95f7709e06f2e259b635470674ea0358430fb9cdfc",
+    "afed053f2d0016a4a03ed2e40978562289a20de5abd0ddacd4b529e200984a19",
+    "0cf4a2190ba1df8dd5e27834d4ce9f769c4d0e34f8041f39f0858a572c60418b",
+    "39bd82dcebe4edf8c5d82d429de5f14b2ddee3a3c87871d4745a9f0467b648ae",
+  ];
+  const BASE_SCHEMA_DIGEST = "3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f";
+  const PRE_MIGRATION_WORK_ITEM_COLUMNS = [
+    "project_id", "work_item_id", "config_revision", "repo_target_id", "title", "body", "lifecycle_state", "resource_revision", "created_at_ms", "updated_at_ms",
+  ];
+
+  it("appends the lane-thread migration without touching any shipped statement or the contract", () => {
+    expect(MIGRATIONS).toHaveLength(BASE_MIGRATION_STATEMENT_DIGESTS.length + 1);
+    expect(MIGRATIONS.slice(0, BASE_MIGRATION_STATEMENT_DIGESTS.length).map(sha256)).toEqual(BASE_MIGRATION_STATEMENT_DIGESTS);
+    expect(sha256(MIGRATIONS.slice(0, BASE_MIGRATION_STATEMENT_DIGESTS.length).join("\n"))).toBe(BASE_SCHEMA_DIGEST);
+    expect(MIGRATIONS.at(-1)).toBe("ALTER TABLE work_items ADD COLUMN lane_thread_id TEXT");
+    expect(SCHEMA_VERSION).toBe(16);
+    expect(CONTRACT_VERSION).toBe(21);
+  });
+
+  it("applies only the appended statement to pre-migration rows and backfills the prose", () => {
+    const db = new Database(":memory:");
+    databaseIsReady(db);
+    try {
+      for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement);
+      db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, ?, ?, 1)").run(PROJECT_ID, canonicalJson({}), sha256(canonicalJson({})));
+      db.prepare("INSERT INTO repository_targets (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest) VALUES (?, 'target-main', 1, 'source-1', 'host-1', '/repo', NULL, 'main', 'digest-1')").run(PROJECT_ID);
+      const insert = db.prepare(
+        `INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms)
+         VALUES (?, ?, 1, 'target-main', ?, ?, ?, ?, ?, ?)`,
+      );
+      // Every prior column varies and is non-NULL across rows: a column NULL in all rows
+      // would make the byte-for-value proof prove only NULL-to-NULL for it.
+      insert.run(PROJECT_ID, "wi-lead-comma", "Sever apply path", "Lane thr_backfill02, Reassigned after PR #9 was closed", "cancelled", 7, 200, 207);
+      insert.run(PROJECT_ID, "wi-lead-writing", "Sever references", "Writing lane thr_backfill01. Brief frozen at dispatch", "in_progress", 4, 100, 104);
+      insert.run(PROJECT_ID, "wi-near-miss", "Reply-only token", "Brief frozen at dispatch. Reply to thr_notmylane99 when done.", "ready", 2, 300, 302);
+      insert.run(PROJECT_ID, "wi-plain", "No token at all", "Plain body with no thread token.", "succeeded", 9, 400, 409);
+      expect((db.prepare("PRAGMA table_info(work_items)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual(PRE_MIGRATION_WORK_ITEM_COLUMNS);
+
+      const before = db.prepare("SELECT * FROM work_items ORDER BY work_item_id").all() as Array<Record<string, unknown>>;
+      const thrBearingBefore = before.filter((row) => /thr_[a-z0-9]/.test(String(row.body)));
+      const extractableBefore = thrBearingBefore.filter((row) => /^(?:writing )?lane thr_[a-z0-9]+[.,]\s+/i.test(String(row.body)));
+      expect(thrBearingBefore).toHaveLength(3);
+      expect(extractableBefore).toHaveLength(2);
+
+      db.exec(MIGRATIONS.at(-1)!);
+
+      expect((db.prepare("PRAGMA table_info(work_items)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual([...PRE_MIGRATION_WORK_ITEM_COLUMNS, "lane_thread_id"]);
+      const afterMigration = db.prepare("SELECT * FROM work_items ORDER BY work_item_id").all() as Array<Record<string, unknown>>;
+      for (const row of afterMigration) {
+        expect(row.lane_thread_id).toBeNull();
+        const beforeRow = before.find((candidate) => candidate.work_item_id === row.work_item_id)!;
+        for (const [column, value] of Object.entries(beforeRow)) expect(row[column]).toEqual(value);
+      }
+
+      const backfill = backfillWorkItemLaneThreads(db);
+      expect(backfill).toEqual({ bound: extractableBefore.length, skipped: thrBearingBefore.length - extractableBefore.length });
+      expect(backfill.bound + backfill.skipped).toBe(thrBearingBefore.length);
+      const after = db.prepare("SELECT work_item_id, body, lifecycle_state, lane_thread_id FROM work_items ORDER BY work_item_id").all() as Array<{ work_item_id: string; body: string; lifecycle_state: string; lane_thread_id: string | null }>;
+      expect(after).toEqual([
+        { work_item_id: "wi-lead-comma", body: "Reassigned after PR #9 was closed", lifecycle_state: "cancelled", lane_thread_id: "thr_backfill02" },
+        { work_item_id: "wi-lead-writing", body: "Brief frozen at dispatch", lifecycle_state: "in_progress", lane_thread_id: "thr_backfill01" },
+        { work_item_id: "wi-near-miss", body: "Brief frozen at dispatch. Reply to thr_notmylane99 when done.", lifecycle_state: "ready", lane_thread_id: null },
+        { work_item_id: "wi-plain", body: "Plain body with no thread token.", lifecycle_state: "succeeded", lane_thread_id: null },
+      ]);
+      // No extractable prose survives anywhere, and every still-null binding is exactly the
+      // unattributable near-miss a silent partial success would have hidden behind.
+      expect(after.filter((row) => /^(?:writing )?lane thr_[a-z0-9]+[.,]\s+/i.test(row.body))).toHaveLength(0);
+      expect(after.filter((row) => row.lane_thread_id === null && /thr_[a-z0-9]/.test(row.body)).map((row) => row.work_item_id)).toEqual(["wi-near-miss"]);
+      // Idempotence on the binding half: nothing new is bound on a second pass. The
+      // skipped count stays loud while unattributable prose remains — that is the
+      // surface that keeps a standing near-miss visible, not a re-migration.
+      expect(backfillWorkItemLaneThreads(db)).toEqual({ bound: 0, skipped: 1 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("records the lane thread at dispatch and refuses prose bodies and stray bindings", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      workItem: { workItemId: "wi-prose", title: "Prose body", body: "Writing lane thr_newlane01. brief" },
+    }))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM work_items WHERE work_item_id = 'wi-prose'").get()).toEqual({ count: 0 });
+
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken))).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2, { laneThreadId: null }))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2, { laneThreadId: "not-a-thread" }))).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0 });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2, { laneThreadId: "thr_registration1" }))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+    expect(db.prepare("SELECT lane_thread_id FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lane_thread_id: "thr_registration1" });
+    const event = db.prepare(
+      "SELECT event_json FROM state_events WHERE aggregate_type = 'work_item' AND event_type = 'work_item_transitioned' ORDER BY event_sequence DESC LIMIT 1",
+    ).get() as { event_json: string };
+    expect(JSON.parse(event.event_json)).toMatchObject({ workItemId: WORK_ITEM_ID, laneThreadId: "thr_registration1" });
+
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "succeeded", 3, { laneThreadId: "thr_other0000001" }))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "succeeded", 3))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(db.prepare("SELECT lane_thread_id FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lane_thread_id: "thr_registration1" });
+  });
+
+  it("doctor reports lane-thread ids and counts unbound in-progress items instead of aliasing", async () => {
+    const host = await loadedHost();
+    const config = roleConfig();
+    (config.extensions.bbCollab as Record<string, unknown>).writingLaneCeiling = 3;
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config });
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken))).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2, { laneThreadId: "thr_capacityalias1" }))).toMatchObject({ outcome: "OK" });
+    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
+      outcome: "OK",
+      evidence: { capacity: { activeWriterCount: 1, activeWriterLaneIds: ["thr_capacityalias1"], unboundActiveWriterCount: 0, ceilingViolated: false } },
+    });
+    db.prepare("UPDATE work_items SET lane_thread_id = NULL").run();
+    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
+      outcome: "OK",
+      evidence: { capacity: { activeWriterCount: 0, activeWriterLaneIds: [], unboundActiveWriterCount: 1, ceilingViolated: false } },
+    });
+  });
+
+  it("reconcile error recovery wakes a bound errored lane thread and reports lane coverage", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, { laneThreadId: "thr_laneerrored1" }))).toMatchObject({ outcome: "OK" });
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      environmentId: `environment-${threadId}`,
+      status: threadId === "thr_laneerrored1" ? "error" : "idle",
+      updatedAt: 1,
+    })) as never);
+    fixture.host.harness.sdk.stub("environments.status", (async () => ({
+      outcome: "available",
+      workspace: { checkout: { kind: "branch", branchName: "bb/lane-binding", headSha: "lanebinding-head" } },
+    })) as never);
+    fixture.host.harness.sdk.stub("threads.send", (async ({ mode }: { mode: string }) => {
+      if (mode !== "auto") throw new Error("HTTP 409: Thread is not active");
+      return { ok: true };
+    }) as never);
+    const service = fixture.host.harness.runService("lane-watcher");
+    try {
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.startsWith("error-recovery coverage="))).toHaveLength(1));
+    } finally {
+      service.controller.abort();
+      await service.done;
+    }
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([
+      [expect.objectContaining({ threadId: "thr_laneerrored1", mode: "auto" })],
+    ]);
+    expect(fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.startsWith("error-recovery coverage="))).toEqual([
+      { level: "error", message: "error-recovery coverage=armed event=armed roleRestart=armed roles=2 failedRoles=0 laneRestart=armed lanes=1 failedLanes=0 unboundOpenWorkItems=0" },
+    ]);
   });
 
   it("records one WorkItem wait and refuses terminal transition until it is cleared", async () => {
@@ -6837,10 +7025,10 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(15, 21))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(16, 21))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 

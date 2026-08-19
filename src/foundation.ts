@@ -9,12 +9,13 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 export const CONTRACT_VERSION = 21;
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 // v21 makes project configuration visibility explicitly visible-only.
 const PREVIOUS_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-const PREVIOUS_SCHEMA_VERSION = 14;
+// v16 appends work_items.lane_thread_id (GH-300); the contract text is unchanged.
+const PREVIOUS_SCHEMA_VERSION = 15;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatProfile = {
@@ -661,6 +662,10 @@ export const MIGRATIONS: string[] = [
     CHECK (replied_at_ms IS NULL OR reply_text IS NOT NULL),
     CHECK (reply_delivery_error IS NULL OR (replied_at_ms IS NULL AND reply_text IS NOT NULL))
   )`,
+  // v16 (GH-300): append-only. Binds a work item to the BB thread doing the work.
+  // NULL means the item claims no live lane thread (never dispatched, or pre-v16
+  // prose the adoption backfill could not attribute unambiguously).
+  `ALTER TABLE work_items ADD COLUMN lane_thread_id TEXT`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -1223,6 +1228,12 @@ const workItemInputSchema = z
     body: z.string().max(64 * 1024),
   })
   .strict();
+// A canonical BB thread id (`thr_` plus an alphanumeric suffix). Exported because the
+// apply schema, the migration backfill, and tests must agree on one spelling.
+export const LANE_THREAD_ID_PATTERN = /^thr_[a-z0-9]+$/;
+// The prose convention the lane_thread_id column replaces: a leading sentence naming the
+// lane's own thread, e.g. "Writing lane thr_ab12cd34. " or "Lane thr_ab12cd34, ...".
+const LANE_BODY_PREFIX_PATTERN = /^(?:writing )?lane (thr_[a-z0-9]+)[.,]\s+/i;
 const workItemWaitSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("schedule"), schedule: id, declaredBySeat: id }).strict(),
   z.object({ kind: z.literal("seat"), seat: z.enum(ROLE_IDS), declaredBySeat: id }).strict(),
@@ -1480,6 +1491,7 @@ export const applyRequestSchema = z
     workItem: workItemInputSchema.optional(),
     workItemId: id.optional(),
     lifecycleState: workItemStateSchema.optional(),
+    laneThreadId: z.string().regex(LANE_THREAD_ID_PATTERN).nullable().optional(),
     workItemWait: workItemWaitSchema.nullable().optional(),
     projectionKind: z.literal("github_issue").optional(),
     roleId: roleIdSchema.optional(),
@@ -2500,6 +2512,9 @@ function normalizeRequest(request: ApplyRequest): ApplyRequest {
     workItem: request.workItem ?? undefined,
     workItemId: request.workItemId ?? undefined,
     lifecycleState: request.lifecycleState ?? undefined,
+    // Stays undefined (not null) when absent so historical mutation-request digests replay
+    // byte-identically; the binding is a new field, not a renormalized old one.
+    laneThreadId: request.laneThreadId ?? undefined,
     workItemWait: request.workItemWait === undefined ? undefined : request.workItemWait,
     projectionKind: request.projectionKind ?? undefined,
     roleId: request.roleId ?? undefined,
@@ -4977,6 +4992,7 @@ interface WorkItemRow {
   title: string;
   body: string;
   lifecycle_state: WorkItemState;
+  lane_thread_id: string | null;
   resource_revision: number;
   created_at_ms: number;
   updated_at_ms: number;
@@ -5087,6 +5103,12 @@ function applyWorkItemCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
   if (request.expectedResourceRevision !== null) throw refusal("WORK_ITEM_REVISION_STALE", "work item create requires no existing resource revision");
   if (db.prepare("SELECT 1 FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, request.workItem.workItemId)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item already exists");
+  }
+  // GH-300: the thread binding is the lane_thread_id column, recorded by the dispatch
+  // transition. A thr_ id in the body is the retired prose workaround; storing a new
+  // one would leave two sources of truth that can disagree.
+  if (/thr_[a-z0-9]/.test(request.workItem.body)) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work item body must not carry a lane thread id; record it with laneThreadId on the in_progress transition");
   }
   const createdAtMs = now();
   db.prepare(
@@ -5202,6 +5224,14 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
   if (!nextState || !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
+  // GH-300: the dispatch transition is the one moment a thread takes the item, so it is
+  // the only transition that must — and may — carry the binding.
+  if (nextState === "in_progress" && request.laneThreadId == null) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work item dispatch must record its lane thread id");
+  }
+  if (nextState !== "in_progress" && request.laneThreadId != null) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "lane thread id is recorded by the in_progress dispatch transition only");
+  }
   if (["succeeded", "failed", "cancelled"].includes(nextState) && db.prepare(
     "SELECT 1 FROM work_item_waits WHERE project_id = ? AND work_item_id = ?",
   ).get(request.projectId, workItem.work_item_id)) {
@@ -5209,9 +5239,9 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
   }
   const nextRevision = workItem.resource_revision + 1;
   const updated = db.prepare(
-    `UPDATE work_items SET lifecycle_state = ?, resource_revision = ?, updated_at_ms = ?
+    `UPDATE work_items SET lifecycle_state = ?, lane_thread_id = COALESCE(?, lane_thread_id), resource_revision = ?, updated_at_ms = ?
      WHERE project_id = ? AND work_item_id = ? AND resource_revision = ? AND lifecycle_state = ?`,
-  ).run(nextState, nextRevision, now(), request.projectId, workItem.work_item_id, workItem.resource_revision, workItem.lifecycle_state);
+  ).run(nextState, request.laneThreadId ?? null, nextRevision, now(), request.projectId, workItem.work_item_id, workItem.resource_revision, workItem.lifecycle_state);
   if (updated.changes !== 1) {
     throw refusal("WORK_ITEM_REVISION_STALE", "work item compare-and-swap failed", {
       currentResourceRevision: workItem.resource_revision,
@@ -5228,7 +5258,7 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
       aggregateId: workItem.work_item_id,
       aggregateRevision: nextRevision,
       eventType: "work_item_transitioned",
-      event: { workItemId: workItem.work_item_id, from: workItem.lifecycle_state, to: nextState },
+      event: { workItemId: workItem.work_item_id, from: workItem.lifecycle_state, to: nextState, ...(request.laneThreadId != null ? { laneThreadId: request.laneThreadId } : {}) },
     },
     { expected: 1, attempted: 1, verified: 1 },
     {
@@ -5236,7 +5266,7 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
       currentGovernanceEpoch: governor.governance_epoch,
       currentResourceRevision: nextRevision,
       expectedResourceRevision: request.expectedResourceRevision ?? undefined,
-      evidence: { workItemId: workItem.work_item_id, lifecycleState: nextState },
+      evidence: { workItemId: workItem.work_item_id, lifecycleState: nextState, ...(request.laneThreadId != null ? { laneThreadId: request.laneThreadId } : {}) },
     },
   );
 }
@@ -6422,8 +6452,11 @@ export async function doctor(
     const writingLaneCeiling = writingLaneCeilingFromJson(configJson);
     const assignmentAttempts: Array<Record<string, unknown>> = [];
     const activeWriters = db.prepare(
-      "SELECT work_item_id AS lane_id FROM work_items WHERE project_id = ? AND lifecycle_state = 'in_progress' ORDER BY work_item_id",
+      "SELECT lane_thread_id AS lane_id FROM work_items WHERE project_id = ? AND lifecycle_state = 'in_progress' AND lane_thread_id IS NOT NULL ORDER BY lane_thread_id",
     ).all(projectId) as Array<{ lane_id: string }>;
+    const unboundActiveWriterCount = (db.prepare(
+      "SELECT COUNT(*) AS count FROM work_items WHERE project_id = ? AND lifecycle_state = 'in_progress' AND lane_thread_id IS NULL",
+    ).get(projectId) as { count: number }).count;
     const unresolvedAttempts: Array<Record<string, unknown>> = [];
     const profileAuditEntries: Array<Record<string, unknown>> = [];
     const profileAudit = {
@@ -6464,6 +6497,7 @@ export async function doctor(
           activeWriterLaneIds: activeWriters.map((row) => row.lane_id),
           duplicateLaneIds: [...new Set(activeWriters.map((row) => row.lane_id).filter((laneId, index, all) => all.indexOf(laneId) !== index))],
           ceilingViolated: activeWriters.length > writingLaneCeiling,
+          unboundActiveWriterCount,
         },
         unresolvedAttempts,
         decisionIntegrity,
@@ -6475,6 +6509,47 @@ export async function doctor(
   } catch (error) {
     return result("BB_FACTS_UNAVAILABLE", projectId, 1, 0, 0, { message: String(error) });
   }
+}
+
+export interface WorkItemLaneBackfill {
+  bound: number;
+  skipped: number;
+}
+
+/**
+ * GH-300 adoption backfill: migrates the lane-thread prose out of work-item bodies into
+ * lane_thread_id. Binds and scrubs a row only when its body carries exactly one distinct
+ * thr_ token AND it sits in the leading lane sentence — a token anywhere else could name
+ * another thread (a dispatcher to reply to), so it is skipped and left for the unbound
+ * counters to surface rather than guessed at. Idempotent: bound rows no longer match.
+ */
+export function backfillWorkItemLaneThreads(db: SqliteDatabase): WorkItemLaneBackfill {
+  const rows = db.prepare(
+    "SELECT project_id, work_item_id, body FROM work_items WHERE lane_thread_id IS NULL",
+  ).all() as Array<{ project_id: string; work_item_id: string; body: string }>;
+  let bound = 0;
+  let skipped = 0;
+  const update = db.prepare(
+    "UPDATE work_items SET lane_thread_id = ?, body = ? WHERE project_id = ? AND work_item_id = ? AND lane_thread_id IS NULL",
+  );
+  db.transaction(() => {
+    for (const row of rows) {
+      const tokens = [...new Set(row.body.match(/thr_[a-z0-9]+/g) ?? [])];
+      const prefix = LANE_BODY_PREFIX_PATTERN.exec(row.body);
+      if (tokens.length !== 1 || prefix?.[1] !== tokens[0]) {
+        // Only thr_-carrying rows count as skipped: a body with prose we could not
+        // attribute, left visible for the unbound counters. Token-less rows were
+        // never candidates.
+        if (tokens.length > 0) skipped += 1;
+        continue;
+      }
+      if (update.run(tokens[0], row.body.replace(LANE_BODY_PREFIX_PATTERN, ""), row.project_id, row.work_item_id).changes !== 1) {
+        throw refusal("WORK_ITEM_STATE_INVALID", "work item lane backfill compare-and-swap failed");
+      }
+      bound += 1;
+    }
+  })();
+  return { bound, skipped };
 }
 
 export function databaseIsReady(db: SqliteDatabase): void {
