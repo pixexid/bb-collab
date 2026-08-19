@@ -118,10 +118,58 @@ restated for this exact region in `docs/issue-63-operator-console.md`, with
 would also stand up a second mechanism beside the sanctioned
 `experimental_setThreadRowStatus` pulse, which the brief for this lane forbids.
 
-There is a second, quieter cost worth recording. Compact chrome prefers the
-manifest icon over a contribution's icon, so giving `bb-collab` a plugin-owned
-`branding.icon` would collapse the Lanes and Inbox nav rows to the *same* glyph
-— the recolour would be bought by making the two rows harder to tell apart.
+## The manifest icon wins, whatever its form — and bb-collab's rows collapse today
+
+This started as a footnote about plugin-owned icons and turned out to be the
+finding that explains a live operator complaint, so it is recorded in full.
+
+**Precedence is form-independent.** A plugin's `branding.icon` overrides every
+one of its contributions' own icons whether it is a plugin-owned `./` path or a
+plain BB icon name. The chain, end to end:
+
+1. The server's `/api/v1/plugins` row builder emits the raw manifest string —
+   `icon: loadedPlugin?.manifest.branding.icon ?? identity?.manifest.branding.icon ?? null`
+   — with no path-versus-name filtering. Its sibling `iconUrl` is documented
+   "Hashed URL when branding.icon declares a plugin-owned compact SVG", so the
+   path case has its own field and `icon` carries everything else, names included.
+2. The app copies both into a branding store keyed by plugin id.
+3. The icon component resolves, after the plugin-owned mask branch, with
+   `let c = o?.icon ?? r` — `o.icon` is the manifest string, `r` is the
+   contribution's icon. A plain nullish coalesce: the contribution's icon is
+   reached **only when the manifest declares none**. There is no `"./"` test.
+
+Every plugin nav row renders through that one component and passes its own
+plugin id, so every row of a given plugin resolves to the same manifest icon.
+The same component draws the sidebar footer action and the Extensions detail
+too — this is not compact-chrome-specific, it is every plugin glyph in the app.
+
+**Measured, not derived.** A throwaway plugin with two nav panels declaring
+`Mail` and `GitBranch`, one install, rows read out of the rendered DOM:
+
+| `branding.icon` | ProbeAlpha (`Mail`) | ProbeBeta (`GitBranch`) |
+| --- | --- | --- |
+| absent (`logo.light` only) | Mail glyph | GitBranch glyph — **distinct** |
+| `"Toolbox"` | Toolbox glyph | Toolbox glyph — **collapsed** |
+
+The app bundle was byte-identical across those two rows; only the manifest
+changed. The same run read `Lanes` and `Inbox` as **both** rendering GitBranch,
+which is `bb-collab`'s `branding.icon`, not `Inbox`'s declared `Mail`.
+
+**So bb-collab's nav rows are already uniform, and the cause is that
+`branding.icon` exists — not that its value happens to collide with one row's.**
+Changing it from `"GitBranch"` to some other name moves every row to that other
+name; it does not restore per-row glyphs.
+
+The only thing that restores them is an absent manifest icon. That has a price:
+`pluginBrandingSchema`'s final refine requires at least one of `icon` and
+`logo.light`, and this repository declares `branding.icon` alone with no
+`assets/` directory, so dropping it means shipping a real `branding.logo.light`
+SVG in the same change. That is an asset decision and it is not this lane's to
+make.
+
+One incidental confirmation: the probe carried `icon` **and** `logo.light`
+together and installed clean, which is the additive rule above observed a second
+time.
 
 ## Disposition
 
