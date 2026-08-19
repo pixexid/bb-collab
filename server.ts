@@ -1169,20 +1169,26 @@ async function runCli(
       if (!source) return invalidCli("project has no source checkout");
       const threads = await listAllProjectThreads((request) => bb.sdk.threads.list(request), projectId);
       const liveWorktreeThreadIds = new Map<string, Set<string>>();
+      // Detached ownership is resolved from the absence of a claim, so an environment we
+      // failed to read is not a missing claim -- it is an unknown one, and the whole
+      // inventory stops being usable as evidence.
+      let environmentInventoryComplete = true;
       for (const thread of threads) {
         if (thread.environmentId === null) continue;
         try {
           const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
-          if (!environment.path) continue;
+          if (!environment.path) {
+            environmentInventoryComplete = false;
+            continue;
+          }
           const owners = liveWorktreeThreadIds.get(canonicalWorktreePath(environment.path)) ?? new Set<string>();
           owners.add(thread.id);
           liveWorktreeThreadIds.set(canonicalWorktreePath(environment.path), owners);
         } catch {
-          // An unresolved environment leaves detached ownership unresolved; the
-          // cleanup planner refuses that path instead of guessing.
+          environmentInventoryComplete = false;
         }
       }
-      const result = cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds);
+      const result = cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete);
       return { exitCode: result.refused.length === 0 ? 0 : 2, stdout: JSON.stringify(result) };
     } catch (error) {
       return { exitCode: 2, stdout: JSON.stringify({ outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error instanceof Error ? error.message : String(error) }], environmentRecordsReleased: false }) };

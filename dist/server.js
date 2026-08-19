@@ -19971,9 +19971,21 @@ async function runArchiveSweep(bb, db, projectId, apply = false, now2 = Date.now
 
 // src/worktree-cleanup.ts
 import { execFileSync } from "node:child_process";
-import { realpathSync as realpathSync2 } from "node:fs";
+import { readFileSync as readFileSync2, realpathSync as realpathSync2, statSync } from "node:fs";
 import { resolve } from "node:path";
 var threadPattern = /thr_[a-z0-9]+/u;
+var defaultQuietFloorMs = 24 * 60 * 60 * 1e3;
+var reflogCreation = /^\S+ \S+ .* (\d+) [-+]\d{4}(?:\t|$)/u;
+function worktreeCreatedAt(path) {
+  try {
+    const dotGit = resolve(path, ".git");
+    const adminDir = statSync(dotGit).isDirectory() ? dotGit : resolve(path, readFileSync2(dotGit, "utf8").match(/^gitdir: (.+)$/mu)?.[1] ?? "");
+    const seconds = readFileSync2(resolve(adminDir, "logs/HEAD"), "utf8").split("\n")[0].match(reflogCreation)?.[1];
+    return seconds === void 0 ? null : Number(seconds) * 1e3;
+  } catch {
+    return null;
+  }
+}
 function canonicalWorktreePath(path) {
   try {
     return realpathSync2(path);
@@ -20004,6 +20016,7 @@ function planWorktreeCleanup(entries, options) {
       continue;
     }
     const associatedLiveThreads = options.liveWorktreeThreadIds?.get(canonicalWorktreePath(entry.path));
+    let unclaimedAgeMs = null;
     if (threadId && options.liveThreadIds.has(threadId) || associatedLiveThreads && associatedLiveThreads.size > 0) {
       const owners = threadId && options.liveThreadIds.has(threadId) ? [threadId] : [...associatedLiveThreads];
       decisions.push({ path: entry.path, population, action: "refuse", reason: `live thread ${owners.join(",")}` });
@@ -20021,9 +20034,27 @@ function planWorktreeCleanup(entries, options) {
       decisions.push({ path: entry.path, population, action: "refuse", reason: "worktree HEAD is unavailable" });
       continue;
     }
-    if (threadId === null && associatedLiveThreads === void 0) {
-      decisions.push({ path: entry.path, population, action: "refuse", reason: "thread ownership unresolved for detached worktree" });
-      continue;
+    if (threadId === null) {
+      if (entry.branch !== null) {
+        decisions.push({ path: entry.path, population, action: "refuse", reason: `thread ownership unresolved for worktree on branch ${entry.branch}` });
+        continue;
+      }
+      if (options.environmentInventoryComplete !== true) {
+        decisions.push({ path: entry.path, population, action: "refuse", reason: "bb environment inventory is incomplete; detached ownership unresolved" });
+        continue;
+      }
+      const createdAt = options.createdAt?.(entry.path) ?? null;
+      if (createdAt === null) {
+        decisions.push({ path: entry.path, population, action: "refuse", reason: "worktree creation record is unavailable; detached ownership unresolved" });
+        continue;
+      }
+      const quietFloorMs = options.quietFloorMs ?? defaultQuietFloorMs;
+      const ageMs = (options.now ?? Date.now()) - createdAt;
+      if (ageMs < quietFloorMs) {
+        decisions.push({ path: entry.path, population, action: "refuse", reason: `created ${(ageMs / 36e5).toFixed(1)}h ago, inside the ${(quietFloorMs / 36e5).toFixed(1)}h quiet floor` });
+        continue;
+      }
+      unclaimedAgeMs = ageMs;
     }
     let status = "";
     try {
@@ -20047,7 +20078,8 @@ function planWorktreeCleanup(entries, options) {
       decisions.push({ path: entry.path, population, action: "refuse", reason: "commits are not reachable from origin/main" });
       continue;
     }
-    decisions.push({ path: entry.path, population, action: "remove", reason: "clean and fully reachable from origin/main" });
+    const unclaimed = unclaimedAgeMs === null ? "" : `, unclaimed by any live bb environment and created ${(unclaimedAgeMs / 36e5).toFixed(1)}h ago`;
+    decisions.push({ path: entry.path, population, action: "remove", reason: `clean and fully reachable from origin/main${unclaimed}` });
   }
   return decisions;
 }
@@ -20074,12 +20106,14 @@ function listGitWorktrees(repoRoot) {
   if (current) entries.push(current);
   return entries;
 }
-function cleanupGitWorktrees(repoRoot, liveThreadIds, liveWorktreeThreadIds = /* @__PURE__ */ new Map()) {
+function cleanupGitWorktrees(repoRoot, liveThreadIds, liveWorktreeThreadIds = /* @__PURE__ */ new Map(), environmentInventoryComplete = false) {
   const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
   const status = (path) => git(["status", "--porcelain", "--untracked-files=all"], path);
   return runWorktreeCleanup(listGitWorktrees(repoRoot), {
     liveThreadIds,
     liveWorktreeThreadIds,
+    environmentInventoryComplete,
+    createdAt: worktreeCreatedAt,
     originMain,
     status,
     reachable: (path, head) => {
@@ -20104,15 +20138,15 @@ async function listAllProjectThreads(list, projectId, pageSize = 1e3) {
 
 // src/checkout-divergence.ts
 import { spawnSync } from "node:child_process";
-import { existsSync as existsSync2, readFileSync as readFileSync2, statSync } from "node:fs";
+import { existsSync as existsSync2, readFileSync as readFileSync3, statSync as statSync2 } from "node:fs";
 import { dirname as dirname2, join as join4, resolve as resolve2 } from "node:path";
 function readRef(gitDirs, ref) {
   for (const gitDir of gitDirs) {
     const looseRef = join4(gitDir, ref);
-    if (existsSync2(looseRef)) return readFileSync2(looseRef, "utf8").trim() || null;
+    if (existsSync2(looseRef)) return readFileSync3(looseRef, "utf8").trim() || null;
     const packedRefs = join4(gitDir, "packed-refs");
     if (!existsSync2(packedRefs)) continue;
-    for (const line of readFileSync2(packedRefs, "utf8").split("\n")) {
+    for (const line of readFileSync3(packedRefs, "utf8").split("\n")) {
       const [sha, name] = line.trim().split(" ");
       if (name === ref) return sha ?? null;
     }
@@ -20122,16 +20156,16 @@ function readRef(gitDirs, ref) {
 function resolveGitDir(checkoutRoot) {
   const dotGit = join4(checkoutRoot, ".git");
   if (!existsSync2(dotGit)) return null;
-  if (statSync(dotGit).isDirectory()) return dotGit;
-  const marker = readFileSync2(dotGit, "utf8").trim();
+  if (statSync2(dotGit).isDirectory()) return dotGit;
+  const marker = readFileSync3(dotGit, "utf8").trim();
   return marker.startsWith("gitdir:") ? resolve2(checkoutRoot, marker.slice("gitdir:".length).trim()) : null;
 }
 function commonGitDir(gitDir) {
   const commondir = join4(gitDir, "commondir");
-  return existsSync2(commondir) ? resolve2(gitDir, readFileSync2(commondir, "utf8").trim()) : gitDir;
+  return existsSync2(commondir) ? resolve2(gitDir, readFileSync3(commondir, "utf8").trim()) : gitDir;
 }
 function readHead(gitDir, commonDir) {
-  const head = readFileSync2(join4(gitDir, "HEAD"), "utf8").trim();
+  const head = readFileSync3(join4(gitDir, "HEAD"), "utf8").trim();
   if (!head.startsWith("ref: ")) return head || null;
   return readRef([gitDir, commonDir], head.slice("ref: ".length));
 }
@@ -20183,7 +20217,7 @@ function readCheckoutDivergence(checkoutRoot) {
 }
 
 // server.ts
-import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync3, rmSync as rmSync2, statSync as statSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync4, rmSync as rmSync2, statSync as statSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { execFile, spawnSync as spawnSync2 } from "node:child_process";
 import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute2, join as join5, relative as relative2, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20666,7 +20700,7 @@ function roleBriefRole(roleId) {
   return roleId === "director" ? "director" : roleId === "project-orchestrator" ? "orchestrator" : "worker";
 }
 async function composeRoleBrief(bb, db, input) {
-  const bundle = roleBriefBundleSchema.parse(JSON.parse(readFileSync3(roleBriefBundlePath(), "utf8")));
+  const bundle = roleBriefBundleSchema.parse(JSON.parse(readFileSync4(roleBriefBundlePath(), "utf8")));
   const project = await bb.sdk.projects.get({ projectId: input.projectId });
   const currentSeats = (db ? readRoleHolderStates(db) : []).filter((holder) => holder.project_id === input.projectId).map((holder) => ({ roleId: holder.role_id, generation: holder.role_generation, threadId: holder.thread_id }));
   const pointers = {
@@ -21121,18 +21155,23 @@ async function runCli(db, bb, argv, ctx, deps) {
       if (!source) return invalidCli("project has no source checkout");
       const threads = await listAllProjectThreads((request) => bb.sdk.threads.list(request), projectId);
       const liveWorktreeThreadIds = /* @__PURE__ */ new Map();
+      let environmentInventoryComplete = true;
       for (const thread of threads) {
         if (thread.environmentId === null) continue;
         try {
           const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
-          if (!environment.path) continue;
+          if (!environment.path) {
+            environmentInventoryComplete = false;
+            continue;
+          }
           const owners = liveWorktreeThreadIds.get(canonicalWorktreePath(environment.path)) ?? /* @__PURE__ */ new Set();
           owners.add(thread.id);
           liveWorktreeThreadIds.set(canonicalWorktreePath(environment.path), owners);
         } catch {
+          environmentInventoryComplete = false;
         }
       }
-      const result2 = cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds);
+      const result2 = cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete);
       return { exitCode: result2.refused.length === 0 ? 0 : 2, stdout: JSON.stringify(result2) };
     } catch (error48) {
       return { exitCode: 2, stdout: JSON.stringify({ outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error48 instanceof Error ? error48.message : String(error48) }], environmentRecordsReleased: false }) };
@@ -21501,8 +21540,8 @@ ${thread.titleFallback ?? ""}`);
       const flagPath = join5(stateDir, LIVENESS_ALERT_FLAG_FILENAME);
       let markerAtMs = null;
       try {
-        const parsed = Number(readFileSync3(markerPath, "utf8").trim());
-        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync2(markerPath).mtimeMs;
+        const parsed = Number(readFileSync4(markerPath, "utf8").trim());
+        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync3(markerPath).mtimeMs;
       } catch {
         markerAtMs = null;
       }
@@ -21533,8 +21572,8 @@ ${thread.titleFallback ?? ""}`);
       const flagPath = join5(stateDir, STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME);
       let markerAtMs = null;
       try {
-        const parsed = Number(readFileSync3(markerPath, "utf8").trim());
-        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync2(markerPath).mtimeMs;
+        const parsed = Number(readFileSync4(markerPath, "utf8").trim());
+        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync3(markerPath).mtimeMs;
       } catch {
         markerAtMs = null;
       }

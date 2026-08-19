@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 
 export type WorktreePopulation = "scratch" | "managed" | "candidate" | "unknown";
@@ -33,9 +33,38 @@ export type WorktreeCleanupOptions = {
   originMain?: string;
   status?: (path: string) => string;
   reachable?: (path: string, head: string) => boolean;
+  environmentInventoryComplete?: boolean;
+  createdAt?: (path: string) => number | null;
+  now?: number;
+  quietFloorMs?: number;
 };
 
 const threadPattern = /thr_[a-z0-9]+/u;
+
+// A chosen safety margin, not a measurement. The floor guards only the gap between a PR
+// merging and the reviewer closing their checkout: a review still in flight is already
+// protected by reachability, because an unmerged head is not an ancestor of origin/main,
+// and a reviewer who wrote anything is already protected by the uncommitted-changes
+// refusal. Cold reviews observed in this repo complete in well under an hour, so 24h is
+// roughly a 24x margin on the longest window actually seen. It sits well above that
+// window rather than close to it because the costs are asymmetric -- keeping a worktree
+// an extra day costs disk, removing one a reviewer still holds costs their work.
+export const defaultQuietFloorMs = 24 * 60 * 60 * 1000;
+
+const reflogCreation = /^\S+ \S+ .* (\d+) [-+]\d{4}(?:\t|$)/u;
+
+export function worktreeCreatedAt(path: string): number | null {
+  try {
+    const dotGit = resolve(path, ".git");
+    const adminDir = statSync(dotGit).isDirectory()
+      ? dotGit
+      : resolve(path, readFileSync(dotGit, "utf8").match(/^gitdir: (.+)$/mu)?.[1] ?? "");
+    const seconds = readFileSync(resolve(adminDir, "logs/HEAD"), "utf8").split("\n")[0].match(reflogCreation)?.[1];
+    return seconds === undefined ? null : Number(seconds) * 1000;
+  } catch {
+    return null;
+  }
+}
 
 export function canonicalWorktreePath(path: string): string {
   try {
@@ -70,6 +99,7 @@ export function planWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeC
       continue;
     }
     const associatedLiveThreads = options.liveWorktreeThreadIds?.get(canonicalWorktreePath(entry.path));
+    let unclaimedAgeMs: number | null = null;
     if ((threadId && options.liveThreadIds.has(threadId)) || (associatedLiveThreads && associatedLiveThreads.size > 0)) {
       const owners = threadId && options.liveThreadIds.has(threadId) ? [threadId] : [...associatedLiveThreads!];
       decisions.push({ path: entry.path, population, action: "refuse", reason: `live thread ${owners.join(",")}` });
@@ -87,9 +117,30 @@ export function planWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeC
       decisions.push({ path: entry.path, population, action: "refuse", reason: "worktree HEAD is unavailable" });
       continue;
     }
-    if (threadId === null && associatedLiveThreads === undefined) {
-      decisions.push({ path: entry.path, population, action: "refuse", reason: "thread ownership unresolved for detached worktree" });
-      continue;
+    // A detached scratch checkout records no thread id anywhere -- not in the path, the
+    // gitdir, or the reflog -- so ownership can only be resolved affirmatively: the live
+    // environment inventory was enumerated in full and no environment claims this path.
+    if (threadId === null) {
+      if (entry.branch !== null) {
+        decisions.push({ path: entry.path, population, action: "refuse", reason: `thread ownership unresolved for worktree on branch ${entry.branch}` });
+        continue;
+      }
+      if (options.environmentInventoryComplete !== true) {
+        decisions.push({ path: entry.path, population, action: "refuse", reason: "bb environment inventory is incomplete; detached ownership unresolved" });
+        continue;
+      }
+      const createdAt = options.createdAt?.(entry.path) ?? null;
+      if (createdAt === null) {
+        decisions.push({ path: entry.path, population, action: "refuse", reason: "worktree creation record is unavailable; detached ownership unresolved" });
+        continue;
+      }
+      const quietFloorMs = options.quietFloorMs ?? defaultQuietFloorMs;
+      const ageMs = (options.now ?? Date.now()) - createdAt;
+      if (ageMs < quietFloorMs) {
+        decisions.push({ path: entry.path, population, action: "refuse", reason: `created ${(ageMs / 3_600_000).toFixed(1)}h ago, inside the ${(quietFloorMs / 3_600_000).toFixed(1)}h quiet floor` });
+        continue;
+      }
+      unclaimedAgeMs = ageMs;
     }
     let status = "";
     try {
@@ -113,7 +164,8 @@ export function planWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeC
       decisions.push({ path: entry.path, population, action: "refuse", reason: "commits are not reachable from origin/main" });
       continue;
     }
-    decisions.push({ path: entry.path, population, action: "remove", reason: "clean and fully reachable from origin/main" });
+    const unclaimed = unclaimedAgeMs === null ? "" : `, unclaimed by any live bb environment and created ${(unclaimedAgeMs / 3_600_000).toFixed(1)}h ago`;
+    decisions.push({ path: entry.path, population, action: "remove", reason: `clean and fully reachable from origin/main${unclaimed}` });
   }
   return decisions;
 }
@@ -144,12 +196,19 @@ export function listGitWorktrees(repoRoot: string): WorktreeEntry[] {
   return entries;
 }
 
-export function cleanupGitWorktrees(repoRoot: string, liveThreadIds: ReadonlySet<string>, liveWorktreeThreadIds: ReadonlyMap<string, ReadonlySet<string>> = new Map()): WorktreeCleanupReport {
+export function cleanupGitWorktrees(
+  repoRoot: string,
+  liveThreadIds: ReadonlySet<string>,
+  liveWorktreeThreadIds: ReadonlyMap<string, ReadonlySet<string>> = new Map(),
+  environmentInventoryComplete = false,
+): WorktreeCleanupReport {
   const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
   const status = (path: string) => git(["status", "--porcelain", "--untracked-files=all"], path);
   return runWorktreeCleanup(listGitWorktrees(repoRoot), {
     liveThreadIds,
     liveWorktreeThreadIds,
+    environmentInventoryComplete,
+    createdAt: worktreeCreatedAt,
     originMain,
     status,
     reachable: (path, head) => {
