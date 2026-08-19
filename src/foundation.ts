@@ -9,12 +9,12 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 export const CONTRACT_VERSION = 21;
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 // v21 makes project configuration visibility explicitly visible-only.
 const PREVIOUS_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-const PREVIOUS_SCHEMA_VERSION = 14;
+const PREVIOUS_SCHEMA_VERSION = 15;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatProfile = {
@@ -663,6 +663,8 @@ export const MIGRATIONS: string[] = [
     CHECK (replied_at_ms IS NULL OR reply_text IS NOT NULL),
     CHECK (reply_delivery_error IS NULL OR (replied_at_ms IS NULL AND reply_text IS NOT NULL))
   )`,
+  `ALTER TABLE operator_messages ADD COLUMN archived_at_ms INTEGER
+   CHECK (archived_at_ms IS NULL OR archived_at_ms >= created_at_ms)`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));

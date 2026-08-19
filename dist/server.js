@@ -14379,11 +14379,11 @@ var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
 var CONTRACT_VERSION = 21;
-var SCHEMA_VERSION = 15;
+var SCHEMA_VERSION = 16;
 var PREVIOUS_CONTRACT_VERSION = 21;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
-var PREVIOUS_SCHEMA_VERSION = 14;
+var PREVIOUS_SCHEMA_VERSION = 15;
 var ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"];
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
 var directorSeatProfile = {
@@ -15024,7 +15024,9 @@ var MIGRATIONS = [
     CHECK (reply_text IS NULL OR length(trim(reply_text)) > 0),
     CHECK (replied_at_ms IS NULL OR reply_text IS NOT NULL),
     CHECK (reply_delivery_error IS NULL OR (replied_at_ms IS NULL AND reply_text IS NOT NULL))
-  )`
+  )`,
+  `ALTER TABLE operator_messages ADD COLUMN archived_at_ms INTEGER
+   CHECK (archived_at_ms IS NULL OR archived_at_ms >= created_at_ms)`
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var CACHED_CONSUMERS = [
@@ -20354,6 +20356,7 @@ var operatorMessageSchema = external_exports.object({
   text: operatorMessageTextSchema,
   createdAtMs: external_exports.number().int().nonnegative(),
   readAtMs: external_exports.number().int().nonnegative().nullable(),
+  archivedAtMs: external_exports.number().int().nonnegative().nullable(),
   repliedAtMs: external_exports.number().int().nonnegative().nullable(),
   replyText: operatorMessageTextSchema.nullable(),
   replyDeliveryError: external_exports.string().nullable(),
@@ -20778,6 +20781,7 @@ function operatorMessage(row) {
     text: row.message_text,
     createdAtMs: row.created_at_ms,
     readAtMs: row.read_at_ms,
+    archivedAtMs: row.archived_at_ms,
     repliedAtMs: row.replied_at_ms,
     replyText: row.reply_text,
     replyDeliveryError: row.reply_delivery_error,
@@ -20819,6 +20823,15 @@ function markOperatorMessageRead(db, projectId, messageId) {
   const store = requireRegisteredInboxProject(db, projectId);
   const result2 = store.prepare(`UPDATE operator_messages SET read_at_ms = COALESCE(read_at_ms, ?)
     WHERE project_id = ? AND message_id = ?`).run(Date.now(), projectId, messageId);
+  if (result2.changes !== 1) throw new Error("operator message does not exist in the requested project");
+  return readOperatorMessage(store, projectId, messageId);
+}
+function archiveOperatorMessage(db, projectId, messageId) {
+  const store = requireRegisteredInboxProject(db, projectId);
+  const now2 = Date.now();
+  const result2 = store.prepare(`UPDATE operator_messages
+    SET read_at_ms = COALESCE(read_at_ms, ?), archived_at_ms = COALESCE(archived_at_ms, ?)
+    WHERE project_id = ? AND message_id = ?`).run(now2, now2, projectId, messageId);
   if (result2.changes !== 1) throw new Error("operator message does not exist in the requested project");
   return readOperatorMessage(store, projectId, messageId);
 }
@@ -21046,16 +21059,18 @@ async function runCli(db, bb, argv, ctx, deps) {
     }
   }
   if (command === "inbox") {
-    const unknown3 = unexpectedFlags(args, ["--project", "--recipient", "--mark-read"]);
+    const unknown3 = unexpectedFlags(args, ["--project", "--recipient", "--mark-read", "--archive"]);
     if (unknown3) return invalidCli(`unexpected flag ${unknown3}`);
     const recipient = parseFlag(args, "--recipient");
     const markRead = parseFlag(args, "--mark-read");
-    if (markRead !== null) {
-      if (recipient !== null) return invalidCli("--recipient cannot be used with --mark-read");
-      const messageId = external_exports.coerce.number().int().positive().safeParse(markRead);
+    const archive = parseFlag(args, "--archive");
+    if (markRead !== null || archive !== null) {
+      if (markRead !== null && archive !== null) return invalidCli("--mark-read and --archive cannot be used together");
+      if (recipient !== null) return invalidCli(`--recipient cannot be used with ${archive !== null ? "--archive" : "--mark-read"}`);
+      const messageId = external_exports.coerce.number().int().positive().safeParse(archive ?? markRead);
       if (!messageId.success) return invalidCli(messageId.error.message);
       try {
-        return { exitCode: 0, stdout: JSON.stringify(markOperatorMessageRead(db, projectId, messageId.data)) };
+        return { exitCode: 0, stdout: JSON.stringify(archive !== null ? archiveOperatorMessage(db, projectId, messageId.data) : markOperatorMessageRead(db, projectId, messageId.data)) };
       } catch (error48) {
         return invalidCli(error48 instanceof Error ? error48.message : String(error48));
       }
@@ -22080,8 +22095,8 @@ ${thread.titleFallback ?? ""}`);
       },
       {
         name: "inbox",
-        summary: "Read or mark read in one exact registered project's operator inbox",
-        usage: "bb collab inbox --project PROJECT_ID [--recipient operator|supervisor | --mark-read MESSAGE_ID]"
+        summary: "Read, mark read, or archive in one exact registered project's operator inbox",
+        usage: "bb collab inbox --project PROJECT_ID [--recipient operator|supervisor | --mark-read MESSAGE_ID | --archive MESSAGE_ID]"
       }
     ],
     run(argv, context) {

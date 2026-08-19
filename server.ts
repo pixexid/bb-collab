@@ -247,6 +247,7 @@ const operatorMessageSchema = z.object({
   text: operatorMessageTextSchema,
   createdAtMs: z.number().int().nonnegative(),
   readAtMs: z.number().int().nonnegative().nullable(),
+  archivedAtMs: z.number().int().nonnegative().nullable(),
   repliedAtMs: z.number().int().nonnegative().nullable(),
   replyText: operatorMessageTextSchema.nullable(),
   replyDeliveryError: z.string().nullable(),
@@ -752,6 +753,7 @@ type OperatorMessageRow = {
   message_text: string;
   created_at_ms: number;
   read_at_ms: number | null;
+  archived_at_ms: number | null;
   replied_at_ms: number | null;
   reply_text: string | null;
   reply_delivery_error: string | null;
@@ -770,6 +772,7 @@ function operatorMessage(row: OperatorMessageRow) {
     text: row.message_text,
     createdAtMs: row.created_at_ms,
     readAtMs: row.read_at_ms,
+    archivedAtMs: row.archived_at_ms,
     repliedAtMs: row.replied_at_ms,
     replyText: row.reply_text,
     replyDeliveryError: row.reply_delivery_error,
@@ -821,6 +824,16 @@ function markOperatorMessageRead(db: SqliteDatabase | null, projectId: string, m
   const store = requireRegisteredInboxProject(db, projectId);
   const result = store.prepare(`UPDATE operator_messages SET read_at_ms = COALESCE(read_at_ms, ?)
     WHERE project_id = ? AND message_id = ?`).run(Date.now(), projectId, messageId);
+  if (result.changes !== 1) throw new Error("operator message does not exist in the requested project");
+  return readOperatorMessage(store, projectId, messageId);
+}
+
+function archiveOperatorMessage(db: SqliteDatabase | null, projectId: string, messageId: number) {
+  const store = requireRegisteredInboxProject(db, projectId);
+  const now = Date.now();
+  const result = store.prepare(`UPDATE operator_messages
+    SET read_at_ms = COALESCE(read_at_ms, ?), archived_at_ms = COALESCE(archived_at_ms, ?)
+    WHERE project_id = ? AND message_id = ?`).run(now, now, projectId, messageId);
   if (result.changes !== 1) throw new Error("operator message does not exist in the requested project");
   return readOperatorMessage(store, projectId, messageId);
 }
@@ -1065,16 +1078,20 @@ async function runCli(
     }
   }
   if (command === "inbox") {
-    const unknown = unexpectedFlags(args, ["--project", "--recipient", "--mark-read"]);
+    const unknown = unexpectedFlags(args, ["--project", "--recipient", "--mark-read", "--archive"]);
     if (unknown) return invalidCli(`unexpected flag ${unknown}`);
     const recipient = parseFlag(args, "--recipient");
     const markRead = parseFlag(args, "--mark-read");
-    if (markRead !== null) {
-      if (recipient !== null) return invalidCli("--recipient cannot be used with --mark-read");
-      const messageId = z.coerce.number().int().positive().safeParse(markRead);
+    const archive = parseFlag(args, "--archive");
+    if (markRead !== null || archive !== null) {
+      if (markRead !== null && archive !== null) return invalidCli("--mark-read and --archive cannot be used together");
+      if (recipient !== null) return invalidCli(`--recipient cannot be used with ${archive !== null ? "--archive" : "--mark-read"}`);
+      const messageId = z.coerce.number().int().positive().safeParse(archive ?? markRead);
       if (!messageId.success) return invalidCli(messageId.error.message);
       try {
-        return { exitCode: 0, stdout: JSON.stringify(markOperatorMessageRead(db, projectId, messageId.data)) };
+        return { exitCode: 0, stdout: JSON.stringify(archive !== null
+          ? archiveOperatorMessage(db, projectId, messageId.data)
+          : markOperatorMessageRead(db, projectId, messageId.data)) };
       } catch (error) {
         return invalidCli(error instanceof Error ? error.message : String(error));
       }
@@ -2166,8 +2183,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       },
       {
         name: "inbox",
-        summary: "Read or mark read in one exact registered project's operator inbox",
-        usage: "bb collab inbox --project PROJECT_ID [--recipient operator|supervisor | --mark-read MESSAGE_ID]",
+        summary: "Read, mark read, or archive in one exact registered project's operator inbox",
+        usage: "bb collab inbox --project PROJECT_ID [--recipient operator|supervisor | --mark-read MESSAGE_ID | --archive MESSAGE_ID]",
       },
     ],
     run(argv, context) {

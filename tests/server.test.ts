@@ -1964,6 +1964,48 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
+  it("archives an inbox message through the project-exact CLI without moving its timestamps", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    try {
+      const host = hostFor();
+      await plugin(host.bb, { notifyUrgent: async () => undefined });
+      const { db } = seedAndBootstrap(host);
+      const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
+        project_id: PROJECT_ID,
+        recipient: "supervisor",
+        severity: "routine",
+        text: "handled supervisor message",
+      }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
+
+      clock.mockReturnValue(1_100_000);
+      const first = await host.harness.runCli(["inbox", "--project", PROJECT_ID, "--archive", String(message.messageId)]);
+      expect(first.exitCode).toBe(0);
+      expect(JSON.parse(first.stdout)).toMatchObject({
+        projectId: PROJECT_ID,
+        messageId: message.messageId,
+        readAtMs: 1_100_000,
+        archivedAtMs: 1_100_000,
+      });
+
+      clock.mockReturnValue(1_200_000);
+      const second = await host.harness.runCli(["inbox", "--project", PROJECT_ID, "--archive", String(message.messageId)]);
+      expect(second.exitCode).toBe(0);
+      expect(JSON.parse(second.stdout)).toMatchObject({ readAtMs: 1_100_000, archivedAtMs: 1_100_000 });
+
+      db.prepare(`INSERT INTO project_config_revisions
+        (project_id, config_revision, canonical_config_json, config_digest, created_at_ms)
+        VALUES (?, 1, '{}', 'foreign-fixture-digest', 1)`).run(FOREIGN_PROJECT_ID);
+      db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 1)").run(FOREIGN_PROJECT_ID);
+      const wrongProject = await host.harness.runCli(["inbox", "--project", FOREIGN_PROJECT_ID, "--archive", String(message.messageId)]);
+      expect(wrongProject.exitCode).toBe(2);
+      expect(JSON.parse(wrongProject.stdout)).toMatchObject({ message: "operator message does not exist in the requested project" });
+      expect(db.prepare("SELECT read_at_ms, archived_at_ms FROM operator_messages WHERE project_id = ? AND message_id = ?").get(PROJECT_ID, message.messageId))
+        .toEqual({ read_at_ms: 1_100_000, archived_at_ms: 1_100_000 });
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it("delivers replies through platform steer only after the matching sender event lands", async () => {
     const host = hostFor();
     await plugin(host.bb, { notifyUrgent: async () => undefined });
@@ -3456,14 +3498,13 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("appends the operator inbox schema without changing the v21 foundation contract", () => {
-    expect(SCHEMA_VERSION).toBe(15);
+  it("appends the operator inbox archive schema without changing the v21 foundation contract", () => {
+    expect(SCHEMA_VERSION).toBe(16);
     expect(CONTRACT_VERSION).toBe(21);
-    expect(MIGRATIONS).toHaveLength(28);
-    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("19ce4f2a3293379c19fab2280357f2aad408da623d858e34d487332b7a5f31fe");
-    expect(MIGRATIONS.at(-1)).toContain("operator_messages");
-    expect(MIGRATIONS.at(-1)).toContain("project_id TEXT NOT NULL");
-    expect(MIGRATIONS.at(-1)).toContain("recipient IN ('operator', 'supervisor')");
+    expect(MIGRATIONS).toHaveLength(29);
+    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
+    expect(schemaDigest).toBe("2ccf07bd64a5a5f78f201255f5285253c977e0d5b9f710f114cf56d9e42efaaa");
+    expect(MIGRATIONS.at(-1)).toContain("ALTER TABLE operator_messages ADD COLUMN archived_at_ms");
     expect(TABLES).toContain("migration_runs");
     expect(TABLES).toContain("operator_messages");
     expect(MIGRATION_STATES).toEqual([
@@ -3474,8 +3515,8 @@ describe("bb-collab plugin boundary", () => {
     ]);
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 14,
-      newSchemaVersion: 15,
+      oldSchemaVersion: 15,
+      newSchemaVersion: 16,
       oldContractVersion: 21,
       newContractVersion: 21,
       action: "refused",
@@ -3483,9 +3524,9 @@ describe("bb-collab plugin boundary", () => {
       attempted: 4,
       verified: 0,
     });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(15, 21))).toMatchObject({
-      oldSchemaVersion: 14,
-      newSchemaVersion: 15,
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(16, 21))).toMatchObject({
+      oldSchemaVersion: 15,
+      newSchemaVersion: 16,
       oldContractVersion: 21,
       newContractVersion: 21,
       action: "reread",
@@ -3495,8 +3536,8 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 14,
-      newSchemaVersion: 15,
+      oldSchemaVersion: 15,
+      newSchemaVersion: 16,
       oldContractVersion: 21,
       newContractVersion: 21,
       action: "refused",
@@ -3532,11 +3573,44 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
+  it("migrates four existing operator messages intact and defaults them to unarchived", () => {
+    const db = new Database(":memory:");
+    databaseIsReady(db);
+    try {
+      const operatorMessagesMigrationIndex = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE IF NOT EXISTS operator_messages"));
+      expect(operatorMessagesMigrationIndex).toBeGreaterThanOrEqual(0);
+      for (const statement of MIGRATIONS.slice(0, operatorMessagesMigrationIndex + 1)) db.exec(statement);
+      db.prepare(`INSERT INTO project_config_revisions
+        (project_id, config_revision, canonical_config_json, config_digest, created_at_ms)
+        VALUES (?, 1, '{}', 'fixture-digest', 10)`).run(PROJECT_ID);
+      db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 10)").run(PROJECT_ID);
+
+      const columns = [
+        "message_id", "project_id", "recipient", "sender_thread_id", "severity", "message_text", "created_at_ms", "read_at_ms",
+        "replied_at_ms", "reply_text", "reply_delivery_error", "notification_attempted_at_ms", "notification_error",
+      ];
+      const existingRows = [
+        [1, PROJECT_ID, "operator", "thread-one", "routine", "unread", 100, null, null, null, null, null, null],
+        [2, PROJECT_ID, "supervisor", "thread-two", "needs-decision", "read", 200, 210, null, null, null, null, null],
+        [3, PROJECT_ID, "operator", "thread-three", "urgent", "repaired delivery", 300, 330, 330, "repaired answer", null, 301, "repaired notification"],
+        [4, PROJECT_ID, "operator", "thread-four", "routine", "confirmed reply", 400, 440, 440, "live answer", null, null, null],
+      ];
+      const insert = db.prepare(`INSERT INTO operator_messages (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`);
+      for (const row of existingRows) insert.run(...row);
+
+      for (const statement of MIGRATIONS.slice(operatorMessagesMigrationIndex + 1)) db.exec(statement);
+      expect(db.prepare(`SELECT ${columns.join(", ")}, archived_at_ms FROM operator_messages ORDER BY message_id`).all()).toEqual(
+        existingRows.map((row) => Object.fromEntries([...columns, "archived_at_ms"].map((column, index) => [column, index === columns.length ? null : row[index]]))),
+      );
+    } finally {
+      db.close();
+    }
+  });
+
   it("assembles the production v21 cached-consumer rollout receipt with stale-v20 refusal semantics", async () => {
     expect(CONTRACT_VERSION).toBe(21);
-    expect(SCHEMA_VERSION).toBe(15);
-    expect(MIGRATIONS).toHaveLength(28);
-    expect(schemaDigest).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
+    expect(SCHEMA_VERSION).toBe(16);
+    expect(MIGRATIONS).toHaveLength(29);
     expect(contractDigest).toBe("6df90c4315ca78dacb7043a45d28ccfdd259947d835bce3953d7b4f44b928c9f");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -3553,7 +3627,7 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 15, observedContractVersion: 21 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 16, observedContractVersion: 21 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -3609,7 +3683,7 @@ describe("bb-collab plugin boundary", () => {
     const before = exportFoundation(db, PROJECT_ID);
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
-      observedSchemaVersion: 15,
+      observedSchemaVersion: 16,
       observedContractVersion: 21,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
@@ -3840,7 +3914,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 15, schemaDigest, contractVersion: 21, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 16, schemaDigest, contractVersion: 21, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -4896,8 +4970,8 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 14, newSchemaVersion: 15, action: "unknown", expected: 4, attempted: 0, verified: 0 },
-        schema: { version: 15 },
+        cachedConsumers: { oldSchemaVersion: 15, newSchemaVersion: 16, action: "unknown", expected: 4, attempted: 0, verified: 0 },
+        schema: { version: 16 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -6537,10 +6611,10 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(15, 21))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(16, 21))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 
