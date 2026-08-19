@@ -305,3 +305,19 @@ A late mechanism is recoverable; a lying one is not. In anything that notifies, 
 ## A check written against an assumed shape has never been tested
 
 > A guard is only as good as the mechanism it actually observes. A reply-delivery confirmation waited for an event type that the transport never emits, so it recorded every successful delivery as a failure; a CSS leak guard matched an assumed substring rather than an observed class token, so it passed leaks whose names collided with unrelated source text. Both were written from a plausible model of the mechanism instead of a captured example of it. Before trusting a check, exercise it against a captured instance of the shape it must catch and a captured instance of the near-miss it must tolerate, and confirm it fires on the first and stays silent on the second. Captured means taken from the mechanism, not imagined from a model of it; a test fixture recording a real payload counts, and staging a live failure to satisfy this does not.
+
+## A written warning is not a mechanism
+
+> Where a rule can be enforced by something that runs, prefer that to something a reader must remember. A lane was told in its own brief not to commit locally-rebuilt artifact metadata; it committed it anyway, and the freshness gate — landed hours earlier on a synthetic proof — caught it on the first real mistake and named the diverged fields. The brief and the gate said the same thing; only one of them stopped it. This is a preference about where to spend effort, not a claim that instructions are worthless: the gate exists because someone wrote the rule down first.
+
+## A suite whose fixtures stub the guard under test is evidence of nothing
+
+> When a test injects a replacement for the thing it is checking, it proves the fixture works. A destructive tool passed its suite while every safety guard was dead in production — an inverted reachability command that would delete a worktree ahead of `origin/main`, a live-thread check that could not resolve its own target population, an inventory bounded to one page. Each fixture supplied the guard's answer directly. Ask of every green test: which code path did this actually execute, and would it still pass if the production path were removed?
+
+## An empty selection is not a pass
+
+> A filtered check that matches nothing must fail rather than report success. A test filter naming a test that does not exist exits zero and prints a passing summary; four times in one night that reported PASS against deliberately broken code, which reads as "the change is not detectable" when the truth is "the filter selected nothing". Take the exact name from the diff rather than guessing a substring, and treat a run that executed zero of the things it was aimed at as a failed check, not a clean one.
+
+## A status check is a fact about the past
+
+> Confirming a condition and then acting on it are two moments, and the condition can change between them. A send gated on "the target is idle" still landed mid-turn, because two callers cleared the same check before either had sent. Where the gap matters, serialise the check and the act together rather than narrowing the window; a smaller race is still a race, and the honest fix names what it closed and what it did not.
