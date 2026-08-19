@@ -2525,11 +2525,11 @@ describe("bb-collab plugin boundary", () => {
     expect(warnings.at(-1)?.message).toMatch(/occurrencesSinceReload=2 cyclesSinceReload=2 projectsSinceReload=0 sinceReloadAt=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u);
   });
 
-  it("does not wake a quiet director seat", async () => {
+  it("runs the fleet watchdog every five minutes without waking a quiet director seat", async () => {
     const fixture = await fleetWatchdogFixture();
     const cron = fixture.host.harness.inspection.registrations.schedules.find((schedule) => schedule.name === "fleet-watchdog")?.cron;
-    if (cron !== "0 * * * *") {
-      throw new Error(`expected registered fleet-watchdog cron "0 * * * *", got "${cron}"\nDRILL BUILD ACTIVE - restore the production cron before merge (teardown item 3)`);
+    if (cron !== "*/5 * * * *") {
+      throw new Error(`expected registered fleet-watchdog cron "*/5 * * * *", got "${cron}"`);
     }
     await fixture.host.harness.runSchedule("fleet-watchdog");
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
@@ -2635,37 +2635,52 @@ describe("bb-collab plugin boundary", () => {
     expect(await fixture.host.bb.storage.kv.get("stall-guard.artifacts")).not.toEqual(baseline);
   });
 
-  it("surfaces a platform-parented stranded lane to its dispatcher without recovering it", async () => {
-    const fixture = await fleetWatchdogFixture(7);
-    const lane = await fixture.host.bb.sdk.threads.spawn({
-      projectId: PROJECT_ID,
-      parentThreadId: fixture.orchestratorThreadId,
-      environment: { type: "project-default" },
-      prompt: "frozen work order",
-      title: "issue lane",
-    });
-    expect(lane).toMatchObject({ projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "error" });
+  it("surfaces a platform-parented stranded lane without recovering it and suppresses unchanged repeats for one hour", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(7);
+      const lane = await fixture.host.bb.sdk.threads.spawn({
+        projectId: PROJECT_ID,
+        parentThreadId: fixture.orchestratorThreadId,
+        environment: { type: "project-default" },
+        prompt: "frozen work order",
+        title: "issue lane",
+      });
+      expect(lane).toMatchObject({ projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "error" });
 
-    await fixture.host.harness.runSchedule("fleet-watchdog");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(60 * 60_000 - 1);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([request]) =>
+        (request as { input: Array<{ text: string }> }).input[0]?.text.startsWith("stranded lane detected"),
+      )).toHaveLength(1);
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
 
-    const sends = fixture.host.harness.inspection.sdk.callsTo("threads.send");
-    expect(sends).toEqual([[
-      {
-        threadId: fixture.orchestratorThreadId,
-        mode: "queue-if-active",
-        input: [{
-          type: "text",
-          visibility: "agent-only",
-          text: expect.stringMatching(new RegExp(`^stranded lane detected at cycle .*: lane=${lane.id} branch=bb/lane-1 lastEvent=turn/started@7 status=error\\. The lane was not recovered; inspect its frozen work order and decide respawn or closure\\.$`)),
-          mentions: [],
-        }],
-      },
-    ]]);
-    expect(sends.some(([request]) => (request as { threadId?: string }).threadId === lane.id)).toBe(false);
-    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
-      level: "info",
-      message: "fleet-watchdog coverage=visible seats=2 lanes=1 cannotSee=none",
-    }));
+      const sends = fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([request]) =>
+        (request as { input: Array<{ text: string }> }).input[0]?.text.startsWith("stranded lane detected"),
+      );
+      expect(sends).toHaveLength(2);
+      expect(sends).toEqual(expect.arrayContaining([[
+        {
+          threadId: fixture.orchestratorThreadId,
+          mode: "queue-if-active",
+          input: [{
+            type: "text",
+            visibility: "agent-only",
+            text: expect.stringMatching(new RegExp(`^stranded lane detected at cycle .*: lane=${lane.id} branch=bb/lane-1 lastEvent=turn/started@7 status=error\\. The lane was not recovered; inspect its frozen work order and decide respawn or closure\\.$`)),
+            mentions: [],
+          }],
+        },
+      ]]));
+      expect(sends.some(([request]) => (request as { threadId?: string }).threadId === lane.id)).toBe(false);
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "info",
+        message: "fleet-watchdog coverage=visible seats=2 lanes=1 cannotSee=none",
+      }));
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("surfaces a stranded lane to the director when its dispatcher is usage-capped", async () => {
@@ -2878,7 +2893,7 @@ describe("bb-collab plugin boundary", () => {
     }));
   });
 
-  it("opens a fresh turn when the current role holder enters error", async () => {
+  it("opens a fresh turn for an errored holder and suppresses repeat recovery for one hour", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
       const fixture = await fleetWatchdogFixture(0);
@@ -2898,8 +2913,7 @@ describe("bb-collab plugin boundary", () => {
       expect(readRoleHolderStates(fixture.db).find((holder) => holder.role_id === "project-orchestrator")?.thread_id).toBe(fixture.orchestratorThreadId);
       expect((await fixture.host.bb.sdk.threads.get({ threadId: fixture.orchestratorThreadId })).status).toBe("error");
 
-      let recoveryClockReads = 0;
-      clock.mockImplementation(() => recoveryClockReads++ === 0 ? 60 * 60_000 : 60 * 60_000 + 30);
+      clock.mockReturnValue(60 * 60_000);
       const logCount = fixture.host.harness.inspection.logEntries.length;
       await fixture.host.harness.runSchedule("fleet-watchdog");
 
@@ -2922,6 +2936,10 @@ describe("bb-collab plugin boundary", () => {
         message: "fleet-watchdog role wake path broken: project=proj_test role=project-orchestrator@1 status=error recovery=sent",
       }));
       expect(fixture.host.harness.inspection.logEntries.slice(logCount).some((entry) => entry.message === "fleet-watchdog healthy cycle")).toBe(false);
+      clock.mockReturnValue(2 * 60 * 60_000 - 1);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
+      clock.mockReturnValue(2 * 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(3);
     } finally {
@@ -3116,7 +3134,8 @@ describe("bb-collab plugin boundary", () => {
     expect(fixture.host.harness.inspection.logEntries.slice(logCount)).toContainEqual(expect.objectContaining({ level: "info", message: "fleet-watchdog healthy cycle" }));
   });
 
-  it("uses in-progress WorkItems to suppress startable intake at capacity", async () => {
+  it("uses in-progress WorkItems for capacity and suppresses repeat intake wakes for one hour", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-queue-"));
     const gh = join(bin, "gh");
     const argsLog = join(bin, "args");
@@ -3133,18 +3152,36 @@ describe("bb-collab plugin boundary", () => {
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 3))).toMatchObject({ outcome: "OK" });
       expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state = 'in_progress'").get()).toEqual({ count: 0 });
       await fixture.host.harness.runSchedule("fleet-watchdog");
+      const startableSends = () => fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([request]) =>
+        (request as { input: Array<{ text: string }> }).input[0]?.text.startsWith("startable queue has"),
+      );
+      expect(startableSends()).toHaveLength(1);
+      clock.mockReturnValue(60 * 60_000 - 1);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+      expect(startableSends()).toHaveLength(1);
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(startableSends()).toEqual([
+        [
         expect.objectContaining({
           threadId: fixture.orchestratorThreadId,
           mode: "queue-if-active",
           input: [expect.objectContaining({ text: "startable queue has 1 issue with 0/1 writing lanes active" })],
         }),
-      ]]);
+        ],
+        [
+          expect.objectContaining({
+            threadId: fixture.orchestratorThreadId,
+            mode: "queue-if-active",
+            input: [expect.objectContaining({ text: "startable queue has 1 issue with 0/1 writing lanes active" })],
+          }),
+        ],
+      ]);
       const persisted = await fixture.host.bb.storage.kv.get<Record<string, { lastFleetWakeAtMs: number | null; lastStartableQueueWakeAtMs: number | null }>>("fleet-watchdog.role-idle");
       expect(Object.values(persisted ?? {})).toContainEqual(expect.objectContaining({ lastFleetWakeAtMs: null, lastStartableQueueWakeAtMs: expect.any(Number) }));
       expect(readFileSync(argsLog, "utf8")).toBe("issue\nlist\n--repo\nexample/project\n--label\nqueue:startable\n--state\nopen\n--json\nnumber\n--limit\n1000\n");
     } finally {
+      clock.mockRestore();
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
       rmSync(bin, { recursive: true, force: true });
@@ -3210,13 +3247,13 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("uses effective live watchdog threshold settings", async () => {
+  it("uses the five-minute default and effective live watchdog threshold settings", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
       const fixture = await fleetWatchdogFixture(0);
       await addPendingReview(fixture);
       expect(fixture.host.harness.inspection.registrations.settingsDescriptors).toMatchObject({
-        fleetWatchdogFloorMs: { default: "3600000" },
+        fleetWatchdogFloorMs: { default: "300000" },
         fleetWatchdogStaleWaitMs: { default: "86400000" },
       });
       await fixture.host.harness.runSchedule("fleet-watchdog");
@@ -3226,6 +3263,111 @@ describe("bb-collab plugin boundary", () => {
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
     } finally {
       clock.mockRestore();
+    }
+  });
+
+  it("migrates the persisted one-hour watchdog floor to five minutes once", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await fixture.host.harness.setSettings({ fleetWatchdogFloorMs: "3600000" });
+      fixture.host.harness.sdk.stub("plugins.updateSettings", (async ({ pluginId, values }: { pluginId: string; values: Record<string, unknown> }) => {
+        expect(pluginId).toBe(PLUGIN_ID);
+        expect(values.fleetWatchdogFloorMs).toBe("300000");
+        expect(typeof values.fleetWatchdogFloorMs).toBe("string");
+        await fixture.host.harness.setSettings({ fleetWatchdogFloorMs: String(values.fleetWatchdogFloorMs) });
+        return { ok: true as const, schema: {}, values };
+      }) as never);
+      await addPendingReview(fixture);
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("plugins.updateSettings")).toHaveLength(1);
+      expect(await fixture.host.bb.storage.kv.get("fleet-watchdog.floor-default-v2-migrated")).toBe(true);
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: "fleet-watchdog floor setting migrated: 3600000 -> 300000",
+      }));
+      clock.mockReturnValue(5 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+      expect(fixture.host.harness.inspection.sdk.callsTo("plugins.updateSettings")).toHaveLength(1);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("preserves an explicit non-default watchdog floor during migration", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await fixture.host.harness.setSettings({ fleetWatchdogFloorMs: "600000" });
+      fixture.host.harness.sdk.stub("plugins.updateSettings", (async () => {
+        throw new Error("explicit watchdog floor was overwritten");
+      }) as never);
+      await addPendingReview(fixture);
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("plugins.updateSettings")).toHaveLength(0);
+      expect(await fixture.host.bb.storage.kv.get("fleet-watchdog.floor-default-v2-migrated")).toBe(true);
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "info",
+        message: "fleet-watchdog floor setting preserved: explicit value 600000",
+      }));
+      clock.mockReturnValue(5 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      clock.mockReturnValue(10 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("does not touch the watchdog floor after its migration marker exists", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      await fixture.host.harness.setSettings({ fleetWatchdogFloorMs: "3600000" });
+      await fixture.host.bb.storage.kv.set("fleet-watchdog.floor-default-v2-migrated", true);
+      fixture.host.harness.sdk.stub("plugins.updateSettings", (async () => {
+        throw new Error("already-migrated watchdog floor was touched");
+      }) as never);
+      await addPendingReview(fixture);
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("plugins.updateSettings")).toHaveLength(0);
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "info",
+        message: "fleet-watchdog floor setting preserved: already migrated",
+      }));
+      clock.mockReturnValue(5 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("refuses and retries after watchdog floor update or verification failure without marking migration complete", async () => {
+    for (const failure of ["update", "verification"] as const) {
+      const fixture = await fleetWatchdogFixture(0);
+      await fixture.host.harness.setSettings({ fleetWatchdogFloorMs: "3600000" });
+      fixture.host.harness.sdk.stub("plugins.updateSettings", (async () => {
+        if (failure === "update") throw new Error("settings update failed");
+        return { ok: true as const, schema: {}, values: { fleetWatchdogFloorMs: "3600000" } };
+      }) as never);
+      await addPendingReview(fixture);
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("plugins.updateSettings"), failure).toHaveLength(2);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send"), failure).toHaveLength(0);
+      expect(await fixture.host.bb.storage.kv.get("fleet-watchdog.floor-default-v2-migrated"), failure).toBeUndefined();
+      expect(fixture.host.harness.inspection.logEntries, failure).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining("fleet-watchdog failed:"),
+      }));
     }
   });
 
@@ -3305,21 +3447,27 @@ describe("bb-collab plugin boundary", () => {
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
   });
 
-  it("wakes a stalled director exactly once for nextStartable work", async () => {
+  it("holds fleet tier-2 escalation for one hour after tier 1", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
       const fixture = await fleetWatchdogFixture();
       await addPendingReview(fixture);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      clock.mockReturnValue(60 * 60_000);
+      clock.mockReturnValue(5 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      clock.mockReturnValue(2 * 60 * 60_000);
+      clock.mockReturnValue(10 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([input]) => (input as { threadId: string }).threadId === fixture.directorThreadId)).toHaveLength(0);
+      clock.mockReturnValue(5 * 60_000 + 60 * 60_000 - 1);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([input]) => (input as { threadId: string }).threadId === fixture.directorThreadId)).toHaveLength(0);
+      clock.mockReturnValue(5 * 60_000 + 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([input]) => (input as { threadId: string }).threadId === fixture.directorThreadId)).toEqual([[
         {
           threadId: fixture.directorThreadId,
           mode: "queue-if-active",
-          input: [{ type: "text", visibility: "agent-only", text: "fleet still quiet at cycle 1970-01-01T02:00:00.000Z with open work since 1970-01-01T00:00:00.000Z", mentions: [] }],
+          input: [{ type: "text", visibility: "agent-only", text: "fleet still quiet at cycle 1970-01-01T01:05:00.000Z with open work since 1970-01-01T00:00:00.000Z", mentions: [] }],
         },
       ]]);
     } finally {
@@ -3449,20 +3597,26 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("escalates an owing non-director seat to the director", async () => {
+  it("holds owing-seat escalation for one hour after tier 1", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
       const fixture = await fleetWatchdogFixture(0);
       await addPendingReview(fixture);
       expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 3, { kind: "seat", seat: "project-orchestrator", declaredBySeat: "worker-seat" }))).toMatchObject({ outcome: "OK" });
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      clock.mockReturnValue(60 * 60_000);
+      clock.mockReturnValue(5 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      clock.mockReturnValue(2 * 60 * 60_000);
+      clock.mockReturnValue(10 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+      clock.mockReturnValue(5 * 60_000 + 60 * 60_000 - 1);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+      clock.mockReturnValue(5 * 60_000 + 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([
-        [expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "owed act quiet at cycle 1970-01-01T01:00:00.000Z with open work since 1970-01-01T00:00:00.000Z" })] })],
-        [expect.objectContaining({ threadId: fixture.directorThreadId, input: [expect.objectContaining({ text: "owed act still quiet at cycle 1970-01-01T02:00:00.000Z with open work since 1970-01-01T00:00:00.000Z" })] })],
+        [expect.objectContaining({ threadId: fixture.orchestratorThreadId, input: [expect.objectContaining({ text: "owed act quiet at cycle 1970-01-01T00:05:00.000Z with open work since 1970-01-01T00:00:00.000Z" })] })],
+        [expect.objectContaining({ threadId: fixture.directorThreadId, input: [expect.objectContaining({ text: "owed act still quiet at cycle 1970-01-01T01:05:00.000Z with open work since 1970-01-01T00:00:00.000Z" })] })],
       ]);
     } finally {
       clock.mockRestore();
@@ -3519,15 +3673,18 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
-  it("does not wake pending work before the director idle floor", async () => {
-    const clock = vi.spyOn(Date, "now").mockReturnValue(60 * 60_000);
+  it("wakes pending work at the five-minute director idle floor, not before", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
       const fixture = await fleetWatchdogFixture(0);
       await addPendingReview(fixture);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      clock.mockReturnValue(90 * 60_000);
+      clock.mockReturnValue(5 * 60_000 - 1);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      clock.mockReturnValue(5 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
     } finally {
       clock.mockRestore();
     }
