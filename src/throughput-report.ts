@@ -65,6 +65,8 @@ const median = (values: number[]): number | null => {
 
 const hours = (ms: number) => Number((ms / 3_600_000).toFixed(3));
 const inWindow = (at: number | null, start: number, end: number) => at !== null && at >= start && at < end;
+const overlapsWindow = (startAt: number | null, endAt: number | null, start: number, end: number) =>
+  startAt !== null && startAt < end && (endAt === null || endAt > start);
 
 export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAtMs: number; endAtMs: number }): WeeklyThroughputReport {
   const issueCandidates = facts.issues.filter((issue) => inWindow(issue.openedAtMs, window.startAtMs, window.endAtMs) || inWindow(issue.closedAtMs, window.startAtMs, window.endAtMs));
@@ -133,7 +135,7 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
     const durations = issues.filter((issue) => issue.openedAtMs !== null).map((issue) => issue.closedAtMs! - issue.openedAtMs!);
     const cohortMerges = mergeTimes.filter((mergedAtMs) => inWindow(mergedAtMs, cohort.startAtMs, cohort.endAtMs));
     const gaps = cohortMerges.slice(1).map((mergedAtMs, index) => mergedAtMs - cohortMerges[index]);
-    const cohortReviews = facts.reviews.filter((review) => inWindow(review.submittedAtMs, cohort.startAtMs, cohort.endAtMs) || inWindow(review.completedAtMs, cohort.startAtMs, cohort.endAtMs));
+    const cohortReviews = facts.reviews.filter((review) => overlapsWindow(review.submittedAtMs, review.completedAtMs, cohort.startAtMs, cohort.endAtMs));
     return {
       label: cohort.label,
       window: { startAtMs: cohort.startAtMs, endAtMs: cohort.endAtMs },

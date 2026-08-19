@@ -57,6 +57,31 @@ describe("weekly throughput report", () => {
     expect(report.outlierCohorts[0].reviewRounds).toEqual({ status: "known" });
   });
 
+  it("grounds a review enclosed by the cohort window", () => {
+    const report = weeklyThroughputReport({ ...empty, reviews: [{ id: "enclosed", tier: "B", submittedAtMs: 1, completedAtMs: 3 }], outlierCohorts: [{ label: "cohort", startAtMs: 0, endAtMs: 4 }] }, window);
+    expect(report.outlierCohorts[0].reviewRounds).toEqual({ status: "known" });
+  });
+
+  it("grounds a review left-straddling the cohort window", () => {
+    const report = weeklyThroughputReport({ ...empty, reviews: [{ id: "left-straddle", tier: "B", submittedAtMs: -2, completedAtMs: 2 }], outlierCohorts: [{ label: "cohort", startAtMs: 0, endAtMs: 4 }] }, window);
+    expect(report.outlierCohorts[0].reviewRounds).toEqual({ status: "known" });
+  });
+
+  it("grounds a review right-straddling the cohort window", () => {
+    const report = weeklyThroughputReport({ ...empty, reviews: [{ id: "right-straddle", tier: "B", submittedAtMs: 2, completedAtMs: 6 }], outlierCohorts: [{ label: "cohort", startAtMs: 0, endAtMs: 4 }] }, window);
+    expect(report.outlierCohorts[0].reviewRounds).toEqual({ status: "known" });
+  });
+
+  it("grounds a review enclosing the cohort window", () => {
+    const report = weeklyThroughputReport({ ...empty, reviews: [{ id: "enclosing", tier: "B", submittedAtMs: -2, completedAtMs: 6 }], outlierCohorts: [{ label: "cohort", startAtMs: 0, endAtMs: 4 }] }, window);
+    expect(report.outlierCohorts[0].reviewRounds).toEqual({ status: "known" });
+  });
+
+  it("grounds a pending review as open-ended across the cohort window", () => {
+    const report = weeklyThroughputReport({ ...empty, reviews: [{ id: "pending-open-ended", tier: "B", submittedAtMs: -2, completedAtMs: null }], outlierCohorts: [{ label: "cohort", startAtMs: 0, endAtMs: 4 }] }, window);
+    expect(report.outlierCohorts[0].reviewRounds).toEqual({ status: "known" });
+  });
+
   it("keeps partial issue and review windows explicit", () => {
     const report = weeklyThroughputReport({
       ...empty,
