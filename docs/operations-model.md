@@ -7,8 +7,8 @@ This is the canonical role and review matrix. It describes operating choices, no
 | Role or lane | Harness/provider | Model | Reasoning |
 | --- | --- | --- | --- |
 | Director | `claude-code` or `pi` | `claude-opus-5[1m]` or `zai/glm-5.3` | MEDIUM / HIGH |
-| Orchestrator primary | `codex` | `gpt-5.6-sol` | MEDIUM |
-| Orchestrator alternate | `claude-code` | `claude-opus-5[1m]` | MEDIUM |
+| Orchestrator primary | `claude-code` | `claude-opus-5[1m]` | MEDIUM |
+| Orchestrator alternate | `codex` | `gpt-5.6-sol` | MEDIUM |
 | Merge-bound worker (routine) | `codex` | `gpt-5.6-luna` | Any, up to MAX |
 | Merge-bound worker (hard) | `codex` | `gpt-5.6-sol` | MEDIUM to LOW |
 | Merge-bound worker | `pi` | `zai/glm-5.3` | MEDIUM or HIGH |
@@ -19,7 +19,7 @@ This is the canonical role and review matrix. It describes operating choices, no
 
 Every new spawn should pass explicit provider, model, reasoning, and `visibility: "visible"` flags; remembered defaults are not evidence.
 
-The project's spawn default is `codex/gpt-5.6-sol` at MEDIUM, ruled 2026-08-18 on the GH-222 placement probe. It governs the unpinned spawn case only; a pinned dispatch follows the preferences above, with the fallback ladder available when the preferred placement is unavailable. Prefer not to use Sol to grade or review work of its own class; the ladder governs that preference, including its same-model reasoning-level and fresh-session rungs, and the default does not change it. The ruling replaced a silent fallback that nobody selected (GH-149).
+The spawn default is `codex/gpt-5.6-luna` MAX for unpinned spawns.
 
 ### Degraded review (last resort)
 
