@@ -32,3 +32,23 @@ When every preferred reviewer is unavailable, a Tier-B post-merge review by `gpt
 | A | Authority, canonical lifecycle, spend, concurrency, migration, review or release policy, and tracked runtime artifacts | Independent cold review of the exact candidate head before merge. |
 | B | Features or refactors with no Tier-A contact | Local verification and CI before merge; cold review follows after merge. |
 | C | Documentation, mechanical edits, and additive tests | Local verification and CI. |
+
+## Escalation
+
+Escalation is the director's, held directly. There is no named escalation seat: one existed, was stood down by the operator for noise, and re-creating it would re-create the noise under a new name.
+
+| Path | Route |
+| --- | --- |
+| Work-level | worker → orchestrator → director |
+| Operator-level | director → operator, via the inbox, under severity rules |
+| No-seat floor | the `fleet-watchdog` schedule |
+
+The floor is the part that is easy to miss. `fleet-watchdog` subsumed the retired `sentinel-wake-floor` schedule, so escalation coverage was never lost when the seat stood down — it **relocated from a seat to a schedule**. That relocation was not written down, and on 2026-08-19 two seats independently concluded coverage was missing before checking. It is written down here so the next reader inherits the decision rather than the silence.
+
+### Role state is canonical in the role definition, not in thread surfaces
+
+A thread's title, status, and pinned flag say nothing about whether it still holds its role. A stood-down or re-scoped seat keeps its original title, still reports `active`, and still errors and recovers like any other — so every surface a dispatcher naturally reads will describe a role the seat may no longer hold.
+
+Canonical role state lives in the role definitions under `docs/roles/` and in the role facts in `src/foundation.ts`. **A dispatcher reading thread surfaces is reading titles, not roles.**
+
+Inferring a recipient's role from surface attributes is the same error as reading a mounted worktree instead of the branch head, one level up. On 2026-08-19 a recovery wake ordered a seat to resume a duty it had not held for two days; the seat declining is the only thing that stopped it, which means the control was the recipient's judgement rather than anything the sender consulted.
