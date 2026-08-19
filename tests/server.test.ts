@@ -32,6 +32,7 @@ import {
   assembleV21CachedConsumerRolloutEvidence,
   applyFixtureMutation,
   applyAuthorizedMutation,
+  backfillWorkItemAttempts,
   cachedConsumerRolloutEvidence,
   canonicalJson,
   contractDigest,
@@ -594,6 +595,7 @@ function transitionRequest(
     expectedResourceRevision,
     workItemId: WORK_ITEM_ID,
     lifecycleState: state,
+    ...(state === "in_progress" ? { workAttempt: { laneId: "lane-work-item-1", threadId: "thread-work-item-1", assignmentKind: "write" as const } } : {}),
     ...overrides,
   };
 }
@@ -1376,7 +1378,10 @@ function directDatabase() {
   const path = join(directory, "data.db");
   const db = new Database(path);
   databaseIsReady(db);
-  for (const statement of MIGRATIONS) db.exec(statement);
+  db.transaction(() => {
+    for (const statement of MIGRATIONS) db.exec(statement);
+  })();
+  backfillWorkItemAttempts(db);
   return { db, path, directory };
 }
 
@@ -4206,7 +4211,10 @@ describe("bb-collab plugin boundary", () => {
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-      for (const statement of MIGRATIONS) db.exec(statement);
+      db.transaction(() => {
+        for (const statement of MIGRATIONS) db.exec(statement);
+      })();
+      backfillWorkItemAttempts(db);
       seedMigrationAuthority(db);
       seedEvidenceArtifact(db, "large-artifact", 270 * 1024);
       expect(exportFoundation(db, PROJECT_ID)).toMatchObject({
@@ -4220,13 +4228,44 @@ describe("bb-collab plugin boundary", () => {
   });
 
   it("appends the operator inbox schema without changing the v21 foundation contract", () => {
-    expect(SCHEMA_VERSION).toBe(15);
+    expect(SCHEMA_VERSION).toBe(16);
     expect(CONTRACT_VERSION).toBe(21);
-    expect(MIGRATIONS).toHaveLength(28);
-    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("19ce4f2a3293379c19fab2280357f2aad408da623d858e34d487332b7a5f31fe");
-    expect(MIGRATIONS.at(-1)).toContain("operator_messages");
-    expect(MIGRATIONS.at(-1)).toContain("project_id TEXT NOT NULL");
-    expect(MIGRATIONS.at(-1)).toContain("recipient IN ('operator', 'supervisor')");
+    expect(MIGRATIONS).toHaveLength(29);
+    expect(MIGRATIONS.slice(0, -1).map(sha256)).toEqual([
+      "2ac2daf5e9bedfefdc007f0ff150814dace6938963b214c463dba8f66332d708",
+      "e55c1268522fb2a3c42670c6565376860731de77b7afc8f122755db613d92967",
+      "e1901bbaa8edfcb325f3007617b4cda0e07e0c56ab4c970ce778d1fd33c732ab",
+      "cb9c1cb6f5de495b994207c606acb5cd05c99e65a7cb846a6dd0b444e8799431",
+      "2f9812b3d46d3b6421362e6c9340c19ae431580f4a8a396624c31c9333a1ab63",
+      "7c46d4dbc7eb02431fd31d0b654b8f6081ca3321a9b022ee09c649d5759eb149",
+      "e74da80858b74279ded398e6ef183ac1941937811317555e4143f0925c102ffa",
+      "c10bff0e093349ebabda3c1503487f2b75ee5a549b26e281da1f7abfcc192aeb",
+      "06b71decee834f117cc891ae0c6a06d87625b525999c529baa7e12ae66cef33b",
+      "c11496414ffc8ff89f96aedc8842f74fe0f5e4e6760106169c7da8ad7dddd0f6",
+      "b33f3a978ecb368e2ae9b2ef8a25be61c752417049ba92d498241b2991e0100c",
+      "a270c7c2d80840d232ceb199c5a26bbd0408d133d7e3a7fb2a95c6e98dbc33b9",
+      "8a1a6c407747597452c5bccca820fc948f37976f37a59ed57228d380dfb57035",
+      "f62da821948fe6a3f72d1dcaf83beca0ddde903e972fe3e517cbd9cd00924024",
+      "6cc060ff5c1af083d2f7fe3cda9cf22a6ceaffeb893822295782123ac4692283",
+      "a2c6cf993d5a3e807d0b230f0f64cd82b52ad445aa055c1266cab937f8757969",
+      "42b02c91a397eb72dcdc4cf0398eda1887c07c730b10650a6502fbcccd44f79b",
+      "6a7baeb209e8384d90fca3a2ed6feda7c56bc8f6a38b1bf134cdf9e39938a5b8",
+      "1bf8d7bbd5a5edea82328913e6fbac68593f12d28361a37d1e824fd3356a0d9e",
+      "90e21329defdacd9aa3556c01eb6906720aded15187e003df95b538e8c717709",
+      "6d0aee69a7a8253242f41825a2232c83f8699ef68b3e93640fd2dd28f12003f2",
+      "f957f5e7ffea61194f5dc7efc23e66d67e12eed0d5796a287d975d9189a187d1",
+      "369e873385598500cc3a0867a70a9426ec652eab5a82d327a192bc4e40d8f042",
+      "0ff825bd1749c3a6e4beb27493ed9769c4bc4169ce590fea11fbfe3cb2bab36f",
+      "3c919b39021adf2ba9d01f95f7709e06f2e259b635470674ea0358430fb9cdfc",
+      "afed053f2d0016a4a03ed2e40978562289a20de5abd0ddacd4b529e200984a19",
+      "0cf4a2190ba1df8dd5e27834d4ce9f769c4d0e34f8041f39f0858a572c60418b",
+      "39bd82dcebe4edf8c5d82d429de5f14b2ddee3a3c87871d4745a9f0467b648ae",
+    ]);
+    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("19ce4f2a3293379c19fab2280357f2aad408da623d858e34d487332b7a5f31fe");
+    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
+    expect(MIGRATIONS.at(-2)).toContain("operator_messages");
+    expect(MIGRATIONS.at(-2)).toContain("project_id TEXT NOT NULL");
+    expect(MIGRATIONS.at(-2)).toContain("recipient IN ('operator', 'supervisor')");
     expect(TABLES).toContain("migration_runs");
     expect(TABLES).toContain("operator_messages");
     expect(MIGRATION_STATES).toEqual([
@@ -4237,8 +4276,8 @@ describe("bb-collab plugin boundary", () => {
     ]);
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 14,
-      newSchemaVersion: 15,
+      oldSchemaVersion: 15,
+      newSchemaVersion: 16,
       oldContractVersion: 21,
       newContractVersion: 21,
       action: "refused",
@@ -4246,9 +4285,9 @@ describe("bb-collab plugin boundary", () => {
       attempted: 4,
       verified: 0,
     });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(15, 21))).toMatchObject({
-      oldSchemaVersion: 14,
-      newSchemaVersion: 15,
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(16, 21))).toMatchObject({
+      oldSchemaVersion: 15,
+      newSchemaVersion: 16,
       oldContractVersion: 21,
       newContractVersion: 21,
       action: "reread",
@@ -4258,8 +4297,8 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 14,
-      newSchemaVersion: 15,
+      oldSchemaVersion: 15,
+      newSchemaVersion: 16,
       oldContractVersion: 21,
       newContractVersion: 21,
       action: "refused",
@@ -4297,9 +4336,9 @@ describe("bb-collab plugin boundary", () => {
 
   it("assembles the production v21 cached-consumer rollout receipt with stale-v20 refusal semantics", async () => {
     expect(CONTRACT_VERSION).toBe(21);
-    expect(SCHEMA_VERSION).toBe(15);
-    expect(MIGRATIONS).toHaveLength(28);
-    expect(schemaDigest).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
+    expect(SCHEMA_VERSION).toBe(16);
+    expect(MIGRATIONS).toHaveLength(29);
+    expect(schemaDigest).toBe("4051aa08e489728a2b752340ad979716de7a2a1df9fdd46d2c4b8ccc86d9f5d2");
     expect(contractDigest).toBe("6df90c4315ca78dacb7043a45d28ccfdd259947d835bce3953d7b4f44b928c9f");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -4316,7 +4355,7 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 15, observedContractVersion: 21 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 16, observedContractVersion: 21 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -4327,6 +4366,200 @@ describe("bb-collab plugin boundary", () => {
       sourceRef: "live-plugin:dist/server.js",
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
+  });
+
+  it("backfills attributable Lane sentences into scratch attempt records and refuses ambiguous prose", async () => {
+    const projectId = "proj_gh300_backfill";
+    const host = await loadedHost(projectId);
+    const { db, fenceToken } = seedAndBootstrap(host, projectId);
+    const items = [
+      { id: "backfill-succeeded", body: "Writing lane thr_succeeded. Ship it", state: "succeeded", created: 101, updated: 202 },
+      { id: "backfill-running", body: "Lane thr_running. Keep going", state: "in_progress", created: 303, updated: 404 },
+      { id: "backfill-failed", body: "Writing lane thr_failed, Nope", state: "cancelled", created: 505, updated: 606 },
+      { id: "backfill-wildcard", body: "Writing lane thrXnot-a-token. No real thread", state: "succeeded", created: 707, updated: 808 },
+    ] as const;
+    for (const item of items) {
+      expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+        projectId,
+        idempotencyKey: `backfill-create-${item.id}`,
+        workItemId: item.id,
+        workItem: { workItemId: item.id, title: item.id, body: item.body },
+      })).outcome).toBe("OK");
+      db.prepare(
+        "UPDATE work_items SET lifecycle_state = ?, created_at_ms = ?, updated_at_ms = ? WHERE project_id = ? AND work_item_id = ?",
+      ).run(item.state, item.created, item.updated, projectId, item.id);
+    }
+    const counts = backfillWorkItemAttempts(db);
+    expect(counts).toEqual({ candidates: 3, attributable: 3, inserted: 3, alreadyBound: 0, residualProposed: 0, unresolved: 0 });
+    expect(db.prepare(
+      `SELECT work_item_id, state, lane_id, thread_id, assignment_kind, attempt_ordinal,
+              reason_code, created_at_ms, observed_at_ms, completed_at_ms,
+              lease_owner_thread_id, lease_expires_at_ms,
+              role_id, role_generation, governance_epoch, bb_server_id, environment_id,
+              source_id, host_id, environment_path, environment_digest
+       FROM execution_attempts WHERE project_id = ? AND origin = 'work_item' ORDER BY work_item_id`,
+    ).all(projectId)).toEqual([
+      {
+        work_item_id: "backfill-failed", state: "failed", lane_id: "thr_failed", thread_id: "thr_failed", assignment_kind: "write", attempt_ordinal: 1,
+        reason_code: "gh300_backfill", created_at_ms: 505, observed_at_ms: 606, completed_at_ms: 606,
+        lease_owner_thread_id: null, lease_expires_at_ms: null,
+        role_id: null, role_generation: null, governance_epoch: null, bb_server_id: null, environment_id: null,
+        source_id: null, host_id: null, environment_path: null, environment_digest: null,
+      },
+      {
+        work_item_id: "backfill-running", state: "running", lane_id: "thr_running", thread_id: "thr_running", assignment_kind: "write", attempt_ordinal: 1,
+        reason_code: "gh300_backfill", created_at_ms: 303, observed_at_ms: 404, completed_at_ms: null,
+        lease_owner_thread_id: null, lease_expires_at_ms: null,
+        role_id: null, role_generation: null, governance_epoch: null, bb_server_id: null, environment_id: null,
+        source_id: null, host_id: null, environment_path: null, environment_digest: null,
+      },
+      {
+        work_item_id: "backfill-succeeded", state: "done", lane_id: "thr_succeeded", thread_id: "thr_succeeded", assignment_kind: "write", attempt_ordinal: 1,
+        reason_code: "gh300_backfill", created_at_ms: 101, observed_at_ms: 202, completed_at_ms: 202,
+        lease_owner_thread_id: null, lease_expires_at_ms: null,
+        role_id: null, role_generation: null, governance_epoch: null, bb_server_id: null, environment_id: null,
+        source_id: null, host_id: null, environment_path: null, environment_digest: null,
+      },
+    ]);
+    expect(db.prepare("SELECT body FROM work_items WHERE project_id = ? ORDER BY work_item_id").all(projectId)).toEqual([
+        { body: "Nope" },
+        { body: "Keep going" },
+        { body: "Ship it" },
+        { body: "Writing lane thrXnot-a-token. No real thread" },
+    ]);
+
+    const proposedId = "backfill-proposed";
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      projectId,
+      idempotencyKey: "backfill-create-proposed",
+      workItemId: proposedId,
+      workItem: { workItemId: proposedId, title: proposedId, body: "Writing lane thr_proposed. Planned reference" },
+    })).outcome).toBe("OK");
+    expect(backfillWorkItemAttempts(db)).toEqual({ candidates: 1, attributable: 0, inserted: 0, alreadyBound: 0, residualProposed: 1, unresolved: 0 });
+    expect(db.prepare("SELECT body FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, proposedId)).toEqual({ body: "Writing lane thr_proposed. Planned reference" });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(projectId, proposedId)).toEqual({ count: 0 });
+
+    const ambiguousId = "backfill-ambiguous";
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      projectId,
+      idempotencyKey: "backfill-create-ambiguous",
+      workItemId: ambiguousId,
+      workItem: { workItemId: ambiguousId, title: ambiguousId, body: "Writing lane thr_one. Also thr_two" },
+    })).outcome).toBe("OK");
+    expect(() => backfillWorkItemAttempts(db)).toThrow("1 thr_ work item(s) were not attributable");
+    expect(db.prepare("SELECT body FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, ambiguousId)).toEqual({ body: "Writing lane thr_one. Also thr_two" });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(projectId, ambiguousId)).toEqual({ count: 0 });
+
+    const malformedId = "backfill-malformed-token";
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      projectId,
+      idempotencyKey: "backfill-create-malformed-token",
+      workItemId: malformedId,
+      workItem: { workItemId: malformedId, title: malformedId, body: "Writing lane thr_bad-token. Must refuse" },
+    })).outcome).toBe("OK");
+    db.prepare("UPDATE work_items SET lifecycle_state = 'succeeded' WHERE project_id = ? AND work_item_id = ?").run(projectId, malformedId);
+    expect(() => backfillWorkItemAttempts(db)).toThrow("2 thr_ work item(s) were not attributable");
+    expect(db.prepare("SELECT body FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, malformedId)).toEqual({ body: "Writing lane thr_bad-token. Must refuse" });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(projectId, malformedId)).toEqual({ count: 0 });
+  });
+
+  it("rebuilds execution_attempts with scoped nullability and active work indexes", () => {
+    const { db, directory } = directDatabase();
+    try {
+      const columns = db.prepare("PRAGMA table_info(execution_attempts)").all() as Array<{ name: string; notnull: number }>;
+      const byName = new Map(columns.map((column) => [column.name, column.notnull]));
+      expect(byName.get("progress_json")).toBe(1);
+      expect(byName.get("lease_owner_thread_id")).toBe(0);
+      expect(byName.get("lease_expires_at_ms")).toBe(0);
+      expect(byName.get("continuation_of_attempt_id")).toBe(0);
+      for (const name of ["role_id", "role_generation", "governance_epoch", "bb_server_id", "environment_id", "source_id", "host_id", "environment_path", "environment_digest"]) {
+        expect(byName.get(name)).toBe(0);
+      }
+      const indexes = db.prepare("PRAGMA index_list(execution_attempts)").all() as Array<{ name: string; unique: number; partial: number }>;
+      expect(indexes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: "execution_attempts_active_writer_lane", unique: 1, partial: 1 }),
+        expect.objectContaining({ name: "execution_attempts_active_work_item", unique: 1, partial: 1 }),
+        expect.objectContaining({ name: "execution_attempts_active_writer_thread", unique: 1, partial: 1 }),
+      ]));
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves every varying non-null prior execution_attempts value across the appended rebuild", () => {
+    const db = new Database(":memory:");
+    databaseIsReady(db);
+    const projectId = "proj_gh300_rebuild";
+    try {
+      db.transaction(() => {
+        for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement);
+      })();
+      db.pragma("foreign_keys = OFF");
+      const insert = (table: string, row: Record<string, unknown>) => {
+        const names = Object.keys(row);
+        db.prepare(`INSERT INTO ${table} (${names.join(", ")}) VALUES (${names.map((name) => `@${name}`).join(", ")})`).run(row);
+      };
+      insert("project_config_revisions", { project_id: projectId, config_revision: 1, canonical_config_json: "{}", config_digest: sha256("{}"), created_at_ms: 1 });
+      insert("repository_targets", { project_id: projectId, repo_target_id: "target-rebuild", config_revision: 1, source_id: "source-rebuild", host_id: "host-rebuild", path: "/rebuild", remote_url: null, default_branch: "main", target_digest: "target-digest" });
+      insert("work_items", { project_id: projectId, work_item_id: "work-rebuild", config_revision: 1, repo_target_id: "target-rebuild", title: "rebuild", body: "body", lifecycle_state: "proposed", resource_revision: 1, created_at_ms: 1, updated_at_ms: 2 });
+      insert("qualification_observations", {
+        project_id: projectId, qualification_id: "qualification-rebuild", role_requirement_id: "worker-v1", config_revision: 1, repo_target_id: "target-rebuild",
+        role_requirement_digest: "role-requirement-digest", executed_profile_digest: "executed-profile-digest", provider_id: "provider-rebuild", model: "model-rebuild",
+        reasoning_level: "reasoning-rebuild", permission_mode: "full", service_tier: "tier-rebuild", visibility: "visible", thread_id: "thread-rebuild",
+        environment_id: "environment-rebuild", source_id: "source-rebuild", host_id: "host-rebuild", provider_thread_id: "provider-thread-rebuild",
+        request_event_id: "request-rebuild", request_event_seq: 1, completion_event_id: "completion-rebuild", completion_event_seq: 2, bb_version: "bb-rebuild",
+        plugin_sdk_version: "sdk-rebuild", qualification_context_digest: "qualification-context-digest", fixture_context_digest: "fixture-context-digest",
+        outcome: "qualified", observed_at_ms: 3, expires_at_ms: null, evidence_digest: "evidence-rebuild", observation_digest: "observation-rebuild", reason_code: "fixture-rebuild",
+      });
+      insert("role_generations", {
+        project_id: projectId, role_id: "worker", generation: 1, role_requirement_id: "worker-v1", config_revision: 1, repo_target_id: "target-rebuild",
+        status: "active", predecessor_generation: null, holder_execution_attempt_id: "holder-rebuild", holder_context_digest: "holder-context-digest",
+        holder_executed_profile_digest: "holder-profile-digest", qualification_id: "qualification-rebuild", eligibility_derivation_digest: "eligibility-digest",
+        created_at_ms: 4, activated_at_ms: 5, retired_at_ms: null,
+      });
+      insert("assignments", {
+        project_id: projectId, assignment_id: "assignment-rebuild", work_item_id: "work-rebuild", assignment_kind: "write", lane_id: "lane-rebuild",
+        role_requirement_id: "worker-v1", role_id: "worker", role_generation: 1, config_revision: 1, governance_epoch: 1, work_item_revision: 1,
+        repo_target_id: "target-rebuild", branch_name: "branch-rebuild", base_sha: "a".repeat(40), candidate_semantics: "base", candidate_sha: null,
+        bb_server_id: "server-rebuild", environment_id: "environment-rebuild", source_id: "source-rebuild", host_id: "host-rebuild",
+        environment_path: "/rebuild", environment_mode: "managed-worktree", frozen_brief_version: 1, frozen_brief_digest: "brief-digest",
+        requested_provider_id: "provider-rebuild", requested_model: "model-rebuild", requested_reasoning_level: "reasoning-rebuild", requested_permission_mode: "full",
+        requested_service_tier: "tier-rebuild", requested_visibility: "visible", requested_profile_digest: "requested-profile-digest", dispatch_kind: "spawn",
+        attach_thread_id: null, parent_assignment_id: null, depth: 0, deadline_at_ms: 9, assignment_digest: "assignment-digest",
+        idempotency_key: "assignment-idempotency", creation_event_sequence: 10, created_at_ms: 11,
+      });
+      const priorValues: Record<string, unknown> = {
+        project_id: projectId, execution_attempt_id: "attempt-rebuild", assignment_id: "assignment-rebuild", origin: "assignment", assignment_digest: "assignment-digest",
+        lane_id: "lane-rebuild", assignment_kind: "write", attempt_ordinal: 2, dispatch_kind: "spawn", config_revision: 1, governance_epoch: 1,
+        work_item_id: "work-rebuild", repo_target_id: "target-rebuild", role_id: "worker", role_generation: 1, state: "prepared", bb_server_id: "server-rebuild",
+        environment_id: "environment-rebuild", source_id: "source-rebuild", host_id: "host-rebuild", environment_path: "/rebuild", thread_id: "thread-rebuild",
+        provider_thread_id: "provider-thread-rebuild", native_request_id: "native-request-rebuild", request_event_id: "request-rebuild", request_event_seq: 12,
+        accepted_event_id: "accepted-rebuild", accepted_event_seq: 13, first_action_event_id: "first-action-rebuild", first_action_event_seq: 14,
+        content_event_id: "content-rebuild", content_event_seq: 15, completion_event_id: "completion-rebuild", completion_event_seq: 16,
+        terminal_event_id: "terminal-rebuild", terminal_event_seq: 17, frozen_brief_digest: "frozen-brief-rebuild", content_receipt_digest: "content-receipt-rebuild",
+        actual_provider_id: "actual-provider-rebuild", actual_model: "actual-model-rebuild", actual_reasoning_level: "actual-reasoning-rebuild",
+        actual_permission_mode: "full", actual_service_tier: "actual-tier-rebuild", actual_visibility: "visible", actual_profile_digest: "actual-profile-rebuild",
+        branch_name: "branch-rebuild", base_sha: "b".repeat(40), candidate_sha: "c".repeat(40), environment_digest: "environment-rebuild-digest",
+        native_receipt_digest: "native-receipt-rebuild", terminal_result: "DONE", reported_outcome: "DONE", terminal_report_digest: "terminal-report-rebuild",
+        conflicting_terminal_digest: "conflict-rebuild", reason_code: "reason-rebuild", last_event_seq: 18, created_at_ms: 19, observed_at_ms: 20,
+        completed_at_ms: 21, attempt_digest: "attempt-rebuild-digest",
+      };
+      insert("execution_attempts", priorValues);
+      db.pragma("foreign_keys = ON");
+      const columns = (db.prepare("PRAGMA table_info(execution_attempts)").all() as Array<{ name: string }>).map((column) => column.name);
+      const before = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
+      expect(Object.values(before).every((value) => value !== null)).toBe(true);
+      expect(new Set(Object.values(before).map((value) => String(value))).size).toBeGreaterThan(20);
+      db.transaction(() => db.exec(MIGRATIONS.at(-1)!))();
+      const after = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
+      expect(Object.fromEntries(columns.map((column) => [column, after[column]]))).toEqual(Object.fromEntries(columns.map((column) => [column, before[column]])));
+      expect(after.progress_json).toBe("{}");
+      expect(after.lease_owner_thread_id).toBeNull();
+      expect(after.continuation_of_attempt_id).toBeNull();
+    } finally {
+      db.close();
+    }
   });
 
   it("refuses v21 rollout evidence when one cached consumer did not execute", async () => {
@@ -4372,7 +4605,7 @@ describe("bb-collab plugin boundary", () => {
     const before = exportFoundation(db, PROJECT_ID);
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
-      observedSchemaVersion: 15,
+      observedSchemaVersion: 16,
       observedContractVersion: 21,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
@@ -4603,7 +4836,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 15, schemaDigest, contractVersion: 21, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 16, schemaDigest, contractVersion: 21, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -5603,7 +5836,10 @@ describe("bb-collab plugin boundary", () => {
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-      for (const statement of MIGRATIONS) db.exec(statement);
+      db.transaction(() => {
+        for (const statement of MIGRATIONS) db.exec(statement);
+      })();
+      backfillWorkItemAttempts(db);
       seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
       const bootstrap = applyFixtureMutation(db, bootstrapRequest());
       const fenceToken = (bootstrap.evidence as { fenceToken: string }).fenceToken;
@@ -5661,8 +5897,8 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 14, newSchemaVersion: 15, action: "unknown", expected: 4, attempted: 0, verified: 0 },
-        schema: { version: 15 },
+        cachedConsumers: { oldSchemaVersion: 15, newSchemaVersion: 16, action: "unknown", expected: 4, attempted: 0, verified: 0 },
+        schema: { version: 16 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -6008,12 +6244,86 @@ describe("bb-collab plugin boundary", () => {
         capacity: {
           writingLaneCeiling: 0,
           activeWriterCount: 1,
-          activeWriterLaneIds: [WORK_ITEM_ID],
+          activeWriterLaneIds: ["lane-work-item-1"],
           duplicateLaneIds: [],
           ceilingViolated: true,
         },
       },
     });
+  });
+
+  it("registers work attempts, enforces lane and thread collisions, supersedes a live seat, and terminalizes the current attempt atomically", async () => {
+    const host = await loadedHost("proj_gh300_registration");
+    const workItemId = "gh300-registration-item";
+    const { db, fenceToken } = seedAndBootstrap(host, "proj_gh300_registration");
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      projectId: "proj_gh300_registration",
+      idempotencyKey: "gh300-registration-create",
+      workItemId,
+      workItem: { workItemId, title: workItemId, body: "typed attempt" },
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, {
+      projectId: "proj_gh300_registration",
+      workItemId,
+      idempotencyKey: "gh300-registration-ready",
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2, {
+      projectId: "proj_gh300_registration",
+      workItemId,
+      idempotencyKey: "gh300-registration-start",
+      workAttempt: { laneId: "lane-first", threadId: "thread-first", assignmentKind: "write" },
+    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+    const first = db.prepare(
+      "SELECT execution_attempt_id, state, attempt_ordinal, lane_id, thread_id, continuation_of_attempt_id FROM execution_attempts WHERE project_id = ? AND origin = 'work_item'",
+    ).get("proj_gh300_registration") as { execution_attempt_id: string; state: string; attempt_ordinal: number; lane_id: string; thread_id: string; continuation_of_attempt_id: string | null };
+    expect(first).toMatchObject({ state: "running", attempt_ordinal: 1, lane_id: "lane-first", thread_id: "thread-first", continuation_of_attempt_id: null });
+
+    const collisionItem = "gh300-collision-item";
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      projectId: "proj_gh300_registration",
+      idempotencyKey: "gh300-collision-create",
+      workItemId: collisionItem,
+      workItem: { workItemId: collisionItem, title: collisionItem, body: "collision" },
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, {
+      projectId: "proj_gh300_registration",
+      workItemId: collisionItem,
+      idempotencyKey: "gh300-collision-ready",
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2, {
+      projectId: "proj_gh300_registration",
+      workItemId: collisionItem,
+      idempotencyKey: "gh300-collision-lane",
+      workAttempt: { laneId: "lane-first", threadId: "thread-second", assignmentKind: "write" },
+    }))).toMatchObject({ outcome: "CANONICAL_STORE_UNAVAILABLE", attempted: 0 });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2, {
+      projectId: "proj_gh300_registration",
+      workItemId: collisionItem,
+      idempotencyKey: "gh300-collision-thread",
+      workAttempt: { laneId: "lane-second", threadId: "thread-first", assignmentKind: "write" },
+    }))).toMatchObject({ outcome: "CANONICAL_STORE_UNAVAILABLE", attempted: 0 });
+
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, undefined, 3, {
+      projectId: "proj_gh300_registration",
+      workItemId,
+      idempotencyKey: "gh300-registration-replace",
+      workAttempt: { laneId: "lane-second", threadId: "thread-second", assignmentKind: "write" },
+    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    const attempts = db.prepare(
+      "SELECT execution_attempt_id, state, attempt_ordinal, lane_id, thread_id, continuation_of_attempt_id FROM execution_attempts WHERE project_id = ? AND origin = 'work_item' ORDER BY attempt_ordinal",
+    ).all("proj_gh300_registration");
+    expect(attempts).toEqual([
+      { execution_attempt_id: first.execution_attempt_id, state: "superseded", attempt_ordinal: 1, lane_id: "lane-first", thread_id: "thread-first", continuation_of_attempt_id: null },
+      { execution_attempt_id: expect.any(String), state: "running", attempt_ordinal: 2, lane_id: "lane-second", thread_id: "thread-second", continuation_of_attempt_id: first.execution_attempt_id },
+    ]);
+
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "succeeded", 4, {
+      projectId: "proj_gh300_registration",
+      workItemId,
+      idempotencyKey: "gh300-registration-done",
+    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
+    expect(db.prepare("SELECT state, completed_at_ms FROM execution_attempts WHERE project_id = ? AND origin = 'work_item' AND attempt_ordinal = 2").get("proj_gh300_registration")).toMatchObject({ state: "done", completed_at_ms: expect.any(Number) });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND origin = 'work_item' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')").get("proj_gh300_registration")).toEqual({ count: 0 });
   });
 
   it("records one WorkItem wait and refuses terminal transition until it is cleared", async () => {
@@ -7424,10 +7734,10 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(15, 21))).toMatchObject({ oldSchemaVersion: 14, newSchemaVersion: 15, oldContractVersion: 21, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(16, 21))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 

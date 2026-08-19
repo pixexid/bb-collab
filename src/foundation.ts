@@ -9,12 +9,12 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 export const CONTRACT_VERSION = 21;
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 // v21 makes project configuration visibility explicitly visible-only.
 const PREVIOUS_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-const PREVIOUS_SCHEMA_VERSION = 14;
+const PREVIOUS_SCHEMA_VERSION = 15;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatProfile = {
@@ -661,6 +661,138 @@ export const MIGRATIONS: string[] = [
     CHECK (replied_at_ms IS NULL OR reply_text IS NOT NULL),
     CHECK (reply_delivery_error IS NULL OR (replied_at_ms IS NULL AND reply_text IS NOT NULL))
   )`,
+  `PRAGMA defer_foreign_keys = ON;
+  CREATE TABLE execution_attempts_gh300 (
+    project_id TEXT NOT NULL,
+    execution_attempt_id TEXT NOT NULL,
+    assignment_id TEXT,
+    origin TEXT NOT NULL CHECK (origin IN ('assignment', 'role_holder', 'legacy_unresolved', 'work_item')),
+    assignment_digest TEXT,
+    lane_id TEXT,
+    assignment_kind TEXT CHECK (assignment_kind IS NULL OR assignment_kind IN ('write', 'review', 'probe')),
+    attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal > 0),
+    dispatch_kind TEXT CHECK (dispatch_kind IS NULL OR dispatch_kind IN ('spawn', 'attach')),
+    config_revision INTEGER NOT NULL,
+    governance_epoch INTEGER CHECK (governance_epoch IS NULL OR governance_epoch > 0),
+    work_item_id TEXT,
+    repo_target_id TEXT,
+    role_id TEXT,
+    role_generation INTEGER CHECK (role_generation IS NULL OR role_generation > 0),
+    state TEXT NOT NULL CHECK (state IN ('prepared', 'armed', 'content_delivered', 'running', 'done', 'blocked', 'failed', 'dispatch_unknown', 'superseded')),
+    bb_server_id TEXT,
+    environment_id TEXT,
+    source_id TEXT,
+    host_id TEXT,
+    environment_path TEXT,
+    thread_id TEXT,
+    provider_thread_id TEXT,
+    native_request_id TEXT,
+    request_event_id TEXT,
+    request_event_seq INTEGER,
+    accepted_event_id TEXT,
+    accepted_event_seq INTEGER,
+    first_action_event_id TEXT,
+    first_action_event_seq INTEGER,
+    content_event_id TEXT,
+    content_event_seq INTEGER,
+    completion_event_id TEXT,
+    completion_event_seq INTEGER,
+    terminal_event_id TEXT,
+    terminal_event_seq INTEGER,
+    frozen_brief_digest TEXT,
+    content_receipt_digest TEXT,
+    actual_provider_id TEXT,
+    actual_model TEXT,
+    actual_reasoning_level TEXT,
+    actual_permission_mode TEXT,
+    actual_service_tier TEXT,
+    actual_visibility TEXT CHECK (actual_visibility IS NULL OR actual_visibility IN ('visible', 'hidden')),
+    actual_profile_digest TEXT,
+    branch_name TEXT,
+    base_sha TEXT,
+    candidate_sha TEXT,
+    environment_digest TEXT,
+    native_receipt_digest TEXT,
+    terminal_result TEXT CHECK (terminal_result IS NULL OR terminal_result IN ('DONE', 'BLOCKED')),
+    reported_outcome TEXT CHECK (reported_outcome IS NULL OR reported_outcome IN ('DONE', 'BLOCKED')),
+    terminal_report_digest TEXT,
+    conflicting_terminal_digest TEXT,
+    reason_code TEXT,
+    last_event_seq INTEGER,
+    progress_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(progress_json)),
+    lease_owner_thread_id TEXT,
+    lease_expires_at_ms INTEGER CHECK (lease_expires_at_ms IS NULL OR lease_expires_at_ms >= 0),
+    continuation_of_attempt_id TEXT,
+    created_at_ms INTEGER NOT NULL,
+    observed_at_ms INTEGER,
+    completed_at_ms INTEGER,
+    attempt_digest TEXT NOT NULL,
+    PRIMARY KEY (project_id, execution_attempt_id),
+    FOREIGN KEY (project_id, assignment_id)
+      REFERENCES assignments(project_id, assignment_id),
+    FOREIGN KEY (project_id, repo_target_id, config_revision)
+      REFERENCES repository_targets(project_id, repo_target_id, config_revision),
+    CHECK ((origin = 'assignment' AND assignment_id IS NOT NULL AND assignment_digest IS NOT NULL AND lane_id IS NOT NULL AND assignment_kind IS NOT NULL) OR
+           (origin IN ('role_holder', 'legacy_unresolved', 'work_item') AND assignment_id IS NULL)),
+    CHECK ((origin = 'work_item' AND work_item_id IS NOT NULL AND lane_id IS NOT NULL AND assignment_kind IS NOT NULL) OR
+           origin != 'work_item'),
+    CHECK (origin = 'work_item' OR
+           (role_id IS NOT NULL AND role_generation IS NOT NULL AND governance_epoch IS NOT NULL AND
+            bb_server_id IS NOT NULL AND environment_id IS NOT NULL AND source_id IS NOT NULL AND
+            host_id IS NOT NULL AND environment_path IS NOT NULL AND environment_digest IS NOT NULL))
+  );
+  INSERT INTO execution_attempts_gh300 (
+    project_id, execution_attempt_id, assignment_id, origin, assignment_digest, lane_id,
+    assignment_kind, attempt_ordinal, dispatch_kind, config_revision, governance_epoch,
+    work_item_id, repo_target_id, role_id, role_generation, state, bb_server_id,
+    environment_id, source_id, host_id, environment_path, thread_id, provider_thread_id,
+    native_request_id, request_event_id, request_event_seq, accepted_event_id, accepted_event_seq,
+    first_action_event_id, first_action_event_seq, content_event_id, content_event_seq,
+    completion_event_id, completion_event_seq, terminal_event_id, terminal_event_seq,
+    frozen_brief_digest, content_receipt_digest, actual_provider_id, actual_model,
+    actual_reasoning_level, actual_permission_mode, actual_service_tier, actual_visibility,
+    actual_profile_digest, branch_name, base_sha, candidate_sha, environment_digest,
+    native_receipt_digest, terminal_result, reported_outcome, terminal_report_digest,
+    conflicting_terminal_digest, reason_code, last_event_seq, progress_json,
+    lease_owner_thread_id, lease_expires_at_ms, continuation_of_attempt_id, created_at_ms,
+    observed_at_ms, completed_at_ms, attempt_digest
+  ) SELECT
+    project_id, execution_attempt_id, assignment_id, origin, assignment_digest, lane_id,
+    assignment_kind, attempt_ordinal, dispatch_kind, config_revision, governance_epoch,
+    work_item_id, repo_target_id, role_id, role_generation, state, bb_server_id,
+    environment_id, source_id, host_id, environment_path, thread_id, provider_thread_id,
+    native_request_id, request_event_id, request_event_seq, accepted_event_id, accepted_event_seq,
+    first_action_event_id, first_action_event_seq, content_event_id, content_event_seq,
+    completion_event_id, completion_event_seq, terminal_event_id, terminal_event_seq,
+    frozen_brief_digest, content_receipt_digest, actual_provider_id, actual_model,
+    actual_reasoning_level, actual_permission_mode, actual_service_tier, actual_visibility,
+    actual_profile_digest, branch_name, base_sha, candidate_sha, environment_digest,
+    native_receipt_digest, terminal_result, reported_outcome, terminal_report_digest,
+    conflicting_terminal_digest, reason_code, last_event_seq, '{}', NULL, NULL, NULL,
+    created_at_ms, observed_at_ms, completed_at_ms, attempt_digest
+  FROM execution_attempts;
+  DROP TABLE execution_attempts;
+  ALTER TABLE execution_attempts_gh300 RENAME TO execution_attempts;
+  CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_active_assignment
+    ON execution_attempts(project_id, assignment_digest)
+    WHERE origin = 'assignment' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown');
+  CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_active_writer_lane
+    ON execution_attempts(project_id, lane_id)
+    WHERE origin IN ('assignment', 'work_item') AND assignment_kind = 'write'
+      AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown');
+  CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_active_work_item
+    ON execution_attempts(project_id, work_item_id)
+    WHERE origin = 'work_item' AND assignment_kind = 'write'
+      AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown');
+  CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_active_writer_thread
+    ON execution_attempts(project_id, thread_id)
+    WHERE origin = 'work_item' AND assignment_kind = 'write' AND thread_id IS NOT NULL
+      AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown');
+  CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_native_request
+    ON execution_attempts(bb_server_id, thread_id, native_request_id)
+    WHERE thread_id IS NOT NULL AND native_request_id IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS execution_attempts_project_state
+    ON execution_attempts(project_id, state, assignment_kind, lane_id)`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -1227,6 +1359,13 @@ const workItemWaitSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("schedule"), schedule: id, declaredBySeat: id }).strict(),
   z.object({ kind: z.literal("seat"), seat: z.enum(ROLE_IDS), declaredBySeat: id }).strict(),
 ]);
+const workAttemptSchema = z
+  .object({
+    laneId: id,
+    threadId: id.optional(),
+    assignmentKind: z.enum(["write", "review", "probe"]),
+  })
+  .strict();
 
 const githubMappingSchema = z
   .object({
@@ -1481,6 +1620,7 @@ export const applyRequestSchema = z
     workItemId: id.optional(),
     lifecycleState: workItemStateSchema.optional(),
     workItemWait: workItemWaitSchema.nullable().optional(),
+    workAttempt: workAttemptSchema.optional(),
     projectionKind: z.literal("github_issue").optional(),
     roleId: roleIdSchema.optional(),
     roleRequirementId: id.optional(),
@@ -2505,6 +2645,7 @@ function normalizeRequest(request: ApplyRequest): ApplyRequest {
     workItemId: request.workItemId ?? undefined,
     lifecycleState: request.lifecycleState ?? undefined,
     workItemWait: request.workItemWait === undefined ? undefined : request.workItemWait,
+    workAttempt: request.workAttempt ?? undefined,
     projectionKind: request.projectionKind ?? undefined,
     roleId: request.roleId ?? undefined,
     roleRequirementId: request.roleRequirementId ?? undefined,
@@ -4986,6 +5127,211 @@ interface WorkItemRow {
   updated_at_ms: number;
 }
 
+type WorkAttempt = z.infer<typeof workAttemptSchema>;
+type WorkAttemptState = "running" | "done" | "failed";
+const ACTIVE_WORK_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"] as const;
+const WORK_ITEM_THREAD_TOKEN = /thr_[A-Za-z0-9]+/gu;
+const WORK_ITEM_LANE_SENTENCE = /^(?:Lane|Writing lane) (thr_[A-Za-z0-9]+)(?:[,.!?])?(?:[ \t]+|\r?\n|$)/u;
+
+export interface WorkItemBackfillCounts {
+  candidates: number;
+  attributable: number;
+  inserted: number;
+  alreadyBound: number;
+  residualProposed: number;
+  unresolved: number;
+}
+
+function parseBackfillLane(body: string): { token: string; strippedBody: string } | null {
+  const tokens = [...body.matchAll(WORK_ITEM_THREAD_TOKEN)].map((match) => match[0]);
+  const distinctTokens = new Set(tokens);
+  const leading = WORK_ITEM_LANE_SENTENCE.exec(body);
+  if (!leading || distinctTokens.size !== 1 || leading[1] !== [...distinctTokens][0]) return null;
+  return { token: leading[1], strippedBody: body.slice(leading[0].length) };
+}
+
+function workAttemptId(input: {
+  projectId: string;
+  workItemId: string;
+  attemptOrdinal: number;
+  laneId: string;
+  threadId: string | null;
+}): string {
+  return sha256(canonicalJson({ origin: "work_item", ...input }));
+}
+
+function insertWorkItemAttempt(
+  db: SqliteDatabase,
+  input: {
+    projectId: string;
+    workItemId: string;
+    configRevision: number;
+    repoTargetId: string;
+    laneId: string;
+    threadId: string | null;
+    leaseOwnerThreadId: string | null;
+    assignmentKind: WorkAttempt["assignmentKind"];
+    attemptOrdinal: number;
+    state: WorkAttemptState;
+    reasonCode: string;
+    createdAtMs: number;
+    observedAtMs: number;
+    completedAtMs: number | null;
+    continuationOfAttemptId: string | null;
+  },
+): string {
+  const executionAttemptId = workAttemptId(input);
+  const attemptDigest = sha256(canonicalJson({
+    origin: "work_item",
+    executionAttemptId,
+    projectId: input.projectId,
+    workItemId: input.workItemId,
+    laneId: input.laneId,
+    threadId: input.threadId,
+    assignmentKind: input.assignmentKind,
+    attemptOrdinal: input.attemptOrdinal,
+    state: input.state,
+    reasonCode: input.reasonCode,
+    createdAtMs: input.createdAtMs,
+    continuationOfAttemptId: input.continuationOfAttemptId,
+  }));
+  db.prepare(
+    `INSERT INTO execution_attempts (
+       project_id, execution_attempt_id, origin, lane_id, assignment_kind, attempt_ordinal,
+       config_revision, work_item_id, repo_target_id, state, thread_id, reason_code,
+       progress_json, lease_owner_thread_id, continuation_of_attempt_id, created_at_ms,
+       observed_at_ms, completed_at_ms, attempt_digest
+     ) VALUES (
+       @projectId, @executionAttemptId, 'work_item', @laneId, @assignmentKind, @attemptOrdinal,
+       @configRevision, @workItemId, @repoTargetId, @state, @threadId, @reasonCode,
+       '{}', @leaseOwnerThreadId, @continuationOfAttemptId, @createdAtMs,
+       @observedAtMs, @completedAtMs, @attemptDigest
+     )`,
+  ).run({
+    projectId: input.projectId,
+    executionAttemptId,
+    laneId: input.laneId,
+    assignmentKind: input.assignmentKind,
+    attemptOrdinal: input.attemptOrdinal,
+    configRevision: input.configRevision,
+    workItemId: input.workItemId,
+    repoTargetId: input.repoTargetId,
+    state: input.state,
+    threadId: input.threadId,
+    reasonCode: input.reasonCode,
+    leaseOwnerThreadId: input.leaseOwnerThreadId,
+    continuationOfAttemptId: input.continuationOfAttemptId,
+    createdAtMs: input.createdAtMs,
+    observedAtMs: input.observedAtMs,
+    completedAtMs: input.completedAtMs,
+    attemptDigest,
+  });
+  return executionAttemptId;
+}
+
+export function backfillWorkItemAttempts(db: SqliteDatabase): WorkItemBackfillCounts {
+  return transaction(db, () => {
+    const rows = db.prepare(
+      `SELECT project_id, work_item_id, config_revision, repo_target_id, body, lifecycle_state, created_at_ms, updated_at_ms
+       FROM work_items WHERE body LIKE '%thr\\_%' ESCAPE '\\' ORDER BY project_id, work_item_id`,
+    ).all() as Array<WorkItemRow>;
+    const counts: WorkItemBackfillCounts = { candidates: rows.length, attributable: 0, inserted: 0, alreadyBound: 0, residualProposed: 0, unresolved: 0 };
+    for (const row of rows) {
+      const existing = db.prepare(
+        "SELECT 1 FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item' LIMIT 1",
+      ).get(row.project_id, row.work_item_id);
+      if (existing) {
+        counts.alreadyBound += 1;
+        continue;
+      }
+      const parsed = parseBackfillLane(row.body);
+      if (row.lifecycle_state === "proposed") {
+        if (!parsed) {
+          counts.unresolved += 1;
+          continue;
+        }
+        counts.residualProposed += 1;
+        continue;
+      }
+      const state: WorkAttemptState | null = row.lifecycle_state === "succeeded"
+        ? "done"
+        : row.lifecycle_state === "in_progress"
+          ? "running"
+          : row.lifecycle_state === "failed" || row.lifecycle_state === "cancelled"
+            ? "failed"
+            : null;
+      if (!parsed || state === null) {
+        counts.unresolved += 1;
+        continue;
+      }
+      counts.attributable += 1;
+      insertWorkItemAttempt(db, {
+        projectId: row.project_id,
+        workItemId: row.work_item_id,
+        configRevision: row.config_revision,
+        repoTargetId: row.repo_target_id,
+        laneId: parsed.token,
+        threadId: parsed.token,
+        leaseOwnerThreadId: null,
+        assignmentKind: "write",
+        attemptOrdinal: 1,
+        state,
+        reasonCode: "gh300_backfill",
+        createdAtMs: row.created_at_ms,
+        observedAtMs: row.updated_at_ms,
+        completedAtMs: state === "running" ? null : row.updated_at_ms,
+        continuationOfAttemptId: null,
+      });
+      db.prepare(
+        "UPDATE work_items SET body = ? WHERE project_id = ? AND work_item_id = ?",
+      ).run(parsed.strippedBody, row.project_id, row.work_item_id);
+      counts.inserted += 1;
+    }
+    if (counts.unresolved > 0) {
+      throw new Error(`GH300 backfill refused: ${counts.unresolved} thr_ work item(s) were not attributable`);
+    }
+    const remaining = (db.prepare(
+      `SELECT COUNT(*) AS count FROM work_items
+       WHERE body LIKE '%thr\\_%' ESCAPE '\\' AND NOT EXISTS (
+         SELECT 1 FROM execution_attempts
+         WHERE execution_attempts.project_id = work_items.project_id
+           AND execution_attempts.work_item_id = work_items.work_item_id
+           AND execution_attempts.origin = 'work_item'
+       )`,
+    ).get() as { count: number }).count;
+    if (remaining !== counts.residualProposed) throw new Error(`GH300 backfill refused: ${remaining} thr_ work item(s) have no attempt record`);
+    return counts;
+  });
+}
+
+function nextWorkAttemptOrdinal(db: SqliteDatabase, projectId: string, workItemId: string): number {
+  return ((db.prepare(
+    "SELECT COALESCE(MAX(attempt_ordinal), 0) AS next_attempt_ordinal FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'",
+  ).get(projectId, workItemId) as { next_attempt_ordinal: number }).next_attempt_ordinal) + 1;
+}
+
+function activeWorkItemAttempt(db: SqliteDatabase, projectId: string, workItemId: string): { execution_attempt_id: string } | undefined {
+  return asRow<{ execution_attempt_id: string }>(db.prepare(
+    `SELECT execution_attempt_id FROM execution_attempts
+     WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+       AND state IN (${ACTIVE_WORK_ATTEMPT_STATES.map(() => "?").join(", ")})
+     ORDER BY attempt_ordinal DESC LIMIT 1`,
+  ).get(projectId, workItemId, ...ACTIVE_WORK_ATTEMPT_STATES));
+}
+
+function terminalizeWorkItemAttempt(db: SqliteDatabase, projectId: string, workItemId: string, state: "done" | "failed" | "superseded"): string | null {
+  const active = activeWorkItemAttempt(db, projectId, workItemId);
+  if (!active) return null;
+  const completedAtMs = now();
+  db.prepare(
+    `UPDATE execution_attempts
+     SET state = ?, observed_at_ms = ?, completed_at_ms = ?, lease_owner_thread_id = NULL,
+         progress_json = '{}'
+     WHERE project_id = ? AND execution_attempt_id = ?`,
+  ).run(state, completedAtMs, completedAtMs, projectId, active.execution_attempt_id);
+  return active.execution_attempt_id;
+}
+
 interface WorkItemWaitRow {
   project_id: string;
   work_item_id: string;
@@ -5152,7 +5498,8 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
     nextState === "succeeded" || nextState === "failed" || nextState === "cancelled" || request.workItemWait === null,
   );
   const wait = request.workItemWait;
-  if (wait !== undefined && nextState !== undefined) {
+  const workAttempt = request.workAttempt;
+  if (wait !== undefined && (nextState !== undefined || workAttempt !== undefined)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item wait mutation cannot change lifecycle state");
   }
   if (wait !== undefined) {
@@ -5203,8 +5550,74 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
       },
     );
   }
+  if (workAttempt !== undefined && nextState !== undefined && nextState !== "in_progress") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work attempts may only accompany an in-progress transition");
+  }
+  if (workAttempt !== undefined && nextState === undefined) {
+    if (workItem.lifecycle_state !== "in_progress") {
+      throw refusal("WORK_ITEM_STATE_INVALID", "replacement work attempts require an in-progress work item");
+    }
+    const prior = activeWorkItemAttempt(db, request.projectId, workItem.work_item_id);
+    const nextRevision = workItem.resource_revision + 1;
+    const updated = db.prepare(
+      `UPDATE work_items SET resource_revision = ?, updated_at_ms = ?
+       WHERE project_id = ? AND work_item_id = ? AND resource_revision = ?`,
+    ).run(nextRevision, now(), request.projectId, workItem.work_item_id, workItem.resource_revision);
+    if (updated.changes !== 1) throw refusal("WORK_ITEM_REVISION_STALE", "work item compare-and-swap failed", {
+      currentResourceRevision: workItem.resource_revision,
+      expectedResourceRevision: request.expectedResourceRevision ?? undefined,
+    });
+    if (prior) terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded");
+    const createdAtMs = now();
+    const executionAttemptId = insertWorkItemAttempt(db, {
+      projectId: request.projectId,
+      workItemId: workItem.work_item_id,
+      configRevision: workItem.config_revision,
+      repoTargetId: workItem.repo_target_id,
+      laneId: workAttempt.laneId,
+      threadId: workAttempt.threadId ?? null,
+      leaseOwnerThreadId: workAttempt.threadId ?? null,
+      assignmentKind: workAttempt.assignmentKind,
+      attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
+      state: "running",
+      reasonCode: "work_item_dispatch",
+      createdAtMs,
+      observedAtMs: createdAtMs,
+      completedAtMs: null,
+      continuationOfAttemptId: prior?.execution_attempt_id ?? null,
+    });
+    return commitMutation(
+      db,
+      request,
+      digest,
+      actorReceiptId,
+      {
+        aggregateType: "work_item",
+        aggregateId: workItem.work_item_id,
+        aggregateRevision: nextRevision,
+        eventType: "work_item_attempt_registered",
+        event: {
+          workItemId: workItem.work_item_id,
+          executionAttemptId,
+          supersededExecutionAttemptId: prior?.execution_attempt_id ?? null,
+          workAttempt,
+        },
+      },
+      { expected: 1, attempted: 1, verified: 1 },
+      {
+        currentConfigRevision: configRevision,
+        currentGovernanceEpoch: governor.governance_epoch,
+        currentResourceRevision: nextRevision,
+        expectedResourceRevision: request.expectedResourceRevision ?? undefined,
+        evidence: { workItemId: workItem.work_item_id, executionAttemptId, workAttempt, supersededExecutionAttemptId: prior?.execution_attempt_id ?? null },
+      },
+    );
+  }
   if (!nextState || !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
+  }
+  if (nextState === "in_progress" && workAttempt === undefined) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "entering in-progress requires a work attempt");
   }
   if (["succeeded", "failed", "cancelled"].includes(nextState) && db.prepare(
     "SELECT 1 FROM work_item_waits WHERE project_id = ? AND work_item_id = ?",
@@ -5222,6 +5635,30 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
       expectedResourceRevision: request.expectedResourceRevision ?? undefined,
     });
   }
+  const executionAttemptId = nextState === "in_progress"
+    ? insertWorkItemAttempt(db, {
+      projectId: request.projectId,
+      workItemId: workItem.work_item_id,
+      configRevision: workItem.config_revision,
+      repoTargetId: workItem.repo_target_id,
+      laneId: workAttempt!.laneId,
+      threadId: workAttempt!.threadId ?? null,
+      leaseOwnerThreadId: workAttempt!.threadId ?? null,
+      assignmentKind: workAttempt!.assignmentKind,
+      attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
+      state: "running",
+      reasonCode: "work_item_dispatch",
+      createdAtMs: now(),
+      observedAtMs: now(),
+      completedAtMs: null,
+      continuationOfAttemptId: null,
+    })
+    : terminalizeWorkItemAttempt(
+      db,
+      request.projectId,
+      workItem.work_item_id,
+      nextState === "succeeded" ? "done" : nextState === "failed" || nextState === "cancelled" ? "failed" : "failed",
+    );
   return commitMutation(
     db,
     request,
@@ -5232,7 +5669,13 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
       aggregateId: workItem.work_item_id,
       aggregateRevision: nextRevision,
       eventType: "work_item_transitioned",
-      event: { workItemId: workItem.work_item_id, from: workItem.lifecycle_state, to: nextState },
+      event: {
+        workItemId: workItem.work_item_id,
+        from: workItem.lifecycle_state,
+        to: nextState,
+        ...(executionAttemptId === null ? {} : { executionAttemptId }),
+        ...(nextState === "in_progress" ? { workAttempt } : {}),
+      },
     },
     { expected: 1, attempted: 1, verified: 1 },
     {
@@ -5240,7 +5683,7 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
       currentGovernanceEpoch: governor.governance_epoch,
       currentResourceRevision: nextRevision,
       expectedResourceRevision: request.expectedResourceRevision ?? undefined,
-      evidence: { workItemId: workItem.work_item_id, lifecycleState: nextState },
+        evidence: { workItemId: workItem.work_item_id, lifecycleState: nextState, ...(executionAttemptId === null ? {} : { executionAttemptId }) },
     },
   );
 }
@@ -6565,7 +7008,10 @@ export async function doctor(
     const writingLaneCeiling = writingLaneCeilingFromJson(configJson);
     const assignmentAttempts: Array<Record<string, unknown>> = [];
     const activeWriters = db.prepare(
-      "SELECT work_item_id AS lane_id FROM work_items WHERE project_id = ? AND lifecycle_state = 'in_progress' ORDER BY work_item_id",
+      `SELECT lane_id FROM execution_attempts
+       WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
+         AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')
+       ORDER BY lane_id`,
     ).all(projectId) as Array<{ lane_id: string }>;
     const unresolvedAttempts: Array<Record<string, unknown>> = [];
     const profileAuditEntries: Array<Record<string, unknown>> = [];
