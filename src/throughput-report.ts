@@ -138,7 +138,7 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
       window: { startAtMs: cohort.startAtMs, endAtMs: cohort.endAtMs },
       issueOpenToClose: { maximumHours: durations.length ? hours(Math.max(...durations)) : null, completed: durations.length, unknown: issues.length - durations.length },
       mergeCadence: { maximumGapHours: gaps.length ? hours(Math.max(...gaps)) : null, knownMerges: cohortMerges.length },
-      reviewRounds: { status: "unknown" as const, reason: facts.unknownReasons?.reviewLatency ?? "BB review threads are not canonically linked to pull requests" },
+      reviewRounds: { status: "unknown" as const, reason: facts.unknownReasons?.reviewLatency ?? "no canonically linked review observations" },
     };
   });
   const issueMedian = median(issueDurations);
