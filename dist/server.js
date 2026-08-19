@@ -15292,6 +15292,7 @@ var MIGRATIONS = [
   ALTER TABLE work_items_gh295 RENAME TO work_items`
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
+var GH300_BACKFILL_MIGRATION_ID = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE execution_attempts_gh300"));
 var CACHED_CONSUMERS = [
   "server.rpcContract",
   "server.collabCli",
@@ -18715,12 +18716,19 @@ function insertWorkItemAttempt(db, input) {
   });
   return executionAttemptId;
 }
-function backfillWorkItemAttempts(db) {
+function gh300BackfillEpochMs(db) {
+  const row = db.prepare("SELECT applied_at FROM _bb_migrations WHERE id = ?").get(GH300_BACKFILL_MIGRATION_ID);
+  if (typeof row?.applied_at !== "number" || !Number.isSafeInteger(row.applied_at)) {
+    throw new Error("GH300 backfill refused: migration epoch is unavailable");
+  }
+  return row.applied_at;
+}
+function backfillWorkItemAttempts(db, migrationAppliedAtMs = gh300BackfillEpochMs(db)) {
   return transaction(db, () => {
     const rows = db.prepare(
       `SELECT project_id, work_item_id, config_revision, repo_target_id, body, lifecycle_state, created_at_ms, updated_at_ms
-       FROM work_items WHERE body LIKE '%thr\\_%' ESCAPE '\\' ORDER BY project_id, work_item_id`
-    ).all();
+       FROM work_items WHERE body LIKE '%thr\\_%' ESCAPE '\\' AND created_at_ms <= ? ORDER BY project_id, work_item_id`
+    ).all(migrationAppliedAtMs);
     const counts = { candidates: rows.length, attributable: 0, inserted: 0, alreadyBound: 0, residualProposed: 0, unresolved: 0 };
     for (const row of rows) {
       const existing = db.prepare(
@@ -18772,13 +18780,13 @@ function backfillWorkItemAttempts(db) {
     }
     const remaining = db.prepare(
       `SELECT COUNT(*) AS count FROM work_items
-       WHERE body LIKE '%thr\\_%' ESCAPE '\\' AND NOT EXISTS (
+       WHERE body LIKE '%thr\\_%' ESCAPE '\\' AND created_at_ms <= ? AND NOT EXISTS (
          SELECT 1 FROM execution_attempts
          WHERE execution_attempts.project_id = work_items.project_id
            AND execution_attempts.work_item_id = work_items.work_item_id
            AND execution_attempts.origin = 'work_item'
        )`
-    ).get().count;
+    ).get(migrationAppliedAtMs).count;
     if (remaining !== counts.residualProposed) throw new Error(`GH300 backfill refused: ${remaining} thr_ work item(s) have no attempt record`);
     return counts;
   });
@@ -22339,7 +22347,11 @@ async function plugin(bb, options = {}) {
     db = bb.storage.database();
     databaseIsReady(db);
     bb.storage.migrate(db, MIGRATIONS);
-    backfillWorkItemAttempts(db);
+    try {
+      backfillWorkItemAttempts(db);
+    } catch (error48) {
+      bb.log.error(`GH300 backfill degraded; canonical store remains available: ${String(error48)}`);
+    }
   } catch (error48) {
     bb.log.error(`canonical store unavailable: ${String(error48)}`);
     db = null;
@@ -23593,7 +23605,7 @@ ${thread.titleFallback ?? ""}`);
       return runCli(db, bb, argv, context, cliDeps);
     }
   });
-  bb.log.info(`${PLUGIN_ID} loaded for BB ${BB_VERSION_RANGE}; plugin SDK ${PLUGIN_SDK_VERSION}`);
+  bb.log.info(`${PLUGIN_ID} loaded for BB ${BB_VERSION_RANGE}; plugin SDK ${PLUGIN_SDK_VERSION}; canonicalStore=${db === null ? "unavailable" : "available"}`);
 }
 export {
   FLEET_WATCHDOG_FLOOR_MS,

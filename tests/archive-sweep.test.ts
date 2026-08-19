@@ -86,7 +86,7 @@ function fixture(options: {
   db.transaction(() => {
     for (const migration of MIGRATIONS) db.exec(migration);
   })();
-  backfillWorkItemAttempts(db);
+  backfillWorkItemAttempts(db, Number.MAX_SAFE_INTEGER);
   db.pragma("foreign_keys = OFF");
   insertAttempt(db, { id: "role-holder", origin: "role_holder", threadId: "role-holder" });
   insertAttempt(db, { id: "director-holder", origin: "role_holder", threadId: "director-exemption", roleId: "director" });
