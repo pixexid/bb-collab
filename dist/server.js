@@ -20913,6 +20913,7 @@ function startableQueueDepth(repositories) {
 }
 var FLEET_WATCHDOG_FLOOR_MS = 5 * 6e4;
 var FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS = 60 * 6e4;
+var IDLE_FLEET_ATTEMPT_STALE_MS = 10 * 6e4;
 var FLEET_WATCHDOG_LEGACY_FLOOR_MS = 60 * 6e4;
 var FLEET_WATCHDOG_FLOOR_MIGRATION_KEY = "fleet-watchdog.floor-default-v2-migrated";
 var FLEET_WATCHDOG_STALE_WAIT_MS = 24 * 60 * 6e4;
@@ -22318,7 +22319,7 @@ ${thread.titleFallback ?? ""}`);
     kind: "blind",
     message: `idle-fleet coverage=blind orchestrator=${orchestrator} activeLanes=${activeLanes} startable=${startable} reason=${reason}`
   });
-  const readIdleFleetActiveLanes = (projectId) => {
+  const readIdleFleetActiveLanes = async (projectId) => {
     if (!db) return { known: false, reason: "canonical-store-unavailable" };
     try {
       const unbound = db.prepare(
@@ -22332,14 +22333,49 @@ ${thread.titleFallback ?? ""}`);
            ) LIMIT 1`
       ).get(projectId);
       if (unbound) return { known: false, reason: "work-items-have-no-thread-binding:GH-300" };
-      const row = db.prepare(
-        `SELECT COUNT(DISTINCT lane_id) AS count FROM execution_attempts
+      const rows = db.prepare(
+        `SELECT lane_id, thread_id, state, observed_at_ms FROM execution_attempts
          WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
            AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')`
-      ).get(projectId);
-      return typeof row?.count === "number" && Number.isSafeInteger(row.count) && row.count >= 0 ? { known: true, value: row.count } : { known: false, reason: "active-lanes-unreadable" };
+      ).all(projectId);
+      const laneIds = /* @__PURE__ */ new Set();
+      const now2 = Date.now();
+      for (const row of rows) {
+        if (row.state === "dispatch_unknown") return { known: false, reason: "dispatch-unknown-attempt" };
+        if (typeof row.lane_id !== "string" || row.lane_id.length === 0 || typeof row.thread_id !== "string" || row.thread_id.length === 0) {
+          return { known: false, reason: "work-item-attempt-has-no-thread-binding:GH-300" };
+        }
+        if (!Number.isSafeInteger(row.observed_at_ms) || row.observed_at_ms < 0 || now2 - row.observed_at_ms > IDLE_FLEET_ATTEMPT_STALE_MS) {
+          return { known: false, reason: "stale-active-attempt" };
+        }
+        laneIds.add(row.lane_id);
+      }
+      return { known: true, value: laneIds.size };
     } catch (error48) {
       return { known: false, reason: `active-lanes-unreadable:${String(error48)}` };
+    }
+  };
+  const readIdleFleetNativeLanes = async (projectId) => {
+    if (!db) return { known: false, reason: "canonical-store-unavailable" };
+    try {
+      const dispatcherThreadIds = new Set(
+        db.prepare(
+          "SELECT thread_id FROM execution_attempts WHERE project_id = ? AND origin = 'role_holder' AND thread_id IS NOT NULL"
+        ).all(projectId).map((row) => row.thread_id)
+      );
+      if (dispatcherThreadIds.size === 0) return { known: false, reason: "native-lane-parents-unreadable" };
+      const threads = [];
+      for (let offset = 0; ; offset += 100) {
+        const page = await bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset });
+        threads.push(...page);
+        if (page.length < 100) break;
+      }
+      const liveLanes = threads.filter(
+        (thread) => !dispatcherThreadIds.has(thread.id) && thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null && thread.status !== "error" && thread.status !== "stopping"
+      );
+      return { known: true, value: liveLanes.length };
+    } catch (error48) {
+      return { known: false, reason: `native-lanes-unreadable:${String(error48)}` };
     }
   };
   const readIdleFleetStartable = (projectId) => {
@@ -22405,18 +22441,29 @@ ${thread.titleFallback ?? ""}`);
     if (thread.status !== "idle") return { kind: "silent" };
     if (!Number.isFinite(thread.updatedAt)) return idleFleetBlind("blind", "blind", "blind", "orchestrator-unreadable");
     if (String(thread.updatedAt) !== probe.idleEpisode) return { kind: "silent" };
-    const activeLanes = readIdleFleetActiveLanes(probe.projectId);
-    const startable = readIdleFleetStartable(probe.projectId);
-    if (activeLanes.known && activeLanes.value > 0) return { kind: "silent" };
-    if (startable.known && startable.value.count === 0) return { kind: "silent" };
-    if (!activeLanes.known || !startable.known) {
+    const [activeLanes, nativeLanes, startable] = await Promise.all([
+      readIdleFleetActiveLanes(probe.projectId),
+      readIdleFleetNativeLanes(probe.projectId),
+      readIdleFleetStartable(probe.projectId)
+    ]);
+    const laneDisagreement = activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value;
+    if (!activeLanes.known || !nativeLanes.known || !startable.known) {
+      const blindReasons = [
+        !activeLanes.known ? activeLanes.reason : null,
+        !nativeLanes.known ? nativeLanes.reason : null,
+        !startable.known ? startable.reason : null
+      ].filter((reason) => reason !== null);
       return idleFleetBlind(
         "known",
-        activeLanes.known ? "known" : "blind",
+        !activeLanes.known || !nativeLanes.known ? "blind" : "known",
         startable.known ? "known" : "blind",
-        activeLanes.known ? startable.known ? "startable-queue-unreadable" : startable.reason : activeLanes.reason
+        blindReasons.join(";")
       );
     }
+    if (laneDisagreement) {
+      return idleFleetBlind("known", "blind", "known", `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value}`);
+    }
+    if (activeLanes.value > 0 || startable.value.count === 0) return { kind: "silent" };
     const queueHead = startable.value.head;
     if (!queueHead) return { kind: "silent" };
     const role = {
@@ -22430,7 +22477,7 @@ ${thread.titleFallback ?? ""}`);
     };
     return {
       kind: "ready",
-      episodeKey: `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${holder.execution_attempt_id}:${holder.thread_id}:${thread.updatedAt}:${queueHead}`,
+      episodeKey: `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${holder.execution_attempt_id}:${holder.thread_id}:activeLanes=0:${queueHead}`,
       role,
       message: `Idle fleet: queue head ${queueHead} is startable with zero active writing lanes. Dispatch it or record the blocker.`
     };
@@ -23190,6 +23237,7 @@ export {
   FLEET_WATCHDOG_FLOOR_MS,
   FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS,
   FLEET_WATCHDOG_STALE_WAIT_MS,
+  IDLE_FLEET_ATTEMPT_STALE_MS,
   URGENT_NOTIFICATION_DEDUP_MS,
   plugin as default,
   foundationResultSchema,
