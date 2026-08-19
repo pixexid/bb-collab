@@ -5869,6 +5869,28 @@ exit 1
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
   });
 
+  it("refuses a real config mutation when the project governorship is frozen", () => {
+    const { db, directory } = directDatabase();
+    try {
+      freezeMigration(db);
+      const before = exportFoundation(db, PROJECT_ID);
+      const governor = currentGovernor(db);
+      const refused = applyWithFixtureReceipt(db, bootstrapRequest(PROJECT_ID, {
+        operationClass: "config_revision",
+        idempotencyKey: "frozen-config-revision",
+        expectedConfigRevision: 1,
+        configRevision: 2,
+        expectedGovernanceEpoch: governor.governance_epoch,
+        expectedFenceToken: governor.fence_token,
+      }));
+      expect(refused).toMatchObject({ outcome: "PROJECT_FROZEN", attempted: 0, verified: 0 });
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("returns the original receipt on duplicate idempotency and refuses conflicting reuse", async () => {
     const host = await loadedHost();
     const { db, request } = seedAndBootstrap(host);
