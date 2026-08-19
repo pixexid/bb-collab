@@ -10,6 +10,8 @@
 
 > Before citing evidence, ask: could this pass in a world where my claim is false? Silently skipped tests, report-only alerts, and load-lines without content checks are activity, not proof. When a signature changes, “fails against pre-fix source” degrades to a compile error and discriminates nothing.
 
+A filtered run that matched nothing is this rule's commonest form: a test filter naming a test that does not exist exits zero and prints a passing summary, which reads as "the change is not detectable" when the truth is "the filter selected nothing". Take the exact name from the diff rather than guessing a substring, and read the executed count rather than the exit code. `vitest --passWithNoTests` does not cover this: the file has tests, so an unmatched filter reports them as skipped rather than absent.
+
 A mechanism's own status surface outranks any correlation assembled from logs. Before citing a log correlation as proof that something did not happen, [name the status surface you checked first](#a-status-read-is-evidence-about-the-moment-it-was-read); if you cannot name one, you have not checked. A negative result also needs proof the mechanism was live during the window — "nothing was delivered" and "nothing ran" are indistinguishable without receipts.
 
 Apply this to your own evidence, not only to evidence you are reviewing. Verifying that a message was really sent says nothing about whether what it said was true; provenance, delivery and truth are three separate claims.
@@ -256,6 +258,8 @@ A governance-level change — a severance, a contract bump, a matrix re-ratifica
 
 > Registry state and live state are different substrates. Before acting on "X is dead", re-read or address X directly — a status field is already history when you read it; [the status surface you cite must be the one you checked](#proof-must-discriminate). The same gap applies to your checkout versus the repo, and to a source file versus the deployed artifact.
 
+A read does not reserve what it read. Two callers gated on "the target is idle" both cleared the check, and the second sent while the first had already made it active. Narrowing that window is not closing it: name a mechanism that closes or tolerates the race and state what remains open. Serialising a sender closes it among that sender's own callers and cannot make another process's state and your send atomic.
+
 ## Two notions of one fact
 
 > When one stored value answers two different questions, it will eventually answer one of them wrongly. Split it at the point the second meaning appears, not after the false read. A dead field left in place "but ignored" is a trap for the next reader: ignoring is a property of today's code, not of the data.
@@ -310,14 +314,6 @@ A late mechanism is recoverable; a lying one is not. In anything that notifies, 
 
 > Where a rule can be enforced by something that runs, prefer that to something a reader must remember. A lane was told in its own brief not to commit locally-rebuilt artifact metadata; it committed it anyway, and the freshness gate — landed hours earlier on a synthetic proof — caught it on the first real mistake and named the diverged fields. The brief and the gate said the same thing; only one of them stopped it. This is a preference about where to spend effort, not a claim that instructions are worthless: the gate exists because someone wrote the rule down first.
 
-## A suite whose fixtures stub the guard under test is evidence of nothing
+## A test that injects a guard's answer does not cover that guard
 
-> When a test injects a replacement for the thing it is checking, it proves the fixture works. A destructive tool passed its suite while every safety guard was dead in production — an inverted reachability command that would delete a worktree ahead of `origin/main`, a live-thread check that could not resolve its own target population, an inventory bounded to one page. Each fixture supplied the guard's answer directly. Ask of every green test: which code path did this actually execute, and would it still pass if the production path were removed?
-
-## An empty selection is not a pass
-
-> A filtered check that matches nothing must fail rather than report success. A test filter naming a test that does not exist exits zero and prints a passing summary; four times in one night that reported PASS against deliberately broken code, which reads as "the change is not detectable" when the truth is "the filter selected nothing". Take the exact name from the diff rather than guessing a substring, and treat a run that executed zero of the things it was aimed at as a failed check, not a clean one.
-
-## A status check is a fact about the past
-
-> Confirming a condition and then acting on it are two moments, and the condition can change between them. A send gated on "the target is idle" still landed mid-turn, because two callers cleared the same check before either had sent. Where the gap matters, serialise the check and the act together rather than narrowing the window; a smaller race is still a race, and the honest fix names what it closed and what it did not.
+> Injection is ordinary and often proves plenty — a test that supplies page responses while executing the real pagination loop is genuine evidence about that loop. The narrow failure is injecting the answer of the very guard whose correctness is being claimed. A destructive tool passed its suite while every safety guard was dead in production: an inverted reachability command that would delete a worktree ahead of `origin/main`, a live-thread check that could not resolve its own target population, and an inventory bounded to one page. Each fixture supplied that guard's verdict directly, so the suite exercised the fixture instead. Before citing a green test as coverage of a guard, name the guard's own code path and say whether the test executed it.
