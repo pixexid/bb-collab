@@ -1,6 +1,6 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
-import { readRoleHolderStates } from "./awareness.js";
-import type { SqliteDatabase } from "./foundation.js";
+import { DIRECTOR_SEAT_ROLE_REQUIREMENT_ID, type SqliteDatabase } from "./foundation.js";
+import { listAllProjectThreads } from "./worktree-cleanup.js";
 
 export const DEFAULT_ARCHIVE_SWEEP_IDLE_HOURS = 24;
 const THREAD_LIST_LIMIT = 1000;
@@ -74,25 +74,85 @@ export type ArchiveSweepResult = {
   message?: string;
 };
 
+type ArchiveSweepThread = Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["list"]>>[number];
+const KNOWN_THREAD_STATUSES = new Set(["active", "error", "idle", "starting", "stopping"]);
+
+function requiredThreadId(value: unknown, label: string): string {
+  if (typeof value !== "string" || value === "") throw new Error(`${label} is unreadable`);
+  return value;
+}
+
 function protectedThreadIds(db: SqliteDatabase, projectId: string): Set<string> {
-  const attemptCount = (db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ?").get(projectId) as { count?: unknown } | undefined)?.count;
-  if (!Number.isInteger(attemptCount) || attemptCount === 0) throw new Error("execution attempts are unavailable or empty");
-  const rows = db.prepare(
-    `SELECT attempts.thread_id
+  const attempts = db.prepare(
+    "SELECT execution_attempt_id, thread_id FROM execution_attempts WHERE project_id = ? ORDER BY execution_attempt_id",
+  ).all(projectId) as Array<{ execution_attempt_id?: unknown; thread_id?: unknown }>;
+  if (attempts.length === 0) throw new Error("execution attempts are unavailable or empty");
+  const ids = new Set<string>();
+  for (const attempt of attempts) ids.add(requiredThreadId(attempt.thread_id, `execution attempt ${String(attempt.execution_attempt_id ?? "unknown")} thread binding`));
+
+  const generations = db.prepare(
+    `SELECT generations.role_id, generations.generation, generations.role_requirement_id,
+            generations.holder_execution_attempt_id,
+            attempts.execution_attempt_id, attempts.origin, attempts.thread_id
        FROM role_generations AS generations
-       JOIN execution_attempts AS attempts
+       LEFT JOIN execution_attempts AS attempts
          ON attempts.project_id = generations.project_id
         AND attempts.execution_attempt_id = generations.holder_execution_attempt_id
-      WHERE generations.project_id = ? AND attempts.thread_id IS NOT NULL`,
-  ).all(projectId) as Array<{ thread_id?: unknown }>;
-  const ids = new Set<string>();
-  for (const holder of readRoleHolderStates(db).filter((holder) => holder.project_id === projectId)) {
-    if (typeof holder.thread_id !== "string" || holder.thread_id === "") throw new Error("live seat thread id is invalid");
-    ids.add(holder.thread_id);
+      WHERE generations.project_id = ?
+      ORDER BY generations.role_id, generations.generation`,
+  ).all(projectId) as Array<{
+    role_id?: unknown;
+    generation?: unknown;
+    role_requirement_id?: unknown;
+    holder_execution_attempt_id?: unknown;
+    execution_attempt_id?: unknown;
+    origin?: unknown;
+    thread_id?: unknown;
+  }>;
+  for (const generation of generations) {
+    if (
+      typeof generation.holder_execution_attempt_id !== "string" ||
+      generation.execution_attempt_id !== generation.holder_execution_attempt_id ||
+      generation.origin !== "role_holder"
+    ) throw new Error(`role generation ${String(generation.role_id ?? "unknown")} holder binding is unreadable`);
+    const isDirectorExemption = generation.role_requirement_id === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID && generation.generation === 1;
+    const label = isDirectorExemption
+      ? "director first-generation holder"
+      : `role generation ${String(generation.role_id ?? "unknown")} holder`;
+    ids.add(requiredThreadId(generation.thread_id, label));
   }
-  for (const row of rows) {
-    if (typeof row.thread_id !== "string" || row.thread_id === "") throw new Error("protected thread id is invalid");
-    ids.add(row.thread_id);
+
+  const currentSeats = db.prepare(
+    `SELECT heads.role_id, heads.current_generation, generations.status,
+            generations.holder_execution_attempt_id,
+            attempts.execution_attempt_id, attempts.origin, attempts.thread_id
+       FROM role_generation_heads AS heads
+       LEFT JOIN role_generations AS generations
+         ON generations.project_id = heads.project_id
+        AND generations.role_id = heads.role_id
+        AND generations.generation = heads.current_generation
+       LEFT JOIN execution_attempts AS attempts
+         ON attempts.project_id = generations.project_id
+        AND attempts.execution_attempt_id = generations.holder_execution_attempt_id
+      WHERE heads.project_id = ?
+      ORDER BY heads.role_id`,
+  ).all(projectId) as Array<{
+    role_id?: unknown;
+    current_generation?: unknown;
+    status?: unknown;
+    holder_execution_attempt_id?: unknown;
+    execution_attempt_id?: unknown;
+    origin?: unknown;
+    thread_id?: unknown;
+  }>;
+  for (const seat of currentSeats) {
+    if (
+      seat.status !== "active" ||
+      typeof seat.holder_execution_attempt_id !== "string" ||
+      seat.execution_attempt_id !== seat.holder_execution_attempt_id ||
+      seat.origin !== "role_holder"
+    ) throw new Error(`current role seat ${String(seat.role_id ?? "unknown")} is unreadable`);
+    ids.add(requiredThreadId(seat.thread_id, `current role seat ${String(seat.role_id ?? "unknown")} thread`));
   }
   return ids;
 }
@@ -100,6 +160,67 @@ function protectedThreadIds(db: SqliteDatabase, projectId: string): Set<string> 
 function idleHours(): number {
   const configured = Number(process.env.BB_COLLAB_ARCHIVE_IDLE_H);
   return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_ARCHIVE_SWEEP_IDLE_HOURS;
+}
+
+async function listProjectThreads(
+  bb: Pick<BbPluginApi, "sdk">,
+  projectId: string,
+  archived: boolean,
+): Promise<ArchiveSweepThread[]> {
+  return listAllProjectThreads(
+    (request) => bb.sdk.threads.list({ ...request, archived }),
+    projectId,
+    THREAD_LIST_LIMIT,
+  );
+}
+
+function validateThreadInventory(
+  projectId: string,
+  unarchived: ArchiveSweepThread[],
+  archived: ArchiveSweepThread[],
+): void {
+  const all = new Map<string, ArchiveSweepThread>();
+  for (const [threads, expectArchived] of [[unarchived, false], [archived, true]] as const) {
+    for (const thread of threads) {
+      const id = requiredThreadId(thread.id, "thread inventory id");
+      if (thread.projectId !== projectId) throw new Error(`thread ${id} belongs to another project`);
+      const archiveStateKnown = expectArchived
+        ? typeof thread.archivedAt === "number" && Number.isFinite(thread.archivedAt)
+        : thread.archivedAt === null;
+      if (!archiveStateKnown) throw new Error(`thread ${id} archive state is unreadable`);
+      if (all.has(id)) throw new Error(`thread ${id} appears more than once in inventory`);
+      all.set(id, thread);
+    }
+  }
+  for (const thread of unarchived) {
+    const threadId = requiredThreadId(thread.id, "thread inventory id");
+    for (const [relation, relatedId] of [["parent", thread.parentThreadId], ["source", thread.sourceThreadId]] as const) {
+      if (relatedId === null) continue;
+      if (typeof relatedId !== "string" || relatedId === "" || !all.has(relatedId)) {
+        throw new Error(`thread ${threadId} ${relation} relationship is unresolved`);
+      }
+    }
+  }
+}
+
+async function threadPullRequestState(
+  bb: Pick<BbPluginApi, "sdk">,
+  thread: ArchiveSweepThread,
+): Promise<"absent" | "protected" | "unknown"> {
+  if (thread.environmentId === null) return "absent";
+  if (typeof thread.environmentId !== "string" || thread.environmentId === "") return "unknown";
+  try {
+    const result = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
+    if (result.outcome === "absent") return "absent";
+    if (result.outcome === "unavailable") return "unknown";
+    if (result.outcome === "available") {
+      if (result.pullRequest.state === "open" || result.pullRequest.state === "draft") return "protected";
+      if (result.pullRequest.state === "closed" || result.pullRequest.state === "merged") return "absent";
+    }
+  } catch {
+    // A dangling environment is a per-thread unknown; it must not abort other roots.
+  }
+  return "unknown";
 }
 
 function ancestorIds(threads: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["list"]>>, threadIds: Set<string>): Set<string> {
@@ -178,28 +299,35 @@ export async function runArchiveSweep(
   }
   try {
     const protectedIds = protectedThreadIds(db, projectId);
-    const threads = await bb.sdk.threads.list({ projectId, archived: false, includeHidden: true, limit: THREAD_LIST_LIMIT });
-    if (threads.length >= THREAD_LIST_LIMIT) throw new Error("thread inventory reached the bounded read limit");
+    const [threads, archivedThreads] = await Promise.all([
+      listProjectThreads(bb, projectId, false),
+      listProjectThreads(bb, projectId, true),
+    ]);
+    validateThreadInventory(projectId, threads, archivedThreads);
     const minimumUpdatedAt = now - idleHours() * 60 * 60 * 1000;
-    const blockedIds = new Set(threads.filter((thread) =>
-      ["active", "starting"].includes(thread.status) ||
-      thread.archivedAt !== null ||
-      thread.deletedAt !== null ||
-      thread.updatedAt > minimumUpdatedAt ||
-      protectedIds.has(thread.id),
-    ).map((thread) => thread.id));
+    const blockedIds = new Set<string>();
     let unresolvedThreadCount = 0;
     for (const thread of threads) {
-      if (thread.environmentId === null) continue;
-      try {
-        const pullRequest = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
-        if (pullRequest.outcome === "unavailable") {
-          blockedIds.add(thread.id);
-          unresolvedThreadCount += 1;
-        } else if (pullRequest.outcome === "available" && ["open", "draft"].includes(pullRequest.pullRequest.state)) blockedIds.add(thread.id);
-      } catch {
-        blockedIds.add(thread.id);
+      const threadId = requiredThreadId(thread.id, "thread inventory id");
+      if (!KNOWN_THREAD_STATUSES.has(thread.status)) {
+        blockedIds.add(threadId);
         unresolvedThreadCount += 1;
+      } else if (
+        thread.status === "active" ||
+        thread.status === "starting" ||
+        thread.archivedAt !== null ||
+        thread.deletedAt !== null ||
+        !Number.isFinite(thread.updatedAt) ||
+        thread.updatedAt > minimumUpdatedAt ||
+        protectedIds.has(threadId)
+      ) {
+        blockedIds.add(threadId);
+        if (!Number.isFinite(thread.updatedAt)) unresolvedThreadCount += 1;
+      }
+      const pullRequestState = await threadPullRequestState(bb, thread);
+      if (pullRequestState !== "absent") {
+        blockedIds.add(threadId);
+        if (pullRequestState === "unknown") unresolvedThreadCount += 1;
       }
     }
     const protectedAncestors = ancestorIds(threads, blockedIds);

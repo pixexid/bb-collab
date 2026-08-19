@@ -20359,182 +20359,6 @@ function livenessDecision(state, alerted) {
   return "silent";
 }
 
-// src/archive-sweep.ts
-var DEFAULT_ARCHIVE_SWEEP_IDLE_HOURS = 24;
-var THREAD_LIST_LIMIT = 1e3;
-var ARCHIVE_SWEEP_GUARD = "thread-archive-sweep";
-function createArchiveSweepRefusalCounter(sinceReloadAtMs = Date.now()) {
-  let cycle = 0;
-  const states = /* @__PURE__ */ new Map();
-  return {
-    beginCycle() {
-      cycle += 1;
-    },
-    observe(reason, projectId) {
-      if (cycle === 0) throw new Error("archive refusal counter cycle has not started");
-      const key = `${ARCHIVE_SWEEP_GUARD}\0${reason}`;
-      const existing = states.get(key) ?? {
-        guard: ARCHIVE_SWEEP_GUARD,
-        reason,
-        occurrencesSinceReload: 0,
-        cyclesSinceReload: 0,
-        projectsSinceReload: 0,
-        sinceReloadAtMs,
-        lastCycle: 0,
-        projectIds: /* @__PURE__ */ new Set()
-      };
-      existing.occurrencesSinceReload += 1;
-      if (existing.lastCycle !== cycle) {
-        existing.cyclesSinceReload += 1;
-        existing.lastCycle = cycle;
-      }
-      if (projectId !== null && !existing.projectIds.has(projectId)) {
-        existing.projectIds.add(projectId);
-        existing.projectsSinceReload = existing.projectIds.size;
-      }
-      states.set(key, existing);
-      return {
-        guard: existing.guard,
-        reason: existing.reason,
-        occurrencesSinceReload: existing.occurrencesSinceReload,
-        cyclesSinceReload: existing.cyclesSinceReload,
-        projectsSinceReload: existing.projectsSinceReload,
-        sinceReloadAtMs: existing.sinceReloadAtMs
-      };
-    }
-  };
-}
-function protectedThreadIds(db, projectId) {
-  const attemptCount = db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ?").get(projectId)?.count;
-  if (!Number.isInteger(attemptCount) || attemptCount === 0) throw new Error("execution attempts are unavailable or empty");
-  const rows = db.prepare(
-    `SELECT attempts.thread_id
-       FROM role_generations AS generations
-       JOIN execution_attempts AS attempts
-         ON attempts.project_id = generations.project_id
-        AND attempts.execution_attempt_id = generations.holder_execution_attempt_id
-      WHERE generations.project_id = ? AND attempts.thread_id IS NOT NULL`
-  ).all(projectId);
-  const ids = /* @__PURE__ */ new Set();
-  for (const holder of readRoleHolderStates(db).filter((holder2) => holder2.project_id === projectId)) {
-    if (typeof holder.thread_id !== "string" || holder.thread_id === "") throw new Error("live seat thread id is invalid");
-    ids.add(holder.thread_id);
-  }
-  for (const row of rows) {
-    if (typeof row.thread_id !== "string" || row.thread_id === "") throw new Error("protected thread id is invalid");
-    ids.add(row.thread_id);
-  }
-  return ids;
-}
-function idleHours() {
-  const configured = Number(process.env.BB_COLLAB_ARCHIVE_IDLE_H);
-  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_ARCHIVE_SWEEP_IDLE_HOURS;
-}
-function ancestorIds(threads, threadIds) {
-  const parentIdsByThreadId = new Map(threads.map((thread) => [thread.id, [thread.parentThreadId, thread.sourceThreadId].filter((id2) => id2 !== null)]));
-  const ancestors = /* @__PURE__ */ new Set();
-  const visit = (threadId, path) => {
-    for (const parentThreadId of parentIdsByThreadId.get(threadId) ?? []) {
-      if (path.has(parentThreadId)) throw new Error("thread ancestry cycle");
-      ancestors.add(parentThreadId);
-      visit(parentThreadId, new Set(path).add(parentThreadId));
-    }
-  };
-  for (const thread of threads) {
-    if (!threadIds.has(thread.id)) continue;
-    visit(thread.id, /* @__PURE__ */ new Set([thread.id]));
-  }
-  return ancestors;
-}
-function topLevelIds(threads, eligibleIds) {
-  const parentIdsByThreadId = new Map(threads.map((thread) => [thread.id, [thread.parentThreadId, thread.sourceThreadId].filter((id2) => id2 !== null)]));
-  const roots = /* @__PURE__ */ new Set();
-  const hasEligibleAncestor = (threadId, path) => {
-    for (const parentThreadId of parentIdsByThreadId.get(threadId) ?? []) {
-      if (path.has(parentThreadId)) throw new Error("thread ancestry cycle");
-      if (eligibleIds.has(parentThreadId) || hasEligibleAncestor(parentThreadId, new Set(path).add(parentThreadId))) return true;
-    }
-    return false;
-  };
-  for (const thread of threads) {
-    if (!eligibleIds.has(thread.id)) continue;
-    if (!hasEligibleAncestor(thread.id, /* @__PURE__ */ new Set([thread.id]))) roots.add(thread.id);
-  }
-  return roots;
-}
-async function runArchiveSweep(bb, db, projectId, apply = false, now2 = Date.now()) {
-  if (!db) return { outcome: "refused", archivableThreadIds: [], archivedThreadIds: [], protectedThreadCount: 0, unresolvedThreadCount: 0, message: "canonical store unavailable" };
-  if (apply) {
-    const report = await runArchiveSweep(bb, db, projectId, false, now2);
-    if (report.outcome !== "reported") return report;
-    const archivedThreadIds = /* @__PURE__ */ new Set();
-    try {
-      for (const threadId of report.archivableThreadIds) {
-        const freshReport = await runArchiveSweep(bb, db, projectId, false, now2);
-        if (freshReport.outcome !== "reported" || !freshReport.archivableThreadIds.includes(threadId)) {
-          return {
-            outcome: "refused",
-            archivableThreadIds: [],
-            archivedThreadIds: [...archivedThreadIds],
-            protectedThreadCount: freshReport.protectedThreadCount,
-            unresolvedThreadCount: freshReport.unresolvedThreadCount,
-            message: `archive candidate changed before apply: ${threadId}`
-          };
-        }
-        const archived = await bb.sdk.threads.archive({ threadId });
-        for (const archivedThreadId of archived.archivedThreadIds) archivedThreadIds.add(archivedThreadId);
-      }
-      return { ...report, outcome: "applied", archivedThreadIds: [...archivedThreadIds] };
-    } catch (error48) {
-      return {
-        outcome: "refused",
-        archivableThreadIds: [],
-        archivedThreadIds: [...archivedThreadIds],
-        protectedThreadCount: report.protectedThreadCount,
-        unresolvedThreadCount: report.unresolvedThreadCount,
-        message: error48 instanceof Error ? error48.message : String(error48)
-      };
-    }
-  }
-  try {
-    const protectedIds = protectedThreadIds(db, projectId);
-    const threads = await bb.sdk.threads.list({ projectId, archived: false, includeHidden: true, limit: THREAD_LIST_LIMIT });
-    if (threads.length >= THREAD_LIST_LIMIT) throw new Error("thread inventory reached the bounded read limit");
-    const minimumUpdatedAt = now2 - idleHours() * 60 * 60 * 1e3;
-    const blockedIds = new Set(threads.filter(
-      (thread) => ["active", "starting"].includes(thread.status) || thread.archivedAt !== null || thread.deletedAt !== null || thread.updatedAt > minimumUpdatedAt || protectedIds.has(thread.id)
-    ).map((thread) => thread.id));
-    let unresolvedThreadCount = 0;
-    for (const thread of threads) {
-      if (thread.environmentId === null) continue;
-      try {
-        const pullRequest = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
-        if (pullRequest.outcome === "unavailable") {
-          blockedIds.add(thread.id);
-          unresolvedThreadCount += 1;
-        } else if (pullRequest.outcome === "available" && ["open", "draft"].includes(pullRequest.pullRequest.state)) blockedIds.add(thread.id);
-      } catch {
-        blockedIds.add(thread.id);
-        unresolvedThreadCount += 1;
-      }
-    }
-    const protectedAncestors = ancestorIds(threads, blockedIds);
-    const eligibleIds = new Set(threads.filter((thread) => !blockedIds.has(thread.id) && !protectedAncestors.has(thread.id)).map((thread) => thread.id));
-    const rootEligibleIds = topLevelIds(threads, eligibleIds);
-    const archivableThreadIds = threads.filter((thread) => rootEligibleIds.has(thread.id)).map((thread) => thread.id);
-    return { outcome: "reported", archivableThreadIds, archivedThreadIds: [], protectedThreadCount: protectedIds.size, unresolvedThreadCount };
-  } catch (error48) {
-    return {
-      outcome: "refused",
-      archivableThreadIds: [],
-      archivedThreadIds: [],
-      protectedThreadCount: 0,
-      unresolvedThreadCount: 0,
-      message: error48 instanceof Error ? error48.message : String(error48)
-    };
-  }
-}
-
 // src/worktree-cleanup.ts
 import { execFileSync } from "node:child_process";
 import { readFileSync as readFileSync2, realpathSync as realpathSync2, statSync } from "node:fs";
@@ -20703,6 +20527,257 @@ async function listAllProjectThreads(list, projectId, pageSize = 1e3) {
     threads.push(...page);
     if (page.length < pageSize) return threads;
     if (offset >= 1e5) throw new Error("thread inventory exceeded bounded pagination");
+  }
+}
+
+// src/archive-sweep.ts
+var DEFAULT_ARCHIVE_SWEEP_IDLE_HOURS = 24;
+var THREAD_LIST_LIMIT = 1e3;
+var ARCHIVE_SWEEP_GUARD = "thread-archive-sweep";
+function createArchiveSweepRefusalCounter(sinceReloadAtMs = Date.now()) {
+  let cycle = 0;
+  const states = /* @__PURE__ */ new Map();
+  return {
+    beginCycle() {
+      cycle += 1;
+    },
+    observe(reason, projectId) {
+      if (cycle === 0) throw new Error("archive refusal counter cycle has not started");
+      const key = `${ARCHIVE_SWEEP_GUARD}\0${reason}`;
+      const existing = states.get(key) ?? {
+        guard: ARCHIVE_SWEEP_GUARD,
+        reason,
+        occurrencesSinceReload: 0,
+        cyclesSinceReload: 0,
+        projectsSinceReload: 0,
+        sinceReloadAtMs,
+        lastCycle: 0,
+        projectIds: /* @__PURE__ */ new Set()
+      };
+      existing.occurrencesSinceReload += 1;
+      if (existing.lastCycle !== cycle) {
+        existing.cyclesSinceReload += 1;
+        existing.lastCycle = cycle;
+      }
+      if (projectId !== null && !existing.projectIds.has(projectId)) {
+        existing.projectIds.add(projectId);
+        existing.projectsSinceReload = existing.projectIds.size;
+      }
+      states.set(key, existing);
+      return {
+        guard: existing.guard,
+        reason: existing.reason,
+        occurrencesSinceReload: existing.occurrencesSinceReload,
+        cyclesSinceReload: existing.cyclesSinceReload,
+        projectsSinceReload: existing.projectsSinceReload,
+        sinceReloadAtMs: existing.sinceReloadAtMs
+      };
+    }
+  };
+}
+var KNOWN_THREAD_STATUSES = /* @__PURE__ */ new Set(["active", "error", "idle", "starting", "stopping"]);
+function requiredThreadId(value, label) {
+  if (typeof value !== "string" || value === "") throw new Error(`${label} is unreadable`);
+  return value;
+}
+function protectedThreadIds(db, projectId) {
+  const attempts = db.prepare(
+    "SELECT execution_attempt_id, thread_id FROM execution_attempts WHERE project_id = ? ORDER BY execution_attempt_id"
+  ).all(projectId);
+  if (attempts.length === 0) throw new Error("execution attempts are unavailable or empty");
+  const ids = /* @__PURE__ */ new Set();
+  for (const attempt of attempts) ids.add(requiredThreadId(attempt.thread_id, `execution attempt ${String(attempt.execution_attempt_id ?? "unknown")} thread binding`));
+  const generations = db.prepare(
+    `SELECT generations.role_id, generations.generation, generations.role_requirement_id,
+            generations.holder_execution_attempt_id,
+            attempts.execution_attempt_id, attempts.origin, attempts.thread_id
+       FROM role_generations AS generations
+       LEFT JOIN execution_attempts AS attempts
+         ON attempts.project_id = generations.project_id
+        AND attempts.execution_attempt_id = generations.holder_execution_attempt_id
+      WHERE generations.project_id = ?
+      ORDER BY generations.role_id, generations.generation`
+  ).all(projectId);
+  for (const generation of generations) {
+    if (typeof generation.holder_execution_attempt_id !== "string" || generation.execution_attempt_id !== generation.holder_execution_attempt_id || generation.origin !== "role_holder") throw new Error(`role generation ${String(generation.role_id ?? "unknown")} holder binding is unreadable`);
+    const isDirectorExemption = generation.role_requirement_id === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID && generation.generation === 1;
+    const label = isDirectorExemption ? "director first-generation holder" : `role generation ${String(generation.role_id ?? "unknown")} holder`;
+    ids.add(requiredThreadId(generation.thread_id, label));
+  }
+  const currentSeats = db.prepare(
+    `SELECT heads.role_id, heads.current_generation, generations.status,
+            generations.holder_execution_attempt_id,
+            attempts.execution_attempt_id, attempts.origin, attempts.thread_id
+       FROM role_generation_heads AS heads
+       LEFT JOIN role_generations AS generations
+         ON generations.project_id = heads.project_id
+        AND generations.role_id = heads.role_id
+        AND generations.generation = heads.current_generation
+       LEFT JOIN execution_attempts AS attempts
+         ON attempts.project_id = generations.project_id
+        AND attempts.execution_attempt_id = generations.holder_execution_attempt_id
+      WHERE heads.project_id = ?
+      ORDER BY heads.role_id`
+  ).all(projectId);
+  for (const seat of currentSeats) {
+    if (seat.status !== "active" || typeof seat.holder_execution_attempt_id !== "string" || seat.execution_attempt_id !== seat.holder_execution_attempt_id || seat.origin !== "role_holder") throw new Error(`current role seat ${String(seat.role_id ?? "unknown")} is unreadable`);
+    ids.add(requiredThreadId(seat.thread_id, `current role seat ${String(seat.role_id ?? "unknown")} thread`));
+  }
+  return ids;
+}
+function idleHours() {
+  const configured = Number(process.env.BB_COLLAB_ARCHIVE_IDLE_H);
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_ARCHIVE_SWEEP_IDLE_HOURS;
+}
+async function listProjectThreads(bb, projectId, archived) {
+  return listAllProjectThreads(
+    (request) => bb.sdk.threads.list({ ...request, archived }),
+    projectId,
+    THREAD_LIST_LIMIT
+  );
+}
+function validateThreadInventory(projectId, unarchived, archived) {
+  const all = /* @__PURE__ */ new Map();
+  for (const [threads, expectArchived] of [[unarchived, false], [archived, true]]) {
+    for (const thread of threads) {
+      const id2 = requiredThreadId(thread.id, "thread inventory id");
+      if (thread.projectId !== projectId) throw new Error(`thread ${id2} belongs to another project`);
+      const archiveStateKnown = expectArchived ? typeof thread.archivedAt === "number" && Number.isFinite(thread.archivedAt) : thread.archivedAt === null;
+      if (!archiveStateKnown) throw new Error(`thread ${id2} archive state is unreadable`);
+      if (all.has(id2)) throw new Error(`thread ${id2} appears more than once in inventory`);
+      all.set(id2, thread);
+    }
+  }
+  for (const thread of unarchived) {
+    const threadId = requiredThreadId(thread.id, "thread inventory id");
+    for (const [relation, relatedId] of [["parent", thread.parentThreadId], ["source", thread.sourceThreadId]]) {
+      if (relatedId === null) continue;
+      if (typeof relatedId !== "string" || relatedId === "" || !all.has(relatedId)) {
+        throw new Error(`thread ${threadId} ${relation} relationship is unresolved`);
+      }
+    }
+  }
+}
+async function threadPullRequestState(bb, thread) {
+  if (thread.environmentId === null) return "absent";
+  if (typeof thread.environmentId !== "string" || thread.environmentId === "") return "unknown";
+  try {
+    const result2 = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
+    if (result2.outcome === "absent") return "absent";
+    if (result2.outcome === "unavailable") return "unknown";
+    if (result2.outcome === "available") {
+      if (result2.pullRequest.state === "open" || result2.pullRequest.state === "draft") return "protected";
+      if (result2.pullRequest.state === "closed" || result2.pullRequest.state === "merged") return "absent";
+    }
+  } catch {
+  }
+  return "unknown";
+}
+function ancestorIds(threads, threadIds) {
+  const parentIdsByThreadId = new Map(threads.map((thread) => [thread.id, [thread.parentThreadId, thread.sourceThreadId].filter((id2) => id2 !== null)]));
+  const ancestors = /* @__PURE__ */ new Set();
+  const visit = (threadId, path) => {
+    for (const parentThreadId of parentIdsByThreadId.get(threadId) ?? []) {
+      if (path.has(parentThreadId)) throw new Error("thread ancestry cycle");
+      ancestors.add(parentThreadId);
+      visit(parentThreadId, new Set(path).add(parentThreadId));
+    }
+  };
+  for (const thread of threads) {
+    if (!threadIds.has(thread.id)) continue;
+    visit(thread.id, /* @__PURE__ */ new Set([thread.id]));
+  }
+  return ancestors;
+}
+function topLevelIds(threads, eligibleIds) {
+  const parentIdsByThreadId = new Map(threads.map((thread) => [thread.id, [thread.parentThreadId, thread.sourceThreadId].filter((id2) => id2 !== null)]));
+  const roots = /* @__PURE__ */ new Set();
+  const hasEligibleAncestor = (threadId, path) => {
+    for (const parentThreadId of parentIdsByThreadId.get(threadId) ?? []) {
+      if (path.has(parentThreadId)) throw new Error("thread ancestry cycle");
+      if (eligibleIds.has(parentThreadId) || hasEligibleAncestor(parentThreadId, new Set(path).add(parentThreadId))) return true;
+    }
+    return false;
+  };
+  for (const thread of threads) {
+    if (!eligibleIds.has(thread.id)) continue;
+    if (!hasEligibleAncestor(thread.id, /* @__PURE__ */ new Set([thread.id]))) roots.add(thread.id);
+  }
+  return roots;
+}
+async function runArchiveSweep(bb, db, projectId, apply = false, now2 = Date.now()) {
+  if (!db) return { outcome: "refused", archivableThreadIds: [], archivedThreadIds: [], protectedThreadCount: 0, unresolvedThreadCount: 0, message: "canonical store unavailable" };
+  if (apply) {
+    const report = await runArchiveSweep(bb, db, projectId, false, now2);
+    if (report.outcome !== "reported") return report;
+    const archivedThreadIds = /* @__PURE__ */ new Set();
+    try {
+      for (const threadId of report.archivableThreadIds) {
+        const freshReport = await runArchiveSweep(bb, db, projectId, false, now2);
+        if (freshReport.outcome !== "reported" || !freshReport.archivableThreadIds.includes(threadId)) {
+          return {
+            outcome: "refused",
+            archivableThreadIds: [],
+            archivedThreadIds: [...archivedThreadIds],
+            protectedThreadCount: freshReport.protectedThreadCount,
+            unresolvedThreadCount: freshReport.unresolvedThreadCount,
+            message: `archive candidate changed before apply: ${threadId}`
+          };
+        }
+        const archived = await bb.sdk.threads.archive({ threadId });
+        for (const archivedThreadId of archived.archivedThreadIds) archivedThreadIds.add(archivedThreadId);
+      }
+      return { ...report, outcome: "applied", archivedThreadIds: [...archivedThreadIds] };
+    } catch (error48) {
+      return {
+        outcome: "refused",
+        archivableThreadIds: [],
+        archivedThreadIds: [...archivedThreadIds],
+        protectedThreadCount: report.protectedThreadCount,
+        unresolvedThreadCount: report.unresolvedThreadCount,
+        message: error48 instanceof Error ? error48.message : String(error48)
+      };
+    }
+  }
+  try {
+    const protectedIds = protectedThreadIds(db, projectId);
+    const [threads, archivedThreads] = await Promise.all([
+      listProjectThreads(bb, projectId, false),
+      listProjectThreads(bb, projectId, true)
+    ]);
+    validateThreadInventory(projectId, threads, archivedThreads);
+    const minimumUpdatedAt = now2 - idleHours() * 60 * 60 * 1e3;
+    const blockedIds = /* @__PURE__ */ new Set();
+    let unresolvedThreadCount = 0;
+    for (const thread of threads) {
+      const threadId = requiredThreadId(thread.id, "thread inventory id");
+      if (!KNOWN_THREAD_STATUSES.has(thread.status)) {
+        blockedIds.add(threadId);
+        unresolvedThreadCount += 1;
+      } else if (thread.status === "active" || thread.status === "starting" || thread.archivedAt !== null || thread.deletedAt !== null || !Number.isFinite(thread.updatedAt) || thread.updatedAt > minimumUpdatedAt || protectedIds.has(threadId)) {
+        blockedIds.add(threadId);
+        if (!Number.isFinite(thread.updatedAt)) unresolvedThreadCount += 1;
+      }
+      const pullRequestState = await threadPullRequestState(bb, thread);
+      if (pullRequestState !== "absent") {
+        blockedIds.add(threadId);
+        if (pullRequestState === "unknown") unresolvedThreadCount += 1;
+      }
+    }
+    const protectedAncestors = ancestorIds(threads, blockedIds);
+    const eligibleIds = new Set(threads.filter((thread) => !blockedIds.has(thread.id) && !protectedAncestors.has(thread.id)).map((thread) => thread.id));
+    const rootEligibleIds = topLevelIds(threads, eligibleIds);
+    const archivableThreadIds = threads.filter((thread) => rootEligibleIds.has(thread.id)).map((thread) => thread.id);
+    return { outcome: "reported", archivableThreadIds, archivedThreadIds: [], protectedThreadCount: protectedIds.size, unresolvedThreadCount };
+  } catch (error48) {
+    return {
+      outcome: "refused",
+      archivableThreadIds: [],
+      archivedThreadIds: [],
+      protectedThreadCount: 0,
+      unresolvedThreadCount: 0,
+      message: error48 instanceof Error ? error48.message : String(error48)
+    };
   }
 }
 
