@@ -43,9 +43,6 @@ export const MAX_EXPORT_ROWS = 256;
 export const ROLE_CONTEXT_EVENT_PAGE_SIZE = 256;
 export const MAX_EXPORT_BYTES = 512 * 1024;
 export const MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 8);
-/** Deferred until a later cutover operation; issue #3 has no sanctioned freeze transition. */
-export const DEFERRED_ISSUE_3_OUTCOMES = ["PROJECT_FROZEN"] as const;
-
 export const TABLES = [
   "project_config_revisions",
   "project_config_heads",
@@ -2628,19 +2625,6 @@ export function writingLaneCeilingFromJson(configJson: string): number {
     throw refusal("INVALID_INPUT", `stored writingLaneCeiling must be an integer from 0 through ${MAX_WRITING_LANE_CEILING}`);
   }
   return value;
-}
-
-export function writingLaneCeilingForProject(db: SqliteDatabase, projectId: string): number {
-  const row = asRow<{ canonical_config_json: string }>(db.prepare(
-    `SELECT revisions.canonical_config_json
-     FROM project_config_heads AS heads
-     JOIN project_config_revisions AS revisions
-       ON revisions.project_id = heads.project_id
-      AND revisions.config_revision = heads.config_revision
-     WHERE heads.project_id = ?`,
-  ).get(projectId));
-  if (!row) throw refusal("PROJECT_CONFIG_REQUIRED", "project config head is unavailable");
-  return writingLaneCeilingFromJson(row.canonical_config_json);
 }
 
 function reviewPolicyFromJson(configJson: string): z.infer<typeof reviewPolicySchema> | null {

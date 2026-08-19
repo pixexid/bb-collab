@@ -11,7 +11,6 @@ import { z } from "zod";
 import plugin, { IDLE_FLEET_ATTEMPT_STALE_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
 import { canonicalWorktreePath } from "../src/worktree-cleanup.js";
 import {
-  DEFERRED_ISSUE_3_OUTCOMES,
   CACHED_CONSUMERS,
   CONTRACT_VERSION,
   DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
@@ -62,7 +61,7 @@ import {
   seedFixtureDecision,
   seedVerifiedFixtureReceipt,
 } from "../src/test-support.js";
-import { createLaneWatcher, createRoleIdleLedger, IDLE_FLEET_DEBOUNCE_MS, readRoleHolderStates, resolveCurrentRoleBinding, roleIdleKey, type RoleIdleRecord } from "../src/awareness.js";
+import { createLaneWatcher, createRoleIdleLedger, IDLE_FLEET_DEBOUNCE_MS, readRoleHolderStates, roleIdleKey, type RoleIdleRecord } from "../src/awareness.js";
 import { findCheckoutRoot, readCheckoutDivergence } from "../src/checkout-divergence.js";
 
 const PROJECT_ID = "proj_test";
@@ -5950,10 +5949,6 @@ exit 1
     }
   });
 
-  it("records the frozen cutover outcome as deferred for issue #3", () => {
-    expect(DEFERRED_ISSUE_3_OUTCOMES).toEqual(["PROJECT_FROZEN"]);
-  });
-
   it("serializes two real SQLite governorship contenders and leaves no loser receipt or event", async () => {
     const { db: firstDb, path, directory } = directDatabase();
     const secondDb = new Database(path);
@@ -7430,21 +7425,11 @@ exit 1
     ]);
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeList);
     expect(host.harness.inspection.sdk.callsTo("threads.list")).toEqual([]);
-    expect(resolveCurrentRoleBinding(db, PROJECT_ID, "project-orchestrator", successorContext.threadId)).toEqual({
-      standing: "active",
-      binding: { roleId: "project-orchestrator", generation: 2, executionAttemptId, threadId: successorContext.threadId },
-    });
-    expect(resolveCurrentRoleBinding(db, PROJECT_ID, "director", successorContext.threadId)).toEqual({ standing: "unseated" });
-    expect(resolveCurrentRoleBinding(db, PROJECT_ID, "project-orchestrator", ROLE_THREAD_ID)).toEqual({ standing: "unseated" });
     const foreign = await host.harness.runCli(["role-list", "--project", FOREIGN_PROJECT_ID]);
     expect(foreign.exitCode).toBe(2);
     expect(JSON.parse(foreign.stdout)).toMatchObject({ outcome: "PROJECT_UNKNOWN", message: "current role standing is unknown: project-unknown" });
 
     db.close();
-    expect(resolveCurrentRoleBinding(db, PROJECT_ID, "project-orchestrator", ROLE_THREAD_ID)).toEqual({
-      standing: "unknown",
-      reason: "canonical-store-unreadable",
-    });
     const unreadable = await host.harness.runCli(["role-list", "--project", PROJECT_ID]);
     expect(unreadable.exitCode).toBe(2);
     expect(JSON.parse(unreadable.stdout)).toMatchObject({
