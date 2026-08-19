@@ -6,7 +6,7 @@ This is the canonical role and review matrix. It describes operating choices, no
 
 | Role or lane | Harness/provider | Model | Reasoning |
 | --- | --- | --- | --- |
-| Director | `claude-code` or `pi` | `claude-opus-5[1m]` or `zai/glm-5.3` | MEDIUM / HIGH |
+| Director | `claude-code` or `pi` | `kimi-coding/k3`, `claude-opus-5[1m]`, or `zai/glm-5.3` | MEDIUM / HIGH |
 | Orchestrator primary | `claude-code` | `claude-opus-5[1m]` | MEDIUM |
 | Orchestrator alternate | `codex` | `gpt-5.6-sol` | MEDIUM |
 | Merge-bound worker (routine) | `codex` | `gpt-5.6-luna` | Any, up to MAX |
@@ -15,6 +15,8 @@ This is the canonical role and review matrix. It describes operating choices, no
 | Tier-A reviewer | `codex` | `gpt-5.6-sol` | MEDIUM only |
 | Tier-B reviewer | `codex` | `gpt-5.6-luna` | Any |
 | Mechanical subagent | `codex` | `gpt-5.6-luna` | LOW |
+
+The `kimi-coding/k3` deprecation applies only to review placement; it remains the director default.
 
 `zai/glm-5.3` is temporarily withdrawn from non-director placement to conserve peak-hour usage; the resulting one-provider worker spread is accepted for peak hours as the priced-in cost of the withdrawal; Codex is therefore the only worker provider, and Codex saturation escalates to the operator with usage data rather than re-seating on GLM.
 
