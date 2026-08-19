@@ -2464,6 +2464,50 @@ describe("bb-collab plugin boundary", () => {
     ]]);
   });
 
+  it("records the gap and still recovers when the provider reports its cap state as unknown", async () => {
+    const fixture = await fleetWatchdogFixture();
+    // The one status that is neither a cap nor a denial of one. It must not reach a caller
+    // as a quiet negative just because it is not the string "blocked".
+    fixture.recordRateLimits(fixture.orchestratorThreadId, { providerId: "codex", status: "unknown", kind: "unknown", windows: [], reachedReason: null, overageStatus: null, overageReason: null });
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      status: threadId === fixture.orchestratorThreadId ? "error" : "idle",
+      updatedAt: 1,
+    })) as never);
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringContaining(`platform-rate-limit:${fixture.orchestratorThreadId}:provider-reports-unknown-rate-limit-state`),
+    }));
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+      expect.objectContaining({ threadId: fixture.orchestratorThreadId, mode: "start" }),
+    ]]);
+  });
+
+  it("records the unbounded hold when a blocked window carries no reset time", async () => {
+    const fixture = await fleetWatchdogFixture();
+    fixture.setUsageCapped(fixture.orchestratorThreadId, null);
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      status: threadId === fixture.orchestratorThreadId ? "error" : "idle",
+      updatedAt: 1,
+    })) as never);
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    // The hold itself is correct and stays; without the degrade it is indistinguishable from
+    // a seat waiting out a dated cap, and nothing in the tick would ever bound it.
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringContaining(`platform-rate-limit:${fixture.orchestratorThreadId}:blocked-without-a-reset-time`),
+    }));
+  });
+
   it("opens a fresh turn when the current role holder enters error", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {

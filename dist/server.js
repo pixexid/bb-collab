@@ -21613,14 +21613,19 @@ ${thread.titleFallback ?? ""}`);
           degrade(`platform-rate-limit:${threadId}:${String(error48)}`);
           return "unreadable";
         }
-        if (latest?.type !== "provider/rateLimits/updated") {
-          degrade(`platform-rate-limit:${threadId}:no-rate-limit-event-observed`);
+        const rateLimits = latest?.type === "provider/rateLimits/updated" ? latest.data.rateLimits : void 0;
+        if (rateLimits === void 0 || rateLimits.status === "unknown") {
+          degrade(`platform-rate-limit:${threadId}:${rateLimits === void 0 ? "no-rate-limit-event-observed" : "provider-reports-unknown-rate-limit-state"}`);
           return "unobserved";
         }
-        const { rateLimits } = latest.data;
         if (rateLimits.status !== "blocked" || rateLimits.kind !== "subscription-window") return "not-capped";
         const blocked = rateLimits.windows.filter((window) => window.status === "blocked");
-        return blocked.length > 0 && blocked.every((window) => window.resetsAtMs !== null && window.resetsAtMs <= now2) ? "not-capped" : "capped";
+        const resetsAtMs = blocked.flatMap((window) => window.resetsAtMs ?? []);
+        if (blocked.length === 0 || resetsAtMs.length !== blocked.length) {
+          degrade(`platform-rate-limit:${threadId}:blocked-without-a-reset-time`);
+          return "capped";
+        }
+        return resetsAtMs.every((resets) => resets <= now2) ? "not-capped" : "capped";
       };
       const lastEvent = async (threadId) => {
         let latest;

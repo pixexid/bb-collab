@@ -1679,18 +1679,31 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           degrade(`platform-rate-limit:${threadId}:${String(error)}`);
           return "unreadable";
         }
-        if (latest?.type !== "provider/rateLimits/updated") {
-          degrade(`platform-rate-limit:${threadId}:no-rate-limit-event-observed`);
+        const rateLimits = latest?.type === "provider/rateLimits/updated" ? latest.data.rateLimits : undefined;
+        // The schema's status is a four-value enum, and the provider's own "unknown" is an
+        // absent cap signal exactly like a missing event -- not a negative. Both answer
+        // "unobserved" so neither can reach a caller without also reaching the record.
+        if (rateLimits === undefined || rateLimits.status === "unknown") {
+          degrade(`platform-rate-limit:${threadId}:${rateLimits === undefined ? "no-rate-limit-event-observed" : "provider-reports-unknown-rate-limit-state"}`);
           return "unobserved";
         }
-        const { rateLimits } = latest.data;
         if (rateLimits.status !== "blocked" || rateLimits.kind !== "subscription-window") return "not-capped";
         // The provider emits nothing until the thread runs again, so a block we keep honouring
         // past its reset would idle the thread forever waiting for an event that our own
         // refusal to wake it prevents. Lift only on positive evidence that every blocked
-        // window has already reset; an unknown reset stays capped.
+        // window has already reset.
         const blocked = rateLimits.windows.filter((window) => window.status === "blocked");
-        return blocked.length > 0 && blocked.every((window) => window.resetsAtMs !== null && window.resetsAtMs <= now) ? "not-capped" : "capped";
+        const resetsAtMs = blocked.flatMap((window) => window.resetsAtMs ?? []);
+        // A block with no dated window can never lift on its own: the reset that would clear
+        // it arrives on an event only the thread's next turn produces, and this hold is why
+        // there is no next turn. Keep honouring it -- lifting would wake a genuinely blocked
+        // seat every tick against a provider already refusing us -- but record the unbounded
+        // hold so it is distinguishable from a seat correctly waiting out a dated cap.
+        if (blocked.length === 0 || resetsAtMs.length !== blocked.length) {
+          degrade(`platform-rate-limit:${threadId}:blocked-without-a-reset-time`);
+          return "capped";
+        }
+        return resetsAtMs.every((resets) => resets <= now) ? "not-capped" : "capped";
       };
       const lastEvent = async (threadId: string) => {
         let latest: Awaited<ReturnType<typeof bb.sdk.threads.events.list>>[number] | undefined;
