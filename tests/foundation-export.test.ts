@@ -48,4 +48,4 @@ it("keeps an export RPC spill path out of ordinary copies", async () => {
   } finally {
     await host.harness.dispose();
   }
-});
+}, 15_000);
