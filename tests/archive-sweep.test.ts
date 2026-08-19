@@ -75,6 +75,7 @@ function fixture(options: {
   includeUnknownPullRequest?: boolean;
   includeUnreadableArchiveState?: boolean;
   activateArchiveChildOnSecondReport?: boolean;
+  activateArchiveChildOnThirdReport?: boolean;
   includeLegacyArchiveCoverage?: boolean;
   includeForeignProject?: boolean;
   throwOnList?: boolean;
@@ -143,6 +144,9 @@ function fixture(options: {
           if (!archived) {
             unarchivedListCalls += 1;
             if (options.activateArchiveChildOnSecondReport && unarchivedListCalls === 2) {
+              threads.push(makeThreadResponse({ id: "late-active-child", projectId: PROJECT_ID, status: "active", archivedAt: null, deletedAt: null, parentThreadId: "ordinary", updatedAt: now }));
+            }
+            if (options.activateArchiveChildOnThirdReport && unarchivedListCalls === 3) {
               threads.push(makeThreadResponse({ id: "late-active-child", projectId: PROJECT_ID, status: "active", archivedAt: null, deletedAt: null, parentThreadId: "ordinary", updatedAt: now }));
             }
           }
@@ -300,6 +304,17 @@ describe("thread archive sweep", () => {
       archivedThreadIds: ["archive-parent", "archive-child", "ordinary"],
     });
     expect(host.harness.inspection.sdk.callsTo("threads.archive")).toEqual([[{ threadId: "archive-parent" }], [{ threadId: "ordinary" }]]);
+  });
+
+  it("rechecks every archive root before applying", async () => {
+    const { db, host } = fixture({ includeLegacyArchiveCoverage: true, activateArchiveChildOnThirdReport: true });
+    const result = await runArchiveSweep(host.bb, db, PROJECT_ID, true, now);
+    expect(result).toMatchObject({
+      outcome: "refused",
+      archivedThreadIds: ["archive-parent", "archive-child"],
+      message: expect.stringContaining("candidate changed before apply: ordinary"),
+    });
+    expect(host.harness.inspection.sdk.callsTo("threads.archive")).toEqual([[{ threadId: "archive-parent" }]]);
   });
 
   it("refuses explicit apply when a candidate changes after the report", async () => {
