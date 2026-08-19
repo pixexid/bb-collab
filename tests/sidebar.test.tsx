@@ -204,7 +204,7 @@ describe("replacement thread list", () => {
     expect((rendered.getByLabelText("Project") as HTMLSelectElement).value).toBe("");
   });
 
-  it("navigates the sender thread from its secondary id", async () => {
+  it("shows the sender title with lane, secondary id, and exact navigation", async () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
     const rendered = renderSlot(inbox, { subPath: "" }, {
@@ -214,6 +214,7 @@ describe("replacement thread list", () => {
         projectId: "project-a",
         recipient: "operator" as const,
         senderThreadId: "sender-thread",
+        senderTitle: "Inbox drill: URGENT to operator",
         senderLaneId: "lane-one",
         severity: "routine" as const,
         text: "Open my session",
@@ -228,10 +229,40 @@ describe("replacement thread list", () => {
     });
 
     const sender = await waitFor(() => rendered.getByRole("link", { name: "Open sender session sender-thread" }));
-    expect(sender.textContent).toBe("sender-thread");
-    expect(rendered.getByText("lane-one ·")).toBeTruthy();
+    expect(sender.textContent).toBe("Inbox drill: URGENT to operator");
+    expect(rendered.getByText("lane-one · sender-thread")).toBeTruthy();
     fireEvent.click(sender);
     expect(rendered.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "sender-thread" });
+  });
+
+  it("falls back to the secondary sender id when its live title is unavailable", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => [{
+        messageId: 5,
+        projectId: "project-a",
+        recipient: "operator" as const,
+        senderThreadId: "missing-sender-thread",
+        senderTitle: null,
+        senderLaneId: null,
+        severity: "routine" as const,
+        text: "Fallback sender",
+        createdAtMs: 1,
+        readAtMs: null,
+        repliedAtMs: null,
+        replyText: null,
+        replyDeliveryError: null,
+        notificationStatus: "not-requested" as const,
+        notificationError: null,
+      }] } as never,
+    });
+
+    const sender = await waitFor(() => rendered.getByRole("link", { name: "Open sender session missing-sender-thread" }));
+    expect(sender.textContent).toBe("missing-sender-thread");
+    fireEvent.click(sender);
+    expect(rendered.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "missing-sender-thread" });
   });
 
   it("keeps the inbox mounted when a sender id has a hostile shape", async () => {

@@ -936,23 +936,26 @@ function InboxPanel(_props) {
           /* @__PURE__ */ jsx("span", { className: "font-medium text-foreground", children: projectNames.get(message.projectId) ?? message.projectId }),
           /* @__PURE__ */ jsx("span", { className: "font-medium text-foreground", children: message.recipient }),
           /* @__PURE__ */ jsx("span", { children: message.severity }),
-          /* @__PURE__ */ jsxs("span", { children: [
-            asText(message.senderLaneId) ? `${asText(message.senderLaneId)} \xB7 ` : "",
-            asText(message.senderThreadId) ? /* @__PURE__ */ jsx(
+          /* @__PURE__ */ jsx("span", { className: "inline-grid", children: asText(message.senderThreadId) ? /* @__PURE__ */ jsxs(Fragment2, { children: [
+            /* @__PURE__ */ jsx(
               "a",
               {
                 href: "#",
-                className: "underline decoration-muted-foreground/50 underline-offset-2 hover:text-foreground",
+                className: "font-medium text-foreground underline decoration-muted-foreground/50 underline-offset-2 hover:text-foreground",
                 "aria-label": `Open sender session ${asText(message.senderThreadId)}`,
                 title: `Open sender session ${asText(message.senderThreadId)}`,
                 onClick: (event) => {
                   event.preventDefault();
                   navigate.toThread(asText(message.senderThreadId));
                 },
-                children: asText(message.senderThreadId)
+                children: asText(message.senderTitle) ?? asText(message.senderThreadId)
               }
-            ) : /* @__PURE__ */ jsx("span", { children: "Sender unavailable" })
-          ] }),
+            ),
+            asText(message.senderTitle) ? /* @__PURE__ */ jsxs("span", { children: [
+              asText(message.senderLaneId) ? `${asText(message.senderLaneId)} \xB7 ` : "",
+              asText(message.senderThreadId)
+            ] }) : asText(message.senderLaneId) ? /* @__PURE__ */ jsx("span", { children: asText(message.senderLaneId) }) : null
+          ] }) : /* @__PURE__ */ jsx("span", { children: "Sender unavailable" }) }),
           /* @__PURE__ */ jsx("time", { className: "ml-auto", dateTime: new Date(message.createdAtMs).toISOString(), children: new Date(message.createdAtMs).toLocaleString() })
         ] }),
         /* @__PURE__ */ jsx("p", { className: "my-3 whitespace-pre-wrap text-sm", children: message.text }),

@@ -853,18 +853,22 @@ function InboxPanel(_props: PluginNavPanelProps) {
                     <span className="font-medium text-foreground">{projectNames.get(message.projectId) ?? message.projectId}</span>
                     <span className="font-medium text-foreground">{message.recipient}</span>
                     <span>{message.severity}</span>
-                    <span>
-                      {asText(message.senderLaneId) ? `${asText(message.senderLaneId)} · ` : ""}
+                    <span className="inline-grid">
                       {asText(message.senderThreadId) ? (
-                        <a
-                          href="#"
-                          className="underline decoration-muted-foreground/50 underline-offset-2 hover:text-foreground"
-                          aria-label={`Open sender session ${asText(message.senderThreadId)}`}
-                          title={`Open sender session ${asText(message.senderThreadId)}`}
-                          onClick={(event) => { event.preventDefault(); navigate.toThread(asText(message.senderThreadId)!); }}
-                        >
-                          {asText(message.senderThreadId)}
-                        </a>
+                        <>
+                          <a
+                            href="#"
+                            className="font-medium text-foreground underline decoration-muted-foreground/50 underline-offset-2 hover:text-foreground"
+                            aria-label={`Open sender session ${asText(message.senderThreadId)}`}
+                            title={`Open sender session ${asText(message.senderThreadId)}`}
+                            onClick={(event) => { event.preventDefault(); navigate.toThread(asText(message.senderThreadId)!); }}
+                          >
+                            {asText(message.senderTitle) ?? asText(message.senderThreadId)}
+                          </a>
+                          {asText(message.senderTitle) ? (
+                            <span>{asText(message.senderLaneId) ? `${asText(message.senderLaneId)} · ` : ""}{asText(message.senderThreadId)}</span>
+                          ) : asText(message.senderLaneId) ? <span>{asText(message.senderLaneId)}</span> : null}
+                        </>
                       ) : <span>Sender unavailable</span>}
                     </span>
                     <time className="ml-auto" dateTime={new Date(message.createdAtMs).toISOString()}>{new Date(message.createdAtMs).toLocaleString()}</time>

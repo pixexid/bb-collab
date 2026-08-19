@@ -183,6 +183,9 @@
     .inline-flex {
       display: inline-flex;
     }
+    .inline-grid {
+      display: inline-grid;
+    }
     .table {
       display: table;
     }

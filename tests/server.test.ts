@@ -1900,7 +1900,11 @@ describe("bb-collab plugin boundary", () => {
       ], context);
       expect(cli.exitCode).toBe(0);
       expect(JSON.parse(cli.stdout)).toMatchObject({ projectId: PROJECT_ID, recipient: "supervisor", notificationStatus: "not-requested" });
-      expect(await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID })).toHaveLength(6);
+      const titleReadsBeforeList = host.harness.inspection.sdk.callsTo("threads.get").length;
+      expect(await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID })).toEqual(
+        expect.arrayContaining([expect.objectContaining({ senderThreadId: ROLE_THREAD_ID, senderTitle: "Managed role holder" })]),
+      );
+      expect(host.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(titleReadsBeforeList + 1);
       expect(await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, recipient: "supervisor" })).toHaveLength(2);
       await expect(host.harness.callRpc("operatorMessages", { projectId: FOREIGN_PROJECT_ID })).rejects.toThrow("not registered");
       await expect(host.harness.callAgentTool("send_to_operator", {
@@ -1912,6 +1916,23 @@ describe("bb-collab plugin boundary", () => {
     } finally {
       clock.mockRestore();
     }
+  });
+
+  it("keeps inbox messages readable when a sender title cannot be resolved", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    await host.harness.callAgentTool("send_to_operator", {
+      project_id: PROJECT_ID,
+      recipient: "operator",
+      severity: "routine",
+      text: "sender may disappear",
+    }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID });
+    host.harness.sdk.stub("threads.get", async () => { throw new Error("thread no longer exists"); });
+
+    await expect(host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID })).resolves.toEqual([
+      expect.objectContaining({ senderThreadId: ROLE_THREAD_ID, senderTitle: null }),
+    ]);
   });
 
   it("attempts both notification channels and leaves a visible failure", async () => {
