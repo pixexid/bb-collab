@@ -19,6 +19,8 @@ const timestamp = (name) => {
   if (!Number.isFinite(value)) throw new Error(`${name} must be an ISO-8601 timestamp`);
   return value;
 };
+const reviewTierConventionStartAtMs = Date.parse("2026-08-15T23:26:13Z");
+const reviewTierConventionStart = new Date(reviewTierConventionStartAtMs).toISOString();
 const quote = (value) => /[^A-Za-z0-9_./:=@-]/u.test(value) ? JSON.stringify(value) : value;
 const command = (parts) => parts.map(quote).join(" ");
 const ghJson = (ghArgs) => JSON.parse(execFileSync("gh", ghArgs, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] }));
@@ -108,5 +110,17 @@ const report = weeklyThroughputReport({
     defectEscape: command(["gh", ...labelArgs]),
   },
 }, { startAtMs, endAtMs });
+
+const preConventionMerges = pulls.filter((pull) => pull.mergedAtMs !== null && pull.mergedAtMs < reviewTierConventionStartAtMs);
+const conventionEraReviewTierDeclarations = { A: 0, B: 0, C: 0, unknown: 0 };
+for (const pull of pulls) {
+  if (pull.mergedAtMs === null || pull.mergedAtMs < reviewTierConventionStartAtMs || pull.mergedAtMs < startAtMs || pull.mergedAtMs >= endAtMs) continue;
+  conventionEraReviewTierDeclarations[pull.tier ?? "unknown"] += 1;
+}
+report.reviewTierDeclarations = {
+  conventionStartAt: reviewTierConventionStart,
+  preConventionExcluded: preConventionMerges.length,
+  conventionEra: conventionEraReviewTierDeclarations,
+};
 
 process.stdout.write(`${renderWeeklyThroughputReport(report)}\n`);

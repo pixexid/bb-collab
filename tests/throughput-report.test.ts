@@ -106,7 +106,7 @@ case "$1 $2" in
   "issue list") printf '%s' '[{"number":1,"createdAt":"2026-08-16T00:30:32Z","closedAt":"2026-08-16T01:30:32Z","state":"CLOSED"}]' ;;
   "pr list") printf '%s' '[{"number":2,"mergedAt":"2026-08-16T01:00:32Z","body":"Review tier: B","title":"ship"}]' ;;
   "label list") printf '%s' '[]' ;;
-  "api repos/pixexid/bb-collab/pulls/338/reviews") printf '%s' '[]' ;;
+  "api repos/pixexid/bb-collab/pulls/338/reviews") exit 91 ;;
   *) exit 2 ;;
 esac
 `);
@@ -124,12 +124,47 @@ esac
       ], { encoding: "utf8", env: { ...process.env, PATH: `${directory}:${process.env.PATH ?? ""}` } });
       const report = JSON.parse(output);
       expect(report.issueOpenToClose).toMatchObject({ medianHours: 1, maximumHours: 1, completed: 1 });
-      expect(report.reviewTierDeclarations).toEqual({ A: 0, B: 1, C: 0, unknown: 0 });
+      expect(report.reviewTierDeclarations).toEqual({
+        conventionStartAt: "2026-08-15T23:26:13.000Z",
+        preConventionExcluded: 0,
+        conventionEra: { A: 0, B: 1, C: 0, unknown: 0 },
+      });
       expect(report.laneSlotUtilization.status).toBe("unknown");
       expect(report.reviewLatencyByTier.B.status).toBe("unknown");
       expect(report.defectEscape.postMergeP0s).toMatchObject({ status: "unknown", count: null });
       expect(report.outlierCohorts[0]).toMatchObject({ label: "operator-noted day", issueOpenToClose: { completed: 1 }, mergeCadence: { knownMerges: 1 }, reviewRounds: { status: "unknown" } });
       expect(report.sourceCommands.issues).toContain("gh issue list");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps pre-convention merges visible and out of convention-era tier readings", () => {
+    const directory = mkdtempSync(join(tmpdir(), "bb-collab-throughput-convention-"));
+    const gh = join(directory, "gh");
+    writeFileSync(gh, `#!/bin/sh
+case "$1 $2" in
+  "issue list") printf '%s' '[]' ;;
+  "pr list") printf '%s' '[
+    {"number":85,"mergedAt":"2026-08-15T23:25:13Z","body":"","title":"before convention"},
+    {"number":86,"mergedAt":"2026-08-15T23:26:13Z","body":"Review tier: A","title":"convention starts"},
+    {"number":87,"mergedAt":"2026-08-16T00:00:00Z","body":"Review tier: B","title":"after convention"}
+  ]' ;;
+  "label list") printf '%s' '[]' ;;
+  *) exit 2 ;;
+esac
+`);
+    chmodSync(gh, 0o755);
+    try {
+      const output = execFileSync(process.execPath, [
+        join(process.cwd(), "scripts", "weekly-throughput-report.mjs"),
+        "--repo", "pixexid/bb-collab", "--start", "2026-08-15T00:00:00Z", "--end", "2026-08-17T00:00:00Z", "--dials-landed-at", "2026-08-15T00:00:00Z",
+      ], { encoding: "utf8", env: { ...process.env, PATH: `${directory}:${process.env.PATH ?? ""}` } });
+      expect(JSON.parse(output).reviewTierDeclarations).toEqual({
+        conventionStartAt: "2026-08-15T23:26:13.000Z",
+        preConventionExcluded: 1,
+        conventionEra: { A: 1, B: 1, C: 0, unknown: 0 },
+      });
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
