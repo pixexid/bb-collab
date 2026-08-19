@@ -16,7 +16,7 @@ This is the canonical role and review matrix. It describes operating choices, no
 | Tier-B reviewer | `codex` | `gpt-5.6-luna` | Any |
 | Mechanical subagent | `codex` | `gpt-5.6-luna` | LOW |
 
-`zai/glm-5.3` is temporarily withdrawn from non-director placement to conserve peak-hour usage; Codex is therefore the only worker provider, and Codex saturation escalates to the operator with usage data rather than re-seating on GLM.
+`zai/glm-5.3` is temporarily withdrawn from non-director placement to conserve peak-hour usage; the resulting one-provider worker spread is accepted for peak hours as the priced-in cost of the withdrawal; Codex is therefore the only worker provider, and Codex saturation escalates to the operator with usage data rather than re-seating on GLM.
 
 [GH-314](https://github.com/pixexid/bb-collab/issues/314)'s routing-uniformity mirror should report any GLM worker routing as a violation while this withdrawal is in force.
 
