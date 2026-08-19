@@ -14044,6 +14044,25 @@ function readRoleHolderStates(db) {
        ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`
   ).all();
 }
+function readCurrentRoleBindings(db, projectId) {
+  if (!db) return { status: "unknown", reason: "canonical-store-unavailable" };
+  try {
+    if (!db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId)) {
+      return { status: "unknown", reason: "project-unknown" };
+    }
+    return {
+      status: "known",
+      bindings: readRoleHolderStates(db).filter((holder) => holder.project_id === projectId).map((holder) => ({
+        roleId: holder.role_id,
+        generation: holder.role_generation,
+        executionAttemptId: holder.execution_attempt_id,
+        threadId: holder.thread_id
+      }))
+    };
+  } catch {
+    return { status: "unknown", reason: "canonical-store-unreadable" };
+  }
+}
 function createLaneWatcher(options) {
   const waitRegistry = options.waitRegistry ?? createWaitRegistry();
   const roleIdleLedger = createRoleIdleLedger(options.roleIdlePersistence);
@@ -21062,8 +21081,8 @@ async function replyToOperatorMessage(db, bb, projectId, messageId, replyText) {
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, archive-sweep, worktree-cleanup, cached-consumer-rollout, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
+  if (!command || !["doctor", "export", "apply", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, archive-sweep, worktree-cleanup, cached-consumer-rollout, role-list, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
   }
   if (command === "wait-validator") {
     const unknown3 = args.find((arg) => arg !== "--cycle");
@@ -21227,6 +21246,30 @@ async function runCli(db, bb, argv, ctx, deps) {
     } catch (error48) {
       return { exitCode: 2, stdout: JSON.stringify({ outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error48 instanceof Error ? error48.message : String(error48) }], environmentRecordsReleased: false }) };
     }
+  }
+  if (command === "role-list") {
+    const unknown3 = unexpectedFlags(args, ["--project"]);
+    if (unknown3) return invalidCli(`unexpected flag ${unknown3}`);
+    const current = readCurrentRoleBindings(db, projectId);
+    if (current.status === "unknown") {
+      return cliResult({
+        outcome: current.reason === "project-unknown" ? "PROJECT_UNKNOWN" : "CANONICAL_STORE_UNAVAILABLE",
+        subject: projectId,
+        expected: 1,
+        attempted: 0,
+        verified: 0,
+        message: `current role standing is unknown: ${current.reason}`
+      });
+    }
+    return cliResult({
+      outcome: "OK",
+      subject: projectId,
+      expected: current.bindings.length,
+      attempted: current.bindings.length,
+      verified: current.bindings.length,
+      message: `${current.bindings.length} current role bindings`,
+      evidence: current.bindings
+    });
   }
   if (command === "wait-register") {
     const unknown3 = unexpectedFlags(args, ["--project", "--request"]);
@@ -22248,6 +22291,7 @@ ${thread.titleFallback ?? ""}`);
         summary: "Persist the live v21 cached-consumer rollout evidence (exact live production evidence required)",
         usage: "bb collab cached-consumer-rollout --project PROJECT_ID --request JSON"
       },
+      { name: "role-list", summary: "List exact current active role bindings (read-only)", usage: "bb collab role-list --project PROJECT_ID" },
       {
         name: "wait-register",
         summary: "Register one bounded durable wait (deadline mandatory, fail closed)",

@@ -142,6 +142,25 @@ export interface RoleHolderState {
   thread_id: string;
 }
 
+export interface CurrentRoleBinding {
+  roleId: string;
+  generation: number;
+  executionAttemptId: string;
+  threadId: string;
+}
+
+export type CurrentRoleBindingUnknownReason = "canonical-store-unavailable" | "canonical-store-unreadable" | "project-unknown";
+
+export type CurrentRoleBindingRead =
+  | { status: "known"; bindings: CurrentRoleBinding[] }
+  | { status: "unknown"; reason: CurrentRoleBindingUnknownReason };
+
+export type CurrentRoleBindingResolution =
+  | { standing: "active"; binding: CurrentRoleBinding }
+  | { standing: "unseated" }
+  | { standing: "refused"; reason: "multiple-active-bindings" }
+  | { standing: "unknown"; reason: CurrentRoleBindingUnknownReason };
+
 export function roleIdleKey(holder: RoleHolderState, queueHeadId: string): string {
   return `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${queueHeadId}`;
 }
@@ -414,6 +433,42 @@ export function readRoleHolderStates(db: SqliteDatabase): RoleHolderState[] {
        ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`,
     )
     .all() as RoleHolderState[];
+}
+
+export function readCurrentRoleBindings(db: SqliteDatabase | null, projectId: string): CurrentRoleBindingRead {
+  if (!db) return { status: "unknown", reason: "canonical-store-unavailable" };
+  try {
+    if (!db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId)) {
+      return { status: "unknown", reason: "project-unknown" };
+    }
+    return {
+      status: "known",
+      bindings: readRoleHolderStates(db)
+        .filter((holder) => holder.project_id === projectId)
+        .map((holder) => ({
+          roleId: holder.role_id,
+          generation: holder.role_generation,
+          executionAttemptId: holder.execution_attempt_id,
+          threadId: holder.thread_id,
+        })),
+    };
+  } catch {
+    return { status: "unknown", reason: "canonical-store-unreadable" };
+  }
+}
+
+export function resolveCurrentRoleBinding(
+  db: SqliteDatabase | null,
+  projectId: string,
+  roleId: string,
+  threadId: string,
+): CurrentRoleBindingResolution {
+  const current = readCurrentRoleBindings(db, projectId);
+  if (current.status === "unknown") return { standing: "unknown", reason: current.reason };
+  const matches = current.bindings.filter((binding) => binding.roleId === roleId && binding.threadId === threadId);
+  if (matches.length === 0) return { standing: "unseated" };
+  if (matches.length > 1) return { standing: "refused", reason: "multiple-active-bindings" };
+  return { standing: "active", binding: matches[0]! };
 }
 
 export function createLaneWatcher(options: {

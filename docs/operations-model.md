@@ -58,4 +58,6 @@ Two different things are canonical in two different places, and conflating them 
 
 The role pages say so themselves — "Live state is never this page" — and a checked-in file cannot answer a question whose answer changes without a commit. **A dispatcher reading thread surfaces is reading titles, not roles; a dispatcher reading `docs/roles/` is reading the definition, not the standing.**
 
+Before any role-directed tell, resolve the desired role and target thread through the live current-role surface: `bb collab role-list --project PROJECT_ID`. Proceed only when exactly one active binding matches both. Zero matches means the thread is unseated; multiple matches or an unreadable store mean refuse. Native thread attributes may then be checked for reachability, never for standing.
+
 Inferring a recipient's role from surface attributes is the same error as reading a mounted worktree instead of the branch head, one level up. On 2026-08-19 a recovery wake ordered a seat to resume a duty it had not held for two days; the seat declining is the only thing that stopped it, which means the control was the recipient's judgement rather than anything the sender consulted.

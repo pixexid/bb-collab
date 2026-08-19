@@ -58,7 +58,7 @@ import {
   seedFixtureDecision,
   seedVerifiedFixtureReceipt,
 } from "../src/test-support.js";
-import { createLaneWatcher, createRoleIdleLedger, readRoleHolderStates, roleIdleKey, type RoleIdleRecord } from "../src/awareness.js";
+import { createLaneWatcher, createRoleIdleLedger, readRoleHolderStates, resolveCurrentRoleBinding, roleIdleKey, type RoleIdleRecord } from "../src/awareness.js";
 import { findCheckoutRoot, readCheckoutDivergence } from "../src/checkout-divergence.js";
 
 const PROJECT_ID = "proj_test";
@@ -6193,6 +6193,79 @@ describe("bb-collab plugin boundary", () => {
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeProductionRefusal);
   });
 
+  it("lists only exact current role bindings and keeps unseated distinct from unknown", async () => {
+    const host = await loadedHost();
+    host.harness.sdk.stub("threads.list", (async () => [makeThreadResponse({
+      id: ROLE_THREAD_ID,
+      projectId: PROJECT_ID,
+      title: "Sentinel escalation coverage",
+      status: "active",
+      pinnedAt: 1,
+    })]) as never);
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+
+    const successorContext = {
+      threadId: "orchestrator-successor",
+      requestEventId: "orchestrator-successor-request",
+      requestEventSeq: 1,
+      completionEventId: "orchestrator-successor-completion",
+      completionEventSeq: 4,
+    };
+    const successorFacts = roleReader((facts) => {
+      facts.thread.id = successorContext.threadId;
+      facts.thread.environmentId = "orchestrator-successor-environment";
+      facts.environment.id = "orchestrator-successor-environment";
+      facts.events[0]!.id = successorContext.requestEventId;
+      facts.events[3]!.id = successorContext.completionEventId;
+    });
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      idempotencyKey: "role-list-qualification-2",
+      qualificationId: "role-list-qualification-2",
+      roleContext: successorContext,
+    }), null, successorFacts).outcome).toBe("OK");
+    const successor = applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      idempotencyKey: "role-list-succession-2",
+      qualificationId: "role-list-qualification-2",
+      expectedGeneration: 1,
+      predecessorGeneration: 1,
+      roleContext: successorContext,
+    }), null, successorFacts);
+    expect(successor.outcome).toBe("OK");
+    const executionAttemptId = (successor.evidence as { holderExecutionAttemptId: string }).holderExecutionAttemptId;
+
+    const beforeList = exportFoundation(db, PROJECT_ID);
+    const listed = await host.harness.runCli(["role-list", "--project", PROJECT_ID]);
+    expect(listed.exitCode).toBe(0);
+    expect(JSON.parse(listed.stdout).evidence).toEqual([
+      { roleId: "project-orchestrator", generation: 2, executionAttemptId, threadId: successorContext.threadId },
+    ]);
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeList);
+    expect(host.harness.inspection.sdk.callsTo("threads.list")).toEqual([]);
+    expect(resolveCurrentRoleBinding(db, PROJECT_ID, "project-orchestrator", successorContext.threadId)).toEqual({
+      standing: "active",
+      binding: { roleId: "project-orchestrator", generation: 2, executionAttemptId, threadId: successorContext.threadId },
+    });
+    expect(resolveCurrentRoleBinding(db, PROJECT_ID, "director", successorContext.threadId)).toEqual({ standing: "unseated" });
+    expect(resolveCurrentRoleBinding(db, PROJECT_ID, "project-orchestrator", ROLE_THREAD_ID)).toEqual({ standing: "unseated" });
+    const foreign = await host.harness.runCli(["role-list", "--project", FOREIGN_PROJECT_ID]);
+    expect(foreign.exitCode).toBe(2);
+    expect(JSON.parse(foreign.stdout)).toMatchObject({ outcome: "PROJECT_UNKNOWN", message: "current role standing is unknown: project-unknown" });
+
+    db.close();
+    expect(resolveCurrentRoleBinding(db, PROJECT_ID, "project-orchestrator", ROLE_THREAD_ID)).toEqual({
+      standing: "unknown",
+      reason: "canonical-store-unreadable",
+    });
+    const unreadable = await host.harness.runCli(["role-list", "--project", PROJECT_ID]);
+    expect(unreadable.exitCode).toBe(2);
+    expect(JSON.parse(unreadable.stdout)).toMatchObject({
+      outcome: "CANONICAL_STORE_UNAVAILABLE",
+      message: "current role standing is unknown: canonical-store-unreadable",
+    });
+  });
+
   it("briefs newly created canonical director and orchestrator seats with their own role content", async () => {
     const scenarios = [
       {
@@ -7213,7 +7286,7 @@ describe("bb-collab plugin boundary", () => {
     const host = await loadedHost();
     const registrations = host.harness.inspection.registrations;
     expect(registrations.rpcMethods).not.toContain("seed-fixture-receipt");
-    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "cached-consumer-rollout", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "worktree-cleanup", "send-to-operator", "inbox"]);
+    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "worktree-cleanup", "send-to-operator", "inbox"]);
     expect(registrations.httpRoutes.map((route) => route.path)).toEqual(["/lanes"]);
     expect(seedFixtureDecision).toBeTypeOf("function");
   });
