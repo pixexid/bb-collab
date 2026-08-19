@@ -144,9 +144,15 @@ export function planWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeC
       }
       unclaimedAgeMs = ageMs;
     }
+    // An absent probe and a probe reporting clean are different facts that "" cannot tell
+    // apart, so the absence is resolved here rather than folded into the emptiness test below.
+    if (options.status === undefined) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "no git status probe supplied; cleanliness unresolved" });
+      continue;
+    }
     let status = "";
     try {
-      status = options.status?.(entry.path) ?? "";
+      status = options.status(entry.path);
     } catch (error) {
       decisions.push({ path: entry.path, population, action: "refuse", reason: `git status failed for ${entry.path}: ${error instanceof Error ? error.message : String(error)}` });
       continue;

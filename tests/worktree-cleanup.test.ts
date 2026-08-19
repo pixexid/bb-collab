@@ -78,6 +78,19 @@ describe("worktree cleanup", () => {
     expect(Math.abs(Date.now() - createdAt!)).toBeLessThan(60_000);
   });
 
+  // The two optional probes had opposite fail-safe polarity: an omitted reachable gives
+  // Boolean(undefined) = false = refuse, while an omitted status gave "" = clean = allow.
+  // "" is a legitimate clean result from a real porcelain call, so absence is what moved.
+  it("refuses a clean reachable orphan when no status probe is supplied", () => {
+    const { root, paths } = fixture();
+    const result = report(root, new Set(), new Map(), { status: undefined });
+    expect(result.wouldRemove).toEqual([]);
+    expect(result.refused).toContainEqual(expect.objectContaining({
+      path: canonicalWorktreePath(paths[1]),
+      reason: "no git status probe supplied; cleanliness unresolved",
+    }));
+  });
+
   it("reports exactly the clean detached orphan and refuses live and dirty entries", () => {
     const { root, paths } = fixture();
     const ownership = new Map([[canonicalWorktreePath(paths[0]), new Set(["thr_live"])]]);

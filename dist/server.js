@@ -20056,9 +20056,13 @@ function planWorktreeCleanup(entries, options) {
       }
       unclaimedAgeMs = ageMs;
     }
+    if (options.status === void 0) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "no git status probe supplied; cleanliness unresolved" });
+      continue;
+    }
     let status = "";
     try {
-      status = options.status?.(entry.path) ?? "";
+      status = options.status(entry.path);
     } catch (error48) {
       decisions.push({ path: entry.path, population, action: "refuse", reason: `git status failed for ${entry.path}: ${error48 instanceof Error ? error48.message : String(error48)}` });
       continue;
