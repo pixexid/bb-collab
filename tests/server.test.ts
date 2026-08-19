@@ -8512,6 +8512,7 @@ exit 1
     add("wi-gh-305", "cancelled", 14);
     add("not-a-github-work-item", "proposed", 15);
     add("wi-gh-999999999999999999999", "review_pending", 16);
+    add("prefix-wi-gh-306", "ready", 17);
     const newStates = ["proposed", "ready", "in_progress", "review_pending", "succeeded", "failed", "cancelled"];
     for (const [index, state] of newStates.entries()) add(`wi-gh-new-${state}`, state, 101 + index);
 
@@ -8536,9 +8537,10 @@ exit 1
       return { owner, repo, issueNumber: issueNumber + 1, title: "Wrong number", body: "Wrong", state: "open" as const, labels: [], externalRevision: "wrong-number" };
     }, 100);
 
-    expect(result).toMatchObject({ state: "degraded", candidates: 7, bound: 1, alreadyBound: 0, unresolved: 6, epochCreatedAtMs: 100 });
+    expect(result).toMatchObject({ state: "degraded", candidates: 8, bound: 1, alreadyBound: 0, unresolved: 7, epochCreatedAtMs: 100 });
     expect(calls).toEqual([301, 302, 303, 304, 305]);
     expect(db.prepare("SELECT issue_number, projection_state, observed_external_revision FROM external_work_refs WHERE work_item_id = ?").get("wi-gh-301")).toEqual({ issue_number: 301, projection_state: "pending", observed_external_revision: "issue-301" });
+    expect(db.prepare("SELECT 1 FROM external_work_refs WHERE work_item_id = ?").get("prefix-wi-gh-306")).toBeUndefined();
     expect(db.prepare("SELECT COUNT(*) AS count FROM external_work_refs").get()).toEqual({ count: 1 });
     expect(result.outcomes).toEqual(expect.arrayContaining([
       { workItemId: "wi-gh-302", status: "unresolved", reason: "github_issue_missing", issueNumber: 302 },
@@ -8546,6 +8548,7 @@ exit 1
       { workItemId: "wi-gh-304", status: "unresolved", reason: "github_issue_unreadable", issueNumber: 304 },
       { workItemId: "wi-gh-305", status: "unresolved", reason: "github_issue_identity_mismatch", issueNumber: 305 },
       { workItemId: "not-a-github-work-item", status: "unresolved", reason: "work_item_id_not_github_issue" },
+      { workItemId: "prefix-wi-gh-306", status: "unresolved", reason: "work_item_id_not_github_issue" },
     ]));
     expect(db.prepare("SELECT state, epoch_created_at_ms FROM work_item_github_backfills WHERE project_id = ?").get(PROJECT_ID)).toEqual({ state: "degraded", epoch_created_at_ms: 100 });
 
