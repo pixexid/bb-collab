@@ -19446,14 +19446,35 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
     const unresolvedRoleHolders = roleGenerationHeads.filter((row) => row.holder_attempt_state !== "done" || !row.holder_native_receipt_digest).map((row) => ({ roleId: row.role_id, generation: row.current_generation, holderExecutionAttemptId: row.holder_execution_attempt_id, reason: "ROLE_HOLDER_UNRESOLVED" }));
     const decisionIntegrity = decisionDoctorEvidence(db, projectId);
     const cachedConsumers = persistedCachedConsumerRolloutEvidence(db, projectId);
+    const installedPlugins = await sdk.plugins.list();
+    const incompatiblePlugins = await Promise.all(installedPlugins.plugins.filter((plugin2) => plugin2.status === "incompatible").map(async (plugin2) => {
+      const source = await sdk.plugins.getSource({ pluginId: plugin2.id });
+      const name = plugin2.name ?? plugin2.id;
+      const requiredBbRange = source.engines.bb ?? null;
+      return {
+        id: plugin2.id,
+        name,
+        pluginVersion: plugin2.version,
+        requiredBbRange,
+        bbVersion: version2.currentVersion,
+        loaded: false,
+        message: requiredBbRange === null ? `plugin "${name}" ${plugin2.version} is not loaded: its declared BB range is unavailable` : `plugin "${name}" ${plugin2.version} is not loaded: declared BB range ${requiredBbRange} excludes running BB ${version2.currentVersion}`
+      };
+    }));
+    const pluginCompatibilityMessage = incompatiblePlugins.length === 0 ? void 0 : incompatiblePlugins.map((plugin2) => plugin2.message).join("; ");
     const expected = targets.length + 1;
     return result("OK", projectId, expected, expected, expected, {
       currentConfigRevision: configHead.config_revision,
       currentGovernanceEpoch: governor ? Number(governor.governance_epoch) : void 0,
+      message: pluginCompatibilityMessage,
       evidence: {
         bbVersion: version2.currentVersion,
         pluginSdkVersion: PLUGIN_SDK_VERSION,
-        compatibility: { bb: BB_VERSION_RANGE, bbPluginSdk: `^${PLUGIN_SDK_VERSION}` },
+        compatibility: {
+          bb: BB_VERSION_RANGE,
+          bbPluginSdk: `^${PLUGIN_SDK_VERSION}`,
+          plugins: { checked: installedPlugins.plugins.length, incompatible: incompatiblePlugins }
+        },
         project: { id: project.id, kind: project.kind, name: project.name, gitRemoteUrl: project.gitRemoteUrl },
         targets: targetEvidence,
         governorshipHead: governor ?? null,
