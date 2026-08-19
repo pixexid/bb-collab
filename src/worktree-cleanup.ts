@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 
 export type WorktreePopulation = "scratch" | "managed" | "candidate" | "unknown";
 
@@ -20,26 +20,33 @@ export type WorktreeDecision = {
 };
 
 export type WorktreeCleanupReport = {
-  outcome: "reported" | "applied" | "refused";
-  removed: string[];
+  outcome: "reported" | "refused";
+  wouldRemove: WorktreeDecision[];
   refused: WorktreeDecision[];
   environmentRecordsReleased: false;
 };
 
 export type WorktreeCleanupOptions = {
   liveThreadIds: ReadonlySet<string>;
-  apply?: boolean;
+  liveWorktreeThreadIds?: ReadonlyMap<string, ReadonlySet<string>>;
   home?: string;
   originMain?: string;
   status?: (path: string) => string;
   reachable?: (path: string, head: string) => boolean;
-  remove?: (path: string) => void;
 };
 
 const threadPattern = /thr_[a-z0-9]+/u;
 
+export function canonicalWorktreePath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
 export function classifyWorktree(path: string, home = process.env.HOME ?? ""): WorktreePopulation {
-  const target = resolve(path);
+  const target = canonicalWorktreePath(path);
   const tmp = ["/tmp", "/private/tmp"].map((root) => resolve(root));
   if (tmp.some((root) => target === root || target.startsWith(`${root}/`))) return "scratch";
   const managed = resolve(home, ".bb/worktrees");
@@ -62,8 +69,10 @@ export function planWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeC
       decisions.push({ path: entry.path, population, action: "refuse", reason: "per-thread candidate checkout is protected" });
       continue;
     }
-    if (threadId && options.liveThreadIds.has(threadId)) {
-      decisions.push({ path: entry.path, population, action: "refuse", reason: `live thread ${threadId}` });
+    const associatedLiveThreads = options.liveWorktreeThreadIds?.get(canonicalWorktreePath(entry.path));
+    if ((threadId && options.liveThreadIds.has(threadId)) || (associatedLiveThreads && associatedLiveThreads.size > 0)) {
+      const owners = threadId && options.liveThreadIds.has(threadId) ? [threadId] : [...associatedLiveThreads!];
+      decisions.push({ path: entry.path, population, action: "refuse", reason: `live thread ${owners.join(",")}` });
       continue;
     }
     if (population === "managed") {
@@ -78,11 +87,29 @@ export function planWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeC
       decisions.push({ path: entry.path, population, action: "refuse", reason: "worktree HEAD is unavailable" });
       continue;
     }
-    if ((options.status?.(entry.path) ?? "") !== "") {
+    if (threadId === null && associatedLiveThreads === undefined) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "thread ownership unresolved for detached worktree" });
+      continue;
+    }
+    let status = "";
+    try {
+      status = options.status?.(entry.path) ?? "";
+    } catch (error) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: `git status failed for ${entry.path}: ${error instanceof Error ? error.message : String(error)}` });
+      continue;
+    }
+    if (status !== "") {
       decisions.push({ path: entry.path, population, action: "refuse", reason: "uncommitted changes" });
       continue;
     }
-    if (!options.originMain || !(options.reachable?.(entry.path, entry.head) ?? false)) {
+    let reachable = false;
+    try {
+      reachable = Boolean(options.originMain && options.reachable?.(entry.path, entry.head));
+    } catch (error) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: `reachability check failed for ${entry.path}: ${error instanceof Error ? error.message : String(error)}` });
+      continue;
+    }
+    if (!reachable) {
       decisions.push({ path: entry.path, population, action: "refuse", reason: "commits are not reachable from origin/main" });
       continue;
     }
@@ -93,19 +120,9 @@ export function planWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeC
 
 export function runWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeCleanupOptions): WorktreeCleanupReport {
   const decisions = planWorktreeCleanup(entries, options);
-  const removed: string[] = [];
+  const wouldRemove = decisions.filter((decision) => decision.action === "remove");
   const refused = decisions.filter((decision) => decision.action === "refuse");
-  if (options.apply) {
-    for (const decision of decisions.filter((item) => item.action === "remove")) {
-      try {
-        options.remove?.(decision.path);
-        removed.push(decision.path);
-      } catch (error) {
-        refused.push({ ...decision, action: "refuse", reason: `git worktree remove failed: ${error instanceof Error ? error.message : String(error)}` });
-      }
-    }
-  }
-  return { outcome: refused.length > 0 ? "refused" : options.apply ? "applied" : "reported", removed, refused, environmentRecordsReleased: false };
+  return { outcome: refused.length > 0 ? "refused" : "reported", wouldRemove, refused, environmentRecordsReleased: false };
 }
 
 function git(args: string[], cwd: string): string {
@@ -119,7 +136,7 @@ export function listGitWorktrees(repoRoot: string): WorktreeEntry[] {
   for (const line of lines) {
     if (line.startsWith("worktree ")) {
       if (current) entries.push(current);
-      current = { path: line.slice("worktree ".length), branch: null, head: null };
+      current = { path: canonicalWorktreePath(line.slice("worktree ".length)), branch: null, head: null };
     } else if (current && line.startsWith("HEAD ")) current.head = line.slice("HEAD ".length);
     else if (current && line.startsWith("branch ")) current.branch = line.slice("branch ".length).replace(/^refs\/heads\//u, "");
   }
@@ -127,20 +144,36 @@ export function listGitWorktrees(repoRoot: string): WorktreeEntry[] {
   return entries;
 }
 
-export function cleanupGitWorktrees(repoRoot: string, liveThreadIds: ReadonlySet<string>, apply = false): WorktreeCleanupReport {
+export function cleanupGitWorktrees(repoRoot: string, liveThreadIds: ReadonlySet<string>, liveWorktreeThreadIds: ReadonlyMap<string, ReadonlySet<string>> = new Map()): WorktreeCleanupReport {
   const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
   const status = (path: string) => git(["status", "--porcelain", "--untracked-files=all"], path);
   const reachable = (path: string, head: string) => git(["rev-list", "--not", originMain, head], path) === "";
   return runWorktreeCleanup(listGitWorktrees(repoRoot), {
     liveThreadIds,
-    apply,
+    liveWorktreeThreadIds,
     originMain,
     status,
-    reachable,
-    remove: (path) => {
-      if (!existsSync(path)) return;
-      if (!isAbsolute(path)) throw new Error("worktree path is not absolute");
-      execFileSync("git", ["worktree", "remove", path], { cwd: repoRoot, stdio: "pipe" });
+    reachable: (path, head) => {
+      try {
+        execFileSync("git", ["merge-base", "--is-ancestor", head, originMain], { cwd: path, stdio: "pipe", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } });
+        return true;
+      } catch {
+        return false;
+      }
     },
   });
+}
+
+export async function listAllProjectThreads<T extends { id: string }>(
+  list: (args: { projectId: string; archived: false; includeHidden: true; limit: number; offset: number }) => Promise<T[]>,
+  projectId: string,
+  pageSize = 1000,
+): Promise<T[]> {
+  const threads: T[] = [];
+  for (let offset = 0; ; offset += pageSize) {
+    const page = await list({ projectId, archived: false, includeHidden: true, limit: pageSize, offset });
+    threads.push(...page);
+    if (page.length < pageSize) return threads;
+    if (offset >= 100_000) throw new Error("thread inventory exceeded bounded pagination");
+  }
 }
