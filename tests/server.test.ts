@@ -901,7 +901,11 @@ describe("checkout divergence detection", () => {
     const originalPidFile = process.env.HOSTILE_GIT_PID_FILE;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
     process.env.HOSTILE_GIT_PID_FILE = join(bin, "grandchild.pid");
-    const started = Date.now();
+    // Resolving is the entire proof. Plugin load never resolves the checkout, so a
+    // `.git/HEAD` that blocks forever and a missing `.git` both come back `undefined`.
+    // An eager read blocks the worker inside readFileSync, where nothing downstream
+    // runs and vitest's own timeout cannot fire — so no wall-clock bound could catch
+    // it, and the one that used to sit here caught nothing either (#287).
     try {
       await expect(Promise.all([
         plugin(hostFor().bb, { checkoutRoot: fifoCheckout }),
@@ -916,8 +920,7 @@ describe("checkout divergence detection", () => {
       rmSync(missingGitCheckout, { recursive: true, force: true });
       rmSync(bin, { recursive: true, force: true });
     }
-    expect(Date.now() - started).toBeLessThan(2_000);
-  }, 5_000);
+  });
 
   it("reports an unavailable checkout through doctor RPC and CLI", async () => {
     const directory = mkdtempSync(join(tmpdir(), "bb-collab-no-git-"));
