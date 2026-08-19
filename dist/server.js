@@ -19175,8 +19175,12 @@ async function routingDoctorEvidence(sdk, projectId, roleGenerationHeads) {
   const escalationThreadIds = new Set(escalationHeads.map((row) => String(row.holder_thread_id)));
   const workerThreads = threads.filter((thread) => thread.status === "active" && !escalationThreadIds.has(thread.id));
   const profileFor = async (thread) => {
-    const options = await sdk.threads.defaultExecutionOptions({ threadId: thread.id });
-    return options && typeof thread.providerId === "string" && typeof options.model === "string" && typeof options.reasoningLevel === "string" ? { providerId: thread.providerId, model: options.model, reasoningLevel: options.reasoningLevel } : null;
+    try {
+      const options = await sdk.threads.defaultExecutionOptions({ threadId: thread.id });
+      return options && typeof thread.providerId === "string" && typeof options.model === "string" && typeof options.reasoningLevel === "string" ? { providerId: thread.providerId, model: options.model, reasoningLevel: options.reasoningLevel } : null;
+    } catch {
+      return null;
+    }
   };
   const workerProfiles = await Promise.all(workerThreads.map(async (thread) => ({ thread, profile: await profileFor(thread) })));
   const buckets = /* @__PURE__ */ new Map();
