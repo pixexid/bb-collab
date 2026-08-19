@@ -44,6 +44,7 @@ import {
   parseApplyRequest,
   schemaDigest,
   sha256,
+  workItemReconciliationIssues,
   type ApplyRequest,
   type ExportFilePayload,
   type ExportPayload,
@@ -605,7 +606,9 @@ function transitionRequest(
     expectedResourceRevision,
     workItemId: WORK_ITEM_ID,
     lifecycleState: state,
-    ...(state === "in_progress" ? { workAttempt: { laneId: "lane-work-item-1", threadId: "thread-work-item-1", assignmentKind: "write" as const } } : {}),
+    ...(state === "in_progress" ? { workAttempt: { laneId: "lane-work-item-1", threadId: "thread-work-item-1", assignmentKind: "write" as const } }
+      : state === "review_pending" ? { workAttempt: { laneId: "lane-review-item-1", threadId: "thread-review-item-1", assignmentKind: "review" as const } }
+        : {}),
     ...overrides,
   };
 }
@@ -3124,7 +3127,8 @@ describe("bb-collab plugin boundary", () => {
       expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state = 'in_progress'").get()).toEqual({ count: 1 });
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 3))).toMatchObject({ outcome: "OK" });
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3))).toMatchObject({ outcome: "OK" });
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4))).toMatchObject({ outcome: "OK" });
       expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state = 'in_progress'").get()).toEqual({ count: 0 });
       await fixture.host.harness.runSchedule("fleet-watchdog");
       const startableSends = () => fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([request]) =>
@@ -3157,6 +3161,136 @@ describe("bb-collab plugin boundary", () => {
       expect(readFileSync(argsLog, "utf8")).toBe("issue\nlist\n--repo\nexample/project\n--label\nqueue:startable\n--state\nopen\n--json\nnumber\n--limit\n1000\n");
     } finally {
       clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("flags linked closed issues and merged pull requests during the hourly watchdog cycle", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-stale-terminal-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "pr" ]; then
+  if [ "$3" = "206" ] || [ "$3" = "208" ]; then printf '%s\\n' '{"state":"MERGED","mergedAt":"2026-08-19T00:00:00Z"}'; exit 0; fi
+  exit 1
+fi
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[{"number":999}]'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "207" ]; then exit 1; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"state":"CLOSED"}'; exit 0; fi
+exit 1
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      const mergedWorkItemId = "merged-work-item";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "merged-work-item-create",
+        workItemId: mergedWorkItemId,
+        workItem: { workItemId: mergedWorkItemId, title: mergedWorkItemId, body: "merged PR" },
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { idempotencyKey: "merged-work-item-ready", workItemId: mergedWorkItemId })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+        idempotencyKey: "merged-work-item-start",
+        workItemId: mergedWorkItemId,
+        workAttempt: { laneId: "lane-merged", threadId: "thread-merged", assignmentKind: "write" },
+      })).outcome).toBe("OK");
+      const racyWorkItemId = "racy-work-item";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "racy-work-item-create",
+        workItemId: racyWorkItemId,
+        workItem: { workItemId: racyWorkItemId, title: racyWorkItemId, body: "TOCTOU merge-close" },
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { idempotencyKey: "racy-work-item-ready", workItemId: racyWorkItemId })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+        idempotencyKey: "racy-work-item-start",
+        workItemId: racyWorkItemId,
+        workAttempt: { laneId: "lane-racy", threadId: "thread-racy", assignmentKind: "write" },
+      })).outcome).toBe("OK");
+      const unreadableWorkItemId = "unreadable-work-item";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "unreadable-work-item-create",
+        workItemId: unreadableWorkItemId,
+        workItem: { workItemId: unreadableWorkItemId, title: unreadableWorkItemId, body: "unreadable GitHub state" },
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { idempotencyKey: "unreadable-work-item-ready", workItemId: unreadableWorkItemId })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+        idempotencyKey: "unreadable-work-item-start",
+        workItemId: unreadableWorkItemId,
+        workAttempt: { laneId: "lane-unreadable", threadId: "thread-unreadable", assignmentKind: "write" },
+      })).outcome).toBe("OK");
+      const insertRef = fixture.db.prepare(
+        `INSERT INTO external_work_refs (
+           project_id, work_item_id, provider, owner, repo, issue_number, projection_state,
+           attempted_resource_revision, projected_resource_revision, desired_digest,
+           observed_external_revision, observed_external_digest, last_idempotency_key,
+           last_request_digest, created_at_ms, updated_at_ms
+         ) VALUES (?, ?, 'github', 'example', 'project', ?, 'current', ?, ?, ?, 'fixture', ?, ?, ?, 1, 1)`,
+      );
+      insertRef.run(PROJECT_ID, WORK_ITEM_ID, 205, 3, 3, sha256("closed-desired"), sha256("closed-observed"), "closed-ref", sha256("closed-request"));
+      insertRef.run(PROJECT_ID, mergedWorkItemId, 206, 3, 3, sha256("merged-desired"), sha256("merged-observed"), "merged-ref", sha256("merged-request"));
+      insertRef.run(PROJECT_ID, racyWorkItemId, 208, 3, 3, sha256("racy-desired"), sha256("racy-observed"), "racy-ref", sha256("racy-request"));
+      insertRef.run(PROJECT_ID, unreadableWorkItemId, 207, 3, 3, sha256("unreadable-desired"), sha256("unreadable-observed"), "unreadable-ref", sha256("unreadable-request"));
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "fleet-watchdog-plugin", actorKind: "plugin", subjectId: PLUGIN_ID });
+      fixture.db.exec(`
+        CREATE TRIGGER mutate_racy_merge_close
+        AFTER UPDATE OF lifecycle_state ON work_items
+        WHEN NEW.project_id = 'proj_test'
+          AND NEW.work_item_id = 'racy-work-item'
+          AND NEW.lifecycle_state = 'review_pending'
+        BEGIN
+          UPDATE work_items
+             SET lifecycle_state = 'in_progress',
+                 resource_revision = resource_revision + 1,
+                 updated_at_ms = updated_at_ms + 1
+           WHERE project_id = NEW.project_id
+             AND work_item_id = NEW.work_item_id;
+        END
+      `);
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining("stale-terminal work item: project=proj_test workItem=work-item-1 linked=example/project#205 status=closed"),
+      }));
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining("stale-terminal work item: project=proj_test workItem=merged-work-item linked=example/project#206 status=merged"),
+      }));
+      expect(fixture.db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, mergedWorkItemId)).toEqual({ lifecycle_state: "succeeded", resource_revision: 5 });
+      expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal").all(PROJECT_ID, mergedWorkItemId)).toEqual([{ state: "done" }]);
+      expect(fixture.db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, racyWorkItemId)).toEqual({ lifecycle_state: "in_progress", resource_revision: 5 });
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining("merge-close transition refused: project=proj_test workItem=racy-work-item outcome=WORK_ITEM_REVISION_STALE"),
+      }));
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining("fleet-watchdog coverage=degraded"),
+      }));
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining("cannotSee=github-work-item-terminalize:proj_test:racy-work-item"),
+      }));
+      expect(fixture.host.harness.inspection.logEntries).not.toContainEqual(expect.objectContaining({
+        level: "info",
+        message: expect.stringContaining("auto-terminalized merged and closed work item: project=proj_test workItem=racy-work-item"),
+      }));
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "in_progress" });
+      expect(fixture.db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, unreadableWorkItemId)).toEqual({ lifecycle_state: "in_progress", resource_revision: 3 });
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining("github-work-item-status:proj_test:unreadable-work-item"),
+      }));
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "info",
+        message: expect.stringContaining("auto-terminalized merged and closed work item: project=proj_test workItem=merged-work-item via=review_pending"),
+      }));
+    } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
       rmSync(bin, { recursive: true, force: true });
@@ -3271,6 +3405,43 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
+  it("wakes an idle orchestrator when non-terminal work is review_pending", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-review-pending-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(1, true);
+      fixture.host.harness.sdk.stub("threads.wait", (async () => undefined) as never);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3)).outcome).toBe("OK");
+      vi.useFakeTimers();
+      try {
+        await fixture.host.harness.emitThreadEvent("thread.idle", {
+          thread: makeThreadResponse({ id: fixture.orchestratorThreadId, projectId: PROJECT_ID, status: "idle", updatedAt: 1 }),
+          lastAssistantText: null,
+        });
+        await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+
+        expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+          expect.objectContaining({
+            threadId: fixture.orchestratorThreadId,
+            mode: "steer",
+            input: [expect.objectContaining({ text: expect.stringContaining("example/project#305") })],
+          }),
+        ]]);
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("fails closed and names the active-lane reader when that conjunct is unreadable", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-blind-"));
     const gh = join(bin, "gh");
@@ -3283,7 +3454,7 @@ describe("bb-collab plugin boundary", () => {
       fixture.host.harness.sdk.stub("threads.wait", (async () => undefined) as never);
       const originalPrepare = fixture.db.prepare.bind(fixture.db);
       vi.spyOn(fixture.db, "prepare").mockImplementation(((sql: string) => {
-        if (sql.includes("SELECT lane_id, thread_id, state, observed_at_ms")) throw new Error("lane read failed");
+        if (sql.includes("SELECT execution_attempts.lane_id, execution_attempts.thread_id, execution_attempts.state, execution_attempts.observed_at_ms")) throw new Error("lane read failed");
         return originalPrepare(sql);
       }) as never);
       vi.useFakeTimers();
@@ -3405,7 +3576,8 @@ describe("bb-collab plugin boundary", () => {
     try {
       const fixture = await fleetWatchdogFixture(0, true);
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 3))).toMatchObject({ outcome: "OK" });
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3))).toMatchObject({ outcome: "OK" });
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4))).toMatchObject({ outcome: "OK" });
       let directorReads = 0;
       fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
         id: threadId,
@@ -4430,9 +4602,9 @@ describe("bb-collab plugin boundary", () => {
   });
 
   it("appends the operator inbox schema without changing the v21 foundation contract", () => {
-    expect(SCHEMA_VERSION).toBe(16);
+    expect(SCHEMA_VERSION).toBe(17);
     expect(CONTRACT_VERSION).toBe(21);
-    expect(MIGRATIONS).toHaveLength(29);
+    expect(MIGRATIONS).toHaveLength(30);
     expect(MIGRATIONS.slice(0, -1).map(sha256)).toEqual([
       "2ac2daf5e9bedfefdc007f0ff150814dace6938963b214c463dba8f66332d708",
       "e55c1268522fb2a3c42670c6565376860731de77b7afc8f122755db613d92967",
@@ -4462,12 +4634,15 @@ describe("bb-collab plugin boundary", () => {
       "afed053f2d0016a4a03ed2e40978562289a20de5abd0ddacd4b529e200984a19",
       "0cf4a2190ba1df8dd5e27834d4ce9f769c4d0e34f8041f39f0858a572c60418b",
       "39bd82dcebe4edf8c5d82d429de5f14b2ddee3a3c87871d4745a9f0467b648ae",
+      "5c7fe2675ba012bae345e37985137d36aabf6b85b890c415c3d1c624b88045cc",
     ]);
-    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("19ce4f2a3293379c19fab2280357f2aad408da623d858e34d487332b7a5f31fe");
-    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
-    expect(MIGRATIONS.at(-2)).toContain("operator_messages");
-    expect(MIGRATIONS.at(-2)).toContain("project_id TEXT NOT NULL");
-    expect(MIGRATIONS.at(-2)).toContain("recipient IN ('operator', 'supervisor')");
+    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
+    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("4051aa08e489728a2b752340ad979716de7a2a1df9fdd46d2c4b8ccc86d9f5d2");
+    expect(MIGRATIONS.at(-3)).toContain("operator_messages");
+    expect(MIGRATIONS.at(-3)).toContain("project_id TEXT NOT NULL");
+    expect(MIGRATIONS.at(-3)).toContain("recipient IN ('operator', 'supervisor')");
+    expect(MIGRATIONS.at(-2)).toContain("execution_attempts_gh300");
+    expect(MIGRATIONS.at(-1)).toContain("work_items_gh295");
     expect(TABLES).toContain("migration_runs");
     expect(TABLES).toContain("operator_messages");
     expect(MIGRATION_STATES).toEqual([
@@ -4478,8 +4653,8 @@ describe("bb-collab plugin boundary", () => {
     ]);
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 15,
-      newSchemaVersion: 16,
+      oldSchemaVersion: 16,
+      newSchemaVersion: 17,
       oldContractVersion: 21,
       newContractVersion: 21,
       action: "refused",
@@ -4487,9 +4662,9 @@ describe("bb-collab plugin boundary", () => {
       attempted: 4,
       verified: 0,
     });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(16, 21))).toMatchObject({
-      oldSchemaVersion: 15,
-      newSchemaVersion: 16,
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(17, 21))).toMatchObject({
+      oldSchemaVersion: 16,
+      newSchemaVersion: 17,
       oldContractVersion: 21,
       newContractVersion: 21,
       action: "reread",
@@ -4499,8 +4674,8 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 15,
-      newSchemaVersion: 16,
+      oldSchemaVersion: 16,
+      newSchemaVersion: 17,
       oldContractVersion: 21,
       newContractVersion: 21,
       action: "refused",
@@ -4536,11 +4711,36 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
+  it("appends the review_pending work-item migration without rewriting historical rows", () => {
+    const db = new Database(":memory:");
+    databaseIsReady(db);
+    const projectId = "proj_gh295_migration";
+    try {
+      db.transaction(() => {
+        for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement);
+      })();
+      db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, '{}', ?, 1)").run(projectId, sha256("{}"));
+      db.prepare("INSERT INTO repository_targets (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest) VALUES (?, 'target-main', 1, 'source', 'host', '/migration', NULL, 'main', 'target-digest')").run(projectId);
+      db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'historical', 1, 'target-main', 'Historical', 'preserve me', 'in_progress', 3, 10, 20)").run(projectId);
+      const beforeRows = db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId);
+      const priorStatementDigests = MIGRATIONS.slice(0, -1).map(sha256);
+      db.transaction(() => db.exec(MIGRATIONS.at(-1)!))();
+      expect(MIGRATIONS.slice(0, -1).map(sha256)).toEqual(priorStatementDigests);
+      expect(db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId)).toEqual(beforeRows);
+      expect(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'work_items'").get()).toMatchObject({ sql: expect.stringContaining("review_pending") });
+      db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'reviewable', 1, 'target-main', 'Reviewable', 'new state', 'review_pending', 1, 30, 30)").run(projectId);
+      expect(db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? ORDER BY work_item_id").all(projectId)).toEqual([{ lifecycle_state: "in_progress" }, { lifecycle_state: "review_pending" }]);
+      expect(() => db.prepare("UPDATE work_items SET lifecycle_state = 'unknown_future' WHERE project_id = ? AND work_item_id = 'historical'").run(projectId)).toThrow(/CHECK constraint failed/iu);
+    } finally {
+      db.close();
+    }
+  });
+
   it("assembles the production v21 cached-consumer rollout receipt with stale-v20 refusal semantics", async () => {
     expect(CONTRACT_VERSION).toBe(21);
-    expect(SCHEMA_VERSION).toBe(16);
-    expect(MIGRATIONS).toHaveLength(29);
-    expect(schemaDigest).toBe("4051aa08e489728a2b752340ad979716de7a2a1df9fdd46d2c4b8ccc86d9f5d2");
+    expect(SCHEMA_VERSION).toBe(17);
+    expect(MIGRATIONS).toHaveLength(30);
+    expect(schemaDigest).toBe("7d9d30ecaf897f87b32f0da787366e67ee44194ad9fcd8fd3b33a2ca14eec221");
     expect(contractDigest).toBe("6df90c4315ca78dacb7043a45d28ccfdd259947d835bce3953d7b4f44b928c9f");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -4557,7 +4757,7 @@ describe("bb-collab plugin boundary", () => {
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 16, observedContractVersion: 21 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 17, observedContractVersion: 21 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -4695,7 +4895,7 @@ describe("bb-collab plugin boundary", () => {
     const projectId = "proj_gh300_rebuild";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -2)) db.exec(statement);
       })();
       db.pragma("foreign_keys = OFF");
       const insert = (table: string, row: Record<string, unknown>) => {
@@ -4753,7 +4953,7 @@ describe("bb-collab plugin boundary", () => {
       const before = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.values(before).every((value) => value !== null)).toBe(true);
       expect(new Set(Object.values(before).map((value) => String(value))).size).toBeGreaterThan(20);
-      db.transaction(() => db.exec(MIGRATIONS.at(-1)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-2)!))();
       const after = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.fromEntries(columns.map((column) => [column, after[column]]))).toEqual(Object.fromEntries(columns.map((column) => [column, before[column]])));
       expect(after.progress_json).toBe("{}");
@@ -4807,7 +5007,7 @@ describe("bb-collab plugin boundary", () => {
     const before = exportFoundation(db, PROJECT_ID);
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
-      observedSchemaVersion: 16,
+      observedSchemaVersion: 17,
       observedContractVersion: 21,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
@@ -5038,7 +5238,7 @@ describe("bb-collab plugin boundary", () => {
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 16, schemaDigest, contractVersion: 21, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 17, schemaDigest, contractVersion: 21, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -6099,8 +6299,8 @@ describe("bb-collab plugin boundary", () => {
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 15, newSchemaVersion: 16, action: "unknown", expected: 4, attempted: 0, verified: 0 },
-        schema: { version: 16 },
+        cachedConsumers: { oldSchemaVersion: 16, newSchemaVersion: 17, action: "unknown", expected: 4, attempted: 0, verified: 0 },
+        schema: { version: 17 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -6431,6 +6631,33 @@ describe("bb-collab plugin boundary", () => {
     expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE aggregate_type = 'work_item'").get()).toEqual({ count: 2 });
   });
 
+  it("requires review_pending between authorship and terminal success and supports review findings re-entry", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "succeeded", 3))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items").get()).toEqual({ lifecycle_state: "in_progress", resource_revision: 3 });
+
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(db.prepare("SELECT assignment_kind, state FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal").all(PROJECT_ID, WORK_ITEM_ID)).toEqual([
+      { assignment_kind: "write", state: "done" },
+      { assignment_kind: "review", state: "running" },
+    ]);
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 4))).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
+    expect(db.prepare("SELECT assignment_kind, state FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal").all(PROJECT_ID, WORK_ITEM_ID)).toEqual([
+      { assignment_kind: "write", state: "done" },
+      { assignment_kind: "review", state: "superseded" },
+      { assignment_kind: "write", state: "running" },
+    ]);
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "succeeded", 5))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 5))).toMatchObject({ outcome: "OK", currentResourceRevision: 6 });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "succeeded", 6))).toMatchObject({ outcome: "OK", currentResourceRevision: 7 });
+    expect(db.prepare("SELECT lifecycle_state FROM work_items").get()).toEqual({ lifecycle_state: "succeeded" });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ count: 0 });
+  });
+
   it("doctor measures in-progress WorkItems as active writing lanes", async () => {
     const host = await loadedHost();
     const config = roleConfig();
@@ -6452,6 +6679,90 @@ describe("bb-collab plugin boundary", () => {
         },
       },
     });
+  });
+
+  it("keeps review_pending out of authorship capacity and reports dispatch_unknown as idle-enforcer blind", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3)).outcome).toBe("OK");
+    db.prepare("UPDATE execution_attempts SET assignment_kind = 'write' WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'review'").run(PROJECT_ID, WORK_ITEM_ID);
+
+    const blindWorkItemId = "blind-work-item";
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      idempotencyKey: "blind-work-item-create",
+      workItemId: blindWorkItemId,
+      workItem: { workItemId: blindWorkItemId, title: blindWorkItemId, body: "dispatch unknown" },
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, { idempotencyKey: "blind-work-item-ready", workItemId: blindWorkItemId })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2, {
+      idempotencyKey: "blind-work-item-start",
+      workItemId: blindWorkItemId,
+      workAttempt: { laneId: "lane-blind", threadId: "thread-blind", assignmentKind: "write" },
+    })).outcome).toBe("OK");
+    db.prepare("UPDATE execution_attempts SET state = 'dispatch_unknown' WHERE project_id = ? AND work_item_id = ?").run(PROJECT_ID, blindWorkItemId);
+
+    for (const state of ["prepared", "armed", "content_delivered"] as const) {
+      const workItemId = `unobserved-${state}`;
+      expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+        idempotencyKey: `${workItemId}-create`,
+        workItemId,
+        workItem: { workItemId, title: workItemId, body: state },
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, { idempotencyKey: `${workItemId}-ready`, workItemId })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2, {
+        idempotencyKey: `${workItemId}-start`,
+        workItemId,
+        workAttempt: { laneId: `lane-${state}`, threadId: `thread-${state}`, assignmentKind: "write" },
+      })).outcome).toBe("OK");
+      db.prepare("UPDATE execution_attempts SET state = ? WHERE project_id = ? AND work_item_id = ?").run(state, PROJECT_ID, workItemId);
+    }
+
+    await expect(host.harness.callRpc("doctor", { projectId: PROJECT_ID })).resolves.toMatchObject({
+      outcome: "OK",
+      evidence: {
+        capacity: {
+          lifecycleStates: ["in_progress"],
+          attemptStates: ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"],
+          activeWriterCount: 4,
+          activeWriterLaneIds: ["lane-armed", "lane-blind", "lane-content_delivered", "lane-prepared"],
+          blindWriterLaneIds: ["lane-blind"],
+        },
+        idleEnforcer: {
+          activeStates: ["prepared", "armed", "content_delivered", "running"],
+          blindStates: ["dispatch_unknown"],
+          status: "blind",
+          activeLaneCount: 3,
+          activeLaneIds: ["lane-armed", "lane-content_delivered", "lane-prepared"],
+          blindLaneCount: 1,
+          blindLaneIds: ["lane-blind"],
+        },
+      },
+    });
+  });
+
+  it("gates project-orchestrator handoff on canonical WorkItem reconciliation", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    db.prepare("UPDATE work_items SET lifecycle_state = 'review_pending' WHERE project_id = ? AND work_item_id = ?").run(PROJECT_ID, WORK_ITEM_ID);
+    expect(workItemReconciliationIssues(db, PROJECT_ID)).toEqual([
+      { kind: "authoring_attempt_count", workItemId: WORK_ITEM_ID, lifecycleState: "review_pending", count: 1 },
+    ]);
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+    const beforeHandoff = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken), null, roleReader())).toMatchObject({
+      outcome: "WORK_ITEM_STATE_INVALID",
+      expected: 0,
+      attempted: 1,
+      verified: 0,
+    });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeHandoff);
+    expect(db.prepare("SELECT 1 FROM role_generation_heads WHERE project_id = ? AND role_id = 'project-orchestrator'").get(PROJECT_ID)).toBeUndefined();
   });
 
   it("registers work attempts, enforces lane and thread collisions, supersedes a live seat, and terminalizes the current attempt atomically", async () => {
@@ -6519,11 +6830,18 @@ describe("bb-collab plugin boundary", () => {
       { execution_attempt_id: expect.any(String), state: "running", attempt_ordinal: 2, lane_id: "lane-second", thread_id: "thread-second", continuation_of_attempt_id: first.execution_attempt_id },
     ]);
 
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "succeeded", 4, {
+    const reviewPendingWithoutReviewAttempt = transitionRequest(fenceToken, "review_pending", 4, {
+      projectId: "proj_gh300_registration",
+      workItemId,
+      idempotencyKey: "gh300-registration-review-pending",
+    });
+    const { workAttempt: _reviewAttempt, ...reviewPendingWithoutAttempt } = reviewPendingWithoutReviewAttempt;
+    expect(applyWithFixtureReceipt(db, reviewPendingWithoutAttempt)).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "succeeded", 5, {
       projectId: "proj_gh300_registration",
       workItemId,
       idempotencyKey: "gh300-registration-done",
-    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
+    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 6 });
     expect(db.prepare("SELECT state, completed_at_ms FROM execution_attempts WHERE project_id = ? AND origin = 'work_item' AND attempt_ordinal = 2").get("proj_gh300_registration")).toMatchObject({ state: "done", completed_at_ms: expect.any(Number) });
     expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND origin = 'work_item' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')").get("proj_gh300_registration")).toEqual({ count: 0 });
   });
@@ -7936,10 +8254,10 @@ describe("bb-collab plugin boundary", () => {
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(16, 21))).toMatchObject({ oldSchemaVersion: 15, newSchemaVersion: 16, oldContractVersion: 21, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 16, newSchemaVersion: 17, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 16, newSchemaVersion: 17, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 20))).toMatchObject({ oldSchemaVersion: 16, newSchemaVersion: 17, oldContractVersion: 21, newContractVersion: 21, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(17, 21))).toMatchObject({ oldSchemaVersion: 16, newSchemaVersion: 17, oldContractVersion: 21, newContractVersion: 21, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 

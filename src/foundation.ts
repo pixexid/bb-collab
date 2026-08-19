@@ -9,12 +9,12 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 export const CONTRACT_VERSION = 21;
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
 // v21 makes project configuration visibility explicitly visible-only.
 const PREVIOUS_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-const PREVIOUS_SCHEMA_VERSION = 15;
+const PREVIOUS_SCHEMA_VERSION = 16;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatProfile = {
@@ -793,6 +793,34 @@ export const MIGRATIONS: string[] = [
     WHERE thread_id IS NOT NULL AND native_request_id IS NOT NULL;
   CREATE INDEX IF NOT EXISTS execution_attempts_project_state
     ON execution_attempts(project_id, state, assignment_kind, lane_id)`,
+  `PRAGMA defer_foreign_keys = ON;
+  CREATE TABLE work_items_gh295 (
+    project_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    config_revision INTEGER NOT NULL,
+    repo_target_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    lifecycle_state TEXT NOT NULL
+      CHECK (lifecycle_state IN ('proposed', 'ready', 'in_progress', 'review_pending', 'succeeded', 'failed', 'cancelled')),
+    resource_revision INTEGER NOT NULL CHECK (resource_revision > 0),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (project_id, work_item_id),
+    FOREIGN KEY (project_id, config_revision)
+      REFERENCES project_config_revisions(project_id, config_revision),
+    FOREIGN KEY (project_id, repo_target_id, config_revision)
+      REFERENCES repository_targets(project_id, repo_target_id, config_revision)
+  );
+  INSERT INTO work_items_gh295 (
+    project_id, work_item_id, config_revision, repo_target_id, title, body,
+    lifecycle_state, resource_revision, created_at_ms, updated_at_ms
+  ) SELECT
+    project_id, work_item_id, config_revision, repo_target_id, title, body,
+    lifecycle_state, resource_revision, created_at_ms, updated_at_ms
+  FROM work_items;
+  DROP TABLE work_items;
+  ALTER TABLE work_items_gh295 RENAME TO work_items`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -1346,7 +1374,66 @@ const decisionEvidenceSchema = z
   })
   .strict();
 
-export const WORK_ITEM_STATES = ["proposed", "ready", "in_progress", "succeeded", "failed", "cancelled"] as const;
+export const WORK_ITEM_STATES = ["proposed", "ready", "in_progress", "review_pending", "succeeded", "failed", "cancelled"] as const;
+// review_pending is authorship-complete but non-terminal: it covers human review and CI-only waiting.
+export const WORK_ITEM_NON_TERMINAL_STATES = ["proposed", "ready", "in_progress", "review_pending"] as const;
+export const WORK_ITEM_CAPACITY_LIFECYCLE_STATES = ["in_progress"] as const;
+export const WORK_ITEM_CAPACITY_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"] as const;
+export const WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running"] as const;
+export const WORK_ITEM_IDLE_BLIND_ATTEMPT_STATES = ["dispatch_unknown"] as const;
+
+export interface WorkItemCapacityLaneEvidence {
+  lane_id: string;
+  thread_id: string | null;
+  state: (typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES)[number];
+  observed_at_ms: number | null;
+  idle_kind: "active" | "blind";
+}
+
+export interface WorkItemCapacityEvidence {
+  lanes: WorkItemCapacityLaneEvidence[];
+  unboundWorkItemIds: string[];
+}
+
+export function workItemCapacityLaneEvidence(db: SqliteDatabase, projectId: string): WorkItemCapacityEvidence {
+  const lanes = (db.prepare(
+    `SELECT execution_attempts.lane_id, execution_attempts.thread_id, execution_attempts.state, execution_attempts.observed_at_ms
+     FROM execution_attempts
+     JOIN work_items ON work_items.project_id = execution_attempts.project_id
+       AND work_items.work_item_id = execution_attempts.work_item_id
+     WHERE execution_attempts.project_id = ?
+       AND execution_attempts.origin = 'work_item'
+       AND execution_attempts.assignment_kind = 'write'
+       AND work_items.lifecycle_state IN (${WORK_ITEM_CAPACITY_LIFECYCLE_STATES.map(() => "?").join(", ")})
+       AND execution_attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+     ORDER BY execution_attempts.lane_id, execution_attempts.execution_attempt_id`,
+  ).all(projectId, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES) as Array<{
+    lane_id: string;
+    thread_id: string | null;
+    state: (typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES)[number];
+    observed_at_ms: number | null;
+  }>).map((row) => ({
+    ...row,
+    idle_kind: WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES.includes(row.state as (typeof WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES)[number]) ? "active" as const : "blind" as const,
+  }));
+  const unboundWorkItemIds = (db.prepare(
+    `SELECT work_items.work_item_id
+     FROM work_items
+     WHERE work_items.project_id = ?
+       AND work_items.lifecycle_state IN (${WORK_ITEM_CAPACITY_LIFECYCLE_STATES.map(() => "?").join(", ")})
+       AND NOT EXISTS (
+         SELECT 1 FROM execution_attempts
+         WHERE execution_attempts.project_id = work_items.project_id
+           AND execution_attempts.work_item_id = work_items.work_item_id
+           AND execution_attempts.origin = 'work_item'
+           AND execution_attempts.assignment_kind = 'write'
+           AND execution_attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+       )
+     ORDER BY work_items.work_item_id`,
+  ).all(projectId, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES) as Array<{ work_item_id: string }>).map((row) => row.work_item_id);
+  return { lanes, unboundWorkItemIds };
+}
+
 const workItemStateSchema = z.enum(WORK_ITEM_STATES);
 const workItemInputSchema = z
   .object({
@@ -4967,6 +5054,16 @@ function applyRoleGenerationSuccession(
   }
   if (observation.outcome === "unknown" || projection.effective_status === "unknown") throw refusal("CAPABILITY_UNKNOWN", "qualification outcome is unknown");
   if (observation.outcome !== "qualified" || projection.effective_status !== "eligible") throw refusal("ROLE_UNQUALIFIED", "qualification is not eligible");
+  if (request.roleId === "project-orchestrator") {
+    const reconciliationIssues = workItemReconciliationIssues(db, request.projectId);
+    if (reconciliationIssues.length > 0) {
+      throw refusal(
+        "WORK_ITEM_STATE_INVALID",
+        `orchestrator handoff reconciliation refused: ${canonicalJson(reconciliationIssues)}`,
+        { expected: 0, attempted: reconciliationIssues.length, verified: 0 },
+      );
+    }
+  }
   const head = asRow<{ current_generation: number }>(
     db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(request.projectId, request.roleId),
   );
@@ -5129,7 +5226,7 @@ interface WorkItemRow {
 
 type WorkAttempt = z.infer<typeof workAttemptSchema>;
 type WorkAttemptState = "running" | "done" | "failed";
-const ACTIVE_WORK_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"] as const;
+const ACTIVE_WORK_ATTEMPT_STATES = WORK_ITEM_CAPACITY_ATTEMPT_STATES;
 const WORK_ITEM_THREAD_TOKEN = /thr_[A-Za-z0-9]+/gu;
 const WORK_ITEM_LANE_SENTENCE = /^(?:Lane|Writing lane) (thr_[A-Za-z0-9]+)(?:[,.!?])?(?:[ \t]+|\r?\n|$)/u;
 
@@ -5257,9 +5354,11 @@ export function backfillWorkItemAttempts(db: SqliteDatabase): WorkItemBackfillCo
         ? "done"
         : row.lifecycle_state === "in_progress"
           ? "running"
-          : row.lifecycle_state === "failed" || row.lifecycle_state === "cancelled"
-            ? "failed"
-            : null;
+          : row.lifecycle_state === "review_pending"
+            ? "done"
+            : row.lifecycle_state === "failed" || row.lifecycle_state === "cancelled"
+              ? "failed"
+              : null;
       if (!parsed || state === null) {
         counts.unresolved += 1;
         continue;
@@ -5310,17 +5409,29 @@ function nextWorkAttemptOrdinal(db: SqliteDatabase, projectId: string, workItemI
   ).get(projectId, workItemId) as { next_attempt_ordinal: number }).next_attempt_ordinal) + 1;
 }
 
-function activeWorkItemAttempt(db: SqliteDatabase, projectId: string, workItemId: string): { execution_attempt_id: string } | undefined {
+function activeWorkItemAttempt(
+  db: SqliteDatabase,
+  projectId: string,
+  workItemId: string,
+  assignmentKind?: WorkAttempt["assignmentKind"],
+): { execution_attempt_id: string } | undefined {
+  const assignmentFilter = assignmentKind === undefined ? "" : " AND assignment_kind = ?";
   return asRow<{ execution_attempt_id: string }>(db.prepare(
     `SELECT execution_attempt_id FROM execution_attempts
      WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
-       AND state IN (${ACTIVE_WORK_ATTEMPT_STATES.map(() => "?").join(", ")})
+       AND state IN (${ACTIVE_WORK_ATTEMPT_STATES.map(() => "?").join(", ")})${assignmentFilter}
      ORDER BY attempt_ordinal DESC LIMIT 1`,
-  ).get(projectId, workItemId, ...ACTIVE_WORK_ATTEMPT_STATES));
+  ).get(projectId, workItemId, ...ACTIVE_WORK_ATTEMPT_STATES, ...(assignmentKind === undefined ? [] : [assignmentKind])));
 }
 
-function terminalizeWorkItemAttempt(db: SqliteDatabase, projectId: string, workItemId: string, state: "done" | "failed" | "superseded"): string | null {
-  const active = activeWorkItemAttempt(db, projectId, workItemId);
+function terminalizeWorkItemAttempt(
+  db: SqliteDatabase,
+  projectId: string,
+  workItemId: string,
+  state: "done" | "failed" | "superseded",
+  assignmentKind?: WorkAttempt["assignmentKind"],
+): string | null {
+  const active = activeWorkItemAttempt(db, projectId, workItemId, assignmentKind);
   if (!active) return null;
   const completedAtMs = now();
   db.prepare(
@@ -5330,6 +5441,63 @@ function terminalizeWorkItemAttempt(db: SqliteDatabase, projectId: string, workI
      WHERE project_id = ? AND execution_attempt_id = ?`,
   ).run(state, completedAtMs, completedAtMs, projectId, active.execution_attempt_id);
   return active.execution_attempt_id;
+}
+
+export interface WorkItemReconciliationIssue {
+  kind: "authoring_attempt_count" | "review_attempt_count" | "terminal_attempt" | "duplicate_writer_lane";
+  workItemId?: string;
+  laneId?: string;
+  lifecycleState?: WorkItemState;
+  count: number;
+}
+
+export function workItemReconciliationIssues(db: SqliteDatabase, projectId: string): WorkItemReconciliationIssue[] {
+  const issues: WorkItemReconciliationIssue[] = [];
+  const rows = db.prepare(
+    `SELECT work_items.work_item_id, work_items.lifecycle_state,
+       SUM(CASE WHEN execution_attempts.origin = 'work_item'
+          AND execution_attempts.assignment_kind = 'write'
+          AND execution_attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")}) THEN 1 ELSE 0 END) AS writer_count,
+       SUM(CASE WHEN execution_attempts.origin = 'work_item'
+          AND execution_attempts.assignment_kind = 'review'
+          AND execution_attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")}) THEN 1 ELSE 0 END) AS review_count
+     FROM work_items
+     LEFT JOIN execution_attempts ON execution_attempts.project_id = work_items.project_id
+       AND execution_attempts.work_item_id = work_items.work_item_id
+     WHERE work_items.project_id = ?
+     GROUP BY work_items.work_item_id, work_items.lifecycle_state
+     ORDER BY work_items.work_item_id`,
+  ).all(...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES, projectId) as Array<{
+    work_item_id: string;
+    lifecycle_state: WorkItemState;
+    writer_count: number;
+    review_count: number;
+  }>;
+  for (const row of rows) {
+    const writerCount = Number(row.writer_count);
+    const reviewCount = Number(row.review_count);
+    const nonTerminal = WORK_ITEM_NON_TERMINAL_STATES.includes(row.lifecycle_state as (typeof WORK_ITEM_NON_TERMINAL_STATES)[number]);
+    if (!nonTerminal && (writerCount !== 0 || reviewCount !== 0)) {
+      issues.push({ kind: "terminal_attempt", workItemId: row.work_item_id, lifecycleState: row.lifecycle_state, count: writerCount + reviewCount });
+      continue;
+    }
+    const expectedWriterCount = WORK_ITEM_CAPACITY_LIFECYCLE_STATES.includes(row.lifecycle_state as (typeof WORK_ITEM_CAPACITY_LIFECYCLE_STATES)[number]) ? 1 : 0;
+    if (writerCount !== expectedWriterCount) {
+      issues.push({ kind: "authoring_attempt_count", workItemId: row.work_item_id, lifecycleState: row.lifecycle_state, count: writerCount });
+    }
+    if (row.lifecycle_state === "review_pending" ? reviewCount > 1 : reviewCount !== 0) {
+      issues.push({ kind: "review_attempt_count", workItemId: row.work_item_id, lifecycleState: row.lifecycle_state, count: reviewCount });
+    }
+  }
+  for (const row of db.prepare(
+    `SELECT lane_id, COUNT(*) AS count FROM execution_attempts
+     WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
+       AND state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+     GROUP BY lane_id HAVING COUNT(*) > 1 ORDER BY lane_id`,
+  ).all(projectId, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES) as Array<{ lane_id: string; count: number }>) {
+    issues.push({ kind: "duplicate_writer_lane", laneId: row.lane_id, count: Number(row.count) });
+  }
+  return issues;
 }
 
 interface WorkItemWaitRow {
@@ -5479,7 +5647,8 @@ function applyWorkItemCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
 const WORK_ITEM_TRANSITIONS: Readonly<Record<WorkItemState, readonly WorkItemState[]>> = {
   proposed: ["ready", "cancelled"],
   ready: ["in_progress", "cancelled"],
-  in_progress: ["succeeded", "failed", "cancelled"],
+  in_progress: ["review_pending", "failed", "cancelled"],
+  review_pending: ["in_progress", "succeeded", "failed", "cancelled"],
   succeeded: [],
   failed: [],
   cancelled: [],
@@ -5550,12 +5719,24 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
       },
     );
   }
-  if (workAttempt !== undefined && nextState !== undefined && nextState !== "in_progress") {
-    throw refusal("WORK_ITEM_STATE_INVALID", "work attempts may only accompany an in-progress transition");
+  if (workAttempt !== undefined && nextState !== undefined && nextState !== "in_progress" && nextState !== "review_pending") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work attempts may only accompany in-progress or review-pending transitions");
+  }
+  if (workAttempt?.assignmentKind === "probe") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "probe attempts cannot hold a work item lifecycle state");
+  }
+  if (nextState === "in_progress" && workAttempt?.assignmentKind !== "write") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "in-progress requires a writing attempt");
+  }
+  if (nextState === "review_pending" && workAttempt?.assignmentKind !== undefined && workAttempt.assignmentKind !== "review") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "review-pending may only register a review attempt");
   }
   if (workAttempt !== undefined && nextState === undefined) {
     if (workItem.lifecycle_state !== "in_progress") {
       throw refusal("WORK_ITEM_STATE_INVALID", "replacement work attempts require an in-progress work item");
+    }
+    if (workAttempt.assignmentKind !== "write") {
+      throw refusal("WORK_ITEM_STATE_INVALID", "replacement work attempts must be writing attempts");
     }
     const prior = activeWorkItemAttempt(db, request.projectId, workItem.work_item_id);
     const nextRevision = workItem.resource_revision + 1;
@@ -5619,6 +5800,12 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
   if (nextState === "in_progress" && workAttempt === undefined) {
     throw refusal("WORK_ITEM_STATE_INVALID", "entering in-progress requires a work attempt");
   }
+  if (nextState === "review_pending" && !activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "review-pending requires an active writing attempt to close");
+  }
+  if (workItem.lifecycle_state === "review_pending" && activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "review-pending cannot carry an active writing attempt");
+  }
   if (["succeeded", "failed", "cancelled"].includes(nextState) && db.prepare(
     "SELECT 1 FROM work_item_waits WHERE project_id = ? AND work_item_id = ?",
   ).get(request.projectId, workItem.work_item_id)) {
@@ -5635,8 +5822,14 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
       expectedResourceRevision: request.expectedResourceRevision ?? undefined,
     });
   }
-  const executionAttemptId = nextState === "in_progress"
-    ? insertWorkItemAttempt(db, {
+  let executionAttemptId: string | null = null;
+  let reviewExecutionAttemptId: string | null = null;
+  if (nextState === "in_progress") {
+    const prior = workItem.lifecycle_state === "review_pending"
+      ? activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "review")
+      : undefined;
+    if (prior) terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded", "review");
+    executionAttemptId = insertWorkItemAttempt(db, {
       projectId: request.projectId,
       workItemId: workItem.work_item_id,
       configRevision: workItem.config_revision,
@@ -5651,14 +5844,38 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
       createdAtMs: now(),
       observedAtMs: now(),
       completedAtMs: null,
-      continuationOfAttemptId: null,
-    })
-    : terminalizeWorkItemAttempt(
+      continuationOfAttemptId: prior?.execution_attempt_id ?? null,
+    });
+  } else if (nextState === "review_pending") {
+    executionAttemptId = terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "done", "write");
+    if (workAttempt) {
+      reviewExecutionAttemptId = insertWorkItemAttempt(db, {
+        projectId: request.projectId,
+        workItemId: workItem.work_item_id,
+        configRevision: workItem.config_revision,
+        repoTargetId: workItem.repo_target_id,
+        laneId: workAttempt.laneId,
+        threadId: workAttempt.threadId ?? null,
+        leaseOwnerThreadId: workAttempt.threadId ?? null,
+        assignmentKind: "review",
+        attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
+        state: "running",
+        reasonCode: "work_item_review",
+        createdAtMs: now(),
+        observedAtMs: now(),
+        completedAtMs: null,
+        continuationOfAttemptId: executionAttemptId,
+      });
+    }
+  } else {
+    executionAttemptId = terminalizeWorkItemAttempt(
       db,
       request.projectId,
       workItem.work_item_id,
-      nextState === "succeeded" ? "done" : nextState === "failed" || nextState === "cancelled" ? "failed" : "failed",
+      nextState === "succeeded" ? "done" : "failed",
+      workItem.lifecycle_state === "review_pending" ? "review" : undefined,
     );
+  }
   return commitMutation(
     db,
     request,
@@ -5674,7 +5891,8 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
         from: workItem.lifecycle_state,
         to: nextState,
         ...(executionAttemptId === null ? {} : { executionAttemptId }),
-        ...(nextState === "in_progress" ? { workAttempt } : {}),
+        ...(reviewExecutionAttemptId === null ? {} : { reviewExecutionAttemptId }),
+        ...(workAttempt === undefined ? {} : { workAttempt }),
       },
     },
     { expected: 1, attempted: 1, verified: 1 },
@@ -5683,7 +5901,12 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
       currentGovernanceEpoch: governor.governance_epoch,
       currentResourceRevision: nextRevision,
       expectedResourceRevision: request.expectedResourceRevision ?? undefined,
-        evidence: { workItemId: workItem.work_item_id, lifecycleState: nextState, ...(executionAttemptId === null ? {} : { executionAttemptId }) },
+        evidence: {
+          workItemId: workItem.work_item_id,
+          lifecycleState: nextState,
+          ...(executionAttemptId === null ? {} : { executionAttemptId }),
+          ...(reviewExecutionAttemptId === null ? {} : { reviewExecutionAttemptId }),
+        },
     },
   );
 }
@@ -7007,12 +7230,10 @@ export async function doctor(
     const configJson = storedConfigJson(db, projectId, configHead.config_revision);
     const writingLaneCeiling = writingLaneCeilingFromJson(configJson);
     const assignmentAttempts: Array<Record<string, unknown>> = [];
-    const activeWriters = db.prepare(
-      `SELECT lane_id FROM execution_attempts
-       WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
-         AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')
-       ORDER BY lane_id`,
-    ).all(projectId) as Array<{ lane_id: string }>;
+    const capacityEvidence = workItemCapacityLaneEvidence(db, projectId);
+    const activeWriters = capacityEvidence.lanes;
+    const idleActiveWriters = activeWriters.filter((row) => row.idle_kind === "active");
+    const blindWriters = activeWriters.filter((row) => row.idle_kind === "blind");
     const unresolvedAttempts: Array<Record<string, unknown>> = [];
     const profileAuditEntries: Array<Record<string, unknown>> = [];
     const profileAudit = {
@@ -7079,10 +7300,22 @@ export async function doctor(
         profileAudit,
         capacity: {
           writingLaneCeiling,
+          lifecycleStates: [...WORK_ITEM_CAPACITY_LIFECYCLE_STATES],
+          attemptStates: [...WORK_ITEM_CAPACITY_ATTEMPT_STATES],
           activeWriterCount: activeWriters.length,
           activeWriterLaneIds: activeWriters.map((row) => row.lane_id),
+          blindWriterLaneIds: blindWriters.map((row) => row.lane_id),
           duplicateLaneIds: [...new Set(activeWriters.map((row) => row.lane_id).filter((laneId, index, all) => all.indexOf(laneId) !== index))],
           ceilingViolated: activeWriters.length > writingLaneCeiling,
+        },
+        idleEnforcer: {
+          activeStates: [...WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES],
+          blindStates: [...WORK_ITEM_IDLE_BLIND_ATTEMPT_STATES],
+          status: blindWriters.length > 0 ? "blind" : idleActiveWriters.length > 0 ? "active" : "idle",
+          activeLaneCount: idleActiveWriters.length,
+          activeLaneIds: idleActiveWriters.map((row) => row.lane_id),
+          blindLaneCount: blindWriters.length,
+          blindLaneIds: blindWriters.map((row) => row.lane_id),
         },
         unresolvedAttempts,
         decisionIntegrity,

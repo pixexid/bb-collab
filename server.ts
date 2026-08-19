@@ -38,6 +38,8 @@ import {
   refusal,
   roleContextPreflightRefusal,
   writingLaneCeilingFromJson,
+  WORK_ITEM_NON_TERMINAL_STATES,
+  workItemCapacityLaneEvidence,
   type ApplyRequest,
   type FoundationCode,
   type FoundationResult,
@@ -85,35 +87,67 @@ function githubRepository(remoteUrl: string | null): string | null {
 
 type StartableQueueState = { count: number; head: string | null };
 
-function startableQueueState(repositories: string[]): StartableQueueState | null {
+function githubJson(args: string[]): unknown | null {
   try {
-    let count = 0;
-    const heads: string[] = [];
-    for (const repository of repositories) {
-      const options: SpawnSyncOptionsWithStringEncoding & { detached: true } = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000, killSignal: "SIGKILL", detached: true };
-      const result = spawnSync("gh", ["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number", "--limit", "1000"], options);
-      if (typeof result.pid === "number" && result.pid > 0) {
-        try {
-          process.kill(-result.pid, "SIGKILL");
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ESRCH") return null;
-        }
+    const options: SpawnSyncOptionsWithStringEncoding & { detached: true } = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000, killSignal: "SIGKILL", detached: true };
+    const result = spawnSync("gh", args, options);
+    if (typeof result.pid === "number" && result.pid > 0) {
+      try {
+        process.kill(-result.pid, "SIGKILL");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return null;
       }
-      if (result.error || result.status !== 0) return null;
-      const issues = JSON.parse(result.stdout) as unknown;
-      if (!Array.isArray(issues) || !issues.every((issue) => issue && typeof issue === "object" && !Array.isArray(issue) && typeof (issue as { number?: unknown }).number === "number")) return null;
-      count += issues.length;
-      const numbers = issues.map((issue) => (issue as { number: number }).number);
-      if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
     }
-    return { count, head: heads.sort()[0] ?? null };
+    if (result.error || result.status !== 0) return null;
+    return JSON.parse(result.stdout) as unknown;
   } catch {
     return null;
   }
 }
 
+function startableQueueState(repositories: string[]): StartableQueueState | null {
+  let count = 0;
+  const heads: string[] = [];
+  for (const repository of repositories) {
+    const issues = githubJson(["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number", "--limit", "1000"]);
+    if (!Array.isArray(issues) || !issues.every((issue) => issue && typeof issue === "object" && !Array.isArray(issue) && typeof (issue as { number?: unknown }).number === "number")) return null;
+    count += issues.length;
+    const numbers = issues.map((issue) => (issue as { number: number }).number);
+    if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
+  }
+  return { count, head: heads.sort()[0] ?? null };
+}
+
 function startableQueueDepth(repositories: string[]): number | null {
   return startableQueueState(repositories)?.count ?? null;
+}
+
+type LinkedGithubStatus = "open" | "closed" | "merged";
+
+type LinkedGithubObservation = {
+  status: LinkedGithubStatus;
+  pullRequestMerged: boolean;
+  issueClosed: boolean;
+};
+
+function linkedGithubObservation(owner: string, repo: string, issueNumber: number): LinkedGithubObservation | null {
+  const pullRequest = githubJson(["pr", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,mergedAt"]);
+  let pullRequestMerged = false;
+  let pullRequestClosed = false;
+  if (pullRequest && typeof pullRequest === "object" && !Array.isArray(pullRequest)) {
+    const state = (pullRequest as { state?: unknown }).state;
+    const mergedAt = (pullRequest as { mergedAt?: unknown }).mergedAt;
+    pullRequestMerged = (mergedAt !== null && mergedAt !== undefined) || state === "MERGED";
+    pullRequestClosed = state === "CLOSED";
+  }
+  const issue = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state"]);
+  const issueClosed = Boolean(issue && typeof issue === "object" && !Array.isArray(issue) && (issue as { state?: unknown }).state === "CLOSED");
+  const issueOpen = Boolean(issue && typeof issue === "object" && !Array.isArray(issue) && (issue as { state?: unknown }).state === "OPEN");
+  if (!pullRequest && !issue) return null;
+  const status = pullRequestMerged || pullRequestClosed || issueClosed
+    ? pullRequestMerged ? "merged" : "closed"
+    : issueOpen ? "open" : null;
+  return status === null ? null : { status, pullRequestMerged, issueClosed };
 }
 
 export const FLEET_WATCHDOG_FLOOR_MS = 5 * 60_000;
@@ -1738,30 +1772,16 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   const readIdleFleetActiveLanes = async (projectId: string): Promise<IdleFleetFact<number>> => {
     if (!db) return { known: false, reason: "canonical-store-unavailable" };
     try {
-      const unbound = db.prepare(
-        `SELECT 1 FROM work_items
-         WHERE project_id = ? AND lifecycle_state = 'in_progress'
-           AND NOT EXISTS (
-             SELECT 1 FROM execution_attempts
-             WHERE execution_attempts.project_id = work_items.project_id
-               AND execution_attempts.work_item_id = work_items.work_item_id
-               AND execution_attempts.origin = 'work_item'
-           ) LIMIT 1`,
-      ).get(projectId);
-      if (unbound) return { known: false, reason: "work-items-have-no-thread-binding:GH-300" };
-      const rows = db.prepare(
-        `SELECT lane_id, thread_id, state, observed_at_ms FROM execution_attempts
-         WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
-           AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')`,
-      ).all(projectId) as Array<{ lane_id: unknown; thread_id: unknown; state: unknown; observed_at_ms: unknown }>;
+      const capacityEvidence = workItemCapacityLaneEvidence(db, projectId);
+      if (capacityEvidence.unboundWorkItemIds.length > 0) return { known: false, reason: "work-items-have-no-thread-binding:GH-300" };
       const laneIds = new Set<string>();
       const now = Date.now();
-      for (const row of rows) {
-        if (row.state === "dispatch_unknown") return { known: false, reason: "dispatch-unknown-attempt" };
-        if (typeof row.lane_id !== "string" || row.lane_id.length === 0 || typeof row.thread_id !== "string" || row.thread_id.length === 0) {
+      for (const row of capacityEvidence.lanes) {
+        if (row.idle_kind === "blind") return { known: false, reason: "dispatch-unknown-attempt" };
+        if (row.lane_id.length === 0 || typeof row.thread_id !== "string" || row.thread_id.length === 0) {
           return { known: false, reason: "work-item-attempt-has-no-thread-binding:GH-300" };
         }
-        if (!Number.isSafeInteger(row.observed_at_ms) || (row.observed_at_ms as number) < 0 || now - (row.observed_at_ms as number) > IDLE_FLEET_ATTEMPT_STALE_MS) {
+        if (typeof row.observed_at_ms !== "number" || !Number.isSafeInteger(row.observed_at_ms) || row.observed_at_ms < 0 || now - row.observed_at_ms > IDLE_FLEET_ATTEMPT_STALE_MS) {
           return { known: false, reason: "stale-active-attempt" };
         }
         laneIds.add(row.lane_id);
@@ -2121,6 +2141,14 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         dispatcherThreadIdsByProject.set(row.project_id, threadIds);
       }
       const projectIds = new Set([...holdersByProject.keys(), ...dispatcherThreadIdsByProject.keys()]);
+      for (const row of db.prepare(
+        `SELECT DISTINCT work_items.project_id FROM work_items JOIN external_work_refs
+           ON external_work_refs.project_id = work_items.project_id
+          AND external_work_refs.work_item_id = work_items.work_item_id
+          AND external_work_refs.provider = 'github'
+         WHERE work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
+           AND external_work_refs.issue_number IS NOT NULL`,
+      ).all(...WORK_ITEM_NON_TERMINAL_STATES) as Array<{ project_id: string }>) projectIds.add(row.project_id);
       const lanesByProject = new Map<string, Awaited<ReturnType<typeof bb.sdk.threads.list>>>();
       for (const projectId of projectIds) {
         if (onlyProjectId !== undefined && projectId !== onlyProjectId) continue;
@@ -2149,9 +2177,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         `SELECT work_items.project_id, work_items.work_item_id, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
          FROM work_items LEFT JOIN work_item_waits
            ON work_item_waits.project_id = work_items.project_id AND work_item_waits.work_item_id = work_items.work_item_id
-         WHERE work_items.lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')
+         WHERE work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
          ORDER BY work_items.created_at_ms, work_items.work_item_id`,
-      ).all() as Array<{ project_id: string; work_item_id: string; waker: string | null; waker_kind: "schedule" | "seat" | null; declared_at_ms: number | null }>) {
+      ).all(...WORK_ITEM_NON_TERMINAL_STATES) as Array<{ project_id: string; work_item_id: string; waker: string | null; waker_kind: "schedule" | "seat" | null; declared_at_ms: number | null }>) {
         const workItems = openWorkItemsByProject.get(workItem.project_id) ?? [];
         workItems.push({ workItemId: workItem.work_item_id, waker: workItem.waker, wakerKind: workItem.waker_kind, declaredAtMs: workItem.declared_at_ms });
         openWorkItemsByProject.set(workItem.project_id, workItems);
@@ -2247,11 +2275,101 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           wakeInFlight.delete(key);
         }
       };
+      const inspectLinkedWorkItems = (projectId: string) => {
+        // The handoff gate owns canonical ledger/attempt drift; this existing watchdog owns
+        // external terminal drift. The active writer indexes remain the duplicate-claim detector.
+        const linkedWorkItems = db.prepare(
+          `SELECT work_items.work_item_id, external_work_refs.owner, external_work_refs.repo, external_work_refs.issue_number
+           FROM work_items JOIN external_work_refs
+             ON external_work_refs.project_id = work_items.project_id
+            AND external_work_refs.work_item_id = work_items.work_item_id
+            AND external_work_refs.provider = 'github'
+           WHERE work_items.project_id = ?
+             AND work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
+             AND external_work_refs.issue_number IS NOT NULL
+           ORDER BY work_items.work_item_id`,
+        ).all(projectId, ...WORK_ITEM_NON_TERMINAL_STATES) as Array<{ work_item_id: string; owner: string; repo: string; issue_number: number }>;
+        for (const linked of linkedWorkItems) {
+          const observation = linkedGithubObservation(linked.owner, linked.repo, linked.issue_number);
+          if (observation === null) {
+            degrade(`github-work-item-status:${projectId}:${linked.work_item_id}`);
+            continue;
+          }
+          if (observation.status !== "open") {
+            bb.log.warn(`fleet-watchdog stale-terminal work item: project=${projectId} workItem=${linked.work_item_id} linked=${linked.owner}/${linked.repo}#${linked.issue_number} status=${observation.status}`);
+          }
+          if (!observation.pullRequestMerged || !observation.issueClosed) continue;
+          const actor = db.prepare(
+            `SELECT receipt_id FROM actor_receipts
+             WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
+               AND verification_state = 'verified'
+             ORDER BY issued_at_ms DESC LIMIT 1`,
+          ).get(projectId, PLUGIN_ID) as { receipt_id: string } | undefined;
+          const governor = db.prepare(
+            "SELECT governance_epoch, fence_token FROM project_governorship_heads WHERE project_id = ?",
+          ).get(projectId) as { governance_epoch: number; fence_token: string } | undefined;
+          const config = db.prepare(
+            "SELECT config_revision FROM project_config_heads WHERE project_id = ?",
+          ).get(projectId) as { config_revision: number } | undefined;
+          const workItem = db.prepare(
+            `SELECT repo_target_id, resource_revision, lifecycle_state
+             FROM work_items WHERE project_id = ? AND work_item_id = ?`,
+          ).get(projectId, linked.work_item_id) as { repo_target_id: string; resource_revision: number; lifecycle_state: string } | undefined;
+          if (!actor || !governor || !config || !workItem) {
+            degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
+            bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} reason=authority-or-work-item-unavailable`);
+            continue;
+          }
+          const transition = (state: "review_pending" | "succeeded", expectedResourceRevision: number) => applyAuthorizedMutation(db, {
+            projectId,
+            operationClass: "work_item_transition",
+            idempotencyKey: `fleet-watchdog:merge-close:${linked.work_item_id}:${state}`,
+            actorReceiptId: actor.receipt_id,
+            expectedConfigRevision: config.config_revision,
+            expectedGovernanceEpoch: governor.governance_epoch,
+            expectedFenceToken: governor.fence_token,
+            repoTargetId: workItem.repo_target_id,
+            expectedResourceRevision,
+            workItemId: linked.work_item_id,
+            lifecycleState: state,
+          });
+          let result: FoundationResult;
+          if (workItem.lifecycle_state === "in_progress") {
+            result = transition("review_pending", workItem.resource_revision);
+            if (result.outcome === "OK") {
+              const current = db.prepare(
+                "SELECT resource_revision, lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?",
+              ).get(projectId, linked.work_item_id) as { resource_revision: number; lifecycle_state: string } | undefined;
+              result = current?.lifecycle_state === "review_pending"
+                ? transition("succeeded", current.resource_revision)
+                : {
+                  outcome: "WORK_ITEM_REVISION_STALE",
+                  subject: linked.work_item_id,
+                  expected: 1,
+                  attempted: 1,
+                  verified: 0,
+                  message: "work item changed before merge-close terminalization",
+                };
+            }
+          } else if (workItem.lifecycle_state === "review_pending") {
+            result = transition("succeeded", workItem.resource_revision);
+          } else {
+            result = { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close automation requires in_progress or review_pending, found ${workItem.lifecycle_state}` };
+          }
+          if (result.outcome === "OK") {
+            bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=review_pending`);
+          } else {
+            degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
+            bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result.outcome}`);
+          }
+        }
+      };
       let brokenWakePath = false;
       for (const projectId of projectIds) {
         const holders = holdersByProject.get(projectId) ?? [];
         try {
           if (onlyProjectId !== undefined && projectId !== onlyProjectId) continue;
+          inspectLinkedWorkItems(projectId);
           const directors = holders.filter((holder) => holder.role_id === "director");
           const orchestrators = holders.filter((holder) => holder.role_id === "project-orchestrator");
           if (directors.length !== 1 || orchestrators.length !== 1) {
@@ -2370,11 +2488,13 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           } catch {
             writingLaneCeiling = null;
           }
-          const activeLaneCount = (db.prepare(
-            `SELECT COUNT(*) AS count FROM execution_attempts
-             WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
-               AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')`,
-          ).get(projectId) as { count: number }).count;
+          const capacityEvidence = workItemCapacityLaneEvidence(db, projectId);
+          const activeLaneCount = capacityEvidence.lanes.length;
+          const idleActiveLaneCount = capacityEvidence.lanes.filter((lane) => lane.idle_kind === "active").length;
+          const blindLaneCount = capacityEvidence.lanes.filter((lane) => lane.idle_kind === "blind").length;
+          if (blindLaneCount > 0) {
+            bb.log.warn(`fleet-watchdog idle enforcer activeLanes=blind project=${projectId} visible=${idleActiveLaneCount} dispatchUnknown=${blindLaneCount}`);
+          }
           const repositories = (db.prepare(
             `SELECT targets.remote_url FROM project_config_heads AS heads
              JOIN repository_targets AS targets
