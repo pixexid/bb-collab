@@ -208,7 +208,7 @@ And when reading a credential file for any reason: ask for shape, not contents. 
 
 ## Spawn against a fetched ref
 
-> Fleet spawns pass `--base-branch origin/main`; never bare `main`, which silently resolves the stale local ref. The trap is silent, material, and recurring: measured 2026-08-19, local `main` was `aea7054933e08bddc16fef2f2ef9386f93c04645` while `origin/main` was `c513770a2c3647c7ab40686600326da5282027b6` (five commits behind). Until [get-bb/bb#1917](https://github.com/get-bb/bb/issues/1917) lands, refresh a base checkout with `bin/llm-collab local_main_sync.py --apply --repo <checkout>`.
+> Fleet spawns pass `--base-branch origin/main`; never bare `main`, which silently resolves the stale local ref. The trap is silent, material, and recurring: measured 2026-08-19, local `main` was `aea7054933e08bddc16fef2f2ef9386f93c04645` while `origin/main` was `c513770a2c3647c7ab40686600326da5282027b6` (14 commits behind). Until [get-bb/bb#1917](https://github.com/get-bb/bb/issues/1917) lands, refresh a base checkout with `git fetch origin && git update-ref refs/heads/main origin/main`.
 
 ## The no-dispatch reason is the second half of the intake check
 
