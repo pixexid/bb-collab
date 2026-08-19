@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing";
-import { MIGRATIONS, databaseIsReady, PLUGIN_ID } from "../src/foundation.js";
+import { MIGRATIONS, backfillWorkItemAttempts, databaseIsReady, PLUGIN_ID } from "../src/foundation.js";
 import * as awareness from "../src/awareness.js";
 import { runArchiveSweep } from "../src/archive-sweep.js";
 
@@ -20,7 +20,10 @@ const idle = (id: string, extra: Record<string, unknown> = {}) => makeThreadResp
 function fixture({ activateArchiveChildOnSecondList = false, includeCanonicalSeat = false, includeUnresolvableEnvironment = false } = {}) {
   const db = new Database(":memory:");
   databaseIsReady(db);
-  for (const migration of MIGRATIONS) db.exec(migration);
+  db.transaction(() => {
+    for (const migration of MIGRATIONS) db.exec(migration);
+  })();
+  backfillWorkItemAttempts(db);
   db.pragma("foreign_keys = OFF");
   db.prepare("INSERT INTO execution_attempts (project_id, execution_attempt_id, origin, attempt_ordinal, config_revision, governance_epoch, role_id, role_generation, state, bb_server_id, environment_id, source_id, host_id, environment_path, environment_digest, attempt_digest, created_at_ms, thread_id) VALUES (?, 'bound', 'role_holder', 1, 1, 1, 'worker', 1, 'done', 'server', 'env', 'source', 'host', 'path', 'environment', 'attempt', 1, 'bound-holder')").run(PROJECT_ID);
   db.prepare("INSERT INTO role_generations (project_id, role_id, generation, role_requirement_id, config_revision, repo_target_id, status, predecessor_generation, holder_execution_attempt_id, holder_context_digest, holder_executed_profile_digest, qualification_id, eligibility_derivation_digest, created_at_ms, activated_at_ms, retired_at_ms) VALUES (?, 'worker', 1, 'worker-v1', 1, NULL, 'active', NULL, 'bound', 'context', 'profile', 'qualification', 'eligibility', 1, 1, NULL)").run(PROJECT_ID);
