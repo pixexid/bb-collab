@@ -3902,9 +3902,10 @@ describe("bb-collab plugin boundary", () => {
     const host = await loadedHost(projectId);
     const { db, fenceToken } = seedAndBootstrap(host, projectId);
     const items = [
-      { id: "backfill-succeeded", body: "Writing lane thr_succeeded\nShip it", state: "succeeded", created: 101, updated: 202 },
-      { id: "backfill-running", body: "Lane thr_running\nKeep going", state: "in_progress", created: 303, updated: 404 },
-      { id: "backfill-failed", body: "Writing lane thr_failed\nNope", state: "cancelled", created: 505, updated: 606 },
+      { id: "backfill-succeeded", body: "Writing lane thr_succeeded. Ship it", state: "succeeded", created: 101, updated: 202 },
+      { id: "backfill-running", body: "Lane thr_running. Keep going", state: "in_progress", created: 303, updated: 404 },
+      { id: "backfill-failed", body: "Writing lane thr_failed. Nope", state: "cancelled", created: 505, updated: 606 },
+      { id: "backfill-wildcard", body: "Writing lane thrXnot-a-token. No real thread", state: "succeeded", created: 707, updated: 808 },
     ] as const;
     for (const item of items) {
       expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
@@ -3918,10 +3919,11 @@ describe("bb-collab plugin boundary", () => {
       ).run(item.state, item.created, item.updated, projectId, item.id);
     }
     const counts = backfillWorkItemAttempts(db);
-    expect(counts).toEqual({ candidates: 3, attributable: 3, inserted: 3, alreadyBound: 0, unresolved: 0 });
+    expect(counts).toEqual({ candidates: 3, attributable: 3, inserted: 3, alreadyBound: 0, residualProposed: 0, unresolved: 0 });
     expect(db.prepare(
       `SELECT work_item_id, state, lane_id, thread_id, assignment_kind, attempt_ordinal,
               reason_code, created_at_ms, observed_at_ms, completed_at_ms,
+              lease_owner_thread_id, lease_expires_at_ms,
               role_id, role_generation, governance_epoch, bb_server_id, environment_id,
               source_id, host_id, environment_path, environment_digest
        FROM execution_attempts WHERE project_id = ? AND origin = 'work_item' ORDER BY work_item_id`,
@@ -3929,37 +3931,53 @@ describe("bb-collab plugin boundary", () => {
       {
         work_item_id: "backfill-failed", state: "failed", lane_id: "thr_failed", thread_id: "thr_failed", assignment_kind: "write", attempt_ordinal: 1,
         reason_code: "gh300_backfill", created_at_ms: 505, observed_at_ms: 606, completed_at_ms: 606,
+        lease_owner_thread_id: null, lease_expires_at_ms: null,
         role_id: null, role_generation: null, governance_epoch: null, bb_server_id: null, environment_id: null,
         source_id: null, host_id: null, environment_path: null, environment_digest: null,
       },
       {
         work_item_id: "backfill-running", state: "running", lane_id: "thr_running", thread_id: "thr_running", assignment_kind: "write", attempt_ordinal: 1,
         reason_code: "gh300_backfill", created_at_ms: 303, observed_at_ms: 404, completed_at_ms: null,
+        lease_owner_thread_id: null, lease_expires_at_ms: null,
         role_id: null, role_generation: null, governance_epoch: null, bb_server_id: null, environment_id: null,
         source_id: null, host_id: null, environment_path: null, environment_digest: null,
       },
       {
         work_item_id: "backfill-succeeded", state: "done", lane_id: "thr_succeeded", thread_id: "thr_succeeded", assignment_kind: "write", attempt_ordinal: 1,
         reason_code: "gh300_backfill", created_at_ms: 101, observed_at_ms: 202, completed_at_ms: 202,
+        lease_owner_thread_id: null, lease_expires_at_ms: null,
         role_id: null, role_generation: null, governance_epoch: null, bb_server_id: null, environment_id: null,
         source_id: null, host_id: null, environment_path: null, environment_digest: null,
       },
     ]);
     expect(db.prepare("SELECT body FROM work_items WHERE project_id = ? ORDER BY work_item_id").all(projectId)).toEqual([
-      { body: "Nope" },
-      { body: "Keep going" },
-      { body: "Ship it" },
+        { body: "Nope" },
+        { body: "Keep going" },
+        { body: "Ship it" },
+        { body: "Writing lane thrXnot-a-token. No real thread" },
     ]);
+
+    const proposedId = "backfill-proposed";
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      projectId,
+      idempotencyKey: "backfill-create-proposed",
+      workItemId: proposedId,
+      workItem: { workItemId: proposedId, title: proposedId, body: "Writing lane thr_proposed. Planned reference" },
+    })).outcome).toBe("OK");
+    expect(backfillWorkItemAttempts(db)).toEqual({ candidates: 1, attributable: 0, inserted: 0, alreadyBound: 0, residualProposed: 1, unresolved: 0 });
+    expect(db.prepare("SELECT body FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, proposedId)).toEqual({ body: "Writing lane thr_proposed. Planned reference" });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(projectId, proposedId)).toEqual({ count: 0 });
 
     const ambiguousId = "backfill-ambiguous";
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
       projectId,
       idempotencyKey: "backfill-create-ambiguous",
       workItemId: ambiguousId,
-      workItem: { workItemId: ambiguousId, title: ambiguousId, body: "Writing lane thr_one\nAlso thr_two" },
+      workItem: { workItemId: ambiguousId, title: ambiguousId, body: "Writing lane thr_one. Also thr_two" },
     })).outcome).toBe("OK");
+    db.prepare("UPDATE work_items SET lifecycle_state = 'succeeded' WHERE project_id = ? AND work_item_id = ?").run(projectId, ambiguousId);
     expect(() => backfillWorkItemAttempts(db)).toThrow("1 thr_ work item(s) were not attributable");
-    expect(db.prepare("SELECT body FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, ambiguousId)).toEqual({ body: "Writing lane thr_one\nAlso thr_two" });
+    expect(db.prepare("SELECT body FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, ambiguousId)).toEqual({ body: "Writing lane thr_one. Also thr_two" });
     expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(projectId, ambiguousId)).toEqual({ count: 0 });
   });
 
