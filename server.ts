@@ -103,6 +103,7 @@ export const FLEET_WATCHDOG_STALE_WAIT_MS = 24 * 60 * 60_000;
 const FLEET_WATCHDOG_STOPPING_WAIT_MS = 30_000;
 const AUTOMATED_TELL_IDLE_WAIT_MS = 30_000;
 const automatedTellQueues = new Map<string, Promise<void>>();
+const operatorRepliesInFlight = new Set<string>();
 const projectIdSchema = z.string().trim().min(1).max(256);
 const mutationReceiptSchema = z
   .object({
@@ -249,6 +250,7 @@ const operatorMessageSchema = z.object({
   repliedAtMs: z.number().int().nonnegative().nullable(),
   replyText: operatorMessageTextSchema.nullable(),
   replyDeliveryError: z.string().nullable(),
+  replyInProgress: z.boolean(),
   notificationStatus: z.enum(["not-requested", "deduplicated", "sent", "failed"]),
   notificationError: z.string().nullable(),
 }).strict();
@@ -771,6 +773,7 @@ function operatorMessage(row: OperatorMessageRow) {
     repliedAtMs: row.replied_at_ms,
     replyText: row.reply_text,
     replyDeliveryError: row.reply_delivery_error,
+    replyInProgress: false,
     notificationStatus: row.severity !== "urgent"
       ? "not-requested" as const
       : row.notification_attempted_at_ms === null
@@ -921,6 +924,10 @@ async function replyToOperatorMessage(db: SqliteDatabase | null, bb: BbPluginApi
   const store = requireRegisteredInboxProject(db, projectId);
   const message = readOperatorMessage(store, projectId, messageId);
   if (message.repliedAtMs !== null) throw new Error("operator message already has a delivered reply");
+  // ponytail: this process-local guard covers every current RPC caller; a host atomic primitive is the cross-process upgrade.
+  const claimKey = JSON.stringify([projectId, messageId]);
+  if (operatorRepliesInFlight.has(claimKey)) return { ...message, replyInProgress: true };
+  operatorRepliesInFlight.add(claimKey);
   try {
     const thread = await bb.sdk.threads.get({ threadId: message.senderThreadId });
     if (thread.projectId !== projectId || !thread.environmentId) throw new Error("sender thread no longer has a project-exact environment");
@@ -943,6 +950,8 @@ async function replyToOperatorMessage(db: SqliteDatabase | null, bb: BbPluginApi
     store.prepare(`UPDATE operator_messages
       SET reply_text = ?, replied_at_ms = NULL, read_at_ms = COALESCE(read_at_ms, ?), reply_delivery_error = ?
       WHERE project_id = ? AND message_id = ?`).run(replyText, Date.now(), String(error).slice(0, 1_000), projectId, messageId);
+  } finally {
+    operatorRepliesInFlight.delete(claimKey);
   }
   return readOperatorMessage(store, projectId, messageId);
 }

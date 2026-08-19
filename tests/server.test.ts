@@ -1997,6 +1997,43 @@ describe("bb-collab plugin boundary", () => {
       .rejects.toThrow("already has a delivered reply");
   });
 
+  it("atomically claims one delivery when two callers reply to the same operator message", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    const sent: string[] = [];
+    host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
+    host.harness.sdk.stub("threads.send", (async (input: { input: Array<{ text: string }> }) => {
+      sent.push(input.input[0]!.text);
+      return { ok: true };
+    }) as never);
+    host.harness.sdk.stub("threads.events.wait", (async ({ threadId }: { threadId: string }) => ({
+      id: "event-delivered",
+      threadId,
+      seq: 99,
+      type: "client/turn/requested",
+      scope: { kind: "thread" },
+      data: { source: "tell", input: [{ type: "text", text: sent.at(-1)!, mentions: [] }] },
+      createdAt: 99,
+    })) as never);
+    const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
+      project_id: PROJECT_ID,
+      recipient: "operator",
+      severity: "routine",
+      text: "one reply only",
+    }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
+
+    const replies = await Promise.all([
+      host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "first" }),
+      host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "second" }),
+    ]);
+    expect(sent).toHaveLength(1);
+    expect(replies).toEqual(expect.arrayContaining([
+      expect.objectContaining({ repliedAtMs: expect.any(Number), replyInProgress: false }),
+      expect.objectContaining({ repliedAtMs: null, replyInProgress: true }),
+    ]));
+  });
+
   it("waits for the inbox sender thread to become idle before delivering its reply", async () => {
     const host = hostFor();
     await plugin(host.bb, { notifyUrgent: async () => undefined });
@@ -2034,12 +2071,25 @@ describe("bb-collab plugin boundary", () => {
     expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
   });
 
-  it("persists an inbox reply failure when the sender never becomes idle", async () => {
+  it("persists an inbox reply failure and releases its in-process guard for retry", async () => {
     const host = hostFor();
     await plugin(host.bb, { notifyUrgent: async () => undefined });
     seedAndBootstrap(host);
-    host.harness.sdk.stub("threads.wait", (async () => { throw new Error("idle wait timed out"); }) as never);
+    let timeout = true;
+    host.harness.sdk.stub("threads.wait", (async () => {
+      if (timeout) throw new Error("idle wait timed out");
+      return { matched: true };
+    }) as never);
     host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
+    host.harness.sdk.stub("threads.events.wait", (async ({ threadId }: { threadId: string }) => ({
+      id: "event-delivered",
+      threadId,
+      seq: 99,
+      type: "client/turn/requested",
+      scope: { kind: "thread" },
+      data: { source: "tell", input: [{ type: "text", text: "[bb-collab inbox reply 1 to operator]\nretry", mentions: [] }] },
+      createdAt: 99,
+    })) as never);
     const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
       project_id: PROJECT_ID,
       recipient: "operator",
@@ -2054,7 +2104,16 @@ describe("bb-collab plugin boundary", () => {
       repliedAtMs: null,
       replyText: "answer",
       replyDeliveryError: "Error: idle wait timed out",
+      replyInProgress: false,
     });
+
+    timeout = false;
+    await expect(host.harness.callRpc("replyToOperatorMessage", {
+      projectId: PROJECT_ID,
+      messageId: message.messageId,
+      text: "retry",
+    })).resolves.toMatchObject({ repliedAtMs: expect.any(Number), replyText: "retry", replyInProgress: false });
+    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
   });
 
   it("records an accepted reply tell as failed when no matching sender event lands", async () => {
