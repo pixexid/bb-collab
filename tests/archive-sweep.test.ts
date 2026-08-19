@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing";
-import { MIGRATIONS, databaseIsReady, PLUGIN_ID, type SqliteDatabase } from "../src/foundation.js";
+import { MIGRATIONS, backfillWorkItemAttempts, databaseIsReady, PLUGIN_ID, type SqliteDatabase } from "../src/foundation.js";
 import { createArchiveSweepRefusalCounter, runArchiveSweep } from "../src/archive-sweep.js";
 
 const now = 48 * 60 * 60 * 1000;
@@ -73,12 +73,16 @@ function fixture(options: {
   includeUnresolvableChild?: boolean;
   includeUnknownPullRequest?: boolean;
   includeUnreadableArchiveState?: boolean;
+  activateArchiveChildOnSecondReport?: boolean;
   throwOnList?: boolean;
 } = {}) {
   const db = new Database(":memory:");
   openDbs.push(db);
   databaseIsReady(db);
-  for (const migration of MIGRATIONS) db.exec(migration);
+  db.transaction(() => {
+    for (const migration of MIGRATIONS) db.exec(migration);
+  })();
+  backfillWorkItemAttempts(db);
   db.pragma("foreign_keys = OFF");
   insertAttempt(db, { id: "role-holder", origin: "role_holder", threadId: "role-holder" });
   insertAttempt(db, { id: "director-holder", origin: "role_holder", threadId: "director-exemption", roleId: "director" });
@@ -103,6 +107,7 @@ function fixture(options: {
     makeThreadResponse({ id: "hidden-fork", projectId: PROJECT_ID, status: "active", archivedAt: null, deletedAt: null, sourceThreadId: "source-root", updatedAt: now }),
     makeThreadResponse({ id: "starting", projectId: PROJECT_ID, status: "starting", archivedAt: null, deletedAt: null, updatedAt: 0 }),
     idle("fresh", { updatedAt: now }),
+    idle("fallback-boundary", { updatedAt: now - 12 * 60 * 60 * 1000 }),
     idle("ordinary"),
     idle("archived-thread", { archivedAt: now }),
     ...(options.includeUnknownStatus ? [makeThreadResponse({ id: "unknown-status", projectId: PROJECT_ID, status: "unknown" as never, archivedAt: null, deletedAt: null, updatedAt: 0 })] : []),
@@ -111,12 +116,19 @@ function fixture(options: {
     ...(options.includeUnresolvableChild ? [idle("unresolvable-child", { parentThreadId: "missing-parent" })] : []),
   ];
 
+  let unarchivedListCalls = 0;
   const host = createFakePluginHost({
     pluginId: PLUGIN_ID,
     sdk: {
       threads: {
         list: async ({ projectId, archived = false, limit = 1000, offset = 0 }: { projectId?: string; archived?: boolean; limit?: number; offset?: number } = {}) => {
           if (options.throwOnList) throw new Error("thread inventory unavailable");
+          if (!archived) {
+            unarchivedListCalls += 1;
+            if (options.activateArchiveChildOnSecondReport && unarchivedListCalls === 2) {
+              threads.push(makeThreadResponse({ id: "late-active-child", projectId: PROJECT_ID, status: "active", archivedAt: null, deletedAt: null, parentThreadId: "ordinary", updatedAt: now }));
+            }
+          }
           return threads
             .filter((thread) => thread.projectId === projectId && ((thread.archivedAt !== null) === archived))
             .map((thread) => options.includeUnreadableArchiveState && thread.id === "archived-thread"
@@ -124,7 +136,7 @@ function fixture(options: {
               : thread)
             .slice(offset, offset + limit);
         },
-        archive: async () => ({ ok: true as const, archivedThreadIds: [] }),
+        archive: async ({ threadId }: { threadId: string }) => ({ ok: true as const, archivedThreadIds: [threadId] }),
       },
       environments: {
         pullRequest: (async ({ environmentId }: { environmentId: string }) => {
@@ -146,8 +158,9 @@ afterEach(() => {
   delete process.env.BB_COLLAB_ARCHIVE_IDLE_H;
 });
 
-async function report(host: ReturnType<typeof fixture>["host"], db: SqliteDatabase | null) {
-  process.env.BB_COLLAB_ARCHIVE_IDLE_H = "24";
+async function report(host: ReturnType<typeof fixture>["host"], db: SqliteDatabase | null, configuredIdleHours?: string) {
+  if (configuredIdleHours === undefined) delete process.env.BB_COLLAB_ARCHIVE_IDLE_H;
+  else process.env.BB_COLLAB_ARCHIVE_IDLE_H = configuredIdleHours;
   return runArchiveSweep(host.bb, db, PROJECT_ID, false, now);
 }
 
@@ -226,6 +239,42 @@ describe("thread archive sweep", () => {
     expect(result.archivableThreadIds).toContain("ordinary");
     expect(host.harness.inspection.sdk.callsTo("threads.archive")).toEqual([]);
   });
+
+  it("omitting apply defaults to dry-run and never archives a valid candidate", async () => {
+    const { db, host } = fixture();
+    const result = await runArchiveSweep(host.bb, db, PROJECT_ID);
+    expect(result).toMatchObject({ outcome: "reported", archivedThreadIds: [] });
+    expect(result.archivableThreadIds).toContain("ordinary");
+    expect(host.harness.inspection.sdk.callsTo("threads.archive")).toEqual([]);
+  });
+
+  it("explicit apply archives exactly the reported candidate id", async () => {
+    const { db, host } = fixture();
+    const result = await runArchiveSweep(host.bb, db, PROJECT_ID, true, now);
+    expect(result).toMatchObject({ outcome: "applied", archivableThreadIds: ["ordinary"], archivedThreadIds: ["ordinary"] });
+    expect(host.harness.inspection.sdk.callsTo("threads.archive")).toEqual([[{ threadId: "ordinary" }]]);
+  });
+
+  it("refuses explicit apply when a candidate changes after the report", async () => {
+    const { db, host } = fixture({ activateArchiveChildOnSecondReport: true });
+    const result = await runArchiveSweep(host.bb, db, PROJECT_ID, true, now);
+    expect(result).toMatchObject({ outcome: "refused", message: expect.stringContaining("candidate changed") });
+    expect(host.harness.inspection.sdk.callsTo("threads.archive")).toEqual([]);
+  });
+
+  for (const [label, configuredIdleHours] of [
+    ["missing", undefined],
+    ["malformed", "not-a-number"],
+    ["zero", "0"],
+    ["negative", "-1"],
+  ] as const) {
+    it(`falls back to 24 hours for a ${label} idle setting`, async () => {
+      const { db, host } = fixture();
+      const result = await report(host, db, configuredIdleHours);
+      expect(result.archivableThreadIds).toContain("ordinary");
+      expect(result.archivableThreadIds).not.toContain("fallback-boundary");
+    });
+  }
 
   it("isolates a dangling environment and protects only that thread", async () => {
     const { db, host } = fixture({ includeUnresolvableEnvironment: true });
