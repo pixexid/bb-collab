@@ -183,6 +183,39 @@ function dynamicAnalysis(program, checker, sourceSet, recordsByKey) {
   const dynamicKeys = new Set();
   const reasons = new Set();
   const namespaceSymbols = new Map();
+  const registrySymbols = new Map();
+
+  const capturedExports = (expression) => {
+    const keys = new Set();
+    ts.forEachChild(expression, function collect(node) {
+      if (ts.isIdentifier(node) && !declarationName(node)) {
+        const symbol = ts.isShorthandPropertyAssignment(node.parent)
+          ? checker.getShorthandAssignmentValueSymbol(node.parent)
+          : checker.getSymbolAtLocation(node);
+        if (symbol) {
+          const key = symbolKey(resolveAlias(checker, symbol));
+          if (recordsByKey.has(key)) keys.add(key);
+        }
+      }
+      ts.forEachChild(node, collect);
+    });
+    return keys;
+  };
+
+  const symbolMembers = (expression) => {
+    if (!ts.isIdentifier(expression)) return null;
+    const symbol = checker.getSymbolAtLocation(expression);
+    if (!symbol) return null;
+    const key = symbolKey(resolveAlias(checker, symbol));
+    return registrySymbols.get(key) ?? namespaceSymbols.get(key) ?? null;
+  };
+
+  const markUnknown = (keys, reason) => {
+    if (!keys) return false;
+    keys.forEach((key) => dynamicKeys.add(key));
+    reasons.add(reason);
+    return true;
+  };
 
   for (const sourceFile of program.getSourceFiles()) {
     if (!sourceSet.has(sourceFile.fileName)) continue;
@@ -195,6 +228,11 @@ function dynamicAnalysis(program, checker, sourceSet, recordsByKey) {
           namespaceSymbols.set(symbolKey(resolveAlias(checker, local)), exports.map((item) => symbolKey(resolveAlias(checker, item))));
         }
       }
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && ts.isObjectLiteralExpression(node.initializer)) {
+        const local = checker.getSymbolAtLocation(node.name);
+        const members = capturedExports(node.initializer);
+        if (local && members.size > 0) registrySymbols.set(symbolKey(resolveAlias(checker, local)), members);
+      }
       ts.forEachChild(node, collect);
     });
   }
@@ -203,11 +241,9 @@ function dynamicAnalysis(program, checker, sourceSet, recordsByKey) {
     if (!sourceSet.has(sourceFile.fileName)) continue;
     ts.forEachChild(sourceFile, function inspect(node) {
       if (ts.isElementAccessExpression(node)) {
-        const objectSymbol = ts.isIdentifier(node.expression) ? checker.getSymbolAtLocation(node.expression) : null;
-        const namespaceKeys = objectSymbol ? namespaceSymbols.get(symbolKey(resolveAlias(checker, objectSymbol))) : null;
-        if (namespaceKeys) {
-          namespaceKeys.forEach((key) => dynamicKeys.add(key));
-          reasons.add("UNKNOWN: namespace, computed, or string-keyed access cannot prove a specific export");
+        const memberKeys = symbolMembers(node.expression);
+        if (memberKeys) {
+          markUnknown(memberKeys, "UNKNOWN: namespace, computed, or string-keyed access cannot prove a specific export");
         } else if (!node.argumentExpression || !ts.isStringLiteral(node.argumentExpression) && !ts.isNumericLiteral(node.argumentExpression)) {
           reasons.add("UNKNOWN: computed property access cannot prove a specific export");
         } else if (ts.isIdentifier(node.expression) && /registry|handler|dispatch|plugin|route|command|adapter/iu.test(node.expression.text)) {
@@ -219,7 +255,10 @@ function dynamicAnalysis(program, checker, sourceSet, recordsByKey) {
         if (ts.isPropertyAccessExpression(expression) && ts.isIdentifier(expression.expression)) {
           const owner = expression.expression.text;
           if ((owner === "Reflect" && expression.name.text === "get") || (owner === "Object" && /^(?:keys|values|entries)$/u.test(expression.name.text))) {
-            reasons.add("UNKNOWN: reflection or registry enumeration cannot prove a specific export");
+            const memberKeys = symbolMembers(node.arguments[0]);
+            if (!markUnknown(memberKeys, "UNKNOWN: reflection or registry enumeration cannot prove a specific export")) {
+              reasons.add("UNKNOWN: reflection or registry enumeration cannot prove a specific export");
+            }
           }
         }
         if (expression.kind === ts.SyntaxKind.ImportKeyword && node.arguments[0] && !ts.isStringLiteral(node.arguments[0])) {

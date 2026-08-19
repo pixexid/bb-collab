@@ -28,6 +28,7 @@ export function barrelOnly() {}
 export interface Structural { value: string }
 `);
   writeFileSync(join(directory, "src", "dynamic-target.ts"), "export function dynamicallySelected() {}\n");
+  writeFileSync(join(directory, "src", "registry-target.ts"), "export function registrySelected() {}\n");
   writeFileSync(join(directory, "src", "consumer.ts"), `
 import { calledInProduction } from "./feature.js";
 calledInProduction();
@@ -37,6 +38,12 @@ calledInProduction();
 import * as feature from "./dynamic-target.js";
 const key = "dynamicallySelected";
 feature[key];
+`);
+  writeFileSync(join(directory, "src", "registry.ts"), `
+import { registrySelected } from "./registry-target.js";
+const registry = { registrySelected };
+const key = "registrySelected";
+registry[key]();
 `);
   writeFileSync(join(directory, "src", "public-api.ts"), "export function externalOnly() {}\n");
   writeFileSync(join(directory, "src", "test-support.ts"), `
@@ -67,6 +74,9 @@ describe("production reachability report", () => {
       expect(status.get("calledInProduction")).toBe("STATIC_PRODUCTION_REFERENCE");
       expect(status.get("barrelOnly")).toBe("STATIC_UNREFERENCED");
       expect(status.get("dynamicallySelected")).toBe("UNKNOWN_DYNAMIC");
+      expect(status.get("registrySelected")).toBe("UNKNOWN_DYNAMIC");
+      expect(result.rows.find((row: { names: string[] }) => row.names.includes("registrySelected"))).toMatchObject({ status: "UNKNOWN_DYNAMIC", productionReferenceCount: 1 });
+      expect(result.unknown.dynamicExports.some((row: { names: string[] }) => row.names.includes("registrySelected"))).toBe(true);
       expect(status.get("externalOnly")).toBe("UNKNOWN_EXTERNAL");
       expect(status.get("Structural")).toBe("UNKNOWN_TYPE_ONLY");
       expect(status.get("default")).toBe("EXEMPT_PACKAGE_ENTRYPOINT");
