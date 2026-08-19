@@ -41,6 +41,14 @@ export type WorktreeCleanupOptions = {
 
 const threadPattern = /thr_[a-z0-9]+/u;
 
+// A chosen safety margin, not a measurement. The floor guards only the gap between a PR
+// merging and the reviewer closing their checkout: a review still in flight is already
+// protected by reachability, because an unmerged head is not an ancestor of origin/main,
+// and a reviewer who wrote anything is already protected by the uncommitted-changes
+// refusal. Cold reviews observed in this repo complete in well under an hour, so 24h is
+// roughly a 24x margin on the longest window actually seen. It sits well above that
+// window rather than close to it because the costs are asymmetric -- keeping a worktree
+// an extra day costs disk, removing one a reviewer still holds costs their work.
 export const defaultQuietFloorMs = 24 * 60 * 60 * 1000;
 
 const reflogCreation = /^\S+ \S+ .* (\d+) [-+]\d{4}(?:\t|$)/u;
