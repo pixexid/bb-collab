@@ -4686,7 +4686,7 @@ exit 1
     expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("7d9d30ecaf897f87b32f0da787366e67ee44194ad9fcd8fd3b33a2ca14eec221");
     expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("3aafb2d48eb7560b5ce2a61b7611b34c9fb52e6dfe063f7e37f6782fe822f652");
     expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("cdb3f0e553be06e6405f2c1040ed08043accdc506d0ffecc0fd8fc0df9e69591");
-    expect(schemaDigest).toBe("e2572f2cf4f06f0cf3e98db9bfa097903acdc6af37983acfb40416c1a9d6d9ee");
+    expect(schemaDigest).toBe("abf83bf6369c9f5acc8e58a7365c89524f5a32c6ab0ab5c5c3729b0d969e1810");
     expect(MIGRATIONS.at(-6)).toContain("operator_messages");
     expect(MIGRATIONS.at(-6)).toContain("project_id TEXT NOT NULL");
     expect(MIGRATIONS.at(-6)).toContain("recipient IN ('operator', 'supervisor')");
