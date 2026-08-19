@@ -608,7 +608,7 @@ function transitionRequest(
     workItemId: WORK_ITEM_ID,
     lifecycleState: state,
     ...(state === "in_progress" ? { workAttempt: { laneId: "lane-work-item-1", threadId: "thread-work-item-1", assignmentKind: "write" as const } }
-      : state === "review_pending" ? { workAttempt: { laneId: "lane-review-item-1", threadId: "thread-review-item-1", assignmentKind: "review" as const } }
+      : state === "review_pending" ? { workAttempt: { laneId: "lane-review-item-1", threadId: "thread-review-item-1", assignmentKind: "review" as const, reviewPrNumber: 338, reviewPrHeadSha: CANDIDATE_SHA } }
         : {}),
     ...overrides,
   };
@@ -4648,8 +4648,8 @@ exit 1
   it("appends the operator inbox schema without changing the v21 foundation contract", () => {
     expect(SCHEMA_VERSION).toBe(19);
     expect(CONTRACT_VERSION).toBe(21);
-    expect(MIGRATIONS).toHaveLength(32);
-    expect(MIGRATIONS.slice(0, -4).map(sha256)).toEqual([
+    expect(MIGRATIONS).toHaveLength(33);
+    expect(MIGRATIONS.slice(0, -5).map(sha256)).toEqual([
       "2ac2daf5e9bedfefdc007f0ff150814dace6938963b214c463dba8f66332d708",
       "e55c1268522fb2a3c42670c6565376860731de77b7afc8f122755db613d92967",
       "e1901bbaa8edfcb325f3007617b4cda0e07e0c56ab4c970ce778d1fd33c732ab",
@@ -4679,17 +4679,18 @@ exit 1
       "0cf4a2190ba1df8dd5e27834d4ce9f769c4d0e34f8041f39f0858a572c60418b",
       "39bd82dcebe4edf8c5d82d429de5f14b2ddee3a3c87871d4745a9f0467b648ae",
     ]);
-    expect(sha256(MIGRATIONS.slice(0, -4).join("\n"))).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
-    expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("4051aa08e489728a2b752340ad979716de7a2a1df9fdd46d2c4b8ccc86d9f5d2");
-    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("7d9d30ecaf897f87b32f0da787366e67ee44194ad9fcd8fd3b33a2ca14eec221");
-    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("3aafb2d48eb7560b5ce2a61b7611b34c9fb52e6dfe063f7e37f6782fe822f652");
-    expect(MIGRATIONS.at(-5)).toContain("operator_messages");
-    expect(MIGRATIONS.at(-5)).toContain("project_id TEXT NOT NULL");
-    expect(MIGRATIONS.at(-5)).toContain("recipient IN ('operator', 'supervisor')");
-    expect(MIGRATIONS.at(-4)).toContain("execution_attempts_gh300");
-    expect(MIGRATIONS.at(-3)).toContain("work_items_gh295");
-    expect(MIGRATIONS.at(-2)).toContain("work_item_github_backfills");
-    expect(MIGRATIONS.at(-1)).toContain("ADD COLUMN config_revision");
+    expect(sha256(MIGRATIONS.slice(0, -5).join("\n"))).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
+    expect(sha256(MIGRATIONS.slice(0, -4).join("\n"))).toBe("4051aa08e489728a2b752340ad979716de7a2a1df9fdd46d2c4b8ccc86d9f5d2");
+    expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("7d9d30ecaf897f87b32f0da787366e67ee44194ad9fcd8fd3b33a2ca14eec221");
+    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("3aafb2d48eb7560b5ce2a61b7611b34c9fb52e6dfe063f7e37f6782fe822f652");
+    expect(MIGRATIONS.at(-6)).toContain("operator_messages");
+    expect(MIGRATIONS.at(-6)).toContain("project_id TEXT NOT NULL");
+    expect(MIGRATIONS.at(-6)).toContain("recipient IN ('operator', 'supervisor')");
+    expect(MIGRATIONS.at(-5)).toContain("execution_attempts_gh300");
+    expect(MIGRATIONS.at(-4)).toContain("work_items_gh295");
+    expect(MIGRATIONS.at(-3)).toContain("work_item_github_backfills");
+    expect(MIGRATIONS.at(-2)).toContain("ADD COLUMN config_revision");
+    expect(MIGRATIONS.at(-1)).toContain("review_pr_number");
     expect(TABLES).toContain("migration_runs");
     expect(TABLES).toContain("operator_messages");
     expect(MIGRATION_STATES).toEqual([
@@ -4764,15 +4765,15 @@ exit 1
     const projectId = "proj_gh295_migration";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -3)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -4)) db.exec(statement);
       })();
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, '{}', ?, 1)").run(projectId, sha256("{}"));
       db.prepare("INSERT INTO repository_targets (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest) VALUES (?, 'target-main', 1, 'source', 'host', '/migration', NULL, 'main', 'target-digest')").run(projectId);
       db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'historical', 1, 'target-main', 'Historical', 'preserve me', 'in_progress', 3, 10, 20)").run(projectId);
       const beforeRows = db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId);
-      const priorStatementDigests = MIGRATIONS.slice(0, -3).map(sha256);
-      db.transaction(() => db.exec(MIGRATIONS.at(-3)!))();
-      expect(MIGRATIONS.slice(0, -3).map(sha256)).toEqual(priorStatementDigests);
+      const priorStatementDigests = MIGRATIONS.slice(0, -4).map(sha256);
+      db.transaction(() => db.exec(MIGRATIONS.at(-4)!))();
+      expect(MIGRATIONS.slice(0, -4).map(sha256)).toEqual(priorStatementDigests);
       expect(db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId)).toEqual(beforeRows);
       expect(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'work_items'").get()).toMatchObject({ sql: expect.stringContaining("review_pending") });
       db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'reviewable', 1, 'target-main', 'Reviewable', 'new state', 'review_pending', 1, 30, 30)").run(projectId);
@@ -4788,7 +4789,7 @@ exit 1
     databaseIsReady(db);
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -2)) db.exec(statement);
       })();
       const legacyResult = JSON.stringify({
         projectId: "proj_backfill_legacy",
@@ -4809,7 +4810,7 @@ exit 1
         "SELECT project_id, epoch_created_at_ms, state, result_json, created_at_ms, updated_at_ms FROM work_item_github_backfills",
       ).get();
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-1)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-2)!))();
 
       expect((db.prepare("PRAGMA table_info(work_item_github_backfills)").all() as Array<{ name: string }>).map((column) => column.name)).toEqual([
         "project_id", "epoch_created_at_ms", "state", "result_json", "created_at_ms", "updated_at_ms", "config_revision", "attempt_reason",
@@ -4826,8 +4827,7 @@ exit 1
   it("assembles the production v21 cached-consumer rollout receipt with stale-v20 refusal semantics", async () => {
     expect(CONTRACT_VERSION).toBe(21);
     expect(SCHEMA_VERSION).toBe(19);
-    expect(MIGRATIONS).toHaveLength(32);
-    expect(schemaDigest).toBe("cdb3f0e553be06e6405f2c1040ed08043accdc506d0ffecc0fd8fc0df9e69591");
+    expect(MIGRATIONS).toHaveLength(33);
     expect(contractDigest).toBe("6df90c4315ca78dacb7043a45d28ccfdd259947d835bce3953d7b4f44b928c9f");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -5002,7 +5002,7 @@ exit 1
     const projectId = "proj_gh300_rebuild";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -4)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -5)) db.exec(statement);
       })();
       db.pragma("foreign_keys = OFF");
       const insert = (table: string, row: Record<string, unknown>) => {
@@ -5060,7 +5060,7 @@ exit 1
       const before = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.values(before).every((value) => value !== null)).toBe(true);
       expect(new Set(Object.values(before).map((value) => String(value))).size).toBeGreaterThan(20);
-      db.transaction(() => db.exec(MIGRATIONS.at(-4)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-5)!))();
       const after = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.fromEntries(columns.map((column) => [column, after[column]]))).toEqual(Object.fromEntries(columns.map((column) => [column, before[column]])));
       expect(after.progress_json).toBe("{}");
@@ -6792,6 +6792,10 @@ exit 1
       { assignment_kind: "write", state: "done" },
       { assignment_kind: "review", state: "running" },
     ]);
+    expect(db.prepare("SELECT review_pr_number, review_pr_head_sha, created_at_ms, completed_at_ms FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'review'").get(PROJECT_ID, WORK_ITEM_ID)).toMatchObject({
+      review_pr_number: 338,
+      review_pr_head_sha: CANDIDATE_SHA,
+    });
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 4))).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
     expect(db.prepare("SELECT assignment_kind, state FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal").all(PROJECT_ID, WORK_ITEM_ID)).toEqual([
       { assignment_kind: "write", state: "done" },
