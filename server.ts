@@ -2,14 +2,19 @@ import { defineRpcContract, type BbPluginApi, type PluginCliContext } from "@bb/
 import { z } from "zod";
 import {
   createLaneWatcher,
+  createIdleFleetDetector,
   createRoleIdleLedger,
   createWaitRegistry,
+  IDLE_FLEET_DEBOUNCE_MS,
   readCurrentRoleBindings,
   readRoleHolderStates,
   roleIdleKey,
   subscribeToThreadChanges,
   threadEventStatus,
   type RoleHolderState,
+  type IdleFleetDecision,
+  type IdleFleetProbe,
+  type IdleFleetReady,
   type RoleIdleRecord,
 } from "./src/awareness.js";
 import {
@@ -78,9 +83,12 @@ function githubRepository(remoteUrl: string | null): string | null {
   return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : null;
 }
 
-function startableQueueDepth(repositories: string[]): number | null {
+type StartableQueueState = { count: number; head: string | null };
+
+function startableQueueState(repositories: string[]): StartableQueueState | null {
   try {
     let count = 0;
+    const heads: string[] = [];
     for (const repository of repositories) {
       const options: SpawnSyncOptionsWithStringEncoding & { detached: true } = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000, killSignal: "SIGKILL", detached: true };
       const result = spawnSync("gh", ["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number", "--limit", "1000"], options);
@@ -95,15 +103,22 @@ function startableQueueDepth(repositories: string[]): number | null {
       const issues = JSON.parse(result.stdout) as unknown;
       if (!Array.isArray(issues) || !issues.every((issue) => issue && typeof issue === "object" && !Array.isArray(issue) && typeof (issue as { number?: unknown }).number === "number")) return null;
       count += issues.length;
+      const numbers = issues.map((issue) => (issue as { number: number }).number);
+      if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
     }
-    return count;
+    return { count, head: heads.sort()[0] ?? null };
   } catch {
     return null;
   }
 }
 
+function startableQueueDepth(repositories: string[]): number | null {
+  return startableQueueState(repositories)?.count ?? null;
+}
+
 export const FLEET_WATCHDOG_FLOOR_MS = 5 * 60_000;
 export const FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS = 60 * 60_000;
+export const IDLE_FLEET_ATTEMPT_STALE_MS = 10 * 60_000;
 const FLEET_WATCHDOG_LEGACY_FLOOR_MS = 60 * 60_000;
 const FLEET_WATCHDOG_FLOOR_MIGRATION_KEY = "fleet-watchdog.floor-default-v2-migrated";
 export const FLEET_WATCHDOG_STALE_WAIT_MS = 24 * 60 * 60_000;
@@ -1597,7 +1612,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   const readRoleScopes = async () => [];
 
-  const steerRole = async (role: import("./src/awareness.js").RoleIdleView) => {
+  const sendRoleWake = async (role: import("./src/awareness.js").RoleIdleView, text: string) => {
     if (!db) return "error" as const;
     const expectedHolder: RoleHolderState = {
       project_id: role.projectId,
@@ -1635,6 +1650,21 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return false;
     }
     roleLivenessWarnings.delete(roleLivenessKey(holders[0]));
+    try {
+      await sendWhenThreadIdle(bb, {
+        threadId: holders[0].thread_id,
+        mode: "steer",
+        input: [{ type: "text", visibility: "agent-only", text, mentions: [] }],
+      });
+    } catch (error) {
+      warnRoleLiveness(holders[0], `idle-wait=failed error=${String(error)}`);
+      return "error" as const;
+    }
+    return true;
+  };
+
+  const steerRole = async (role: import("./src/awareness.js").RoleIdleView) => {
+    if (!db) return "error" as const;
     let startable: { work_item_id: string } | undefined;
     try {
       startable = db.prepare(
@@ -1646,24 +1676,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return "error" as const;
     }
     if (!startable) return false;
-    try {
-      await sendWhenThreadIdle(bb, {
-        threadId: holders[0].thread_id,
-        mode: "steer",
-        input: [
-          {
-            type: "text",
-            visibility: "agent-only",
-            text: `Wrongful idle: queue head ${startable.work_item_id} is startable. Inspect the queue and act or record the blocker.`,
-            mentions: [],
-          },
-        ],
-      });
-    } catch (error) {
-      warnRoleLiveness(holders[0], `idle-wait=failed error=${String(error)}`);
-      return "error" as const;
-    }
-    return true;
+    return sendRoleWake(role, `Wrongful idle: queue head ${startable.work_item_id} is startable. Inspect the queue and act or record the blocker.`);
   };
 
   const watcher = createLaneWatcher({
@@ -1712,6 +1725,205 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     write: (state) => bb.storage.kv.set("fleet-watchdog.role-idle", state),
   });
 
+  type IdleFleetFact<T> = { known: true; value: T } | { known: false; reason: string };
+  const idleFleetBlind = (
+    orchestrator: "known" | "blind",
+    activeLanes: "known" | "blind",
+    startable: "known" | "blind",
+    reason: string,
+  ): IdleFleetDecision => ({
+    kind: "blind",
+    message: `idle-fleet coverage=blind orchestrator=${orchestrator} activeLanes=${activeLanes} startable=${startable} reason=${reason}`,
+  });
+  const readIdleFleetActiveLanes = async (projectId: string): Promise<IdleFleetFact<number>> => {
+    if (!db) return { known: false, reason: "canonical-store-unavailable" };
+    try {
+      const unbound = db.prepare(
+        `SELECT 1 FROM work_items
+         WHERE project_id = ? AND lifecycle_state = 'in_progress'
+           AND NOT EXISTS (
+             SELECT 1 FROM execution_attempts
+             WHERE execution_attempts.project_id = work_items.project_id
+               AND execution_attempts.work_item_id = work_items.work_item_id
+               AND execution_attempts.origin = 'work_item'
+           ) LIMIT 1`,
+      ).get(projectId);
+      if (unbound) return { known: false, reason: "work-items-have-no-thread-binding:GH-300" };
+      const rows = db.prepare(
+        `SELECT lane_id, thread_id, state, observed_at_ms FROM execution_attempts
+         WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
+           AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')`,
+      ).all(projectId) as Array<{ lane_id: unknown; thread_id: unknown; state: unknown; observed_at_ms: unknown }>;
+      const laneIds = new Set<string>();
+      const now = Date.now();
+      for (const row of rows) {
+        if (row.state === "dispatch_unknown") return { known: false, reason: "dispatch-unknown-attempt" };
+        if (typeof row.lane_id !== "string" || row.lane_id.length === 0 || typeof row.thread_id !== "string" || row.thread_id.length === 0) {
+          return { known: false, reason: "work-item-attempt-has-no-thread-binding:GH-300" };
+        }
+        if (!Number.isSafeInteger(row.observed_at_ms) || (row.observed_at_ms as number) < 0 || now - (row.observed_at_ms as number) > IDLE_FLEET_ATTEMPT_STALE_MS) {
+          return { known: false, reason: "stale-active-attempt" };
+        }
+        laneIds.add(row.lane_id);
+      }
+      return { known: true, value: laneIds.size };
+    } catch (error) {
+      return { known: false, reason: `active-lanes-unreadable:${String(error)}` };
+    }
+  };
+  const readIdleFleetNativeLanes = async (projectId: string): Promise<IdleFleetFact<number>> => {
+    if (!db) return { known: false, reason: "canonical-store-unavailable" };
+    try {
+      const dispatcherThreadIds = new Set(
+        (db.prepare(
+          "SELECT thread_id FROM execution_attempts WHERE project_id = ? AND origin = 'role_holder' AND thread_id IS NOT NULL",
+        ).all(projectId) as Array<{ thread_id: string }>).map((row) => row.thread_id),
+      );
+      if (dispatcherThreadIds.size === 0) return { known: false, reason: "native-lane-parents-unreadable" };
+      const threads: Awaited<ReturnType<typeof bb.sdk.threads.list>> = [];
+      for (let offset = 0; ; offset += 100) {
+        const page = await bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset });
+        threads.push(...page);
+        if (page.length < 100) break;
+      }
+      const liveLanes = threads.filter((thread) =>
+        !dispatcherThreadIds.has(thread.id) &&
+        thread.parentThreadId !== null &&
+        dispatcherThreadIds.has(thread.parentThreadId) &&
+        thread.archivedAt === null &&
+        thread.deletedAt === null &&
+        thread.status !== "error" && thread.status !== "stopping",
+      );
+      return { known: true, value: liveLanes.length };
+    } catch (error) {
+      return { known: false, reason: `native-lanes-unreadable:${String(error)}` };
+    }
+  };
+  const readIdleFleetStartable = (projectId: string): IdleFleetFact<StartableQueueState> => {
+    if (!db) return { known: false, reason: "canonical-store-unavailable" };
+    try {
+      const repositories = (db.prepare(
+        `SELECT targets.remote_url FROM project_config_heads AS heads
+         JOIN repository_targets AS targets
+           ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
+         WHERE heads.project_id = ? ORDER BY targets.repo_target_id`,
+      ).all(projectId) as Array<{ remote_url: string | null }>).map((target) => githubRepository(target.remote_url));
+      if (repositories.length === 0 || repositories.some((repository) => repository === null)) {
+        return { known: false, reason: "configured-repositories-unreadable" };
+      }
+      const queue = startableQueueState(repositories as string[]);
+      return queue === null ? { known: false, reason: "startable-queue-unreadable" } : { known: true, value: queue };
+    } catch (error) {
+      return { known: false, reason: `startable-queue-unreadable:${String(error)}` };
+    }
+  };
+  const readIdleFleetProbes = async (): Promise<IdleFleetProbe[]> => {
+    if (!db) throw new Error("canonical-store-unavailable");
+    const holders = readRoleHolderStates(db).filter((holder) => holder.role_id === "project-orchestrator");
+    const probes: IdleFleetProbe[] = [];
+    for (const holder of holders) {
+      const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
+      if (thread.projectId !== holder.project_id || thread.archivedAt !== null || thread.deletedAt !== null) {
+        throw new Error("orchestrator-unreadable");
+      }
+      if (thread.status === "idle" && !Number.isFinite(thread.updatedAt)) {
+        throw new Error("orchestrator-unreadable");
+      }
+      if (
+        thread.status === "idle"
+      ) {
+        probes.push({ projectId: holder.project_id, threadId: holder.thread_id, idleEpisode: String(thread.updatedAt) });
+      }
+    }
+    return probes;
+  };
+  const readIdleFleet = async (probe: IdleFleetProbe): Promise<IdleFleetDecision> => {
+    if (!db) return idleFleetBlind("blind", "blind", "blind", "canonical-store-unavailable");
+    let holder: RoleHolderState | undefined;
+    try {
+      if (!db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(probe.projectId)) return { kind: "silent" };
+      const orchestrators = readRoleHolderStates(db).filter((candidate) => candidate.project_id === probe.projectId && candidate.role_id === "project-orchestrator");
+      if (orchestrators.length === 0) return { kind: "silent" };
+      if (orchestrators.length !== 1) {
+        return idleFleetBlind("blind", "blind", "blind", "canonical-orchestrator-ambiguous");
+      }
+      holder = orchestrators[0];
+      if (holder.thread_id !== probe.threadId) return { kind: "silent" };
+    } catch (error) {
+      return idleFleetBlind("blind", "blind", "blind", `canonical-role-holders-unreadable:${String(error)}`);
+    }
+
+    let thread: Awaited<ReturnType<typeof bb.sdk.threads.get>>;
+    try {
+      thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
+    } catch (error) {
+      return idleFleetBlind("blind", "blind", "blind", `orchestrator-unreadable:${String(error)}`);
+    }
+    if (thread.projectId !== probe.projectId || thread.archivedAt !== null || thread.deletedAt !== null) {
+      return idleFleetBlind("blind", "blind", "blind", "orchestrator-unreadable");
+    }
+    if (thread.status !== "idle") return { kind: "silent" };
+    if (!Number.isFinite(thread.updatedAt)) return idleFleetBlind("blind", "blind", "blind", "orchestrator-unreadable");
+    if (String(thread.updatedAt) !== probe.idleEpisode) return { kind: "silent" };
+
+    const [activeLanes, nativeLanes, startable] = await Promise.all([
+      readIdleFleetActiveLanes(probe.projectId),
+      readIdleFleetNativeLanes(probe.projectId),
+      readIdleFleetStartable(probe.projectId),
+    ]);
+    const laneDisagreement = activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value;
+    if (!activeLanes.known || !nativeLanes.known || !startable.known) {
+      const blindReasons = [
+        !activeLanes.known ? activeLanes.reason : null,
+        !nativeLanes.known ? nativeLanes.reason : null,
+        !startable.known ? startable.reason : null,
+      ].filter((reason): reason is string => reason !== null);
+      return idleFleetBlind(
+        "known",
+        !activeLanes.known || !nativeLanes.known ? "blind" : "known",
+        startable.known ? "known" : "blind",
+        blindReasons.join(";"),
+      );
+    }
+    if (laneDisagreement) {
+      return idleFleetBlind("known", "blind", "known", `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value}`);
+    }
+    if (activeLanes.value > 0 || startable.value.count === 0) return { kind: "silent" };
+    const queueHead = startable.value.head;
+    if (!queueHead) return { kind: "silent" };
+    const role = {
+      projectId: holder.project_id,
+      roleId: holder.role_id,
+      roleGeneration: holder.role_generation,
+      executionAttemptId: holder.execution_attempt_id,
+      threadId: holder.thread_id,
+      queueHeadId: queueHead,
+      idleAgeMs: 0,
+    };
+    return {
+      kind: "ready",
+      episodeKey: `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${holder.execution_attempt_id}:${holder.thread_id}:activeLanes=0:${queueHead}`,
+      role,
+      message: `Idle fleet: queue head ${queueHead} is startable with zero active writing lanes. Dispatch it or record the blocker.`,
+    };
+  };
+  const idleFleetDetector = createIdleFleetDetector({
+    read: readIdleFleet,
+    readRearmProbes: readIdleFleetProbes,
+    persistence: {
+      read: () => bb.storage.kv.get<unknown>("idle-fleet.wake"),
+      write: (state) => bb.storage.kv.set("idle-fleet.wake", state),
+    },
+    debounceMs: IDLE_FLEET_DEBOUNCE_MS,
+    onBlind: (message) => bb.log.warn(message),
+    wake: async (ready: IdleFleetReady) => {
+      const confirmed = await readIdleFleet(ready.probe);
+      if (confirmed.kind !== "ready" || confirmed.episodeKey !== ready.episodeKey) return false;
+      return (await sendRoleWake(confirmed.role, confirmed.message)) === true;
+    },
+  });
+  bb.onDispose(idleFleetDetector.stop);
+
   const stallGuardCycle = createStallGuardCycle({
     readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
     readArtifact: async (projectId) => {
@@ -1751,7 +1963,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     return watcher.observe(id, status);
   };
   bb.events.on("thread.active", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
-  bb.events.on("thread.idle", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
+  bb.events.on("thread.idle", (payload) => {
+    idleFleetDetector.arm({ projectId: payload.thread.projectId, threadId: payload.thread.id, idleEpisode: String(payload.thread.updatedAt) });
+    void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`));
+  });
   bb.events.on("thread.failed", async (payload) => {
     await observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`));
     const { id, status } = threadEventStatus(payload);
@@ -1763,6 +1978,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   bb.onDispose(unsubscribe);
   bb.background.service("lane-watcher", {
     async start(signal) {
+      void idleFleetDetector.rearm();
       void reconcileErrorRecovery().catch((error) => bb.log.warn(`error-recovery reconcile failed: ${String(error)}`));
       while (!signal.aborted) {
         await watcher.poll().catch((error) => bb.log.warn(`lane poll failed: ${String(error)}`));

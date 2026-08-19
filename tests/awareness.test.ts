@@ -2,7 +2,10 @@ import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import {
   createLaneWatcher,
+  createIdleFleetDetector,
   createWaitRegistry,
+  IDLE_FLEET_DEBOUNCE_MS,
+  type IdleFleetDecision,
   type OperatorWait,
   type RegisteredWait,
   readRoleHolderStates,
@@ -520,5 +523,102 @@ describe("lane awareness", () => {
       generations: db.prepare("SELECT * FROM role_generations").all(),
     }).toEqual(before);
     db.close();
+  });
+
+  it.each(["active orchestrator", "one active lane", "zero startable work"])("keeps the %s conjunct silent", async () => {
+    vi.useFakeTimers();
+    try {
+      const wake = vi.fn(async () => true);
+      const onBlind = vi.fn();
+      const detector = createIdleFleetDetector({
+        read: async (): Promise<IdleFleetDecision> => ({ kind: "silent" }),
+        readRearmProbes: async () => [],
+        wake,
+        onBlind,
+        debounceMs: IDLE_FLEET_DEBOUNCE_MS,
+      });
+
+      detector.arm({ projectId: "project-1", threadId: "orchestrator-1", idleEpisode: "episode-1" });
+      await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+
+      expect(wake).not.toHaveBeenCalled();
+      expect(onBlind).not.toHaveBeenCalled();
+      detector.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports an unreadable conjunct and never treats it as healthy", async () => {
+    vi.useFakeTimers();
+    try {
+      const wake = vi.fn(async () => true);
+      const onBlind = vi.fn();
+      const message = "idle-fleet coverage=blind orchestrator=known activeLanes=blind startable=known reason=work-items-have-no-thread-binding:GH-300";
+      const detector = createIdleFleetDetector({
+        read: async (): Promise<IdleFleetDecision> => ({ kind: "blind", message }),
+        readRearmProbes: async () => [],
+        wake,
+        onBlind,
+        debounceMs: IDLE_FLEET_DEBOUNCE_MS,
+      });
+
+      detector.arm({ projectId: "project-1", threadId: "orchestrator-1", idleEpisode: "episode-1" });
+      await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+
+      expect(wake).not.toHaveBeenCalled();
+      expect(onBlind).toHaveBeenCalledExactlyOnceWith(message);
+      detector.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("debounces, persists, and deduplicates one unchanged idle-fleet episode", async () => {
+    vi.useFakeTimers();
+    try {
+      let persisted: unknown;
+      const wake = vi.fn(async () => true);
+      const role = {
+        projectId: "project-1",
+        roleId: "project-orchestrator",
+        roleGeneration: 3,
+        executionAttemptId: "attempt-3",
+        threadId: "orchestrator-1",
+        queueHeadId: "repo#305",
+        idleAgeMs: 0,
+      };
+      const options = {
+        read: async (): Promise<IdleFleetDecision> => ({ kind: "ready", episodeKey: "episode-1:repo#305", role, message: "wake" }),
+        readRearmProbes: async () => [{ projectId: "project-1", threadId: "orchestrator-1", idleEpisode: "episode-1" }],
+        wake,
+        onBlind: vi.fn(),
+        persistence: {
+          read: async () => persisted,
+          write: async (state: Record<string, string>) => { persisted = state; },
+        },
+        debounceMs: IDLE_FLEET_DEBOUNCE_MS,
+      };
+      const detector = createIdleFleetDetector(options);
+
+      detector.arm({ projectId: "project-1", threadId: "orchestrator-1", idleEpisode: "episode-1" });
+      await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS - 1);
+      expect(wake).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(wake).toHaveBeenCalledTimes(1);
+
+      detector.arm({ projectId: "project-1", threadId: "orchestrator-1", idleEpisode: "episode-1" });
+      await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+      expect(wake).toHaveBeenCalledTimes(1);
+      detector.stop();
+
+      const restarted = createIdleFleetDetector(options);
+      await restarted.rearm();
+      await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+      expect(wake).toHaveBeenCalledTimes(1);
+      restarted.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
