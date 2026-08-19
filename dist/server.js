@@ -14485,11 +14485,11 @@ var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
 var CONTRACT_VERSION = 21;
-var SCHEMA_VERSION = 19;
+var SCHEMA_VERSION = 20;
 var PREVIOUS_CONTRACT_VERSION = 21;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
-var PREVIOUS_SCHEMA_VERSION = 18;
+var PREVIOUS_SCHEMA_VERSION = 19;
 var ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"];
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
 var directorSeatProfile = {
@@ -15302,7 +15302,9 @@ var MIGRATIONS = [
   `ALTER TABLE work_item_github_backfills
      ADD COLUMN config_revision INTEGER CHECK (config_revision IS NULL OR config_revision > 0);
    ALTER TABLE work_item_github_backfills
-     ADD COLUMN attempt_reason TEXT CHECK (attempt_reason IS NULL OR attempt_reason IN ('initial', 'config_revision_changed'))`
+     ADD COLUMN attempt_reason TEXT CHECK (attempt_reason IS NULL OR attempt_reason IN ('initial', 'config_revision_changed'))`,
+  `ALTER TABLE execution_attempts ADD COLUMN review_pr_number INTEGER CHECK (review_pr_number IS NULL OR review_pr_number > 0);
+   ALTER TABLE execution_attempts ADD COLUMN review_pr_head_sha TEXT CHECK (review_pr_head_sha IS NULL OR review_pr_head_sha GLOB '[0-9a-f]*');`
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var GH300_BACKFILL_MIGRATION_ID = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE execution_attempts_gh300"));
@@ -15800,11 +15802,19 @@ var workItemWaitSchema = external_exports.discriminatedUnion("kind", [
   external_exports.object({ kind: external_exports.literal("schedule"), schedule: id, declaredBySeat: id }).strict(),
   external_exports.object({ kind: external_exports.literal("seat"), seat: external_exports.enum(ROLE_IDS), declaredBySeat: id }).strict()
 ]);
+var gitShaSchema = external_exports.string().regex(/^[0-9a-f]{40,64}$/u);
 var workAttemptSchema = external_exports.object({
   laneId: id,
   threadId: id.optional(),
-  assignmentKind: external_exports.enum(["write", "review", "probe"])
-}).strict();
+  assignmentKind: external_exports.enum(["write", "review", "probe"]),
+  reviewPrNumber: external_exports.number().int().positive().refine(Number.isSafeInteger, "reviewPrNumber must be a safe integer").optional(),
+  reviewPrHeadSha: gitShaSchema.optional()
+}).strict().superRefine((attempt, ctx) => {
+  const linked = attempt.reviewPrNumber !== void 0 || attempt.reviewPrHeadSha !== void 0;
+  if (attempt.assignmentKind !== "review" && linked) {
+    ctx.addIssue({ code: "custom", message: "pull request linkage is valid only for review attempts" });
+  }
+});
 var githubMappingSchema = external_exports.object({
   repoTargetId: id,
   owner: id,
@@ -15917,7 +15927,6 @@ var roleContextRefSchema = external_exports.object({
   completionEventId: id,
   completionEventSeq: external_exports.number().int().positive()
 }).strict();
-var gitShaSchema = external_exports.string().regex(/^[0-9a-f]{40,64}$/u);
 var OPERATOR_RECEIPT_RETIREMENT_CONDITION = "host-issued receipt get-bb/bb#1541";
 var CANONICAL_MUTATION_CLASSES = [
   "bootstrap",
@@ -18694,6 +18703,8 @@ function insertWorkItemAttempt(db, input) {
     laneId: input.laneId,
     threadId: input.threadId,
     assignmentKind: input.assignmentKind,
+    reviewPrNumber: input.reviewPrNumber,
+    reviewPrHeadSha: input.reviewPrHeadSha,
     attemptOrdinal: input.attemptOrdinal,
     state: input.state,
     reasonCode: input.reasonCode,
@@ -18704,11 +18715,12 @@ function insertWorkItemAttempt(db, input) {
     `INSERT INTO execution_attempts (
        project_id, execution_attempt_id, origin, lane_id, assignment_kind, attempt_ordinal,
        config_revision, work_item_id, repo_target_id, state, thread_id, reason_code,
-       progress_json, lease_owner_thread_id, continuation_of_attempt_id, created_at_ms,
+       review_pr_number, review_pr_head_sha, progress_json, lease_owner_thread_id, continuation_of_attempt_id, created_at_ms,
        observed_at_ms, completed_at_ms, attempt_digest
      ) VALUES (
        @projectId, @executionAttemptId, 'work_item', @laneId, @assignmentKind, @attemptOrdinal,
        @configRevision, @workItemId, @repoTargetId, @state, @threadId, @reasonCode,
+       @reviewPrNumber, @reviewPrHeadSha,
        '{}', @leaseOwnerThreadId, @continuationOfAttemptId, @createdAtMs,
        @observedAtMs, @completedAtMs, @attemptDigest
      )`
@@ -18724,6 +18736,8 @@ function insertWorkItemAttempt(db, input) {
     state: input.state,
     threadId: input.threadId,
     reasonCode: input.reasonCode,
+    reviewPrNumber: input.reviewPrNumber,
+    reviewPrHeadSha: input.reviewPrHeadSha,
     leaseOwnerThreadId: input.leaseOwnerThreadId,
     continuationOfAttemptId: input.continuationOfAttemptId,
     createdAtMs: input.createdAtMs,
@@ -18785,7 +18799,9 @@ function backfillWorkItemAttempts(db, migrationAppliedAtMs = gh300BackfillEpochM
         createdAtMs: row.created_at_ms,
         observedAtMs: row.updated_at_ms,
         completedAtMs: state === "running" ? null : row.updated_at_ms,
-        continuationOfAttemptId: null
+        continuationOfAttemptId: null,
+        reviewPrNumber: null,
+        reviewPrHeadSha: null
       });
       db.prepare(
         "UPDATE work_items SET body = ? WHERE project_id = ? AND work_item_id = ?"
@@ -19147,7 +19163,9 @@ function applyWorkItemTransition(db, request, digest) {
       createdAtMs,
       observedAtMs: createdAtMs,
       completedAtMs: null,
-      continuationOfAttemptId: prior?.execution_attempt_id ?? null
+      continuationOfAttemptId: prior?.execution_attempt_id ?? null,
+      reviewPrNumber: null,
+      reviewPrHeadSha: null
     });
     return commitMutation(
       db,
@@ -19224,7 +19242,9 @@ function applyWorkItemTransition(db, request, digest) {
       createdAtMs: now(),
       observedAtMs: now(),
       completedAtMs: null,
-      continuationOfAttemptId: prior?.execution_attempt_id ?? null
+      continuationOfAttemptId: prior?.execution_attempt_id ?? null,
+      reviewPrNumber: null,
+      reviewPrHeadSha: null
     });
   } else if (nextState === "review_pending") {
     executionAttemptId = terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "done", "write");
@@ -19244,7 +19264,9 @@ function applyWorkItemTransition(db, request, digest) {
         createdAtMs: now(),
         observedAtMs: now(),
         completedAtMs: null,
-        continuationOfAttemptId: executionAttemptId
+        continuationOfAttemptId: executionAttemptId,
+        reviewPrNumber: workAttempt.reviewPrNumber ?? null,
+        reviewPrHeadSha: workAttempt.reviewPrHeadSha ?? null
       });
     }
   } else {
