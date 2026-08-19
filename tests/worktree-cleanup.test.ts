@@ -2,7 +2,17 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { canonicalWorktreePath, classifyWorktree, cleanupGitWorktrees, listAllProjectThreads } from "../src/worktree-cleanup.js";
+import type { WorktreeCleanupOptions } from "../src/worktree-cleanup.js";
+import {
+  canonicalWorktreePath,
+  classifyWorktree,
+  cleanupGitWorktrees,
+  defaultQuietFloorMs,
+  listAllProjectThreads,
+  listGitWorktrees,
+  runWorktreeCleanup,
+  worktreeCreatedAt,
+} from "../src/worktree-cleanup.js";
 
 const roots: string[] = [];
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: "pipe" }).trim();
@@ -24,6 +34,30 @@ function fixture() {
   return { root, paths };
 }
 
+// Mirrors cleanupGitWorktrees' git wiring while leaving the clock and the inventory
+// verdict injectable, so each refusal can be exercised in isolation.
+function report(root: string, live: Set<string>, ownership: Map<string, Set<string>>, overrides: Partial<WorktreeCleanupOptions> = {}) {
+  const originMain = git(root, "rev-parse", "refs/remotes/origin/main");
+  return runWorktreeCleanup(listGitWorktrees(root), {
+    liveThreadIds: live,
+    liveWorktreeThreadIds: ownership,
+    originMain,
+    status: (path) => git(path, "status", "--porcelain", "--untracked-files=all"),
+    reachable: (path, head) => {
+      try {
+        git(path, "merge-base", "--is-ancestor", head, originMain);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    environmentInventoryComplete: true,
+    createdAt: worktreeCreatedAt,
+    now: Date.now() + defaultQuietFloorMs,
+    ...overrides,
+  });
+}
+
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -37,10 +71,17 @@ describe("worktree cleanup", () => {
     expect(candidate).toBe("candidate");
   });
 
+  it("reads the creation timestamp git wrote into the detached worktree's own reflog", () => {
+    const { paths } = fixture();
+    const createdAt = worktreeCreatedAt(paths[1]);
+    expect(createdAt).not.toBeNull();
+    expect(Math.abs(Date.now() - createdAt!)).toBeLessThan(60_000);
+  });
+
   it("reports exactly the clean detached orphan and refuses live and dirty entries", () => {
     const { root, paths } = fixture();
-    const ownership = new Map(paths.map((path, index) => [canonicalWorktreePath(path), new Set(index === 0 ? ["thr_live"] : [])]));
-    const result = cleanupGitWorktrees(root, new Set(["thr_live"]), ownership);
+    const ownership = new Map([[canonicalWorktreePath(paths[0]), new Set(["thr_live"])]]);
+    const result = report(root, new Set(["thr_live"]), ownership);
     expect(result.wouldRemove.map(({ path }) => path)).toEqual([canonicalWorktreePath(paths[1])]);
     expect(result.refused).toEqual(expect.arrayContaining([
       expect.objectContaining({ path: canonicalWorktreePath(paths[0]), reason: "live thread thr_live" }),
@@ -49,14 +90,41 @@ describe("worktree cleanup", () => {
     console.log(`fixture discrimination: ${JSON.stringify({ wouldRemove: result.wouldRemove.map(({ path }) => path), refused: result.refused.map(({ path, reason }) => ({ path, reason })) })}`);
   });
 
+  it("refuses the checked-out main worktree that carries no thread id", () => {
+    const { root } = fixture();
+    const result = report(root, new Set(), new Map());
+    expect(result.wouldRemove.map(({ path }) => path)).not.toContain(canonicalWorktreePath(root));
+    expect(result.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(root), reason: "thread ownership unresolved for worktree on branch main" }));
+  });
+
+  it("refuses every detached worktree when the environment inventory is incomplete", () => {
+    const { root, paths } = fixture();
+    const result = report(root, new Set(), new Map(), { environmentInventoryComplete: false });
+    expect(result.wouldRemove).toEqual([]);
+    expect(result.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(paths[1]), reason: "bb environment inventory is incomplete; detached ownership unresolved" }));
+  });
+
+  it("refuses a detached worktree created inside the quiet floor", () => {
+    const { root, paths } = fixture();
+    const result = report(root, new Set(), new Map(), { now: Date.now() });
+    expect(result.wouldRemove).toEqual([]);
+    expect(result.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(paths[1]), reason: expect.stringContaining("quiet floor") }));
+  });
+
+  it("refuses a detached worktree whose creation record cannot be read", () => {
+    const { root, paths } = fixture();
+    const result = report(root, new Set(), new Map(), { createdAt: () => null });
+    expect(result.wouldRemove).toEqual([]);
+    expect(result.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(paths[1]), reason: "worktree creation record is unavailable; detached ownership unresolved" }));
+  });
+
   it("refuses a clean worktree one commit ahead of origin/main", () => {
     const { root, paths } = fixture();
     writeFileSync(join(paths[1], "ahead.txt"), "ahead\n");
     git(paths[1], "add", "ahead.txt");
     git(paths[1], "commit", "--quiet", "-m", "ahead");
-    const ownership = new Map([[canonicalWorktreePath(paths[1]), new Set<string>()]]);
-    const result = cleanupGitWorktrees(root, new Set(), ownership);
-    expect(result.wouldRemove).toEqual([]);
+    const result = report(root, new Set(), new Map());
+    expect(result.wouldRemove.map(({ path }) => path)).not.toContain(canonicalWorktreePath(paths[1]));
     expect(result.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(paths[1]), reason: "commits are not reachable from origin/main" }));
   });
 
@@ -65,14 +133,16 @@ describe("worktree cleanup", () => {
     const threads = await listAllProjectThreads(async ({ offset }) => pages[offset / 1000].map((id) => ({ id })), "project");
     expect(threads).toHaveLength(1001);
     const { root, paths } = fixture();
-    const result = cleanupGitWorktrees(root, new Set(["thr_1000"]), new Map([[canonicalWorktreePath(paths[1]), new Set(["thr_1000"])]]));
-    expect(result.wouldRemove).toEqual([]);
+    const result = report(root, new Set(["thr_1000"]), new Map([[canonicalWorktreePath(paths[1]), new Set(["thr_1000"])]]));
+    expect(result.wouldRemove.map(({ path }) => path)).not.toContain(canonicalWorktreePath(paths[1]));
+    expect(result.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(paths[1]), reason: "live thread thr_1000" }));
   });
 
-  it("is report-only and makes no removal callback available", () => {
-    const { root, paths } = fixture();
-    const result = cleanupGitWorktrees(root, new Set(), new Map(paths.map((path) => [canonicalWorktreePath(path), new Set()])));
+  it("is report-only and defaults to refusing detached worktrees without an inventory verdict", () => {
+    const { root } = fixture();
+    const result = cleanupGitWorktrees(root, new Set());
     expect(result).not.toHaveProperty("removed");
     expect(result.environmentRecordsReleased).toBe(false);
+    expect(result.wouldRemove).toEqual([]);
   });
 });

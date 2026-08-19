@@ -9,6 +9,7 @@ import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import plugin, { rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
+import { canonicalWorktreePath } from "../src/worktree-cleanup.js";
 import {
   DEFERRED_ISSUE_3_OUTCOMES,
   CACHED_CONSUMERS,
@@ -6678,5 +6679,41 @@ describe("bb-collab plugin boundary", () => {
     expect(reported.exitCode).toBe(2);
     expect(output).toMatchObject({ outcome: "refused", wouldRemove: [], environmentRecordsReleased: false });
     expect(output).not.toHaveProperty("removed");
+  });
+
+  it("resolves detached ownership only while the environment inventory reads completely", async () => {
+    const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: "pipe" }).trim();
+    const root = mkdtempSync("/tmp/bb-cli-worktree-cleanup-");
+    try {
+      git(root, "init", "--quiet");
+      git(root, "config", "user.email", "test@example.invalid");
+      git(root, "config", "user.name", "test");
+      writeFileSync(join(root, "base.txt"), "base\n");
+      git(root, "add", "base.txt");
+      git(root, "commit", "--quiet", "-m", "base");
+      git(root, "branch", "-M", "main");
+      git(root, "update-ref", "refs/remotes/origin/main", "HEAD");
+      const orphan = join(root, "orphan");
+      git(root, "worktree", "add", "--quiet", "--detach", orphan, "HEAD");
+      const reflog = join(root, ".git/worktrees/orphan/logs/HEAD");
+      const aged = Math.floor(Date.now() / 1000) - 72 * 60 * 60;
+      writeFileSync(reflog, readFileSync(reflog, "utf8").replace(/ \d+ ([-+]\d{4})/u, ` ${aged} $1`));
+
+      const host = await loadedHost();
+      host.harness.sdk.stub("projects.get", (async () => ({ sources: [{ isDefault: true, path: root }] })) as never);
+      host.harness.sdk.stub("threads.list", (async ({ offset }: { offset: number }) => (offset === 0 ? [{ id: "thr_elsewhere", environmentId: "env_elsewhere" }] : [])) as never);
+
+      host.harness.sdk.stub("environments.get", (async () => ({ path: join(root, "unrelated") })) as never);
+      const resolved = JSON.parse((await host.harness.runCli(["worktree-cleanup", "--project", PROJECT_ID])).stdout) as { wouldRemove: { path: string; reason: string }[] };
+      expect(resolved.wouldRemove.map(({ path }) => path)).toContain(canonicalWorktreePath(orphan));
+
+      host.harness.sdk.stub("environments.get", (async () => { throw new Error("environment deleted"); }) as never);
+      const unresolved = JSON.parse((await host.harness.runCli(["worktree-cleanup", "--project", PROJECT_ID])).stdout) as { wouldRemove: unknown[]; refused: { path: string; reason: string }[] };
+      expect(unresolved.wouldRemove).toEqual([]);
+      expect(unresolved.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(orphan), reason: "bb environment inventory is incomplete; detached ownership unresolved" }));
+      console.log(`inventory discrimination: ${JSON.stringify({ resolved: resolved.wouldRemove.map(({ reason }) => reason), unresolved: unresolved.refused.map(({ reason }) => reason) })}`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
