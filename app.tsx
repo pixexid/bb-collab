@@ -35,6 +35,18 @@ const MAX_VISIBLE_THREADS = 5;
 const MAX_VISIBLE_INBOX_MESSAGES = 256;
 const SIDEBAR_RPC_BATCH_SIZE = 256;
 const INBOX_FILTER_STORAGE_KEY = "bb-collab.inbox-filters";
+// The host lists every BB project while inbox registration lives in
+// `project_config_heads`, so the aggregate fan-out necessarily reads projects
+// that have no inbox. That rejection is the normal case there and is skipped.
+// It is skipped ONLY there: picking one project by name is a question about
+// that project, and it is owed the answer. There is no typed error on this
+// path yet, so the match is exact-message equality against the sentence
+// server.ts throws — a wrapped or quoted failure stays visible.
+const UNREGISTERED_INBOX_PROJECT = "operator inbox project is not registered";
+
+function isUnregisteredInboxProject(reason: unknown): boolean {
+  return reason instanceof Error && reason.message === UNREGISTERED_INBOX_PROJECT;
+}
 
 type InboxFilters = { projectId: string; recipient: "" | OperatorMessage["recipient"] };
 
@@ -701,6 +713,7 @@ function InboxPanel(_props: PluginNavPanelProps) {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [replyingMessageKey, setReplyingMessageKey] = useState<string | null>(null);
   const [errors, setErrors] = useState<readonly string[]>([]);
+  const [notice, setNotice] = useState<string | null>(null);
   const refreshSequence = useRef(0);
   const projects = useMemo(() => projectId ? sidebar.projects.filter((candidate) => candidate.id === projectId) : sidebar.projects, [projectId, sidebar.projects]);
   const projectNames = useMemo(() => new Map(sidebar.projects.map((candidate) => [candidate.id, candidate.name])), [sidebar.projects]);
@@ -714,6 +727,7 @@ function InboxPanel(_props: PluginNavPanelProps) {
 
   const refresh = useCallback(() => {
     const sequence = ++refreshSequence.current;
+    setNotice(null);
     if (projects.length === 0) {
       setMessages([]);
       setErrors([]);
@@ -726,7 +740,7 @@ function InboxPanel(_props: PluginNavPanelProps) {
         const failed: string[] = [];
         results.forEach((result, index) => {
           if (result.status === "fulfilled") loaded.push(...result.value);
-          else failed.push(`${projects[index]!.name} (${projects[index]!.id}): ${String(result.reason)}`);
+          else if (projectId !== "" || !isUnregisteredInboxProject(result.reason)) failed.push(`${projects[index]!.name} (${projects[index]!.id}): ${String(result.reason)}`);
         });
         loaded.sort((left, right) => Number(left.readAtMs !== null) - Number(right.readAtMs !== null) || right.createdAtMs - left.createdAtMs || right.messageId - left.messageId);
         setMessages(loaded);
@@ -761,16 +775,17 @@ function InboxPanel(_props: PluginNavPanelProps) {
         </div>
         {sidebar.projects.length === 0 ? <p className="text-sm text-muted-foreground">No registered projects.</p> : null}
         {errors.map((loadError) => <p key={loadError} className="text-sm text-destructive">Unable to read inbox: {loadError}</p>)}
+        {notice ? <p role="status" className="text-sm text-primary">{notice}</p> : null}
         {sidebar.projects.length > 0 ? (
           <section aria-labelledby="inbox-project-heading">
-            <h2 id="inbox-project-heading" className="mb-2 text-sm font-semibold">{projectId ? `${projectNames.get(projectId) ?? projectId} · ${projectId}` : "All projects"}</h2>
+            <h2 id="inbox-project-heading" className="mb-2 text-sm font-semibold">{projectId ? projectNames.get(projectId) ?? projectId : "All projects"}</h2>
             {messages.length === 0 ? <p className="text-sm text-muted-foreground">No messages for this project and recipient filter.</p> : null}
             {messages.length > MAX_VISIBLE_INBOX_MESSAGES ? <p className="mb-3 text-sm text-muted-foreground">Showing the first {MAX_VISIBLE_INBOX_MESSAGES} of {messages.length} messages; unread messages are first. Select a project to narrow the list.</p> : null}
             <div className="space-y-3">
               {visibleMessages.map((message) => (
                 <article key={messageKey(message)} className={`rounded-lg border p-4 ${message.readAtMs === null ? "border-primary/50" : "border-border"}`}>
                   <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                    <span className="font-medium text-foreground">{projectNames.get(message.projectId) ?? message.projectId} · {message.projectId}</span>
+                    <span className="font-medium text-foreground">{projectNames.get(message.projectId) ?? message.projectId}</span>
                     <span className="font-medium text-foreground">{message.recipient}</span>
                     <span>{message.severity}</span>
                     <span>
@@ -806,14 +821,19 @@ function InboxPanel(_props: PluginNavPanelProps) {
                           const text = (drafts[messageKey(message)] ?? message.replyText ?? "").trim();
                           if (!text) return;
                           setErrors([]);
+                          setNotice(null);
                           setReplyingMessageKey(messageKey(message));
                           void rpc.call("replyToOperatorMessage", { projectId: message.projectId, messageId: message.messageId, text })
-                            .then(updateMessage)
+                            .then((replied) => { updateMessage(replied); setNotice("Reply delivered."); })
                             .catch((reason: unknown) => setErrors([String(reason)]))
                             .finally(() => setReplyingMessageKey(null));
                         }}>{replyingMessageKey === messageKey(message) ? "Delivering…" : "Reply"}</button>
                         {message.readAtMs === null ? <button type="button" className="rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-muted" onClick={() => {
-                          void rpc.call("markOperatorMessageRead", { projectId: message.projectId, messageId: message.messageId }).then(updateMessage).catch((reason: unknown) => setErrors([String(reason)]));
+                          setErrors([]);
+                          setNotice(null);
+                          void rpc.call("markOperatorMessageRead", { projectId: message.projectId, messageId: message.messageId })
+                            .then((read) => { updateMessage(read); setNotice("Marked read."); })
+                            .catch((reason: unknown) => setErrors([String(reason)]));
                         }}>Mark read</button> : null}
                       </div>
                     </div>

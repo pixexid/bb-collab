@@ -132,7 +132,7 @@ describe("replacement thread list", () => {
     await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a" }));
     expect(rendered.getByText("Need an answer")).toBeTruthy();
     expect(rendered.getByText(/Reply delivery failed: environment deleted/)).toBeTruthy();
-    expect(rendered.getByRole("heading", { name: /Project A · project-a/ })).toBeTruthy();
+    expect(rendered.getByRole("heading", { name: "Project A" })).toBeTruthy();
   });
 
   it("aggregates every project by default, sorts unread first, and filters by project", async () => {
@@ -151,7 +151,7 @@ describe("replacement thread list", () => {
     await waitFor(() => expect(rendered.getByText("unread B")).toBeTruthy());
     expect(operatorMessages).toHaveBeenCalledTimes(2);
     expect(Array.from(rendered.container.querySelectorAll("article p.my-3")).map((row) => row.textContent)).toEqual(["unread B", "read A"]);
-    expect(rendered.getAllByText("Project B · project-b").length).toBeGreaterThan(1);
+    expect(Array.from(rendered.container.querySelectorAll("article")).map((row) => row.textContent)).toEqual([expect.stringContaining("Project B"), expect.stringContaining("Project A")]);
     fireEvent.change(rendered.getByLabelText("Project"), { target: { value: "project-a" } });
     await waitFor(() => expect(rendered.queryByText("unread B")).toBeNull());
     expect(rendered.getByText("read A")).toBeTruthy();
@@ -276,6 +276,104 @@ describe("replacement thread list", () => {
 
     await waitFor(() => expect(rendered.getByText("loaded A")).toBeTruthy());
     expect(rendered.getByText(/Unable to read inbox: Project B \(project-b\): Error: project unavailable/)).toBeTruthy();
+  });
+
+  it("skips unregistered projects silently while a genuine read failure keeps its scoped error", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const operatorMessages = vi.fn(async ({ projectId }: { projectId: string }) => {
+      if (projectId === "project-b") throw new Error("operator inbox project is not registered");
+      if (projectId === "project-c") throw new Error("project unavailable");
+      return [{ messageId: 7, projectId, recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "loaded A", createdAtMs: 1, readAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null }];
+    });
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A"), project("project-b", "Project B"), project("project-c", "Project C")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("loaded A")).toBeTruthy());
+    expect(rendered.getByText(/Unable to read inbox: Project C \(project-c\): Error: project unavailable/)).toBeTruthy();
+    expect(rendered.queryByText(/not registered/)).toBeNull();
+    expect(rendered.queryByText(/Unable to read inbox: Project B/)).toBeNull();
+    expect(rendered.container.querySelectorAll("p.text-destructive")).toHaveLength(1);
+  });
+
+  it("binds the skip to the rejection the server itself produces, and only in aggregate mode", async () => {
+    const host = createFakePluginHost({ pluginId: "bb-collab" });
+    await plugin(host.bb);
+    // The rejection is taken from the running server rather than authored here:
+    // reword the throw at server.ts:794, or wrap the sentinel as the cause of
+    // another Error, and this stops matching — the error becomes visible
+    // instead of the skip silently over-reaching. A change of THROWN TYPE does
+    // not break it: createFakePluginHost canonicalises every handler rejection
+    // through errorMessage() and rethrows a new Error, so a non-Error throw
+    // reaches the panel as an Error carrying the sentinel. Closing that case
+    // needs a domain code rather than a message (#280).
+    const serverRejection = await host.harness.callRpc("operatorMessages", { projectId: "project-b" }).then(() => null, (error: unknown) => error);
+    expect(serverRejection).toBeInstanceOf(Error);
+
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const options = {
+      sidebarThreads: { status: "ready" as const, projects: [project("project-b", "Project B")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => { throw serverRejection; } } as never,
+    };
+
+    const aggregate = renderSlot(inbox, { subPath: "" }, options);
+    await waitFor(() => expect(aggregate.getByText("No messages for this project and recipient filter.")).toBeTruthy());
+    expect(aggregate.container.querySelectorAll("p.text-destructive")).toHaveLength(0);
+
+    fireEvent.change(aggregate.getByLabelText("Project"), { target: { value: "project-b" } });
+    await waitFor(() => expect(aggregate.getByText(/Unable to read inbox: Project B \(project-b\): Error: operator inbox project is not registered/)).toBeTruthy());
+  });
+
+  it("keeps a failure that merely quotes the unregistered sentence visible", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-b", "Project B")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => { throw new Error("transport failed after operator inbox project is not registered response"); } } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText(/Unable to read inbox: Project B \(project-b\): Error: transport failed after operator inbox project is not registered response/)).toBeTruthy());
+  });
+
+  it("headers the card with the project name and not its raw id", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("proj_a8zzfsx36j", "bb-collab")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => [{ messageId: 8, projectId: "proj_a8zzfsx36j", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "header check", createdAtMs: 1, readAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null }] } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("header check")).toBeTruthy());
+    const card = rendered.container.querySelector("article")!;
+    expect(card.textContent).toContain("bb-collab");
+    expect(card.textContent).not.toContain("proj_a8zzfsx36j");
+    expect(rendered.getByRole("heading", { name: "All projects" })).toBeTruthy();
+  });
+
+  it("confirms a delivered reply and a mark-read with visible success feedback", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const message = { messageId: 9, projectId: "project-a", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "answer me", createdAtMs: 1, readAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null };
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: {
+        ...(rpcHandlers() as unknown as Record<string, unknown>),
+        operatorMessages: async () => [message],
+        markOperatorMessageRead: async () => ({ ...message, readAtMs: 5 }),
+        replyToOperatorMessage: async () => ({ ...message, readAtMs: 5, repliedAtMs: 6, replyText: "on it" }),
+      } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("answer me")).toBeTruthy());
+    fireEvent.click(rendered.getByRole("button", { name: "Mark read" }));
+    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Marked read."));
+
+    fireEvent.change(rendered.getByLabelText("Reply"), { target: { value: "on it" } });
+    fireEvent.click(rendered.getByRole("button", { name: "Reply" }));
+    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Reply delivered."));
   });
 
   it("discloses and caps the aggregate display spill", async () => {
