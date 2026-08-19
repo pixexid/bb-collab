@@ -2020,7 +2020,7 @@ describe("bb-collab plugin boundary", () => {
 
     const unregistered = await host.harness.runCli(["inbox", "--project", FOREIGN_PROJECT_ID]);
     expect(unregistered.exitCode).toBe(2);
-    expect(JSON.parse(unregistered.stdout)).toMatchObject({ outcome: "INVALID_INPUT" });
+    expect(JSON.parse(unregistered.stdout)).toMatchObject({ outcome: "PROJECT_CONFIG_REQUIRED" });
   });
 
   it("preserves the registered-project refusal code through the CLI send catch", async () => {

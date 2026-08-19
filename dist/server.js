@@ -21135,7 +21135,7 @@ async function runCli(db, bb, argv, ctx, deps) {
     if (parsedRecipient && !parsedRecipient.success) return invalidCli(parsedRecipient.error.message);
     try {
       const listed = await listOperatorMessages(db, bb, projectId, parsedRecipient?.data);
-      if (listed.outcome !== "OK") return invalidCli(listed.message ?? listed.outcome);
+      if (listed.outcome !== "OK") return invalidCli(listed.message ?? listed.outcome, listed.outcome);
       return { exitCode: 0, stdout: JSON.stringify(listed.messages) };
     } catch (error48) {
       return invalidCli(error48 instanceof Error ? error48.message : String(error48), isRefusal(error48) ? error48.data.code : "INVALID_INPUT");

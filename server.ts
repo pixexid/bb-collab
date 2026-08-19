@@ -1144,7 +1144,7 @@ async function runCli(
       // The reader answers a refusal instead of throwing it (#280), so the CLI has
       // to refuse on its own account. The code is the fallback because `message` is
       // optional on the result and a future outcome could arrive without one.
-      if (listed.outcome !== "OK") return invalidCli(listed.message ?? listed.outcome);
+      if (listed.outcome !== "OK") return invalidCli(listed.message ?? listed.outcome, listed.outcome);
       return { exitCode: 0, stdout: JSON.stringify(listed.messages) };
     } catch (error) {
       return invalidCli(error instanceof Error ? error.message : String(error), isRefusal(error) ? error.data.code : "INVALID_INPUT");
