@@ -3202,12 +3202,14 @@ describe("bb-collab plugin boundary", () => {
     const gh = join(bin, "gh");
     writeFileSync(gh, `#!/bin/sh
 if [ "$1" = "pr" ]; then
-  if [ "$3" = "206" ] || [ "$3" = "208" ]; then printf '%s\\n' '{"state":"MERGED","mergedAt":"2026-08-19T00:00:00Z"}'; exit 0; fi
+  if [ "$3" = "340" ] && [ "$7" = "state,mergedAt" ]; then printf '%s\\n' '{"state":"MERGED","mergedAt":"2026-08-19T00:00:00Z"}'; exit 0; fi
   exit 1
 fi
 if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[{"number":999}]'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "207" ]; then exit 1; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"state":"CLOSED"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" != "state,closedByPullRequestsReferences" ]; then exit 1; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && { [ "$3" = "206" ] || [ "$3" = "208" ]; }; then printf '%s\\n' '{"state":"CLOSED","closedByPullRequestsReferences":[{"number":340}]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"state":"CLOSED","closedByPullRequestsReferences":[]}'; exit 0; fi
 exit 1
 `);
     chmodSync(gh, 0o755);
