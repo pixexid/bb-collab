@@ -15978,6 +15978,9 @@ var Refusal = class extends Error {
 function refusal(code, message, extra = {}) {
   return new Refusal({ code, message, ...extra });
 }
+function isRefusal(error48) {
+  return error48 instanceof Refusal;
+}
 function sha256(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
@@ -20494,9 +20497,9 @@ function cliResult(result2) {
     stdout: jsonResult(result2)
   };
 }
-function invalidCli(message) {
+function invalidCli(message, outcome = "INVALID_INPUT") {
   return cliResult({
-    outcome: "INVALID_INPUT",
+    outcome,
     subject: "cli",
     expected: 1,
     attempted: 0,
@@ -20841,18 +20844,18 @@ function inboxProjectIsRegistered(db, projectId) {
   return db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId) !== void 0;
 }
 function requireInboxStore(db) {
-  if (!db) throw new Error("operator inbox store is unavailable");
+  if (!db) throw refusal("CANONICAL_STORE_UNAVAILABLE", "operator inbox store is unavailable");
   return db;
 }
 function requireRegisteredInboxProject(db, projectId) {
   const store = requireInboxStore(db);
-  if (!inboxProjectIsRegistered(store, projectId)) throw new Error(UNREGISTERED_INBOX_MESSAGE);
+  if (!inboxProjectIsRegistered(store, projectId)) throw refusal("PROJECT_CONFIG_REQUIRED", UNREGISTERED_INBOX_MESSAGE);
   return store;
 }
 function readOperatorMessage(db, projectId, messageId) {
   const store = requireRegisteredInboxProject(db, projectId);
   const row = store.prepare(`${operatorMessageSelect} WHERE message.project_id = ? AND message.message_id = ?`).get(projectId, messageId);
-  if (!row) throw new Error("operator message does not exist in the requested project");
+  if (!row) throw refusal("RESOURCE_UNKNOWN", "operator message does not exist in the requested project");
   return operatorMessage(row);
 }
 async function resolveSenderTitles(bb, messages) {
@@ -20885,13 +20888,13 @@ async function markOperatorMessageRead(db, bb, projectId, messageId) {
   const store = requireRegisteredInboxProject(db, projectId);
   const result2 = store.prepare(`UPDATE operator_messages SET read_at_ms = COALESCE(read_at_ms, ?)
     WHERE project_id = ? AND message_id = ?`).run(Date.now(), projectId, messageId);
-  if (result2.changes !== 1) throw new Error("operator message does not exist in the requested project");
+  if (result2.changes !== 1) throw refusal("RESOURCE_UNKNOWN", "operator message does not exist in the requested project");
   return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0];
 }
 async function assertSenderProject(bb, projectId, senderThreadId) {
   const thread = await bb.sdk.threads.get({ threadId: senderThreadId });
   if (thread.id !== senderThreadId || thread.projectId !== projectId) {
-    throw new Error("project_id must exactly match the sender thread project");
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "project_id must exactly match the sender thread project");
   }
 }
 function runBbCommand(args) {
@@ -21110,7 +21113,7 @@ async function runCli(db, bb, argv, ctx, deps) {
     try {
       return { exitCode: 0, stdout: JSON.stringify(await sendOperatorMessage(db, bb, parsed.data, ctx.threadId, deps.notifyUrgent)) };
     } catch (error48) {
-      return invalidCli(error48 instanceof Error ? error48.message : String(error48));
+      return invalidCli(error48 instanceof Error ? error48.message : String(error48), isRefusal(error48) ? error48.data.code : "INVALID_INPUT");
     }
   }
   if (command === "inbox") {
@@ -21125,17 +21128,17 @@ async function runCli(db, bb, argv, ctx, deps) {
       try {
         return { exitCode: 0, stdout: JSON.stringify(await markOperatorMessageRead(db, bb, projectId, messageId.data)) };
       } catch (error48) {
-        return invalidCli(error48 instanceof Error ? error48.message : String(error48));
+        return invalidCli(error48 instanceof Error ? error48.message : String(error48), isRefusal(error48) ? error48.data.code : "INVALID_INPUT");
       }
     }
     const parsedRecipient = recipient === null ? void 0 : operatorRecipientSchema.safeParse(recipient);
     if (parsedRecipient && !parsedRecipient.success) return invalidCli(parsedRecipient.error.message);
     try {
       const listed = await listOperatorMessages(db, bb, projectId, parsedRecipient?.data);
-      if (listed.outcome !== "OK") return invalidCli(listed.message ?? listed.outcome);
+      if (listed.outcome !== "OK") return invalidCli(listed.message ?? listed.outcome, listed.outcome);
       return { exitCode: 0, stdout: JSON.stringify(listed.messages) };
     } catch (error48) {
-      return invalidCli(error48 instanceof Error ? error48.message : String(error48));
+      return invalidCli(error48 instanceof Error ? error48.message : String(error48), isRefusal(error48) ? error48.data.code : "INVALID_INPUT");
     }
   }
   if (command === "archive-sweep") {

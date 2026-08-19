@@ -2189,8 +2189,12 @@ class Refusal extends Error {
   }
 }
 
-function refusal(code: FoundationCode, message: string, extra: Omit<RefusalData, "code" | "message"> = {}): Refusal {
+export function refusal(code: FoundationCode, message: string, extra: Omit<RefusalData, "code" | "message"> = {}): Refusal {
   return new Refusal({ code, message, ...extra });
+}
+
+export function isRefusal(error: unknown): error is { readonly data: { readonly code: FoundationCode; readonly message: string } } {
+  return error instanceof Refusal;
 }
 
 export function sha256(value: string): string {

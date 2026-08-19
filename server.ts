@@ -24,9 +24,11 @@ import {
   doctor,
   exportFoundation,
   canonicalJson,
+  isRefusal,
   probeV21NewLegacyApplyProvenanceRefusal,
   probeV21ConsumedLegacyReplay,
   parseApplyRequest,
+  refusal,
   roleContextPreflightRefusal,
   writingLaneCeilingFromJson,
   type ApplyRequest,
@@ -362,9 +364,9 @@ function cliResult(result: FoundationResult) {
   };
 }
 
-function invalidCli(message: string) {
+function invalidCli(message: string, outcome: FoundationCode = "INVALID_INPUT") {
   return cliResult({
-    outcome: "INVALID_INPUT",
+    outcome,
     subject: "cli",
     expected: 1,
     attempted: 0,
@@ -813,13 +815,13 @@ function inboxProjectIsRegistered(db: SqliteDatabase, projectId: string): boolea
 }
 
 function requireInboxStore(db: SqliteDatabase | null): SqliteDatabase {
-  if (!db) throw new Error("operator inbox store is unavailable");
+  if (!db) throw refusal("CANONICAL_STORE_UNAVAILABLE", "operator inbox store is unavailable");
   return db;
 }
 
 function requireRegisteredInboxProject(db: SqliteDatabase | null, projectId: string) {
   const store = requireInboxStore(db);
-  if (!inboxProjectIsRegistered(store, projectId)) throw new Error(UNREGISTERED_INBOX_MESSAGE);
+  if (!inboxProjectIsRegistered(store, projectId)) throw refusal("PROJECT_CONFIG_REQUIRED", UNREGISTERED_INBOX_MESSAGE);
   return store;
 }
 
@@ -827,7 +829,7 @@ function readOperatorMessage(db: SqliteDatabase | null, projectId: string, messa
   const store = requireRegisteredInboxProject(db, projectId);
   const row = store.prepare(`${operatorMessageSelect} WHERE message.project_id = ? AND message.message_id = ?`)
     .get(projectId, messageId) as OperatorMessageRow | undefined;
-  if (!row) throw new Error("operator message does not exist in the requested project");
+  if (!row) throw refusal("RESOURCE_UNKNOWN", "operator message does not exist in the requested project");
   return operatorMessage(row);
 }
 
@@ -875,14 +877,14 @@ async function markOperatorMessageRead(db: SqliteDatabase | null, bb: BbPluginAp
   const store = requireRegisteredInboxProject(db, projectId);
   const result = store.prepare(`UPDATE operator_messages SET read_at_ms = COALESCE(read_at_ms, ?)
     WHERE project_id = ? AND message_id = ?`).run(Date.now(), projectId, messageId);
-  if (result.changes !== 1) throw new Error("operator message does not exist in the requested project");
+  if (result.changes !== 1) throw refusal("RESOURCE_UNKNOWN", "operator message does not exist in the requested project");
   return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0]!;
 }
 
 async function assertSenderProject(bb: BbPluginApi, projectId: string, senderThreadId: string) {
   const thread = await bb.sdk.threads.get({ threadId: senderThreadId });
   if (thread.id !== senderThreadId || thread.projectId !== projectId) {
-    throw new Error("project_id must exactly match the sender thread project");
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "project_id must exactly match the sender thread project");
   }
 }
 
@@ -1117,7 +1119,7 @@ async function runCli(
     try {
       return { exitCode: 0, stdout: JSON.stringify(await sendOperatorMessage(db, bb, parsed.data, ctx.threadId, deps.notifyUrgent)) };
     } catch (error) {
-      return invalidCli(error instanceof Error ? error.message : String(error));
+      return invalidCli(error instanceof Error ? error.message : String(error), isRefusal(error) ? error.data.code : "INVALID_INPUT");
     }
   }
   if (command === "inbox") {
@@ -1132,7 +1134,7 @@ async function runCli(
       try {
         return { exitCode: 0, stdout: JSON.stringify(await markOperatorMessageRead(db, bb, projectId, messageId.data)) };
       } catch (error) {
-        return invalidCli(error instanceof Error ? error.message : String(error));
+        return invalidCli(error instanceof Error ? error.message : String(error), isRefusal(error) ? error.data.code : "INVALID_INPUT");
       }
     }
     const parsedRecipient = recipient === null ? undefined : operatorRecipientSchema.safeParse(recipient);
@@ -1142,10 +1144,10 @@ async function runCli(
       // The reader answers a refusal instead of throwing it (#280), so the CLI has
       // to refuse on its own account. The code is the fallback because `message` is
       // optional on the result and a future outcome could arrive without one.
-      if (listed.outcome !== "OK") return invalidCli(listed.message ?? listed.outcome);
+      if (listed.outcome !== "OK") return invalidCli(listed.message ?? listed.outcome, listed.outcome);
       return { exitCode: 0, stdout: JSON.stringify(listed.messages) };
     } catch (error) {
-      return invalidCli(error instanceof Error ? error.message : String(error));
+      return invalidCli(error instanceof Error ? error.message : String(error), isRefusal(error) ? error.data.code : "INVALID_INPUT");
     }
   }
   if (command === "archive-sweep") {

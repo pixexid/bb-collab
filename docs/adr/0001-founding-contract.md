@@ -470,9 +470,23 @@ second authority.
 
 ## 9. Typed fail-closed outcomes
 
+### Amendment (2026-08-19): operator-inbox refusal codes
+
+This amendment extends the typed-outcomes table below with three refusal codes
+that already existed in `FoundationCode` but were not yet ratified here:
+`PROJECT_CONFIG_REQUIRED`, `RESOURCE_UNKNOWN` and
+`EXECUTION_CONTEXT_FOREIGN`. These codes are the semantic results for the
+operator-inbox project, message and sender-context boundaries respectively.
+The amendment changes no FoundationCode member, contract or schema version,
+migration, or receipt binding; it makes the existing typed vocabulary explicit
+for these call sites.
+
 | Condition | Typed result | State effect |
 | --- | --- | --- |
 | Unknown project or stale config | PROJECT_UNKNOWN or PROJECT_CONFIG_STALE | No mutation. Report expected and current revisions. |
+| Unregistered operator-inbox project | PROJECT_CONFIG_REQUIRED | Do not read or write the inbox for an unregistered project. |
+| Unknown operator-inbox message | RESOURCE_UNKNOWN | Do not read, mark or reply to a message absent from the exact project. |
+| Sender project differs from the exact execution context | EXECUTION_CONTEXT_FOREIGN | Do not send across project boundaries. |
 | Missing, ambiguous, foreign or stale repository | REPO_TARGET_REQUIRED, REPO_TARGET_AMBIGUOUS, REPO_TARGET_FOREIGN or REPO_TARGET_STALE | No checkout, spawn, review, release or cleanup. |
 | Guard unavailable, project frozen or stale epoch/token | GOVERNOR_UNAVAILABLE, PROJECT_FROZEN or GOVERNOR_EPOCH_STALE | No source or target canonical write. Diagnostics remain read-only. |
 | Retired, wrong or mismatched role generation | ROLE_GENERATION_STALE, ROLE_NOT_ACTIVE or ROLE_HOLDER_MISMATCH | No authority action and no provider/thread/display fallback. |
