@@ -42,6 +42,8 @@ invented at a call site.
 The implemented contract and schema versions are the authoritative
 [`CONTRACT_VERSION` and `SCHEMA_VERSION` constants](src/foundation.ts); do not
 transcribe them here.
+Director profile selection is likewise intentionally omitted from this summary;
+resolve it from canonical live state when needed.
 
 Shipped operational surfaces include:
 
