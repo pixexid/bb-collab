@@ -5288,14 +5288,14 @@ export function backfillWorkItemAttempts(db: SqliteDatabase): WorkItemBackfillCo
     }
     const remaining = (db.prepare(
       `SELECT COUNT(*) AS count FROM work_items
-       WHERE body LIKE '%thr\\_%' ESCAPE '\\' AND lifecycle_state <> 'proposed' AND NOT EXISTS (
+       WHERE body LIKE '%thr\\_%' ESCAPE '\\' AND NOT EXISTS (
          SELECT 1 FROM execution_attempts
          WHERE execution_attempts.project_id = work_items.project_id
            AND execution_attempts.work_item_id = work_items.work_item_id
            AND execution_attempts.origin = 'work_item'
        )`,
     ).get() as { count: number }).count;
-    if (remaining !== 0) throw new Error(`GH300 backfill refused: ${remaining} thr_ work item(s) have no attempt record`);
+    if (remaining !== counts.residualProposed) throw new Error(`GH300 backfill refused: ${remaining} thr_ work item(s) have no attempt record`);
     return counts;
   });
 }
