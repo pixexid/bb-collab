@@ -6410,4 +6410,17 @@ describe("bb-collab plugin boundary", () => {
     expect(registrations.httpRoutes.map((route) => route.path)).toEqual(["/lanes"]);
     expect(seedFixtureDecision).toBeTypeOf("function");
   });
+
+  it("runs worktree cleanup through the registered report-only CLI", async () => {
+    const host = await loadedHost();
+    host.harness.sdk.stub("threads.list", (async () => []) as never);
+    const invalid = await host.harness.runCli(["worktree-cleanup", "--project", PROJECT_ID, "--apply"]);
+    expect(invalid.exitCode).toBe(2);
+    expect(JSON.parse(invalid.stdout)).toMatchObject({ outcome: "INVALID_INPUT", message: expect.stringContaining("report-only command has no apply mode") });
+    const reported = await host.harness.runCli(["worktree-cleanup", "--project", PROJECT_ID]);
+    const output = JSON.parse(reported.stdout) as Record<string, unknown>;
+    expect(reported.exitCode).toBe(2);
+    expect(output).toMatchObject({ outcome: "refused", wouldRemove: [], environmentRecordsReleased: false });
+    expect(output).not.toHaveProperty("removed");
+  });
 });

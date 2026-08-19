@@ -47,12 +47,12 @@ export function canonicalWorktreePath(path: string): string {
 
 export function classifyWorktree(path: string, home = process.env.HOME ?? ""): WorktreePopulation {
   const target = canonicalWorktreePath(path);
-  const tmp = ["/tmp", "/private/tmp"].map((root) => resolve(root));
-  if (tmp.some((root) => target === root || target.startsWith(`${root}/`))) return "scratch";
   const managed = resolve(home, ".bb/worktrees");
   if (target === managed || target.startsWith(`${managed}/`)) return "managed";
   const candidates = resolve(home, ".bb/thread-storage");
   if (target === candidates || target.startsWith(`${candidates}/`)) return "candidate";
+  const tmp = ["/tmp", "/private/tmp"].map((root) => resolve(root));
+  if (tmp.some((root) => target === root || target.startsWith(`${root}/`))) return "scratch";
   return "unknown";
 }
 

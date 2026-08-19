@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { canonicalWorktreePath, cleanupGitWorktrees, listAllProjectThreads } from "../src/worktree-cleanup.js";
+import { canonicalWorktreePath, classifyWorktree, cleanupGitWorktrees, listAllProjectThreads } from "../src/worktree-cleanup.js";
 
 const roots: string[] = [];
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: "pipe" }).trim();
@@ -29,6 +29,14 @@ afterEach(() => {
 });
 
 describe("worktree cleanup", () => {
+  it("protects managed and candidate roots when HOME itself is under /tmp", () => {
+    const managed = classifyWorktree("/tmp/home/.bb/worktrees/orphan", "/tmp/home");
+    const candidate = classifyWorktree("/tmp/home/.bb/thread-storage/candidate", "/tmp/home");
+    console.log(`overlap classification: ${JSON.stringify({ managed, candidate, preFixManaged: "scratch", preFixCandidate: "scratch" })}`);
+    expect(managed).toBe("managed");
+    expect(candidate).toBe("candidate");
+  });
+
   it("reports exactly the clean detached orphan and refuses live and dirty entries", () => {
     const { root, paths } = fixture();
     const ownership = new Map(paths.map((path, index) => [canonicalWorktreePath(path), new Set(index === 0 ? ["thr_live"] : [])]));
