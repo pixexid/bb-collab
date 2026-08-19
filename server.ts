@@ -800,6 +800,23 @@ function operatorMessage(row: OperatorMessageRow) {
   };
 }
 
+function operatorMessagesCliResult(
+  projectId: string,
+  messages: z.infer<typeof operatorMessageSchema>[],
+  message: string,
+) {
+  const count = messages.length;
+  return cliResult({
+    outcome: "OK",
+    subject: projectId,
+    expected: count,
+    attempted: count,
+    verified: count,
+    message,
+    evidence: { messages },
+  });
+}
+
 const operatorMessageSelect = `SELECT message.*,
   (SELECT attempt.lane_id FROM execution_attempts AS attempt
    WHERE attempt.project_id = message.project_id
@@ -1117,7 +1134,8 @@ async function runCli(
     });
     if (!parsed.success) return invalidCli(parsed.error.message);
     try {
-      return { exitCode: 0, stdout: JSON.stringify(await sendOperatorMessage(db, bb, parsed.data, ctx.threadId, deps.notifyUrgent)) };
+      const sent = await sendOperatorMessage(db, bb, parsed.data, ctx.threadId, deps.notifyUrgent);
+      return operatorMessagesCliResult(projectId, [sent], "operator message persisted");
     } catch (error) {
       return invalidCli(error instanceof Error ? error.message : String(error), isRefusal(error) ? error.data.code : "INVALID_INPUT");
     }
@@ -1132,7 +1150,8 @@ async function runCli(
       const messageId = z.coerce.number().int().positive().safeParse(markRead);
       if (!messageId.success) return invalidCli(messageId.error.message);
       try {
-        return { exitCode: 0, stdout: JSON.stringify(await markOperatorMessageRead(db, bb, projectId, messageId.data)) };
+        const marked = await markOperatorMessageRead(db, bb, projectId, messageId.data);
+        return operatorMessagesCliResult(projectId, [marked], "operator message marked read");
       } catch (error) {
         return invalidCli(error instanceof Error ? error.message : String(error), isRefusal(error) ? error.data.code : "INVALID_INPUT");
       }
@@ -1145,7 +1164,7 @@ async function runCli(
       // to refuse on its own account. The code is the fallback because `message` is
       // optional on the result and a future outcome could arrive without one.
       if (listed.outcome !== "OK") return invalidCli(listed.message ?? listed.outcome, listed.outcome);
-      return { exitCode: 0, stdout: JSON.stringify(listed.messages) };
+      return operatorMessagesCliResult(projectId, listed.messages, `${listed.messages.length} operator inbox messages`);
     } catch (error) {
       return invalidCli(error instanceof Error ? error.message : String(error), isRefusal(error) ? error.data.code : "INVALID_INPUT");
     }

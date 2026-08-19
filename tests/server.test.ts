@@ -1906,7 +1906,14 @@ describe("bb-collab plugin boundary", () => {
         "send-to-operator", "--project", PROJECT_ID, "--recipient", "supervisor", "--severity", "routine", "--message", "supervisor pickup",
       ], context);
       expect(cli.exitCode).toBe(0);
-      expect(JSON.parse(cli.stdout)).toMatchObject({ projectId: PROJECT_ID, recipient: "supervisor", notificationStatus: "not-requested" });
+      expect(JSON.parse(cli.stdout)).toMatchObject({
+        outcome: "OK",
+        subject: PROJECT_ID,
+        expected: 1,
+        attempted: 1,
+        verified: 1,
+        evidence: { messages: [{ projectId: PROJECT_ID, recipient: "supervisor", notificationStatus: "not-requested" }] },
+      });
       const titleReadsBeforeList = host.harness.inspection.sdk.callsTo("threads.get").length;
       expect((await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID }) as { messages: unknown[] }).messages).toHaveLength(6);
       expect(host.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(titleReadsBeforeList);
@@ -1928,6 +1935,44 @@ describe("bb-collab plugin boundary", () => {
     } finally {
       clock.mockRestore();
     }
+  });
+
+  it("uses one FoundationResult evidence.messages envelope across operator inbox CLI successes", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    const context = { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID };
+    const expectEnvelope = (result: Record<string, unknown>, count: number, message: string) => expect(result).toEqual({
+      outcome: "OK",
+      subject: PROJECT_ID,
+      expected: count,
+      attempted: count,
+      verified: count,
+      message,
+      evidence: { messages: expect.any(Array) },
+    });
+
+    const empty = JSON.parse((await host.harness.runCli(["inbox", "--project", PROJECT_ID])).stdout);
+    expectEnvelope(empty, 0, "0 operator inbox messages");
+    expect(empty.evidence.messages).toHaveLength(0);
+
+    const sent = JSON.parse((await host.harness.runCli([
+      "send-to-operator", "--project", PROJECT_ID, "--recipient", "operator", "--severity", "routine", "--message", "shape probe",
+    ], context)).stdout);
+    expectEnvelope(sent, 1, "operator message persisted");
+    expect(sent.evidence.messages).toEqual([expect.objectContaining({ projectId: PROJECT_ID, text: "shape probe" })]);
+
+    const listed = JSON.parse((await host.harness.runCli(["inbox", "--project", PROJECT_ID])).stdout);
+    expectEnvelope(listed, 1, "1 operator inbox messages");
+    expect(listed.evidence.messages).toEqual([expect.objectContaining({ messageId: sent.evidence.messages[0].messageId })]);
+
+    const marked = JSON.parse((await host.harness.runCli([
+      "inbox", "--project", PROJECT_ID, "--mark-read", String(sent.evidence.messages[0].messageId),
+    ])).stdout);
+    expectEnvelope(marked, 1, "operator message marked read");
+    expect(marked.evidence.messages).toEqual([
+      expect.objectContaining({ messageId: sent.evidence.messages[0].messageId, readAtMs: expect.any(Number) }),
+    ]);
   });
 
   it("keeps inbox messages readable when a sender title cannot be resolved", async () => {
@@ -1982,12 +2027,26 @@ describe("bb-collab plugin boundary", () => {
       clock.mockReturnValue(1_100_000);
       const first = await host.harness.runCli(["inbox", "--project", PROJECT_ID, "--mark-read", String(message.messageId)]);
       expect(first.exitCode).toBe(0);
-      expect(JSON.parse(first.stdout)).toMatchObject({ projectId: PROJECT_ID, messageId: message.messageId, readAtMs: 1_100_000 });
+      expect(JSON.parse(first.stdout)).toMatchObject({
+        outcome: "OK",
+        subject: PROJECT_ID,
+        expected: 1,
+        attempted: 1,
+        verified: 1,
+        evidence: { messages: [{ projectId: PROJECT_ID, messageId: message.messageId, readAtMs: 1_100_000 }] },
+      });
 
       clock.mockReturnValue(1_200_000);
       const second = await host.harness.runCli(["inbox", "--project", PROJECT_ID, "--mark-read", String(message.messageId)]);
       expect(second.exitCode).toBe(0);
-      expect(JSON.parse(second.stdout)).toMatchObject({ projectId: PROJECT_ID, messageId: message.messageId, readAtMs: 1_100_000 });
+      expect(JSON.parse(second.stdout)).toMatchObject({
+        outcome: "OK",
+        subject: PROJECT_ID,
+        expected: 1,
+        attempted: 1,
+        verified: 1,
+        evidence: { messages: [{ projectId: PROJECT_ID, messageId: message.messageId, readAtMs: 1_100_000 }] },
+      });
 
       const wrongProject = await host.harness.runCli(["inbox", "--project", FOREIGN_PROJECT_ID, "--mark-read", String(message.messageId)]);
       expect(wrongProject.exitCode).toBe(2);
@@ -2016,7 +2075,16 @@ describe("bb-collab plugin boundary", () => {
     // without it a CLI that refused everything would pass.
     const registered = await host.harness.runCli(["inbox", "--project", PROJECT_ID]);
     expect(registered.exitCode).toBe(0);
-    expect(JSON.parse(registered.stdout)).toHaveLength(1);
+    const registeredResult = JSON.parse(registered.stdout);
+    expect(registeredResult).toMatchObject({
+      outcome: "OK",
+      subject: PROJECT_ID,
+      expected: 1,
+      attempted: 1,
+      verified: 1,
+      evidence: { messages: [expect.objectContaining({ projectId: PROJECT_ID, text: "supervisor pickup" })] },
+    });
+    expect(registeredResult.evidence.messages).toHaveLength(1);
 
     const unregistered = await host.harness.runCli(["inbox", "--project", FOREIGN_PROJECT_ID]);
     expect(unregistered.exitCode).toBe(2);
