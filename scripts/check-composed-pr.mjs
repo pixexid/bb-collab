@@ -43,6 +43,10 @@ function usage() {
 
 function deriveCommitMessages() {
   // ponytail: main-targeting and network-required; offline cannot prove the push baseline, so add validated remote-base discovery if that changes.
+  // ponytail: this is a fast LOCAL check against honest error and misconfiguration.
+  // Its authority ends at the local environment — every guard here is enforced by code
+  // a hostile caller could edit. Enforcement is CI's GitHub-sourced commit list
+  // (scripts/check-pr-lifecycle.mjs:44, /pulls/<n>/commits), which is outside the caller's control.
   const remote = spawnSync("git", ["ls-remote", "origin", "refs/heads/main"], { encoding: "utf8" });
   const remoteLines = remote.stdout.split(/\r?\n/u);
   if (remoteLines.at(-1) === "") remoteLines.pop();
