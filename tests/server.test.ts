@@ -3868,6 +3868,33 @@ exit 1
     }
   });
 
+  it("excludes idle native lanes from the active lane count", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-idle-lanes-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(1, true);
+      fixture.addNativeLane("idle-native-lane", "idle");
+      await fixture.host.harness.emitThreadEvent("thread.idle", {
+        thread: makeThreadResponse({ id: "idle-native-lane", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "idle", updatedAt: 1 }),
+        lastAssistantText: null,
+      });
+
+      await vi.waitFor(() => {
+        expect(fixture.db.prepare(
+          "SELECT coverage_state, active_lane_count, reason FROM lane_capacity_intervals",
+        ).get()).toEqual({ coverage_state: "known", active_lane_count: 0, reason: null });
+      });
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("reports native live lanes disagreeing with canonical zero and never wakes", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-native-disagreement-"));
     const gh = join(bin, "gh");
