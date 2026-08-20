@@ -106,11 +106,17 @@ visible as `observedProfile`, but its compliance result is `unknown` because it
 does not establish an exact dispatched SKU or context-window suffix such as
 `[1m]`. The reader never normalizes or guesses that suffix.
 
-Pi session logs are scoped to the exact environment-derived project directory.
-Its assistant entry id must exactly match BB's completion checkpoint id; the
-entry supplies provider/model and its ancestor state supplies the reasoning
-level. Missing directories, unreadable logs, absent or ambiguous matches, and
-checkpoints that appear only as parent links stay named unknowns.
+Pi bridge logs use `~/.bb/pi-bridge-sessions/SANITIZED_PROVIDER_THREAD_ID.jsonl`;
+`BB_PI_BRIDGE_SESSION_DIR` overrides the directory, and filename characters
+outside `[A-Za-z0-9._-]` become `_`. The filename identifies the BB provider
+session while the session header's `cwd` must still equal the exact environment
+path. A completion checkpoint may be the leaf below its assistant envelope, so
+the reader walks `parentId`: the assistant envelope supplies executed
+provider/model and its nearest `thinking_level_change` ancestor supplies
+reasoning. `model_change` is selection evidence only; disagreement is reported
+without replacing the executed model. Missing or ambiguous evidence stays
+unknown per element, so a proven model remains visible when reasoning is
+unknown.
 
 ## Sidebar thread list
 

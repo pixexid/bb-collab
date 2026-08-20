@@ -53,9 +53,14 @@ function claudeProjectDirectory(home, environmentPath, providerThreadId) {
   return join(home, ".claude", "projects", projectDirectory);
 }
 
-function piProjectDirectory(home, environmentPath) {
-  if (typeof environmentPath !== "string" || !isAbsolute(environmentPath)) return null;
-  return join(home, ".pi", "agent", "sessions", `--${environmentPath.replace(/^[/\\]/u, "").replace(/[/\\:]/gu, "-")}--`);
+function piBridgeDirectory(home, env) {
+  return typeof env?.BB_PI_BRIDGE_SESSION_DIR === "string" && env.BB_PI_BRIDGE_SESSION_DIR !== ""
+    ? env.BB_PI_BRIDGE_SESSION_DIR
+    : join(home, ".bb", "pi-bridge-sessions");
+}
+
+function piBridgeFilename(providerThreadId) {
+  return `${providerThreadId.replace(/[^A-Za-z0-9._-]/gu, "_")}.jsonl`;
 }
 
 async function readJsonLines(path, visit) {
@@ -142,7 +147,7 @@ function settle(turns, profiles, source, { absentReason = "provider-native turn 
   };
 }
 
-export async function readExecutedProfiles({ thread, environment, events, home = homedir() }) {
+export async function readExecutedProfiles({ thread, environment, events, home = homedir(), env = process.env }) {
   const active = activeTurn(thread, events);
   if (active?.reason) {
     return { outcome: "unknown", coverage: { activeTurns: 1, completedTurns: 0, knownTurns: 0, unknownTurns: 1, observedOnlyTurns: 0 }, turns: [], reason: active.reason };
@@ -214,68 +219,104 @@ export async function readExecutedProfiles({ thread, environment, events, home =
   if (thread.providerId === "pi") {
     let failureReason = "Pi session log is unreadable";
     try {
-      const root = join(home, ".pi", "agent", "sessions");
-      const directory = piProjectDirectory(home, environment?.path);
-      const files = directory ? filesNamed(root, directory, (name) => /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.jsonl$/iu.test(name)) : [];
-      const activeProfiles = [];
-      let activeSessionMatches = 0;
-      const ambiguous = new Set();
-      const assistantIds = new Set();
-      for (const file of files) {
-        const entries = [];
-        await readJsonLines(file, (record) => {
-          if (entries.length === 0 && (record?.type !== "session" || record.cwd !== environment.path)) {
-            failureReason = "Pi session header does not match the exact BB environment path";
-            throw new Error("Pi session scope mismatch");
-          }
-          entries.push(record);
-        });
-        if (entries.length === 0) throw new Error("empty Pi session log");
-        const isActiveSession = Boolean(active && entries[0]?.id === providerThreadId);
-        if (isActiveSession) activeSessionMatches += 1;
-        const entryIds = entries.flatMap((entry) => typeof entry?.id === "string" ? [entry.id] : []);
-        if (new Set(entryIds).size !== entryIds.length) {
-          failureReason = "Pi session entry ids are ambiguous";
-          throw new Error("duplicate Pi entry id");
+      const root = piBridgeDirectory(home, env);
+      const candidate = realPathInside(root, join(root, piBridgeFilename(providerThreadId)));
+      if (!candidate || !isFile(candidate)) {
+        const reason = `${active ? "active BB turn: " : ""}expected the exact Pi bridge session log, found 0`;
+        return { ...settle(turns, profiles, "Pi assistant envelope and thinking state", { absentReason: reason }), reason };
+      }
+      const entries = [];
+      await readJsonLines(candidate, (record) => {
+        if (entries.length === 0 && (record?.type !== "session" || record.cwd !== environment?.path)) {
+          failureReason = "Pi session header does not match the exact BB environment path";
+          throw new Error("Pi session scope mismatch");
         }
-        const byId = new Map(entries.flatMap((entry) => typeof entry?.id === "string" ? [[entry.id, entry]] : []));
+        entries.push(record);
+      });
+      if (entries.length === 0) throw new Error("empty Pi session log");
+      const entryIds = entries.flatMap((entry) => typeof entry?.id === "string" ? [entry.id] : []);
+      if (new Set(entryIds).size !== entryIds.length) {
+        failureReason = "Pi session entry ids are ambiguous";
+        throw new Error("duplicate Pi entry id");
+      }
+      const byId = new Map(entries.flatMap((entry) => typeof entry?.id === "string" ? [[entry.id, entry]] : []));
+      const piProfiles = new Map();
+      const addPi = (turnId, profile) => piProfiles.set(turnId, [...(piProfiles.get(turnId) ?? []), profile]);
+      const profileForAssistant = (assistant) => {
+        const nativeProvider = assistant.message?.provider;
+        const nativeModel = assistant.message?.model;
+        const model = typeof nativeProvider === "string" && nativeProvider !== "" && typeof nativeModel === "string" && nativeModel !== ""
+          ? nativeModel.startsWith(`${nativeProvider}/`) ? nativeModel : `${nativeProvider}/${nativeModel}`
+          : null;
+        let reasoningLevel = null;
+        let selectedModel = null;
+        let ancestor = assistant;
+        const seen = new Set();
+        while (typeof ancestor?.parentId === "string" && !seen.has(ancestor.parentId)) {
+          seen.add(ancestor.parentId);
+          ancestor = byId.get(ancestor.parentId);
+          if (!ancestor) break;
+          if (!reasoningLevel && ancestor.type === "thinking_level_change" && typeof ancestor.thinkingLevel === "string" && ancestor.thinkingLevel !== "") reasoningLevel = ancestor.thinkingLevel;
+          if (!selectedModel && ancestor.type === "model_change" && typeof ancestor.provider === "string" && ancestor.provider !== "" && typeof ancestor.modelId === "string" && ancestor.modelId !== "") {
+            selectedModel = ancestor.modelId.startsWith(`${ancestor.provider}/`) ? ancestor.modelId : `${ancestor.provider}/${ancestor.modelId}`;
+          }
+        }
+        return { model, reasoningLevel, selectionMismatch: Boolean(model && selectedModel && model !== selectedModel) };
+      };
+      const assistantFrom = (entry) => {
+        let current = entry;
+        const seen = new Set();
+        while (current && !(current.type === "message" && current.message?.role === "assistant")) {
+          if (current.type === "message" && current.message?.role === "user") return null;
+          if (typeof current.parentId !== "string" || seen.has(current.parentId)) return null;
+          seen.add(current.parentId);
+          current = byId.get(current.parentId);
+        }
+        return current ?? null;
+      };
+      if (active) {
         for (const record of entries) {
-          if (record?.type !== "message" || record.message?.role !== "assistant") continue;
-          let ancestor = record;
-          const seen = new Set();
-          while (typeof ancestor?.parentId === "string" && !seen.has(ancestor.parentId)) {
-            seen.add(ancestor.parentId);
-            ancestor = byId.get(ancestor.parentId);
-            if (ancestor?.type === "thinking_level_change") break;
-          }
-          const nativeProvider = record.message?.provider;
-          const nativeModel = record.message?.model;
-          const model = typeof nativeProvider === "string" && nativeProvider !== "" && typeof nativeModel === "string" && nativeModel !== ""
-            ? nativeModel.startsWith(`${nativeProvider}/`) ? nativeModel : `${nativeProvider}/${nativeModel}`
-            : null;
-          if (assistantIds.has(record.id)) ambiguous.add(record.id);
-          assistantIds.add(record.id);
-          add(record.id, model, ancestor?.thinkingLevel);
-          if (isActiveSession && recordAtOrAfter(record, active.requestedAtMs)) activeProfiles.push({ model, reasoningLevel: ancestor?.thinkingLevel });
+          if (record?.type === "message" && record.message?.role === "assistant" && recordAtOrAfter(record, active.requestedAtMs)) addPi(ACTIVE_PROFILE, profileForAssistant(record));
+        }
+      } else {
+        for (const turn of turns) {
+          const assistant = assistantFrom(byId.get(turn.checkpointId));
+          if (assistant) addPi(turn.checkpointId, profileForAssistant(assistant));
         }
       }
-      if (active && activeSessionMatches !== 1) {
-        const reason = `active BB turn: expected one Pi session matching the BB provider session, found ${activeSessionMatches}`;
-        return { ...settle(turns, profiles, "Pi assistant message", { absentReason: reason }), reason };
-      }
-      for (const profile of activeProfiles) add(ACTIVE_PROFILE, profile.model, profile.reasoningLevel);
-      const reason = !directory
-        ? "BB environment path cannot identify an exact Pi project directory"
-        : files.length === 0
-        ? "expected at least one Pi session log in the exact environment-derived project directory, found 0"
-        : active
-        ? "active Pi assistant message at or after the BB turn request is absent"
-        : "Pi checkpoints do not correlate to assistant message ids carrying model and reasoning level";
-      const result = settle(turns, profiles, "Pi assistant message", { absentReason: reason, ambiguous });
-      return result.outcome === "unknown" ? { ...result, reason: `${active ? "active BB turn: " : ""}${reason}` } : result;
+      const results = turns.map((turn) => {
+        const correlationId = turn.phase === "active" ? ACTIVE_PROFILE : turn.checkpointId;
+        if (!correlationId || !turn.providerThreadId) return { ...turn, status: "unknown", reason: "BB completion lacks provider correlation" };
+        const matches = piProfiles.get(correlationId) ?? [];
+        const models = [...new Set(matches.map((profile) => profile.model).filter(Boolean))];
+        const reasoningLevels = [...new Set(matches.map((profile) => profile.reasoningLevel).filter(Boolean))];
+        const model = matches.length > 0 && matches.every((profile) => profile.model) && models.length === 1 ? models[0] : null;
+        const reasoningLevel = matches.length > 0 && matches.every((profile) => profile.reasoningLevel) && reasoningLevels.length === 1 ? reasoningLevels[0] : null;
+        const unknownElements = [...(!model ? ["model"] : []), ...(!reasoningLevel ? ["reasoningLevel"] : [])];
+        const selectionMismatch = matches.some((profile) => profile.selectionMismatch);
+        const executedProfile = model || reasoningLevel ? {
+          ...(model ? { providerId: thread.providerId, model } : {}),
+          ...(reasoningLevel ? { reasoningLevel } : {}),
+          kind: "executed-provider-native",
+          source: model && reasoningLevel ? "Pi assistant envelope and thinking state" : model ? "Pi assistant envelope" : "Pi thinking state",
+        } : null;
+        if (unknownElements.length === 0) return { ...turn, status: "known", executedProfile, ...(selectionMismatch ? { selectionMismatch: true } : {}) };
+        const reason = matches.length === 0
+          ? active ? "active Pi assistant envelope at or after the BB turn request is absent" : "Pi checkpoint parent chain does not reach an assistant envelope"
+          : `Pi ${unknownElements.join(" and ")} evidence is absent or ambiguous`;
+        return { ...turn, status: "unknown", reason, ...(executedProfile ? { executedProfile, unknownElements } : {}), ...(selectionMismatch ? { selectionMismatch: true } : {}) };
+      });
+      const knownTurns = results.filter((turn) => turn.status === "known").length;
+      const activeTurns = results.filter((turn) => turn.phase === "active").length;
+      const result = {
+        outcome: knownTurns === results.length && results.length > 0 ? "known" : knownTurns > 0 ? "partial" : "unknown",
+        coverage: { ...(activeTurns > 0 ? { activeTurns } : {}), completedTurns: results.length - activeTurns, knownTurns, unknownTurns: results.length - knownTurns, observedOnlyTurns: 0 },
+        turns: results,
+      };
+      return result.outcome === "unknown" ? { ...result, reason: results[0]?.reason ?? "Pi turn evidence is absent or ambiguous" } : result;
     } catch {
       profiles.clear();
-      return { ...settle(turns, profiles, "Pi assistant message", { absentReason: failureReason }), reason: `${active ? "active BB turn: " : ""}${failureReason}` };
+      return { ...settle(turns, profiles, "Pi assistant envelope and thinking state", { absentReason: failureReason }), reason: `${active ? "active BB turn: " : ""}${failureReason}` };
     }
   }
 
