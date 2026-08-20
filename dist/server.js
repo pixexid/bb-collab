@@ -22077,6 +22077,12 @@ function invalidCli(message, outcome = "INVALID_INPUT") {
     message
   });
 }
+function cliSchemaError(error48, flags) {
+  return JSON.stringify(error48.issues.map((issue2) => {
+    const [field, ...rest] = issue2.path;
+    return typeof field === "string" && flags[field] ? { ...issue2, path: [flags[field], ...rest] } : issue2;
+  }), null, 2);
+}
 function workItemRegistrationDoctorResult(db, projectId, doctorResult) {
   const actor = db.prepare(
     `SELECT receipt_id FROM actor_receipts
@@ -22724,7 +22730,12 @@ async function runCli(db, bb, argv, ctx, deps) {
       severity: parseFlag(args, "--severity"),
       text: parseFlag(args, "--message")
     });
-    if (!parsed.success) return invalidCli(parsed.error.message);
+    if (!parsed.success) return invalidCli(cliSchemaError(parsed.error, {
+      project_id: "project",
+      recipient: "recipient",
+      severity: "severity",
+      text: "message"
+    }));
     try {
       const sent = await sendOperatorMessage(db, bb, parsed.data, ctx.threadId, deps.notifyUrgent);
       return operatorMessagesCliResult(projectId, [sent], "operator message persisted");
