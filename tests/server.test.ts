@@ -3188,7 +3188,7 @@ describe("bb-collab plugin boundary", () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-queue-"));
     const gh = join(bin, "gh");
     const argsLog = join(bin, "args");
-    writeFileSync(gh, `#!/bin/sh\nprintf '%s\\n' "$@" > "${argsLog}"\nprintf '%s\\n' '[{"number":205}]'\n`);
+    writeFileSync(gh, `#!/bin/sh\nprintf '%s\\n' "$@" > "${argsLog}"\nprintf '%s\\n' '[{"number":205,"labels":[{"name":"queue:startable"}]}]'\n`);
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3216,22 +3216,51 @@ describe("bb-collab plugin boundary", () => {
         expect.objectContaining({
           threadId: fixture.orchestratorThreadId,
           mode: "queue-if-active",
-          input: [expect.objectContaining({ text: "startable queue has 1 issue with 0/1 writing lanes active" })],
+          input: [expect.objectContaining({ text: "startable queue has 1 issue; 0 open issues have no queue label; 0/1 writing lanes active" })],
         }),
         ],
         [
           expect.objectContaining({
             threadId: fixture.orchestratorThreadId,
             mode: "queue-if-active",
-            input: [expect.objectContaining({ text: "startable queue has 1 issue with 0/1 writing lanes active" })],
+            input: [expect.objectContaining({ text: "startable queue has 1 issue; 0 open issues have no queue label; 0/1 writing lanes active" })],
           }),
         ],
       ]);
       const persisted = await fixture.host.bb.storage.kv.get<Record<string, { lastFleetWakeAtMs: number | null; lastStartableQueueWakeAtMs: number | null }>>("fleet-watchdog.role-idle");
       expect(Object.values(persisted ?? {})).toContainEqual(expect.objectContaining({ lastFleetWakeAtMs: null, lastStartableQueueWakeAtMs: expect.any(Number) }));
-      expect(readFileSync(argsLog, "utf8")).toBe("issue\nlist\n--repo\nexample/project\n--label\nqueue:startable\n--state\nopen\n--json\nnumber\n--limit\n1000\n");
+      expect(readFileSync(argsLog, "utf8")).toBe("issue\nlist\n--repo\nexample/project\n--state\nopen\n--json\nnumber,labels\n--limit\n1000\n");
     } finally {
       clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("surfaces open issues with no queue label beside startable and lane counts", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-unlabelled-queue-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$8" != "number,labels" ]; then exit 1; fi
+printf '%s\\n' '[{"number":457,"labels":[]},{"number":249,"labels":[{"name":"queue:blocked"}]}]'
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({
+          threadId: fixture.orchestratorThreadId,
+          mode: "queue-if-active",
+          input: [expect.objectContaining({ text: "startable queue has 0 issues; 1 open issue has no queue label; 0/1 writing lanes active" })],
+        }),
+      ]]);
+    } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
       rmSync(bin, { recursive: true, force: true });
@@ -3246,7 +3275,7 @@ if [ "$1" = "pr" ]; then
   if [ "$3" = "340" ] && [ "$7" = "state,mergedAt" ]; then printf '%s\\n' '{"state":"MERGED","mergedAt":"2026-08-19T00:00:00Z"}'; exit 0; fi
   exit 1
 fi
-if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[{"number":999}]'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[{"number":999,"labels":[{"name":"queue:startable"}]}]'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "207" ]; then exit 1; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then printf '%s\\n' '{"number":'"$3"',"title":"issue","body":"body","state":"CLOSED","labels":[],"updatedAt":"closed-'"$3"'"}'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" != "state,updatedAt,closedByPullRequestsReferences" ]; then exit 1; fi
@@ -3387,7 +3416,7 @@ exit 1
   it("wakes the exact idle orchestrator from a real idle event after the debounce", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-queue-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3423,7 +3452,7 @@ exit 1
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-dedupe-"));
     const gh = join(bin, "gh");
     const queue = join(bin, "queue.json");
-    writeFileSync(queue, '[{"number":305}]\n');
+    writeFileSync(queue, '[{"number":305,"labels":[{"name":"queue:startable"}]}]\n');
     writeFileSync(gh, `#!/bin/sh\ncat ${queue}\n`);
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
@@ -3446,7 +3475,7 @@ exit 1
         await emitIdle(2);
         expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
 
-        writeFileSync(queue, '[{"number":306}]\n');
+        writeFileSync(queue, '[{"number":306,"labels":[{"name":"queue:startable"}]}]\n');
         await emitIdle(3);
         expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
       } finally {
@@ -3462,7 +3491,7 @@ exit 1
   it.each(["active orchestrator", "one active writing lane", "zero startable issues"])("stays silent for %s", async (scenario) => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-false-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, `#!/bin/sh\nprintf '%s\\n' '${scenario === "zero startable issues" ? "[]" : "[{\"number\":305}]"}'\n`);
+    writeFileSync(gh, `#!/bin/sh\nprintf '%s\\n' '${scenario === "zero startable issues" ? "[]" : "[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]"}'\n`);
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3495,7 +3524,7 @@ exit 1
   it("wakes an idle orchestrator when non-terminal work is review_pending", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-review-pending-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3532,7 +3561,7 @@ exit 1
   it("extends unchanged lane-capacity observations and starts a new interval when facts change", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-lane-capacity-write-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3600,7 +3629,7 @@ exit 1
     const gh = join(bin, "gh");
     const queue = join(bin, "queue.json");
     const calls = join(bin, "calls");
-    writeFileSync(queue, '[{"number":305}]');
+    writeFileSync(queue, '[{"number":305,"labels":[{"name":"queue:startable"}]}]');
     writeFileSync(gh, `#!/bin/sh\nprintf 'call\\n' >> "${calls}"\ncat "${queue}"\n`);
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
@@ -3666,7 +3695,7 @@ exit 1
   it("refreshes running attempts only from an active native lane observation", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-attempt-liveness-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3707,7 +3736,7 @@ exit 1
   it("records known coverage on the first active observation after staleness", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-attempt-liveness-first-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3733,7 +3762,7 @@ exit 1
   it("does not refresh an ambiguous writer and review match", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-attempt-liveness-ambiguous-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3773,7 +3802,7 @@ exit 1
   it("keeps attempts stale when native lane status is unavailable", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-attempt-liveness-404-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3850,7 +3879,7 @@ exit 1
   ])("fails closed for a known-but-invalid %s attempt", async (_name, state, threadId, reason) => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-invalid-attempt-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3891,7 +3920,7 @@ exit 1
   it("excludes idle native lanes from the active lane count", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-idle-lanes-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3918,7 +3947,7 @@ exit 1
   it("reports native live lanes disagreeing with canonical zero and never wakes", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-native-disagreement-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3960,7 +3989,7 @@ exit 1
   it("keeps startable intake running when a holder recovery is refused", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-after-refused-recovery-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":205}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":205,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3984,7 +4013,7 @@ exit 1
         expect.objectContaining({
           threadId: fixture.orchestratorThreadId,
           mode: "queue-if-active",
-          input: [expect.objectContaining({ text: "startable queue has 1 issue with 0/3 writing lanes active" })],
+          input: [expect.objectContaining({ text: "startable queue has 1 issue; 0 open issues have no queue label; 0/3 writing lanes active" })],
         }),
       ]]);
       expect(fixture.host.harness.inspection.logEntries.slice(logCount)).toContainEqual(expect.objectContaining({

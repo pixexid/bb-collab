@@ -21776,18 +21776,18 @@ function githubJson(args) {
 }
 function startableQueueState(repositories) {
   let count = 0;
+  let unlabelledCount = 0;
   const heads = [];
   for (const repository of repositories) {
-    const issues = githubJson(["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number", "--limit", "1000"]);
-    if (!Array.isArray(issues) || !issues.every((issue2) => issue2 && typeof issue2 === "object" && !Array.isArray(issue2) && typeof issue2.number === "number")) return null;
-    count += issues.length;
-    const numbers = issues.map((issue2) => issue2.number);
+    const issues = githubJson(["issue", "list", "--repo", repository, "--state", "open", "--json", "number,labels", "--limit", "1000"]);
+    if (!Array.isArray(issues) || !issues.every((issue2) => issue2 && typeof issue2 === "object" && !Array.isArray(issue2) && typeof issue2.number === "number" && Array.isArray(issue2.labels) && issue2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string"))) return null;
+    const startable = issues.filter((issue2) => issue2.labels.some((label) => label.name === "queue:startable"));
+    count += startable.length;
+    unlabelledCount += issues.filter((issue2) => !issue2.labels.some((label) => label.name.startsWith("queue:"))).length;
+    const numbers = startable.map((issue2) => issue2.number);
     if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
   }
-  return { count, head: heads.sort()[0] ?? null };
-}
-function startableQueueDepth(repositories) {
-  return startableQueueState(repositories)?.count ?? null;
+  return { count, head: heads.sort()[0] ?? null, unlabelledCount };
 }
 function linkedGithubObservation(owner, repo, issueNumber) {
   const issue2 = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,updatedAt,closedByPullRequestsReferences"]);
@@ -24132,9 +24132,9 @@ ${thread.titleFallback ?? ""}`);
                ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
              WHERE heads.project_id = ? ORDER BY targets.repo_target_id`
           ).all(projectId).map((target) => githubRepository(target.remote_url));
-          const startableCount = repositories.length === 0 || repositories.some((repository) => repository === null) ? null : startableQueueDepth(repositories);
-          if (startableCount !== null && startableCount > 0 && writingLaneCeiling !== null && activeLaneCount < writingLaneCeiling) {
-            await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${startableCount} issue${startableCount === 1 ? "" : "s"} with ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
+          const queue = repositories.length === 0 || repositories.some((repository) => repository === null) ? null : startableQueueState(repositories);
+          if (queue !== null && (queue.count > 0 || queue.unlabelledCount > 0) && writingLaneCeiling !== null && activeLaneCount < writingLaneCeiling) {
+            await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${queue.count} issue${queue.count === 1 ? "" : "s"}; ${queue.unlabelledCount} open issue${queue.unlabelledCount === 1 ? " has" : "s have"} no queue label; ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
           }
           if (workItems.length === 0) continue;
           const unblocked = /* @__PURE__ */ new Set();
