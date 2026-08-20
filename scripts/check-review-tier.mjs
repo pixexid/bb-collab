@@ -17,7 +17,7 @@ const tierA = [
   /^\.github\/workflows\/issue-lifecycle\.yml$/u,
   /^\.github\/workflows\/issue-lifecycle-audit\.yml$/u,
   /^dist\//u,
-  /^docs\/(?:adr\/0001-founding-contract|import-manifest|issue-76-tiered-review-policy|operations-model|roadmap|threat-model)\.md$/u,
+  /^docs\/(?:adr\/0001-founding-contract|import-manifest|issue-76-tiered-review-policy|operations-model|threat-model)\.md$/u,
   /^scripts\/build\.mjs$/u,
   /^scripts\/check-pr-lifecycle\.mjs$/u,
   /^scripts\/handle-merged-pr-lifecycle\.mjs$/u,

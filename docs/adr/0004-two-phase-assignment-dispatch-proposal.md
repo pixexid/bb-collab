@@ -57,7 +57,7 @@ All citations are against base head
 GH-104 ("Assignment/ExecutionAttempt recording gap blocks profile compliance
 audit") is OPEN. The canonical assignment profile audit shipped in merged
 commit `3d05093` ("Add canonical assignment profile audit") and is documented
-in [the GH-104 audit note](../issue-104-assignment-profile-audit.md): the
+in [the GH-104 audit note](../incidents/issue-104-assignment-profile-audit.md): the
 doctor exposes `profileAudit` from canonical Assignment/ExecutionAttempt rows
 and reports `no_canonical_assignments` when zero rows exist
 (`src/foundation.ts`, doctor `profileAudit` status). Through the sanctioned
@@ -462,6 +462,6 @@ the controlling behavior and must not be relaxed, bypassed, or feature-flagged.
   working adapters.
 - `docs/threat-model.md` (receipt replay/phase-splitting row) — defended
   vector behind the refusal.
-- `docs/issue-104-assignment-profile-audit.md` — audit seam and its
+- `docs/incidents/issue-104-assignment-profile-audit.md` — audit seam and its
   explicitly deferred live-adapter boundary.
 - GH-104 issue state: OPEN at proposal time.

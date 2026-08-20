@@ -301,6 +301,18 @@ conformance, governorship and resolver seams exist.
 | [docs/threat-model.md](docs/threat-model.md) | Trust boundaries, threats, controls and enforcement ceiling. |
 | [docs/import-manifest.md](docs/import-manifest.md) | Surviving llm-collab clauses, issue ledger and migration rules. |
 | [Issue labels and Taskboard](docs/rules.md#quiet-with-startable-work-is-a-defect-state) | Canonical planning and intake queue. |
+| [BB plugin capability scoping](docs/bb-plugin-capability-scoping.md) | Supported BB plugin surfaces and limits. |
+| [Issue 57 mechanism 1](docs/issue-57-mechanism-1.md) | Turn-terminal awareness bridge. |
+| [Issue 57 mechanism 8](docs/issue-57-mechanism-8.md) | Registered-wait awareness bridge. |
+| [Issue 93 durable wait validator](docs/issue-93-durable-wait-validator.md) | Durable wait validation method. |
+| [Placement probe task](docs/probe-task-visible-markdown.md) | Frozen model-placement probe. |
+| [Route-time holder acceptance](docs/routing-acceptance-repair.md) | Canonical-holder routing evidence. |
+| [Sidebar navigation limitation](docs/sidebar-plugin-nav-collapse.md) | Current host-support boundary. |
+| [Sidebar provider logos](docs/sidebar-provider-logos.md) | Provider-branding implementation boundary. |
+| [Canonical WorkItem registration](docs/workitem-registration.md) | Authorized registration procedure. |
+| [Role succession runbook](docs/succession-runbook.md) | Current project-agnostic succession method. |
+| [Thread archive sweep](docs/thread-archive-sweep.md) | Current fail-closed archive capability. |
+| [Archived documentation](docs/incidents/README.md) | Issue-linked historical records. |
 
 ## Dependency sequence
 

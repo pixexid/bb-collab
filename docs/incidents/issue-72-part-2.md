@@ -26,7 +26,7 @@ This is awareness only: it adds no role generation, assignment, dispatch,
 receipt, SQLite, console, or GitHub mutation, and it does not create or record
 the Part 1 standby seat. The standby is recorded by the existing
 receipt-gated RoleGeneration succession path described in
-[the succession runbook](succession-runbook.md).
+[the succession runbook](../succession-runbook.md).
 
 ## Director-seat recording gate
 
