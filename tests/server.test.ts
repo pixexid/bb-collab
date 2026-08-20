@@ -678,8 +678,9 @@ async function loadedHost(
   mutateRoleFacts?: (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => void,
 ) {
   const host = hostFor(projectId, mutateRoleFacts);
-  await plugin(host.bb);
-  return host;
+  const checkDeployedDist = vi.fn();
+  await plugin(host.bb, { checkDeployedDist });
+  return Object.assign(host, { checkDeployedDist });
 }
 
 async function loadedDistHost() {
@@ -2561,6 +2562,7 @@ describe("bb-collab plugin boundary", () => {
       throw new Error(`expected registered fleet-watchdog cron "*/5 * * * *", got "${cron}"`);
     }
     await fixture.host.harness.runSchedule("fleet-watchdog");
+    expect(fixture.host.checkDeployedDist).toHaveBeenCalledOnce();
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
     expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
       level: "info",

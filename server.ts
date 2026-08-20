@@ -77,6 +77,7 @@ import { fileURLToPath } from "node:url";
 
 type PluginOptions = {
   checkoutRoot?: string | null;
+  checkDeployedDist?: () => void;
   notifyUrgent?: (message: string, senderThreadId: string) => Promise<void>;
   runBbCommand?: (args: string[]) => Promise<void>;
 };
@@ -2895,7 +2896,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     await fleetWatchdogIdle.clearWakeHistory(`${projectId}:`);
     bb.log.warn(`fleet-watchdog history reset: project=${projectId} invokedBy=${invokedBy} at=${Date.now()}`);
   };
-  const checkDeployedDist = () => {
+  const checkDeployedDist = options.checkDeployedDist ?? (() => {
     const root = findCheckoutRoot(dirname(fileURLToPath(import.meta.url)));
     if (!root) {
       bb.log.error("deployed-dist automatic check failed: cannot find plugin checkout root");
@@ -2912,7 +2913,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     if (result.status === 0 && !result.error) return;
     const detail = [result.error?.message, result.stderr?.trim(), result.stdout?.trim()].filter(Boolean).join(" ");
     bb.log.error(`deployed-dist automatic check failed: ${detail || `exit ${String(result.status)}`}`);
-  };
+  });
   // Report-only: this never rebuilds, writes, or repairs the deployed checkout.
   bb.background.schedule("fleet-watchdog", "*/5 * * * *", () => {
     checkDeployedDist();

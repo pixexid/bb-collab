@@ -7,6 +7,17 @@ import { renderWeeklyThroughputReport, weeklyThroughputReport, type ThroughputFa
 
 const window = { startAtMs: 0, endAtMs: 7 * 86_400_000 };
 const empty: ThroughputFacts = { dialsLandedAtMs: null, issues: [], merges: [], reviews: [], defects: [] };
+const writeEmptyBb = (directory: string) => {
+  const bb = join(directory, "bb");
+  writeFileSync(bb, `#!/bin/sh
+case "$1 $2" in
+  "project list") printf '%s' '[{"id":"project-test","gitRemoteUrl":"https://github.com/pixexid/bb-collab.git"}]' ;;
+  "collab export") printf '%s' '{"evidence":{"export":{"recordsNdjson":""}}}' ;;
+  *) exit 2 ;;
+esac
+`);
+  chmodSync(bb, 0o755);
+};
 
 describe("weekly throughput report", () => {
   it("defines medians, cadence bins, review latency, and escapes deterministically", () => {
@@ -207,6 +218,7 @@ case "$1 $2" in
 esac
 `);
     chmodSync(gh, 0o755);
+    writeEmptyBb(directory);
     try {
       const output = execFileSync(process.execPath, [
         join(process.cwd(), "scripts", "weekly-throughput-report.mjs"),
@@ -251,6 +263,7 @@ case "$1 $2" in
 esac
 `);
     chmodSync(gh, 0o755);
+    writeEmptyBb(directory);
     try {
       const output = execFileSync(process.execPath, [
         join(process.cwd(), "scripts", "weekly-throughput-report.mjs"),

@@ -24236,7 +24236,7 @@ ${thread.titleFallback ?? ""}`);
     await fleetWatchdogIdle.clearWakeHistory(`${projectId}:`);
     bb.log.warn(`fleet-watchdog history reset: project=${projectId} invokedBy=${invokedBy} at=${Date.now()}`);
   };
-  const checkDeployedDist = () => {
+  const checkDeployedDist = options.checkDeployedDist ?? (() => {
     const root = findCheckoutRoot(dirname3(fileURLToPath(import.meta.url)));
     if (!root) {
       bb.log.error("deployed-dist automatic check failed: cannot find plugin checkout root");
@@ -24253,7 +24253,7 @@ ${thread.titleFallback ?? ""}`);
     if (result2.status === 0 && !result2.error) return;
     const detail = [result2.error?.message, result2.stderr?.trim(), result2.stdout?.trim()].filter(Boolean).join(" ");
     bb.log.error(`deployed-dist automatic check failed: ${detail || `exit ${String(result2.status)}`}`);
-  };
+  });
   bb.background.schedule("fleet-watchdog", "*/5 * * * *", () => {
     checkDeployedDist();
     return fleetWatchdogCycle();
