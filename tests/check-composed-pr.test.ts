@@ -29,6 +29,7 @@ describe("composed PR pre-push check", () => {
     ["blank title", { ...good, title: "" }, "title"],
     ["missing changed path", { ...good, files: [undefined as unknown as string] }, "changed files"],
     ["blank changed path", { ...good, files: [""] }, "changed files"],
+    ["missing commit messages", { ...good, commitMessages: undefined as unknown as string[] }, "commit-message"],
   ])("rejects %s before invoking either gate", (_name, input, message) => {
     const result = validateComposedPullRequest(input);
     expect(result.ok).toBe(false);
