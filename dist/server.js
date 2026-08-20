@@ -23352,11 +23352,11 @@ ${thread.titleFallback ?? ""}`);
         threads.push(...page);
         if (page.length < 100) break;
       }
+      const isWorkingLane = (lane) => lane.status === "active" || lane.status === "starting";
       const liveLanes = threads.filter(
-        (thread) => !dispatcherThreadIds.has(thread.id) && thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null && thread.status !== "error" && thread.status !== "stopping"
+        (thread) => !dispatcherThreadIds.has(thread.id) && thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null && isWorkingLane(thread)
       );
       for (const lane of liveLanes) {
-        if (lane.status !== "active" && lane.status !== "starting") continue;
         const matches = db.prepare(
           `SELECT execution_attempt_id, assignment_kind
            FROM execution_attempts
