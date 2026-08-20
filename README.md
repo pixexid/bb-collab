@@ -41,9 +41,10 @@ invented at a call site.
 
 ## Founding status
 
-The implemented contract and schema versions are the authoritative
-[`CONTRACT_VERSION` and `SCHEMA_VERSION` constants](src/foundation.ts); do not
-transcribe them here.
+The implemented runtime and schema versions are the authoritative
+[`RUNTIME_CONTRACT_VERSION` and `SCHEMA_VERSION` constants](src/foundation.ts);
+do not transcribe them here. The separate instruction contract is
+`INSTRUCTION_CONTRACT_VERSION` in `AGENTS.md`.
 Director profile selection is likewise intentionally omitted from this summary;
 resolve it from canonical live state when needed.
 

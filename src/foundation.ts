@@ -8,10 +8,11 @@ import type { CheckoutDivergence } from "./checkout-divergence.js";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-export const CONTRACT_VERSION = 22;
+// Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION: 34 in AGENTS.md.
+export const RUNTIME_CONTRACT_VERSION = 22;
 export const SCHEMA_VERSION = 22;
 // v22 establishes the director's exact accepted-profile set.
-const PREVIOUS_CONTRACT_VERSION = 21;
+const PREVIOUS_RUNTIME_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
 const PREVIOUS_SCHEMA_VERSION = 21;
@@ -997,7 +998,7 @@ export function cachedConsumerRolloutEvidence(observations: readonly CachedConsu
   const names = observations.map((observation) => observation.name);
   const requiredNames = [...CACHED_CONSUMERS];
   const verifiedNames = new Set(observations
-    .filter((observation) => observation.observedSchemaVersion === SCHEMA_VERSION && observation.observedContractVersion === CONTRACT_VERSION)
+    .filter((observation) => observation.observedSchemaVersion === SCHEMA_VERSION && observation.observedContractVersion === RUNTIME_CONTRACT_VERSION)
     .map((observation) => observation.name));
   const verified = requiredNames.filter((name) => verifiedNames.has(name)).length;
   const reread = observations.length === requiredNames.length && verified === requiredNames.length &&
@@ -1007,8 +1008,8 @@ export function cachedConsumerRolloutEvidence(observations: readonly CachedConsu
     observations,
     oldSchemaVersion: PREVIOUS_SCHEMA_VERSION,
     newSchemaVersion: SCHEMA_VERSION,
-    oldContractVersion: PREVIOUS_CONTRACT_VERSION,
-    newContractVersion: CONTRACT_VERSION,
+    oldContractVersion: PREVIOUS_RUNTIME_CONTRACT_VERSION,
+    newContractVersion: RUNTIME_CONTRACT_VERSION,
     action: reread ? "reread" : "refused",
     incompatiblePolicy: CACHED_CONSUMER_ROLLOUT_POLICY,
     expected: requiredNames.length,
@@ -1025,8 +1026,8 @@ function unknownCachedConsumerRolloutEvidence() {
     observations: [],
     oldSchemaVersion: PREVIOUS_SCHEMA_VERSION,
     newSchemaVersion: SCHEMA_VERSION,
-    oldContractVersion: PREVIOUS_CONTRACT_VERSION,
-    newContractVersion: CONTRACT_VERSION,
+    oldContractVersion: PREVIOUS_RUNTIME_CONTRACT_VERSION,
+    newContractVersion: RUNTIME_CONTRACT_VERSION,
     action: "unknown" as const,
     incompatiblePolicy: CACHED_CONSUMER_ROLLOUT_POLICY,
     expected: CACHED_CONSUMERS.length,
@@ -1150,7 +1151,7 @@ export const MIGRATION_STEPS = [
   "mark_fix_forward_required",
 ] as const;
 export const contractDigest = sha256(canonicalJson({
-  contractVersion: CONTRACT_VERSION,
+  contractVersion: RUNTIME_CONTRACT_VERSION,
   operationClasses: ["migration_prepare", "migration_step"],
   migrationStates: MIGRATION_STATES,
   migrationSteps: MIGRATION_STEPS,
@@ -2728,14 +2729,14 @@ export function probeV21ConsumedLegacyReplay(db: SqliteDatabase, projectId: stri
   }
   return {
     observedSchemaVersion: SCHEMA_VERSION,
-    observedContractVersion: CONTRACT_VERSION,
+    observedContractVersion: RUNTIME_CONTRACT_VERSION,
     consumedLegacyReplay: { outcome: "OK" as const },
   };
 }
 
 export function probeV21NewLegacyApplyProvenanceRefusal() {
   const newApplyRefusal = newApplyProvenanceRefusal(null);
-  return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION, newApplyRefusal };
+  return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: RUNTIME_CONTRACT_VERSION, newApplyRefusal };
 }
 
 export function writingLaneCeilingFromJson(configJson: string): number {
@@ -3732,7 +3733,7 @@ function validateMigrationExport(
   const manifest = payload.manifest;
   const expectedTables = Object.fromEntries(TABLES.map((table) => [table, manifest.tableCounts[table] ?? -1]));
   if (
-    manifest.schemaVersion !== SCHEMA_VERSION || manifest.contractVersion !== CONTRACT_VERSION ||
+    manifest.schemaVersion !== SCHEMA_VERSION || manifest.contractVersion !== RUNTIME_CONTRACT_VERSION ||
     manifest.pluginId !== PLUGIN_ID || manifest.projectId !== projectId ||
     canonicalJson(manifest.migrationStatementIds) !== canonicalJson(MIGRATIONS.map((_, index) => index)) ||
     manifest.schemaDigest !== schemaDigest || manifest.contractDigest !== contractDigest ||
@@ -7437,7 +7438,7 @@ export function exportFoundation(db: SqliteDatabase | null, projectId: string): 
     const artifactIndexDigest = sha256(artifactIndexJson);
     const manifestWithoutRoot = {
       schemaVersion: SCHEMA_VERSION,
-      contractVersion: CONTRACT_VERSION,
+      contractVersion: RUNTIME_CONTRACT_VERSION,
       pluginId: PLUGIN_ID,
       projectId,
       migrationStatementIds: MIGRATIONS.map((_, index) => index),

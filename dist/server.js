@@ -14484,9 +14484,9 @@ import { basename, dirname, isAbsolute, join, relative } from "node:path";
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var CONTRACT_VERSION = 22;
+var RUNTIME_CONTRACT_VERSION = 22;
 var SCHEMA_VERSION = 22;
-var PREVIOUS_CONTRACT_VERSION = 21;
+var PREVIOUS_RUNTIME_CONTRACT_VERSION = 21;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
 var PREVIOUS_SCHEMA_VERSION = 21;
@@ -15444,7 +15444,7 @@ async function assembleV22CachedConsumerRolloutEvidence(input) {
 function cachedConsumerRolloutEvidence(observations) {
   const names = observations.map((observation) => observation.name);
   const requiredNames = [...CACHED_CONSUMERS];
-  const verifiedNames = new Set(observations.filter((observation) => observation.observedSchemaVersion === SCHEMA_VERSION && observation.observedContractVersion === CONTRACT_VERSION).map((observation) => observation.name));
+  const verifiedNames = new Set(observations.filter((observation) => observation.observedSchemaVersion === SCHEMA_VERSION && observation.observedContractVersion === RUNTIME_CONTRACT_VERSION).map((observation) => observation.name));
   const verified = requiredNames.filter((name) => verifiedNames.has(name)).length;
   const reread = observations.length === requiredNames.length && verified === requiredNames.length && canonicalJson([...new Set(names)].sort()) === canonicalJson(requiredNames.slice().sort());
   const evidence = {
@@ -15452,8 +15452,8 @@ function cachedConsumerRolloutEvidence(observations) {
     observations,
     oldSchemaVersion: PREVIOUS_SCHEMA_VERSION,
     newSchemaVersion: SCHEMA_VERSION,
-    oldContractVersion: PREVIOUS_CONTRACT_VERSION,
-    newContractVersion: CONTRACT_VERSION,
+    oldContractVersion: PREVIOUS_RUNTIME_CONTRACT_VERSION,
+    newContractVersion: RUNTIME_CONTRACT_VERSION,
     action: reread ? "reread" : "refused",
     incompatiblePolicy: CACHED_CONSUMER_ROLLOUT_POLICY,
     expected: requiredNames.length,
@@ -15469,8 +15469,8 @@ function unknownCachedConsumerRolloutEvidence() {
     observations: [],
     oldSchemaVersion: PREVIOUS_SCHEMA_VERSION,
     newSchemaVersion: SCHEMA_VERSION,
-    oldContractVersion: PREVIOUS_CONTRACT_VERSION,
-    newContractVersion: CONTRACT_VERSION,
+    oldContractVersion: PREVIOUS_RUNTIME_CONTRACT_VERSION,
+    newContractVersion: RUNTIME_CONTRACT_VERSION,
     action: "unknown",
     incompatiblePolicy: CACHED_CONSUMER_ROLLOUT_POLICY,
     expected: CACHED_CONSUMERS.length,
@@ -15563,7 +15563,7 @@ var MIGRATION_STEPS = [
   "mark_fix_forward_required"
 ];
 var contractDigest = sha256(canonicalJson({
-  contractVersion: CONTRACT_VERSION,
+  contractVersion: RUNTIME_CONTRACT_VERSION,
   operationClasses: ["migration_prepare", "migration_step"],
   migrationStates: MIGRATION_STATES,
   migrationSteps: MIGRATION_STEPS,
@@ -16558,13 +16558,13 @@ function probeV21ConsumedLegacyReplay(db, projectId) {
   }
   return {
     observedSchemaVersion: SCHEMA_VERSION,
-    observedContractVersion: CONTRACT_VERSION,
+    observedContractVersion: RUNTIME_CONTRACT_VERSION,
     consumedLegacyReplay: { outcome: "OK" }
   };
 }
 function probeV21NewLegacyApplyProvenanceRefusal() {
   const newApplyRefusal = newApplyProvenanceRefusal(null);
-  return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: CONTRACT_VERSION, newApplyRefusal };
+  return { observedSchemaVersion: SCHEMA_VERSION, observedContractVersion: RUNTIME_CONTRACT_VERSION, newApplyRefusal };
 }
 function writingLaneCeilingFromJson(configJson) {
   const config2 = JSON.parse(configJson);
@@ -17351,7 +17351,7 @@ function validateMigrationExport(db, input, projectId) {
   const payload = fromFiles ? readMigrationExportFiles(db, input) : input;
   const manifest = payload.manifest;
   const expectedTables = Object.fromEntries(TABLES.map((table) => [table, manifest.tableCounts[table] ?? -1]));
-  if (manifest.schemaVersion !== SCHEMA_VERSION || manifest.contractVersion !== CONTRACT_VERSION || manifest.pluginId !== PLUGIN_ID || manifest.projectId !== projectId || canonicalJson(manifest.migrationStatementIds) !== canonicalJson(MIGRATIONS.map((_, index) => index)) || manifest.schemaDigest !== schemaDigest || manifest.contractDigest !== contractDigest || Object.keys(manifest.tableCounts).sort().join("\0") !== [...TABLES].sort().join("\0") || Object.values(expectedTables).some((count) => count < 0)) {
+  if (manifest.schemaVersion !== SCHEMA_VERSION || manifest.contractVersion !== RUNTIME_CONTRACT_VERSION || manifest.pluginId !== PLUGIN_ID || manifest.projectId !== projectId || canonicalJson(manifest.migrationStatementIds) !== canonicalJson(MIGRATIONS.map((_, index) => index)) || manifest.schemaDigest !== schemaDigest || manifest.contractDigest !== contractDigest || Object.keys(manifest.tableCounts).sort().join("\0") !== [...TABLES].sort().join("\0") || Object.values(expectedTables).some((count) => count < 0)) {
     throw refusal("IMPORT_EQUIVALENCE_FAILED", "fixture export identity does not match the exact runtime/schema/project contract");
   }
   const lines = payload.recordsNdjson === "" ? [] : payload.recordsNdjson.split("\n");
@@ -20350,7 +20350,7 @@ function exportFoundation(db, projectId) {
     const artifactIndexDigest = sha256(artifactIndexJson);
     const manifestWithoutRoot = {
       schemaVersion: SCHEMA_VERSION,
-      contractVersion: CONTRACT_VERSION,
+      contractVersion: RUNTIME_CONTRACT_VERSION,
       pluginId: PLUGIN_ID,
       projectId,
       migrationStatementIds: MIGRATIONS.map((_, index) => index),
