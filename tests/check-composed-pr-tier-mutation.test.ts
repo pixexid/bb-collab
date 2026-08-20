@@ -11,6 +11,7 @@ describe("composed PR wrong-tier wording mutation", () => {
       title: "Improve awareness",
       body: "Related GH-402\n\nReview tier: C",
       files: ["src/foundation.ts"],
+      commitMessages: ["Improve awareness"],
     });
     expect(result.ok).toBe(false);
     if (result.ok) return;

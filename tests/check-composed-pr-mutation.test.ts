@@ -11,6 +11,7 @@ describe("composed PR gate linkage mutation", () => {
       title: "Improve awareness",
       body: "Related GH-402\n\nReview tier: B",
       files: ["src/awareness.ts"],
+      commitMessages: ["Improve awareness"],
     });
     expect(result.ok).toBe(false);
     if (result.ok) return;

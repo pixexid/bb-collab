@@ -2,11 +2,11 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parsePullRequestDisposition } from "./pr-lifecycle.mjs";
+import { parsePullRequestDisposition, validateCommitMessages } from "./pr-lifecycle.mjs";
 
 const hostGotchas = "`gh run rerun` replays the original event payload, so only a new edited/synchronize/reopened event evaluates current content; `gh pr checks` shows the stale failed run until the new one completes.";
 
-export function validateComposedPullRequest({ title, body, files }) {
+export function validateComposedPullRequest({ title, body, files, commitMessages }) {
   if (typeof title !== "string" || title.trim() === "") return { ok: false, error: "title is required and must not be blank" };
   if (typeof body !== "string") return { ok: false, error: "body is required" };
   if (!Array.isArray(files) || files.length === 0 || files.some((file) => typeof file !== "string" || file.trim() === "")) {
@@ -17,6 +17,8 @@ export function validateComposedPullRequest({ title, body, files }) {
   if (!parsed.ok) {
     return { ok: false, error: `title/body lifecycle disposition violation (the title is checked too; linkage verbs paired with #NN count): ${parsed.error}\n${hostGotchas}` };
   }
+  const commitCheck = validateCommitMessages(parsed, commitMessages);
+  if (!commitCheck.ok) return { ok: false, error: `commit-message lifecycle violation: ${commitCheck.error}\n${hostGotchas}` };
 
   const directory = mkdtempSync(join(tmpdir(), "bb-collab-composed-pr-"));
   const event = join(directory, "event.json");
@@ -36,7 +38,7 @@ export function validateComposedPullRequest({ title, body, files }) {
 }
 
 function usage() {
-  throw new Error("usage: check-composed-pr.mjs --title <title> (--body <body> | --body-file <path>) --file <changed-path> [...]");
+  throw new Error("usage: check-composed-pr.mjs --title <title> (--body <body> | --body-file <path>) --commit-message <message> [...] --file <changed-path> [...]");
 }
 
 const args = process.argv.slice(2);
@@ -45,15 +47,17 @@ if (args.length > 0) {
   let body;
   let bodyFile;
   const files = [];
+  const commitMessages = [];
   for (let index = 0; index < args.length; index += 1) {
     if (args[index] === "--title") title = args[++index];
     else if (args[index] === "--body") body = args[++index];
     else if (args[index] === "--body-file") bodyFile = args[++index];
+    else if (args[index] === "--commit-message") commitMessages.push(args[++index]);
     else if (args[index] === "--file") files.push(args[++index]);
     else usage();
   }
-  if (typeof title !== "string" || (typeof body !== "string") === (typeof bodyFile !== "string") || files.length === 0) usage();
-  const result = validateComposedPullRequest({ title, body: body ?? readFileSync(bodyFile, "utf8"), files });
+  if (typeof title !== "string" || (typeof body !== "string") === (typeof bodyFile !== "string") || commitMessages.length === 0 || files.length === 0) usage();
+  const result = validateComposedPullRequest({ title, body: body ?? readFileSync(bodyFile, "utf8"), files, commitMessages });
   if (!result.ok) {
     console.error(`PR lifecycle pre-push check failed: ${result.error}`);
     process.exit(1);
