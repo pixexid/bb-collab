@@ -180,9 +180,6 @@ Shipped operational surfaces include:
   ([#342](https://github.com/pixexid/bb-collab/pull/342)); lane-slot utilization reads
   forward-only `lane_capacity_intervals`; liveness never extends observed fact coverage, and any
   pre-instrumentation or recording gap remains unknown;
-
-Metric authors must not sum or compare `tokenUsage` across harnesses: it preserves harness/provider accounting, not a cross-harness unit. For cross-harness context load, use non-null `contextWindowUsage.usedTokens`, retain its `estimated` flag and `modelContextWindow`, and refuse the comparison when that normalized context value is unavailable ([#459](https://github.com/pixexid/bb-collab/issues/459)).
-
 - the report-only static production reachability check, invoked with
   `node scripts/check-production-reachability.mjs`
   ([#347](https://github.com/pixexid/bb-collab/pull/347)); and
@@ -195,6 +192,8 @@ Metric authors must not sum or compare `tokenUsage` across harnesses: it preserv
   `ready`; a GitHub closure triggers reassessment and does not prove that an
   installed host capability now exists
   ([#200](https://github.com/pixexid/bb-collab/issues/200)).
+
+Metric authors must not sum or compare `tokenUsage` across harnesses: it preserves harness/provider accounting, not a cross-harness unit. For cross-harness context load, use non-null `contextWindowUsage.usedTokens`, retain its `estimated` flag and `modelContextWindow`, and refuse the comparison when that normalized context value is unavailable ([#459](https://github.com/pixexid/bb-collab/issues/459)).
 
 Historical contract and schema decisions belong in the
 [ADRs](docs/adr/), especially the [founding contract](docs/adr/0001-founding-contract.md)
