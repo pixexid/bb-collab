@@ -42,6 +42,7 @@ function usage() {
 }
 
 function deriveCommitMessages(base) {
+  // Known ceiling: main-targeting only; if another base arrives, derive from a validated base ref, never supplied evidence.
   const result = spawnSync("git", ["log", `${base}..HEAD`, "--format=%B%x00"], { encoding: "utf8" });
   if (result.status !== 0 || result.error) throw new Error(`could not derive commit messages from ${base}..HEAD`);
   if (result.stdout === "") throw new Error(`no commit messages found in ${base}..HEAD`);
