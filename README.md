@@ -14,6 +14,60 @@ it exits nonzero and names every divergent artifact against the deployed
 commit. The scheduled check reports divergence;
 it never rebuilds, repairs, or commits the deployed checkout.
 
+## Deploy sequence
+
+The orchestrator owns deploys. A lane does not deploy, and an irreversible or
+production-changing action gets its own message rather than a line in a status
+burst. Immediately after a lane finishes, run its terminal WorkItem transition;
+otherwise a completed lane is indistinguishable from a silent one and coverage
+goes blind for the wrong reason.
+
+Run this sequence from the deploy checkout:
+
+```sh
+git merge --ff-only origin/main
+find dist -type f -exec touch {} +
+node scripts/check-dist.mjs --deployed
+bb plugin reload bb-collab
+bb plugin list
+bb collab doctor --project <id>
+# Wait more than 15 seconds.
+node scripts/check-dist.mjs --deployed
+# Run the change's live acceptance query against SQLite with ?mode=ro.
+```
+
+The fast-forward merge binds the deploy to the current integrated main and
+refuses accidental local history. The first `check-dist` proves the deployed
+checkout before the host can load it; reload then makes that checked artifact
+the running revision. Doctor checks the live project's store conformance before
+acceptance, and the final query is the change's own live proof rather than a
+green build standing in for it.
+
+Touch `dist` after the merge so the deployed artifacts are newer than the
+sources before the pre-load check. The BB host rebuilds `dist/app.js` and
+`dist/app.css` during plugin load when a source is newer; without this margin,
+the load can write build-location paths into the deployed artifact and the
+next deploy fails its check. Equal mtimes currently pass because the gate is
+“exceeds”; the real margin avoids that boundary condition.
+
+`reload-exit=0` is only the loader's verdict. `bb plugin list` is required
+because a reload once left the old lane-watcher resident with a closed database
+handle: the loader exited 0 while the plugin was DEGRADED, `bb collab` had
+vanished, and coverage went unrecorded for fifteen minutes. The list reports
+nothing on every healthy deploy, which is why it is easy to drop.
+If it shows DEGRADED, do not trust a second reload: it can clear the label
+while leaving the orphaned service resident; `bb plugin disable bb-collab`
+followed by `bb plugin enable bb-collab` unloads the code entirely, then verify
+recovery from the store because the log lags.
+
+Wait before the second deployed-artifact check: the rebuild landed about 13
+seconds after reload returned, and an immediate check twice gave a confident
+false exculpation. The live acceptance query must use `?mode=ro`; `?immutable=1`
+ignores the WAL and produced stale coverage in the incident. Right after reload,
+`?mode=ro` may fail with “unable to open database file (14)” because clean WAL
+shutdown removes sidecars and a read-only connection cannot create `-shm`.
+Wait and retry; do not switch to the write-permitting plain path.
+
 ## Incident logs
 
 For the durable `bb-collab` emission history, read:
