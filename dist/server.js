@@ -18988,7 +18988,7 @@ function nextWorkAttemptOrdinal(db, projectId, workItemId) {
 function activeWorkItemAttempt(db, projectId, workItemId, assignmentKind) {
   const assignmentFilter = assignmentKind === void 0 ? "" : " AND assignment_kind = ?";
   return asRow(db.prepare(
-    `SELECT execution_attempt_id FROM execution_attempts
+    `SELECT execution_attempt_id, review_pr_number, review_pr_head_sha FROM execution_attempts
      WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
        AND state IN (${ACTIVE_WORK_ATTEMPT_STATES.map(() => "?").join(", ")})${assignmentFilter}
      ORDER BY attempt_ordinal DESC LIMIT 1`
@@ -19374,6 +19374,11 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
   if (nextState === "review_pending" && workAttempt?.assignmentKind !== void 0 && workAttempt.assignmentKind !== "review") {
     throw refusal("WORK_ITEM_STATE_INVALID", "review-pending may only register a review attempt");
   }
+  const redispatchingReview = workItem.lifecycle_state === "review_pending" && nextState === "review_pending";
+  const priorReview = redispatchingReview ? activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "review") : void 0;
+  if (redispatchingReview && (!workAttempt || !workAttempt.threadId || !workAttempt.requestedProfile || workAttempt.reviewPrNumber === void 0 || workAttempt.reviewPrHeadSha === void 0 || !priorReview || priorReview.review_pr_number !== workAttempt.reviewPrNumber || priorReview.review_pr_head_sha !== workAttempt.reviewPrHeadSha)) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "review re-dispatch requires one active review and the same exact PR head, replacement thread, and profile");
+  }
   if (workAttempt !== void 0 && nextState === void 0) {
     if (workItem.lifecycle_state !== "in_progress") {
       throw refusal("WORK_ITEM_STATE_INVALID", "replacement work attempts require an in-progress work item");
@@ -19440,7 +19445,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       }
     );
   }
-  if (!nextState || !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
+  if (!nextState || !redispatchingReview && !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
   let recordedExternalEvent = null;
@@ -19479,7 +19484,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
   if (nextState === "in_progress" && workAttempt === void 0) {
     throw refusal("WORK_ITEM_STATE_INVALID", "entering in-progress requires a work attempt");
   }
-  if (nextState === "review_pending" && !activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
+  if (nextState === "review_pending" && !redispatchingReview && !activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
     throw refusal("WORK_ITEM_STATE_INVALID", "review-pending requires an active writing attempt to close");
   }
   if (workItem.lifecycle_state === "review_pending" && activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
@@ -19534,7 +19539,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       reviewPrHeadSha: null
     });
   } else if (nextState === "review_pending") {
-    executionAttemptId = terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "done", "write");
+    executionAttemptId = redispatchingReview ? terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded", "review") : terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "done", "write");
     if (workAttempt) {
       reviewExecutionAttemptId = insertWorkItemAttempt(db, {
         projectId: request.projectId,
