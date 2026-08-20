@@ -91,7 +91,7 @@ message; none of their messages appeared in the daemon logs.
 
 ## Executed profile read-back
 
-For a completed Codex or Claude Code thread on the current host, correlate BB's
+For a completed Codex, Claude Code, or Pi thread on the current host, correlate BB's
 provider session and completion IDs with the provider-native turn records:
 
 ```sh
@@ -106,11 +106,11 @@ visible as `observedProfile`, but its compliance result is `unknown` because it
 does not establish an exact dispatched SKU or context-window suffix such as
 `[1m]`. The reader never normalizes or guesses that suffix.
 
-Pi has zero measured native read-back coverage. Its result and each affected
-turn explicitly say `provider pi has no measured native read-back`; this is
-different from a broken Codex or Claude reader. Until Pi gains native read-back,
-the director's executed profile is self-attested rather than verified by this
-tool.
+Pi session logs are scoped to the exact environment-derived project directory.
+Its assistant entry id must exactly match BB's completion checkpoint id; the
+entry supplies provider/model and its ancestor state supplies the reasoning
+level. Missing directories, unreadable logs, absent or ambiguous matches, and
+checkpoints that appear only as parent links stay named unknowns.
 
 ## Sidebar thread list
 

@@ -52,6 +52,11 @@ function claudeProjectDirectory(home, environmentPath, providerThreadId) {
   return join(home, ".claude", "projects", projectDirectory);
 }
 
+function piProjectDirectory(home, environmentPath) {
+  if (typeof environmentPath !== "string" || !isAbsolute(environmentPath)) return null;
+  return join(home, ".pi", "agent", "sessions", `--${environmentPath.replace(/^[/\\]/u, "").replace(/[/\\:]/gu, "-")}--`);
+}
+
 async function readJsonLines(path, visit) {
   const lines = createInterface({ input: createReadStream(path, "utf8"), crlfDelay: Infinity });
   for await (const line of lines) {
@@ -73,11 +78,12 @@ function completedTurns(events) {
   });
 }
 
-function settle(turns, profiles, source, { absentReason = "provider-native turn profile is absent", missingCorrelationReason = "BB completion lacks provider correlation", classify } = {}) {
+function settle(turns, profiles, source, { absentReason = "provider-native turn profile is absent", ambiguous = new Set(), missingCorrelationReason = "BB completion lacks provider correlation", classify } = {}) {
   const results = turns.map((turn) => {
     if (!turn.checkpointId || !turn.providerThreadId) {
       return { ...turn, status: "unknown", reason: missingCorrelationReason };
     }
+    if (ambiguous.has(turn.checkpointId)) return { ...turn, status: "unknown", reason: "provider-native turn correlation is ambiguous" };
     const matches = profiles.get(turn.checkpointId) ?? [];
     const distinct = [...new Map(matches.map((profile) => [`${profile.model}\0${profile.reasoningLevel}`, profile])).values()];
     if (distinct.length !== 1) {
@@ -143,6 +149,62 @@ export async function readExecutedProfiles({ thread, environment, events, home =
     } catch {
       profiles.clear();
       return { ...settle(turns, profiles, "Claude assistant envelope"), reason: "Claude session log is unreadable" };
+    }
+  }
+
+  if (thread.providerId === "pi") {
+    let failureReason = "Pi session log is unreadable";
+    try {
+      const root = join(home, ".pi", "agent", "sessions");
+      const directory = piProjectDirectory(home, environment?.path);
+      const files = directory ? filesNamed(root, directory, (name) => /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.jsonl$/iu.test(name)) : [];
+      const ambiguous = new Set();
+      const assistantIds = new Set();
+      for (const file of files) {
+        const entries = [];
+        await readJsonLines(file, (record) => {
+          if (entries.length === 0 && (record?.type !== "session" || record.cwd !== environment.path)) {
+            failureReason = "Pi session header does not match the exact BB environment path";
+            throw new Error("Pi session scope mismatch");
+          }
+          entries.push(record);
+        });
+        if (entries.length === 0) throw new Error("empty Pi session log");
+        const entryIds = entries.flatMap((entry) => typeof entry?.id === "string" ? [entry.id] : []);
+        if (new Set(entryIds).size !== entryIds.length) {
+          failureReason = "Pi session entry ids are ambiguous";
+          throw new Error("duplicate Pi entry id");
+        }
+        const byId = new Map(entries.flatMap((entry) => typeof entry?.id === "string" ? [[entry.id, entry]] : []));
+        for (const record of entries) {
+          if (record?.type !== "message" || record.message?.role !== "assistant") continue;
+          let ancestor = record;
+          const seen = new Set();
+          while (typeof ancestor?.parentId === "string" && !seen.has(ancestor.parentId)) {
+            seen.add(ancestor.parentId);
+            ancestor = byId.get(ancestor.parentId);
+            if (ancestor?.type === "thinking_level_change") break;
+          }
+          const nativeProvider = record.message?.provider;
+          const nativeModel = record.message?.model;
+          const model = typeof nativeProvider === "string" && nativeProvider !== "" && typeof nativeModel === "string" && nativeModel !== ""
+            ? nativeModel.startsWith(`${nativeProvider}/`) ? nativeModel : `${nativeProvider}/${nativeModel}`
+            : null;
+          if (assistantIds.has(record.id)) ambiguous.add(record.id);
+          assistantIds.add(record.id);
+          add(record.id, model, ancestor?.thinkingLevel);
+        }
+      }
+      const reason = !directory
+        ? "BB environment path cannot identify an exact Pi project directory"
+        : files.length === 0
+        ? "expected at least one Pi session log in the exact environment-derived project directory, found 0"
+        : "Pi checkpoints do not correlate to assistant message ids carrying model and reasoning level";
+      const result = settle(turns, profiles, "Pi assistant message", { absentReason: reason, ambiguous });
+      return result.outcome === "unknown" ? { ...result, reason } : result;
+    } catch {
+      profiles.clear();
+      return { ...settle(turns, profiles, "Pi assistant message", { absentReason: failureReason }), reason: failureReason };
     }
   }
 
