@@ -8,7 +8,7 @@ import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import plugin, { IDLE_FLEET_ATTEMPT_STALE_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
+import plugin, { cliSchemaError, IDLE_FLEET_ATTEMPT_STALE_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
 import { canonicalWorktreePath } from "../src/worktree-cleanup.js";
 import {
   CACHED_CONSUMERS,
@@ -9787,5 +9787,19 @@ exit 1
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("preserves schema paths that only exist on Object.prototype", () => {
+    const error = new z.ZodError([{ code: "custom", path: ["constructor", "nested"], message: "bad" }]);
+    expect(JSON.parse(cliSchemaError(error, {}))).toEqual([
+      expect.objectContaining({ path: ["constructor", "nested"] }),
+    ]);
+  });
+
+  it("serializes bigint issue values as strings", () => {
+    const error = new z.ZodError([{ code: "custom", path: ["value"], message: "bad", input: 1n } as never]);
+    expect(JSON.parse(cliSchemaError(error, {}))).toEqual([
+      expect.objectContaining({ input: "1", path: ["value"] }),
+    ]);
   });
 });
