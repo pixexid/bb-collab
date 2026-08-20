@@ -40,7 +40,7 @@ describe("pull-request review tier policy", () => {
     }
   });
 
-  it("fails under-declarations, permits over-declarations, and prints the required rule", () => {
+  it("fails under-declarations, permits over-declarations, and prints the stricter rule", () => {
     const result = check("Review tier: C", ["src/foundation.ts"]);
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("::error::Review finding");
@@ -49,6 +49,6 @@ describe("pull-request review tier policy", () => {
     const overDeclared = check("Review tier: A", ["docs/issue-57-mechanism-1.md"]);
     expect(overDeclared.status).toBe(0);
     expect(overDeclared.stderr).toBe("");
-    expect(overDeclared.stdout).toContain("Review tier C: local verify and CI only");
+    expect(overDeclared.stdout).toContain("Review tier A: cold exact-head review before merge");
   });
 });

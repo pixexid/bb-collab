@@ -49,9 +49,10 @@ if (declared !== required) {
   }
 }
 
+const ruleTier = { A: 3, B: 2, C: 1 }[declared] > { A: 3, B: 2, C: 1 }[required] ? declared : required;
 const rule = {
   A: "cold exact-head review before merge",
   B: "local verify and CI before merge; cold review post-merge in parallel",
   C: "local verify and CI only",
-}[required];
-console.log(`Review tier ${required}: ${rule}`);
+}[ruleTier];
+console.log(`Review tier ${ruleTier}: ${rule}`);
