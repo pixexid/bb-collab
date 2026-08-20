@@ -3509,7 +3509,7 @@ exit 1
     }
   });
 
-  it("fails closed when the full-cap interval write is unavailable and records the recovered interval", async () => {
+  it("extends unchanged lane-capacity observations and starts a new interval when facts change", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-lane-capacity-write-"));
     const gh = join(bin, "gh");
     writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
@@ -3542,8 +3542,16 @@ exit 1
       });
       await vi.waitFor(() => expect(fixture.db.prepare("SELECT * FROM lane_capacity_intervals").all()).toHaveLength(1));
       expect(fixture.db.prepare(
-        "SELECT coverage_state, active_lane_count, writing_lane_ceiling, startable_work, started_at_ms, ended_at_ms FROM lane_capacity_intervals",
-      ).get()).toEqual({ coverage_state: "known", active_lane_count: 1, writing_lane_ceiling: 1, startable_work: 1, started_at_ms: 100, ended_at_ms: null });
+        "SELECT coverage_state, active_lane_count, writing_lane_ceiling, startable_work, started_at_ms, last_confirmed_at_ms, ended_at_ms FROM lane_capacity_intervals",
+      ).get()).toEqual({ coverage_state: "known", active_lane_count: 1, writing_lane_ceiling: 1, startable_work: 1, started_at_ms: 100, last_confirmed_at_ms: 100, ended_at_ms: null });
+
+      clock.mockReturnValue(160);
+      await fixture.host.harness.emitThreadEvent("thread.active", {
+        thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active", updatedAt: 160 }),
+      });
+      await vi.waitFor(() => expect(fixture.db.prepare(
+        "SELECT COUNT(*) AS count, MAX(last_confirmed_at_ms) AS last_confirmed_at_ms FROM lane_capacity_intervals",
+      ).get()).toEqual({ count: 1, last_confirmed_at_ms: 160 }));
 
       clock.mockReturnValue(200);
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3))).toMatchObject({ outcome: "OK" });
@@ -3553,10 +3561,10 @@ exit 1
       });
       await vi.waitFor(() => expect(fixture.db.prepare("SELECT * FROM lane_capacity_intervals").all()).toHaveLength(2));
       expect(fixture.db.prepare(
-        "SELECT active_lane_count, started_at_ms, ended_at_ms FROM lane_capacity_intervals ORDER BY interval_id",
+        "SELECT active_lane_count, started_at_ms, last_confirmed_at_ms, ended_at_ms FROM lane_capacity_intervals ORDER BY interval_id",
       ).all()).toEqual([
-        { active_lane_count: 1, started_at_ms: 100, ended_at_ms: 100 },
-        { active_lane_count: 0, started_at_ms: 200, ended_at_ms: null },
+        { active_lane_count: 1, started_at_ms: 100, last_confirmed_at_ms: 160, ended_at_ms: 160 },
+        { active_lane_count: 0, started_at_ms: 200, last_confirmed_at_ms: 200, ended_at_ms: null },
       ]);
       expect(exportFoundation(fixture.db, PROJECT_ID).export?.recordsNdjson).toContain('"table":"lane_capacity_intervals"');
     } finally {

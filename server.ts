@@ -1848,6 +1848,21 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   const recordLaneCapacityInterval = (observation: LaneCapacityObservation) => {
     if (!db) throw new Error("canonical-store-unavailable");
     db.transaction(() => {
+      const startableWork = observation.startableWork === null ? null : observation.startableWork ? 1 : 0;
+      const extended = db!.prepare(
+        `UPDATE lane_capacity_intervals SET last_confirmed_at_ms = ?
+         WHERE project_id = ? AND ended_at_ms IS NULL
+           AND coverage_state = ? AND active_lane_count IS ?
+           AND writing_lane_ceiling IS ? AND startable_work IS ?`,
+      ).run(
+        observation.observedAtMs,
+        observation.projectId,
+        observation.coverageState,
+        observation.activeLaneCount,
+        observation.writingLaneCeiling,
+        startableWork,
+      );
+      if (extended.changes === 1) return;
       db!.prepare(
         "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE project_id = ? AND ended_at_ms IS NULL",
       ).run(observation.projectId);
@@ -1864,7 +1879,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         observation.coverageState,
         observation.activeLaneCount,
         observation.writingLaneCeiling,
-        observation.startableWork === null ? null : observation.startableWork ? 1 : 0,
+        startableWork,
         observation.reason,
         observation.observedAtMs,
         observation.observedAtMs,
