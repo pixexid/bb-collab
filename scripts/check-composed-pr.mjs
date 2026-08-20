@@ -27,7 +27,7 @@ export function validateComposedPullRequest({ title, body, files, commitMessages
     const result = spawnSync(process.execPath, [new URL("./check-review-tier.mjs", import.meta.url).pathname, event], {
       input: `${files.join("\n")}\n`, encoding: "utf8",
     });
-    // check-review-tier signals wrong-tier declarations on stderr while retaining exit 0; the channel is the protocol, not its wording.
+    // check-review-tier uses stderr for under-declaration errors; over-declaration remains a pass.
     if (result.status !== 0 || result.stderr.trim() !== "") {
       return { ok: false, error: `review tier violation: ${(result.stderr || result.stdout).trim()}\n${hostGotchas}` };
     }
