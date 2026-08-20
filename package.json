@@ -24,6 +24,7 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "check:composed-pr": "node scripts/check-composed-pr.mjs",
+    "executed-profile": "node scripts/read-executed-profile.mjs",
     "throughput-report": "node scripts/weekly-throughput-report.mjs",
     "verify": "npm run typecheck && npm test && npm run build && node scripts/check-css-bundle.mjs && node scripts/role-brief-bundle.mjs && node scripts/check-dist.mjs"
   },
