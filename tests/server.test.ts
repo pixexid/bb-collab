@@ -2046,7 +2046,7 @@ describe("bb-collab plugin boundary", () => {
     expect(cli.exitCode).toBe(2);
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "ACTOR_RECEIPT_UNKNOWN" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["lane-watcher"]);
-    expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "thread-archive-sweep"]);
+    expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "worktree-cleanup", "thread-archive-sweep"]);
     expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "doctor", "export", "lanes", "markOperatorMessageRead", "operatorMessages", "registerWait", "reorderPinned", "replyToOperatorMessage", "roleBrief", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
     expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["send_to_operator"]);
   });
@@ -9941,6 +9941,41 @@ exit 1
     expect(reported.exitCode).toBe(2);
     expect(output).toMatchObject({ outcome: "refused", wouldRemove: [], environmentRecordsReleased: false });
     expect(output).not.toHaveProperty("removed");
+  });
+
+  it("reports removable worktrees hourly without removing them", async () => {
+    const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: "pipe" }).trim();
+    const root = mkdtempSync("/tmp/bb-scheduled-worktree-cleanup-");
+    try {
+      git(root, "init", "--quiet");
+      git(root, "config", "user.email", "test@example.invalid");
+      git(root, "config", "user.name", "test");
+      writeFileSync(join(root, "base.txt"), "base\n");
+      git(root, "add", "base.txt");
+      git(root, "commit", "--quiet", "-m", "base");
+      git(root, "branch", "-M", "main");
+      git(root, "update-ref", "refs/remotes/origin/main", "HEAD");
+      const orphan = join(root, "orphan");
+      git(root, "worktree", "add", "--quiet", "--detach", orphan, "HEAD");
+      const reflog = join(root, ".git/worktrees/orphan/logs/HEAD");
+      const aged = Math.floor(Date.now() / 1000) - 72 * 60 * 60;
+      writeFileSync(reflog, readFileSync(reflog, "utf8").replace(/ \d+ ([-+]\d{4})/u, ` ${aged} $1`));
+
+      const host = hostFor();
+      host.harness.sdk.stub("projects.get", (async () => ({ ...projectFacts(), sources: [{ ...projectFacts().sources[0], path: root }] })) as never);
+      await plugin(host.bb);
+
+      expect(host.harness.inspection.registrations.schedules.find((schedule) => schedule.name === "worktree-cleanup")?.cron).toBe("0 * * * *");
+      await host.harness.runSchedule("worktree-cleanup");
+
+      expect(existsSync(orphan)).toBe(true);
+      expect(host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining(JSON.stringify(canonicalWorktreePath(orphan))),
+      }));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("resolves detached ownership only while the environment inventory reads completely", async () => {

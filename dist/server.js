@@ -22646,6 +22646,31 @@ async function replyToOperatorMessage(db, bb, projectId, messageId, replyText) {
   }
   return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0];
 }
+async function reportProjectWorktreeCleanup(bb, projectId) {
+  const project = await bb.sdk.projects.get({ projectId });
+  const source = project.sources.find((item) => item.isDefault) ?? project.sources[0];
+  if (!source) throw new Error("project has no source checkout");
+  const threads = await listAllProjectThreads((request) => bb.sdk.threads.list(request), projectId);
+  const liveWorktreeThreadIds = /* @__PURE__ */ new Map();
+  let environmentInventoryComplete = true;
+  for (const thread of threads) {
+    if (thread.environmentId === null) continue;
+    try {
+      const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
+      if (!environment.path) {
+        environmentInventoryComplete = false;
+        continue;
+      }
+      const path = canonicalWorktreePath(environment.path);
+      const owners = liveWorktreeThreadIds.get(path) ?? /* @__PURE__ */ new Set();
+      owners.add(thread.id);
+      liveWorktreeThreadIds.set(path, owners);
+    } catch {
+      environmentInventoryComplete = false;
+    }
+  }
+  return cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete);
+}
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];
   const args = argv.slice(1);
@@ -22793,28 +22818,7 @@ async function runCli(db, bb, argv, ctx, deps) {
   if (command === "worktree-cleanup") {
     if (unexpectedFlags(args, ["--project"])) return invalidCli("unexpected worktree-cleanup argument; report-only command has no apply mode");
     try {
-      const project = await bb.sdk.projects.get({ projectId });
-      const source = project.sources.find((item) => item.isDefault) ?? project.sources[0];
-      if (!source) return invalidCli("project has no source checkout");
-      const threads = await listAllProjectThreads((request) => bb.sdk.threads.list(request), projectId);
-      const liveWorktreeThreadIds = /* @__PURE__ */ new Map();
-      let environmentInventoryComplete = true;
-      for (const thread of threads) {
-        if (thread.environmentId === null) continue;
-        try {
-          const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
-          if (!environment.path) {
-            environmentInventoryComplete = false;
-            continue;
-          }
-          const owners = liveWorktreeThreadIds.get(canonicalWorktreePath(environment.path)) ?? /* @__PURE__ */ new Set();
-          owners.add(thread.id);
-          liveWorktreeThreadIds.set(canonicalWorktreePath(environment.path), owners);
-        } catch {
-          environmentInventoryComplete = false;
-        }
-      }
-      const result2 = cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete);
+      const result2 = await reportProjectWorktreeCleanup(bb, projectId);
       return { exitCode: result2.refused.length === 0 ? 0 : 2, stdout: JSON.stringify(result2) };
     } catch (error48) {
       return { exitCode: 2, stdout: JSON.stringify({ outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error48 instanceof Error ? error48.message : String(error48) }], environmentRecordsReleased: false }) };
@@ -24276,6 +24280,29 @@ ${thread.titleFallback ?? ""}`);
   bb.background.schedule("fleet-watchdog", "*/5 * * * *", () => {
     checkDeployedDist();
     return fleetWatchdogCycle();
+  });
+  bb.background.schedule("worktree-cleanup", "0 * * * *", async () => {
+    let projects;
+    try {
+      projects = await bb.sdk.projects.list({ includePersonal: true });
+    } catch (error48) {
+      const report = { outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: `project inventory unavailable: ${String(error48)}` }], environmentRecordsReleased: false };
+      bb.log.warn(`worktree-cleanup report: ${JSON.stringify(report)}`);
+      bb.realtime.publish("worktree-cleanup", report);
+      return;
+    }
+    for (const project of projects) {
+      try {
+        const report = await reportProjectWorktreeCleanup(bb, project.id);
+        if (report.wouldRemove.length > 0) bb.log.warn(`worktree-cleanup report: project=${project.id} ${JSON.stringify(report)}`);
+        else bb.log.info(`worktree-cleanup healthy cycle: project=${project.id} refused=${report.refused.length}`);
+        bb.realtime.publish("worktree-cleanup", { projectId: project.id, ...report });
+      } catch (error48) {
+        const report = { projectId: project.id, outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error48 instanceof Error ? error48.message : String(error48) }], environmentRecordsReleased: false };
+        bb.log.warn(`worktree-cleanup report: project=${project.id} ${JSON.stringify(report)}`);
+        bb.realtime.publish("worktree-cleanup", report);
+      }
+    }
   });
   const archiveSweepRefusalCounter = createArchiveSweepRefusalCounter();
   bb.background.schedule("thread-archive-sweep", "0 * * * *", async () => {
