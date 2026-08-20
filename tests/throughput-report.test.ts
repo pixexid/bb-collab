@@ -62,6 +62,29 @@ describe("weekly throughput report", () => {
     expect(report.outlierCohorts[0].reviewRounds).toEqual({ status: "known" });
   });
 
+  it.each([
+    ["disjoint before", -4, -2],
+    ["disjoint after", 5, 7],
+    ["touching cohort start", -2, 0],
+    ["touching cohort end", 4, 6],
+  ])("leaves a %s review disjoint from the cohort", (_relationship, submittedAtMs, completedAtMs) => {
+    const report = weeklyThroughputReport({ ...empty, reviews: [{ id: "disjoint", tier: "B", submittedAtMs, completedAtMs }], outlierCohorts: [{ label: "cohort", startAtMs: 0, endAtMs: 4 }] }, window);
+    expect(report.outlierCohorts[0].reviewRounds).toEqual({ status: "unknown", reason: "no canonically linked review observations" });
+  });
+
+  it("recognizes a review equal to the cohort", () => {
+    const report = weeklyThroughputReport({ ...empty, reviews: [{ id: "equal", tier: "B", submittedAtMs: 0, completedAtMs: 4 }], outlierCohorts: [{ label: "cohort", startAtMs: 0, endAtMs: 4 }] }, window);
+    expect(report.outlierCohorts[0].reviewRounds).toEqual({ status: "known" });
+  });
+
+  it.each([
+    ["zero-length", 2, 2],
+    ["reversed", 3, 1],
+  ])("rejects a %s review interval as malformed", (_relationship, submittedAtMs, completedAtMs) => {
+    const report = weeklyThroughputReport({ ...empty, reviews: [{ id: "malformed", tier: "B", submittedAtMs, completedAtMs }], outlierCohorts: [{ label: "cohort", startAtMs: 0, endAtMs: 4 }] }, window);
+    expect(report.outlierCohorts[0].reviewRounds).toEqual({ status: "unknown", reason: "no canonically linked review observations" });
+  });
+
   it("grounds a review left-straddling the cohort window", () => {
     const report = weeklyThroughputReport({ ...empty, reviews: [{ id: "left-straddle", tier: "B", submittedAtMs: -2, completedAtMs: 2 }], outlierCohorts: [{ label: "cohort", startAtMs: 0, endAtMs: 4 }] }, window);
     expect(report.outlierCohorts[0].reviewRounds).toEqual({ status: "known" });
@@ -80,6 +103,11 @@ describe("weekly throughput report", () => {
   it("grounds a pending review as open-ended across the cohort window", () => {
     const report = weeklyThroughputReport({ ...empty, reviews: [{ id: "pending-open-ended", tier: "B", submittedAtMs: -2, completedAtMs: null }], outlierCohorts: [{ label: "cohort", startAtMs: 0, endAtMs: 4 }] }, window);
     expect(report.outlierCohorts[0].reviewRounds).toEqual({ status: "known" });
+  });
+
+  it("leaves a pending review starting at cohort end disjoint", () => {
+    const report = weeklyThroughputReport({ ...empty, reviews: [{ id: "pending-at-end", tier: "B", submittedAtMs: 4, completedAtMs: null }], outlierCohorts: [{ label: "cohort", startAtMs: 0, endAtMs: 4 }] }, window);
+    expect(report.outlierCohorts[0].reviewRounds).toEqual({ status: "unknown", reason: "no canonically linked review observations" });
   });
 
   it("keeps partial issue and review windows explicit", () => {
@@ -242,6 +270,39 @@ esac
       const unknown = run().reviewLatencyByTier;
       expect(unknown.B.status).toBe("unknown");
       expect(unknown.B).toHaveProperty("reason", "no canonically linked Tier B review observations");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("does not map a completed superseded review to an open-ended pending interval", () => {
+    const directory = mkdtempSync(join(tmpdir(), "bb-collab-superseded-review-"));
+    const gh = join(directory, "gh");
+    const bb = join(directory, "bb");
+    writeFileSync(gh, `#!/bin/sh
+case "$1 $2" in
+  "issue list") printf '%s' '[]' ;;
+  "pr list") printf '%s' '[{"number":338,"mergedAt":"2026-08-13T00:00:00Z","body":"Review tier: B","title":"review target"}]' ;;
+  "label list") printf '%s' '[]' ;;
+  *) exit 2 ;;
+esac
+`);
+    writeFileSync(bb, `#!/bin/sh
+case "$1 $2" in
+  "project list") printf '%s' '[{"id":"project-test","gitRemoteUrl":"https://github.com/pixexid/bb-collab.git"}]' ;;
+  "collab export") printf '%s' '${JSON.stringify({ evidence: { export: { recordsNdjson: '{"table":"execution_attempts","row":{"execution_attempt_id":"review-superseded","review_pr_number":338,"created_at_ms":1786579200000,"completed_at_ms":1786584600000,"state":"superseded"}}' } } })}' ;;
+  *) exit 2 ;;
+esac
+`);
+    chmodSync(gh, 0o755);
+    chmodSync(bb, 0o755);
+    const output = execFileSync(process.execPath, [
+      join(process.cwd(), "scripts", "weekly-throughput-report.mjs"),
+      "--repo", "pixexid/bb-collab", "--start", "2026-08-12T00:00:00Z", "--end", "2026-08-20T00:00:00Z", "--dials-landed-at", "2026-08-13T00:00:00Z",
+      "--outlier-label", "later cohort", "--outlier-start", "2026-08-16T00:00:00Z", "--outlier-end", "2026-08-17T00:00:00Z",
+    ], { encoding: "utf8", env: { ...process.env, BB_CLI: undefined, PATH: `${directory}:${process.env.PATH ?? ""}` } });
+    try {
+      expect(JSON.parse(output).outlierCohorts[0].reviewRounds).toEqual({ status: "unknown", reason: "no canonically linked review observations" });
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

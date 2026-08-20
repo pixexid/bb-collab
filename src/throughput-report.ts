@@ -66,7 +66,7 @@ const median = (values: number[]): number | null => {
 const hours = (ms: number) => Number((ms / 3_600_000).toFixed(3));
 const inWindow = (at: number | null, start: number, end: number) => at !== null && at >= start && at < end;
 const overlapsWindow = (startAt: number | null, endAt: number | null, start: number, end: number) =>
-  startAt !== null && startAt < end && (endAt === null || endAt > start);
+  startAt !== null && startAt < end && (endAt === null || (startAt < endAt && endAt > start));
 
 export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAtMs: number; endAtMs: number }): WeeklyThroughputReport {
   const issueCandidates = facts.issues.filter((issue) => inWindow(issue.openedAtMs, window.startAtMs, window.endAtMs) || inWindow(issue.closedAtMs, window.startAtMs, window.endAtMs));

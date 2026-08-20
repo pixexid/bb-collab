@@ -81,7 +81,7 @@ const reviews = canonicalReviews.rows.map(({ row }) => ({
   id: row.execution_attempt_id,
   tier: pulls.find((pull) => pull.id === `#${row.review_pr_number}`)?.tier ?? null,
   submittedAtMs: row.created_at_ms,
-  completedAtMs: row.state === "done" ? row.completed_at_ms : null,
+  completedAtMs: row.completed_at_ms ?? null,
 }));
 
 const report = weeklyThroughputReport({
