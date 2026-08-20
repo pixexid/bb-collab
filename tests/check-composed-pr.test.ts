@@ -48,7 +48,7 @@ describe("composed PR pre-push check", () => {
     expect(result.error).toContain("conflicts with the PR disposition");
   });
 
-  it.each(["", "   "]) ("rejects a blank commit message: %j", (commitMessage) => {
+  it.each(["", "   ", "\t"]) ("rejects a blank commit message: %j", (commitMessage) => {
     const result = validateComposedPullRequest({ ...good, commitMessages: [commitMessage] });
     expect(result.ok).toBe(false);
     if (result.ok) return;
