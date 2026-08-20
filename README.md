@@ -69,7 +69,13 @@ Shipped operational surfaces include:
   ([#347](https://github.com/pixexid/bb-collab/pull/347)); and
 - the `review_pending` WorkItem lifecycle state, which separates completed
   authorship from work awaiting review
-  ([#295](https://github.com/pixexid/bb-collab/issues/295)).
+  ([#295](https://github.com/pixexid/bb-collab/issues/295)); and
+- the non-terminal, zero-writing-capacity `blocked` WorkItem state, entered
+  atomically with a machine-evaluable `work_item_succeeded` or
+  `github_issue_closed` condition. The watchdog returns a fired blocker to
+  `ready`; a GitHub closure triggers reassessment and does not prove that an
+  installed host capability now exists
+  ([#200](https://github.com/pixexid/bb-collab/issues/200)).
 
 Historical contract and schema decisions belong in the
 [ADRs](docs/adr/), especially the [founding contract](docs/adr/0001-founding-contract.md)

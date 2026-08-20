@@ -14485,11 +14485,11 @@ var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
 var CONTRACT_VERSION = 22;
-var SCHEMA_VERSION = 21;
+var SCHEMA_VERSION = 22;
 var PREVIOUS_CONTRACT_VERSION = 21;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
-var PREVIOUS_SCHEMA_VERSION = 20;
+var PREVIOUS_SCHEMA_VERSION = 21;
 var ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"];
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
 var directorSeatPrimaryProfile = {
@@ -15329,7 +15329,59 @@ var MIGRATIONS = [
    ALTER TABLE qualification_observations RENAME COLUMN service_tier TO requested_service_tier;
    ALTER TABLE qualification_observations RENAME COLUMN visibility TO requested_visibility;
    ALTER TABLE eligibility_projections RENAME COLUMN profile_digest TO requested_profile_digest;
-   ALTER TABLE role_generations RENAME COLUMN holder_executed_profile_digest TO holder_requested_profile_digest;`
+   ALTER TABLE role_generations RENAME COLUMN holder_executed_profile_digest TO holder_requested_profile_digest;`,
+  `PRAGMA defer_foreign_keys = ON;
+   CREATE TEMP TABLE gh200_assignments AS SELECT * FROM assignments;
+   CREATE TEMP TABLE gh200_external_work_refs AS SELECT * FROM external_work_refs;
+   CREATE TEMP TABLE gh200_work_item_waits AS SELECT * FROM work_item_waits;
+   DELETE FROM assignments;
+   DELETE FROM external_work_refs;
+   DELETE FROM work_item_waits;
+   CREATE TABLE work_items_gh200 (
+     project_id TEXT NOT NULL,
+     work_item_id TEXT NOT NULL,
+     config_revision INTEGER NOT NULL,
+     repo_target_id TEXT NOT NULL,
+     title TEXT NOT NULL,
+     body TEXT NOT NULL,
+     lifecycle_state TEXT NOT NULL
+       CHECK (lifecycle_state IN ('proposed', 'ready', 'in_progress', 'review_pending', 'blocked', 'succeeded', 'failed', 'cancelled')),
+     resource_revision INTEGER NOT NULL CHECK (resource_revision > 0),
+     created_at_ms INTEGER NOT NULL,
+     updated_at_ms INTEGER NOT NULL,
+     PRIMARY KEY (project_id, work_item_id),
+     FOREIGN KEY (project_id, config_revision)
+       REFERENCES project_config_revisions(project_id, config_revision),
+     FOREIGN KEY (project_id, repo_target_id, config_revision)
+       REFERENCES repository_targets(project_id, repo_target_id, config_revision)
+   );
+   INSERT INTO work_items_gh200 SELECT * FROM work_items;
+   DROP TABLE work_items;
+   ALTER TABLE work_items_gh200 RENAME TO work_items;
+   CREATE TABLE work_item_waits_gh200 (
+     project_id TEXT NOT NULL,
+     work_item_id TEXT NOT NULL,
+     waker TEXT NOT NULL,
+     declared_at_ms INTEGER NOT NULL CHECK (declared_at_ms >= 0),
+     declared_by_seat TEXT NOT NULL,
+     waker_kind TEXT NOT NULL
+       CHECK (waker_kind IN ('schedule', 'seat', 'work_item_succeeded', 'github_issue_closed')),
+     note TEXT CHECK (note IS NULL OR length(note) <= 4096),
+     PRIMARY KEY (project_id, work_item_id),
+     FOREIGN KEY (project_id, work_item_id)
+       REFERENCES work_items(project_id, work_item_id)
+   );
+   DROP TABLE work_item_waits;
+   ALTER TABLE work_item_waits_gh200 RENAME TO work_item_waits;
+   INSERT INTO assignments SELECT * FROM gh200_assignments;
+   INSERT INTO external_work_refs SELECT * FROM gh200_external_work_refs;
+   INSERT INTO work_item_waits (
+     project_id, work_item_id, waker, declared_at_ms, declared_by_seat, waker_kind, note
+   ) SELECT project_id, work_item_id, waker, declared_at_ms, declared_by_seat, waker_kind, NULL
+     FROM gh200_work_item_waits;
+   DROP TABLE gh200_assignments;
+   DROP TABLE gh200_external_work_refs;
+   DROP TABLE gh200_work_item_waits;`
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var GH300_BACKFILL_MIGRATION_ID = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE execution_attempts_gh300"));
@@ -15773,8 +15825,8 @@ var decisionEvidenceSchema = external_exports.object({
   actualProfileDigest: digestSchema.optional(),
   nativeReceiptDigest: digestSchema.optional()
 }).strict();
-var WORK_ITEM_STATES = ["proposed", "ready", "in_progress", "review_pending", "succeeded", "failed", "cancelled"];
-var WORK_ITEM_NON_TERMINAL_STATES = ["proposed", "ready", "in_progress", "review_pending"];
+var WORK_ITEM_STATES = ["proposed", "ready", "in_progress", "review_pending", "blocked", "succeeded", "failed", "cancelled"];
+var WORK_ITEM_NON_TERMINAL_STATES = ["proposed", "ready", "in_progress", "review_pending", "blocked"];
 var WORK_ITEM_CAPACITY_LIFECYCLE_STATES = ["in_progress"];
 var WORK_ITEM_CAPACITY_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
 var WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running"];
@@ -15822,10 +15874,26 @@ var workItemInputSchema = external_exports.object({
   body: external_exports.string().max(64 * 1024),
   githubIssue: githubIssueBindingSchema.optional()
 }).strict();
+var githubRefPartSchema = external_exports.string().trim().min(1).max(256).regex(/^[A-Za-z0-9_.-]+$/u);
+var workItemBlockerSchema = external_exports.discriminatedUnion("kind", [
+  external_exports.object({ kind: external_exports.literal("work_item_succeeded"), workItemId: id }).strict(),
+  external_exports.object({ kind: external_exports.literal("github_issue_closed"), owner: githubRefPartSchema, repo: githubRefPartSchema, issueNumber: external_exports.number().int().positive().refine(Number.isSafeInteger) }).strict()
+]);
+var workItemBlockerWithDeclarationSchema = external_exports.discriminatedUnion("kind", [
+  external_exports.object({ kind: external_exports.literal("work_item_succeeded"), workItemId: id, declaredBySeat: id, note: external_exports.string().trim().min(1).max(4096).optional() }).strict(),
+  external_exports.object({ kind: external_exports.literal("github_issue_closed"), owner: githubRefPartSchema, repo: githubRefPartSchema, issueNumber: external_exports.number().int().positive().refine(Number.isSafeInteger), declaredBySeat: id, note: external_exports.string().trim().min(1).max(4096).optional() }).strict()
+]);
 var workItemWaitSchema = external_exports.discriminatedUnion("kind", [
   external_exports.object({ kind: external_exports.literal("schedule"), schedule: id, declaredBySeat: id }).strict(),
-  external_exports.object({ kind: external_exports.literal("seat"), seat: external_exports.enum(ROLE_IDS), declaredBySeat: id }).strict()
+  external_exports.object({ kind: external_exports.literal("seat"), seat: external_exports.enum(ROLE_IDS), declaredBySeat: id }).strict(),
+  ...workItemBlockerWithDeclarationSchema.options
 ]);
+var workItemExternalEventSchema = external_exports.object({
+  kind: external_exports.enum(["github_issue_closed", "github_issue_reopened"]),
+  owner: githubRefPartSchema,
+  repo: githubRefPartSchema,
+  issueNumber: external_exports.number().int().positive().refine(Number.isSafeInteger)
+}).strict();
 var gitShaSchema = external_exports.string().regex(/^[0-9a-f]{40,64}$/u);
 var workAttemptSchema = external_exports.object({
   laneId: id,
@@ -16062,6 +16130,8 @@ var applyRequestSchema = external_exports.object({
   workItemId: id.optional(),
   lifecycleState: workItemStateSchema.optional(),
   workItemWait: workItemWaitSchema.nullable().optional(),
+  workItemUnblock: workItemBlockerSchema.optional(),
+  workItemExternalEvent: workItemExternalEventSchema.optional(),
   workAttempt: workAttemptSchema.optional(),
   projectionKind: external_exports.literal("github_issue").optional(),
   roleId: roleIdSchema.optional(),
@@ -18928,6 +18998,26 @@ function workItemReconciliationIssues(db, projectId) {
   }
   return issues;
 }
+function workItemBlockerWaker(blocker) {
+  return blocker.kind === "work_item_succeeded" ? blocker.workItemId : `${blocker.owner}/${blocker.repo}#${blocker.issueNumber}`;
+}
+function storedWorkItemBlocker(row) {
+  if (row.waker_kind === "work_item_succeeded") {
+    return { kind: "work_item_succeeded", workItemId: row.waker };
+  }
+  if (row.waker_kind !== "github_issue_closed") return null;
+  const match = row.waker.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u);
+  const issueNumber = match?.[3] === void 0 ? NaN : Number(match[3]);
+  return match?.[1] && match[2] && Number.isSafeInteger(issueNumber) ? { kind: "github_issue_closed", owner: match[1], repo: match[2], issueNumber } : null;
+}
+function sameWorkItemBlocker(left, right) {
+  return canonicalJson(left) === canonicalJson(right);
+}
+function workItemGithubReadTarget(request) {
+  const targets = [request.workItemWait, request.workItemUnblock, request.workItemExternalEvent].flatMap((value) => value && value.kind !== "work_item_succeeded" && value.kind !== "schedule" && value.kind !== "seat" ? [{ owner: value.owner, repo: value.repo, issueNumber: value.issueNumber }] : []);
+  if (targets.length > 1) throw refusal("WORK_ITEM_STATE_INVALID", "work item transition accepts one external condition");
+  return targets[0] ?? null;
+}
 var githubSnapshotSchema = external_exports.object({
   owner: id,
   repo: id,
@@ -19080,14 +19170,70 @@ function applyWorkItemCreate(db, request, digest) {
 }
 var WORK_ITEM_TRANSITIONS = {
   proposed: ["ready", "cancelled"],
-  ready: ["in_progress", "cancelled"],
-  in_progress: ["review_pending", "failed", "cancelled"],
-  review_pending: ["in_progress", "succeeded", "failed", "cancelled"],
-  succeeded: [],
+  ready: ["in_progress", "blocked", "cancelled"],
+  in_progress: ["review_pending", "blocked", "failed", "cancelled"],
+  review_pending: ["in_progress", "blocked", "succeeded", "failed", "cancelled"],
+  blocked: ["ready", "cancelled"],
+  succeeded: ["ready"],
   failed: [],
   cancelled: []
 };
-function applyWorkItemTransition(db, request, digest) {
+function requireBoundGithubIssue(db, projectId, workItemId, target) {
+  const ref = externalRef(db, projectId, workItemId);
+  if (!ref || ref.issue_number === null) throw refusal("EXTERNAL_REF_REQUIRED", "work item has no exact GitHub issue binding");
+  if (ref.owner !== target.owner || ref.repo !== target.repo || ref.issue_number !== target.issueNumber) {
+    throw refusal("EXTERNAL_REF_CONFLICT", "GitHub observation does not match the work item's exact external binding");
+  }
+  return ref;
+}
+function requireBlockerCondition(db, request, blocker, githubObservation, satisfied) {
+  let conditionSatisfied;
+  if (blocker.kind === "work_item_succeeded") {
+    if (blocker.workItemId === request.workItemId) throw refusal("WORK_ITEM_STATE_INVALID", "work item cannot block on itself");
+    const dependency = asRow(db.prepare(
+      "SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?"
+    ).get(request.projectId, blocker.workItemId));
+    if (!dependency) throw refusal("WORK_ITEM_UNKNOWN", "blocking work item does not exist in the exact project");
+    if (["failed", "cancelled"].includes(dependency.lifecycle_state)) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "work item cannot block on a terminal dependency that did not succeed");
+    }
+    conditionSatisfied = dependency.lifecycle_state === "succeeded";
+  } else {
+    if (!githubObservation) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub blocker observation is unavailable");
+    conditionSatisfied = githubObservation.state === "closed";
+  }
+  if (conditionSatisfied !== satisfied) {
+    throw refusal("WORK_ITEM_STATE_INVALID", satisfied ? "work item blocker has not fired" : "work item blocker already fired");
+  }
+}
+function recordedGithubCloseObservation(db, projectId, workItemId, resourceRevision) {
+  const row = asRow(db.prepare(
+    `SELECT event_json FROM state_events
+     WHERE project_id = ? AND aggregate_type = 'work_item' AND aggregate_id = ?
+       AND aggregate_revision = ? AND event_type = 'work_item_transitioned'
+     ORDER BY event_sequence DESC LIMIT 1`
+  ).get(projectId, workItemId, resourceRevision));
+  if (!row) throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item has no recorded close observation");
+  let event;
+  try {
+    event = JSON.parse(row.event_json);
+  } catch {
+    throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item close observation is malformed");
+  }
+  const parsed = external_exports.object({
+    to: external_exports.literal("succeeded"),
+    externalEvent: external_exports.object({
+      kind: external_exports.literal("github_issue_closed"),
+      owner: githubRefPartSchema,
+      repo: githubRefPartSchema,
+      issueNumber: external_exports.number().int().positive().refine(Number.isSafeInteger),
+      externalRevision: id
+    }).strict()
+  }).passthrough().safeParse(event);
+  if (!parsed.success) throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item has no exact recorded close observation");
+  return parsed.data.externalEvent;
+}
+function applyWorkItemTransition(db, request, digest, githubObservation) {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
@@ -19100,19 +19246,31 @@ function applyWorkItemTransition(db, request, digest) {
     nextState !== void 0 || request.workItemWait === null
   );
   const wait = request.workItemWait;
+  const unblock = request.workItemUnblock;
+  const externalEvent = request.workItemExternalEvent;
   const workAttempt = request.workAttempt;
-  if (wait !== void 0 && (nextState !== void 0 || workAttempt !== void 0)) {
+  const existingWait = asRow(db.prepare(
+    "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?"
+  ).get(request.projectId, workItem.work_item_id));
+  const machineWait = wait && (wait.kind === "work_item_succeeded" || wait.kind === "github_issue_closed") ? wait : null;
+  const enteringBlocked = nextState === "blocked";
+  if (enteringBlocked) {
+    if (!machineWait || workAttempt !== void 0 || unblock !== void 0 || externalEvent !== void 0) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "entering blocked requires exactly one machine-evaluable blocker");
+    }
+    if (existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
+    const blocker = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber };
+    requireBlockerCondition(db, request, blocker, githubObservation, false);
+  } else if (wait !== void 0 && (nextState !== void 0 || workAttempt !== void 0)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item wait mutation cannot change lifecycle state");
   }
-  if (wait !== void 0) {
-    if (["succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state)) {
-      throw refusal("WORK_ITEM_STATE_INVALID", "terminal work item cannot carry a wait");
+  if (wait !== void 0 && !enteringBlocked) {
+    if (machineWait) throw refusal("WORK_ITEM_STATE_INVALID", "machine-evaluable blocker requires an atomic transition to blocked");
+    if (["blocked", "succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state)) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "blocked or terminal work item cannot carry a human wait");
     }
-    const existing = asRow(db.prepare(
-      "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?"
-    ).get(request.projectId, workItem.work_item_id));
-    if (wait !== null && existing) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
-    if (wait === null && !existing) throw refusal("WORK_ITEM_WAIT_OPEN", "work item carries no open wait");
+    if (wait !== null && existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
+    if (wait === null && !existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item carries no open wait");
     const nextRevision2 = workItem.resource_revision + 1;
     const updated2 = db.prepare(
       `UPDATE work_items SET resource_revision = ?, updated_at_ms = ?
@@ -19125,9 +19283,10 @@ function applyWorkItemTransition(db, request, digest) {
     if (wait === null) {
       db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
     } else {
+      if (wait.kind !== "schedule" && wait.kind !== "seat") throw refusal("WORK_ITEM_STATE_INVALID", "machine-evaluable blocker requires blocked");
       db.prepare(
-        `INSERT INTO work_item_waits (project_id, work_item_id, waker, waker_kind, declared_at_ms, declared_by_seat)
-         VALUES (?, ?, ?, ?, ?, ?)`
+        `INSERT INTO work_item_waits (project_id, work_item_id, waker, waker_kind, declared_at_ms, declared_by_seat, note)
+         VALUES (?, ?, ?, ?, ?, ?, NULL)`
       ).run(request.projectId, workItem.work_item_id, wait.kind === "schedule" ? wait.schedule : wait.seat, wait.kind, now(), wait.declaredBySeat);
     }
     return commitMutation(
@@ -19232,6 +19391,39 @@ function applyWorkItemTransition(db, request, digest) {
   if (!nextState || !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
+  let recordedExternalEvent = null;
+  if (workItem.lifecycle_state === "blocked") {
+    const storedBlocker = existingWait ? storedWorkItemBlocker(existingWait) : null;
+    if (!storedBlocker) throw refusal("WORK_ITEM_STATE_INVALID", "blocked work item has no valid machine-evaluable blocker");
+    if (nextState === "ready") {
+      if (!unblock || !sameWorkItemBlocker(storedBlocker, unblock)) {
+        throw refusal("WORK_ITEM_STATE_INVALID", "blocked to ready requires the exact stored blocker");
+      }
+      requireBlockerCondition(db, request, unblock, githubObservation, true);
+    } else if (unblock !== void 0) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "work item unblock evidence only permits blocked to ready");
+    }
+  } else if (unblock !== void 0) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work item unblock evidence requires a blocked work item");
+  }
+  if (externalEvent) {
+    if (!githubObservation) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub lifecycle observation is unavailable");
+    requireBoundGithubIssue(db, request.projectId, workItem.work_item_id, externalEvent);
+    if (externalEvent.kind === "github_issue_closed") {
+      if (nextState !== "succeeded" || githubObservation.state !== "closed") {
+        throw refusal("WORK_ITEM_STATE_INVALID", "close observation only permits a transition to succeeded");
+      }
+    } else {
+      if (workItem.lifecycle_state !== "succeeded" || nextState !== "ready" || githubObservation.state !== "open") {
+        throw refusal("WORK_ITEM_STATE_INVALID", "reopen observation only permits succeeded to ready");
+      }
+      const prior = recordedGithubCloseObservation(db, request.projectId, workItem.work_item_id, workItem.resource_revision);
+      if (prior.owner !== externalEvent.owner || prior.repo !== externalEvent.repo || prior.issueNumber !== externalEvent.issueNumber || prior.externalRevision === githubObservation.externalRevision) throw refusal("WORK_ITEM_STATE_INVALID", "GitHub reopen does not follow the exact recorded close observation");
+    }
+    recordedExternalEvent = { ...externalEvent, externalRevision: githubObservation.externalRevision };
+  } else if (workItem.lifecycle_state === "succeeded" && nextState === "ready") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item can return only after a proven GitHub issue reopening");
+  }
   if (nextState === "in_progress" && workAttempt === void 0) {
     throw refusal("WORK_ITEM_STATE_INVALID", "entering in-progress requires a work attempt");
   }
@@ -19241,9 +19433,7 @@ function applyWorkItemTransition(db, request, digest) {
   if (workItem.lifecycle_state === "review_pending" && activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
     throw refusal("WORK_ITEM_STATE_INVALID", "review-pending cannot carry an active writing attempt");
   }
-  if (["succeeded", "failed", "cancelled"].includes(nextState) && db.prepare(
-    "SELECT 1 FROM work_item_waits WHERE project_id = ? AND work_item_id = ?"
-  ).get(request.projectId, workItem.work_item_id)) {
+  if (["succeeded", "failed", "cancelled"].includes(nextState) && existingWait && workItem.lifecycle_state !== "blocked") {
     throw refusal("WORK_ITEM_WAIT_OPEN", "resolve the work item wait before terminalizing it");
   }
   const nextRevision = workItem.resource_revision + 1;
@@ -19256,6 +19446,15 @@ function applyWorkItemTransition(db, request, digest) {
       currentResourceRevision: workItem.resource_revision,
       expectedResourceRevision: request.expectedResourceRevision ?? void 0
     });
+  }
+  if (enteringBlocked) {
+    const blocker = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber };
+    db.prepare(
+      `INSERT INTO work_item_waits (project_id, work_item_id, waker, waker_kind, declared_at_ms, declared_by_seat, note)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(request.projectId, workItem.work_item_id, workItemBlockerWaker(blocker), blocker.kind, now(), machineWait.declaredBySeat, machineWait.note ?? null);
+  } else if (workItem.lifecycle_state === "blocked") {
+    db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
   }
   let executionAttemptId = null;
   let reviewExecutionAttemptId = null;
@@ -19309,7 +19508,7 @@ function applyWorkItemTransition(db, request, digest) {
       db,
       request.projectId,
       workItem.work_item_id,
-      nextState === "succeeded" ? "done" : "failed",
+      nextState === "succeeded" ? "done" : nextState === "blocked" ? "blocked" : "failed",
       workItem.lifecycle_state === "review_pending" ? "review" : void 0
     );
   }
@@ -19329,7 +19528,10 @@ function applyWorkItemTransition(db, request, digest) {
         to: nextState,
         ...executionAttemptId === null ? {} : { executionAttemptId },
         ...reviewExecutionAttemptId === null ? {} : { reviewExecutionAttemptId },
-        ...workAttempt === void 0 ? {} : { workAttempt }
+        ...workAttempt === void 0 ? {} : { workAttempt },
+        ...machineWait === null ? {} : { blocker: machineWait },
+        ...unblock === void 0 ? {} : { unblock },
+        ...recordedExternalEvent === null ? {} : { externalEvent: recordedExternalEvent }
       }
     },
     { expected: 1, attempted: 1, verified: 1 },
@@ -19342,7 +19544,10 @@ function applyWorkItemTransition(db, request, digest) {
         workItemId: workItem.work_item_id,
         lifecycleState: nextState,
         ...executionAttemptId === null ? {} : { executionAttemptId },
-        ...reviewExecutionAttemptId === null ? {} : { reviewExecutionAttemptId }
+        ...reviewExecutionAttemptId === null ? {} : { reviewExecutionAttemptId },
+        ...machineWait === null ? {} : { blocker: machineWait },
+        ...unblock === void 0 ? {} : { unblock },
+        ...recordedExternalEvent === null ? {} : { externalEvent: recordedExternalEvent }
       }
     }
   );
@@ -19952,7 +20157,7 @@ function isConstraintError(error48) {
 function unavailableResult(subject, message) {
   return result("CANONICAL_STORE_UNAVAILABLE", subject, 1, 0, 0, { message });
 }
-function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null) {
+function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null) {
   let request;
   try {
     request = parseApplyRequest(input);
@@ -19961,9 +20166,9 @@ function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error48) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader);
 }
-function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null) {
+function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null) {
   let request;
   try {
     request = parseApplyRequest(input);
@@ -19982,6 +20187,20 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
     }
     if (request.operationClass === "decision_disposition") {
       return applyDecisionMutation(db, request, digest, reviewFactReader);
+    }
+    const githubTarget = request.operationClass === "work_item_transition" ? workItemGithubReadTarget(request) : null;
+    let githubObservation = null;
+    if (githubTarget) {
+      const replay = checkIdempotency(db, request, digest);
+      if (replay) return replay;
+      const reader = githubIssueReader ?? (githubAdapter ? githubAdapter.read.bind(githubAdapter) : null);
+      if (!reader) throw refusal("EXTERNAL_TARGET_REQUIRED", "work item transition requires a live GitHub issue reader");
+      try {
+        githubObservation = reader(githubTarget.owner, githubTarget.repo, githubTarget.issueNumber);
+      } catch {
+        throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue observation is unavailable");
+      }
+      if (!githubObservation || githubObservation.owner !== githubTarget.owner || githubObservation.repo !== githubTarget.repo || githubObservation.issueNumber !== githubTarget.issueNumber) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue observation does not match the exact blocker identity");
     }
     return transaction(db, () => {
       const replay = checkIdempotency(db, request, digest);
@@ -20004,7 +20223,7 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
         case "work_item_create":
           return applyWorkItemCreate(db, request, digest);
         case "work_item_transition":
-          return applyWorkItemTransition(db, request, digest);
+          return applyWorkItemTransition(db, request, digest, githubObservation);
         case "github_issue_projection":
           throw refusal("INTERNAL_ERROR", "projection must not run inside the canonical transaction");
         case "qualification_observation_record":
@@ -21509,11 +21728,12 @@ function startableQueueDepth(repositories) {
   return startableQueueState(repositories)?.count ?? null;
 }
 function linkedGithubObservation(owner, repo, issueNumber) {
-  const issue2 = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,closedByPullRequestsReferences"]);
+  const issue2 = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,updatedAt,closedByPullRequestsReferences"]);
   if (!issue2 || typeof issue2 !== "object" || Array.isArray(issue2)) return null;
   const issueState = issue2.state;
+  const externalRevision = issue2.updatedAt;
   const closingPullRequests = issue2.closedByPullRequestsReferences;
-  if (issueState !== "OPEN" && issueState !== "CLOSED" || !Array.isArray(closingPullRequests)) return null;
+  if (issueState !== "OPEN" && issueState !== "CLOSED" || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
   const closingPullRequest = closingPullRequests[0];
   if (closingPullRequest !== void 0 && (!closingPullRequest || typeof closingPullRequest !== "object" || Array.isArray(closingPullRequest) || typeof closingPullRequest.number !== "number" || !Number.isSafeInteger(closingPullRequest.number))) return null;
   const pullRequest = closingPullRequest === void 0 ? null : githubJson(["pr", "view", String(closingPullRequest.number), "--repo", `${owner}/${repo}`, "--json", "state,mergedAt"]);
@@ -21528,7 +21748,7 @@ function linkedGithubObservation(owner, repo, issueNumber) {
   const issueClosed = issueState === "CLOSED";
   const issueOpen = issueState === "OPEN";
   const status = pullRequestMerged || pullRequestClosed || issueClosed ? pullRequestMerged ? "merged" : "closed" : issueOpen ? "open" : null;
-  return status === null ? null : { status, pullRequestMerged, issueClosed };
+  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, externalRevision };
 }
 function readGithubIssueForBackfill(owner, repo, issueNumber) {
   const value = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,labels,updatedAt"]);
@@ -21977,7 +22197,7 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
   if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v22-rollout-receipt")) {
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
-  if (parsed.success && parsed.data.workItemWait !== void 0 && parsed.data.workItemWait !== null) {
+  if (parsed.success && parsed.data.workItemWait !== void 0 && parsed.data.workItemWait !== null && (parsed.data.workItemWait.kind === "schedule" || parsed.data.workItemWait.kind === "seat")) {
     try {
       if (!await liveWorkItemWaker(bb, db, parsed.data.projectId, parsed.data.workItemWait)) {
         const waker = parsed.data.workItemWait.kind === "schedule" ? `schedule ${parsed.data.workItemWait.schedule}` : `seat ${parsed.data.workItemWait.seat}`;
@@ -21988,7 +22208,7 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     }
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
-  const result2 = applyAuthorizedMutation(db, input, null, reader);
+  const result2 = applyAuthorizedMutation(db, input, null, reader, null, null, readGithubIssueForBackfill);
   await deliverSucceededSeatBrief(bb, db, input, result2);
   return result2;
 }
@@ -21996,6 +22216,7 @@ async function liveWorkItemWaker(bb, db, projectId, waker) {
   if (waker.kind === "seat") {
     return db !== null && readRoleHolderStates(db).filter((holder) => holder.project_id === projectId && holder.role_id === waker.seat).length === 1;
   }
+  if (waker.kind !== "schedule") return false;
   return liveWaker(bb, waker.schedule);
 }
 async function liveWaker(bb, schedule) {
@@ -23330,9 +23551,9 @@ ${thread.titleFallback ?? ""}`);
            ON external_work_refs.project_id = work_items.project_id
           AND external_work_refs.work_item_id = work_items.work_item_id
           AND external_work_refs.provider = 'github'
-         WHERE work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
+         WHERE work_items.lifecycle_state IN (${[...WORK_ITEM_NON_TERMINAL_STATES, "succeeded"].map(() => "?").join(", ")})
            AND external_work_refs.issue_number IS NOT NULL`
-      ).all(...WORK_ITEM_NON_TERMINAL_STATES)) projectIds.add(row.project_id);
+      ).all(...WORK_ITEM_NON_TERMINAL_STATES, "succeeded")) projectIds.add(row.project_id);
       const lanesByProject = /* @__PURE__ */ new Map();
       for (const projectId of projectIds) {
         if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
@@ -23355,14 +23576,14 @@ ${thread.titleFallback ?? ""}`);
       }
       const openWorkItemsByProject = /* @__PURE__ */ new Map();
       for (const workItem of db.prepare(
-        `SELECT work_items.project_id, work_items.work_item_id, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
+        `SELECT work_items.project_id, work_items.work_item_id, work_items.lifecycle_state, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
          FROM work_items LEFT JOIN work_item_waits
            ON work_item_waits.project_id = work_items.project_id AND work_item_waits.work_item_id = work_items.work_item_id
          WHERE work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
          ORDER BY work_items.created_at_ms, work_items.work_item_id`
       ).all(...WORK_ITEM_NON_TERMINAL_STATES)) {
         const workItems = openWorkItemsByProject.get(workItem.project_id) ?? [];
-        workItems.push({ workItemId: workItem.work_item_id, waker: workItem.waker, wakerKind: workItem.waker_kind, declaredAtMs: workItem.declared_at_ms });
+        workItems.push({ workItemId: workItem.work_item_id, lifecycleState: workItem.lifecycle_state, waker: workItem.waker, wakerKind: workItem.waker_kind, declaredAtMs: workItem.declared_at_ms });
         openWorkItemsByProject.set(workItem.project_id, workItems);
       }
       const isCurrent = (candidate, holder) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
@@ -23435,70 +23656,105 @@ ${thread.titleFallback ?? ""}`);
           wakeInFlight.delete(key);
         }
       };
+      const transitionWorkItem = (projectId, workItemId, state, idempotencyKey, extra = {}) => {
+        const actor = db.prepare(
+          `SELECT receipt_id FROM actor_receipts
+           WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
+             AND verification_state = 'verified'
+           ORDER BY issued_at_ms DESC LIMIT 1`
+        ).get(projectId, PLUGIN_ID);
+        const governor = db.prepare(
+          "SELECT governance_epoch, fence_token FROM project_governorship_heads WHERE project_id = ?"
+        ).get(projectId);
+        const config2 = db.prepare(
+          "SELECT config_revision FROM project_config_heads WHERE project_id = ?"
+        ).get(projectId);
+        const workItem = db.prepare(
+          `SELECT repo_target_id, resource_revision
+           FROM work_items WHERE project_id = ? AND work_item_id = ?`
+        ).get(projectId, workItemId);
+        if (!actor || !governor || !config2 || !workItem) {
+          return { outcome: "WORK_ITEM_STATE_INVALID", subject: workItemId, expected: 1, attempted: 0, verified: 0, message: "authority or work item unavailable" };
+        }
+        return applyAuthorizedMutation(db, {
+          projectId,
+          operationClass: "work_item_transition",
+          idempotencyKey,
+          actorReceiptId: actor.receipt_id,
+          expectedConfigRevision: config2.config_revision,
+          expectedGovernanceEpoch: governor.governance_epoch,
+          expectedFenceToken: governor.fence_token,
+          repoTargetId: workItem.repo_target_id,
+          expectedResourceRevision: workItem.resource_revision,
+          workItemId,
+          lifecycleState: state,
+          ...extra
+        }, null, null, null, null, readGithubIssueForBackfill);
+      };
       const inspectLinkedWorkItems = (projectId) => {
         const linkedWorkItems = db.prepare(
-          `SELECT work_items.work_item_id, external_work_refs.owner, external_work_refs.repo, external_work_refs.issue_number
+          `SELECT work_items.work_item_id, work_items.lifecycle_state, external_work_refs.owner, external_work_refs.repo, external_work_refs.issue_number
            FROM work_items JOIN external_work_refs
              ON external_work_refs.project_id = work_items.project_id
             AND external_work_refs.work_item_id = work_items.work_item_id
             AND external_work_refs.provider = 'github'
            WHERE work_items.project_id = ?
-             AND work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
+             AND work_items.lifecycle_state IN (${[...WORK_ITEM_NON_TERMINAL_STATES, "succeeded"].map(() => "?").join(", ")})
              AND external_work_refs.issue_number IS NOT NULL
            ORDER BY work_items.work_item_id`
-        ).all(projectId, ...WORK_ITEM_NON_TERMINAL_STATES);
+        ).all(projectId, ...WORK_ITEM_NON_TERMINAL_STATES, "succeeded");
         for (const linked of linkedWorkItems) {
           const observation = linkedGithubObservation(linked.owner, linked.repo, linked.issue_number);
           if (observation === null) {
             degrade(`github-work-item-status:${projectId}:${linked.work_item_id}`);
             continue;
           }
+          if (linked.lifecycle_state === "succeeded") {
+            if (!observation.issueOpen) continue;
+            const result3 = transitionWorkItem(
+              projectId,
+              linked.work_item_id,
+              "ready",
+              `fleet-watchdog:issue-reopened:${linked.work_item_id}:${observation.externalRevision}`,
+              { workItemExternalEvent: { kind: "github_issue_reopened", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } }
+            );
+            if (result3.outcome === "OK") {
+              bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation.externalRevision}`);
+            } else {
+              degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
+              bb.log.warn(`fleet-watchdog issue-reopen transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result3.outcome}`);
+            }
+            continue;
+          }
+          if (linked.lifecycle_state === "blocked") continue;
           if (observation.status !== "open") {
             bb.log.warn(`fleet-watchdog stale-terminal work item: project=${projectId} workItem=${linked.work_item_id} linked=${linked.owner}/${linked.repo}#${linked.issue_number} status=${observation.status}`);
           }
           if (!observation.pullRequestMerged || !observation.issueClosed) continue;
-          const actor = db.prepare(
-            `SELECT receipt_id FROM actor_receipts
-             WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
-               AND verification_state = 'verified'
-             ORDER BY issued_at_ms DESC LIMIT 1`
-          ).get(projectId, PLUGIN_ID);
-          const governor = db.prepare(
-            "SELECT governance_epoch, fence_token FROM project_governorship_heads WHERE project_id = ?"
-          ).get(projectId);
-          const config2 = db.prepare(
-            "SELECT config_revision FROM project_config_heads WHERE project_id = ?"
-          ).get(projectId);
           const workItem = db.prepare(
-            `SELECT repo_target_id, resource_revision, lifecycle_state
+            `SELECT resource_revision, lifecycle_state
              FROM work_items WHERE project_id = ? AND work_item_id = ?`
           ).get(projectId, linked.work_item_id);
-          if (!actor || !governor || !config2 || !workItem) {
+          if (!workItem) {
             degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
             bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} reason=authority-or-work-item-unavailable`);
             continue;
           }
-          const transition = (state, expectedResourceRevision) => applyAuthorizedMutation(db, {
+          const transition = (state) => transitionWorkItem(
             projectId,
-            operationClass: "work_item_transition",
-            idempotencyKey: `fleet-watchdog:merge-close:${linked.work_item_id}:${state}`,
-            actorReceiptId: actor.receipt_id,
-            expectedConfigRevision: config2.config_revision,
-            expectedGovernanceEpoch: governor.governance_epoch,
-            expectedFenceToken: governor.fence_token,
-            repoTargetId: workItem.repo_target_id,
-            expectedResourceRevision,
-            workItemId: linked.work_item_id,
-            lifecycleState: state
-          });
+            linked.work_item_id,
+            state,
+            `fleet-watchdog:merge-close:${linked.work_item_id}:${state}`,
+            state === "succeeded" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {}
+          );
           let result2;
           if (workItem.lifecycle_state === "in_progress") {
-            result2 = transition("review_pending", workItem.resource_revision);
+            result2 = transition("review_pending");
             if (result2.outcome === "OK") {
               const current = db.prepare(
                 "SELECT resource_revision, lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?"
               ).get(projectId, linked.work_item_id);
-              result2 = current?.lifecycle_state === "review_pending" ? transition("succeeded", current.resource_revision) : {
+              result2 = current?.lifecycle_state === "review_pending" ? transition("succeeded") : {
                 outcome: "WORK_ITEM_REVISION_STALE",
                 subject: linked.work_item_id,
                 expected: 1,
@@ -23508,7 +23764,7 @@ ${thread.titleFallback ?? ""}`);
               };
             }
           } else if (workItem.lifecycle_state === "review_pending") {
-            result2 = transition("succeeded", workItem.resource_revision);
+            result2 = transition("succeeded");
           } else {
             result2 = { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close automation requires in_progress or review_pending, found ${workItem.lifecycle_state}` };
           }
@@ -23659,12 +23915,54 @@ ${thread.titleFallback ?? ""}`);
             await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${startableCount} issue${startableCount === 1 ? "" : "s"} with ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
           }
           if (workItems.length === 0) continue;
-          const staleWait = workItems.find((workItem) => workItem.declaredAtMs !== null && now2 - workItem.declaredAtMs >= staleWaitMs);
+          const unblocked = /* @__PURE__ */ new Set();
+          for (const blocked of workItems.filter((workItem) => workItem.lifecycleState === "blocked")) {
+            let condition;
+            let idempotencyKey;
+            if (blocked.wakerKind === "work_item_succeeded" && blocked.waker !== null) {
+              const dependency = db.prepare(
+                "SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?"
+              ).get(projectId, blocked.waker);
+              if (dependency?.lifecycle_state !== "succeeded") continue;
+              condition = { kind: "work_item_succeeded", workItemId: blocked.waker };
+              idempotencyKey = `fleet-watchdog:blocker-fired:${blocked.workItemId}:${blocked.waker}`;
+            } else if (blocked.wakerKind === "github_issue_closed" && blocked.waker !== null) {
+              const match = blocked.waker.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u);
+              const issueNumber = match?.[3] === void 0 ? NaN : Number(match[3]);
+              if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
+                degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
+                continue;
+              }
+              let snapshot2;
+              try {
+                snapshot2 = readGithubIssueForBackfill(match[1], match[2], issueNumber);
+              } catch {
+                degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
+                continue;
+              }
+              if (snapshot2.state !== "closed") continue;
+              condition = { kind: "github_issue_closed", owner: match[1], repo: match[2], issueNumber };
+              idempotencyKey = `fleet-watchdog:blocker-fired:${blocked.workItemId}:${snapshot2.externalRevision}`;
+            } else {
+              degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
+              continue;
+            }
+            const result2 = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition });
+            if (result2.outcome === "OK") {
+              unblocked.add(blocked.workItemId);
+              bb.log.info(`fleet-watchdog returned blocked work item to ready: project=${projectId} workItem=${blocked.workItemId} blocker=${blocked.wakerKind}`);
+            } else {
+              degrade(`work-item-unblock:${projectId}:${blocked.workItemId}`);
+              bb.log.warn(`fleet-watchdog unblock transition refused: project=${projectId} workItem=${blocked.workItemId} outcome=${result2.outcome}`);
+            }
+          }
+          const remainingWorkItems = workItems.filter((workItem) => !unblocked.has(workItem.workItemId));
+          const staleWait = remainingWorkItems.find((workItem) => workItem.declaredAtMs !== null && now2 - workItem.declaredAtMs >= staleWaitMs);
           if (staleWait) {
             await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait");
             continue;
           }
-          const seatWait = workItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null);
+          const seatWait = remainingWorkItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null);
           if (seatWait) {
             const owing = holders.find((holder) => holder.role_id === seatWait.waker);
             if (!owing) continue;
@@ -23685,7 +23983,7 @@ ${thread.titleFallback ?? ""}`);
             }
             continue;
           }
-          const openWorkItem = workItems.find((workItem) => workItem.declaredAtMs === null);
+          const openWorkItem = remainingWorkItems.find((workItem) => workItem.declaredAtMs === null);
           if (!openWorkItem) {
             await resetIdle();
             continue;
