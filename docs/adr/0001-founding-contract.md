@@ -723,9 +723,8 @@ raw-BB veto claims, multi-server active-active authority and untested
 post-write reverse migration.
 
 The detailed surviving clause and issue ledger is
-[docs/import-manifest.md](../import-manifest.md). The dependency-ordered
-implementation and adoption evidence are in
-[docs/roadmap.md](../roadmap.md).
+[docs/import-manifest.md](../import-manifest.md). The canonical planning and
+intake surface is the [labeled issue queue and Taskboard](../rules.md#quiet-with-startable-work-is-a-defect-state).
 
 ## 15. Evidence and source fence
 
