@@ -30,7 +30,7 @@ describe("composed PR pre-push check", () => {
     ["missing changed path", { ...good, files: [undefined as unknown as string] }, "changed files"],
     ["blank changed path", { ...good, files: [""] }, "changed files"],
     ["missing commit messages", { ...good, commitMessages: undefined as unknown as string[] }, "commit-message"],
-  ])("rejects %s before invoking either gate", (_name, input, message) => {
+  ])("rejects %s before invoking the review-tier gate", (_name, input, message) => {
     const result = validateComposedPullRequest(input);
     expect(result.ok).toBe(false);
     if (result.ok) return;
@@ -46,5 +46,12 @@ describe("composed PR pre-push check", () => {
     if (result.ok) return;
     expect(result.error).toContain("commit-message lifecycle violation");
     expect(result.error).toContain("conflicts with the PR disposition");
+  });
+
+  it.each(["", "   "]) ("rejects a blank commit message: %j", (commitMessage) => {
+    const result = validateComposedPullRequest({ ...good, commitMessages: [commitMessage] });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain("commit-message lifecycle violation");
   });
 });

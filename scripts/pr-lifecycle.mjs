@@ -114,7 +114,8 @@ export async function validateIssueTarget(parsed, readIssue) {
 }
 
 export function validateCommitMessages(parsed, commitMessages) {
-  if (!parsed.ok || !Array.isArray(commitMessages) || commitMessages.some((message) => typeof message !== "string")) {
+  if (!parsed.ok || !Array.isArray(commitMessages) || commitMessages.length === 0
+    || commitMessages.some((message) => typeof message !== "string" || message.trim() === "")) {
     return { ok: false, error: "Pull-request commit messages could not be verified; refusing uncertain lifecycle linkage." };
   }
   const mentions = commitMessages.flatMap((message) => [...message.matchAll(linkageMentionPattern)].map((match) => ({
