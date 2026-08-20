@@ -161,6 +161,51 @@ describe("composed PR pre-push check", () => {
     }
   });
 
+  it("refuses a remote that advertises main more than once", () => {
+    const directory = mkdtempSync(join(tmpdir(), "bb-collab-duplicate-main-"));
+    const helperDirectory = mkdtempSync(join(tmpdir(), "bb-collab-duplicate-main-helper-"));
+    try {
+      const run = (args: string[], input?: string | Buffer) => spawnSync("git", ["-C", directory, ...args], { encoding: "utf8", input });
+      expect(run(["init"]).status).toBe(0);
+      expect(run(["config", "user.email", "test@example.com"]).status).toBe(0);
+      expect(run(["config", "user.name", "Test"]).status).toBe(0);
+      expect(run(["commit", "--allow-empty", "-m", "base"]).status).toBe(0);
+      expect(run(["branch", "-M", "main"]).status).toBe(0);
+      expect(run(["switch", "-c", "feature"]).status).toBe(0);
+      expect(run(["commit", "--allow-empty", "-m", "Fixes #411"]).status).toBe(0);
+      const forbidden = run(["rev-parse", "HEAD"]).stdout.trim();
+      expect(run(["commit", "--allow-empty", "-m", "ordinary tip"]).status).toBe(0);
+      expect(run(["update-ref", "refs/remotes/origin/main", forbidden]).status).toBe(0);
+      const helper = join(helperDirectory, "git-remote-duplicate");
+      writeFileSync(helper, `#!/bin/sh
+while IFS= read -r command; do
+  case "$command" in
+    capabilities) printf 'fetch\\n\\n' ;;
+    option*) printf 'ok\\n' ;;
+    list*) printf '${forbidden} refs/heads/main\\n${forbidden} refs/heads/main\\n\\n' ;;
+  esac
+done
+      `, { mode: 0o755 });
+      expect(run(["remote", "add", "origin", "duplicate::remote"]).status).toBe(0);
+      const advertised = spawnSync("git", ["-C", directory, "ls-remote", "origin", "refs/heads/main"], {
+        encoding: "utf8", env: { ...process.env, PATH: `${helperDirectory}:${process.env.PATH}` },
+      });
+      expect(advertised.status).toBe(0);
+      expect(advertised.stdout.trim().split(/\r?\n/u)).toHaveLength(2);
+      const bodyFile = join(directory, "event-body.md");
+      writeFileSync(bodyFile, "Related GH-411\n\nReview tier: B\n");
+      const result = spawnSync(process.execPath, [new URL("../scripts/check-composed-pr.mjs", import.meta.url).pathname,
+        "--title", "Duplicate baseline", "--body-file", bodyFile, "--file", "src/awareness.ts"], {
+        cwd: directory, encoding: "utf8", env: { ...process.env, PATH: `${helperDirectory}:${process.env.PATH}` },
+      });
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}${result.stderr}`).toContain("remote origin/main is unavailable");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+      rmSync(helperDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a real NUL-bearing commit when framing produces extra records", () => {
     const directory = mkdtempSync(join(tmpdir(), "bb-collab-nul-commit-"));
     let remote: string | undefined;

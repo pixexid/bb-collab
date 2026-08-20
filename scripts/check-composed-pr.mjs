@@ -44,8 +44,11 @@ function usage() {
 function deriveCommitMessages() {
   // ponytail: main-targeting and network-required; offline cannot prove the push baseline, so add validated remote-base discovery if that changes.
   const remote = spawnSync("git", ["ls-remote", "origin", "refs/heads/main"], { encoding: "utf8" });
-  const remoteSha = remote.stdout.trim().split(/\s+/u)[0];
-  if (remote.status !== 0 || remote.error || !/^[0-9a-f]{40}$/u.test(remoteSha)) throw new Error("cannot verify baseline: remote origin/main is unavailable");
+  const remoteLines = remote.stdout.split(/\r?\n/u);
+  if (remoteLines.at(-1) === "") remoteLines.pop();
+  const remoteMatch = remoteLines.length === 1 ? remoteLines[0].match(/^([0-9a-f]{40})\s+refs\/heads\/main$/u) : null;
+  if (remote.status !== 0 || remote.error || !remoteMatch) throw new Error("cannot verify baseline: remote origin/main is unavailable");
+  const remoteSha = remoteMatch[1];
   const local = spawnSync("git", ["rev-parse", "--verify", "refs/remotes/origin/main"], { encoding: "utf8" });
   const localSha = local.stdout.trim();
   if (local.status !== 0 || local.error || !/^[0-9a-f]{40}$/u.test(localSha)) throw new Error("cannot verify baseline: local origin/main is unavailable");
@@ -70,7 +73,7 @@ function deriveCommitMessages() {
   const messages = result.stdout.split("\0").map((message, index) => index === 0 ? message : message.replace(/^\r?\n/u, ""));
   if (messages.at(-1) === "") messages.pop();
   // ponytail: defence-in-depth invariant, no known trigger. Not reached by a shallow clone
-  // (ancestry rejects first), a NUL-bearing commit (git truncates %B at the NUL, so the count
+  // (the shallow check rejects first), a NUL-bearing commit (git truncates %B at the NUL, so the count
   // agrees), a blob-filtered clone, an empty commit message, a newline-only body, a merge
   // commit, or a git-replace graph. If this ever fires, records != rev-list means the derivation
   // saw a different population than the push — that is a new class, not a bug in this check.
