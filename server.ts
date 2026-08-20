@@ -470,13 +470,13 @@ function invalidCli(message: string, outcome: FoundationCode = "INVALID_INPUT") 
   });
 }
 
-function cliSchemaError(error: z.ZodError, flags: Readonly<Record<string, string>>): string {
+export function cliSchemaError(error: z.ZodError, flags: Readonly<Record<string, string>>): string {
   return JSON.stringify(error.issues.map((issue) => {
     const [field, ...rest] = issue.path;
-    return typeof field === "string" && flags[field]
+    return typeof field === "string" && Object.hasOwn(flags, field)
       ? { ...issue, path: [flags[field], ...rest] }
       : issue;
-  }), null, 2);
+  }), (_, value) => typeof value === "bigint" ? value.toString() : value, 2);
 }
 
 function workItemRegistrationDoctorResult(db: SqliteDatabase, projectId: string, doctorResult: FoundationResult): FoundationResult {

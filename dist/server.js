@@ -22080,8 +22080,8 @@ function invalidCli(message, outcome = "INVALID_INPUT") {
 function cliSchemaError(error48, flags) {
   return JSON.stringify(error48.issues.map((issue2) => {
     const [field, ...rest] = issue2.path;
-    return typeof field === "string" && flags[field] ? { ...issue2, path: [flags[field], ...rest] } : issue2;
-  }), null, 2);
+    return typeof field === "string" && Object.hasOwn(flags, field) ? { ...issue2, path: [flags[field], ...rest] } : issue2;
+  }), (_, value) => typeof value === "bigint" ? value.toString() : value, 2);
 }
 function workItemRegistrationDoctorResult(db, projectId, doctorResult) {
   const actor = db.prepare(
@@ -24522,6 +24522,7 @@ export {
   FLEET_WATCHDOG_STALE_WAIT_MS,
   IDLE_FLEET_ATTEMPT_STALE_MS,
   URGENT_NOTIFICATION_DEDUP_MS,
+  cliSchemaError,
   plugin as default,
   foundationResultSchema,
   isLiveCachedConsumerRolloutArtifact,
