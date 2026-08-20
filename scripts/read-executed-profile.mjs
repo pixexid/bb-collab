@@ -1,17 +1,41 @@
 import { execFileSync } from "node:child_process";
-import { createReadStream, existsSync, readdirSync } from "node:fs";
+import { createReadStream, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 
 const PAGE_SIZE = 1_000;
 
-function filesNamed(directory, predicate) {
-  if (!existsSync(directory)) return [];
-  return readdirSync(directory, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && predicate(entry.name))
-    .map((entry) => join(directory, entry.name));
+function realPathInside(root, candidate) {
+  try {
+    const realRoot = realpathSync(root);
+    const realCandidate = realpathSync(candidate);
+    const fromRoot = relative(realRoot, realCandidate);
+    return fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`) && !isAbsolute(fromRoot) ? realCandidate : null;
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return null;
+    throw error;
+  }
+}
+
+function isFile(path) {
+  try {
+    return statSync(path).isFile();
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return false;
+    throw error;
+  }
+}
+
+function filesNamed(root, directory, predicate) {
+  const realDirectory = realPathInside(root, directory);
+  if (!realDirectory) return [];
+  return readdirSync(realDirectory, { withFileTypes: true }).flatMap((entry) => {
+    if (!predicate(entry.name)) return [];
+    const path = realPathInside(root, join(realDirectory, entry.name));
+    return path && isFile(path) ? [path] : [];
+  });
 }
 
 function codexSessionDirectory(home, providerThreadId) {
@@ -22,10 +46,10 @@ function codexSessionDirectory(home, providerThreadId) {
   return join(home, ".codex", "sessions", String(date.getUTCFullYear()), String(date.getUTCMonth() + 1).padStart(2, "0"), String(date.getUTCDate()).padStart(2, "0"));
 }
 
-function claudeSessionPath(home, environmentPath, providerThreadId) {
+function claudeProjectDirectory(home, environmentPath, providerThreadId) {
   if (typeof environmentPath !== "string" || !isAbsolute(environmentPath) || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(providerThreadId)) return null;
   const projectDirectory = environmentPath.replace(/[^a-z0-9-]/giu, "-");
-  return join(home, ".claude", "projects", projectDirectory, `${providerThreadId}.jsonl`);
+  return join(home, ".claude", "projects", projectDirectory);
 }
 
 async function readJsonLines(path, visit) {
@@ -88,8 +112,9 @@ export async function readExecutedProfiles({ thread, environment, events, home =
 
   if (thread.providerId === "codex") {
     try {
+      const root = join(home, ".codex", "sessions");
       const directory = codexSessionDirectory(home, providerThreadId);
-      const files = directory ? filesNamed(directory, (name) => name.endsWith(`-${providerThreadId}.jsonl`)) : [];
+      const files = directory ? filesNamed(root, directory, (name) => name.endsWith(`-${providerThreadId}.jsonl`)) : [];
       if (files.length !== 1) return { ...settle(turns, profiles, "codex turn_context"), reason: `expected one Codex session log, found ${files.length}` };
       await readJsonLines(files[0], (record) => {
         if (record?.type === "turn_context") add(record.payload?.turn_id, record.payload?.model, record.payload?.effort);
@@ -103,8 +128,11 @@ export async function readExecutedProfiles({ thread, environment, events, home =
 
   if (thread.providerId === "claude-code") {
     try {
-      const path = claudeSessionPath(home, environment?.path, providerThreadId);
-      const files = path && existsSync(path) ? [path] : [];
+      const root = join(home, ".claude", "projects");
+      const candidateDirectory = claudeProjectDirectory(home, environment?.path, providerThreadId);
+      const directory = candidateDirectory ? realPathInside(root, candidateDirectory) : null;
+      const path = directory ? realPathInside(root, join(directory, `${providerThreadId}.jsonl`)) : null;
+      const files = path && isFile(path) ? [path] : [];
       if (files.length !== 1) return { ...settle(turns, profiles, "Claude assistant envelope"), reason: `expected one Claude session log, found ${files.length}` };
       await readJsonLines(files[0], (record) => {
         if (record?.type === "assistant" && record.message?.model !== "<synthetic>") add(record.uuid, record.message?.model, record.effort);
