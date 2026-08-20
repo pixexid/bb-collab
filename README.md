@@ -91,8 +91,8 @@ message; none of their messages appeared in the daemon logs.
 
 ## Executed profile read-back
 
-For a completed Codex, Claude Code, or Pi thread on the current host, correlate BB's
-provider session and completion IDs with the provider-native turn records:
+For an active or completed Codex, Claude Code, or Pi thread on the current host,
+correlate BB's provider session and turn IDs with the provider-native records:
 
 ```sh
 npm run --silent executed-profile -- --project PROJECT_ID --thread THREAD_ID
@@ -100,7 +100,7 @@ npm run --silent executed-profile -- --project PROJECT_ID --thread THREAD_ID
 
 The command reports only provider-native executed model/reasoning evidence. It
 returns `unknown` rather than substituting requested spawn fields when the
-native record is absent, conflicting, still running, or from an unsupported
+native record is absent, conflicting, not exactly correlated, or from an unsupported
 provider. A Claude Code base-family observation such as `claude-opus-5` remains
 visible as `observedProfile`, but its compliance result is `unknown` because it
 does not establish an exact dispatched SKU or context-window suffix such as

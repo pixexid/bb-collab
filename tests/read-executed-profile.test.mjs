@@ -11,13 +11,84 @@ const completion = (providerThreadId, checkpointId) => ({
   data: { status: "completed", providerThreadId, providerCheckpointId: checkpointId },
 });
 
+const activeStart = (providerThreadId) => ({ id: "event-active", seq: 11, type: "turn/started", data: { providerThreadId } });
+
 function jsonl(path, records) {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
 }
 
 describe("executed profile read-back", () => {
-  it("correlates Codex turn_context and rejects conflicting profiles", async () => {
+  it("DISCRIMINATOR: reads the active Codex turn from its provider-native rollout", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/test/project" } },
+      { type: "turn_context", payload: { turn_id: "active-turn", model: "gpt-5.6-sol", effort: "medium" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "active" },
+      environment: { path: "/test/project" },
+      events: [activeStart(providerThreadId)],
+      home,
+    });
+    expect(result).toMatchObject({
+      outcome: "known",
+      coverage: { activeTurns: 1, completedTurns: 0, knownTurns: 1, unknownTurns: 0 },
+      turns: [{
+        phase: "active",
+        status: "known",
+        executedProfile: { providerId: "codex", model: "gpt-5.6-sol", reasoningLevel: "medium", kind: "executed-provider-native" },
+      }],
+    });
+  });
+
+  it("GUARD: reads active Claude and Pi profiles from their native session surfaces", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const claudeSession = "123e4567-e89b-42d3-a456-426614174000";
+    jsonl(join(home, ".claude", "projects", "-test-project", `${claudeSession}.jsonl`), [
+      { type: "assistant", uuid: "active-claude", effort: "medium", message: { model: "claude-opus-5[1m]" } },
+    ]);
+    const claudeResult = await readExecutedProfiles({
+      thread: { providerId: "claude-code", status: "active" },
+      environment: { path: "/test/project" },
+      events: [activeStart(claudeSession)],
+      home,
+    });
+    expect(claudeResult).toMatchObject({ outcome: "known", turns: [{ phase: "active", executedProfile: { model: "claude-opus-5[1m]", reasoningLevel: "medium" } }] });
+
+    jsonl(join(home, ".pi", "agent", "sessions", "--test-project--", "2026-08-20T00-00-00-000Z_123e4567-e89b-42d3-a456-426614174000.jsonl"), [
+      { type: "session", id: "123e4567-e89b-42d3-a456-426614174000", cwd: "/test/project" },
+      { type: "thinking_level_change", id: "00000001", parentId: null, thinkingLevel: "high" },
+      { type: "message", id: "00000002", parentId: "00000001", message: { role: "assistant", provider: "kimi-coding", model: "k3" } },
+    ]);
+    const piResult = await readExecutedProfiles({
+      thread: { providerId: "pi", status: "active" },
+      environment: { path: "/test/project" },
+      events: [activeStart("pi-thread")],
+      home,
+    });
+    expect(piResult).toMatchObject({ outcome: "known", turns: [{ phase: "active", executedProfile: { model: "kimi-coding/k3", reasoningLevel: "high" } }] });
+  });
+
+  it("GUARD: refuses active Codex evidence without matching native session metadata", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/other/project" } },
+      { type: "turn_context", payload: { turn_id: "active-turn", model: "DO_NOT_EMIT", effort: "medium" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "active" },
+      environment: { path: "/test/project" },
+      events: [activeStart(providerThreadId)],
+      home,
+    });
+    expect(result).toMatchObject({ outcome: "unknown", reason: "active BB turn: Codex session_meta does not match the BB session and exact environment path" });
+    expect(JSON.stringify(result)).not.toMatch(/DO_NOT_EMIT|other\/project|executedProfile/u);
+  });
+
+  it("GUARD: preserves completed Codex correlation and conflict handling", async () => {
     const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
     const providerThreadId = "018cc251-f400-7000-8000-000000000000";
     jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
