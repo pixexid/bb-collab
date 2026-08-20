@@ -23340,13 +23340,30 @@ ${thread.titleFallback ?? ""}`);
       if (dispatcherThreadIds.size === 0) return { known: false, reason: "native-lane-parents-unreadable" };
       const threads = [];
       for (let offset = 0; ; offset += 100) {
-        const page = await bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset });
+        let timeout;
+        const page = await Promise.race([
+          bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset }),
+          new Promise((_, reject) => {
+            timeout = setTimeout(() => reject(new Error("native-lane-observation-timeout")), 1e4);
+          })
+        ]).finally(() => {
+          if (timeout) clearTimeout(timeout);
+        });
         threads.push(...page);
         if (page.length < 100) break;
       }
       const liveLanes = threads.filter(
         (thread) => !dispatcherThreadIds.has(thread.id) && thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null && thread.status !== "error" && thread.status !== "stopping"
       );
+      const observedAtMs = Date.now();
+      for (const lane of liveLanes) {
+        if (lane.status !== "active" && lane.status !== "starting") continue;
+        db.prepare(
+          `UPDATE execution_attempts
+           SET observed_at_ms = ?
+           WHERE project_id = ? AND origin = 'work_item' AND state = 'running' AND thread_id = ?`
+        ).run(observedAtMs, projectId, lane.id);
+      }
       return { known: true, value: liveLanes.length };
     } catch (error48) {
       return { known: false, reason: `native-lanes-unreadable:${String(error48)}` };

@@ -3643,6 +3643,47 @@ exit 1
     }
   });
 
+  it("refreshes running attempts only from an active native lane observation", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-attempt-liveness-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(100);
+    try {
+      const fixture = await fleetWatchdogFixture(1, true, 1);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      fixture.addNativeLane("thread-work-item-1", "active");
+      const observed = () => (fixture.db.prepare(
+        "SELECT observed_at_ms FROM execution_attempts WHERE project_id = ? AND origin = 'work_item'",
+      ).get(PROJECT_ID) as { observed_at_ms: number }).observed_at_ms;
+
+      await fixture.host.harness.emitThreadEvent("thread.active", {
+        thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active", updatedAt: 100 }),
+      });
+      await vi.waitFor(() => expect(observed()).toBe(100));
+
+      clock.mockReturnValue(200);
+      await fixture.host.harness.emitThreadEvent("thread.active", {
+        thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active", updatedAt: 200 }),
+      });
+      await vi.waitFor(() => expect(observed()).toBe(200));
+
+      fixture.addNativeLane("thread-work-item-1", "idle");
+      clock.mockReturnValue(300);
+      await fixture.host.harness.emitThreadEvent("thread.active", {
+        thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active", updatedAt: 300 }),
+      });
+      await vi.waitFor(() => expect(observed()).toBe(200));
+    } finally {
+      clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("fails closed and names the active-lane reader when that conjunct is unreadable", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-blind-"));
     const gh = join(bin, "gh");
