@@ -2,6 +2,7 @@ const dispositionPattern = /^\s*(Closes #[1-9]\d*|Related GH-[1-9]\d*|No issue:\
 const acceptancePattern = /^\s*Acceptance\s*:\s*(complete|incomplete|unknown)\s*$/iu;
 const linkageCandidatePattern = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|related)\b[^\r\n]*(?:(?:#|GH-)\S+|[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\S+|https?:\/\/github\.com\/\S+)/iu;
 const linkageMentionPattern = /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|references?|related)\s*:?\s*(?:(https?:\/\/github\.com\/[^\s/]+\/[^\s/]+\/(?:issues|pull)\/)|([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#)|(#|GH-))([1-9]\d*)\b/giu;
+const blankCommitMessagePattern = /^[\p{White_Space}\p{Cf}]*$/u;
 
 export function visibleMarkdown(text) {
   const withoutComments = text.replace(/<!--[\s\S]*?(?:-->|$)/gu, "");
@@ -115,7 +116,7 @@ export async function validateIssueTarget(parsed, readIssue) {
 
 export function validateCommitMessages(parsed, commitMessages) {
   if (!parsed.ok || !Array.isArray(commitMessages) || commitMessages.length === 0
-    || commitMessages.some((message) => typeof message !== "string" || message.trim() === "")) {
+    || commitMessages.some((message) => typeof message !== "string" || blankCommitMessagePattern.test(message))) {
     return { ok: false, error: "Pull-request commit messages could not be verified; refusing uncertain lifecycle linkage." };
   }
   const mentions = commitMessages.flatMap((message) => [...message.matchAll(linkageMentionPattern)].map((match) => ({

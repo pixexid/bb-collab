@@ -1,3 +1,7 @@
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { validateComposedPullRequest } from "../scripts/check-composed-pr.mjs";
 
@@ -53,5 +57,28 @@ describe("composed PR pre-push check", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.error).toContain("commit-message lifecycle violation");
+  });
+
+  it("rejects a real zero-width-space commit through the CLI", () => {
+    const directory = mkdtempSync(join(tmpdir(), "bb-collab-zero-width-"));
+    const run = (args: string[]) => spawnSync("git", ["-C", directory, ...args], { encoding: "utf8" });
+    try {
+      expect(run(["init"]).status).toBe(0);
+      expect(run(["config", "user.email", "test@example.com"]).status).toBe(0);
+      expect(run(["config", "user.name", "Test"]).status).toBe(0);
+      expect(run(["commit", "--allow-empty", "-m", "base"]).status).toBe(0);
+      expect(run(["update-ref", "refs/remotes/origin/main", "HEAD"]).status).toBe(0);
+      expect(run(["commit", "--allow-empty", "-m", "\u200b"]).status).toBe(0);
+      const bodyFile = join(directory, "event-body.md");
+      writeFileSync(bodyFile, "Related GH-402\n\nReview tier: B\n");
+      const result = spawnSync(process.execPath, [new URL("../scripts/check-composed-pr.mjs", import.meta.url).pathname,
+        "--title", "Zero-width evidence", "--body-file", bodyFile, "--file", "src/awareness.ts"], {
+        cwd: directory, encoding: "utf8",
+      });
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}${result.stderr}`).toContain("commit-message lifecycle violation");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

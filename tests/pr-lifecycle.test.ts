@@ -85,6 +85,12 @@ describe("pull-request lifecycle linkage", () => {
     expect(validateCommitMessages(related, ["   \n"]).ok).toBe(false);
   });
 
+  it("does not invent linkage across commit boundaries", () => {
+    const related = parsePullRequestDisposition({ body: "Related GH-999" });
+    expect(validateCommitMessages(related, ["#999", "Fixes"]).ok).toBe(true);
+    expect(validateCommitMessages(related, ["Fixes\n\n#999"]).ok).toBe(false);
+  });
+
   it("uses one deterministic marker to make merge handling duplicate-safe", () => {
     const marker = lifecycleMarker(87, "issue-80", "related");
     expect(marker).toBe("<!-- bb-collab:issue-lifecycle:pr-87:issue-80:related -->");
