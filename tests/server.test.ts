@@ -3110,7 +3110,10 @@ describe("bb-collab plugin boundary", () => {
       const fixture = await fleetWatchdogFixture(0);
       let threadReads = 0;
       let firstReadSettled = false;
-      let interactionReads = 0;
+      let interactionReadStarted!: () => void;
+      const firstInteractionRead = new Promise<void>((resolve) => {
+        interactionReadStarted = resolve;
+      });
       fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => {
         threadReads += 1;
         if (threadReads === 1 && firstRecoveryReadHangs) await new Promise<never>(() => undefined);
@@ -3118,20 +3121,19 @@ describe("bb-collab plugin boundary", () => {
         return makeThreadResponse({ id: threadId, projectId: PROJECT_ID, status: "idle", updatedAt: 1 });
       }) as never);
       fixture.host.harness.sdk.stub("threads.interactions.list", (async () => {
-        interactionReads += 1;
+        interactionReadStarted();
         return [];
       }) as never);
 
       const service = fixture.host.harness.runService("lane-watcher");
-      const loopStarted = await vi.waitFor(() => expect(interactionReads).toBeGreaterThan(0), { timeout: 100 })
-        .then(() => true, () => false);
+      const loopStarted = await firstInteractionRead.then(() => "loop-started" as const);
       service.controller.abort();
       const shutdown = await Promise.race([
         service.done.then(() => "shutdown-completed" as const),
         new Promise<"still-hung-after-abort">((resolve) => setTimeout(() => resolve("still-hung-after-abort"), 100)),
       ]);
 
-      expect({ loopStarted, shutdown }).toEqual({ loopStarted: true, shutdown: "shutdown-completed" });
+      expect({ loopStarted, shutdown }).toEqual({ loopStarted: "loop-started", shutdown: "shutdown-completed" });
       expect(threadReads).toBeGreaterThan(firstRecoveryReadHangs ? 1 : 0);
       expect(firstReadSettled).toBe(!firstRecoveryReadHangs);
     }
