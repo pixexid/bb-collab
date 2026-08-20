@@ -88,7 +88,7 @@ function githubRepository(remoteUrl: string | null): string | null {
   return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : null;
 }
 
-type StartableQueueState = { count: number; head: string | null };
+type StartableQueueState = { count: number; head: string | null; unlabelledCount: number };
 
 function githubJson(args: string[]): unknown | null {
   try {
@@ -110,19 +110,23 @@ function githubJson(args: string[]): unknown | null {
 
 function startableQueueState(repositories: string[]): StartableQueueState | null {
   let count = 0;
+  let unlabelledCount = 0;
   const heads: string[] = [];
+  const isIssue = (issue: unknown): issue is { number: number; labels: Array<{ name: string }> } => Boolean(issue && typeof issue === "object" && !Array.isArray(issue)
+    && typeof (issue as { number?: unknown }).number === "number"
+    && Array.isArray((issue as { labels?: unknown }).labels)
+    && (issue as { labels: unknown[] }).labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof (label as { name?: unknown }).name === "string"));
   for (const repository of repositories) {
-    const issues = githubJson(["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number", "--limit", "1000"]);
-    if (!Array.isArray(issues) || !issues.every((issue) => issue && typeof issue === "object" && !Array.isArray(issue) && typeof (issue as { number?: unknown }).number === "number")) return null;
-    count += issues.length;
-    const numbers = issues.map((issue) => (issue as { number: number }).number);
+    const startable = githubJson(["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number,labels", "--limit", "1000"]);
+    const pages = githubJson(["api", `repos/${repository}/issues`, "--paginate", "--slurp", "--method", "GET", "-f", "state=open", "-f", "per_page=100"]);
+    if (!Array.isArray(startable) || !startable.every(isIssue)
+      || !Array.isArray(pages) || !pages.every((page) => Array.isArray(page) && page.every(isIssue))) return null;
+    count += startable.length;
+    unlabelledCount += pages.flat().filter((issue) => !("pull_request" in issue) && !issue.labels.some((label) => label.name.startsWith("queue:"))).length;
+    const numbers = startable.map((issue) => issue.number);
     if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
   }
-  return { count, head: heads.sort()[0] ?? null };
-}
-
-function startableQueueDepth(repositories: string[]): number | null {
-  return startableQueueState(repositories)?.count ?? null;
+  return { count, head: heads.sort()[0] ?? null, unlabelledCount };
 }
 
 type LinkedGithubStatus = "open" | "closed" | "merged";
@@ -2786,11 +2790,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
                ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
              WHERE heads.project_id = ? ORDER BY targets.repo_target_id`,
           ).all(projectId) as Array<{ remote_url: string | null }>).map((target) => githubRepository(target.remote_url));
-          const startableCount = repositories.length === 0 || repositories.some((repository) => repository === null)
+          const queue = repositories.length === 0 || repositories.some((repository) => repository === null)
             ? null
-            : startableQueueDepth(repositories as string[]);
-          if (startableCount !== null && startableCount > 0 && writingLaneCeiling !== null && activeLaneCount < writingLaneCeiling) {
-            await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${startableCount} issue${startableCount === 1 ? "" : "s"} with ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
+            : startableQueueState(repositories as string[]);
+          if (queue !== null && (queue.count > 0 || queue.unlabelledCount > 0) && writingLaneCeiling !== null && activeLaneCount < writingLaneCeiling) {
+            await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${queue.count} issue${queue.count === 1 ? "" : "s"}; ${queue.unlabelledCount} open issue${queue.unlabelledCount === 1 ? " has" : "s have"} no queue label; ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
           }
           if (workItems.length === 0) continue;
           const unblocked = new Set<string>();
