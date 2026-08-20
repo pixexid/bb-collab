@@ -35,6 +35,21 @@ from `2026-08-13T21:37:01.166Z` through `2026-08-20T04:20:50.841Z`, including
 `bb plugin logs bb-collab` matched 0/100 daemon records by timestamp, level and
 message; none of their messages appeared in the daemon logs.
 
+## Executed profile read-back
+
+For a completed Codex or Claude Code thread on the current host, correlate BB's
+provider session and completion IDs with the provider-native turn records:
+
+```sh
+npm run --silent executed-profile -- --project PROJECT_ID --thread THREAD_ID
+```
+
+The command reports only provider-native executed model/reasoning evidence. It
+returns `unknown` rather than substituting requested spawn fields when the
+native record is absent, conflicting, still running, or from an unsupported
+provider. Claude Code reports its native model name but does not prove a
+requested context-window suffix such as `[1m]`.
+
 ## Sidebar thread list
 
 The optional `bb-collab thread list` provider groups live threads by stable
