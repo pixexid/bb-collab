@@ -54,13 +54,19 @@ When every preferred reviewer is unavailable, a Tier-B post-merge review by `gpt
 
 ## WorkItem `review_pending`
 
-`review_pending` means authorship is complete but the WorkItem is still waiting on review or CI; it is non-terminal and consumes no writing capacity. The canonical state list and capacity list are in [`foundation.ts`](../src/foundation.ts#L1488-L1492).
+`review_pending` means authorship is complete but the WorkItem is still waiting on review or CI; it is non-terminal and consumes no writing capacity. The canonical state and capacity definitions are [`WORK_ITEM_STATES` and `WORK_ITEM_CAPACITY_LIFECYCLE_STATES`](../src/foundation.ts).
 
-Enter it from `in_progress` only while an active writing attempt exists. The transition closes that attempt as `done`. It may omit a work attempt; that is the legal orchestrator-verifies-the-fixed-head shape. If a work attempt is supplied, it must be a `review` attempt; the resolver registers its reviewer thread, requested profile, PR number, and PR head SHA. Review attempts require both exact PR fields in the input schema ([transition checks](../src/foundation.ts#L6091-L6101), [close/register](../src/foundation.ts#L6222-L6229), [recording](../src/foundation.ts#L6283-L6307)).
+Enter it from `in_progress` only while an active writing attempt exists; that attempt is closed as `done`. Omitting a work attempt is legal for the orchestrator-verifies-the-fixed-head shape. If supplied, the attempt must be `review` with a lane, requested profile, PR number, and PR head SHA; its initial thread ID is optional. These requirements and the registration are enforced by [`workAttemptSchema` and `applyWorkItemTransition`](../src/foundation.ts).
 
-From `review_pending`, the canonical transitions are `in_progress` (request changes: supersede the active review and open a fresh writing attempt), `blocked`, or the terminal states `succeeded`, `failed`, and `cancelled`; see [`WORK_ITEM_TRANSITIONS`](../src/foundation.ts#L5921-L5930). A same-state `review_pending → review_pending` re-dispatch is also allowed: it supersedes the active review and registers a replacement, but requires an active review, replacement thread/profile, and the same PR number and head SHA ([guards](../src/foundation.ts#L6103-L6113), [replacement](../src/foundation.ts#L6283-L6307)).
+The canonical exits are [`WORK_ITEM_TRANSITIONS`](../src/foundation.ts):
 
-Keep exactly one active review attempt. `workItemReconciliationIssues` raises `review_attempt_count` when a `review_pending` item has more than one; any reconciliation issue blocks the next project-orchestrator succession ([query](../src/foundation.ts#L5643-L5679), [handoff gate](../src/foundation.ts#L5214-L5221)).
+- `in_progress` for request changes, with a supplied writing attempt and requested profile; the active review is superseded and a fresh writing attempt opens.
+- `blocked`, only with exactly one unsatisfied machine-evaluable blocker in the same act, and with no work attempt, unblock, or external event.
+- `succeeded`, `failed`, or `cancelled`, only without an open wait on this non-blocked item.
+
+A same-state `review_pending → review_pending` re-dispatch is also allowed. It supersedes the active review and registers a replacement, but the replacement must include a lane, thread, requested profile, PR number, and PR head SHA, with an active prior review carrying the same PR number and head SHA. These rules are enforced by [`applyWorkItemTransition`](../src/foundation.ts).
+
+`workItemReconciliationIssues` reports `review_attempt_count` only when a `review_pending` item has more than one active review attempt; zero is accepted. Any reconciliation issue blocks the next project-orchestrator succession ([`workItemReconciliationIssues`](../src/foundation.ts), [`applyWorkItemTransition`](../src/foundation.ts)).
 
 ## Escalation
 
