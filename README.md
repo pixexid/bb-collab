@@ -14,6 +14,27 @@ it exits nonzero and names every divergent artifact against the deployed
 commit. The scheduled check reports divergence;
 it never rebuilds, repairs, or commits the deployed checkout.
 
+## Incident logs
+
+For the durable `bb-collab` emission history, read:
+
+```sh
+~/.bb/plugins/bb-collab/logs/plugin.log
+```
+
+`bb plugin logs bb-collab` shows only the tail of that file (100 records at
+the time of verification). The host-daemon files at
+`~/.bb/logs/host-daemon*.log` are a separate operational stream: they do not
+contain the plugin's emitted records and are not a valid negative control for
+plugin events. Search `plugin.log` when checking whether a plugin event did or
+did not occur.
+
+Verification snapshot, 2026-08-20: `plugin.log` contained 3,269 JSON records
+from `2026-08-13T21:37:01.166Z` through `2026-08-20T04:20:50.841Z`, including
+594 `fleet-watchdog` records. The overlapping 100 records from
+`bb plugin logs bb-collab` matched 0/100 daemon records by timestamp, level and
+message; none of their messages appeared in the daemon logs.
+
 ## Sidebar thread list
 
 The optional `bb-collab thread list` provider groups live threads by stable
