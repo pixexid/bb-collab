@@ -7,6 +7,26 @@ import { validateComposedPullRequest } from "../scripts/check-composed-pr.mjs";
 
 const files = ["src/awareness.ts"];
 const good = { title: "Improve awareness", body: "Related GH-402\n\nReview tier: B", files, commitMessages: ["Improve awareness"] };
+const runRealCommitCli = (message: string) => {
+  const directory = mkdtempSync(join(tmpdir(), "bb-collab-real-commit-"));
+  const run = (args: string[], input?: string | Buffer) => spawnSync("git", ["-C", directory, ...args], { encoding: "utf8", input });
+  try {
+    expect(run(["init"]).status).toBe(0);
+    expect(run(["config", "user.email", "test@example.com"]).status).toBe(0);
+    expect(run(["config", "user.name", "Test"]).status).toBe(0);
+    expect(run(["commit", "--allow-empty", "-m", "base"]).status).toBe(0);
+    expect(run(["update-ref", "refs/remotes/origin/main", "HEAD"]).status).toBe(0);
+    expect(run(["commit", "--allow-empty", "-m", message]).status).toBe(0);
+    const bodyFile = join(directory, "event-body.md");
+    writeFileSync(bodyFile, "Related GH-402\n\nReview tier: B\n");
+    return spawnSync(process.execPath, [new URL("../scripts/check-composed-pr.mjs", import.meta.url).pathname,
+      "--title", "Invisible evidence", "--body-file", bodyFile, "--file", "src/awareness.ts"], {
+      cwd: directory, encoding: "utf8",
+    });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+};
 
 describe("composed PR pre-push check", () => {
   it("rejects the four issue failures and accepts a known-good PR", () => {
@@ -60,23 +80,70 @@ describe("composed PR pre-push check", () => {
   });
 
   it("rejects a real zero-width-space commit through the CLI", () => {
-    const directory = mkdtempSync(join(tmpdir(), "bb-collab-zero-width-"));
-    const run = (args: string[]) => spawnSync("git", ["-C", directory, ...args], { encoding: "utf8" });
+    const result = runRealCommitCli("\u200b");
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toContain("commit-message lifecycle violation");
+  });
+
+  it("rejects a real combining-grapheme-joiner commit through the CLI", () => {
+    const result = runRealCommitCli("\u034f");
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toContain("commit-message lifecycle violation");
+  });
+
+  it("refuses a real shallow clone before deriving incomplete evidence", () => {
+    const source = mkdtempSync(join(tmpdir(), "bb-collab-shallow-source-"));
+    const clone = mkdtempSync(join(tmpdir(), "bb-collab-shallow-clone-"));
+    const run = (directory: string, args: string[], input?: string | Buffer) => spawnSync("git", ["-C", directory, ...args], { encoding: "utf8", input });
+    try {
+      expect(run(source, ["init"]).status).toBe(0);
+      expect(run(source, ["config", "user.email", "test@example.com"]).status).toBe(0);
+      expect(run(source, ["config", "user.name", "Test"]).status).toBe(0);
+      expect(run(source, ["commit", "--allow-empty", "-m", "base"]).status).toBe(0);
+      expect(run(source, ["branch", "-M", "main"]).status).toBe(0);
+      expect(run(source, ["switch", "-c", "feature"]).status).toBe(0);
+      expect(run(source, ["commit", "--allow-empty", "-m", "Fixes #411"]).status).toBe(0);
+      expect(run(source, ["commit", "--allow-empty", "-m", "ordinary tip"]).status).toBe(0);
+      expect(run(".", ["clone", "--depth", "1", "--branch", "feature", `file://${source}`, clone]).status).toBe(0);
+      expect(run(clone, ["fetch", "--depth", "1", "origin", "main:refs/remotes/origin/main"]).status).toBe(0);
+      expect(run(clone, ["rev-parse", "--is-shallow-repository"]).stdout.trim()).toBe("true");
+      const bodyFile = join(clone, "event-body.md");
+      writeFileSync(bodyFile, "Related GH-411\n\nReview tier: B\n");
+      const result = spawnSync(process.execPath, [new URL("../scripts/check-composed-pr.mjs", import.meta.url).pathname,
+        "--title", "Shallow evidence", "--body-file", bodyFile, "--file", "src/awareness.ts"], {
+        cwd: clone, encoding: "utf8",
+      });
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}${result.stderr}`).toContain("repository is shallow");
+    } finally {
+      rmSync(source, { recursive: true, force: true });
+      rmSync(clone, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a real NUL-bearing commit when framing produces extra records", () => {
+    const directory = mkdtempSync(join(tmpdir(), "bb-collab-nul-commit-"));
+    const run = (args: string[], input?: string | Buffer) => spawnSync("git", ["-C", directory, ...args], { encoding: "utf8", input });
     try {
       expect(run(["init"]).status).toBe(0);
       expect(run(["config", "user.email", "test@example.com"]).status).toBe(0);
       expect(run(["config", "user.name", "Test"]).status).toBe(0);
       expect(run(["commit", "--allow-empty", "-m", "base"]).status).toBe(0);
-      expect(run(["update-ref", "refs/remotes/origin/main", "HEAD"]).status).toBe(0);
-      expect(run(["commit", "--allow-empty", "-m", "\u200b"]).status).toBe(0);
+      const base = run(["rev-parse", "HEAD"]).stdout.trim();
+      const tree = run(["mktree"], "").stdout.trim();
+      const rawCommit = `tree ${tree}\nparent ${base}\nauthor Test <test@example.com> 0 +0000\ncommitter Test <test@example.com> 0 +0000\n\nalpha\0beta\n`;
+      const nulCommit = run(["hash-object", "--stdin", "-t", "commit", "--literally", "-w"], Buffer.from(rawCommit));
+      expect(nulCommit.status).toBe(0);
+      expect(run(["update-ref", "HEAD", nulCommit.stdout.trim()]).status).toBe(0);
+      expect(run(["update-ref", "refs/remotes/origin/main", base]).status).toBe(0);
       const bodyFile = join(directory, "event-body.md");
       writeFileSync(bodyFile, "Related GH-402\n\nReview tier: B\n");
       const result = spawnSync(process.execPath, [new URL("../scripts/check-composed-pr.mjs", import.meta.url).pathname,
-        "--title", "Zero-width evidence", "--body-file", bodyFile, "--file", "src/awareness.ts"], {
+        "--title", "NUL evidence", "--body-file", bodyFile, "--file", "src/awareness.ts"], {
         cwd: directory, encoding: "utf8",
       });
       expect(result.status).not.toBe(0);
-      expect(`${result.stdout}${result.stderr}`).toContain("commit-message lifecycle violation");
+      expect(`${result.stdout}${result.stderr}`).toContain("contains a NUL character");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

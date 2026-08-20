@@ -43,11 +43,29 @@ function usage() {
 
 function deriveCommitMessages() {
   // ponytail: main-targeting only. A second base requires deriving from a validated base ref — never supplied evidence.
+  const shallow = spawnSync("git", ["rev-parse", "--is-shallow-repository"], { encoding: "utf8" });
+  if (shallow.status !== 0 || shallow.error || shallow.stdout.trim() === "true") throw new Error("cannot verify commit range: repository is shallow");
+  const ancestry = spawnSync("git", ["merge-base", "--is-ancestor", "origin/main", "HEAD"], { encoding: "utf8" });
+  if (ancestry.status !== 0 || ancestry.error) throw new Error("cannot verify commit range: origin/main ancestry is unproven");
+  const count = spawnSync("git", ["rev-list", "--count", "origin/main..HEAD"], { encoding: "utf8" });
+  if (count.status !== 0 || count.error || !/^\d+\n?$/u.test(count.stdout)) throw new Error("cannot verify commit range: commit count is unavailable");
+  const expectedCount = Number(count.stdout.trim());
+  const commits = spawnSync("git", ["rev-list", "origin/main..HEAD"], { encoding: "utf8" });
+  if (commits.status !== 0 || commits.error) throw new Error("cannot verify commit range: commit identities are unavailable");
+  for (const commit of commits.stdout.trim().split(/\r?\n/u).filter(Boolean)) {
+    const object = spawnSync("git", ["cat-file", "commit", commit], { encoding: "utf8" });
+    if (object.status !== 0 || object.error) throw new Error(`cannot verify commit range: commit ${commit} is unreadable`);
+    if (object.stdout.includes("\0")) throw new Error(`commit evidence is untrustworthy: commit ${commit} contains a NUL character`);
+  }
   const result = spawnSync("git", ["log", "origin/main..HEAD", "--format=%B%x00"], { encoding: "utf8" });
   if (result.status !== 0 || result.error) throw new Error("could not derive commit messages from origin/main..HEAD");
   if (result.stdout === "") throw new Error("no commit messages found in origin/main..HEAD");
   const messages = result.stdout.split("\0").map((message, index) => index === 0 ? message : message.replace(/^\r?\n/u, ""));
   if (messages.at(-1) === "") messages.pop();
+  if (messages.length !== expectedCount) {
+    const direction = messages.length > expectedCount ? "more" : "fewer";
+    throw new Error(`commit evidence is untrustworthy: derived ${messages.length} records, but rev-list proves ${expectedCount} commits (${direction} evidence than commits)`);
+  }
   if (messages.length === 0 || messages.some((message) => message.length === 0)) throw new Error("could not derive commit messages from origin/main..HEAD");
   return messages;
 }
