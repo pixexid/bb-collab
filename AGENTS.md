@@ -8,7 +8,7 @@ The fleet is a director, an orchestrator, and workers using BB-native threads an
 
 ## Contract
 
-`INSTRUCTION_CONTRACT_VERSION: 34` — this is the instruction contract for agent sessions; apply the [instruction-contract version-bump test](docs/rules.md#version-bump-test) before changing it. The separate `RUNTIME_CONTRACT_VERSION: 22` lives in `src/foundation.ts` and feeds `contractDigest`.
+`INSTRUCTION_CONTRACT_VERSION: 35` — this is the instruction contract for agent sessions; apply the [instruction-contract version-bump test](docs/rules.md#version-bump-test) before changing it. The separate `RUNTIME_CONTRACT_VERSION: 22` lives in `src/foundation.ts` and feeds `contractDigest`.
 
 ## Reading order for a fresh seat
 
@@ -18,6 +18,19 @@ The fleet is a director, an orchestrator, and workers using BB-native threads an
 4. Read the [working rules](docs/rules.md) before coordinating, reviewing, or making a decision.
 5. Read the [threat model](docs/threat-model.md) before touching a trust boundary.
 6. Read the [README](README.md) for implemented internals; read ADRs only when changing their subject.
+
+## Before pushing
+
+After committing, run the composed-PR gate against the full range it derives from `origin/main..HEAD`:
+
+```sh
+env -u BB_CLI node scripts/check-composed-pr.mjs \
+  --title <title> --body-file <path> --file <each changed path>
+```
+
+Do not add `--commit-message` or `--base`; the command has nothing to check before a commit exists. Pair a pass with a rejection: run the same command once with a deliberately invalid PR body, confirm it fails, then run it with the real body and require the pass. A commit-message linkage is accepted only when the PR disposition is `Closes #NN` and every commit mention is `closes #<that same number>`; `Related` or `Ref` mentions fail. Keep the disposition line in the PR body only.
+
+A fresh worktree may have no dependencies. `npm ci` is expected before verification; “do not deploy, reload, or install” applies to PLUGIN operations, not npm.
 
 ## Operator
 
