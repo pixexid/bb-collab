@@ -2,6 +2,17 @@ export type ReportTier = "A" | "B" | "C";
 export type CadenceBin = "<1h" | "1-3h" | "3-6h" | ">=6h";
 
 type UnknownMetric = { status: "unknown"; reason: string };
+type LaneCapacityInterval = {
+  orchestratorId: string;
+  coverageState: "known" | "blind";
+  activeLaneCount: number | null;
+  writingLaneCeiling: number | null;
+  startableWork: boolean | null;
+  reason: string | null;
+  startedAtMs: number;
+  lastConfirmedAtMs: number;
+  endedAtMs: number | null;
+};
 
 export type ThroughputFacts = {
   dialsLandedAtMs: number | null;
@@ -20,6 +31,7 @@ export type ThroughputFacts = {
     submittedAtMs: number | null;
     completedAtMs: number | null;
   }>;
+  laneCapacityIntervals?: LaneCapacityInterval[];
   defects: Array<{
     id: string;
     reverted: boolean | null;
@@ -38,7 +50,10 @@ export type WeeklyThroughputReport = {
   issueAcceptanceAudit: { openCompleted: string[]; openIncomplete: string[]; unknown: string[]; status: "pass" | "fail" | "unknown" };
   mergeCadence: { histogram: Record<CadenceBin, number>; maximumGapHours: number | null; knownMerges: number; unknown: number };
   reviewTierDeclarations: Record<ReportTier | "unknown", number>;
-  laneSlotUtilization: UnknownMetric;
+  laneSlotUtilization: UnknownMetric | {
+    status: "known";
+    orchestrators: Record<string, { utilization: number; fullWithStartableMs: number; coveredMs: number }>;
+  };
   reviewLatencyByTier: Record<ReportTier, UnknownMetric | { status: "known" | "partial"; medianHours: number | null; completed: number; unknown: number }>;
   defectEscape: {
     reverts: UnknownMetric & { total: null; observedExplicitRevertIds: string[] } | { status: "known"; total: number; observedExplicitRevertIds: string[] };
@@ -67,6 +82,40 @@ const hours = (ms: number) => Number((ms / 3_600_000).toFixed(3));
 const inWindow = (at: number | null, start: number, end: number) => at !== null && at >= start && at < end;
 const overlapsWindow = (startAt: number | null, endAt: number | null, start: number, end: number) =>
   startAt !== null && startAt < end && (endAt === null || (startAt < endAt && endAt > start));
+
+function laneSlotUtilization(
+  intervals: LaneCapacityInterval[],
+  window: { startAtMs: number; endAtMs: number },
+  absentReason: string,
+): WeeklyThroughputReport["laneSlotUtilization"] {
+  const overlapping = intervals
+    .map((interval) => ({ ...interval, effectiveEndAtMs: interval.endedAtMs ?? interval.lastConfirmedAtMs }))
+    .filter((interval) => interval.startedAtMs < window.endAtMs && interval.effectiveEndAtMs > window.startAtMs)
+    .sort((left, right) => left.startedAtMs - right.startedAtMs);
+  if (overlapping.length === 0) return { status: "unknown", reason: absentReason };
+  let cursor = window.startAtMs;
+  const orchestrators: Record<string, { utilization: number; fullWithStartableMs: number; coveredMs: number }> = {};
+  for (const interval of overlapping) {
+    const start = Math.max(interval.startedAtMs, window.startAtMs);
+    const end = Math.min(interval.effectiveEndAtMs, window.endAtMs);
+    if (start !== cursor) return { status: "unknown", reason: `lane capacity coverage is partial at ${cursor}` };
+    if (interval.coverageState !== "known" || interval.activeLaneCount === null || interval.writingLaneCeiling === null || interval.startableWork === null) {
+      return { status: "unknown", reason: `lane capacity coverage is blind: ${interval.reason ?? "unreadable interval"}` };
+    }
+    if (interval.writingLaneCeiling === 0) return { status: "unknown", reason: "lane capacity coverage has a zero writing-lane ceiling" };
+    const current = orchestrators[interval.orchestratorId] ?? { utilization: 0, fullWithStartableMs: 0, coveredMs: 0 };
+    const duration = end - start;
+    current.coveredMs += duration;
+    if (interval.activeLaneCount >= interval.writingLaneCeiling && interval.startableWork) current.fullWithStartableMs += duration;
+    orchestrators[interval.orchestratorId] = current;
+    cursor = end;
+  }
+  if (cursor !== window.endAtMs) return { status: "unknown", reason: `lane capacity coverage is partial at ${cursor}` };
+  for (const value of Object.values(orchestrators)) {
+    value.utilization = Number((value.fullWithStartableMs / value.coveredMs).toFixed(3));
+  }
+  return { status: "known", orchestrators };
+}
 
 export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAtMs: number; endAtMs: number }): WeeklyThroughputReport {
   const issueCandidates = facts.issues.filter((issue) => inWindow(issue.openedAtMs, window.startAtMs, window.endAtMs) || inWindow(issue.closedAtMs, window.startAtMs, window.endAtMs));
@@ -162,7 +211,11 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
     issueAcceptanceAudit,
     mergeCadence: { histogram, maximumGapHours: mergeGaps.length ? Math.max(...mergeGaps) : null, knownMerges: mergeTimes.filter((merge) => inWindow(merge, window.startAtMs, window.endAtMs)).length, unknown: facts.merges.filter((merge) => merge.mergedAtMs === null).length },
     reviewTierDeclarations,
-    laneSlotUtilization: { status: "unknown", reason: facts.unknownReasons?.laneSlotUtilization ?? "lane slot utilization is unavailable" },
+    laneSlotUtilization: laneSlotUtilization(
+      facts.laneCapacityIntervals ?? [],
+      window,
+      facts.unknownReasons?.laneSlotUtilization ?? "lane slot utilization is unavailable",
+    ),
     reviewLatencyByTier,
     defectEscape: { reverts, postMergeP0s, postMergeP1s },
     outlierCohorts,

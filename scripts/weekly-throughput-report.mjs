@@ -61,7 +61,7 @@ const pulls = ghJson(mergeArgs).map((pull) => ({
   title: pull.title,
 }));
 const labels = ghJson(labelArgs).map((label) => label.name.toLowerCase());
-const canonicalReviews = (() => {
+const canonicalExport = (() => {
   try {
     const projects = bbJson(["project", "list", "--json"]).filter((project) => project.gitRemoteUrl === `https://github.com/${repo}.git`);
     if (projects.length !== 1) return { rows: [], reason: "canonical BB project identity is unavailable or ambiguous" };
@@ -72,16 +72,29 @@ const canonicalReviews = (() => {
       const dataDir = bbJson(["status", "--json"]).dataDir;
       return readFileSync(join(dataDir, "plugins", "bb-collab", directory, "records.ndjson"), "utf8");
     })();
-    return { rows: records.split("\n").filter(Boolean).map((line) => JSON.parse(line)).filter((record) => record.table === "execution_attempts" && Number.isSafeInteger(record.row.review_pr_number)), reason: null };
+    return { rows: records.split("\n").filter(Boolean).map((line) => JSON.parse(line)), reason: null };
   } catch {
     return { rows: [], reason: "canonical BB export is unavailable" };
   }
 })();
-const reviews = canonicalReviews.rows.map(({ row }) => ({
+const reviews = canonicalExport.rows.filter((record) =>
+  record.table === "execution_attempts" && Number.isSafeInteger(record.row.review_pr_number),
+).map(({ row }) => ({
   id: row.execution_attempt_id,
   tier: pulls.find((pull) => pull.id === `#${row.review_pr_number}`)?.tier ?? null,
   submittedAtMs: row.created_at_ms,
   completedAtMs: row.completed_at_ms ?? null,
+}));
+const laneCapacityIntervals = canonicalExport.rows.filter((record) => record.table === "lane_capacity_intervals").map(({ row }) => ({
+  orchestratorId: row.orchestrator_thread_id,
+  coverageState: row.coverage_state,
+  activeLaneCount: row.active_lane_count,
+  writingLaneCeiling: row.writing_lane_ceiling,
+  startableWork: row.startable_work === null ? null : row.startable_work === 1,
+  reason: row.reason,
+  startedAtMs: row.started_at_ms,
+  lastConfirmedAtMs: row.last_confirmed_at_ms,
+  endedAtMs: row.ended_at_ms,
 }));
 
 const report = weeklyThroughputReport({
@@ -89,13 +102,14 @@ const report = weeklyThroughputReport({
   issues,
   merges: pulls,
   reviews,
+  laneCapacityIntervals,
   defects: pulls
     .filter((pull) => pull.mergedAtMs !== null && pull.mergedAtMs >= startAtMs && pull.mergedAtMs < endAtMs)
     .map((pull) => ({ id: pull.id, reverted: /^revert(?:\b|:)/iu.test(pull.title) ? true : null, postMergeSeverity: null })),
   outlierCohorts,
   unknownReasons: {
     laneSlotUtilization: "PR #338 emits zero-lane and blind episodes but does not persist full-cap intervals; startability must not be recomputed",
-    ...(canonicalReviews.reason === null ? {} : { reviewLatency: canonicalReviews.reason }),
+    ...(canonicalExport.reason === null ? {} : { reviewLatency: canonicalExport.reason }),
     reverts: "only explicit revert-titled merged pull requests are observable; manual rollback coverage is unknown",
     postMergeSeverity: labels.some((label) => label === "p0" || label === "p1")
       ? "P0/P1 labels exist but post-merge culprit-PR linkage is not canonical"
@@ -106,7 +120,7 @@ const report = weeklyThroughputReport({
     merges: command(["gh", ...mergeArgs]),
     reviewTiers: `${command(["gh", ...mergeArgs])}; parse exactly one visible 'Review tier: A|B|C' declaration`,
     reviewLatency: "bb project list --json; bb collab export --project PROJECT_ID; read execution_attempts.review_pr_number",
-    laneSlotUtilization: "rg -n 'activeLanes.value > 0|activeLanes=0|idle-fleet coverage=blind|idle-fleet.wake' server.ts src/awareness.ts",
+    laneSlotUtilization: "bb collab export --project PROJECT_ID; read lane_capacity_intervals",
     defectEscape: command(["gh", ...labelArgs]),
   },
 }, { startAtMs, endAtMs });

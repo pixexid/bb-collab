@@ -835,7 +835,7 @@ export function threadEventStatus(
 
 export function subscribeToThreadChanges(
   sdk: Pick<BbPluginApi["sdk"], "subscribe" | "threads">,
-  observe: (threadId: string, status: ThreadStatus, archived?: boolean) => Promise<void>,
+  observe: (threadId: string, status: ThreadStatus, archived?: boolean, projectId?: string, parentThreadId?: string | null) => Promise<void>,
 ): () => void {
   try {
     return sdk.subscribe({
@@ -845,8 +845,8 @@ export function subscribeToThreadChanges(
         void sdk.threads
           .get({ threadId: event.id })
           .then((thread) => thread.archivedAt === null && thread.deletedAt === null
-            ? observe(thread.id, thread.status)
-            : observe(thread.id, thread.status, true))
+            ? observe(thread.id, thread.status, false, thread.projectId, thread.parentThreadId)
+            : observe(thread.id, thread.status, true, thread.projectId, thread.parentThreadId))
           .catch(() => undefined);
       },
     });
@@ -881,6 +881,12 @@ export interface IdleFleetPersistence {
   write(state: Record<string, string>): Promise<void>;
 }
 
+export interface IdleFleetCapacityRecorder {
+  readProjectIds(): Promise<string[]>;
+  observe(projectId: string): Promise<void>;
+  close(): void;
+}
+
 function idleFleetWakeState(input: unknown): Record<string, string> {
   if (input === undefined || input === null) return {};
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid idle-fleet wake state");
@@ -898,9 +904,11 @@ export function createIdleFleetDetector(options: {
   wake: (ready: IdleFleetReady) => Promise<boolean>;
   onBlind: (message: string) => void;
   persistence?: IdleFleetPersistence;
+  capacity?: IdleFleetCapacityRecorder;
   debounceMs?: number;
 }): {
   arm(probe: IdleFleetProbe): void;
+  observeCapacity(projectId: string): Promise<void>;
   rearm(): Promise<void>;
   stop(): void;
 } {
@@ -911,6 +919,7 @@ export function createIdleFleetDetector(options: {
   let state: Record<string, string> = {};
   let loaded = false;
   let stopped = false;
+  const capacityQueues = new Map<string, Promise<void>>();
   const probeKey = (probe: IdleFleetProbe) => `${probe.projectId}:${probe.threadId}`;
 
   const load = async () => {
@@ -968,13 +977,27 @@ export function createIdleFleetDetector(options: {
     timers.set(key, timer);
   };
 
+  const observeCapacity = (projectId: string): Promise<void> => {
+    if (stopped || !options.capacity) return Promise.resolve();
+    const previous = capacityQueues.get(projectId) ?? Promise.resolve();
+    const next = previous.then(() => options.capacity!.observe(projectId));
+    capacityQueues.set(projectId, next.catch(() => undefined));
+    return next.catch((error) => {
+      reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error)}`);
+    });
+  };
+
   return {
     arm,
+    observeCapacity,
     async rearm() {
       if (stopped) return;
       try {
         const probes = await options.readRearmProbes();
         for (const probe of probes) arm(probe);
+        if (options.capacity) {
+          for (const projectId of await options.capacity.readProjectIds()) await observeCapacity(projectId);
+        }
       } catch (error) {
         reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=restart-rearm-unreadable:${String(error)}`);
       }
@@ -983,6 +1006,11 @@ export function createIdleFleetDetector(options: {
       stopped = true;
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
+      try {
+        options.capacity?.close();
+      } catch (error) {
+        reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-close-unreadable:${String(error)}`);
+      }
     },
   };
 }

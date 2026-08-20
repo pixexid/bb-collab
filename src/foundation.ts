@@ -10,12 +10,13 @@ export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION: 34 in AGENTS.md.
 export const RUNTIME_CONTRACT_VERSION = 22;
-export const SCHEMA_VERSION = 22;
+export const SCHEMA_VERSION = 23;
 // v22 establishes the director's exact accepted-profile set.
 const PREVIOUS_RUNTIME_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-const PREVIOUS_SCHEMA_VERSION = 21;
+// Schema v23 adds forward-only lane-capacity intervals; runtime policy remains v22.
+const PREVIOUS_SCHEMA_VERSION = 22;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatPrimaryProfile = {
@@ -79,6 +80,7 @@ export const TABLES = [
   "execution_attempts",
   "role_generations",
   "role_generation_heads",
+  "lane_capacity_intervals",
   "operator_messages",
 ] as const;
 
@@ -911,6 +913,25 @@ export const MIGRATIONS: string[] = [
    DROP TABLE gh200_assignments;
    DROP TABLE gh200_external_work_refs;
    DROP TABLE gh200_work_item_waits;`,
+  `CREATE TABLE IF NOT EXISTS lane_capacity_intervals (
+    interval_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL CHECK (length(project_id) > 0),
+    orchestrator_thread_id TEXT NOT NULL CHECK (length(orchestrator_thread_id) > 0),
+    orchestrator_role_generation INTEGER NOT NULL CHECK (orchestrator_role_generation > 0),
+    coverage_state TEXT NOT NULL CHECK (coverage_state IN ('known', 'blind')),
+    active_lane_count INTEGER CHECK (active_lane_count IS NULL OR active_lane_count >= 0),
+    writing_lane_ceiling INTEGER CHECK (writing_lane_ceiling IS NULL OR writing_lane_ceiling >= 0),
+    startable_work INTEGER CHECK (startable_work IS NULL OR startable_work IN (0, 1)),
+    reason TEXT,
+    started_at_ms INTEGER NOT NULL CHECK (started_at_ms >= 0),
+    last_confirmed_at_ms INTEGER NOT NULL CHECK (last_confirmed_at_ms >= started_at_ms),
+    ended_at_ms INTEGER CHECK (ended_at_ms IS NULL OR ended_at_ms >= started_at_ms),
+    FOREIGN KEY (project_id) REFERENCES project_config_heads(project_id),
+    CHECK ((coverage_state = 'known' AND active_lane_count IS NOT NULL AND writing_lane_ceiling IS NOT NULL AND startable_work IS NOT NULL AND reason IS NULL)
+      OR (coverage_state = 'blind' AND reason IS NOT NULL))
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS lane_capacity_intervals_one_open
+    ON lane_capacity_intervals(project_id) WHERE ended_at_ms IS NULL;`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -7361,6 +7382,7 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     execution_attempts: "execution_attempt_id",
     role_generations: "role_id, generation",
     role_generation_heads: "role_id",
+    lane_capacity_intervals: "interval_id",
     operator_messages: "message_id",
   };
   const query =
