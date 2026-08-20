@@ -9,12 +9,12 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 export const CONTRACT_VERSION = 22;
-export const SCHEMA_VERSION = 21;
+export const SCHEMA_VERSION = 22;
 // v22 establishes the director's exact accepted-profile set.
 const PREVIOUS_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-const PREVIOUS_SCHEMA_VERSION = 20;
+const PREVIOUS_SCHEMA_VERSION = 21;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatPrimaryProfile = {
@@ -858,6 +858,58 @@ export const MIGRATIONS: string[] = [
    ALTER TABLE qualification_observations RENAME COLUMN visibility TO requested_visibility;
    ALTER TABLE eligibility_projections RENAME COLUMN profile_digest TO requested_profile_digest;
    ALTER TABLE role_generations RENAME COLUMN holder_executed_profile_digest TO holder_requested_profile_digest;`,
+  `PRAGMA defer_foreign_keys = ON;
+   CREATE TEMP TABLE gh200_assignments AS SELECT * FROM assignments;
+   CREATE TEMP TABLE gh200_external_work_refs AS SELECT * FROM external_work_refs;
+   CREATE TEMP TABLE gh200_work_item_waits AS SELECT * FROM work_item_waits;
+   DELETE FROM assignments;
+   DELETE FROM external_work_refs;
+   DELETE FROM work_item_waits;
+   CREATE TABLE work_items_gh200 (
+     project_id TEXT NOT NULL,
+     work_item_id TEXT NOT NULL,
+     config_revision INTEGER NOT NULL,
+     repo_target_id TEXT NOT NULL,
+     title TEXT NOT NULL,
+     body TEXT NOT NULL,
+     lifecycle_state TEXT NOT NULL
+       CHECK (lifecycle_state IN ('proposed', 'ready', 'in_progress', 'review_pending', 'blocked', 'succeeded', 'failed', 'cancelled')),
+     resource_revision INTEGER NOT NULL CHECK (resource_revision > 0),
+     created_at_ms INTEGER NOT NULL,
+     updated_at_ms INTEGER NOT NULL,
+     PRIMARY KEY (project_id, work_item_id),
+     FOREIGN KEY (project_id, config_revision)
+       REFERENCES project_config_revisions(project_id, config_revision),
+     FOREIGN KEY (project_id, repo_target_id, config_revision)
+       REFERENCES repository_targets(project_id, repo_target_id, config_revision)
+   );
+   INSERT INTO work_items_gh200 SELECT * FROM work_items;
+   DROP TABLE work_items;
+   ALTER TABLE work_items_gh200 RENAME TO work_items;
+   CREATE TABLE work_item_waits_gh200 (
+     project_id TEXT NOT NULL,
+     work_item_id TEXT NOT NULL,
+     waker TEXT NOT NULL,
+     declared_at_ms INTEGER NOT NULL CHECK (declared_at_ms >= 0),
+     declared_by_seat TEXT NOT NULL,
+     waker_kind TEXT NOT NULL
+       CHECK (waker_kind IN ('schedule', 'seat', 'work_item_succeeded', 'github_issue_closed')),
+     note TEXT CHECK (note IS NULL OR length(note) <= 4096),
+     PRIMARY KEY (project_id, work_item_id),
+     FOREIGN KEY (project_id, work_item_id)
+       REFERENCES work_items(project_id, work_item_id)
+   );
+   DROP TABLE work_item_waits;
+   ALTER TABLE work_item_waits_gh200 RENAME TO work_item_waits;
+   INSERT INTO assignments SELECT * FROM gh200_assignments;
+   INSERT INTO external_work_refs SELECT * FROM gh200_external_work_refs;
+   INSERT INTO work_item_waits (
+     project_id, work_item_id, waker, declared_at_ms, declared_by_seat, waker_kind, note
+   ) SELECT project_id, work_item_id, waker, declared_at_ms, declared_by_seat, waker_kind, NULL
+     FROM gh200_work_item_waits;
+   DROP TABLE gh200_assignments;
+   DROP TABLE gh200_external_work_refs;
+   DROP TABLE gh200_work_item_waits;`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -1411,9 +1463,9 @@ const decisionEvidenceSchema = z
   })
   .strict();
 
-export const WORK_ITEM_STATES = ["proposed", "ready", "in_progress", "review_pending", "succeeded", "failed", "cancelled"] as const;
+export const WORK_ITEM_STATES = ["proposed", "ready", "in_progress", "review_pending", "blocked", "succeeded", "failed", "cancelled"] as const;
 // review_pending is authorship-complete but non-terminal: it covers human review and CI-only waiting.
-export const WORK_ITEM_NON_TERMINAL_STATES = ["proposed", "ready", "in_progress", "review_pending"] as const;
+export const WORK_ITEM_NON_TERMINAL_STATES = ["proposed", "ready", "in_progress", "review_pending", "blocked"] as const;
 export const WORK_ITEM_CAPACITY_LIFECYCLE_STATES = ["in_progress"] as const;
 export const WORK_ITEM_CAPACITY_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"] as const;
 export const WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running"] as const;
@@ -1485,10 +1537,26 @@ const workItemInputSchema = z
     githubIssue: githubIssueBindingSchema.optional(),
   })
   .strict();
+const githubRefPartSchema = z.string().trim().min(1).max(256).regex(/^[A-Za-z0-9_.-]+$/u);
+const workItemBlockerSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("work_item_succeeded"), workItemId: id }).strict(),
+  z.object({ kind: z.literal("github_issue_closed"), owner: githubRefPartSchema, repo: githubRefPartSchema, issueNumber: z.number().int().positive().refine(Number.isSafeInteger) }).strict(),
+]);
+const workItemBlockerWithDeclarationSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("work_item_succeeded"), workItemId: id, declaredBySeat: id, note: z.string().trim().min(1).max(4096).optional() }).strict(),
+  z.object({ kind: z.literal("github_issue_closed"), owner: githubRefPartSchema, repo: githubRefPartSchema, issueNumber: z.number().int().positive().refine(Number.isSafeInteger), declaredBySeat: id, note: z.string().trim().min(1).max(4096).optional() }).strict(),
+]);
 const workItemWaitSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("schedule"), schedule: id, declaredBySeat: id }).strict(),
   z.object({ kind: z.literal("seat"), seat: z.enum(ROLE_IDS), declaredBySeat: id }).strict(),
+  ...workItemBlockerWithDeclarationSchema.options,
 ]);
+const workItemExternalEventSchema = z.object({
+  kind: z.enum(["github_issue_closed", "github_issue_reopened"]),
+  owner: githubRefPartSchema,
+  repo: githubRefPartSchema,
+  issueNumber: z.number().int().positive().refine(Number.isSafeInteger),
+}).strict();
 const gitShaSchema = z.string().regex(/^[0-9a-f]{40,64}$/u);
 const workAttemptSchema = z
   .object({
@@ -1771,6 +1839,8 @@ export const applyRequestSchema = z
     workItemId: id.optional(),
     lifecycleState: workItemStateSchema.optional(),
     workItemWait: workItemWaitSchema.nullable().optional(),
+    workItemUnblock: workItemBlockerSchema.optional(),
+    workItemExternalEvent: workItemExternalEventSchema.optional(),
     workAttempt: workAttemptSchema.optional(),
     projectionKind: z.literal("github_issue").optional(),
     roleId: roleIdSchema.optional(),
@@ -5509,7 +5579,7 @@ function terminalizeWorkItemAttempt(
   db: SqliteDatabase,
   projectId: string,
   workItemId: string,
-  state: "done" | "failed" | "superseded",
+  state: "done" | "blocked" | "failed" | "superseded",
   assignmentKind?: WorkAttempt["assignmentKind"],
 ): string | null {
   const active = activeWorkItemAttempt(db, projectId, workItemId, assignmentKind);
@@ -5585,9 +5655,43 @@ interface WorkItemWaitRow {
   project_id: string;
   work_item_id: string;
   waker: string;
-  waker_kind: "schedule" | "seat";
+  waker_kind: "schedule" | "seat" | "work_item_succeeded" | "github_issue_closed";
   declared_at_ms: number;
   declared_by_seat: string;
+  note: string | null;
+}
+
+type WorkItemBlocker = NonNullable<ApplyRequest["workItemUnblock"]>;
+
+function workItemBlockerWaker(blocker: WorkItemBlocker): string {
+  return blocker.kind === "work_item_succeeded"
+    ? blocker.workItemId
+    : `${blocker.owner}/${blocker.repo}#${blocker.issueNumber}`;
+}
+
+function storedWorkItemBlocker(row: WorkItemWaitRow): WorkItemBlocker | null {
+  if (row.waker_kind === "work_item_succeeded") {
+    return { kind: "work_item_succeeded", workItemId: row.waker };
+  }
+  if (row.waker_kind !== "github_issue_closed") return null;
+  const match = row.waker.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u);
+  const issueNumber = match?.[3] === undefined ? NaN : Number(match[3]);
+  return match?.[1] && match[2] && Number.isSafeInteger(issueNumber)
+    ? { kind: "github_issue_closed", owner: match[1], repo: match[2], issueNumber }
+    : null;
+}
+
+function sameWorkItemBlocker(left: WorkItemBlocker, right: WorkItemBlocker): boolean {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+function workItemGithubReadTarget(request: ApplyRequest): { owner: string; repo: string; issueNumber: number } | null {
+  const targets = [request.workItemWait, request.workItemUnblock, request.workItemExternalEvent]
+    .flatMap((value) => value && value.kind !== "work_item_succeeded" && value.kind !== "schedule" && value.kind !== "seat"
+      ? [{ owner: value.owner, repo: value.repo, issueNumber: value.issueNumber }]
+      : []);
+  if (targets.length > 1) throw refusal("WORK_ITEM_STATE_INVALID", "work item transition accepts one external condition");
+  return targets[0] ?? null;
 }
 
 interface ExternalWorkRefRow {
@@ -5778,15 +5882,95 @@ function applyWorkItemCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
 
 const WORK_ITEM_TRANSITIONS: Readonly<Record<WorkItemState, readonly WorkItemState[]>> = {
   proposed: ["ready", "cancelled"],
-  ready: ["in_progress", "cancelled"],
-  in_progress: ["review_pending", "failed", "cancelled"],
-  review_pending: ["in_progress", "succeeded", "failed", "cancelled"],
-  succeeded: [],
+  ready: ["in_progress", "blocked", "cancelled"],
+  in_progress: ["review_pending", "blocked", "failed", "cancelled"],
+  review_pending: ["in_progress", "blocked", "succeeded", "failed", "cancelled"],
+  blocked: ["ready", "cancelled"],
+  succeeded: ["ready"],
   failed: [],
   cancelled: [],
 };
 
-function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
+function requireBoundGithubIssue(
+  db: SqliteDatabase,
+  projectId: string,
+  workItemId: string,
+  target: { owner: string; repo: string; issueNumber: number },
+): ExternalWorkRefRow {
+  const ref = externalRef(db, projectId, workItemId);
+  if (!ref || ref.issue_number === null) throw refusal("EXTERNAL_REF_REQUIRED", "work item has no exact GitHub issue binding");
+  if (ref.owner !== target.owner || ref.repo !== target.repo || ref.issue_number !== target.issueNumber) {
+    throw refusal("EXTERNAL_REF_CONFLICT", "GitHub observation does not match the work item's exact external binding");
+  }
+  return ref;
+}
+
+function requireBlockerCondition(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  blocker: WorkItemBlocker,
+  githubObservation: GitHubIssueSnapshot | null,
+  satisfied: boolean,
+): void {
+  let conditionSatisfied: boolean;
+  if (blocker.kind === "work_item_succeeded") {
+    if (blocker.workItemId === request.workItemId) throw refusal("WORK_ITEM_STATE_INVALID", "work item cannot block on itself");
+    const dependency = asRow<{ lifecycle_state: WorkItemState }>(db.prepare(
+      "SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?",
+    ).get(request.projectId, blocker.workItemId));
+    if (!dependency) throw refusal("WORK_ITEM_UNKNOWN", "blocking work item does not exist in the exact project");
+    if (["failed", "cancelled"].includes(dependency.lifecycle_state)) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "work item cannot block on a terminal dependency that did not succeed");
+    }
+    conditionSatisfied = dependency.lifecycle_state === "succeeded";
+  } else {
+    if (!githubObservation) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub blocker observation is unavailable");
+    conditionSatisfied = githubObservation.state === "closed";
+  }
+  if (conditionSatisfied !== satisfied) {
+    throw refusal("WORK_ITEM_STATE_INVALID", satisfied ? "work item blocker has not fired" : "work item blocker already fired");
+  }
+}
+
+function recordedGithubCloseObservation(
+  db: SqliteDatabase,
+  projectId: string,
+  workItemId: string,
+  resourceRevision: number,
+): { kind: "github_issue_closed"; owner: string; repo: string; issueNumber: number; externalRevision: string } {
+  const row = asRow<{ event_json: string }>(db.prepare(
+    `SELECT event_json FROM state_events
+     WHERE project_id = ? AND aggregate_type = 'work_item' AND aggregate_id = ?
+       AND aggregate_revision = ? AND event_type = 'work_item_transitioned'
+     ORDER BY event_sequence DESC LIMIT 1`,
+  ).get(projectId, workItemId, resourceRevision));
+  if (!row) throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item has no recorded close observation");
+  let event: unknown;
+  try {
+    event = JSON.parse(row.event_json);
+  } catch {
+    throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item close observation is malformed");
+  }
+  const parsed = z.object({
+    to: z.literal("succeeded"),
+    externalEvent: z.object({
+      kind: z.literal("github_issue_closed"),
+      owner: githubRefPartSchema,
+      repo: githubRefPartSchema,
+      issueNumber: z.number().int().positive().refine(Number.isSafeInteger),
+      externalRevision: id,
+    }).strict(),
+  }).passthrough().safeParse(event);
+  if (!parsed.success) throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item has no exact recorded close observation");
+  return parsed.data.externalEvent;
+}
+
+function applyWorkItemTransition(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+  githubObservation: GitHubIssueSnapshot | null,
+): FoundationResult {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
@@ -5799,19 +5983,33 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
     nextState !== undefined || request.workItemWait === null,
   );
   const wait = request.workItemWait;
+  const unblock = request.workItemUnblock;
+  const externalEvent = request.workItemExternalEvent;
   const workAttempt = request.workAttempt;
-  if (wait !== undefined && (nextState !== undefined || workAttempt !== undefined)) {
+  const existingWait = asRow<WorkItemWaitRow>(db.prepare(
+    "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?",
+  ).get(request.projectId, workItem.work_item_id));
+  const machineWait = wait && (wait.kind === "work_item_succeeded" || wait.kind === "github_issue_closed") ? wait : null;
+  const enteringBlocked = nextState === "blocked";
+  if (enteringBlocked) {
+    if (!machineWait || workAttempt !== undefined || unblock !== undefined || externalEvent !== undefined) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "entering blocked requires exactly one machine-evaluable blocker");
+    }
+    if (existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
+    const blocker: WorkItemBlocker = machineWait.kind === "work_item_succeeded"
+      ? { kind: machineWait.kind, workItemId: machineWait.workItemId }
+      : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber };
+    requireBlockerCondition(db, request, blocker, githubObservation, false);
+  } else if (wait !== undefined && (nextState !== undefined || workAttempt !== undefined)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item wait mutation cannot change lifecycle state");
   }
-  if (wait !== undefined) {
-    if (["succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state)) {
-      throw refusal("WORK_ITEM_STATE_INVALID", "terminal work item cannot carry a wait");
+  if (wait !== undefined && !enteringBlocked) {
+    if (machineWait) throw refusal("WORK_ITEM_STATE_INVALID", "machine-evaluable blocker requires an atomic transition to blocked");
+    if (["blocked", "succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state)) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "blocked or terminal work item cannot carry a human wait");
     }
-    const existing = asRow<WorkItemWaitRow>(db.prepare(
-      "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?",
-    ).get(request.projectId, workItem.work_item_id));
-    if (wait !== null && existing) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
-    if (wait === null && !existing) throw refusal("WORK_ITEM_WAIT_OPEN", "work item carries no open wait");
+    if (wait !== null && existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
+    if (wait === null && !existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item carries no open wait");
     const nextRevision = workItem.resource_revision + 1;
     const updated = db.prepare(
       `UPDATE work_items SET resource_revision = ?, updated_at_ms = ?
@@ -5824,9 +6022,10 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
     if (wait === null) {
       db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
     } else {
+      if (wait.kind !== "schedule" && wait.kind !== "seat") throw refusal("WORK_ITEM_STATE_INVALID", "machine-evaluable blocker requires blocked");
       db.prepare(
-        `INSERT INTO work_item_waits (project_id, work_item_id, waker, waker_kind, declared_at_ms, declared_by_seat)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO work_item_waits (project_id, work_item_id, waker, waker_kind, declared_at_ms, declared_by_seat, note)
+         VALUES (?, ?, ?, ?, ?, ?, NULL)`,
       ).run(request.projectId, workItem.work_item_id, wait.kind === "schedule" ? wait.schedule : wait.seat, wait.kind, now(), wait.declaredBySeat);
     }
     return commitMutation(
@@ -5931,6 +6130,44 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
   if (!nextState || !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
+  let recordedExternalEvent: { kind: "github_issue_closed" | "github_issue_reopened"; owner: string; repo: string; issueNumber: number; externalRevision: string } | null = null;
+  if (workItem.lifecycle_state === "blocked") {
+    const storedBlocker = existingWait ? storedWorkItemBlocker(existingWait) : null;
+    if (!storedBlocker) throw refusal("WORK_ITEM_STATE_INVALID", "blocked work item has no valid machine-evaluable blocker");
+    if (nextState === "ready") {
+      if (!unblock || !sameWorkItemBlocker(storedBlocker, unblock)) {
+        throw refusal("WORK_ITEM_STATE_INVALID", "blocked to ready requires the exact stored blocker");
+      }
+      requireBlockerCondition(db, request, unblock, githubObservation, true);
+    } else if (unblock !== undefined) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "work item unblock evidence only permits blocked to ready");
+    }
+  } else if (unblock !== undefined) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work item unblock evidence requires a blocked work item");
+  }
+  if (externalEvent) {
+    if (!githubObservation) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub lifecycle observation is unavailable");
+    requireBoundGithubIssue(db, request.projectId, workItem.work_item_id, externalEvent);
+    if (externalEvent.kind === "github_issue_closed") {
+      if (nextState !== "succeeded" || githubObservation.state !== "closed") {
+        throw refusal("WORK_ITEM_STATE_INVALID", "close observation only permits a transition to succeeded");
+      }
+    } else {
+      if (workItem.lifecycle_state !== "succeeded" || nextState !== "ready" || githubObservation.state !== "open") {
+        throw refusal("WORK_ITEM_STATE_INVALID", "reopen observation only permits succeeded to ready");
+      }
+      const prior = recordedGithubCloseObservation(db, request.projectId, workItem.work_item_id, workItem.resource_revision);
+      if (
+        prior.owner !== externalEvent.owner ||
+        prior.repo !== externalEvent.repo ||
+        prior.issueNumber !== externalEvent.issueNumber ||
+        prior.externalRevision === githubObservation.externalRevision
+      ) throw refusal("WORK_ITEM_STATE_INVALID", "GitHub reopen does not follow the exact recorded close observation");
+    }
+    recordedExternalEvent = { ...externalEvent, externalRevision: githubObservation.externalRevision };
+  } else if (workItem.lifecycle_state === "succeeded" && nextState === "ready") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item can return only after a proven GitHub issue reopening");
+  }
   if (nextState === "in_progress" && workAttempt === undefined) {
     throw refusal("WORK_ITEM_STATE_INVALID", "entering in-progress requires a work attempt");
   }
@@ -5940,9 +6177,7 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
   if (workItem.lifecycle_state === "review_pending" && activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
     throw refusal("WORK_ITEM_STATE_INVALID", "review-pending cannot carry an active writing attempt");
   }
-  if (["succeeded", "failed", "cancelled"].includes(nextState) && db.prepare(
-    "SELECT 1 FROM work_item_waits WHERE project_id = ? AND work_item_id = ?",
-  ).get(request.projectId, workItem.work_item_id)) {
+  if (["succeeded", "failed", "cancelled"].includes(nextState) && existingWait && workItem.lifecycle_state !== "blocked") {
     throw refusal("WORK_ITEM_WAIT_OPEN", "resolve the work item wait before terminalizing it");
   }
   const nextRevision = workItem.resource_revision + 1;
@@ -5955,6 +6190,17 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
       currentResourceRevision: workItem.resource_revision,
       expectedResourceRevision: request.expectedResourceRevision ?? undefined,
     });
+  }
+  if (enteringBlocked) {
+    const blocker: WorkItemBlocker = machineWait!.kind === "work_item_succeeded"
+      ? { kind: machineWait!.kind, workItemId: machineWait!.workItemId }
+      : { kind: machineWait!.kind, owner: machineWait!.owner, repo: machineWait!.repo, issueNumber: machineWait!.issueNumber };
+    db.prepare(
+      `INSERT INTO work_item_waits (project_id, work_item_id, waker, waker_kind, declared_at_ms, declared_by_seat, note)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(request.projectId, workItem.work_item_id, workItemBlockerWaker(blocker), blocker.kind, now(), machineWait!.declaredBySeat, machineWait!.note ?? null);
+  } else if (workItem.lifecycle_state === "blocked") {
+    db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
   }
   let executionAttemptId: string | null = null;
   let reviewExecutionAttemptId: string | null = null;
@@ -6010,7 +6256,7 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
       db,
       request.projectId,
       workItem.work_item_id,
-      nextState === "succeeded" ? "done" : "failed",
+      nextState === "succeeded" ? "done" : nextState === "blocked" ? "blocked" : "failed",
       workItem.lifecycle_state === "review_pending" ? "review" : undefined,
     );
   }
@@ -6031,6 +6277,9 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
         ...(executionAttemptId === null ? {} : { executionAttemptId }),
         ...(reviewExecutionAttemptId === null ? {} : { reviewExecutionAttemptId }),
         ...(workAttempt === undefined ? {} : { workAttempt }),
+        ...(machineWait === null ? {} : { blocker: machineWait }),
+        ...(unblock === undefined ? {} : { unblock }),
+        ...(recordedExternalEvent === null ? {} : { externalEvent: recordedExternalEvent }),
       },
     },
     { expected: 1, attempted: 1, verified: 1 },
@@ -6044,6 +6293,9 @@ function applyWorkItemTransition(db: SqliteDatabase, request: ApplyRequest, dige
           lifecycleState: nextState,
           ...(executionAttemptId === null ? {} : { executionAttemptId }),
           ...(reviewExecutionAttemptId === null ? {} : { reviewExecutionAttemptId }),
+          ...(machineWait === null ? {} : { blocker: machineWait }),
+          ...(unblock === undefined ? {} : { unblock }),
+          ...(recordedExternalEvent === null ? {} : { externalEvent: recordedExternalEvent }),
         },
     },
   );
@@ -6966,6 +7218,7 @@ export function applyAuthorizedMutation(
   roleFactReader: RoleFactReader | null = null,
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
   reviewFactReader: ReviewFactReader | null = null,
+  githubIssueReader: GitHubIssueReader | null = null,
 ): FoundationResult {
   let request: ApplyRequest;
   try {
@@ -6975,7 +7228,7 @@ export function applyAuthorizedMutation(
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader);
 }
 
 export function applyFixtureMutation(
@@ -6985,6 +7238,7 @@ export function applyFixtureMutation(
   roleFactReader: RoleFactReader | null = null,
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
   reviewFactReader: ReviewFactReader | null = null,
+  githubIssueReader: GitHubIssueReader | null = null,
 ): FoundationResult {
   let request: ApplyRequest;
   try {
@@ -7004,6 +7258,27 @@ export function applyFixtureMutation(
     }
     if (request.operationClass === "decision_disposition") {
       return applyDecisionMutation(db, request, digest, reviewFactReader);
+    }
+    const githubTarget = request.operationClass === "work_item_transition"
+      ? workItemGithubReadTarget(request)
+      : null;
+    let githubObservation: GitHubIssueSnapshot | null = null;
+    if (githubTarget) {
+      const replay = checkIdempotency(db, request, digest);
+      if (replay) return replay;
+      const reader = githubIssueReader ?? (githubAdapter ? githubAdapter.read.bind(githubAdapter) : null);
+      if (!reader) throw refusal("EXTERNAL_TARGET_REQUIRED", "work item transition requires a live GitHub issue reader");
+      try {
+        githubObservation = reader(githubTarget.owner, githubTarget.repo, githubTarget.issueNumber);
+      } catch {
+        throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue observation is unavailable");
+      }
+      if (
+        !githubObservation ||
+        githubObservation.owner !== githubTarget.owner ||
+        githubObservation.repo !== githubTarget.repo ||
+        githubObservation.issueNumber !== githubTarget.issueNumber
+      ) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue observation does not match the exact blocker identity");
     }
     return transaction(db, () => {
       const replay = checkIdempotency(db, request, digest);
@@ -7026,7 +7301,7 @@ export function applyFixtureMutation(
         case "work_item_create":
           return applyWorkItemCreate(db, request, digest);
         case "work_item_transition":
-          return applyWorkItemTransition(db, request, digest);
+          return applyWorkItemTransition(db, request, digest, githubObservation);
         case "github_issue_projection":
           throw refusal("INTERNAL_ERROR", "projection must not run inside the canonical transaction");
         case "qualification_observation_record":

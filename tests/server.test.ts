@@ -3217,9 +3217,10 @@ if [ "$1" = "pr" ]; then
 fi
 if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[{"number":999}]'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "207" ]; then exit 1; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" != "state,closedByPullRequestsReferences" ]; then exit 1; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && { [ "$3" = "206" ] || [ "$3" = "208" ]; }; then printf '%s\\n' '{"state":"CLOSED","closedByPullRequestsReferences":[{"number":340}]}'; exit 0; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"state":"CLOSED","closedByPullRequestsReferences":[]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then printf '%s\\n' '{"number":'"$3"',"title":"issue","body":"body","state":"CLOSED","labels":[],"updatedAt":"closed-'"$3"'"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" != "state,updatedAt,closedByPullRequestsReferences" ]; then exit 1; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && { [ "$3" = "206" ] || [ "$3" = "208" ]; }; then printf '%s\\n' '{"state":"CLOSED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[{"number":340}]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"state":"CLOSED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[]}'; exit 0; fi
 exit 1
 `);
     chmodSync(gh, 0o755);
@@ -3879,6 +3880,93 @@ exit 1
     const seat = await host.harness.callRpc("apply", workItemWaitRequest("fence", 1, { kind: "seat", seat: "worker", declaredBySeat: "worker-seat" }));
     expect(seat).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0, message: "waker seat worker is not live: declaration refused" });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("returns a blocked WorkItem to ready when the watchdog observes its dependency succeeded", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    const dependencyId = "watchdog-dependency";
+    expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+      idempotencyKey: "watchdog-dependency-create",
+      workItemId: dependencyId,
+      workItem: { workItemId: dependencyId, title: dependencyId, body: dependencyId },
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "blocked", 2, {
+      idempotencyKey: "watchdog-target-blocked",
+      workItemWait: { kind: "work_item_succeeded", workItemId: dependencyId, declaredBySeat: "worker-seat" },
+    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { idempotencyKey: "watchdog-dependency-ready", workItemId: dependencyId })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+      idempotencyKey: "watchdog-dependency-start",
+      workItemId: dependencyId,
+      workAttempt: { laneId: "lane-watchdog-dependency", threadId: "thread-watchdog-dependency", assignmentKind: "write" },
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, {
+      idempotencyKey: "watchdog-dependency-review",
+      workItemId: dependencyId,
+      workAttempt: { laneId: "lane-watchdog-dependency-review", threadId: "thread-watchdog-dependency-review", assignmentKind: "review", reviewPrNumber: 200, reviewPrHeadSha: CANDIDATE_SHA },
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4, { idempotencyKey: "watchdog-dependency-succeeded", workItemId: dependencyId })).outcome).toBe("OK");
+    seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "fleet-watchdog-plugin-gh200", actorKind: "plugin", subjectId: PLUGIN_ID });
+
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+
+    expect(fixture.db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lifecycle_state: "ready", resource_revision: 4 });
+    expect(fixture.db.prepare("SELECT 1 FROM work_item_waits WHERE work_item_id = ?").get(WORK_ITEM_ID)).toBeUndefined();
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "info",
+      message: expect.stringContaining("returned blocked work item to ready: project=proj_test workItem=work-item-1 blocker=work_item_succeeded"),
+    }));
+  });
+
+  it("returns succeeded to ready when the watchdog observes the exact bound GitHub issue reopened", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-reopened-work-item-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\n' '[]'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\n' '{"state":"OPEN","updatedAt":"open-y","closedByPullRequestsReferences":[]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then printf '%s\n' '{"number":'"$3"',"title":"reopened","body":"","state":"OPEN","labels":[],"updatedAt":"open-y"}'; exit 0; fi
+exit 1
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      const workItemId = "reopened-work-item";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "reopened-work-item-create",
+        workItemId,
+        workItem: { workItemId, title: workItemId, body: "reopened", githubIssue: { issueNumber: 351 } },
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { idempotencyKey: "reopened-work-item-ready", workItemId })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+        idempotencyKey: "reopened-work-item-start", workItemId,
+        workAttempt: { laneId: "lane-reopened", threadId: "thread-reopened", assignmentKind: "write" },
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, {
+        idempotencyKey: "reopened-work-item-review", workItemId,
+        workAttempt: { laneId: "lane-reopened-review", threadId: "thread-reopened-review", assignmentKind: "review", reviewPrNumber: 200, reviewPrHeadSha: CANDIDATE_SHA },
+      })).outcome).toBe("OK");
+      const github = new DeterministicGitHubIssueAdapter();
+      github.put({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: workItemId, body: "reopened", state: "closed", labels: [], externalRevision: "closed-x" });
+      expect(applyFixtureMutation(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4, {
+        idempotencyKey: "reopened-work-item-succeeded", workItemId,
+        workItemExternalEvent: { kind: "github_issue_closed", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
+      }), null, null, null, null, github.read.bind(github))).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "fleet-watchdog-plugin-reopen", actorKind: "plugin", subjectId: PLUGIN_ID });
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      expect(fixture.db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE work_item_id = ?").get(workItemId)).toEqual({ lifecycle_state: "ready", resource_revision: 6 });
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "info",
+        message: expect.stringContaining("returned succeeded work item to ready: project=proj_test workItem=reopened-work-item externalRevision=open-y"),
+      }));
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
   });
 
   it("holds fleet tier-2 escalation for one hour after tier 1", async () => {
@@ -4656,13 +4744,13 @@ exit 1
     }
   });
 
-  it("appends the request-provenance migration without bumping runtime contract v22", () => {
-    expect(SCHEMA_VERSION).toBe(21);
+  it("appends the blocked-work migration without bumping runtime contract v22", () => {
+    expect(SCHEMA_VERSION).toBe(22);
     expect(CONTRACT_VERSION).toBe(22);
-    expect(MIGRATIONS).toHaveLength(34);
+    expect(MIGRATIONS).toHaveLength(35);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
-    expect(MIGRATIONS.slice(0, -6).map(sha256)).toEqual([
+    expect(MIGRATIONS.slice(0, -7).map(sha256)).toEqual([
       "2ac2daf5e9bedfefdc007f0ff150814dace6938963b214c463dba8f66332d708",
       "e55c1268522fb2a3c42670c6565376860731de77b7afc8f122755db613d92967",
       "e1901bbaa8edfcb325f3007617b4cda0e07e0c56ab4c970ce778d1fd33c732ab",
@@ -4692,22 +4780,23 @@ exit 1
       "0cf4a2190ba1df8dd5e27834d4ce9f769c4d0e34f8041f39f0858a572c60418b",
       "39bd82dcebe4edf8c5d82d429de5f14b2ddee3a3c87871d4745a9f0467b648ae",
     ]);
-    expect(sha256(MIGRATIONS.slice(0, -6).join("\n"))).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
-    expect(sha256(MIGRATIONS.slice(0, -5).join("\n"))).toBe("4051aa08e489728a2b752340ad979716de7a2a1df9fdd46d2c4b8ccc86d9f5d2");
-    expect(sha256(MIGRATIONS.slice(0, -4).join("\n"))).toBe("7d9d30ecaf897f87b32f0da787366e67ee44194ad9fcd8fd3b33a2ca14eec221");
-    expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("3aafb2d48eb7560b5ce2a61b7611b34c9fb52e6dfe063f7e37f6782fe822f652");
-    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("cdb3f0e553be06e6405f2c1040ed08043accdc506d0ffecc0fd8fc0df9e69591");
-    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("abf83bf6369c9f5acc8e58a7365c89524f5a32c6ab0ab5c5c3729b0d969e1810");
-    expect(schemaDigest).toBe("dcc9fe39083b57f4861c97a5dc38dab25058bbcd53c029dd318db830f9335e76");
-    expect(MIGRATIONS.at(-7)).toContain("operator_messages");
-    expect(MIGRATIONS.at(-7)).toContain("project_id TEXT NOT NULL");
-    expect(MIGRATIONS.at(-7)).toContain("recipient IN ('operator', 'supervisor')");
-    expect(MIGRATIONS.at(-6)).toContain("execution_attempts_gh300");
-    expect(MIGRATIONS.at(-5)).toContain("work_items_gh295");
-    expect(MIGRATIONS.at(-4)).toContain("work_item_github_backfills");
-    expect(MIGRATIONS.at(-3)).toContain("ADD COLUMN config_revision");
-    expect(MIGRATIONS.at(-2)).toContain("review_pr_number");
-    expect(MIGRATIONS.at(-1)).toContain("RENAME COLUMN actual_model TO requested_model");
+    expect(sha256(MIGRATIONS.slice(0, -7).join("\n"))).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
+    expect(sha256(MIGRATIONS.slice(0, -6).join("\n"))).toBe("4051aa08e489728a2b752340ad979716de7a2a1df9fdd46d2c4b8ccc86d9f5d2");
+    expect(sha256(MIGRATIONS.slice(0, -5).join("\n"))).toBe("7d9d30ecaf897f87b32f0da787366e67ee44194ad9fcd8fd3b33a2ca14eec221");
+    expect(sha256(MIGRATIONS.slice(0, -4).join("\n"))).toBe("3aafb2d48eb7560b5ce2a61b7611b34c9fb52e6dfe063f7e37f6782fe822f652");
+    expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("cdb3f0e553be06e6405f2c1040ed08043accdc506d0ffecc0fd8fc0df9e69591");
+    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("abf83bf6369c9f5acc8e58a7365c89524f5a32c6ab0ab5c5c3729b0d969e1810");
+    expect(MIGRATIONS.at(-8)).toContain("operator_messages");
+    expect(MIGRATIONS.at(-8)).toContain("project_id TEXT NOT NULL");
+    expect(MIGRATIONS.at(-8)).toContain("recipient IN ('operator', 'supervisor')");
+    expect(MIGRATIONS.at(-7)).toContain("execution_attempts_gh300");
+    expect(MIGRATIONS.at(-6)).toContain("work_items_gh295");
+    expect(MIGRATIONS.at(-5)).toContain("work_item_github_backfills");
+    expect(MIGRATIONS.at(-4)).toContain("ADD COLUMN config_revision");
+    expect(MIGRATIONS.at(-3)).toContain("review_pr_number");
+    expect(MIGRATIONS.at(-2)).toContain("RENAME COLUMN actual_model TO requested_model");
+    expect(MIGRATIONS.at(-1)).toContain("work_items_gh200");
+    expect(MIGRATIONS.at(-1)).not.toMatch(/UPDATE work_items|wi-gh-/u);
     expect(TABLES).toContain("migration_runs");
     expect(TABLES).toContain("operator_messages");
     expect(MIGRATION_STATES).toEqual([
@@ -4718,8 +4807,8 @@ exit 1
     ]);
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 20,
-      newSchemaVersion: 21,
+      oldSchemaVersion: 21,
+      newSchemaVersion: 22,
       oldContractVersion: 21,
       newContractVersion: 22,
       action: "refused",
@@ -4728,8 +4817,8 @@ exit 1
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(20, 22))).toMatchObject({
-      oldSchemaVersion: 20,
-      newSchemaVersion: 21,
+      oldSchemaVersion: 21,
+      newSchemaVersion: 22,
       oldContractVersion: 21,
       newContractVersion: 22,
       action: "refused",
@@ -4737,11 +4826,12 @@ exit 1
       attempted: 4,
       verified: 0,
     });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(21, 22))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(21, 22))).toMatchObject({ action: "refused", verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 20,
-      newSchemaVersion: 21,
+      oldSchemaVersion: 21,
+      newSchemaVersion: 22,
       oldContractVersion: 21,
       newContractVersion: 22,
       action: "refused",
@@ -4765,7 +4855,7 @@ exit 1
       expect((db.prepare("PRAGMA table_info(mutation_receipts)").all() as Array<{ name: string }>).map((row) => row.name)).toContain("operator_receipt_id");
       expect((db.prepare("PRAGMA table_info(actor_receipts)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual(expect.arrayContaining(["operator_receipt_id", "retirement_condition"]));
       expect((db.prepare("PRAGMA table_info(work_item_waits)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual([
-        "project_id", "work_item_id", "waker", "declared_at_ms", "declared_by_seat", "waker_kind",
+        "project_id", "work_item_id", "waker", "declared_at_ms", "declared_by_seat", "waker_kind", "note",
       ]);
       expect((db.prepare("PRAGMA index_list(migration_runs)").all() as Array<{ name: string; unique: number; partial: number }>).filter((row) => row.name.startsWith("migration_runs_"))).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "migration_runs_final_export_identity", unique: 1, partial: 1 }),
@@ -4777,21 +4867,74 @@ exit 1
     }
   });
 
+  it("adds blocked without rewriting or rebinding the protected historical WorkItems", () => {
+    const db = new Database(":memory:");
+    databaseIsReady(db);
+    const projectId = "proj_gh200_migration";
+    try {
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement); })();
+      for (const configRevision of [5, 6]) {
+        db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, ?, '{}', ?, ?)")
+          .run(projectId, configRevision, sha256("{}"), configRevision);
+        db.prepare("INSERT INTO repository_targets (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest) VALUES (?, 'target-main', ?, 'source', 'host', '/migration', NULL, 'main', ?)")
+          .run(projectId, configRevision, `target-${configRevision}`);
+      }
+      const protectedRows = [
+        ["wi-gh-141", 5, "ready", 2, "Writing lane thr_bgtungnjhs"],
+        ["wi-gh-249", 6, "cancelled", 4, "Blocked upstream; lane thr_249"],
+        ["wi-gh-296", 5, "proposed", 1, "Writing lane thr_7dmhnghr7f"],
+        ["wi-gh-343", 6, "in_progress", 3, "Writing lane thr_343"],
+        ["wi-gh-351", 6, "succeeded", 5, "Terminal issue; lane thr_351"],
+      ] as const;
+      const insertWorkItem = db.prepare(
+        "INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, ?, ?, 'target-main', ?, ?, ?, ?, 10, 20)",
+      );
+      const insertRef = db.prepare(
+        `INSERT INTO external_work_refs (
+           project_id, work_item_id, provider, owner, repo, issue_number, projection_state,
+           attempted_resource_revision, projected_resource_revision, desired_digest,
+           observed_external_revision, observed_external_digest, last_idempotency_key,
+           last_request_digest, created_at_ms, updated_at_ms
+         ) VALUES (?, ?, 'github', 'pixexid', 'bb-collab', ?, 'pending', ?, NULL, ?, NULL, NULL, ?, ?, 10, 20)`,
+      );
+      for (const [workItemId, configRevision, lifecycleState, resourceRevision, body] of protectedRows) {
+        insertWorkItem.run(projectId, workItemId, configRevision, workItemId, body, lifecycleState, resourceRevision);
+        const issueNumber = Number(workItemId.slice("wi-gh-".length));
+        insertRef.run(projectId, workItemId, issueNumber, resourceRevision, sha256(`${workItemId}-desired`), `${workItemId}-ref`, sha256(`${workItemId}-request`));
+      }
+      const snapshot = () => db.prepare(
+        `SELECT work_items.*, external_work_refs.owner, external_work_refs.repo, external_work_refs.issue_number,
+                external_work_refs.projection_state, external_work_refs.last_idempotency_key
+         FROM work_items JOIN external_work_refs USING (project_id, work_item_id)
+         WHERE work_items.project_id = ? ORDER BY work_items.work_item_id`,
+      ).all(projectId);
+      const before = snapshot();
+      db.transaction(() => db.exec(MIGRATIONS.at(-1)!))();
+      expect(snapshot()).toEqual(before);
+      expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+      expect(db.prepare("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
+      expect(() => insertWorkItem.run(projectId, "new-blocked", 6, "New blocked", "new state", "blocked", 1)).not.toThrow();
+      expect(() => db.prepare("UPDATE work_items SET lifecycle_state = 'unknown_future' WHERE project_id = ? AND work_item_id = 'new-blocked'").run(projectId)).toThrow(/CHECK constraint failed/iu);
+    } finally {
+      db.close();
+    }
+  });
+
   it("appends the review_pending work-item migration without rewriting historical rows", () => {
     const db = new Database(":memory:");
     databaseIsReady(db);
     const projectId = "proj_gh295_migration";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -5)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -6)) db.exec(statement);
       })();
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, '{}', ?, 1)").run(projectId, sha256("{}"));
       db.prepare("INSERT INTO repository_targets (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest) VALUES (?, 'target-main', 1, 'source', 'host', '/migration', NULL, 'main', 'target-digest')").run(projectId);
       db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'historical', 1, 'target-main', 'Historical', 'preserve me', 'in_progress', 3, 10, 20)").run(projectId);
       const beforeRows = db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId);
-      const priorStatementDigests = MIGRATIONS.slice(0, -5).map(sha256);
-      db.transaction(() => db.exec(MIGRATIONS.at(-5)!))();
-      expect(MIGRATIONS.slice(0, -5).map(sha256)).toEqual(priorStatementDigests);
+      const priorStatementDigests = MIGRATIONS.slice(0, -6).map(sha256);
+      db.transaction(() => db.exec(MIGRATIONS.at(-6)!))();
+      expect(MIGRATIONS.slice(0, -6).map(sha256)).toEqual(priorStatementDigests);
       expect(db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId)).toEqual(beforeRows);
       expect(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'work_items'").get()).toMatchObject({ sql: expect.stringContaining("review_pending") });
       db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'reviewable', 1, 'target-main', 'Reviewable', 'new state', 'review_pending', 1, 30, 30)").run(projectId);
@@ -4807,7 +4950,7 @@ exit 1
     databaseIsReady(db);
     const projectId = "proj_review_linkage_migration";
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -2)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -3)) db.exec(statement); })();
       const configJson = "{}";
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, ?, ?, 1)").run(projectId, configJson, sha256(configJson));
       db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 1)").run(projectId);
@@ -4822,7 +4965,7 @@ exit 1
       const before = db.prepare(`SELECT ${existingColumns.join(", ")} FROM execution_attempts`).all();
       const rowCount = (db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get() as { count: number }).count;
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-2)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-3)!))();
 
       expect((db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get() as { count: number }).count).toBe(rowCount);
       expect(db.prepare(`SELECT ${existingColumns.join(", ")} FROM execution_attempts`).all()).toEqual(before);
@@ -4838,7 +4981,7 @@ exit 1
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -2)) db.exec(statement); })();
       db.pragma("foreign_keys = OFF");
       db.prepare("INSERT INTO project_config_revisions VALUES ('project', 1, '{}', 'config-digest', 1)").run();
       db.prepare("INSERT INTO repository_targets VALUES ('project', 'target', 1, 'source', 'host', '/target', NULL, 'main', 'target-digest')").run();
@@ -4870,11 +5013,11 @@ exit 1
         eligibility: db.prepare("SELECT profile_digest, derivation_digest FROM eligibility_projections").get(),
         generation: db.prepare("SELECT holder_executed_profile_digest, holder_context_digest, eligibility_derivation_digest FROM role_generations").get(),
       };
-      const priorStatementDigests = MIGRATIONS.slice(0, -1).map(sha256);
+      const priorStatementDigests = MIGRATIONS.slice(0, -2).map(sha256);
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-1)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-2)!))();
 
-      expect(MIGRATIONS.slice(0, -1).map(sha256)).toEqual(priorStatementDigests);
+      expect(MIGRATIONS.slice(0, -2).map(sha256)).toEqual(priorStatementDigests);
       expect(db.prepare("SELECT requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode, requested_service_tier, requested_visibility, requested_profile_digest, attempt_digest FROM execution_attempts").get()).toEqual(Object.fromEntries(Object.entries(before.attempt as Record<string, unknown>).map(([name, value]) => [name.replace(/^actual_/u, "requested_"), value])));
       expect(db.prepare("SELECT requested_profile_digest, requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode, requested_service_tier, requested_visibility, evidence_digest, observation_digest FROM qualification_observations").get()).toEqual({
         requested_profile_digest: "legacy-profile-digest", requested_provider_id: "provider", requested_model: "model",
@@ -4902,7 +5045,7 @@ exit 1
     databaseIsReady(db);
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -3)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -4)) db.exec(statement);
       })();
       const legacyResult = JSON.stringify({
         projectId: "proj_backfill_legacy",
@@ -4923,7 +5066,7 @@ exit 1
         "SELECT project_id, epoch_created_at_ms, state, result_json, created_at_ms, updated_at_ms FROM work_item_github_backfills",
       ).get();
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-3)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-4)!))();
 
       expect((db.prepare("PRAGMA table_info(work_item_github_backfills)").all() as Array<{ name: string }>).map((column) => column.name)).toEqual([
         "project_id", "epoch_created_at_ms", "state", "result_json", "created_at_ms", "updated_at_ms", "config_revision", "attempt_reason",
@@ -4939,8 +5082,8 @@ exit 1
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
     expect(CONTRACT_VERSION).toBe(22);
-    expect(SCHEMA_VERSION).toBe(21);
-    expect(MIGRATIONS).toHaveLength(34);
+    expect(SCHEMA_VERSION).toBe(22);
+    expect(MIGRATIONS).toHaveLength(35);
     expect(contractDigest).toBe("f6b0ecbda7e8afd986d46e0eda77662815a737dadc94e268ef00b7d74ba18ed4");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -4957,7 +5100,7 @@ exit 1
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 21, observedContractVersion: 22 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 22, observedContractVersion: 22 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -5115,7 +5258,7 @@ exit 1
     const projectId = "proj_gh300_rebuild";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -6)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -7)) db.exec(statement);
       })();
       db.pragma("foreign_keys = OFF");
       const insert = (table: string, row: Record<string, unknown>) => {
@@ -5173,7 +5316,7 @@ exit 1
       const before = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.values(before).every((value) => value !== null)).toBe(true);
       expect(new Set(Object.values(before).map((value) => String(value))).size).toBeGreaterThan(20);
-      db.transaction(() => db.exec(MIGRATIONS.at(-6)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-7)!))();
       const after = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.fromEntries(columns.map((column) => [column, after[column]]))).toEqual(Object.fromEntries(columns.map((column) => [column, before[column]])));
       expect(after.progress_json).toBe("{}");
@@ -5227,7 +5370,7 @@ exit 1
     const before = exportFoundation(db, PROJECT_ID);
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
-      observedSchemaVersion: 21,
+      observedSchemaVersion: 22,
       observedContractVersion: 22,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
@@ -5458,7 +5601,7 @@ exit 1
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 21, schemaDigest, contractVersion: 22, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 22, schemaDigest, contractVersion: 22, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -6537,8 +6680,8 @@ exit 1
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 20, newSchemaVersion: 21, action: "unknown", expected: 4, attempted: 0, verified: 0 },
-        schema: { version: 21 },
+        cachedConsumers: { oldSchemaVersion: 21, newSchemaVersion: 22, action: "unknown", expected: 4, attempted: 0, verified: 0 },
+        schema: { version: 22 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -6919,6 +7062,132 @@ exit 1
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(afterWinner);
     expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE aggregate_type = 'work_item'").get()).toEqual({ count: 2 });
+  });
+
+  it("requires an atomic machine-evaluable blocker and only resumes on the exact fired condition", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const dependencyId = "work-item-dependency";
+    const laterDependencyId = "work-item-later-dependency";
+    const create = (workItemId: string) => applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      idempotencyKey: `${workItemId}-create`,
+      workItemId,
+      workItem: { workItemId, title: workItemId, body: workItemId },
+    }));
+    const transition = (workItemId: string, state: ApplyRequest["lifecycleState"], revision: number, overrides: Partial<ApplyRequest> = {}) =>
+      applyWithFixtureReceipt(db, transitionRequest(fenceToken, state, revision, { idempotencyKey: `${workItemId}-${state}-${revision}`, workItemId, ...overrides }));
+    expect(create(WORK_ITEM_ID).outcome).toBe("OK");
+    expect(create(dependencyId).outcome).toBe("OK");
+    expect(create(laterDependencyId).outcome).toBe("OK");
+    expect(transition(WORK_ITEM_ID, "ready", 1).outcome).toBe("OK");
+
+    const beforeRefusals = exportFoundation(db, PROJECT_ID);
+    expect(transition(WORK_ITEM_ID, "blocked", 2)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(transition(WORK_ITEM_ID, "blocked", 2, {
+      idempotencyKey: "human-wait-cannot-block",
+      workItemWait: { kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat" },
+    })).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(transition(laterDependencyId, "blocked", 1, {
+      workItemWait: { kind: "work_item_succeeded", workItemId: dependencyId, declaredBySeat: "worker-seat" },
+    })).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 2, {
+      kind: "work_item_succeeded", workItemId: dependencyId, declaredBySeat: "worker-seat",
+    }))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusals);
+
+    expect(transition(WORK_ITEM_ID, "blocked", 2, {
+      workItemWait: { kind: "work_item_succeeded", workItemId: dependencyId, declaredBySeat: "worker-seat", note: "Resume only after the dependency succeeds." },
+    })).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+    expect(db.prepare("SELECT lifecycle_state FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lifecycle_state: "blocked" });
+    expect(db.prepare("SELECT waker, waker_kind, declared_by_seat, note FROM work_item_waits WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({
+      waker: dependencyId,
+      waker_kind: "work_item_succeeded",
+      declared_by_seat: "worker-seat",
+      note: "Resume only after the dependency succeeds.",
+    });
+    const blockedSnapshot = exportFoundation(db, PROJECT_ID);
+    expect(transition(WORK_ITEM_ID, "ready", 3)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(transition(WORK_ITEM_ID, "ready", 3, { workItemUnblock: { kind: "work_item_succeeded", workItemId: laterDependencyId } })).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(transition(WORK_ITEM_ID, "ready", 3, { workItemUnblock: { kind: "work_item_succeeded", workItemId: dependencyId } })).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(blockedSnapshot);
+
+    expect(transition(dependencyId, "ready", 1).outcome).toBe("OK");
+    expect(transition(dependencyId, "in_progress", 2, { workAttempt: { laneId: "lane-dependency", threadId: "thread-dependency", assignmentKind: "write" } }).outcome).toBe("OK");
+    expect(transition(dependencyId, "review_pending", 3, { workAttempt: { laneId: "lane-dependency-review", threadId: "thread-dependency-review", assignmentKind: "review", reviewPrNumber: 200, reviewPrHeadSha: CANDIDATE_SHA } }).outcome).toBe("OK");
+    expect(transition(dependencyId, "succeeded", 4).outcome).toBe("OK");
+    expect(transition(WORK_ITEM_ID, "ready", 3, { workItemUnblock: { kind: "work_item_succeeded", workItemId: dependencyId } })).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(db.prepare("SELECT 1 FROM work_item_waits WHERE work_item_id = ?").get(WORK_ITEM_ID)).toBeUndefined();
+
+    const github = new DeterministicGitHubIssueAdapter();
+    github.put({ owner: "upstream", repo: "host", issueNumber: 1949, title: "Release API", body: "", state: "open", labels: [], externalRevision: "open-x" });
+    const githubRead = github.read.bind(github);
+    expect(transition(WORK_ITEM_ID, "in_progress", 4).outcome).toBe("OK");
+    expect(applyFixtureMutation(db, transitionRequest(fenceToken, "blocked", 5, {
+      idempotencyKey: "work-item-github-blocked",
+      workItemWait: { kind: "github_issue_closed", owner: "upstream", repo: "host", issueNumber: 1949, declaredBySeat: "worker-seat", note: "Closure only triggers a host capability recheck." },
+    }), null, null, null, null, githubRead)).toMatchObject({ outcome: "OK", currentResourceRevision: 6 });
+    expect(db.prepare("SELECT state FROM execution_attempts WHERE work_item_id = ? ORDER BY attempt_ordinal DESC LIMIT 1").get(WORK_ITEM_ID)).toEqual({ state: "blocked" });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 6, { idempotencyKey: "project-blocked-work-item" }), github)).toMatchObject({ outcome: "OK" });
+    expect(github.snapshot(GITHUB_OWNER, GITHUB_REPO, 1950)?.state).toBe("open");
+    github.put({ owner: "upstream", repo: "host", issueNumber: 1949, title: "Release API", body: "", state: "closed", labels: [], externalRevision: "closed-y" });
+    expect(applyFixtureMutation(db, transitionRequest(fenceToken, "ready", 6, {
+      idempotencyKey: "work-item-github-unblocked",
+      workItemUnblock: { kind: "github_issue_closed", owner: "upstream", repo: "host", issueNumber: 1949 },
+    }), null, null, null, null, githubRead)).toMatchObject({ outcome: "OK", currentResourceRevision: 7 });
+
+    expect(transition(WORK_ITEM_ID, "in_progress", 7).outcome).toBe("OK");
+    expect(transition(WORK_ITEM_ID, "review_pending", 8).outcome).toBe("OK");
+    expect(transition(WORK_ITEM_ID, "blocked", 9, {
+      workItemWait: { kind: "work_item_succeeded", workItemId: laterDependencyId, declaredBySeat: "worker-seat" },
+    })).toMatchObject({ outcome: "OK", currentResourceRevision: 10 });
+    expect(db.prepare("SELECT state FROM execution_attempts WHERE work_item_id = ? AND assignment_kind = 'review' ORDER BY attempt_ordinal DESC LIMIT 1").get(WORK_ITEM_ID)).toEqual({ state: "blocked" });
+    expect(transition(WORK_ITEM_ID, "cancelled", 10)).toMatchObject({ outcome: "OK", currentResourceRevision: 11 });
+    expect(db.prepare("SELECT 1 FROM work_item_waits WHERE work_item_id = ?").get(WORK_ITEM_ID)).toBeUndefined();
+    expect(transition(WORK_ITEM_ID, "ready", 11)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(transition(laterDependencyId, "ready", 1).outcome).toBe("OK");
+    expect(transition(laterDependencyId, "in_progress", 2).outcome).toBe("OK");
+    expect(transition(laterDependencyId, "failed", 3).outcome).toBe("OK");
+    expect(transition(laterDependencyId, "ready", 4)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+  });
+
+  it("permits succeeded to return only after a later exact GitHub reopen observation", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const github = new DeterministicGitHubIssueAdapter();
+    const closed = { owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: "Reopenable", body: "", state: "closed" as const, labels: [], externalRevision: "closed-x" };
+    github.put(closed);
+    const githubRead = github.read.bind(github);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      workItem: { workItemId: WORK_ITEM_ID, title: "Reopenable", body: "", githubIssue: { issueNumber: 351 } },
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3)).outcome).toBe("OK");
+    expect(applyFixtureMutation(db, transitionRequest(fenceToken, "succeeded", 4, {
+      workItemExternalEvent: { kind: "github_issue_closed", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
+    }), null, null, null, null, githubRead)).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
+
+    const succeededSnapshot = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 5))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    github.put({ ...closed, state: "open", externalRevision: "closed-x" });
+    expect(applyFixtureMutation(db, transitionRequest(fenceToken, "ready", 5, {
+      idempotencyKey: "same-revision-reopen",
+      workItemExternalEvent: { kind: "github_issue_reopened", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
+    }), null, null, null, null, githubRead)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(succeededSnapshot);
+
+    github.put({ ...closed, state: "open", externalRevision: "open-y" });
+    const reopened = transitionRequest(fenceToken, "ready", 5, {
+      idempotencyKey: "later-reopen",
+      workItemExternalEvent: { kind: "github_issue_reopened", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
+    });
+    expect(applyFixtureMutation(db, reopened, null, null, null, null, githubRead)).toMatchObject({ outcome: "OK", currentResourceRevision: 6 });
+    github.readOutcomes.push("unavailable");
+    expect(applyFixtureMutation(db, reopened, null, null, null, null, githubRead)).toMatchObject({ outcome: "OK", currentResourceRevision: 6 });
+    expect(github.readOutcomes).toEqual(["unavailable"]);
+    expect(db.prepare("SELECT lifecycle_state FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lifecycle_state: "ready" });
+    const event = db.prepare("SELECT event_json FROM state_events WHERE aggregate_type = 'work_item' AND aggregate_id = ? AND aggregate_revision = 6").get(WORK_ITEM_ID) as { event_json: string };
+    expect(JSON.parse(event.event_json)).toMatchObject({ externalEvent: { kind: "github_issue_reopened", externalRevision: "open-y" } });
   });
 
   it("requires review_pending between authorship and terminal success and supports review findings re-entry", async () => {
@@ -8615,7 +8884,7 @@ exit 1
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
     db.exec(MIGRATIONS.find((statement) => statement.includes("CREATE TABLE IF NOT EXISTS assignments"))!);
-    for (const statement of MIGRATIONS.at(-1)!.split(";").filter((statement) => statement.includes("ALTER TABLE execution_attempts"))) db.exec(statement);
+    for (const statement of MIGRATIONS.at(-2)!.split(";").filter((statement) => statement.includes("ALTER TABLE execution_attempts"))) db.exec(statement);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -8635,10 +8904,10 @@ exit 1
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 20, newSchemaVersion: 21, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 20, newSchemaVersion: 21, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(20, 22))).toMatchObject({ oldSchemaVersion: 20, newSchemaVersion: 21, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(21, 22))).toMatchObject({ oldSchemaVersion: 20, newSchemaVersion: 21, oldContractVersion: 21, newContractVersion: 22, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 21, newSchemaVersion: 22, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 21, newSchemaVersion: 22, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(21, 22))).toMatchObject({ oldSchemaVersion: 21, newSchemaVersion: 22, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 21, newSchemaVersion: 22, oldContractVersion: 21, newContractVersion: 22, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 

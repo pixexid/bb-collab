@@ -130,14 +130,17 @@ type LinkedGithubObservation = {
   status: LinkedGithubStatus;
   pullRequestMerged: boolean;
   issueClosed: boolean;
+  issueOpen: boolean;
+  externalRevision: string;
 };
 
 function linkedGithubObservation(owner: string, repo: string, issueNumber: number): LinkedGithubObservation | null {
-  const issue = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,closedByPullRequestsReferences"]);
+  const issue = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,updatedAt,closedByPullRequestsReferences"]);
   if (!issue || typeof issue !== "object" || Array.isArray(issue)) return null;
   const issueState = (issue as { state?: unknown }).state;
+  const externalRevision = (issue as { updatedAt?: unknown }).updatedAt;
   const closingPullRequests = (issue as { closedByPullRequestsReferences?: unknown }).closedByPullRequestsReferences;
-  if ((issueState !== "OPEN" && issueState !== "CLOSED") || !Array.isArray(closingPullRequests)) return null;
+  if ((issueState !== "OPEN" && issueState !== "CLOSED") || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
   const closingPullRequest = closingPullRequests[0];
   if (closingPullRequest !== undefined && (!closingPullRequest || typeof closingPullRequest !== "object" || Array.isArray(closingPullRequest)
     || typeof (closingPullRequest as { number?: unknown }).number !== "number"
@@ -158,7 +161,7 @@ function linkedGithubObservation(owner: string, repo: string, issueNumber: numbe
   const status = pullRequestMerged || pullRequestClosed || issueClosed
     ? pullRequestMerged ? "merged" : "closed"
     : issueOpen ? "open" : null;
-  return status === null ? null : { status, pullRequestMerged, issueClosed };
+  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, externalRevision };
 }
 
 function readGithubIssueForBackfill(owner: string, repo: string, issueNumber: number): GitHubIssueSnapshot {
@@ -662,7 +665,8 @@ async function applyLiveAuthorizedMutation(
   if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v22-rollout-receipt")) {
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
-  if (parsed.success && parsed.data.workItemWait !== undefined && parsed.data.workItemWait !== null) {
+  if (parsed.success && parsed.data.workItemWait !== undefined && parsed.data.workItemWait !== null
+    && (parsed.data.workItemWait.kind === "schedule" || parsed.data.workItemWait.kind === "seat")) {
     try {
       if (!await liveWorkItemWaker(bb, db, parsed.data.projectId, parsed.data.workItemWait)) {
         const waker = parsed.data.workItemWait.kind === "schedule" ? `schedule ${parsed.data.workItemWait.schedule}` : `seat ${parsed.data.workItemWait.seat}`;
@@ -673,7 +677,7 @@ async function applyLiveAuthorizedMutation(
     }
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
-  const result = applyAuthorizedMutation(db, input, null, reader);
+  const result = applyAuthorizedMutation(db, input, null, reader, null, null, readGithubIssueForBackfill);
   await deliverSucceededSeatBrief(bb, db, input, result);
   return result;
 }
@@ -682,6 +686,7 @@ async function liveWorkItemWaker(bb: BbPluginApi, db: SqliteDatabase | null, pro
   if (waker.kind === "seat") {
     return db !== null && readRoleHolderStates(db).filter((holder) => holder.project_id === projectId && holder.role_id === waker.seat).length === 1;
   }
+  if (waker.kind !== "schedule") return false;
   return liveWaker(bb, waker.schedule);
 }
 
@@ -2210,9 +2215,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
            ON external_work_refs.project_id = work_items.project_id
           AND external_work_refs.work_item_id = work_items.work_item_id
           AND external_work_refs.provider = 'github'
-         WHERE work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
+         WHERE work_items.lifecycle_state IN (${[...WORK_ITEM_NON_TERMINAL_STATES, "succeeded"].map(() => "?").join(", ")})
            AND external_work_refs.issue_number IS NOT NULL`,
-      ).all(...WORK_ITEM_NON_TERMINAL_STATES) as Array<{ project_id: string }>) projectIds.add(row.project_id);
+      ).all(...WORK_ITEM_NON_TERMINAL_STATES, "succeeded") as Array<{ project_id: string }>) projectIds.add(row.project_id);
       const lanesByProject = new Map<string, Awaited<ReturnType<typeof bb.sdk.threads.list>>>();
       for (const projectId of projectIds) {
         if (onlyProjectId !== undefined && projectId !== onlyProjectId) continue;
@@ -2236,16 +2241,16 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         visibleLaneCount += lanes.length;
         lanesByProject.set(projectId, lanes);
       }
-      const openWorkItemsByProject = new Map<string, Array<{ workItemId: string; waker: string | null; wakerKind: "schedule" | "seat" | null; declaredAtMs: number | null }>>();
+      const openWorkItemsByProject = new Map<string, Array<{ workItemId: string; lifecycleState: string; waker: string | null; wakerKind: "schedule" | "seat" | "work_item_succeeded" | "github_issue_closed" | null; declaredAtMs: number | null }>>();
       for (const workItem of db.prepare(
-        `SELECT work_items.project_id, work_items.work_item_id, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
+        `SELECT work_items.project_id, work_items.work_item_id, work_items.lifecycle_state, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
          FROM work_items LEFT JOIN work_item_waits
            ON work_item_waits.project_id = work_items.project_id AND work_item_waits.work_item_id = work_items.work_item_id
          WHERE work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
          ORDER BY work_items.created_at_ms, work_items.work_item_id`,
-      ).all(...WORK_ITEM_NON_TERMINAL_STATES) as Array<{ project_id: string; work_item_id: string; waker: string | null; waker_kind: "schedule" | "seat" | null; declared_at_ms: number | null }>) {
+      ).all(...WORK_ITEM_NON_TERMINAL_STATES) as Array<{ project_id: string; work_item_id: string; lifecycle_state: string; waker: string | null; waker_kind: "schedule" | "seat" | "work_item_succeeded" | "github_issue_closed" | null; declared_at_ms: number | null }>) {
         const workItems = openWorkItemsByProject.get(workItem.project_id) ?? [];
-        workItems.push({ workItemId: workItem.work_item_id, waker: workItem.waker, wakerKind: workItem.waker_kind, declaredAtMs: workItem.declared_at_ms });
+        workItems.push({ workItemId: workItem.work_item_id, lifecycleState: workItem.lifecycle_state, waker: workItem.waker, wakerKind: workItem.waker_kind, declaredAtMs: workItem.declared_at_ms });
         openWorkItemsByProject.set(workItem.project_id, workItems);
       }
       const isCurrent = (candidate: RoleHolderState, holder: RoleHolderState) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
@@ -2339,73 +2344,114 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           wakeInFlight.delete(key);
         }
       };
+      const transitionWorkItem = (
+        projectId: string,
+        workItemId: string,
+        state: "ready" | "review_pending" | "succeeded",
+        idempotencyKey: string,
+        extra: Pick<ApplyRequest, "workItemUnblock" | "workItemExternalEvent"> = {},
+      ): FoundationResult => {
+        const actor = db.prepare(
+          `SELECT receipt_id FROM actor_receipts
+           WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
+             AND verification_state = 'verified'
+           ORDER BY issued_at_ms DESC LIMIT 1`,
+        ).get(projectId, PLUGIN_ID) as { receipt_id: string } | undefined;
+        const governor = db.prepare(
+          "SELECT governance_epoch, fence_token FROM project_governorship_heads WHERE project_id = ?",
+        ).get(projectId) as { governance_epoch: number; fence_token: string } | undefined;
+        const config = db.prepare(
+          "SELECT config_revision FROM project_config_heads WHERE project_id = ?",
+        ).get(projectId) as { config_revision: number } | undefined;
+        const workItem = db.prepare(
+          `SELECT repo_target_id, resource_revision
+           FROM work_items WHERE project_id = ? AND work_item_id = ?`,
+        ).get(projectId, workItemId) as { repo_target_id: string; resource_revision: number } | undefined;
+        if (!actor || !governor || !config || !workItem) {
+          return { outcome: "WORK_ITEM_STATE_INVALID", subject: workItemId, expected: 1, attempted: 0, verified: 0, message: "authority or work item unavailable" };
+        }
+        return applyAuthorizedMutation(db, {
+          projectId,
+          operationClass: "work_item_transition",
+          idempotencyKey,
+          actorReceiptId: actor.receipt_id,
+          expectedConfigRevision: config.config_revision,
+          expectedGovernanceEpoch: governor.governance_epoch,
+          expectedFenceToken: governor.fence_token,
+          repoTargetId: workItem.repo_target_id,
+          expectedResourceRevision: workItem.resource_revision,
+          workItemId,
+          lifecycleState: state,
+          ...extra,
+        }, null, null, null, null, readGithubIssueForBackfill);
+      };
       const inspectLinkedWorkItems = (projectId: string) => {
         // The handoff gate owns canonical ledger/attempt drift; this existing watchdog owns
         // external terminal drift. The active writer indexes remain the duplicate-claim detector.
         const linkedWorkItems = db.prepare(
-          `SELECT work_items.work_item_id, external_work_refs.owner, external_work_refs.repo, external_work_refs.issue_number
+          `SELECT work_items.work_item_id, work_items.lifecycle_state, external_work_refs.owner, external_work_refs.repo, external_work_refs.issue_number
            FROM work_items JOIN external_work_refs
              ON external_work_refs.project_id = work_items.project_id
             AND external_work_refs.work_item_id = work_items.work_item_id
             AND external_work_refs.provider = 'github'
            WHERE work_items.project_id = ?
-             AND work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
+             AND work_items.lifecycle_state IN (${[...WORK_ITEM_NON_TERMINAL_STATES, "succeeded"].map(() => "?").join(", ")})
              AND external_work_refs.issue_number IS NOT NULL
            ORDER BY work_items.work_item_id`,
-        ).all(projectId, ...WORK_ITEM_NON_TERMINAL_STATES) as Array<{ work_item_id: string; owner: string; repo: string; issue_number: number }>;
+        ).all(projectId, ...WORK_ITEM_NON_TERMINAL_STATES, "succeeded") as Array<{ work_item_id: string; lifecycle_state: string; owner: string; repo: string; issue_number: number }>;
         for (const linked of linkedWorkItems) {
           const observation = linkedGithubObservation(linked.owner, linked.repo, linked.issue_number);
           if (observation === null) {
             degrade(`github-work-item-status:${projectId}:${linked.work_item_id}`);
             continue;
           }
+          if (linked.lifecycle_state === "succeeded") {
+            if (!observation.issueOpen) continue;
+            const result = transitionWorkItem(
+              projectId,
+              linked.work_item_id,
+              "ready",
+              `fleet-watchdog:issue-reopened:${linked.work_item_id}:${observation.externalRevision}`,
+              { workItemExternalEvent: { kind: "github_issue_reopened", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } },
+            );
+            if (result.outcome === "OK") {
+              bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation.externalRevision}`);
+            } else {
+              degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
+              bb.log.warn(`fleet-watchdog issue-reopen transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result.outcome}`);
+            }
+            continue;
+          }
+          if (linked.lifecycle_state === "blocked") continue;
           if (observation.status !== "open") {
             bb.log.warn(`fleet-watchdog stale-terminal work item: project=${projectId} workItem=${linked.work_item_id} linked=${linked.owner}/${linked.repo}#${linked.issue_number} status=${observation.status}`);
           }
           if (!observation.pullRequestMerged || !observation.issueClosed) continue;
-          const actor = db.prepare(
-            `SELECT receipt_id FROM actor_receipts
-             WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
-               AND verification_state = 'verified'
-             ORDER BY issued_at_ms DESC LIMIT 1`,
-          ).get(projectId, PLUGIN_ID) as { receipt_id: string } | undefined;
-          const governor = db.prepare(
-            "SELECT governance_epoch, fence_token FROM project_governorship_heads WHERE project_id = ?",
-          ).get(projectId) as { governance_epoch: number; fence_token: string } | undefined;
-          const config = db.prepare(
-            "SELECT config_revision FROM project_config_heads WHERE project_id = ?",
-          ).get(projectId) as { config_revision: number } | undefined;
           const workItem = db.prepare(
-            `SELECT repo_target_id, resource_revision, lifecycle_state
+            `SELECT resource_revision, lifecycle_state
              FROM work_items WHERE project_id = ? AND work_item_id = ?`,
-          ).get(projectId, linked.work_item_id) as { repo_target_id: string; resource_revision: number; lifecycle_state: string } | undefined;
-          if (!actor || !governor || !config || !workItem) {
+          ).get(projectId, linked.work_item_id) as { resource_revision: number; lifecycle_state: string } | undefined;
+          if (!workItem) {
             degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
             bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} reason=authority-or-work-item-unavailable`);
             continue;
           }
-          const transition = (state: "review_pending" | "succeeded", expectedResourceRevision: number) => applyAuthorizedMutation(db, {
+          const transition = (state: "review_pending" | "succeeded") => transitionWorkItem(
             projectId,
-            operationClass: "work_item_transition",
-            idempotencyKey: `fleet-watchdog:merge-close:${linked.work_item_id}:${state}`,
-            actorReceiptId: actor.receipt_id,
-            expectedConfigRevision: config.config_revision,
-            expectedGovernanceEpoch: governor.governance_epoch,
-            expectedFenceToken: governor.fence_token,
-            repoTargetId: workItem.repo_target_id,
-            expectedResourceRevision,
-            workItemId: linked.work_item_id,
-            lifecycleState: state,
-          });
+            linked.work_item_id,
+            state,
+            `fleet-watchdog:merge-close:${linked.work_item_id}:${state}`,
+            state === "succeeded" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
+          );
           let result: FoundationResult;
           if (workItem.lifecycle_state === "in_progress") {
-            result = transition("review_pending", workItem.resource_revision);
+            result = transition("review_pending");
             if (result.outcome === "OK") {
               const current = db.prepare(
                 "SELECT resource_revision, lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?",
               ).get(projectId, linked.work_item_id) as { resource_revision: number; lifecycle_state: string } | undefined;
               result = current?.lifecycle_state === "review_pending"
-                ? transition("succeeded", current.resource_revision)
+                ? transition("succeeded")
                 : {
                   outcome: "WORK_ITEM_REVISION_STALE",
                   subject: linked.work_item_id,
@@ -2416,7 +2462,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
                 };
             }
           } else if (workItem.lifecycle_state === "review_pending") {
-            result = transition("succeeded", workItem.resource_revision);
+            result = transition("succeeded");
           } else {
             result = { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close automation requires in_progress or review_pending, found ${workItem.lifecycle_state}` };
           }
@@ -2572,12 +2618,54 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${startableCount} issue${startableCount === 1 ? "" : "s"} with ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
           }
           if (workItems.length === 0) continue;
-          const staleWait = workItems.find((workItem) => workItem.declaredAtMs !== null && now - workItem.declaredAtMs >= staleWaitMs);
+          const unblocked = new Set<string>();
+          for (const blocked of workItems.filter((workItem) => workItem.lifecycleState === "blocked")) {
+            let condition: ApplyRequest["workItemUnblock"];
+            let idempotencyKey: string;
+            if (blocked.wakerKind === "work_item_succeeded" && blocked.waker !== null) {
+              const dependency = db.prepare(
+                "SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?",
+              ).get(projectId, blocked.waker) as { lifecycle_state: string } | undefined;
+              if (dependency?.lifecycle_state !== "succeeded") continue;
+              condition = { kind: "work_item_succeeded", workItemId: blocked.waker };
+              idempotencyKey = `fleet-watchdog:blocker-fired:${blocked.workItemId}:${blocked.waker}`;
+            } else if (blocked.wakerKind === "github_issue_closed" && blocked.waker !== null) {
+              const match = blocked.waker.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u);
+              const issueNumber = match?.[3] === undefined ? NaN : Number(match[3]);
+              if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
+                degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
+                continue;
+              }
+              let snapshot: GitHubIssueSnapshot;
+              try {
+                snapshot = readGithubIssueForBackfill(match[1], match[2], issueNumber);
+              } catch {
+                degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
+                continue;
+              }
+              if (snapshot.state !== "closed") continue;
+              condition = { kind: "github_issue_closed", owner: match[1], repo: match[2], issueNumber };
+              idempotencyKey = `fleet-watchdog:blocker-fired:${blocked.workItemId}:${snapshot.externalRevision}`;
+            } else {
+              degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
+              continue;
+            }
+            const result = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition });
+            if (result.outcome === "OK") {
+              unblocked.add(blocked.workItemId);
+              bb.log.info(`fleet-watchdog returned blocked work item to ready: project=${projectId} workItem=${blocked.workItemId} blocker=${blocked.wakerKind}`);
+            } else {
+              degrade(`work-item-unblock:${projectId}:${blocked.workItemId}`);
+              bb.log.warn(`fleet-watchdog unblock transition refused: project=${projectId} workItem=${blocked.workItemId} outcome=${result.outcome}`);
+            }
+          }
+          const remainingWorkItems = workItems.filter((workItem) => !unblocked.has(workItem.workItemId));
+          const staleWait = remainingWorkItems.find((workItem) => workItem.declaredAtMs !== null && now - workItem.declaredAtMs >= staleWaitMs);
           if (staleWait) {
             await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait");
             continue;
           }
-          const seatWait = workItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null);
+          const seatWait = remainingWorkItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null);
           if (seatWait) {
             const owing = holders.find((holder) => holder.role_id === seatWait.waker);
             if (!owing) continue;
@@ -2598,7 +2686,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             }
             continue;
           }
-          const openWorkItem = workItems.find((workItem) => workItem.declaredAtMs === null);
+          const openWorkItem = remainingWorkItems.find((workItem) => workItem.declaredAtMs === null);
           if (!openWorkItem) {
             await resetIdle();
             continue;
