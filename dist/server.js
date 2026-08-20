@@ -15951,7 +15951,9 @@ var workAttemptSchema = external_exports.object({
   reviewPrHeadSha: gitShaSchema.optional()
 }).strict().superRefine((attempt, ctx) => {
   const linked = attempt.reviewPrNumber !== void 0 || attempt.reviewPrHeadSha !== void 0;
-  if (attempt.assignmentKind !== "review" && linked) {
+  if (attempt.assignmentKind === "review" && (attempt.reviewPrNumber === void 0 || attempt.reviewPrHeadSha === void 0)) {
+    ctx.addIssue({ code: "custom", message: "review attempts require an exact pull request number and head SHA" });
+  } else if (attempt.assignmentKind !== "review" && linked) {
     ctx.addIssue({ code: "custom", message: "pull request linkage is valid only for review attempts" });
   }
 });
