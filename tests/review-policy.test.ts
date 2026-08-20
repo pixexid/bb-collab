@@ -40,9 +40,15 @@ describe("pull-request review tier policy", () => {
     }
   });
 
-  it("keeps wrong-tiering visible as a review finding without changing merge policy", () => {
+  it("fails under-declarations, permits over-declarations, and prints the stricter rule", () => {
     const result = check("Review tier: C", ["src/foundation.ts"]);
-    expect(result.status).toBe(0);
-    expect(result.stderr).toContain("Review finding");
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("::error::Review finding");
+    expect(result.stdout).toContain("Review tier A: cold exact-head review before merge");
+
+    const overDeclared = check("Review tier: A", ["docs/issue-57-mechanism-1.md"]);
+    expect(overDeclared.status).toBe(0);
+    expect(overDeclared.stderr).toContain("::warning::Review finding: declared Tier A, but touched surfaces require Tier C.");
+    expect(overDeclared.stdout).toContain("Review tier A: cold exact-head review before merge");
   });
 });

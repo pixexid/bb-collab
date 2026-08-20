@@ -43,12 +43,18 @@ if (declared === null) {
 }
 
 if (declared !== required) {
-  console.error(`::warning::Review finding: declared Tier ${declared}, but touched surfaces require Tier ${required}.`);
+  if ({ A: 3, B: 2, C: 1 }[required] > { A: 3, B: 2, C: 1 }[declared]) {
+    console.error(`::error::Review finding: declared Tier ${declared}, but touched surfaces require Tier ${required}.`);
+    process.exitCode = 1;
+  } else {
+    console.error(`::warning::Review finding: declared Tier ${declared}, but touched surfaces require Tier ${required}.`);
+  }
 }
 
+const ruleTier = { A: 3, B: 2, C: 1 }[declared] > { A: 3, B: 2, C: 1 }[required] ? declared : required;
 const rule = {
   A: "cold exact-head review before merge",
   B: "local verify and CI before merge; cold review post-merge in parallel",
   C: "local verify and CI only",
-}[declared];
-console.log(`Review tier ${declared}: ${rule}`);
+}[ruleTier];
+console.log(`Review tier ${ruleTier}: ${rule}`);
