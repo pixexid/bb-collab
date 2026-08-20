@@ -1176,6 +1176,35 @@ async function replyToOperatorMessage(db: SqliteDatabase | null, bb: BbPluginApi
   return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0]!;
 }
 
+async function reportProjectWorktreeCleanup(bb: BbPluginApi, projectId: string) {
+  const project = await bb.sdk.projects.get({ projectId });
+  const source = project.sources.find((item) => item.isDefault) ?? project.sources[0];
+  if (!source) throw new Error("project has no source checkout");
+  const threads = await listAllProjectThreads((request) => bb.sdk.threads.list(request), projectId);
+  const liveWorktreeThreadIds = new Map<string, Set<string>>();
+  // Detached ownership is resolved from the absence of a claim, so an environment we
+  // failed to read is not a missing claim -- it is an unknown one, and the whole
+  // inventory stops being usable as evidence.
+  let environmentInventoryComplete = true;
+  for (const thread of threads) {
+    if (thread.environmentId === null) continue;
+    try {
+      const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
+      if (!environment.path) {
+        environmentInventoryComplete = false;
+        continue;
+      }
+      const path = canonicalWorktreePath(environment.path);
+      const owners = liveWorktreeThreadIds.get(path) ?? new Set<string>();
+      owners.add(thread.id);
+      liveWorktreeThreadIds.set(path, owners);
+    } catch {
+      environmentInventoryComplete = false;
+    }
+  }
+  return cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete);
+}
+
 async function runCli(
   db: SqliteDatabase | null,
   bb: BbPluginApi,
@@ -1335,31 +1364,7 @@ async function runCli(
   if (command === "worktree-cleanup") {
     if (unexpectedFlags(args, ["--project"])) return invalidCli("unexpected worktree-cleanup argument; report-only command has no apply mode");
     try {
-      const project = await bb.sdk.projects.get({ projectId });
-      const source = project.sources.find((item) => item.isDefault) ?? project.sources[0];
-      if (!source) return invalidCli("project has no source checkout");
-      const threads = await listAllProjectThreads((request) => bb.sdk.threads.list(request), projectId);
-      const liveWorktreeThreadIds = new Map<string, Set<string>>();
-      // Detached ownership is resolved from the absence of a claim, so an environment we
-      // failed to read is not a missing claim -- it is an unknown one, and the whole
-      // inventory stops being usable as evidence.
-      let environmentInventoryComplete = true;
-      for (const thread of threads) {
-        if (thread.environmentId === null) continue;
-        try {
-          const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
-          if (!environment.path) {
-            environmentInventoryComplete = false;
-            continue;
-          }
-          const owners = liveWorktreeThreadIds.get(canonicalWorktreePath(environment.path)) ?? new Set<string>();
-          owners.add(thread.id);
-          liveWorktreeThreadIds.set(canonicalWorktreePath(environment.path), owners);
-        } catch {
-          environmentInventoryComplete = false;
-        }
-      }
-      const result = cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete);
+      const result = await reportProjectWorktreeCleanup(bb, projectId);
       return { exitCode: result.refused.length === 0 ? 0 : 2, stdout: JSON.stringify(result) };
     } catch (error) {
       return { exitCode: 2, stdout: JSON.stringify({ outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error instanceof Error ? error.message : String(error) }], environmentRecordsReleased: false }) };
@@ -2936,6 +2941,30 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   bb.background.schedule("fleet-watchdog", "*/5 * * * *", () => {
     checkDeployedDist();
     return fleetWatchdogCycle();
+  });
+
+  bb.background.schedule("worktree-cleanup", "0 * * * *", async () => {
+    let projects: Awaited<ReturnType<typeof bb.sdk.projects.list>>;
+    try {
+      projects = await bb.sdk.projects.list({ includePersonal: true });
+    } catch (error) {
+      const report = { outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: `project inventory unavailable: ${String(error)}` }], environmentRecordsReleased: false };
+      bb.log.warn(`worktree-cleanup report: ${JSON.stringify(report)}`);
+      bb.realtime.publish("worktree-cleanup", report);
+      return;
+    }
+    for (const project of projects) {
+      try {
+        const report = await reportProjectWorktreeCleanup(bb, project.id);
+        if (report.wouldRemove.length > 0) bb.log.warn(`worktree-cleanup report: project=${project.id} ${JSON.stringify(report)}`);
+        else bb.log.info(`worktree-cleanup healthy cycle: project=${project.id} refused=${report.refused.length}`);
+        bb.realtime.publish("worktree-cleanup", { projectId: project.id, ...report });
+      } catch (error) {
+        const report = { projectId: project.id, outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error instanceof Error ? error.message : String(error) }], environmentRecordsReleased: false };
+        bb.log.warn(`worktree-cleanup report: project=${project.id} ${JSON.stringify(report)}`);
+        bb.realtime.publish("worktree-cleanup", report);
+      }
+    }
   });
 
   // This is deliberately a report-only schedule. Archive is available only
