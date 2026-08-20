@@ -47,8 +47,16 @@ npm run --silent executed-profile -- --project PROJECT_ID --thread THREAD_ID
 The command reports only provider-native executed model/reasoning evidence. It
 returns `unknown` rather than substituting requested spawn fields when the
 native record is absent, conflicting, still running, or from an unsupported
-provider. Claude Code reports its native model name but does not prove a
-requested context-window suffix such as `[1m]`.
+provider. A Claude Code base-family observation such as `claude-opus-5` remains
+visible as `observedProfile`, but its compliance result is `unknown` because it
+does not establish an exact dispatched SKU or context-window suffix such as
+`[1m]`. The reader never normalizes or guesses that suffix.
+
+Pi has zero measured native read-back coverage. Its result and each affected
+turn explicitly say `provider pi has no measured native read-back`; this is
+different from a broken Codex or Claude reader. Until Pi gains native read-back,
+the director's executed profile is self-attested rather than verified by this
+tool.
 
 ## Sidebar thread list
 
