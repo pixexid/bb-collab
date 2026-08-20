@@ -8,6 +8,11 @@ paired succession action.
 Superseded in part by [ADR 0007](0007-v21-authority-ceremony-removal.md) for
 the authority-ceremony machinery it removes. The role-split history remains.
 
+Contract v34 corrects the profile provenance assumed by this 2026-08-16 ADR:
+the stored tuple and native request event are requested, not executed,
+evidence. Executed-profile readback remains unavailable under GH-215 and
+upstream get-bb/bb#1787.
+
 Supersedes: the contract v14 director-seat placement under the
 `project-orchestrator` role, the contract v15 current-generation exemption
 attached to that placement, and the already-shipped v16 witness-holder
@@ -40,7 +45,7 @@ Contract v17 splits the director into its own logical role.
   `worker`, `independent-reviewer`. `director` is project-scoped with zero
   writing-lane capacity. Scoping rules otherwise unchanged.
 - The `director-seat` role requirement migrates from role
-  `project-orchestrator` to role `director`. Its executed profile
+  `project-orchestrator` to role `director`. Its requested profile
   (`pi/kimi-coding/k3/high`, full/default/visible) and its exact Opus-medium
   standby profile are unchanged. The standby carries no authority, lease,
   assignment, dispatch target, or traffic, as before.
@@ -72,7 +77,7 @@ Contract v17 splits the director into its own logical role.
 
 - The director first-generation creation runs as instrumented drill zero:
   null predecessor, the existing `role_generation_succession` machinery, the
-  full graded evidence set (executed profile from the execution event, exact
+  full graded evidence set (requested profile from the request event, exact
   environment/source identifiers, mutation receipt and idempotency key,
   holder-state resolution proof, witness-refusal firing proof, zero tells on
   the retired seat). It is single-seat and does not count toward the paired

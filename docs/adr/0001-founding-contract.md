@@ -8,6 +8,13 @@
 Superseded in part by [ADR 0007](0007-v21-authority-ceremony-removal.md) for
 the authority-ceremony machinery it removes. The remaining history is intact.
 
+Contract v34 corrects this ADR's execution-profile terminology. Current
+`ExecutionAttempt` profile fields are request provenance from
+`client/turn/requested`; they do not prove what BB executed. Historical
+contract descriptions below retain the terminology used at their dates.
+Authoritative executed-profile readback remains unavailable under GH-215 and
+upstream get-bb/bb#1787.
+
 This ADR is the controlling design decision for issue 1. The GPT-5 Pro
 verdict is advisory evidence. The founder adjudication is the disposition.
 This repository is a distillation from llm-collab, not a fork or a second
@@ -71,11 +78,11 @@ infrastructure, but they must not create duplicate authority concepts.
 | WorkItem | work_item_id | Canonical work lifecycle, project, optional exact repository target, state, priority, holds and optimistic revision. |
 | ExternalWorkRef | source_system, external_scope_id, external_key | Typed mapping to one WorkItem for a GitHub issue, BB Task or imported legacy task. The external object is not authority. |
 | Assignment | assignment_id | Immutable requested authorization: WorkItem, assignment kind, lane, role requirement, target, branch/base/candidate semantics, brief digest, requested profile, parent/depth and idempotency key. |
-| ExecutionAttempt | execution_attempt_id | One dispatch attempt under an Assignment, including BB server, thread, environment, host, native correlation IDs, actual profile, lifecycle and terminal evidence. Native references are unique in their BB server scope. |
+| ExecutionAttempt | execution_attempt_id | One dispatch attempt under an Assignment, including BB server, thread, environment, host, native correlation IDs, requested-profile provenance, lifecycle and terminal evidence. Native references are unique in their BB server scope. |
 | Decision | decision_id | Immutable project, scope, class and options identity. A consult does not become an authority decision merely by existing. |
 | DecisionDisposition | decision_id, disposition_sequence | Append-only proposed, adopted, rejected, superseded or revoked disposition, with typed actor, conditions, reason and revert. Current state is derived. |
 | AuthorizedApprover | project_id, approver_id, authorizing_decision_id, authorizing_disposition_sequence | Durable active/revoked registry row for `orchestrator:bb-collab`, linked to the exact adopted `operator_only` Decision disposition and the exact current ten-class set; the bounded historical v11 repair remains readable during authority maintenance. |
-| QualificationObservation | qualification_id | Immutable fixture-bound capability result for an exact executed-profile digest and observed BB/runtime/fixture context. |
+| QualificationObservation | qualification_id | Immutable fixture-bound capability result for an exact requested-profile digest and observed BB/runtime/fixture context. It does not prove the profile BB executed. |
 | EligibilityProjection | project_id, role_requirement_id, profile_digest | Rebuildable current eligibility with observation references, expiry and requalification trigger. |
 | EvidenceArtifact | evidence_id, content_digest where appropriate | Content-addressed review, test, consult, release, export, receipt or legacy artifact with durable location metadata. |
 | MigrationRun | migration_id; unique source_system, project_id, source_export_digest | Idempotent prepare/freeze/export/import/equivalence/activation/rollback receipt. |
@@ -350,15 +357,16 @@ An ExecutionAttempt records:
 
 - exact BB server, thread, environment and host references;
 - native command/request and event-correlation IDs;
-- actual provider, model, reasoning, permission and visibility from
-  provider/BB receipts;
+- requested provider, model, reasoning, permission, service tier, and
+  visibility from `client/turn/requested`, labeled as request provenance;
 - lifecycle events and timestamps;
 - terminal DONE, BLOCKED, FAILED, CANCELED or DISPATCH_UNKNOWN state;
 - terminal report digest and evidence references.
 
-The requested tuple is never copied into executed fields. Unknown executed
-values remain unknown. If the role or gate requires a known value, the attempt
-is ineligible even if its output looks plausible.
+No executed-profile fields exist until BB exposes an authoritative readback.
+Executed model, reasoning, permission mode, and service tier therefore remain
+unknown after the fact. A request tuple can support requested-policy checks but
+cannot satisfy a gate that requires executed-profile proof.
 
 One active writer per lane is policy. A read-only review or probe is
 explicitly assigned, uses a clean isolated environment bound to the exact
@@ -378,8 +386,9 @@ Worker briefs also make subagent effort explicit. Mechanical subtasks such as
 fixtures, sweeps, documentation sync and scaffolds default to LOW reasoning
 when the value is omitted, including when their parent used HIGH or MAX. HIGH
 or MAX is retained only for an explicit hard-core request. The existing
-Assignment requested profile and ExecutionAttempt actual profile are the
-conformance record; this rule adds no spawn queue or authority store.
+Assignment and ExecutionAttempt requested profiles are the request-conformance
+record; this rule adds no spawn queue or authority store and provides no
+executed-profile readback.
 
 ## 7. Review, release and connector policy
 
@@ -674,7 +683,7 @@ The advisory verdict is adopted only through these dispositions:
 | Logical role/current generation | Amend: keep RoleGeneration and RoleHead with pending, active, draining, retired and invalidated states; add separate governorship. |
 | Assignment/execution | Amend: split immutable Assignment intent from one-or-more ExecutionAttempt receipts. |
 | Decision/provenance | Amend: immutable Decision, append-only dispositions and advisory EvidenceArtifact relations. |
-| Capability/qualification | Amend: immutable QualificationObservation keyed by executed-profile and runtime/fixture digest; derive EligibilityProjection. |
+| Capability/qualification | Amend: immutable QualificationObservation keyed by requested-profile and runtime/fixture digest; derive EligibilityProjection. Executed-profile qualification awaits authoritative BB readback. |
 | Project extension | Amend: immutable config revisions and stable repository targets; store secret references only. |
 | Missing WorkItem | Reject the omission: add canonical WorkItem and ExternalWorkRef. |
 | Missing ProjectGovernorship | Reject the omission: add one epoch/head/fence. |

@@ -9,7 +9,7 @@ second role store.
 
 Contract v17 moves `director-seat` to the separate `director` role and
 supersedes the v15 current-generation exemption with one exact
-first-generation environment exemption. The primary executed profile is exactly
+first-generation environment exemption. The primary requested profile is exactly
 `pi/kimi-coding/k3/high` (`providerId: pi`, `model: kimi-coding/k3`,
 `reasoningLevel: high`, `permissionMode: full`, `serviceTier: default`,
 `visibility: visible`). Its alternate/standby is exactly
@@ -22,6 +22,10 @@ qualification and create director generation 1, receipt-gated with no
 predecessor and no existing director head, from that approved unmanaged
 canonical environment. Every later director generation requires a ready managed
 isolated worktree; the exemption is not a general unmanaged path.
+
+This profile is a dispatch-time requirement, not executed readback. BB exposes
+no authoritative executed model or reasoning fact after the turn; GH-215 and
+upstream get-bb/bb#1787 track that platform gap.
 
 The following is a prepared operator-only Decision payload, not a canonical
 Decision row or a succession apply:
@@ -58,7 +62,7 @@ to the holder, source, environment, and profile; foreign, stale,
 wrong-generation, wrong-profile, and writing requests refuse before any write.
 No historical RoleGeneration row is fabricated. Before any future handover, dry-run
 the proposed holder against the current requirement, exact managed environment
-and executed profile, and generation head plus one. If that preflight predicts a
+and requested profile, and generation head plus one. If that preflight predicts a
 refusal, amend the requirement through `config_revision` and its exact operator
 receipt first. Then record the succession through the receipt-gated apply before
 the successor takes the seat. Operator word or witness evidence alone never
@@ -72,10 +76,11 @@ seated successor.
 ## Separate generic orchestrator seat
 
 The ordinary `orchestrator-v1` project-orchestrator requirement is a separate
-seat from `director-seat`. Its actual executed profile is the exact profile in
-the canonical requirement and native execution evidence; the repository's
+seat from `director-seat`. Its required requested profile is the exact profile
+in the canonical requirement; the repository's
 current generic fixture is `codex/gpt-5.6-sol/high/full/default/visible`. It
-does not inherit the director primary or standby profile. The prepared
+does not prove the profile BB executed and does not inherit the director primary
+or standby profile. The prepared
 current director configuration uses `pi/kimi-coding/k3/high` with
 `claude-code/claude-opus-5[1m]/medium` standby as stated above, but the ratified
 director pair is symmetric: either profile may hold the seat with the other as
@@ -90,7 +95,7 @@ Only `director-seat` generations name one standby profile in
 `RoleGeneration.standby_profile_json`. The configured standby is the exact
 `claude-code/claude-opus-5[1m]/medium` profile for the
 `pi/kimi-coding/k3`-primary amendment,
-and its provider must differ from the director holder's executed provider; a
+and its provider must differ from the director holder's requested provider; a
 same-provider or missing standby refuses before any canonical write. The pair
 is symmetric: either ratified profile may be the holder and the other the
 standby, subject to the different-provider rule. When the standby is promoted,
@@ -124,7 +129,10 @@ thread's model in place.
 3. Prepare the successor with explicit provider, model, reasoning,
    permission, service-tier, and visibility values. Do not rely on remembered
    defaults.
-4. Verify the executed profile from native provider events, not spawn flags.
+4. Bind the exact requested profile at dispatch and require the successor to
+   attest its executed profile. Do not treat that attestation or the
+   `client/turn/requested` event as authoritative readback; after-the-fact
+   execution remains unknown until GH-215/upstream get-bb/bb#1787 lands.
    If promoting the director standby, reverse the ratified pair in the
    succession request: the promoted former standby is the holder and the
    former primary is the standby. Confirm that the standby provider differs
@@ -166,6 +174,10 @@ canonical record even when the dead thread cannot receive a tell.
 
 ## Live v13 evidence (2026-08-15)
 
+This section is retained as dated history. Its `executed profile` labels were
+later disproved by GH-228: those stored values came from request provenance,
+not authoritative executed readback.
+
 The live `bb-collab` checkout was refreshed to merge
 `468c770ed4f94975ace80bd5d36f5d0b67feaddf` for project
 `proj_a8zzfsx36j`. Doctor and export report contract v13/schema v11, with all
@@ -176,7 +188,7 @@ standing approver is the exact ten-class registry adopted by
 The recorded project-orchestrator generation is generation 2, predecessor 1,
 active, with holder execution attempt
 `a10c36147f8a585f94fd140f2caec739e7abeda16ef750f46fad62518db86875` and
-executed profile `claude-code/claude-opus-5[1m]/max/full/default/visible`.
+request-derived profile `claude-code/claude-opus-5[1m]/max/full/default/visible`.
 Its standby is the witnessed different-provider profile
 `pi/zai/glm-5.3/high/full/default/visible`, profile digest
 `40047e9f3f3db755b0dd7639860ddcf6e4e2f0a32d13e2acc6a051b440d5cc82`.

@@ -132,8 +132,9 @@ The first release is complete only when it can provide:
    and independent-reviewer roles; only director generation 1 may use the
    exact receipt-gated unmanaged qualification-and-creation exception.
 7. One sanctioned native BB assignment path with separate Assignment and
-   ExecutionAttempt records, exact executed-profile receipts, isolated
-   environments and terminal reports.
+   ExecutionAttempt records, exact requested-profile provenance, isolated
+   environments and terminal reports. Executed-profile readback remains a BB
+   platform gap tracked by GH-215 and upstream get-bb/bb#1787.
 8. Decisions, dispositions, evidence artifacts and operator holds, with
    consults explicitly advisory.
 9. Tiered review, release and environment-safety gates with Tier-A exact-head

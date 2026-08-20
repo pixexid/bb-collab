@@ -18,11 +18,15 @@ This is the only option that makes the schema answer one question per value.
 It also prevents a future executed tuple from being written over, or compared
 as though it were interchangeable with, the historical request tuple.
 
-## Measured live population
+## Measured pre-migration live population
 
 Read from the live canonical store on 2026-08-19. A row counted as populated
 when any of the four subject columns was non-null; in this population, every
 such row had all four non-null.
+
+The table and query in this section deliberately retain the pre-migration
+`actual_*` names as dated evidence. They are not current schema guidance after
+the rename.
 
 | Origin | Rows | Rows with subject `actual_*` values | Interpretation |
 | --- | ---: | ---: | --- |
@@ -82,8 +86,9 @@ relabel the four populated values and `actual_profile_digest` to requested names
 rename or type the qualification, eligibility, and role-generation digest
 consumers as request-derived legacy evidence; preserve the existing four
 `attempt_digest` values byte-for-byte; and update every verifier, export, receipt, and
-projection that follows those digests. The 45 `work_item` attempts remain null
-and must not be backfilled with invented profile data.
+projection that follows those digests. All non-role-holder attempts in the
+dated sample remain null: 68 total minus four `role_holder` attempts derives 64
+`work_item` attempts. They must not be backfilled with invented profile data.
 
 The later platform-gated phase adds a separate executed digest graph rather
 than reusing the request digest. Until then, executed-profile checks return
