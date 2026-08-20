@@ -3188,7 +3188,14 @@ describe("bb-collab plugin boundary", () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-queue-"));
     const gh = join(bin, "gh");
     const argsLog = join(bin, "args");
-    writeFileSync(gh, `#!/bin/sh\nprintf '%s\\n' "$@" > "${argsLog}"\nprintf '%s\\n' '[{"number":205,"labels":[{"name":"queue:startable"}]}]'\n`);
+    writeFileSync(gh, `#!/bin/sh
+printf '%s\\n' "$@" >> "${argsLog}"
+if [ "$1" = "api" ]; then
+  printf '%s\\n' '[[{"number":205,"labels":[{"name":"queue:startable"}]}]]'
+else
+  printf '%s\\n' '[{"number":205,"labels":[{"name":"queue:startable"}]}]'
+fi
+`);
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3229,7 +3236,7 @@ describe("bb-collab plugin boundary", () => {
       ]);
       const persisted = await fixture.host.bb.storage.kv.get<Record<string, { lastFleetWakeAtMs: number | null; lastStartableQueueWakeAtMs: number | null }>>("fleet-watchdog.role-idle");
       expect(Object.values(persisted ?? {})).toContainEqual(expect.objectContaining({ lastFleetWakeAtMs: null, lastStartableQueueWakeAtMs: expect.any(Number) }));
-      expect(readFileSync(argsLog, "utf8")).toBe("issue\nlist\n--repo\nexample/project\n--state\nopen\n--json\nnumber,labels\n--limit\n1000\n");
+      expect(readFileSync(argsLog, "utf8")).toBe("issue\nlist\n--repo\nexample/project\n--label\nqueue:startable\n--state\nopen\n--json\nnumber,labels\n--limit\n1000\napi\nrepos/example/project/issues\n--paginate\n--slurp\n--method\nGET\n-f\nstate=open\n-f\nper_page=100\n".repeat(4));
     } finally {
       clock.mockRestore();
       if (originalPath === undefined) delete process.env.PATH;
@@ -3242,8 +3249,11 @@ describe("bb-collab plugin boundary", () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-unlabelled-queue-"));
     const gh = join(bin, "gh");
     writeFileSync(gh, `#!/bin/sh
-if [ "$8" != "number,labels" ]; then exit 1; fi
-printf '%s\\n' '[{"number":457,"labels":[]},{"number":249,"labels":[{"name":"queue:blocked"}]}]'
+if [ "$1" = "api" ]; then
+  printf '%s\\n' '[[{"number":457,"labels":[]},{"number":249,"labels":[{"name":"queue:blocked"}]}]]'
+else
+  printf '%s\\n' '[]'
+fi
 `);
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
@@ -3258,6 +3268,39 @@ printf '%s\\n' '[{"number":457,"labels":[]},{"number":249,"labels":[{"name":"que
           threadId: fixture.orchestratorThreadId,
           mode: "queue-if-active",
           input: [expect.objectContaining({ text: "startable queue has 0 issues; 1 open issue has no queue label; 0/1 writing lanes active" })],
+        }),
+      ]]);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves server-side startable filtering beyond the unlabelled scan page limit", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-page-limit-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/usr/bin/env node
+const blocked = Array.from({ length: 1000 }, (_, index) => ({ number: index + 2, labels: [{ name: "queue:blocked" }] }));
+const startable = { number: 1, labels: [{ name: "queue:startable" }] };
+const args = process.argv.slice(2);
+if (args[0] === "api") console.log(JSON.stringify([blocked, [startable]]));
+else if (args.includes("--label")) console.log(JSON.stringify([startable]));
+else console.log(JSON.stringify(blocked));
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({
+          threadId: fixture.orchestratorThreadId,
+          mode: "queue-if-active",
+          input: [expect.objectContaining({ text: "startable queue has 1 issue; 0 open issues have no queue label; 0/1 writing lanes active" })],
         }),
       ]]);
     } finally {
@@ -3416,7 +3459,7 @@ exit 1
   it("wakes the exact idle orchestrator from a real idle event after the debounce", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-queue-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s\\n' '[[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]]'; else printf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'; fi\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3453,7 +3496,7 @@ exit 1
     const gh = join(bin, "gh");
     const queue = join(bin, "queue.json");
     writeFileSync(queue, '[{"number":305,"labels":[{"name":"queue:startable"}]}]\n');
-    writeFileSync(gh, `#!/bin/sh\ncat ${queue}\n`);
+    writeFileSync(gh, `#!/bin/sh\nif [ "$1" = api ]; then printf '['; cat ${queue}; printf ']\\n'; else cat ${queue}; fi\n`);
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3524,7 +3567,7 @@ exit 1
   it("wakes an idle orchestrator when non-terminal work is review_pending", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-review-pending-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s\\n' '[[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]]'; else printf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'; fi\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3561,7 +3604,7 @@ exit 1
   it("extends unchanged lane-capacity observations and starts a new interval when facts change", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-lane-capacity-write-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s\\n' '[[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]]'; else printf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'; fi\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3630,7 +3673,7 @@ exit 1
     const queue = join(bin, "queue.json");
     const calls = join(bin, "calls");
     writeFileSync(queue, '[{"number":305,"labels":[{"name":"queue:startable"}]}]');
-    writeFileSync(gh, `#!/bin/sh\nprintf 'call\\n' >> "${calls}"\ncat "${queue}"\n`);
+    writeFileSync(gh, `#!/bin/sh\nprintf 'call\\n' >> "${calls}"\nif [ "$1" = api ]; then printf '['; cat "${queue}"; printf ']\\n'; else cat "${queue}"; fi\n`);
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3736,7 +3779,7 @@ exit 1
   it("records known coverage on the first active observation after staleness", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-attempt-liveness-first-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s\\n' '[[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]]'; else printf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'; fi\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3802,7 +3845,7 @@ exit 1
   it("keeps attempts stale when native lane status is unavailable", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-attempt-liveness-404-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s\\n' '[[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]]'; else printf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'; fi\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3879,7 +3922,7 @@ exit 1
   ])("fails closed for a known-but-invalid %s attempt", async (_name, state, threadId, reason) => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-invalid-attempt-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s\\n' '[[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]]'; else printf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'; fi\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3920,7 +3963,7 @@ exit 1
   it("excludes idle native lanes from the active lane count", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-idle-lanes-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s\\n' '[[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]]'; else printf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'; fi\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3947,7 +3990,7 @@ exit 1
   it("reports native live lanes disagreeing with canonical zero and never wakes", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-native-disagreement-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s\\n' '[[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]]'; else printf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'; fi\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
@@ -3989,7 +4032,7 @@ exit 1
   it("keeps startable intake running when a holder recovery is refused", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-after-refused-recovery-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":205,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s\\n' '[[{\"number\":205,\"labels\":[{\"name\":\"queue:startable\"}]}]]'; else printf '%s\\n' '[{\"number\":205,\"labels\":[{\"name\":\"queue:startable\"}]}]'; fi\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;

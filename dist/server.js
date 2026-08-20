@@ -21778,12 +21778,13 @@ function startableQueueState(repositories) {
   let count = 0;
   let unlabelledCount = 0;
   const heads = [];
+  const isIssue = (issue2) => Boolean(issue2 && typeof issue2 === "object" && !Array.isArray(issue2) && typeof issue2.number === "number" && Array.isArray(issue2.labels) && issue2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string"));
   for (const repository of repositories) {
-    const issues = githubJson(["issue", "list", "--repo", repository, "--state", "open", "--json", "number,labels", "--limit", "1000"]);
-    if (!Array.isArray(issues) || !issues.every((issue2) => issue2 && typeof issue2 === "object" && !Array.isArray(issue2) && typeof issue2.number === "number" && Array.isArray(issue2.labels) && issue2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string"))) return null;
-    const startable = issues.filter((issue2) => issue2.labels.some((label) => label.name === "queue:startable"));
+    const startable = githubJson(["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number,labels", "--limit", "1000"]);
+    const pages = githubJson(["api", `repos/${repository}/issues`, "--paginate", "--slurp", "--method", "GET", "-f", "state=open", "-f", "per_page=100"]);
+    if (!Array.isArray(startable) || !startable.every(isIssue) || !Array.isArray(pages) || !pages.every((page) => Array.isArray(page) && page.every(isIssue))) return null;
     count += startable.length;
-    unlabelledCount += issues.filter((issue2) => !issue2.labels.some((label) => label.name.startsWith("queue:"))).length;
+    unlabelledCount += pages.flat().filter((issue2) => !("pull_request" in issue2) && !issue2.labels.some((label) => label.name.startsWith("queue:"))).length;
     const numbers = startable.map((issue2) => issue2.number);
     if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
   }

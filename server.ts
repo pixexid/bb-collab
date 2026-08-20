@@ -112,16 +112,18 @@ function startableQueueState(repositories: string[]): StartableQueueState | null
   let count = 0;
   let unlabelledCount = 0;
   const heads: string[] = [];
+  const isIssue = (issue: unknown): issue is { number: number; labels: Array<{ name: string }> } => Boolean(issue && typeof issue === "object" && !Array.isArray(issue)
+    && typeof (issue as { number?: unknown }).number === "number"
+    && Array.isArray((issue as { labels?: unknown }).labels)
+    && (issue as { labels: unknown[] }).labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof (label as { name?: unknown }).name === "string"));
   for (const repository of repositories) {
-    const issues = githubJson(["issue", "list", "--repo", repository, "--state", "open", "--json", "number,labels", "--limit", "1000"]);
-    if (!Array.isArray(issues) || !issues.every((issue) => issue && typeof issue === "object" && !Array.isArray(issue)
-      && typeof (issue as { number?: unknown }).number === "number"
-      && Array.isArray((issue as { labels?: unknown }).labels)
-      && (issue as { labels: unknown[] }).labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof (label as { name?: unknown }).name === "string"))) return null;
-    const startable = issues.filter((issue) => (issue as { labels: Array<{ name: string }> }).labels.some((label) => label.name === "queue:startable"));
+    const startable = githubJson(["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number,labels", "--limit", "1000"]);
+    const pages = githubJson(["api", `repos/${repository}/issues`, "--paginate", "--slurp", "--method", "GET", "-f", "state=open", "-f", "per_page=100"]);
+    if (!Array.isArray(startable) || !startable.every(isIssue)
+      || !Array.isArray(pages) || !pages.every((page) => Array.isArray(page) && page.every(isIssue))) return null;
     count += startable.length;
-    unlabelledCount += issues.filter((issue) => !(issue as { labels: Array<{ name: string }> }).labels.some((label) => label.name.startsWith("queue:"))).length;
-    const numbers = startable.map((issue) => (issue as { number: number }).number);
+    unlabelledCount += pages.flat().filter((issue) => !("pull_request" in issue) && !issue.labels.some((label) => label.name.startsWith("queue:"))).length;
+    const numbers = startable.map((issue) => issue.number);
     if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
   }
   return { count, head: heads.sort()[0] ?? null, unlabelledCount };
