@@ -11,13 +11,168 @@ const completion = (providerThreadId, checkpointId) => ({
   data: { status: "completed", providerThreadId, providerCheckpointId: checkpointId },
 });
 
+function activeEvents(providerThreadId, nativeTurnId = "active-turn") {
+  const scope = { kind: "turn", turnId: `bb-turn-${nativeTurnId}` };
+  return [
+    { id: "event-requested", seq: 10, type: "client/turn/requested", data: { requestId: "request-active" }, createdAt: Date.parse("2026-08-20T00:00:10.000Z") },
+    { id: "event-active", seq: 11, type: "turn/started", data: { providerThreadId }, scope, createdAt: Date.parse("2026-08-20T00:00:11.000Z") },
+    { id: "event-accepted", seq: 12, type: "turn/input/accepted", data: { providerThreadId, clientRequestId: "request-active" }, scope, createdAt: Date.parse("2026-08-20T00:00:11.000Z") },
+  ];
+}
+
 function jsonl(path, records) {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
 }
 
 describe("executed profile read-back", () => {
-  it("correlates Codex turn_context and rejects conflicting profiles", async () => {
+  it("DISCRIMINATOR: reads the active Codex turn from its provider-native rollout", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/test/project" } },
+      { type: "turn_context", timestamp: "2026-08-20T00:00:10.500Z", payload: { turn_id: "active-turn", model: "gpt-5.6-sol", effort: "medium" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "active" },
+      environment: { path: "/test/project" },
+      events: activeEvents(providerThreadId),
+      home,
+    });
+    expect(result).toMatchObject({
+      outcome: "known",
+      coverage: { activeTurns: 1, completedTurns: 0, knownTurns: 1, unknownTurns: 0 },
+      turns: [{
+        phase: "active",
+        status: "known",
+        executedProfile: { providerId: "codex", model: "gpt-5.6-sol", reasoningLevel: "medium", kind: "executed-provider-native" },
+      }],
+    });
+  });
+
+  it("GUARD: reads active Claude and Pi profiles from their native session surfaces", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const claudeSession = "123e4567-e89b-42d3-a456-426614174000";
+    jsonl(join(home, ".claude", "projects", "-test-project", `${claudeSession}.jsonl`), [
+      { type: "assistant", timestamp: "2026-08-20T00:00:10.500Z", uuid: "active-claude", effort: "medium", message: { model: "claude-opus-5[1m]" } },
+    ]);
+    const claudeResult = await readExecutedProfiles({
+      thread: { providerId: "claude-code", status: "active" },
+      environment: { path: "/test/project" },
+      events: activeEvents(claudeSession),
+      home,
+    });
+    expect(claudeResult).toMatchObject({ outcome: "known", turns: [{ phase: "active", executedProfile: { model: "claude-opus-5[1m]", reasoningLevel: "medium" } }] });
+
+    jsonl(join(home, ".pi", "agent", "sessions", "--test-project--", "2026-08-20T00-00-00-000Z_123e4567-e89b-42d3-a456-426614174000.jsonl"), [
+      { type: "session", id: "123e4567-e89b-42d3-a456-426614174000", cwd: "/test/project" },
+      { type: "thinking_level_change", id: "00000001", parentId: null, thinkingLevel: "high" },
+      { type: "message", id: "00000002", parentId: "00000001", timestamp: "2026-08-20T00:00:10.500Z", message: { role: "assistant", provider: "kimi-coding", model: "k3" } },
+    ]);
+    const piResult = await readExecutedProfiles({
+      thread: { providerId: "pi", status: "active" },
+      environment: { path: "/test/project" },
+      events: activeEvents("123e4567-e89b-42d3-a456-426614174000"),
+      home,
+    });
+    expect(piResult).toMatchObject({ outcome: "known", turns: [{ phase: "active", executedProfile: { model: "kimi-coding/k3", reasoningLevel: "high" } }] });
+  });
+
+  it("GUARD: refuses ambiguous or foreign active Codex sessions", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/other/project" } },
+      { type: "turn_context", timestamp: "2026-08-20T00:00:10.500Z", payload: { turn_id: "active-turn", model: "DO_NOT_EMIT", effort: "medium" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "active" },
+      environment: { path: "/test/project" },
+      events: activeEvents(providerThreadId),
+      home,
+    });
+    expect(result).toMatchObject({ outcome: "unknown", reason: "active BB turn: Codex session_meta does not match the BB session and exact environment path" });
+    expect(JSON.stringify(result)).not.toMatch(/DO_NOT_EMIT|other\/project|executedProfile/u);
+
+    const ambiguousHome = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    for (const prefix of ["rollout-a", "rollout-b"]) {
+      jsonl(join(ambiguousHome, ".codex", "sessions", "2024", "01", "01", `${prefix}-${providerThreadId}.jsonl`), [
+        { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/test/project" } },
+        { type: "turn_context", timestamp: "2026-08-20T00:00:10.500Z", payload: { turn_id: prefix, model: "DO_NOT_EMIT", effort: "medium" } },
+      ]);
+    }
+    const ambiguous = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "active" },
+      environment: { path: "/test/project" },
+      events: activeEvents(providerThreadId),
+      home: ambiguousHome,
+    });
+    expect(ambiguous).toMatchObject({ outcome: "unknown", reason: "active BB turn: expected one Codex session log, found 2" });
+    expect(JSON.stringify(ambiguous)).not.toMatch(/DO_NOT_EMIT|executedProfile/u);
+  });
+
+  it("DISCRIMINATOR: refuses stale Codex and Claude profiles that predate the active BB turn request", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const codexSession = "018cc251-f400-7000-8000-000000000000";
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${codexSession}.jsonl`), [
+      { type: "session_meta", payload: { id: codexSession, originator: "bb", cwd: "/test/project" } },
+      { type: "turn_context", timestamp: "2026-08-20T00:00:09.000Z", payload: { turn_id: "prior-turn", model: "STALE_CODEX", effort: "high" } },
+    ]);
+    const codexResult = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "active" },
+      environment: { path: "/test/project" },
+      events: activeEvents(codexSession, "current-turn"),
+      home,
+    });
+    expect(codexResult).toMatchObject({ outcome: "unknown", turns: [{ phase: "active", status: "unknown" }] });
+    expect(JSON.stringify(codexResult)).not.toMatch(/STALE_CODEX|executedProfile/u);
+
+    const claudeSession = "123e4567-e89b-42d3-a456-426614174000";
+    jsonl(join(home, ".claude", "projects", "-test-project", `${claudeSession}.jsonl`), [
+      { type: "assistant", timestamp: "2026-08-20T00:00:09.000Z", uuid: "prior-turn", effort: "high", message: { model: "STALE_CLAUDE[1m]" } },
+    ]);
+    const claudeResult = await readExecutedProfiles({
+      thread: { providerId: "claude-code", status: "active" },
+      environment: { path: "/test/project" },
+      events: activeEvents(claudeSession),
+      home,
+    });
+    expect(claudeResult).toMatchObject({ outcome: "unknown", turns: [{ phase: "active", status: "unknown" }] });
+    expect(JSON.stringify(claudeResult)).not.toMatch(/STALE_CLAUDE|executedProfile/u);
+  });
+
+  it("DISCRIMINATOR: refuses Pi profiles when the BB-named native session is absent", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const directory = join(home, ".pi", "agent", "sessions", "--test-project--");
+    for (const [timestamp, sessionId, provider, model] of [
+      ["2026-08-20T00-00-00-000Z", "123e4567-e89b-42d3-a456-426614174000", "kimi-coding", "older"],
+      ["2026-08-20T01-00-00-000Z", "223e4567-e89b-42d3-a456-426614174000", "WRONG_PROVIDER", "WRONG_SESSION"],
+    ]) {
+      jsonl(join(directory, `${timestamp}_${sessionId}.jsonl`), [
+        { type: "session", id: sessionId, cwd: "/test/project" },
+        { type: "thinking_level_change", id: `${sessionId}-reasoning`, parentId: null, thinkingLevel: "high" },
+        { type: "message", id: `${sessionId}-message`, parentId: `${sessionId}-reasoning`, timestamp: "2026-08-20T00:00:11.000Z", message: { role: "assistant", provider, model } },
+      ]);
+    }
+    const result = await readExecutedProfiles({
+      thread: { providerId: "pi", status: "active" },
+      environment: { path: "/test/project" },
+      events: activeEvents("323e4567-e89b-42d3-a456-426614174000"),
+      home,
+    });
+    expect(result).toMatchObject({ outcome: "unknown", turns: [{ phase: "active", status: "unknown" }] });
+    expect(JSON.stringify(result)).not.toMatch(/WRONG_PROVIDER|WRONG_SESSION|executedProfile/u);
+
+    const selected = await readExecutedProfiles({
+      thread: { providerId: "pi", status: "active" },
+      environment: { path: "/test/project" },
+      events: activeEvents("123e4567-e89b-42d3-a456-426614174000"),
+      home,
+    });
+    expect(selected).toMatchObject({ outcome: "known", turns: [{ executedProfile: { model: "kimi-coding/older", reasoningLevel: "high" } }] });
+  });
+
+  it("GUARD: preserves completed Codex correlation and conflict handling", async () => {
     const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
     const providerThreadId = "018cc251-f400-7000-8000-000000000000";
     jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [

@@ -6,6 +6,7 @@ import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 
 const PAGE_SIZE = 1_000;
+const ACTIVE_PROFILE = Symbol("active profile");
 
 function realPathInside(root, candidate) {
   try {
@@ -78,13 +79,50 @@ function completedTurns(events) {
   });
 }
 
+function activeTurn(thread, events) {
+  if (thread.status !== "active") return null;
+  const start = events
+    .filter((event) => event?.type === "turn/started" && typeof event.data?.providerThreadId === "string" && event.data.providerThreadId !== "")
+    .sort((left, right) => left.seq - right.seq)
+    .at(-1);
+  if (!start) return { reason: "BB thread is active but its current turn start is missing" };
+  if (typeof start.scope?.turnId !== "string" || start.scope.turnId === "") return { reason: "BB active turn identity is unavailable" };
+  const completedAfterStart = events.some((event) => event?.type === "turn/completed" && event.seq > start.seq && event.data?.providerThreadId === start.data.providerThreadId);
+  if (completedAfterStart) return { reason: "BB thread is active but its latest provider turn is already terminal" };
+  const accepted = events.filter((event) => event?.type === "turn/input/accepted"
+    && event.data?.providerThreadId === start.data.providerThreadId
+    && event.scope?.turnId === start.scope?.turnId);
+  if (accepted.length !== 1 || typeof accepted[0].data?.clientRequestId !== "string" || accepted[0].data.clientRequestId === "") {
+    return { reason: "BB active turn input correlation is missing or ambiguous" };
+  }
+  const requests = events.filter((event) => event?.type === "client/turn/requested" && event.data?.requestId === accepted[0].data.clientRequestId);
+  if (requests.length !== 1 || !Number.isSafeInteger(requests[0].createdAt)) return { reason: "BB active turn request timestamp is missing or ambiguous" };
+  return {
+    requestedAtMs: requests[0].createdAt,
+    scopeTurnId: start.scope.turnId,
+    turn: {
+      eventId: start.id,
+      eventSeq: start.seq,
+      checkpointId: null,
+      providerThreadId: start.data.providerThreadId,
+      phase: "active",
+    },
+  };
+}
+
+function recordAtOrAfter(record, timestampMs) {
+  const recordAtMs = typeof record?.timestamp === "string" ? Date.parse(record.timestamp) : Number.NaN;
+  return Number.isFinite(recordAtMs) && recordAtMs >= timestampMs;
+}
+
 function settle(turns, profiles, source, { absentReason = "provider-native turn profile is absent", ambiguous = new Set(), missingCorrelationReason = "BB completion lacks provider correlation", classify } = {}) {
   const results = turns.map((turn) => {
-    if (!turn.checkpointId || !turn.providerThreadId) {
+    const correlationId = turn.phase === "active" ? ACTIVE_PROFILE : turn.checkpointId;
+    if (!correlationId || !turn.providerThreadId) {
       return { ...turn, status: "unknown", reason: missingCorrelationReason };
     }
-    if (ambiguous.has(turn.checkpointId)) return { ...turn, status: "unknown", reason: "provider-native turn correlation is ambiguous" };
-    const matches = profiles.get(turn.checkpointId) ?? [];
+    if (ambiguous.has(correlationId)) return { ...turn, status: "unknown", reason: "provider-native turn correlation is ambiguous" };
+    const matches = profiles.get(correlationId) ?? [];
     const distinct = [...new Map(matches.map((profile) => [`${profile.model}\0${profile.reasoningLevel}`, profile])).values()];
     if (distinct.length !== 1) {
       return { ...turn, status: "unknown", reason: distinct.length === 0 ? absentReason : "provider-native turn profiles conflict" };
@@ -96,23 +134,30 @@ function settle(turns, profiles, source, { absentReason = "provider-native turn 
   });
   const knownTurns = results.filter((turn) => turn.status === "known").length;
   const observedOnlyTurns = results.filter((turn) => turn.observedProfile).length;
+  const activeTurns = results.filter((turn) => turn.phase === "active").length;
   return {
     outcome: knownTurns === results.length && results.length > 0 ? "known" : knownTurns > 0 ? "partial" : "unknown",
-    coverage: { completedTurns: results.length, knownTurns, unknownTurns: results.length - knownTurns, observedOnlyTurns },
+    coverage: { ...(activeTurns > 0 ? { activeTurns } : {}), completedTurns: results.length - activeTurns, knownTurns, unknownTurns: results.length - knownTurns, observedOnlyTurns },
     turns: results,
   };
 }
 
 export async function readExecutedProfiles({ thread, environment, events, home = homedir() }) {
-  const turns = completedTurns(events);
+  const active = activeTurn(thread, events);
+  if (active?.reason) {
+    return { outcome: "unknown", coverage: { activeTurns: 1, completedTurns: 0, knownTurns: 0, unknownTurns: 1, observedOnlyTurns: 0 }, turns: [], reason: active.reason };
+  }
+  const turns = active ? [active.turn] : completedTurns(events);
   const providerThreadIds = [...new Set(turns.map((turn) => turn.providerThreadId).filter(Boolean))];
   if (providerThreadIds.length !== 1) {
-    return { outcome: "unknown", coverage: { completedTurns: turns.length, knownTurns: 0, unknownTurns: turns.length, observedOnlyTurns: 0 }, turns, reason: "BB completions do not resolve to one provider session" };
+    const reason = active ? "active BB turn does not resolve to one provider session" : "BB completions do not resolve to one provider session";
+    return { outcome: "unknown", coverage: { ...(active ? { activeTurns: 1 } : {}), completedTurns: active ? 0 : turns.length, knownTurns: 0, unknownTurns: turns.length, observedOnlyTurns: 0 }, turns, reason };
   }
   const providerThreadId = providerThreadIds[0];
   const profiles = new Map();
   const add = (turnId, model, reasoningLevel) => {
-    if (![turnId, model, reasoningLevel].every((value) => typeof value === "string" && value !== "")) return;
+    if (turnId !== ACTIVE_PROFILE && (typeof turnId !== "string" || turnId === "")) return;
+    if (![model, reasoningLevel].every((value) => typeof value === "string" && value !== "")) return;
     profiles.set(turnId, [...(profiles.get(turnId) ?? []), { providerId: thread.providerId, model, reasoningLevel }]);
   };
 
@@ -121,14 +166,22 @@ export async function readExecutedProfiles({ thread, environment, events, home =
       const root = join(home, ".codex", "sessions");
       const directory = codexSessionDirectory(home, providerThreadId);
       const files = directory ? filesNamed(root, directory, (name) => name.endsWith(`-${providerThreadId}.jsonl`)) : [];
-      if (files.length !== 1) return { ...settle(turns, profiles, "codex turn_context"), reason: `expected one Codex session log, found ${files.length}` };
+      if (files.length !== 1) return { ...settle(turns, profiles, "codex turn_context"), reason: `${active ? "active BB turn: " : ""}expected one Codex session log, found ${files.length}` };
+      const activeProfiles = [];
+      let activeSessionMatches = !active;
       await readJsonLines(files[0], (record) => {
-        if (record?.type === "turn_context") add(record.payload?.turn_id, record.payload?.model, record.payload?.effort);
+        if (record?.type === "session_meta" && record.payload?.id === providerThreadId && record.payload?.originator === "bb" && record.payload?.cwd === environment?.path) activeSessionMatches = true;
+        if (record?.type === "turn_context") {
+          add(record.payload?.turn_id, record.payload?.model, record.payload?.effort);
+          if (active && typeof record.payload?.turn_id === "string" && recordAtOrAfter(record, active.requestedAtMs) && active.scopeTurnId.endsWith(`-${record.payload.turn_id}`)) activeProfiles.push(record.payload);
+        }
       });
-      return settle(turns, profiles, "codex turn_context");
+      if (!activeSessionMatches) return { ...settle(turns, profiles, "codex turn_context"), reason: "active BB turn: Codex session_meta does not match the BB session and exact environment path" };
+      for (const profile of activeProfiles) add(ACTIVE_PROFILE, profile.model, profile.effort);
+      return settle(turns, profiles, "codex turn_context", { absentReason: active ? "active Codex turn_context at or after the BB turn request is absent" : undefined });
     } catch {
       profiles.clear();
-      return { ...settle(turns, profiles, "codex turn_context"), reason: "Codex session log is unreadable" };
+      return { ...settle(turns, profiles, "codex turn_context"), reason: `${active ? "active BB turn: " : ""}Codex session log is unreadable` };
     }
   }
 
@@ -139,16 +192,22 @@ export async function readExecutedProfiles({ thread, environment, events, home =
       const directory = candidateDirectory ? realPathInside(root, candidateDirectory) : null;
       const path = directory ? realPathInside(root, join(directory, `${providerThreadId}.jsonl`)) : null;
       const files = path && isFile(path) ? [path] : [];
-      if (files.length !== 1) return { ...settle(turns, profiles, "Claude assistant envelope"), reason: `expected one Claude session log, found ${files.length}` };
+      if (files.length !== 1) return { ...settle(turns, profiles, "Claude assistant envelope"), reason: `${active ? "active BB turn: " : ""}expected one Claude session log, found ${files.length}` };
+      const activeProfiles = [];
       await readJsonLines(files[0], (record) => {
-        if (record?.type === "assistant" && record.message?.model !== "<synthetic>") add(record.uuid, record.message?.model, record.effort);
+        if (record?.type === "assistant" && record.message?.model !== "<synthetic>") {
+          add(record.uuid, record.message?.model, record.effort);
+          if (active && recordAtOrAfter(record, active.requestedAtMs)) activeProfiles.push({ model: record.message?.model, reasoningLevel: record.effort });
+        }
       });
+      for (const profile of activeProfiles) add(ACTIVE_PROFILE, profile.model, profile.reasoningLevel);
       return settle(turns, profiles, "Claude assistant envelope", {
+        absentReason: active ? "active Claude assistant envelope at or after the BB turn request is absent" : undefined,
         classify: (profile) => /\[[^\]]+\]$/u.test(profile.model) ? null : "provider-native model does not establish the exact dispatched SKU or context-window suffix",
       });
     } catch {
       profiles.clear();
-      return { ...settle(turns, profiles, "Claude assistant envelope"), reason: "Claude session log is unreadable" };
+      return { ...settle(turns, profiles, "Claude assistant envelope"), reason: `${active ? "active BB turn: " : ""}Claude session log is unreadable` };
     }
   }
 
@@ -158,6 +217,8 @@ export async function readExecutedProfiles({ thread, environment, events, home =
       const root = join(home, ".pi", "agent", "sessions");
       const directory = piProjectDirectory(home, environment?.path);
       const files = directory ? filesNamed(root, directory, (name) => /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.jsonl$/iu.test(name)) : [];
+      const activeProfiles = [];
+      let activeSessionMatches = 0;
       const ambiguous = new Set();
       const assistantIds = new Set();
       for (const file of files) {
@@ -170,6 +231,8 @@ export async function readExecutedProfiles({ thread, environment, events, home =
           entries.push(record);
         });
         if (entries.length === 0) throw new Error("empty Pi session log");
+        const isActiveSession = Boolean(active && entries[0]?.id === providerThreadId);
+        if (isActiveSession) activeSessionMatches += 1;
         const entryIds = entries.flatMap((entry) => typeof entry?.id === "string" ? [entry.id] : []);
         if (new Set(entryIds).size !== entryIds.length) {
           failureReason = "Pi session entry ids are ambiguous";
@@ -193,18 +256,26 @@ export async function readExecutedProfiles({ thread, environment, events, home =
           if (assistantIds.has(record.id)) ambiguous.add(record.id);
           assistantIds.add(record.id);
           add(record.id, model, ancestor?.thinkingLevel);
+          if (isActiveSession && recordAtOrAfter(record, active.requestedAtMs)) activeProfiles.push({ model, reasoningLevel: ancestor?.thinkingLevel });
         }
       }
+      if (active && activeSessionMatches !== 1) {
+        const reason = `active BB turn: expected one Pi session matching the BB provider session, found ${activeSessionMatches}`;
+        return { ...settle(turns, profiles, "Pi assistant message", { absentReason: reason }), reason };
+      }
+      for (const profile of activeProfiles) add(ACTIVE_PROFILE, profile.model, profile.reasoningLevel);
       const reason = !directory
         ? "BB environment path cannot identify an exact Pi project directory"
         : files.length === 0
         ? "expected at least one Pi session log in the exact environment-derived project directory, found 0"
+        : active
+        ? "active Pi assistant message at or after the BB turn request is absent"
         : "Pi checkpoints do not correlate to assistant message ids carrying model and reasoning level";
       const result = settle(turns, profiles, "Pi assistant message", { absentReason: reason, ambiguous });
-      return result.outcome === "unknown" ? { ...result, reason } : result;
+      return result.outcome === "unknown" ? { ...result, reason: `${active ? "active BB turn: " : ""}${reason}` } : result;
     } catch {
       profiles.clear();
-      return { ...settle(turns, profiles, "Pi assistant message", { absentReason: failureReason }), reason: failureReason };
+      return { ...settle(turns, profiles, "Pi assistant message", { absentReason: failureReason }), reason: `${active ? "active BB turn: " : ""}${failureReason}` };
     }
   }
 
