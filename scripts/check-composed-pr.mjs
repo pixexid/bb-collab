@@ -38,17 +38,17 @@ export function validateComposedPullRequest({ title, body, files, commitMessages
 }
 
 function usage() {
-  throw new Error("usage: check-composed-pr.mjs --title <title> (--body <body> | --body-file <path>) [--base <git-ref>] [--commit-message <message> [...]] --file <changed-path> [...]");
+  throw new Error("usage: check-composed-pr.mjs --title <title> (--body <body> | --body-file <path>) --file <changed-path> [...]");
 }
 
-function deriveCommitMessages(base) {
-  // Known ceiling: main-targeting only; if another base arrives, derive from a validated base ref, never supplied evidence.
-  const result = spawnSync("git", ["log", `${base}..HEAD`, "--format=%B%x00"], { encoding: "utf8" });
-  if (result.status !== 0 || result.error) throw new Error(`could not derive commit messages from ${base}..HEAD`);
-  if (result.stdout === "") throw new Error(`no commit messages found in ${base}..HEAD`);
+function deriveCommitMessages() {
+  // ponytail: main-targeting only. A second base requires deriving from a validated base ref — never supplied evidence.
+  const result = spawnSync("git", ["log", "origin/main..HEAD", "--format=%B%x00"], { encoding: "utf8" });
+  if (result.status !== 0 || result.error) throw new Error("could not derive commit messages from origin/main..HEAD");
+  if (result.stdout === "") throw new Error("no commit messages found in origin/main..HEAD");
   const messages = result.stdout.split("\0").map((message, index) => index === 0 ? message : message.replace(/^\r?\n/u, ""));
   if (messages.at(-1) === "") messages.pop();
-  if (messages.length === 0 || messages.some((message) => message.length === 0)) throw new Error(`could not derive commit messages from ${base}..HEAD`);
+  if (messages.length === 0 || messages.some((message) => message.length === 0)) throw new Error("could not derive commit messages from origin/main..HEAD");
   return messages;
 }
 
@@ -57,30 +57,19 @@ if (args.length > 0) {
   let title;
   let body;
   let bodyFile;
-  let base = "origin/main";
   const files = [];
-  const commitMessages = [];
   for (let index = 0; index < args.length; index += 1) {
     if (args[index] === "--title") title = args[++index];
     else if (args[index] === "--body") body = args[++index];
     else if (args[index] === "--body-file") bodyFile = args[++index];
-    else if (args[index] === "--base") base = args[++index];
-    else if (args[index] === "--commit-message") commitMessages.push(args[++index]);
     else if (args[index] === "--file") files.push(args[++index]);
     else usage();
   }
   if (typeof title !== "string" || (typeof body !== "string") === (typeof bodyFile !== "string") || files.length === 0) usage();
-  const suppliedEvidence = commitMessages.length > 0;
-  const evidence = suppliedEvidence ? commitMessages : deriveCommitMessages(base);
-  const result = validateComposedPullRequest({ title, body: body ?? readFileSync(bodyFile, "utf8"), files, commitMessages: evidence });
+  const result = validateComposedPullRequest({ title, body: body ?? readFileSync(bodyFile, "utf8"), files, commitMessages: deriveCommitMessages() });
   if (!result.ok) {
     console.error(`PR lifecycle pre-push check failed: ${result.error}`);
     process.exit(1);
   }
-  const evidenceSource = suppliedEvidence
-    ? "validated supplied --commit-message evidence (not the pushed range)"
-    : base === "origin/main"
-      ? "validated derived evidence from origin/main..HEAD"
-      : `validated derived evidence from overridden range ${base}..HEAD (not the default range)`;
-  console.log(`PR lifecycle pre-push check passed: ${result.disposition}; Review tier: ${result.reviewTier}; Evidence: ${evidenceSource}`);
+  console.log(`PR lifecycle pre-push check passed: ${result.disposition}; Review tier: ${result.reviewTier}`);
 }
