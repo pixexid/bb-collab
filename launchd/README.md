@@ -146,7 +146,7 @@ launchctl bootout gui/$(id -u)/com.bbcollab.wait-validator
 ## Deletion condition
 
 This artifact retires when BB natively hosts plugin background work
-surviving app restarts/crashes/updates (see the roadmap and
+surviving app restarts/crashes/updates (see the canonical intake rule and
 get-bb/bb#1543); at that point the in-plugin cycle already covers
 validation and the LaunchAgent is dead weight. The terminal stall-guard
 retirement named in issue #93 is a separate, explicit operator decision and

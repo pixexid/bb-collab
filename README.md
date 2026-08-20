@@ -212,7 +212,7 @@ implementation.
   ceiling.
 - [Import manifest](docs/import-manifest.md) records surviving clauses and
   issue dispositions.
-- [Roadmap](docs/roadmap.md) gives the dependency order and adoption gate.
+- The [labeled issue queue and Taskboard](docs/rules.md#quiet-with-startable-work-is-a-defect-state) are the canonical planning and intake surface.
 
 Evidence is public and durable:
 [approved founding evidence gist](https://gist.github.com/pixexid/77c7ac47afc27a63a147159195ba56b7)
@@ -300,7 +300,7 @@ conformance, governorship and resolver seams exist.
 | [docs/adr/0001-founding-contract.md](docs/adr/0001-founding-contract.md) | Complete adjudicated schema, authority, failure and cutover decision. |
 | [docs/threat-model.md](docs/threat-model.md) | Trust boundaries, threats, controls and enforcement ceiling. |
 | [docs/import-manifest.md](docs/import-manifest.md) | Surviving llm-collab clauses, issue ledger and migration rules. |
-| [docs/roadmap.md](docs/roadmap.md) | Dependency-ordered implementation and adoption evidence. |
+| [Issue labels and Taskboard](docs/rules.md#quiet-with-startable-work-is-a-defect-state) | Canonical planning and intake queue. |
 
 ## Dependency sequence
 
