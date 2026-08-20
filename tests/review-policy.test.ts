@@ -48,7 +48,7 @@ describe("pull-request review tier policy", () => {
 
     const overDeclared = check("Review tier: A", ["docs/issue-57-mechanism-1.md"]);
     expect(overDeclared.status).toBe(0);
-    expect(overDeclared.stderr).toBe("");
+    expect(overDeclared.stderr).toContain("::warning::Review finding: declared Tier A, but touched surfaces require Tier C.");
     expect(overDeclared.stdout).toContain("Review tier A: cold exact-head review before merge");
   });
 });

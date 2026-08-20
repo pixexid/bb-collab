@@ -46,6 +46,8 @@ if (declared !== required) {
   if ({ A: 3, B: 2, C: 1 }[required] > { A: 3, B: 2, C: 1 }[declared]) {
     console.error(`::error::Review finding: declared Tier ${declared}, but touched surfaces require Tier ${required}.`);
     process.exitCode = 1;
+  } else {
+    console.error(`::warning::Review finding: declared Tier ${declared}, but touched surfaces require Tier ${required}.`);
   }
 }
 
