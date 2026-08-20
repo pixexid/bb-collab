@@ -12,7 +12,7 @@ import plugin, { IDLE_FLEET_ATTEMPT_STALE_MS, rpcContract, URGENT_NOTIFICATION_D
 import { canonicalWorktreePath } from "../src/worktree-cleanup.js";
 import {
   CACHED_CONSUMERS,
-  CONTRACT_VERSION,
+  RUNTIME_CONTRACT_VERSION,
   DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
   EVIDENCE_ONLY_EQUIVALENCE_DISPOSITION,
   GH300_BACKFILL_MIGRATION_ID,
@@ -240,7 +240,7 @@ function cachedConsumerObservations(observedSchemaVersion: number, observedContr
 
 function policyProbeReread(name: (typeof CACHED_CONSUMERS)[number], result: Pick<FoundationResult, "outcome">, expectedOutcome: FoundationResult["outcome"]) {
   if (result.outcome !== expectedOutcome) throw new Error(`${name} policy probe did not return ${expectedOutcome}`);
-  const reread = cachedConsumerRolloutEvidence(cachedConsumerObservations(SCHEMA_VERSION, CONTRACT_VERSION));
+  const reread = cachedConsumerRolloutEvidence(cachedConsumerObservations(SCHEMA_VERSION, RUNTIME_CONTRACT_VERSION));
   if (reread.action !== "reread") throw new Error(`${name} did not reread v22`);
   const observation = reread.observations.find((candidate) => candidate.name === name);
   if (!observation) throw new Error(`${name} reread observation is unavailable`);
@@ -4746,7 +4746,7 @@ exit 1
 
   it("appends the blocked-work migration without bumping runtime contract v22", () => {
     expect(SCHEMA_VERSION).toBe(22);
-    expect(CONTRACT_VERSION).toBe(22);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(22);
     expect(MIGRATIONS).toHaveLength(35);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
@@ -5081,7 +5081,7 @@ exit 1
   });
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
-    expect(CONTRACT_VERSION).toBe(22);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(22);
     expect(SCHEMA_VERSION).toBe(22);
     expect(MIGRATIONS).toHaveLength(35);
     expect(contractDigest).toBe("f6b0ecbda7e8afd986d46e0eda77662815a737dadc94e268ef00b7d74ba18ed4");

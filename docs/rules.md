@@ -24,7 +24,7 @@ Quote what is there rather than what it means: a paraphrase inside quotation mar
 
 ## Version-bump test
 
-> Bump the contract version iff a session still running on the old text would keep doing something now prohibited, keep trusting something now false, or fail to do something newly required. Wording, examples, and relocations never bump.
+> Bump `INSTRUCTION_CONTRACT_VERSION` iff a session still running on the old instruction text would keep doing something now prohibited, keep trusting something now false, or fail to do something newly required. Wording, examples, and relocations never bump. This governs the instruction contract in `AGENTS.md`, not the separate `RUNTIME_CONTRACT_VERSION` in `src/foundation.ts`, whose value feeds `contractDigest` and whose bump is a runtime cached-consumer compatibility decision.
 
 ## Question is not delegation
 
