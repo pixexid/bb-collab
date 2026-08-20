@@ -1125,7 +1125,13 @@ while :; do :; done
     try {
       const result = readCheckoutDivergence(fixture.directory);
       expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: null, verdict: "diverged", processGroupReap: "absent" });
-      childPid = Number(readFileSync(pidFile, "utf8").trim());
+      let childPidText = "";
+      for (let attempt = 0; attempt < 50 && !childPidText; attempt += 1) {
+        if (existsSync(pidFile)) childPidText = readFileSync(pidFile, "utf8").trim();
+        if (!childPidText) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(childPidText, "setsid escapee did not write its pidfile").not.toBe("");
+      childPid = Number(childPidText);
       expect(Number.isInteger(childPid)).toBe(true);
       expect(childPid).toBeGreaterThan(0);
       for (let attempt = 0; attempt < 50; attempt += 1) {
