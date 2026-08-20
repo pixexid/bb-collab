@@ -28,7 +28,7 @@ env -u BB_CLI node scripts/check-composed-pr.mjs \
   --title <title> --body-file <path> --file <each changed path>
 ```
 
-Do not add `--commit-message` or `--base`; the command has nothing to check before a commit exists. Pair a pass with a rejection: run the same command once with a deliberately invalid PR body, confirm it fails, then run it with the real body and require the pass. A commit-message linkage is accepted only when the PR disposition is `Closes #NN` and every commit mention is `closes #<that same number>`; `Related` or `Ref` mentions fail. Keep the disposition line in the PR body only.
+Run this only after committing because it derives commit messages from `origin/main..HEAD`. The `--commit-message` and `--base` options no longer exist, so do not add them. Pair a pass with a rejection: run the same command once with a deliberately invalid PR body, confirm it fails, then run it with the real body and require the pass. Commit messages may omit issue linkage. If one contains a close/fix/resolve mention, the PR disposition must be `Closes #NN` and every linkage mention must target that issue; `Related`, `Ref`, or `References` mentions fail. Keep the disposition line in the PR body only.
 
 A fresh worktree may have no dependencies. `npm ci` is expected before verification; “do not deploy, reload, or install” applies to PLUGIN operations, not npm.
 
