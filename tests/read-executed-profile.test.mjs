@@ -25,6 +25,9 @@ function jsonl(path, records) {
   writeFileSync(path, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
 }
 
+const piBridgeLog = (home, providerThreadId, directory = join(home, ".bb", "pi-bridge-sessions")) =>
+  join(directory, `${providerThreadId.replace(/[^A-Za-z0-9._-]/gu, "_")}.jsonl`);
+
 describe("executed profile read-back", () => {
   it("DISCRIMINATOR: reads the active Codex turn from its provider-native rollout", async () => {
     const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
@@ -50,7 +53,7 @@ describe("executed profile read-back", () => {
     });
   });
 
-  it("GUARD: reads active Claude and Pi profiles from their native session surfaces", async () => {
+  it("GUARD: reads the active Claude profile from its native session surface", async () => {
     const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
     const claudeSession = "123e4567-e89b-42d3-a456-426614174000";
     jsonl(join(home, ".claude", "projects", "-test-project", `${claudeSession}.jsonl`), [
@@ -63,19 +66,78 @@ describe("executed profile read-back", () => {
       home,
     });
     expect(claudeResult).toMatchObject({ outcome: "known", turns: [{ phase: "active", executedProfile: { model: "claude-opus-5[1m]", reasoningLevel: "medium" } }] });
+  });
 
-    jsonl(join(home, ".pi", "agent", "sessions", "--test-project--", "2026-08-20T00-00-00-000Z_123e4567-e89b-42d3-a456-426614174000.jsonl"), [
-      { type: "session", id: "123e4567-e89b-42d3-a456-426614174000", cwd: "/test/project" },
-      { type: "thinking_level_change", id: "00000001", parentId: null, thinkingLevel: "high" },
-      { type: "message", id: "00000002", parentId: "00000001", timestamp: "2026-08-20T00:00:10.500Z", message: { role: "assistant", provider: "kimi-coding", model: "k3" } },
+  it("DISCRIMINATOR: reads active Pi evidence from the BB bridge filename, not the unrelated session header id", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "pi-thread-active";
+    jsonl(piBridgeLog(home, providerThreadId), [
+      { type: "session", id: "unrelated-session-header", cwd: "/test/project" },
+      { type: "model_change", id: "00000001", parentId: null, provider: "kimi-coding", modelId: "k3-256k" },
+      { type: "thinking_level_change", id: "00000002", parentId: "00000001", thinkingLevel: "high" },
+      { type: "message", id: "00000003", parentId: "00000002", timestamp: "2026-08-20T00:00:10.500Z", message: { role: "assistant", provider: "kimi-coding", model: "k3" } },
     ]);
     const piResult = await readExecutedProfiles({
       thread: { providerId: "pi", status: "active" },
       environment: { path: "/test/project" },
-      events: activeEvents("123e4567-e89b-42d3-a456-426614174000"),
+      events: activeEvents(providerThreadId),
       home,
     });
-    expect(piResult).toMatchObject({ outcome: "known", turns: [{ phase: "active", executedProfile: { model: "kimi-coding/k3", reasoningLevel: "high" } }] });
+    expect(piResult).toMatchObject({
+      outcome: "known",
+      turns: [{ phase: "active", selectionMismatch: true, executedProfile: { model: "kimi-coding/k3", reasoningLevel: "high" } }],
+    });
+    expect(JSON.stringify(piResult)).not.toContain("k3-256k");
+  });
+
+  it("DISCRIMINATOR: refuses a colliding Pi bridge neighbour when the requested id sanitizes lossily", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const requestedId = "pi/thread";
+    const foreignId = "pi:thread";
+    expect(requestedId).not.toBe(foreignId);
+    expect(piBridgeLog(home, requestedId)).toBe(piBridgeLog(home, foreignId));
+    jsonl(piBridgeLog(home, foreignId), [
+      { type: "session", id: "unrelated-session-header", cwd: "/test/project" },
+      { type: "thinking_level_change", id: "foreign-reasoning", parentId: null, thinkingLevel: "high" },
+      { type: "message", id: "foreign-assistant", parentId: "foreign-reasoning", timestamp: "2026-08-20T00:00:10.500Z", message: { role: "assistant", provider: "FOREIGN_PROVIDER", model: "FOREIGN_MODEL" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "pi", status: "active" },
+      environment: { path: "/test/project" },
+      events: activeEvents(requestedId),
+      home,
+    });
+    expect(result).toMatchObject({ outcome: "unknown", reason: "active BB turn: Pi provider session id requires lossy filename sanitization" });
+    expect(JSON.stringify(result)).not.toMatch(/FOREIGN_PROVIDER|FOREIGN_MODEL|executedProfile/u);
+  });
+
+  it("GUARD: reports Pi model evidence while marking conflicting turn reasoning unknown", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "pi-reasoning-change";
+    jsonl(piBridgeLog(home, providerThreadId), [
+      { type: "session", id: "unrelated-session-header", cwd: "/test/project" },
+      { type: "thinking_level_change", id: "00000001", parentId: null, thinkingLevel: "high" },
+      { type: "message", id: "00000002", parentId: "00000001", timestamp: "2026-08-20T00:00:10.500Z", message: { role: "assistant", provider: "kimi-coding", model: "k3" } },
+      { type: "thinking_level_change", id: "00000003", parentId: "00000002", thinkingLevel: "medium" },
+      { type: "message", id: "00000004", parentId: "00000003", timestamp: "2026-08-20T00:00:11.500Z", message: { role: "assistant", provider: "kimi-coding", model: "k3" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "pi", status: "active" },
+      environment: { path: "/test/project" },
+      events: activeEvents(providerThreadId),
+      home,
+    });
+    expect(result).toMatchObject({
+      outcome: "unknown",
+      coverage: { activeTurns: 1, knownTurns: 0, unknownTurns: 1 },
+      turns: [{
+        status: "unknown",
+        reason: "Pi reasoningLevel evidence is absent or ambiguous",
+        unknownElements: ["reasoningLevel"],
+        executedProfile: { providerId: "pi", model: "kimi-coding/k3", kind: "executed-provider-native", source: "Pi assistant envelope" },
+      }],
+    });
+    expect(result.turns[0].executedProfile).not.toHaveProperty("reasoningLevel");
   });
 
   it("GUARD: refuses ambiguous or foreign active Codex sessions", async () => {
@@ -141,35 +203,37 @@ describe("executed profile read-back", () => {
     expect(JSON.stringify(claudeResult)).not.toMatch(/STALE_CLAUDE|executedProfile/u);
   });
 
-  it("DISCRIMINATOR: refuses Pi profiles when the BB-named native session is absent", async () => {
+  it("DISCRIMINATOR: refuses foreign Pi bridge sessions and honours the bridge-directory override", async () => {
     const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
-    const directory = join(home, ".pi", "agent", "sessions", "--test-project--");
-    for (const [timestamp, sessionId, provider, model] of [
-      ["2026-08-20T00-00-00-000Z", "123e4567-e89b-42d3-a456-426614174000", "kimi-coding", "older"],
-      ["2026-08-20T01-00-00-000Z", "223e4567-e89b-42d3-a456-426614174000", "WRONG_PROVIDER", "WRONG_SESSION"],
-    ]) {
-      jsonl(join(directory, `${timestamp}_${sessionId}.jsonl`), [
-        { type: "session", id: sessionId, cwd: "/test/project" },
-        { type: "thinking_level_change", id: `${sessionId}-reasoning`, parentId: null, thinkingLevel: "high" },
-        { type: "message", id: `${sessionId}-message`, parentId: `${sessionId}-reasoning`, timestamp: "2026-08-20T00:00:11.000Z", message: { role: "assistant", provider, model } },
-      ]);
-    }
+    const override = join(home, "pi-override");
+    jsonl(piBridgeLog(home, "foreign-session", override), [
+      { type: "session", id: "unrelated-header", cwd: "/test/project" },
+      { type: "thinking_level_change", id: "foreign-reasoning", parentId: null, thinkingLevel: "high" },
+      { type: "message", id: "foreign-message", parentId: "foreign-reasoning", timestamp: "2026-08-20T00:00:11.000Z", message: { role: "assistant", provider: "WRONG_PROVIDER", model: "WRONG_SESSION" } },
+    ]);
     const result = await readExecutedProfiles({
       thread: { providerId: "pi", status: "active" },
       environment: { path: "/test/project" },
-      events: activeEvents("323e4567-e89b-42d3-a456-426614174000"),
+      events: activeEvents("target-session"),
       home,
+      env: { BB_PI_BRIDGE_SESSION_DIR: override },
     });
-    expect(result).toMatchObject({ outcome: "unknown", turns: [{ phase: "active", status: "unknown" }] });
+    expect(result).toMatchObject({ outcome: "unknown", reason: "active BB turn: expected the exact Pi bridge session log, found 0" });
     expect(JSON.stringify(result)).not.toMatch(/WRONG_PROVIDER|WRONG_SESSION|executedProfile/u);
 
+    jsonl(piBridgeLog(home, "target-session", override), [
+      { type: "session", id: "another-unrelated-header", cwd: "/test/project" },
+      { type: "thinking_level_change", id: "target-reasoning", parentId: null, thinkingLevel: "high" },
+      { type: "message", id: "target-message", parentId: "target-reasoning", timestamp: "2026-08-20T00:00:11.000Z", message: { role: "assistant", provider: "kimi-coding", model: "k3" } },
+    ]);
     const selected = await readExecutedProfiles({
       thread: { providerId: "pi", status: "active" },
       environment: { path: "/test/project" },
-      events: activeEvents("123e4567-e89b-42d3-a456-426614174000"),
+      events: activeEvents("target-session"),
       home,
+      env: { BB_PI_BRIDGE_SESSION_DIR: override },
     });
-    expect(selected).toMatchObject({ outcome: "known", turns: [{ executedProfile: { model: "kimi-coding/older", reasoningLevel: "high" } }] });
+    expect(selected).toMatchObject({ outcome: "known", turns: [{ executedProfile: { model: "kimi-coding/k3", reasoningLevel: "high" } }] });
   });
 
   it("GUARD: preserves completed Codex correlation and conflict handling", async () => {
@@ -221,19 +285,20 @@ describe("executed profile read-back", () => {
     });
   });
 
-  it("correlates Pi completion ids to assistant messages and their reasoning state", async () => {
+  it("DISCRIMINATOR: walks a completed Pi checkpoint chain and keeps envelope model authoritative over selection", async () => {
     const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
-    const directory = join(home, ".pi", "agent", "sessions", "--test-project--");
-    jsonl(join(directory, "2026-08-20T00-00-00-000Z_123e4567-e89b-42d3-a456-426614174000.jsonl"), [
-      { type: "session", version: 3, id: "123e4567-e89b-42d3-a456-426614174000", timestamp: "2026-08-20T00:00:00.000Z", cwd: "/test/project" },
-      { type: "model_change", id: "00000001", parentId: null, timestamp: "2026-08-20T00:00:01.000Z", provider: "kimi-coding", modelId: "k3" },
+    const providerThreadId = "pi-session";
+    jsonl(piBridgeLog(home, providerThreadId), [
+      { type: "session", version: 3, id: "unrelated-session-header", timestamp: "2026-08-20T00:00:00.000Z", cwd: "/test/project" },
+      { type: "model_change", id: "00000001", parentId: null, timestamp: "2026-08-20T00:00:01.000Z", provider: "kimi-coding", modelId: "k3-256k" },
       { type: "thinking_level_change", id: "00000002", parentId: "00000001", timestamp: "2026-08-20T00:00:02.000Z", thinkingLevel: "high" },
       { type: "message", id: "00000003", parentId: "00000002", timestamp: "2026-08-20T00:00:03.000Z", message: { role: "assistant", provider: "kimi-coding", model: "k3", usage: { reasoning: 42 }, content: "DO_NOT_EMIT" } },
+      { type: "message", id: "00000004", parentId: "00000003", timestamp: "2026-08-20T00:00:04.000Z", message: { role: "toolResult", content: "DO_NOT_EMIT" } },
     ]);
     const result = await readExecutedProfiles({
       thread: { providerId: "pi" },
       environment: { path: "/test/project" },
-      events: [completion("pi-session", "00000003")],
+      events: [completion(providerThreadId, "00000004")],
       home,
     });
     expect(result).toMatchObject({
@@ -241,17 +306,20 @@ describe("executed profile read-back", () => {
       coverage: { completedTurns: 1, knownTurns: 1, unknownTurns: 0 },
       turns: [{
         status: "known",
+        selectionMismatch: true,
         executedProfile: { providerId: "pi", model: "kimi-coding/k3", reasoningLevel: "high", kind: "executed-provider-native" },
       }],
     });
-    expect(JSON.stringify(result)).not.toContain("DO_NOT_EMIT");
+    expect(JSON.stringify(result)).not.toMatch(/DO_NOT_EMIT|k3-256k/u);
   });
 
-  it("returns a named unknown when Pi checkpoint ids do not correlate", async () => {
+  it("DISCRIMINATOR: returns unknown when a Pi checkpoint parent chain cannot reach an assistant envelope", async () => {
     const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
-    jsonl(join(home, ".pi", "agent", "sessions", "--test-project--", "2026-08-20T00-00-00-000Z_123e4567-e89b-42d3-a456-426614174000.jsonl"), [
-      { type: "session", version: 3, id: "123e4567-e89b-42d3-a456-426614174000", timestamp: "2026-08-20T00:00:00.000Z", cwd: "/test/project" },
-      { type: "message", id: "00000003", parentId: "checkpoint-1", message: { role: "assistant", provider: "kimi-coding", model: "k3", usage: { reasoning: 42 }, content: "DO_NOT_EMIT" } },
+    jsonl(piBridgeLog(home, "pi-session"), [
+      { type: "session", version: 3, id: "unrelated-session-header", timestamp: "2026-08-20T00:00:00.000Z", cwd: "/test/project" },
+      { type: "message", id: "prior-assistant", parentId: null, message: { role: "assistant", provider: "WRONG_PROVIDER", model: "WRONG_MODEL", content: "DO_NOT_EMIT" } },
+      { type: "message", id: "current-user", parentId: "prior-assistant", message: { role: "user", content: "DO_NOT_EMIT" } },
+      { type: "message", id: "checkpoint-1", parentId: "current-user", message: { role: "toolResult", content: "DO_NOT_EMIT" } },
     ]);
     const result = await readExecutedProfiles({
       thread: { providerId: "pi" },
@@ -261,15 +329,33 @@ describe("executed profile read-back", () => {
     });
     expect(result).toMatchObject({
       outcome: "unknown",
-      reason: "Pi checkpoints do not correlate to assistant message ids carrying model and reasoning level",
-      turns: [{ reason: "Pi checkpoints do not correlate to assistant message ids carrying model and reasoning level" }],
+      reason: "Pi checkpoint parent chain does not reach an assistant envelope",
+      turns: [{ reason: "Pi checkpoint parent chain does not reach an assistant envelope" }],
     });
-    expect(JSON.stringify(result)).not.toMatch(/DO_NOT_EMIT|content/u);
+    expect(JSON.stringify(result)).not.toMatch(/DO_NOT_EMIT|WRONG_PROVIDER|WRONG_MODEL|content/u);
+  });
+
+  it("GUARD: preserves Pi's completed-turn refusal when BB omits checkpoint correlation", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    jsonl(piBridgeLog(home, "pi-session"), [
+      { type: "session", id: "unrelated-session-header", cwd: "/test/project" },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "pi" },
+      environment: { path: "/test/project" },
+      events: [completion("pi-session", null)],
+      home,
+    });
+    expect(result).toMatchObject({
+      outcome: "unknown",
+      reason: "BB completion lacks provider correlation",
+      turns: [{ status: "unknown", reason: "BB completion lacks provider correlation" }],
+    });
   });
 
   it("refuses a Pi session whose header names a different cwd", async () => {
     const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
-    const path = join(home, ".pi", "agent", "sessions", "--test-project--", "2026-08-20T00-00-00-000Z_123e4567-e89b-42d3-a456-426614174000.jsonl");
+    const path = piBridgeLog(home, "pi-session");
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, `${JSON.stringify({ type: "session", version: 3, id: "123e4567-e89b-42d3-a456-426614174000", timestamp: "2026-08-20T00:00:00.000Z", cwd: "/other/project" })}\n{DO_NOT_EMIT}\n`);
     const result = await readExecutedProfiles({
@@ -280,6 +366,30 @@ describe("executed profile read-back", () => {
     });
     expect(result).toMatchObject({ outcome: "unknown", reason: "Pi session header does not match the exact BB environment path" });
     expect(JSON.stringify(result)).not.toMatch(/DO_NOT_EMIT|other\/project/u);
+  });
+
+  it("GUARD: refuses a non-session Pi header and a crafted traversal id without leakage", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    jsonl(piBridgeLog(home, "pi-session"), [
+      { type: "message", id: "not-a-session-header", cwd: "/test/project", message: { role: "assistant", provider: "DO_NOT_EMIT", model: "DO_NOT_EMIT" } },
+    ]);
+    const badHeader = await readExecutedProfiles({
+      thread: { providerId: "pi" },
+      environment: { path: "/test/project" },
+      events: [completion("pi-session", "not-a-session-header")],
+      home,
+    });
+    expect(badHeader).toMatchObject({ outcome: "unknown", reason: "Pi session header does not match the exact BB environment path" });
+    expect(JSON.stringify(badHeader)).not.toMatch(/DO_NOT_EMIT|executedProfile/u);
+
+    const traversal = await readExecutedProfiles({
+      thread: { providerId: "pi" },
+      environment: { path: "/test/project" },
+      events: [completion("../../private-session", "checkpoint")],
+      home,
+    });
+    expect(traversal).toMatchObject({ outcome: "unknown", reason: "Pi provider session id requires lossy filename sanitization" });
+    expect(JSON.stringify(traversal)).not.toMatch(/executedProfile/u);
   });
 
   it("returns unknown when a provider-native log is malformed", async () => {
@@ -334,28 +444,16 @@ describe("executed profile read-back", () => {
     expect(codexResult).toMatchObject({ outcome: "unknown", reason: "expected one Codex session log, found 0" });
     expect(JSON.stringify(codexResult)).not.toMatch(/DO_NOT_EMIT|private-codex-log|executedProfile/u);
 
-    const piRoot = join(home, ".pi", "agent", "sessions");
+    const piRoot = join(home, ".bb", "pi-bridge-sessions");
     mkdirSync(piRoot, { recursive: true });
-    symlinkSync(outsideDirectory, join(piRoot, "--pi-dir--"), "dir");
-    const piDirectoryResult = await readExecutedProfiles({
-      thread: { providerId: "pi" },
-      environment: { path: "/pi/dir" },
-      events: [completion("pi-session", "turn-1")],
-      home,
-    });
-    expect(piDirectoryResult).toMatchObject({ outcome: "unknown", reason: "expected at least one Pi session log in the exact environment-derived project directory, found 0" });
-    expect(JSON.stringify(piDirectoryResult)).not.toMatch(/DO_NOT_EMIT|private-other-project|executedProfile/u);
-
-    const piDirectory = join(piRoot, "--pi-file--");
-    mkdirSync(piDirectory, { recursive: true });
-    symlinkSync(outsideFile, join(piDirectory, "2026-08-20T00-00-00-000Z_123e4567-e89b-42d3-a456-426614174000.jsonl"));
+    symlinkSync(outsideFile, join(piRoot, "pi-session.jsonl"));
     const piFileResult = await readExecutedProfiles({
       thread: { providerId: "pi" },
       environment: { path: "/pi/file" },
       events: [completion("pi-session", "turn-1")],
       home,
     });
-    expect(piFileResult).toMatchObject({ outcome: "unknown", reason: "expected at least one Pi session log in the exact environment-derived project directory, found 0" });
+    expect(piFileResult).toMatchObject({ outcome: "unknown", reason: "expected the exact Pi bridge session log, found 0" });
     expect(JSON.stringify(piFileResult)).not.toMatch(/DO_NOT_EMIT|private-codex-log|executedProfile/u);
   });
 });
