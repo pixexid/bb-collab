@@ -2145,6 +2145,21 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
+  it("names the CLI message flag when send-to-operator has no message", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    const result = await host.harness.runCli([
+      "send-to-operator", "--project", PROJECT_ID, "--recipient", "supervisor", "--severity", "routine",
+    ], { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID });
+    const refusal = JSON.parse(result.stdout) as { message: string };
+
+    expect(result.exitCode).toBe(2);
+    expect(JSON.parse(refusal.message)).toEqual([
+      expect.objectContaining({ path: ["message"] }),
+    ]);
+    expect(refusal.message).not.toContain('"text"');
+  });
+
   it("uses one FoundationResult evidence.messages envelope across operator inbox CLI successes", async () => {
     const host = hostFor();
     await plugin(host.bb, { notifyUrgent: async () => undefined });

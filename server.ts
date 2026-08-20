@@ -470,6 +470,15 @@ function invalidCli(message: string, outcome: FoundationCode = "INVALID_INPUT") 
   });
 }
 
+function cliSchemaError(error: z.ZodError, flags: Readonly<Record<string, string>>): string {
+  return JSON.stringify(error.issues.map((issue) => {
+    const [field, ...rest] = issue.path;
+    return typeof field === "string" && flags[field]
+      ? { ...issue, path: [flags[field], ...rest] }
+      : issue;
+  }), null, 2);
+}
+
 function workItemRegistrationDoctorResult(db: SqliteDatabase, projectId: string, doctorResult: FoundationResult): FoundationResult {
   const actor = db.prepare(
     `SELECT receipt_id FROM actor_receipts
@@ -1264,7 +1273,12 @@ async function runCli(
       severity: parseFlag(args, "--severity"),
       text: parseFlag(args, "--message"),
     });
-    if (!parsed.success) return invalidCli(parsed.error.message);
+    if (!parsed.success) return invalidCli(cliSchemaError(parsed.error, {
+      project_id: "project",
+      recipient: "recipient",
+      severity: "severity",
+      text: "message",
+    }));
     try {
       const sent = await sendOperatorMessage(db, bb, parsed.data, ctx.threadId, deps.notifyUrgent);
       return operatorMessagesCliResult(projectId, [sent], "operator message persisted");
