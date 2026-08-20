@@ -62,8 +62,11 @@ function deriveCommitMessages() {
   if (result.stdout === "") throw new Error("no commit messages found in origin/main..HEAD");
   const messages = result.stdout.split("\0").map((message, index) => index === 0 ? message : message.replace(/^\r?\n/u, ""));
   if (messages.at(-1) === "") messages.pop();
-  // ponytail: defence-in-depth invariant, no known trigger. Shallow clones (ancestry rejects first), NUL-bearing commits (git truncates %B at NUL), filtered clones, empty/newline-only messages, merge commits, and git-replace graphs all left records == rev-list.
-  // If this fires, records != rev-list means derivation saw a different population than the push — a new class, not a bug in this check.
+  // ponytail: defence-in-depth invariant, no known trigger. Not reached by a shallow clone
+  // (ancestry rejects first), a NUL-bearing commit (git truncates %B at the NUL, so the count
+  // agrees), a blob-filtered clone, an empty commit message, a newline-only body, a merge
+  // commit, or a git-replace graph. If this ever fires, records != rev-list means the derivation
+  // saw a different population than the push — that is a new class, not a bug in this check.
   if (messages.length !== expectedCount) {
     const direction = messages.length > expectedCount ? "more" : "fewer";
     throw new Error(`commit evidence is untrustworthy: derived ${messages.length} records, but rev-list proves ${expectedCount} commits (${direction} evidence than commits)`);
