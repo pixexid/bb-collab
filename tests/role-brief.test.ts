@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import plugin from "../server.js";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -29,40 +29,26 @@ describe("role briefs", () => {
     });
   });
 
-  it("waits for a created worker to become idle before sending its role brief", async () => {
+  it("queues a created worker brief while its first turn is active", async () => {
     const host = createFakePluginHost({ pluginId: "bb-collab" });
     host.harness.sdk.stub("projects.get", (async ({ projectId }: { projectId: string }) => project(projectId)) as never);
-    let releaseIdle!: () => void;
-    const idle = new Promise<void>((resolve) => { releaseIdle = resolve; });
-    host.harness.sdk.stub("threads.wait", (async ({ status }: { status: string }) => {
-      if (status === "idle") await idle;
-      return { matched: true };
-    }) as never);
+    host.harness.sdk.stub("threads.wait", (async () => { throw new Error("must not wait for first-turn seating"); }) as never);
     host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
     await plugin(host.bb);
 
-    const delivery = host.harness.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id: "worker-brief", projectId: "project-brief", status: "active" }) });
-    await vi.waitFor(() => expect(host.harness.inspection.sdk.callsTo("threads.wait")).toHaveLength(1));
-    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
-    releaseIdle();
-    await expect(delivery).resolves.toEqual({ errors: [] });
+    await expect(host.harness.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id: "worker-brief", projectId: "project-brief", status: "active" }) })).resolves.toEqual({ errors: [] });
     const request = host.harness.inspection.sdk.callsTo("threads.send")[0]?.[0] as { threadId: string; mode: string; input: Array<{ visibility: string; text: string }> };
     expect(request).toMatchObject({ threadId: "worker-brief", mode: "queue-if-active" });
     expect(request.input[0]).toMatchObject({ visibility: "agent-only", text: expect.stringContaining("Does this need to exist at all?") });
-    expect(host.harness.inspection.sdk.callsTo("threads.wait")[0]?.[0]).toMatchObject({ threadId: "worker-brief", status: "idle", timeoutMs: 30_000 });
+    expect(host.harness.inspection.sdk.callsTo("threads.wait")).toHaveLength(0);
   });
 
-  it("serializes concurrent role briefs for the same thread across idle wait and send", async () => {
+  it("serializes concurrent role briefs without waiting for idle", async () => {
     const host = createFakePluginHost({ pluginId: "bb-collab" });
     host.harness.sdk.stub("projects.get", (async ({ projectId }: { projectId: string }) => project(projectId)) as never);
-    let status: "idle" | "active" = "idle";
-    let releaseIdle!: () => void;
-    const idle = new Promise<void>((resolve) => { releaseIdle = resolve; });
     const sendStatuses: string[] = [];
-    host.harness.sdk.stub("threads.wait", (async () => {
-      if (status === "active") await idle;
-      return { matched: true };
-    }) as never);
+    let status: "idle" | "active" = "idle";
+    host.harness.sdk.stub("threads.wait", (async () => { throw new Error("must not wait for seating"); }) as never);
     host.harness.sdk.stub("threads.send", (async () => {
       sendStatuses.push(status);
       status = "active";
@@ -70,31 +56,25 @@ describe("role briefs", () => {
     }) as never);
     await plugin(host.bb);
 
-    const thread = makeThreadResponse({ id: "worker-brief", projectId: "project-brief", status: "idle" });
-    const deliveries = [
+    const thread = makeThreadResponse({ id: "worker-brief", projectId: "project-brief", status: "active" });
+    await expect(Promise.all([
       host.harness.emitThreadEvent("thread.created", { thread }),
       host.harness.emitThreadEvent("thread.created", { thread }),
-    ];
-    await vi.waitFor(() => expect(host.harness.inspection.sdk.callsTo("threads.wait")).toHaveLength(2));
-    expect(sendStatuses).toEqual(["idle"]);
-    status = "idle";
-    releaseIdle();
-    await expect(Promise.all(deliveries)).resolves.toEqual([{ errors: [] }, { errors: [] }]);
-    expect(sendStatuses).toEqual(["idle", "idle"]);
+    ])).resolves.toEqual([{ errors: [] }, { errors: [] }]);
+    expect(sendStatuses).toEqual(["idle", "active"]);
+    expect(host.harness.inspection.sdk.callsTo("threads.wait")).toHaveLength(0);
   });
 
-  it("logs a role-brief timeout without sending", async () => {
+  it("logs a role-brief send failure at error level", async () => {
     const host = createFakePluginHost({ pluginId: "bb-collab" });
     host.harness.sdk.stub("projects.get", (async ({ projectId }: { projectId: string }) => project(projectId)) as never);
-    host.harness.sdk.stub("threads.wait", (async () => { throw new Error("idle wait timed out"); }) as never);
-    host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
+    host.harness.sdk.stub("threads.send", (async () => { throw new Error("send failed"); }) as never);
     await plugin(host.bb);
 
-    await expect(host.harness.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id: "worker-timeout", projectId: "project-brief", status: "active" }) })).resolves.toEqual({ errors: [] });
-    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    await expect(host.harness.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id: "worker-failure", projectId: "project-brief", status: "active" }) })).resolves.toEqual({ errors: [] });
     expect(host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
-      level: "warn",
-      message: "role brief seating failed for thread=worker-timeout: Error: idle wait timed out",
+      level: "error",
+      message: "role brief seating failed for thread=worker-failure: Error: send failed",
     }));
   });
 
@@ -107,10 +87,8 @@ describe("role briefs", () => {
     await plugin(host.bb);
 
     await expect(host.harness.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id: "worker-idle", projectId: "project-brief", status: "idle" }) })).resolves.toEqual({ errors: [] });
-    expect(order).toEqual(["idle", "send"]);
-    expect(host.harness.inspection.sdk.callsTo("threads.wait")).toEqual([[
-      { threadId: "worker-idle", status: "idle", timeoutMs: 30_000 },
-    ]]);
+    expect(order).toEqual(["send"]);
+    expect(host.harness.inspection.sdk.callsTo("threads.wait")).toHaveLength(0);
   });
 
   it("rejects a stale generated bundle", () => {

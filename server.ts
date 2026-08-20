@@ -798,18 +798,23 @@ async function sendRoleBrief(
   role: z.infer<typeof roleBriefRoleSchema>,
 ): Promise<void> {
   const brief = await composeRoleBrief(bb, db, { projectId, role });
-  await sendWhenThreadIdle(bb, {
+  // created is observe-only and can race the first turn; queue instead of waiting for idle.
+  await sendWhenThreadReady(bb, {
     threadId,
     mode: "queue-if-active",
     input: [{ type: "text", visibility: "agent-only", text: brief.prompt, mentions: [] }],
   });
 }
 
-async function sendWhenThreadIdle(bb: BbPluginApi, request: Parameters<BbPluginApi["sdk"]["threads"]["send"]>[0]): Promise<void> {
-  // ponytail: this process-local queue covers this plugin's senders; a host atomic send-if-idle API is the cross-process upgrade.
+async function enqueueAutomatedTell(
+  bb: BbPluginApi,
+  request: Parameters<BbPluginApi["sdk"]["threads"]["send"]>[0],
+  waitForIdle: boolean,
+): Promise<void> {
+  // ponytail: this process-local queue covers this plugin’s senders; a host atomic send-if-idle API is the cross-process upgrade.
   const previous = automatedTellQueues.get(request.threadId) ?? Promise.resolve();
   const current = previous.catch(() => undefined).then(async () => {
-    await bb.sdk.threads.wait({ threadId: request.threadId, status: "idle", timeoutMs: AUTOMATED_TELL_IDLE_WAIT_MS });
+    if (waitForIdle) await bb.sdk.threads.wait({ threadId: request.threadId, status: "idle", timeoutMs: AUTOMATED_TELL_IDLE_WAIT_MS });
     await bb.sdk.threads.send(request);
   });
   automatedTellQueues.set(request.threadId, current);
@@ -818,6 +823,14 @@ async function sendWhenThreadIdle(bb: BbPluginApi, request: Parameters<BbPluginA
   } finally {
     if (automatedTellQueues.get(request.threadId) === current) automatedTellQueues.delete(request.threadId);
   }
+}
+
+async function sendWhenThreadReady(bb: BbPluginApi, request: Parameters<BbPluginApi["sdk"]["threads"]["send"]>[0]): Promise<void> {
+  await enqueueAutomatedTell(bb, request, false);
+}
+
+async function sendWhenThreadIdle(bb: BbPluginApi, request: Parameters<BbPluginApi["sdk"]["threads"]["send"]>[0]): Promise<void> {
+  await enqueueAutomatedTell(bb, request, true);
 }
 
 async function deliverSucceededSeatBrief(
@@ -831,7 +844,7 @@ async function deliverSucceededSeatBrief(
   try {
     await sendRoleBrief(bb, db, request.data.projectId, request.data.roleContext.threadId, roleBriefRole(request.data.roleId));
   } catch (error) {
-    bb.log.warn(`role brief seating failed for thread=${request.data.roleContext.threadId}: ${String(error)}`);
+    bb.log.error(`role brief seating failed for thread=${request.data.roleContext.threadId}: ${String(error)}`);
   }
 }
 
@@ -3018,7 +3031,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     try {
       await sendRoleBrief(bb, db, thread.projectId, thread.id, roleForThread(db, thread.projectId, thread.id));
     } catch (error) {
-      bb.log.warn(`role brief seating failed for thread=${thread.id}: ${String(error)}`);
+      bb.log.error(`role brief seating failed for thread=${thread.id}: ${String(error)}`);
     }
   });
 

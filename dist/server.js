@@ -22355,16 +22355,16 @@ async function composeRoleBrief(bb, db, input) {
 }
 async function sendRoleBrief(bb, db, projectId, threadId, role) {
   const brief = await composeRoleBrief(bb, db, { projectId, role });
-  await sendWhenThreadIdle(bb, {
+  await sendWhenThreadReady(bb, {
     threadId,
     mode: "queue-if-active",
     input: [{ type: "text", visibility: "agent-only", text: brief.prompt, mentions: [] }]
   });
 }
-async function sendWhenThreadIdle(bb, request) {
+async function enqueueAutomatedTell(bb, request, waitForIdle) {
   const previous = automatedTellQueues.get(request.threadId) ?? Promise.resolve();
   const current = previous.catch(() => void 0).then(async () => {
-    await bb.sdk.threads.wait({ threadId: request.threadId, status: "idle", timeoutMs: AUTOMATED_TELL_IDLE_WAIT_MS });
+    if (waitForIdle) await bb.sdk.threads.wait({ threadId: request.threadId, status: "idle", timeoutMs: AUTOMATED_TELL_IDLE_WAIT_MS });
     await bb.sdk.threads.send(request);
   });
   automatedTellQueues.set(request.threadId, current);
@@ -22374,13 +22374,19 @@ async function sendWhenThreadIdle(bb, request) {
     if (automatedTellQueues.get(request.threadId) === current) automatedTellQueues.delete(request.threadId);
   }
 }
+async function sendWhenThreadReady(bb, request) {
+  await enqueueAutomatedTell(bb, request, false);
+}
+async function sendWhenThreadIdle(bb, request) {
+  await enqueueAutomatedTell(bb, request, true);
+}
 async function deliverSucceededSeatBrief(bb, db, input, result2) {
   const request = applyRequestSchema.safeParse(input);
   if (!request.success || result2.outcome !== "OK" || request.data.operationClass !== "role_generation_succession" || !request.data.roleContext || !request.data.roleId) return;
   try {
     await sendRoleBrief(bb, db, request.data.projectId, request.data.roleContext.threadId, roleBriefRole(request.data.roleId));
   } catch (error48) {
-    bb.log.warn(`role brief seating failed for thread=${request.data.roleContext.threadId}: ${String(error48)}`);
+    bb.log.error(`role brief seating failed for thread=${request.data.roleContext.threadId}: ${String(error48)}`);
   }
 }
 function liveCachedConsumerReread(name, result2) {
@@ -24348,7 +24354,7 @@ ${thread.titleFallback ?? ""}`);
     try {
       await sendRoleBrief(bb, db, thread.projectId, thread.id, roleForThread(db, thread.projectId, thread.id));
     } catch (error48) {
-      bb.log.warn(`role brief seating failed for thread=${thread.id}: ${String(error48)}`);
+      bb.log.error(`role brief seating failed for thread=${thread.id}: ${String(error48)}`);
     }
   });
   bb.http.route(
