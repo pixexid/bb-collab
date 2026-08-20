@@ -1,5 +1,18 @@
 # GH-104: Assignment profile audit
 
+> Current correction (2026-08-19, contract v34): GH-228 disproved the executed
+> profile assertions below. `ExecutionAttempt` stores request provenance from
+> `client/turn/requested` under `requested_*` names. BB exposes no authoritative
+> executed model, reasoning level, permission mode, or service tier readback, so
+> the doctor can assess requested-policy conformance only. A post-hoc executed
+> profile audit remains unknown and is tracked by GH-215 and upstream
+> get-bb/bb#1787.
+
+## Historical 2026-08-16 assessment (superseded)
+
+The following text is retained as issue-record history. Its claims that the
+store held actual execution evidence are not current operational guidance.
+
 The existing canonical resolver is the recording seam. `assignment_prepare`
 stores the immutable requested profile on `Assignment`; `assignment_dispatch`
 and `assignment_reconcile` accept only BB-native evidence from the

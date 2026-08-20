@@ -4,6 +4,12 @@ Audit date: 2026-08-13 (America/Los_Angeles). This is a read-only disposition
 report. No GitHub issue, task, repository document, branch, PR, or project state
 was created, edited, closed, or transitioned.
 
+> Current correction (2026-08-19, contract v34): execution-profile claims in
+> this dated ledger were later disproved by GH-228. The store holds request
+> provenance from `client/turn/requested`, not authoritative executed readback;
+> that gap remains GH-215 and upstream get-bb/bb#1787. The ledger body below is
+> preserved with its period terminology and assertions.
+
 ## Scope and live authority
 
 - Source repository: `pixexid/llm-collab`, exact source fence and clean local

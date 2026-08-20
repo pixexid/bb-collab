@@ -91,7 +91,7 @@ automatic v17 receipt migration/write is part of this slice.
 
 7. **Role generations and qualification.** Implement manual director,
    project-orchestrator, worker and independent-reviewer succession, holder
-   ExecutionAttempt binding, executed-profile digests, current eligibility,
+   ExecutionAttempt binding, requested-profile digests, current eligibility,
    expiry and stale/retired-generation refusal. Only director generation 1 may
    use the exact receipt-gated unmanaged qualification-and-creation exception;
    keep leases, heartbeat expiry and automatic failover deferred.
@@ -101,7 +101,8 @@ automatic v17 receipt migration/write is part of this slice.
    through canonical operator-authorized config and honoured by seats at
    dispatch time; no runtime path gates admission or queue startability against
    it. Preserve exact branch/base/candidate semantics, frozen-brief digest, native BB
-   spawn/attach, actual profile receipt, isolated environment and terminal
+   spawn/attach, a future BB-authenticated executed-profile receipt (currently
+   unavailable under GH-215 and upstream get-bb/bb#1787), isolated environment and terminal
    DONE|BLOCKED report. Read-only reviews/probes do not consume the cap.
    Reconcile ambiguous dispatch as DISPATCH_UNKNOWN; do not blind-retry.
 

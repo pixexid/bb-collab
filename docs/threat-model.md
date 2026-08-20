@@ -4,6 +4,12 @@ This document defines the threats the founding contract must fail closed
 against and the boundary it cannot honestly enforce. The full schema and
 resolver contract are in [ADR 0001](adr/0001-founding-contract.md).
 
+> Current correction (2026-08-19, contract v34): execution-profile claims in
+> this dated contract record were later disproved by GH-228. The store holds
+> request provenance from `client/turn/requested`, not authoritative executed
+> readback; that gap remains GH-215 and upstream get-bb/bb#1787. The body below
+> is preserved with its period terminology and assertions.
+
 ## Scope and trust boundaries
 
 bb-collab governs canonical records and sanctioned mutations for a project. It

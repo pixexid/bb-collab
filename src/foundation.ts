@@ -9,12 +9,12 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 export const CONTRACT_VERSION = 22;
-export const SCHEMA_VERSION = 20;
+export const SCHEMA_VERSION = 21;
 // v22 establishes the director's exact accepted-profile set.
 const PREVIOUS_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-const PREVIOUS_SCHEMA_VERSION = 19;
+const PREVIOUS_SCHEMA_VERSION = 20;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatPrimaryProfile = {
@@ -842,6 +842,22 @@ export const MIGRATIONS: string[] = [
      ADD COLUMN attempt_reason TEXT CHECK (attempt_reason IS NULL OR attempt_reason IN ('initial', 'config_revision_changed'))`,
   `ALTER TABLE execution_attempts ADD COLUMN review_pr_number INTEGER CHECK (review_pr_number IS NULL OR review_pr_number > 0);
    ALTER TABLE execution_attempts ADD COLUMN review_pr_head_sha TEXT CHECK (review_pr_head_sha IS NULL OR review_pr_head_sha GLOB '[0-9a-f]*');`,
+  `ALTER TABLE execution_attempts RENAME COLUMN actual_provider_id TO requested_provider_id;
+   ALTER TABLE execution_attempts RENAME COLUMN actual_model TO requested_model;
+   ALTER TABLE execution_attempts RENAME COLUMN actual_reasoning_level TO requested_reasoning_level;
+   ALTER TABLE execution_attempts RENAME COLUMN actual_permission_mode TO requested_permission_mode;
+   ALTER TABLE execution_attempts RENAME COLUMN actual_service_tier TO requested_service_tier;
+   ALTER TABLE execution_attempts RENAME COLUMN actual_visibility TO requested_visibility;
+   ALTER TABLE execution_attempts RENAME COLUMN actual_profile_digest TO requested_profile_digest;
+   ALTER TABLE qualification_observations RENAME COLUMN executed_profile_digest TO requested_profile_digest;
+   ALTER TABLE qualification_observations RENAME COLUMN provider_id TO requested_provider_id;
+   ALTER TABLE qualification_observations RENAME COLUMN model TO requested_model;
+   ALTER TABLE qualification_observations RENAME COLUMN reasoning_level TO requested_reasoning_level;
+   ALTER TABLE qualification_observations RENAME COLUMN permission_mode TO requested_permission_mode;
+   ALTER TABLE qualification_observations RENAME COLUMN service_tier TO requested_service_tier;
+   ALTER TABLE qualification_observations RENAME COLUMN visibility TO requested_visibility;
+   ALTER TABLE eligibility_projections RENAME COLUMN profile_digest TO requested_profile_digest;
+   ALTER TABLE role_generations RENAME COLUMN holder_executed_profile_digest TO holder_requested_profile_digest;`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -2007,7 +2023,7 @@ export interface NativeAssignmentAdapter {
 
 export interface ResolvedRoleContext {
   profile: ExecutionProfile;
-  profileDigest: string;
+  requestedProfileDigest: string;
   baseContext: Record<string, unknown>;
   holderExecutionAttemptId: string;
   threadId: string;
@@ -2169,7 +2185,7 @@ export function resolveRoleContext(reader: RoleFactReader | null, request: Apply
   const permissionMode = stringField(execution.permissionMode);
   const serviceTier = stringField(execution.serviceTier);
   const executionSource = stringField(execution.source);
-  if (!model || !reasoningLevel || !permissionMode || !serviceTier || !executionSource) {
+  if (!model || !reasoningLevel || !permissionMode || !serviceTier || executionSource !== "client/turn/requested") {
     throw refusal("EXECUTION_PROFILE_UNKNOWN", "execution profile fields are incomplete");
   }
   const accepted = events.filter(
@@ -2256,7 +2272,7 @@ export function resolveRoleContext(reader: RoleFactReader | null, request: Apply
   }));
   return {
     profile,
-    profileDigest: sha256(canonicalJson(profile)),
+    requestedProfileDigest: requestedProfileDigest(profile),
     baseContext,
     holderExecutionAttemptId,
     threadId: thread.id,
@@ -2562,6 +2578,10 @@ function validateConfig(value: unknown): string {
 type GithubIssuesConfig = z.infer<typeof githubIssuesConfigSchema>;
 type WorkItemState = (typeof WORK_ITEM_STATES)[number];
 export type ExecutionProfile = z.infer<typeof executionProfileSchema>;
+
+export function requestedProfileDigest(profile: ExecutionProfile): string {
+  return sha256(canonicalJson({ provenance: "client/turn/requested", profile }));
+}
 type RoleRequirement = z.infer<typeof roleRequirementSchema>;
 
 function githubConfigFromJson(configJson: string): GithubIssuesConfig | null {
@@ -4654,12 +4674,12 @@ function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest, requ
     config_revision: number;
     holder_execution_attempt_id: string;
     holder_context_digest: string;
-    holder_executed_profile_digest: string;
+    holder_requested_profile_digest: string;
     qualification_id: string;
     eligibility_derivation_digest: string;
   }>(
     db.prepare(`SELECT status, role_requirement_id, config_revision, holder_execution_attempt_id,
-                       holder_context_digest, holder_executed_profile_digest, qualification_id,
+                       holder_context_digest, holder_requested_profile_digest, qualification_id,
                        eligibility_derivation_digest
                 FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?`).get(
       request.projectId,
@@ -4670,8 +4690,8 @@ function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest, requ
   if (!head || head.current_generation !== actor.role_generation) throw refusal("ROLE_GENERATION_STALE", "role actor is not the current generation");
   if (!generation || generation.status !== "active") throw refusal("ROLE_NOT_ACTIVE", "role actor is not active");
   if (generation.holder_execution_attempt_id !== actor.subject_id) throw refusal("ROLE_HOLDER_MISMATCH", "role actor does not bind the current holder context");
-  const attempt = asRow<{ origin: string; state: string; native_receipt_digest: string | null; actual_profile_digest: string | null }>(
-    db.prepare("SELECT origin, state, native_receipt_digest, actual_profile_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(
+  const attempt = asRow<{ origin: string; state: string; native_receipt_digest: string | null; requested_profile_digest: string | null }>(
+    db.prepare("SELECT origin, state, native_receipt_digest, requested_profile_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(
       request.projectId,
       generation.holder_execution_attempt_id,
     ),
@@ -4681,7 +4701,7 @@ function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest, requ
     attempt.origin !== "role_holder" ||
     attempt.state !== "done" ||
     attempt.native_receipt_digest !== generation.holder_context_digest ||
-    attempt.actual_profile_digest !== generation.holder_executed_profile_digest
+    attempt.requested_profile_digest !== generation.holder_requested_profile_digest
   ) {
     throw refusal("ROLE_HOLDER_MISMATCH", "role holder has no complete canonical execution attempt");
   }
@@ -4694,8 +4714,8 @@ function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest, requ
   }>(db.prepare(
     `SELECT current_qualification_id, effective_status, config_revision, expires_at_ms, derivation_digest
      FROM eligibility_projections
-     WHERE project_id = ? AND role_requirement_id = ? AND profile_digest = ?`,
-  ).get(request.projectId, generation.role_requirement_id, generation.holder_executed_profile_digest));
+     WHERE project_id = ? AND role_requirement_id = ? AND requested_profile_digest = ?`,
+  ).get(request.projectId, generation.role_requirement_id, generation.holder_requested_profile_digest));
   if (
     !eligibility || eligibility.current_qualification_id !== generation.qualification_id ||
     eligibility.effective_status !== "eligible" || eligibility.config_revision !== generation.config_revision ||
@@ -4765,7 +4785,7 @@ function applyQualificationObservation(
   const effectiveStatus = observationOutcome === "qualified" ? "eligible" : observationOutcome === "unqualified" ? "ineligible" : "unknown";
   const reasonCode = mismatch ? "execution_profile_mismatch" : request.reasonCode;
   const evidenceDigest = sha256(canonicalJson({
-    executedProfileDigest: context.profileDigest,
+    requestedProfileDigest: context.requestedProfileDigest,
     qualificationContextDigest: contextDigest,
     fixtureContextDigest,
     outcome: observationOutcome,
@@ -4778,7 +4798,7 @@ function applyQualificationObservation(
     configRevision,
     repoTargetId: resolved.requirement.repoTargetId,
     roleRequirementDigest: resolved.digest,
-    executedProfileDigest: context.profileDigest,
+    requestedProfileDigest: context.requestedProfileDigest,
     qualificationContextDigest: contextDigest,
     fixtureContextDigest,
     outcome: observationOutcome,
@@ -4791,8 +4811,8 @@ function applyQualificationObservation(
   db.prepare(
     `INSERT INTO qualification_observations (
       project_id, qualification_id, role_requirement_id, config_revision, repo_target_id,
-      role_requirement_digest, executed_profile_digest, provider_id, model, reasoning_level,
-      permission_mode, service_tier, visibility, thread_id, environment_id, source_id, host_id,
+      role_requirement_digest, requested_profile_digest, requested_provider_id, requested_model, requested_reasoning_level,
+      requested_permission_mode, requested_service_tier, requested_visibility, thread_id, environment_id, source_id, host_id,
       provider_thread_id, request_event_id, request_event_seq, completion_event_id, completion_event_seq,
       bb_version, plugin_sdk_version, qualification_context_digest, fixture_context_digest, outcome,
       observed_at_ms, expires_at_ms, evidence_digest, observation_digest, reason_code
@@ -4804,7 +4824,7 @@ function applyQualificationObservation(
     configRevision,
     resolved.requirement.repoTargetId,
     resolved.digest,
-    context.profileDigest,
+    context.requestedProfileDigest,
     context.profile.providerId,
     context.profile.model,
     context.profile.reasoningLevel,
@@ -4834,7 +4854,7 @@ function applyQualificationObservation(
   const derivedAtMs = now();
   const derivationDigest = sha256(canonicalJson({
     qualificationId,
-    profileDigest: context.profileDigest,
+    requestedProfileDigest: context.requestedProfileDigest,
     effectiveStatus,
     contextDigest,
     configRevision,
@@ -4845,11 +4865,11 @@ function applyQualificationObservation(
   }));
   db.prepare(
     `INSERT INTO eligibility_projections (
-      project_id, role_requirement_id, profile_digest, current_qualification_id,
+      project_id, role_requirement_id, requested_profile_digest, current_qualification_id,
       effective_status, qualification_context_digest, config_revision, role_requirement_digest,
       derived_at_ms, expires_at_ms, derivation_digest, reason_code
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(project_id, role_requirement_id, profile_digest) DO UPDATE SET
+    ON CONFLICT(project_id, role_requirement_id, requested_profile_digest) DO UPDATE SET
       current_qualification_id = excluded.current_qualification_id,
       effective_status = excluded.effective_status,
       qualification_context_digest = excluded.qualification_context_digest,
@@ -4862,7 +4882,7 @@ function applyQualificationObservation(
   ).run(
     request.projectId,
     resolved.requirement.roleRequirementId,
-    context.profileDigest,
+    context.requestedProfileDigest,
     qualificationId,
     effectiveStatus,
     contextDigest,
@@ -4883,13 +4903,13 @@ function applyQualificationObservation(
       aggregateId: qualificationId,
       aggregateRevision: 1,
       eventType: "qualification_observation_recorded",
-      event: { qualificationId, roleRequirementId: resolved.requirement.roleRequirementId, profileDigest: context.profileDigest, outcome: observationOutcome },
+      event: { qualificationId, roleRequirementId: resolved.requirement.roleRequirementId, requestedProfileDigest: context.requestedProfileDigest, outcome: observationOutcome },
     },
     { expected: 1, attempted: 1, verified: 1 },
     {
       currentConfigRevision: configRevision,
       currentGovernanceEpoch: governor.governance_epoch,
-      evidence: { qualificationId, roleRequirementId: resolved.requirement.roleRequirementId, profileDigest: context.profileDigest, effectiveStatus, observationDigest, derivationDigest, reasonCode },
+      evidence: { qualificationId, roleRequirementId: resolved.requirement.roleRequirementId, requestedProfileDigest: context.requestedProfileDigest, effectiveStatus, observationDigest, derivationDigest, reasonCode },
     },
     mismatch ? "EXECUTION_PROFILE_MISMATCH" : "OK",
   );
@@ -4901,7 +4921,7 @@ interface QualificationObservationRow {
   config_revision: number;
   repo_target_id: string | null;
   role_requirement_digest: string;
-  executed_profile_digest: string;
+  requested_profile_digest: string;
   qualification_context_digest: string;
   fixture_context_digest: string;
   outcome: "qualified" | "unqualified" | "unknown";
@@ -4953,7 +4973,7 @@ function materializeRoleHolderAttempt(
     startEventSeq: context.startEventSeq,
     completionEventId: context.completionEventId,
     completionEventSeq: context.completionEventSeq,
-    actualProfileDigest: context.profileDigest,
+    requestedProfileDigest: context.requestedProfileDigest,
     holderContextDigest,
   };
   const attemptDigest = sha256(canonicalJson(attemptEvidence));
@@ -4978,8 +4998,8 @@ function materializeRoleHolderAttempt(
       environment_id, source_id, host_id, environment_path, thread_id, provider_thread_id,
       native_request_id, request_event_id, request_event_seq, accepted_event_id, accepted_event_seq,
       first_action_event_id, first_action_event_seq, completion_event_id, completion_event_seq,
-      actual_provider_id, actual_model, actual_reasoning_level, actual_permission_mode,
-      actual_service_tier, actual_visibility, actual_profile_digest, branch_name,
+      requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode,
+      requested_service_tier, requested_visibility, requested_profile_digest, branch_name,
       environment_digest, native_receipt_digest, reason_code, last_event_seq,
       created_at_ms, observed_at_ms, completed_at_ms, attempt_digest
     ) VALUES (?, ?, NULL, 'role_holder', NULL, NULL, NULL, 1, NULL, ?, ?, NULL, ?, ?, ?,
@@ -5015,7 +5035,7 @@ function materializeRoleHolderAttempt(
     context.profile.permissionMode,
     context.profile.serviceTier,
     context.profile.visibility,
-    context.profileDigest,
+    context.requestedProfileDigest,
     environment.branchName,
     sha256(canonicalJson(context.baseContext.environment)),
     holderContextDigest,
@@ -5042,8 +5062,8 @@ function applyRoleGenerationSuccession(
   }
   const resolved = requireRoleRequirement(db, request, configRevision);
   requireRoleTargetContext(db, request, resolved, context);
-  if (!roleRequirementProfileMatches(resolved.requirement, context.profile) || request.profileDigest !== context.profileDigest) {
-    throw refusal("EXECUTION_PROFILE_MISMATCH", "holder executed profile does not match the role requirement");
+  if (!roleRequirementProfileMatches(resolved.requirement, context.profile) || request.profileDigest !== context.requestedProfileDigest) {
+    throw refusal("EXECUTION_PROFILE_MISMATCH", "holder requested profile does not match the role requirement");
   }
   const standbyProfile = request.standbyProfile;
   if (resolved.requirement.standbyProfile && (!standbyProfile || !roleRequirementProfileMatches(resolved.requirement, standbyProfile))) {
@@ -5062,7 +5082,7 @@ function applyRoleGenerationSuccession(
   );
   if (!observation) throw refusal("ROLE_UNQUALIFIED", "qualification observation is not known");
   const projection = asRow<EligibilityProjectionRow>(
-    db.prepare("SELECT * FROM eligibility_projections WHERE project_id = ? AND role_requirement_id = ? AND profile_digest = ?").get(
+    db.prepare("SELECT * FROM eligibility_projections WHERE project_id = ? AND role_requirement_id = ? AND requested_profile_digest = ?").get(
       request.projectId,
       resolved.requirement.roleRequirementId,
       request.profileDigest,
@@ -5082,7 +5102,7 @@ function applyRoleGenerationSuccession(
   if (
     observation.role_requirement_id !== resolved.requirement.roleRequirementId ||
     observation.repo_target_id !== resolved.requirement.repoTargetId ||
-    observation.executed_profile_digest !== request.profileDigest ||
+    observation.requested_profile_digest !== request.profileDigest ||
     observation.qualification_context_digest !== expectedContextDigest ||
     observation.fixture_context_digest !== request.fixtureContextDigest ||
     projection.current_qualification_id !== observation.qualification_id ||
@@ -5150,7 +5170,7 @@ function applyRoleGenerationSuccession(
     `INSERT INTO role_generations (
       project_id, role_id, generation, role_requirement_id, config_revision, repo_target_id,
       status, predecessor_generation, holder_execution_attempt_id, holder_context_digest,
-      holder_executed_profile_digest, qualification_id, eligibility_derivation_digest,
+      holder_requested_profile_digest, qualification_id, eligibility_derivation_digest,
       created_at_ms, activated_at_ms, retired_at_ms, standby_profile_json
     ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
   ).run(
@@ -5163,7 +5183,7 @@ function applyRoleGenerationSuccession(
     request.predecessorGeneration,
     context.holderExecutionAttemptId,
     expectedContextDigest,
-    context.profileDigest,
+    context.requestedProfileDigest,
     request.qualificationId,
     projection.derivation_digest,
     createdAtMs,
@@ -5218,7 +5238,7 @@ function applyRoleGenerationSuccession(
         predecessorGeneration: request.predecessorGeneration,
         holderExecutionAttemptId: context.holderExecutionAttemptId,
         holderContextDigest: expectedContextDigest,
-        executedProfileDigest: context.profileDigest,
+        requestedProfileDigest: context.requestedProfileDigest,
         qualificationId: request.qualificationId,
         eligibilityDerivationDigest: projection.derivation_digest,
         standbyProfile: standbyProfile ?? null,
@@ -6899,14 +6919,14 @@ interface ExecutionAttemptRow {
   content_receipt_digest: string | null;
   frozen_brief_digest: string | null;
   environment_digest: string | null;
-  actual_provider_id: string | null;
-  actual_model: string | null;
-  actual_reasoning_level: string | null;
-  actual_permission_mode: string | null;
-  actual_service_tier: string | null;
-  actual_visibility: "visible" | "hidden" | null;
+  requested_provider_id: string | null;
+  requested_model: string | null;
+  requested_reasoning_level: string | null;
+  requested_permission_mode: string | null;
+  requested_service_tier: string | null;
+  requested_visibility: "visible" | "hidden" | null;
   native_receipt_digest: string | null;
-  actual_profile_digest: string | null;
+  requested_profile_digest: string | null;
   candidate_sha: string | null;
   terminal_result: "DONE" | "BLOCKED" | null;
   reported_outcome: "DONE" | "BLOCKED" | null;
@@ -6924,8 +6944,8 @@ const NATIVE_EVIDENCE_COLUMNS = [
   "thread_id", "provider_thread_id", "native_request_id",
   "request_event_id", "request_event_seq", "accepted_event_id", "accepted_event_seq",
   "first_action_event_id", "first_action_event_seq", "content_event_id", "content_event_seq",
-  "content_receipt_digest", "actual_provider_id", "actual_model", "actual_reasoning_level",
-  "actual_permission_mode", "actual_service_tier", "actual_visibility", "actual_profile_digest",
+  "content_receipt_digest", "requested_provider_id", "requested_model", "requested_reasoning_level",
+  "requested_permission_mode", "requested_service_tier", "requested_visibility", "requested_profile_digest",
   "native_receipt_digest", "last_event_seq",
 ] as const;
 type NativeEvidenceColumn = (typeof NATIVE_EVIDENCE_COLUMNS)[number];
@@ -7043,7 +7063,7 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     external_work_refs: "work_item_id, provider",
     work_item_github_backfills: "project_id",
     qualification_observations: "qualification_id",
-    eligibility_projections: "role_requirement_id, profile_digest",
+    eligibility_projections: "role_requirement_id, requested_profile_digest",
     assignments: "assignment_id",
     execution_attempts: "execution_attempt_id",
     role_generations: "role_id, generation",
@@ -7393,10 +7413,10 @@ function decisionDoctorEvidence(db: SqliteDatabase, projectId: string): {
         });
         if (receiptDigest !== actor.receipt_digest) issues.push({ decisionId: decision.decision_id, reason: "decision_actor_digest_invalid" });
         if (actor.actor_kind === "role") {
-          const role = asRow<{ current_generation: number; status: string; holder_execution_attempt_id: string; holder_context_digest: string; holder_executed_profile_digest: string; qualification_id: string; eligibility_derivation_digest: string; role_requirement_id: string }>(db.prepare(
+          const role = asRow<{ current_generation: number; status: string; holder_execution_attempt_id: string; holder_context_digest: string; holder_requested_profile_digest: string; qualification_id: string; eligibility_derivation_digest: string; role_requirement_id: string }>(db.prepare(
             `SELECT role_generation_heads.current_generation, role_generations.status,
                     role_generations.holder_execution_attempt_id, role_generations.holder_context_digest,
-                    role_generations.holder_executed_profile_digest, role_generations.qualification_id,
+                    role_generations.holder_requested_profile_digest, role_generations.qualification_id,
                     role_generations.eligibility_derivation_digest, role_generations.role_requirement_id
              FROM role_generation_heads JOIN role_generations
                ON role_generations.project_id = role_generation_heads.project_id
@@ -7404,16 +7424,16 @@ function decisionDoctorEvidence(db: SqliteDatabase, projectId: string): {
               AND role_generations.generation = role_generation_heads.current_generation
              WHERE role_generation_heads.project_id = ? AND role_generation_heads.role_id = ?`,
           ).get(projectId, actor.role_id));
-          const holder = role && asRow<{ state: string; origin: string; native_receipt_digest: string | null; actual_profile_digest: string | null }>(
-            db.prepare("SELECT state, origin, native_receipt_digest, actual_profile_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, role.holder_execution_attempt_id),
+          const holder = role && asRow<{ state: string; origin: string; native_receipt_digest: string | null; requested_profile_digest: string | null }>(
+            db.prepare("SELECT state, origin, native_receipt_digest, requested_profile_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, role.holder_execution_attempt_id),
           );
           const eligibility = role && asRow<{ current_qualification_id: string; effective_status: string; expires_at_ms: number | null; derivation_digest: string }>(db.prepare(
-            "SELECT current_qualification_id, effective_status, expires_at_ms, derivation_digest FROM eligibility_projections WHERE project_id = ? AND role_requirement_id = ? AND profile_digest = ?",
-          ).get(projectId, role.role_requirement_id, role.holder_executed_profile_digest));
+            "SELECT current_qualification_id, effective_status, expires_at_ms, derivation_digest FROM eligibility_projections WHERE project_id = ? AND role_requirement_id = ? AND requested_profile_digest = ?",
+          ).get(projectId, role.role_requirement_id, role.holder_requested_profile_digest));
           if (
             !role || actor.role_generation !== role.current_generation || role.status !== "active" || actor.subject_id !== role.holder_execution_attempt_id ||
             !holder || holder.origin !== "role_holder" || holder.state !== "done" || holder.native_receipt_digest !== role.holder_context_digest ||
-            holder.actual_profile_digest !== role.holder_executed_profile_digest || !eligibility ||
+            holder.requested_profile_digest !== role.holder_requested_profile_digest || !eligibility ||
             eligibility.current_qualification_id !== role.qualification_id || eligibility.effective_status !== "eligible" ||
             eligibility.derivation_digest !== role.eligibility_derivation_digest ||
             (eligibility.expires_at_ms !== null && eligibility.expires_at_ms <= now())
@@ -7492,12 +7512,12 @@ function decisionDoctorEvidence(db: SqliteDatabase, projectId: string): {
       issues.push({ evidenceId, reason: "evidence_artifact_redaction_invalid" });
     }
     if (artifact.evidence_kind === "delegated_action_receipt") {
-      const attempt = asRow<{ state: string; terminal_result: string | null; reported_outcome: string | null; terminal_report_digest: string | null; native_receipt_digest: string | null; actual_profile_digest: string | null; conflicting_terminal_digest: string | null }>(
-        db.prepare("SELECT state, terminal_result, reported_outcome, terminal_report_digest, native_receipt_digest, actual_profile_digest, conflicting_terminal_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, artifact.execution_attempt_id),
+      const attempt = asRow<{ state: string; terminal_result: string | null; reported_outcome: string | null; terminal_report_digest: string | null; native_receipt_digest: string | null; requested_profile_digest: string | null; conflicting_terminal_digest: string | null }>(
+        db.prepare("SELECT state, terminal_result, reported_outcome, terminal_report_digest, native_receipt_digest, requested_profile_digest, conflicting_terminal_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, artifact.execution_attempt_id),
       );
       if (
         !attempt || attempt.state !== "done" || attempt.terminal_result !== "DONE" || attempt.reported_outcome !== "DONE" ||
-        attempt.terminal_report_digest !== artifact.content_digest || !attempt.native_receipt_digest || !attempt.actual_profile_digest ||
+        attempt.terminal_report_digest !== artifact.content_digest || !attempt.native_receipt_digest || !attempt.requested_profile_digest ||
         attempt.conflicting_terminal_digest !== null
       ) {
         issues.push({ evidenceId, reason: "delegated_evidence_binding_invalid" });
@@ -7627,16 +7647,16 @@ export async function doctor(
     )?.count ?? 0;
     const configuredRequirements = roleRequirementsFromJson(storedConfigJson(db, projectId, configHead.config_revision));
     const eligibility = (db.prepare(
-      `SELECT role_requirement_id, profile_digest, current_qualification_id, effective_status,
+      `SELECT role_requirement_id, requested_profile_digest, current_qualification_id, effective_status,
               config_revision, role_requirement_digest, expires_at_ms, reason_code
-       FROM eligibility_projections WHERE project_id = ? ORDER BY role_requirement_id, profile_digest`,
+       FROM eligibility_projections WHERE project_id = ? ORDER BY role_requirement_id, requested_profile_digest`,
     ).all(projectId) as Array<Record<string, unknown>>).map((row) => {
       const requirement = configuredRequirements.find((candidate) => candidate.roleRequirementId === row.role_requirement_id);
       const stale = row.config_revision !== configHead.config_revision || !requirement || sha256(canonicalJson(requirement)) !== row.role_requirement_digest;
       const expired = typeof row.expires_at_ms === "number" && row.expires_at_ms <= now();
       return {
         roleRequirementId: row.role_requirement_id,
-        profileDigest: row.profile_digest,
+        requestedProfileDigest: row.requested_profile_digest,
         currentQualificationId: row.current_qualification_id,
         effectiveStatus: stale ? "stale" : expired ? "expired" : row.effective_status,
         reasonCode: stale ? "requirement_or_config_stale" : expired ? "eligibility_expired" : row.reason_code,

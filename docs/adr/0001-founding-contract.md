@@ -8,6 +8,12 @@
 Superseded in part by [ADR 0007](0007-v21-authority-ceremony-removal.md) for
 the authority-ceremony machinery it removes. The remaining history is intact.
 
+> Current correction (2026-08-19, contract v34): the execution-profile claims
+> in this dated ADR were later disproved by GH-228. The store holds request
+> provenance from `client/turn/requested`, not authoritative executed readback;
+> that gap remains GH-215 and upstream get-bb/bb#1787. The ADR body below is
+> preserved with its period terminology and assertions.
+
 This ADR is the controlling design decision for issue 1. The GPT-5 Pro
 verdict is advisory evidence. The founder adjudication is the disposition.
 This repository is a distillation from llm-collab, not a fork or a second
