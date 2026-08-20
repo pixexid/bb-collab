@@ -5385,6 +5385,22 @@ exit 1
     }))).toThrow(/pull request linkage is valid only for review attempts/iu);
   });
 
+  it("discriminator: refuses to activate a review attempt without exact pull-request identity", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
+
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3, {
+      workAttempt: { laneId: "lane-review", assignmentKind: "review", reviewPrNumber: 338 },
+    }))).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0 });
+    expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({
+      lifecycle_state: "in_progress",
+      resource_revision: 3,
+    });
+  });
+
   it("adds config-scoped backfill epoch columns without rewriting a legacy marker", () => {
     const db = new Database(":memory:");
     databaseIsReady(db);
@@ -7666,7 +7682,7 @@ exit 1
     expect(workItemReconciliationIssues(db, PROJECT_ID)).toEqual([]);
   });
 
-  it("still refuses orchestrator succession with two active review attempts", async () => {
+  it("guard: still refuses orchestrator succession with two active review attempts", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
@@ -7689,7 +7705,7 @@ exit 1
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeHandoff);
   });
 
-  it("still refuses same-state transitions outside exact same-head review re-dispatch", async () => {
+  it("guard: still refuses same-state transitions outside exact same-head review re-dispatch", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host);
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");

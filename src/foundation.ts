@@ -1602,7 +1602,9 @@ const workAttemptSchema = z
   .strict()
   .superRefine((attempt, ctx) => {
     const linked = attempt.reviewPrNumber !== undefined || attempt.reviewPrHeadSha !== undefined;
-    if (attempt.assignmentKind !== "review" && linked) {
+    if (attempt.assignmentKind === "review" && (attempt.reviewPrNumber === undefined || attempt.reviewPrHeadSha === undefined)) {
+      ctx.addIssue({ code: "custom", message: "review attempts require an exact pull request number and head SHA" });
+    } else if (attempt.assignmentKind !== "review" && linked) {
       ctx.addIssue({ code: "custom", message: "pull request linkage is valid only for review attempts" });
     }
   });
