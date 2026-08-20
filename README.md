@@ -193,6 +193,8 @@ Shipped operational surfaces include:
   installed host capability now exists
   ([#200](https://github.com/pixexid/bb-collab/issues/200)).
 
+Metric authors must not sum or compare `tokenUsage` across harnesses: it preserves harness/provider accounting, not a cross-harness unit. For cross-harness context load, use non-null `contextWindowUsage.usedTokens`, retain its `estimated` flag and `modelContextWindow`, and refuse the comparison when that normalized context value is unavailable ([#459](https://github.com/pixexid/bb-collab/issues/459)).
+
 Historical contract and schema decisions belong in the
 [ADRs](docs/adr/), especially the [founding contract](docs/adr/0001-founding-contract.md)
 and the [director-role split](docs/adr/0002-director-role-split.md), rather than
