@@ -52,6 +52,22 @@ When every preferred reviewer is unavailable, a Tier-B post-merge review by `gpt
 | B | Features or refactors with no Tier-A contact | Local verification and CI before merge; cold review follows after merge. |
 | C | Documentation, mechanical edits, and additive tests | Local verification and CI. |
 
+## WorkItem `review_pending`
+
+`review_pending` means authorship is complete but the WorkItem is still waiting on review or CI; it is non-terminal and consumes no writing capacity. The canonical state and capacity definitions are [`WORK_ITEM_STATES` and `WORK_ITEM_CAPACITY_LIFECYCLE_STATES`](../src/foundation.ts).
+
+Enter it from `in_progress` only while an active writing attempt exists; that attempt is closed as `done`. Omitting a work attempt is legal for the orchestrator-verifies-the-fixed-head shape. If supplied, the attempt must be `review` with a lane, requested profile, PR number, and PR head SHA; its initial thread ID is optional. These requirements and the registration are enforced by [`workAttemptSchema` and `applyWorkItemTransition`](../src/foundation.ts).
+
+The canonical exits are [`WORK_ITEM_TRANSITIONS`](../src/foundation.ts):
+
+- `in_progress` for request changes, with a supplied writing attempt and requested profile; the active review is superseded and a fresh writing attempt opens.
+- `blocked`, only with exactly one unsatisfied machine-evaluable blocker in the same act, and with no work attempt, unblock, or external event.
+- `succeeded`, `failed`, or `cancelled`, only without an open wait on this non-blocked item.
+
+A same-state `review_pending → review_pending` re-dispatch is also allowed. It supersedes the active review and registers a replacement, but the replacement must include a lane, thread, requested profile, PR number, and PR head SHA, with an active prior review carrying the same PR number and head SHA. These rules are enforced by [`applyWorkItemTransition`](../src/foundation.ts).
+
+`workItemReconciliationIssues` reports `review_attempt_count` only when a `review_pending` item has more than one active review attempt; zero is accepted. Any reconciliation issue blocks the next project-orchestrator succession ([`workItemReconciliationIssues`](../src/foundation.ts), [`applyWorkItemTransition`](../src/foundation.ts)).
+
 ## Escalation
 
 Escalation is the director's, held directly. There is no named escalation seat: one existed, was stood down by the operator for noise, and re-creating it would re-create the noise under a new name.
