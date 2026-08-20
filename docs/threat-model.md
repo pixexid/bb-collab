@@ -4,6 +4,12 @@ This document defines the threats the founding contract must fail closed
 against and the boundary it cannot honestly enforce. The full schema and
 resolver contract are in [ADR 0001](adr/0001-founding-contract.md).
 
+> Current correction (2026-08-19, contract v34): execution-profile claims in
+> this dated contract record were later disproved by GH-228. The store holds
+> request provenance from `client/turn/requested`, not authoritative executed
+> readback; that gap remains GH-215 and upstream get-bb/bb#1787. The body below
+> is preserved with its period terminology and assertions.
+
 ## Scope and trust boundaries
 
 bb-collab governs canonical records and sanctioned mutations for a project. It
@@ -23,8 +29,8 @@ Role requirements are bounded at four logical roles: director and
 project-orchestrator are project-scoped, while worker and independent-reviewer
 bind to an exact repository target. `director-seat` is the only director
 requirement and has zero writing-lane capacity. Each role requirement carries
-requested-profile qualification. That binds dispatch policy but does not prove
-execution; authoritative executed-profile readback remains unavailable.
+its executed-profile qualification; this adds no assignment or dispatch
+authority.
 
 The v20/schema v12 contract retains the v10 operator gate, which has a host/UI
 confirmation boundary only for authorizing or revoking the approver. An adopted
@@ -135,7 +141,7 @@ The goals are:
 | Role succession race | Retired or non-head generation accepts a decision | Current RoleHead, active state, holder receipt and monotonic generation checks; ROLE_GENERATION_STALE. |
 | Unqualified actor | Expired, contradictory or absent qualification satisfies a role or review gate | Immutable observations and derived eligibility; ROLE_UNQUALIFIED or CAPABILITY_UNKNOWN. |
 | Duplicate writer | Two active writers share a project lane | One-writer-per-lane policy at dispatch; no runtime ceiling enforcement remains after the assignment-subsystem severance. |
-| Requested/executed confusion | Requested profile is reported as actual execution | Store request provenance only under `requested_*`; executed-profile audit remains unknown until BB exposes authoritative readback (GH-215, upstream get-bb/bb#1787). |
+| Requested/executed confusion | Requested profile is reported as actual execution | Separate Assignment and ExecutionAttempt; EXECUTION_PROFILE_UNKNOWN or EXECUTION_PROFILE_MISMATCH. |
 | Dispatch ambiguity | Native spawn is acknowledged but start/terminal evidence is missing | DISPATCH_UNKNOWN; reconcile by native/idempotent identity and do not blind-retry. |
 | Quiet worker failure | Worker dies, hangs or quota-fails without a terminal tell | Native lifecycle and terminal receipt required; FAILED or unresolved dispatch, never success by silence. |
 | Connector bypass | Required external review is relabeled unavailable or inferred healthy from another repository | Separate policy/capability and exact-target fixture; CONNECTOR_REQUIRED_UNSATISFIED. |

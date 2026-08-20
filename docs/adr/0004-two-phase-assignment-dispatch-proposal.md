@@ -8,10 +8,12 @@
 
 Superseded by [ADR 0007](0007-v21-authority-ceremony-removal.md) for this
 proposal’s removed receipt and approval machinery. It remains historical.
-Its `actual profile` and `executed evidence` language records the proposal's
-2026-08-16 assumption, not current store semantics: GH-228 established that the
-available BB event is `client/turn/requested`; executed-profile readback remains
-unavailable under GH-215 and upstream get-bb/bb#1787.
+
+> Current correction (2026-08-19, contract v34): the execution-profile claims
+> in this dated proposal were later disproved by GH-228. The store holds request
+> provenance from `client/turn/requested`, not authoritative executed readback;
+> that gap remains GH-215 and upstream get-bb/bb#1787. The proposal body below
+> is preserved with its period terminology and assertions.
 
 ## 1. Decision direction (Option A adopted; Option B declined)
 
