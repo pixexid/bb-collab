@@ -3684,6 +3684,71 @@ exit 1
     }
   });
 
+  it("records known coverage on the first active observation after staleness", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-attempt-liveness-first-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(100);
+    try {
+      const fixture = await fleetWatchdogFixture(1, true, 1);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      fixture.addNativeLane("thread-work-item-1", "active");
+      clock.mockReturnValue(IDLE_FLEET_ATTEMPT_STALE_MS + 200);
+      await fixture.host.harness.emitThreadEvent("thread.active", {
+        thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active", updatedAt: Date.now() }),
+      });
+      await vi.waitFor(() => expect(fixture.db.prepare("SELECT * FROM lane_capacity_intervals").all()).toHaveLength(1));
+      expect(fixture.db.prepare("SELECT coverage_state, reason FROM lane_capacity_intervals").get()).toEqual({ coverage_state: "known", reason: null });
+    } finally {
+      clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("does not refresh an ambiguous writer and review match", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-attempt-liveness-ambiguous-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(700);
+    try {
+      const fixture = await fleetWatchdogFixture(1, true, 1);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      fixture.db.prepare(`
+        INSERT INTO execution_attempts (
+          project_id, execution_attempt_id, origin, lane_id, assignment_kind, attempt_ordinal,
+          config_revision, work_item_id, state, thread_id, created_at_ms, observed_at_ms, attempt_digest
+        ) SELECT project_id, 'ambiguous-review-attempt', 'work_item', lane_id, 'review', attempt_ordinal,
+          config_revision, work_item_id, 'running', thread_id, created_at_ms, 700, 'ambiguous-review-digest'
+        FROM execution_attempts
+        WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
+      `).run(PROJECT_ID);
+      fixture.addNativeLane("thread-work-item-1", "active");
+      await fixture.host.harness.emitThreadEvent("thread.active", {
+        thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active", updatedAt: 800 }),
+      });
+      await vi.waitFor(() => expect(fixture.db.prepare("SELECT * FROM lane_capacity_intervals").all()).toHaveLength(1));
+      expect(fixture.db.prepare(
+        "SELECT assignment_kind, observed_at_ms FROM execution_attempts WHERE project_id = ? AND thread_id = ? ORDER BY assignment_kind",
+      ).all(PROJECT_ID, "thread-work-item-1")).toEqual([
+        { assignment_kind: "review", observed_at_ms: 700 },
+        { assignment_kind: "write", observed_at_ms: 700 },
+      ]);
+    } finally {
+      clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("keeps attempts stale when native lane status is unavailable", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-attempt-liveness-404-"));
     const gh = join(bin, "gh");

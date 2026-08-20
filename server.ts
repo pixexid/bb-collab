@@ -1948,14 +1948,20 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         thread.deletedAt === null &&
         thread.status !== "error" && thread.status !== "stopping",
       );
-      const observedAtMs = Date.now();
       for (const lane of liveLanes) {
         if (lane.status !== "active" && lane.status !== "starting") continue;
+        const matches = db.prepare(
+          `SELECT execution_attempt_id
+           FROM execution_attempts
+           WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
+             AND state = 'running' AND thread_id = ?`,
+        ).all(projectId, lane.id) as Array<{ execution_attempt_id: string }>;
+        if (matches.length !== 1) continue;
         db.prepare(
           `UPDATE execution_attempts
            SET observed_at_ms = ?
-           WHERE project_id = ? AND origin = 'work_item' AND state = 'running' AND thread_id = ?`,
-        ).run(observedAtMs, projectId, lane.id);
+           WHERE project_id = ? AND execution_attempt_id = ? AND state = 'running'`,
+        ).run(Date.now(), projectId, matches[0]!.execution_attempt_id);
       }
       return { known: true, value: liveLanes.length };
     } catch (error) {
@@ -2004,13 +2010,13 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     );
     if (orchestrators.length !== 1) throw new Error(`canonical-orchestrator-count:${orchestrators.length}`);
     const holder = orchestrators[0]!;
-    const observedAtMs = Date.now();
-    const [activeLanes, nativeLanes, startable, ceiling] = await Promise.all([
+    const nativeLanes = await readIdleFleetNativeLanes(projectId);
+    const [activeLanes, startable, ceiling] = await Promise.all([
       readIdleFleetActiveLanes(projectId),
-      readIdleFleetNativeLanes(projectId),
       readIdleFleetStartable(projectId),
       readIdleFleetCeiling(projectId),
     ]);
+    const observedAtMs = Date.now();
     const reasons = [
       !activeLanes.known ? activeLanes.reason : null,
       !nativeLanes.known ? nativeLanes.reason : null,
