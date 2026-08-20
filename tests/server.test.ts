@@ -178,19 +178,22 @@ async function readCheckoutProbeResult(child: ChildProcess, resultPath: string):
   return JSON.parse(readFileSync(resultPath, "utf8")) as CheckoutProbeResult;
 }
 
-function assertCheckoutProbeProcessGroupGone(result: CheckoutProbeResult) {
+async function assertCheckoutProbeProcessGroupGone(result: CheckoutProbeResult) {
   expect(result.processGroupReap).toBe("reaped");
   const processGroupId = result.requestedProcessGroupId;
   expect(Number.isInteger(processGroupId)).toBe(true);
   expect(processGroupId).toBeGreaterThan(0);
   if (typeof processGroupId !== "number" || !Number.isInteger(processGroupId) || processGroupId <= 0) throw new Error("checkout probe did not report a process group ID");
-  let error: NodeJS.ErrnoException | undefined;
-  try {
-    process.kill(-processGroupId, 0);
-  } catch (caught) {
-    error = caught as NodeJS.ErrnoException;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      process.kill(-processGroupId, 0);
+    } catch (caught) {
+      expect((caught as NodeJS.ErrnoException).code).toBe("ESRCH");
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  expect(error?.code).toBe("ESRCH");
+  throw new Error(`checkout probe process group ${processGroupId} survived reaping`);
 }
 
 function roleConfig(connector: "required" | "optional" | "prohibited" = "optional") {
@@ -1047,7 +1050,7 @@ while :; do :; done
       probe = runCheckoutProbe(fixture.directory, resultPath);
       const result = await readCheckoutProbeResult(probe, resultPath);
       expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: null, verdict: "diverged" });
-      assertCheckoutProbeProcessGroupGone(result);
+      await assertCheckoutProbeProcessGroupGone(result);
     } finally {
       if (probe && probe.exitCode === null) probe.kill("SIGKILL");
       if (originalPath === undefined) delete process.env.PATH;
@@ -1075,7 +1078,7 @@ exit 0
       probe = runCheckoutProbe(fixture.directory, resultPath);
       const result = await readCheckoutProbeResult(probe, resultPath);
       expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 1, verdict: "diverged", processGroupReap: "reaped" });
-      assertCheckoutProbeProcessGroupGone(result);
+      await assertCheckoutProbeProcessGroupGone(result);
     } finally {
       if (probe && probe.exitCode === null) probe.kill("SIGKILL");
       if (originalPath === undefined) delete process.env.PATH;
@@ -1104,7 +1107,7 @@ exit 0
       probe = runCheckoutProbe(fixture.directory, resultPath);
       const result = await readCheckoutProbeResult(probe, resultPath);
       expect(result).toMatchObject({ checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: null, verdict: "diverged", processGroupReap: "reaped" });
-      assertCheckoutProbeProcessGroupGone(result);
+      await assertCheckoutProbeProcessGroupGone(result);
     } finally {
       if (probe && probe.exitCode === null) probe.kill("SIGKILL");
       if (originalPath === undefined) delete process.env.PATH;
