@@ -7611,6 +7611,115 @@ exit 1
     expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ count: 0 });
   });
 
+  it("re-dispatches a same-head review without changing lifecycle state or writing capacity", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    const prior = db.prepare(
+      "SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'review'",
+    ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
+
+    const replacementProfile = { ...ROLE_PROFILE, reasoningLevel: "medium" };
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 4, {
+      idempotencyKey: "review-redispatch",
+      workAttempt: {
+        laneId: "lane-review-item-2",
+        threadId: "thread-review-item-2",
+        assignmentKind: "review",
+        requestedProfile: replacementProfile,
+        reviewPrNumber: 338,
+        reviewPrHeadSha: CANDIDATE_SHA,
+      },
+    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
+
+    expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({
+      lifecycle_state: "review_pending",
+      resource_revision: 5,
+    });
+    expect(db.prepare(
+      `SELECT execution_attempt_id, state, assignment_kind, lane_id, thread_id, continuation_of_attempt_id,
+         review_pr_number, review_pr_head_sha, requested_provider_id, requested_model, requested_reasoning_level
+       FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal`,
+    ).all(PROJECT_ID, WORK_ITEM_ID)).toEqual([
+      expect.objectContaining({ state: "done", assignment_kind: "write" }),
+      expect.objectContaining({ execution_attempt_id: prior.execution_attempt_id, state: "superseded", assignment_kind: "review" }),
+      {
+        execution_attempt_id: expect.any(String),
+        state: "running",
+        assignment_kind: "review",
+        lane_id: "lane-review-item-2",
+        thread_id: "thread-review-item-2",
+        continuation_of_attempt_id: prior.execution_attempt_id,
+        review_pr_number: 338,
+        review_pr_head_sha: CANDIDATE_SHA,
+        requested_provider_id: replacementProfile.providerId,
+        requested_model: replacementProfile.model,
+        requested_reasoning_level: replacementProfile.reasoningLevel,
+      },
+    ]);
+    expect(db.prepare(
+      "SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'write' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')",
+    ).get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ count: 0 });
+    expect(workItemReconciliationIssues(db, PROJECT_ID)).toEqual([]);
+  });
+
+  it("still refuses orchestrator succession with two active review attempts", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3)).outcome).toBe("OK");
+    db.prepare("UPDATE execution_attempts SET assignment_kind = 'review', state = 'running' WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'write'").run(PROJECT_ID, WORK_ITEM_ID);
+
+    expect(workItemReconciliationIssues(db, PROJECT_ID)).toEqual([
+      { kind: "review_attempt_count", workItemId: WORK_ITEM_ID, lifecycleState: "review_pending", count: 2 },
+    ]);
+    expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, roleReader()).outcome).toBe("OK");
+    const beforeHandoff = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken), null, roleReader())).toMatchObject({
+      outcome: "WORK_ITEM_STATE_INVALID",
+      expected: 0,
+      attempted: 1,
+      verified: 0,
+    });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeHandoff);
+  });
+
+  it("still refuses same-state transitions outside exact same-head review re-dispatch", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1))).toMatchObject({ outcome: "OK", currentResourceRevision: 2 });
+
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 2, {
+      idempotencyKey: "same-state-ready",
+    }))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({
+      lifecycle_state: "ready",
+      resource_revision: 2,
+    });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 4, {
+      idempotencyKey: "changed-head-review-redispatch",
+      workAttempt: {
+        laneId: "lane-review-item-2",
+        threadId: "thread-review-item-2",
+        assignmentKind: "review",
+        reviewPrNumber: 338,
+        reviewPrHeadSha: H1_CANDIDATE_SHA,
+      },
+    }))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({
+      lifecycle_state: "review_pending",
+      resource_revision: 4,
+    });
+  });
+
   it("doctor measures in-progress WorkItems as active writing lanes", async () => {
     const host = await loadedHost();
     const config = roleConfig();

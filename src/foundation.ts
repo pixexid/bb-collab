@@ -5601,10 +5601,10 @@ function activeWorkItemAttempt(
   projectId: string,
   workItemId: string,
   assignmentKind?: WorkAttempt["assignmentKind"],
-): { execution_attempt_id: string } | undefined {
+): { execution_attempt_id: string; review_pr_number: number | null; review_pr_head_sha: string | null } | undefined {
   const assignmentFilter = assignmentKind === undefined ? "" : " AND assignment_kind = ?";
-  return asRow<{ execution_attempt_id: string }>(db.prepare(
-    `SELECT execution_attempt_id FROM execution_attempts
+  return asRow<{ execution_attempt_id: string; review_pr_number: number | null; review_pr_head_sha: string | null }>(db.prepare(
+    `SELECT execution_attempt_id, review_pr_number, review_pr_head_sha FROM execution_attempts
      WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
        AND state IN (${ACTIVE_WORK_ATTEMPT_STATES.map(() => "?").join(", ")})${assignmentFilter}
      ORDER BY attempt_ordinal DESC LIMIT 1`,
@@ -6098,6 +6098,18 @@ function applyWorkItemTransition(
   if (nextState === "review_pending" && workAttempt?.assignmentKind !== undefined && workAttempt.assignmentKind !== "review") {
     throw refusal("WORK_ITEM_STATE_INVALID", "review-pending may only register a review attempt");
   }
+  const redispatchingReview = workItem.lifecycle_state === "review_pending" && nextState === "review_pending";
+  const priorReview = redispatchingReview
+    ? activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "review")
+    : undefined;
+  if (redispatchingReview && (
+    !workAttempt || !workAttempt.threadId || !workAttempt.requestedProfile ||
+    workAttempt.reviewPrNumber === undefined || workAttempt.reviewPrHeadSha === undefined ||
+    !priorReview || priorReview.review_pr_number !== workAttempt.reviewPrNumber ||
+    priorReview.review_pr_head_sha !== workAttempt.reviewPrHeadSha
+  )) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "review re-dispatch requires one active review and the same exact PR head, replacement thread, and profile");
+  }
   if (workAttempt !== undefined && nextState === undefined) {
     if (workItem.lifecycle_state !== "in_progress") {
       throw refusal("WORK_ITEM_STATE_INVALID", "replacement work attempts require an in-progress work item");
@@ -6164,7 +6176,7 @@ function applyWorkItemTransition(
       },
     );
   }
-  if (!nextState || !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
+  if (!nextState || (!redispatchingReview && !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState))) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
   let recordedExternalEvent: { kind: "github_issue_closed" | "github_issue_reopened"; owner: string; repo: string; issueNumber: number; externalRevision: string } | null = null;
@@ -6208,7 +6220,7 @@ function applyWorkItemTransition(
   if (nextState === "in_progress" && workAttempt === undefined) {
     throw refusal("WORK_ITEM_STATE_INVALID", "entering in-progress requires a work attempt");
   }
-  if (nextState === "review_pending" && !activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
+  if (nextState === "review_pending" && !redispatchingReview && !activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
     throw refusal("WORK_ITEM_STATE_INVALID", "review-pending requires an active writing attempt to close");
   }
   if (workItem.lifecycle_state === "review_pending" && activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
@@ -6267,7 +6279,9 @@ function applyWorkItemTransition(
       reviewPrHeadSha: null,
     });
   } else if (nextState === "review_pending") {
-    executionAttemptId = terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "done", "write");
+    executionAttemptId = redispatchingReview
+      ? terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded", "review")
+      : terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "done", "write");
     if (workAttempt) {
       reviewExecutionAttemptId = insertWorkItemAttempt(db, {
         projectId: request.projectId,
