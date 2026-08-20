@@ -8,7 +8,7 @@ The fleet is a director, an orchestrator, and workers using BB-native threads an
 
 ## Contract
 
-`INSTRUCTION_CONTRACT_VERSION: 36` — this is the instruction contract for agent sessions; apply the [instruction-contract version-bump test](docs/rules.md#version-bump-test) before changing it. The separate `RUNTIME_CONTRACT_VERSION: 22` lives in `src/foundation.ts` and feeds `contractDigest`.
+`INSTRUCTION_CONTRACT_VERSION: 37` — this is the instruction contract for agent sessions; apply the [instruction-contract version-bump test](docs/rules.md#version-bump-test) before changing it. The separate `RUNTIME_CONTRACT_VERSION: 22` lives in `src/foundation.ts` and feeds `contractDigest`.
 
 ## Reading order for a fresh seat
 
@@ -49,6 +49,7 @@ A fresh worktree may have no dependencies. `npm ci` is expected before verificat
 - [Version-bump test](docs/rules.md#version-bump-test) — bump only for a changed running-session obligation.
 - [Question is not delegation](docs/rules.md#question-is-not-delegation) — keep questions and frozen work orders separate.
 - [Delegation return path](docs/rules.md#delegation-return-path) — every delegation says where DONE, BLOCKED, or WAITING returns.
+- [A work order owns bounds, not method](docs/rules.md#a-work-order-owns-bounds-not-method) — authors set coordination constraints; lanes choose implementation from code evidence.
 - [One writer per lane](docs/rules.md#one-writer-per-lane) — one branch and one owner per edit lane.
 - [Quiet with startable work is a defect state](docs/rules.md#quiet-with-startable-work-is-a-defect-state) — intake fires on every wake; the check is `startable > 0 AND lanes < cap`.
 - [Blast radius](docs/rules.md#blast-radius) — update affected open artifacts with the decision that invalidates them.
