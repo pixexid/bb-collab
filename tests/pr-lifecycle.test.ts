@@ -80,6 +80,15 @@ describe("pull-request lifecycle linkage", () => {
     expect(validateCommitMessages(closes, ["Fixes #81"]).ok).toBe(false);
     expect(validateCommitMessages(closes, ["Fixes pixexid/bb-collab#81"]).ok).toBe(false);
     expect(validateCommitMessages(related, null).ok).toBe(false);
+    expect(validateCommitMessages(related, []).ok).toBe(false);
+    expect(validateCommitMessages(related, [""]).ok).toBe(false);
+    expect(validateCommitMessages(related, ["   \n"]).ok).toBe(false);
+  });
+
+  it("does not invent linkage across commit boundaries", () => {
+    const related = parsePullRequestDisposition({ body: "Related GH-999" });
+    expect(validateCommitMessages(related, ["#999", "Fixes"]).ok).toBe(true);
+    expect(validateCommitMessages(related, ["Fixes\n\n#999"]).ok).toBe(false);
   });
 
   it("uses one deterministic marker to make merge handling duplicate-safe", () => {
