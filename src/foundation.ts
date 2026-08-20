@@ -1559,11 +1559,22 @@ const workItemExternalEventSchema = z.object({
   issueNumber: z.number().int().positive().refine(Number.isSafeInteger),
 }).strict();
 const gitShaSchema = z.string().regex(/^[0-9a-f]{40,64}$/u);
+const executionProfileSchema = z
+  .object({
+    providerId: id,
+    model: id,
+    reasoningLevel: id,
+    permissionMode: id,
+    serviceTier: id,
+    visibility: z.enum(["visible", "hidden"]),
+  })
+  .strict();
 const workAttemptSchema = z
   .object({
     laneId: id,
     threadId: id.optional(),
     assignmentKind: z.enum(["write", "review", "probe"]),
+    requestedProfile: executionProfileSchema.optional(),
     reviewPrNumber: z.number().int().positive().refine(Number.isSafeInteger, "reviewPrNumber must be a safe integer").optional(),
     reviewPrHeadSha: gitShaSchema.optional(),
   })
@@ -1625,16 +1636,6 @@ const githubIssuesConfigSchema = z
 const reviewPolicySchema = z.object({ connectors: reviewConnectorsSchema }).strict();
 
 const roleIdSchema = z.enum(ROLE_IDS);
-const executionProfileSchema = z
-  .object({
-    providerId: id,
-    model: id,
-    reasoningLevel: id,
-    permissionMode: id,
-    serviceTier: id,
-    visibility: z.enum(["visible", "hidden"]),
-  })
-  .strict();
 function profileIsOneOf(profile: unknown, profiles: readonly unknown[]): boolean {
   const value = canonicalJson(profile);
   return profiles.some((candidate) => value === canonicalJson(candidate));
@@ -5403,6 +5404,7 @@ function insertWorkItemAttempt(
     threadId: string | null;
     leaseOwnerThreadId: string | null;
     assignmentKind: WorkAttempt["assignmentKind"];
+    requestedProfile?: ExecutionProfile;
     attemptOrdinal: number;
     state: WorkAttemptState;
     reasonCode: string;
@@ -5423,6 +5425,7 @@ function insertWorkItemAttempt(
     laneId: input.laneId,
     threadId: input.threadId,
     assignmentKind: input.assignmentKind,
+    requestedProfileDigest: input.requestedProfile ? requestedProfileDigest(input.requestedProfile) : null,
     reviewPrNumber: input.reviewPrNumber,
     reviewPrHeadSha: input.reviewPrHeadSha,
     attemptOrdinal: input.attemptOrdinal,
@@ -5435,11 +5438,13 @@ function insertWorkItemAttempt(
     `INSERT INTO execution_attempts (
        project_id, execution_attempt_id, origin, lane_id, assignment_kind, attempt_ordinal,
        config_revision, work_item_id, repo_target_id, state, thread_id, reason_code,
+       requested_provider_id, requested_model, requested_reasoning_level, requested_profile_digest,
        review_pr_number, review_pr_head_sha, progress_json, lease_owner_thread_id, continuation_of_attempt_id, created_at_ms,
        observed_at_ms, completed_at_ms, attempt_digest
      ) VALUES (
        @projectId, @executionAttemptId, 'work_item', @laneId, @assignmentKind, @attemptOrdinal,
        @configRevision, @workItemId, @repoTargetId, @state, @threadId, @reasonCode,
+       @requestedProviderId, @requestedModel, @requestedReasoningLevel, @requestedProfileDigest,
        @reviewPrNumber, @reviewPrHeadSha,
        '{}', @leaseOwnerThreadId, @continuationOfAttemptId, @createdAtMs,
        @observedAtMs, @completedAtMs, @attemptDigest
@@ -5456,6 +5461,10 @@ function insertWorkItemAttempt(
     state: input.state,
     threadId: input.threadId,
     reasonCode: input.reasonCode,
+    requestedProviderId: input.requestedProfile?.providerId ?? null,
+    requestedModel: input.requestedProfile?.model ?? null,
+    requestedReasoningLevel: input.requestedProfile?.reasoningLevel ?? null,
+    requestedProfileDigest: input.requestedProfile ? requestedProfileDigest(input.requestedProfile) : null,
     reviewPrNumber: input.reviewPrNumber,
     reviewPrHeadSha: input.reviewPrHeadSha,
     leaseOwnerThreadId: input.leaseOwnerThreadId,
@@ -5466,6 +5475,11 @@ function insertWorkItemAttempt(
     attemptDigest,
   });
   return executionAttemptId;
+}
+
+function requireWorkAttemptProfile(attempt: WorkAttempt): ExecutionProfile {
+  if (!attempt.requestedProfile) throw refusal("EXECUTION_PROFILE_UNKNOWN", "work-item dispatch requires an explicit requested execution profile");
+  return attempt.requestedProfile;
 }
 
 function gh300BackfillEpochMs(db: SqliteDatabase): number {
@@ -6091,6 +6105,7 @@ function applyWorkItemTransition(
       threadId: workAttempt.threadId ?? null,
       leaseOwnerThreadId: workAttempt.threadId ?? null,
       assignmentKind: workAttempt.assignmentKind,
+      requestedProfile: requireWorkAttemptProfile(workAttempt),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
       state: "running",
       reasonCode: "work_item_dispatch",
@@ -6219,6 +6234,7 @@ function applyWorkItemTransition(
       threadId: workAttempt!.threadId ?? null,
       leaseOwnerThreadId: workAttempt!.threadId ?? null,
       assignmentKind: workAttempt!.assignmentKind,
+      requestedProfile: requireWorkAttemptProfile(workAttempt!),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
       state: "running",
       reasonCode: "work_item_dispatch",
@@ -6241,6 +6257,7 @@ function applyWorkItemTransition(
         threadId: workAttempt.threadId ?? null,
         leaseOwnerThreadId: workAttempt.threadId ?? null,
         assignmentKind: "review",
+        requestedProfile: requireWorkAttemptProfile(workAttempt),
         attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
         state: "running",
         reasonCode: "work_item_review",

@@ -15895,10 +15895,19 @@ var workItemExternalEventSchema = external_exports.object({
   issueNumber: external_exports.number().int().positive().refine(Number.isSafeInteger)
 }).strict();
 var gitShaSchema = external_exports.string().regex(/^[0-9a-f]{40,64}$/u);
+var executionProfileSchema = external_exports.object({
+  providerId: id,
+  model: id,
+  reasoningLevel: id,
+  permissionMode: id,
+  serviceTier: id,
+  visibility: external_exports.enum(["visible", "hidden"])
+}).strict();
 var workAttemptSchema = external_exports.object({
   laneId: id,
   threadId: id.optional(),
   assignmentKind: external_exports.enum(["write", "review", "probe"]),
+  requestedProfile: executionProfileSchema.optional(),
   reviewPrNumber: external_exports.number().int().positive().refine(Number.isSafeInteger, "reviewPrNumber must be a safe integer").optional(),
   reviewPrHeadSha: gitShaSchema.optional()
 }).strict().superRefine((attempt, ctx) => {
@@ -15946,14 +15955,6 @@ var githubIssuesConfigSchema = external_exports.object({
 });
 var reviewPolicySchema = external_exports.object({ connectors: reviewConnectorsSchema }).strict();
 var roleIdSchema = external_exports.enum(ROLE_IDS);
-var executionProfileSchema = external_exports.object({
-  providerId: id,
-  model: id,
-  reasoningLevel: id,
-  permissionMode: id,
-  serviceTier: id,
-  visibility: external_exports.enum(["visible", "hidden"])
-}).strict();
 function profileIsOneOf(profile, profiles) {
   const value = canonicalJson(profile);
   return profiles.some((candidate) => value === canonicalJson(candidate));
@@ -18808,6 +18809,7 @@ function insertWorkItemAttempt(db, input) {
     laneId: input.laneId,
     threadId: input.threadId,
     assignmentKind: input.assignmentKind,
+    requestedProfileDigest: input.requestedProfile ? requestedProfileDigest(input.requestedProfile) : null,
     reviewPrNumber: input.reviewPrNumber,
     reviewPrHeadSha: input.reviewPrHeadSha,
     attemptOrdinal: input.attemptOrdinal,
@@ -18820,11 +18822,13 @@ function insertWorkItemAttempt(db, input) {
     `INSERT INTO execution_attempts (
        project_id, execution_attempt_id, origin, lane_id, assignment_kind, attempt_ordinal,
        config_revision, work_item_id, repo_target_id, state, thread_id, reason_code,
+       requested_provider_id, requested_model, requested_reasoning_level, requested_profile_digest,
        review_pr_number, review_pr_head_sha, progress_json, lease_owner_thread_id, continuation_of_attempt_id, created_at_ms,
        observed_at_ms, completed_at_ms, attempt_digest
      ) VALUES (
        @projectId, @executionAttemptId, 'work_item', @laneId, @assignmentKind, @attemptOrdinal,
        @configRevision, @workItemId, @repoTargetId, @state, @threadId, @reasonCode,
+       @requestedProviderId, @requestedModel, @requestedReasoningLevel, @requestedProfileDigest,
        @reviewPrNumber, @reviewPrHeadSha,
        '{}', @leaseOwnerThreadId, @continuationOfAttemptId, @createdAtMs,
        @observedAtMs, @completedAtMs, @attemptDigest
@@ -18841,6 +18845,10 @@ function insertWorkItemAttempt(db, input) {
     state: input.state,
     threadId: input.threadId,
     reasonCode: input.reasonCode,
+    requestedProviderId: input.requestedProfile?.providerId ?? null,
+    requestedModel: input.requestedProfile?.model ?? null,
+    requestedReasoningLevel: input.requestedProfile?.reasoningLevel ?? null,
+    requestedProfileDigest: input.requestedProfile ? requestedProfileDigest(input.requestedProfile) : null,
     reviewPrNumber: input.reviewPrNumber,
     reviewPrHeadSha: input.reviewPrHeadSha,
     leaseOwnerThreadId: input.leaseOwnerThreadId,
@@ -18851,6 +18859,10 @@ function insertWorkItemAttempt(db, input) {
     attemptDigest
   });
   return executionAttemptId;
+}
+function requireWorkAttemptProfile(attempt) {
+  if (!attempt.requestedProfile) throw refusal("EXECUTION_PROFILE_UNKNOWN", "work-item dispatch requires an explicit requested execution profile");
+  return attempt.requestedProfile;
 }
 function gh300BackfillEpochMs(db) {
   const row = db.prepare("SELECT applied_at FROM _bb_migrations WHERE id = ?").get(GH300_BACKFILL_MIGRATION_ID);
@@ -19351,6 +19363,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       threadId: workAttempt.threadId ?? null,
       leaseOwnerThreadId: workAttempt.threadId ?? null,
       assignmentKind: workAttempt.assignmentKind,
+      requestedProfile: requireWorkAttemptProfile(workAttempt),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
       state: "running",
       reasonCode: "work_item_dispatch",
@@ -19470,6 +19483,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       threadId: workAttempt.threadId ?? null,
       leaseOwnerThreadId: workAttempt.threadId ?? null,
       assignmentKind: workAttempt.assignmentKind,
+      requestedProfile: requireWorkAttemptProfile(workAttempt),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
       state: "running",
       reasonCode: "work_item_dispatch",
@@ -19492,6 +19506,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
         threadId: workAttempt.threadId ?? null,
         leaseOwnerThreadId: workAttempt.threadId ?? null,
         assignmentKind: "review",
+        requestedProfile: requireWorkAttemptProfile(workAttempt),
         attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
         state: "running",
         reasonCode: "work_item_review",

@@ -606,7 +606,7 @@ function transitionRequest(
   expectedResourceRevision: number,
   overrides: Partial<ApplyRequest> = {},
 ): ApplyRequest {
-  return {
+  const request: ApplyRequest = {
     projectId: PROJECT_ID,
     operationClass: "work_item_transition",
     idempotencyKey: `work-item-${state}-${expectedResourceRevision}`,
@@ -623,6 +623,10 @@ function transitionRequest(
         : {}),
     ...overrides,
   };
+  if (request.workAttempt && !request.workAttempt.requestedProfile) {
+    request.workAttempt.requestedProfile = ROLE_PROFILE;
+  }
+  return request;
 }
 
 function workItemWaitRequest(
@@ -6899,10 +6903,14 @@ exit 1
       expectedConfigRevision: 2,
       workAttempt: { laneId: "lane-review-item-1", threadId: "thread-review-item-1", assignmentKind: "review", reviewPrNumber: 338, reviewPrHeadSha: CANDIDATE_SHA },
     }))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
-    expect(db.prepare("SELECT review_pr_number, review_pr_head_sha, config_revision FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'review'").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({
+    expect(db.prepare("SELECT review_pr_number, review_pr_head_sha, config_revision, requested_provider_id, requested_model, requested_reasoning_level, requested_profile_digest FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'review'").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({
       review_pr_number: 338,
       review_pr_head_sha: CANDIDATE_SHA,
       config_revision: 1,
+      requested_provider_id: ROLE_PROFILE.providerId,
+      requested_model: ROLE_PROFILE.model,
+      requested_reasoning_level: ROLE_PROFILE.reasoningLevel,
+      requested_profile_digest: ROLE_PROFILE_DIGEST,
     });
     expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND COALESCE(assignment_kind, '') <> 'review' AND (review_pr_number IS NOT NULL OR review_pr_head_sha IS NOT NULL)").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ count: 0 });
     expect(db.prepare("SELECT config_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ config_revision: 1 });
@@ -6928,6 +6936,47 @@ exit 1
       lifecycle_state: "cancelled",
       resource_revision: 6,
     });
+  });
+
+  it("records requested profiles on real work-item dispatch and review attempts", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    const measure = () => db.prepare(
+      `SELECT COUNT(*) AS total,
+              SUM(requested_model IS NOT NULL) AS with_model,
+              SUM(thread_id IS NOT NULL) AS with_thread,
+              SUM(attempt_digest IS NOT NULL) AS with_digest
+       FROM execution_attempts WHERE origin = 'work_item'`,
+    ).get();
+    expect(measure()).toEqual({ total: 0, with_model: null, with_thread: null, with_digest: null });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, { idempotencyKey: "profile-ready" })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2, { idempotencyKey: "profile-dispatch" })).outcome).toBe("OK");
+    expect(measure()).toEqual({ total: 1, with_model: 1, with_thread: 1, with_digest: 1 });
+    expect(db.prepare(
+      `SELECT requested_provider_id, requested_model, requested_reasoning_level, requested_profile_digest
+       FROM execution_attempts WHERE origin = 'work_item'`,
+    ).get()).toEqual({
+      requested_provider_id: ROLE_PROFILE.providerId,
+      requested_model: ROLE_PROFILE.model,
+      requested_reasoning_level: ROLE_PROFILE.reasoningLevel,
+      requested_profile_digest: ROLE_PROFILE_DIGEST,
+    });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3, { idempotencyKey: "profile-review" })).outcome).toBe("OK");
+    expect(measure()).toEqual({ total: 2, with_model: 2, with_thread: 2, with_digest: 2 });
+    expect(db.prepare(
+      `SELECT requested_provider_id, requested_model, requested_reasoning_level, requested_profile_digest
+       FROM execution_attempts WHERE origin = 'work_item' AND assignment_kind = 'review'`,
+    ).get()).toEqual({
+      requested_provider_id: ROLE_PROFILE.providerId,
+      requested_model: ROLE_PROFILE.model,
+      requested_reasoning_level: ROLE_PROFILE.reasoningLevel,
+      requested_profile_digest: ROLE_PROFILE_DIGEST,
+    });
+    const missingProfile = transitionRequest(fenceToken, "in_progress", 4, { idempotencyKey: "profile-missing" });
+    delete missingProfile.workAttempt!.requestedProfile;
+    expect(applyWithFixtureReceipt(db, missingProfile)).toMatchObject({ outcome: "EXECUTION_PROFILE_UNKNOWN", attempted: 0 });
+    expect(measure()).toEqual({ total: 2, with_model: 2, with_thread: 2, with_digest: 2 });
   });
 
   it("keeps stale wait declarations, attempt-only replacements, and projections config-guarded", async () => {
