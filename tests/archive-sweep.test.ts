@@ -61,7 +61,7 @@ function insertGeneration(
     `INSERT INTO role_generations (
        project_id, role_id, generation, role_requirement_id, config_revision,
        repo_target_id, status, predecessor_generation, holder_execution_attempt_id,
-       holder_context_digest, holder_executed_profile_digest, qualification_id,
+       holder_context_digest, holder_requested_profile_digest, qualification_id,
        eligibility_derivation_digest, created_at_ms, activated_at_ms, retired_at_ms
      ) VALUES (?, ?, 1, ?, 1, NULL, ?, NULL, ?, 'context', 'profile',
                'qualification', 'eligibility', 1, 1, ?)`,
