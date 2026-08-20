@@ -38,6 +38,12 @@ A WAITING on the same thing past about 24 hours surfaces to the orchestrator as 
 
 The declarer owes the same check. Before ending a turn in `WAITING`, name the event and confirm it exists; if the next step is yours, or the event has already fired, take it. Orchestrator confirmation catches a phantom wait after it exists, which is one stall too late.
 
+## A work order owns bounds, not method
+
+> The author owns the coordination bounds: exact scope, surfaces held elsewhere, gates, return path, and hard prohibitions, including destructive or irreversible acts and required trust-boundary protections. Those are constraints, not implementation steps.
+
+An author's implementation analysis is a reading to check, never a method the lane must follow. The lane reads the code and chooses the method within those bounds. If evidence disproves the order's reading or no compliant method exists, a well-evidenced `BLOCKED` is a successful return, not a failure to obey.
+
 ## Silence is a defect signal
 
 When you send another seat a blocking question, set the watch in the same act: run `bb thread wait <their-thread> --status idle --timeout <bounded>`, always with an explicit bounded timeout, then check your own inbound for the answer. If their thread is idle and inbound has no answer, it was never sent or delivered: re-ask once, bundled. After the second watch, if there is still no answer, escalate to the operator or supervisor with `director unresponsive`; do not loop a third time. The same pattern applies downward to every lane blocking on you. It is one wait, one inbox check, and at most one re-ask—no polling and no timers.
