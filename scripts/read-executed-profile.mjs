@@ -86,9 +86,20 @@ function activeTurn(thread, events) {
     .sort((left, right) => left.seq - right.seq)
     .at(-1);
   if (!start) return { reason: "BB thread is active but its current turn start is missing" };
+  if (typeof start.scope?.turnId !== "string" || start.scope.turnId === "") return { reason: "BB active turn identity is unavailable" };
   const completedAfterStart = events.some((event) => event?.type === "turn/completed" && event.seq > start.seq && event.data?.providerThreadId === start.data.providerThreadId);
   if (completedAfterStart) return { reason: "BB thread is active but its latest provider turn is already terminal" };
+  const accepted = events.filter((event) => event?.type === "turn/input/accepted"
+    && event.data?.providerThreadId === start.data.providerThreadId
+    && event.scope?.turnId === start.scope?.turnId);
+  if (accepted.length !== 1 || typeof accepted[0].data?.clientRequestId !== "string" || accepted[0].data.clientRequestId === "") {
+    return { reason: "BB active turn input correlation is missing or ambiguous" };
+  }
+  const requests = events.filter((event) => event?.type === "client/turn/requested" && event.data?.requestId === accepted[0].data.clientRequestId);
+  if (requests.length !== 1 || !Number.isSafeInteger(requests[0].createdAt)) return { reason: "BB active turn request timestamp is missing or ambiguous" };
   return {
+    requestedAtMs: requests[0].createdAt,
+    scopeTurnId: start.scope.turnId,
     turn: {
       eventId: start.id,
       eventSeq: start.seq,
@@ -97,6 +108,11 @@ function activeTurn(thread, events) {
       phase: "active",
     },
   };
+}
+
+function recordAtOrAfter(record, timestampMs) {
+  const recordAtMs = typeof record?.timestamp === "string" ? Date.parse(record.timestamp) : Number.NaN;
+  return Number.isFinite(recordAtMs) && recordAtMs >= timestampMs;
 }
 
 function settle(turns, profiles, source, { absentReason = "provider-native turn profile is absent", ambiguous = new Set(), missingCorrelationReason = "BB completion lacks provider correlation", classify } = {}) {
@@ -151,18 +167,18 @@ export async function readExecutedProfiles({ thread, environment, events, home =
       const directory = codexSessionDirectory(home, providerThreadId);
       const files = directory ? filesNamed(root, directory, (name) => name.endsWith(`-${providerThreadId}.jsonl`)) : [];
       if (files.length !== 1) return { ...settle(turns, profiles, "codex turn_context"), reason: `${active ? "active BB turn: " : ""}expected one Codex session log, found ${files.length}` };
-      let activeProfile = null;
+      const activeProfiles = [];
       let activeSessionMatches = !active;
       await readJsonLines(files[0], (record) => {
         if (record?.type === "session_meta" && record.payload?.id === providerThreadId && record.payload?.originator === "bb" && record.payload?.cwd === environment?.path) activeSessionMatches = true;
         if (record?.type === "turn_context") {
           add(record.payload?.turn_id, record.payload?.model, record.payload?.effort);
-          activeProfile = record.payload;
+          if (active && typeof record.payload?.turn_id === "string" && recordAtOrAfter(record, active.requestedAtMs) && active.scopeTurnId.endsWith(`-${record.payload.turn_id}`)) activeProfiles.push(record.payload);
         }
       });
       if (!activeSessionMatches) return { ...settle(turns, profiles, "codex turn_context"), reason: "active BB turn: Codex session_meta does not match the BB session and exact environment path" };
-      if (activeProfile) add(ACTIVE_PROFILE, activeProfile.model, activeProfile.effort);
-      return settle(turns, profiles, "codex turn_context");
+      for (const profile of activeProfiles) add(ACTIVE_PROFILE, profile.model, profile.effort);
+      return settle(turns, profiles, "codex turn_context", { absentReason: active ? "active Codex turn_context at or after the BB turn request is absent" : undefined });
     } catch {
       profiles.clear();
       return { ...settle(turns, profiles, "codex turn_context"), reason: `${active ? "active BB turn: " : ""}Codex session log is unreadable` };
@@ -177,15 +193,16 @@ export async function readExecutedProfiles({ thread, environment, events, home =
       const path = directory ? realPathInside(root, join(directory, `${providerThreadId}.jsonl`)) : null;
       const files = path && isFile(path) ? [path] : [];
       if (files.length !== 1) return { ...settle(turns, profiles, "Claude assistant envelope"), reason: `${active ? "active BB turn: " : ""}expected one Claude session log, found ${files.length}` };
-      let activeProfile = null;
+      const activeProfiles = [];
       await readJsonLines(files[0], (record) => {
         if (record?.type === "assistant" && record.message?.model !== "<synthetic>") {
           add(record.uuid, record.message?.model, record.effort);
-          activeProfile = { model: record.message?.model, reasoningLevel: record.effort };
+          if (active && recordAtOrAfter(record, active.requestedAtMs)) activeProfiles.push({ model: record.message?.model, reasoningLevel: record.effort });
         }
       });
-      if (activeProfile) add(ACTIVE_PROFILE, activeProfile.model, activeProfile.reasoningLevel);
+      for (const profile of activeProfiles) add(ACTIVE_PROFILE, profile.model, profile.reasoningLevel);
       return settle(turns, profiles, "Claude assistant envelope", {
+        absentReason: active ? "active Claude assistant envelope at or after the BB turn request is absent" : undefined,
         classify: (profile) => /\[[^\]]+\]$/u.test(profile.model) ? null : "provider-native model does not establish the exact dispatched SKU or context-window suffix",
       });
     } catch {
@@ -200,8 +217,8 @@ export async function readExecutedProfiles({ thread, environment, events, home =
       const root = join(home, ".pi", "agent", "sessions");
       const directory = piProjectDirectory(home, environment?.path);
       const files = directory ? filesNamed(root, directory, (name) => /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.jsonl$/iu.test(name)) : [];
-      const latestFile = [...files].sort().at(-1);
-      let activeProfile = null;
+      const activeProfiles = [];
+      let activeSessionMatches = 0;
       const ambiguous = new Set();
       const assistantIds = new Set();
       for (const file of files) {
@@ -214,6 +231,8 @@ export async function readExecutedProfiles({ thread, environment, events, home =
           entries.push(record);
         });
         if (entries.length === 0) throw new Error("empty Pi session log");
+        const isActiveSession = Boolean(active && entries[0]?.id === providerThreadId);
+        if (isActiveSession) activeSessionMatches += 1;
         const entryIds = entries.flatMap((entry) => typeof entry?.id === "string" ? [entry.id] : []);
         if (new Set(entryIds).size !== entryIds.length) {
           failureReason = "Pi session entry ids are ambiguous";
@@ -237,14 +256,20 @@ export async function readExecutedProfiles({ thread, environment, events, home =
           if (assistantIds.has(record.id)) ambiguous.add(record.id);
           assistantIds.add(record.id);
           add(record.id, model, ancestor?.thinkingLevel);
-          if (file === latestFile) activeProfile = { model, reasoningLevel: ancestor?.thinkingLevel };
+          if (isActiveSession && recordAtOrAfter(record, active.requestedAtMs)) activeProfiles.push({ model, reasoningLevel: ancestor?.thinkingLevel });
         }
       }
-      if (activeProfile) add(ACTIVE_PROFILE, activeProfile.model, activeProfile.reasoningLevel);
+      if (active && activeSessionMatches !== 1) {
+        const reason = `active BB turn: expected one Pi session matching the BB provider session, found ${activeSessionMatches}`;
+        return { ...settle(turns, profiles, "Pi assistant message", { absentReason: reason }), reason };
+      }
+      for (const profile of activeProfiles) add(ACTIVE_PROFILE, profile.model, profile.reasoningLevel);
       const reason = !directory
         ? "BB environment path cannot identify an exact Pi project directory"
         : files.length === 0
         ? "expected at least one Pi session log in the exact environment-derived project directory, found 0"
+        : active
+        ? "active Pi assistant message at or after the BB turn request is absent"
         : "Pi checkpoints do not correlate to assistant message ids carrying model and reasoning level";
       const result = settle(turns, profiles, "Pi assistant message", { absentReason: reason, ambiguous });
       return result.outcome === "unknown" ? { ...result, reason: `${active ? "active BB turn: " : ""}${reason}` } : result;
