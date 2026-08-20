@@ -42,7 +42,14 @@ function usage() {
 }
 
 function deriveCommitMessages() {
-  // ponytail: main-targeting only. A second base requires deriving from a validated base ref — never supplied evidence.
+  // ponytail: main-targeting and network-required; offline cannot prove the push baseline, so add validated remote-base discovery if that changes.
+  const remote = spawnSync("git", ["ls-remote", "origin", "refs/heads/main"], { encoding: "utf8" });
+  const remoteSha = remote.stdout.trim().split(/\s+/u)[0];
+  if (remote.status !== 0 || remote.error || !/^[0-9a-f]{40}$/u.test(remoteSha)) throw new Error("cannot verify baseline: remote origin/main is unavailable");
+  const local = spawnSync("git", ["rev-parse", "--verify", "refs/remotes/origin/main"], { encoding: "utf8" });
+  const localSha = local.stdout.trim();
+  if (local.status !== 0 || local.error || !/^[0-9a-f]{40}$/u.test(localSha)) throw new Error("cannot verify baseline: local origin/main is unavailable");
+  if (remoteSha !== localSha) throw new Error("cannot verify baseline: local origin/main differs from remote main");
   const shallow = spawnSync("git", ["rev-parse", "--is-shallow-repository"], { encoding: "utf8" });
   if (shallow.status !== 0 || shallow.error || shallow.stdout.trim() === "true") throw new Error("cannot verify commit range: repository is shallow");
   const ancestry = spawnSync("git", ["merge-base", "--is-ancestor", "origin/main", "HEAD"], { encoding: "utf8" });

@@ -9,13 +9,18 @@ const files = ["src/awareness.ts"];
 const good = { title: "Improve awareness", body: "Related GH-402\n\nReview tier: B", files, commitMessages: ["Improve awareness"] };
 const runRealCommitCli = (message: string) => {
   const directory = mkdtempSync(join(tmpdir(), "bb-collab-real-commit-"));
+  const remote = mkdtempSync(join(tmpdir(), "bb-collab-real-remote-"));
   const run = (args: string[], input?: string | Buffer) => spawnSync("git", ["-C", directory, ...args], { encoding: "utf8", input });
   try {
     expect(run(["init"]).status).toBe(0);
     expect(run(["config", "user.email", "test@example.com"]).status).toBe(0);
     expect(run(["config", "user.name", "Test"]).status).toBe(0);
     expect(run(["commit", "--allow-empty", "-m", "base"]).status).toBe(0);
-    expect(run(["update-ref", "refs/remotes/origin/main", "HEAD"]).status).toBe(0);
+    expect(spawnSync("git", ["init", "--bare", remote], { encoding: "utf8" }).status).toBe(0);
+    expect(run(["branch", "-M", "main"]).status).toBe(0);
+    expect(run(["remote", "add", "origin", `file://${remote}`]).status).toBe(0);
+    expect(run(["push", "-q", "origin", "main"]).status).toBe(0);
+    expect(run(["fetch", "-q", "origin", "main"]).status).toBe(0);
     expect(run(["commit", "--allow-empty", "-m", message]).status).toBe(0);
     const bodyFile = join(directory, "event-body.md");
     writeFileSync(bodyFile, "Related GH-402\n\nReview tier: B\n");
@@ -25,6 +30,7 @@ const runRealCommitCli = (message: string) => {
     });
   } finally {
     rmSync(directory, { recursive: true, force: true });
+    rmSync(remote, { recursive: true, force: true });
   }
 };
 
@@ -121,8 +127,43 @@ describe("composed PR pre-push check", () => {
     }
   });
 
+  it("refuses a moved local origin/main tracking ref", () => {
+    const directory = mkdtempSync(join(tmpdir(), "bb-collab-moved-base-"));
+    const remote = mkdtempSync(join(tmpdir(), "bb-collab-moved-base-remote-"));
+    const run = (args: string[], input?: string | Buffer) => spawnSync("git", ["-C", directory, ...args], { encoding: "utf8", input });
+    try {
+      expect(run(["init"]).status).toBe(0);
+      expect(run(["config", "user.email", "test@example.com"]).status).toBe(0);
+      expect(run(["config", "user.name", "Test"]).status).toBe(0);
+      expect(run(["commit", "--allow-empty", "-m", "base"]).status).toBe(0);
+      const base = run(["rev-parse", "HEAD"]).stdout.trim();
+      expect(run(["branch", "-M", "main"]).status).toBe(0);
+      expect(spawnSync("git", ["init", "--bare", remote], { encoding: "utf8" }).status).toBe(0);
+      expect(run(["remote", "add", "origin", `file://${remote}`]).status).toBe(0);
+      expect(run(["push", "-q", "origin", "main"]).status).toBe(0);
+      expect(run(["switch", "-c", "feature"]).status).toBe(0);
+      expect(run(["commit", "--allow-empty", "-m", "Fixes #411"]).status).toBe(0);
+      expect(run(["commit", "--allow-empty", "-m", "ordinary tip"]).status).toBe(0);
+      const forbidden = run(["rev-parse", "HEAD^"]).stdout.trim();
+      expect(forbidden).not.toBe(base);
+      expect(run(["update-ref", "refs/remotes/origin/main", forbidden]).status).toBe(0);
+      const bodyFile = join(directory, "event-body.md");
+      writeFileSync(bodyFile, "Related GH-411\n\nReview tier: B\n");
+      const result = spawnSync(process.execPath, [new URL("../scripts/check-composed-pr.mjs", import.meta.url).pathname,
+        "--title", "Moved baseline", "--body-file", bodyFile, "--file", "src/awareness.ts"], {
+        cwd: directory, encoding: "utf8",
+      });
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}${result.stderr}`).toContain("differs from remote main");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+      rmSync(remote, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a real NUL-bearing commit when framing produces extra records", () => {
     const directory = mkdtempSync(join(tmpdir(), "bb-collab-nul-commit-"));
+    let remote: string | undefined;
     const run = (args: string[], input?: string | Buffer) => spawnSync("git", ["-C", directory, ...args], { encoding: "utf8", input });
     try {
       expect(run(["init"]).status).toBe(0);
@@ -135,7 +176,12 @@ describe("composed PR pre-push check", () => {
       const nulCommit = run(["hash-object", "--stdin", "-t", "commit", "--literally", "-w"], Buffer.from(rawCommit));
       expect(nulCommit.status).toBe(0);
       expect(run(["update-ref", "HEAD", nulCommit.stdout.trim()]).status).toBe(0);
-      expect(run(["update-ref", "refs/remotes/origin/main", base]).status).toBe(0);
+      remote = mkdtempSync(join(tmpdir(), "bb-collab-nul-remote-"));
+      expect(spawnSync("git", ["init", "--bare", remote], { encoding: "utf8" }).status).toBe(0);
+      expect(run(["branch", "-M", "main"]).status).toBe(0);
+      expect(run(["remote", "add", "origin", `file://${remote}`]).status).toBe(0);
+      expect(run(["push", "-q", "origin", `${base}:refs/heads/main`]).status).toBe(0);
+      expect(run(["fetch", "-q", "origin", "main"]).status).toBe(0);
       const bodyFile = join(directory, "event-body.md");
       writeFileSync(bodyFile, "Related GH-402\n\nReview tier: B\n");
       const result = spawnSync(process.execPath, [new URL("../scripts/check-composed-pr.mjs", import.meta.url).pathname,
@@ -146,6 +192,7 @@ describe("composed PR pre-push check", () => {
       expect(`${result.stdout}${result.stderr}`).toContain("contains a NUL character");
     } finally {
       rmSync(directory, { recursive: true, force: true });
+      if (remote) rmSync(remote, { recursive: true, force: true });
     }
   });
 });
