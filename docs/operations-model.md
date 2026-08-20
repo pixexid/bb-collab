@@ -2,6 +2,8 @@
 
 This is the canonical role and review matrix. It describes operating choices, not a second authority store; the decision hierarchy is in the role pages.
 
+Governance scope is deliberate: canonical config defines role-generation seat profiles; this matrix defines lane routing, enforced by the dispatch-time naming and executed-profile attestation protocol below.
+
 ## Role matrix
 
 | Role or lane | Harness/provider | Model | Reasoning |
