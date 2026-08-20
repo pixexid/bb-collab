@@ -404,7 +404,7 @@ function analyzeRepository(rootDirectory = scriptRoot, explicitFiles = null) {
 
   return {
     command: "node scripts/check-production-reachability.mjs",
-    mode: "report-only",
+    mode: "enforced",
     unknownIsNotReachable: true,
     root,
     summary: {
@@ -429,7 +429,15 @@ function cliRoot(argv) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
-  console.log(JSON.stringify(analyzeRepository(cliRoot(process.argv.slice(2))), null, 2));
+  const report = analyzeRepository(cliRoot(process.argv.slice(2)));
+  console.log(JSON.stringify(report, null, 2));
+  if (report.findings.length > 0) {
+    console.error(`Production reachability check failed: ${report.findings.length} finding(s)`);
+    for (const finding of report.findings) {
+      console.error(`- ${finding.file}:${finding.line} ${finding.names.join(", ")} (${finding.status})`);
+    }
+    process.exitCode = 1;
+  }
 }
 
 export { analyzeRepository };

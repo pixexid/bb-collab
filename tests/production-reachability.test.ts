@@ -60,7 +60,11 @@ assembleV17CachedConsumerRolloutEvidence();
 }
 
 function report(directory: string) {
-  return JSON.parse(execFileSync(process.execPath, [checker, "--root", directory], { encoding: "utf8" }));
+  try {
+    return JSON.parse(execFileSync(process.execPath, [checker, "--root", directory], { encoding: "utf8" }));
+  } catch (error) {
+    return JSON.parse((error as { stdout: string }).stdout);
+  }
 }
 
 describe("production reachability report", () => {
@@ -68,7 +72,7 @@ describe("production reachability report", () => {
     const directory = writeFixture();
     try {
       const result = report(directory);
-      expect(result.mode).toBe("report-only");
+      expect(result.mode).toBe("enforced");
       expect(result.unknownIsNotReachable).toBe(true);
       const status = new Map(result.rows.flatMap((row: { names: string[]; status: string }) => row.names.map((name) => [name, row.status])));
       expect(status.get("calledInProduction")).toBe("STATIC_PRODUCTION_REFERENCE");
