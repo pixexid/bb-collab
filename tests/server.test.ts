@@ -64,6 +64,7 @@ import {
 } from "../src/test-support.js";
 import { createLaneWatcher, createRoleIdleLedger, IDLE_FLEET_DEBOUNCE_MS, readRoleHolderStates, roleIdleKey, type RoleIdleRecord } from "../src/awareness.js";
 import { findCheckoutRoot, readCheckoutDivergence } from "../src/checkout-divergence.js";
+import { weeklyThroughputReport } from "../src/throughput-report.js";
 
 const PROJECT_ID = "proj_test";
 const PLUGIN_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -3508,6 +3509,132 @@ exit 1
     }
   });
 
+  it("fails closed when the full-cap interval write is unavailable and records the recovered interval", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-lane-capacity-write-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305}]'\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(100);
+    try {
+      const fixture = await fleetWatchdogFixture(1, true, 1);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      fixture.addNativeLane("thread-work-item-1");
+      const originalPrepare = fixture.db.prepare.bind(fixture.db);
+      const brokenWrite = vi.spyOn(fixture.db, "prepare").mockImplementation(((sql: string) => {
+        if (sql.includes("INSERT INTO lane_capacity_intervals")) throw new Error("interval write failed");
+        return originalPrepare(sql);
+      }) as never);
+
+      await fixture.host.harness.emitThreadEvent("thread.active", {
+        thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active", updatedAt: 100 }),
+      });
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: "idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:Error: interval write failed",
+      })));
+      expect(fixture.db.prepare("SELECT * FROM lane_capacity_intervals").all()).toEqual([]);
+
+      brokenWrite.mockRestore();
+      await fixture.host.harness.emitThreadEvent("thread.active", {
+        thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active", updatedAt: 101 }),
+      });
+      await vi.waitFor(() => expect(fixture.db.prepare("SELECT * FROM lane_capacity_intervals").all()).toHaveLength(1));
+      expect(fixture.db.prepare(
+        "SELECT coverage_state, active_lane_count, writing_lane_ceiling, startable_work, started_at_ms, ended_at_ms FROM lane_capacity_intervals",
+      ).get()).toEqual({ coverage_state: "known", active_lane_count: 1, writing_lane_ceiling: 1, startable_work: 1, started_at_ms: 100, ended_at_ms: null });
+
+      clock.mockReturnValue(200);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3))).toMatchObject({ outcome: "OK" });
+      fixture.addNativeLane("thread-work-item-1", "error");
+      await fixture.host.harness.emitThreadEvent("thread.active", {
+        thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active", updatedAt: 200 }),
+      });
+      await vi.waitFor(() => expect(fixture.db.prepare("SELECT * FROM lane_capacity_intervals").all()).toHaveLength(2));
+      expect(fixture.db.prepare(
+        "SELECT active_lane_count, started_at_ms, ended_at_ms FROM lane_capacity_intervals ORDER BY interval_id",
+      ).all()).toEqual([
+        { active_lane_count: 1, started_at_ms: 100, ended_at_ms: 100 },
+        { active_lane_count: 0, started_at_ms: 200, ended_at_ms: null },
+      ]);
+      expect(exportFoundation(fixture.db, PROJECT_ID).export?.recordsNdjson).toContain('"table":"lane_capacity_intervals"');
+    } finally {
+      clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("does not extend lane-capacity fact coverage from service liveness", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-lane-capacity-liveness-"));
+    const gh = join(bin, "gh");
+    const queue = join(bin, "queue.json");
+    const calls = join(bin, "calls");
+    writeFileSync(queue, '[{"number":305}]');
+    writeFileSync(gh, `#!/bin/sh\nprintf 'call\\n' >> "${calls}"\ncat "${queue}"\n`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(100);
+    try {
+      const fixture = await fleetWatchdogFixture(1, true, 1);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      fixture.addNativeLane("thread-work-item-1");
+      await fixture.host.harness.emitThreadEvent("thread.active", {
+        thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active", updatedAt: 100 }),
+      });
+      await vi.waitFor(() => expect(fixture.db.prepare("SELECT * FROM lane_capacity_intervals").all()).toHaveLength(1));
+
+      clock.mockReturnValue(110);
+      const service = fixture.host.harness.runService("lane-watcher");
+      try {
+        await vi.waitFor(() => expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(2));
+        await vi.waitFor(() => expect((fixture.db.prepare(
+          "SELECT MAX(last_confirmed_at_ms) AS at_ms FROM lane_capacity_intervals",
+        ).get() as { at_ms: number }).at_ms).toBe(110));
+
+        writeFileSync(queue, "[]");
+        clock.mockReturnValue(200);
+        const pollCount = fixture.host.harness.inspection.sdk.callsTo("threads.interactions.list").length;
+        await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.interactions.list").length).toBeGreaterThan(pollCount), { timeout: 2_000 });
+      } finally {
+        service.controller.abort();
+        await service.done;
+      }
+
+      const laneCapacityIntervals = (fixture.db.prepare(
+        `SELECT orchestrator_thread_id, coverage_state, active_lane_count, writing_lane_ceiling,
+                startable_work, reason, started_at_ms, last_confirmed_at_ms, ended_at_ms
+         FROM lane_capacity_intervals ORDER BY interval_id`,
+      ).all() as Array<Record<string, number | string | null>>).map((row) => ({
+        orchestratorId: String(row.orchestrator_thread_id),
+        coverageState: row.coverage_state as "known" | "blind",
+        activeLaneCount: row.active_lane_count as number | null,
+        writingLaneCeiling: row.writing_lane_ceiling as number | null,
+        startableWork: row.startable_work === null ? null : row.startable_work === 1,
+        reason: row.reason as string | null,
+        startedAtMs: row.started_at_ms as number,
+        lastConfirmedAtMs: row.last_confirmed_at_ms as number,
+        endedAtMs: row.ended_at_ms as number | null,
+      }));
+      expect(weeklyThroughputReport({
+        dialsLandedAtMs: null,
+        issues: [],
+        merges: [],
+        reviews: [],
+        laneCapacityIntervals,
+        defects: [],
+      }, { startAtMs: 110, endAtMs: 200 }).laneSlotUtilization.status).toBe("unknown");
+    } finally {
+      clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("fails closed and names the active-lane reader when that conjunct is unreadable", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-blind-"));
     const gh = join(bin, "gh");
@@ -4754,13 +4881,13 @@ exit 1
     }
   });
 
-  it("appends the blocked-work migration without bumping runtime contract v22", () => {
-    expect(SCHEMA_VERSION).toBe(22);
+  it("appends lane-capacity intervals without bumping runtime contract v22", () => {
+    expect(SCHEMA_VERSION).toBe(23);
     expect(RUNTIME_CONTRACT_VERSION).toBe(22);
-    expect(MIGRATIONS).toHaveLength(35);
+    expect(MIGRATIONS).toHaveLength(36);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
-    expect(MIGRATIONS.slice(0, -7).map(sha256)).toEqual([
+    expect(MIGRATIONS.slice(0, -8).map(sha256)).toEqual([
       "2ac2daf5e9bedfefdc007f0ff150814dace6938963b214c463dba8f66332d708",
       "e55c1268522fb2a3c42670c6565376860731de77b7afc8f122755db613d92967",
       "e1901bbaa8edfcb325f3007617b4cda0e07e0c56ab4c970ce778d1fd33c732ab",
@@ -4790,24 +4917,29 @@ exit 1
       "0cf4a2190ba1df8dd5e27834d4ce9f769c4d0e34f8041f39f0858a572c60418b",
       "39bd82dcebe4edf8c5d82d429de5f14b2ddee3a3c87871d4745a9f0467b648ae",
     ]);
-    expect(sha256(MIGRATIONS.slice(0, -7).join("\n"))).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
-    expect(sha256(MIGRATIONS.slice(0, -6).join("\n"))).toBe("4051aa08e489728a2b752340ad979716de7a2a1df9fdd46d2c4b8ccc86d9f5d2");
-    expect(sha256(MIGRATIONS.slice(0, -5).join("\n"))).toBe("7d9d30ecaf897f87b32f0da787366e67ee44194ad9fcd8fd3b33a2ca14eec221");
-    expect(sha256(MIGRATIONS.slice(0, -4).join("\n"))).toBe("3aafb2d48eb7560b5ce2a61b7611b34c9fb52e6dfe063f7e37f6782fe822f652");
-    expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("cdb3f0e553be06e6405f2c1040ed08043accdc506d0ffecc0fd8fc0df9e69591");
-    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("abf83bf6369c9f5acc8e58a7365c89524f5a32c6ab0ab5c5c3729b0d969e1810");
-    expect(MIGRATIONS.at(-8)).toContain("operator_messages");
-    expect(MIGRATIONS.at(-8)).toContain("project_id TEXT NOT NULL");
-    expect(MIGRATIONS.at(-8)).toContain("recipient IN ('operator', 'supervisor')");
-    expect(MIGRATIONS.at(-7)).toContain("execution_attempts_gh300");
-    expect(MIGRATIONS.at(-6)).toContain("work_items_gh295");
-    expect(MIGRATIONS.at(-5)).toContain("work_item_github_backfills");
-    expect(MIGRATIONS.at(-4)).toContain("ADD COLUMN config_revision");
-    expect(MIGRATIONS.at(-3)).toContain("review_pr_number");
-    expect(MIGRATIONS.at(-2)).toContain("RENAME COLUMN actual_model TO requested_model");
-    expect(MIGRATIONS.at(-1)).toContain("work_items_gh200");
-    expect(MIGRATIONS.at(-1)).not.toMatch(/UPDATE work_items|wi-gh-/u);
+    expect(sha256(MIGRATIONS.slice(0, -8).join("\n"))).toBe("3ed6ed11079141d5009cc57129502db80112f6d24a9d687ab545778e0b46c43f");
+    expect(sha256(MIGRATIONS.slice(0, -7).join("\n"))).toBe("4051aa08e489728a2b752340ad979716de7a2a1df9fdd46d2c4b8ccc86d9f5d2");
+    expect(sha256(MIGRATIONS.slice(0, -6).join("\n"))).toBe("7d9d30ecaf897f87b32f0da787366e67ee44194ad9fcd8fd3b33a2ca14eec221");
+    expect(sha256(MIGRATIONS.slice(0, -5).join("\n"))).toBe("3aafb2d48eb7560b5ce2a61b7611b34c9fb52e6dfe063f7e37f6782fe822f652");
+    expect(sha256(MIGRATIONS.slice(0, -4).join("\n"))).toBe("cdb3f0e553be06e6405f2c1040ed08043accdc506d0ffecc0fd8fc0df9e69591");
+    expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("abf83bf6369c9f5acc8e58a7365c89524f5a32c6ab0ab5c5c3729b0d969e1810");
+    expect(sha256(MIGRATIONS.slice(0, -2).join("\n"))).toBe("dcc9fe39083b57f4861c97a5dc38dab25058bbcd53c029dd318db830f9335e76");
+    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("68e3fe96e82258a0b534e9877bc1240b912dba7794328498a62cf0858cae1f0c");
+    expect(schemaDigest).toBe("592fe40c5019ad29b745928fdba285c0f749ea4983b20addc198b84604e6761b");
+    expect(MIGRATIONS.at(-9)).toContain("operator_messages");
+    expect(MIGRATIONS.at(-9)).toContain("project_id TEXT NOT NULL");
+    expect(MIGRATIONS.at(-9)).toContain("recipient IN ('operator', 'supervisor')");
+    expect(MIGRATIONS.at(-8)).toContain("execution_attempts_gh300");
+    expect(MIGRATIONS.at(-7)).toContain("work_items_gh295");
+    expect(MIGRATIONS.at(-6)).toContain("work_item_github_backfills");
+    expect(MIGRATIONS.at(-5)).toContain("ADD COLUMN config_revision");
+    expect(MIGRATIONS.at(-4)).toContain("review_pr_number");
+    expect(MIGRATIONS.at(-3)).toContain("RENAME COLUMN actual_model TO requested_model");
+    expect(MIGRATIONS.at(-2)).toContain("work_items_gh200");
+    expect(MIGRATIONS.at(-2)).not.toMatch(/UPDATE work_items|wi-gh-/u);
+    expect(MIGRATIONS.at(-1)).toContain("lane_capacity_intervals");
     expect(TABLES).toContain("migration_runs");
+    expect(TABLES).toContain("lane_capacity_intervals");
     expect(TABLES).toContain("operator_messages");
     expect(MIGRATION_STATES).toEqual([
       "prepared", "frozen", "exported", "imported", "equivalent", "target_active", "exercised", "retired", "rolled_back", "fix_forward_required",
@@ -4817,8 +4949,8 @@ exit 1
     ]);
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 21,
-      newSchemaVersion: 22,
+      oldSchemaVersion: 22,
+      newSchemaVersion: 23,
       oldContractVersion: 21,
       newContractVersion: 22,
       action: "refused",
@@ -4827,8 +4959,8 @@ exit 1
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(20, 22))).toMatchObject({
-      oldSchemaVersion: 21,
-      newSchemaVersion: 22,
+      oldSchemaVersion: 22,
+      newSchemaVersion: 23,
       oldContractVersion: 21,
       newContractVersion: 22,
       action: "refused",
@@ -4836,12 +4968,12 @@ exit 1
       attempted: 4,
       verified: 0,
     });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(21, 22))).toMatchObject({ action: "refused", verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "refused", verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(23, 22))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 21,
-      newSchemaVersion: 22,
+      oldSchemaVersion: 22,
+      newSchemaVersion: 23,
       oldContractVersion: 21,
       newContractVersion: 22,
       action: "refused",
@@ -4867,6 +4999,11 @@ exit 1
       expect((db.prepare("PRAGMA table_info(work_item_waits)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual([
         "project_id", "work_item_id", "waker", "declared_at_ms", "declared_by_seat", "waker_kind", "note",
       ]);
+      expect((db.prepare("PRAGMA table_info(lane_capacity_intervals)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual([
+        "interval_id", "project_id", "orchestrator_thread_id", "orchestrator_role_generation", "coverage_state",
+        "active_lane_count", "writing_lane_ceiling", "startable_work", "reason", "started_at_ms", "last_confirmed_at_ms", "ended_at_ms",
+      ]);
+      expect(db.prepare("SELECT COUNT(*) AS count FROM lane_capacity_intervals").get()).toEqual({ count: 0 });
       expect((db.prepare("PRAGMA index_list(migration_runs)").all() as Array<{ name: string; unique: number; partial: number }>).filter((row) => row.name.startsWith("migration_runs_"))).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "migration_runs_final_export_identity", unique: 1, partial: 1 }),
         expect.objectContaining({ name: "migration_runs_one_open", unique: 1, partial: 1 }),
@@ -4882,7 +5019,7 @@ exit 1
     databaseIsReady(db);
     const projectId = "proj_gh200_migration";
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -2)) db.exec(statement); })();
       for (const configRevision of [5, 6]) {
         db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, ?, '{}', ?, ?)")
           .run(projectId, configRevision, sha256("{}"), configRevision);
@@ -4919,7 +5056,7 @@ exit 1
          WHERE work_items.project_id = ? ORDER BY work_items.work_item_id`,
       ).all(projectId);
       const before = snapshot();
-      db.transaction(() => db.exec(MIGRATIONS.at(-1)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-2)!))();
       expect(snapshot()).toEqual(before);
       expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
       expect(db.prepare("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
@@ -4936,15 +5073,15 @@ exit 1
     const projectId = "proj_gh295_migration";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -6)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -7)) db.exec(statement);
       })();
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, '{}', ?, 1)").run(projectId, sha256("{}"));
       db.prepare("INSERT INTO repository_targets (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest) VALUES (?, 'target-main', 1, 'source', 'host', '/migration', NULL, 'main', 'target-digest')").run(projectId);
       db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'historical', 1, 'target-main', 'Historical', 'preserve me', 'in_progress', 3, 10, 20)").run(projectId);
       const beforeRows = db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId);
-      const priorStatementDigests = MIGRATIONS.slice(0, -6).map(sha256);
-      db.transaction(() => db.exec(MIGRATIONS.at(-6)!))();
-      expect(MIGRATIONS.slice(0, -6).map(sha256)).toEqual(priorStatementDigests);
+      const priorStatementDigests = MIGRATIONS.slice(0, -7).map(sha256);
+      db.transaction(() => db.exec(MIGRATIONS.at(-7)!))();
+      expect(MIGRATIONS.slice(0, -7).map(sha256)).toEqual(priorStatementDigests);
       expect(db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId)).toEqual(beforeRows);
       expect(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'work_items'").get()).toMatchObject({ sql: expect.stringContaining("review_pending") });
       db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'reviewable', 1, 'target-main', 'Reviewable', 'new state', 'review_pending', 1, 30, 30)").run(projectId);
@@ -4960,7 +5097,7 @@ exit 1
     databaseIsReady(db);
     const projectId = "proj_review_linkage_migration";
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -3)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -4)) db.exec(statement); })();
       const configJson = "{}";
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, ?, ?, 1)").run(projectId, configJson, sha256(configJson));
       db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 1)").run(projectId);
@@ -4975,7 +5112,7 @@ exit 1
       const before = db.prepare(`SELECT ${existingColumns.join(", ")} FROM execution_attempts`).all();
       const rowCount = (db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get() as { count: number }).count;
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-3)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-4)!))();
 
       expect((db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get() as { count: number }).count).toBe(rowCount);
       expect(db.prepare(`SELECT ${existingColumns.join(", ")} FROM execution_attempts`).all()).toEqual(before);
@@ -4991,7 +5128,7 @@ exit 1
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -2)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -3)) db.exec(statement); })();
       db.pragma("foreign_keys = OFF");
       db.prepare("INSERT INTO project_config_revisions VALUES ('project', 1, '{}', 'config-digest', 1)").run();
       db.prepare("INSERT INTO repository_targets VALUES ('project', 'target', 1, 'source', 'host', '/target', NULL, 'main', 'target-digest')").run();
@@ -5023,11 +5160,11 @@ exit 1
         eligibility: db.prepare("SELECT profile_digest, derivation_digest FROM eligibility_projections").get(),
         generation: db.prepare("SELECT holder_executed_profile_digest, holder_context_digest, eligibility_derivation_digest FROM role_generations").get(),
       };
-      const priorStatementDigests = MIGRATIONS.slice(0, -2).map(sha256);
+      const priorStatementDigests = MIGRATIONS.slice(0, -3).map(sha256);
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-2)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-3)!))();
 
-      expect(MIGRATIONS.slice(0, -2).map(sha256)).toEqual(priorStatementDigests);
+      expect(MIGRATIONS.slice(0, -3).map(sha256)).toEqual(priorStatementDigests);
       expect(db.prepare("SELECT requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode, requested_service_tier, requested_visibility, requested_profile_digest, attempt_digest FROM execution_attempts").get()).toEqual(Object.fromEntries(Object.entries(before.attempt as Record<string, unknown>).map(([name, value]) => [name.replace(/^actual_/u, "requested_"), value])));
       expect(db.prepare("SELECT requested_profile_digest, requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode, requested_service_tier, requested_visibility, evidence_digest, observation_digest FROM qualification_observations").get()).toEqual({
         requested_profile_digest: "legacy-profile-digest", requested_provider_id: "provider", requested_model: "model",
@@ -5055,7 +5192,7 @@ exit 1
     databaseIsReady(db);
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -4)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -5)) db.exec(statement);
       })();
       const legacyResult = JSON.stringify({
         projectId: "proj_backfill_legacy",
@@ -5076,7 +5213,7 @@ exit 1
         "SELECT project_id, epoch_created_at_ms, state, result_json, created_at_ms, updated_at_ms FROM work_item_github_backfills",
       ).get();
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-4)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-5)!))();
 
       expect((db.prepare("PRAGMA table_info(work_item_github_backfills)").all() as Array<{ name: string }>).map((column) => column.name)).toEqual([
         "project_id", "epoch_created_at_ms", "state", "result_json", "created_at_ms", "updated_at_ms", "config_revision", "attempt_reason",
@@ -5092,8 +5229,8 @@ exit 1
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
     expect(RUNTIME_CONTRACT_VERSION).toBe(22);
-    expect(SCHEMA_VERSION).toBe(22);
-    expect(MIGRATIONS).toHaveLength(35);
+    expect(SCHEMA_VERSION).toBe(23);
+    expect(MIGRATIONS).toHaveLength(36);
     expect(contractDigest).toBe("f6b0ecbda7e8afd986d46e0eda77662815a737dadc94e268ef00b7d74ba18ed4");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -5110,7 +5247,7 @@ exit 1
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 22, observedContractVersion: 22 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 23, observedContractVersion: 22 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -5268,7 +5405,7 @@ exit 1
     const projectId = "proj_gh300_rebuild";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -7)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -8)) db.exec(statement);
       })();
       db.pragma("foreign_keys = OFF");
       const insert = (table: string, row: Record<string, unknown>) => {
@@ -5326,7 +5463,7 @@ exit 1
       const before = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.values(before).every((value) => value !== null)).toBe(true);
       expect(new Set(Object.values(before).map((value) => String(value))).size).toBeGreaterThan(20);
-      db.transaction(() => db.exec(MIGRATIONS.at(-7)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-8)!))();
       const after = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.fromEntries(columns.map((column) => [column, after[column]]))).toEqual(Object.fromEntries(columns.map((column) => [column, before[column]])));
       expect(after.progress_json).toBe("{}");
@@ -5380,7 +5517,7 @@ exit 1
     const before = exportFoundation(db, PROJECT_ID);
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
-      observedSchemaVersion: 22,
+      observedSchemaVersion: 23,
       observedContractVersion: 22,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
@@ -5611,7 +5748,7 @@ exit 1
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 22, schemaDigest, contractVersion: 22, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 23, schemaDigest, contractVersion: 22, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -6690,8 +6827,8 @@ exit 1
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 21, newSchemaVersion: 22, action: "unknown", expected: 4, attempted: 0, verified: 0 },
-        schema: { version: 22 },
+        cachedConsumers: { oldSchemaVersion: 22, newSchemaVersion: 23, action: "unknown", expected: 4, attempted: 0, verified: 0 },
+        schema: { version: 23 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -8939,7 +9076,7 @@ exit 1
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
     db.exec(MIGRATIONS.find((statement) => statement.includes("CREATE TABLE IF NOT EXISTS assignments"))!);
-    for (const statement of MIGRATIONS.at(-2)!.split(";").filter((statement) => statement.includes("ALTER TABLE execution_attempts"))) db.exec(statement);
+    for (const statement of MIGRATIONS.at(-3)!.split(";").filter((statement) => statement.includes("ALTER TABLE execution_attempts"))) db.exec(statement);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -8959,10 +9096,10 @@ exit 1
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 21, newSchemaVersion: 22, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 21, newSchemaVersion: 22, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(21, 22))).toMatchObject({ oldSchemaVersion: 21, newSchemaVersion: 22, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 21, newSchemaVersion: 22, oldContractVersion: 21, newContractVersion: 22, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 22, newSchemaVersion: 23, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 22, newSchemaVersion: 23, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 22, newSchemaVersion: 23, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(23, 22))).toMatchObject({ oldSchemaVersion: 22, newSchemaVersion: 23, oldContractVersion: 21, newContractVersion: 22, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 

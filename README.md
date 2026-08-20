@@ -85,7 +85,9 @@ Shipped operational surfaces include:
   ([#330](https://github.com/pixexid/bb-collab/pull/330));
 - the weekly GitHub-backed throughput report, invoked with
   `npm run throughput-report -- --repo OWNER/REPO --start START_ISO --end END_ISO --dials-landed-at DIALS_ISO`
-  ([#342](https://github.com/pixexid/bb-collab/pull/342));
+  ([#342](https://github.com/pixexid/bb-collab/pull/342)); lane-slot utilization reads
+  forward-only `lane_capacity_intervals`; liveness never extends observed fact coverage, and any
+  pre-instrumentation or recording gap remains unknown;
 - the report-only static production reachability check, invoked with
   `node scripts/check-production-reachability.mjs`
   ([#347](https://github.com/pixexid/bb-collab/pull/347)); and

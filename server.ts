@@ -1829,6 +1829,52 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   });
 
   type IdleFleetFact<T> = { known: true; value: T } | { known: false; reason: string };
+  type LaneCapacityObservation = {
+    projectId: string;
+    orchestratorThreadId: string;
+    orchestratorRoleGeneration: number;
+    coverageState: "known" | "blind";
+    activeLaneCount: number | null;
+    writingLaneCeiling: number | null;
+    startableWork: boolean | null;
+    reason: string | null;
+    observedAtMs: number;
+  };
+  if (db) {
+    db.prepare(
+      "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE ended_at_ms IS NULL",
+    ).run();
+  }
+  const recordLaneCapacityInterval = (observation: LaneCapacityObservation) => {
+    if (!db) throw new Error("canonical-store-unavailable");
+    db.transaction(() => {
+      db!.prepare(
+        "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE project_id = ? AND ended_at_ms IS NULL",
+      ).run(observation.projectId);
+      db!.prepare(
+        `INSERT INTO lane_capacity_intervals (
+           project_id, orchestrator_thread_id, orchestrator_role_generation,
+           coverage_state, active_lane_count, writing_lane_ceiling, startable_work,
+           reason, started_at_ms, last_confirmed_at_ms, ended_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+      ).run(
+        observation.projectId,
+        observation.orchestratorThreadId,
+        observation.orchestratorRoleGeneration,
+        observation.coverageState,
+        observation.activeLaneCount,
+        observation.writingLaneCeiling,
+        observation.startableWork === null ? null : observation.startableWork ? 1 : 0,
+        observation.reason,
+        observation.observedAtMs,
+        observation.observedAtMs,
+      );
+    })();
+  };
+  const closeLaneCapacityCoverage = () => {
+    if (!db) return;
+    db.prepare("UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE ended_at_ms IS NULL").run();
+  };
   const idleFleetBlind = (
     orchestrator: "known" | "blind",
     activeLanes: "known" | "blind",
@@ -1905,6 +1951,58 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     } catch (error) {
       return { known: false, reason: `startable-queue-unreadable:${String(error)}` };
     }
+  };
+  const readIdleFleetCeiling = (projectId: string): IdleFleetFact<number> => {
+    if (!db) return { known: false, reason: "canonical-store-unavailable" };
+    try {
+      const row = db.prepare(
+        `SELECT revisions.canonical_config_json
+         FROM project_config_heads AS heads
+         JOIN project_config_revisions AS revisions
+           ON revisions.project_id = heads.project_id AND revisions.config_revision = heads.config_revision
+         WHERE heads.project_id = ?`,
+      ).get(projectId) as { canonical_config_json: string } | undefined;
+      return row
+        ? { known: true, value: writingLaneCeilingFromJson(row.canonical_config_json) }
+        : { known: false, reason: "writing-lane-ceiling-unreadable" };
+    } catch (error) {
+      return { known: false, reason: `writing-lane-ceiling-unreadable:${String(error)}` };
+    }
+  };
+  const readLaneCapacityObservation = async (projectId: string): Promise<LaneCapacityObservation> => {
+    if (!db) throw new Error("canonical-store-unavailable");
+    const orchestrators = readRoleHolderStates(db).filter((candidate) =>
+      candidate.project_id === projectId && candidate.role_id === "project-orchestrator",
+    );
+    if (orchestrators.length !== 1) throw new Error(`canonical-orchestrator-count:${orchestrators.length}`);
+    const holder = orchestrators[0]!;
+    const observedAtMs = Date.now();
+    const [activeLanes, nativeLanes, startable, ceiling] = await Promise.all([
+      readIdleFleetActiveLanes(projectId),
+      readIdleFleetNativeLanes(projectId),
+      readIdleFleetStartable(projectId),
+      readIdleFleetCeiling(projectId),
+    ]);
+    const reasons = [
+      !activeLanes.known ? activeLanes.reason : null,
+      !nativeLanes.known ? nativeLanes.reason : null,
+      !startable.known ? startable.reason : null,
+      !ceiling.known ? ceiling.reason : null,
+      activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value
+        ? `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value}`
+        : null,
+    ].filter((reason): reason is string => reason !== null);
+    return {
+      projectId,
+      orchestratorThreadId: holder.thread_id,
+      orchestratorRoleGeneration: holder.role_generation,
+      coverageState: reasons.length === 0 ? "known" : "blind",
+      activeLaneCount: activeLanes.known ? activeLanes.value : null,
+      writingLaneCeiling: ceiling.known ? ceiling.value : null,
+      startableWork: startable.known ? startable.value.count > 0 : null,
+      reason: reasons.length === 0 ? null : reasons.join(";"),
+      observedAtMs,
+    };
   };
   const readIdleFleetProbes = async (): Promise<IdleFleetProbe[]> => {
     if (!db) throw new Error("canonical-store-unavailable");
@@ -2003,6 +2101,15 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       read: () => bb.storage.kv.get<unknown>("idle-fleet.wake"),
       write: (state) => bb.storage.kv.set("idle-fleet.wake", state),
     },
+    capacity: {
+      readProjectIds: async () => [...new Set((db ? readRoleHolderStates(db) : []).filter((holder) =>
+        holder.role_id === "project-orchestrator",
+      ).map((holder) => holder.project_id))],
+      observe: async (projectId) => {
+        recordLaneCapacityInterval(await readLaneCapacityObservation(projectId));
+      },
+      close: closeLaneCapacityCoverage,
+    },
     debounceMs: IDLE_FLEET_DEBOUNCE_MS,
     onBlind: (message) => bb.log.warn(message),
     wake: async (ready: IdleFleetReady) => {
@@ -2051,19 +2158,38 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     const { id, status } = threadEventStatus(payload);
     return watcher.observe(id, status);
   };
-  bb.events.on("thread.active", (payload) => void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
-  bb.events.on("thread.idle", (payload) => {
+  const observeCapacityAfter = async (payload: Parameters<typeof threadEventStatus>[0]) => {
+    await observe(payload);
+    if (payload.thread.parentThreadId != null) await idleFleetDetector.observeCapacity(payload.thread.projectId);
+  };
+  bb.events.on("thread.active", async (payload) => {
+    await observeCapacityAfter(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`));
+  });
+  bb.events.on("thread.idle", async (payload) => {
     idleFleetDetector.arm({ projectId: payload.thread.projectId, threadId: payload.thread.id, idleEpisode: String(payload.thread.updatedAt) });
-    void observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`));
+    await observeCapacityAfter(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`));
   });
   bb.events.on("thread.failed", async (payload) => {
-    await observe(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`));
+    await observeCapacityAfter(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`));
     const { id, status } = threadEventStatus(payload);
     if (status === "error") await recoverErroredThread(id, payload.thread.projectId);
   });
-  bb.events.on("thread.archived", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
-  bb.events.on("thread.deleted", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`)));
-  const unsubscribe = subscribeToThreadChanges(bb.sdk, (threadId, status, archived = false) => watcher.observe(threadId, status, undefined, archived));
+  bb.events.on("thread.archived", async (payload) => {
+    await (async () => {
+      await watcher.observe(payload.thread.id, payload.thread.status, false, true);
+      if (payload.thread.parentThreadId != null) await idleFleetDetector.observeCapacity(payload.thread.projectId);
+    })().catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`));
+  });
+  bb.events.on("thread.deleted", async (payload) => {
+    await (async () => {
+      await watcher.observe(payload.thread.id, payload.thread.status, false, true);
+      if (payload.thread.parentThreadId != null) await idleFleetDetector.observeCapacity(payload.thread.projectId);
+    })().catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`));
+  });
+  const unsubscribe = subscribeToThreadChanges(bb.sdk, async (threadId, status, archived = false, projectId, parentThreadId) => {
+    await watcher.observe(threadId, status, undefined, archived);
+    if (projectId && parentThreadId != null) await idleFleetDetector.observeCapacity(projectId);
+  });
   bb.onDispose(unsubscribe);
   bb.background.service("lane-watcher", {
     async start(signal) {

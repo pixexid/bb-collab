@@ -14382,7 +14382,7 @@ function subscribeToThreadChanges(sdk, observe) {
       event: "thread:changed",
       callback: (event) => {
         if (event.entity !== "thread" || !event.id) return;
-        void sdk.threads.get({ threadId: event.id }).then((thread) => thread.archivedAt === null && thread.deletedAt === null ? observe(thread.id, thread.status) : observe(thread.id, thread.status, true)).catch(() => void 0);
+        void sdk.threads.get({ threadId: event.id }).then((thread) => thread.archivedAt === null && thread.deletedAt === null ? observe(thread.id, thread.status, false, thread.projectId, thread.parentThreadId) : observe(thread.id, thread.status, true, thread.projectId, thread.parentThreadId)).catch(() => void 0);
       }
     });
   } catch {
@@ -14406,6 +14406,7 @@ function createIdleFleetDetector(options) {
   let state = {};
   let loaded = false;
   let stopped = false;
+  const capacityQueues = /* @__PURE__ */ new Map();
   const probeKey = (probe) => `${probe.projectId}:${probe.threadId}`;
   const load = async () => {
     if (loaded) return;
@@ -14458,13 +14459,26 @@ function createIdleFleetDetector(options) {
     }, debounceMs);
     timers.set(key, timer);
   };
+  const observeCapacity = (projectId) => {
+    if (stopped || !options.capacity) return Promise.resolve();
+    const previous = capacityQueues.get(projectId) ?? Promise.resolve();
+    const next = previous.then(() => options.capacity.observe(projectId));
+    capacityQueues.set(projectId, next.catch(() => void 0));
+    return next.catch((error48) => {
+      reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error48)}`);
+    });
+  };
   return {
     arm,
+    observeCapacity,
     async rearm() {
       if (stopped) return;
       try {
         const probes = await options.readRearmProbes();
         for (const probe of probes) arm(probe);
+        if (options.capacity) {
+          for (const projectId of await options.capacity.readProjectIds()) await observeCapacity(projectId);
+        }
       } catch (error48) {
         reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=restart-rearm-unreadable:${String(error48)}`);
       }
@@ -14473,6 +14487,11 @@ function createIdleFleetDetector(options) {
       stopped = true;
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
+      try {
+        options.capacity?.close();
+      } catch (error48) {
+        reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-close-unreadable:${String(error48)}`);
+      }
     }
   };
 }
@@ -14485,11 +14504,11 @@ var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
 var RUNTIME_CONTRACT_VERSION = 22;
-var SCHEMA_VERSION = 22;
+var SCHEMA_VERSION = 23;
 var PREVIOUS_RUNTIME_CONTRACT_VERSION = 21;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
-var PREVIOUS_SCHEMA_VERSION = 21;
+var PREVIOUS_SCHEMA_VERSION = 22;
 var ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"];
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
 var directorSeatPrimaryProfile = {
@@ -14551,6 +14570,7 @@ var TABLES = [
   "execution_attempts",
   "role_generations",
   "role_generation_heads",
+  "lane_capacity_intervals",
   "operator_messages"
 ];
 var MIGRATIONS = [
@@ -15381,7 +15401,26 @@ var MIGRATIONS = [
      FROM gh200_work_item_waits;
    DROP TABLE gh200_assignments;
    DROP TABLE gh200_external_work_refs;
-   DROP TABLE gh200_work_item_waits;`
+   DROP TABLE gh200_work_item_waits;`,
+  `CREATE TABLE IF NOT EXISTS lane_capacity_intervals (
+    interval_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL CHECK (length(project_id) > 0),
+    orchestrator_thread_id TEXT NOT NULL CHECK (length(orchestrator_thread_id) > 0),
+    orchestrator_role_generation INTEGER NOT NULL CHECK (orchestrator_role_generation > 0),
+    coverage_state TEXT NOT NULL CHECK (coverage_state IN ('known', 'blind')),
+    active_lane_count INTEGER CHECK (active_lane_count IS NULL OR active_lane_count >= 0),
+    writing_lane_ceiling INTEGER CHECK (writing_lane_ceiling IS NULL OR writing_lane_ceiling >= 0),
+    startable_work INTEGER CHECK (startable_work IS NULL OR startable_work IN (0, 1)),
+    reason TEXT,
+    started_at_ms INTEGER NOT NULL CHECK (started_at_ms >= 0),
+    last_confirmed_at_ms INTEGER NOT NULL CHECK (last_confirmed_at_ms >= started_at_ms),
+    ended_at_ms INTEGER CHECK (ended_at_ms IS NULL OR ended_at_ms >= started_at_ms),
+    FOREIGN KEY (project_id) REFERENCES project_config_heads(project_id),
+    CHECK ((coverage_state = 'known' AND active_lane_count IS NOT NULL AND writing_lane_ceiling IS NOT NULL AND startable_work IS NOT NULL AND reason IS NULL)
+      OR (coverage_state = 'blind' AND reason IS NOT NULL))
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS lane_capacity_intervals_one_open
+    ON lane_capacity_intervals(project_id) WHERE ended_at_ms IS NULL;`
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var GH300_BACKFILL_MIGRATION_ID = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE execution_attempts_gh300"));
@@ -20279,6 +20318,7 @@ function tableRows(db, table, projectId, offset) {
     execution_attempts: "execution_attempt_id",
     role_generations: "role_id, generation",
     role_generation_heads: "role_id",
+    lane_capacity_intervals: "interval_id",
     operator_messages: "message_id"
   };
   const query = table === "decision_dispositions" || table === "decision_evidence" ? `SELECT ${table}.* FROM ${table}
@@ -23213,6 +23253,41 @@ ${thread.titleFallback ?? ""}`);
     read: () => bb.storage.kv.get("fleet-watchdog.role-idle"),
     write: (state) => bb.storage.kv.set("fleet-watchdog.role-idle", state)
   });
+  if (db) {
+    db.prepare(
+      "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE ended_at_ms IS NULL"
+    ).run();
+  }
+  const recordLaneCapacityInterval = (observation) => {
+    if (!db) throw new Error("canonical-store-unavailable");
+    db.transaction(() => {
+      db.prepare(
+        "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE project_id = ? AND ended_at_ms IS NULL"
+      ).run(observation.projectId);
+      db.prepare(
+        `INSERT INTO lane_capacity_intervals (
+           project_id, orchestrator_thread_id, orchestrator_role_generation,
+           coverage_state, active_lane_count, writing_lane_ceiling, startable_work,
+           reason, started_at_ms, last_confirmed_at_ms, ended_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      ).run(
+        observation.projectId,
+        observation.orchestratorThreadId,
+        observation.orchestratorRoleGeneration,
+        observation.coverageState,
+        observation.activeLaneCount,
+        observation.writingLaneCeiling,
+        observation.startableWork === null ? null : observation.startableWork ? 1 : 0,
+        observation.reason,
+        observation.observedAtMs,
+        observation.observedAtMs
+      );
+    })();
+  };
+  const closeLaneCapacityCoverage = () => {
+    if (!db) return;
+    db.prepare("UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE ended_at_ms IS NULL").run();
+  };
   const idleFleetBlind = (orchestrator, activeLanes, startable, reason) => ({
     kind: "blind",
     message: `idle-fleet coverage=blind orchestrator=${orchestrator} activeLanes=${activeLanes} startable=${startable} reason=${reason}`
@@ -23279,6 +23354,54 @@ ${thread.titleFallback ?? ""}`);
     } catch (error48) {
       return { known: false, reason: `startable-queue-unreadable:${String(error48)}` };
     }
+  };
+  const readIdleFleetCeiling = (projectId) => {
+    if (!db) return { known: false, reason: "canonical-store-unavailable" };
+    try {
+      const row = db.prepare(
+        `SELECT revisions.canonical_config_json
+         FROM project_config_heads AS heads
+         JOIN project_config_revisions AS revisions
+           ON revisions.project_id = heads.project_id AND revisions.config_revision = heads.config_revision
+         WHERE heads.project_id = ?`
+      ).get(projectId);
+      return row ? { known: true, value: writingLaneCeilingFromJson(row.canonical_config_json) } : { known: false, reason: "writing-lane-ceiling-unreadable" };
+    } catch (error48) {
+      return { known: false, reason: `writing-lane-ceiling-unreadable:${String(error48)}` };
+    }
+  };
+  const readLaneCapacityObservation = async (projectId) => {
+    if (!db) throw new Error("canonical-store-unavailable");
+    const orchestrators = readRoleHolderStates(db).filter(
+      (candidate) => candidate.project_id === projectId && candidate.role_id === "project-orchestrator"
+    );
+    if (orchestrators.length !== 1) throw new Error(`canonical-orchestrator-count:${orchestrators.length}`);
+    const holder = orchestrators[0];
+    const observedAtMs = Date.now();
+    const [activeLanes, nativeLanes, startable, ceiling] = await Promise.all([
+      readIdleFleetActiveLanes(projectId),
+      readIdleFleetNativeLanes(projectId),
+      readIdleFleetStartable(projectId),
+      readIdleFleetCeiling(projectId)
+    ]);
+    const reasons = [
+      !activeLanes.known ? activeLanes.reason : null,
+      !nativeLanes.known ? nativeLanes.reason : null,
+      !startable.known ? startable.reason : null,
+      !ceiling.known ? ceiling.reason : null,
+      activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value ? `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value}` : null
+    ].filter((reason) => reason !== null);
+    return {
+      projectId,
+      orchestratorThreadId: holder.thread_id,
+      orchestratorRoleGeneration: holder.role_generation,
+      coverageState: reasons.length === 0 ? "known" : "blind",
+      activeLaneCount: activeLanes.known ? activeLanes.value : null,
+      writingLaneCeiling: ceiling.known ? ceiling.value : null,
+      startableWork: startable.known ? startable.value.count > 0 : null,
+      reason: reasons.length === 0 ? null : reasons.join(";"),
+      observedAtMs
+    };
   };
   const readIdleFleetProbes = async () => {
     if (!db) throw new Error("canonical-store-unavailable");
@@ -23373,6 +23496,15 @@ ${thread.titleFallback ?? ""}`);
       read: () => bb.storage.kv.get("idle-fleet.wake"),
       write: (state) => bb.storage.kv.set("idle-fleet.wake", state)
     },
+    capacity: {
+      readProjectIds: async () => [...new Set((db ? readRoleHolderStates(db) : []).filter(
+        (holder) => holder.role_id === "project-orchestrator"
+      ).map((holder) => holder.project_id))],
+      observe: async (projectId) => {
+        recordLaneCapacityInterval(await readLaneCapacityObservation(projectId));
+      },
+      close: closeLaneCapacityCoverage
+    },
     debounceMs: IDLE_FLEET_DEBOUNCE_MS,
     onBlind: (message) => bb.log.warn(message),
     wake: async (ready) => {
@@ -23415,19 +23547,38 @@ ${thread.titleFallback ?? ""}`);
     const { id: id2, status } = threadEventStatus(payload);
     return watcher.observe(id2, status);
   };
-  bb.events.on("thread.active", (payload) => void observe(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
-  bb.events.on("thread.idle", (payload) => {
+  const observeCapacityAfter = async (payload) => {
+    await observe(payload);
+    if (payload.thread.parentThreadId != null) await idleFleetDetector.observeCapacity(payload.thread.projectId);
+  };
+  bb.events.on("thread.active", async (payload) => {
+    await observeCapacityAfter(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
+  });
+  bb.events.on("thread.idle", async (payload) => {
     idleFleetDetector.arm({ projectId: payload.thread.projectId, threadId: payload.thread.id, idleEpisode: String(payload.thread.updatedAt) });
-    void observe(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
+    await observeCapacityAfter(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
   });
   bb.events.on("thread.failed", async (payload) => {
-    await observe(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
+    await observeCapacityAfter(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
     const { id: id2, status } = threadEventStatus(payload);
     if (status === "error") await recoverErroredThread(id2, payload.thread.projectId);
   });
-  bb.events.on("thread.archived", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
-  bb.events.on("thread.deleted", (payload) => void watcher.observe(payload.thread.id, payload.thread.status, false, true).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`)));
-  const unsubscribe = subscribeToThreadChanges(bb.sdk, (threadId, status, archived = false) => watcher.observe(threadId, status, void 0, archived));
+  bb.events.on("thread.archived", async (payload) => {
+    await (async () => {
+      await watcher.observe(payload.thread.id, payload.thread.status, false, true);
+      if (payload.thread.parentThreadId != null) await idleFleetDetector.observeCapacity(payload.thread.projectId);
+    })().catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
+  });
+  bb.events.on("thread.deleted", async (payload) => {
+    await (async () => {
+      await watcher.observe(payload.thread.id, payload.thread.status, false, true);
+      if (payload.thread.parentThreadId != null) await idleFleetDetector.observeCapacity(payload.thread.projectId);
+    })().catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
+  });
+  const unsubscribe = subscribeToThreadChanges(bb.sdk, async (threadId, status, archived = false, projectId, parentThreadId) => {
+    await watcher.observe(threadId, status, void 0, archived);
+    if (projectId && parentThreadId != null) await idleFleetDetector.observeCapacity(projectId);
+  });
   bb.onDispose(unsubscribe);
   bb.background.service("lane-watcher", {
     async start(signal) {

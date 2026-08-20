@@ -41,6 +41,41 @@ describe("weekly throughput report", () => {
     expect(report.dialGuidance).toContain("unknown");
   });
 
+  it("integrates persisted full-cap intervals only across complete known coverage", () => {
+    const facts = {
+      ...empty,
+      laneCapacityIntervals: [
+        { orchestratorId: "orchestrator-1", coverageState: "known", activeLaneCount: 3, writingLaneCeiling: 3, startableWork: true, reason: null, startedAtMs: 0, lastConfirmedAtMs: 20, endedAtMs: 20 },
+        { orchestratorId: "orchestrator-1", coverageState: "known", activeLaneCount: 2, writingLaneCeiling: 3, startableWork: true, reason: null, startedAtMs: 20, lastConfirmedAtMs: 40, endedAtMs: 40 },
+        { orchestratorId: "orchestrator-1", coverageState: "known", activeLaneCount: 3, writingLaneCeiling: 3, startableWork: false, reason: null, startedAtMs: 40, lastConfirmedAtMs: 100, endedAtMs: 100 },
+      ],
+    } satisfies ThroughputFacts;
+    const report = weeklyThroughputReport(facts, { startAtMs: 0, endAtMs: 100 });
+    expect(report.laneSlotUtilization).toEqual({
+      status: "known",
+      orchestrators: { "orchestrator-1": { utilization: 0.2, fullWithStartableMs: 20, coveredMs: 100 } },
+    });
+    expect(weeklyThroughputReport(facts, { startAtMs: 10, endAtMs: 90 }).laneSlotUtilization).toEqual({
+      status: "known",
+      orchestrators: { "orchestrator-1": { utilization: 0.125, fullWithStartableMs: 10, coveredMs: 80 } },
+    });
+  });
+
+  it.each([
+    ["gap", [
+      { orchestratorId: "orchestrator-1", coverageState: "known" as const, activeLaneCount: 3, writingLaneCeiling: 3, startableWork: true, reason: null, startedAtMs: 0, lastConfirmedAtMs: 40, endedAtMs: 40 },
+      { orchestratorId: "orchestrator-1", coverageState: "known" as const, activeLaneCount: 3, writingLaneCeiling: 3, startableWork: true, reason: null, startedAtMs: 50, lastConfirmedAtMs: 100, endedAtMs: 100 },
+    ]],
+    ["blind interval", [
+      { orchestratorId: "orchestrator-1", coverageState: "blind" as const, activeLaneCount: null, writingLaneCeiling: 3, startableWork: true, reason: "active-lanes-unreadable", startedAtMs: 0, lastConfirmedAtMs: 100, endedAtMs: 100 },
+    ]],
+    ["unconfirmed tail", [
+      { orchestratorId: "orchestrator-1", coverageState: "known" as const, activeLaneCount: 3, writingLaneCeiling: 3, startableWork: true, reason: null, startedAtMs: 0, lastConfirmedAtMs: 90, endedAtMs: null },
+    ]],
+  ])("refuses partially recorded lane capacity coverage: %s", (_case, laneCapacityIntervals) => {
+    expect(weeklyThroughputReport({ ...empty, laneCapacityIntervals }, { startAtMs: 0, endAtMs: 100 }).laneSlotUtilization.status).toBe("unknown");
+  });
+
   it("describes absent review observations without claiming the linkage mechanism is missing", () => {
     const report = weeklyThroughputReport(empty, window);
     expect(report.outlierCohorts).toEqual([]);
