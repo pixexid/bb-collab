@@ -76,12 +76,13 @@ Historical contract v11 required the exact nine-class set; historical contract v
 requirement with the exact primary `pi/kimi-coding/k3/high` and Opus-medium
 standby profiles, zero writing-lane capacity, and the existing
 managed-worktree/source/environment checks. Historical contract v15 added only the exact
-current-generation qualification exemption for generation 2, holder
-`thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source `src_x8veidmpik`.
-The current head and holder execution attempt remained required; foreign, stale,
-wrong-profile, future-generation, succession, and writing requests refused
-before any write. The grandfathered unmanaged epoch-2 service could not establish
-generation-3 occupancy without a later receipt-gated succession. Contract v17
+current-generation qualification exemption for generation 2, using the holder
+returned by the canonical `role_generation_heads` query together with
+`env_3znzsxb7ce` and `src_x8veidmpik`. The current head and holder execution
+attempt remained required; foreign, stale, wrong-profile, future-generation,
+succession, and writing requests refused before any write. The grandfathered unmanaged epoch-2 service could not establish
+generation-3 occupancy without a later receipt-gated succession. Contract
+v17
 supersedes those historical v13-v15 rules: only director generation 1 uses the
 exact holder/environment/source qualification-and-creation exemption, only director generations carry the
 named different-provider standby, and project-orchestrator generations omit it.
