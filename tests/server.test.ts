@@ -3731,6 +3731,7 @@ exit 1
         WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
       `).run(PROJECT_ID);
       fixture.addNativeLane("thread-work-item-1", "active");
+      clock.mockReturnValue(800);
       await fixture.host.harness.emitThreadEvent("thread.active", {
         thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active", updatedAt: 800 }),
       });

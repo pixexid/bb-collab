@@ -23358,12 +23358,12 @@ ${thread.titleFallback ?? ""}`);
       for (const lane of liveLanes) {
         if (lane.status !== "active" && lane.status !== "starting") continue;
         const matches = db.prepare(
-          `SELECT execution_attempt_id
+          `SELECT execution_attempt_id, assignment_kind
            FROM execution_attempts
-           WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
+           WHERE project_id = ? AND origin = 'work_item'
              AND state = 'running' AND thread_id = ?`
         ).all(projectId, lane.id);
-        if (matches.length !== 1) continue;
+        if (matches.length !== 1 || matches[0].assignment_kind !== "write") continue;
         db.prepare(
           `UPDATE execution_attempts
            SET observed_at_ms = ?
