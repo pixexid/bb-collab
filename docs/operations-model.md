@@ -52,6 +52,16 @@ When every preferred reviewer is unavailable, a Tier-B post-merge review by `gpt
 | B | Features or refactors with no Tier-A contact | Local verification and CI before merge; cold review follows after merge. |
 | C | Documentation, mechanical edits, and additive tests | Local verification and CI. |
 
+## WorkItem `review_pending`
+
+`review_pending` means authorship is complete but the WorkItem is still waiting on review or CI; it is non-terminal and consumes no writing capacity. The canonical state list and capacity list are in [`foundation.ts`](../src/foundation.ts#L1488-L1492).
+
+Enter it from `in_progress` only while an active writing attempt exists. The transition closes that attempt as `done`. It may omit a work attempt; that is the legal orchestrator-verifies-the-fixed-head shape. If a work attempt is supplied, it must be a `review` attempt; the resolver registers its reviewer thread, requested profile, PR number, and PR head SHA. Review attempts require both exact PR fields in the input schema ([transition checks](../src/foundation.ts#L6091-L6101), [close/register](../src/foundation.ts#L6222-L6229), [recording](../src/foundation.ts#L6283-L6307)).
+
+From `review_pending`, the canonical transitions are `in_progress` (request changes: supersede the active review and open a fresh writing attempt), `blocked`, or the terminal states `succeeded`, `failed`, and `cancelled`; see [`WORK_ITEM_TRANSITIONS`](../src/foundation.ts#L5921-L5930). A same-state `review_pending → review_pending` re-dispatch is also allowed: it supersedes the active review and registers a replacement, but requires an active review, replacement thread/profile, and the same PR number and head SHA ([guards](../src/foundation.ts#L6103-L6113), [replacement](../src/foundation.ts#L6283-L6307)).
+
+Keep exactly one active review attempt. `workItemReconciliationIssues` raises `review_attempt_count` when a `review_pending` item has more than one; any reconciliation issue blocks the next project-orchestrator succession ([query](../src/foundation.ts#L5643-L5679), [handoff gate](../src/foundation.ts#L5214-L5221)).
+
 ## Escalation
 
 Escalation is the director's, held directly. There is no named escalation seat: one existed, was stood down by the operator for noise, and re-creating it would re-create the noise under a new name.
