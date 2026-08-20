@@ -20,10 +20,10 @@ function check(body: string, files: string[]) {
 
 describe("pull-request review tier policy", () => {
   it("requires a declaration, derives risk, and encodes merge timing", () => {
-    expect(check("Related GH-76", ["docs/roadmap.md"]).status).toBe(1);
-    expect(check("Review tier: A\nReview tier: B", ["docs/roadmap.md"]).status).toBe(1);
-    expect(check("<!-- Review tier: A -->", ["docs/roadmap.md"]).status).toBe(1);
-    expect(check("```\nReview tier: A\n```", ["docs/roadmap.md"]).status).toBe(1);
+    expect(check("Related GH-76", ["docs/operations-model.md"]).status).toBe(1);
+    expect(check("Review tier: A\nReview tier: B", ["docs/operations-model.md"]).status).toBe(1);
+    expect(check("<!-- Review tier: A -->", ["docs/operations-model.md"]).status).toBe(1);
+    expect(check("```\nReview tier: A\n```", ["docs/operations-model.md"]).status).toBe(1);
     const tierC = check("Review tier: C", ["docs/issue-57-mechanism-1.md", "tests/review-policy.test.ts"]);
     expect(tierC.status).toBe(0);
     expect(tierC.stderr).not.toContain("Review finding");

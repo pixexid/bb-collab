@@ -8,5 +8,4 @@ These documents are retained as issue-linked historical records. The closed issu
 - [GH-76 tiered review policy](issue-76-tiered-review-policy.md)
 - [GH-79 subagent effort](issue-79-subagent-effort.md)
 - [GH-104 assignment profile audit](issue-104-assignment-profile-audit.md)
-- [GH-147 thread archive sweep](thread-archive-sweep.md)
 - [GH-228 execution-profile provenance](issue-228-execution-profile-provenance.md)

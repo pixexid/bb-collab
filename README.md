@@ -311,6 +311,7 @@ conformance, governorship and resolver seams exist.
 | [Sidebar provider logos](docs/sidebar-provider-logos.md) | Provider-branding implementation boundary. |
 | [Canonical WorkItem registration](docs/workitem-registration.md) | Authorized registration procedure. |
 | [Role succession runbook](docs/succession-runbook.md) | Current project-agnostic succession method. |
+| [Thread archive sweep](docs/thread-archive-sweep.md) | Current fail-closed archive capability. |
 | [Archived documentation](docs/incidents/README.md) | Issue-linked historical records. |
 
 ## Dependency sequence
