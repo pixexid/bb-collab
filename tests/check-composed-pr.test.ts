@@ -24,4 +24,15 @@ describe("composed PR pre-push check", () => {
     }
     expect(validateComposedPullRequest(good)).toMatchObject({ ok: true, reviewTier: "B" });
   });
+
+  it.each([
+    ["blank title", { ...good, title: "" }, "title"],
+    ["missing changed path", { ...good, files: [undefined as unknown as string] }, "changed files"],
+    ["blank changed path", { ...good, files: [""] }, "changed files"],
+  ])("rejects %s before invoking either gate", (_name, input, message) => {
+    const result = validateComposedPullRequest(input);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain(message);
+  });
 });
