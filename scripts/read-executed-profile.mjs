@@ -60,7 +60,8 @@ function piBridgeDirectory(home, env) {
 }
 
 function piBridgeFilename(providerThreadId) {
-  return `${providerThreadId.replace(/[^A-Za-z0-9._-]/gu, "_")}.jsonl`;
+  const sanitized = providerThreadId.replace(/[^A-Za-z0-9._-]/gu, "_");
+  return sanitized === providerThreadId ? `${sanitized}.jsonl` : null;
 }
 
 async function readJsonLines(path, visit) {
@@ -220,7 +221,12 @@ export async function readExecutedProfiles({ thread, environment, events, home =
     let failureReason = "Pi session log is unreadable";
     try {
       const root = piBridgeDirectory(home, env);
-      const candidate = realPathInside(root, join(root, piBridgeFilename(providerThreadId)));
+      const filename = piBridgeFilename(providerThreadId);
+      if (!filename) {
+        const reason = `${active ? "active BB turn: " : ""}Pi provider session id requires lossy filename sanitization`;
+        return { ...settle(turns, profiles, "Pi assistant envelope and thinking state", { absentReason: reason }), reason };
+      }
+      const candidate = realPathInside(root, join(root, filename));
       if (!candidate || !isFile(candidate)) {
         const reason = `${active ? "active BB turn: " : ""}expected the exact Pi bridge session log, found 0`;
         return { ...settle(turns, profiles, "Pi assistant envelope and thinking state", { absentReason: reason }), reason };

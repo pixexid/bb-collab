@@ -106,16 +106,20 @@ visible as `observedProfile`, but its compliance result is `unknown` because it
 does not establish an exact dispatched SKU or context-window suffix such as
 `[1m]`. The reader never normalizes or guesses that suffix.
 
-Pi bridge logs use `~/.bb/pi-bridge-sessions/SANITIZED_PROVIDER_THREAD_ID.jsonl`;
-`BB_PI_BRIDGE_SESSION_DIR` overrides the directory, and filename characters
-outside `[A-Za-z0-9._-]` become `_`. The filename identifies the BB provider
-session while the session header's `cwd` must still equal the exact environment
-path. A completion checkpoint may be the leaf below its assistant envelope, so
-the reader walks `parentId`: the assistant envelope supplies executed
-provider/model and its nearest `thinking_level_change` ancestor supplies
-reasoning. `model_change` is selection evidence only; disagreement is reported
-without replacing the executed model. Missing or ambiguous evidence stays
-unknown per element, so a proven model remains visible when reasoning is
+Pi bridge logs use `~/.bb/pi-bridge-sessions/PROVIDER_THREAD_ID.jsonl`;
+`BB_PI_BRIDGE_SESSION_DIR` overrides the directory. The bridge replaces
+filename characters outside `[A-Za-z0-9._-]` with `_`; because that mapping is
+non-injective, the reader accepts only provider thread IDs that require no
+replacement, as current BB-generated IDs do. For an accepted ID, its filename
+and an exact session-header `cwd` match provide the available correlation. A
+foreign lossy ID can still occupy the same filename as a safe ID, and the
+file's UUID-plus-`cwd` header contains no evidence that can detect that residual
+collision. A completion checkpoint may be the leaf below its assistant
+envelope, so the reader walks `parentId`: the assistant envelope supplies
+executed provider/model and its nearest `thinking_level_change` ancestor
+supplies reasoning. `model_change` is selection evidence only; disagreement is
+reported without replacing the executed model. Missing or ambiguous evidence
+stays unknown per element, so a proven model remains visible when reasoning is
 unknown.
 
 ## Sidebar thread list
