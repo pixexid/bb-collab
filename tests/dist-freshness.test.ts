@@ -57,6 +57,12 @@ describe("dist freshness gate", () => {
       expect(deployedHonest.stdout).toBe("");
       expect(deployedHonest.stderr).toBe("");
 
+      writeFileSync(join(root, "dist/server.js.map"), "map changed\n");
+      const changedMap = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
+      expect(changedMap.status).toBe(0);
+      expect(changedMap.stdout).toContain("working tree dist/ matches commit");
+      writeFileSync(join(root, "dist/server.js.map"), "map\n");
+
       writeFileSync(join(root, "dist/server.js"), "hand edited\n");
       const stale = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
       expect(stale.status).toBe(1);
