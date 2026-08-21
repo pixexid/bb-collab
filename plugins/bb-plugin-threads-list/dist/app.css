@@ -297,6 +297,9 @@
     .p-1 {
       padding: calc(var(--spacing) * 1);
     }
+    .p-2 {
+      padding: calc(var(--spacing) * 2);
+    }
     .p-3 {
       padding: calc(var(--spacing) * 3);
     }
@@ -352,6 +355,9 @@
     }
     .text-primary {
       color: var(--primary);
+    }
+    .underline {
+      text-decoration-line: underline;
     }
     .opacity-0 {
       opacity: 0%;

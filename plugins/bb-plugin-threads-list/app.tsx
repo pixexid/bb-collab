@@ -452,6 +452,7 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   const [customStates, setCustomStates] = useState<ThreadStates>({});
   const [indicatorBroken, setIndicatorBroken] = useState<string | null>(null);
   const [threadModels, setThreadModels] = useState<ThreadModels>({});
+  const [stateMigrationNotice, setStateMigrationNotice] = useState(() => window.localStorage.getItem("bb-plugin-threads-list.state-migration-notice") !== "dismissed");
   const threadIds = useMemo(() => sidebar.threads.map((thread) => thread.id), [sidebar.threads]);
   const threadIdsKey = threadIds.join("\u0000");
   const projectIds = useMemo(() => sidebar.projects.map((project) => project.id), [sidebar.projects]);
@@ -565,7 +566,7 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
 
   return (
     <div className="h-full space-y-3 overflow-y-auto p-1">
-      
+      {stateMigrationNotice ? <p role="status" className="rounded-md border border-border p-2 text-xs text-muted-foreground">Thread-list collapse and custom state were reset during the plugin move. <button type="button" className="underline" onClick={() => { window.localStorage.setItem("bb-plugin-threads-list.state-migration-notice", "dismissed"); setStateMigrationNotice(false); }}>Dismiss</button></p> : null}
       {groups.map(({ project, threads }) => {
         const tree = buildThreadTree(threads);
         const collapsed = collapsedProjects.has(project.id);

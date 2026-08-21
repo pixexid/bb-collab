@@ -485,6 +485,7 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
   const [customStates, setCustomStates] = useState({});
   const [indicatorBroken, setIndicatorBroken] = useState(null);
   const [threadModels, setThreadModels] = useState({});
+  const [stateMigrationNotice, setStateMigrationNotice] = useState(() => window.localStorage.getItem("bb-plugin-threads-list.state-migration-notice") !== "dismissed");
   const threadIds = useMemo(() => sidebar.threads.map((thread) => thread.id), [sidebar.threads]);
   const threadIdsKey = threadIds.join("\0");
   const projectIds = useMemo(() => sidebar.projects.map((project) => project.id), [sidebar.projects]);
@@ -595,38 +596,47 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
       !childrenCollapsed ? node.children.map((child) => renderNode(child, threadModels[child.thread.id] ?? null, depth + 1)) : null
     ] }, node.thread.id);
   };
-  return /* @__PURE__ */ jsx("div", { className: "h-full space-y-3 overflow-y-auto p-1", children: groups.map(({ project, threads }) => {
-    const tree = buildThreadTree(threads);
-    const collapsed = collapsedProjects.has(project.id);
-    const expanded = expandedProjects.has(project.id);
-    const visibleThreads = expanded ? tree : tree.slice(0, MAX_VISIBLE_THREADS);
-    const projectName = asText(project.name) ?? asText(project.id) ?? "Untitled project";
-    return /* @__PURE__ */ jsxs("section", { "aria-labelledby": `project-${project.id}`, children: [
-      /* @__PURE__ */ jsxs("div", { className: "flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-normal text-muted-foreground", children: [
-        /* @__PURE__ */ jsx("span", { className: "flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground", "aria-hidden": "true", children: projectAvatar(projectName) }),
-        /* @__PURE__ */ jsx("span", { id: `project-${project.id}`, className: "min-w-0 truncate", children: projectName }),
-        /* @__PURE__ */ jsx("span", { className: "ml-auto shrink-0", "data-project-thread-count": "", children: threads.length }),
-        /* @__PURE__ */ jsx("button", { type: "button", className: "inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none", "aria-label": `${collapsed ? "Expand" : "Collapse"} ${projectName} section`, "aria-expanded": !collapsed, onClick: () => toggleProject(project.id), children: collapsed ? "\u203A" : "\u2304" })
-      ] }),
-      !collapsed ? /* @__PURE__ */ jsxs("div", { className: "mt-0.5 space-y-px", children: [
-        visibleThreads.map((node) => renderNode(node, threadModels[node.thread.id] ?? null, 0)),
-        tree.length > MAX_VISIBLE_THREADS ? /* @__PURE__ */ jsx(
-          "button",
-          {
-            type: "button",
-            className: "flex h-6 w-full items-center rounded-md pl-2 text-left text-xs text-muted-foreground transition-colors duration-150 hover:bg-muted/50 hover:text-foreground motion-reduce:transition-none",
-            onClick: () => setExpandedProjects((current) => {
-              const updated = new Set(current);
-              if (expanded) updated.delete(project.id);
-              else updated.add(project.id);
-              return updated;
-            }),
-            children: expanded ? "Show less" : `Show more (${tree.length - MAX_VISIBLE_THREADS})`
-          }
-        ) : null
-      ] }) : null
-    ] }, project.id);
-  }) });
+  return /* @__PURE__ */ jsxs("div", { className: "h-full space-y-3 overflow-y-auto p-1", children: [
+    stateMigrationNotice ? /* @__PURE__ */ jsxs("p", { role: "status", className: "rounded-md border border-border p-2 text-xs text-muted-foreground", children: [
+      "Thread-list collapse and custom state were reset during the plugin move. ",
+      /* @__PURE__ */ jsx("button", { type: "button", className: "underline", onClick: () => {
+        window.localStorage.setItem("bb-plugin-threads-list.state-migration-notice", "dismissed");
+        setStateMigrationNotice(false);
+      }, children: "Dismiss" })
+    ] }) : null,
+    groups.map(({ project, threads }) => {
+      const tree = buildThreadTree(threads);
+      const collapsed = collapsedProjects.has(project.id);
+      const expanded = expandedProjects.has(project.id);
+      const visibleThreads = expanded ? tree : tree.slice(0, MAX_VISIBLE_THREADS);
+      const projectName = asText(project.name) ?? asText(project.id) ?? "Untitled project";
+      return /* @__PURE__ */ jsxs("section", { "aria-labelledby": `project-${project.id}`, children: [
+        /* @__PURE__ */ jsxs("div", { className: "flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-normal text-muted-foreground", children: [
+          /* @__PURE__ */ jsx("span", { className: "flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground", "aria-hidden": "true", children: projectAvatar(projectName) }),
+          /* @__PURE__ */ jsx("span", { id: `project-${project.id}`, className: "min-w-0 truncate", children: projectName }),
+          /* @__PURE__ */ jsx("span", { className: "ml-auto shrink-0", "data-project-thread-count": "", children: threads.length }),
+          /* @__PURE__ */ jsx("button", { type: "button", className: "inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none", "aria-label": `${collapsed ? "Expand" : "Collapse"} ${projectName} section`, "aria-expanded": !collapsed, onClick: () => toggleProject(project.id), children: collapsed ? "\u203A" : "\u2304" })
+        ] }),
+        !collapsed ? /* @__PURE__ */ jsxs("div", { className: "mt-0.5 space-y-px", children: [
+          visibleThreads.map((node) => renderNode(node, threadModels[node.thread.id] ?? null, 0)),
+          tree.length > MAX_VISIBLE_THREADS ? /* @__PURE__ */ jsx(
+            "button",
+            {
+              type: "button",
+              className: "flex h-6 w-full items-center rounded-md pl-2 text-left text-xs text-muted-foreground transition-colors duration-150 hover:bg-muted/50 hover:text-foreground motion-reduce:transition-none",
+              onClick: () => setExpandedProjects((current) => {
+                const updated = new Set(current);
+                if (expanded) updated.delete(project.id);
+                else updated.add(project.id);
+                return updated;
+              }),
+              children: expanded ? "Show less" : `Show more (${tree.length - MAX_VISIBLE_THREADS})`
+            }
+          ) : null
+        ] }) : null
+      ] }, project.id);
+    })
+  ] });
 }
 var app_default = definePluginApp((app) => {
   app.slots.experimental_threadList({ id: "threads-list", title: "Threads", description: "Project-grouped thread list.", component: SidebarThreadList });

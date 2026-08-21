@@ -1,0 +1,23 @@
+{
+  "$schema": "https://getbb.app/schemas/marketplace.schema.json",
+  "schemaVersion": 1,
+  "name": "bb-collab",
+  "displayName": "bb-collab plugins",
+  "description": "Plugins maintained with bb-collab.",
+  "plugins": [
+    {
+      "id": "threads-list",
+      "displayName": "Threads List",
+      "description": "Project-grouped thread list with pinning and execution details.",
+      "author": { "name": "bb-collab" },
+      "source": {
+        "git": {
+          "url": "https://github.com/pixexid/bb-collab.git",
+          "subdir": "plugins/bb-plugin-threads-list",
+          "range": "*",
+          "tagPrefix": "threads-list/"
+        }
+      }
+    }
+  ]
+}

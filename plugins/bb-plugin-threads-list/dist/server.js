@@ -13795,6 +13795,10 @@ var rpcContract = defineRpcContract({
     input: external_exports.object({ threadIds: external_exports.array(id).max(256) }).strict(),
     output: external_exports.record(external_exports.string(), execution.nullable())
   },
+  setThreadState: {
+    input: external_exports.object({ threadId: id, state: state.nullable() }).strict(),
+    output: external_exports.object({ state: state.nullable() }).strict()
+  },
   sidebarCollapseState: {
     input: external_exports.object({ projectIds: external_exports.array(id).max(256), threadIds: external_exports.array(id).max(256) }).strict(),
     output: external_exports.object({ projects: external_exports.record(external_exports.string(), external_exports.boolean()), threads: external_exports.record(external_exports.string(), external_exports.boolean()) }).strict()
@@ -13829,6 +13833,11 @@ function plugin(bb) {
         }
       }));
       return Object.fromEntries(values);
+    },
+    async setThreadState(input) {
+      if (input.state === null) await bb.storage.kv.delete(stateKey(input.threadId));
+      else await bb.storage.kv.set(stateKey(input.threadId), input.state);
+      return { state: input.state };
     },
     async sidebarCollapseState({ projectIds, threadIds }) {
       const read = async (kind, ids) => {

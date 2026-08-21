@@ -15,6 +15,10 @@ export const rpcContract = defineRpcContract({
     input: z.object({ threadIds: z.array(id).max(256) }).strict(),
     output: z.record(z.string(), execution.nullable()),
   },
+  setThreadState: {
+    input: z.object({ threadId: id, state: state.nullable() }).strict(),
+    output: z.object({ state: state.nullable() }).strict(),
+  },
   sidebarCollapseState: {
     input: z.object({ projectIds: z.array(id).max(256), threadIds: z.array(id).max(256) }).strict(),
     output: z.object({ projects: z.record(z.string(), z.boolean()), threads: z.record(z.string(), z.boolean()) }).strict(),
@@ -49,6 +53,11 @@ export default function plugin(bb: BbPluginApi) {
         } catch { return [threadId, null] as const; }
       }));
       return Object.fromEntries(values);
+    },
+    async setThreadState(input) {
+      if (input.state === null) await bb.storage.kv.delete(stateKey(input.threadId));
+      else await bb.storage.kv.set(stateKey(input.threadId), input.state);
+      return { state: input.state };
     },
     async sidebarCollapseState({ projectIds, threadIds }) {
       const read = async (kind: "project" | "thread", ids: string[]): Promise<Record<string, boolean>> => {

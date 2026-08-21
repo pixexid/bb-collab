@@ -17,7 +17,7 @@
     "skills": []
   },
   "scripts": {
-    "build": "bb plugin build",
+    "build": "bb plugin build && node ../../scripts/normalize-plugin-dist.mjs",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run"
   },
