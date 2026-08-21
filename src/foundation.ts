@@ -1381,7 +1381,7 @@ const reviewScopeSchema = z
   .object({ targets: z.array(reviewTargetSchema).min(1).max(32) })
   .strict()
   .superRefine((scope, ctx) => {
-    const keys = scope.targets.map((target) => `${target.workItemId}\u0000${target.repoTargetId}`);
+    const keys = scope.targets.map((target) => JSON.stringify([target.workItemId, target.repoTargetId]));
     if (new Set(scope.targets.map((target) => target.workItemId)).size !== scope.targets.length) {
       ctx.addIssue({ code: "custom", path: ["targets"], message: "one WorkItem cannot span multiple review targets" });
     }
@@ -1398,7 +1398,7 @@ const reviewConnectorsSchema = z
   .min(1)
   .max(128)
   .superRefine((connectors, ctx) => {
-    const keys = connectors.map((connector) => `${connector.repoTargetId}\u0000${connector.connectorId}`);
+    const keys = connectors.map((connector) => JSON.stringify([connector.repoTargetId, connector.connectorId]));
     if (new Set(keys).size !== keys.length) {
       ctx.addIssue({ code: "custom", message: "review connector mappings must be duplicate-free" });
     }
@@ -1935,6 +1935,7 @@ export interface GitHubIssueSnapshot {
   title: string;
   body: string;
   state: "open" | "closed";
+  stateReason?: "COMPLETED" | "NOT_PLANNED" | "DUPLICATE" | "REOPENED";
   labels: string[];
   externalRevision: string;
 }
@@ -2985,7 +2986,7 @@ function actorReceiptDigest(input: {
   }));
 }
 
-function mutationRequestDigest(request: ApplyRequest): string {
+export function mutationRequestDigest(request: ApplyRequest): string {
   return sha256(canonicalJson(Object.fromEntries(Object.entries(request).filter(([, value]) => value !== undefined))));
 }
 
@@ -5787,6 +5788,12 @@ interface ExternalWorkRefRow {
   updated_at_ms: number;
 }
 
+function validGithubSnapshotStateReason(state: GitHubIssueSnapshot["state"], reason: GitHubIssueSnapshot["stateReason"]): boolean {
+  return state === "open"
+    ? reason === undefined || reason === "REOPENED"
+    : reason === "COMPLETED" || reason === "NOT_PLANNED" || reason === "DUPLICATE";
+}
+
 const githubSnapshotSchema = z
   .object({
     owner: id,
@@ -5795,10 +5802,16 @@ const githubSnapshotSchema = z
     title: z.string().max(4096),
     body: z.string().max(64 * 1024),
     state: z.enum(["open", "closed"]),
+    stateReason: z.enum(["COMPLETED", "NOT_PLANNED", "DUPLICATE", "REOPENED"]).optional(),
     labels: z.array(id).max(256),
     externalRevision: id,
   })
-  .strict();
+  .strict()
+  .superRefine((snapshot, context) => {
+    if (!validGithubSnapshotStateReason(snapshot.state, snapshot.stateReason)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["stateReason"], message: "GitHub issue state and reason do not match" });
+    }
+  });
 
 function storedConfigJson(db: SqliteDatabase, projectId: string, configRevision: number): string {
   const row = asRow<{ canonical_config_json: string }>(
@@ -6218,6 +6231,9 @@ function applyWorkItemTransition(
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
   let recordedExternalEvent: { kind: "github_issue_closed" | "github_issue_reopened"; owner: string; repo: string; issueNumber: number; externalRevision: string } | null = null;
+  if (githubObservation && !validGithubSnapshotStateReason(githubObservation.state, githubObservation.stateReason)) {
+    throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue state and reason do not match");
+  }
   if (workItem.lifecycle_state === "blocked") {
     const storedBlocker = existingWait ? storedWorkItemBlocker(existingWait) : null;
     if (!storedBlocker) throw refusal("WORK_ITEM_STATE_INVALID", "blocked work item has no valid machine-evaluable blocker");
@@ -6236,8 +6252,12 @@ function applyWorkItemTransition(
     if (!githubObservation) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub lifecycle observation is unavailable");
     requireBoundGithubIssue(db, request.projectId, workItem.work_item_id, externalEvent);
     if (externalEvent.kind === "github_issue_closed") {
-      if (nextState !== "succeeded" || githubObservation.state !== "closed") {
-        throw refusal("WORK_ITEM_STATE_INVALID", "close observation only permits a transition to succeeded");
+      const absorbedBeforeStart = workItem.lifecycle_state === "proposed" && nextState === "cancelled";
+      if ((!absorbedBeforeStart && nextState !== "succeeded") || githubObservation.state !== "closed") {
+        throw refusal("WORK_ITEM_STATE_INVALID", "close observation only permits succeeded, or proposed to cancelled");
+      }
+      if (absorbedBeforeStart && githubObservation.stateReason !== "COMPLETED") {
+        throw refusal("WORK_ITEM_STATE_INVALID", "proposed cancellation requires a completed GitHub close observation");
       }
     } else {
       if (workItem.lifecycle_state !== "succeeded" || nextState !== "ready" || githubObservation.state !== "open") {
@@ -6722,7 +6742,7 @@ export function backfillWorkItemGithubIssues(
           github: mapping.github,
           mapping: mapping.mapping,
           issueNumber,
-          idempotencyKey: `github-issue-backfill:${projectId}:${row.work_item_id}`,
+          idempotencyKey: `github-issue-backfill:${JSON.stringify([projectId, row.work_item_id])}`,
           requestDigest: sha256(canonicalJson({ projectId, workItemId: row.work_item_id, epochCreatedAtMs: result.epochCreatedAtMs, configRevision: result.configRevision })),
           observed: snapshot!,
         });
@@ -7654,7 +7674,7 @@ async function routingDoctorEvidence(
   const buckets = new Map<string, RoutingProfile & { count: number; threadIds: string[] }>();
   for (const { thread, profile } of workerProfiles) {
     if (!profile) continue;
-    const key = `${profile.providerId}\0${profile.model}\0${profile.reasoningLevel}`;
+    const key = JSON.stringify([profile.providerId, profile.model, profile.reasoningLevel]);
     const bucket = buckets.get(key) ?? { ...profile, count: 0, threadIds: [] };
     bucket.count += 1;
     bucket.threadIds.push(thread.id);
