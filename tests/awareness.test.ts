@@ -575,6 +575,28 @@ describe("lane awareness", () => {
     }
   });
 
+  it("does no further reads after disposal", async () => {
+    vi.useFakeTimers();
+    try {
+      const read = vi.fn(async (): Promise<IdleFleetDecision> => ({ kind: "silent" }));
+      const detector = createIdleFleetDetector({
+        read,
+        readRearmProbes: async () => [],
+        wake: async () => true,
+        onBlind: vi.fn(),
+        debounceMs: 1,
+      });
+
+      detector.stop();
+      detector.arm({ projectId: "project-1", threadId: "orchestrator-1", idleEpisode: "episode-1" });
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(read).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reports an unreadable conjunct and never treats it as healthy", async () => {
     vi.useFakeTimers();
     try {

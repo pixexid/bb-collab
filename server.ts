@@ -2326,6 +2326,17 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     },
   });
   bb.onDispose(idleFleetDetector.stop);
+  bb.background.service("idle-fleet-detector", {
+    async start(signal) {
+      try {
+        if (!signal.aborted) {
+          await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        }
+      } finally {
+        idleFleetDetector.stop();
+      }
+    },
+  });
 
   const stallGuardCycle = createStallGuardCycle({
     readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
