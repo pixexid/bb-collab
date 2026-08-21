@@ -3491,6 +3491,35 @@ fi
     }
   });
 
+  it("reports blind intake coverage when the queue is unreadable", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-unreadable-queue-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "api" ]; then
+  printf '%s\\n' 'not-json'
+else
+  printf '%s\\n' '[]'
+fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: `fleet-watchdog intake coverage=blind project=${PROJECT_ID} reason=startable-queue-unreadable`,
+      }));
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("preserves server-side startable filtering beyond the unlabelled scan page limit", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-page-limit-"));
     const gh = join(bin, "gh");

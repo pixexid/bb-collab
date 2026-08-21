@@ -24338,6 +24338,8 @@ ${thread.titleFallback ?? ""}`);
             if ((queue.count > 0 || queue.unlabelledCount > 0) && writingLaneCeiling !== null && activeLaneCount < writingLaneCeiling) {
               await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${queue.count} issue${queue.count === 1 ? "" : "s"}; ${queue.unlabelledCount} open issue${queue.unlabelledCount === 1 ? " has" : "s have"} no queue label; ${queue.blockedCount} blocked; ${queue.waitingExternalCount} waiting-external; ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
             }
+          } else {
+            bb.log.warn(`fleet-watchdog intake coverage=blind project=${projectId} reason=startable-queue-unreadable`);
           }
           if (workItems.length === 0) continue;
           const unblocked = /* @__PURE__ */ new Set();
