@@ -32,7 +32,7 @@ describe("pull-request review tier policy", () => {
     expect(tierB.status).toBe(0);
     expect(tierB.stderr).not.toContain("Review finding");
     expect(tierB.stdout).toContain("post-merge in parallel");
-    for (const file of ["src/foundation.ts", "server.ts", "app.tsx", "dist/server.js", "scripts/build.mjs"]) {
+    for (const file of ["src/foundation.ts", "server.ts", "app.tsx", "dist/server.js", "plugins/example/dist/server.js", "scripts/build.mjs"]) {
       const tierA = check("Review tier: A", [file]);
       expect(tierA.status, file).toBe(0);
       expect(tierA.stderr, file).not.toContain("Review finding");
