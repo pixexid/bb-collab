@@ -978,10 +978,14 @@ export function createIdleFleetDetector(options: {
         reportBlind(decision.message);
         return;
       }
-      if (state[legacyProbeKey(probe)] !== undefined) {
-        // Legacy wins when both exist: an interrupted migration may have left a stale canonical copy.
-        state[key] = state[legacyProbeKey(probe)]!;
-        delete state[legacyProbeKey(probe)];
+      const legacyKey = legacyProbeKey(probe);
+      if (state[legacyKey] !== undefined) {
+        if (state[key] !== undefined) {
+          reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=ambiguous-migration:${key}`);
+          return;
+        }
+        state[key] = state[legacyKey]!;
+        delete state[legacyKey];
         await save();
       }
       if (state[key] === decision.episodeKey) return;

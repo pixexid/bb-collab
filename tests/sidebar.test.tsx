@@ -958,6 +958,16 @@ describe("replacement thread list", () => {
     expect(reorderPinned).toHaveBeenCalledWith({ threadId: "thread-1", previousThreadId: null, nextThreadId: "thread-2" });
   });
 
+  it("reads and migrates legacy collapse keys", async () => {
+    const host = createFakePluginHost({ pluginId: "bb-collab" });
+    await plugin(host.bb);
+    await host.bb.storage.kv.set("sidebar.collapse:project:project-a", true);
+
+    await expect(host.harness.callRpc("sidebarCollapseState", { projectIds: ["project-a"], threadIds: [] })).resolves.toEqual({ projects: { "project-a": true }, threads: {} });
+    await expect(host.bb.storage.kv.get("sidebar.collapse:[\"project\",\"project-a\"]")).resolves.toBe(true);
+    await expect(host.bb.storage.kv.get("sidebar.collapse:project:project-a")).resolves.toBeUndefined();
+  });
+
   it("accepts the live sidebar population across every batched RPC input", async () => {
     const host = createFakePluginHost({ pluginId: "bb-collab" });
     await plugin(host.bb);

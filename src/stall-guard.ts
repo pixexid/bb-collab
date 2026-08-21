@@ -26,6 +26,7 @@ export interface StallGuardCycleOptions {
   readArtifact: (projectId: string) => Promise<StallGuardArtifact[] | null>;
   wakeRole: (role: RoleIdleView) => Promise<RoleWakeResult>;
   persistence: StallGuardPersistence;
+  onAmbiguous?: (message: string) => void;
 }
 
 export interface StallGuardCycleSummary {
@@ -36,6 +37,7 @@ export interface StallGuardCycleSummary {
   attempted: number;
   verified: number;
   steered: number;
+  ambiguous: number;
 }
 
 function stateFromUnknown(value: unknown): Record<string, string> {
@@ -91,12 +93,17 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
       let attempted = 0;
       let verified = 0;
       let steered = 0;
+      let ambiguous = 0;
 
       for (const holder of holders) {
         const key = JSON.stringify([holder.project_id, holder.role_id]);
         const legacyKey = `${holder.project_id}:${holder.role_id}`;
         if (nextState[legacyKey] !== undefined) {
-          // Legacy wins when both exist: an interrupted migration may have left a stale canonical copy.
+          if (nextState[key] !== undefined) {
+            ambiguous += 1;
+            options.onAmbiguous?.(`stall-guard ambiguous migration: ${key}`);
+            continue;
+          }
           nextState[key] = nextState[legacyKey]!;
           delete nextState[legacyKey];
           changed += 1;
@@ -149,7 +156,7 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
         await options.persistence.write(nextState);
         state = nextState;
       }
-      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered };
+      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered, ambiguous };
     },
   };
 }

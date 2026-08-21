@@ -647,26 +647,31 @@ describe("lane awareness", () => {
     }
   });
 
-  it("prefers legacy idle-fleet history when partial migration left both keys", async () => {
+  it("reports ambiguous idle-fleet migration without waking or rewriting history", async () => {
     vi.useFakeTimers();
     try {
       const wake = vi.fn(async () => true);
+      const onBlind = vi.fn();
       let persisted: unknown = {
-        '["project-1","orchestrator-1"]': "stale-canonical-episode",
+        '["project-1","orchestrator-1"]': "canonical-episode",
         "project-1:orchestrator-1": "legacy-episode",
       };
       const detector = createIdleFleetDetector({
         read: async (): Promise<IdleFleetDecision> => ({ kind: "ready", episodeKey: "new-episode", legacyEpisodeKey: "legacy-episode", role: {} as never, message: "wake" }),
         readRearmProbes: async () => [],
         wake,
-        onBlind: vi.fn(),
+        onBlind,
         persistence: { read: async () => persisted, write: async (state) => { persisted = state; } },
         debounceMs: IDLE_FLEET_DEBOUNCE_MS,
       });
       detector.arm({ projectId: "project-1", threadId: "orchestrator-1", idleEpisode: "episode-1" });
       await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
       expect(wake).not.toHaveBeenCalled();
-      expect(persisted).toEqual({ '["project-1","orchestrator-1"]': "new-episode" });
+      expect(onBlind).toHaveBeenCalledOnce();
+      expect(persisted).toEqual({
+        '["project-1","orchestrator-1"]': "canonical-episode",
+        "project-1:orchestrator-1": "legacy-episode",
+      });
       detector.stop();
     } finally {
       vi.useRealTimers();

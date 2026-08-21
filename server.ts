@@ -462,6 +462,7 @@ const sidebarThreadExecutionSchema = z
   .strict();
 const sidebarCollapseKindSchema = z.enum(["project", "thread"]);
 const sidebarCollapseKey = (kind: "project" | "thread", id: string) => `sidebar.collapse:${JSON.stringify([kind, id])}`;
+const legacySidebarCollapseKey = (kind: "project" | "thread", id: string) => `sidebar.collapse:${kind}:${id}`;
 const roleBriefRoleSchema = z.enum(["director", "orchestrator", "worker"]);
 const roleBriefBundleSchema = z.object({
   ponytail: z.string().min(1),
@@ -2521,6 +2522,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   });
 
   const stallGuardCycle = createStallGuardCycle({
+    onAmbiguous: (message) => bb.log.warn(message),
     readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
     readArtifact: async (projectId) => {
       if (!db) return null;
@@ -3515,8 +3517,14 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     async sidebarCollapseState(input) {
       const read = async (kind: "project" | "thread", ids: readonly string[]) => {
         const entries = await Promise.all(ids.map(async (id) => {
-          const value = await bb.storage.kv.get<unknown>(sidebarCollapseKey(kind, id));
-          return value === true ? ([id, true] as const) : null;
+          const key = sidebarCollapseKey(kind, id);
+          const value = await bb.storage.kv.get<unknown>(key);
+          if (value === true) return [id, true] as const;
+          const legacyKey = legacySidebarCollapseKey(kind, id);
+          if (await bb.storage.kv.get<unknown>(legacyKey) !== true) return null;
+          await bb.storage.kv.set(key, true);
+          await bb.storage.kv.delete(legacyKey);
+          return [id, true] as const;
         }));
         return Object.fromEntries(entries.filter((entry): entry is readonly [string, true] => entry !== null));
       };
