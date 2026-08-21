@@ -20433,7 +20433,7 @@ function isConstraintError(error48) {
 function unavailableResult(subject, message) {
   return result("CANONICAL_STORE_UNAVAILABLE", subject, 1, 0, 0, { message });
 }
-function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null) {
+function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, dryRun = false) {
   let request;
   try {
     request = parseApplyRequest(input);
@@ -20442,9 +20442,9 @@ function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error48) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, dryRun);
 }
-function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null) {
+function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, dryRun = false) {
   let request;
   try {
     request = parseApplyRequest(input);
@@ -20478,7 +20478,7 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
       }
       if (!githubObservation || githubObservation.owner !== githubTarget.owner || githubObservation.repo !== githubTarget.repo || githubObservation.issueNumber !== githubTarget.issueNumber) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue observation does not match the exact blocker identity");
     }
-    return transaction(db, () => {
+    const mutate = () => {
       const replay = checkIdempotency(db, request, digest);
       if (replay) return replay;
       switch (request.operationClass) {
@@ -20506,7 +20506,20 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
         case "role_generation_succession":
           throw refusal("INTERNAL_ERROR", "role fact operations must not run inside the canonical transaction");
       }
-    });
+    };
+    if (!dryRun) return transaction(db, mutate);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const value = mutate();
+      db.exec("ROLLBACK");
+      return value;
+    } catch (error48) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+      }
+      throw error48;
+    }
   } catch (error48) {
     if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
     if (isConstraintError(error48)) return result("CANONICAL_STORE_UNAVAILABLE", request.projectId, 1, 0, 0, { message: String(error48) });
@@ -22632,7 +22645,7 @@ async function dispatchLane(bb, db, input) {
     ...request,
     reasonCode: `dispatch_parent:${dispatchParentThreadId}`,
     workAttempt: intentAttempt
-  });
+  }, false, "stop-active");
   if (intent.outcome !== "OK" || intent.replay) return intent;
   let thread;
   try {
@@ -22688,6 +22701,10 @@ async function prepareWorkItemAttemptTerminalization(bb, db, request, policy) {
 }
 async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = readGithubIssueForBackfill) {
   const parsed = applyRequestSchema.safeParse(input);
+  if (parsed.success && terminalizationPolicy === "stop-active") {
+    const authorized = applyAuthorizedMutation(db, input, null, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, true);
+    if (authorized.outcome !== "OK" || authorized.replay) return authorized;
+  }
   if (parsed.success) {
     const laneGuard = await prepareWorkItemAttemptTerminalization(bb, db, parsed.data, terminalizationPolicy);
     if (laneGuard) return laneGuard;

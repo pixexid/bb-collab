@@ -7424,6 +7424,7 @@ export function applyAuthorizedMutation(
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
   reviewFactReader: ReviewFactReader | null = null,
   githubIssueReader: GitHubIssueReader | null = null,
+  dryRun = false,
 ): FoundationResult {
   let request: ApplyRequest;
   try {
@@ -7433,7 +7434,7 @@ export function applyAuthorizedMutation(
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, dryRun);
 }
 
 export function applyFixtureMutation(
@@ -7444,6 +7445,7 @@ export function applyFixtureMutation(
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
   reviewFactReader: ReviewFactReader | null = null,
   githubIssueReader: GitHubIssueReader | null = null,
+  dryRun = false,
 ): FoundationResult {
   let request: ApplyRequest;
   try {
@@ -7485,7 +7487,7 @@ export function applyFixtureMutation(
         githubObservation.issueNumber !== githubTarget.issueNumber
       ) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue observation does not match the exact blocker identity");
     }
-    return transaction(db, () => {
+    const mutate = () => {
       const replay = checkIdempotency(db, request, digest);
       if (replay) return replay;
       switch (request.operationClass) {
@@ -7513,7 +7515,17 @@ export function applyFixtureMutation(
         case "role_generation_succession":
           throw refusal("INTERNAL_ERROR", "role fact operations must not run inside the canonical transaction");
       }
-    });
+    };
+    if (!dryRun) return transaction(db, mutate);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const value = mutate();
+      db.exec("ROLLBACK");
+      return value;
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch { /* preserve refusal */ }
+      throw error;
+    }
   } catch (error) {
     if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
     if (isConstraintError(error)) return result("CANONICAL_STORE_UNAVAILABLE", request.projectId, 1, 0, 0, { message: String(error) });

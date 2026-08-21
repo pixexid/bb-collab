@@ -848,7 +848,7 @@ async function dispatchLane(
     ...request,
     reasonCode: `dispatch_parent:${dispatchParentThreadId}`,
     workAttempt: intentAttempt,
-  });
+  }, false, "stop-active");
   if (intent.outcome !== "OK" || intent.replay) return intent;
 
   let thread: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["spawn"]>>;
@@ -926,6 +926,10 @@ async function applyLiveAuthorizedMutation(
   githubIssueReader: (owner: string, repo: string, issueNumber: number) => GitHubIssueSnapshot = readGithubIssueForBackfill,
 ): Promise<FoundationResult> {
   const parsed = applyRequestSchema.safeParse(input);
+  if (parsed.success && terminalizationPolicy === "stop-active") {
+    const authorized = applyAuthorizedMutation(db, input, null, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, true);
+    if (authorized.outcome !== "OK" || authorized.replay) return authorized;
+  }
   if (parsed.success) {
     const laneGuard = await prepareWorkItemAttemptTerminalization(bb, db, parsed.data, terminalizationPolicy);
     if (laneGuard) return laneGuard;
