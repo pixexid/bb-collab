@@ -3,6 +3,7 @@
   "schemaVersion": 1,
   "name": "bb-collab-plugins",
   "plugins": [
-    { "name": "threads-list", "source": "./plugins/bb-plugin-threads-list" }
+    { "name": "threads-list", "source": "./plugins/bb-plugin-threads-list" },
+    { "name": "companion-watcher", "source": "./plugins/bb-plugin-companion-watcher" }
   ]
 }
