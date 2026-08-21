@@ -45,6 +45,7 @@ import {
   probeV21ConsumedLegacyReplay,
   parseApplyRequest,
   requestedProfileDigest,
+  reconcilePreparedWorkItemDispatches,
   schemaDigest,
   sha256,
   workItemReconciliationIssues,
@@ -3679,7 +3680,26 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     expect(fixture.db.prepare("SELECT lane_id, thread_id, state FROM execution_attempts WHERE origin = 'work_item'").get()).toMatchObject({ lane_id: "lane-work-item-1", thread_id: null, state: "prepared" });
     fixture.db.prepare("UPDATE execution_attempts SET created_at_ms = 0 WHERE origin = 'work_item'").run();
     await fixture.host.harness.runSchedule("fleet-watchdog");
-    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "failed" });
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared" });
+  });
+
+  it("keeps a renamed spawned lane as a capacity-consuming wedge", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { throw new Error("response lost after spawn"); }) as never);
+    await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId });
+    const wedges = reconcilePreparedWorkItemDispatches(fixture.db, PROJECT_ID, [{
+      id: "lane-renamed",
+      parentThreadId: fixture.orchestratorThreadId,
+      title: "ordinary user title",
+      archivedAt: null,
+      deletedAt: null,
+    }]);
+    expect(wedges).toEqual([{ executionAttemptId: expect.any(String), workItemId: WORK_ITEM_ID }]);
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared" });
   });
 
   it("uses in-progress WorkItems for capacity and suppresses repeat intake wakes for one hour", async () => {

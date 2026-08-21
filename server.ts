@@ -2838,6 +2838,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
            AND external_work_refs.issue_number IS NOT NULL`,
       ).all(...WORK_ITEM_NON_TERMINAL_STATES, "succeeded") as Array<{ project_id: string }>) projectIds.add(row.project_id);
       const lanesByProject = new Map<string, Awaited<ReturnType<typeof bb.sdk.threads.list>>>();
+      const dispatchWedgesByProject = new Map<string, Array<{ executionAttemptId: string; workItemId: string }>>();
       for (const projectId of projectIds) {
         if (onlyProjectId !== undefined && projectId !== onlyProjectId) continue;
         const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? new Set<string>();
@@ -2854,8 +2855,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           degrade(fleetWatchdogScope("platform-parentage", projectId, String(error)));
         }
         if (threadInventoryReadable) {
-          const reconciledDispatches = reconcilePreparedWorkItemDispatches(db, projectId, threads);
-          if (reconciledDispatches > 0) bb.log.warn(`fleet-watchdog reconciled dispatch intents: project=${projectId} count=${reconciledDispatches}`);
+          const wedges = reconcilePreparedWorkItemDispatches(db, projectId, threads);
+          if (wedges.length > 0) {
+            dispatchWedgesByProject.set(projectId, wedges);
+            bb.log.warn(`fleet-watchdog dispatch wedge: project=${projectId} workItems=${wedges.map(({ workItemId }) => workItemId).join(",")}`);
+          }
         }
         const lanes = threads.filter((thread) =>
           thread.parentThreadId !== null &&
@@ -3308,6 +3312,16 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
                ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
              WHERE heads.project_id = ? ORDER BY targets.repo_target_id`,
           ).all(projectId) as Array<{ remote_url: string | null }>).map((target) => githubRepository(target.remote_url));
+          for (const wedge of dispatchWedgesByProject.get(projectId) ?? []) {
+            await wake(
+              projectId,
+              orchestrator,
+              roleIdleKey(orchestrator, `dispatch-wedge:${wedge.executionAttemptId}`),
+              `dispatch identity unresolved for WorkItem ${wedge.workItemId}; its writing slot remains held. Inspect the native thread and decide recovery or closure before dispatching another lane.`,
+              false,
+              "owed-act",
+            );
+          }
           const queue = repositories.length === 0 || repositories.some((repository) => repository === null)
             ? null
             : await startableQueueStateAsync(repositories as string[]);

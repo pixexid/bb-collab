@@ -1546,42 +1546,47 @@ export interface WorkItemDispatchThread {
   deletedAt: number | null;
 }
 
-/** Resolve an interrupted dispatch only from the native thread inventory. */
+export interface WorkItemDispatchWedge {
+  executionAttemptId: string;
+  workItemId: string;
+}
+
+/** Reconcile only positive identity evidence; ambiguity remains a capacity-consuming wedge. */
 export function reconcilePreparedWorkItemDispatches(
   db: SqliteDatabase,
   projectId: string,
   threads: WorkItemDispatchThread[],
-): number {
+): WorkItemDispatchWedge[] {
   const prepared = db.prepare(
-    `SELECT execution_attempt_id, reason_code FROM execution_attempts
+    `SELECT execution_attempt_id, work_item_id, reason_code FROM execution_attempts
      WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
        AND state = 'prepared' AND thread_id IS NULL`,
-  ).all(projectId) as Array<{ execution_attempt_id: string; reason_code: string | null }>;
-  let resolved = 0;
+  ).all(projectId) as Array<{ execution_attempt_id: string; work_item_id: string; reason_code: string | null }>;
+  const wedges: WorkItemDispatchWedge[] = [];
   for (const attempt of prepared) {
     const marker = attempt.reason_code?.startsWith("work_item_dispatch_intent:")
       ? attempt.reason_code.slice("work_item_dispatch_intent:".length)
       : null;
-    if (!marker) continue;
+    if (!marker) {
+      wedges.push({ executionAttemptId: attempt.execution_attempt_id, workItemId: attempt.work_item_id });
+      continue;
+    }
     const thread = threads.find((candidate) =>
       candidate.parentThreadId !== null && candidate.archivedAt === null && candidate.deletedAt === null &&
       candidate.title?.includes(`[dispatch:${marker}]`) === true,
     );
     const observedAtMs = now();
-    const result = thread
-      ? db.prepare(
+    if (thread) {
+      const result = db.prepare(
         `UPDATE execution_attempts
          SET state = 'running', thread_id = ?, lease_owner_thread_id = ?, reason_code = 'work_item_dispatch', observed_at_ms = ?
          WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL`,
-      ).run(thread.id, thread.id, observedAtMs, projectId, attempt.execution_attempt_id)
-      : db.prepare(
-        `UPDATE execution_attempts
-         SET state = 'failed', reason_code = 'dispatch_not_found', observed_at_ms = ?, completed_at_ms = ?
-         WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL`,
-      ).run(observedAtMs, observedAtMs, projectId, attempt.execution_attempt_id);
-    resolved += result.changes;
+      ).run(thread.id, thread.id, observedAtMs, projectId, attempt.execution_attempt_id);
+      if (result.changes > 0) continue;
+    }
+    wedges.push({ executionAttemptId: attempt.execution_attempt_id, workItemId: attempt.work_item_id });
   }
-  return resolved;
+  return wedges;
 }
 
 export function workItemCapacityLaneEvidence(db: SqliteDatabase, projectId: string): WorkItemCapacityEvidence {

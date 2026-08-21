@@ -15943,30 +15943,32 @@ var WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES = ["prepared", "armed", "content_delive
 var WORK_ITEM_IDLE_BLIND_ATTEMPT_STATES = ["dispatch_unknown"];
 function reconcilePreparedWorkItemDispatches(db, projectId, threads) {
   const prepared = db.prepare(
-    `SELECT execution_attempt_id, reason_code FROM execution_attempts
+    `SELECT execution_attempt_id, work_item_id, reason_code FROM execution_attempts
      WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
        AND state = 'prepared' AND thread_id IS NULL`
   ).all(projectId);
-  let resolved = 0;
+  const wedges = [];
   for (const attempt of prepared) {
     const marker = attempt.reason_code?.startsWith("work_item_dispatch_intent:") ? attempt.reason_code.slice("work_item_dispatch_intent:".length) : null;
-    if (!marker) continue;
+    if (!marker) {
+      wedges.push({ executionAttemptId: attempt.execution_attempt_id, workItemId: attempt.work_item_id });
+      continue;
+    }
     const thread = threads.find(
       (candidate) => candidate.parentThreadId !== null && candidate.archivedAt === null && candidate.deletedAt === null && candidate.title?.includes(`[dispatch:${marker}]`) === true
     );
     const observedAtMs = now();
-    const result2 = thread ? db.prepare(
-      `UPDATE execution_attempts
+    if (thread) {
+      const result2 = db.prepare(
+        `UPDATE execution_attempts
          SET state = 'running', thread_id = ?, lease_owner_thread_id = ?, reason_code = 'work_item_dispatch', observed_at_ms = ?
          WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL`
-    ).run(thread.id, thread.id, observedAtMs, projectId, attempt.execution_attempt_id) : db.prepare(
-      `UPDATE execution_attempts
-         SET state = 'failed', reason_code = 'dispatch_not_found', observed_at_ms = ?, completed_at_ms = ?
-         WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL`
-    ).run(observedAtMs, observedAtMs, projectId, attempt.execution_attempt_id);
-    resolved += result2.changes;
+      ).run(thread.id, thread.id, observedAtMs, projectId, attempt.execution_attempt_id);
+      if (result2.changes > 0) continue;
+    }
+    wedges.push({ executionAttemptId: attempt.execution_attempt_id, workItemId: attempt.work_item_id });
   }
-  return resolved;
+  return wedges;
 }
 function workItemCapacityLaneEvidence(db, projectId) {
   const lanes = db.prepare(
@@ -24326,6 +24328,7 @@ ${thread.titleFallback ?? ""}`);
            AND external_work_refs.issue_number IS NOT NULL`
       ).all(...WORK_ITEM_NON_TERMINAL_STATES, "succeeded")) projectIds.add(row.project_id);
       const lanesByProject = /* @__PURE__ */ new Map();
+      const dispatchWedgesByProject = /* @__PURE__ */ new Map();
       for (const projectId of projectIds) {
         if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
         const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? /* @__PURE__ */ new Set();
@@ -24342,8 +24345,11 @@ ${thread.titleFallback ?? ""}`);
           degrade(fleetWatchdogScope("platform-parentage", projectId, String(error48)));
         }
         if (threadInventoryReadable) {
-          const reconciledDispatches = reconcilePreparedWorkItemDispatches(db, projectId, threads);
-          if (reconciledDispatches > 0) bb.log.warn(`fleet-watchdog reconciled dispatch intents: project=${projectId} count=${reconciledDispatches}`);
+          const wedges = reconcilePreparedWorkItemDispatches(db, projectId, threads);
+          if (wedges.length > 0) {
+            dispatchWedgesByProject.set(projectId, wedges);
+            bb.log.warn(`fleet-watchdog dispatch wedge: project=${projectId} workItems=${wedges.map(({ workItemId }) => workItemId).join(",")}`);
+          }
         }
         const lanes = threads.filter(
           (thread) => thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null
@@ -24752,6 +24758,16 @@ ${thread.titleFallback ?? ""}`);
                ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
              WHERE heads.project_id = ? ORDER BY targets.repo_target_id`
           ).all(projectId).map((target) => githubRepository(target.remote_url));
+          for (const wedge of dispatchWedgesByProject.get(projectId) ?? []) {
+            await wake(
+              projectId,
+              orchestrator,
+              roleIdleKey(orchestrator, `dispatch-wedge:${wedge.executionAttemptId}`),
+              `dispatch identity unresolved for WorkItem ${wedge.workItemId}; its writing slot remains held. Inspect the native thread and decide recovery or closure before dispatching another lane.`,
+              false,
+              "owed-act"
+            );
+          }
           const queue = repositories.length === 0 || repositories.some((repository) => repository === null) ? null : await startableQueueStateAsync(repositories);
           if (queue !== null) {
             const intake = `startable=${queue.count} unlabelled=${queue.unlabelledCount} blocked=${queue.blockedCount} waiting-external=${queue.waitingExternalCount}`;
