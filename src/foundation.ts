@@ -1381,7 +1381,7 @@ const reviewScopeSchema = z
   .object({ targets: z.array(reviewTargetSchema).min(1).max(32) })
   .strict()
   .superRefine((scope, ctx) => {
-    const keys = scope.targets.map((target) => `${target.workItemId}\u0000${target.repoTargetId}`);
+    const keys = scope.targets.map((target) => JSON.stringify([target.workItemId, target.repoTargetId]));
     if (new Set(scope.targets.map((target) => target.workItemId)).size !== scope.targets.length) {
       ctx.addIssue({ code: "custom", path: ["targets"], message: "one WorkItem cannot span multiple review targets" });
     }
@@ -1398,7 +1398,7 @@ const reviewConnectorsSchema = z
   .min(1)
   .max(128)
   .superRefine((connectors, ctx) => {
-    const keys = connectors.map((connector) => `${connector.repoTargetId}\u0000${connector.connectorId}`);
+    const keys = connectors.map((connector) => JSON.stringify([connector.repoTargetId, connector.connectorId]));
     if (new Set(keys).size !== keys.length) {
       ctx.addIssue({ code: "custom", message: "review connector mappings must be duplicate-free" });
     }
@@ -1536,6 +1536,60 @@ export interface WorkItemCapacityLaneEvidence {
 export interface WorkItemCapacityEvidence {
   lanes: WorkItemCapacityLaneEvidence[];
   unboundWorkItemIds: string[];
+}
+
+export interface WorkItemDispatchThread {
+  id: string;
+  parentThreadId: string | null;
+  title: string | null;
+  archivedAt: number | null;
+  deletedAt: number | null;
+}
+
+export interface WorkItemDispatchWedge {
+  executionAttemptId: string;
+  workItemId: string;
+}
+
+/** Reconcile only positive identity evidence; ambiguity remains a capacity-consuming wedge. */
+export function reconcilePreparedWorkItemDispatches(
+  db: SqliteDatabase,
+  projectId: string,
+  threads: WorkItemDispatchThread[],
+): WorkItemDispatchWedge[] {
+  const prepared = db.prepare(
+    `SELECT execution_attempt_id, work_item_id, reason_code FROM execution_attempts
+     WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
+       AND state = 'prepared' AND thread_id IS NULL`,
+  ).all(projectId) as Array<{ execution_attempt_id: string; work_item_id: string; reason_code: string | null }>;
+  const wedges: WorkItemDispatchWedge[] = [];
+  for (const attempt of prepared) {
+    const marker = attempt.reason_code?.startsWith("work_item_dispatch_intent:")
+      ? attempt.reason_code.slice("work_item_dispatch_intent:".length)
+      : null;
+    const parentMarker = marker?.lastIndexOf(":parent=") ?? -1;
+    const dispatchMarker = parentMarker >= 0 ? marker!.slice(0, parentMarker) : null;
+    const expectedParentThreadId = parentMarker >= 0 ? marker!.slice(parentMarker + ":parent=".length) : null;
+    if (!dispatchMarker || !expectedParentThreadId) {
+      wedges.push({ executionAttemptId: attempt.execution_attempt_id, workItemId: attempt.work_item_id });
+      continue;
+    }
+    const thread = threads.find((candidate) =>
+      candidate.parentThreadId === expectedParentThreadId && candidate.archivedAt === null && candidate.deletedAt === null &&
+      candidate.title?.includes(`[dispatch:${dispatchMarker}]`) === true,
+    );
+    const observedAtMs = now();
+    if (thread) {
+      const result = db.prepare(
+        `UPDATE execution_attempts
+         SET state = 'running', thread_id = ?, lease_owner_thread_id = ?, reason_code = 'work_item_dispatch', observed_at_ms = ?
+         WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL`,
+      ).run(thread.id, thread.id, observedAtMs, projectId, attempt.execution_attempt_id);
+      if (result.changes > 0) continue;
+    }
+    wedges.push({ executionAttemptId: attempt.execution_attempt_id, workItemId: attempt.work_item_id });
+  }
+  return wedges;
 }
 
 export function workItemCapacityLaneEvidence(db: SqliteDatabase, projectId: string): WorkItemCapacityEvidence {
@@ -1935,6 +1989,7 @@ export interface GitHubIssueSnapshot {
   title: string;
   body: string;
   state: "open" | "closed";
+  stateReason?: "COMPLETED" | "NOT_PLANNED" | "DUPLICATE" | "REOPENED";
   labels: string[];
   externalRevision: string;
 }
@@ -2526,6 +2581,7 @@ export interface MutationReceipt {
 
 export interface FoundationResult {
   outcome: FoundationCode;
+  replay?: boolean;
   subject: string;
   expected: number;
   attempted: number;
@@ -2985,7 +3041,7 @@ function actorReceiptDigest(input: {
   }));
 }
 
-function mutationRequestDigest(request: ApplyRequest): string {
+export function mutationRequestDigest(request: ApplyRequest): string {
   return sha256(canonicalJson(Object.fromEntries(Object.entries(request).filter(([, value]) => value !== undefined))));
 }
 
@@ -3164,7 +3220,9 @@ function checkIdempotency(db: SqliteDatabase, request: ApplyRequest, digest: str
   if (row.request_digest !== digest) {
     throw refusal("IDEMPOTENCY_KEY_CONFLICT", "idempotency key was already used for another request");
   }
-  return JSON.parse(row.outcome_json) as FoundationResult;
+  const replay = JSON.parse(row.outcome_json) as FoundationResult;
+  Object.defineProperty(replay, "replay", { value: true });
+  return replay;
 }
 
 function nextEventSequence(db: SqliteDatabase, projectId: string): number {
@@ -5426,7 +5484,7 @@ interface WorkItemRow {
 }
 
 type WorkAttempt = z.infer<typeof workAttemptSchema>;
-type WorkAttemptState = "running" | "done" | "failed";
+type WorkAttemptState = (typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES)[number] | "done" | "blocked" | "failed";
 const ACTIVE_WORK_ATTEMPT_STATES = WORK_ITEM_CAPACITY_ATTEMPT_STATES;
 const WORK_ITEM_THREAD_TOKEN = /thr_[A-Za-z0-9]+/gu;
 const WORK_ITEM_LANE_SENTENCE = /^(?:Lane|Writing lane) (thr_[A-Za-z0-9]+)(?:[,.!?])?(?:[ \t]+|\r?\n|$)/u;
@@ -5795,6 +5853,12 @@ interface ExternalWorkRefRow {
   updated_at_ms: number;
 }
 
+function validGithubSnapshotStateReason(state: GitHubIssueSnapshot["state"], reason: GitHubIssueSnapshot["stateReason"]): boolean {
+  return state === "open"
+    ? reason === undefined || reason === "REOPENED"
+    : reason === "COMPLETED" || reason === "NOT_PLANNED" || reason === "DUPLICATE";
+}
+
 const githubSnapshotSchema = z
   .object({
     owner: id,
@@ -5803,10 +5867,16 @@ const githubSnapshotSchema = z
     title: z.string().max(4096),
     body: z.string().max(64 * 1024),
     state: z.enum(["open", "closed"]),
+    stateReason: z.enum(["COMPLETED", "NOT_PLANNED", "DUPLICATE", "REOPENED"]).optional(),
     labels: z.array(id).max(256),
     externalRevision: id,
   })
-  .strict();
+  .strict()
+  .superRefine((snapshot, context) => {
+    if (!validGithubSnapshotStateReason(snapshot.state, snapshot.stateReason)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["stateReason"], message: "GitHub issue state and reason do not match" });
+    }
+  });
 
 function storedConfigJson(db: SqliteDatabase, projectId: string, configRevision: number): string {
   const row = asRow<{ canonical_config_json: string }>(
@@ -6056,6 +6126,9 @@ function applyWorkItemTransition(
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
+  // The watchdog uses a verified plugin actor rather than a role holder; role actors
+  // must still prove current standing on every revalidation, including after stop.
+  requireRoleActorBinding(db, request, false);
   const nextState = request.lifecycleState;
   const workItem = requireWorkItem(
     db,
@@ -6157,6 +6230,41 @@ function applyWorkItemTransition(
     throw refusal("WORK_ITEM_STATE_INVALID", "review re-dispatch requires one active review and the same exact PR head, replacement thread, and profile");
   }
   if (workAttempt !== undefined && nextState === undefined) {
+    const dispatchIntent = db.prepare(
+      `SELECT execution_attempt_id FROM execution_attempts
+       WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+         AND assignment_kind = 'write' AND state = 'prepared' AND thread_id IS NULL
+       ORDER BY attempt_ordinal DESC LIMIT 1`,
+    ).get(request.projectId, workItem.work_item_id) as { execution_attempt_id: string } | undefined;
+    if (dispatchIntent && workAttempt.threadId) {
+      const observedAtMs = now();
+      db.prepare(
+        `UPDATE execution_attempts
+         SET state = 'running', thread_id = ?, lease_owner_thread_id = ?, reason_code = 'work_item_dispatch', observed_at_ms = ?
+         WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL`,
+      ).run(workAttempt.threadId, workAttempt.threadId, observedAtMs, request.projectId, dispatchIntent.execution_attempt_id);
+      return commitMutation(
+        db,
+        request,
+        digest,
+        actorReceiptId,
+        {
+          aggregateType: "work_item",
+          aggregateId: workItem.work_item_id,
+          aggregateRevision: workItem.resource_revision,
+          eventType: "work_item_attempt_armed",
+          event: { workItemId: workItem.work_item_id, executionAttemptId: dispatchIntent.execution_attempt_id, workAttempt },
+        },
+        { expected: 1, attempted: 1, verified: 1 },
+        {
+          currentConfigRevision: configRevision,
+          currentGovernanceEpoch: governor.governance_epoch,
+          currentResourceRevision: workItem.resource_revision,
+          expectedResourceRevision: request.expectedResourceRevision ?? undefined,
+          evidence: { workItemId: workItem.work_item_id, executionAttemptId: dispatchIntent.execution_attempt_id, workAttempt },
+        },
+      );
+    }
     if (workItem.lifecycle_state !== "in_progress") {
       throw refusal("WORK_ITEM_STATE_INVALID", "replacement work attempts require an in-progress work item");
     }
@@ -6186,8 +6294,8 @@ function applyWorkItemTransition(
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
-      state: "running",
-      reasonCode: "work_item_dispatch",
+      state: workAttempt.threadId ? "running" : "prepared",
+      reasonCode: workAttempt.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}${request.reasonCode?.startsWith("dispatch_parent:") ? `:parent=${request.reasonCode.slice("dispatch_parent:".length)}` : ""}`,
       createdAtMs,
       observedAtMs: createdAtMs,
       completedAtMs: null,
@@ -6226,6 +6334,9 @@ function applyWorkItemTransition(
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
   let recordedExternalEvent: { kind: "github_issue_closed" | "github_issue_reopened"; owner: string; repo: string; issueNumber: number; externalRevision: string } | null = null;
+  if (githubObservation && !validGithubSnapshotStateReason(githubObservation.state, githubObservation.stateReason)) {
+    throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue state and reason do not match");
+  }
   if (workItem.lifecycle_state === "blocked") {
     const storedBlocker = existingWait ? storedWorkItemBlocker(existingWait) : null;
     if (!storedBlocker) throw refusal("WORK_ITEM_STATE_INVALID", "blocked work item has no valid machine-evaluable blocker");
@@ -6244,8 +6355,12 @@ function applyWorkItemTransition(
     if (!githubObservation) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub lifecycle observation is unavailable");
     requireBoundGithubIssue(db, request.projectId, workItem.work_item_id, externalEvent);
     if (externalEvent.kind === "github_issue_closed") {
-      if (nextState !== "succeeded" || githubObservation.state !== "closed") {
-        throw refusal("WORK_ITEM_STATE_INVALID", "close observation only permits a transition to succeeded");
+      const absorbedBeforeStart = workItem.lifecycle_state === "proposed" && nextState === "cancelled";
+      if ((!absorbedBeforeStart && nextState !== "succeeded") || githubObservation.state !== "closed") {
+        throw refusal("WORK_ITEM_STATE_INVALID", "close observation only permits succeeded, or proposed to cancelled");
+      }
+      if (absorbedBeforeStart && githubObservation.stateReason !== "COMPLETED") {
+        throw refusal("WORK_ITEM_STATE_INVALID", "proposed cancellation requires a completed GitHub close observation");
       }
     } else {
       if (workItem.lifecycle_state !== "succeeded" || nextState !== "ready" || githubObservation.state !== "open") {
@@ -6317,8 +6432,8 @@ function applyWorkItemTransition(
       assignmentKind: workAttempt!.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt!),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
-      state: "running",
-      reasonCode: "work_item_dispatch",
+      state: workAttempt!.threadId ? "running" : "prepared",
+      reasonCode: workAttempt!.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}${request.reasonCode?.startsWith("dispatch_parent:") ? `:parent=${request.reasonCode.slice("dispatch_parent:".length)}` : ""}`,
       createdAtMs: now(),
       observedAtMs: now(),
       completedAtMs: null,
@@ -6730,7 +6845,7 @@ export function backfillWorkItemGithubIssues(
           github: mapping.github,
           mapping: mapping.mapping,
           issueNumber,
-          idempotencyKey: `github-issue-backfill:${projectId}:${row.work_item_id}`,
+          idempotencyKey: `github-issue-backfill:${JSON.stringify([projectId, row.work_item_id])}`,
           requestDigest: sha256(canonicalJson({ projectId, workItemId: row.work_item_id, epochCreatedAtMs: result.epochCreatedAtMs, configRevision: result.configRevision })),
           observed: snapshot!,
         });
@@ -7320,6 +7435,7 @@ export function applyAuthorizedMutation(
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
   reviewFactReader: ReviewFactReader | null = null,
   githubIssueReader: GitHubIssueReader | null = null,
+  dryRun = false,
 ): FoundationResult {
   let request: ApplyRequest;
   try {
@@ -7329,7 +7445,7 @@ export function applyAuthorizedMutation(
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, dryRun);
 }
 
 export function applyFixtureMutation(
@@ -7340,6 +7456,7 @@ export function applyFixtureMutation(
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
   reviewFactReader: ReviewFactReader | null = null,
   githubIssueReader: GitHubIssueReader | null = null,
+  dryRun = false,
 ): FoundationResult {
   let request: ApplyRequest;
   try {
@@ -7381,7 +7498,7 @@ export function applyFixtureMutation(
         githubObservation.issueNumber !== githubTarget.issueNumber
       ) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue observation does not match the exact blocker identity");
     }
-    return transaction(db, () => {
+    const mutate = () => {
       const replay = checkIdempotency(db, request, digest);
       if (replay) return replay;
       switch (request.operationClass) {
@@ -7409,7 +7526,17 @@ export function applyFixtureMutation(
         case "role_generation_succession":
           throw refusal("INTERNAL_ERROR", "role fact operations must not run inside the canonical transaction");
       }
-    });
+    };
+    if (!dryRun) return transaction(db, mutate);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const value = mutate();
+      db.exec("ROLLBACK");
+      return value;
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch { /* preserve refusal */ }
+      throw error;
+    }
   } catch (error) {
     if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
     if (isConstraintError(error)) return result("CANONICAL_STORE_UNAVAILABLE", request.projectId, 1, 0, 0, { message: String(error) });
@@ -7662,7 +7789,7 @@ async function routingDoctorEvidence(
   const buckets = new Map<string, RoutingProfile & { count: number; threadIds: string[] }>();
   for (const { thread, profile } of workerProfiles) {
     if (!profile) continue;
-    const key = `${profile.providerId}\0${profile.model}\0${profile.reasoningLevel}`;
+    const key = JSON.stringify([profile.providerId, profile.model, profile.reasoningLevel]);
     const bucket = buckets.get(key) ?? { ...profile, count: 0, threadIds: [] };
     bucket.count += 1;
     bucket.threadIds.push(thread.id);
