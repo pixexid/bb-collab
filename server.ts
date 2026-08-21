@@ -1671,9 +1671,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     bb.log.error(`error-recovery coverage=blind event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=blind unboundOpenWorkItems=${openWorkItems} reason=work-items-have-no-thread-binding:GH-300`);
   };
 
-  const readPendingExternalWait = async (threadId: string) => {
+  const readPendingExternalWait = async (threadId: string, signal?: AbortSignal) => {
     try {
-      return (await bb.sdk.threads.interactions.list({ threadId })).some((interaction) => interaction.status === "pending");
+      return (await bb.sdk.threads.interactions.list({ threadId, ...(signal ? { signal } : {}) })).some((interaction) => interaction.status === "pending");
     } catch {
       return true;
     }
@@ -1836,11 +1836,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     waitRegistry,
     onAlert: (alert) => bb.log.warn(`role awareness ${alert.kind}: ${alert.role.roleId}@${alert.role.roleGeneration} queue ${alert.role.queueHeadId}`),
     onRoleSuccessionRequired: (role) => bb.log.warn(`role succession required: ${role.roleId}@${role.roleGeneration}`),
-    readWorker: async (threadId) => {
+    readWorker: async (threadId, signal) => {
       const roleHolders = db ? readRoleHolderStates(db).filter((holder) => holder.thread_id === threadId) : [];
       let thread;
       try {
-        thread = await bb.sdk.threads.get({ threadId });
+        thread = await bb.sdk.threads.get({ threadId, ...(signal ? { signal } : {}) });
       } catch (error) {
         for (const holder of roleHolders) warnRoleLiveness(holder, `liveness=unknown error=${String(error)}`);
         throw error;
@@ -1859,7 +1859,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return {
         projectId: thread.projectId,
         status: thread.status,
-        pendingExternalWait: archived ? true : await readPendingExternalWait(threadId),
+        pendingExternalWait: archived ? true : await readPendingExternalWait(threadId, signal),
         archived,
         operatorWait: null,
         operatorWaitKnown: true,
@@ -2277,7 +2277,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       void idleFleetDetector.rearm();
       void reconcileErrorRecovery().catch((error) => bb.log.warn(`error-recovery reconcile failed: ${String(error)}`));
       while (!signal.aborted) {
-        await watcher.poll().catch((error) => bb.log.warn(`lane poll failed: ${String(error)}`));
+        await watcher.poll(signal).catch((error) => bb.log.warn(`lane poll failed: ${String(error)}`));
+        if (signal.aborted) break;
         await escalationCycle.cycle().catch((error) => bb.log.warn(`wait escalation failed: ${String(error)}`));
         if (signal.aborted) break;
         await new Promise<void>((resolve) => {

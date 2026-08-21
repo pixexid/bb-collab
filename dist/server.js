@@ -14069,7 +14069,7 @@ function createLaneWatcher(options) {
   const roleIdleThresholdMs = Number.isInteger(options.roleIdleThresholdMs) && (options.roleIdleThresholdMs ?? 0) >= 0 ? options.roleIdleThresholdMs : WRONGFUL_IDLE_THRESHOLD_MS;
   const now2 = options.now ?? Date.now;
   let queue = Promise.resolve();
-  const readWaitContext = async (suppliedSource) => {
+  const readWaitContext = async (suppliedSource, signal) => {
     let waits;
     try {
       await waitRegistry.recover();
@@ -14090,7 +14090,7 @@ function createLaneWatcher(options) {
         };
       } else if (options.readWorker) {
         try {
-          observation = await options.readWorker(sourceThreadId);
+          observation = signal ? await options.readWorker(sourceThreadId, signal) : await options.readWorker(sourceThreadId);
         } catch {
           observation = null;
         }
@@ -14150,7 +14150,7 @@ function createLaneWatcher(options) {
     roleAlert(role);
     options.onRoleSuccessionRequired?.(role);
   };
-  const observeRoleNow = async (threadId, suppliedScopes, waitContext) => {
+  const observeRoleNow = async (threadId, suppliedScopes, waitContext, signal) => {
     if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return;
     let holders;
     try {
@@ -14169,6 +14169,7 @@ function createLaneWatcher(options) {
       }
     }
     for (const holder of holders) {
+      if (signal?.aborted) return;
       const projectHolders = holders.filter((candidate) => candidate.project_id === holder.project_id && candidate.role_id === holder.role_id);
       if (projectHolders.length !== 1 || !holder.thread_id) continue;
       const targetThreadId = holder.thread_id;
@@ -14177,7 +14178,7 @@ function createLaneWatcher(options) {
       const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
       let observation;
       try {
-        observation = await options.readWorker(targetThreadId);
+        observation = signal ? await options.readWorker(targetThreadId, signal) : await options.readWorker(targetThreadId);
       } catch {
         continue;
       }
@@ -14300,10 +14301,17 @@ function createLaneWatcher(options) {
     if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, target);
     return { attempted: true, delivered: !failed };
   };
-  const enqueue = (work) => {
+  const enqueue = (work, signal) => {
     const result2 = queue.then(work);
     queue = result2.then(() => void 0, () => void 0);
-    return result2;
+    if (!signal) return result2;
+    if (signal.aborted) return Promise.resolve(void 0);
+    let onAbort;
+    const aborted2 = new Promise((resolve3) => {
+      onAbort = () => resolve3(void 0);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    return Promise.race([result2, aborted2]).finally(() => signal.removeEventListener("abort", onAbort));
   };
   const emitWaitEvents = async (context) => {
     for (const event of context.events) await options.onWaitEvent?.(event);
@@ -14326,9 +14334,10 @@ function createLaneWatcher(options) {
         }
       });
     },
-    poll() {
+    poll(signal) {
       return enqueue(async () => {
-        const context = await readWaitContext();
+        if (signal?.aborted) return;
+        const context = await readWaitContext(void 0, signal);
         await emitWaitEvents(context);
         if (!options.readWorker) return;
         if (options.readRoleHolders) {
@@ -14342,10 +14351,13 @@ function createLaneWatcher(options) {
             }
           }
           if (roleScopes) {
-            for (const threadId of roleThreadIds) await observeRoleNow(threadId, roleScopes, context);
+            for (const threadId of roleThreadIds) {
+              if (signal?.aborted) return;
+              await observeRoleNow(threadId, roleScopes, context, signal);
+            }
           }
         }
-      });
+      }, signal);
     },
     wakeRole(role) {
       return enqueue(() => wakeRoleNow(role));
@@ -23125,9 +23137,9 @@ async function plugin(bb, options = {}) {
     const roleRestart = failedRoles === 0 ? "armed" : "degraded";
     bb.log.error(`error-recovery coverage=blind event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=blind unboundOpenWorkItems=${openWorkItems} reason=work-items-have-no-thread-binding:GH-300`);
   };
-  const readPendingExternalWait = async (threadId) => {
+  const readPendingExternalWait = async (threadId, signal) => {
     try {
-      return (await bb.sdk.threads.interactions.list({ threadId })).some((interaction) => interaction.status === "pending");
+      return (await bb.sdk.threads.interactions.list({ threadId, ...signal ? { signal } : {} })).some((interaction) => interaction.status === "pending");
     } catch {
       return true;
     }
@@ -23272,11 +23284,11 @@ ${thread.titleFallback ?? ""}`);
     waitRegistry,
     onAlert: (alert) => bb.log.warn(`role awareness ${alert.kind}: ${alert.role.roleId}@${alert.role.roleGeneration} queue ${alert.role.queueHeadId}`),
     onRoleSuccessionRequired: (role) => bb.log.warn(`role succession required: ${role.roleId}@${role.roleGeneration}`),
-    readWorker: async (threadId) => {
+    readWorker: async (threadId, signal) => {
       const roleHolders = db ? readRoleHolderStates(db).filter((holder) => holder.thread_id === threadId) : [];
       let thread;
       try {
-        thread = await bb.sdk.threads.get({ threadId });
+        thread = await bb.sdk.threads.get({ threadId, ...signal ? { signal } : {} });
       } catch (error48) {
         for (const holder of roleHolders) warnRoleLiveness(holder, `liveness=unknown error=${String(error48)}`);
         throw error48;
@@ -23295,7 +23307,7 @@ ${thread.titleFallback ?? ""}`);
       return {
         projectId: thread.projectId,
         status: thread.status,
-        pendingExternalWait: archived ? true : await readPendingExternalWait(threadId),
+        pendingExternalWait: archived ? true : await readPendingExternalWait(threadId, signal),
         archived,
         operatorWait: null,
         operatorWaitKnown: true,
@@ -23680,7 +23692,8 @@ ${thread.titleFallback ?? ""}`);
       void idleFleetDetector.rearm();
       void reconcileErrorRecovery().catch((error48) => bb.log.warn(`error-recovery reconcile failed: ${String(error48)}`));
       while (!signal.aborted) {
-        await watcher.poll().catch((error48) => bb.log.warn(`lane poll failed: ${String(error48)}`));
+        await watcher.poll(signal).catch((error48) => bb.log.warn(`lane poll failed: ${String(error48)}`));
+        if (signal.aborted) break;
         await escalationCycle.cycle().catch((error48) => bb.log.warn(`wait escalation failed: ${String(error48)}`));
         if (signal.aborted) break;
         await new Promise((resolve3) => {

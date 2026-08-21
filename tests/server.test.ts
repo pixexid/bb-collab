@@ -3113,30 +3113,40 @@ describe("bb-collab plugin boundary", () => {
       const fixture = await fleetWatchdogFixture(0);
       let threadReads = 0;
       let firstReadSettled = false;
-      let interactionReadStarted!: () => void;
-      const firstInteractionRead = new Promise<void>((resolve) => {
-        interactionReadStarted = resolve;
+      let pollReadReceivedAbortSignal = false;
+      let pollReadStarted!: () => void;
+      const pollRead = new Promise<void>((resolve) => {
+        pollReadStarted = resolve;
       });
-      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => {
+      await fixture.host.harness.callRpc("registerWait", {
+        waitId: "shutdown-check",
+        waiterThreadId: "waiter",
+        sourceThreadId: "thread-holder",
+        sourceEvent: "terminal",
+        deadlineAtMs: Date.now() + 60_000,
+        wakerSchedule: "stall-guard-liveness",
+      });
+      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId, signal }: { threadId: string; signal?: AbortSignal }) => {
         threadReads += 1;
+        if (signal) {
+          pollReadReceivedAbortSignal = true;
+          pollReadStarted();
+          await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+          throw new DOMException("Aborted", "AbortError");
+        }
         if (threadReads === 1 && firstRecoveryReadHangs) await new Promise<never>(() => undefined);
         if (threadReads === 1) firstReadSettled = true;
         return makeThreadResponse({ id: threadId, projectId: PROJECT_ID, status: "idle", updatedAt: 1 });
       }) as never);
-      fixture.host.harness.sdk.stub("threads.interactions.list", (async () => {
-        interactionReadStarted();
-        return [];
-      }) as never);
+      fixture.host.harness.sdk.stub("threads.interactions.list", (async () => []) as never);
 
       const service = fixture.host.harness.runService("lane-watcher");
-      const loopStarted = await firstInteractionRead.then(() => "loop-started" as const);
+      const loopStarted = await pollRead.then(() => "loop-started" as const);
       service.controller.abort();
-      const shutdown = await Promise.race([
-        service.done.then(() => "shutdown-completed" as const),
-        new Promise<"still-hung-after-abort">((resolve) => setTimeout(() => resolve("still-hung-after-abort"), 100)),
-      ]);
+      const shutdown = await service.done.then(() => "shutdown-completed" as const);
 
       expect({ loopStarted, shutdown }).toEqual({ loopStarted: "loop-started", shutdown: "shutdown-completed" });
+      expect(pollReadReceivedAbortSignal).toBe(true);
       expect(threadReads).toBeGreaterThan(firstRecoveryReadHangs ? 1 : 0);
       expect(firstReadSettled).toBe(!firstRecoveryReadHangs);
     }
