@@ -1726,6 +1726,27 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
        AND attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
        AND items.lifecycle_state IN (${WORK_ITEM_CAPACITY_LIFECYCLE_STATES.map(() => "?").join(", ")})`,
   ).get(lane.project_id, lane.execution_attempt_id, lane.thread_id, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES));
+  const resolveRecoveryIdentity = (projectId: string, threadId: string): { holder?: RoleHolderState; lane?: LaneRecoveryTarget } | null => {
+    if (db === null) return {};
+    try {
+      const holder = db.prepare(
+        `SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id
+         FROM execution_attempts
+         WHERE project_id = ? AND thread_id = ? AND origin = 'role_holder'
+         ORDER BY rowid DESC LIMIT 1`,
+      ).get(projectId, threadId) as RoleHolderState | undefined;
+      const lane = db.prepare(
+        `SELECT project_id, thread_id, execution_attempt_id
+         FROM execution_attempts
+         WHERE project_id = ? AND thread_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
+         ORDER BY rowid DESC LIMIT 1`,
+      ).get(projectId, threadId) as LaneRecoveryTarget | undefined;
+      return { holder, lane };
+    } catch (error) {
+      bb.log.warn(`error-recovery identity resolution failed: project=${projectId} thread=${threadId} ${String(error)}`);
+      return null;
+    }
+  };
   const recoverErroredThread = async (threadId: string, projectId: string, holder?: RoleHolderState, lane?: LaneRecoveryTarget) => {
     if (recoveryInFlight.has(threadId)) {
       bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=recovery-in-flight`);
@@ -1746,7 +1767,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       if (thread.environmentId !== null) {
         const environmentId = thread.environmentId;
         try {
-          const status = await withRecoveryTimeout("environments.status", () => bb.sdk.environments.status({ environmentId }));
+          const status = await withRecoveryTimeout("environments.status", (signal) => bb.sdk.environments.status({ environmentId, signal }));
           if (status.outcome === "available") {
             const checkout = status.workspace.checkout;
             if (checkout.kind === "branch" || checkout.kind === "detached") head = checkout.headSha ?? `${checkout.kind} checkout with no HEAD`;
@@ -1755,6 +1776,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         } catch (error) {
           bb.log.warn(`error-recovery head unavailable: thread=${threadId} ${String(error)}`);
         }
+      }
+      if (holder !== undefined && !isCurrentRoleHolder(holder)) {
+        bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=role-holder-no-longer-current`);
+        return false;
       }
       if (lane !== undefined && !isCurrentLane(lane)) {
         bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=lane-no-longer-current`);
@@ -2471,7 +2496,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   bb.events.on("thread.failed", async (payload) => {
     await observeCapacityAfter(payload).catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`));
     const { id, status } = threadEventStatus(payload);
-    if (status === "error") await recoverErroredThread(id, payload.thread.projectId);
+    if (status === "error") {
+      const identity = resolveRecoveryIdentity(payload.thread.projectId, id);
+      if (identity === null) return;
+      await recoverErroredThread(id, payload.thread.projectId, identity.holder, identity.lane);
+    }
   });
   bb.events.on("thread.archived", async (payload) => {
     await (async () => {

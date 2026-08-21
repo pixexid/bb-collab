@@ -3340,6 +3340,73 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     })).toBe(false);
   });
 
+  it("rejects a late failure event for a completed canonical lane", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    fixture.addNativeLane("thread-work-item-1", "error");
+    fixture.db.prepare("UPDATE work_items SET lifecycle_state = 'review_pending' WHERE project_id = ? AND work_item_id = ?").run(PROJECT_ID, WORK_ITEM_ID);
+
+    await fixture.host.harness.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, status: "error", updatedAt: 1 }),
+      error: "late failure",
+    });
+
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("rechecks role-holder identity immediately before an event recovery wake", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    const statuses = new Map([[fixture.orchestratorThreadId, "error" as const]]);
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      environmentId: `environment-${threadId}`,
+      status: statuses.get(threadId) ?? "idle",
+      updatedAt: 1,
+    })) as never);
+    fixture.host.harness.sdk.stub("environments.status", (async () => {
+      fixture.db.prepare("UPDATE role_generations SET status = 'retired' WHERE project_id = ? AND role_id = 'project-orchestrator' AND generation = 1").run(PROJECT_ID);
+      return { outcome: "available", workspace: { checkout: { kind: "detached", headSha: "stale-head" } } };
+    }) as never);
+
+    await fixture.host.harness.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: fixture.orchestratorThreadId, projectId: PROJECT_ID, status: "error", updatedAt: 1 }),
+      error: "retired holder",
+    });
+
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringContaining("reason=role-holder-no-longer-current"),
+    }));
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("aborts a hanging recovery status read", async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      let aborted = false;
+      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+        id: threadId,
+        projectId: PROJECT_ID,
+        environmentId: "recovery-environment",
+        status: "error",
+        updatedAt: 1,
+      })) as never);
+      fixture.host.harness.sdk.stub("environments.status", (async ({ signal }: { signal?: AbortSignal }) => {
+        await new Promise<void>((resolve) => signal?.addEventListener("abort", () => { aborted = true; resolve(); }, { once: true }));
+        return { outcome: "unavailable" };
+      }) as never);
+      const service = fixture.host.harness.runService("lane-watcher");
+      await vi.advanceTimersByTimeAsync(10_000);
+      await vi.waitFor(() => expect(aborted).toBe(true));
+      service.controller.abort();
+      await service.done;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("starts and stops the lane watcher whether restart reconciliation resolves or hangs", async () => {
     for (const firstRecoveryReadHangs of [false, true]) {
       const fixture = await fleetWatchdogFixture(0);
