@@ -2028,7 +2028,12 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   };
   const closeLaneCapacityCoverage = () => {
     if (!db) return;
-    db.prepare("UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE ended_at_ms IS NULL").run();
+    db.pragma("busy_timeout = 0");
+    try {
+      db.prepare("UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE ended_at_ms IS NULL").run();
+    } finally {
+      db.pragma("busy_timeout = 5000");
+    }
   };
   const idleFleetBlind = (
     orchestrator: "known" | "blind",

@@ -14475,7 +14475,10 @@ function createIdleFleetDetector(options) {
   const observeCapacity = (projectId) => {
     if (stopped || !options.capacity) return Promise.resolve();
     const previous = capacityQueues.get(projectId) ?? Promise.resolve();
-    const next = previous.then(() => options.capacity.observe(projectId));
+    const next = previous.then(() => {
+      if (stopped) return;
+      return options.capacity.observe(projectId);
+    });
     capacityQueues.set(projectId, next.catch(() => void 0));
     return next.catch((error48) => {
       reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error48)}`);
@@ -14497,6 +14500,7 @@ function createIdleFleetDetector(options) {
       }
     },
     stop() {
+      if (stopped) return;
       stopped = true;
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
@@ -23441,7 +23445,12 @@ ${thread.titleFallback ?? ""}`);
   };
   const closeLaneCapacityCoverage = () => {
     if (!db) return;
-    db.prepare("UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE ended_at_ms IS NULL").run();
+    db.pragma("busy_timeout = 0");
+    try {
+      db.prepare("UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE ended_at_ms IS NULL").run();
+    } finally {
+      db.pragma("busy_timeout = 5000");
+    }
   };
   const idleFleetBlind = (orchestrator, activeLanes, startable, reason) => ({
     kind: "blind",
