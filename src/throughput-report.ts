@@ -187,7 +187,7 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
   if (filed !== null && attributed !== null && unattributed !== null && filed !== attributed + unattributed) throw new Error("defect escape attribution population does not reconcile");
   const defectSummary = filed === null
     ? "defects filed unknown; defects attributed unknown; defects unattributed unknown"
-    : `defects filed ${filed}; defects attributed ${attributed}; defects unattributed ${unattributed}; attribution coverage ${attributionCoverage! * 100}%`;
+    : `defects filed ${filed}; defects attributed ${attributed}; defects unattributed ${unattributed}; attribution coverage ${Number((attributionCoverage! * 100).toFixed(1))}%`;
   const explicitRevertIds = defects.filter((defect) => defect.reverted === true).map((defect) => defect.id);
   const reverts = facts.unknownReasons?.reverts || defects.length === 0 || defects.some((defect) => defect.reverted === null)
     ? { status: "unknown" as const, total: null, observedExplicitRevertIds: explicitRevertIds, reason: facts.unknownReasons?.reverts ?? "revert coverage is unavailable" }

@@ -51,6 +51,15 @@ describe("weekly throughput report", () => {
     }, window);
     expect(report.defectEscape).toMatchObject({ filed: 1, attributed: 0, unattributed: 1, attributionCoverage: 0 });
     expect(report.defectEscape.summary).toContain("defects filed 1; defects attributed 0; defects unattributed 1");
+    const third = weeklyThroughputReport({
+      ...empty,
+      defects: [
+        { id: "bug-1", culpritMergeId: "merge-1", attributionKnown: true, reverted: false, postMergeSeverity: "P1" },
+        { id: "bug-2", culpritMergeId: null, attributionKnown: true, reverted: false, postMergeSeverity: "P1" },
+        { id: "bug-3", culpritMergeId: null, attributionKnown: true, reverted: false, postMergeSeverity: "P1" },
+      ],
+    }, window);
+    expect(third.defectEscape.summary).toContain("attribution coverage 33.3%");
   });
 
   it("states metric populations and excludes a merge gap crossing the window boundary", () => {
