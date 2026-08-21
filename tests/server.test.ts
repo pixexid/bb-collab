@@ -8,7 +8,7 @@ import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import plugin, { cliSchemaError, deployedDistFailureDetail, IDLE_FLEET_ATTEMPT_STALE_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
+import plugin, { cliSchemaError, deployedDistFailureDetail, fleetWatchdogReopenKey, IDLE_FLEET_ATTEMPT_STALE_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
 import { canonicalWorktreePath } from "../src/worktree-cleanup.js";
 import {
   CACHED_CONSUMERS,
@@ -2614,6 +2614,12 @@ describe("bb-collab plugin boundary", () => {
     expect(source).toContain("cwd: root");
     expect(script).toContain("return process.cwd();");
     expect(script).not.toContain("BB_COLLAB_DEPLOYED_ROOT");
+  });
+
+  it("keeps colon-containing reopen subjects distinct", () => {
+    const first = fleetWatchdogReopenKey("proj:a", "wi");
+    const second = fleetWatchdogReopenKey("proj", "a:wi");
+    expect(first).not.toBe(second);
   });
 
   it("learns permanent reopen refusals instead of retrying them", () => {

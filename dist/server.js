@@ -21826,6 +21826,7 @@ import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as rea
 import { execFile, spawnSync as spawnSync2 } from "node:child_process";
 import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute2, join as join5, relative as relative2, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+var fleetWatchdogReopenKey = (projectId, workItemId) => `${projectId}\0${workItemId}`;
 function githubRepository(remoteUrl) {
   const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
   return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : null;
@@ -24113,7 +24114,7 @@ ${thread.titleFallback ?? ""}`);
           }
           if (linked.lifecycle_state === "succeeded") {
             if (!observation.issueOpen) continue;
-            const permanentReopenKey = `${projectId}:${linked.work_item_id}`;
+            const permanentReopenKey = fleetWatchdogReopenKey(projectId, linked.work_item_id);
             const pendingReopenKey = `${permanentReopenKey}:${observation.externalRevision}`;
             const permanentRefusalReason = permanentlyRefusedReopens.get(permanentReopenKey);
             const pendingRefusalReason = pendingRefusedReopens.get(pendingReopenKey);
@@ -24784,6 +24785,7 @@ export {
   cliSchemaError,
   plugin as default,
   deployedDistFailureDetail,
+  fleetWatchdogReopenKey,
   foundationResultSchema,
   isLiveCachedConsumerRolloutArtifact,
   readLiveRoleFactReader,
