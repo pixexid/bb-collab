@@ -24876,9 +24876,10 @@ ${thread.titleFallback ?? ""}`);
         const entries = await Promise.all(ids.map(async (id2) => {
           const key = sidebarCollapseKey(kind, id2);
           const value = await bb.storage.kv.get(key);
-          if (value === true) return [id2, true];
+          if (value !== void 0) return value === true ? [id2, true] : null;
           const legacyKey = legacySidebarCollapseKey(kind, id2);
           if (await bb.storage.kv.get(legacyKey) !== true) return null;
+          if (await bb.storage.kv.get(key) !== void 0) return null;
           await bb.storage.kv.set(key, true);
           await bb.storage.kv.delete(legacyKey);
           return [id2, true];
@@ -24893,7 +24894,10 @@ ${thread.titleFallback ?? ""}`);
     async setSidebarCollapse(input) {
       const key = sidebarCollapseKey(input.kind, input.id);
       if (input.collapsed) await bb.storage.kv.set(key, true);
-      else await bb.storage.kv.delete(key);
+      else {
+        await bb.storage.kv.set(key, false);
+        await bb.storage.kv.delete(legacySidebarCollapseKey(input.kind, input.id));
+      }
       return input;
     },
     async reorderPinned(input) {

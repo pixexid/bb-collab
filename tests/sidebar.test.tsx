@@ -968,6 +968,37 @@ describe("replacement thread list", () => {
     await expect(host.bb.storage.kv.get("sidebar.collapse:project:project-a")).resolves.toBeUndefined();
   });
 
+  it("does not resurrect a clear interleaved with legacy migration", async () => {
+    const host = createFakePluginHost({ pluginId: "bb-collab" });
+    await plugin(host.bb);
+    const legacyKey = "sidebar.collapse:project:project-a";
+    const canonicalKey = "sidebar.collapse:[\"project\",\"project-a\"]";
+    await host.bb.storage.kv.set(legacyKey, true);
+
+    let observeLegacy!: () => void;
+    const legacyObserved = new Promise<void>((resolve) => { observeLegacy = resolve; });
+    let releaseMigration!: () => void;
+    const migrationReleased = new Promise<void>((resolve) => { releaseMigration = resolve; });
+    const originalGet = host.bb.storage.kv.get.bind(host.bb.storage.kv);
+    async function interceptedGet<T>(key: string): Promise<T | undefined> {
+      const value = await originalGet<T>(key);
+      if (key === legacyKey) {
+        observeLegacy();
+        await migrationReleased;
+      }
+      return value;
+    }
+    host.bb.storage.kv.get = interceptedGet;
+
+    const migration = host.harness.callRpc("sidebarCollapseState", { projectIds: ["project-a"], threadIds: [] });
+    await legacyObserved;
+    await expect(host.harness.callRpc("setSidebarCollapse", { kind: "project", id: "project-a", collapsed: false })).resolves.toEqual({ kind: "project", id: "project-a", collapsed: false });
+    releaseMigration();
+
+    await expect(migration).resolves.toEqual({ projects: {}, threads: {} });
+    await expect(host.bb.storage.kv.get(canonicalKey)).resolves.toBe(false);
+  });
+
   it("accepts the live sidebar population across every batched RPC input", async () => {
     const host = createFakePluginHost({ pluginId: "bb-collab" });
     await plugin(host.bb);

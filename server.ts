@@ -3519,9 +3519,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         const entries = await Promise.all(ids.map(async (id) => {
           const key = sidebarCollapseKey(kind, id);
           const value = await bb.storage.kv.get<unknown>(key);
-          if (value === true) return [id, true] as const;
+          if (value !== undefined) return value === true ? [id, true] as const : null;
           const legacyKey = legacySidebarCollapseKey(kind, id);
           if (await bb.storage.kv.get<unknown>(legacyKey) !== true) return null;
+          // A clear leaves a false tombstone so this check cannot resurrect it.
+          if (await bb.storage.kv.get<unknown>(key) !== undefined) return null;
           await bb.storage.kv.set(key, true);
           await bb.storage.kv.delete(legacyKey);
           return [id, true] as const;
@@ -3536,7 +3538,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     async setSidebarCollapse(input) {
       const key = sidebarCollapseKey(input.kind, input.id);
       if (input.collapsed) await bb.storage.kv.set(key, true);
-      else await bb.storage.kv.delete(key);
+      else {
+        await bb.storage.kv.set(key, false);
+        await bb.storage.kv.delete(legacySidebarCollapseKey(input.kind, input.id));
+      }
       return input;
     },
     async reorderPinned(input) {
