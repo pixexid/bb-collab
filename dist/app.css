@@ -14,6 +14,7 @@
     --text-sm--line-height: calc(1.25 / 0.875);
     --text-lg: 1.125rem;
     --text-lg--line-height: calc(1.75 / 1.125);
+    --font-weight-normal: 400;
     --font-weight-medium: 500;
     --font-weight-semibold: 600;
     --shadow-2xs: var(--shadow-2xs);
@@ -149,6 +150,9 @@
     .my-3 {
       margin-block: calc(var(--spacing) * 3);
     }
+    .mt-0\.5 {
+      margin-top: calc(var(--spacing) * 0.5);
+    }
     .mb-2 {
       margin-bottom: calc(var(--spacing) * 2);
     }
@@ -204,6 +208,9 @@
     .size-\[5px\] {
       width: 5px;
       height: 5px;
+    }
+    .h-6 {
+      height: calc(var(--spacing) * 6);
     }
     .h-7 {
       height: calc(var(--spacing) * 7);
@@ -293,6 +300,13 @@
         margin-block-end: calc(calc(var(--spacing) * 3) * calc(1 - var(--tw-space-y-reverse)));
       }
     }
+    .space-y-px {
+      :where(& > :not(:last-child)) {
+        --tw-space-y-reverse: 0;
+        margin-block-start: calc(1px * var(--tw-space-y-reverse));
+        margin-block-end: calc(1px * calc(1 - var(--tw-space-y-reverse)));
+      }
+    }
     .divide-y {
       :where(& > :not(:last-child)) {
         --tw-divide-y-reverse: 0;
@@ -372,6 +386,9 @@
     .p-2 {
       padding: calc(var(--spacing) * 2);
     }
+    .p-3 {
+      padding: calc(var(--spacing) * 3);
+    }
     .p-4 {
       padding: calc(var(--spacing) * 4);
     }
@@ -396,6 +413,9 @@
     .pr-1 {
       padding-right: calc(var(--spacing) * 1);
     }
+    .pl-2 {
+      padding-left: calc(var(--spacing) * 2);
+    }
     .text-left {
       text-align: left;
     }
@@ -411,6 +431,9 @@
       font-size: var(--text-xs);
       line-height: var(--tw-leading, var(--text-xs--line-height));
     }
+    .text-\[9px\] {
+      font-size: 9px;
+    }
     .text-\[11px\] {
       font-size: 11px;
     }
@@ -425,6 +448,10 @@
     .font-medium {
       --tw-font-weight: var(--font-weight-medium);
       font-weight: var(--font-weight-medium);
+    }
+    .font-normal {
+      --tw-font-weight: var(--font-weight-normal);
+      font-weight: var(--font-weight-normal);
     }
     .font-semibold {
       --tw-font-weight: var(--font-weight-semibold);

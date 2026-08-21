@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 
 import { cleanup, waitFor } from "@testing-library/react";
-import { installTestPluginRuntime, loadPluginApp, renderSlot } from "@bb/plugin-sdk/testing/app";
-import type { PluginSidebarProject, PluginSidebarThread, PluginThreadListProps } from "@bb/plugin-sdk/app";
+import { installTestPluginRuntime, loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
+import type { PluginSidebarProject, PluginSidebarThread, PluginThreadListProps } from "@get-bb/plugin-sdk/app";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // The live crash (React #31) came from artifact skew, not from bad host data: a

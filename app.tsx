@@ -486,6 +486,229 @@ function ThreadRow({
   );
 }
 
+export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: PluginThreadListProps) {
+  const sidebar = experimental_useSidebarThreads();
+  const rpc = useRpc<typeof rpcContract>();
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
+  const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set());
+  const [collapsedThreads, setCollapsedThreads] = useState<Set<string>>(() => new Set());
+  const draggingThreadId = useRef<string | null>(null);
+  const provenUnread = useRef(new Map<string, number>());
+  const reportedBreak = useRef<string | null>(null);
+  const dragTargetId = useRef<string | null>(null);
+  const [customStates, setCustomStates] = useState<ThreadStates>({});
+  const [indicatorBroken, setIndicatorBroken] = useState<string | null>(null);
+  const [threadModels, setThreadModels] = useState<ThreadModels>({});
+  const threadIds = useMemo(() => sidebar.threads.map((thread) => thread.id), [sidebar.threads]);
+  const threadIdsKey = threadIds.join("\u0000");
+  const projectIds = useMemo(() => sidebar.projects.map((project) => project.id), [sidebar.projects]);
+  const projectIdsKey = projectIds.join("\u0000");
+
+  useEffect(() => {
+    let mounted = true;
+    void Promise.all(sidebarRpcBatches(threadIds).map((batch) => rpc.call("threadStates", { threadIds: batch }))).then((states) => {
+      const merged = Object.assign({}, ...states);
+      if (mounted) setCustomStates(merged);
+    }).catch(() => {
+      if (mounted) setCustomStates({});
+    });
+    void Promise.all(sidebarRpcBatches(threadIds).map((batch) => rpc.call("threadModels", { threadIds: batch }))).then((models) => {
+      const merged = Object.assign({}, ...models);
+      if (mounted) setThreadModels(merged);
+    }).catch(() => {
+      if (mounted) setThreadModels(Object.fromEntries(threadIds.map((threadId) => [threadId, null])));
+    });
+    return () => {
+      mounted = false;
+    };
+  }, [rpc, threadIdsKey]);
+
+  useEffect(() => {
+    let mounted = true;
+    const projectBatches = sidebarRpcBatches(projectIds);
+    const threadBatches = sidebarRpcBatches(threadIds);
+    void Promise.all(Array.from({ length: Math.max(projectBatches.length, threadBatches.length) }, (_, index) => rpc.call("sidebarCollapseState", {
+      projectIds: projectBatches[index] ?? [],
+      threadIds: threadBatches[index] ?? [],
+    }))).then((states) => {
+      const state: SidebarCollapseState = {
+        projects: Object.assign({}, ...states.map((result) => result.projects)),
+        threads: Object.assign({}, ...states.map((result) => result.threads)),
+      };
+      if (!mounted) return;
+      setCollapsedProjects(collapseMap(state.projects));
+      setCollapsedThreads(collapseMap(state.threads));
+    }).catch(() => undefined);
+    return () => { mounted = false; };
+  }, [projectIdsKey, rpc, threadIdsKey]);
+
+  // The nav row is host-rendered and carries no plugin-facing badge surface
+  // (get-bb/bb#1852), so the count is painted onto it directly under the narrow
+  // exception in docs/sidebar-plugin-nav-collapse.md. A zero-match is the
+  // coupling breaking, and it is reported rather than swallowed.
+  useEffect(() => {
+    let cancelled = false;
+    const paint = async () => {
+      const results = await Promise.allSettled(projectIds.map((projectId) => rpc.call("operatorMessages", { projectId })));
+      if (cancelled) return;
+      const unread = results.reduce((total, result, index) => {
+        const projectId = projectIds[index]!;
+        // An answered read is a proven count, including the unregistered
+        // outcome, which carries no rows and so proves zero — no sentence is
+        // consulted to reach that (#280). A rejection is a failed read, and a
+        // failed read is not an empty inbox: keep the count that project did
+        // prove rather than erasing it.
+        if (result.status === "fulfilled") {
+          const count = result.value.messages.filter((message) => message.readAtMs === null).length;
+          provenUnread.current.set(projectId, count);
+          return total + count;
+        }
+        return total + (provenUnread.current.get(projectId) ?? 0);
+      }, 0);
+      // Two deaths, not one: the row goes missing, or the row is there and the
+      // glyph beside it is the wrong one. The second returns null when it
+      // cannot be judged, which is not a failure and must not read as one.
+      const painted = paintInboxNavUnread(document, unread);
+      const broken = painted.matched === false ? painted : inspectInboxNavGlyph(document);
+      if (broken === null || broken.matched) {
+        reportedBreak.current = null;
+        setIndicatorBroken(null);
+        return;
+      }
+      // The alert is the standing report; the error records the transition, so
+      // a break that lasts an hour does not write 120 identical lines.
+      if (reportedBreak.current !== broken.reason) {
+        console.error(`[bb-collab] ${INBOX_INDICATOR_BROKEN_TITLE}: ${broken.reason}`);
+        reportedBreak.current = broken.reason;
+      }
+      setIndicatorBroken(broken.reason);
+    };
+    void paint();
+    const timer = window.setInterval(() => { void paint(); }, INBOX_UNREAD_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      paintInboxNavUnread(document, 0);
+    };
+  }, [projectIdsKey, rpc]);
+
+  const indicatorAlert = indicatorBroken === null ? null : (
+    <p role="alert" className="p-3 text-sm text-destructive">
+      {INBOX_INDICATOR_BROKEN_TITLE} — open Inbox to check for unread messages. Cause: {indicatorBroken}
+    </p>
+  );
+
+  const groups = groupThreads(sidebar.projects, sidebar.threads, searchQuery);
+  if (sidebar.status === "loading") return <>{indicatorAlert}<p className="p-3 text-sm text-muted-foreground">Loading threads…</p></>;
+  if (sidebar.status === "error") return <>{indicatorAlert}<p className="p-3 text-sm text-destructive">Unable to load threads.</p></>;
+  if (groups.length === 0) return <>{indicatorAlert}<p className="p-3 text-sm text-muted-foreground">No matching threads.</p></>;
+
+  const toggleProject = (projectId: string) => {
+    const collapsed = !collapsedProjects.has(projectId);
+    setCollapsedProjects((current) => { const next = new Set(current); if (collapsed) next.add(projectId); else next.delete(projectId); return next; });
+    void rpc.call("setSidebarCollapse", { kind: "project", id: projectId, collapsed }).catch(() => undefined);
+  };
+  const toggleThread = (threadId: string) => {
+    const collapsed = !collapsedThreads.has(threadId);
+    setCollapsedThreads((current) => { const next = new Set(current); if (collapsed) next.add(threadId); else next.delete(threadId); return next; });
+    void rpc.call("setSidebarCollapse", { kind: "thread", id: threadId, collapsed }).catch(() => undefined);
+  };
+  // Placement mirrors a sortable list: dragging down lands after the target,
+  // dragging up lands before it. Anchoring on the target alone made every
+  // downward drag a no-op.
+  const reorderPinned = (draggedId: string, targetId: string) => {
+    if (!draggedId || !targetId || draggedId === targetId) return;
+    const byId = new Map(sidebar.threads.map((thread) => [thread.id, thread]));
+    const dragged = byId.get(draggedId);
+    const target = byId.get(targetId);
+    if (!dragged?.isPinned || !target?.isPinned) return;
+    // Pinned rows are only ever adjacent inside one project group, so the
+    // neighbours handed to the host come from that group. A global pinned list
+    // names neighbours the user never saw next to the row.
+    if (dragged.projectId !== target.projectId) return;
+    const order = sidebar.threads.filter((thread) => thread.isPinned && thread.projectId === dragged.projectId).map((thread) => thread.id);
+    const from = order.indexOf(draggedId);
+    const to = order.indexOf(targetId);
+    if (from < 0 || to < 0) return;
+    const remaining = order.filter((id) => id !== draggedId);
+    const insertionIndex = remaining.indexOf(targetId) + (from < to ? 1 : 0);
+    void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: remaining[insertionIndex - 1] ?? null, nextThreadId: remaining[insertionIndex] ?? null }).catch(() => undefined);
+  };
+  const startPinnedDrag = (threadId: string) => {
+    draggingThreadId.current = threadId;
+    dragTargetId.current = null;
+    // The row's own handler runs first. Reaching here with a source still armed
+    // means the release missed every row: commit to the last row crossed on a
+    // real release, discard on cancel, and never leave a stale source behind.
+    const settle = (event: Event) => {
+      if (event.type === "pointerup" && draggingThreadId.current) finishPinnedDrag("");
+      draggingThreadId.current = null;
+      dragTargetId.current = null;
+      window.removeEventListener("pointerup", settle);
+      window.removeEventListener("pointercancel", settle);
+    };
+    window.addEventListener("pointerup", settle);
+    window.addEventListener("pointercancel", settle);
+  };
+  const trackPinnedDrag = (threadId: string) => { if (draggingThreadId.current) dragTargetId.current = threadId; };
+  const finishPinnedDrag = (targetId: string) => {
+    const draggedId = draggingThreadId.current ?? "";
+    draggingThreadId.current = null;
+    reorderPinned(draggedId, targetId || dragTargetId.current || "");
+    dragTargetId.current = null;
+  };
+
+  const renderNode = (node: ThreadTreeNode, execution: ThreadExecution | null, depth: number): ReactNode => {
+    const childrenCollapsed = collapsedThreads.has(node.thread.id);
+    return <div key={node.thread.id} className="space-y-px">
+      <ThreadRow thread={node.thread} execution={execution} active={node.thread.id === activeThreadId} customState={customStates[node.thread.id]} depth={depth} collapsed={childrenCollapsed} hasChildren={node.children.length > 0} onToggleChildren={() => toggleThread(node.thread.id)} onPinnedDragStart={startPinnedDrag} onPinnedDragOver={trackPinnedDrag} onPinnedDragEnd={finishPinnedDrag} onNavigate={onNavigate} />
+      {!childrenCollapsed ? node.children.map((child) => renderNode(child, threadModels[child.thread.id] ?? null, depth + 1)) : null}
+    </div>;
+  };
+
+  return (
+    <div className="h-full space-y-3 overflow-y-auto p-1">
+      {indicatorAlert}
+      {groups.map(({ project, threads }) => {
+        const tree = buildThreadTree(threads);
+        const collapsed = collapsedProjects.has(project.id);
+        const expanded = expandedProjects.has(project.id);
+        const visibleThreads = expanded ? tree : tree.slice(0, MAX_VISIBLE_THREADS);
+        const projectName = asText(project.name) ?? asText(project.id) ?? "Untitled project";
+        return (
+          <section key={project.id} aria-labelledby={`project-${project.id}`}>
+            <div className="flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-normal text-muted-foreground">
+              <span className="flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground" aria-hidden="true">{projectAvatar(projectName)}</span>
+              <span id={`project-${project.id}`} className="min-w-0 truncate">{projectName}</span>
+              {/* No type utilities of its own: the counter inherits the header's
+                  size, weight, colour and baseline so it never outweighs the name. */}
+              <span className="ml-auto shrink-0" data-project-thread-count="">{threads.length}</span>
+              <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none" aria-label={`${collapsed ? "Expand" : "Collapse"} ${projectName} section`} aria-expanded={!collapsed} onClick={() => toggleProject(project.id)}>{collapsed ? "›" : "⌄"}</button>
+            </div>
+            {!collapsed ? <div className="mt-0.5 space-y-px">
+              {visibleThreads.map((node) => renderNode(node, threadModels[node.thread.id] ?? null, 0))}
+              {tree.length > MAX_VISIBLE_THREADS ? (
+                <button
+                  type="button"
+                  className="flex h-6 w-full items-center rounded-md pl-2 text-left text-xs text-muted-foreground transition-colors duration-150 hover:bg-muted/50 hover:text-foreground motion-reduce:transition-none"
+                  onClick={() => setExpandedProjects((current) => {
+                    const updated = new Set(current);
+                    if (expanded) updated.delete(project.id);
+                    else updated.add(project.id);
+                    return updated;
+                  })}
+                >
+                  {expanded ? "Show less" : `Show more (${tree.length - MAX_VISIBLE_THREADS})`}
+                </button>
+              ) : null}
+            </div> : null}
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
 // Issue #61's deferral is a state of the lane, not a gate on it: it leaves
 // `queueBlocked` false and keeps the lane in the same list in the same order,
 // so this only ever changes the status text. Every field comes from the `lanes`
@@ -734,6 +957,12 @@ function mountLanePulse({ signal, setStatus }: { signal: AbortSignal; setStatus:
 }
 
 export default definePluginApp((app) => {
+  app.slots.experimental_threadList({
+    id: "bb-collab-threads",
+    title: "bb-collab thread list",
+    description: "Group threads by project with durable bb-collab state.",
+    component: SidebarThreadList,
+  });
   app.slots.sidebarFooterAction({
     id: "bb-collab-settings",
     title: SETTINGS_ACTION_TITLE,

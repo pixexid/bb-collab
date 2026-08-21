@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { definePluginApp, experimental_useSidebarThreadActions, experimental_useSidebarThreads, useRpc } from "@bb/plugin-sdk/app";
+import { definePluginApp, experimental_useSidebarThreadActions, experimental_useSidebarThreads, useRpc } from "@get-bb/plugin-sdk/app";
 import type {
   PluginRpcResult,
   PluginSidebarProject,
   PluginSidebarThread,
   PluginThreadListProps,
-} from "@bb/plugin-sdk/app";
+} from "@get-bb/plugin-sdk/app";
 import { providerMark, providerMarkKey } from "./src/provider-marks";
 import type { rpcContract } from "./server";
 
