@@ -575,6 +575,32 @@ describe("lane awareness", () => {
     }
   });
 
+  it("keeps only one live timer when the detector is armed twice", async () => {
+    vi.useFakeTimers();
+    try {
+      const read = vi.fn(async (): Promise<IdleFleetDecision> => ({ kind: "blind", message: "blind" }));
+      const onBlind = vi.fn();
+      const detector = createIdleFleetDetector({
+        read,
+        readRearmProbes: async () => [],
+        wake: async () => true,
+        onBlind,
+        debounceMs: 1,
+      });
+
+      const probe = { projectId: "project-1", threadId: "orchestrator-1", idleEpisode: "episode-1" };
+      detector.arm(probe);
+      detector.arm(probe);
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(read).toHaveBeenCalledExactlyOnceWith(probe);
+      expect(onBlind).toHaveBeenCalledExactlyOnceWith("blind");
+      detector.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does no further reads after disposal", async () => {
     vi.useFakeTimers();
     try {

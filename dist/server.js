@@ -23104,6 +23104,7 @@ async function runCli(db, bb, argv, ctx, deps) {
   }
   return cliResult(exportFoundation(db, projectId));
 }
+var activeIdleFleetDetectors = /* @__PURE__ */ new WeakMap();
 async function plugin(bb, options = {}) {
   const notifyUrgent = options.notifyUrgent ?? ((message, senderThreadId) => defaultNotifyUrgent(message, senderThreadId, options.runBbCommand ?? runBbCommand));
   const fleetWatchdogSettings = bb.settings.define({
@@ -23829,6 +23830,7 @@ ${thread.titleFallback ?? ""}`);
     };
   };
   const capacityObservationLocks = /* @__PURE__ */ new Map();
+  activeIdleFleetDetectors.get(bb)?.stop();
   const idleFleetDetector = createIdleFleetDetector({
     read: readIdleFleet,
     readRearmProbes: readIdleFleetProbes,
@@ -23866,17 +23868,26 @@ ${thread.titleFallback ?? ""}`);
       return await sendRoleWake(confirmed.role, confirmed.message) === true;
     }
   });
-  bb.onDispose(idleFleetDetector.stop);
-  bb.background.service("idle-fleet-detector", {
-    async start(signal) {
-      try {
-        if (!signal.aborted) {
-          await new Promise((resolve3) => signal.addEventListener("abort", () => resolve3(), { once: true }));
+  try {
+    bb.background.service("idle-fleet-detector", {
+      async start(signal) {
+        try {
+          if (!signal.aborted) {
+            await new Promise((resolve3) => signal.addEventListener("abort", () => resolve3(), { once: true }));
+          }
+        } finally {
+          idleFleetDetector.stop();
         }
-      } finally {
-        idleFleetDetector.stop();
       }
-    }
+    });
+  } catch (error48) {
+    idleFleetDetector.stop();
+    throw error48;
+  }
+  activeIdleFleetDetectors.set(bb, idleFleetDetector);
+  bb.onDispose(() => {
+    idleFleetDetector.stop();
+    if (activeIdleFleetDetectors.get(bb) === idleFleetDetector) activeIdleFleetDetectors.delete(bb);
   });
   const stallGuardCycle = createStallGuardCycle({
     readRoleHolders: () => db ? readRoleHolderStates(db) : [],

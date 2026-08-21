@@ -1644,6 +1644,8 @@ async function runCli(
   return cliResult(exportFoundation(db, projectId));
 }
 
+const activeIdleFleetDetectors = new WeakMap<BbPluginApi, ReturnType<typeof createIdleFleetDetector>>();
+
 export default async function plugin(bb: BbPluginApi, options: PluginOptions = {}) {
   const notifyUrgent = options.notifyUrgent ?? ((message, senderThreadId) => defaultNotifyUrgent(message, senderThreadId, options.runBbCommand ?? runBbCommand));
   const fleetWatchdogSettings = bb.settings.define({
@@ -2436,6 +2438,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     };
   };
   const capacityObservationLocks = new Map<string, Promise<void>>();
+  activeIdleFleetDetectors.get(bb)?.stop();
   const idleFleetDetector = createIdleFleetDetector({
     read: readIdleFleet,
     readRearmProbes: readIdleFleetProbes,
@@ -2471,17 +2474,26 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return (await sendRoleWake(confirmed.role, confirmed.message)) === true;
     },
   });
-  bb.onDispose(idleFleetDetector.stop);
-  bb.background.service("idle-fleet-detector", {
-    async start(signal) {
-      try {
-        if (!signal.aborted) {
-          await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+  try {
+    bb.background.service("idle-fleet-detector", {
+      async start(signal) {
+        try {
+          if (!signal.aborted) {
+            await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+          }
+        } finally {
+          idleFleetDetector.stop();
         }
-      } finally {
-        idleFleetDetector.stop();
-      }
-    },
+      },
+    });
+  } catch (error) {
+    idleFleetDetector.stop();
+    throw error;
+  }
+  activeIdleFleetDetectors.set(bb, idleFleetDetector);
+  bb.onDispose(() => {
+    idleFleetDetector.stop();
+    if (activeIdleFleetDetectors.get(bb) === idleFleetDetector) activeIdleFleetDetectors.delete(bb);
   });
 
   const stallGuardCycle = createStallGuardCycle({
