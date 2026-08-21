@@ -4,7 +4,6 @@ import { z } from "zod";
 import {
   createLaneWatcher,
   createIdleFleetDetector,
-  IdleFleetCapacityReadError,
   createRoleIdleLedger,
   createWaitRegistry,
   IDLE_FLEET_DEBOUNCE_MS,
@@ -2477,7 +2476,6 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     };
   };
   const capacityObservationLocks = new Map<string, Promise<void>>();
-  let capacityClosed = false;
   const idleFleetDetector = createIdleFleetDetector({
     read: readIdleFleet,
     readRearmProbes: readIdleFleetProbes,
@@ -2498,17 +2496,12 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         await previous;
         try {
           recordLaneCapacityInterval(await readLaneCapacityObservation(projectId));
-        } catch (error) {
-          throw new IdleFleetCapacityReadError(error, capacityClosed);
         } finally {
           release();
           if (capacityObservationLocks.get(projectId) === queued) capacityObservationLocks.delete(projectId);
         }
       },
-      close: () => {
-        capacityClosed = true;
-        closeLaneCapacityCoverage();
-      },
+      close: closeLaneCapacityCoverage,
     },
     debounceMs: IDLE_FLEET_DEBOUNCE_MS,
     onBlind: (message) => bb.log.warn(message),

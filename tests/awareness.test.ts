@@ -3,7 +3,6 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createLaneWatcher,
   createIdleFleetDetector,
-  IdleFleetCapacityReadError,
   createWaitRegistry,
   IDLE_FLEET_DEBOUNCE_MS,
   type IdleFleetDecision,
@@ -623,48 +622,6 @@ describe("lane awareness", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-
-  it("does not report an in-flight capacity read closed by disposal", async () => {
-    let rejectFirst!: (error: Error) => void;
-    const first = new Promise<void>((_, reject) => { rejectFirst = reject; });
-    const onBlind = vi.fn();
-    const detector = createIdleFleetDetector({
-      read: async (): Promise<IdleFleetDecision> => ({ kind: "silent" }),
-      readRearmProbes: async () => [],
-      wake: async () => true,
-      onBlind,
-      capacity: { readProjectIds: async () => [], observe: async () => first, close: vi.fn() },
-    });
-
-    const read = detector.observeCapacity("project-1");
-    await Promise.resolve();
-    detector.stop();
-    rejectFirst(new IdleFleetCapacityReadError(new Error("The database connection is not open"), true));
-    await read;
-    expect(onBlind).not.toHaveBeenCalled();
-  });
-
-  it("reports a live capacity read that rejects before disposal", async () => {
-    let rejectFirst!: (error: Error) => void;
-    const first = new Promise<void>((_, reject) => { rejectFirst = reject; });
-    const onBlind = vi.fn();
-    const detector = createIdleFleetDetector({
-      read: async (): Promise<IdleFleetDecision> => ({ kind: "silent" }),
-      readRearmProbes: async () => [],
-      wake: async () => true,
-      onBlind,
-      capacity: { readProjectIds: async () => [], observe: async () => first, close: vi.fn() },
-    });
-
-    const read = detector.observeCapacity("project-1");
-    await Promise.resolve();
-    rejectFirst(new IdleFleetCapacityReadError(new Error("The database connection failed"), false));
-    detector.stop();
-    await read;
-
-    expect(onBlind).toHaveBeenCalledOnce();
-    expect(onBlind).toHaveBeenLastCalledWith(expect.stringContaining("capacity-interval-unreadable"));
   });
 
   it("cancels queued capacity reads after disposal and closes once", async () => {
