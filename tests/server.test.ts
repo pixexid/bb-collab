@@ -5309,10 +5309,18 @@ printf '%s\\n' '{"number":501,"title":"merge","body":"","state":"OPEN","labels":
       })).outcome).toBe("OK");
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { workItemId, idempotencyKey: "owed-merge-ready" })).outcome).toBe("OK");
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, { workItemId, idempotencyKey: "owed-merge-start" })).outcome).toBe("OK");
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { workItemId, idempotencyKey: "owed-merge-review" })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, {
+        workItemId,
+        idempotencyKey: "owed-merge-review",
+        workAttempt: { laneId: "lane-owed-merge-review", threadId: "thread-owed-merge-review", assignmentKind: "review", reviewPrNumber: 501, reviewPrHeadSha: CANDIDATE_SHA },
+      })).outcome).toBe("OK");
+      expect(fixture.db.prepare("SELECT review_pr_number FROM execution_attempts WHERE work_item_id = ? AND assignment_kind = 'review'").get(workItemId)).toEqual({ review_pr_number: 501 });
+      expect(fixture.db.prepare("SELECT owner, repo, issue_number FROM external_work_refs WHERE work_item_id = ?").get(workItemId)).toEqual({ owner: "example", repo: "project", issue_number: 501 });
       expect(fixture.db.prepare("SELECT 1 FROM work_item_waits WHERE work_item_id = ?").get(workItemId)).toBeUndefined();
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "fleet-watchdog-plugin-owed-merge", actorKind: "plugin", subjectId: PLUGIN_ID });
 
       await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.db.prepare("SELECT waker, waker_kind FROM work_item_waits WHERE work_item_id = ?").get(workItemId)).toEqual({ waker: "project-orchestrator", waker_kind: "seat" });
       clock.mockReturnValue(300_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
 
@@ -5353,8 +5361,14 @@ printf '%s\\n' '{"number":501,"title":"merge","body":"","state":"OPEN","labels":
       })).outcome).toBe("OK");
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { workItemId, idempotencyKey: "not-owed-ready" })).outcome).toBe("OK");
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, { workItemId, idempotencyKey: "not-owed-start" })).outcome).toBe("OK");
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { workItemId, idempotencyKey: "not-owed-review" })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, {
+        workItemId,
+        idempotencyKey: "not-owed-review",
+        workAttempt: { laneId: "lane-not-owed-merge-review", threadId: "thread-not-owed-merge-review", assignmentKind: "review", reviewPrNumber: 501, reviewPrHeadSha: CANDIDATE_SHA },
+      })).outcome).toBe("OK");
+      expect(fixture.db.prepare("SELECT review_pr_number FROM execution_attempts WHERE work_item_id = ? AND assignment_kind = 'review'").get(workItemId)).toEqual({ review_pr_number: 501 });
       expect(fixture.db.prepare("SELECT 1 FROM work_item_waits WHERE work_item_id = ?").get(workItemId)).toBeUndefined();
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "fleet-watchdog-plugin-not-owed-merge", actorKind: "plugin", subjectId: PLUGIN_ID });
       await fixture.host.harness.runSchedule("fleet-watchdog");
       clock.mockReturnValue(300_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");

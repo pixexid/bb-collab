@@ -23983,21 +23983,14 @@ ${thread.titleFallback ?? ""}`);
       }
       const openWorkItemsByProject = /* @__PURE__ */ new Map();
       for (const workItem of db.prepare(
-        `SELECT work_items.project_id, work_items.work_item_id, work_items.lifecycle_state, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms,
-                external_work_refs.owner AS github_owner, external_work_refs.repo AS github_repo,
-                (SELECT review_pr_number FROM execution_attempts
-                 WHERE execution_attempts.project_id = work_items.project_id AND execution_attempts.work_item_id = work_items.work_item_id
-                   AND execution_attempts.assignment_kind = 'review'
-                 ORDER BY attempt_ordinal DESC LIMIT 1) AS review_pr_number
+        `SELECT work_items.project_id, work_items.work_item_id, work_items.lifecycle_state, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
          FROM work_items LEFT JOIN work_item_waits
            ON work_item_waits.project_id = work_items.project_id AND work_item_waits.work_item_id = work_items.work_item_id
-         LEFT JOIN external_work_refs
-           ON external_work_refs.project_id = work_items.project_id AND external_work_refs.work_item_id = work_items.work_item_id AND external_work_refs.provider = 'github'
          WHERE work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
          ORDER BY work_items.created_at_ms, work_items.work_item_id`
       ).all(...WORK_ITEM_NON_TERMINAL_STATES)) {
         const workItems = openWorkItemsByProject.get(workItem.project_id) ?? [];
-        workItems.push({ workItemId: workItem.work_item_id, lifecycleState: workItem.lifecycle_state, waker: workItem.waker, wakerKind: workItem.waker_kind, declaredAtMs: workItem.declared_at_ms, githubOwner: workItem.github_owner, githubRepo: workItem.github_repo, reviewPrNumber: workItem.review_pr_number });
+        workItems.push({ workItemId: workItem.work_item_id, lifecycleState: workItem.lifecycle_state, waker: workItem.waker, wakerKind: workItem.waker_kind, declaredAtMs: workItem.declared_at_ms });
         openWorkItemsByProject.set(workItem.project_id, workItems);
       }
       const isCurrent = (candidate, holder) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
