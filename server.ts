@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { defineRpcContract, type BbPluginApi, type PluginCliContext } from "@bb/plugin-sdk";
 import { z } from "zod";
 import {
@@ -1962,7 +1963,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     writingLaneCeiling: number | null;
     startableWork: boolean | null;
     reason: string | null;
+    laneCapacityObservationId: string;
     observedAtMs: number;
+    executionAttemptIds: string[];
   };
   if (db) {
     db.prepare(
@@ -1971,43 +1974,56 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   }
   const recordLaneCapacityInterval = (observation: LaneCapacityObservation) => {
     if (!db) throw new Error("canonical-store-unavailable");
+    // Keep this transaction to roll back partial evidence when a later attempt row fails.
+    // Orphan absence is separately guaranteed by interval-before-evidence ordering; the current fixture yields one native attempt, so no test covers this partial case.
     db.transaction(() => {
       const startableWork = observation.startableWork === null ? null : observation.startableWork ? 1 : 0;
       const extended = db!.prepare(
-        `UPDATE lane_capacity_intervals SET last_confirmed_at_ms = ?
+        `UPDATE lane_capacity_intervals SET last_confirmed_at_ms = ?,
+           lane_capacity_observation_id = COALESCE(lane_capacity_observation_id, ?)
          WHERE project_id = ? AND ended_at_ms IS NULL
            AND coverage_state = ? AND active_lane_count IS ?
            AND writing_lane_ceiling IS ? AND startable_work IS ?`,
       ).run(
         observation.observedAtMs,
+        observation.laneCapacityObservationId,
         observation.projectId,
         observation.coverageState,
         observation.activeLaneCount,
         observation.writingLaneCeiling,
         startableWork,
       );
-      if (extended.changes === 1) return;
-      db!.prepare(
+      if (extended.changes !== 1) {
+        db!.prepare(
         "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE project_id = ? AND ended_at_ms IS NULL",
       ).run(observation.projectId);
       db!.prepare(
         `INSERT INTO lane_capacity_intervals (
            project_id, orchestrator_thread_id, orchestrator_role_generation,
            coverage_state, active_lane_count, writing_lane_ceiling, startable_work,
-           reason, started_at_ms, last_confirmed_at_ms, ended_at_ms
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-      ).run(
-        observation.projectId,
-        observation.orchestratorThreadId,
+           reason, lane_capacity_observation_id, started_at_ms, last_confirmed_at_ms, ended_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+        ).run(
+          observation.projectId,
+          observation.orchestratorThreadId,
         observation.orchestratorRoleGeneration,
         observation.coverageState,
         observation.activeLaneCount,
         observation.writingLaneCeiling,
         startableWork,
         observation.reason,
-        observation.observedAtMs,
-        observation.observedAtMs,
-      );
+        observation.laneCapacityObservationId,
+          observation.observedAtMs,
+          observation.observedAtMs,
+        );
+      }
+      for (const executionAttemptId of observation.executionAttemptIds) {
+        db!.prepare(
+          `INSERT OR IGNORE INTO lane_capacity_refresh_evidence (
+             project_id, lane_capacity_observation_id, execution_attempt_id, observed_at_ms
+           ) VALUES (?, ?, ?, ?)`,
+        ).run(observation.projectId, observation.laneCapacityObservationId, executionAttemptId, observation.observedAtMs);
+      }
     })();
   };
   const closeLaneCapacityCoverage = () => {
@@ -2045,7 +2061,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return { known: false, reason: `active-lanes-unreadable:${String(error)}` };
     }
   };
-  const readIdleFleetNativeLanes = async (projectId: string): Promise<IdleFleetFact<number>> => {
+  const readIdleFleetNativeLanes = async (projectId: string): Promise<IdleFleetFact<{ count: number; executionAttemptIds: string[] }>> => {
     if (!db) return { known: false, reason: "canonical-store-unavailable" };
     try {
       const dispatcherThreadIds = new Set(
@@ -2073,6 +2089,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         thread.deletedAt === null &&
         isWorkingLane(thread),
       );
+      const executionAttemptIds: string[] = [];
       for (const lane of liveLanes) {
         const matches = db.prepare(
           `SELECT execution_attempt_id, assignment_kind
@@ -2081,13 +2098,14 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
              AND state = 'running' AND thread_id = ?`,
         ).all(projectId, lane.id) as Array<{ execution_attempt_id: string; assignment_kind: string | null }>;
         if (matches.length !== 1 || matches[0]!.assignment_kind !== "write") continue;
+        const observedAtMs = Date.now();
         db.prepare(
-          `UPDATE execution_attempts
-           SET observed_at_ms = ?
+          `UPDATE execution_attempts SET observed_at_ms = ?
            WHERE project_id = ? AND execution_attempt_id = ? AND state = 'running'`,
-        ).run(Date.now(), projectId, matches[0]!.execution_attempt_id);
+        ).run(observedAtMs, projectId, matches[0]!.execution_attempt_id);
+        executionAttemptIds.push(matches[0]!.execution_attempt_id);
       }
-      return { known: true, value: liveLanes.length };
+      return { known: true, value: { count: liveLanes.length, executionAttemptIds } };
     } catch (error) {
       return { known: false, reason: `native-lanes-unreadable:${String(error)}` };
     }
@@ -2146,20 +2164,39 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       !nativeLanes.known ? nativeLanes.reason : null,
       !startable.known ? startable.reason : null,
       !ceiling.known ? ceiling.reason : null,
-      activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value
-        ? `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value}`
+      activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value.count
+        ? `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value.count}`
         : null,
     ].filter((reason): reason is string => reason !== null);
+    const coverageState = reasons.length === 0 ? "known" : "blind";
+    const startableWork = startable.known ? startable.value.count > 0 : null;
+    const open = db.prepare(
+      `SELECT coverage_state, active_lane_count, writing_lane_ceiling, startable_work, reason, lane_capacity_observation_id
+       FROM lane_capacity_intervals WHERE project_id = ? AND ended_at_ms IS NULL`,
+    ).get(projectId) as {
+      coverage_state: string; active_lane_count: number | null; writing_lane_ceiling: number | null;
+      startable_work: number | null; reason: string | null; lane_capacity_observation_id: string | null;
+    } | undefined;
+    const sameFacts = open !== undefined && open.coverage_state === coverageState &&
+      open.active_lane_count === (activeLanes.known ? activeLanes.value : null) &&
+      open.writing_lane_ceiling === (ceiling.known ? ceiling.value : null) &&
+      open.startable_work === (startableWork === null ? null : startableWork ? 1 : 0) &&
+      open.reason === (reasons.length === 0 ? null : reasons.join(";"));
+    const laneCapacityObservationId = sameFacts && open?.lane_capacity_observation_id
+      ? open.lane_capacity_observation_id
+      : randomBytes(16).toString("hex");
     return {
       projectId,
       orchestratorThreadId: holder.thread_id,
       orchestratorRoleGeneration: holder.role_generation,
-      coverageState: reasons.length === 0 ? "known" : "blind",
+      coverageState,
       activeLaneCount: activeLanes.known ? activeLanes.value : null,
       writingLaneCeiling: ceiling.known ? ceiling.value : null,
-      startableWork: startable.known ? startable.value.count > 0 : null,
+      startableWork,
       reason: reasons.length === 0 ? null : reasons.join(";"),
+      laneCapacityObservationId,
       observedAtMs,
+      executionAttemptIds: nativeLanes.known ? nativeLanes.value.executionAttemptIds : [],
     };
   };
   const readIdleFleetProbes = async (): Promise<IdleFleetProbe[]> => {
@@ -2216,7 +2253,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       readIdleFleetNativeLanes(probe.projectId),
       readIdleFleetStartable(probe.projectId),
     ]);
-    const laneDisagreement = activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value;
+    const laneDisagreement = activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value.count;
     if (!activeLanes.known || !nativeLanes.known || !startable.known) {
       const blindReasons = [
         !activeLanes.known ? activeLanes.reason : null,
@@ -2231,7 +2268,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       );
     }
     if (laneDisagreement) {
-      return idleFleetBlind("known", "blind", "known", `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value}`);
+      return idleFleetBlind("known", "blind", "known", `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value.count}`);
     }
     if (activeLanes.value > 0 || startable.value.count === 0) return { kind: "silent" };
     const queueHead = startable.value.head;
@@ -2252,6 +2289,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       message: `Idle fleet: queue head ${queueHead} is startable with zero active writing lanes. Dispatch it or record the blocker.`,
     };
   };
+  const capacityObservationLocks = new Map<string, Promise<void>>();
   const idleFleetDetector = createIdleFleetDetector({
     read: readIdleFleet,
     readRearmProbes: readIdleFleetProbes,
@@ -2264,7 +2302,18 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         holder.role_id === "project-orchestrator",
       ).map((holder) => holder.project_id))],
       observe: async (projectId) => {
-        recordLaneCapacityInterval(await readLaneCapacityObservation(projectId));
+        const previous = capacityObservationLocks.get(projectId) ?? Promise.resolve();
+        let release!: () => void;
+        const current = new Promise<void>((resolve) => { release = resolve; });
+        const queued = previous.then(() => current);
+        capacityObservationLocks.set(projectId, queued);
+        await previous;
+        try {
+          recordLaneCapacityInterval(await readLaneCapacityObservation(projectId));
+        } finally {
+          release();
+          if (capacityObservationLocks.get(projectId) === queued) capacityObservationLocks.delete(projectId);
+        }
       },
       close: closeLaneCapacityCoverage,
     },
