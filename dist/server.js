@@ -21582,6 +21582,9 @@ function classifyWorktree(path, home = process.env.HOME ?? "") {
 function threadIdFromBranch(branch) {
   return branch?.match(threadPattern)?.[0] ?? null;
 }
+function cleanupCandidateThreadIds(decisions) {
+  return new Set(decisions.filter((decision) => decision.action === "remove").map((decision) => decision.threadId).filter((id2) => id2 !== null && id2 !== void 0));
+}
 function withCleanupAttestationSubjects(attestation, subjects) {
   return attestation.coverage === "at-risk" ? { ...attestation, affected: subjects } : attestation;
 }
@@ -23168,7 +23171,8 @@ async function reportProjectWorktreeCleanup(bb, projectId) {
   const entries = listGitWorktrees(source.path);
   const cleanupArgs = [source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete, protectedEnvironmentPaths, pluginSourceResolved];
   const preliminary = cleanupGitWorktrees(...cleanupArgs, { coverage: "known" }, entries);
-  const attestation = await readCleanupAttestation(projectId, preliminary.wouldRemove);
+  const candidateThreadIds = cleanupCandidateThreadIds(preliminary.wouldRemove);
+  const attestation = await readCleanupAttestation(projectId, preliminary.wouldRemove.filter((candidate) => typeof candidate.threadId !== "string" || candidateThreadIds.has(candidate.threadId)));
   return cleanupGitWorktrees(...cleanupArgs, attestation, entries);
 }
 async function runCli(db, bb, argv, ctx, deps) {

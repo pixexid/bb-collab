@@ -73,7 +73,7 @@ import {
   type SourceObservation,
 } from "./src/registered-waits.js";
 import { ARCHIVE_SWEEP_GUARD, createArchiveSweepRefusalCounter, runArchiveSweep, type ArchiveSweepRefusalAggregate } from "./src/archive-sweep.js";
-import { canonicalWorktreePath, cleanupAttestationFromProfile, cleanupGitWorktrees, listAllProjectThreads, listGitWorktrees, withCleanupAttestationSubjects } from "./src/worktree-cleanup.js";
+import { canonicalWorktreePath, cleanupAttestationFromProfile, cleanupCandidateThreadIds, cleanupGitWorktrees, listAllProjectThreads, listGitWorktrees, withCleanupAttestationSubjects } from "./src/worktree-cleanup.js";
 import { findCheckoutRoot, readCheckoutDivergence, type CheckoutDivergence } from "./src/checkout-divergence.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFile, spawnSync, type ExecFileException, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
@@ -1477,7 +1477,8 @@ async function reportProjectWorktreeCleanup(bb: BbPluginApi, projectId: string) 
   const entries = listGitWorktrees(source.path);
   const cleanupArgs = [source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete, protectedEnvironmentPaths, pluginSourceResolved] as const;
   const preliminary = cleanupGitWorktrees(...cleanupArgs, { coverage: "known" }, entries);
-  const attestation = await readCleanupAttestation(projectId, preliminary.wouldRemove);
+  const candidateThreadIds = cleanupCandidateThreadIds(preliminary.wouldRemove);
+  const attestation = await readCleanupAttestation(projectId, preliminary.wouldRemove.filter((candidate) => typeof candidate.threadId !== "string" || candidateThreadIds.has(candidate.threadId)));
   return cleanupGitWorktrees(...cleanupArgs, attestation, entries);
 }
 
