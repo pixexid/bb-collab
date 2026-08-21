@@ -8,9 +8,23 @@ const BACKOFF_MS = 10 * 60_000;
 const ACTIVE = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
 type Condition = "queue" | "startable" | "pr";
 type Finding = { condition: Condition; text: string; key: string };
+type PullRequest = { number: number; state?: string; mergeStateStatus?: string; reviewDecision?: string; checks?: readonly string[] };
 type Snapshot = { sentAt: number; fingerprint: string; turns: number; escalated?: boolean };
 
-export function evaluate(db: Database.Database, projectId: string, queued: readonly { id?: string; content?: unknown }[], startable: readonly number[], prs: readonly { number: number; green: boolean }[]): Finding[] {
+export function isMergeReady(pr: PullRequest): boolean {
+  return pr.state === "OPEN" && pr.mergeStateStatus === "CLEAN" && pr.reviewDecision === "APPROVED" && !!pr.checks?.length && pr.checks.every((check) => check === "SUCCESS");
+}
+export function shouldEscalate(prior: Snapshot | undefined, turnStartedAt: number | undefined, fingerprint: string): boolean {
+  return !!prior && prior.fingerprint === fingerprint && !prior.escalated && turnStartedAt !== undefined && turnStartedAt > prior.sentAt;
+}
+export function openStore(path: string, onUnavailable: (error: unknown) => void): Database.Database | undefined {
+  try { return new Database(path, { readonly: true, fileMustExist: true }); } catch (error) { onUnavailable(error); return undefined; }
+}
+export function isWatchedThread(threadId: string, projectId: string, orchestrators: ReadonlyMap<string, string>): boolean {
+  return orchestrators.get(projectId) === threadId;
+}
+
+export function evaluate(db: Database.Database, projectId: string, queued: readonly { id?: string; content?: unknown }[], startable: readonly number[], prs: readonly PullRequest[]): Finding[] {
   const holder = db.prepare(`SELECT a.thread_id AS thread_id FROM role_generation_heads h JOIN role_generations g ON g.project_id=h.project_id AND g.role_id=h.role_id AND g.generation=h.current_generation JOIN execution_attempts a ON a.project_id=g.project_id AND a.execution_attempt_id=g.holder_execution_attempt_id WHERE h.project_id=? AND h.role_id='project-orchestrator'`).get(projectId) as { thread_id: string } | undefined;
   if (!holder) return [];
   const lane = db.prepare(`SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id=? AND origin='assignment' AND state IN (${ACTIVE.map(() => "?").join(",")})`).get(projectId, ...ACTIVE) as { count: number };
@@ -19,8 +33,8 @@ export function evaluate(db: Database.Database, projectId: string, queued: reado
   if (queued.length) findings.push({ condition: "queue", text: `${queued.length} unconsumed queued message${queued.length === 1 ? "" : "s"}`, key: JSON.stringify(queued.map((m) => [m.id, m.content])) });
   const ceiling = (db.prepare(`SELECT json_extract(c.canonical_config_json, '$.extensions.bbCollab.writingLaneCeiling') AS ceiling FROM project_config_heads h JOIN project_config_revisions c ON c.project_id=h.project_id AND c.config_revision=h.config_revision WHERE h.project_id=?`).get(projectId) as { ceiling: number | null } | undefined)?.ceiling ?? 3;
   if (startable.length && Number(lane.count) < ceiling) findings.push({ condition: "startable", text: `${startable.length} queue:startable issue${startable.length === 1 ? "" : "s"} (${startable.map((n) => `#${n}`).join(", ")}); ${lane.count}/${ceiling} writing lanes active`, key: `${startable.join(",")}:${lane.count}/${ceiling}` });
-  const green = prs.filter((pr) => pr.green);
-  if (green.length) findings.push({ condition: "pr", text: green.map((pr) => `PR #${pr.number} green and unmerged`).join("; "), key: green.map((pr) => pr.number).join(",") });
+  const green = prs.filter(isMergeReady);
+  if (green.length) findings.push({ condition: "pr", text: green.map((pr) => `PR #${pr.number} merge-ready and unmerged`).join("; "), key: green.map((pr) => pr.number).join(",") });
   return findings;
 }
 
@@ -32,17 +46,17 @@ function repoName(remote: string | null): string | null {
   const match = remote?.match(/github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?$/u);
   return match?.[1] ?? null;
 }
-async function github(repo: string): Promise<{ issues: number[]; prs: { number: number; green: boolean }[] }> {
+async function github(repo: string): Promise<{ issues: number[]; prs: PullRequest[] }> {
   const [issues, prs] = await Promise.all([
     json(["issue", "list", "--repo", repo, "--label", "queue:startable", "--state", "open", "--json", "number", "--limit", "1000"]),
-    json(["pr", "list", "--repo", repo, "--state", "open", "--json", "number,statusCheckRollup", "--limit", "1000"]),
+    json(["pr", "list", "--repo", repo, "--state", "open", "--json", "number,state,mergeStateStatus,reviewDecision,statusCheckRollup", "--limit", "1000"]),
   ]);
   const issueNumbers = Array.isArray(issues) ? issues.flatMap((x) => typeof x === "object" && x && typeof (x as { number?: unknown }).number === "number" ? [(x as { number: number }).number] : []) : [];
   const green = Array.isArray(prs) ? prs.flatMap((x) => {
     if (!x || typeof x !== "object" || typeof (x as { number?: unknown }).number !== "number") return [];
     const checks = (x as { statusCheckRollup?: unknown }).statusCheckRollup;
-    const ok = Array.isArray(checks) && checks.length > 0 && checks.every((c) => c && typeof c === "object" && ["SUCCESS", "NEUTRAL", "SKIPPED"].includes(String((c as { conclusion?: unknown }).conclusion)));
-    return ok ? [{ number: (x as { number: number }).number, green: true }] : [];
+    const pr = x as { number: number; state?: unknown; mergeStateStatus?: unknown; reviewDecision?: unknown };
+    return [{ number: pr.number, state: String(pr.state), mergeStateStatus: String(pr.mergeStateStatus), reviewDecision: String(pr.reviewDecision), checks: Array.isArray(checks) ? checks.flatMap((c) => c && typeof c === "object" ? [String((c as { conclusion?: unknown }).conclusion)] : []) : [] }];
   }) : [];
   return { issues: issueNumbers, prs: green };
 }
@@ -50,6 +64,8 @@ async function github(repo: string): Promise<{ issues: number[]; prs: { number: 
 export default function companionWatcher(bb: BbPluginApi) {
   const db = bb.storage.database();
   const snapshots = new Map<string, Snapshot>();
+  const orchestrators = new Map<string, string>();
+  const activeTurns = new Map<string, number>();
   let loaded = false;
   const load = async () => {
     if (loaded) return;
@@ -57,13 +73,26 @@ export default function companionWatcher(bb: BbPluginApi) {
     if (saved) for (const [key, value] of Object.entries(saved)) snapshots.set(key, value);
     loaded = true;
   };
+  bb.events.on("thread.active", ({ thread }) => {
+    if (orchestrators.get(thread.projectId) === thread.id) activeTurns.set(thread.id, Date.now());
+  });
   bb.events.on("thread.idle", async ({ thread }) => {
     await load();
-    const config = await bb.sdk.system.config();
-    const store = new Database(`${config.dataDir}/plugins/bb-collab/data.db`, { readonly: true, fileMustExist: true });
+    const projectId = thread.projectId;
+    if (orchestrators.has(projectId) && !isWatchedThread(thread.id, projectId, orchestrators)) return;
+    let store: Database.Database | undefined;
     try {
-      const target = store.prepare(`SELECT thread_id, project_id FROM execution_attempts WHERE thread_id=? AND origin='role_holder' AND role_id='project-orchestrator'`).get(thread.id) as { project_id: string } | undefined;
+      const config = await bb.sdk.system.config();
+      store = openStore(`${config.dataDir}/plugins/bb-collab/data.db`, (error) => bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=canonical-store-unavailable:${String(error)}`));
+      if (!store) return;
+      if (!orchestrators.has(projectId)) {
+        const holders = store.prepare(`SELECT a.thread_id, g.project_id FROM role_generation_heads h JOIN role_generations g ON g.project_id=h.project_id AND g.role_id=h.role_id AND g.generation=h.current_generation JOIN execution_attempts a ON a.project_id=g.project_id AND a.execution_attempt_id=g.holder_execution_attempt_id WHERE h.role_id='project-orchestrator'`).all() as { thread_id: string; project_id: string }[];
+        for (const holder of holders) orchestrators.set(holder.project_id, holder.thread_id);
+      }
+      const target = orchestrators.get(projectId) === thread.id ? { project_id: projectId } : undefined;
       if (!target) return;
+      const unknown = store.prepare(`SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id=? AND origin='assignment' AND state='dispatch_unknown'`).get(projectId) as { count: number };
+      if (Number(unknown.count) > 0) bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=dispatch_unknown-attempts:${unknown.count}`);
       const queued = await bb.sdk.threads.queuedMessages.list({ threadId: thread.id });
       const { issues, prs } = await github(repoName((await bb.sdk.projects.get({ projectId: target.project_id })).gitRemoteUrl) ?? "");
       const findings = evaluate(store, target.project_id, queued as never, issues, prs);
@@ -73,10 +102,9 @@ export default function companionWatcher(bb: BbPluginApi) {
         const prior = snapshots.get(`${target.project_id}:${finding.condition}`);
         if (!prior || prior.fingerprint !== finding.key || (!prior.escalated && now - prior.sentAt >= BACKOFF_MS)) send.push(finding);
       }
-      const escalations = findings.filter((finding) => {
-        const prior = snapshots.get(`${target.project_id}:${finding.condition}`);
-        return prior?.fingerprint === finding.key && prior.turns > 0 && !prior.escalated;
-      });
+      const turnStartedAt = activeTurns.get(thread.id);
+      activeTurns.delete(thread.id);
+      const escalations = findings.filter((finding) => shouldEscalate(snapshots.get(`${target.project_id}:${finding.condition}`), turnStartedAt, finding.key));
       if (!send.length && !escalations.length) return;
       if (send.length) {
         const message = send.map((f) => f.text).join("; ");
@@ -85,8 +113,7 @@ export default function companionWatcher(bb: BbPluginApi) {
       for (const finding of send) {
         const key = `${target.project_id}:${finding.condition}`;
         const prior = snapshots.get(key);
-        const next = { sentAt: now, fingerprint: finding.key, turns: (prior?.fingerprint === finding.key ? prior.turns : 0) + 1 };
-        snapshots.set(key, next);
+        snapshots.set(key, { sentAt: now, fingerprint: finding.key, turns: (prior?.fingerprint === finding.key ? prior.turns : 0) + 1 });
       }
       for (const finding of escalations) {
         const key = `${target.project_id}:${finding.condition}`;
@@ -96,6 +123,8 @@ export default function companionWatcher(bb: BbPluginApi) {
         if (director) await bb.sdk.threads.send({ threadId: director.thread_id, mode: "auto", input: [{ type: "text", text: `Companion watcher escalation: ${finding.text}; unchanged after a wake and full turn.`, mentions: [] }] });
       }
       await bb.storage.kv.set("backoff", Object.fromEntries(snapshots));
-    } finally { store.close(); }
+    } catch (error) {
+      bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=canonical-store-unavailable:${String(error)}`);
+    } finally { store?.close(); }
   });
 }
