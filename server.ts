@@ -89,7 +89,7 @@ function githubRepository(remoteUrl: string | null): string | null {
   return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : null;
 }
 
-type StartableQueueState = { count: number; head: string | null; unlabelledCount: number };
+type StartableQueueState = { count: number; head: string | null; unlabelledCount: number; blockedCount: number; waitingExternalCount: number };
 
 function githubJson(args: string[]): unknown | null {
   try {
@@ -124,6 +124,8 @@ function githubJsonAsync(args: string[]): Promise<unknown | null> {
 async function startableQueueStateAsync(repositories: string[]): Promise<StartableQueueState | null> {
   let count = 0;
   let unlabelledCount = 0;
+  let blockedCount = 0;
+  let waitingExternalCount = 0;
   const heads: string[] = [];
   const isIssue = (issue: unknown): issue is { number: number; labels: Array<{ name: string }> } => Boolean(issue && typeof issue === "object" && !Array.isArray(issue)
     && typeof (issue as { number?: unknown }).number === "number"
@@ -135,16 +137,21 @@ async function startableQueueStateAsync(repositories: string[]): Promise<Startab
     if (!Array.isArray(startable) || !startable.every(isIssue)
       || !Array.isArray(pages) || !pages.every((page) => Array.isArray(page) && page.every(isIssue))) return null;
     count += startable.length;
-    unlabelledCount += pages.flat().filter((issue) => !("pull_request" in issue) && !issue.labels.some((label) => label.name.startsWith("queue:"))).length;
+    const issues = pages.flat().filter((issue) => !("pull_request" in issue));
+    unlabelledCount += issues.filter((issue) => !issue.labels.some((label) => label.name.startsWith("queue:"))).length;
+    blockedCount += issues.filter((issue) => issue.labels.some((label) => label.name === "queue:blocked")).length;
+    waitingExternalCount += issues.filter((issue) => issue.labels.some((label) => label.name === "queue:waiting-external")).length;
     const numbers = startable.map((issue) => issue.number);
     if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
   }
-  return { count, head: heads.sort()[0] ?? null, unlabelledCount };
+  return { count, head: heads.sort()[0] ?? null, unlabelledCount, blockedCount, waitingExternalCount };
 }
 
 function startableQueueState(repositories: string[]): StartableQueueState | null {
   let count = 0;
   let unlabelledCount = 0;
+  let blockedCount = 0;
+  let waitingExternalCount = 0;
   const heads: string[] = [];
   const isIssue = (issue: unknown): issue is { number: number; labels: Array<{ name: string }> } => Boolean(issue && typeof issue === "object" && !Array.isArray(issue)
     && typeof (issue as { number?: unknown }).number === "number"
@@ -156,11 +163,14 @@ function startableQueueState(repositories: string[]): StartableQueueState | null
     if (!Array.isArray(startable) || !startable.every(isIssue)
       || !Array.isArray(pages) || !pages.every((page) => Array.isArray(page) && page.every(isIssue))) return null;
     count += startable.length;
-    unlabelledCount += pages.flat().filter((issue) => !("pull_request" in issue) && !issue.labels.some((label) => label.name.startsWith("queue:"))).length;
+    const issues = pages.flat().filter((issue) => !("pull_request" in issue));
+    unlabelledCount += issues.filter((issue) => !issue.labels.some((label) => label.name.startsWith("queue:"))).length;
+    blockedCount += issues.filter((issue) => issue.labels.some((label) => label.name === "queue:blocked")).length;
+    waitingExternalCount += issues.filter((issue) => issue.labels.some((label) => label.name === "queue:waiting-external")).length;
     const numbers = startable.map((issue) => issue.number);
     if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
   }
-  return { count, head: heads.sort()[0] ?? null, unlabelledCount };
+  return { count, head: heads.sort()[0] ?? null, unlabelledCount, blockedCount, waitingExternalCount };
 }
 
 type LinkedGithubStatus = "open" | "closed" | "merged";
@@ -2990,8 +3000,14 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           const queue = repositories.length === 0 || repositories.some((repository) => repository === null)
             ? null
             : await startableQueueStateAsync(repositories as string[]);
-          if (queue !== null && (queue.count > 0 || queue.unlabelledCount > 0) && writingLaneCeiling !== null && activeLaneCount < writingLaneCeiling) {
-            await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${queue.count} issue${queue.count === 1 ? "" : "s"}; ${queue.unlabelledCount} open issue${queue.unlabelledCount === 1 ? " has" : "s have"} no queue label; ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
+          if (queue !== null) {
+            const intake = `startable=${queue.count} unlabelled=${queue.unlabelledCount} blocked=${queue.blockedCount} waiting-external=${queue.waitingExternalCount}`;
+            bb.log.info(`fleet-watchdog intake counts: project=${projectId} ${intake}`);
+            if ((queue.count > 0 || queue.unlabelledCount > 0) && writingLaneCeiling !== null && activeLaneCount < writingLaneCeiling) {
+              await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${queue.count} issue${queue.count === 1 ? "" : "s"}; ${queue.unlabelledCount} open issue${queue.unlabelledCount === 1 ? " has" : "s have"} no queue label; ${queue.blockedCount} blocked; ${queue.waitingExternalCount} waiting-external; ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
+            }
+          } else {
+            bb.log.warn(`fleet-watchdog intake coverage=blind project=${projectId} reason=startable-queue-unreadable`);
           }
           if (workItems.length === 0) continue;
           const unblocked = new Set<string>();

@@ -21861,6 +21861,8 @@ function githubJsonAsync(args) {
 async function startableQueueStateAsync(repositories) {
   let count = 0;
   let unlabelledCount = 0;
+  let blockedCount = 0;
+  let waitingExternalCount = 0;
   const heads = [];
   const isIssue = (issue2) => Boolean(issue2 && typeof issue2 === "object" && !Array.isArray(issue2) && typeof issue2.number === "number" && Array.isArray(issue2.labels) && issue2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string"));
   for (const repository of repositories) {
@@ -21868,11 +21870,14 @@ async function startableQueueStateAsync(repositories) {
     const pages = await githubJsonAsync(["api", `repos/${repository}/issues`, "--paginate", "--slurp", "--method", "GET", "-f", "state=open", "-f", "per_page=100"]);
     if (!Array.isArray(startable) || !startable.every(isIssue) || !Array.isArray(pages) || !pages.every((page) => Array.isArray(page) && page.every(isIssue))) return null;
     count += startable.length;
-    unlabelledCount += pages.flat().filter((issue2) => !("pull_request" in issue2) && !issue2.labels.some((label) => label.name.startsWith("queue:"))).length;
+    const issues = pages.flat().filter((issue2) => !("pull_request" in issue2));
+    unlabelledCount += issues.filter((issue2) => !issue2.labels.some((label) => label.name.startsWith("queue:"))).length;
+    blockedCount += issues.filter((issue2) => issue2.labels.some((label) => label.name === "queue:blocked")).length;
+    waitingExternalCount += issues.filter((issue2) => issue2.labels.some((label) => label.name === "queue:waiting-external")).length;
     const numbers = startable.map((issue2) => issue2.number);
     if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
   }
-  return { count, head: heads.sort()[0] ?? null, unlabelledCount };
+  return { count, head: heads.sort()[0] ?? null, unlabelledCount, blockedCount, waitingExternalCount };
 }
 async function linkedGithubObservationAsync(owner, repo, issueNumber) {
   const issue2 = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,updatedAt,closedByPullRequestsReferences"]);
@@ -24327,8 +24332,14 @@ ${thread.titleFallback ?? ""}`);
              WHERE heads.project_id = ? ORDER BY targets.repo_target_id`
           ).all(projectId).map((target) => githubRepository(target.remote_url));
           const queue = repositories.length === 0 || repositories.some((repository) => repository === null) ? null : await startableQueueStateAsync(repositories);
-          if (queue !== null && (queue.count > 0 || queue.unlabelledCount > 0) && writingLaneCeiling !== null && activeLaneCount < writingLaneCeiling) {
-            await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${queue.count} issue${queue.count === 1 ? "" : "s"}; ${queue.unlabelledCount} open issue${queue.unlabelledCount === 1 ? " has" : "s have"} no queue label; ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
+          if (queue !== null) {
+            const intake = `startable=${queue.count} unlabelled=${queue.unlabelledCount} blocked=${queue.blockedCount} waiting-external=${queue.waitingExternalCount}`;
+            bb.log.info(`fleet-watchdog intake counts: project=${projectId} ${intake}`);
+            if ((queue.count > 0 || queue.unlabelledCount > 0) && writingLaneCeiling !== null && activeLaneCount < writingLaneCeiling) {
+              await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${queue.count} issue${queue.count === 1 ? "" : "s"}; ${queue.unlabelledCount} open issue${queue.unlabelledCount === 1 ? " has" : "s have"} no queue label; ${queue.blockedCount} blocked; ${queue.waitingExternalCount} waiting-external; ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
+            }
+          } else {
+            bb.log.warn(`fleet-watchdog intake coverage=blind project=${projectId} reason=startable-queue-unreadable`);
           }
           if (workItems.length === 0) continue;
           const unblocked = /* @__PURE__ */ new Set();
