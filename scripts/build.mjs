@@ -42,6 +42,7 @@ try {
   sourceMap.sources = sourceMap.sources.map((source) => source
     .replace(/^.*?bb-collab-build-[^/]+\//u, "")
     .replace(/^.*?node_modules\//u, "node_modules/"));
+  delete sourceMap.sourcesContent;
   writeFileSync(sourceMapPath, `${JSON.stringify(sourceMap)}\n`);
 } finally {
   rmSync(stage, { recursive: true, force: true });
