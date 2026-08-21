@@ -53,6 +53,22 @@ describe("executed profile read-back", () => {
     });
   });
 
+  it("DISCRIMINATOR: finds a Codex rollout in the adjacent writer-date directory", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "019aa3c6-e964-7c32-8882-42f49fd63f0a";
+    jsonl(join(home, ".codex", "sessions", "2025", "11", "20", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/test/project" } },
+      { type: "turn_context", timestamp: "2026-08-20T00:00:10.500Z", payload: { turn_id: "active-turn", model: "gpt-test", effort: "medium" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "active" },
+      environment: { path: "/test/project" },
+      events: activeEvents(providerThreadId),
+      home,
+    });
+    expect(result).toMatchObject({ outcome: "known", turns: [{ status: "known", executedProfile: { model: "gpt-test", reasoningLevel: "medium" } }] });
+  });
+
   it("GUARD: reads the active Claude profile from its native session surface", async () => {
     const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
     const claudeSession = "123e4567-e89b-42d3-a456-426614174000";
