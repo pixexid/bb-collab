@@ -71,7 +71,7 @@ import { ARCHIVE_SWEEP_GUARD, createArchiveSweepRefusalCounter, runArchiveSweep,
 import { canonicalWorktreePath, cleanupGitWorktrees, listAllProjectThreads } from "./src/worktree-cleanup.js";
 import { findCheckoutRoot, readCheckoutDivergence, type CheckoutDivergence } from "./src/checkout-divergence.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { execFile, spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
+import { execFile, spawnSync, type ExecFileException, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -1061,6 +1061,11 @@ async function assertSenderProject(bb: BbPluginApi, projectId: string, senderThr
   if (thread.id !== senderThreadId || thread.projectId !== projectId) {
     throw refusal("EXECUTION_CONTEXT_FOREIGN", "project_id must exactly match the sender thread project");
   }
+}
+
+export function deployedDistFailureDetail(error: ExecFileException, stdout: string, stderr: string): string {
+  const status = `code=${String(error.code ?? "null")} killed=${String(error.killed ?? false)} signal=${String(error.signal ?? "null")}`;
+  return [error.message, status, stderr.trim(), stdout.trim()].filter(Boolean).join(" ");
 }
 
 function runBbCommand(args: string[]): Promise<void> {
@@ -2964,7 +2969,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     }, (error, stdout, stderr) => {
       deployedDistCheckRunning = false;
       if (!error) return;
-      const detail = [error.message, stderr.trim(), stdout.trim()].filter(Boolean).join(" ");
+      const detail = deployedDistFailureDetail(error, stdout, stderr);
       bb.log.error(`deployed-dist automatic check failed: ${detail || "child process failed"}`);
     });
   });

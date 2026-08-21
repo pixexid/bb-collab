@@ -8,7 +8,7 @@ import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import plugin, { cliSchemaError, IDLE_FLEET_ATTEMPT_STALE_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
+import plugin, { cliSchemaError, deployedDistFailureDetail, IDLE_FLEET_ATTEMPT_STALE_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
 import { canonicalWorktreePath } from "../src/worktree-cleanup.js";
 import {
   CACHED_CONSUMERS,
@@ -2574,6 +2574,14 @@ describe("bb-collab plugin boundary", () => {
     const warnings = host.harness.inspection.logEntries.filter((entry) => entry.level === "warn" && entry.message.startsWith("thread-archive-sweep coverage=degraded"));
     expect(warnings).toHaveLength(2);
     expect(warnings.at(-1)?.message).toMatch(/occurrencesSinceReload=2 cyclesSinceReload=2 projectsSinceReload=0 sinceReloadAt=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u);
+  });
+
+  it("keeps deployed-dist timeout and exit failures distinguishable", () => {
+    const timeout = Object.assign(new Error("Command failed"), { code: null, killed: true, signal: "SIGTERM" as const });
+    const exit = Object.assign(new Error("Command failed"), { code: 1, killed: false, signal: undefined });
+    expect(deployedDistFailureDetail(timeout, "", "")).toContain("code=null killed=true signal=SIGTERM");
+    expect(deployedDistFailureDetail(exit, "", "")).toContain("code=1 killed=false signal=null");
+    expect(deployedDistFailureDetail(timeout, "", "")).not.toBe(deployedDistFailureDetail(exit, "", ""));
   });
 
   it("runs the deployed-dist check asynchronously", () => {

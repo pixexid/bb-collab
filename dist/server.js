@@ -22563,6 +22563,10 @@ async function assertSenderProject(bb, projectId, senderThreadId) {
     throw refusal("EXECUTION_CONTEXT_FOREIGN", "project_id must exactly match the sender thread project");
   }
 }
+function deployedDistFailureDetail(error48, stdout, stderr) {
+  const status = `code=${String(error48.code ?? "null")} killed=${String(error48.killed ?? false)} signal=${String(error48.signal ?? "null")}`;
+  return [error48.message, status, stderr.trim(), stdout.trim()].filter(Boolean).join(" ");
+}
 function runBbCommand(args) {
   return new Promise((resolve3, reject) => {
     execFile(process.env.BB_CLI?.trim() || "bb", args, { timeout: 1e4 }, (error48) => error48 ? reject(error48) : resolve3());
@@ -24327,7 +24331,7 @@ ${thread.titleFallback ?? ""}`);
     }, (error48, stdout, stderr) => {
       deployedDistCheckRunning = false;
       if (!error48) return;
-      const detail = [error48.message, stderr.trim(), stdout.trim()].filter(Boolean).join(" ");
+      const detail = deployedDistFailureDetail(error48, stdout, stderr);
       bb.log.error(`deployed-dist automatic check failed: ${detail || "child process failed"}`);
     });
   });
@@ -24613,6 +24617,7 @@ export {
   URGENT_NOTIFICATION_DEDUP_MS,
   cliSchemaError,
   plugin as default,
+  deployedDistFailureDetail,
   foundationResultSchema,
   isLiveCachedConsumerRolloutArtifact,
   readLiveRoleFactReader,
