@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { evaluate, isMergeReady, isWatchedThread, openStore, shouldEscalate } from "../server.js";
+import { coverageReason, evaluate, isMergeReady, openStore, readOrchestrator, shouldEscalate } from "../server.js";
 
 const dbs: Database.Database[] = [];
 function db(active = 0, ceiling = 3) {
@@ -47,12 +47,20 @@ describe("mechanical conditions", () => {
       { checks: ["SUCCESS", "FAILURE"] },
     ]) expect(isMergeReady({ number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", checks: ["SUCCESS"], ...pr })).toBe(false);
   });
-  it("opens unavailable stores defensively and identifies only the cached orchestrator", () => {
+  it("opens unavailable stores defensively and rereads the current orchestrator head", () => {
     const errors: unknown[] = [];
     expect(openStore("/missing/bb-collab.db", (error) => errors.push(error))).toBeUndefined();
     expect(errors).toHaveLength(1);
-    expect(isWatchedThread("orch", "p", new Map([["p", "orch"]]))).toBe(true);
-    expect(isWatchedThread("lane", "p", new Map([["p", "orch"]]))).toBe(false);
+    const store = db();
+    expect(readOrchestrator(store, "p")).toBe("orch");
+    store.prepare("UPDATE execution_attempts SET thread_id='successor' WHERE execution_attempt_id='o'").run();
+    expect(readOrchestrator(store, "p")).toBe("successor");
+  });
+  it("labels store, GitHub, SDK, and wake failures by the caught cause", () => {
+    expect(coverageReason("store", "read failed")).toContain("canonical-store-unavailable");
+    expect(coverageReason("github", "timeout")).toContain("github-unavailable");
+    expect(coverageReason("sdk", "request failed")).toContain("sdk-unavailable");
+    expect(coverageReason("wake", "send failed")).toContain("wake-delivery-failed");
   });
   it("requires evidence of a completed turn before escalating", () => {
     const prior = { sentAt: 100, fingerprint: "same", turns: 1 };

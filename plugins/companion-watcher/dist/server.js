@@ -26,8 +26,11 @@ function openStore(path, onUnavailable) {
     return void 0;
   }
 }
-function isWatchedThread(threadId, projectId, orchestrators) {
-  return orchestrators.get(projectId) === threadId;
+function readOrchestrator(db, projectId) {
+  return db.prepare(`SELECT a.thread_id AS thread_id FROM role_generation_heads h JOIN role_generations g ON g.project_id=h.project_id AND g.role_id=h.role_id AND g.generation=h.current_generation JOIN execution_attempts a ON a.project_id=g.project_id AND a.execution_attempt_id=g.holder_execution_attempt_id WHERE h.project_id=? AND h.role_id='project-orchestrator'`).get(projectId)?.thread_id;
+}
+function coverageReason(kind, error) {
+  return `${kind === "store" ? "canonical-store-unavailable" : kind === "github" ? "github-unavailable" : kind === "wake" ? "wake-delivery-failed" : "sdk-unavailable"}:${String(error)}`;
 }
 function evaluate(db, projectId, queued, startable, prs) {
   const holder = db.prepare(`SELECT a.thread_id AS thread_id FROM role_generation_heads h JOIN role_generations g ON g.project_id=h.project_id AND g.role_id=h.role_id AND g.generation=h.current_generation JOIN execution_attempts a ON a.project_id=g.project_id AND a.execution_attempt_id=g.holder_execution_attempt_id WHERE h.project_id=? AND h.role_id='project-orchestrator'`).get(projectId);
@@ -65,9 +68,7 @@ async function github(repo) {
   return { issues: issueNumbers, prs: green };
 }
 function companionWatcher(bb) {
-  const db = bb.storage.database();
   const snapshots = /* @__PURE__ */ new Map();
-  const orchestrators = /* @__PURE__ */ new Map();
   const activeTurns = /* @__PURE__ */ new Map();
   let loaded = false;
   const load = async () => {
@@ -77,27 +78,54 @@ function companionWatcher(bb) {
     loaded = true;
   };
   bb.events.on("thread.active", ({ thread }) => {
-    if (orchestrators.get(thread.projectId) === thread.id) activeTurns.set(thread.id, Date.now());
+    activeTurns.set(thread.id, Date.now());
   });
   bb.events.on("thread.idle", async ({ thread }) => {
-    await load();
+    try {
+      await load();
+    } catch (error) {
+      bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("sdk", error)}`);
+      return;
+    }
     const projectId = thread.projectId;
-    if (orchestrators.has(projectId) && !isWatchedThread(thread.id, projectId, orchestrators)) return;
+    const turnStartedAt = activeTurns.get(thread.id);
+    activeTurns.delete(thread.id);
     let store;
     try {
-      const config = await bb.sdk.system.config();
-      store = openStore(`${config.dataDir}/plugins/bb-collab/data.db`, (error) => bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=canonical-store-unavailable:${String(error)}`));
-      if (!store) return;
-      if (!orchestrators.has(projectId)) {
-        const holders = store.prepare(`SELECT a.thread_id, g.project_id FROM role_generation_heads h JOIN role_generations g ON g.project_id=h.project_id AND g.role_id=h.role_id AND g.generation=h.current_generation JOIN execution_attempts a ON a.project_id=g.project_id AND a.execution_attempt_id=g.holder_execution_attempt_id WHERE h.role_id='project-orchestrator'`).all();
-        for (const holder of holders) orchestrators.set(holder.project_id, holder.thread_id);
+      let config;
+      try {
+        config = await bb.sdk.system.config();
+      } catch (error) {
+        bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("sdk", error)}`);
+        return;
       }
-      const target = orchestrators.get(projectId) === thread.id ? { project_id: projectId } : void 0;
-      if (!target) return;
+      store = openStore(`${config.dataDir}/plugins/bb-collab/data.db`, (error) => bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("store", error)}`));
+      if (!store) return;
+      const orchestrator = readOrchestrator(store, projectId);
+      if (!orchestrator) {
+        bb.log.warn("companion-watcher coverage=blind event=thread.idle reason=orchestrator-head-unresolved");
+        return;
+      }
+      if (orchestrator !== thread.id) return;
+      const target = { project_id: projectId };
       const unknown = store.prepare(`SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id=? AND origin='assignment' AND state='dispatch_unknown'`).get(projectId);
       if (Number(unknown.count) > 0) bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=dispatch_unknown-attempts:${unknown.count}`);
-      const queued = await bb.sdk.threads.queuedMessages.list({ threadId: thread.id });
-      const { issues, prs } = await github(repoName((await bb.sdk.projects.get({ projectId: target.project_id })).gitRemoteUrl) ?? "");
+      let queued;
+      let remote;
+      try {
+        queued = await bb.sdk.threads.queuedMessages.list({ threadId: thread.id });
+        remote = (await bb.sdk.projects.get({ projectId: target.project_id })).gitRemoteUrl;
+      } catch (error) {
+        bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("sdk", error)}`);
+        return;
+      }
+      let issues, prs;
+      try {
+        ({ issues, prs } = await github(repoName(remote) ?? ""));
+      } catch (error) {
+        bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("github", error)}`);
+        return;
+      }
       const findings = evaluate(store, target.project_id, queued, issues, prs);
       const now = Date.now();
       const send = [];
@@ -105,13 +133,16 @@ function companionWatcher(bb) {
         const prior = snapshots.get(`${target.project_id}:${finding.condition}`);
         if (!prior || prior.fingerprint !== finding.key || !prior.escalated && now - prior.sentAt >= BACKOFF_MS) send.push(finding);
       }
-      const turnStartedAt = activeTurns.get(thread.id);
-      activeTurns.delete(thread.id);
       const escalations = findings.filter((finding) => shouldEscalate(snapshots.get(`${target.project_id}:${finding.condition}`), turnStartedAt, finding.key));
       if (!send.length && !escalations.length) return;
       if (send.length) {
         const message = send.map((f) => f.text).join("; ");
-        await bb.sdk.threads.send({ threadId: thread.id, mode: "auto", input: [{ type: "text", text: `Companion watcher: ${message}.`, mentions: [] }] });
+        try {
+          await bb.sdk.threads.send({ threadId: thread.id, mode: "auto", input: [{ type: "text", text: `Companion watcher: ${message}.`, mentions: [] }] });
+        } catch (error) {
+          bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("wake", error)}`);
+          return;
+        }
       }
       for (const finding of send) {
         const key = `${target.project_id}:${finding.condition}`;
@@ -123,22 +154,34 @@ function companionWatcher(bb) {
         const prior = snapshots.get(key);
         snapshots.set(key, { ...prior, escalated: true });
         const director = store.prepare(`SELECT a.thread_id AS thread_id FROM role_generation_heads h JOIN role_generations g ON g.project_id=h.project_id AND g.role_id=h.role_id AND g.generation=h.current_generation JOIN execution_attempts a ON a.project_id=g.project_id AND a.execution_attempt_id=g.holder_execution_attempt_id WHERE h.project_id=? AND h.role_id='director'`).get(target.project_id);
-        if (director) await bb.sdk.threads.send({ threadId: director.thread_id, mode: "auto", input: [{ type: "text", text: `Companion watcher escalation: ${finding.text}; unchanged after a wake and full turn.`, mentions: [] }] });
+        if (director) {
+          try {
+            await bb.sdk.threads.send({ threadId: director.thread_id, mode: "auto", input: [{ type: "text", text: `Companion watcher escalation: ${finding.text}; unchanged after a wake and full turn.`, mentions: [] }] });
+          } catch (error) {
+            bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("wake", error)}`);
+            return;
+          }
+        }
       }
-      await bb.storage.kv.set("backoff", Object.fromEntries(snapshots));
+      try {
+        await bb.storage.kv.set("backoff", Object.fromEntries(snapshots));
+      } catch (error) {
+        bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("sdk", error)}`);
+      }
     } catch (error) {
-      bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=canonical-store-unavailable:${String(error)}`);
+      bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("store", error)}`);
     } finally {
       store?.close();
     }
   });
 }
 export {
+  coverageReason,
   companionWatcher as default,
   evaluate,
   isMergeReady,
-  isWatchedThread,
   openStore,
+  readOrchestrator,
   shouldEscalate
 };
 //# sourceMappingURL=server.js.map
