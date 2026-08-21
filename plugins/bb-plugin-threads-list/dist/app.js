@@ -130,6 +130,22 @@ var {
 } = mod3;
 
 // app.tsx
+var STATE_MIGRATION_NOTICE_KEY = "bb-plugin-threads-list.state-migration-notice";
+function migrationNoticeVisible() {
+  try {
+    return window.localStorage.getItem(STATE_MIGRATION_NOTICE_KEY) !== "dismissed";
+  } catch {
+    return true;
+  }
+}
+function dismissMigrationNotice() {
+  try {
+    window.localStorage.setItem(STATE_MIGRATION_NOTICE_KEY, "dismissed");
+    return true;
+  } catch {
+    return false;
+  }
+}
 var MAX_VISIBLE_THREADS = 5;
 var SIDEBAR_RPC_BATCH_SIZE = 256;
 function sidebarRpcBatches(ids) {
@@ -485,7 +501,7 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
   const [customStates, setCustomStates] = useState({});
   const [indicatorBroken, setIndicatorBroken] = useState(null);
   const [threadModels, setThreadModels] = useState({});
-  const [stateMigrationNotice, setStateMigrationNotice] = useState(() => window.localStorage.getItem("bb-plugin-threads-list.state-migration-notice") !== "dismissed");
+  const [stateMigrationNotice, setStateMigrationNotice] = useState(migrationNoticeVisible);
   const threadIds = useMemo(() => sidebar.threads.map((thread) => thread.id), [sidebar.threads]);
   const threadIdsKey = threadIds.join("\0");
   const projectIds = useMemo(() => sidebar.projects.map((project) => project.id), [sidebar.projects]);
@@ -600,7 +616,7 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
     stateMigrationNotice ? /* @__PURE__ */ jsxs("p", { role: "status", className: "rounded-md border border-border p-2 text-xs text-muted-foreground", children: [
       "Thread-list collapse and custom state were reset during the plugin move. ",
       /* @__PURE__ */ jsx("button", { type: "button", className: "underline", onClick: () => {
-        window.localStorage.setItem("bb-plugin-threads-list.state-migration-notice", "dismissed");
+        dismissMigrationNotice();
         setStateMigrationNotice(false);
       }, children: "Dismiss" })
     ] }) : null,
@@ -645,6 +661,7 @@ export {
   SidebarThreadList,
   buildThreadTree,
   app_default as default,
+  dismissMigrationNotice,
   executionBadgeLabel,
   groupThreads,
   reasoningLetter,

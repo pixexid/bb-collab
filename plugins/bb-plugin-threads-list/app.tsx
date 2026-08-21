@@ -586,7 +586,7 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
 
   return (
     <div className="h-full space-y-3 overflow-y-auto p-1">
-      {stateMigrationNotice ? <p role="status" className="rounded-md border border-border p-2 text-xs text-muted-foreground">Thread-list collapse and custom state were reset during the plugin move. <button type="button" className="underline" onClick={() => { if (dismissMigrationNotice()) setStateMigrationNotice(false); }}>Dismiss</button></p> : null}
+      {stateMigrationNotice ? <p role="status" className="rounded-md border border-border p-2 text-xs text-muted-foreground">Thread-list collapse and custom state were reset during the plugin move. <button type="button" className="underline" onClick={() => { dismissMigrationNotice(); setStateMigrationNotice(false); }}>Dismiss</button></p> : null}
       {groups.map(({ project, threads }) => {
         const tree = buildThreadTree(threads);
         const collapsed = collapsedProjects.has(project.id);

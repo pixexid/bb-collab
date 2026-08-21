@@ -114,7 +114,7 @@ describe("replacement thread list", () => {
     expect(rendered.getByRole("status").textContent).toContain("reset during the plugin move");
     expect(rendered.getByText("thread-1")).toBeTruthy();
     fireEvent.click(rendered.getByRole("button", { name: "Dismiss" }));
-    expect(rendered.getByRole("status")).toBeTruthy();
+    expect(rendered.queryByRole("status")).toBeNull();
   });
 
   it("groups by stable project id and limits each project to five recent threads", async () => {
