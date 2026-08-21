@@ -10,13 +10,13 @@ export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION: 34 in AGENTS.md.
 export const RUNTIME_CONTRACT_VERSION = 22;
-export const SCHEMA_VERSION = 23;
+export const SCHEMA_VERSION = 26;
 // v22 establishes the director's exact accepted-profile set.
 const PREVIOUS_RUNTIME_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-// Schema v23 adds forward-only lane-capacity intervals; runtime policy remains v22.
-const PREVIOUS_SCHEMA_VERSION = 22;
+// Schema v26 enforces append-only lane-refresh evidence; runtime policy remains v22.
+const PREVIOUS_SCHEMA_VERSION = 25;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatPrimaryProfile = {
@@ -81,6 +81,7 @@ export const TABLES = [
   "role_generations",
   "role_generation_heads",
   "lane_capacity_intervals",
+  "lane_capacity_refresh_evidence",
   "operator_messages",
 ] as const;
 
@@ -932,6 +933,37 @@ export const MIGRATIONS: string[] = [
   );
   CREATE UNIQUE INDEX IF NOT EXISTS lane_capacity_intervals_one_open
     ON lane_capacity_intervals(project_id) WHERE ended_at_ms IS NULL;`,
+  `ALTER TABLE execution_attempts ADD COLUMN lane_capacity_observation_id TEXT
+     CHECK (lane_capacity_observation_id IS NULL OR length(lane_capacity_observation_id) > 0);
+   ALTER TABLE lane_capacity_intervals ADD COLUMN lane_capacity_observation_id TEXT
+     CHECK (lane_capacity_observation_id IS NULL OR length(lane_capacity_observation_id) > 0);
+   CREATE TRIGGER execution_attempts_lane_capacity_observation_immutable
+     BEFORE UPDATE OF lane_capacity_observation_id ON execution_attempts
+     WHEN OLD.lane_capacity_observation_id IS NOT NULL
+       AND NEW.lane_capacity_observation_id IS NOT OLD.lane_capacity_observation_id
+     BEGIN SELECT RAISE(ABORT, 'lane capacity observation identifier is immutable'); END;
+   CREATE TRIGGER lane_capacity_intervals_observation_immutable
+     BEFORE UPDATE OF lane_capacity_observation_id ON lane_capacity_intervals
+     WHEN NEW.lane_capacity_observation_id IS NOT OLD.lane_capacity_observation_id
+     BEGIN SELECT RAISE(ABORT, 'lane capacity observation identifier is immutable'); END;`,
+  `CREATE TABLE IF NOT EXISTS lane_capacity_refresh_evidence (
+    project_id TEXT NOT NULL CHECK (length(project_id) > 0),
+    lane_capacity_observation_id TEXT NOT NULL CHECK (length(lane_capacity_observation_id) > 0),
+    execution_attempt_id TEXT NOT NULL CHECK (length(execution_attempt_id) > 0),
+    observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+    PRIMARY KEY (project_id, lane_capacity_observation_id, execution_attempt_id),
+    FOREIGN KEY (project_id, execution_attempt_id)
+      REFERENCES execution_attempts(project_id, execution_attempt_id)
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS lane_capacity_intervals_observation_id
+    ON lane_capacity_intervals(project_id, lane_capacity_observation_id)
+    WHERE lane_capacity_observation_id IS NOT NULL;`,
+  `CREATE TRIGGER lane_capacity_refresh_evidence_immutable_update
+     BEFORE UPDATE ON lane_capacity_refresh_evidence
+     BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;
+   CREATE TRIGGER lane_capacity_refresh_evidence_immutable_delete
+     BEFORE DELETE ON lane_capacity_refresh_evidence
+     BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -7400,6 +7432,7 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     role_generations: "role_id, generation",
     role_generation_heads: "role_id",
     lane_capacity_intervals: "interval_id",
+    lane_capacity_refresh_evidence: "lane_capacity_observation_id, execution_attempt_id",
     operator_messages: "message_id",
   };
   const query =

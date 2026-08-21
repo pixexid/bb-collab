@@ -11,6 +11,7 @@ var __export = (target, all) => {
 };
 
 // server.ts
+import { randomBytes as randomBytes2 } from "node:crypto";
 import { defineRpcContract } from "@bb/plugin-sdk";
 
 // node_modules/zod/v4/classic/external.js
@@ -14516,11 +14517,11 @@ var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
 var RUNTIME_CONTRACT_VERSION = 22;
-var SCHEMA_VERSION = 23;
+var SCHEMA_VERSION = 26;
 var PREVIOUS_RUNTIME_CONTRACT_VERSION = 21;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
-var PREVIOUS_SCHEMA_VERSION = 22;
+var PREVIOUS_SCHEMA_VERSION = 25;
 var ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"];
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
 var directorSeatPrimaryProfile = {
@@ -14583,6 +14584,7 @@ var TABLES = [
   "role_generations",
   "role_generation_heads",
   "lane_capacity_intervals",
+  "lane_capacity_refresh_evidence",
   "operator_messages"
 ];
 var MIGRATIONS = [
@@ -15432,7 +15434,38 @@ var MIGRATIONS = [
       OR (coverage_state = 'blind' AND reason IS NOT NULL))
   );
   CREATE UNIQUE INDEX IF NOT EXISTS lane_capacity_intervals_one_open
-    ON lane_capacity_intervals(project_id) WHERE ended_at_ms IS NULL;`
+    ON lane_capacity_intervals(project_id) WHERE ended_at_ms IS NULL;`,
+  `ALTER TABLE execution_attempts ADD COLUMN lane_capacity_observation_id TEXT
+     CHECK (lane_capacity_observation_id IS NULL OR length(lane_capacity_observation_id) > 0);
+   ALTER TABLE lane_capacity_intervals ADD COLUMN lane_capacity_observation_id TEXT
+     CHECK (lane_capacity_observation_id IS NULL OR length(lane_capacity_observation_id) > 0);
+   CREATE TRIGGER execution_attempts_lane_capacity_observation_immutable
+     BEFORE UPDATE OF lane_capacity_observation_id ON execution_attempts
+     WHEN OLD.lane_capacity_observation_id IS NOT NULL
+       AND NEW.lane_capacity_observation_id IS NOT OLD.lane_capacity_observation_id
+     BEGIN SELECT RAISE(ABORT, 'lane capacity observation identifier is immutable'); END;
+   CREATE TRIGGER lane_capacity_intervals_observation_immutable
+     BEFORE UPDATE OF lane_capacity_observation_id ON lane_capacity_intervals
+     WHEN NEW.lane_capacity_observation_id IS NOT OLD.lane_capacity_observation_id
+     BEGIN SELECT RAISE(ABORT, 'lane capacity observation identifier is immutable'); END;`,
+  `CREATE TABLE IF NOT EXISTS lane_capacity_refresh_evidence (
+    project_id TEXT NOT NULL CHECK (length(project_id) > 0),
+    lane_capacity_observation_id TEXT NOT NULL CHECK (length(lane_capacity_observation_id) > 0),
+    execution_attempt_id TEXT NOT NULL CHECK (length(execution_attempt_id) > 0),
+    observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+    PRIMARY KEY (project_id, lane_capacity_observation_id, execution_attempt_id),
+    FOREIGN KEY (project_id, execution_attempt_id)
+      REFERENCES execution_attempts(project_id, execution_attempt_id)
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS lane_capacity_intervals_observation_id
+    ON lane_capacity_intervals(project_id, lane_capacity_observation_id)
+    WHERE lane_capacity_observation_id IS NOT NULL;`,
+  `CREATE TRIGGER lane_capacity_refresh_evidence_immutable_update
+     BEFORE UPDATE ON lane_capacity_refresh_evidence
+     BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;
+   CREATE TRIGGER lane_capacity_refresh_evidence_immutable_delete
+     BEFORE DELETE ON lane_capacity_refresh_evidence
+     BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;`
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var GH300_BACKFILL_MIGRATION_ID = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE execution_attempts_gh300"));
@@ -20338,6 +20371,7 @@ function tableRows(db, table, projectId, offset) {
     role_generations: "role_id, generation",
     role_generation_heads: "role_id",
     lane_capacity_intervals: "interval_id",
+    lane_capacity_refresh_evidence: "lane_capacity_observation_id, execution_attempt_id",
     operator_messages: "message_id"
   };
   const query = table === "decision_dispositions" || table === "decision_evidence" ? `SELECT ${table}.* FROM ${table}
@@ -23358,40 +23392,51 @@ ${thread.titleFallback ?? ""}`);
     db.transaction(() => {
       const startableWork = observation.startableWork === null ? null : observation.startableWork ? 1 : 0;
       const extended = db.prepare(
-        `UPDATE lane_capacity_intervals SET last_confirmed_at_ms = ?
+        `UPDATE lane_capacity_intervals SET last_confirmed_at_ms = ?,
+           lane_capacity_observation_id = COALESCE(lane_capacity_observation_id, ?)
          WHERE project_id = ? AND ended_at_ms IS NULL
            AND coverage_state = ? AND active_lane_count IS ?
            AND writing_lane_ceiling IS ? AND startable_work IS ?`
       ).run(
         observation.observedAtMs,
+        observation.laneCapacityObservationId,
         observation.projectId,
         observation.coverageState,
         observation.activeLaneCount,
         observation.writingLaneCeiling,
         startableWork
       );
-      if (extended.changes === 1) return;
-      db.prepare(
-        "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE project_id = ? AND ended_at_ms IS NULL"
-      ).run(observation.projectId);
-      db.prepare(
-        `INSERT INTO lane_capacity_intervals (
+      if (extended.changes !== 1) {
+        db.prepare(
+          "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE project_id = ? AND ended_at_ms IS NULL"
+        ).run(observation.projectId);
+        db.prepare(
+          `INSERT INTO lane_capacity_intervals (
            project_id, orchestrator_thread_id, orchestrator_role_generation,
            coverage_state, active_lane_count, writing_lane_ceiling, startable_work,
-           reason, started_at_ms, last_confirmed_at_ms, ended_at_ms
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
-      ).run(
-        observation.projectId,
-        observation.orchestratorThreadId,
-        observation.orchestratorRoleGeneration,
-        observation.coverageState,
-        observation.activeLaneCount,
-        observation.writingLaneCeiling,
-        startableWork,
-        observation.reason,
-        observation.observedAtMs,
-        observation.observedAtMs
-      );
+           reason, lane_capacity_observation_id, started_at_ms, last_confirmed_at_ms, ended_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+        ).run(
+          observation.projectId,
+          observation.orchestratorThreadId,
+          observation.orchestratorRoleGeneration,
+          observation.coverageState,
+          observation.activeLaneCount,
+          observation.writingLaneCeiling,
+          startableWork,
+          observation.reason,
+          observation.laneCapacityObservationId,
+          observation.observedAtMs,
+          observation.observedAtMs
+        );
+      }
+      for (const executionAttemptId of observation.executionAttemptIds) {
+        db.prepare(
+          `INSERT OR IGNORE INTO lane_capacity_refresh_evidence (
+             project_id, lane_capacity_observation_id, execution_attempt_id, observed_at_ms
+           ) VALUES (?, ?, ?, ?)`
+        ).run(observation.projectId, observation.laneCapacityObservationId, executionAttemptId, observation.observedAtMs);
+      }
     })();
   };
   const closeLaneCapacityCoverage = () => {
@@ -23451,6 +23496,7 @@ ${thread.titleFallback ?? ""}`);
       const liveLanes = threads.filter(
         (thread) => !dispatcherThreadIds.has(thread.id) && thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null && isWorkingLane(thread)
       );
+      const executionAttemptIds = [];
       for (const lane of liveLanes) {
         const matches = db.prepare(
           `SELECT execution_attempt_id, assignment_kind
@@ -23459,13 +23505,14 @@ ${thread.titleFallback ?? ""}`);
              AND state = 'running' AND thread_id = ?`
         ).all(projectId, lane.id);
         if (matches.length !== 1 || matches[0].assignment_kind !== "write") continue;
+        const observedAtMs = Date.now();
         db.prepare(
-          `UPDATE execution_attempts
-           SET observed_at_ms = ?
+          `UPDATE execution_attempts SET observed_at_ms = ?
            WHERE project_id = ? AND execution_attempt_id = ? AND state = 'running'`
-        ).run(Date.now(), projectId, matches[0].execution_attempt_id);
+        ).run(observedAtMs, projectId, matches[0].execution_attempt_id);
+        executionAttemptIds.push(matches[0].execution_attempt_id);
       }
-      return { known: true, value: liveLanes.length };
+      return { known: true, value: { count: liveLanes.length, executionAttemptIds } };
     } catch (error48) {
       return { known: false, reason: `native-lanes-unreadable:${String(error48)}` };
     }
@@ -23522,18 +23569,28 @@ ${thread.titleFallback ?? ""}`);
       !nativeLanes.known ? nativeLanes.reason : null,
       !startable.known ? startable.reason : null,
       !ceiling.known ? ceiling.reason : null,
-      activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value ? `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value}` : null
+      activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value.count ? `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value.count}` : null
     ].filter((reason) => reason !== null);
+    const coverageState = reasons.length === 0 ? "known" : "blind";
+    const startableWork = startable.known ? startable.value.count > 0 : null;
+    const open = db.prepare(
+      `SELECT coverage_state, active_lane_count, writing_lane_ceiling, startable_work, reason, lane_capacity_observation_id
+       FROM lane_capacity_intervals WHERE project_id = ? AND ended_at_ms IS NULL`
+    ).get(projectId);
+    const sameFacts = open !== void 0 && open.coverage_state === coverageState && open.active_lane_count === (activeLanes.known ? activeLanes.value : null) && open.writing_lane_ceiling === (ceiling.known ? ceiling.value : null) && open.startable_work === (startableWork === null ? null : startableWork ? 1 : 0) && open.reason === (reasons.length === 0 ? null : reasons.join(";"));
+    const laneCapacityObservationId = sameFacts && open?.lane_capacity_observation_id ? open.lane_capacity_observation_id : randomBytes2(16).toString("hex");
     return {
       projectId,
       orchestratorThreadId: holder.thread_id,
       orchestratorRoleGeneration: holder.role_generation,
-      coverageState: reasons.length === 0 ? "known" : "blind",
+      coverageState,
       activeLaneCount: activeLanes.known ? activeLanes.value : null,
       writingLaneCeiling: ceiling.known ? ceiling.value : null,
-      startableWork: startable.known ? startable.value.count > 0 : null,
+      startableWork,
       reason: reasons.length === 0 ? null : reasons.join(";"),
-      observedAtMs
+      laneCapacityObservationId,
+      observedAtMs,
+      executionAttemptIds: nativeLanes.known ? nativeLanes.value.executionAttemptIds : []
     };
   };
   const readIdleFleetProbes = async () => {
@@ -23586,7 +23643,7 @@ ${thread.titleFallback ?? ""}`);
       readIdleFleetNativeLanes(probe.projectId),
       readIdleFleetStartable(probe.projectId)
     ]);
-    const laneDisagreement = activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value;
+    const laneDisagreement = activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value.count;
     if (!activeLanes.known || !nativeLanes.known || !startable.known) {
       const blindReasons = [
         !activeLanes.known ? activeLanes.reason : null,
@@ -23601,7 +23658,7 @@ ${thread.titleFallback ?? ""}`);
       );
     }
     if (laneDisagreement) {
-      return idleFleetBlind("known", "blind", "known", `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value}`);
+      return idleFleetBlind("known", "blind", "known", `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value.count}`);
     }
     if (activeLanes.value > 0 || startable.value.count === 0) return { kind: "silent" };
     const queueHead = startable.value.head;
@@ -23622,6 +23679,7 @@ ${thread.titleFallback ?? ""}`);
       message: `Idle fleet: queue head ${queueHead} is startable with zero active writing lanes. Dispatch it or record the blocker.`
     };
   };
+  const capacityObservationLocks = /* @__PURE__ */ new Map();
   const idleFleetDetector = createIdleFleetDetector({
     read: readIdleFleet,
     readRearmProbes: readIdleFleetProbes,
@@ -23634,7 +23692,20 @@ ${thread.titleFallback ?? ""}`);
         (holder) => holder.role_id === "project-orchestrator"
       ).map((holder) => holder.project_id))],
       observe: async (projectId) => {
-        recordLaneCapacityInterval(await readLaneCapacityObservation(projectId));
+        const previous = capacityObservationLocks.get(projectId) ?? Promise.resolve();
+        let release;
+        const current = new Promise((resolve3) => {
+          release = resolve3;
+        });
+        const queued = previous.then(() => current);
+        capacityObservationLocks.set(projectId, queued);
+        await previous;
+        try {
+          recordLaneCapacityInterval(await readLaneCapacityObservation(projectId));
+        } finally {
+          release();
+          if (capacityObservationLocks.get(projectId) === queued) capacityObservationLocks.delete(projectId);
+        }
       },
       close: closeLaneCapacityCoverage
     },
