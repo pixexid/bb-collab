@@ -65,8 +65,10 @@ const pulls = ghJson(mergeArgs).map((pull) => ({
   body: pull.body,
 }));
 const labels = ghJson(labelArgs).map((label) => label.name.toLowerCase());
+const defectLabel = "bug";
+const defectLabelUsage = issueRows.some((issue) => (issue.labels ?? []).some((label) => String(label.name).toLowerCase() === defectLabel)) ? "used" : "unused";
 let defectEscapeReason = null;
-const defectIssues = issueRows.filter((issue) => inWindow(Date.parse(issue.createdAt), startAtMs, endAtMs) && (issue.labels ?? []).some((label) => ["bug", "defect"].includes(String(label.name).toLowerCase())));
+const defectIssues = issueRows.filter((issue) => inWindow(Date.parse(issue.createdAt), startAtMs, endAtMs) && (issue.labels ?? []).some((label) => String(label.name).toLowerCase() === defectLabel));
 const timelineAttribution = new Map();
 try {
   for (const issue of defectIssues) {
@@ -121,6 +123,7 @@ const laneCapacityIntervals = canonicalExport.rows.filter((record) => record.tab
 const report = weeklyThroughputReport({
   dialsLandedAtMs,
   issues,
+  defectPopulation: { selector: defectLabel, selectorUsage: defectLabelUsage },
   merges: pulls,
   reviews,
   laneCapacityIntervals,
