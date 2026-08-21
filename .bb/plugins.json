@@ -4,6 +4,8 @@
   "name": "bb-collab-plugins",
   "plugins": [
     { "name": "threads-list", "source": "./plugins/bb-plugin-threads-list" },
-    { "name": "companion-watcher", "source": "./plugins/bb-plugin-companion-watcher" }
+    { "name": "companion-watcher", "source": "./plugins/bb-plugin-companion-watcher" },
+    { "name": "alzheimer", "source": "./plugins/bb-plugin-alzheimer" },
+    { "name": "companion-liveness-checker", "source": "./plugins/bb-plugin-companion-liveness-checker" }
   ]
 }

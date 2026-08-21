@@ -13794,8 +13794,14 @@ var DEFAULT_JITTER_MINUTES = 5;
 var MAX_RECENT_EVENTS = 40;
 var MAX_PAGE = 100;
 var ESCALATION_HOLD_MS = 24 * 60 * 6e4;
+var DECLARATION_LEAD_MS = 6e4;
+var accepted = external_exports.object({ accepted: external_exports.literal(true) }).strict();
 function digest(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+function intervalId(projectId, observedAtMs, cadenceMinutes) {
+  const slot = Math.floor(observedAtMs / (cadenceMinutes * 6e4));
+  return `alzheimer:${projectId}:${slot}`;
 }
 function nextWake(now, cadenceMinutes, jitterMinutes, random = Math.random()) {
   return now + cadenceMinutes * 6e4 + Math.floor(random * (jitterMinutes * 2 + 1) - jitterMinutes) * 6e4;
@@ -13827,7 +13833,8 @@ function alzheimer(bb) {
   bb.storage.migrate(db, [
     "CREATE TABLE IF NOT EXISTS receipts (interval_id TEXT PRIMARY KEY, observed_at_ms INTEGER NOT NULL, thread_id TEXT NOT NULL, coverage TEXT NOT NULL CHECK (coverage IN ('known','partial','blind')), report_digest TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS observations (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, observed_at_ms INTEGER NOT NULL, summary TEXT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS holds (project_id TEXT PRIMARY KEY, finding_digest TEXT NOT NULL, held_at_ms INTEGER NOT NULL)"
+    "CREATE TABLE IF NOT EXISTS holds (project_id TEXT PRIMARY KEY, finding_digest TEXT NOT NULL, held_at_ms INTEGER NOT NULL)",
+    "DROP TABLE IF EXISTS receipts"
   ]);
   let companionThreadId;
   let pendingInterval;
@@ -13870,23 +13877,27 @@ canonical read failed: ${String(error48)}` }] };
     }
   });
   bb.agents.configure(() => ({ tools: ["alzheimer_read_canonical"], skills: [] }));
-  const sendJudgment = async (projectId, intervalId) => {
+  const sendJudgment = async (projectId, intervalId2) => {
     if (!companionThreadId) {
-      const thread = await bb.sdk.threads.spawn({ projectId, environment: { type: "project-default" }, title: "Alzheimer companion", visibility: "hidden", providerId: PROVIDER, model: MODEL, reasoningLevel: REASONING, permissionMode: "auto", executionInputSources: { providerId: "explicit", model: "explicit", reasoningLevel: "explicit", permissionMode: "explicit" }, prompt: `You are the Alzheimer resident companion. This is judgment, not a mechanical detector. Read the current canonical snapshot with alzheimer_read_canonical, compare the orchestrator's stated intentions with what actually happened, and decide whether apparent idleness is illegitimate, including parked-without-cause. Evidence is not a gate on worth. Do not send messages, mutate state, merge, label, or decide worth mechanically. Report a concise judgment and exactly one line COVERAGE: known|partial|blind. If director escalation is warranted, add ESCALATE: yes; otherwise ESCALATE: no. The due interval is ${intervalId}.` });
+      const thread = await bb.sdk.threads.spawn({ projectId, environment: { type: "project-default" }, title: "Alzheimer companion", visibility: "hidden", providerId: PROVIDER, model: MODEL, reasoningLevel: REASONING, permissionMode: "auto", executionInputSources: { providerId: "explicit", model: "explicit", reasoningLevel: "explicit", permissionMode: "explicit" }, prompt: `You are the Alzheimer resident companion. This is judgment, not a mechanical detector. Read the current canonical snapshot with alzheimer_read_canonical, compare the orchestrator's stated intentions with what actually happened, and decide whether apparent idleness is illegitimate, including parked-without-cause. Evidence is not a gate on worth. Do not send messages, mutate state, merge, label, or decide worth mechanically. Report a concise judgment and exactly one line COVERAGE: known|partial|blind. If director escalation is warranted, add ESCALATE: yes; otherwise ESCALATE: no. The due interval is ${intervalId2}.` });
       companionThreadId = thread.id;
     }
-    pendingInterval = intervalId;
-    await bb.sdk.threads.send({ threadId: companionThreadId, mode: "auto", input: [{ type: "text", text: `Judgment interval ${intervalId} is due. Read current state now; this wake is not conditional on any mechanical finding. Return the bounded judgment format.`, mentions: [] }] });
+    pendingInterval = intervalId2;
+    await bb.sdk.threads.send({ threadId: companionThreadId, mode: "auto", input: [{ type: "text", text: `Judgment interval ${intervalId2} is due. Read current state now; this wake is not conditional on any mechanical finding. Return the bounded judgment format.`, mentions: [] }] });
   };
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
     if (!pendingInterval || thread.id !== companionThreadId) return;
     const parsed = parseJudgment(lastAssistantText ?? "");
-    const receipt = { intervalId: pendingInterval, observedAtMs: Date.now(), threadId: thread.id, coverage: parsed.coverage, reportDigest: digest(parsed.report) };
-    db.prepare("INSERT OR REPLACE INTO receipts VALUES (?, ?, ?, ?, ?)").run(receipt.intervalId, receipt.observedAtMs, receipt.threadId, receipt.coverage, receipt.reportDigest);
-    db.prepare("INSERT INTO observations (project_id, observed_at_ms, summary) VALUES (?, ?, ?)").run(thread.projectId, receipt.observedAtMs, parsed.report.slice(-32e3));
+    const receipt = { projectId: thread.projectId, intervalId: pendingInterval, observedAtMs: Date.now(), threadId: thread.id, coverage: parsed.coverage, reportDigest: digest(parsed.report) };
+    const observation = db.prepare("INSERT INTO observations (project_id, observed_at_ms, summary) VALUES (?, ?, ?)").run(thread.projectId, receipt.observedAtMs, parsed.report.slice(-32e3));
+    db.prepare("DELETE FROM observations WHERE project_id=? AND id NOT IN (SELECT id FROM observations WHERE project_id=? ORDER BY id DESC LIMIT 100)").run(thread.projectId, thread.projectId);
+    try {
+      await bb.sdk.plugins.callRpc({ pluginId: "companion-liveness-checker", method: "recordReceipt", input: receipt, outputSchema: accepted });
+    } catch (error48) {
+      bb.log.warn(`alzheimer coverage=blind interval=${receipt.intervalId} reason=receipt-rejected:${String(error48)}`);
+    }
     pendingInterval = void 0;
-    db.prepare("DELETE FROM observations WHERE id NOT IN (SELECT id FROM observations ORDER BY id DESC LIMIT 100)").run();
-    if (db.prepare("SELECT COUNT(*) AS count FROM receipts").get().count % 20 === 0) {
+    if (Number(observation.lastInsertRowid) % 20 === 0) {
       try {
         await bb.sdk.threads.compact({ threadId: thread.id });
       } catch (error48) {
@@ -13925,18 +13936,20 @@ Receipt: ${receipt.reportDigest}`, mentions: [] }] });
     } finally {
       canonical.close();
     }
-    const intervalId = `hour-${Math.floor(now / 6e4)}`;
+    const interval = intervalId(project, now, Number(cadenceMinutes));
     nextDue = nextWake(now, Number(cadenceMinutes), Number(jitterMinutes));
     try {
-      await sendJudgment(project, intervalId);
+      await bb.sdk.plugins.callRpc({ pluginId: "companion-liveness-checker", method: "recordExpected", input: { projectId: project, intervalId: interval, dueAtMs: now + DECLARATION_LEAD_MS }, outputSchema: accepted });
+      await sendJudgment(project, interval);
     } catch (error48) {
-      bb.log.warn(`alzheimer coverage=blind interval=${intervalId} reason=${String(error48)}`);
+      bb.log.warn(`alzheimer coverage=blind interval=${interval} reason=${String(error48)}`);
     }
   });
 }
 export {
   alzheimer as default,
   digest,
+  intervalId,
   nextWake,
   parseJudgment
 };

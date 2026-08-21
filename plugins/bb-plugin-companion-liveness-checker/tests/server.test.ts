@@ -1,10 +1,24 @@
 import { describe, expect, it } from "vitest";
-import { reconcile, type Expected, type Receipt } from "../server.js";
+import { intervalId as agentIntervalId } from "../../bb-plugin-alzheimer/server.js";
+import { intervalId as checkerIntervalId, reconcile, type Expected, type Receipt } from "../server.js";
 
 const expected = (dueAtMs = 100): Expected[] => [{ projectId: "p", intervalId: "i", dueAtMs }];
 const receipt = (overrides: Partial<Receipt> = {}): Receipt => ({ intervalId: "i", observedAtMs: 101, threadId: "t", coverage: "known", reportDigest: "d", ...overrides });
 
 describe("companion liveness reconciliation", () => {
+  it("uses the frozen agent interval identity on both sides", () => {
+    expect(agentIntervalId("p", 3_600_001, 60)).toBe("alzheimer:p:1");
+    expect(checkerIntervalId("p", 3_600_001, 60)).toBe(agentIntervalId("p", 3_600_001, 60));
+  });
+  it("reconciles declared intervals against their canonical receipts", () => {
+    const declared = [
+      { projectId: "p", intervalId: "receipted", dueAtMs: 100 },
+      { projectId: "p", intervalId: "unreceipted", dueAtMs: 100 },
+    ];
+    expect(reconcile(declared, [receipt({ intervalId: "receipted" })], 200)).toEqual([
+      { intervalId: "unreceipted", status: "missing" },
+    ]);
+  });
   it("reports a due interval with no receipt as missing", () => {
     expect(reconcile(expected(), [], 200)).toEqual([{ intervalId: "i", status: "missing" }]);
   });

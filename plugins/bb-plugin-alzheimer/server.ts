@@ -14,11 +14,16 @@ const DEFAULT_JITTER_MINUTES = 5;
 const MAX_RECENT_EVENTS = 40;
 const MAX_PAGE = 100;
 const ESCALATION_HOLD_MS = 24 * 60 * 60_000;
+const DECLARATION_LEAD_MS = 60_000;
 
 type Coverage = "known" | "partial" | "blind";
-type Receipt = { intervalId: string; observedAtMs: number; threadId: string; coverage: Coverage; reportDigest: string };
 
+const accepted = z.object({ accepted: z.literal(true) }).strict();
 export function digest(value: string): string { return createHash("sha256").update(value).digest("hex"); }
+export function intervalId(projectId: string, observedAtMs: number, cadenceMinutes: number): string {
+  const slot = Math.floor(observedAtMs / (cadenceMinutes * 60000));
+  return `alzheimer:${projectId}:${slot}`;
+}
 export function nextWake(now: number, cadenceMinutes: number, jitterMinutes: number, random = Math.random()): number {
   return now + cadenceMinutes * 60_000 + Math.floor(random * (jitterMinutes * 2 + 1) - jitterMinutes) * 60_000;
 }
@@ -50,6 +55,7 @@ export default function alzheimer(bb: BbPluginApi) {
     "CREATE TABLE IF NOT EXISTS receipts (interval_id TEXT PRIMARY KEY, observed_at_ms INTEGER NOT NULL, thread_id TEXT NOT NULL, coverage TEXT NOT NULL CHECK (coverage IN ('known','partial','blind')), report_digest TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS observations (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, observed_at_ms INTEGER NOT NULL, summary TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS holds (project_id TEXT PRIMARY KEY, finding_digest TEXT NOT NULL, held_at_ms INTEGER NOT NULL)",
+    "DROP TABLE IF EXISTS receipts",
   ]);
   let companionThreadId: string | undefined;
   let pendingInterval: string | undefined;
@@ -98,12 +104,16 @@ export default function alzheimer(bb: BbPluginApi) {
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
     if (!pendingInterval || thread.id !== companionThreadId) return;
     const parsed = parseJudgment(lastAssistantText ?? "");
-    const receipt: Receipt = { intervalId: pendingInterval, observedAtMs: Date.now(), threadId: thread.id, coverage: parsed.coverage, reportDigest: digest(parsed.report) };
-    db.prepare("INSERT OR REPLACE INTO receipts VALUES (?, ?, ?, ?, ?)").run(receipt.intervalId, receipt.observedAtMs, receipt.threadId, receipt.coverage, receipt.reportDigest);
-    db.prepare("INSERT INTO observations (project_id, observed_at_ms, summary) VALUES (?, ?, ?)").run(thread.projectId, receipt.observedAtMs, parsed.report.slice(-32_000));
+    const receipt = { projectId: thread.projectId, intervalId: pendingInterval, observedAtMs: Date.now(), threadId: thread.id, coverage: parsed.coverage, reportDigest: digest(parsed.report) };
+    const observation = db.prepare("INSERT INTO observations (project_id, observed_at_ms, summary) VALUES (?, ?, ?)").run(thread.projectId, receipt.observedAtMs, parsed.report.slice(-32_000));
+    db.prepare("DELETE FROM observations WHERE project_id=? AND id NOT IN (SELECT id FROM observations WHERE project_id=? ORDER BY id DESC LIMIT 100)").run(thread.projectId, thread.projectId);
+    try {
+      await bb.sdk.plugins.callRpc({ pluginId: "companion-liveness-checker", method: "recordReceipt", input: receipt, outputSchema: accepted });
+    } catch (error) {
+      bb.log.warn(`alzheimer coverage=blind interval=${receipt.intervalId} reason=receipt-rejected:${String(error)}`);
+    }
     pendingInterval = undefined;
-    db.prepare("DELETE FROM observations WHERE id NOT IN (SELECT id FROM observations ORDER BY id DESC LIMIT 100)").run();
-    if ((db.prepare("SELECT COUNT(*) AS count FROM receipts").get() as { count: number }).count % 20 === 0) {
+    if (Number(observation.lastInsertRowid) % 20 === 0) {
       try { await bb.sdk.threads.compact({ threadId: thread.id }); } catch (error) { bb.log.warn(`alzheimer context-rotation-failed: ${String(error)}`); }
     }
     if (parsed.escalate) {
@@ -131,8 +141,11 @@ export default function alzheimer(bb: BbPluginApi) {
       const active = canonical.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id=? AND origin='work_item' AND state NOT IN ('succeeded','failed','cancelled')").get(project) as { count: number };
       if (Number(active.count) > 0) { nextDue = nextWake(now, Number(cadenceMinutes), Number(jitterMinutes)); return; }
     } finally { canonical.close(); }
-    const intervalId = `hour-${Math.floor(now / 60_000)}`;
+    const interval = intervalId(project, now, Number(cadenceMinutes));
     nextDue = nextWake(now, Number(cadenceMinutes), Number(jitterMinutes));
-    try { await sendJudgment(project, intervalId); } catch (error) { bb.log.warn(`alzheimer coverage=blind interval=${intervalId} reason=${String(error)}`); }
+    try {
+      await bb.sdk.plugins.callRpc({ pluginId: "companion-liveness-checker", method: "recordExpected", input: { projectId: project, intervalId: interval, dueAtMs: now + DECLARATION_LEAD_MS }, outputSchema: accepted });
+      await sendJudgment(project, interval);
+    } catch (error) { bb.log.warn(`alzheimer coverage=blind interval=${interval} reason=${String(error)}`); }
   });
 }
