@@ -50,7 +50,7 @@ When you send another seat a blocking question, set the watch in the same act: r
 
 ## Quiet with startable work is a defect state
 
-Intake is not a thing you do when you think of it. It fires on every wake, and the check is two counts: `startable > 0 AND lanes < cap`. If both hold, the fleet is in a defect state and the wake's first act is a dispatch. Labels are queue truth; an unlabelled issue is not in the queue, so labelling is part of filing.
+Intake is not a thing you do when you think of it. It fires on every wake, and the check is two counts: `startable > 0 AND lanes < cap`. If both hold, the fleet is in a defect state and the wake's first act is a dispatch. Labels are queue truth; an unlabelled issue is not in the queue, so labelling is part of filing. A defect report carries `bug` in the same act, applied by the filer and checked by the orchestrator at intake triage in the same pass that checks the queue label. A defect is shipped code behaving incorrectly; a case the code never covered is a gap. The two overlap — an uncovered case can also behave wrongly — so the tiebreak is stated rather than left to the reader: **when both readings apply, label it `bug`.** That makes the call decidable by two filers independently, and it errs toward counting defect debt rather than hiding it, which is the direction the constraint wants. Assert severity with `p0` or `p1` when you assert it at all. `bug` is the population the defect-escape metric measures, so an unlabelled defect is an unmeasured one, and the throughput constraint that throughput never silently buys defect debt cannot be evaluated without it.
 
 ## Epic decomposition and readiness
 
