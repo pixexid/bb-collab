@@ -12,10 +12,10 @@ import { createStallGuardCycle, type StallGuardArtifact } from "../src/stall-gua
 
 const PROJECT_ID = "project-1";
 
-function holder(generation: number, threadId: string): RoleHolderState {
+function holder(generation: number, threadId: string, projectId = PROJECT_ID, roleId = "project-orchestrator"): RoleHolderState {
   return {
-    project_id: PROJECT_ID,
-    role_id: "project-orchestrator",
+    project_id: projectId,
+    role_id: roleId,
     role_generation: generation,
     execution_attempt_id: `attempt-${generation}`,
     thread_id: threadId,
@@ -152,6 +152,47 @@ describe("stall-guard artifact cycle", () => {
     await createStallGuardCycle(options).cycle(PROJECT_ID);
 
     expect(wakeRole).toHaveBeenCalledTimes(1);
+  });
+
+  it("scopes wrongful-idle suppression to each role recipient", async () => {
+    const store = kvPersistence();
+    let currentArtifact = absentArtifact();
+    const holders = [holder(1, "director", PROJECT_ID, "director"), holder(1, "orchestrator")];
+    const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
+    const cycle = createStallGuardCycle({
+      readRoleHolders: () => holders,
+      readArtifact: async () => currentArtifact,
+      readQueueHead: () => ({ workItemId: "queue-head", resourceRevision: 1 }),
+      wakeRole,
+      persistence: store.persistence,
+    });
+
+    await cycle.cycle();
+    currentArtifact = artifact("changed");
+    await cycle.cycle();
+
+    expect(wakeRole).toHaveBeenCalledTimes(2);
+    expect(wakeRole.mock.calls.map(([role]) => role.roleId)).toEqual(["director", "project-orchestrator"]);
+  });
+
+  it("scopes wrongful-idle suppression to each project", async () => {
+    const store = kvPersistence();
+    let currentArtifact = absentArtifact();
+    const holders = [holder(1, "project-one", PROJECT_ID), holder(1, "project-two", "project-2")];
+    const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
+    const cycle = createStallGuardCycle({
+      readRoleHolders: () => holders,
+      readArtifact: async () => currentArtifact,
+      readQueueHead: () => ({ workItemId: "queue-head", resourceRevision: 1 }),
+      wakeRole,
+      persistence: store.persistence,
+    });
+
+    await cycle.cycle();
+    currentArtifact = artifact("changed");
+    await cycle.cycle();
+
+    expect(wakeRole).toHaveBeenCalledTimes(2);
   });
 
   it("baselines a first artifact snapshot without waking", async () => {

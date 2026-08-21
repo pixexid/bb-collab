@@ -2821,11 +2821,20 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.wait").length).toBeGreaterThan(0);
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual(expect.arrayContaining([[
       expect.objectContaining({
+        threadId: fixture.orchestratorThreadId,
         input: [expect.objectContaining({
           text: `Wrongful idle: queue head ${WORK_ITEM_ID} is startable. Inspect the queue and act or record the blocker.`,
         })],
       }),
     ]]));
+    artifact = "third";
+    await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID]);
+    const sends = fixture.host.harness.inspection.sdk.callsTo("threads.send");
+    expect(sends).toHaveLength(2);
+    expect(sends.map(([input]) => (input as { threadId: string }).threadId)).toEqual(expect.arrayContaining([
+      fixture.orchestratorThreadId,
+      fixture.directorThreadId,
+    ]));
   });
 
   it("does not fire wrongful-idle when canonical WorkItems are only in progress", async () => {

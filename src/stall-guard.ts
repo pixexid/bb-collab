@@ -1,4 +1,4 @@
-import type { RoleHolderState, RoleIdleView, RoleWakeResult } from "./awareness.js";
+import { roleIdleKey, type RoleHolderState, type RoleIdleView, type RoleWakeResult } from "./awareness.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -24,6 +24,7 @@ export interface StallGuardArtifact {
 export interface StallGuardCycleOptions {
   readRoleHolders: () => RoleHolderState[];
   readArtifact: (projectId: string) => Promise<StallGuardArtifact[] | null>;
+  readQueueHead?: (projectId: string) => { workItemId: string; resourceRevision: number } | null;
   wakeRole: (role: RoleIdleView) => Promise<RoleWakeResult>;
   persistence: StallGuardPersistence;
   onAmbiguous?: (message: string) => void;
@@ -61,8 +62,19 @@ function priorArtifacts(value: string): StallGuardArtifact[] | null {
   }
 }
 
+type StallGuardObservation = { artifacts: StallGuardArtifact[]; queueHead: { workItemId: string; resourceRevision: number } | null; woken: boolean };
+
+function observation(value: string): StallGuardObservation | null {
+  try {
+    const parsed = JSON.parse(value) as Partial<StallGuardObservation>;
+    return Array.isArray(parsed.artifacts) ? { artifacts: parsed.artifacts, queueHead: parsed.queueHead ?? null, woken: parsed.woken === true } : null;
+  } catch {
+    return null;
+  }
+}
+
 function hasArtifactDelta(previous: string, current: readonly StallGuardArtifact[]): boolean {
-  const prior = priorArtifacts(previous);
+  const prior = observation(previous)?.artifacts ?? priorArtifacts(previous);
   if (!prior) return true;
   const byId = new Map(prior.map((artifact) => [artifact.id, artifact]));
   if (byId.size !== current.length || current.some((artifact) => !byId.has(artifact.id))) return true;
@@ -110,14 +122,23 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
         }
         const current = await readArtifacts(holder.project_id);
         if (current === null) continue;
-        const next = snapshot(current);
+        const queueHead = options.readQueueHead ? options.readQueueHead(holder.project_id) : undefined;
+        const prior = nextState[key] === undefined ? null : observation(nextState[key]);
+        const queueChanged = queueHead !== undefined && (prior?.queueHead?.workItemId !== queueHead?.workItemId
+          || prior?.queueHead?.resourceRevision !== queueHead?.resourceRevision);
+        const queueSuppressionKey = queueHead === undefined || queueHead === null ? undefined : roleIdleKey(holder, queueHead.workItemId);
+        const queueAlreadyWoken = queueSuppressionKey !== undefined && (() => {
+          const record = observation(nextState[queueSuppressionKey] ?? "");
+          return record?.woken === true && record.queueHead?.resourceRevision === queueHead!.resourceRevision;
+        })();
+        const next = queueHead === undefined ? snapshot(current) : JSON.stringify({ artifacts: current, queueHead, woken: prior?.woken === true && !queueChanged });
         if (nextState[key] === undefined) {
           nextState[key] = next;
           changed += 1;
           continue;
         }
         if (nextState[key] === next) continue;
-        if (!hasArtifactDelta(nextState[key], current)) {
+        if (queueAlreadyWoken || !hasArtifactDelta(nextState[key], current)) {
           nextState[key] = next;
           changed += 1;
           continue;
@@ -147,6 +168,7 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
         attempted += 1;
         if (!result.delivered) continue;
         nextState[key] = next;
+        if (queueSuppressionKey !== undefined) nextState[queueSuppressionKey] = JSON.stringify({ artifacts: current, queueHead, woken: true });
         changed += 1;
         verified += 1;
         steered += 1;
