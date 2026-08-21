@@ -19911,7 +19911,7 @@ function backfillWorkItemGithubIssues(db, projectId, reader, epochCreatedAtMs = 
           github: mapping.github,
           mapping: mapping.mapping,
           issueNumber,
-          idempotencyKey: `github-issue-backfill:${projectId}:${row.work_item_id}`,
+          idempotencyKey: `github-issue-backfill:${JSON.stringify([projectId, row.work_item_id])}`,
           requestDigest: sha256(canonicalJson({ projectId, workItemId: row.work_item_id, epochCreatedAtMs: result2.epochCreatedAtMs, configRevision: result2.configRevision })),
           observed: snapshot2
         });
@@ -22112,7 +22112,7 @@ var sidebarThreadStateKey = (threadId) => `sidebar.thread-state:${threadId}`;
 var sidebarReasoningLevelSchema = external_exports.enum(["none", "low", "medium", "high", "xhigh", "ultracode", "max", "ultra"]);
 var sidebarThreadExecutionSchema = external_exports.object({ model: external_exports.string(), reasoning: sidebarReasoningLevelSchema }).strict();
 var sidebarCollapseKindSchema = external_exports.enum(["project", "thread"]);
-var sidebarCollapseKey = (kind, id2) => `sidebar.collapse:${kind}:${id2}`;
+var sidebarCollapseKey = (kind, id2) => `sidebar.collapse:${JSON.stringify([kind, id2])}`;
 var roleBriefRoleSchema = external_exports.enum(["director", "orchestrator", "worker"]);
 var roleBriefBundleSchema = external_exports.object({
   ponytail: external_exports.string().min(1),

@@ -6742,7 +6742,7 @@ export function backfillWorkItemGithubIssues(
           github: mapping.github,
           mapping: mapping.mapping,
           issueNumber,
-          idempotencyKey: `github-issue-backfill:${projectId}:${row.work_item_id}`,
+          idempotencyKey: `github-issue-backfill:${JSON.stringify([projectId, row.work_item_id])}`,
           requestDigest: sha256(canonicalJson({ projectId, workItemId: row.work_item_id, epochCreatedAtMs: result.epochCreatedAtMs, configRevision: result.configRevision })),
           observed: snapshot!,
         });

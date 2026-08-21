@@ -461,7 +461,7 @@ const sidebarThreadExecutionSchema = z
   .object({ model: z.string(), reasoning: sidebarReasoningLevelSchema })
   .strict();
 const sidebarCollapseKindSchema = z.enum(["project", "thread"]);
-const sidebarCollapseKey = (kind: "project" | "thread", id: string) => `sidebar.collapse:${kind}:${id}`;
+const sidebarCollapseKey = (kind: "project" | "thread", id: string) => `sidebar.collapse:${JSON.stringify([kind, id])}`;
 const roleBriefRoleSchema = z.enum(["director", "orchestrator", "worker"]);
 const roleBriefBundleSchema = z.object({
   ponytail: z.string().min(1),
