@@ -3317,6 +3317,20 @@ function commitMutation(
   return output;
 }
 
+// Multi-project is the product direction, so this path is live rather than dead: it is
+// unexercisable today only because requireActor below rejects a receipt from a foreign
+// project and nothing in the shipped system mints one for a new project. The blocking
+// precondition is upstream get-bb/bb#1541, which exposes a host-issued OPERATOR receipt
+// to plugin invocation contexts. That is not itself the actor_receipts row requireActor
+// consumes: a replacement would still need a production surface here that validates the
+// host receipt and atomically derives the same-project actor row. Note the removed
+// ceremony spine did NOT consume such a receipt: it minted its own with provenance
+// "console" and derived from that, so it is precedent for no host-issued authority and
+// #1541 is what a sanctioned replacement would derive from instead. It IS structural
+// precedent for the derivation plumbing, though -- same-project derivation, mutation-class
+// and caller-plugin validation, receipt validation and reuse prevention were all enforced
+// there, and it remains the only implementation of those safeguards. #1541 is also what
+// every existing actor receipt names as its retirement condition.
 function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
   if (request.expectedConfigRevision !== null) {
     throw refusal("PROJECT_CONFIG_STALE", "bootstrap requires an empty config head");
