@@ -161,8 +161,12 @@ export type CurrentRoleBindingResolution =
   | { standing: "refused"; reason: "multiple-active-bindings" }
   | { standing: "unknown"; reason: CurrentRoleBindingUnknownReason };
 
+function roleIdlePrefix(holder: RoleHolderState): string {
+  return `${JSON.stringify([holder.project_id, holder.role_id, holder.role_generation]).slice(0, -1)},`;
+}
+
 export function roleIdleKey(holder: RoleHolderState, queueHeadId: string): string {
-  return `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${queueHeadId}`;
+  return `${roleIdlePrefix(holder)}${JSON.stringify(queueHeadId)}]`;
 }
 
 export interface RoleQueueScope {
@@ -202,6 +206,8 @@ export interface RoleIdleRecord {
   lastRecoveryWakeAtMs: number | null;
   lastStartableQueueWakeAtMs: number | null;
   lastStaleWaitWakeAtMs: number | null;
+  lastStaleWaitExternalRevision: string | null;
+  lastStaleWaitWaker: string | null;
   lastOwedActWakeAtMs: number | null;
   lastEscalationAtMs: number | null;
 }
@@ -228,18 +234,20 @@ function roleIdleState(input: unknown): Record<string, RoleIdleRecord> {
     const lastRecoveryWakeAtMs = typeof record.lastRecoveryWakeAtMs === "number" && Number.isFinite(record.lastRecoveryWakeAtMs) ? record.lastRecoveryWakeAtMs : null;
     const lastStartableQueueWakeAtMs = typeof record.lastStartableQueueWakeAtMs === "number" && Number.isFinite(record.lastStartableQueueWakeAtMs) ? record.lastStartableQueueWakeAtMs : null;
     const lastStaleWaitWakeAtMs = typeof record.lastStaleWaitWakeAtMs === "number" && Number.isFinite(record.lastStaleWaitWakeAtMs) ? record.lastStaleWaitWakeAtMs : null;
+    const lastStaleWaitExternalRevision = typeof record.lastStaleWaitExternalRevision === "string" ? record.lastStaleWaitExternalRevision : null;
+    const lastStaleWaitWaker = typeof record.lastStaleWaitWaker === "string" ? record.lastStaleWaitWaker : null;
     const lastOwedActWakeAtMs = typeof record.lastOwedActWakeAtMs === "number" && Number.isFinite(record.lastOwedActWakeAtMs) ? record.lastOwedActWakeAtMs : null;
     const lastEscalationAtMs = typeof record.lastEscalationAtMs === "number" && Number.isFinite(record.lastEscalationAtMs) ? record.lastEscalationAtMs : null;
     if (!Number.isInteger(record.steerCount) || (record.steerCount as number) < 0 || (record.steerCount as number) > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || (idleSinceMs !== null && idleSinceMs < 0) || (lastSteerAtMs !== null && lastSteerAtMs < 0) || (lastFleetWakeAtMs !== null && lastFleetWakeAtMs < 0) || (lastRecoveryWakeAtMs !== null && lastRecoveryWakeAtMs < 0) || (lastStartableQueueWakeAtMs !== null && lastStartableQueueWakeAtMs < 0) || (lastStaleWaitWakeAtMs !== null && lastStaleWaitWakeAtMs < 0) || (lastOwedActWakeAtMs !== null && lastOwedActWakeAtMs < 0) || (lastEscalationAtMs !== null && lastEscalationAtMs < 0) || typeof record.escalated !== "boolean") {
       throw new Error("invalid role idle state");
     }
-    state[key] = { steerCount: record.steerCount as number, failedSteers, escalated: record.escalated as boolean, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastFleetWakeAtMs, lastRecoveryWakeAtMs, lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs, lastOwedActWakeAtMs, lastEscalationAtMs };
+    state[key] = { steerCount: record.steerCount as number, failedSteers, escalated: record.escalated as boolean, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastFleetWakeAtMs, lastRecoveryWakeAtMs, lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs, lastStaleWaitExternalRevision, lastStaleWaitWaker, lastOwedActWakeAtMs, lastEscalationAtMs };
   }
   return state;
 }
 
 function emptyRoleIdleRecord(): RoleIdleRecord {
-  return { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
+  return { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastStaleWaitExternalRevision: null, lastStaleWaitWaker: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
 }
 
 export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
@@ -280,7 +288,7 @@ export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
       await load();
       const record = state[key];
       if (!record) return;
-      state[key] = { ...emptyRoleIdleRecord(), lastFleetWakeAtMs: record.lastFleetWakeAtMs, lastRecoveryWakeAtMs: record.lastRecoveryWakeAtMs, lastStartableQueueWakeAtMs: record.lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs: record.lastStaleWaitWakeAtMs, lastOwedActWakeAtMs: record.lastOwedActWakeAtMs, lastEscalationAtMs: record.lastEscalationAtMs };
+      state[key] = { ...emptyRoleIdleRecord(), lastFleetWakeAtMs: record.lastFleetWakeAtMs, lastRecoveryWakeAtMs: record.lastRecoveryWakeAtMs, lastStartableQueueWakeAtMs: record.lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs: record.lastStaleWaitWakeAtMs, lastStaleWaitExternalRevision: record.lastStaleWaitExternalRevision, lastStaleWaitWaker: record.lastStaleWaitWaker, lastOwedActWakeAtMs: record.lastOwedActWakeAtMs, lastEscalationAtMs: record.lastEscalationAtMs };
       await save();
     }),
     preserveAfterSteerWake: (key: string) => enqueue(async () => {
@@ -338,9 +346,9 @@ export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
       await persistence?.write(structuredClone(nextState));
       state = nextState;
     }),
-    recordStaleWaitWake: (key: string, sentAtMs: number) => enqueue(async () => {
+    recordStaleWaitWake: (key: string, sentAtMs: number, externalRevision: string | null = null, waker: string | null = null) => enqueue(async () => {
       await load();
-      const nextState = { ...state, [key]: { ...(state[key] ?? emptyRoleIdleRecord()), lastStaleWaitWakeAtMs: sentAtMs } };
+      const nextState = { ...state, [key]: { ...(state[key] ?? emptyRoleIdleRecord()), lastStaleWaitWakeAtMs: sentAtMs, lastStaleWaitExternalRevision: externalRevision, lastStaleWaitWaker: waker } };
       await persistence?.write(structuredClone(nextState));
       state = nextState;
     }),
@@ -359,7 +367,10 @@ export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
     }),
     clearWakeHistory: (prefix: string) => enqueue(async () => {
       await load();
-      for (const key of Object.keys(state)) if (key.startsWith(prefix)) state[key] = { ...state[key]!, idleSinceMs: null, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
+      const encodedPrefix = prefix.endsWith(":")
+        ? `${JSON.stringify([prefix.slice(0, -1)]).slice(0, -1)},`
+        : prefix;
+      for (const key of Object.keys(state)) if (key.startsWith(prefix) || key.startsWith(encodedPrefix)) state[key] = { ...state[key]!, idleSinceMs: null, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastStaleWaitExternalRevision: null, lastStaleWaitWaker: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
       await save();
     }),
   };
@@ -600,7 +611,7 @@ export function createLaneWatcher(options: {
       if (projectHolders.length !== 1 || !holder.thread_id) continue;
       const targetThreadId = holder.thread_id;
       if (threadId && targetThreadId !== threadId) continue;
-      const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
+      const prefix = roleIdlePrefix(holder);
       const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
       let observation: WorkerObservation;
       try {
@@ -717,8 +728,8 @@ export function createLaneWatcher(options: {
       !Number.isFinite(observation.idleSinceMs)
     ) return { attempted: false, delivered: false, refusal: "policy" };
 
-    const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
-    const key = `${prefix}${scope.queueHeadId}`;
+    const prefix = roleIdlePrefix(holder);
+    const key = roleIdleKey(holder, scope.queueHeadId);
     await roleIdleLedger.clearPrefixExcept(prefix, key);
     const currentNow = now();
     const record = await roleIdleLedger.observeIdle(key, observation.idleSinceMs);
@@ -880,6 +891,7 @@ export interface IdleFleetProbe {
 export interface IdleFleetReady {
   probe: IdleFleetProbe;
   episodeKey: string;
+  legacyEpisodeKey?: string;
   role: RoleIdleView;
   message: string;
 }
@@ -887,7 +899,7 @@ export interface IdleFleetReady {
 export type IdleFleetDecision =
   | { kind: "silent" }
   | { kind: "blind"; message: string }
-  | { kind: "ready"; episodeKey: string; role: RoleIdleView; message: string };
+  | { kind: "ready"; episodeKey: string; legacyEpisodeKey?: string; role: RoleIdleView; message: string };
 
 export interface IdleFleetPersistence {
   read(): Promise<unknown>;
@@ -923,7 +935,7 @@ export function createIdleFleetDetector(options: {
   arm(probe: IdleFleetProbe): void;
   observeCapacity(projectId: string): Promise<void>;
   rearm(): Promise<void>;
-  stop(): void;
+  stop(): Promise<void>;
 } {
   const debounceMs = Number.isInteger(options.debounceMs) && (options.debounceMs ?? 0) >= 0
     ? options.debounceMs as number
@@ -933,7 +945,10 @@ export function createIdleFleetDetector(options: {
   let loaded = false;
   let stopped = false;
   const capacityQueues = new Map<string, Promise<void>>();
-  const probeKey = (probe: IdleFleetProbe) => `${probe.projectId}:${probe.threadId}`;
+  const inFlightCapacityReads = new Set<Promise<void>>();
+  let stopping: Promise<void> | undefined;
+  const probeKey = (probe: IdleFleetProbe) => JSON.stringify([probe.projectId, probe.threadId]);
+  const legacyProbeKey = (probe: IdleFleetProbe) => `${probe.projectId}:${probe.threadId}`;
 
   const load = async () => {
     if (loaded) return;
@@ -941,12 +956,44 @@ export function createIdleFleetDetector(options: {
     loaded = true;
   };
   const save = () => options.persistence?.write(structuredClone(state));
-  const reportBlind = (message: string) => {
+  const blindReportIntervalMs = 1_000;
+  let lastBlindMessage: string | null = null;
+  let blindOccurrences = 0;
+  let lastReportedOccurrences = 0;
+  let lastBlindReportAt = 0;
+  let blindCountCutShort = false;
+  const emitBlind = (message: string, occurrences: number) => {
     try {
-      options.onBlind(message);
+      options.onBlind(`${message} occurrences=${blindCountCutShort ? `>=${occurrences} (counting cut short)` : occurrences}`);
     } catch {
       // Coverage reporting cannot keep the detector from re-arming.
     }
+  };
+  const flushBlind = () => {
+    if (lastBlindMessage !== null && blindOccurrences > lastReportedOccurrences) {
+      emitBlind(lastBlindMessage, blindOccurrences);
+    }
+    lastBlindMessage = null;
+    blindOccurrences = 0;
+    lastReportedOccurrences = 0;
+    lastBlindReportAt = 0;
+    blindCountCutShort = false;
+  };
+  const reportBlind = (message: string, capacityRead = false) => {
+    const marked = capacityRead && blindCountCutShort;
+    const now = Date.now();
+    if (message === lastBlindMessage) {
+      blindOccurrences += 1;
+      if (now - lastBlindReportAt < blindReportIntervalMs) return;
+    } else {
+      flushBlind();
+      lastBlindMessage = message;
+      blindOccurrences = 1;
+      if (marked) blindCountCutShort = true;
+    }
+    lastBlindReportAt = now;
+    lastReportedOccurrences = blindOccurrences;
+    emitBlind(message, blindOccurrences);
   };
 
   const evaluate = async (probe: IdleFleetProbe) => {
@@ -969,7 +1016,22 @@ export function createIdleFleetDetector(options: {
         reportBlind(decision.message);
         return;
       }
+      const legacyKey = legacyProbeKey(probe);
+      if (state[legacyKey] !== undefined) {
+        if (state[key] !== undefined) {
+          reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=ambiguous-migration:${key}`);
+          return;
+        }
+        state[key] = state[legacyKey]!;
+        delete state[legacyKey];
+        await save();
+      }
       if (state[key] === decision.episodeKey) return;
+      if (decision.legacyEpisodeKey !== undefined && state[key] === decision.legacyEpisodeKey) {
+        state[key] = decision.episodeKey;
+        await save();
+        return;
+      }
       if (!await options.wake({ ...decision, probe })) return;
       state[key] = decision.episodeKey;
       await save();
@@ -998,9 +1060,12 @@ export function createIdleFleetDetector(options: {
       return options.capacity!.observe(projectId);
     });
     capacityQueues.set(projectId, next.catch(() => undefined));
-    return next.catch((error) => {
-      reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error)}`);
+    const read = next.catch((error) => {
+      reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error)}`, true);
     });
+    inFlightCapacityReads.add(read);
+    void read.then(() => inFlightCapacityReads.delete(read));
+    return read;
   };
 
   return {
@@ -1019,7 +1084,7 @@ export function createIdleFleetDetector(options: {
       }
     },
     stop() {
-      if (stopped) return;
+      if (stopping) return stopping;
       stopped = true;
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
@@ -1028,6 +1093,25 @@ export function createIdleFleetDetector(options: {
       } catch (error) {
         reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-close-unreadable:${String(error)}`);
       }
+      stopping = (async () => {
+        const reads = [...inFlightCapacityReads];
+        if (reads.length > 0) {
+          let expired = true;
+          await new Promise<void>((resolve) => {
+            const timeout = setTimeout(resolve, 1_000);
+            void Promise.allSettled(reads).then(() => {
+              expired = false;
+              clearTimeout(timeout);
+              resolve();
+            });
+          });
+          flushBlind();
+          if (expired) blindCountCutShort = true;
+        } else {
+          flushBlind();
+        }
+      })();
+      return stopping;
     },
   };
 }

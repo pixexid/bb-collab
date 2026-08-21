@@ -1,6 +1,9 @@
 {
   "$schema": "https://getbb.app/schemas/plugins.schema.json",
   "schemaVersion": 1,
-  "name": "bb-collab plugins",
-  "plugins": [{ "name": "companion-watcher", "source": "./plugins/companion-watcher" }]
+  "name": "bb-collab-plugins",
+  "plugins": [
+    { "name": "threads-list", "source": "./plugins/bb-plugin-threads-list" },
+    { "name": "companion-watcher", "source": "./plugins/bb-plugin-companion-watcher" }
+  ]
 }
