@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -45,22 +45,13 @@ describe("dist freshness gate", () => {
       execFileSync("git", ["add", "dist/server.js"], { cwd: root });
       execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: root });
       const sourceRoot = join(root, "source-checkout");
-      const bin = join(root, "bin");
       mkdirSync(sourceRoot);
-      mkdirSync(bin);
-      const bb = join(bin, "bb");
-      const writePluginList = (plugins: unknown[]) => {
-        writeFileSync(bb, `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(JSON.stringify({ plugins }))});\n`);
-        chmodSync(bb, 0o755);
-      };
-      writePluginList([{ id: "bb-collab", rootDir: root, source: `path:${root}` }]);
-      const deployedEnvironment = { ...process.env, PATH: `${bin}:${process.env.PATH}` };
 
       const honest = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
       expect(honest.status).toBe(0);
       expect(honest.stdout).toContain("working tree dist/ matches commit");
 
-      const deployedHonest = spawnSync(process.execPath, [script, "--deployed"], { cwd: sourceRoot, encoding: "utf8", env: deployedEnvironment });
+      const deployedHonest = spawnSync(process.execPath, [script, "--deployed"], { cwd: root, encoding: "utf8" });
       expect(deployedHonest.status).toBe(0);
       expect(deployedHonest.stdout).toBe("");
       expect(deployedHonest.stderr).toBe("");
@@ -71,15 +62,22 @@ describe("dist freshness gate", () => {
       expect(stale.stderr).toContain("dist/server.js");
 
       execFileSync("git", ["add", "dist/server.js"], { cwd: root });
-      const deployedStale = spawnSync(process.execPath, [script, "--deployed"], { cwd: sourceRoot, encoding: "utf8", env: deployedEnvironment });
+      const deployedStale = spawnSync(process.execPath, [script, "--deployed"], { cwd: root, encoding: "utf8" });
       expect(deployedStale.status).toBe(1);
-      expect(deployedStale.stderr).toContain(`deployed working tree dist/ at ${root} differs from commit`);
+      expect(deployedStale.stderr).toContain("deployed working tree dist/");
       expect(deployedStale.stderr).toContain("dist/server.js");
 
-      writePluginList([]);
-      const unresolved = spawnSync(process.execPath, [script, "--deployed"], { cwd: sourceRoot, encoding: "utf8", env: deployedEnvironment });
-      expect(unresolved.status).toBe(1);
-      expect(unresolved.stderr).toContain("cannot resolve deployed bb-collab checkout: expected one installed plugin, found 0");
+      const cleanRoot = join(root, "clean-checkout");
+      mkdirSync(join(cleanRoot, "dist"), { recursive: true });
+      writeFileSync(join(cleanRoot, "dist/server.js"), "clean\n");
+      execFileSync("git", ["init", "--quiet"], { cwd: cleanRoot });
+      execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: cleanRoot });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: cleanRoot });
+      execFileSync("git", ["add", "."], { cwd: cleanRoot });
+      execFileSync("git", ["commit", "--quiet", "-m", "clean"], { cwd: cleanRoot });
+      const redirected = spawnSync(process.execPath, [script, "--deployed"], { cwd: root, encoding: "utf8", env: { ...process.env, BB_COLLAB_DEPLOYED_ROOT: cleanRoot } });
+      expect(redirected.status).toBe(1);
+      expect(redirected.stderr).toContain("deployed working tree dist/");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

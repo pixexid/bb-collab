@@ -108,6 +108,39 @@ function githubJson(args: string[]): unknown | null {
   }
 }
 
+function githubJsonAsync(args: string[]): Promise<unknown | null> {
+  return new Promise((resolve) => {
+    execFile("gh", args, { encoding: "utf8", timeout: 10_000, killSignal: "SIGKILL" }, (error, stdout) => {
+      if (error) {
+        resolve(null);
+        return;
+      }
+      try { resolve(JSON.parse(stdout)); } catch { resolve(null); }
+    });
+  });
+}
+
+async function startableQueueStateAsync(repositories: string[]): Promise<StartableQueueState | null> {
+  let count = 0;
+  let unlabelledCount = 0;
+  const heads: string[] = [];
+  const isIssue = (issue: unknown): issue is { number: number; labels: Array<{ name: string }> } => Boolean(issue && typeof issue === "object" && !Array.isArray(issue)
+    && typeof (issue as { number?: unknown }).number === "number"
+    && Array.isArray((issue as { labels?: unknown }).labels)
+    && (issue as { labels: unknown[] }).labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof (label as { name?: unknown }).name === "string"));
+  for (const repository of repositories) {
+    const startable = await githubJsonAsync(["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number,labels", "--limit", "1000"]);
+    const pages = await githubJsonAsync(["api", `repos/${repository}/issues`, "--paginate", "--slurp", "--method", "GET", "-f", "state=open", "-f", "per_page=100"]);
+    if (!Array.isArray(startable) || !startable.every(isIssue)
+      || !Array.isArray(pages) || !pages.every((page) => Array.isArray(page) && page.every(isIssue))) return null;
+    count += startable.length;
+    unlabelledCount += pages.flat().filter((issue) => !("pull_request" in issue) && !issue.labels.some((label) => label.name.startsWith("queue:"))).length;
+    const numbers = startable.map((issue) => issue.number);
+    if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
+  }
+  return { count, head: heads.sort()[0] ?? null, unlabelledCount };
+}
+
 function startableQueueState(repositories: string[]): StartableQueueState | null {
   let count = 0;
   let unlabelledCount = 0;
@@ -138,6 +171,45 @@ type LinkedGithubObservation = {
   issueOpen: boolean;
   externalRevision: string;
 };
+
+async function linkedGithubObservationAsync(owner: string, repo: string, issueNumber: number): Promise<LinkedGithubObservation | null> {
+  const issue = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,updatedAt,closedByPullRequestsReferences"]);
+  if (!issue || typeof issue !== "object" || Array.isArray(issue)) return null;
+  const issueState = (issue as { state?: unknown }).state;
+  const externalRevision = (issue as { updatedAt?: unknown }).updatedAt;
+  const closingPullRequests = (issue as { closedByPullRequestsReferences?: unknown }).closedByPullRequestsReferences;
+  if ((issueState !== "OPEN" && issueState !== "CLOSED") || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
+  const closingPullRequest = closingPullRequests[0];
+  if (closingPullRequest !== undefined && (!closingPullRequest || typeof closingPullRequest !== "object" || Array.isArray(closingPullRequest)
+    || typeof (closingPullRequest as { number?: unknown }).number !== "number"
+    || !Number.isSafeInteger((closingPullRequest as { number: number }).number))) return null;
+  const pullRequest = closingPullRequest === undefined
+    ? null
+    : await githubJsonAsync(["pr", "view", String((closingPullRequest as { number: number }).number), "--repo", `${owner}/${repo}`, "--json", "state,mergedAt"]);
+  let pullRequestMerged = false;
+  let pullRequestClosed = false;
+  if (pullRequest && typeof pullRequest === "object" && !Array.isArray(pullRequest)) {
+    const state = (pullRequest as { state?: unknown }).state;
+    const mergedAt = (pullRequest as { mergedAt?: unknown }).mergedAt;
+    pullRequestMerged = (mergedAt !== null && mergedAt !== undefined) || state === "MERGED";
+    pullRequestClosed = state === "CLOSED";
+  }
+  const issueClosed = issueState === "CLOSED";
+  const issueOpen = issueState === "OPEN";
+  const status = pullRequestMerged || pullRequestClosed || issueClosed ? pullRequestMerged ? "merged" : "closed" : issueOpen ? "open" : null;
+  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, externalRevision };
+}
+
+async function readGithubIssueForBackfillAsync(owner: string, repo: string, issueNumber: number): Promise<GitHubIssueSnapshot> {
+  const value = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,labels,updatedAt"]);
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
+  const record = value as { number?: unknown; title?: unknown; body?: unknown; state?: unknown; labels?: unknown; updatedAt?: unknown };
+  if (typeof record.number !== "number" || !Number.isSafeInteger(record.number) || typeof record.title !== "string"
+    || (record.body !== null && typeof record.body !== "string") || (record.state !== "OPEN" && record.state !== "CLOSED")
+    || !Array.isArray(record.labels) || !record.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof (label as { name?: unknown }).name === "string")
+    || typeof record.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
+  return { owner, repo, issueNumber: record.number, title: record.title, body: record.body ?? "", state: record.state === "OPEN" ? "open" : "closed", labels: (record.labels as Array<{ name: string }>).map((label) => label.name), externalRevision: record.updatedAt };
+}
 
 function linkedGithubObservation(owner: string, repo: string, issueNumber: number): LinkedGithubObservation | null {
   const issue = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,updatedAt,closedByPullRequestsReferences"]);
@@ -2020,7 +2092,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return { known: false, reason: `native-lanes-unreadable:${String(error)}` };
     }
   };
-  const readIdleFleetStartable = (projectId: string): IdleFleetFact<StartableQueueState> => {
+  const readIdleFleetStartable = async (projectId: string): Promise<IdleFleetFact<StartableQueueState>> => {
     if (!db) return { known: false, reason: "canonical-store-unavailable" };
     try {
       const repositories = (db.prepare(
@@ -2032,7 +2104,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       if (repositories.length === 0 || repositories.some((repository) => repository === null)) {
         return { known: false, reason: "configured-repositories-unreadable" };
       }
-      const queue = startableQueueState(repositories as string[]);
+      const queue = await startableQueueStateAsync(repositories as string[]);
       return queue === null ? { known: false, reason: "startable-queue-unreadable" } : { known: true, value: queue };
     } catch (error) {
       return { known: false, reason: `startable-queue-unreadable:${String(error)}` };
@@ -2306,7 +2378,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   // refreshes every cycle goes stale — meaning launchd itself failed, which
   // is operator territory. A missing marker is never launchd-failure
   // evidence (the agent may not be deployed), so it stays silent.
-  bb.background.schedule("wait-validator-liveness", "*/5 * * * *", async () => {
+  bb.background.schedule("wait-validator-liveness", "1-59/5 * * * *", async () => {
     try {
       const stateDir = waitValidatorStateDir();
       const markerPath = join(stateDir, LIVENESS_MARKER_FILENAME);
@@ -2340,7 +2412,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     }
   });
 
-  bb.background.schedule("stall-guard-liveness", "*/5 * * * *", async () => {
+  bb.background.schedule("stall-guard-liveness", "2-59/5 * * * *", async () => {
     try {
       const stateDir = stallGuardStateDir();
       const markerPath = join(stateDir, STALL_GUARD_LIVENESS_MARKER_FILENAME);
@@ -2374,6 +2446,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   });
 
   const wakeInFlight = new Set<string>();
+  const permanentlyRefusedReopens = new Set<string>();
   // This model-free detector covers threads with obligations in canonical and platform state.
   // Acts named only in prose are outside mechanical coverage because identifying whether they
   // have an executing surface would require interpreting prose.
@@ -2563,6 +2636,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         state: "ready" | "review_pending" | "succeeded",
         idempotencyKey: string,
         extra: Pick<ApplyRequest, "workItemUnblock" | "workItemExternalEvent"> = {},
+        githubSnapshot?: GitHubIssueSnapshot,
       ): FoundationResult => {
         const actor = db.prepare(
           `SELECT receipt_id FROM actor_receipts
@@ -2596,9 +2670,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           workItemId,
           lifecycleState: state,
           ...extra,
-        }, null, null, null, null, readGithubIssueForBackfill);
+        }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
       };
-      const inspectLinkedWorkItems = (projectId: string) => {
+      const inspectLinkedWorkItems = async (projectId: string) => {
         // The handoff gate owns canonical ledger/attempt drift; this existing watchdog owns
         // external terminal drift. The active writer indexes remain the duplicate-claim detector.
         const linkedWorkItems = db.prepare(
@@ -2613,22 +2687,38 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
            ORDER BY work_items.work_item_id`,
         ).all(projectId, ...WORK_ITEM_NON_TERMINAL_STATES, "succeeded") as Array<{ work_item_id: string; lifecycle_state: string; owner: string; repo: string; issue_number: number }>;
         for (const linked of linkedWorkItems) {
-          const observation = linkedGithubObservation(linked.owner, linked.repo, linked.issue_number);
+          const observation = await linkedGithubObservationAsync(linked.owner, linked.repo, linked.issue_number);
           if (observation === null) {
             degrade(`github-work-item-status:${projectId}:${linked.work_item_id}`);
             continue;
           }
           if (linked.lifecycle_state === "succeeded") {
             if (!observation.issueOpen) continue;
+            const reopenKey = `${projectId}:${linked.work_item_id}`;
+            if (permanentlyRefusedReopens.has(reopenKey)) {
+              bb.log.info(`fleet-watchdog skipped permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=succeeded-work-item-has-no-recorded-close-observation`);
+              continue;
+            }
+            let githubSnapshot: GitHubIssueSnapshot;
+            try {
+              githubSnapshot = await readGithubIssueForBackfillAsync(linked.owner, linked.repo, linked.issue_number);
+            } catch {
+              degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
+              continue;
+            }
             const result = transitionWorkItem(
               projectId,
               linked.work_item_id,
               "ready",
               `fleet-watchdog:issue-reopened:${linked.work_item_id}:${observation.externalRevision}`,
               { workItemExternalEvent: { kind: "github_issue_reopened", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } },
+              githubSnapshot,
             );
             if (result.outcome === "OK") {
               bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation.externalRevision}`);
+            } else if (result.outcome === "WORK_ITEM_STATE_INVALID" && (result.message?.includes("succeeded work item has no recorded close observation") || result.message?.includes("succeeded work item can return only after a proven GitHub issue reopening"))) {
+              permanentlyRefusedReopens.add(reopenKey);
+              bb.log.warn(`fleet-watchdog learned permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${result.message}`);
             } else {
               degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
               bb.log.warn(`fleet-watchdog issue-reopen transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result.outcome}`);
@@ -2649,12 +2739,20 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} reason=authority-or-work-item-unavailable`);
             continue;
           }
+          let githubSnapshot: GitHubIssueSnapshot;
+          try {
+            githubSnapshot = await readGithubIssueForBackfillAsync(linked.owner, linked.repo, linked.issue_number);
+          } catch {
+            degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
+            continue;
+          }
           const transition = (state: "review_pending" | "succeeded") => transitionWorkItem(
             projectId,
             linked.work_item_id,
             state,
             `fleet-watchdog:merge-close:${linked.work_item_id}:${state}`,
             state === "succeeded" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
+            githubSnapshot,
           );
           let result: FoundationResult;
           if (workItem.lifecycle_state === "in_progress") {
@@ -2692,7 +2790,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         const holders = holdersByProject.get(projectId) ?? [];
         try {
           if (onlyProjectId !== undefined && projectId !== onlyProjectId) continue;
-          inspectLinkedWorkItems(projectId);
+          await inspectLinkedWorkItems(projectId);
           const directors = holders.filter((holder) => holder.role_id === "director");
           const orchestrators = holders.filter((holder) => holder.role_id === "project-orchestrator");
           if (directors.length !== 1 || orchestrators.length !== 1) {
@@ -2826,7 +2924,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           ).all(projectId) as Array<{ remote_url: string | null }>).map((target) => githubRepository(target.remote_url));
           const queue = repositories.length === 0 || repositories.some((repository) => repository === null)
             ? null
-            : startableQueueState(repositories as string[]);
+            : await startableQueueStateAsync(repositories as string[]);
           if (queue !== null && (queue.count > 0 || queue.unlabelledCount > 0) && writingLaneCeiling !== null && activeLaneCount < writingLaneCeiling) {
             await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${queue.count} issue${queue.count === 1 ? "" : "s"}; ${queue.unlabelledCount} open issue${queue.unlabelledCount === 1 ? " has" : "s have"} no queue label; ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
           }
@@ -2835,6 +2933,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           for (const blocked of workItems.filter((workItem) => workItem.lifecycleState === "blocked")) {
             let condition: ApplyRequest["workItemUnblock"];
             let idempotencyKey: string;
+            let snapshot: GitHubIssueSnapshot | undefined;
             if (blocked.wakerKind === "work_item_succeeded" && blocked.waker !== null) {
               const dependency = db.prepare(
                 "SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?",
@@ -2849,9 +2948,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
                 degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
                 continue;
               }
-              let snapshot: GitHubIssueSnapshot;
               try {
-                snapshot = readGithubIssueForBackfill(match[1], match[2], issueNumber);
+                snapshot = await readGithubIssueForBackfillAsync(match[1], match[2], issueNumber);
               } catch {
                 degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
                 continue;
@@ -2863,7 +2961,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
               continue;
             }
-            const result = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition });
+            const result = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot);
             if (result.outcome === "OK") {
               unblocked.add(blocked.workItemId);
               bb.log.info(`fleet-watchdog returned blocked work item to ready: project=${projectId} workItem=${blocked.workItemId} blocker=${blocked.wakerKind}`);
@@ -2974,12 +3072,12 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     });
   });
   // Report-only: this never rebuilds, writes, or repairs the deployed checkout.
-  bb.background.schedule("fleet-watchdog", "*/5 * * * *", () => {
+  bb.background.schedule("fleet-watchdog", "3-59/5 * * * *", () => {
     checkDeployedDist();
     return fleetWatchdogCycle();
   });
 
-  bb.background.schedule("worktree-cleanup", "0 * * * *", async () => {
+  bb.background.schedule("worktree-cleanup", "4 * * * *", async () => {
     let projects: Awaited<ReturnType<typeof bb.sdk.projects.list>>;
     try {
       projects = await bb.sdk.projects.list({ includePersonal: true });
@@ -3006,7 +3104,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   // This is deliberately a report-only schedule. Archive is available only
   // through the explicit collab archive-sweep --apply command below.
   const archiveSweepRefusalCounter = createArchiveSweepRefusalCounter();
-  bb.background.schedule("thread-archive-sweep", "0 * * * *", async () => {
+  bb.background.schedule("thread-archive-sweep", "5 * * * *", async () => {
     archiveSweepRefusalCounter.beginCycle();
     const refusalsThisCycle = new Map<string, { aggregate: ArchiveSweepRefusalAggregate; firstSighting: boolean }>();
     const refusalMessage = (aggregate: ArchiveSweepRefusalAggregate) => `${ARCHIVE_SWEEP_GUARD} coverage=degraded guard=${aggregate.guard} reason=${aggregate.reason} occurrencesSinceReload=${aggregate.occurrencesSinceReload} cyclesSinceReload=${aggregate.cyclesSinceReload} projectsSinceReload=${aggregate.projectsSinceReload} sinceReloadAt=${new Date(aggregate.sinceReloadAtMs).toISOString()}`;
