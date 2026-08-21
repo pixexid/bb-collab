@@ -5285,13 +5285,13 @@ exit 1
     }
   });
 
-  it("wakes the owing orchestrator for an open linked green PR with no startable work", async () => {
+  it("wakes the owing orchestrator when a linked PR is approved, checks-pass, and mergeable", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-owed-merge-"));
     const gh = join(bin, "gh");
     writeFileSync(gh, `#!/bin/sh
 if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[]'; exit 0; fi
 if [ "$1" = "api" ]; then printf '%s\\n' '[[]]'; exit 0; fi
-if [ "$1" = "pr" ]; then printf '%s\\n' '{"state":"OPEN","mergedAt":null}'; exit 0; fi
+if [ "$1" = "pr" ]; then printf '%s\\n' '{"state":"OPEN","mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","statusCheckRollup":[{"state":"SUCCESS"}]}'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\\n' '{"state":"OPEN","updatedAt":"open-green","closedByPullRequestsReferences":[{"number":501}]}'; exit 0; fi
 printf '%s\\n' '{"number":501,"title":"merge","body":"","state":"OPEN","labels":[],"updatedAt":"open-green"}'
 `);
@@ -5310,7 +5310,7 @@ printf '%s\\n' '{"number":501,"title":"merge","body":"","state":"OPEN","labels":
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { workItemId, idempotencyKey: "owed-merge-ready" })).outcome).toBe("OK");
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, { workItemId, idempotencyKey: "owed-merge-start" })).outcome).toBe("OK");
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { workItemId, idempotencyKey: "owed-merge-review" })).outcome).toBe("OK");
-      expect(fixture.db.prepare("SELECT waker, waker_kind FROM work_item_waits WHERE work_item_id = ?").get(workItemId)).toEqual({ waker: "project-orchestrator", waker_kind: "seat" });
+      expect(fixture.db.prepare("SELECT 1 FROM work_item_waits WHERE work_item_id = ?").get(workItemId)).toBeUndefined();
 
       await fixture.host.harness.runSchedule("fleet-watchdog");
       clock.mockReturnValue(300_000);
@@ -5322,6 +5322,43 @@ printf '%s\\n' '{"number":501,"title":"merge","body":"","state":"OPEN","labels":
           input: [expect.objectContaining({ text: expect.stringContaining("owed act quiet") })],
         }),
       ]);
+    } finally {
+      clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("stays silent for an open linked PR that is not yet owed to merge", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-not-owed-merge-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[]'; exit 0; fi
+if [ "$1" = "api" ]; then printf '%s\\n' '[[]]'; exit 0; fi
+if [ "$1" = "pr" ]; then printf '%s\\n' '{"state":"OPEN","mergedAt":null}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\\n' '{"state":"OPEN","updatedAt":"open-not-owed","closedByPullRequestsReferences":[{"number":501}]}'; exit 0; fi
+printf '%s\\n' '{"number":501,"title":"merge","body":"","state":"OPEN","labels":[],"updatedAt":"open-not-owed"}'
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      const workItemId = "not-owed-merge";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "not-owed-create", workItemId,
+        workItem: { workItemId, title: workItemId, body: workItemId, githubIssue: { issueNumber: 501 } },
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { workItemId, idempotencyKey: "not-owed-ready" })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, { workItemId, idempotencyKey: "not-owed-start" })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { workItemId, idempotencyKey: "not-owed-review" })).outcome).toBe("OK");
+      expect(fixture.db.prepare("SELECT 1 FROM work_item_waits WHERE work_item_id = ?").get(workItemId)).toBeUndefined();
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(300_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([input]) => JSON.stringify(input).includes("owed act"))).toHaveLength(0);
     } finally {
       clock.mockRestore();
       if (originalPath === undefined) delete process.env.PATH;

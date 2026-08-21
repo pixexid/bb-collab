@@ -211,6 +211,19 @@ async function linkedGithubObservationAsync(owner: string, repo: string, issueNu
   return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, externalRevision };
 }
 
+async function readGithubPullRequestMergeReadiness(owner: string, repo: string, prNumber: number): Promise<boolean> {
+  const value = await githubJsonAsync(["pr", "view", String(prNumber), "--repo", `${owner}/${repo}`, "--json", "state,mergeStateStatus,reviewDecision,statusCheckRollup"]);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as { state?: unknown; mergeStateStatus?: unknown; reviewDecision?: unknown; statusCheckRollup?: unknown };
+  const checks = record.statusCheckRollup;
+  return record.state === "OPEN"
+    && record.mergeStateStatus === "CLEAN"
+    && record.reviewDecision === "APPROVED"
+    && Array.isArray(checks)
+    && checks.every((check) => check && typeof check === "object" && !Array.isArray(check)
+      && ((check as { conclusion?: unknown }).conclusion === "SUCCESS" || (check as { state?: unknown }).state === "SUCCESS"));
+}
+
 async function readGithubIssueForBackfillAsync(owner: string, repo: string, issueNumber: number): Promise<GitHubIssueSnapshot> {
   const value = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,labels,updatedAt"]);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
@@ -2602,16 +2615,23 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         visibleLaneCount += lanes.length;
         lanesByProject.set(projectId, lanes);
       }
-      const openWorkItemsByProject = new Map<string, Array<{ workItemId: string; lifecycleState: string; waker: string | null; wakerKind: "schedule" | "seat" | "work_item_succeeded" | "github_issue_closed" | null; declaredAtMs: number | null }>>();
+      const openWorkItemsByProject = new Map<string, Array<{ workItemId: string; lifecycleState: string; waker: string | null; wakerKind: "schedule" | "seat" | "work_item_succeeded" | "github_issue_closed" | null; declaredAtMs: number | null; githubOwner: string | null; githubRepo: string | null; reviewPrNumber: number | null }>>();
       for (const workItem of db.prepare(
-        `SELECT work_items.project_id, work_items.work_item_id, work_items.lifecycle_state, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
+        `SELECT work_items.project_id, work_items.work_item_id, work_items.lifecycle_state, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms,
+                external_work_refs.owner AS github_owner, external_work_refs.repo AS github_repo,
+                (SELECT review_pr_number FROM execution_attempts
+                 WHERE execution_attempts.project_id = work_items.project_id AND execution_attempts.work_item_id = work_items.work_item_id
+                   AND execution_attempts.assignment_kind = 'review'
+                 ORDER BY attempt_ordinal DESC LIMIT 1) AS review_pr_number
          FROM work_items LEFT JOIN work_item_waits
            ON work_item_waits.project_id = work_items.project_id AND work_item_waits.work_item_id = work_items.work_item_id
+         LEFT JOIN external_work_refs
+           ON external_work_refs.project_id = work_items.project_id AND external_work_refs.work_item_id = work_items.work_item_id AND external_work_refs.provider = 'github'
          WHERE work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
          ORDER BY work_items.created_at_ms, work_items.work_item_id`,
-      ).all(...WORK_ITEM_NON_TERMINAL_STATES) as Array<{ project_id: string; work_item_id: string; lifecycle_state: string; waker: string | null; waker_kind: "schedule" | "seat" | "work_item_succeeded" | "github_issue_closed" | null; declared_at_ms: number | null }>) {
+      ).all(...WORK_ITEM_NON_TERMINAL_STATES) as Array<{ project_id: string; work_item_id: string; lifecycle_state: string; waker: string | null; waker_kind: "schedule" | "seat" | "work_item_succeeded" | "github_issue_closed" | null; declared_at_ms: number | null; github_owner: string | null; github_repo: string | null; review_pr_number: number | null }>) {
         const workItems = openWorkItemsByProject.get(workItem.project_id) ?? [];
-        workItems.push({ workItemId: workItem.work_item_id, lifecycleState: workItem.lifecycle_state, waker: workItem.waker, wakerKind: workItem.waker_kind, declaredAtMs: workItem.declared_at_ms });
+        workItems.push({ workItemId: workItem.work_item_id, lifecycleState: workItem.lifecycle_state, waker: workItem.waker, wakerKind: workItem.waker_kind, declaredAtMs: workItem.declared_at_ms, githubOwner: workItem.github_owner, githubRepo: workItem.github_repo, reviewPrNumber: workItem.review_pr_number });
         openWorkItemsByProject.set(workItem.project_id, workItems);
       }
       const isCurrent = (candidate: RoleHolderState, holder: RoleHolderState) => candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id;
@@ -2746,6 +2766,24 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           lifecycleState: state,
           ...extra,
         }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
+      };
+      const declareMergeWait = (projectId: string, workItemId: string, idempotencyKey: string): FoundationResult => {
+        const actor = db.prepare(
+          `SELECT receipt_id FROM actor_receipts
+           WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
+             AND verification_state = 'verified' ORDER BY issued_at_ms DESC LIMIT 1`,
+        ).get(projectId, PLUGIN_ID) as { receipt_id: string } | undefined;
+        const governor = db.prepare("SELECT governance_epoch, fence_token FROM project_governorship_heads WHERE project_id = ?").get(projectId) as { governance_epoch: number; fence_token: string } | undefined;
+        const config = db.prepare("SELECT config_revision FROM project_config_heads WHERE project_id = ?").get(projectId) as { config_revision: number } | undefined;
+        const workItem = db.prepare("SELECT repo_target_id, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, workItemId) as { repo_target_id: string; resource_revision: number } | undefined;
+        if (!actor || !governor || !config || !workItem) return { outcome: "WORK_ITEM_STATE_INVALID", subject: workItemId, expected: 1, attempted: 0, verified: 0, message: "authority or work item unavailable" };
+        return applyAuthorizedMutation(db, {
+          projectId, operationClass: "work_item_transition", idempotencyKey, actorReceiptId: actor.receipt_id,
+          expectedConfigRevision: config.config_revision, expectedGovernanceEpoch: governor.governance_epoch,
+          expectedFenceToken: governor.fence_token, repoTargetId: workItem.repo_target_id,
+          expectedResourceRevision: workItem.resource_revision, workItemId,
+          workItemWait: { kind: "seat", seat: "project-orchestrator", declaredBySeat: "project-orchestrator" },
+        }, null, null, null, null, readGithubIssueForBackfill);
       };
       const inspectLinkedWorkItems = async (projectId: string) => {
         // The handoff gate owns canonical ledger/attempt drift; this existing watchdog owns
@@ -3052,6 +3090,30 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             }
           }
           const remainingWorkItems = workItems.filter((workItem) => !unblocked.has(workItem.workItemId));
+          for (const workItem of remainingWorkItems.filter((candidate) => candidate.lifecycleState === "review_pending")) {
+            if (workItem.waker != null) continue;
+            const review = db.prepare("SELECT review_pr_number FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'review' ORDER BY attempt_ordinal DESC LIMIT 1").get(projectId, workItem.workItemId) as { review_pr_number: number | null } | undefined;
+            if (review?.review_pr_number == null) continue;
+            let mergeOwed = false;
+            try {
+              const github = db.prepare("SELECT owner, repo FROM external_work_refs WHERE project_id = ? AND work_item_id = ? AND provider = 'github' AND issue_number IS NOT NULL").get(projectId, workItem.workItemId) as { owner: string; repo: string } | undefined;
+              if (!github) continue;
+              mergeOwed = await readGithubPullRequestMergeReadiness(github.owner, github.repo, review.review_pr_number);
+            } catch {
+              degrade(`github-pull-request-readiness:${projectId}:${workItem.workItemId}`);
+              continue;
+            }
+            if (!mergeOwed) continue;
+            const result = declareMergeWait(projectId, workItem.workItemId, `fleet-watchdog:merge-owed:${workItem.workItemId}:${review.review_pr_number}`);
+            if (result.outcome === "OK") {
+              workItem.waker = "project-orchestrator";
+              workItem.wakerKind = "seat";
+              workItem.declaredAtMs = now;
+            } else {
+              bb.log.warn(`fleet-watchdog merge wait declaration refused: project=${projectId} workItem=${workItem.workItemId} outcome=${result.outcome}`);
+              degrade(`work-item-merge-wait:${projectId}:${workItem.workItemId}`);
+            }
+          }
           const staleWait = remainingWorkItems.find((workItem) => workItem.declaredAtMs !== null && now - workItem.declaredAtMs >= staleWaitMs);
           if (staleWait) {
             await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait");
@@ -3078,7 +3140,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             }
             continue;
           }
-          const openWorkItem = remainingWorkItems.find((workItem) => workItem.declaredAtMs === null);
+          const openWorkItem = remainingWorkItems.find((workItem) => workItem.declaredAtMs === null && workItem.lifecycleState !== "review_pending");
           if (!openWorkItem) {
             await resetIdle();
             continue;
