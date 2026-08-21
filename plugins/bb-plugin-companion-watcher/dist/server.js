@@ -112,17 +112,19 @@ function firstLine(content) {
   const text = typeof content === "string" ? content : Array.isArray(content) ? content.find((part) => part && typeof part === "object" && typeof part.text === "string")?.text : void 0;
   return typeof text === "string" ? text.split("\n", 1)[0] : "(unreadable)";
 }
-function evaluate(db, projectId, queued, startable, prs) {
+function evaluate(db, projectId, queued, prs) {
   const holder = db.prepare(`SELECT a.thread_id AS thread_id FROM role_generation_heads h JOIN role_generations g ON g.project_id=h.project_id AND g.role_id=h.role_id AND g.generation=h.current_generation JOIN execution_attempts a ON a.project_id=g.project_id AND a.execution_attempt_id=g.holder_execution_attempt_id WHERE h.project_id=? AND h.role_id='project-orchestrator'`).get(projectId);
   if (!holder) return [];
-  const lane = db.prepare(`SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id=? AND origin='assignment' AND state IN (${ACTIVE.map(() => "?").join(",")})`).get(projectId, ...ACTIVE);
+  const lane = db.prepare(`SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id=? AND origin='work_item' AND state IN (${ACTIVE.map(() => "?").join(",")})`).get(projectId, ...ACTIVE);
   if (Number(lane.count) > 0) return [];
   const findings = [];
   if (queued.length) findings.push({ condition: "queue", text: `${queued.length} unconsumed queued message${queued.length === 1 ? "" : "s"}: ${queued.map((m) => `"${firstLine(m.content)}"`).join(", ")}`, key: JSON.stringify(queued.map((m) => [m.id, m.content])) });
-  const ceiling = db.prepare(`SELECT json_extract(c.canonical_config_json, '$.extensions.bbCollab.writingLaneCeiling') AS ceiling FROM project_config_heads h JOIN project_config_revisions c ON c.project_id=h.project_id AND c.config_revision=h.config_revision WHERE h.project_id=?`).get(projectId)?.ceiling ?? 3;
-  if (startable.length && Number(lane.count) < ceiling) findings.push({ condition: "startable", text: `${startable.length} queue:startable issue${startable.length === 1 ? "" : "s"} (${startable.map((issue) => `#${issue.number} ${issue.title} [${issue.labels.join(", ")}]`).join(", ")}); ${lane.count}/${ceiling} writing lanes active`, key: JSON.stringify([startable, lane.count, ceiling]) });
   const green = prs.filter(isMergeReady);
-  if (green.length) findings.push({ condition: "pr", text: green.map((pr) => `PR #${pr.number} merge-ready and unmerged`).join("; "), key: green.map((pr) => pr.number).join(",") });
+  if (green.length) findings.push({
+    condition: "pr",
+    text: green.map((pr) => `PR #${pr.number} merge-ready and unmerged`).join("; "),
+    key: JSON.stringify(green.map((pr) => [pr.number, pr.headCommitOid, pr.approvedCommitOids, pr.checks]))
+  });
   return findings;
 }
 async function json(args) {
@@ -133,32 +135,9 @@ function repoName(remote) {
   const match = remote?.match(/github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?$/u);
   return match?.[1] ?? null;
 }
-function parseStartableIssues(value, onInvalid = () => {
-}) {
-  if (!Array.isArray(value)) throw new Error("github-payload-invalid:startable-not-array");
-  return value.flatMap((item, index) => {
-    try {
-      if (!item || typeof item !== "object") throw new Error(`github-payload-invalid:startable-${index}-not-object`);
-      const issue = item;
-      for (const field of ["number", "title", "labels"]) if (!(field in issue)) throw missing(`startable-${index}-${field}`);
-      if (typeof issue.number !== "number" || typeof issue.title !== "string" || !Array.isArray(issue.labels)) throw new Error(`github-payload-invalid:startable-${index}-field-type`);
-      const labels = issue.labels.map((label, labelIndex) => {
-        if (!label || typeof label !== "object" || typeof label.name !== "string") throw new Error(`github-payload-invalid:startable-${index}-label-${labelIndex}`);
-        return label.name;
-      });
-      return [{ number: issue.number, title: issue.title, labels }];
-    } catch (error) {
-      onInvalid(error);
-      return [];
-    }
-  });
-}
 async function github(repo, onInvalid) {
-  const [issues, prs] = await Promise.all([
-    json(["issue", "list", "--repo", repo, "--label", "queue:startable", "--state", "open", "--json", "number,title,labels", "--limit", "1000"]),
-    json(["pr", "list", "--repo", repo, "--state", "open", "--json", "number,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup", "--limit", "1000"])
-  ]);
-  return { issues: parseStartableIssues(issues, onInvalid), prs: parsePullRequests(prs, onInvalid) };
+  const prs = await json(["pr", "list", "--repo", repo, "--state", "open", "--json", "number,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup", "--limit", "1000"]);
+  return parsePullRequests(prs, onInvalid);
 }
 function companionWatcher(bb) {
   const snapshots = /* @__PURE__ */ new Map();
@@ -200,7 +179,7 @@ function companionWatcher(bb) {
       }
       if (orchestrator !== thread.id) return;
       const target = { project_id: projectId };
-      const unknown = store.prepare(`SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id=? AND origin='assignment' AND state='dispatch_unknown'`).get(projectId);
+      const unknown = store.prepare(`SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id=? AND origin='work_item' AND state='dispatch_unknown'`).get(projectId);
       if (Number(unknown.count) > 0) bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=dispatch_unknown-attempts:${unknown.count}`);
       let queued;
       let remote;
@@ -211,14 +190,14 @@ function companionWatcher(bb) {
         bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("sdk", error)}`);
         return;
       }
-      let issues, prs;
+      let prs;
       try {
-        ({ issues, prs } = await github(repoName(remote) ?? "", (error) => bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("github", error)}`)));
+        prs = await github(repoName(remote) ?? "", (error) => bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("github", error)}`));
       } catch (error) {
         bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("github", error)}`);
         return;
       }
-      const findings = evaluate(store, target.project_id, queued, issues, prs);
+      const findings = evaluate(store, target.project_id, queued, prs);
       const now = Date.now();
       const { send, escalations } = dispatchPlan(findings, snapshots, target.project_id, now, turnStartedAt);
       if (!send.length && !escalations.length) return;
@@ -294,7 +273,6 @@ export {
   isMergeReady,
   openStore,
   parsePullRequests,
-  parseStartableIssues,
   readOrchestrator,
   reserveSnapshot,
   retryStartup,

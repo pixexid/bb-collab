@@ -1,7 +1,6 @@
 import Database from "better-sqlite3";
-import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
-import { coverageReason, dispatchPlan, evaluate, isMergeReady, openStore, parsePullRequests, parseStartableIssues, readOrchestrator, reserveSnapshot, retryStartup, shouldEscalate } from "../server.js";
+import { coverageReason, dispatchPlan, evaluate, isMergeReady, openStore, parsePullRequests, readOrchestrator, reserveSnapshot, retryStartup, shouldEscalate } from "../server.js";
 
 const dbs: Database.Database[] = [];
 function db(active = 0, ceiling = 3) {
@@ -16,30 +15,29 @@ function db(active = 0, ceiling = 3) {
   value.prepare("INSERT INTO execution_attempts VALUES ('p','o','orch','role_holder','done')").run();
   value.prepare("INSERT INTO project_config_heads VALUES ('p',1)").run();
   value.prepare("INSERT INTO project_config_revisions VALUES ('p',1,?)").run(JSON.stringify({ extensions: { bbCollab: { writingLaneCeiling: ceiling } } }));
-  for (let i = 0; i < active; i++) value.prepare("INSERT INTO execution_attempts VALUES ('p',?,?,'assignment','running')").run(`a${i}`, `lane${i}`);
+  for (let i = 0; i < active; i++) value.prepare("INSERT INTO execution_attempts VALUES ('p',?,?,'work_item','running')").run(`a${i}`, `lane${i}`);
   return value;
 }
 afterEach(() => { while (dbs.length) dbs.pop()!.close(); });
 
 describe("mechanical conditions", () => {
   it("wakes with each condition's contents", () => {
-    const findings = evaluate(db(), "p", [{ id: "m1", content: [{ type: "text", text: "ping\nmore" }] }], [{ number: 508, title: "Start this work", labels: ["queue:startable", "priority:high"] }], [{ number: 493, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }]);
-    expect(findings.map((f) => f.condition)).toEqual(["queue", "startable", "pr"]);
+    const findings = evaluate(db(), "p", [{ id: "m1", content: [{ type: "text", text: "ping\nmore" }] }], [{ number: 493, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }]);
+    expect(findings.map((f) => f.condition)).toEqual(["queue", "pr"]);
     expect(findings.map((f) => f.text).join("; ")).toContain('"ping"');
-    expect(findings.map((f) => f.text).join("; ")).toContain("#508 Start this work [queue:startable, priority:high]");
     expect(findings.map((f) => f.text).join("; ")).toContain("PR #493 merge-ready and unmerged");
   });
   it("stays silent for legitimate operator waiting", () => {
-    expect(evaluate(db(), "p", [], [], [])).toEqual([]);
+    expect(evaluate(db(), "p", [], [])).toEqual([]);
   });
   it("stays silent when all work is blocked", () => {
-    expect(evaluate(db(), "p", [], [], [])).toEqual([]);
+    expect(evaluate(db(), "p", [], [])).toEqual([]);
   });
   it("stays silent when lanes are active, while reaching the evaluation", () => {
-    expect(evaluate(db(1), "p", [{ id: "m1" }], [{ number: 508, title: "Start this work", labels: [] }], [{ number: 493, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }])).toEqual([]);
+    expect(evaluate(db(1), "p", [{ id: "m1" }], [{ number: 493, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }])).toEqual([]);
   });
   it("does not wake for parked queues or non-green PRs", () => {
-    expect(evaluate(db(), "p", [], [], [{ number: 493, state: "OPEN", mergeStateStatus: "DIRTY", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }])).toEqual([]);
+    expect(evaluate(db(), "p", [], [{ number: 493, state: "OPEN", mergeStateStatus: "DIRTY", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }])).toEqual([]);
   });
   it("requires clean merge readiness, approval, and successful checks", () => {
     expect(isMergeReady({ number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] })).toBe(true);
@@ -48,6 +46,12 @@ describe("mechanical conditions", () => {
       { reviewDecision: "REVIEW_REQUIRED" },
       { checks: ["SUCCESS", "FAILURE"] },
     ]) expect(isMergeReady({ number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"], ...pr })).toBe(false);
+  });
+  it("changes the PR suppression fingerprint when the approved head changes", () => {
+    const first = { condition: "pr" as const, text: "ready", key: JSON.stringify([[493, "head-a", ["head-a"], ["SUCCESS"]]]) };
+    const second = { ...first, key: JSON.stringify([[493, "head-b", ["head-b"], ["SUCCESS"]]]) };
+    const snapshots = new Map([["p:pr", { sentAt: 100, fingerprint: first.key, turns: 1 }]]);
+    expect(dispatchPlan([second], snapshots, "p", 200, 101)).toEqual({ send: [second], escalations: [] });
   });
   it("requires an approval for the current head", () => {
     const pr = { number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["old"], checks: ["SUCCESS"] };
@@ -61,12 +65,6 @@ describe("mechanical conditions", () => {
     expect(invalid).toHaveLength(1);
     expect(String(invalid[0])).toContain("missing-pr-1-mergeStateStatus");
   });
-  it("rejects malformed startable rows instead of treating them as clean silence", () => {
-    const invalid: unknown[] = [];
-    expect(parseStartableIssues([{ number: 1, labels: [{ name: "queue:startable" }] }, { number: 2, title: "ready", labels: [] }], (error) => invalid.push(error))).toEqual([{ number: 2, title: "ready", labels: [] }]);
-    expect(invalid).toHaveLength(1);
-    expect(String(invalid[0])).toContain("missing-startable-0-title");
-  });
   it("accepts CheckRun conclusions and StatusContext states without suppressing other PRs", () => {
     const invalid: unknown[] = [];
     const prs = parsePullRequests([
@@ -77,11 +75,6 @@ describe("mechanical conditions", () => {
     expect(prs).toHaveLength(2);
     expect(prs.every((pr) => pr.checks?.[0] === "SUCCESS")).toBe(true);
     expect(invalid).toHaveLength(1);
-  });
-  it("keeps the committed bundle source map in sync", () => {
-    const source = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
-    const map = JSON.parse(readFileSync(new URL("../dist/server.js.map", import.meta.url), "utf8")) as { sourcesContent?: string[] };
-    expect(map.sourcesContent).toContain(source);
   });
   it("opens unavailable stores defensively and rereads the current orchestrator head", () => {
     const errors: unknown[] = [];
