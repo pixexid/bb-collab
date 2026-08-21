@@ -3322,9 +3322,12 @@ function commitMutation(
 // project and nothing in the shipped system mints one for a new project. The blocking
 // precondition is upstream get-bb/bb#1541, which exposes a host-issued OPERATOR receipt
 // to plugin invocation contexts. That is not itself the actor_receipts row requireActor
-// consumes -- minting one still needs a production surface here -- but it is the missing
-// authority the removed ceremony spine used to derive an actor receipt from, and it is
-// what all 63 existing receipts name as their retirement condition.
+// consumes: a replacement would still need a production surface here that validates the
+// host receipt and atomically derives the same-project actor row. Note the removed
+// ceremony spine did NOT consume such a receipt -- it minted its own with provenance
+// "console" and derived from that -- so it is precedent for nothing, and #1541 is the
+// authority a sanctioned replacement would derive from instead. It is also what every
+// existing actor receipt names as its retirement condition.
 function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
   if (request.expectedConfigRevision !== null) {
     throw refusal("PROJECT_CONFIG_STALE", "bootstrap requires an empty config head");
