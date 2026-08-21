@@ -876,7 +876,7 @@ async function requireStoppedWorkItemLane(
   db: SqliteDatabase | null,
   request: z.infer<typeof applyRequestSchema>,
 ): Promise<FoundationResult | null> {
-  if (request.operationClass !== "work_item_transition" || request.lifecycleState !== "review_pending" || request.workAttempt !== undefined || !db) return null;
+  if (request.operationClass !== "work_item_transition" || request.lifecycleState !== "review_pending" || !db) return null;
   const attempt = db.prepare(
     `SELECT thread_id FROM execution_attempts
      WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'

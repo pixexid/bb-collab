@@ -3746,6 +3746,19 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     fixture.addNativeLane("thread-work-item-1", "idle");
     expect(await fixture.host.harness.callRpc("apply", request)).toMatchObject({ outcome: "OK" });
     expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "done" });
+
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 4))).toMatchObject({ outcome: "OK" });
+    fixture.addNativeLane("thread-work-item-1", "active");
+    const reviewAttemptRequest = transitionRequest(fixture.fenceToken, "review_pending", 5);
+    expect(await fixture.host.harness.callRpc("apply", reviewAttemptRequest)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 1, verified: 0 });
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item' AND assignment_kind = 'write' ORDER BY attempt_ordinal DESC LIMIT 1").get()).toEqual({ state: "running" });
+    fixture.addNativeLane("thread-work-item-1", "idle");
+    expect(await fixture.host.harness.callRpc("apply", reviewAttemptRequest)).toMatchObject({ outcome: "OK" });
+    expect(fixture.db.prepare("SELECT assignment_kind, state FROM execution_attempts WHERE origin = 'work_item' ORDER BY attempt_ordinal").all()).toEqual([
+      { assignment_kind: "write", state: "done" },
+      { assignment_kind: "write", state: "done" },
+      { assignment_kind: "review", state: "running" },
+    ]);
   });
 
   it("uses in-progress WorkItems for capacity and suppresses repeat intake wakes for one hour", async () => {

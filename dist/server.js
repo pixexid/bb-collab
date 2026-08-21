@@ -22597,7 +22597,7 @@ async function dispatchLane(bb, db, input) {
   });
 }
 async function requireStoppedWorkItemLane(bb, db, request) {
-  if (request.operationClass !== "work_item_transition" || request.lifecycleState !== "review_pending" || request.workAttempt !== void 0 || !db) return null;
+  if (request.operationClass !== "work_item_transition" || request.lifecycleState !== "review_pending" || !db) return null;
   const attempt = db.prepare(
     `SELECT thread_id FROM execution_attempts
      WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
