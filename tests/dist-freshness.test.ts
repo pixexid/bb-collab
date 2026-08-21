@@ -39,10 +39,11 @@ describe("dist freshness gate", () => {
     try {
       mkdirSync(join(root, "dist"));
       writeFileSync(join(root, "dist/server.js"), "honest\n");
+      writeFileSync(join(root, "dist/server.js.map"), "map\n");
       execFileSync("git", ["init", "--quiet"], { cwd: root });
       execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
       execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
-      execFileSync("git", ["add", "dist/server.js"], { cwd: root });
+      execFileSync("git", ["add", "dist/server.js", "dist/server.js.map"], { cwd: root });
       execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: root });
       const sourceRoot = join(root, "source-checkout");
       mkdirSync(sourceRoot);
@@ -61,11 +62,17 @@ describe("dist freshness gate", () => {
       expect(stale.status).toBe(1);
       expect(stale.stderr).toContain("dist/server.js");
 
-      execFileSync("git", ["add", "dist/server.js"], { cwd: root });
+      execFileSync("git", ["add", "dist/server.js", "dist/server.js.map"], { cwd: root });
       const deployedStale = spawnSync(process.execPath, [script, "--deployed"], { cwd: root, encoding: "utf8" });
       expect(deployedStale.status).toBe(1);
       expect(deployedStale.stderr).toContain("deployed working tree dist/");
       expect(deployedStale.stderr).toContain("dist/server.js");
+
+      rmSync(join(root, "dist/server.js.map"));
+      const missingTracked = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
+      expect(missingTracked.status).toBe(1);
+      expect(missingTracked.stderr).toContain("dist/server.js.map");
+      writeFileSync(join(root, "dist/server.js.map"), "map\n");
 
       const cleanRoot = join(root, "clean-checkout");
       mkdirSync(join(cleanRoot, "dist"), { recursive: true });
