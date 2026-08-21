@@ -8,7 +8,7 @@ import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import plugin, { cliSchemaError, deployedDistFailureDetail, IDLE_FLEET_ATTEMPT_STALE_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
+import plugin, { cliSchemaError, deployedDistFailureDetail, fleetWatchdogReopenKey, IDLE_FLEET_ATTEMPT_STALE_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
 import { canonicalWorktreePath } from "../src/worktree-cleanup.js";
 import {
   CACHED_CONSUMERS,
@@ -2054,6 +2054,30 @@ describe("bb-collab plugin boundary", () => {
     expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["send_to_operator"]);
   });
 
+  it("carries structural refusals through the apply RPC output schema", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const github = new DeterministicGitHubIssueAdapter();
+    const githubRead = github.read.bind(github);
+    github.put({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: "Reopenable", body: "", state: "closed", labels: [], externalRevision: "closed-x" });
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      workItem: { workItemId: WORK_ITEM_ID, title: "Reopenable", body: "", githubIssue: { issueNumber: 351 } },
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3)).outcome).toBe("OK");
+    expect(applyFixtureMutation(db, transitionRequest(fenceToken, "succeeded", 4, {
+      workItemExternalEvent: { kind: "github_issue_closed", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
+    }), null, null, null, null, githubRead)).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
+
+    await expect(host.harness.callRpc("apply", transitionRequest(fenceToken, "ready", 5, {
+      idempotencyKey: "rpc-structural-refusal",
+    }))).resolves.toMatchObject({
+      outcome: "WORK_ITEM_STATE_INVALID",
+      structurallyImpossibleAtRevision: true,
+    });
+  });
+
   it("bounds idle-fleet disposal when capacity closure is busy", async () => {
     const host = await loadedHost();
     const db = host.bb.storage.database();
@@ -2616,12 +2640,19 @@ describe("bb-collab plugin boundary", () => {
     expect(script).not.toContain("BB_COLLAB_DEPLOYED_ROOT");
   });
 
+  it("keeps pending reopen subjects distinct through the revision segment", () => {
+    const first = fleetWatchdogReopenKey("proj", "a:2026-01-01T00:00:00Z", "R");
+    const second = fleetWatchdogReopenKey("proj", "a", "2026-01-01T00:00:00Z:R");
+    expect(first).not.toBe(second);
+  });
+
   it("learns permanent reopen refusals instead of retrying them", () => {
     const source = readFileSync(join(PLUGIN_ROOT, "server.ts"), "utf8");
-    expect(source).toContain("permanentlyRefusedReopens.get(reopenKey)");
-    expect(source).toContain("permanentlyRefusedReopens.set(reopenKey, refusalReason)");
-    expect(source).toContain("succeeded work item can return only after a proven GitHub issue reopening");
-    expect(source).toContain("skipped permanently-refused issue-reopen transition");
+    expect(source).toContain("permanentlyRefusedReopens.get(permanentReopenKey)");
+    expect(source).toContain("permanentlyRefusedReopens.set(permanentReopenKey, refusalReason)");
+    expect(source).toContain("pendingRefusedReopens.set(pendingReopenKey, refusalReason)");
+    expect(source).toContain("result.structurallyImpossibleAtRevision === true");
+    expect(source).toContain("skipped ${permanentRefusalReason === undefined ? \"pending\" : \"permanently-refused\"} issue-reopen transition");
   });
 
   it("keeps recurring schedules on distinct cron phases", () => {
@@ -4812,8 +4843,8 @@ exit 1
       await fixture.host.harness.runSchedule("fleet-watchdog");
 
       const refusals = fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("fleet-watchdog issue-reopen transition refused"));
-      const learned = fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("learned permanently-refused issue-reopen transition"));
-      const skips = fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("skipped permanently-refused issue-reopen transition"));
+      const learned = fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("learned pending issue-reopen refusal"));
+      const skips = fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("skipped pending issue-reopen transition"));
       expect(refusals).toHaveLength(0);
       expect(learned).toHaveLength(1);
       const reason = "GitHub reopen does not follow the exact recorded close observation";
@@ -8158,10 +8189,12 @@ exit 1
     const succeededSnapshot = exportFoundation(db, PROJECT_ID);
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 5))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
     github.put({ ...closed, state: "open", externalRevision: "closed-x" });
-    expect(applyFixtureMutation(db, transitionRequest(fenceToken, "ready", 5, {
+    const sameRevisionRefusal = applyFixtureMutation(db, transitionRequest(fenceToken, "ready", 5, {
       idempotencyKey: "same-revision-reopen",
       workItemExternalEvent: { kind: "github_issue_reopened", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
-    }), null, null, null, null, githubRead)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    }), null, null, null, null, githubRead);
+    expect(sameRevisionRefusal).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(sameRevisionRefusal.structurallyImpossibleAtRevision).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(succeededSnapshot);
 
     github.put({ ...closed, state: "open", externalRevision: "open-y" });

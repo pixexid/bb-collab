@@ -84,6 +84,9 @@ type PluginOptions = {
 };
 type WorkItemWait = NonNullable<ApplyRequest["workItemWait"]>;
 
+export const fleetWatchdogReopenKey = (projectId: string, workItemId: string, externalRevision?: string) =>
+  [projectId, workItemId, externalRevision].filter((value): value is string => value !== undefined).join("\u0000");
+
 function githubRepository(remoteUrl: string | null): string | null {
   const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
   return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : null;
@@ -351,6 +354,7 @@ export const foundationResultSchema = z
     expectedGovernanceEpoch: z.number().int().nonnegative().optional(),
     currentResourceRevision: z.number().int().positive().optional(),
     expectedResourceRevision: z.number().int().positive().optional(),
+    structurallyImpossibleAtRevision: z.boolean().optional(),
     mutationReceipt: mutationReceiptSchema.optional(),
     actorReceiptId: z.string().optional(),
     eventSequence: z.number().int().positive().optional(),
@@ -2522,6 +2526,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   const wakeInFlight = new Set<string>();
   const permanentlyRefusedReopens = new Map<string, string>();
+  const pendingRefusedReopens = new Map<string, string>();
   // This model-free detector covers threads with obligations in canonical and platform state.
   // Acts named only in prose are outside mechanical coverage because identifying whether they
   // have an executing surface would require interpreting prose.
@@ -2769,10 +2774,13 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           }
           if (linked.lifecycle_state === "succeeded") {
             if (!observation.issueOpen) continue;
-            const reopenKey = `${projectId}:${linked.work_item_id}:${observation.externalRevision}`;
-            const refusalReason = permanentlyRefusedReopens.get(reopenKey);
+            const permanentReopenKey = fleetWatchdogReopenKey(projectId, linked.work_item_id);
+            const pendingReopenKey = fleetWatchdogReopenKey(projectId, linked.work_item_id, observation.externalRevision);
+            const permanentRefusalReason = permanentlyRefusedReopens.get(permanentReopenKey);
+            const pendingRefusalReason = pendingRefusedReopens.get(pendingReopenKey);
+            const refusalReason = permanentRefusalReason ?? pendingRefusalReason;
             if (refusalReason !== undefined) {
-              bb.log.info(`fleet-watchdog skipped permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${refusalReason}`);
+              bb.log.info(`fleet-watchdog skipped ${permanentRefusalReason === undefined ? "pending" : "permanently-refused"} issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${refusalReason}`);
               continue;
             }
             let githubSnapshot: GitHubIssueSnapshot;
@@ -2792,11 +2800,14 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             );
             if (result.outcome === "OK") {
               bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation.externalRevision}`);
-            } else if (result.outcome === "WORK_ITEM_STATE_INVALID" && (result.message?.includes("succeeded work item has no recorded close observation") || result.message?.includes("succeeded work item can return only after a proven GitHub issue reopening") || result.message?.includes("GitHub reopen does not follow the exact recorded close observation"))) {
+            } else if (result.outcome === "WORK_ITEM_STATE_INVALID" && (result.structurallyImpossibleAtRevision === true || result.message?.includes("GitHub reopen does not follow the exact recorded close observation"))) {
               const refusalReason = result.message ?? "unknown";
-              if (observation.externalRevision === githubSnapshot.externalRevision) {
-                permanentlyRefusedReopens.set(reopenKey, refusalReason);
+              if (result.structurallyImpossibleAtRevision === true) {
+                permanentlyRefusedReopens.set(permanentReopenKey, refusalReason);
                 bb.log.warn(`fleet-watchdog learned permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${refusalReason}`);
+              } else if (observation.externalRevision === githubSnapshot.externalRevision) {
+                pendingRefusedReopens.set(pendingReopenKey, refusalReason);
+                bb.log.warn(`fleet-watchdog learned pending issue-reopen refusal: project=${projectId} workItem=${linked.work_item_id} reason=${refusalReason}`);
               } else {
                 bb.log.warn(`fleet-watchdog did not learn issue-reopen refusal because GitHub revisions disagreed: project=${projectId} workItem=${linked.work_item_id} observationRevision=${observation.externalRevision} snapshotRevision=${githubSnapshot.externalRevision} reason=${refusalReason}`);
               }
