@@ -190,8 +190,7 @@ function threadSignal(thread) {
 function isError(thread) {
   return thread.indicator === "unread-error";
 }
-var TRAILING_SLOT = "inline-flex size-4 shrink-0 items-center justify-center max-md:pointer-coarse:size-5";
-var LEADING_SLOT = "inline-flex size-3.5 shrink-0 items-center justify-center";
+var LEADING_SLOT = "inline-flex w-4 shrink-0 items-center justify-center";
 var NATIVE_DOT = "size-[5px] rounded-full max-md:pointer-coarse:size-1.5";
 function signalDotClasses(thread, kind) {
   if (kind === "attention" && isError(thread)) return "bg-destructive";
@@ -224,21 +223,15 @@ function RunningSpinner({ label }) {
     }
   );
 }
-function ThreadRunningSpinner({ thread }) {
+function ThreadSignal({ thread }) {
   const signal = threadSignal(thread);
-  if (signal.kind !== "running") return null;
-  return /* @__PURE__ */ jsx("span", { className: LEADING_SLOT, "data-sidebar-thread-signal": "running", children: /* @__PURE__ */ jsx(RunningSpinner, { label: signal.label }) });
-}
-function ThreadStateDot({ thread }) {
-  const signal = threadSignal(thread);
-  if (signal.kind === "idle" || signal.kind === "running") return null;
-  return /* @__PURE__ */ jsx("span", { className: TRAILING_SLOT, "data-sidebar-thread-signal": signal.kind, children: /* @__PURE__ */ jsx(
+  return /* @__PURE__ */ jsx("span", { className: LEADING_SLOT, "data-sidebar-thread-signal": signal.kind, children: signal.kind === "running" ? /* @__PURE__ */ jsx(RunningSpinner, { label: signal.label }) : /* @__PURE__ */ jsx(
     "span",
     {
-      className: `${NATIVE_DOT} ${signalDotClasses(thread, signal.kind)}`,
+      className: `${NATIVE_DOT} ${signal.kind === "idle" && thread.isUnread ? "bg-primary" : signalDotClasses(thread, signal.kind)}`,
       role: "img",
-      "aria-label": signal.label,
-      title: signal.label,
+      "aria-label": signal.kind === "idle" && thread.isUnread ? "Unread" : signal.label,
+      title: signal.kind === "idle" && thread.isUnread ? "Unread" : signal.label,
       "data-sidebar-thread-dot": ""
     }
   ) });
@@ -415,7 +408,7 @@ function ThreadRow({
           if (event.key === "Enter") finishRename();
           if (event.key === "Escape") setRenaming(false);
         } }) : /* @__PURE__ */ jsxs("span", { className: "flex min-w-0 flex-1 items-center gap-1.5", children: [
-          /* @__PURE__ */ jsx(ThreadRunningSpinner, { thread }),
+          /* @__PURE__ */ jsx(ThreadSignal, { thread }),
           /* @__PURE__ */ jsx(
             "a",
             {
@@ -436,7 +429,6 @@ function ThreadRow({
           ),
           hasChildren ? /* @__PURE__ */ jsx("button", { type: "button", className: "inline-flex size-4 shrink-0 items-center justify-center rounded text-xs leading-none text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none", "aria-label": `${collapsed ? "Expand" : "Collapse"} ${title} children`, "aria-expanded": !collapsed, onClick: onToggleChildren, children: collapsed ? "\u203A" : "\u2304" }) : null
         ] }),
-        /* @__PURE__ */ jsx(ThreadStateDot, { thread }),
         /* @__PURE__ */ jsxs("span", { className: "relative flex min-w-5 max-w-[45%] shrink items-center justify-end", children: [
           /* @__PURE__ */ jsxs("span", { className: `flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground transition-opacity duration-150 group-focus-within/row:opacity-0 group-hover/row:opacity-0 motion-reduce:transition-none ${menuOpen ? "opacity-0" : ""}`, children: [
             asText(customState) ? /* @__PURE__ */ jsx("span", { className: "min-w-0 truncate rounded bg-muted px-1 leading-4", "data-custom-thread-state": "", children: asText(customState) }) : null,
@@ -499,6 +491,7 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
   const reportedBreak = useRef(null);
   const dragTargetId = useRef(null);
   const [customStates, setCustomStates] = useState({});
+  const [optimisticPinnedOrders, setOptimisticPinnedOrders] = useState({});
   const [indicatorBroken, setIndicatorBroken] = useState(null);
   const [threadModels, setThreadModels] = useState({});
   const [stateMigrationNotice, setStateMigrationNotice] = useState(migrationNoticeVisible);
@@ -544,7 +537,12 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
       mounted = false;
     };
   }, [projectIdsKey, rpc, threadIdsKey]);
-  const groups = groupThreads(sidebar.projects, sidebar.threads, searchQuery);
+  const displayThreads = [...sidebar.threads].sort((a, b) => {
+    const order = optimisticPinnedOrders[a.projectId];
+    if (!order || a.projectId !== b.projectId || !a.isPinned || !b.isPinned) return 0;
+    return order.indexOf(a.id) - order.indexOf(b.id);
+  });
+  const groups = groupThreads(sidebar.projects, displayThreads, searchQuery);
   if (sidebar.status === "loading") return /* @__PURE__ */ jsx(Fragment2, { children: /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-muted-foreground", children: "Loading threads\u2026" }) });
   if (sidebar.status === "error") return /* @__PURE__ */ jsx(Fragment2, { children: /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-destructive", children: "Unable to load threads." }) });
   if (groups.length === 0) return /* @__PURE__ */ jsx(Fragment2, { children: /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-muted-foreground", children: "No matching threads." }) });
@@ -575,12 +573,15 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
     const target = byId.get(targetId);
     if (!dragged?.isPinned || !target?.isPinned) return;
     if (dragged.projectId !== target.projectId) return;
-    const order = sidebar.threads.filter((thread) => thread.isPinned && thread.projectId === dragged.projectId).map((thread) => thread.id);
+    const order = displayThreads.filter((thread) => thread.isPinned && thread.projectId === dragged.projectId).map((thread) => thread.id);
     const from = order.indexOf(draggedId);
     const to = order.indexOf(targetId);
     if (from < 0 || to < 0) return;
     const remaining = order.filter((id) => id !== draggedId);
     const insertionIndex = remaining.indexOf(targetId) + (from < to ? 1 : 0);
+    const nextOrder = [...remaining];
+    nextOrder.splice(insertionIndex, 0, draggedId);
+    setOptimisticPinnedOrders((current) => ({ ...current, [dragged.projectId]: nextOrder }));
     void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: remaining[insertionIndex - 1] ?? null, nextThreadId: remaining[insertionIndex] ?? null }).catch(() => void 0);
   };
   const startPinnedDrag = (threadId) => {
@@ -597,12 +598,15 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
     window.addEventListener("pointercancel", settle);
   };
   const trackPinnedDrag = (threadId) => {
-    if (draggingThreadId.current) dragTargetId.current = threadId;
+    if (!draggingThreadId.current || threadId === draggingThreadId.current) return;
+    reorderPinned(draggingThreadId.current, threadId);
+    dragTargetId.current = threadId;
   };
   const finishPinnedDrag = (targetId) => {
     const draggedId = draggingThreadId.current ?? "";
+    const target = targetId || dragTargetId.current || "";
     draggingThreadId.current = null;
-    reorderPinned(draggedId, targetId || dragTargetId.current || "");
+    if (target && target !== dragTargetId.current) reorderPinned(draggedId, target);
     dragTargetId.current = null;
   };
   const renderNode = (node, execution, depth) => {

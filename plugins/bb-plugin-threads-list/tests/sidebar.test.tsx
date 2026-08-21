@@ -242,15 +242,15 @@ describe("replacement thread list", () => {
     });
     const slotOf = (kind: string) => rendered.container.querySelector(`[data-sidebar-thread-signal="${kind}"]`)! as HTMLElement;
 
-    // Working rows get the spinner; unread/attention rows get the dot. One slot,
-    // never both glyphs, and an idle read row draws nothing at all.
+    // Working rows get the spinner; every idle row gets one dot in the same slot.
     expect(slotOf("running").querySelector("[data-sidebar-thread-spinner]")).toBeTruthy();
     expect(slotOf("running").querySelector("[data-sidebar-thread-dot]")).toBeNull();
     for (const kind of ["pending", "attention"]) {
       expect(slotOf(kind).querySelector("[data-sidebar-thread-dot]")).toBeTruthy();
       expect(slotOf(kind).querySelector("[data-sidebar-thread-spinner]")).toBeNull();
     }
-    expect(rendered.container.querySelector('[data-sidebar-thread-signal="idle"]')).toBeNull();
+    expect(slotOf("idle").querySelector("[data-sidebar-thread-dot]")).toBeTruthy();
+    expect(slotOf("idle").querySelector("[data-sidebar-thread-dot]")!.className).toContain("bg-muted-foreground/60");
 
     // Dot colour still carries the distinction, at the native 5px geometry.
     expect(slotOf("pending").querySelector("[data-sidebar-thread-dot]")!.className).toContain("bg-primary");
@@ -282,11 +282,10 @@ describe("replacement thread list", () => {
     expect(lead.getAttribute("data-sidebar-thread-signal")).toBe("running");
     expect(lead.querySelector("[data-sidebar-thread-spinner]")).toBeTruthy();
 
-    // Otherwise the title leads: no icon, no dot, no placeholder box holding
-    // the space one used to occupy.
+    // Idle keeps the same leading slot and swaps only the glyph.
     const still = rendered.container.querySelector<HTMLAnchorElement>('[data-sidebar-thread-id="still"]')!;
-    expect(still.previousElementSibling).toBeNull();
-    expect(still.parentElement!.firstElementChild).toBe(still);
+    expect(still.previousElementSibling?.getAttribute("data-sidebar-thread-signal")).toBe("idle");
+    expect(still.previousElementSibling?.querySelector("[data-sidebar-thread-dot]")).toBeTruthy();
   });
 
   it("maps host model and reasoning facts to short badge text with safe fallbacks", async () => {
@@ -452,6 +451,21 @@ describe("replacement thread list", () => {
       method: "reorderPinned",
       input: { threadId: "pinned-1", previousThreadId: "pinned-2", nextThreadId: "pinned-3" },
     }));
+  });
+
+  it("visually reorders pinned rows live while dragging downward", async () => {
+    const list = await registration();
+    const first = { ...thread("pinned-1", "project-a", 3), isPinned: true };
+    const second = { ...thread("pinned-2", "project-a", 2), isPinned: true };
+    const third = { ...thread("pinned-3", "project-a", 1), isPinned: true };
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [first, second, third] },
+      rpc: rpcHandlers(),
+    });
+    const row = (id: string) => rendered.container.querySelector(`[data-sidebar-thread-id="${id}"]`)!.closest("div")!;
+    fireEvent.pointerDown(rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!, { button: 0 });
+    fireEvent.pointerEnter(row("pinned-2"));
+    expect(Array.from(rendered.container.querySelectorAll("[data-sidebar-thread-id]")).map((node) => node.getAttribute("data-sidebar-thread-id"))).toEqual(["pinned-2", "pinned-1", "pinned-3"]);
   });
 
   it("sends typed pinned reorder args for an upward pointer drag", async () => {
