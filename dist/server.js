@@ -13866,8 +13866,11 @@ function createWaitRegistry(persistence) {
     })
   };
 }
+function roleIdlePrefix(holder) {
+  return `${JSON.stringify([holder.project_id, holder.role_id, holder.role_generation]).slice(0, -1)},`;
+}
 function roleIdleKey(holder, queueHeadId) {
-  return `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${queueHeadId}`;
+  return `${roleIdlePrefix(holder)}${JSON.stringify(queueHeadId)}]`;
 }
 function roleIdleState(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) return {};
@@ -14016,7 +14019,8 @@ function createRoleIdleLedger(persistence) {
     }),
     clearWakeHistory: (prefix) => enqueue(async () => {
       await load();
-      for (const key of Object.keys(state)) if (key.startsWith(prefix)) state[key] = { ...state[key], idleSinceMs: null, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
+      const encodedPrefix = prefix.endsWith(":") ? `${JSON.stringify([prefix.slice(0, -1)]).slice(0, -1)},` : prefix;
+      for (const key of Object.keys(state)) if (key.startsWith(prefix) || key.startsWith(encodedPrefix)) state[key] = { ...state[key], idleSinceMs: null, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
       await save();
     })
   };
@@ -14175,7 +14179,7 @@ function createLaneWatcher(options) {
       if (projectHolders.length !== 1 || !holder.thread_id) continue;
       const targetThreadId = holder.thread_id;
       if (threadId && targetThreadId !== threadId) continue;
-      const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
+      const prefix = roleIdlePrefix(holder);
       const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
       let observation;
       try {
@@ -14274,8 +14278,8 @@ function createLaneWatcher(options) {
     }
     const scope = scopes.find((candidate) => candidate.projectId === role.projectId);
     if (!scope?.nextStartable || scope.queueHeadId !== role.queueHeadId || scope.deferredReason || observation.projectId !== role.projectId || observation.status !== "idle" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) return { attempted: false, delivered: false, refusal: "policy" };
-    const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
-    const key = `${prefix}${scope.queueHeadId}`;
+    const prefix = roleIdlePrefix(holder);
+    const key = roleIdleKey(holder, scope.queueHeadId);
     await roleIdleLedger.clearPrefixExcept(prefix, key);
     const currentNow = now2();
     const record2 = await roleIdleLedger.observeIdle(key, observation.idleSinceMs);
@@ -14420,7 +14424,7 @@ function createIdleFleetDetector(options) {
   let loaded = false;
   let stopped = false;
   const capacityQueues = /* @__PURE__ */ new Map();
-  const probeKey = (probe) => `${probe.projectId}:${probe.threadId}`;
+  const probeKey = (probe) => JSON.stringify([probe.projectId, probe.threadId]);
   const load = async () => {
     if (loaded) return;
     state = idleFleetWakeState(options.persistence ? await options.persistence.read() : null);
@@ -20545,7 +20549,7 @@ async function routingDoctorEvidence(sdk, projectId, roleGenerationHeads) {
   const buckets = /* @__PURE__ */ new Map();
   for (const { thread, profile } of workerProfiles) {
     if (!profile) continue;
-    const key = `${profile.providerId}\0${profile.model}\0${profile.reasoningLevel}`;
+    const key = JSON.stringify([profile.providerId, profile.model, profile.reasoningLevel]);
     const bucket = buckets.get(key) ?? { ...profile, count: 0, threadIds: [] };
     bucket.count += 1;
     bucket.threadIds.push(thread.id);
@@ -21032,7 +21036,7 @@ function createStallGuardCycle(options) {
       let verified = 0;
       let steered = 0;
       for (const holder of holders) {
-        const key = `${holder.project_id}:${holder.role_id}`;
+        const key = JSON.stringify([holder.project_id, holder.role_id]);
         const current = await readArtifacts(holder.project_id);
         if (current === null) continue;
         const next = snapshot(current);
@@ -24496,7 +24500,7 @@ ${thread.titleFallback ?? ""}`);
                 continue;
               }
               const event = await lastEvent(lane.id);
-              const strandedKey = `stranded:${projectId}:${lane.id}:${recipient.execution_attempt_id}`;
+              const strandedKey = JSON.stringify(["stranded", projectId, lane.id, recipient.execution_attempt_id]);
               const previous = await fleetWatchdogIdle.get(strandedKey);
               if (previous?.lastRecoveryWakeAtMs !== null && previous?.lastRecoveryWakeAtMs !== void 0 && now2 - previous.lastRecoveryWakeAtMs < FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) continue;
               await bb.sdk.threads.send({
@@ -24587,7 +24591,7 @@ ${thread.titleFallback ?? ""}`);
               degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
               continue;
             }
-            const result2 = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot2, fleetWatchdogLegacyBlockerFiredKey(blocked.workItemId, blocked.waker ?? snapshot2?.externalRevision ?? ""));
+            const result2 = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot2, fleetWatchdogLegacyBlockerFiredKey(blocked.workItemId, snapshot2?.externalRevision ?? blocked.waker ?? ""));
             if (result2.outcome === "OK") {
               unblocked.add(blocked.workItemId);
               bb.log.info(`fleet-watchdog returned blocked work item to ready: project=${projectId} workItem=${blocked.workItemId} blocker=${blocked.wakerKind}`);
