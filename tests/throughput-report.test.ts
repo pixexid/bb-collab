@@ -44,6 +44,20 @@ describe("weekly throughput report", () => {
     expect(renderWeeklyThroughputReport(report)).toBe(JSON.stringify(report));
   });
 
+  it("states metric populations and excludes a merge gap crossing the window boundary", () => {
+    const report = weeklyThroughputReport({
+      ...empty,
+      merges: [
+        { id: "before", mergedAtMs: -3_600_000 },
+        { id: "inside", mergedAtMs: 0 },
+        { id: "inside-2", mergedAtMs: 1_800_000 },
+      ],
+    }, { startAtMs: 0, endAtMs: 3_600_000 });
+    expect(report.measurement.mergeCadence).toContain("both merge timestamps inside");
+    expect(report.mergeCadence.knownMerges).toBe(2);
+    expect(report.mergeCadence.histogram).toEqual({ "<1h": 1, "1-3h": 0, "3-6h": 0, ">=6h": 0 });
+  });
+
   it("reports empty windows as unknown without inventing metrics", () => {
     const report = weeklyThroughputReport(empty, window);
     expect(report.issueOpenToClose.medianHours).toBeNull();
