@@ -26,6 +26,7 @@ const tierA = [
   /^scripts\/pr-lifecycle\.d\.mts$/u,
   /^scripts\/pr-lifecycle\.mjs$/u,
   /^scripts\/check-review-tier\.mjs$/u,
+  /^scripts\/check-composed-pr\.mjs$/u,
   /^scripts\/check-dist\.mjs$/u,
   /^scripts\/check-production-reachability\.mjs$/u,
   /^scripts\/read-executed-profile\.mjs$/u,

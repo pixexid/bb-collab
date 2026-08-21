@@ -54,6 +54,7 @@ describe("pull-request review tier policy", () => {
 
   it("classifies every enforced review input with a fail-closed declaration table", () => {
     for (const file of [
+      "scripts/check-composed-pr.mjs",
       "scripts/check-production-reachability.mjs",
       "scripts/read-executed-profile.mjs",
       "scripts/check-css-bundle.mjs",
