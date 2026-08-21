@@ -880,6 +880,7 @@ export interface IdleFleetProbe {
 export interface IdleFleetReady {
   probe: IdleFleetProbe;
   episodeKey: string;
+  legacyEpisodeKey?: string;
   role: RoleIdleView;
   message: string;
 }
@@ -887,7 +888,7 @@ export interface IdleFleetReady {
 export type IdleFleetDecision =
   | { kind: "silent" }
   | { kind: "blind"; message: string }
-  | { kind: "ready"; episodeKey: string; role: RoleIdleView; message: string };
+  | { kind: "ready"; episodeKey: string; legacyEpisodeKey?: string; role: RoleIdleView; message: string };
 
 export interface IdleFleetPersistence {
   read(): Promise<unknown>;
@@ -970,6 +971,11 @@ export function createIdleFleetDetector(options: {
         return;
       }
       if (state[key] === decision.episodeKey) return;
+      if (decision.legacyEpisodeKey !== undefined && state[key] === decision.legacyEpisodeKey) {
+        state[key] = decision.episodeKey;
+        await save();
+        return;
+      }
       if (!await options.wake({ ...decision, probe })) return;
       state[key] = decision.episodeKey;
       await save();

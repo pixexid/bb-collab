@@ -89,23 +89,32 @@ const ERROR_RECOVERY_IO_TIMEOUT_MS = 10_000;
 
 type LaneRecoveryTarget = { project_id: string; thread_id: string; execution_attempt_id: string };
 
-export const fleetWatchdogCompositeKey = (...parts: string[]) => parts.join("\u0000");
+export const fleetWatchdogCompositeKey = (...parts: string[]) => JSON.stringify(parts);
 export const fleetWatchdogIssueReopenedKey = (workItemId: string, externalRevision: string) =>
   `fleet-watchdog:issue-reopened:${fleetWatchdogCompositeKey(workItemId, externalRevision)}`;
+const fleetWatchdogLegacyIssueReopenedKey = (workItemId: string, externalRevision: string) =>
+  `fleet-watchdog:issue-reopened:${workItemId}:${externalRevision}`;
 export const fleetWatchdogMergeCloseKey = (workItemId: string, state: string, externalRevision: string) =>
   `fleet-watchdog:merge-close:${fleetWatchdogCompositeKey(workItemId, state, externalRevision)}`;
+const fleetWatchdogLegacyMergeCloseKey = (workItemId: string, state: string, externalRevision: string) =>
+  `fleet-watchdog:merge-close:${workItemId}:${state}:${externalRevision}`;
 export const fleetWatchdogBlockerFiredKey = (workItemId: string, subject: string) =>
   `fleet-watchdog:blocker-fired:${fleetWatchdogCompositeKey(workItemId, subject)}`;
+const fleetWatchdogLegacyBlockerFiredKey = (workItemId: string, subject: string) =>
+  `fleet-watchdog:blocker-fired:${workItemId}:${subject}`;
 export const fleetWatchdogRoleLivenessKey = (holder: RoleHolderState) => fleetWatchdogCompositeKey(
   holder.project_id, holder.role_id, String(holder.role_generation), holder.execution_attempt_id, holder.thread_id,
 );
 export const fleetWatchdogEpisodeKey = (holder: RoleHolderState, queueHead: string) => fleetWatchdogCompositeKey(
   holder.project_id, holder.role_id, String(holder.role_generation), holder.execution_attempt_id, holder.thread_id, "activeLanes=0", queueHead,
 );
-export const fleetWatchdogScope = (prefix: string, ...parts: string[]) => `${prefix}:${fleetWatchdogCompositeKey(...parts)}`;
+const fleetWatchdogLegacyEpisodeKey = (holder: RoleHolderState, queueHead: string) => [
+  holder.project_id, holder.role_id, holder.role_generation, holder.execution_attempt_id, holder.thread_id, "activeLanes=0", queueHead,
+].join(":");
+export const fleetWatchdogScope = (prefix: string, ...parts: string[]) => `${prefix}:${parts.join(":")}`;
 
 export const fleetWatchdogReopenKey = (projectId: string, workItemId: string, externalRevision?: string) =>
-  [projectId, workItemId, externalRevision].filter((value): value is string => value !== undefined).join("\u0000");
+  fleetWatchdogCompositeKey(...[projectId, workItemId, externalRevision].filter((value): value is string => value !== undefined));
 
 function githubRepository(remoteUrl: string | null): string | null {
   const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
@@ -2446,6 +2455,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     return {
       kind: "ready",
       episodeKey: fleetWatchdogEpisodeKey(holder, queueHead),
+      legacyEpisodeKey: fleetWatchdogLegacyEpisodeKey(holder, queueHead),
       role,
       message: `Idle fleet: queue head ${queueHead} is startable with zero active writing lanes. Dispatch it or record the blocker.`,
     };
@@ -2867,6 +2877,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         idempotencyKey: string,
         extra: Pick<ApplyRequest, "workItemUnblock" | "workItemExternalEvent"> = {},
         githubSnapshot?: GitHubIssueSnapshot,
+        legacyIdempotencyKey?: string,
       ): FoundationResult => {
         const actor = db.prepare(
           `SELECT receipt_id FROM actor_receipts
@@ -2887,10 +2898,13 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         if (!actor || !governor || !config || !workItem) {
           return { outcome: "WORK_ITEM_STATE_INVALID", subject: workItemId, expected: 1, attempted: 0, verified: 0, message: "authority or work item unavailable" };
         }
+        const compatibleKey = legacyIdempotencyKey !== undefined && db.prepare(
+          "SELECT 1 FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
+        ).get(projectId, legacyIdempotencyKey) !== undefined ? legacyIdempotencyKey : idempotencyKey;
         return applyAuthorizedMutation(db, {
           projectId,
           operationClass: "work_item_transition",
-          idempotencyKey,
+          idempotencyKey: compatibleKey,
           actorReceiptId: actor.receipt_id,
           expectedConfigRevision: config.config_revision,
           expectedGovernanceEpoch: governor.governance_epoch,
@@ -2947,6 +2961,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               fleetWatchdogIssueReopenedKey(linked.work_item_id, observation.externalRevision),
               { workItemExternalEvent: { kind: "github_issue_reopened", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } },
               githubSnapshot,
+              fleetWatchdogLegacyIssueReopenedKey(linked.work_item_id, observation.externalRevision),
             );
             if (result.outcome === "OK") {
               bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation.externalRevision}`);
@@ -2997,6 +3012,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } }
               : {},
             githubSnapshot,
+            fleetWatchdogLegacyMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
           );
           let result: FoundationResult;
           if (workItem.lifecycle_state === "in_progress") {
@@ -3214,7 +3230,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
               continue;
             }
-            const result = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot);
+            const result = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot, fleetWatchdogLegacyBlockerFiredKey(blocked.workItemId, blocked.waker ?? snapshot?.externalRevision ?? ""));
             if (result.outcome === "OK") {
               unblocked.add(blocked.workItemId);
               bb.log.info(`fleet-watchdog returned blocked work item to ready: project=${projectId} workItem=${blocked.workItemId} blocker=${blocked.wakerKind}`);

@@ -1381,7 +1381,7 @@ const reviewScopeSchema = z
   .object({ targets: z.array(reviewTargetSchema).min(1).max(32) })
   .strict()
   .superRefine((scope, ctx) => {
-    const keys = scope.targets.map((target) => `${target.workItemId}\u0000${target.repoTargetId}`);
+    const keys = scope.targets.map((target) => JSON.stringify([target.workItemId, target.repoTargetId]));
     if (new Set(scope.targets.map((target) => target.workItemId)).size !== scope.targets.length) {
       ctx.addIssue({ code: "custom", path: ["targets"], message: "one WorkItem cannot span multiple review targets" });
     }
@@ -1398,7 +1398,7 @@ const reviewConnectorsSchema = z
   .min(1)
   .max(128)
   .superRefine((connectors, ctx) => {
-    const keys = connectors.map((connector) => `${connector.repoTargetId}\u0000${connector.connectorId}`);
+    const keys = connectors.map((connector) => JSON.stringify([connector.repoTargetId, connector.connectorId]));
     if (new Set(keys).size !== keys.length) {
       ctx.addIssue({ code: "custom", message: "review connector mappings must be duplicate-free" });
     }

@@ -14454,6 +14454,11 @@ function createIdleFleetDetector(options) {
         return;
       }
       if (state[key] === decision.episodeKey) return;
+      if (decision.legacyEpisodeKey !== void 0 && state[key] === decision.legacyEpisodeKey) {
+        state[key] = decision.episodeKey;
+        await save();
+        return;
+      }
       if (!await options.wake({ ...decision, probe })) return;
       state[key] = decision.episodeKey;
       await save();
@@ -15799,7 +15804,7 @@ var reviewTargetSchema = external_exports.object({
   tierAEntries: sortedIdSetSchema
 }).strict();
 var reviewScopeSchema = external_exports.object({ targets: external_exports.array(reviewTargetSchema).min(1).max(32) }).strict().superRefine((scope, ctx) => {
-  const keys = scope.targets.map((target) => `${target.workItemId}\0${target.repoTargetId}`);
+  const keys = scope.targets.map((target) => JSON.stringify([target.workItemId, target.repoTargetId]));
   if (new Set(scope.targets.map((target) => target.workItemId)).size !== scope.targets.length) {
     ctx.addIssue({ code: "custom", path: ["targets"], message: "one WorkItem cannot span multiple review targets" });
   }
@@ -15810,7 +15815,7 @@ var reviewScopeSchema = external_exports.object({ targets: external_exports.arra
 var connectorPolicySchema = external_exports.enum(["required", "optional", "prohibited"]);
 var reviewConnectorSchema = external_exports.object({ repoTargetId: id, connectorId: id, policy: connectorPolicySchema }).strict();
 var reviewConnectorsSchema = external_exports.array(reviewConnectorSchema).min(1).max(128).superRefine((connectors, ctx) => {
-  const keys = connectors.map((connector) => `${connector.repoTargetId}\0${connector.connectorId}`);
+  const keys = connectors.map((connector) => JSON.stringify([connector.repoTargetId, connector.connectorId]));
   if (new Set(keys).size !== keys.length) {
     ctx.addIssue({ code: "custom", message: "review connector mappings must be duplicate-free" });
   }
@@ -21842,10 +21847,13 @@ import { execFile, spawnSync as spawnSync2 } from "node:child_process";
 import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute2, join as join5, relative as relative2, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 var ERROR_RECOVERY_IO_TIMEOUT_MS = 1e4;
-var fleetWatchdogCompositeKey = (...parts) => parts.join("\0");
+var fleetWatchdogCompositeKey = (...parts) => JSON.stringify(parts);
 var fleetWatchdogIssueReopenedKey = (workItemId, externalRevision) => `fleet-watchdog:issue-reopened:${fleetWatchdogCompositeKey(workItemId, externalRevision)}`;
+var fleetWatchdogLegacyIssueReopenedKey = (workItemId, externalRevision) => `fleet-watchdog:issue-reopened:${workItemId}:${externalRevision}`;
 var fleetWatchdogMergeCloseKey = (workItemId, state, externalRevision) => `fleet-watchdog:merge-close:${fleetWatchdogCompositeKey(workItemId, state, externalRevision)}`;
+var fleetWatchdogLegacyMergeCloseKey = (workItemId, state, externalRevision) => `fleet-watchdog:merge-close:${workItemId}:${state}:${externalRevision}`;
 var fleetWatchdogBlockerFiredKey = (workItemId, subject) => `fleet-watchdog:blocker-fired:${fleetWatchdogCompositeKey(workItemId, subject)}`;
+var fleetWatchdogLegacyBlockerFiredKey = (workItemId, subject) => `fleet-watchdog:blocker-fired:${workItemId}:${subject}`;
 var fleetWatchdogRoleLivenessKey = (holder) => fleetWatchdogCompositeKey(
   holder.project_id,
   holder.role_id,
@@ -21862,8 +21870,17 @@ var fleetWatchdogEpisodeKey = (holder, queueHead) => fleetWatchdogCompositeKey(
   "activeLanes=0",
   queueHead
 );
-var fleetWatchdogScope = (prefix, ...parts) => `${prefix}:${fleetWatchdogCompositeKey(...parts)}`;
-var fleetWatchdogReopenKey = (projectId, workItemId, externalRevision) => [projectId, workItemId, externalRevision].filter((value) => value !== void 0).join("\0");
+var fleetWatchdogLegacyEpisodeKey = (holder, queueHead) => [
+  holder.project_id,
+  holder.role_id,
+  holder.role_generation,
+  holder.execution_attempt_id,
+  holder.thread_id,
+  "activeLanes=0",
+  queueHead
+].join(":");
+var fleetWatchdogScope = (prefix, ...parts) => `${prefix}:${parts.join(":")}`;
+var fleetWatchdogReopenKey = (projectId, workItemId, externalRevision) => fleetWatchdogCompositeKey(...[projectId, workItemId, externalRevision].filter((value) => value !== void 0));
 function githubRepository(remoteUrl) {
   const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
   return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : null;
@@ -23845,6 +23862,7 @@ ${thread.titleFallback ?? ""}`);
     return {
       kind: "ready",
       episodeKey: fleetWatchdogEpisodeKey(holder, queueHead),
+      legacyEpisodeKey: fleetWatchdogLegacyEpisodeKey(holder, queueHead),
       role,
       message: `Idle fleet: queue head ${queueHead} is startable with zero active writing lanes. Dispatch it or record the blocker.`
     };
@@ -24218,7 +24236,7 @@ ${thread.titleFallback ?? ""}`);
           wakeInFlight.delete(key);
         }
       };
-      const transitionWorkItem = (projectId, workItemId, state, idempotencyKey, extra = {}, githubSnapshot) => {
+      const transitionWorkItem = (projectId, workItemId, state, idempotencyKey, extra = {}, githubSnapshot, legacyIdempotencyKey) => {
         const actor = db.prepare(
           `SELECT receipt_id FROM actor_receipts
            WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
@@ -24238,10 +24256,13 @@ ${thread.titleFallback ?? ""}`);
         if (!actor || !governor || !config2 || !workItem) {
           return { outcome: "WORK_ITEM_STATE_INVALID", subject: workItemId, expected: 1, attempted: 0, verified: 0, message: "authority or work item unavailable" };
         }
+        const compatibleKey = legacyIdempotencyKey !== void 0 && db.prepare(
+          "SELECT 1 FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?"
+        ).get(projectId, legacyIdempotencyKey) !== void 0 ? legacyIdempotencyKey : idempotencyKey;
         return applyAuthorizedMutation(db, {
           projectId,
           operationClass: "work_item_transition",
-          idempotencyKey,
+          idempotencyKey: compatibleKey,
           actorReceiptId: actor.receipt_id,
           expectedConfigRevision: config2.config_revision,
           expectedGovernanceEpoch: governor.governance_epoch,
@@ -24295,7 +24316,8 @@ ${thread.titleFallback ?? ""}`);
               "ready",
               fleetWatchdogIssueReopenedKey(linked.work_item_id, observation.externalRevision),
               { workItemExternalEvent: { kind: "github_issue_reopened", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } },
-              githubSnapshot2
+              githubSnapshot2,
+              fleetWatchdogLegacyIssueReopenedKey(linked.work_item_id, observation.externalRevision)
             );
             if (result3.outcome === "OK") {
               bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation.externalRevision}`);
@@ -24343,7 +24365,8 @@ ${thread.titleFallback ?? ""}`);
             state,
             fleetWatchdogMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
             state === "succeeded" || state === "cancelled" && workItem.lifecycle_state === "proposed" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
-            githubSnapshot
+            githubSnapshot,
+            fleetWatchdogLegacyMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision)
           );
           let result2;
           if (workItem.lifecycle_state === "in_progress") {
@@ -24553,7 +24576,7 @@ ${thread.titleFallback ?? ""}`);
               degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
               continue;
             }
-            const result2 = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot2);
+            const result2 = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot2, fleetWatchdogLegacyBlockerFiredKey(blocked.workItemId, blocked.waker ?? snapshot2?.externalRevision ?? ""));
             if (result2.outcome === "OK") {
               unblocked.add(blocked.workItemId);
               bb.log.info(`fleet-watchdog returned blocked work item to ready: project=${projectId} workItem=${blocked.workItemId} blocker=${blocked.wakerKind}`);

@@ -624,6 +624,29 @@ describe("lane awareness", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
+  it("migrates a legacy idle-fleet episode without waking", async () => {
+    vi.useFakeTimers();
+    try {
+      const wake = vi.fn(async () => true);
+      let persisted: unknown = { "project-1:orchestrator-1": "legacy-episode" };
+      const detector = createIdleFleetDetector({
+        read: async (): Promise<IdleFleetDecision> => ({ kind: "ready", episodeKey: "new-episode", legacyEpisodeKey: "legacy-episode", role: {} as never, message: "wake" }),
+        readRearmProbes: async () => [],
+        wake,
+        onBlind: vi.fn(),
+        persistence: { read: async () => persisted, write: async (state) => { persisted = state; } },
+        debounceMs: IDLE_FLEET_DEBOUNCE_MS,
+      });
+      detector.arm({ projectId: "project-1", threadId: "orchestrator-1", idleEpisode: "episode-1" });
+      await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+      expect(wake).not.toHaveBeenCalled();
+      expect(persisted).toEqual({ "project-1:orchestrator-1": "new-episode" });
+      detector.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reports an unreadable conjunct and never treats it as healthy", async () => {
     vi.useFakeTimers();
     try {
