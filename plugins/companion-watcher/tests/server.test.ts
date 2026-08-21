@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { coverageReason, evaluate, isMergeReady, openStore, readOrchestrator, shouldEscalate } from "../server.js";
+import { coverageReason, evaluate, isMergeReady, openStore, parsePullRequests, readOrchestrator, shouldEscalate } from "../server.js";
 
 const dbs: Database.Database[] = [];
 function db(active = 0, ceiling = 3) {
@@ -22,7 +22,7 @@ afterEach(() => { while (dbs.length) dbs.pop()!.close(); });
 
 describe("mechanical conditions", () => {
   it("wakes with each condition's contents", () => {
-    const findings = evaluate(db(), "p", [{ id: "m1", content: [{ type: "text", text: "ping" }] }], [508], [{ number: 493, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", checks: ["SUCCESS"] }]);
+    const findings = evaluate(db(), "p", [{ id: "m1", content: [{ type: "text", text: "ping" }] }], [508], [{ number: 493, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }]);
     expect(findings.map((f) => f.condition)).toEqual(["queue", "startable", "pr"]);
     expect(findings.map((f) => f.text).join("; ")).toContain("#508");
     expect(findings.map((f) => f.text).join("; ")).toContain("PR #493 merge-ready and unmerged");
@@ -34,18 +34,27 @@ describe("mechanical conditions", () => {
     expect(evaluate(db(), "p", [], [], [])).toEqual([]);
   });
   it("stays silent when lanes are active, while reaching the evaluation", () => {
-    expect(evaluate(db(1), "p", [{ id: "m1" }], [508], [{ number: 493, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", checks: ["SUCCESS"] }])).toEqual([]);
+    expect(evaluate(db(1), "p", [{ id: "m1" }], [508], [{ number: 493, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }])).toEqual([]);
   });
   it("does not wake for parked queues or non-green PRs", () => {
-    expect(evaluate(db(), "p", [], [], [{ number: 493, state: "OPEN", mergeStateStatus: "DIRTY", reviewDecision: "APPROVED", checks: ["SUCCESS"] }])).toEqual([]);
+    expect(evaluate(db(), "p", [], [], [{ number: 493, state: "OPEN", mergeStateStatus: "DIRTY", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }])).toEqual([]);
   });
   it("requires clean merge readiness, approval, and successful checks", () => {
-    expect(isMergeReady({ number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", checks: ["SUCCESS"] })).toBe(true);
+    expect(isMergeReady({ number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] })).toBe(true);
     for (const pr of [
       { mergeStateStatus: "DIRTY" },
       { reviewDecision: "REVIEW_REQUIRED" },
       { checks: ["SUCCESS", "FAILURE"] },
-    ]) expect(isMergeReady({ number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", checks: ["SUCCESS"], ...pr })).toBe(false);
+    ]) expect(isMergeReady({ number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"], ...pr })).toBe(false);
+  });
+  it("requires an approval for the current head", () => {
+    const pr = { number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["old"], checks: ["SUCCESS"] };
+    expect(isMergeReady(pr)).toBe(false);
+    expect(isMergeReady({ ...pr, approvedCommitOids: ["head"] })).toBe(true);
+  });
+  it("rejects incomplete GitHub payloads instead of treating them as not owed", () => {
+    expect(() => parsePullRequests([{ number: 1, state: "OPEN" }])).toThrow("missing-pr-0-mergeStateStatus");
+    expect(() => parsePullRequests([{ number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headRefOid: "head", reviews: [], statusCheckRollup: [] }])).not.toThrow();
   });
   it("opens unavailable stores defensively and rereads the current orchestrator head", () => {
     const errors: unknown[] = [];

@@ -8,11 +8,39 @@ const BACKOFF_MS = 10 * 60_000;
 const ACTIVE = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
 type Condition = "queue" | "startable" | "pr";
 type Finding = { condition: Condition; text: string; key: string };
-type PullRequest = { number: number; state?: string; mergeStateStatus?: string; reviewDecision?: string; checks?: readonly string[] };
+type PullRequest = { number: number; state?: string; mergeStateStatus?: string; reviewDecision?: string; headCommitOid?: string; approvedCommitOids?: readonly string[]; checks?: readonly string[] };
 type Snapshot = { sentAt: number; fingerprint: string; turns: number; escalated?: boolean };
 
 export function isMergeReady(pr: PullRequest): boolean {
-  return pr.state === "OPEN" && pr.mergeStateStatus === "CLEAN" && pr.reviewDecision === "APPROVED" && !!pr.checks?.length && pr.checks.every((check) => check === "SUCCESS");
+  return pr.state === "OPEN" && pr.mergeStateStatus === "CLEAN" && pr.reviewDecision === "APPROVED" && !!pr.headCommitOid && pr.approvedCommitOids?.includes(pr.headCommitOid) === true && !!pr.checks?.length && pr.checks.every((check) => check === "SUCCESS");
+}
+
+function missing(path: string): Error {
+  return new Error(`github-payload-invalid:missing-${path}`);
+}
+
+export function parsePullRequests(value: unknown): PullRequest[] {
+  if (!Array.isArray(value)) throw new Error("github-payload-invalid:pull-requests-not-array");
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object") throw new Error(`github-payload-invalid:pr-${index}-not-object`);
+    const pr = item as Record<string, unknown>;
+    for (const field of ["number", "state", "mergeStateStatus", "reviewDecision", "headRefOid", "reviews", "statusCheckRollup"]) {
+      if (!(field in pr)) throw missing(`pr-${index}-${field}`);
+    }
+    if (typeof pr.number !== "number" || typeof pr.state !== "string" || (pr.mergeStateStatus !== null && typeof pr.mergeStateStatus !== "string") || (pr.reviewDecision !== null && typeof pr.reviewDecision !== "string") || typeof pr.headRefOid !== "string" || !Array.isArray(pr.reviews) || !Array.isArray(pr.statusCheckRollup)) throw new Error(`github-payload-invalid:pr-${index}-field-type`);
+    const approvedCommitOids = pr.reviews.map((review, reviewIndex) => {
+      if (!review || typeof review !== "object" || typeof (review as { state?: unknown }).state !== "string") throw new Error(`github-payload-invalid:pr-${index}-review-${reviewIndex}`);
+      if ((review as { state: string }).state !== "APPROVED") return null;
+      const oid = (review as { commit?: { oid?: unknown } }).commit?.oid;
+      if (typeof oid !== "string") throw missing(`pr-${index}-approved-review-${reviewIndex}-commit`);
+      return oid;
+    }).filter((oid): oid is string => oid !== null);
+    const checks = pr.statusCheckRollup.map((check, checkIndex) => {
+      if (!check || typeof check !== "object" || !("conclusion" in check) || ((check as { conclusion?: unknown }).conclusion !== null && typeof (check as { conclusion?: unknown }).conclusion !== "string")) throw new Error(`github-payload-invalid:pr-${index}-check-${checkIndex}`);
+      return (check as { conclusion: string | null }).conclusion ?? "";
+    });
+    return { number: pr.number, state: pr.state, mergeStateStatus: pr.mergeStateStatus ?? undefined, reviewDecision: pr.reviewDecision ?? undefined, headCommitOid: pr.headRefOid, approvedCommitOids, checks };
+  });
 }
 export function shouldEscalate(prior: Snapshot | undefined, turnStartedAt: number | undefined, fingerprint: string): boolean {
   return !!prior && prior.fingerprint === fingerprint && !prior.escalated && turnStartedAt !== undefined && turnStartedAt > prior.sentAt;
@@ -52,15 +80,10 @@ function repoName(remote: string | null): string | null {
 async function github(repo: string): Promise<{ issues: number[]; prs: PullRequest[] }> {
   const [issues, prs] = await Promise.all([
     json(["issue", "list", "--repo", repo, "--label", "queue:startable", "--state", "open", "--json", "number", "--limit", "1000"]),
-    json(["pr", "list", "--repo", repo, "--state", "open", "--json", "number,state,mergeStateStatus,reviewDecision,statusCheckRollup", "--limit", "1000"]),
+    json(["pr", "list", "--repo", repo, "--state", "open", "--json", "number,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup", "--limit", "1000"]),
   ]);
   const issueNumbers = Array.isArray(issues) ? issues.flatMap((x) => typeof x === "object" && x && typeof (x as { number?: unknown }).number === "number" ? [(x as { number: number }).number] : []) : [];
-  const green = Array.isArray(prs) ? prs.flatMap((x) => {
-    if (!x || typeof x !== "object" || typeof (x as { number?: unknown }).number !== "number") return [];
-    const checks = (x as { statusCheckRollup?: unknown }).statusCheckRollup;
-    const pr = x as { number: number; state?: unknown; mergeStateStatus?: unknown; reviewDecision?: unknown };
-    return [{ number: pr.number, state: String(pr.state), mergeStateStatus: String(pr.mergeStateStatus), reviewDecision: String(pr.reviewDecision), checks: Array.isArray(checks) ? checks.flatMap((c) => c && typeof c === "object" ? [String((c as { conclusion?: unknown }).conclusion)] : []) : [] }];
-  }) : [];
+  const green = parsePullRequests(prs);
   return { issues: issueNumbers, prs: green };
 }
 

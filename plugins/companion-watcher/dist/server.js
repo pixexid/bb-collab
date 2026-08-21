@@ -13,7 +13,33 @@ var exec = promisify(execFile);
 var BACKOFF_MS = 10 * 6e4;
 var ACTIVE = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
 function isMergeReady(pr) {
-  return pr.state === "OPEN" && pr.mergeStateStatus === "CLEAN" && pr.reviewDecision === "APPROVED" && !!pr.checks?.length && pr.checks.every((check) => check === "SUCCESS");
+  return pr.state === "OPEN" && pr.mergeStateStatus === "CLEAN" && pr.reviewDecision === "APPROVED" && !!pr.headCommitOid && pr.approvedCommitOids?.includes(pr.headCommitOid) === true && !!pr.checks?.length && pr.checks.every((check) => check === "SUCCESS");
+}
+function missing(path) {
+  return new Error(`github-payload-invalid:missing-${path}`);
+}
+function parsePullRequests(value) {
+  if (!Array.isArray(value)) throw new Error("github-payload-invalid:pull-requests-not-array");
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object") throw new Error(`github-payload-invalid:pr-${index}-not-object`);
+    const pr = item;
+    for (const field of ["number", "state", "mergeStateStatus", "reviewDecision", "headRefOid", "reviews", "statusCheckRollup"]) {
+      if (!(field in pr)) throw missing(`pr-${index}-${field}`);
+    }
+    if (typeof pr.number !== "number" || typeof pr.state !== "string" || pr.mergeStateStatus !== null && typeof pr.mergeStateStatus !== "string" || pr.reviewDecision !== null && typeof pr.reviewDecision !== "string" || typeof pr.headRefOid !== "string" || !Array.isArray(pr.reviews) || !Array.isArray(pr.statusCheckRollup)) throw new Error(`github-payload-invalid:pr-${index}-field-type`);
+    const approvedCommitOids = pr.reviews.map((review, reviewIndex) => {
+      if (!review || typeof review !== "object" || typeof review.state !== "string") throw new Error(`github-payload-invalid:pr-${index}-review-${reviewIndex}`);
+      if (review.state !== "APPROVED") return null;
+      const oid = review.commit?.oid;
+      if (typeof oid !== "string") throw missing(`pr-${index}-approved-review-${reviewIndex}-commit`);
+      return oid;
+    }).filter((oid) => oid !== null);
+    const checks = pr.statusCheckRollup.map((check, checkIndex) => {
+      if (!check || typeof check !== "object" || !("conclusion" in check) || check.conclusion !== null && typeof check.conclusion !== "string") throw new Error(`github-payload-invalid:pr-${index}-check-${checkIndex}`);
+      return check.conclusion ?? "";
+    });
+    return { number: pr.number, state: pr.state, mergeStateStatus: pr.mergeStateStatus ?? void 0, reviewDecision: pr.reviewDecision ?? void 0, headCommitOid: pr.headRefOid, approvedCommitOids, checks };
+  });
 }
 function shouldEscalate(prior, turnStartedAt, fingerprint) {
   return !!prior && prior.fingerprint === fingerprint && !prior.escalated && turnStartedAt !== void 0 && turnStartedAt > prior.sentAt;
@@ -56,15 +82,10 @@ function repoName(remote) {
 async function github(repo) {
   const [issues, prs] = await Promise.all([
     json(["issue", "list", "--repo", repo, "--label", "queue:startable", "--state", "open", "--json", "number", "--limit", "1000"]),
-    json(["pr", "list", "--repo", repo, "--state", "open", "--json", "number,state,mergeStateStatus,reviewDecision,statusCheckRollup", "--limit", "1000"])
+    json(["pr", "list", "--repo", repo, "--state", "open", "--json", "number,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup", "--limit", "1000"])
   ]);
   const issueNumbers = Array.isArray(issues) ? issues.flatMap((x) => typeof x === "object" && x && typeof x.number === "number" ? [x.number] : []) : [];
-  const green = Array.isArray(prs) ? prs.flatMap((x) => {
-    if (!x || typeof x !== "object" || typeof x.number !== "number") return [];
-    const checks = x.statusCheckRollup;
-    const pr = x;
-    return [{ number: pr.number, state: String(pr.state), mergeStateStatus: String(pr.mergeStateStatus), reviewDecision: String(pr.reviewDecision), checks: Array.isArray(checks) ? checks.flatMap((c) => c && typeof c === "object" ? [String(c.conclusion)] : []) : [] }];
-  }) : [];
+  const green = parsePullRequests(prs);
   return { issues: issueNumbers, prs: green };
 }
 function companionWatcher(bb) {
@@ -181,6 +202,7 @@ export {
   evaluate,
   isMergeReady,
   openStore,
+  parsePullRequests,
   readOrchestrator,
   shouldEscalate
 };
