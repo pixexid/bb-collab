@@ -6567,8 +6567,12 @@ interface DesiredProjection {
 
 function desiredProjection(workItem: WorkItemRow, github: GithubIssuesConfig): DesiredProjection {
   const convention = github.issue;
-  const names = new Set(convention?.managedLabels?.names ?? []);
-  const managedLabels = [...new Set(convention?.managedLabels?.byLifecycle?.[workItem.lifecycle_state] ?? [])].sort();
+  // Queue labels are canonical intake state, not prose. Keep them managed here so a
+  // verified lifecycle transition is what moves a parked issue back into intake.
+  const names = new Set([...(convention?.managedLabels?.names ?? []), "queue:startable", "queue:blocked"]);
+  const lifecycleLabels = convention?.managedLabels?.byLifecycle?.[workItem.lifecycle_state] ?? [];
+  const queueLabel = workItem.lifecycle_state === "ready" ? "queue:startable" : workItem.lifecycle_state === "blocked" ? "queue:blocked" : null;
+  const managedLabels = [...new Set([...lifecycleLabels, ...(queueLabel === null ? [] : [queueLabel])])].sort();
   const title = `${convention?.titlePrefix ?? ""}${workItem.title}`;
   const body = `${convention?.bodyPrefix ?? ""}${workItem.body}`;
   const state = (["succeeded", "failed", "cancelled"] as WorkItemState[]).includes(workItem.lifecycle_state) ? "closed" : "open";

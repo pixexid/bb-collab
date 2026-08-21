@@ -5154,6 +5154,9 @@ exit 1
       idempotencyKey: "watchdog-target-blocked",
       workItemWait: { kind: "work_item_succeeded", workItemId: dependencyId, declaredBySeat: "worker-seat" },
     }))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+    // An unresolved authoritative condition is not a wake. The item stays parked.
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+    expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lifecycle_state: "blocked" });
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { idempotencyKey: "watchdog-dependency-ready", workItemId: dependencyId })).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
       idempotencyKey: "watchdog-dependency-start",
@@ -9272,10 +9275,10 @@ fi
     expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2), adapter).outcome).toBe("OK");
     expect(adapter.mutationCalls[1]).toMatchObject({
       kind: "update",
-      addLabels: ["work-ready"],
+      addLabels: ["queue:startable", "work-ready"],
       removeLabels: ["work-proposed"],
     });
-    expect(adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)?.labels).toEqual(["human-triage", "work-ready"]);
+    expect(adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)?.labels).toEqual(["human-triage", "queue:startable", "work-ready"]);
     expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items").get()).toEqual({ lifecycle_state: "ready", resource_revision: 2 });
   });
 

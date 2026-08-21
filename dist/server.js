@@ -19854,8 +19854,10 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
 }
 function desiredProjection(workItem, github) {
   const convention = github.issue;
-  const names = new Set(convention?.managedLabels?.names ?? []);
-  const managedLabels = [...new Set(convention?.managedLabels?.byLifecycle?.[workItem.lifecycle_state] ?? [])].sort();
+  const names = /* @__PURE__ */ new Set([...convention?.managedLabels?.names ?? [], "queue:startable", "queue:blocked"]);
+  const lifecycleLabels = convention?.managedLabels?.byLifecycle?.[workItem.lifecycle_state] ?? [];
+  const queueLabel = workItem.lifecycle_state === "ready" ? "queue:startable" : workItem.lifecycle_state === "blocked" ? "queue:blocked" : null;
+  const managedLabels = [.../* @__PURE__ */ new Set([...lifecycleLabels, ...queueLabel === null ? [] : [queueLabel]])].sort();
   const title = `${convention?.titlePrefix ?? ""}${workItem.title}`;
   const body = `${convention?.bodyPrefix ?? ""}${workItem.body}`;
   const state = ["succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state) ? "closed" : "open";
