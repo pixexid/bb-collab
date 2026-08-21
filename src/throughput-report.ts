@@ -44,6 +44,14 @@ export type ThroughputFacts = {
 
 export type WeeklyThroughputReport = {
   window: { startAtMs: number; endAtMs: number };
+  measurement: {
+    issueOpenToClose: string;
+    mergeCadence: string;
+    laneSlotUtilization: string;
+    reviewLatencyByTier: string;
+    dataQuality: string;
+    defectEscape: string;
+  };
   firstReportAtMs: number | null;
   benchmark: { issueOpenToCloseMedianHours: 0.8 };
   issueOpenToClose: { medianHours: number | null; maximumHours: number | null; completed: number; unknown: number };
@@ -145,11 +153,11 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
       : "pass";
 
   const mergeTimes = facts.merges.filter((merge) => merge.mergedAtMs !== null).map((merge) => merge.mergedAtMs!).sort((a, b) => a - b);
+  const windowMergeTimes = mergeTimes.filter((merge) => inWindow(merge, window.startAtMs, window.endAtMs));
   const histogram: Record<CadenceBin, number> = { "<1h": 0, "1-3h": 0, "3-6h": 0, ">=6h": 0 };
   const mergeGaps: number[] = [];
-  for (let i = 1; i < mergeTimes.length; i += 1) {
-    if (!inWindow(mergeTimes[i], window.startAtMs, window.endAtMs)) continue;
-    const gap = hours(mergeTimes[i] - mergeTimes[i - 1]);
+  for (let i = 1; i < windowMergeTimes.length; i += 1) {
+    const gap = hours(windowMergeTimes[i] - windowMergeTimes[i - 1]);
     mergeGaps.push(gap);
     histogram[gap < 1 ? "<1h" : gap < 3 ? "1-3h" : gap < 6 ? "3-6h" : ">=6h"] += 1;
   }
@@ -205,11 +213,19 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
 
   return {
     window,
+    measurement: {
+      issueOpenToClose: "GitHub issues closed in [window.startAtMs, window.endAtMs); duration requires the GitHub creation timestamp; incomplete timestamps are unknown.",
+      mergeCadence: "Consecutive GitHub PR merges with both merge timestamps inside [window.startAtMs, window.endAtMs); gaps crossing the boundary are excluded; missing merge timestamps cannot be assigned to a window.",
+      laneSlotUtilization: "Known, contiguous lane_capacity_intervals covering the entire window; denominator is covered orchestrator time and numerator is full cap while startable work existed.",
+      reviewLatencyByTier: "Canonically linked review attempts submitted or completed in the window, grouped by declared PR tier; incomplete timestamps are unknown.",
+      dataQuality: "GitHub timestamps are the issue/merge boundary; store-backed timestamps are used as recorded, with no correction for retroactive WorkItem registration, so affected windows may be distorted.",
+      defectEscape: "Merged PRs in the window with explicit observable revert or canonical post-merge severity evidence; missing coverage remains unknown.",
+    },
     firstReportAtMs: facts.dialsLandedAtMs === null ? null : facts.dialsLandedAtMs + 7 * 86_400_000,
     benchmark: { issueOpenToCloseMedianHours: 0.8 },
     issueOpenToClose: { medianHours: issueMedian === null ? null : hours(issueMedian), maximumHours: issueDurations.length ? hours(Math.max(...issueDurations)) : null, completed: issueDurations.length, unknown: issueUnknown },
     issueAcceptanceAudit,
-    mergeCadence: { histogram, maximumGapHours: mergeGaps.length ? Math.max(...mergeGaps) : null, knownMerges: mergeTimes.filter((merge) => inWindow(merge, window.startAtMs, window.endAtMs)).length, unknown: facts.merges.filter((merge) => merge.mergedAtMs === null).length },
+    mergeCadence: { histogram, maximumGapHours: mergeGaps.length ? Math.max(...mergeGaps) : null, knownMerges: windowMergeTimes.length, unknown: facts.merges.filter((merge) => merge.mergedAtMs === null).length },
     reviewTierDeclarations,
     laneSlotUtilization: laneSlotUtilization(
       facts.laneCapacityIntervals ?? [],
