@@ -31,7 +31,7 @@ jobs:
       - name: Run verification
         run: npm exec --yes --package=bb-app@0.39.0 -- npm run verify
       - name: Check committed dist freshness
-        run: node scripts/check-dist.mjs
+        run: npm exec --yes --package=bb-app@0.39.0 -- node scripts/check-dist.mjs
       - name: Check BB plugin types
         run: npm exec --yes --package=bb-app@0.39.0 -- bb plugin types --check
       - name: Check pull-request review tier
