@@ -3243,7 +3243,12 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             const observation = targetMatch?.[1] && targetMatch[2] && Number.isSafeInteger(targetIssueNumber)
               ? waitExternalRevisions.get(waitExternalKey(targetMatch[1], targetMatch[2], targetIssueNumber))
               : undefined;
-            if (!observation) { staleWait = candidate; break; }
+            if (!observation) {
+              const record = await fleetWatchdogIdle.get(roleIdleKey(orchestrator, candidate.workItemId));
+              staleExternalMoved = record?.lastStaleWaitWaker !== candidate.waker;
+              staleWait = candidate;
+              break;
+            }
             const record = await fleetWatchdogIdle.get(roleIdleKey(orchestrator, candidate.workItemId));
             const chased = record?.lastStaleWaitWakeAtMs !== null && record?.lastStaleWaitWakeAtMs !== undefined && record.lastStaleWaitWaker === candidate.waker && record.lastStaleWaitExternalRevision === observation.externalRevision;
             // now - chaseAt >= max(floor, chaseAt - externalUpdatedAt); the interval is fixed at chase time.
@@ -3251,7 +3256,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             if (!chased || now - record!.lastStaleWaitWakeAtMs! >= recheckMs) {
               staleWait = candidate;
               staleObservation = observation;
-              staleExternalMoved = record?.lastStaleWaitExternalRevision !== null && record?.lastStaleWaitExternalRevision !== undefined && record.lastStaleWaitExternalRevision !== observation.externalRevision;
+              staleExternalMoved = record?.lastStaleWaitWaker !== candidate.waker || record?.lastStaleWaitExternalRevision !== observation.externalRevision;
               break;
             }
           }

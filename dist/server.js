@@ -24575,6 +24575,8 @@ ${thread.titleFallback ?? ""}`);
             const targetIssueNumber = targetMatch?.[3] === void 0 ? NaN : Number(targetMatch[3]);
             const observation = targetMatch?.[1] && targetMatch[2] && Number.isSafeInteger(targetIssueNumber) ? waitExternalRevisions.get(waitExternalKey(targetMatch[1], targetMatch[2], targetIssueNumber)) : void 0;
             if (!observation) {
+              const record3 = await fleetWatchdogIdle.get(roleIdleKey(orchestrator, candidate.workItemId));
+              staleExternalMoved = record3?.lastStaleWaitWaker !== candidate.waker;
               staleWait = candidate;
               break;
             }
@@ -24584,7 +24586,7 @@ ${thread.titleFallback ?? ""}`);
             if (!chased || now2 - record2.lastStaleWaitWakeAtMs >= recheckMs) {
               staleWait = candidate;
               staleObservation = observation;
-              staleExternalMoved = record2?.lastStaleWaitExternalRevision !== null && record2?.lastStaleWaitExternalRevision !== void 0 && record2.lastStaleWaitExternalRevision !== observation.externalRevision;
+              staleExternalMoved = record2?.lastStaleWaitWaker !== candidate.waker || record2?.lastStaleWaitExternalRevision !== observation.externalRevision;
               break;
             }
           }

@@ -5271,7 +5271,7 @@ exit 1
     writeFileSync(revision, "1970-01-01T00:00:00.000Z");
     writeFileSync(gh, `#!/bin/sh
 if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
-  printf '{"state":"OPEN","updatedAt":"%s","closedByPullRequestsReferences":[]}' "$(cat "${revision}")"
+  printf '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"%s","closedByPullRequestsReferences":[]}' "$(cat "${revision}")"
 elif [ "$1" = "api" ]; then
   printf '%s\\n' '[[ ]]'
 else
@@ -5294,12 +5294,12 @@ fi
       );
       expect(staleSends()).toHaveLength(1);
 
-      clock.mockReturnValue(26 * 60 * 60_000);
+      clock.mockReturnValue(25 * 60 * 60_000 + 1 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(staleSends()).toHaveLength(1);
 
-      fixture.db.prepare("UPDATE work_item_waits SET waker = ?, declared_at_ms = ? WHERE work_item_id = ?").run("other/repository#1949", 25 * 60 * 60_000, WORK_ITEM_ID);
-      clock.mockReturnValue(50 * 60 * 60_000);
+      fixture.db.prepare("UPDATE work_item_waits SET waker = ? WHERE work_item_id = ?").run("other/repository#1949", WORK_ITEM_ID);
+      clock.mockReturnValue(25 * 60 * 60_000 + 5 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(staleSends()).toHaveLength(2);
 
