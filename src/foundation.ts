@@ -2531,6 +2531,7 @@ export interface FoundationResult {
   attempted: number;
   verified: number;
   message?: string;
+  structurallyImpossibleAtRevision?: boolean;
   currentConfigRevision?: number;
   expectedConfigRevision?: number;
   currentGovernanceEpoch?: number;
@@ -2589,6 +2590,7 @@ type ExportFileInput = Omit<ExportFilePayload, "directory"> & { directory?: stri
 interface RefusalData {
   code: FoundationCode;
   message: string;
+  structurallyImpossibleAtRevision?: boolean;
   currentConfigRevision?: number;
   expectedConfigRevision?: number;
   currentGovernanceEpoch?: number;
@@ -2990,6 +2992,7 @@ function mutationRequestDigest(request: ApplyRequest): string {
 function refusalResult(subject: string, data: RefusalData, expected = 1, attempted = 0, verified = 0): FoundationResult {
   return result(data.code, subject, data.expected ?? expected, data.attempted ?? attempted, data.verified ?? verified, {
     message: data.message,
+    ...(data.structurallyImpossibleAtRevision === undefined ? {} : { structurallyImpossibleAtRevision: data.structurallyImpossibleAtRevision }),
     ...(data.currentConfigRevision === undefined ? {} : { currentConfigRevision: data.currentConfigRevision }),
     ...(data.expectedConfigRevision === undefined ? {} : { expectedConfigRevision: data.expectedConfigRevision }),
     ...(data.currentGovernanceEpoch === undefined ? {} : { currentGovernanceEpoch: data.currentGovernanceEpoch }),
@@ -6015,7 +6018,7 @@ function recordedGithubCloseObservation(
        AND aggregate_revision = ? AND event_type = 'work_item_transitioned'
      ORDER BY event_sequence DESC LIMIT 1`,
   ).get(projectId, workItemId, resourceRevision));
-  if (!row) throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item has no recorded close observation");
+  if (!row) throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item has no recorded close observation", { structurallyImpossibleAtRevision: true });
   let event: unknown;
   try {
     event = JSON.parse(row.event_json);
@@ -6244,13 +6247,15 @@ function applyWorkItemTransition(
       if (
         prior.owner !== externalEvent.owner ||
         prior.repo !== externalEvent.repo ||
-        prior.issueNumber !== externalEvent.issueNumber ||
-        prior.externalRevision === githubObservation.externalRevision
-      ) throw refusal("WORK_ITEM_STATE_INVALID", "GitHub reopen does not follow the exact recorded close observation");
+        prior.issueNumber !== externalEvent.issueNumber
+      ) throw refusal("WORK_ITEM_STATE_INVALID", "GitHub reopen does not match the recorded close identity", { structurallyImpossibleAtRevision: true });
+      if (prior.externalRevision === githubObservation.externalRevision) {
+        throw refusal("WORK_ITEM_STATE_INVALID", "GitHub reopen does not follow the exact recorded close observation");
+      }
     }
     recordedExternalEvent = { ...externalEvent, externalRevision: githubObservation.externalRevision };
   } else if (workItem.lifecycle_state === "succeeded" && nextState === "ready") {
-    throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item can return only after a proven GitHub issue reopening");
+    throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item can return only after a proven GitHub issue reopening", { structurallyImpossibleAtRevision: true });
   }
   if (nextState === "in_progress" && workAttempt === undefined) {
     throw refusal("WORK_ITEM_STATE_INVALID", "entering in-progress requires a work attempt");

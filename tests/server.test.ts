@@ -2618,10 +2618,11 @@ describe("bb-collab plugin boundary", () => {
 
   it("learns permanent reopen refusals instead of retrying them", () => {
     const source = readFileSync(join(PLUGIN_ROOT, "server.ts"), "utf8");
-    expect(source).toContain("permanentlyRefusedReopens.get(reopenKey)");
-    expect(source).toContain("permanentlyRefusedReopens.set(reopenKey, refusalReason)");
-    expect(source).toContain("succeeded work item can return only after a proven GitHub issue reopening");
-    expect(source).toContain("skipped permanently-refused issue-reopen transition");
+    expect(source).toContain("permanentlyRefusedReopens.get(permanentReopenKey)");
+    expect(source).toContain("permanentlyRefusedReopens.set(permanentReopenKey, refusalReason)");
+    expect(source).toContain("pendingRefusedReopens.set(pendingReopenKey, refusalReason)");
+    expect(source).toContain("result.structurallyImpossibleAtRevision === true");
+    expect(source).toContain("skipped ${permanentRefusalReason === undefined ? \"pending\" : \"permanently-refused\"} issue-reopen transition");
   });
 
   it("keeps recurring schedules on distinct cron phases", () => {
@@ -4812,8 +4813,8 @@ exit 1
       await fixture.host.harness.runSchedule("fleet-watchdog");
 
       const refusals = fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("fleet-watchdog issue-reopen transition refused"));
-      const learned = fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("learned permanently-refused issue-reopen transition"));
-      const skips = fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("skipped permanently-refused issue-reopen transition"));
+      const learned = fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("learned pending issue-reopen refusal"));
+      const skips = fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("skipped pending issue-reopen transition"));
       expect(refusals).toHaveLength(0);
       expect(learned).toHaveLength(1);
       const reason = "GitHub reopen does not follow the exact recorded close observation";
@@ -8158,10 +8159,12 @@ exit 1
     const succeededSnapshot = exportFoundation(db, PROJECT_ID);
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 5))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
     github.put({ ...closed, state: "open", externalRevision: "closed-x" });
-    expect(applyFixtureMutation(db, transitionRequest(fenceToken, "ready", 5, {
+    const sameRevisionRefusal = applyFixtureMutation(db, transitionRequest(fenceToken, "ready", 5, {
       idempotencyKey: "same-revision-reopen",
       workItemExternalEvent: { kind: "github_issue_reopened", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
-    }), null, null, null, null, githubRead)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    }), null, null, null, null, githubRead);
+    expect(sameRevisionRefusal).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(sameRevisionRefusal.structurallyImpossibleAtRevision).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(succeededSnapshot);
 
     github.put({ ...closed, state: "open", externalRevision: "open-y" });
