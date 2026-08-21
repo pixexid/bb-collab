@@ -29,8 +29,7 @@
     "throughput-report": "node scripts/weekly-throughput-report.mjs",
     "verify": "npm run typecheck && npm test && npm run build && node scripts/check-css-bundle.mjs && node scripts/role-brief-bundle.mjs && node scripts/check-dist.mjs && node scripts/check-production-reachability.mjs",
     "changeset": "changeset",
-    "version-packages": "changeset version",
-    "release": "node scripts/changeset-release.mjs"
+    "version-packages": "changeset version"
   },
   "dependencies": {
     "zod": "4.3.6"
