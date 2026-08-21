@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
-import { coverageReason, evaluate, isMergeReady, openStore, parsePullRequests, readOrchestrator, shouldEscalate } from "../server.js";
+import { coverageReason, dispatchPlan, evaluate, isMergeReady, openStore, parsePullRequests, readOrchestrator, shouldEscalate } from "../server.js";
 
 const dbs: Database.Database[] = [];
 function db(active = 0, ceiling = 3) {
@@ -23,10 +23,10 @@ afterEach(() => { while (dbs.length) dbs.pop()!.close(); });
 
 describe("mechanical conditions", () => {
   it("wakes with each condition's contents", () => {
-    const findings = evaluate(db(), "p", [{ id: "m1", content: [{ type: "text", text: "ping\nmore" }] }], [{ number: 508, title: "Start this work" }], [{ number: 493, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }]);
+    const findings = evaluate(db(), "p", [{ id: "m1", content: [{ type: "text", text: "ping\nmore" }] }], [{ number: 508, title: "Start this work", labels: ["queue:startable", "priority:high"] }], [{ number: 493, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }]);
     expect(findings.map((f) => f.condition)).toEqual(["queue", "startable", "pr"]);
     expect(findings.map((f) => f.text).join("; ")).toContain('"ping"');
-    expect(findings.map((f) => f.text).join("; ")).toContain("#508 Start this work");
+    expect(findings.map((f) => f.text).join("; ")).toContain("#508 Start this work [queue:startable, priority:high]");
     expect(findings.map((f) => f.text).join("; ")).toContain("PR #493 merge-ready and unmerged");
   });
   it("stays silent for legitimate operator waiting", () => {
@@ -36,7 +36,7 @@ describe("mechanical conditions", () => {
     expect(evaluate(db(), "p", [], [], [])).toEqual([]);
   });
   it("stays silent when lanes are active, while reaching the evaluation", () => {
-    expect(evaluate(db(1), "p", [{ id: "m1" }], [{ number: 508, title: "Start this work" }], [{ number: 493, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }])).toEqual([]);
+    expect(evaluate(db(1), "p", [{ id: "m1" }], [{ number: 508, title: "Start this work", labels: [] }], [{ number: 493, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }])).toEqual([]);
   });
   it("does not wake for parked queues or non-green PRs", () => {
     expect(evaluate(db(), "p", [], [], [{ number: 493, state: "OPEN", mergeStateStatus: "DIRTY", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }])).toEqual([]);
@@ -55,8 +55,11 @@ describe("mechanical conditions", () => {
     expect(isMergeReady({ ...pr, approvedCommitOids: ["head"] })).toBe(true);
   });
   it("rejects incomplete GitHub payloads instead of treating them as not owed", () => {
-    expect(() => parsePullRequests([{ number: 1, state: "OPEN" }])).not.toThrow();
-    expect(() => parsePullRequests([{ number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headRefOid: "head", reviews: [], statusCheckRollup: [] }])).not.toThrow();
+    const invalid: unknown[] = [];
+    const valid = { number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headRefOid: "head", reviews: [], statusCheckRollup: [] };
+    expect(parsePullRequests([valid, { number: 2, state: "OPEN" }], (error) => invalid.push(error))).toEqual([expect.objectContaining({ number: 1 })]);
+    expect(invalid).toHaveLength(1);
+    expect(String(invalid[0])).toContain("missing-pr-1-mergeStateStatus");
   });
   it("accepts CheckRun conclusions and StatusContext states without suppressing other PRs", () => {
     const invalid: unknown[] = [];
@@ -94,5 +97,11 @@ describe("mechanical conditions", () => {
     expect(shouldEscalate(prior, undefined, "same")).toBe(false);
     expect(shouldEscalate(prior, 100, "same")).toBe(false);
     expect(shouldEscalate(prior, 101, "same")).toBe(true);
+  });
+  it("makes the backoff cap terminal instead of sending and escalating together", () => {
+    const finding = { condition: "queue" as const, text: "owed", key: "same" };
+    const plan = dispatchPlan([finding], new Map([["p:queue", { sentAt: 100, fingerprint: "same", turns: 1 }]]), "p", 600_100, 101);
+    expect(plan.send).toEqual([]);
+    expect(plan.escalations).toEqual([finding]);
   });
 });

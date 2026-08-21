@@ -56,6 +56,15 @@ function parsePullRequests(value, onInvalid = () => {
 function shouldEscalate(prior, turnStartedAt, fingerprint) {
   return !!prior && prior.fingerprint === fingerprint && !prior.escalated && turnStartedAt !== void 0 && turnStartedAt > prior.sentAt;
 }
+function dispatchPlan(findings, snapshots, projectId, now, turnStartedAt) {
+  const escalations = findings.filter((finding) => shouldEscalate(snapshots.get(`${projectId}:${finding.condition}`), turnStartedAt, finding.key));
+  const escalationKeys = new Set(escalations.map((finding) => finding.condition));
+  const send = findings.filter((finding) => {
+    const prior = snapshots.get(`${projectId}:${finding.condition}`);
+    return !escalationKeys.has(finding.condition) && (!prior || prior.fingerprint !== finding.key || !prior.escalated && now - prior.sentAt >= BACKOFF_MS);
+  });
+  return { send, escalations };
+}
 function openStore(path, onUnavailable) {
   try {
     return new Database(path, { readonly: true, fileMustExist: true });
@@ -82,7 +91,7 @@ function evaluate(db, projectId, queued, startable, prs) {
   const findings = [];
   if (queued.length) findings.push({ condition: "queue", text: `${queued.length} unconsumed queued message${queued.length === 1 ? "" : "s"}: ${queued.map((m) => `"${firstLine(m.content)}"`).join(", ")}`, key: JSON.stringify(queued.map((m) => [m.id, m.content])) });
   const ceiling = db.prepare(`SELECT json_extract(c.canonical_config_json, '$.extensions.bbCollab.writingLaneCeiling') AS ceiling FROM project_config_heads h JOIN project_config_revisions c ON c.project_id=h.project_id AND c.config_revision=h.config_revision WHERE h.project_id=?`).get(projectId)?.ceiling ?? 3;
-  if (startable.length && Number(lane.count) < ceiling) findings.push({ condition: "startable", text: `${startable.length} queue:startable issue${startable.length === 1 ? "" : "s"} (${startable.map((issue) => `#${issue.number} ${issue.title}`).join(", ")}); ${lane.count}/${ceiling} writing lanes active`, key: JSON.stringify([startable, lane.count, ceiling]) });
+  if (startable.length && Number(lane.count) < ceiling) findings.push({ condition: "startable", text: `${startable.length} queue:startable issue${startable.length === 1 ? "" : "s"} (${startable.map((issue) => `#${issue.number} ${issue.title} [${issue.labels.join(", ")}]`).join(", ")}); ${lane.count}/${ceiling} writing lanes active`, key: JSON.stringify([startable, lane.count, ceiling]) });
   const green = prs.filter(isMergeReady);
   if (green.length) findings.push({ condition: "pr", text: green.map((pr) => `PR #${pr.number} merge-ready and unmerged`).join("; "), key: green.map((pr) => pr.number).join(",") });
   return findings;
@@ -97,10 +106,10 @@ function repoName(remote) {
 }
 async function github(repo, onInvalid) {
   const [issues, prs] = await Promise.all([
-    json(["issue", "list", "--repo", repo, "--label", "queue:startable", "--state", "open", "--json", "number,title", "--limit", "1000"]),
+    json(["issue", "list", "--repo", repo, "--label", "queue:startable", "--state", "open", "--json", "number,title,labels", "--limit", "1000"]),
     json(["pr", "list", "--repo", repo, "--state", "open", "--json", "number,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup", "--limit", "1000"])
   ]);
-  const startable = Array.isArray(issues) ? issues.flatMap((x) => typeof x === "object" && x && typeof x.number === "number" && typeof x.title === "string" ? [{ number: x.number, title: x.title }] : []) : [];
+  const startable = Array.isArray(issues) ? issues.flatMap((x) => typeof x === "object" && x && typeof x.number === "number" && typeof x.title === "string" && Array.isArray(x.labels) ? [{ number: x.number, title: x.title, labels: x.labels.flatMap((label) => typeof label?.name === "string" ? [label.name] : []) }] : []) : [];
   const green = parsePullRequests(prs, onInvalid);
   return { issues: startable, prs: green };
 }
@@ -117,7 +126,7 @@ function companionWatcher(bb) {
   bb.events.on("thread.active", ({ thread }) => {
     activeTurns.set(thread.id, Date.now());
   });
-  bb.events.on("thread.idle", async ({ thread }) => {
+  const handleIdle = async (thread, turnStartedAt) => {
     try {
       await load();
     } catch (error) {
@@ -125,7 +134,6 @@ function companionWatcher(bb) {
       return;
     }
     const projectId = thread.projectId;
-    const turnStartedAt = activeTurns.get(thread.id);
     activeTurns.delete(thread.id);
     let store;
     try {
@@ -165,13 +173,13 @@ function companionWatcher(bb) {
       }
       const findings = evaluate(store, target.project_id, queued, issues, prs);
       const now = Date.now();
-      const send = [];
-      for (const finding of findings) {
-        const prior = snapshots.get(`${target.project_id}:${finding.condition}`);
-        if (!prior || prior.fingerprint !== finding.key || !prior.escalated && now - prior.sentAt >= BACKOFF_MS) send.push(finding);
-      }
-      const escalations = findings.filter((finding) => shouldEscalate(snapshots.get(`${target.project_id}:${finding.condition}`), turnStartedAt, finding.key));
+      const { send, escalations } = dispatchPlan(findings, snapshots, target.project_id, now, turnStartedAt);
       if (!send.length && !escalations.length) return;
+      for (const finding of send) {
+        const key = `${target.project_id}:${finding.condition}`;
+        const prior = snapshots.get(key);
+        snapshots.set(key, { sentAt: now, fingerprint: finding.key, turns: (prior?.fingerprint === finding.key ? prior.turns : 0) + 1 });
+      }
       if (send.length) {
         const message = send.map((f) => f.text).join("; ");
         try {
@@ -181,23 +189,20 @@ function companionWatcher(bb) {
           return;
         }
       }
-      for (const finding of send) {
-        const key = `${target.project_id}:${finding.condition}`;
-        const prior = snapshots.get(key);
-        snapshots.set(key, { sentAt: now, fingerprint: finding.key, turns: (prior?.fingerprint === finding.key ? prior.turns : 0) + 1 });
-      }
       for (const finding of escalations) {
         const key = `${target.project_id}:${finding.condition}`;
         const prior = snapshots.get(key);
-        snapshots.set(key, { ...prior, escalated: true });
         const director = store.prepare(`SELECT a.thread_id AS thread_id FROM role_generation_heads h JOIN role_generations g ON g.project_id=h.project_id AND g.role_id=h.role_id AND g.generation=h.current_generation JOIN execution_attempts a ON a.project_id=g.project_id AND a.execution_attempt_id=g.holder_execution_attempt_id WHERE h.project_id=? AND h.role_id='director'`).get(target.project_id);
-        if (director) {
-          try {
-            await bb.sdk.threads.send({ threadId: director.thread_id, mode: "auto", input: [{ type: "text", text: `Companion watcher escalation: ${finding.text}; unchanged after a wake and full turn.`, mentions: [] }] });
-          } catch (error) {
-            bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("wake", error)}`);
-            return;
-          }
+        if (!director) {
+          bb.log.warn("companion-watcher coverage=blind event=thread.idle reason=director-unavailable");
+          continue;
+        }
+        try {
+          await bb.sdk.threads.send({ threadId: director.thread_id, mode: "auto", input: [{ type: "text", text: `Companion watcher escalation: ${finding.text}; unchanged after a wake and full turn.`, mentions: [] }] });
+          snapshots.set(key, { ...prior, escalated: true });
+        } catch (error) {
+          bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("wake", error)}`);
+          return;
         }
       }
       try {
@@ -210,11 +215,27 @@ function companionWatcher(bb) {
     } finally {
       store?.close();
     }
+  };
+  bb.events.on("thread.idle", ({ thread }) => handleIdle(thread, activeTurns.get(thread.id)));
+  bb.background.service("startup-reconciliation", {
+    start: async (signal) => {
+      try {
+        for (let offset = 0; ; offset += 1e3) {
+          const threads = await bb.sdk.threads.list({ archived: false, limit: 1e3, offset });
+          for (const thread of threads) if (thread.status === "idle") await handleIdle(thread);
+          if (threads.length < 1e3) break;
+        }
+      } catch (error) {
+        bb.log.warn(`companion-watcher coverage=blind event=startup reason=${coverageReason("sdk", error)}`);
+      }
+      await new Promise((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+    }
   });
 }
 export {
   coverageReason,
   companionWatcher as default,
+  dispatchPlan,
   evaluate,
   isMergeReady,
   openStore,
