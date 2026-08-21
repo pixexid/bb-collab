@@ -15941,6 +15941,16 @@ var WORK_ITEM_CAPACITY_LIFECYCLE_STATES = ["in_progress"];
 var WORK_ITEM_CAPACITY_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
 var WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running"];
 var WORK_ITEM_IDLE_BLIND_ATTEMPT_STATES = ["dispatch_unknown"];
+function reconcilePreparedWorkItemDispatches(db, projectId, staleAfterMs) {
+  const cutoff = now() - staleAfterMs;
+  const result2 = db.prepare(
+    `UPDATE execution_attempts
+     SET state = 'dispatch_unknown', reason_code = 'dispatch_reconciliation', observed_at_ms = ?
+     WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
+       AND state = 'prepared' AND thread_id IS NULL AND created_at_ms <= ?`
+  ).run(now(), projectId, cutoff);
+  return result2.changes;
+}
 function workItemCapacityLaneEvidence(db, projectId) {
   const lanes = db.prepare(
     `SELECT execution_attempts.lane_id, execution_attempts.thread_id, execution_attempts.state, execution_attempts.observed_at_ms
@@ -22527,6 +22537,9 @@ async function dispatchLane(bb, db, input) {
   const parsed = dispatchLaneInputSchema.safeParse(input);
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "dispatch", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
   const { request, spawn } = parsed.data;
+  const replayedIntent = db?.prepare(
+    "SELECT 1 FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?"
+  ).get(request.projectId, request.idempotencyKey) !== void 0;
   if (!request.workAttempt || request.lifecycleState !== "in_progress" && request.lifecycleState !== void 0) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "lane dispatch requires a writing work attempt and an in-progress transition" };
   }
@@ -22538,7 +22551,7 @@ async function dispatchLane(bb, db, input) {
     ...request,
     workAttempt: intentAttempt
   });
-  if (intent.outcome !== "OK") return intent;
+  if (intent.outcome !== "OK" || replayedIntent) return intent;
   let thread;
   try {
     thread = await bb.sdk.threads.spawn(spawn);
@@ -24296,6 +24309,8 @@ ${thread.titleFallback ?? ""}`);
       const lanesByProject = /* @__PURE__ */ new Map();
       for (const projectId of projectIds) {
         if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
+        const reconciledDispatches = reconcilePreparedWorkItemDispatches(db, projectId, floorMs);
+        if (reconciledDispatches > 0) bb.log.warn(`fleet-watchdog reconciled prepared dispatches: project=${projectId} count=${reconciledDispatches}`);
         const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? /* @__PURE__ */ new Set();
         const threads = [];
         try {
@@ -24707,6 +24722,7 @@ ${thread.titleFallback ?? ""}`);
           const blindLaneCount = capacityEvidence.lanes.filter((lane) => lane.idle_kind === "blind").length;
           if (blindLaneCount > 0) {
             bb.log.warn(`fleet-watchdog idle enforcer activeLanes=blind project=${projectId} visible=${idleActiveLaneCount} dispatchUnknown=${blindLaneCount}`);
+            await wake(projectId, orchestrator, roleIdleKey(orchestrator, "dispatch-unknown"), `dispatch outcome unknown for ${blindLaneCount} writing lane${blindLaneCount === 1 ? "" : "s"}; reconcile before dispatching again`, false, "recovery");
           }
           const repositories = db.prepare(
             `SELECT targets.remote_url FROM project_config_heads AS heads

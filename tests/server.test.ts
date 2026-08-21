@@ -3626,6 +3626,18 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     expect(fixture.db.prepare("SELECT lane_id, thread_id, state FROM execution_attempts WHERE origin = 'work_item' ORDER BY rowid DESC LIMIT 1").get()).toMatchObject({ lane_id: "lane-work-item-1", thread_id: "lane-1", state: "running" });
   });
 
+  it("does not spawn again when a completed dispatch intent is replayed", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const input = {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
+    };
+    expect(JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", input, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string)).toMatchObject({ outcome: "OK" });
+    expect(JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", input, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string)).toMatchObject({ outcome: "OK" });
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+  });
+
   it("refuses stale lane authorization before spawning", async () => {
     const fixture = await fleetWatchdogFixture(0, true, 1, false);
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
@@ -3648,6 +3660,9 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
     expect(result.outcome).toBe("EXTERNAL_UNAVAILABLE");
     expect(fixture.db.prepare("SELECT lane_id, thread_id, state FROM execution_attempts WHERE origin = 'work_item'").get()).toMatchObject({ lane_id: "lane-work-item-1", thread_id: null, state: "prepared" });
+    fixture.db.prepare("UPDATE execution_attempts SET created_at_ms = 0 WHERE origin = 'work_item'").run();
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "dispatch_unknown" });
   });
 
   it("uses in-progress WorkItems for capacity and suppresses repeat intake wakes for one hour", async () => {

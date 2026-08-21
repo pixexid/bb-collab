@@ -1538,6 +1538,18 @@ export interface WorkItemCapacityEvidence {
   unboundWorkItemIds: string[];
 }
 
+/** Move an old, threadless dispatch intent into the explicitly blind state. */
+export function reconcilePreparedWorkItemDispatches(db: SqliteDatabase, projectId: string, staleAfterMs: number): number {
+  const cutoff = now() - staleAfterMs;
+  const result = db.prepare(
+    `UPDATE execution_attempts
+     SET state = 'dispatch_unknown', reason_code = 'dispatch_reconciliation', observed_at_ms = ?
+     WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
+       AND state = 'prepared' AND thread_id IS NULL AND created_at_ms <= ?`,
+  ).run(now(), projectId, cutoff);
+  return result.changes;
+}
+
 export function workItemCapacityLaneEvidence(db: SqliteDatabase, projectId: string): WorkItemCapacityEvidence {
   const lanes = (db.prepare(
     `SELECT execution_attempts.lane_id, execution_attempts.thread_id, execution_attempts.state, execution_attempts.observed_at_ms

@@ -45,6 +45,7 @@ import {
   WORK_ITEM_CAPACITY_ATTEMPT_STATES,
   WORK_ITEM_CAPACITY_LIFECYCLE_STATES,
   workItemCapacityLaneEvidence,
+  reconcilePreparedWorkItemDispatches,
   type ApplyRequest,
   type FoundationCode,
   type FoundationResult,
@@ -832,6 +833,9 @@ async function dispatchLane(
   const parsed = dispatchLaneInputSchema.safeParse(input);
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "dispatch", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
   const { request, spawn } = parsed.data;
+  const replayedIntent = db?.prepare(
+    "SELECT 1 FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
+  ).get(request.projectId, request.idempotencyKey) !== undefined;
   if (!request.workAttempt || (request.lifecycleState !== "in_progress" && request.lifecycleState !== undefined)) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "lane dispatch requires a writing work attempt and an in-progress transition" };
   }
@@ -843,7 +847,7 @@ async function dispatchLane(
     ...request,
     workAttempt: intentAttempt,
   });
-  if (intent.outcome !== "OK") return intent;
+  if (intent.outcome !== "OK" || replayedIntent) return intent;
 
   let thread: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["spawn"]>>;
   try {
@@ -2836,6 +2840,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       const lanesByProject = new Map<string, Awaited<ReturnType<typeof bb.sdk.threads.list>>>();
       for (const projectId of projectIds) {
         if (onlyProjectId !== undefined && projectId !== onlyProjectId) continue;
+        const reconciledDispatches = reconcilePreparedWorkItemDispatches(db, projectId, floorMs);
+        if (reconciledDispatches > 0) bb.log.warn(`fleet-watchdog reconciled prepared dispatches: project=${projectId} count=${reconciledDispatches}`);
         const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? new Set<string>();
         const threads: Awaited<ReturnType<typeof bb.sdk.threads.list>> = [];
         try {
@@ -3291,6 +3297,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           const blindLaneCount = capacityEvidence.lanes.filter((lane) => lane.idle_kind === "blind").length;
           if (blindLaneCount > 0) {
             bb.log.warn(`fleet-watchdog idle enforcer activeLanes=blind project=${projectId} visible=${idleActiveLaneCount} dispatchUnknown=${blindLaneCount}`);
+            await wake(projectId, orchestrator, roleIdleKey(orchestrator, "dispatch-unknown"), `dispatch outcome unknown for ${blindLaneCount} writing lane${blindLaneCount === 1 ? "" : "s"}; reconcile before dispatching again`, false, "recovery");
           }
           const repositories = (db.prepare(
             `SELECT targets.remote_url FROM project_config_heads AS heads
