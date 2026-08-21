@@ -5298,11 +5298,12 @@ fi
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(staleSends()).toHaveLength(1);
 
-      writeFileSync(revision, "1970-01-02T01:00:00.000Z");
+      fixture.db.prepare("UPDATE work_item_waits SET waker = ?, declared_at_ms = ? WHERE work_item_id = ?").run("other/repository#1949", 25 * 60 * 60_000, WORK_ITEM_ID);
+      clock.mockReturnValue(50 * 60 * 60_000);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(staleSends()).toHaveLength(2);
 
-      clock.mockReturnValue(50 * 60 * 60_000);
+      writeFileSync(revision, "1970-01-02T01:00:00.000Z");
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(staleSends()).toHaveLength(3);
     } finally {

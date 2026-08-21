@@ -2814,7 +2814,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         }
         return latest ? `${latest.type}@${latest.seq}` : "unknown";
       };
-      const wake = async (projectId: string, holder: RoleHolderState, key: string, text: string, requireIdle: boolean, kind: "fleet" | "recovery" | "startable-queue" | "stale-wait" | "owed-act" | "escalation", beforeSend?: () => Promise<boolean>, staleWaitExternalRevision: string | null = null, bypassNotificationFloor = false) => {
+      const wake = async (projectId: string, holder: RoleHolderState, key: string, text: string, requireIdle: boolean, kind: "fleet" | "recovery" | "startable-queue" | "stale-wait" | "owed-act" | "escalation", beforeSend?: () => Promise<boolean>, staleWaitExternalRevision: string | null = null, staleWaitWaker: string | null = null, bypassNotificationFloor = false) => {
         const previous = await fleetWatchdogIdle.get(key);
         const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs
           : kind === "recovery" ? previous?.lastRecoveryWakeAtMs
@@ -2843,7 +2843,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           if (kind === "fleet") await fleetWatchdogIdle.recordFleetWake(key, Date.now());
           else if (kind === "recovery") await fleetWatchdogIdle.recordRecoveryWake(key, now);
           else if (kind === "startable-queue") await fleetWatchdogIdle.recordStartableQueueWake(key, Date.now());
-          else if (kind === "stale-wait") await fleetWatchdogIdle.recordStaleWaitWake(key, Date.now(), staleWaitExternalRevision);
+          else if (kind === "stale-wait") await fleetWatchdogIdle.recordStaleWaitWake(key, Date.now(), staleWaitExternalRevision, staleWaitWaker);
           else if (kind === "owed-act") await fleetWatchdogIdle.recordOwedActWake(key, Date.now());
           else await fleetWatchdogIdle.recordEscalation(key, Date.now());
           return true;
@@ -3245,7 +3245,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               : undefined;
             if (!observation) { staleWait = candidate; break; }
             const record = await fleetWatchdogIdle.get(roleIdleKey(orchestrator, candidate.workItemId));
-            const chased = record?.lastStaleWaitWakeAtMs !== null && record?.lastStaleWaitWakeAtMs !== undefined && record.lastStaleWaitExternalRevision === observation.externalRevision;
+            const chased = record?.lastStaleWaitWakeAtMs !== null && record?.lastStaleWaitWakeAtMs !== undefined && record.lastStaleWaitWaker === candidate.waker && record.lastStaleWaitExternalRevision === observation.externalRevision;
             // now - chaseAt >= max(floor, chaseAt - externalUpdatedAt); the interval is fixed at chase time.
             const recheckMs = observation.updatedAtMs === null || !chased ? FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS : Math.max(FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS, record!.lastStaleWaitWakeAtMs! - observation.updatedAtMs);
             if (!chased || now - record!.lastStaleWaitWakeAtMs! >= recheckMs) {
@@ -3256,7 +3256,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             }
           }
           if (staleWait) {
-            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait", undefined, staleObservation?.externalRevision ?? null, staleExternalMoved);
+            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait", undefined, staleObservation?.externalRevision ?? null, staleWait.waker, staleExternalMoved);
             continue;
           }
           const seatWait = remainingWorkItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null);
