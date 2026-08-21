@@ -15941,15 +15941,32 @@ var WORK_ITEM_CAPACITY_LIFECYCLE_STATES = ["in_progress"];
 var WORK_ITEM_CAPACITY_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
 var WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running"];
 var WORK_ITEM_IDLE_BLIND_ATTEMPT_STATES = ["dispatch_unknown"];
-function reconcilePreparedWorkItemDispatches(db, projectId, staleAfterMs) {
-  const cutoff = now() - staleAfterMs;
-  const result2 = db.prepare(
-    `UPDATE execution_attempts
-     SET state = 'dispatch_unknown', reason_code = 'dispatch_reconciliation', observed_at_ms = ?
+function reconcilePreparedWorkItemDispatches(db, projectId, threads) {
+  const prepared = db.prepare(
+    `SELECT execution_attempt_id, reason_code FROM execution_attempts
      WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
-       AND state = 'prepared' AND thread_id IS NULL AND created_at_ms <= ?`
-  ).run(now(), projectId, cutoff);
-  return result2.changes;
+       AND state = 'prepared' AND thread_id IS NULL`
+  ).all(projectId);
+  let resolved = 0;
+  for (const attempt of prepared) {
+    const marker = attempt.reason_code?.startsWith("work_item_dispatch_intent:") ? attempt.reason_code.slice("work_item_dispatch_intent:".length) : null;
+    if (!marker) continue;
+    const thread = threads.find(
+      (candidate) => candidate.parentThreadId !== null && candidate.archivedAt === null && candidate.deletedAt === null && candidate.title?.includes(`[dispatch:${marker}]`) === true
+    );
+    const observedAtMs = now();
+    const result2 = thread ? db.prepare(
+      `UPDATE execution_attempts
+         SET state = 'running', thread_id = ?, lease_owner_thread_id = ?, reason_code = 'work_item_dispatch', observed_at_ms = ?
+         WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL`
+    ).run(thread.id, thread.id, observedAtMs, projectId, attempt.execution_attempt_id) : db.prepare(
+      `UPDATE execution_attempts
+         SET state = 'failed', reason_code = 'dispatch_not_found', observed_at_ms = ?, completed_at_ms = ?
+         WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL`
+    ).run(observedAtMs, observedAtMs, projectId, attempt.execution_attempt_id);
+    resolved += result2.changes;
+  }
+  return resolved;
 }
 function workItemCapacityLaneEvidence(db, projectId) {
   const lanes = db.prepare(
@@ -16984,7 +17001,9 @@ function checkIdempotency(db, request, digest) {
   if (row.request_digest !== digest) {
     throw refusal("IDEMPOTENCY_KEY_CONFLICT", "idempotency key was already used for another request");
   }
-  return JSON.parse(row.outcome_json);
+  const replay = JSON.parse(row.outcome_json);
+  Object.defineProperty(replay, "replay", { value: true });
+  return replay;
 }
 function nextEventSequence(db, projectId) {
   const row = asRow(
@@ -19537,7 +19556,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       requestedProfile: requireWorkAttemptProfile(workAttempt),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
       state: workAttempt.threadId ? "running" : "prepared",
-      reasonCode: workAttempt.threadId ? "work_item_dispatch" : "work_item_dispatch_intent",
+      reasonCode: workAttempt.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}`,
       createdAtMs,
       observedAtMs: createdAtMs,
       completedAtMs: null,
@@ -19667,7 +19686,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       requestedProfile: requireWorkAttemptProfile(workAttempt),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
       state: workAttempt.threadId ? "running" : "prepared",
-      reasonCode: workAttempt.threadId ? "work_item_dispatch" : "work_item_dispatch_intent",
+      reasonCode: workAttempt.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}`,
       createdAtMs: now(),
       observedAtMs: now(),
       completedAtMs: null,
@@ -22537,9 +22556,6 @@ async function dispatchLane(bb, db, input) {
   const parsed = dispatchLaneInputSchema.safeParse(input);
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "dispatch", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
   const { request, spawn } = parsed.data;
-  const replayedIntent = db?.prepare(
-    "SELECT 1 FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?"
-  ).get(request.projectId, request.idempotencyKey) !== void 0;
   if (!request.workAttempt || request.lifecycleState !== "in_progress" && request.lifecycleState !== void 0) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "lane dispatch requires a writing work attempt and an in-progress transition" };
   }
@@ -22551,10 +22567,13 @@ async function dispatchLane(bb, db, input) {
     ...request,
     workAttempt: intentAttempt
   });
-  if (intent.outcome !== "OK" || replayedIntent) return intent;
+  if (intent.outcome !== "OK" || intent.replay) return intent;
   let thread;
   try {
-    thread = await bb.sdk.threads.spawn(spawn);
+    thread = await bb.sdk.threads.spawn({
+      ...spawn,
+      title: `${String(spawn.title ?? "lane")} [dispatch:${request.idempotencyKey}]`
+    });
   } catch (error48) {
     return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane spawn failed after durable dispatch intent: ${String(error48)}`, evidence: { intent } };
   }
@@ -24309,10 +24328,9 @@ ${thread.titleFallback ?? ""}`);
       const lanesByProject = /* @__PURE__ */ new Map();
       for (const projectId of projectIds) {
         if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
-        const reconciledDispatches = reconcilePreparedWorkItemDispatches(db, projectId, floorMs);
-        if (reconciledDispatches > 0) bb.log.warn(`fleet-watchdog reconciled prepared dispatches: project=${projectId} count=${reconciledDispatches}`);
         const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? /* @__PURE__ */ new Set();
         const threads = [];
+        let threadInventoryReadable = true;
         try {
           for (let offset = 0; ; offset += 100) {
             const page = await bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset });
@@ -24320,7 +24338,12 @@ ${thread.titleFallback ?? ""}`);
             if (page.length < 100) break;
           }
         } catch (error48) {
+          threadInventoryReadable = false;
           degrade(fleetWatchdogScope("platform-parentage", projectId, String(error48)));
+        }
+        if (threadInventoryReadable) {
+          const reconciledDispatches = reconcilePreparedWorkItemDispatches(db, projectId, threads);
+          if (reconciledDispatches > 0) bb.log.warn(`fleet-watchdog reconciled dispatch intents: project=${projectId} count=${reconciledDispatches}`);
         }
         const lanes = threads.filter(
           (thread) => thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null
@@ -24722,7 +24745,6 @@ ${thread.titleFallback ?? ""}`);
           const blindLaneCount = capacityEvidence.lanes.filter((lane) => lane.idle_kind === "blind").length;
           if (blindLaneCount > 0) {
             bb.log.warn(`fleet-watchdog idle enforcer activeLanes=blind project=${projectId} visible=${idleActiveLaneCount} dispatchUnknown=${blindLaneCount}`);
-            await wake(projectId, orchestrator, roleIdleKey(orchestrator, "dispatch-unknown"), `dispatch outcome unknown for ${blindLaneCount} writing lane${blindLaneCount === 1 ? "" : "s"}; reconcile before dispatching again`, false, "recovery");
           }
           const repositories = db.prepare(
             `SELECT targets.remote_url FROM project_config_heads AS heads

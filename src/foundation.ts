@@ -1538,16 +1538,50 @@ export interface WorkItemCapacityEvidence {
   unboundWorkItemIds: string[];
 }
 
-/** Move an old, threadless dispatch intent into the explicitly blind state. */
-export function reconcilePreparedWorkItemDispatches(db: SqliteDatabase, projectId: string, staleAfterMs: number): number {
-  const cutoff = now() - staleAfterMs;
-  const result = db.prepare(
-    `UPDATE execution_attempts
-     SET state = 'dispatch_unknown', reason_code = 'dispatch_reconciliation', observed_at_ms = ?
+export interface WorkItemDispatchThread {
+  id: string;
+  parentThreadId: string | null;
+  title: string | null;
+  archivedAt: number | null;
+  deletedAt: number | null;
+}
+
+/** Resolve an interrupted dispatch only from the native thread inventory. */
+export function reconcilePreparedWorkItemDispatches(
+  db: SqliteDatabase,
+  projectId: string,
+  threads: WorkItemDispatchThread[],
+): number {
+  const prepared = db.prepare(
+    `SELECT execution_attempt_id, reason_code FROM execution_attempts
      WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
-       AND state = 'prepared' AND thread_id IS NULL AND created_at_ms <= ?`,
-  ).run(now(), projectId, cutoff);
-  return result.changes;
+       AND state = 'prepared' AND thread_id IS NULL`,
+  ).all(projectId) as Array<{ execution_attempt_id: string; reason_code: string | null }>;
+  let resolved = 0;
+  for (const attempt of prepared) {
+    const marker = attempt.reason_code?.startsWith("work_item_dispatch_intent:")
+      ? attempt.reason_code.slice("work_item_dispatch_intent:".length)
+      : null;
+    if (!marker) continue;
+    const thread = threads.find((candidate) =>
+      candidate.parentThreadId !== null && candidate.archivedAt === null && candidate.deletedAt === null &&
+      candidate.title?.includes(`[dispatch:${marker}]`) === true,
+    );
+    const observedAtMs = now();
+    const result = thread
+      ? db.prepare(
+        `UPDATE execution_attempts
+         SET state = 'running', thread_id = ?, lease_owner_thread_id = ?, reason_code = 'work_item_dispatch', observed_at_ms = ?
+         WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL`,
+      ).run(thread.id, thread.id, observedAtMs, projectId, attempt.execution_attempt_id)
+      : db.prepare(
+        `UPDATE execution_attempts
+         SET state = 'failed', reason_code = 'dispatch_not_found', observed_at_ms = ?, completed_at_ms = ?
+         WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL`,
+      ).run(observedAtMs, observedAtMs, projectId, attempt.execution_attempt_id);
+    resolved += result.changes;
+  }
+  return resolved;
 }
 
 export function workItemCapacityLaneEvidence(db: SqliteDatabase, projectId: string): WorkItemCapacityEvidence {
@@ -2539,6 +2573,7 @@ export interface MutationReceipt {
 
 export interface FoundationResult {
   outcome: FoundationCode;
+  replay?: boolean;
   subject: string;
   expected: number;
   attempted: number;
@@ -3177,7 +3212,9 @@ function checkIdempotency(db: SqliteDatabase, request: ApplyRequest, digest: str
   if (row.request_digest !== digest) {
     throw refusal("IDEMPOTENCY_KEY_CONFLICT", "idempotency key was already used for another request");
   }
-  return JSON.parse(row.outcome_json) as FoundationResult;
+  const replay = JSON.parse(row.outcome_json) as FoundationResult;
+  Object.defineProperty(replay, "replay", { value: true });
+  return replay;
 }
 
 function nextEventSequence(db: SqliteDatabase, projectId: string): number {
@@ -6239,7 +6276,7 @@ function applyWorkItemTransition(
       requestedProfile: requireWorkAttemptProfile(workAttempt),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
       state: workAttempt.threadId ? "running" : "prepared",
-      reasonCode: workAttempt.threadId ? "work_item_dispatch" : "work_item_dispatch_intent",
+      reasonCode: workAttempt.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}`,
       createdAtMs,
       observedAtMs: createdAtMs,
       completedAtMs: null,
@@ -6377,7 +6414,7 @@ function applyWorkItemTransition(
       requestedProfile: requireWorkAttemptProfile(workAttempt!),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
       state: workAttempt!.threadId ? "running" : "prepared",
-      reasonCode: workAttempt!.threadId ? "work_item_dispatch" : "work_item_dispatch_intent",
+      reasonCode: workAttempt!.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}`,
       createdAtMs: now(),
       observedAtMs: now(),
       completedAtMs: null,
