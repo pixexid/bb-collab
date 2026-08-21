@@ -575,6 +575,55 @@ describe("lane awareness", () => {
     }
   });
 
+  it("does no further reads after disposal", async () => {
+    vi.useFakeTimers();
+    try {
+      const read = vi.fn(async (): Promise<IdleFleetDecision> => ({ kind: "silent" }));
+      const detector = createIdleFleetDetector({
+        read,
+        readRearmProbes: async () => [],
+        wake: async () => true,
+        onBlind: vi.fn(),
+        debounceMs: 1,
+      });
+
+      detector.stop();
+      detector.arm({ projectId: "project-1", threadId: "orchestrator-1", idleEpisode: "episode-1" });
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(read).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels queued capacity reads after disposal and closes once", async () => {
+    let releaseFirst!: () => void;
+    const first = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const observe = vi.fn<(projectId: string) => Promise<void>>()
+      .mockImplementationOnce(() => first)
+      .mockResolvedValue(undefined);
+    const close = vi.fn();
+    const detector = createIdleFleetDetector({
+      read: async (): Promise<IdleFleetDecision> => ({ kind: "silent" }),
+      readRearmProbes: async () => [],
+      wake: async () => true,
+      onBlind: vi.fn(),
+      capacity: { readProjectIds: async () => [], observe, close },
+    });
+
+    const firstRead = detector.observeCapacity("project-1");
+    await Promise.resolve();
+    const secondRead = detector.observeCapacity("project-1");
+    detector.stop();
+    detector.stop();
+    releaseFirst();
+    await Promise.all([firstRead, secondRead]);
+
+    expect(observe).toHaveBeenCalledExactlyOnceWith("project-1");
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
   it("reports an unreadable conjunct and never treats it as healthy", async () => {
     vi.useFakeTimers();
     try {

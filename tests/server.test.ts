@@ -2048,10 +2048,30 @@ describe("bb-collab plugin boundary", () => {
     ]);
     expect(cli.exitCode).toBe(2);
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "ACTOR_RECEIPT_UNKNOWN" });
-    expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["lane-watcher"]);
+    expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["idle-fleet-detector", "lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "worktree-cleanup", "thread-archive-sweep"]);
     expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "doctor", "export", "lanes", "markOperatorMessageRead", "operatorMessages", "registerWait", "reorderPinned", "replyToOperatorMessage", "roleBrief", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
     expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["send_to_operator"]);
+  });
+
+  it("bounds idle-fleet disposal when capacity closure is busy", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    const originalPrepare = db.prepare.bind(db);
+    const prepare = vi.spyOn(db, "prepare").mockImplementation(((sql: string) => {
+      if (sql.includes("UPDATE lane_capacity_intervals SET ended_at_ms")) {
+        return { run: () => { throw new Error("SQLITE_BUSY"); } } as never;
+      }
+      return originalPrepare(sql);
+    }) as never);
+    const pragma = vi.spyOn(db, "pragma");
+    const service = host.harness.runService("idle-fleet-detector");
+    service.controller.abort();
+    await service.done;
+
+    expect(pragma).toHaveBeenCalledWith("busy_timeout = 0");
+    expect(pragma).toHaveBeenCalledWith("busy_timeout = 5000");
+    prepare.mockRestore();
   });
 
   it("keeps the canonical store available when historical backfill refuses", async () => {

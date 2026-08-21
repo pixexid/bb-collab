@@ -993,7 +993,10 @@ export function createIdleFleetDetector(options: {
   const observeCapacity = (projectId: string): Promise<void> => {
     if (stopped || !options.capacity) return Promise.resolve();
     const previous = capacityQueues.get(projectId) ?? Promise.resolve();
-    const next = previous.then(() => options.capacity!.observe(projectId));
+    const next = previous.then(() => {
+      if (stopped) return;
+      return options.capacity!.observe(projectId);
+    });
     capacityQueues.set(projectId, next.catch(() => undefined));
     return next.catch((error) => {
       reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error)}`);
@@ -1016,6 +1019,7 @@ export function createIdleFleetDetector(options: {
       }
     },
     stop() {
+      if (stopped) return;
       stopped = true;
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
