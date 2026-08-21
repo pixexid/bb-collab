@@ -961,9 +961,10 @@ export function createIdleFleetDetector(options: {
   let blindOccurrences = 0;
   let lastReportedOccurrences = 0;
   let lastBlindReportAt = 0;
+  let blindCountCutShort = false;
   const emitBlind = (message: string, occurrences: number) => {
     try {
-      options.onBlind(`${message} occurrences=${occurrences}`);
+      options.onBlind(`${message} occurrences=${blindCountCutShort ? `>=${occurrences} (counting cut short)` : occurrences}`);
     } catch {
       // Coverage reporting cannot keep the detector from re-arming.
     }
@@ -1091,13 +1092,18 @@ export function createIdleFleetDetector(options: {
       }
       stopping = (async () => {
         const reads = [...inFlightCapacityReads];
-        if (reads.length > 0) await new Promise<void>((resolve) => {
-          const timeout = setTimeout(resolve, 1_000);
-          void Promise.allSettled(reads).then(() => {
-            clearTimeout(timeout);
-            resolve();
+        if (reads.length > 0) {
+          let expired = true;
+          await new Promise<void>((resolve) => {
+            const timeout = setTimeout(resolve, 1_000);
+            void Promise.allSettled(reads).then(() => {
+              expired = false;
+              clearTimeout(timeout);
+              resolve();
+            });
           });
-        });
+          if (expired) blindCountCutShort = true;
+        }
         flushBlind();
       })();
       return stopping;

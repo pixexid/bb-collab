@@ -14441,9 +14441,10 @@ function createIdleFleetDetector(options) {
   let blindOccurrences = 0;
   let lastReportedOccurrences = 0;
   let lastBlindReportAt = 0;
+  let blindCountCutShort = false;
   const emitBlind = (message, occurrences) => {
     try {
-      options.onBlind(`${message} occurrences=${occurrences}`);
+      options.onBlind(`${message} occurrences=${blindCountCutShort ? `>=${occurrences} (counting cut short)` : occurrences}`);
     } catch {
     }
   };
@@ -14566,13 +14567,18 @@ function createIdleFleetDetector(options) {
       }
       stopping = (async () => {
         const reads = [...inFlightCapacityReads];
-        if (reads.length > 0) await new Promise((resolve3) => {
-          const timeout = setTimeout(resolve3, 1e3);
-          void Promise.allSettled(reads).then(() => {
-            clearTimeout(timeout);
-            resolve3();
+        if (reads.length > 0) {
+          let expired = true;
+          await new Promise((resolve3) => {
+            const timeout = setTimeout(resolve3, 1e3);
+            void Promise.allSettled(reads).then(() => {
+              expired = false;
+              clearTimeout(timeout);
+              resolve3();
+            });
           });
-        });
+          if (expired) blindCountCutShort = true;
+        }
         flushBlind();
       })();
       return stopping;
