@@ -8,6 +8,7 @@ const BACKOFF_MS = 10 * 60_000;
 const ACTIVE = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
 type Condition = "queue" | "startable" | "pr";
 type Finding = { condition: Condition; text: string; key: string };
+type StartableIssue = { number: number; title: string };
 type PullRequest = { number: number; state?: string; mergeStateStatus?: string; reviewDecision?: string; headCommitOid?: string; approvedCommitOids?: readonly string[]; checks?: readonly string[] };
 type Snapshot = { sentAt: number; fingerprint: string; turns: number; escalated?: boolean };
 
@@ -19,27 +20,38 @@ function missing(path: string): Error {
   return new Error(`github-payload-invalid:missing-${path}`);
 }
 
-export function parsePullRequests(value: unknown): PullRequest[] {
+export function parsePullRequests(value: unknown, onInvalid: (error: unknown) => void = () => {}): PullRequest[] {
   if (!Array.isArray(value)) throw new Error("github-payload-invalid:pull-requests-not-array");
-  return value.map((item, index) => {
-    if (!item || typeof item !== "object") throw new Error(`github-payload-invalid:pr-${index}-not-object`);
-    const pr = item as Record<string, unknown>;
-    for (const field of ["number", "state", "mergeStateStatus", "reviewDecision", "headRefOid", "reviews", "statusCheckRollup"]) {
-      if (!(field in pr)) throw missing(`pr-${index}-${field}`);
+  return value.flatMap((item, index) => {
+    try {
+      if (!item || typeof item !== "object") throw new Error(`github-payload-invalid:pr-${index}-not-object`);
+      const pr = item as Record<string, unknown>;
+      for (const field of ["number", "state", "mergeStateStatus", "reviewDecision", "headRefOid", "reviews", "statusCheckRollup"]) {
+        if (!(field in pr)) throw missing(`pr-${index}-${field}`);
+      }
+      if (typeof pr.number !== "number" || typeof pr.state !== "string" || (pr.mergeStateStatus !== null && typeof pr.mergeStateStatus !== "string") || (pr.reviewDecision !== null && typeof pr.reviewDecision !== "string") || typeof pr.headRefOid !== "string" || !Array.isArray(pr.reviews) || !Array.isArray(pr.statusCheckRollup)) throw new Error(`github-payload-invalid:pr-${index}-field-type`);
+      const approvedCommitOids = pr.reviews.map((review, reviewIndex) => {
+        if (!review || typeof review !== "object" || typeof (review as { state?: unknown }).state !== "string") throw new Error(`github-payload-invalid:pr-${index}-review-${reviewIndex}`);
+        if ((review as { state: string }).state !== "APPROVED") return null;
+        const oid = (review as { commit?: { oid?: unknown } }).commit?.oid;
+        if (typeof oid !== "string") throw missing(`pr-${index}-approved-review-${reviewIndex}-commit`);
+        return oid;
+      }).filter((oid): oid is string => oid !== null);
+      const checks = pr.statusCheckRollup.map((check, checkIndex) => {
+        if (!check || typeof check !== "object") throw new Error(`github-payload-invalid:pr-${index}-check-${checkIndex}`);
+        if ("conclusion" in check) {
+          const conclusion = (check as { conclusion?: unknown }).conclusion;
+          if (conclusion !== null && typeof conclusion !== "string") throw new Error(`github-payload-invalid:pr-${index}-check-${checkIndex}`);
+          return conclusion ?? "";
+        }
+        if ("state" in check && typeof (check as { state?: unknown }).state === "string") return (check as { state: string }).state;
+        throw new Error(`github-payload-invalid:pr-${index}-check-${checkIndex}`);
+      });
+      return [{ number: pr.number, state: pr.state, mergeStateStatus: pr.mergeStateStatus ?? undefined, reviewDecision: pr.reviewDecision ?? undefined, headCommitOid: pr.headRefOid, approvedCommitOids, checks }];
+    } catch (error) {
+      onInvalid(error);
+      return [];
     }
-    if (typeof pr.number !== "number" || typeof pr.state !== "string" || (pr.mergeStateStatus !== null && typeof pr.mergeStateStatus !== "string") || (pr.reviewDecision !== null && typeof pr.reviewDecision !== "string") || typeof pr.headRefOid !== "string" || !Array.isArray(pr.reviews) || !Array.isArray(pr.statusCheckRollup)) throw new Error(`github-payload-invalid:pr-${index}-field-type`);
-    const approvedCommitOids = pr.reviews.map((review, reviewIndex) => {
-      if (!review || typeof review !== "object" || typeof (review as { state?: unknown }).state !== "string") throw new Error(`github-payload-invalid:pr-${index}-review-${reviewIndex}`);
-      if ((review as { state: string }).state !== "APPROVED") return null;
-      const oid = (review as { commit?: { oid?: unknown } }).commit?.oid;
-      if (typeof oid !== "string") throw missing(`pr-${index}-approved-review-${reviewIndex}-commit`);
-      return oid;
-    }).filter((oid): oid is string => oid !== null);
-    const checks = pr.statusCheckRollup.map((check, checkIndex) => {
-      if (!check || typeof check !== "object" || !("conclusion" in check) || ((check as { conclusion?: unknown }).conclusion !== null && typeof (check as { conclusion?: unknown }).conclusion !== "string")) throw new Error(`github-payload-invalid:pr-${index}-check-${checkIndex}`);
-      return (check as { conclusion: string | null }).conclusion ?? "";
-    });
-    return { number: pr.number, state: pr.state, mergeStateStatus: pr.mergeStateStatus ?? undefined, reviewDecision: pr.reviewDecision ?? undefined, headCommitOid: pr.headRefOid, approvedCommitOids, checks };
   });
 }
 export function shouldEscalate(prior: Snapshot | undefined, turnStartedAt: number | undefined, fingerprint: string): boolean {
@@ -55,15 +67,20 @@ export function coverageReason(kind: "store" | "github" | "sdk" | "wake", error:
   return `${kind === "store" ? "canonical-store-unavailable" : kind === "github" ? "github-unavailable" : kind === "wake" ? "wake-delivery-failed" : "sdk-unavailable"}:${String(error)}`;
 }
 
-export function evaluate(db: Database.Database, projectId: string, queued: readonly { id?: string; content?: unknown }[], startable: readonly number[], prs: readonly PullRequest[]): Finding[] {
+function firstLine(content: unknown): string {
+  const text = typeof content === "string" ? content : Array.isArray(content) ? content.find((part) => part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string")?.text : undefined;
+  return typeof text === "string" ? text.split("\n", 1)[0] : "(unreadable)";
+}
+
+export function evaluate(db: Database.Database, projectId: string, queued: readonly { id?: string; content?: unknown }[], startable: readonly StartableIssue[], prs: readonly PullRequest[]): Finding[] {
   const holder = db.prepare(`SELECT a.thread_id AS thread_id FROM role_generation_heads h JOIN role_generations g ON g.project_id=h.project_id AND g.role_id=h.role_id AND g.generation=h.current_generation JOIN execution_attempts a ON a.project_id=g.project_id AND a.execution_attempt_id=g.holder_execution_attempt_id WHERE h.project_id=? AND h.role_id='project-orchestrator'`).get(projectId) as { thread_id: string } | undefined;
   if (!holder) return [];
   const lane = db.prepare(`SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id=? AND origin='assignment' AND state IN (${ACTIVE.map(() => "?").join(",")})`).get(projectId, ...ACTIVE) as { count: number };
   if (Number(lane.count) > 0) return [];
   const findings: Finding[] = [];
-  if (queued.length) findings.push({ condition: "queue", text: `${queued.length} unconsumed queued message${queued.length === 1 ? "" : "s"}`, key: JSON.stringify(queued.map((m) => [m.id, m.content])) });
+  if (queued.length) findings.push({ condition: "queue", text: `${queued.length} unconsumed queued message${queued.length === 1 ? "" : "s"}: ${queued.map((m) => `"${firstLine(m.content)}"`).join(", ")}`, key: JSON.stringify(queued.map((m) => [m.id, m.content])) });
   const ceiling = (db.prepare(`SELECT json_extract(c.canonical_config_json, '$.extensions.bbCollab.writingLaneCeiling') AS ceiling FROM project_config_heads h JOIN project_config_revisions c ON c.project_id=h.project_id AND c.config_revision=h.config_revision WHERE h.project_id=?`).get(projectId) as { ceiling: number | null } | undefined)?.ceiling ?? 3;
-  if (startable.length && Number(lane.count) < ceiling) findings.push({ condition: "startable", text: `${startable.length} queue:startable issue${startable.length === 1 ? "" : "s"} (${startable.map((n) => `#${n}`).join(", ")}); ${lane.count}/${ceiling} writing lanes active`, key: `${startable.join(",")}:${lane.count}/${ceiling}` });
+  if (startable.length && Number(lane.count) < ceiling) findings.push({ condition: "startable", text: `${startable.length} queue:startable issue${startable.length === 1 ? "" : "s"} (${startable.map((issue) => `#${issue.number} ${issue.title}`).join(", ")}); ${lane.count}/${ceiling} writing lanes active`, key: JSON.stringify([startable, lane.count, ceiling]) });
   const green = prs.filter(isMergeReady);
   if (green.length) findings.push({ condition: "pr", text: green.map((pr) => `PR #${pr.number} merge-ready and unmerged`).join("; "), key: green.map((pr) => pr.number).join(",") });
   return findings;
@@ -77,14 +94,14 @@ function repoName(remote: string | null): string | null {
   const match = remote?.match(/github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?$/u);
   return match?.[1] ?? null;
 }
-async function github(repo: string): Promise<{ issues: number[]; prs: PullRequest[] }> {
+async function github(repo: string, onInvalid: (error: unknown) => void): Promise<{ issues: StartableIssue[]; prs: PullRequest[] }> {
   const [issues, prs] = await Promise.all([
-    json(["issue", "list", "--repo", repo, "--label", "queue:startable", "--state", "open", "--json", "number", "--limit", "1000"]),
+    json(["issue", "list", "--repo", repo, "--label", "queue:startable", "--state", "open", "--json", "number,title", "--limit", "1000"]),
     json(["pr", "list", "--repo", repo, "--state", "open", "--json", "number,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup", "--limit", "1000"]),
   ]);
-  const issueNumbers = Array.isArray(issues) ? issues.flatMap((x) => typeof x === "object" && x && typeof (x as { number?: unknown }).number === "number" ? [(x as { number: number }).number] : []) : [];
-  const green = parsePullRequests(prs);
-  return { issues: issueNumbers, prs: green };
+  const startable = Array.isArray(issues) ? issues.flatMap((x) => typeof x === "object" && x && typeof (x as { number?: unknown }).number === "number" && typeof (x as { title?: unknown }).title === "string" ? [{ number: (x as { number: number }).number, title: (x as { title: string }).title }] : []) : [];
+  const green = parsePullRequests(prs, onInvalid);
+  return { issues: startable, prs: green };
 }
 
 export default function companionWatcher(bb: BbPluginApi) {
@@ -139,9 +156,9 @@ export default function companionWatcher(bb: BbPluginApi) {
         bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("sdk", error)}`);
         return;
       }
-      let issues: number[], prs: PullRequest[];
+      let issues: StartableIssue[], prs: PullRequest[];
       try {
-        ({ issues, prs } = await github(repoName(remote) ?? ""));
+        ({ issues, prs } = await github(repoName(remote) ?? "", (error) => bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("github", error)}`)));
       } catch (error) {
         bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("github", error)}`);
         return;
