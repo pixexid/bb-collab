@@ -23,7 +23,9 @@ const reviewTierConventionStartAtMs = Date.parse("2026-08-15T23:26:13Z");
 const reviewTierConventionStart = new Date(reviewTierConventionStartAtMs).toISOString();
 const quote = (value) => /[^A-Za-z0-9_./:=@-]/u.test(value) ? JSON.stringify(value) : value;
 const command = (parts) => parts.map(quote).join(" ");
+const inWindow = (at, start, end) => Number.isFinite(at) && at >= start && at < end;
 const ghJson = (ghArgs) => JSON.parse(execFileSync("gh", ghArgs, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] }));
+const ghJsonQuiet = (ghArgs) => JSON.parse(execFileSync("gh", ghArgs, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
 const bbJson = (bbArgs) => JSON.parse(execFileSync("bb", bbArgs, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
 const tier = (body) => {
   const declarations = visibleMarkdown(body ?? "").match(/^\s*Review tier\s*:\s*([ABC])\s*$/gmu) ?? [];
@@ -45,10 +47,11 @@ if (outlierCohorts.some((cohort) => !Number.isFinite(cohort.startAtMs) || !Numbe
   throw new Error("outlier bounds must be valid increasing ISO-8601 timestamps");
 }
 
-const issueArgs = ["issue", "list", "--repo", repo, "--state", "all", "--limit", "1000", "--json", "number,createdAt,closedAt,state"];
+const issueArgs = ["issue", "list", "--repo", repo, "--state", "all", "--limit", "1000", "--json", "number,createdAt,closedAt,state,labels"];
 const mergeArgs = ["pr", "list", "--repo", repo, "--state", "merged", "--limit", "1000", "--json", "number,mergedAt,body,title"];
 const labelArgs = ["label", "list", "--repo", repo, "--limit", "1000", "--json", "name"];
-const issues = ghJson(issueArgs).map((issue) => ({
+const issueRows = ghJson(issueArgs);
+const issues = issueRows.map((issue) => ({
   id: `#${issue.number}`,
   openedAtMs: Date.parse(issue.createdAt),
   closedAtMs: issue.closedAt === null ? null : Date.parse(issue.closedAt),
@@ -59,8 +62,26 @@ const pulls = ghJson(mergeArgs).map((pull) => ({
   mergedAtMs: pull.mergedAt === null ? null : Date.parse(pull.mergedAt),
   tier: tier(pull.body),
   title: pull.title,
+  body: pull.body,
 }));
 const labels = ghJson(labelArgs).map((label) => label.name.toLowerCase());
+let defectEscapeReason = null;
+const defectIssues = issueRows.filter((issue) => inWindow(Date.parse(issue.createdAt), startAtMs, endAtMs) && (issue.labels ?? []).some((label) => ["bug", "defect"].includes(String(label.name).toLowerCase())));
+const timelineAttribution = new Map();
+try {
+  for (const issue of defectIssues) {
+    const events = ghJsonQuiet(["api", `repos/${repo}/issues/${issue.number}/timeline`, "--paginate"]);
+    const crossRefs = events.filter((event) => event.event === "cross-referenced" && event.source?.issue?.number && event.source.issue.pull_request?.merged_at);
+    if (crossRefs.length) timelineAttribution.set(issue.number, `#${crossRefs[0].source.issue.number}`);
+  }
+} catch {
+  defectEscapeReason = "GitHub issue timeline attribution is unavailable";
+}
+const hotfixOrRevertAttribution = new Map();
+for (const pull of pulls) {
+  if (pull.mergedAtMs === null || !/(?:hotfix|revert)/iu.test(`${pull.title} ${pull.body ?? ""}`)) continue;
+  for (const match of `${pull.title} ${pull.body ?? ""}`.matchAll(/#(\d+)/gu)) hotfixOrRevertAttribution.set(Number(match[1]), pull.id);
+}
 const canonicalExport = (() => {
   try {
     const projects = bbJson(["project", "list", "--json"]).filter((project) => project.gitRemoteUrl === `https://github.com/${repo}.git`);
@@ -103,13 +124,19 @@ const report = weeklyThroughputReport({
   merges: pulls,
   reviews,
   laneCapacityIntervals,
-  defects: pulls
-    .filter((pull) => pull.mergedAtMs !== null && pull.mergedAtMs >= startAtMs && pull.mergedAtMs < endAtMs)
-    .map((pull) => ({ id: pull.id, reverted: /^revert(?:\b|:)/iu.test(pull.title) ? true : null, postMergeSeverity: null })),
+  defects: defectIssues.map((issue) => ({
+    id: `#${issue.number}`,
+    filedAtMs: Date.parse(issue.createdAt),
+    culpritMergeId: timelineAttribution.get(issue.number) ?? hotfixOrRevertAttribution.get(issue.number) ?? null,
+    attributionKnown: defectEscapeReason === null,
+    reverted: null,
+    postMergeSeverity: null,
+  })),
   outlierCohorts,
   unknownReasons: {
     laneSlotUtilization: "PR #338 emits zero-lane and blind episodes but does not persist full-cap intervals; startability must not be recomputed",
     ...(canonicalExport.reason === null ? {} : { reviewLatency: canonicalExport.reason }),
+    ...(defectEscapeReason ? { defectEscape: defectEscapeReason } : {}),
     reverts: "only explicit revert-titled merged pull requests are observable; manual rollback coverage is unknown",
     postMergeSeverity: labels.some((label) => label === "p0" || label === "p1")
       ? "P0/P1 labels exist but post-merge culprit-PR linkage is not canonical"
@@ -121,7 +148,7 @@ const report = weeklyThroughputReport({
     reviewTiers: `${command(["gh", ...mergeArgs])}; parse exactly one visible 'Review tier: A|B|C' declaration`,
     reviewLatency: "bb project list --json; bb collab export --project PROJECT_ID; read execution_attempts.review_pr_number",
     laneSlotUtilization: "bb collab export --project PROJECT_ID; read lane_capacity_intervals",
-    defectEscape: command(["gh", ...labelArgs]),
+    defectEscape: `${command(["gh", ...issueArgs])}; ${command(["gh", ...mergeArgs])}; gh api repos/OWNER/REPO/issues/ISSUE/timeline --paginate`,
   },
 }, { startAtMs, endAtMs });
 

@@ -44,6 +44,15 @@ describe("weekly throughput report", () => {
     expect(renderWeeklyThroughputReport(report)).toBe(JSON.stringify(report));
   });
 
+  it("keeps a filed defect without culprit linkage in unattributed coverage", () => {
+    const report = weeklyThroughputReport({
+      ...empty,
+      defects: [{ id: "bug-1", culpritMergeId: null, attributionKnown: true, reverted: false, postMergeSeverity: "P1" }],
+    }, window);
+    expect(report.defectEscape).toMatchObject({ filed: 1, attributed: 0, unattributed: 1, attributionCoverage: 0 });
+    expect(report.defectEscape.summary).toContain("defects filed 1; defects attributed 0; defects unattributed 1");
+  });
+
   it("states metric populations and excludes a merge gap crossing the window boundary", () => {
     const report = weeklyThroughputReport({
       ...empty,
