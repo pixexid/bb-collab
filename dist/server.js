@@ -14426,6 +14426,8 @@ function createIdleFleetDetector(options) {
   let loaded = false;
   let stopped = false;
   const capacityQueues = /* @__PURE__ */ new Map();
+  const inFlightCapacityReads = /* @__PURE__ */ new Set();
+  let stopping;
   const probeKey = (probe) => JSON.stringify([probe.projectId, probe.threadId]);
   const legacyProbeKey = (probe) => `${probe.projectId}:${probe.threadId}`;
   const load = async () => {
@@ -14434,11 +14436,43 @@ function createIdleFleetDetector(options) {
     loaded = true;
   };
   const save = () => options.persistence?.write(structuredClone(state));
-  const reportBlind = (message) => {
+  const blindReportIntervalMs = 1e3;
+  let lastBlindMessage = null;
+  let blindOccurrences = 0;
+  let lastReportedOccurrences = 0;
+  let lastBlindReportAt = 0;
+  let blindCountCutShort = false;
+  const emitBlind = (message, occurrences) => {
     try {
-      options.onBlind(message);
+      options.onBlind(`${message} occurrences=${blindCountCutShort ? `>=${occurrences} (counting cut short)` : occurrences}`);
     } catch {
     }
+  };
+  const flushBlind = () => {
+    if (lastBlindMessage !== null && blindOccurrences > lastReportedOccurrences) {
+      emitBlind(lastBlindMessage, blindOccurrences);
+    }
+    lastBlindMessage = null;
+    blindOccurrences = 0;
+    lastReportedOccurrences = 0;
+    lastBlindReportAt = 0;
+    blindCountCutShort = false;
+  };
+  const reportBlind = (message, capacityRead = false) => {
+    const marked = capacityRead && blindCountCutShort;
+    const now2 = Date.now();
+    if (message === lastBlindMessage) {
+      blindOccurrences += 1;
+      if (now2 - lastBlindReportAt < blindReportIntervalMs) return;
+    } else {
+      flushBlind();
+      lastBlindMessage = message;
+      blindOccurrences = 1;
+      if (marked) blindCountCutShort = true;
+    }
+    lastBlindReportAt = now2;
+    lastReportedOccurrences = blindOccurrences;
+    emitBlind(message, blindOccurrences);
   };
   const evaluate = async (probe) => {
     try {
@@ -14502,9 +14536,12 @@ function createIdleFleetDetector(options) {
       return options.capacity.observe(projectId);
     });
     capacityQueues.set(projectId, next.catch(() => void 0));
-    return next.catch((error48) => {
-      reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error48)}`);
+    const read = next.catch((error48) => {
+      reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error48)}`, true);
     });
+    inFlightCapacityReads.add(read);
+    void read.then(() => inFlightCapacityReads.delete(read));
+    return read;
   };
   return {
     arm,
@@ -14522,7 +14559,7 @@ function createIdleFleetDetector(options) {
       }
     },
     stop() {
-      if (stopped) return;
+      if (stopping) return stopping;
       stopped = true;
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
@@ -14531,6 +14568,25 @@ function createIdleFleetDetector(options) {
       } catch (error48) {
         reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-close-unreadable:${String(error48)}`);
       }
+      stopping = (async () => {
+        const reads = [...inFlightCapacityReads];
+        if (reads.length > 0) {
+          let expired = true;
+          await new Promise((resolve3) => {
+            const timeout = setTimeout(resolve3, 1e3);
+            void Promise.allSettled(reads).then(() => {
+              expired = false;
+              clearTimeout(timeout);
+              resolve3();
+            });
+          });
+          flushBlind();
+          if (expired) blindCountCutShort = true;
+        } else {
+          flushBlind();
+        }
+      })();
+      return stopping;
     }
   };
 }

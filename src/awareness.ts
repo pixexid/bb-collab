@@ -935,7 +935,7 @@ export function createIdleFleetDetector(options: {
   arm(probe: IdleFleetProbe): void;
   observeCapacity(projectId: string): Promise<void>;
   rearm(): Promise<void>;
-  stop(): void;
+  stop(): Promise<void>;
 } {
   const debounceMs = Number.isInteger(options.debounceMs) && (options.debounceMs ?? 0) >= 0
     ? options.debounceMs as number
@@ -945,6 +945,8 @@ export function createIdleFleetDetector(options: {
   let loaded = false;
   let stopped = false;
   const capacityQueues = new Map<string, Promise<void>>();
+  const inFlightCapacityReads = new Set<Promise<void>>();
+  let stopping: Promise<void> | undefined;
   const probeKey = (probe: IdleFleetProbe) => JSON.stringify([probe.projectId, probe.threadId]);
   const legacyProbeKey = (probe: IdleFleetProbe) => `${probe.projectId}:${probe.threadId}`;
 
@@ -954,12 +956,44 @@ export function createIdleFleetDetector(options: {
     loaded = true;
   };
   const save = () => options.persistence?.write(structuredClone(state));
-  const reportBlind = (message: string) => {
+  const blindReportIntervalMs = 1_000;
+  let lastBlindMessage: string | null = null;
+  let blindOccurrences = 0;
+  let lastReportedOccurrences = 0;
+  let lastBlindReportAt = 0;
+  let blindCountCutShort = false;
+  const emitBlind = (message: string, occurrences: number) => {
     try {
-      options.onBlind(message);
+      options.onBlind(`${message} occurrences=${blindCountCutShort ? `>=${occurrences} (counting cut short)` : occurrences}`);
     } catch {
       // Coverage reporting cannot keep the detector from re-arming.
     }
+  };
+  const flushBlind = () => {
+    if (lastBlindMessage !== null && blindOccurrences > lastReportedOccurrences) {
+      emitBlind(lastBlindMessage, blindOccurrences);
+    }
+    lastBlindMessage = null;
+    blindOccurrences = 0;
+    lastReportedOccurrences = 0;
+    lastBlindReportAt = 0;
+    blindCountCutShort = false;
+  };
+  const reportBlind = (message: string, capacityRead = false) => {
+    const marked = capacityRead && blindCountCutShort;
+    const now = Date.now();
+    if (message === lastBlindMessage) {
+      blindOccurrences += 1;
+      if (now - lastBlindReportAt < blindReportIntervalMs) return;
+    } else {
+      flushBlind();
+      lastBlindMessage = message;
+      blindOccurrences = 1;
+      if (marked) blindCountCutShort = true;
+    }
+    lastBlindReportAt = now;
+    lastReportedOccurrences = blindOccurrences;
+    emitBlind(message, blindOccurrences);
   };
 
   const evaluate = async (probe: IdleFleetProbe) => {
@@ -1026,9 +1060,12 @@ export function createIdleFleetDetector(options: {
       return options.capacity!.observe(projectId);
     });
     capacityQueues.set(projectId, next.catch(() => undefined));
-    return next.catch((error) => {
-      reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error)}`);
+    const read = next.catch((error) => {
+      reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error)}`, true);
     });
+    inFlightCapacityReads.add(read);
+    void read.then(() => inFlightCapacityReads.delete(read));
+    return read;
   };
 
   return {
@@ -1047,7 +1084,7 @@ export function createIdleFleetDetector(options: {
       }
     },
     stop() {
-      if (stopped) return;
+      if (stopping) return stopping;
       stopped = true;
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
@@ -1056,6 +1093,25 @@ export function createIdleFleetDetector(options: {
       } catch (error) {
         reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-close-unreadable:${String(error)}`);
       }
+      stopping = (async () => {
+        const reads = [...inFlightCapacityReads];
+        if (reads.length > 0) {
+          let expired = true;
+          await new Promise<void>((resolve) => {
+            const timeout = setTimeout(resolve, 1_000);
+            void Promise.allSettled(reads).then(() => {
+              expired = false;
+              clearTimeout(timeout);
+              resolve();
+            });
+          });
+          flushBlind();
+          if (expired) blindCountCutShort = true;
+        } else {
+          flushBlind();
+        }
+      })();
+      return stopping;
     },
   };
 }
