@@ -2521,7 +2521,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   });
 
   const wakeInFlight = new Set<string>();
-  const permanentlyRefusedReopens = new Set<string>();
+  const permanentlyRefusedReopens = new Map<string, string>();
   // This model-free detector covers threads with obligations in canonical and platform state.
   // Acts named only in prose are outside mechanical coverage because identifying whether they
   // have an executing surface would require interpreting prose.
@@ -2769,9 +2769,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           }
           if (linked.lifecycle_state === "succeeded") {
             if (!observation.issueOpen) continue;
-            const reopenKey = `${projectId}:${linked.work_item_id}`;
-            if (permanentlyRefusedReopens.has(reopenKey)) {
-              bb.log.info(`fleet-watchdog skipped permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=succeeded-work-item-has-no-recorded-close-observation`);
+            const reopenKey = `${projectId}:${linked.work_item_id}:${observation.externalRevision}`;
+            const refusalReason = permanentlyRefusedReopens.get(reopenKey);
+            if (refusalReason !== undefined) {
+              bb.log.info(`fleet-watchdog skipped permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${refusalReason}`);
               continue;
             }
             let githubSnapshot: GitHubIssueSnapshot;
@@ -2791,12 +2792,17 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             );
             if (result.outcome === "OK") {
               bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation.externalRevision}`);
-            } else if (result.outcome === "WORK_ITEM_STATE_INVALID" && (result.message?.includes("succeeded work item has no recorded close observation") || result.message?.includes("succeeded work item can return only after a proven GitHub issue reopening"))) {
-              permanentlyRefusedReopens.add(reopenKey);
-              bb.log.warn(`fleet-watchdog learned permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${result.message}`);
+            } else if (result.outcome === "WORK_ITEM_STATE_INVALID" && (result.message?.includes("succeeded work item has no recorded close observation") || result.message?.includes("succeeded work item can return only after a proven GitHub issue reopening") || result.message?.includes("GitHub reopen does not follow the exact recorded close observation"))) {
+              const refusalReason = result.message ?? "unknown";
+              if (observation.externalRevision === githubSnapshot.externalRevision) {
+                permanentlyRefusedReopens.set(reopenKey, refusalReason);
+                bb.log.warn(`fleet-watchdog learned permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${refusalReason}`);
+              } else {
+                bb.log.warn(`fleet-watchdog did not learn issue-reopen refusal because GitHub revisions disagreed: project=${projectId} workItem=${linked.work_item_id} observationRevision=${observation.externalRevision} snapshotRevision=${githubSnapshot.externalRevision} reason=${refusalReason}`);
+              }
             } else {
               degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
-              bb.log.warn(`fleet-watchdog issue-reopen transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result.outcome}`);
+              bb.log.warn(`fleet-watchdog issue-reopen transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result.outcome} message=${result.message ?? "unknown"}`);
             }
             continue;
           }
@@ -2825,7 +2831,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             projectId,
             linked.work_item_id,
             state,
-            `fleet-watchdog:merge-close:${linked.work_item_id}:${state}`,
+            `fleet-watchdog:merge-close:${linked.work_item_id}:${state}:${githubSnapshot.externalRevision}`,
             state === "succeeded" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
             githubSnapshot,
           );

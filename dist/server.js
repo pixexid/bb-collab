@@ -23896,7 +23896,7 @@ ${thread.titleFallback ?? ""}`);
     }
   });
   const wakeInFlight = /* @__PURE__ */ new Set();
-  const permanentlyRefusedReopens = /* @__PURE__ */ new Set();
+  const permanentlyRefusedReopens = /* @__PURE__ */ new Map();
   const fleetWatchdogCycle = async (onlyProjectId) => {
     let coverage = "blind";
     let visibleSeatCount = 0;
@@ -24108,9 +24108,10 @@ ${thread.titleFallback ?? ""}`);
           }
           if (linked.lifecycle_state === "succeeded") {
             if (!observation.issueOpen) continue;
-            const reopenKey = `${projectId}:${linked.work_item_id}`;
-            if (permanentlyRefusedReopens.has(reopenKey)) {
-              bb.log.info(`fleet-watchdog skipped permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=succeeded-work-item-has-no-recorded-close-observation`);
+            const reopenKey = `${projectId}:${linked.work_item_id}:${observation.externalRevision}`;
+            const refusalReason = permanentlyRefusedReopens.get(reopenKey);
+            if (refusalReason !== void 0) {
+              bb.log.info(`fleet-watchdog skipped permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${refusalReason}`);
               continue;
             }
             let githubSnapshot2;
@@ -24130,12 +24131,17 @@ ${thread.titleFallback ?? ""}`);
             );
             if (result3.outcome === "OK") {
               bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation.externalRevision}`);
-            } else if (result3.outcome === "WORK_ITEM_STATE_INVALID" && (result3.message?.includes("succeeded work item has no recorded close observation") || result3.message?.includes("succeeded work item can return only after a proven GitHub issue reopening"))) {
-              permanentlyRefusedReopens.add(reopenKey);
-              bb.log.warn(`fleet-watchdog learned permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${result3.message}`);
+            } else if (result3.outcome === "WORK_ITEM_STATE_INVALID" && (result3.message?.includes("succeeded work item has no recorded close observation") || result3.message?.includes("succeeded work item can return only after a proven GitHub issue reopening") || result3.message?.includes("GitHub reopen does not follow the exact recorded close observation"))) {
+              const refusalReason2 = result3.message ?? "unknown";
+              if (observation.externalRevision === githubSnapshot2.externalRevision) {
+                permanentlyRefusedReopens.set(reopenKey, refusalReason2);
+                bb.log.warn(`fleet-watchdog learned permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${refusalReason2}`);
+              } else {
+                bb.log.warn(`fleet-watchdog did not learn issue-reopen refusal because GitHub revisions disagreed: project=${projectId} workItem=${linked.work_item_id} observationRevision=${observation.externalRevision} snapshotRevision=${githubSnapshot2.externalRevision} reason=${refusalReason2}`);
+              }
             } else {
               degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
-              bb.log.warn(`fleet-watchdog issue-reopen transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result3.outcome}`);
+              bb.log.warn(`fleet-watchdog issue-reopen transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result3.outcome} message=${result3.message ?? "unknown"}`);
             }
             continue;
           }
@@ -24164,7 +24170,7 @@ ${thread.titleFallback ?? ""}`);
             projectId,
             linked.work_item_id,
             state,
-            `fleet-watchdog:merge-close:${linked.work_item_id}:${state}`,
+            `fleet-watchdog:merge-close:${linked.work_item_id}:${state}:${githubSnapshot.externalRevision}`,
             state === "succeeded" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
             githubSnapshot
           );
