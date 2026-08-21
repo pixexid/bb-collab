@@ -21309,6 +21309,14 @@ function livenessDecision(state, alerted) {
 import { execFileSync } from "node:child_process";
 import { readFileSync as readFileSync2, realpathSync as realpathSync2, statSync } from "node:fs";
 import { resolve } from "node:path";
+function cleanupAttestationFromProfile(threadId, profile) {
+  const reason = profile.reason ?? profile.turns?.find((turn) => turn.reason)?.reason;
+  if (profile.outcome === "unknown" && reason === "provider-native turn profile is absent") {
+    return { coverage: "known", expiredThreadIds: /* @__PURE__ */ new Set([threadId]) };
+  }
+  if (profile.outcome === "unknown") return { coverage: "blind", reason: `executed-profile:${threadId}:${reason ?? "unknown-cause"}` };
+  return { coverage: "known", expiredThreadIds: /* @__PURE__ */ new Set() };
+}
 var threadPattern = /thr_[a-z0-9]+/u;
 var defaultQuietFloorMs = 24 * 60 * 60 * 1e3;
 var reflogCreation = /^\S+ \S+ .* (\d+) [-+]\d{4}(?:\t|$)/u;
@@ -21459,10 +21467,10 @@ function listGitWorktrees(repoRoot) {
   if (current) entries.push(current);
   return entries;
 }
-function cleanupGitWorktrees(repoRoot, liveThreadIds, liveWorktreeThreadIds = /* @__PURE__ */ new Map(), environmentInventoryComplete = false, protectedEnvironmentPaths = /* @__PURE__ */ new Set(), pluginSourceResolved = true, attestation) {
+function cleanupGitWorktrees(repoRoot, liveThreadIds, liveWorktreeThreadIds = /* @__PURE__ */ new Map(), environmentInventoryComplete = false, protectedEnvironmentPaths = /* @__PURE__ */ new Set(), pluginSourceResolved = true, attestation, entries) {
   const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
   const status = (path) => git(["status", "--porcelain", "--untracked-files=all"], path);
-  return runWorktreeCleanup(listGitWorktrees(repoRoot), {
+  return runWorktreeCleanup(entries ?? listGitWorktrees(repoRoot), {
     liveThreadIds,
     liveWorktreeThreadIds,
     environmentInventoryComplete,
@@ -22776,7 +22784,9 @@ async function readCleanupAttestation(projectId, threadIds) {
     });
     try {
       const profile = JSON.parse(result2.output);
-      if (profile.outcome === "unknown") expiredThreadIds.add(threadId);
+      const attestation = cleanupAttestationFromProfile(threadId, profile);
+      if (attestation.coverage === "blind") return attestation;
+      for (const expiredThreadId of attestation.expiredThreadIds) expiredThreadIds.add(expiredThreadId);
     } catch {
       return { coverage: "blind", reason: `reader-unreadable:${threadId}` };
     }
@@ -22818,7 +22828,7 @@ async function reportProjectWorktreeCleanup(bb, projectId) {
   const entries = listGitWorktrees(source.path);
   const candidateThreadIds = new Set(entries.map((entry) => threadIdFromBranch(entry.branch)).filter((id2) => id2 !== null));
   const attestation = await readCleanupAttestation(projectId, candidateThreadIds);
-  return cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete, protectedEnvironmentPaths, pluginSourceResolved, attestation);
+  return cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete, protectedEnvironmentPaths, pluginSourceResolved, attestation, entries);
 }
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];

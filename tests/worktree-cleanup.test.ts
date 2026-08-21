@@ -2,9 +2,12 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+// @ts-expect-error JavaScript reader has no declaration file; this test intentionally exercises its real result.
+import { readExecutedProfiles } from "../scripts/read-executed-profile.mjs";
 import type { WorktreeCleanupOptions } from "../src/worktree-cleanup.js";
 import {
   canonicalWorktreePath,
+  cleanupAttestationFromProfile,
   classifyWorktree,
   cleanupGitWorktrees,
   defaultQuietFloorMs,
@@ -136,6 +139,34 @@ describe("worktree cleanup", () => {
     });
     expect(counted.attestation).toEqual({ coverage: "known", expiredExecutedProfileCount: 1 });
     expect(runWorktreeCleanup(threaded, { liveThreadIds: new Set(), attestation: { coverage: "blind", reason: "reader-unreadable" } }).attestation).toEqual({ coverage: "blind", reason: "reader-unreadable" });
+  });
+
+  it("classifies a real reader refusal as blind instead of expired", async () => {
+    const profile = await readExecutedProfiles({
+      thread: { providerId: "unsupported-provider", status: "idle" },
+      environment: { path: "/test/project" },
+      events: [{
+        id: "event-completed",
+        seq: 1,
+        type: "turn/completed",
+        data: { status: "completed", providerThreadId: "provider-session", providerCheckpointId: "checkpoint" },
+      }],
+    });
+    expect(profile.outcome).toBe("unknown");
+    expect(cleanupAttestationFromProfile("thr_unreadable", profile)).toEqual({
+      coverage: "blind",
+      reason: "executed-profile:thr_unreadable:provider unsupported-provider has no measured native read-back",
+    });
+  });
+
+  it("uses the measured worktree snapshot for cleanup decisions", () => {
+    const { root, paths } = fixture();
+    const result = cleanupGitWorktrees(root, new Set(), new Map(), true, new Set(), true, {
+      coverage: "known",
+      expiredThreadIds: new Set(),
+    }, []);
+    expect(result.wouldRemove).toEqual([]);
+    expect(result.refused).toEqual([]);
   });
 
   it("reports exactly the clean detached orphan and refuses live and dirty entries", () => {

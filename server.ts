@@ -69,7 +69,7 @@ import {
   type SourceObservation,
 } from "./src/registered-waits.js";
 import { ARCHIVE_SWEEP_GUARD, createArchiveSweepRefusalCounter, runArchiveSweep, type ArchiveSweepRefusalAggregate } from "./src/archive-sweep.js";
-import { canonicalWorktreePath, cleanupGitWorktrees, listAllProjectThreads, listGitWorktrees, threadIdFromBranch } from "./src/worktree-cleanup.js";
+import { canonicalWorktreePath, cleanupAttestationFromProfile, cleanupGitWorktrees, listAllProjectThreads, listGitWorktrees, threadIdFromBranch } from "./src/worktree-cleanup.js";
 import { findCheckoutRoot, readCheckoutDivergence, type CheckoutDivergence } from "./src/checkout-divergence.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFile, spawnSync, type ExecFileException, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
@@ -1293,8 +1293,10 @@ async function readCleanupAttestation(projectId: string, threadIds: ReadonlySet<
       }, (error, stdout) => resolve({ output: stdout, error: error ?? null }));
     });
     try {
-      const profile = JSON.parse(result.output) as { outcome?: string };
-      if (profile.outcome === "unknown") expiredThreadIds.add(threadId);
+      const profile = JSON.parse(result.output) as { outcome?: string; reason?: string; turns?: ReadonlyArray<{ reason?: string }> };
+      const attestation = cleanupAttestationFromProfile(threadId, profile);
+      if (attestation.coverage === "blind") return attestation;
+      for (const expiredThreadId of attestation.expiredThreadIds) expiredThreadIds.add(expiredThreadId);
     } catch {
       return { coverage: "blind" as const, reason: `reader-unreadable:${threadId}` };
     }
@@ -1341,7 +1343,7 @@ async function reportProjectWorktreeCleanup(bb: BbPluginApi, projectId: string) 
   const entries = listGitWorktrees(source.path);
   const candidateThreadIds = new Set(entries.map((entry) => threadIdFromBranch(entry.branch)).filter((id): id is string => id !== null));
   const attestation = await readCleanupAttestation(projectId, candidateThreadIds);
-  return cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete, protectedEnvironmentPaths, pluginSourceResolved, attestation);
+  return cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete, protectedEnvironmentPaths, pluginSourceResolved, attestation, entries);
 }
 
 async function runCli(

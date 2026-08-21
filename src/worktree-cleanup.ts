@@ -28,6 +28,18 @@ export type WorktreeCleanupReport = {
   attestation: { coverage: "known"; expiredExecutedProfileCount: number } | { coverage: "blind"; reason: string };
 };
 
+export type ExecutedProfileRead = { outcome?: string; reason?: string; turns?: ReadonlyArray<{ reason?: string }> };
+
+export function cleanupAttestationFromProfile(threadId: string, profile: ExecutedProfileRead):
+  { coverage: "known"; expiredThreadIds: ReadonlySet<string> } | { coverage: "blind"; reason: string } {
+  const reason = profile.reason ?? profile.turns?.find((turn) => turn.reason)?.reason;
+  if (profile.outcome === "unknown" && reason === "provider-native turn profile is absent") {
+    return { coverage: "known", expiredThreadIds: new Set([threadId]) };
+  }
+  if (profile.outcome === "unknown") return { coverage: "blind", reason: `executed-profile:${threadId}:${reason ?? "unknown-cause"}` };
+  return { coverage: "known", expiredThreadIds: new Set() };
+}
+
 export type WorktreeCleanupOptions = {
   liveThreadIds: ReadonlySet<string>;
   liveWorktreeThreadIds?: ReadonlyMap<string, ReadonlySet<string>>;
@@ -234,10 +246,11 @@ export function cleanupGitWorktrees(
   protectedEnvironmentPaths: ReadonlySet<string> = new Set(),
   pluginSourceResolved = true,
   attestation?: WorktreeCleanupOptions["attestation"],
+  entries?: WorktreeEntry[],
 ): WorktreeCleanupReport {
   const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
   const status = (path: string) => git(["status", "--porcelain", "--untracked-files=all"], path);
-  return runWorktreeCleanup(listGitWorktrees(repoRoot), {
+  return runWorktreeCleanup(entries ?? listGitWorktrees(repoRoot), {
     liveThreadIds,
     liveWorktreeThreadIds,
     environmentInventoryComplete,
