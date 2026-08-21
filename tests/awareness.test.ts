@@ -664,6 +664,43 @@ describe("lane awareness", () => {
     }
   });
 
+  it("scopes the cut-short marker to the aggregate that expired", async () => {
+    vi.useFakeTimers();
+    try {
+      const onBlind = vi.fn();
+      let rejectDetectorRead!: (error: Error) => void;
+      const detectorRead = new Promise<IdleFleetDecision>((_, reject) => { rejectDetectorRead = reject; });
+      const detector = createIdleFleetDetector({
+        read: async () => detectorRead,
+        readRearmProbes: async () => [],
+        wake: async () => true,
+        onBlind,
+        capacity: {
+          readProjectIds: async () => [],
+          observe: async () => new Promise<void>(() => {}),
+          close: vi.fn(),
+        },
+        debounceMs: 1,
+      });
+
+      detector.arm({ projectId: "project-1", threadId: "orchestrator-1", idleEpisode: "episode-1" });
+      detector.observeCapacity("project-1");
+      await vi.advanceTimersByTimeAsync(1);
+      const stopping = detector.stop();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await stopping;
+
+      rejectDetectorRead(new Error("detector read failed"));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(onBlind).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("reason=detector-unreadable:Error: detector read failed occurrences=1"));
+      expect(onBlind.mock.calls[0]?.[0]).not.toContain("counting cut short");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not emit an empty blind aggregate on disposal", async () => {
     const onBlind = vi.fn();
     const detector = createIdleFleetDetector({

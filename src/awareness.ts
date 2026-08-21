@@ -977,8 +977,10 @@ export function createIdleFleetDetector(options: {
     blindOccurrences = 0;
     lastReportedOccurrences = 0;
     lastBlindReportAt = 0;
+    blindCountCutShort = false;
   };
-  const reportBlind = (message: string) => {
+  const reportBlind = (message: string, capacityRead = false) => {
+    const marked = capacityRead && blindCountCutShort;
     const now = Date.now();
     if (message === lastBlindMessage) {
       blindOccurrences += 1;
@@ -987,6 +989,7 @@ export function createIdleFleetDetector(options: {
       flushBlind();
       lastBlindMessage = message;
       blindOccurrences = 1;
+      if (marked) blindCountCutShort = true;
     }
     lastBlindReportAt = now;
     lastReportedOccurrences = blindOccurrences;
@@ -1058,7 +1061,7 @@ export function createIdleFleetDetector(options: {
     });
     capacityQueues.set(projectId, next.catch(() => undefined));
     const read = next.catch((error) => {
-      reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error)}`);
+      reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error)}`, true);
     });
     inFlightCapacityReads.add(read);
     void read.then(() => inFlightCapacityReads.delete(read));
@@ -1102,9 +1105,11 @@ export function createIdleFleetDetector(options: {
               resolve();
             });
           });
+          flushBlind();
           if (expired) blindCountCutShort = true;
+        } else {
+          flushBlind();
         }
-        flushBlind();
       })();
       return stopping;
     },
