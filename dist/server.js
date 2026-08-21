@@ -23148,6 +23148,7 @@ async function plugin(bb, options = {}) {
     db = null;
   }
   const recoveryInFlight = /* @__PURE__ */ new Set();
+  const RECOVERY_UNRECOVERABLE = "unrecoverable";
   const withRecoveryTimeout = async (label, operation) => {
     const controller = new AbortController();
     let timer;
@@ -23197,17 +23198,41 @@ async function plugin(bb, options = {}) {
       return null;
     }
   };
+  const withRecoverySendTimeout = async (threadId, operation) => {
+    let timer;
+    let timedOut = false;
+    try {
+      return await Promise.race([
+        operation(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(new Error(`error-recovery threads.send timed out after ${ERROR_RECOVERY_IO_TIMEOUT_MS}ms`));
+          }, ERROR_RECOVERY_IO_TIMEOUT_MS);
+        })
+      ]);
+    } catch (error48) {
+      if (timedOut) bb.log.error(`error-recovery send anomaly: thread=${threadId} reason=uncancellable-send-timeout ${String(error48)}`);
+      throw error48;
+    } finally {
+      if (timer !== void 0) clearTimeout(timer);
+    }
+  };
   const recoverErroredThread = async (threadId, projectId, holder, lane) => {
     if (recoveryInFlight.has(threadId)) {
       bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=recovery-in-flight`);
       return null;
     }
-    if (db === null) return false;
+    if (db === null) return null;
     recoveryInFlight.add(threadId);
     try {
       if (!db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId)) return false;
       const thread = await withRecoveryTimeout("threads.get", (signal) => bb.sdk.threads.get({ threadId, signal }));
-      if (thread.id !== threadId || thread.projectId !== projectId || thread.status !== "error" || thread.archivedAt !== null || thread.deletedAt !== null || holder !== void 0 && !isCurrentRoleHolder(holder) || lane !== void 0 && !isCurrentLane(lane)) return false;
+      if (thread.id !== threadId || thread.projectId !== projectId || thread.archivedAt !== null || thread.deletedAt !== null) {
+        bb.log.error(`error-recovery target unrecoverable: project=${projectId} thread=${threadId} reason=canonical-target-invalid`);
+        return RECOVERY_UNRECOVERABLE;
+      }
+      if (thread.status !== "error" || holder !== void 0 && !isCurrentRoleHolder(holder) || lane !== void 0 && !isCurrentLane(lane)) return false;
       let head = "unavailable (re-fetch before continuing)";
       if (thread.environmentId !== null) {
         const environmentId = thread.environmentId;
@@ -23230,7 +23255,7 @@ async function plugin(bb, options = {}) {
         bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=lane-no-longer-current`);
         return false;
       }
-      await bb.sdk.threads.send({
+      await withRecoverySendTimeout(threadId, () => bb.sdk.threads.send({
         threadId,
         mode: "auto",
         input: [{
@@ -23239,7 +23264,7 @@ async function plugin(bb, options = {}) {
           text: `RECOVERY WAKE \u2014 reconcile state before resuming. The workspace and recorded conversation survived the daemon interruption, but the interrupted turn may have half-applied intent and a composed instruction may not have been delivered. Observed checkout head: ${head}. Re-fetch and confirm the current head, reconcile the frozen work order and canonical state against the conversation, identify any half-applied mutation or lost delivery, and re-run every pre-crash measurement whose command and output are not visible before continuing.`,
           mentions: []
         }]
-      });
+      }));
       bb.log.warn(`error-recovery wake sent: project=${projectId} thread=${threadId} mode=auto head=${head}`);
       return true;
     } catch (error48) {
@@ -23282,11 +23307,13 @@ async function plugin(bb, options = {}) {
     }
     let failedRoles = 0;
     for (const holder of holders) {
-      if (await recoverErroredThread(holder.thread_id, holder.project_id, holder) === null) failedRoles += 1;
+      const outcome = await recoverErroredThread(holder.thread_id, holder.project_id, holder);
+      if (outcome === null || outcome === RECOVERY_UNRECOVERABLE) failedRoles += 1;
     }
     let failedLanes = 0;
     for (const lane of lanes) {
-      if (await recoverErroredThread(lane.thread_id, lane.project_id, void 0, lane) === null) failedLanes += 1;
+      const outcome = await recoverErroredThread(lane.thread_id, lane.project_id, void 0, lane);
+      if (outcome === null || outcome === RECOVERY_UNRECOVERABLE) failedLanes += 1;
     }
     const roleRestart = failedRoles === 0 ? "armed" : "degraded";
     const laneRestart = failedLanes === 0 ? "armed" : "degraded";

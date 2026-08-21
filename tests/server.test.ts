@@ -3245,6 +3245,29 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     await service.done;
   });
 
+  it("reports an archived canonical lane as degraded recovery coverage", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    fixture.addNativeLane("thread-work-item-1", "error");
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      status: threadId === "thread-work-item-1" ? "error" : "idle",
+      archivedAt: threadId === "thread-work-item-1" ? 1 : null,
+      updatedAt: 1,
+    })) as never);
+
+    const service = fixture.host.harness.runService("lane-watcher");
+    await vi.waitFor(() => {
+      const entry = fixture.host.harness.inspection.logEntries.find((candidate) => candidate.message.startsWith("error-recovery coverage="));
+      expect(entry).toEqual(expect.objectContaining({ level: "error" }));
+      expect(entry?.message).toContain("coverage=degraded event=armed roleRestart=armed");
+      expect(entry?.message).toContain("laneRestart=degraded lanes=1 failedLanes=1");
+    });
+    service.controller.abort();
+    await service.done;
+  });
+
   it("re-arms role recovery on service restart and loudly reports blind lane coverage", async () => {
     const fixture = await fleetWatchdogFixture(0);
     const statuses = new Map([[fixture.orchestratorThreadId, "error" as "error" | "active"]]);
@@ -3310,33 +3333,35 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     }
   });
 
-  it("holds recovery suppression until an uncancellable send settles", async () => {
-    const fixture = await fleetWatchdogFixture(0);
-    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
-    fixture.addNativeLane("thread-work-item-1", "error");
-    let releaseSend!: () => void;
-    fixture.host.harness.sdk.stub("threads.send", (async ({ mode }: { mode: string }) => {
-      if (mode === "auto") await new Promise<void>((resolve) => { releaseSend = resolve; });
-      return { ok: true };
-    }) as never);
+  it("bounds the recovery guard around a send that never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+      fixture.addNativeLane("thread-work-item-1", "error");
+      fixture.host.harness.sdk.stub("threads.send", (async () => new Promise<never>(() => undefined)) as never);
 
-    const first = fixture.host.harness.emitThreadEvent("thread.failed", {
-      thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, status: "error", updatedAt: 1 }),
-      error: "daemon connection lost",
-    });
-    await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toContainEqual([
-      expect.objectContaining({ threadId: "thread-work-item-1", mode: "auto" }),
-    ]));
-    await fixture.host.harness.emitThreadEvent("thread.failed", {
-      thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, status: "error", updatedAt: 2 }),
-      error: "duplicate failure",
-    });
-    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
-      level: "warn",
-      message: expect.stringContaining("reason=recovery-in-flight"),
-    }));
-    releaseSend();
-    await first;
+      const emit = () => fixture.host.harness.emitThreadEvent("thread.failed", {
+        thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, status: "error", updatedAt: Date.now() }),
+        error: "daemon connection lost",
+      });
+      const first = emit();
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1));
+      await vi.advanceTimersByTimeAsync(10_000);
+      await first;
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")[0]?.[0]).not.toHaveProperty("signal");
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "error",
+        message: expect.stringContaining("reason=uncancellable-send-timeout"),
+      }));
+
+      const second = emit();
+      await vi.advanceTimersByTimeAsync(10_000);
+      await second;
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("restarts a genuinely errored canonical lane through auto mode", async () => {
