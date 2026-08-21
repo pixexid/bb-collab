@@ -838,29 +838,28 @@ async function dispatchLane(
   if (spawn.projectId !== request.projectId) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "spawn projectId must match request projectId" };
   }
+  const { threadId: _threadId, ...intentAttempt } = request.workAttempt;
+  const intent = await applyLiveAuthorizedMutation(bb, db, {
+    ...request,
+    workAttempt: intentAttempt,
+  });
+  if (intent.outcome !== "OK") return intent;
+
   let thread: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["spawn"]>>;
   try {
     thread = await bb.sdk.threads.spawn(spawn as unknown as Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]);
   } catch (error) {
-    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane spawn failed: ${String(error)}` };
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane spawn failed after durable dispatch intent: ${String(error)}`, evidence: { intent } };
   }
-  const registered = await applyLiveAuthorizedMutation(bb, db, {
+
+  const intentEvidence = intent as { currentResourceRevision?: number };
+  return applyLiveAuthorizedMutation(bb, db, {
     ...request,
+    lifecycleState: undefined,
+    expectedResourceRevision: intentEvidence?.currentResourceRevision,
+    idempotencyKey: `${request.idempotencyKey}-finalize`,
     workAttempt: { ...request.workAttempt, threadId: thread.id },
   });
-  if (registered.outcome !== "OK") {
-    try {
-      await bb.sdk.threads.stop({ threadId: thread.id });
-    } catch (error) {
-      return {
-        ...registered,
-        outcome: "INTERNAL_ERROR",
-        message: `${registered.message ?? registered.outcome}; spawned lane ${thread.id} could not be stopped: ${String(error)}`,
-        evidence: { registration: registered, spawnedThreadId: thread.id, stopFailed: true },
-      };
-    }
-  }
-  return registered;
 }
 
 async function applyLiveAuthorizedMutation(

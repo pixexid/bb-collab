@@ -5419,7 +5419,7 @@ interface WorkItemRow {
 }
 
 type WorkAttempt = z.infer<typeof workAttemptSchema>;
-type WorkAttemptState = "running" | "done" | "failed";
+type WorkAttemptState = (typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES)[number] | "done" | "blocked" | "failed";
 const ACTIVE_WORK_ATTEMPT_STATES = WORK_ITEM_CAPACITY_ATTEMPT_STATES;
 const WORK_ITEM_THREAD_TOKEN = /thr_[A-Za-z0-9]+/gu;
 const WORK_ITEM_LANE_SENTENCE = /^(?:Lane|Writing lane) (thr_[A-Za-z0-9]+)(?:[,.!?])?(?:[ \t]+|\r?\n|$)/u;
@@ -6162,6 +6162,41 @@ function applyWorkItemTransition(
     throw refusal("WORK_ITEM_STATE_INVALID", "review re-dispatch requires one active review and the same exact PR head, replacement thread, and profile");
   }
   if (workAttempt !== undefined && nextState === undefined) {
+    const dispatchIntent = db.prepare(
+      `SELECT execution_attempt_id FROM execution_attempts
+       WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+         AND assignment_kind = 'write' AND state = 'prepared' AND thread_id IS NULL
+       ORDER BY attempt_ordinal DESC LIMIT 1`,
+    ).get(request.projectId, workItem.work_item_id) as { execution_attempt_id: string } | undefined;
+    if (dispatchIntent && workAttempt.threadId) {
+      const observedAtMs = now();
+      db.prepare(
+        `UPDATE execution_attempts
+         SET state = 'running', thread_id = ?, lease_owner_thread_id = ?, reason_code = 'work_item_dispatch', observed_at_ms = ?
+         WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL`,
+      ).run(workAttempt.threadId, workAttempt.threadId, observedAtMs, request.projectId, dispatchIntent.execution_attempt_id);
+      return commitMutation(
+        db,
+        request,
+        digest,
+        actorReceiptId,
+        {
+          aggregateType: "work_item",
+          aggregateId: workItem.work_item_id,
+          aggregateRevision: workItem.resource_revision,
+          eventType: "work_item_attempt_armed",
+          event: { workItemId: workItem.work_item_id, executionAttemptId: dispatchIntent.execution_attempt_id, workAttempt },
+        },
+        { expected: 1, attempted: 1, verified: 1 },
+        {
+          currentConfigRevision: configRevision,
+          currentGovernanceEpoch: governor.governance_epoch,
+          currentResourceRevision: workItem.resource_revision,
+          expectedResourceRevision: request.expectedResourceRevision ?? undefined,
+          evidence: { workItemId: workItem.work_item_id, executionAttemptId: dispatchIntent.execution_attempt_id, workAttempt },
+        },
+      );
+    }
     if (workItem.lifecycle_state !== "in_progress") {
       throw refusal("WORK_ITEM_STATE_INVALID", "replacement work attempts require an in-progress work item");
     }
@@ -6191,8 +6226,8 @@ function applyWorkItemTransition(
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
-      state: "running",
-      reasonCode: "work_item_dispatch",
+      state: workAttempt.threadId ? "running" : "prepared",
+      reasonCode: workAttempt.threadId ? "work_item_dispatch" : "work_item_dispatch_intent",
       createdAtMs,
       observedAtMs: createdAtMs,
       completedAtMs: null,
@@ -6329,8 +6364,8 @@ function applyWorkItemTransition(
       assignmentKind: workAttempt!.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt!),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
-      state: "running",
-      reasonCode: "work_item_dispatch",
+      state: workAttempt!.threadId ? "running" : "prepared",
+      reasonCode: workAttempt!.threadId ? "work_item_dispatch" : "work_item_dispatch_intent",
       createdAtMs: now(),
       observedAtMs: now(),
       completedAtMs: null,

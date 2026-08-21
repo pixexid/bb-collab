@@ -19462,6 +19462,41 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
     throw refusal("WORK_ITEM_STATE_INVALID", "review re-dispatch requires one active review and the same exact PR head, replacement thread, and profile");
   }
   if (workAttempt !== void 0 && nextState === void 0) {
+    const dispatchIntent = db.prepare(
+      `SELECT execution_attempt_id FROM execution_attempts
+       WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+         AND assignment_kind = 'write' AND state = 'prepared' AND thread_id IS NULL
+       ORDER BY attempt_ordinal DESC LIMIT 1`
+    ).get(request.projectId, workItem.work_item_id);
+    if (dispatchIntent && workAttempt.threadId) {
+      const observedAtMs = now();
+      db.prepare(
+        `UPDATE execution_attempts
+         SET state = 'running', thread_id = ?, lease_owner_thread_id = ?, reason_code = 'work_item_dispatch', observed_at_ms = ?
+         WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL`
+      ).run(workAttempt.threadId, workAttempt.threadId, observedAtMs, request.projectId, dispatchIntent.execution_attempt_id);
+      return commitMutation(
+        db,
+        request,
+        digest,
+        actorReceiptId,
+        {
+          aggregateType: "work_item",
+          aggregateId: workItem.work_item_id,
+          aggregateRevision: workItem.resource_revision,
+          eventType: "work_item_attempt_armed",
+          event: { workItemId: workItem.work_item_id, executionAttemptId: dispatchIntent.execution_attempt_id, workAttempt }
+        },
+        { expected: 1, attempted: 1, verified: 1 },
+        {
+          currentConfigRevision: configRevision,
+          currentGovernanceEpoch: governor.governance_epoch,
+          currentResourceRevision: workItem.resource_revision,
+          expectedResourceRevision: request.expectedResourceRevision ?? void 0,
+          evidence: { workItemId: workItem.work_item_id, executionAttemptId: dispatchIntent.execution_attempt_id, workAttempt }
+        }
+      );
+    }
     if (workItem.lifecycle_state !== "in_progress") {
       throw refusal("WORK_ITEM_STATE_INVALID", "replacement work attempts require an in-progress work item");
     }
@@ -19491,8 +19526,8 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
-      state: "running",
-      reasonCode: "work_item_dispatch",
+      state: workAttempt.threadId ? "running" : "prepared",
+      reasonCode: workAttempt.threadId ? "work_item_dispatch" : "work_item_dispatch_intent",
       createdAtMs,
       observedAtMs: createdAtMs,
       completedAtMs: null,
@@ -19621,8 +19656,8 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
-      state: "running",
-      reasonCode: "work_item_dispatch",
+      state: workAttempt.threadId ? "running" : "prepared",
+      reasonCode: workAttempt.threadId ? "work_item_dispatch" : "work_item_dispatch_intent",
       createdAtMs: now(),
       observedAtMs: now(),
       completedAtMs: null,
@@ -22498,29 +22533,26 @@ async function dispatchLane(bb, db, input) {
   if (spawn.projectId !== request.projectId) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "spawn projectId must match request projectId" };
   }
+  const { threadId: _threadId, ...intentAttempt } = request.workAttempt;
+  const intent = await applyLiveAuthorizedMutation(bb, db, {
+    ...request,
+    workAttempt: intentAttempt
+  });
+  if (intent.outcome !== "OK") return intent;
   let thread;
   try {
     thread = await bb.sdk.threads.spawn(spawn);
   } catch (error48) {
-    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane spawn failed: ${String(error48)}` };
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane spawn failed after durable dispatch intent: ${String(error48)}`, evidence: { intent } };
   }
-  const registered = await applyLiveAuthorizedMutation(bb, db, {
+  const intentEvidence = intent;
+  return applyLiveAuthorizedMutation(bb, db, {
     ...request,
+    lifecycleState: void 0,
+    expectedResourceRevision: intentEvidence?.currentResourceRevision,
+    idempotencyKey: `${request.idempotencyKey}-finalize`,
     workAttempt: { ...request.workAttempt, threadId: thread.id }
   });
-  if (registered.outcome !== "OK") {
-    try {
-      await bb.sdk.threads.stop({ threadId: thread.id });
-    } catch (error48) {
-      return {
-        ...registered,
-        outcome: "INTERNAL_ERROR",
-        message: `${registered.message ?? registered.outcome}; spawned lane ${thread.id} could not be stopped: ${String(error48)}`,
-        evidence: { registration: registered, spawnedThreadId: thread.id, stopFailed: true }
-      };
-    }
-  }
-  return registered;
 }
 async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false) {
   const parsed = applyRequestSchema.safeParse(input);

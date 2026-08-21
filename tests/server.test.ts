@@ -3623,7 +3623,31 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
       spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
     }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
     expect(result).toMatchObject({ outcome: "OK" });
-    expect(fixture.db.prepare("SELECT lane_id, thread_id, state FROM execution_attempts WHERE origin = 'work_item'").get()).toMatchObject({ lane_id: "lane-work-item-1", thread_id: "lane-1", state: "running" });
+    expect(fixture.db.prepare("SELECT lane_id, thread_id, state FROM execution_attempts WHERE origin = 'work_item' ORDER BY rowid DESC LIMIT 1").get()).toMatchObject({ lane_id: "lane-work-item-1", thread_id: "lane-1", state: "running" });
+  });
+
+  it("refuses stale lane authorization before spawning", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: { ...transitionRequest(fixture.fenceToken, "in_progress", 2), expectedResourceRevision: 99 },
+      spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).not.toBe("OK");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ count: 0 });
+  });
+
+  it("leaves a durable prepared intent when dispatch is interrupted", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { throw new Error("interrupted"); }) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("EXTERNAL_UNAVAILABLE");
+    expect(fixture.db.prepare("SELECT lane_id, thread_id, state FROM execution_attempts WHERE origin = 'work_item'").get()).toMatchObject({ lane_id: "lane-work-item-1", thread_id: null, state: "prepared" });
   });
 
   it("uses in-progress WorkItems for capacity and suppresses repeat intake wakes for one hour", async () => {
