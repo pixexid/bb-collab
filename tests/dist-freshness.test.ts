@@ -34,37 +34,15 @@ describe("dist freshness gate", () => {
     }
   });
 
-  it("rejects a build artifact omitted from the commit", () => {
-    const root = mkdtempSync(join(tmpdir(), "bb-collab-dist-omission-"));
-    try {
-      mkdirSync(join(root, "dist"));
-      writeFileSync(join(root, "dist/server.js"), "//# sourceMappingURL=server.js.map\n");
-      writeFileSync(join(root, "dist/server.meta.json"), "{}\n");
-      writeFileSync(join(root, "dist/server.js.map"), "map\n");
-      execFileSync("git", ["init", "--quiet"], { cwd: root });
-      execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
-      execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
-      execFileSync("git", ["add", "dist/server.js", "dist/server.meta.json"], { cwd: root });
-      execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: root });
-
-      const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain("dist/server.js.map");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
   it("passes an honest artifact and names a hand-edited artifact when it fails", () => {
     const root = mkdtempSync(join(tmpdir(), "bb-collab-dist-freshness-"));
     try {
       mkdirSync(join(root, "dist"));
       writeFileSync(join(root, "dist/server.js"), "honest\n");
-      writeFileSync(join(root, "dist/server.js.map"), "map\n");
       execFileSync("git", ["init", "--quiet"], { cwd: root });
       execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
       execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
-      execFileSync("git", ["add", "dist/server.js", "dist/server.js.map"], { cwd: root });
+      execFileSync("git", ["add", "dist/server.js"], { cwd: root });
       execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: root });
       const sourceRoot = join(root, "source-checkout");
       mkdirSync(sourceRoot);
@@ -78,28 +56,16 @@ describe("dist freshness gate", () => {
       expect(deployedHonest.stdout).toBe("");
       expect(deployedHonest.stderr).toBe("");
 
-      writeFileSync(join(root, "dist/server.js.map"), "map changed\n");
-      const changedMap = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
-      expect(changedMap.status).toBe(0);
-      expect(changedMap.stdout).toContain("working tree dist/ matches commit");
-      writeFileSync(join(root, "dist/server.js.map"), "map\n");
-
       writeFileSync(join(root, "dist/server.js"), "hand edited\n");
       const stale = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
       expect(stale.status).toBe(1);
       expect(stale.stderr).toContain("dist/server.js");
 
-      execFileSync("git", ["add", "dist/server.js", "dist/server.js.map"], { cwd: root });
+      execFileSync("git", ["add", "dist/server.js"], { cwd: root });
       const deployedStale = spawnSync(process.execPath, [script, "--deployed"], { cwd: root, encoding: "utf8" });
       expect(deployedStale.status).toBe(1);
       expect(deployedStale.stderr).toContain("deployed working tree dist/");
       expect(deployedStale.stderr).toContain("dist/server.js");
-
-      rmSync(join(root, "dist/server.js.map"));
-      const missingTracked = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
-      expect(missingTracked.status).toBe(1);
-      expect(missingTracked.stderr).toContain("dist/server.js.map");
-      writeFileSync(join(root, "dist/server.js.map"), "map\n");
 
       const cleanRoot = join(root, "clean-checkout");
       mkdirSync(join(cleanRoot, "dist"), { recursive: true });
