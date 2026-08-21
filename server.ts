@@ -71,7 +71,7 @@ import { ARCHIVE_SWEEP_GUARD, createArchiveSweepRefusalCounter, runArchiveSweep,
 import { canonicalWorktreePath, cleanupGitWorktrees, listAllProjectThreads } from "./src/worktree-cleanup.js";
 import { findCheckoutRoot, readCheckoutDivergence, type CheckoutDivergence } from "./src/checkout-divergence.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { execFile, spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
+import { execFile, spawnSync, type ExecFileException, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -1061,6 +1061,11 @@ async function assertSenderProject(bb: BbPluginApi, projectId: string, senderThr
   if (thread.id !== senderThreadId || thread.projectId !== projectId) {
     throw refusal("EXECUTION_CONTEXT_FOREIGN", "project_id must exactly match the sender thread project");
   }
+}
+
+export function deployedDistFailureDetail(error: ExecFileException, stdout: string, stderr: string): string {
+  const status = `code=${String(error.code ?? "null")} killed=${String(error.killed ?? false)} signal=${String(error.signal ?? "null")}`;
+  return [error.message, status, stderr.trim(), stdout.trim()].filter(Boolean).join(" ");
 }
 
 function runBbCommand(args: string[]): Promise<void> {
@@ -2943,23 +2948,30 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     await fleetWatchdogIdle.clearWakeHistory(`${projectId}:`);
     bb.log.warn(`fleet-watchdog history reset: project=${projectId} invokedBy=${invokedBy} at=${Date.now()}`);
   };
+  let deployedDistCheckRunning = false;
   const checkDeployedDist = options.checkDeployedDist ?? (() => {
+    if (deployedDistCheckRunning) {
+      bb.log.warn("deployed-dist automatic check skipped: previous check still running");
+      return;
+    }
     const root = findCheckoutRoot(dirname(fileURLToPath(import.meta.url)));
     if (!root) {
       bb.log.error("deployed-dist automatic check failed: cannot find plugin checkout root");
       return;
     }
+    deployedDistCheckRunning = true;
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "BB_CLI"));
-    const result = spawnSync(process.execPath, [join(root, "scripts", "check-dist.mjs"), "--deployed"], {
+    execFile(process.execPath, [join(root, "scripts", "check-dist.mjs"), "--deployed"], {
       cwd: root,
       encoding: "utf8",
       env,
-      stdio: ["ignore", "pipe", "pipe"],
       timeout: 10_000,
+    }, (error, stdout, stderr) => {
+      deployedDistCheckRunning = false;
+      if (!error) return;
+      const detail = deployedDistFailureDetail(error, stdout, stderr);
+      bb.log.error(`deployed-dist automatic check failed: ${detail || "child process failed"}`);
     });
-    if (result.status === 0 && !result.error) return;
-    const detail = [result.error?.message, result.stderr?.trim(), result.stdout?.trim()].filter(Boolean).join(" ");
-    bb.log.error(`deployed-dist automatic check failed: ${detail || `exit ${String(result.status)}`}`);
   });
   // Report-only: this never rebuilds, writes, or repairs the deployed checkout.
   bb.background.schedule("fleet-watchdog", "*/5 * * * *", () => {
