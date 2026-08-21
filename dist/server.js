@@ -14425,6 +14425,7 @@ function createIdleFleetDetector(options) {
   let stopped = false;
   const capacityQueues = /* @__PURE__ */ new Map();
   const probeKey = (probe) => JSON.stringify([probe.projectId, probe.threadId]);
+  const legacyProbeKey = (probe) => `${probe.projectId}:${probe.threadId}`;
   const load = async () => {
     if (loaded) return;
     state = idleFleetWakeState(options.persistence ? await options.persistence.read() : null);
@@ -14456,6 +14457,11 @@ function createIdleFleetDetector(options) {
         }
         reportBlind(decision.message);
         return;
+      }
+      if (state[key] === void 0 && state[legacyProbeKey(probe)] !== void 0) {
+        state[key] = state[legacyProbeKey(probe)];
+        delete state[legacyProbeKey(probe)];
+        await save();
       }
       if (state[key] === decision.episodeKey) return;
       if (decision.legacyEpisodeKey !== void 0 && state[key] === decision.legacyEpisodeKey) {
@@ -21037,6 +21043,12 @@ function createStallGuardCycle(options) {
       let steered = 0;
       for (const holder of holders) {
         const key = JSON.stringify([holder.project_id, holder.role_id]);
+        const legacyKey = `${holder.project_id}:${holder.role_id}`;
+        if (nextState[key] === void 0 && nextState[legacyKey] !== void 0) {
+          nextState[key] = nextState[legacyKey];
+          delete nextState[legacyKey];
+          changed += 1;
+        }
         const current = await readArtifacts(holder.project_id);
         if (current === null) continue;
         const next = snapshot(current);

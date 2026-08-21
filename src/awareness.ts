@@ -942,6 +942,7 @@ export function createIdleFleetDetector(options: {
   let stopped = false;
   const capacityQueues = new Map<string, Promise<void>>();
   const probeKey = (probe: IdleFleetProbe) => JSON.stringify([probe.projectId, probe.threadId]);
+  const legacyProbeKey = (probe: IdleFleetProbe) => `${probe.projectId}:${probe.threadId}`;
 
   const load = async () => {
     if (loaded) return;
@@ -976,6 +977,11 @@ export function createIdleFleetDetector(options: {
         }
         reportBlind(decision.message);
         return;
+      }
+      if (state[key] === undefined && state[legacyProbeKey(probe)] !== undefined) {
+        state[key] = state[legacyProbeKey(probe)]!;
+        delete state[legacyProbeKey(probe)];
+        await save();
       }
       if (state[key] === decision.episodeKey) return;
       if (decision.legacyEpisodeKey !== undefined && state[key] === decision.legacyEpisodeKey) {

@@ -640,7 +640,7 @@ describe("lane awareness", () => {
       detector.arm({ projectId: "project-1", threadId: "orchestrator-1", idleEpisode: "episode-1" });
       await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
       expect(wake).not.toHaveBeenCalled();
-      expect(persisted).toEqual({ "project-1:orchestrator-1": "new-episode" });
+      expect(persisted).toEqual({ '["project-1","orchestrator-1"]': "new-episode" });
       detector.stop();
     } finally {
       vi.useRealTimers();

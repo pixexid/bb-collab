@@ -94,6 +94,12 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
 
       for (const holder of holders) {
         const key = JSON.stringify([holder.project_id, holder.role_id]);
+        const legacyKey = `${holder.project_id}:${holder.role_id}`;
+        if (nextState[key] === undefined && nextState[legacyKey] !== undefined) {
+          nextState[key] = nextState[legacyKey]!;
+          delete nextState[legacyKey];
+          changed += 1;
+        }
         const current = await readArtifacts(holder.project_id);
         if (current === null) continue;
         const next = snapshot(current);
