@@ -23718,6 +23718,17 @@ ${thread.titleFallback ?? ""}`);
     }
   });
   bb.onDispose(idleFleetDetector.stop);
+  bb.background.service("idle-fleet-detector", {
+    async start(signal) {
+      try {
+        if (!signal.aborted) {
+          await new Promise((resolve3) => signal.addEventListener("abort", () => resolve3(), { once: true }));
+        }
+      } finally {
+        idleFleetDetector.stop();
+      }
+    }
+  });
   const stallGuardCycle = createStallGuardCycle({
     readRoleHolders: () => db ? readRoleHolderStates(db) : [],
     readArtifact: async (projectId) => {
