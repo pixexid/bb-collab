@@ -1,8 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
-execFileSync("npx", ["changeset", "publish"], { stdio: "inherit" });
-
 const { version } = JSON.parse(readFileSync("plugins/bb-plugin-threads-list/package.json", "utf8"));
 const tag = `threads-list/v${version}`;
 const legacy = `bb-plugin-threads-list@${version}`;
