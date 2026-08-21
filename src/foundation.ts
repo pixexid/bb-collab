@@ -5788,6 +5788,12 @@ interface ExternalWorkRefRow {
   updated_at_ms: number;
 }
 
+function validGithubSnapshotStateReason(state: GitHubIssueSnapshot["state"], reason: GitHubIssueSnapshot["stateReason"]): boolean {
+  return state === "open"
+    ? reason === undefined || reason === "REOPENED"
+    : reason === "COMPLETED" || reason === "NOT_PLANNED" || reason === "DUPLICATE";
+}
+
 const githubSnapshotSchema = z
   .object({
     owner: id,
@@ -5800,7 +5806,12 @@ const githubSnapshotSchema = z
     labels: z.array(id).max(256),
     externalRevision: id,
   })
-  .strict();
+  .strict()
+  .superRefine((snapshot, context) => {
+    if (!validGithubSnapshotStateReason(snapshot.state, snapshot.stateReason)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["stateReason"], message: "GitHub issue state and reason do not match" });
+    }
+  });
 
 function storedConfigJson(db: SqliteDatabase, projectId: string, configRevision: number): string {
   const row = asRow<{ canonical_config_json: string }>(
@@ -6220,6 +6231,9 @@ function applyWorkItemTransition(
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
   let recordedExternalEvent: { kind: "github_issue_closed" | "github_issue_reopened"; owner: string; repo: string; issueNumber: number; externalRevision: string } | null = null;
+  if (githubObservation && !validGithubSnapshotStateReason(githubObservation.state, githubObservation.stateReason)) {
+    throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue state and reason do not match");
+  }
   if (workItem.lifecycle_state === "blocked") {
     const storedBlocker = existingWait ? storedWorkItemBlocker(existingWait) : null;
     if (!storedBlocker) throw refusal("WORK_ITEM_STATE_INVALID", "blocked work item has no valid machine-evaluable blocker");

@@ -19121,6 +19121,9 @@ function workItemGithubReadTarget(request) {
   if (targets.length > 1) throw refusal("WORK_ITEM_STATE_INVALID", "work item transition accepts one external condition");
   return targets[0] ?? null;
 }
+function validGithubSnapshotStateReason(state, reason) {
+  return state === "open" ? reason === void 0 || reason === "REOPENED" : reason === "COMPLETED" || reason === "NOT_PLANNED" || reason === "DUPLICATE";
+}
 var githubSnapshotSchema = external_exports.object({
   owner: id,
   repo: id,
@@ -19131,7 +19134,11 @@ var githubSnapshotSchema = external_exports.object({
   stateReason: external_exports.enum(["COMPLETED", "NOT_PLANNED", "DUPLICATE", "REOPENED"]).optional(),
   labels: external_exports.array(id).max(256),
   externalRevision: id
-}).strict();
+}).strict().superRefine((snapshot2, context) => {
+  if (!validGithubSnapshotStateReason(snapshot2.state, snapshot2.stateReason)) {
+    context.addIssue({ code: external_exports.ZodIssueCode.custom, path: ["stateReason"], message: "GitHub issue state and reason do not match" });
+  }
+});
 function storedConfigJson(db, projectId, configRevision) {
   const row = asRow(
     db.prepare("SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = ?").get(projectId, configRevision)
@@ -19502,6 +19509,9 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
   let recordedExternalEvent = null;
+  if (githubObservation && !validGithubSnapshotStateReason(githubObservation.state, githubObservation.stateReason)) {
+    throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue state and reason do not match");
+  }
   if (workItem.lifecycle_state === "blocked") {
     const storedBlocker = existingWait ? storedWorkItemBlocker(existingWait) : null;
     if (!storedBlocker) throw refusal("WORK_ITEM_STATE_INVALID", "blocked work item has no valid machine-evaluable blocker");
@@ -21890,6 +21900,9 @@ async function startableQueueStateAsync(repositories) {
   }
   return { count, head: heads.sort()[0] ?? null, unlabelledCount, blockedCount, waitingExternalCount };
 }
+function validGithubStateReason(state, reason) {
+  return state === "OPEN" ? reason === void 0 || reason === null || reason === "" || reason === "REOPENED" : state === "CLOSED" && (reason === "COMPLETED" || reason === "NOT_PLANNED" || reason === "DUPLICATE");
+}
 async function linkedGithubObservationAsync(owner, repo, issueNumber) {
   const issue2 = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,stateReason,updatedAt,closedByPullRequestsReferences"]);
   if (!issue2 || typeof issue2 !== "object" || Array.isArray(issue2)) return null;
@@ -21897,7 +21910,7 @@ async function linkedGithubObservationAsync(owner, repo, issueNumber) {
   const stateReason = issue2.stateReason;
   const externalRevision = issue2.updatedAt;
   const closingPullRequests = issue2.closedByPullRequestsReferences;
-  if (issueState !== "OPEN" && issueState !== "CLOSED" || (stateReason === void 0 || stateReason === null || stateReason === "" ? issueState !== "OPEN" : stateReason !== "COMPLETED" && stateReason !== "NOT_PLANNED" && stateReason !== "DUPLICATE" && stateReason !== "REOPENED") || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
+  if (issueState !== "OPEN" && issueState !== "CLOSED" || !validGithubStateReason(issueState, stateReason) || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
   const closingPullRequest = closingPullRequests[0];
   if (closingPullRequest !== void 0 && (!closingPullRequest || typeof closingPullRequest !== "object" || Array.isArray(closingPullRequest) || typeof closingPullRequest.number !== "number" || !Number.isSafeInteger(closingPullRequest.number))) return null;
   const pullRequest = closingPullRequest === void 0 ? null : await githubJsonAsync(["pr", "view", String(closingPullRequest.number), "--repo", `${owner}/${repo}`, "--json", "state,mergedAt"]);
@@ -21918,14 +21931,14 @@ async function readGithubIssueForBackfillAsync(owner, repo, issueNumber) {
   const value = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"]);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
   const record2 = value;
-  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || (record2.stateReason === void 0 || record2.stateReason === null || record2.stateReason === "" ? record2.state !== "OPEN" : record2.stateReason !== "COMPLETED" && record2.stateReason !== "NOT_PLANNED" && record2.stateReason !== "DUPLICATE" && record2.stateReason !== "REOPENED") || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
+  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !validGithubStateReason(record2.state, record2.stateReason) || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
   return { owner, repo, issueNumber: record2.number, title: record2.title, body: record2.body ?? "", state: record2.state === "OPEN" ? "open" : "closed", stateReason: record2.stateReason === "" || record2.stateReason === null ? void 0 : record2.stateReason, labels: record2.labels.map((label) => label.name), externalRevision: record2.updatedAt };
 }
 function readGithubIssueForBackfill(owner, repo, issueNumber) {
   const value = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"]);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
   const record2 = value;
-  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || (record2.stateReason === void 0 || record2.stateReason === null || record2.stateReason === "" ? record2.state !== "OPEN" : record2.stateReason !== "COMPLETED" && record2.stateReason !== "NOT_PLANNED" && record2.stateReason !== "DUPLICATE" && record2.stateReason !== "REOPENED") || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
+  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !validGithubStateReason(record2.state, record2.stateReason) || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
   return {
     owner,
     repo,
