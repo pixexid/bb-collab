@@ -45,6 +45,7 @@ import {
   WORK_ITEM_CAPACITY_ATTEMPT_STATES,
   WORK_ITEM_CAPACITY_LIFECYCLE_STATES,
   workItemCapacityLaneEvidence,
+  reconcilePreparedWorkItemDispatches,
   type ApplyRequest,
   type FoundationCode,
   type FoundationResult,
@@ -517,6 +518,11 @@ const sendOperatorMessageInputSchema = z.object({
   severity: operatorSeveritySchema,
   text: operatorMessageTextSchema,
 }).strict();
+const dispatchLaneInputSchema = z.object({
+  request: applyRequestSchema,
+  spawn: z.record(z.string(), z.unknown()),
+}).strict();
+
 export const rpcContract = defineRpcContract({
   lanes: {
     input: z.object({}).strict(),
@@ -570,6 +576,10 @@ export const rpcContract = defineRpcContract({
   },
   apply: {
     input: applyRequestSchema,
+    output: foundationResultSchema,
+  },
+  dispatchLane: {
+    input: dispatchLaneInputSchema,
     output: foundationResultSchema,
   },
   cachedConsumerRollout: {
@@ -815,13 +825,115 @@ export async function readLiveRoleFactReader(
   }
 }
 
+async function dispatchLane(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  input: unknown,
+): Promise<FoundationResult> {
+  const parsed = dispatchLaneInputSchema.safeParse(input);
+  if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "dispatch", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
+  const { request, spawn } = parsed.data;
+  if (!request.workAttempt || (request.lifecycleState !== "in_progress" && request.lifecycleState !== undefined)) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "lane dispatch requires a writing work attempt and an in-progress transition" };
+  }
+  if (spawn.projectId !== request.projectId) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "spawn projectId must match request projectId" };
+  }
+  const dispatchParentThreadId = typeof spawn.parentThreadId === "string" ? spawn.parentThreadId : null;
+  if (!dispatchParentThreadId) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "lane dispatch requires the dispatcher parent thread" };
+  }
+  const { threadId: _threadId, ...intentAttempt } = request.workAttempt;
+  const intent = await applyLiveAuthorizedMutation(bb, db, {
+    ...request,
+    reasonCode: `dispatch_parent:${dispatchParentThreadId}`,
+    workAttempt: intentAttempt,
+  }, false, "stop-active");
+  if (intent.outcome !== "OK" || intent.replay) return intent;
+
+  let thread: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["spawn"]>>;
+  try {
+    thread = await bb.sdk.threads.spawn({
+      ...spawn,
+      title: `${String(spawn.title ?? "lane")} [dispatch:${request.idempotencyKey}]`,
+    } as unknown as Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]);
+  } catch (error) {
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane spawn failed after durable dispatch intent: ${String(error)}`, evidence: { intent } };
+  }
+
+  const intentEvidence = intent as { currentResourceRevision?: number };
+  return applyLiveAuthorizedMutation(bb, db, {
+    ...request,
+    lifecycleState: undefined,
+    expectedResourceRevision: intentEvidence?.currentResourceRevision,
+    idempotencyKey: `${request.idempotencyKey}-finalize`,
+    workAttempt: { ...request.workAttempt, threadId: thread.id },
+  }, false, "stop-active");
+}
+
+type WorkItemAttemptTerminalizationPolicy = "refuse-active" | "stop-active";
+
+async function prepareWorkItemAttemptTerminalization(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  request: z.infer<typeof applyRequestSchema>,
+  policy: WorkItemAttemptTerminalizationPolicy,
+): Promise<FoundationResult | null> {
+  if (request.operationClass !== "work_item_transition" || !db) return null;
+  const terminalizesWriter = request.lifecycleState === "review_pending" ||
+    ["blocked", "failed", "cancelled"].includes(request.lifecycleState ?? "") ||
+    (request.lifecycleState === undefined && request.workAttempt?.assignmentKind === "write");
+  if (!terminalizesWriter) return null;
+  const attempts = db.prepare(
+    `SELECT thread_id FROM execution_attempts
+     WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+       AND assignment_kind = 'write' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')
+     ORDER BY attempt_ordinal DESC`,
+  ).all(request.projectId, request.workItemId) as Array<{ thread_id: string | null }>;
+  const attempt = attempts.find((candidate) => candidate.thread_id !== null);
+  if (!attempt) {
+    // A dispatch finalization is itself the terminalization point for the old writer;
+    // its newly prepared replacement has no native thread yet and is not the old lane.
+    if (request.lifecycleState === undefined && request.workAttempt?.threadId && attempts.length > 0) return null;
+    if (attempts.length === 0) return null;
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "writing attempt terminalization requires a bound lane with native stop evidence" };
+  }
+  const threadId = attempt.thread_id;
+  if (!threadId) return null;
+  let lane: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["get"]>>;
+  try {
+    lane = await bb.sdk.threads.get({ threadId });
+    if (policy === "stop-active" && lane.status !== "idle") {
+      await bb.sdk.threads.stop({ threadId });
+      await bb.sdk.threads.wait({ threadId, status: "idle", timeoutMs: FLEET_WATCHDOG_STOPPING_WAIT_MS });
+      lane = await bb.sdk.threads.get({ threadId });
+    }
+  } catch (error) {
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane stop evidence unavailable: ${String(error)}` };
+  }
+  if (lane.status !== "idle") {
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane has no native stopped evidence: status=${lane.status}` };
+  }
+  return null;
+}
+
 async function applyLiveAuthorizedMutation(
   bb: BbPluginApi,
   db: SqliteDatabase | null,
   input: unknown,
   allowCachedConsumerRollout = false,
+  terminalizationPolicy: WorkItemAttemptTerminalizationPolicy = "refuse-active",
+  githubIssueReader: (owner: string, repo: string, issueNumber: number) => GitHubIssueSnapshot = readGithubIssueForBackfill,
 ): Promise<FoundationResult> {
   const parsed = applyRequestSchema.safeParse(input);
+  if (parsed.success && terminalizationPolicy === "stop-active") {
+    const authorized = applyAuthorizedMutation(db, input, null, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, true);
+    if (authorized.outcome !== "OK" || authorized.replay) return authorized;
+  }
+  if (parsed.success) {
+    const laneGuard = await prepareWorkItemAttemptTerminalization(bb, db, parsed.data, terminalizationPolicy);
+    if (laneGuard) return laneGuard;
+  }
   if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v22-rollout-receipt")) {
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
@@ -837,7 +949,7 @@ async function applyLiveAuthorizedMutation(
     }
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
-  const result = applyAuthorizedMutation(db, input, null, reader, null, null, readGithubIssueForBackfill);
+  const result = applyAuthorizedMutation(db, input, null, reader, null, null, githubIssueReader);
   await deliverSucceededSeatBrief(bb, db, input, result);
   return result;
 }
@@ -1388,8 +1500,8 @@ async function runCli(
 ) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "github-issue-backfill", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, github-issue-backfill, archive-sweep, worktree-cleanup, cached-consumer-rollout, role-list, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
+  if (!command || !["doctor", "export", "apply", "dispatch-lane", "github-issue-backfill", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, dispatch-lane, github-issue-backfill, archive-sweep, worktree-cleanup, cached-consumer-rollout, role-list, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
   }
   if (command === "wait-validator") {
     const unknown = args.find((arg) => arg !== "--cycle");
@@ -1470,6 +1582,23 @@ async function runCli(
   }
   const projectId = parseFlag(args, "--project");
   if (!projectId) return invalidCli("--project PROJECT_ID is required; CLI context is never used as a fallback");
+  if (command === "dispatch-lane") {
+    const unknown = unexpectedFlags(args, ["--project", "--request", "--spawn"]);
+    if (unknown) return invalidCli(`unexpected flag ${unknown}`);
+    const requestJson = parseFlag(args, "--request");
+    const spawnJson = parseFlag(args, "--spawn");
+    if (!requestJson || !spawnJson) return invalidCli("--request JSON and --spawn JSON are required");
+    try {
+      const request = JSON.parse(requestJson);
+      const spawn = JSON.parse(spawnJson);
+      const parsed = dispatchLaneInputSchema.safeParse({ request, spawn });
+      if (!parsed.success) return invalidCli(parsed.error.message);
+      if (parsed.data.request.projectId !== projectId) return invalidCli("request projectId must match --project");
+      return cliResult(await dispatchLane(bb, db, parsed.data));
+    } catch (error) {
+      return invalidCli(error instanceof Error ? error.message : String(error));
+    }
+  }
   if (command === "send-to-operator") {
     const unknown = unexpectedFlags(args, ["--project", "--recipient", "--severity", "--message"]);
     if (unknown) return invalidCli(`unexpected flag ${unknown}`);
@@ -2770,10 +2899,12 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
            AND external_work_refs.issue_number IS NOT NULL`,
       ).all(...WORK_ITEM_NON_TERMINAL_STATES, "succeeded") as Array<{ project_id: string }>) projectIds.add(row.project_id);
       const lanesByProject = new Map<string, Awaited<ReturnType<typeof bb.sdk.threads.list>>>();
+      const dispatchWedgesByProject = new Map<string, Array<{ executionAttemptId: string; workItemId: string }>>();
       for (const projectId of projectIds) {
         if (onlyProjectId !== undefined && projectId !== onlyProjectId) continue;
         const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? new Set<string>();
         const threads: Awaited<ReturnType<typeof bb.sdk.threads.list>> = [];
+        let threadInventoryReadable = true;
         try {
           for (let offset = 0; ; offset += 100) {
             const page = await bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset });
@@ -2781,7 +2912,15 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             if (page.length < 100) break;
           }
         } catch (error) {
+          threadInventoryReadable = false;
           degrade(fleetWatchdogScope("platform-parentage", projectId, String(error)));
+        }
+        if (threadInventoryReadable) {
+          const wedges = reconcilePreparedWorkItemDispatches(db, projectId, threads);
+          if (wedges.length > 0) {
+            dispatchWedgesByProject.set(projectId, wedges);
+            bb.log.warn(`fleet-watchdog dispatch wedge: project=${projectId} workItems=${wedges.map(({ workItemId }) => workItemId).join(",")}`);
+          }
         }
         const lanes = threads.filter((thread) =>
           thread.parentThreadId !== null &&
@@ -2898,7 +3037,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           wakeInFlight.delete(key);
         }
       };
-      const transitionWorkItem = (
+      const transitionWorkItem = async (
         projectId: string,
         workItemId: string,
         state: "ready" | "review_pending" | "succeeded" | "cancelled",
@@ -2906,7 +3045,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         extra: Pick<ApplyRequest, "workItemUnblock" | "workItemExternalEvent"> = {},
         githubSnapshot?: GitHubIssueSnapshot,
         legacyIdempotencyKey?: string,
-      ): FoundationResult => {
+        terminalizationPolicy: WorkItemAttemptTerminalizationPolicy = "refuse-active",
+      ): Promise<FoundationResult> => {
         const actor = db.prepare(
           `SELECT receipt_id FROM actor_receipts
            WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
@@ -2945,7 +3085,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         ).get(projectId, legacyIdempotencyKey, mutationRequestDigest({ ...request, idempotencyKey: legacyIdempotencyKey })) !== undefined
           ? legacyIdempotencyKey
           : idempotencyKey;
-        return applyAuthorizedMutation(db, { ...request, idempotencyKey: compatibleKey }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
+        return applyLiveAuthorizedMutation(bb, db, { ...request, idempotencyKey: compatibleKey }, false, terminalizationPolicy, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
       };
       const inspectWaitTargets = async (projectId: string) => {
         for (const workItem of openWorkItemsByProject.get(projectId) ?? []) {
@@ -3002,7 +3142,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               degrade(fleetWatchdogScope("github-work-item-reopen", projectId, linked.work_item_id));
               continue;
             }
-            const result = transitionWorkItem(
+            const result = await transitionWorkItem(
               projectId,
               linked.work_item_id,
               "ready",
@@ -3061,16 +3201,17 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               : {},
             githubSnapshot,
             fleetWatchdogLegacyMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
+            "stop-active",
           );
           let result: FoundationResult;
           if (workItem.lifecycle_state === "in_progress") {
-            result = transition("review_pending");
+            result = await transition("review_pending");
             if (result.outcome === "OK") {
               const current = db.prepare(
                 "SELECT resource_revision, lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?",
               ).get(projectId, linked.work_item_id) as { resource_revision: number; lifecycle_state: string } | undefined;
               result = current?.lifecycle_state === "review_pending"
-                ? transition("succeeded")
+                ? await transition("succeeded")
                 : {
                   outcome: "WORK_ITEM_REVISION_STALE",
                   subject: linked.work_item_id,
@@ -3081,10 +3222,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
                 };
             }
           } else if (workItem.lifecycle_state === "review_pending") {
-            result = transition("succeeded");
+            result = await transition("succeeded");
           } else if (workItem.lifecycle_state === "proposed") {
             // A closed issue absorbs work that never started; it did not succeed.
-            result = transition("cancelled");
+            result = await transition("cancelled");
           } else {
             result = { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close automation requires in_progress, review_pending, or proposed, found ${workItem.lifecycle_state}` };
           }
@@ -3234,6 +3375,16 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
                ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
              WHERE heads.project_id = ? ORDER BY targets.repo_target_id`,
           ).all(projectId) as Array<{ remote_url: string | null }>).map((target) => githubRepository(target.remote_url));
+          for (const wedge of dispatchWedgesByProject.get(projectId) ?? []) {
+            await wake(
+              projectId,
+              orchestrator,
+              roleIdleKey(orchestrator, `dispatch-wedge:${wedge.executionAttemptId}`),
+              `dispatch identity unresolved for WorkItem ${wedge.workItemId}; its writing slot remains held. Inspect the native thread and decide recovery or closure before dispatching another lane.`,
+              false,
+              "owed-act",
+            );
+          }
           const queue = repositories.length === 0 || repositories.some((repository) => repository === null)
             ? null
             : await startableQueueStateAsync(repositories as string[]);
@@ -3279,7 +3430,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
               continue;
             }
-            const result = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot, fleetWatchdogLegacyBlockerFiredKey(blocked.workItemId, snapshot?.externalRevision ?? blocked.waker ?? ""));
+            const result = await transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot, fleetWatchdogLegacyBlockerFiredKey(blocked.workItemId, snapshot?.externalRevision ?? blocked.waker ?? ""));
             if (result.outcome === "OK") {
               unblocked.add(blocked.workItemId);
               bb.log.info(`fleet-watchdog returned blocked work item to ready: project=${projectId} workItem=${blocked.workItemId} blocker=${blocked.wakerKind}`);
@@ -3609,6 +3760,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     async apply(input) {
       return applyLiveAuthorizedMutation(bb, db, input);
     },
+    async dispatchLane(input) {
+      return dispatchLane(bb, db, input);
+    },
     async cachedConsumerRollout(input) {
       return applyLiveCachedConsumerRollout(bb, db, input, cliDeps);
     },
@@ -3627,6 +3781,16 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   });
 
   bb.agents.registerTool({
+    name: "dispatch_lane",
+    description: "Dispatch one writing lane through the canonical registration seam.",
+    instructions: "Use this instead of spawning a lane directly. The request projectId must match the current thread project.",
+    parameters: dispatchLaneInputSchema,
+    async execute(input, context) {
+      if (input.request.projectId !== context.projectId) throw new Error("request projectId must exactly match the current thread project");
+      return JSON.stringify(await dispatchLane(bb, db, input));
+    },
+  });
+  bb.agents.registerTool({
     name: "send_to_operator",
     description: "Send a durable project-scoped message to the operator or supervisor without a model relay.",
     instructions: "Use this for actionable content directed to an external non-bb party. project_id must be the current thread's exact registered project.",
@@ -3636,7 +3800,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return JSON.stringify(await sendOperatorMessage(db, bb, input, context.threadId, notifyUrgent));
     },
   });
-  bb.agents.configure(() => ({ tools: ["send_to_operator"], skills: [] }));
+  bb.agents.configure(() => ({ tools: ["dispatch_lane", "send_to_operator"], skills: [] }));
 
   bb.cli.register({
     name: "collab",
@@ -3648,6 +3812,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         name: "apply",
         summary: "Explicit foundation apply",
         usage: "bb collab apply --project PROJECT_ID --request JSON",
+      },
+      {
+        name: "dispatch-lane",
+        summary: "Spawn and register one writing lane atomically through the canonical seam",
+        usage: "bb collab dispatch-lane --project PROJECT_ID --request JSON --spawn JSON",
       },
       {
         name: "github-issue-backfill",

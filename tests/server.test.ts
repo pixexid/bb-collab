@@ -45,6 +45,7 @@ import {
   probeV21ConsumedLegacyReplay,
   parseApplyRequest,
   requestedProfileDigest,
+  reconcilePreparedWorkItemDispatches,
   schemaDigest,
   sha256,
   workItemReconciliationIssues,
@@ -2051,8 +2052,8 @@ describe("bb-collab plugin boundary", () => {
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "ACTOR_RECEIPT_UNKNOWN" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["idle-fleet-detector", "lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "worktree-cleanup", "thread-archive-sweep"]);
-    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "doctor", "export", "lanes", "markOperatorMessageRead", "operatorMessages", "registerWait", "reorderPinned", "replyToOperatorMessage", "roleBrief", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
-    expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["send_to_operator"]);
+    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "dispatchLane", "doctor", "export", "lanes", "markOperatorMessageRead", "operatorMessages", "registerWait", "reorderPinned", "replyToOperatorMessage", "roleBrief", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
+    expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["dispatch_lane", "send_to_operator"]);
   });
 
   it("carries structural refusals through the apply RPC output schema", async () => {
@@ -3615,6 +3616,151 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     expect(fixture.host.harness.inspection.logEntries.slice(logCount)).toContainEqual(expect.objectContaining({ level: "info", message: "fleet-watchdog healthy cycle" }));
   });
 
+  it("registers the attempt through the canonical lane dispatch seam", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result).toMatchObject({ outcome: "OK" });
+    expect(fixture.db.prepare("SELECT lane_id, thread_id, state FROM execution_attempts WHERE origin = 'work_item' ORDER BY rowid DESC LIMIT 1").get()).toMatchObject({ lane_id: "lane-work-item-1", thread_id: "lane-1", state: "running" });
+  });
+
+  it("claims permission atomically when identical dispatches race", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const input = {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
+    };
+    const results = await Promise.all([
+      fixture.host.harness.callAgentTool("dispatch_lane", input, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }),
+      fixture.host.harness.callAgentTool("dispatch_lane", input, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }),
+    ]);
+    expect(results.map((result) => JSON.parse(result as string))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ outcome: "OK" }),
+    ]));
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+  });
+
+  it("does not spawn again when a completed dispatch intent is replayed", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const input = {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
+    };
+    expect(JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", input, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string)).toMatchObject({ outcome: "OK" });
+    expect(JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", input, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string)).toMatchObject({ outcome: "OK" });
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+  });
+
+  it("refuses stale lane authorization before spawning", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: { ...transitionRequest(fixture.fenceToken, "in_progress", 2), expectedResourceRevision: 99 },
+      spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).not.toBe("OK");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ count: 0 });
+  });
+
+  it("leaves a durable prepared intent when dispatch is interrupted", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { throw new Error("interrupted"); }) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("EXTERNAL_UNAVAILABLE");
+    expect(fixture.db.prepare("SELECT lane_id, thread_id, state FROM execution_attempts WHERE origin = 'work_item'").get()).toMatchObject({ lane_id: "lane-work-item-1", thread_id: null, state: "prepared" });
+    fixture.db.prepare("UPDATE execution_attempts SET created_at_ms = 0 WHERE origin = 'work_item'").run();
+    await fixture.host.harness.runSchedule("fleet-watchdog");
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared" });
+  });
+
+  it("keeps a renamed spawned lane as a capacity-consuming wedge", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { throw new Error("response lost after spawn"); }) as never);
+    await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId });
+    const wedges = reconcilePreparedWorkItemDispatches(fixture.db, PROJECT_ID, [{
+      id: "lane-renamed",
+      parentThreadId: fixture.orchestratorThreadId,
+      title: "ordinary user title",
+      archivedAt: null,
+      deletedAt: null,
+    }]);
+    expect(wedges).toEqual([{ executionAttemptId: expect.any(String), workItemId: WORK_ITEM_ID }]);
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared" });
+  });
+
+  it("binds a prepared dispatch only to its recorded dispatcher parent across all six identity cases", async () => {
+    const cases = [
+      { name: "original", parentThreadId: "orchestrator-thread", title: "marker", archivedAt: null, deletedAt: null, binds: true },
+      { name: "renamed", parentThreadId: "orchestrator-thread", title: "ordinary user title", archivedAt: null, deletedAt: null, binds: false },
+      { name: "cleared parent", parentThreadId: null, title: "marker", archivedAt: null, deletedAt: null, binds: false },
+      { name: "archived", parentThreadId: "orchestrator-thread", title: "marker", archivedAt: 1, deletedAt: null, binds: false },
+      { name: "deleted", parentThreadId: "orchestrator-thread", title: "marker", archivedAt: null, deletedAt: 1, binds: false },
+      { name: "unrelated parent", parentThreadId: "other-dispatcher", title: "marker", archivedAt: null, deletedAt: null, binds: false },
+    ];
+    for (const testCase of cases) {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+      fixture.host.harness.sdk.stub("threads.spawn", (async () => { throw new Error("response lost after spawn"); }) as never);
+      await fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+        spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
+      }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId });
+      const attempt = fixture.db.prepare("SELECT reason_code FROM execution_attempts WHERE origin = 'work_item'").get() as { reason_code: string };
+      const marker = attempt.reason_code.match(/^work_item_dispatch_intent:(.*):parent=/u)?.[1];
+      expect(marker).toBeTruthy();
+      const wedges = reconcilePreparedWorkItemDispatches(fixture.db, PROJECT_ID, [{
+        id: `lane-${testCase.name}`,
+        parentThreadId: testCase.parentThreadId === "orchestrator-thread" ? fixture.orchestratorThreadId : testCase.parentThreadId,
+        title: testCase.title === "marker" ? `lane [dispatch:${marker}]` : testCase.title,
+        archivedAt: testCase.archivedAt,
+        deletedAt: testCase.deletedAt,
+      }]);
+      expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual(testCase.binds
+        ? { state: "running", thread_id: `lane-${testCase.name}` }
+        : { state: "prepared", thread_id: null });
+      expect(wedges).toHaveLength(testCase.binds ? 0 : 1);
+    }
+  });
+
+  it("refuses review-pending until the native lane is idle", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+    fixture.addNativeLane("thread-work-item-1", "active");
+    const request = { ...transitionRequest(fixture.fenceToken, "review_pending", 3), workAttempt: undefined };
+    expect(await fixture.host.harness.callRpc("apply", request)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 1, verified: 0 });
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "running" });
+    fixture.addNativeLane("thread-work-item-1", "idle");
+    expect(await fixture.host.harness.callRpc("apply", request)).toMatchObject({ outcome: "OK" });
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "done" });
+
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 4))).toMatchObject({ outcome: "OK" });
+    fixture.addNativeLane("thread-work-item-1", "active");
+    const reviewAttemptRequest = transitionRequest(fixture.fenceToken, "review_pending", 5);
+    expect(await fixture.host.harness.callRpc("apply", reviewAttemptRequest)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 1, verified: 0 });
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item' AND assignment_kind = 'write' ORDER BY attempt_ordinal DESC LIMIT 1").get()).toEqual({ state: "running" });
+    fixture.addNativeLane("thread-work-item-1", "idle");
+    expect(await fixture.host.harness.callRpc("apply", reviewAttemptRequest)).toMatchObject({ outcome: "OK" });
+    expect(fixture.db.prepare("SELECT assignment_kind, state FROM execution_attempts WHERE origin = 'work_item' ORDER BY attempt_ordinal").all()).toEqual([
+      { assignment_kind: "write", state: "done" },
+      { assignment_kind: "write", state: "done" },
+      { assignment_kind: "review", state: "running" },
+    ]);
+  });
+
   it("uses in-progress WorkItems for capacity and suppresses repeat intake wakes for one hour", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-queue-"));
@@ -3633,8 +3779,15 @@ fi
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
     try {
       const fixture = await fleetWatchdogFixture(0, true, 1, false);
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      const dispatch = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+        spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
+      }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+      expect(dispatch).toMatchObject({ outcome: "OK" });
+      fixture.addNativeLane("lane-1", "active");
       expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state = 'in_progress'").get()).toEqual({ count: 1 });
+      expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'work_item' AND assignment_kind = 'write' AND state = 'running'").get()).toEqual({ count: 1 });
+      expect(workItemReconciliationIssues(fixture.db, PROJECT_ID)).toEqual([]);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3))).toMatchObject({ outcome: "OK" });
@@ -7734,6 +7887,22 @@ fi
     expect(applyWithFixtureReceipt(db, { ...disposition, reason: { mechanism: "changed" } }).outcome).toBe("IDEMPOTENCY_KEY_CONFLICT");
   });
 
+  it("revalidates role standing for work-item transitions", async () => {
+    const { db, fenceToken } = await assignmentFixture();
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2, {
+      idempotencyKey: "role-standing-work-item-start",
+      actorReceiptId: "role-actor-assignment",
+    })).outcome).toBe("OK");
+
+    db.prepare("UPDATE role_generations SET status = 'retired' WHERE project_id = ? AND role_id = 'project-orchestrator' AND generation = 1").run(PROJECT_ID);
+    const before = db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID);
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3, {
+      idempotencyKey: "retired-role-work-item-review",
+      actorReceiptId: "role-actor-assignment",
+    })).outcome).toBe("ROLE_NOT_ACTIVE");
+    expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual(before);
+  });
+
   it("requires the current qualified role holder for Decision authority", async () => {
     const { db, fenceToken, holderExecutionAttemptId } = await assignmentFixture();
     expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken)).outcome).toBe("OK");
@@ -10824,7 +10993,7 @@ exit 1
     const host = await loadedHost();
     const registrations = host.harness.inspection.registrations;
     expect(registrations.rpcMethods).not.toContain("seed-fixture-receipt");
-    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "github-issue-backfill", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "worktree-cleanup", "send-to-operator", "inbox"]);
+    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "dispatch-lane", "github-issue-backfill", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "worktree-cleanup", "send-to-operator", "inbox"]);
     expect(registrations.httpRoutes.map((route) => route.path)).toEqual(["/lanes"]);
     expect(seedFixtureDecision).toBeTypeOf("function");
   });
