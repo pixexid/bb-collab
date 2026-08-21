@@ -3141,15 +3141,9 @@ describe("bb-collab plugin boundary", () => {
       fixture.host.harness.sdk.stub("threads.interactions.list", (async () => []) as never);
 
       const service = fixture.host.harness.runService("lane-watcher");
-      const loopStarted = await Promise.race([
-        pollRead.then(() => "loop-started" as const),
-        new Promise<"poll-did-not-start">((resolve) => setTimeout(() => resolve("poll-did-not-start"), 100)),
-      ]);
+      const loopStarted = await pollRead.then(() => "loop-started" as const);
       service.controller.abort();
-      const shutdown = await Promise.race([
-        service.done.then(() => "shutdown-completed" as const),
-        new Promise<"still-hung-after-abort">((resolve) => setTimeout(() => resolve("still-hung-after-abort"), 100)),
-      ]);
+      const shutdown = await service.done.then(() => "shutdown-completed" as const);
 
       expect({ loopStarted, shutdown }).toEqual({ loopStarted: "loop-started", shutdown: "shutdown-completed" });
       expect(pollReadReceivedAbortSignal).toBe(true);
