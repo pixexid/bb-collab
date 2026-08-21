@@ -8,7 +8,7 @@ import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import plugin, { cliSchemaError, deployedDistFailureDetail, fleetWatchdogReopenKey, IDLE_FLEET_ATTEMPT_STALE_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
+import plugin, { cliSchemaError, deployedDistFailureDetail, fleetWatchdogBlockerFiredKey, fleetWatchdogEpisodeKey, fleetWatchdogIssueReopenedKey, fleetWatchdogMergeCloseKey, fleetWatchdogReopenKey, fleetWatchdogRoleLivenessKey, fleetWatchdogScope, IDLE_FLEET_ATTEMPT_STALE_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
 import { canonicalWorktreePath } from "../src/worktree-cleanup.js";
 import {
   CACHED_CONSUMERS,
@@ -2644,6 +2644,17 @@ describe("bb-collab plugin boundary", () => {
     const first = fleetWatchdogReopenKey("proj", "a:2026-01-01T00:00:00Z", "R");
     const second = fleetWatchdogReopenKey("proj", "a", "2026-01-01T00:00:00Z:R");
     expect(first).not.toBe(second);
+  });
+
+  it("keeps every watchdog composite key distinct when identifier segments contain colons", () => {
+    const holder = (project_id: string, role_id: string, role_generation: number, execution_attempt_id: string, thread_id: string) => ({ project_id, role_id, role_generation, execution_attempt_id, thread_id });
+    expect(fleetWatchdogIssueReopenedKey("a:b", "c")).not.toBe(fleetWatchdogIssueReopenedKey("a", "b:c"));
+    expect(fleetWatchdogMergeCloseKey("a:b", "c", "d")).not.toBe(fleetWatchdogMergeCloseKey("a", "b:c", "d"));
+    expect(fleetWatchdogMergeCloseKey("a", "b:c", "d")).not.toBe(fleetWatchdogMergeCloseKey("a", "b", "c:d"));
+    expect(fleetWatchdogBlockerFiredKey("a:b", "c")).not.toBe(fleetWatchdogBlockerFiredKey("a", "b:c"));
+    expect(fleetWatchdogRoleLivenessKey(holder("a:b", "c", 1, "d", "e"))).not.toBe(fleetWatchdogRoleLivenessKey(holder("a", "b:c", 1, "d", "e")));
+    expect(fleetWatchdogEpisodeKey(holder("a", "b", 1, "c", "d"), "e:f")).not.toBe(fleetWatchdogEpisodeKey(holder("a", "b", 1, "c", "d:e"), "f"));
+    expect(fleetWatchdogScope("degrade", "a:b", "c")).not.toBe(fleetWatchdogScope("degrade", "a", "b:c"));
   });
 
   it("learns permanent reopen refusals instead of retrying them", () => {

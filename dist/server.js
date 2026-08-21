@@ -21842,6 +21842,27 @@ import { execFile, spawnSync as spawnSync2 } from "node:child_process";
 import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute2, join as join5, relative as relative2, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 var ERROR_RECOVERY_IO_TIMEOUT_MS = 1e4;
+var fleetWatchdogCompositeKey = (...parts) => parts.join("\0");
+var fleetWatchdogIssueReopenedKey = (workItemId, externalRevision) => `fleet-watchdog:issue-reopened:${fleetWatchdogCompositeKey(workItemId, externalRevision)}`;
+var fleetWatchdogMergeCloseKey = (workItemId, state, externalRevision) => `fleet-watchdog:merge-close:${fleetWatchdogCompositeKey(workItemId, state, externalRevision)}`;
+var fleetWatchdogBlockerFiredKey = (workItemId, subject) => `fleet-watchdog:blocker-fired:${fleetWatchdogCompositeKey(workItemId, subject)}`;
+var fleetWatchdogRoleLivenessKey = (holder) => fleetWatchdogCompositeKey(
+  holder.project_id,
+  holder.role_id,
+  String(holder.role_generation),
+  holder.execution_attempt_id,
+  holder.thread_id
+);
+var fleetWatchdogEpisodeKey = (holder, queueHead) => fleetWatchdogCompositeKey(
+  holder.project_id,
+  holder.role_id,
+  String(holder.role_generation),
+  holder.execution_attempt_id,
+  holder.thread_id,
+  "activeLanes=0",
+  queueHead
+);
+var fleetWatchdogScope = (prefix, ...parts) => `${prefix}:${fleetWatchdogCompositeKey(...parts)}`;
 var fleetWatchdogReopenKey = (projectId, workItemId, externalRevision) => [projectId, workItemId, externalRevision].filter((value) => value !== void 0).join("\0");
 function githubRepository(remoteUrl) {
   const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
@@ -23405,7 +23426,7 @@ async function plugin(bb, options = {}) {
     write: (state) => bb.storage.kv.set("lane-watcher.role-idle", state)
   };
   const roleLivenessWarnings = /* @__PURE__ */ new Map();
-  const roleLivenessKey = (holder) => `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${holder.execution_attempt_id}:${holder.thread_id}`;
+  const roleLivenessKey = fleetWatchdogRoleLivenessKey;
   const warnRoleLiveness = (holder, evidence) => {
     const key = roleLivenessKey(holder);
     if (roleLivenessWarnings.get(key) === evidence) return;
@@ -23823,7 +23844,7 @@ ${thread.titleFallback ?? ""}`);
     };
     return {
       kind: "ready",
-      episodeKey: `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${holder.execution_attempt_id}:${holder.thread_id}:activeLanes=0:${queueHead}`,
+      episodeKey: fleetWatchdogEpisodeKey(holder, queueHead),
       role,
       message: `Idle fleet: queue head ${queueHead} is startable with zero active writing lanes. Dispatch it or record the blocker.`
     };
@@ -24107,7 +24128,7 @@ ${thread.titleFallback ?? ""}`);
             if (page.length < 100) break;
           }
         } catch (error48) {
-          degrade(`platform-parentage:${projectId}:${String(error48)}`);
+          degrade(fleetWatchdogScope("platform-parentage", projectId, String(error48)));
         }
         const lanes = threads.filter(
           (thread) => thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null
@@ -24133,19 +24154,19 @@ ${thread.titleFallback ?? ""}`);
         try {
           [latest] = await bb.sdk.threads.events.list({ threadId, types: ["provider/rateLimits/updated"], order: "desc", limit: "1" });
         } catch (error48) {
-          degrade(`platform-rate-limit:${threadId}:${String(error48)}`);
+          degrade(fleetWatchdogScope("platform-rate-limit", threadId, String(error48)));
           return "unreadable";
         }
         const rateLimits = latest?.type === "provider/rateLimits/updated" ? latest.data.rateLimits : void 0;
         if (rateLimits === void 0 || rateLimits.status === "unknown") {
-          degrade(`platform-rate-limit:${threadId}:${rateLimits === void 0 ? "no-rate-limit-event-observed" : "provider-reports-unknown-rate-limit-state"}`);
+          degrade(fleetWatchdogScope("platform-rate-limit", threadId, rateLimits === void 0 ? "no-rate-limit-event-observed" : "provider-reports-unknown-rate-limit-state"));
           return "unobserved";
         }
         if (rateLimits.status !== "blocked" || rateLimits.kind !== "subscription-window") return "not-capped";
         const blocked = rateLimits.windows.filter((window) => window.status === "blocked");
         const resetsAtMs = blocked.flatMap((window) => window.resetsAtMs ?? []);
         if (blocked.length === 0 || resetsAtMs.length !== blocked.length) {
-          degrade(`platform-rate-limit:${threadId}:blocked-without-a-reset-time`);
+          degrade(fleetWatchdogScope("platform-rate-limit", threadId, "blocked-without-a-reset-time"));
           return "capped";
         }
         return resetsAtMs.every((resets) => resets <= now2) ? "not-capped" : "capped";
@@ -24161,7 +24182,7 @@ ${thread.titleFallback ?? ""}`);
             afterSeq = String(latest.seq);
           }
         } catch (error48) {
-          degrade(`platform-events:${threadId}:${String(error48)}`);
+          degrade(fleetWatchdogScope("platform-events", threadId, String(error48)));
         }
         return latest ? `${latest.type}@${latest.seq}` : "unknown";
       };
@@ -24247,7 +24268,7 @@ ${thread.titleFallback ?? ""}`);
         for (const linked of linkedWorkItems) {
           const observation = await linkedGithubObservationAsync(linked.owner, linked.repo, linked.issue_number);
           if (observation === null) {
-            degrade(`github-work-item-status:${projectId}:${linked.work_item_id}`);
+            degrade(fleetWatchdogScope("github-work-item-status", projectId, linked.work_item_id));
             continue;
           }
           if (linked.lifecycle_state === "succeeded") {
@@ -24265,14 +24286,14 @@ ${thread.titleFallback ?? ""}`);
             try {
               githubSnapshot2 = await readGithubIssueForBackfillAsync(linked.owner, linked.repo, linked.issue_number);
             } catch {
-              degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
+              degrade(fleetWatchdogScope("github-work-item-reopen", projectId, linked.work_item_id));
               continue;
             }
             const result3 = transitionWorkItem(
               projectId,
               linked.work_item_id,
               "ready",
-              `fleet-watchdog:issue-reopened:${linked.work_item_id}:${observation.externalRevision}`,
+              fleetWatchdogIssueReopenedKey(linked.work_item_id, observation.externalRevision),
               { workItemExternalEvent: { kind: "github_issue_reopened", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } },
               githubSnapshot2
             );
@@ -24290,7 +24311,7 @@ ${thread.titleFallback ?? ""}`);
                 bb.log.warn(`fleet-watchdog did not learn issue-reopen refusal because GitHub revisions disagreed: project=${projectId} workItem=${linked.work_item_id} observationRevision=${observation.externalRevision} snapshotRevision=${githubSnapshot2.externalRevision} reason=${refusalReason2}`);
               }
             } else {
-              degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
+              degrade(fleetWatchdogScope("github-work-item-reopen", projectId, linked.work_item_id));
               bb.log.warn(`fleet-watchdog issue-reopen transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result3.outcome} message=${result3.message ?? "unknown"}`);
             }
             continue;
@@ -24305,7 +24326,7 @@ ${thread.titleFallback ?? ""}`);
              FROM work_items WHERE project_id = ? AND work_item_id = ?`
           ).get(projectId, linked.work_item_id);
           if (!workItem) {
-            degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
+            degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
             bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} reason=authority-or-work-item-unavailable`);
             continue;
           }
@@ -24313,14 +24334,14 @@ ${thread.titleFallback ?? ""}`);
           try {
             githubSnapshot = await readGithubIssueForBackfillAsync(linked.owner, linked.repo, linked.issue_number);
           } catch {
-            degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
+            degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
             continue;
           }
           const transition = (state) => transitionWorkItem(
             projectId,
             linked.work_item_id,
             state,
-            `fleet-watchdog:merge-close:${linked.work_item_id}:${state}:${githubSnapshot.externalRevision}`,
+            fleetWatchdogMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
             state === "succeeded" || state === "cancelled" && workItem.lifecycle_state === "proposed" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
             githubSnapshot
           );
@@ -24350,7 +24371,7 @@ ${thread.titleFallback ?? ""}`);
           if (result2.outcome === "OK") {
             bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=${workItem.lifecycle_state === "proposed" ? "proposed-cancel" : "review_pending"}`);
           } else {
-            degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
+            degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
             bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result2.outcome} message=${result2.message}`);
           }
         }
@@ -24366,7 +24387,7 @@ ${thread.titleFallback ?? ""}`);
           if (directors.length !== 1 || orchestrators.length !== 1) {
             if (directors.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active director holders=${directors.length}`);
             if (orchestrators.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active project-orchestrator holders=${orchestrators.length}`);
-            degrade(`routing:${projectId}:directors=${directors.length},orchestrators=${orchestrators.length}`);
+            degrade(fleetWatchdogScope("routing", projectId, `directors=${directors.length},orchestrators=${orchestrators.length}`));
             continue;
           }
           const director = directors[0];
@@ -24411,7 +24432,7 @@ ${thread.titleFallback ?? ""}`);
                 currentLane = await bb.sdk.threads.get({ threadId: lane.id });
               }
             } catch (error48) {
-              degrade(`platform-lane:${lane.id}:${String(error48)}`);
+              degrade(fleetWatchdogScope("platform-lane", lane.id, String(error48)));
               continue;
             }
             if (currentLane.archivedAt !== null || currentLane.deletedAt !== null) continue;
@@ -24423,7 +24444,7 @@ ${thread.titleFallback ?? ""}`);
                 const dispatcherThread = await bb.sdk.threads.get({ threadId: dispatcher.thread_id });
                 if (dispatcherThread.archivedAt !== null || dispatcherThread.deletedAt !== null || dispatcherThread.status === "error" || dispatcherThread.status === "stopping") recipient = director;
               } catch (error48) {
-                degrade(`platform-dispatcher:${dispatcher.thread_id}:${String(error48)}`);
+                degrade(fleetWatchdogScope("platform-dispatcher", dispatcher.thread_id, String(error48)));
                 recipient = director;
               }
             }
@@ -24432,12 +24453,12 @@ ${thread.titleFallback ?? ""}`);
                 (candidate) => candidate.project_id === projectId && candidate.role_id === recipient.role_id && isCurrent(candidate, recipient)
               );
               if (currentRecipients.length !== 1) {
-                degrade(`dispatcher:${lane.id}:stale-recipient`);
+                degrade(fleetWatchdogScope("dispatcher", lane.id, "stale-recipient"));
                 continue;
               }
               const recipientThread = await bb.sdk.threads.get({ threadId: recipient.thread_id });
               if (recipientThread.archivedAt !== null || recipientThread.deletedAt !== null || recipientThread.status === "error" || recipientThread.status === "stopping") {
-                degrade(`dispatcher:${lane.id}:unreachable`);
+                degrade(fleetWatchdogScope("dispatcher", lane.id, "unreachable"));
                 continue;
               }
               const event = await lastEvent(lane.id);
@@ -24458,7 +24479,7 @@ ${thread.titleFallback ?? ""}`);
               brokenWakePath = true;
               bb.log.warn(`fleet-watchdog stranded lane surfaced: project=${projectId} lane=${lane.id} dispatcher=${recipient.role_id}@${recipient.role_generation} status=${observedStatus}`);
             } catch (error48) {
-              degrade(`dispatcher:${lane.id}:${String(error48)}`);
+              degrade(fleetWatchdogScope("dispatcher", lane.id, String(error48)));
             }
           }
           const workItems = openWorkItemsByProject.get(projectId) ?? [];
@@ -24511,25 +24532,25 @@ ${thread.titleFallback ?? ""}`);
               ).get(projectId, blocked.waker);
               if (dependency?.lifecycle_state !== "succeeded") continue;
               condition = { kind: "work_item_succeeded", workItemId: blocked.waker };
-              idempotencyKey = `fleet-watchdog:blocker-fired:${blocked.workItemId}:${blocked.waker}`;
+              idempotencyKey = fleetWatchdogBlockerFiredKey(blocked.workItemId, blocked.waker);
             } else if (blocked.wakerKind === "github_issue_closed" && blocked.waker !== null) {
               const match = blocked.waker.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u);
               const issueNumber = match?.[3] === void 0 ? NaN : Number(match[3]);
               if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
-                degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
+                degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
                 continue;
               }
               try {
                 snapshot2 = await readGithubIssueForBackfillAsync(match[1], match[2], issueNumber);
               } catch {
-                degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
+                degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
                 continue;
               }
               if (snapshot2.state !== "closed") continue;
               condition = { kind: "github_issue_closed", owner: match[1], repo: match[2], issueNumber };
-              idempotencyKey = `fleet-watchdog:blocker-fired:${blocked.workItemId}:${snapshot2.externalRevision}`;
+              idempotencyKey = fleetWatchdogBlockerFiredKey(blocked.workItemId, snapshot2.externalRevision);
             } else {
-              degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
+              degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
               continue;
             }
             const result2 = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot2);
@@ -24537,7 +24558,7 @@ ${thread.titleFallback ?? ""}`);
               unblocked.add(blocked.workItemId);
               bb.log.info(`fleet-watchdog returned blocked work item to ready: project=${projectId} workItem=${blocked.workItemId} blocker=${blocked.wakerKind}`);
             } else {
-              degrade(`work-item-unblock:${projectId}:${blocked.workItemId}`);
+              degrade(fleetWatchdogScope("work-item-unblock", projectId, blocked.workItemId));
               bb.log.warn(`fleet-watchdog unblock transition refused: project=${projectId} workItem=${blocked.workItemId} outcome=${result2.outcome}`);
             }
           }
@@ -24599,16 +24620,16 @@ ${thread.titleFallback ?? ""}`);
             continue;
           }
         } catch (error48) {
-          degrade(`project:${projectId}:${String(error48)}`);
+          degrade(fleetWatchdogScope("project", projectId, String(error48)));
           bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
         }
       }
       if (!brokenWakePath && coverage === "visible") bb.log.info("fleet-watchdog healthy cycle");
     } catch (error48) {
-      degrade(`cycle:${String(error48)}`);
+      degrade(fleetWatchdogScope("cycle", String(error48)));
       bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
     } finally {
-      const message = `fleet-watchdog coverage=${coverage} seats=${visibleSeatCount} lanes=${visibleLaneCount} cannotSee=${cannotSee.size === 0 ? "none" : [...cannotSee].join("|")}`;
+      const message = `fleet-watchdog coverage=${coverage} seats=${visibleSeatCount} lanes=${visibleLaneCount} cannotSee=${cannotSee.size === 0 ? "none" : [...cannotSee].join("|").replace(/\u0000/gu, ":")}`;
       if (coverage === "visible") bb.log.info(message);
       else bb.log.warn(message);
     }
@@ -24925,7 +24946,14 @@ export {
   cliSchemaError,
   plugin as default,
   deployedDistFailureDetail,
+  fleetWatchdogBlockerFiredKey,
+  fleetWatchdogCompositeKey,
+  fleetWatchdogEpisodeKey,
+  fleetWatchdogIssueReopenedKey,
+  fleetWatchdogMergeCloseKey,
   fleetWatchdogReopenKey,
+  fleetWatchdogRoleLivenessKey,
+  fleetWatchdogScope,
   foundationResultSchema,
   isLiveCachedConsumerRolloutArtifact,
   readLiveRoleFactReader,
