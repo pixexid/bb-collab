@@ -21897,7 +21897,7 @@ async function linkedGithubObservationAsync(owner, repo, issueNumber) {
   const stateReason = issue2.stateReason;
   const externalRevision = issue2.updatedAt;
   const closingPullRequests = issue2.closedByPullRequestsReferences;
-  if (issueState !== "OPEN" && issueState !== "CLOSED" || stateReason !== "COMPLETED" && stateReason !== "NOT_PLANNED" && stateReason !== "DUPLICATE" && stateReason !== "REOPENED" || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
+  if (issueState !== "OPEN" && issueState !== "CLOSED" || (stateReason === void 0 || stateReason === null || stateReason === "" ? issueState !== "OPEN" : stateReason !== "COMPLETED" && stateReason !== "NOT_PLANNED" && stateReason !== "DUPLICATE" && stateReason !== "REOPENED") || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
   const closingPullRequest = closingPullRequests[0];
   if (closingPullRequest !== void 0 && (!closingPullRequest || typeof closingPullRequest !== "object" || Array.isArray(closingPullRequest) || typeof closingPullRequest.number !== "number" || !Number.isSafeInteger(closingPullRequest.number))) return null;
   const pullRequest = closingPullRequest === void 0 ? null : await githubJsonAsync(["pr", "view", String(closingPullRequest.number), "--repo", `${owner}/${repo}`, "--json", "state,mergedAt"]);
@@ -21912,20 +21912,20 @@ async function linkedGithubObservationAsync(owner, repo, issueNumber) {
   const issueClosed = issueState === "CLOSED";
   const issueOpen = issueState === "OPEN";
   const status = pullRequestMerged || pullRequestClosed || issueClosed ? pullRequestMerged ? "merged" : "closed" : issueOpen ? "open" : null;
-  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason, externalRevision };
+  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason: stateReason === "" || stateReason === null ? void 0 : stateReason, externalRevision };
 }
 async function readGithubIssueForBackfillAsync(owner, repo, issueNumber) {
   const value = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"]);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
   const record2 = value;
-  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || record2.stateReason !== "COMPLETED" && record2.stateReason !== "NOT_PLANNED" && record2.stateReason !== "DUPLICATE" && record2.stateReason !== "REOPENED" || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
-  return { owner, repo, issueNumber: record2.number, title: record2.title, body: record2.body ?? "", state: record2.state === "OPEN" ? "open" : "closed", stateReason: record2.stateReason, labels: record2.labels.map((label) => label.name), externalRevision: record2.updatedAt };
+  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || (record2.stateReason === void 0 || record2.stateReason === null || record2.stateReason === "" ? record2.state !== "OPEN" : record2.stateReason !== "COMPLETED" && record2.stateReason !== "NOT_PLANNED" && record2.stateReason !== "DUPLICATE" && record2.stateReason !== "REOPENED") || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
+  return { owner, repo, issueNumber: record2.number, title: record2.title, body: record2.body ?? "", state: record2.state === "OPEN" ? "open" : "closed", stateReason: record2.stateReason === "" || record2.stateReason === null ? void 0 : record2.stateReason, labels: record2.labels.map((label) => label.name), externalRevision: record2.updatedAt };
 }
 function readGithubIssueForBackfill(owner, repo, issueNumber) {
   const value = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"]);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
   const record2 = value;
-  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || record2.stateReason !== "COMPLETED" && record2.stateReason !== "NOT_PLANNED" && record2.stateReason !== "DUPLICATE" && record2.stateReason !== "REOPENED" || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
+  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || (record2.stateReason === void 0 || record2.stateReason === null || record2.stateReason === "" ? record2.state !== "OPEN" : record2.stateReason !== "COMPLETED" && record2.stateReason !== "NOT_PLANNED" && record2.stateReason !== "DUPLICATE" && record2.stateReason !== "REOPENED") || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
   return {
     owner,
     repo,
@@ -21933,7 +21933,7 @@ function readGithubIssueForBackfill(owner, repo, issueNumber) {
     title: record2.title,
     body: record2.body ?? "",
     state: record2.state === "OPEN" ? "open" : "closed",
-    stateReason: record2.stateReason,
+    stateReason: record2.stateReason === "" || record2.stateReason === null ? void 0 : record2.stateReason,
     labels: record2.labels.map((label) => label.name),
     externalRevision: record2.updatedAt
   };

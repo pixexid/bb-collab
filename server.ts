@@ -183,12 +183,14 @@ function startableQueueState(repositories: string[]): StartableQueueState | null
 
 type LinkedGithubStatus = "open" | "closed" | "merged";
 
+type GithubStateReason = "COMPLETED" | "NOT_PLANNED" | "DUPLICATE" | "REOPENED";
+
 type LinkedGithubObservation = {
   status: LinkedGithubStatus;
   pullRequestMerged: boolean;
   issueClosed: boolean;
   issueOpen: boolean;
-  stateReason: "COMPLETED" | "NOT_PLANNED" | "DUPLICATE" | "REOPENED";
+  stateReason?: GithubStateReason;
   externalRevision: string;
 };
 
@@ -199,7 +201,7 @@ async function linkedGithubObservationAsync(owner: string, repo: string, issueNu
   const stateReason = (issue as { stateReason?: unknown }).stateReason;
   const externalRevision = (issue as { updatedAt?: unknown }).updatedAt;
   const closingPullRequests = (issue as { closedByPullRequestsReferences?: unknown }).closedByPullRequestsReferences;
-  if ((issueState !== "OPEN" && issueState !== "CLOSED") || (stateReason !== "COMPLETED" && stateReason !== "NOT_PLANNED" && stateReason !== "DUPLICATE" && stateReason !== "REOPENED") || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
+  if ((issueState !== "OPEN" && issueState !== "CLOSED") || ((stateReason === undefined || stateReason === null || stateReason === "") ? issueState !== "OPEN" : (stateReason !== "COMPLETED" && stateReason !== "NOT_PLANNED" && stateReason !== "DUPLICATE" && stateReason !== "REOPENED")) || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
   const closingPullRequest = closingPullRequests[0];
   if (closingPullRequest !== undefined && (!closingPullRequest || typeof closingPullRequest !== "object" || Array.isArray(closingPullRequest)
     || typeof (closingPullRequest as { number?: unknown }).number !== "number"
@@ -218,7 +220,7 @@ async function linkedGithubObservationAsync(owner: string, repo: string, issueNu
   const issueClosed = issueState === "CLOSED";
   const issueOpen = issueState === "OPEN";
   const status = pullRequestMerged || pullRequestClosed || issueClosed ? pullRequestMerged ? "merged" : "closed" : issueOpen ? "open" : null;
-  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason, externalRevision };
+  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason: stateReason === "" || stateReason === null ? undefined : stateReason as GithubStateReason, externalRevision };
 }
 
 async function readGithubIssueForBackfillAsync(owner: string, repo: string, issueNumber: number): Promise<GitHubIssueSnapshot> {
@@ -227,10 +229,10 @@ async function readGithubIssueForBackfillAsync(owner: string, repo: string, issu
   const record = value as { number?: unknown; title?: unknown; body?: unknown; state?: unknown; stateReason?: unknown; labels?: unknown; updatedAt?: unknown };
   if (typeof record.number !== "number" || !Number.isSafeInteger(record.number) || typeof record.title !== "string"
     || (record.body !== null && typeof record.body !== "string") || (record.state !== "OPEN" && record.state !== "CLOSED")
-    || (record.stateReason !== "COMPLETED" && record.stateReason !== "NOT_PLANNED" && record.stateReason !== "DUPLICATE" && record.stateReason !== "REOPENED")
+    || ((record.stateReason === undefined || record.stateReason === null || record.stateReason === "") ? record.state !== "OPEN" : (record.stateReason !== "COMPLETED" && record.stateReason !== "NOT_PLANNED" && record.stateReason !== "DUPLICATE" && record.stateReason !== "REOPENED"))
     || !Array.isArray(record.labels) || !record.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof (label as { name?: unknown }).name === "string")
     || typeof record.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
-  return { owner, repo, issueNumber: record.number, title: record.title, body: record.body ?? "", state: record.state === "OPEN" ? "open" : "closed", stateReason: record.stateReason as "COMPLETED" | "NOT_PLANNED" | "DUPLICATE" | "REOPENED", labels: (record.labels as Array<{ name: string }>).map((label) => label.name), externalRevision: record.updatedAt };
+  return { owner, repo, issueNumber: record.number, title: record.title, body: record.body ?? "", state: record.state === "OPEN" ? "open" : "closed", stateReason: record.stateReason === "" || record.stateReason === null ? undefined : record.stateReason as GithubStateReason, labels: (record.labels as Array<{ name: string }>).map((label) => label.name), externalRevision: record.updatedAt };
 }
 
 function linkedGithubObservation(owner: string, repo: string, issueNumber: number): LinkedGithubObservation | null {
@@ -240,7 +242,7 @@ function linkedGithubObservation(owner: string, repo: string, issueNumber: numbe
   const stateReason = (issue as { stateReason?: unknown }).stateReason;
   const externalRevision = (issue as { updatedAt?: unknown }).updatedAt;
   const closingPullRequests = (issue as { closedByPullRequestsReferences?: unknown }).closedByPullRequestsReferences;
-  if ((issueState !== "OPEN" && issueState !== "CLOSED") || (stateReason !== "COMPLETED" && stateReason !== "NOT_PLANNED" && stateReason !== "DUPLICATE" && stateReason !== "REOPENED") || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
+  if ((issueState !== "OPEN" && issueState !== "CLOSED") || ((stateReason === undefined || stateReason === null || stateReason === "") ? issueState !== "OPEN" : (stateReason !== "COMPLETED" && stateReason !== "NOT_PLANNED" && stateReason !== "DUPLICATE" && stateReason !== "REOPENED")) || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
   const closingPullRequest = closingPullRequests[0];
   if (closingPullRequest !== undefined && (!closingPullRequest || typeof closingPullRequest !== "object" || Array.isArray(closingPullRequest)
     || typeof (closingPullRequest as { number?: unknown }).number !== "number"
@@ -261,7 +263,7 @@ function linkedGithubObservation(owner: string, repo: string, issueNumber: numbe
   const status = pullRequestMerged || pullRequestClosed || issueClosed
     ? pullRequestMerged ? "merged" : "closed"
     : issueOpen ? "open" : null;
-  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason, externalRevision };
+  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason: stateReason === "" || stateReason === null ? undefined : stateReason as GithubStateReason, externalRevision };
 }
 
 function readGithubIssueForBackfill(owner: string, repo: string, issueNumber: number): GitHubIssueSnapshot {
@@ -274,7 +276,7 @@ function readGithubIssueForBackfill(owner: string, repo: string, issueNumber: nu
     typeof record.title !== "string" ||
     (record.body !== null && typeof record.body !== "string") ||
     (record.state !== "OPEN" && record.state !== "CLOSED") ||
-    (record.stateReason !== "COMPLETED" && record.stateReason !== "NOT_PLANNED" && record.stateReason !== "DUPLICATE" && record.stateReason !== "REOPENED") ||
+    ((record.stateReason === undefined || record.stateReason === null || record.stateReason === "") ? record.state !== "OPEN" : (record.stateReason !== "COMPLETED" && record.stateReason !== "NOT_PLANNED" && record.stateReason !== "DUPLICATE" && record.stateReason !== "REOPENED")) ||
     !Array.isArray(record.labels) ||
     !record.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof (label as { name?: unknown }).name === "string") ||
     typeof record.updatedAt !== "string"
@@ -286,7 +288,7 @@ function readGithubIssueForBackfill(owner: string, repo: string, issueNumber: nu
     title: record.title,
     body: record.body ?? "",
     state: record.state === "OPEN" ? "open" : "closed",
-    stateReason: record.stateReason as "COMPLETED" | "NOT_PLANNED" | "DUPLICATE" | "REOPENED",
+    stateReason: record.stateReason === "" || record.stateReason === null ? undefined : record.stateReason as GithubStateReason,
     labels: record.labels.map((label) => (label as { name: string }).name),
     externalRevision: record.updatedAt,
   };

@@ -10662,7 +10662,7 @@ exit 1
     const calls = join(bin, "calls");
     writeFileSync(gh, `#!/bin/sh
 printf '%s\n' "$@" >> "${calls}"
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "401" ]; then printf '%s\n' '{"number":401,"title":"Existing","body":"Existing","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"2026-08-19T00:00:00Z"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "401" ]; then printf '%s\n' '{"number":401,"title":"Existing","body":"Existing","state":"OPEN","stateReason":"","labels":[],"updatedAt":"2026-08-19T00:00:00Z"}'; exit 0; fi
 exit 1
 `);
     chmodSync(gh, 0o755);
