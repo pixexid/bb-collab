@@ -41,6 +41,8 @@ import {
   roleContextPreflightRefusal,
   writingLaneCeilingFromJson,
   WORK_ITEM_NON_TERMINAL_STATES,
+  WORK_ITEM_CAPACITY_ATTEMPT_STATES,
+  WORK_ITEM_CAPACITY_LIFECYCLE_STATES,
   workItemCapacityLaneEvidence,
   type ApplyRequest,
   type FoundationCode,
@@ -1741,26 +1743,48 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   };
   const reconcileErrorRecovery = async () => {
     if (db === null) {
-      bb.log.error("error-recovery coverage=blind event=blind roleRestart=blind roles=unknown laneRestart=blind unboundOpenWorkItems=unknown reason=canonical-store-unreadable;work-items-have-no-thread-binding:GH-300");
+      const coverage = "blind";
+      const roleRestart = "blind";
+      const laneRestart = "blind";
+      bb.log.error(`error-recovery coverage=${coverage} event=blind roleRestart=${roleRestart} roles=unknown laneRestart=${laneRestart} lanes=unknown unboundOpenWorkItems=unknown reason=canonical-store-unreadable`);
       return;
     }
     let holders: RoleHolderState[];
+    let lanes: Array<{ project_id: string; thread_id: string }>;
     let openWorkItems: number;
     try {
       holders = readRoleHolderStates(db);
+      lanes = db.prepare(
+        `SELECT attempts.project_id, attempts.thread_id FROM execution_attempts AS attempts
+         JOIN work_items AS items ON items.project_id = attempts.project_id AND items.work_item_id = attempts.work_item_id
+         WHERE attempts.origin = 'work_item' AND attempts.assignment_kind = 'write' AND attempts.thread_id IS NOT NULL
+           AND attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+           AND items.lifecycle_state IN (${WORK_ITEM_CAPACITY_LIFECYCLE_STATES.map(() => "?").join(", ")})
+         ORDER BY attempts.project_id, attempts.thread_id`,
+      ).all(...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES) as Array<{ project_id: string; thread_id: string }>;
       openWorkItems = (db.prepare(
         "SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')",
       ).get() as { count: number }).count;
     } catch (error) {
-      bb.log.error(`error-recovery coverage=blind event=armed roleRestart=blind roles=unknown laneRestart=blind unboundOpenWorkItems=unknown reason=role-inventory-unreadable:${String(error)};work-items-have-no-thread-binding:GH-300`);
+      const coverage = "blind";
+      const roleRestart = "blind";
+      const laneRestart = "blind";
+      bb.log.error(`error-recovery coverage=${coverage} event=armed roleRestart=${roleRestart} roles=unknown laneRestart=${laneRestart} lanes=unknown unboundOpenWorkItems=unknown reason=canonical-inventory-unreadable:${String(error)}`);
       return;
     }
     let failedRoles = 0;
     for (const holder of holders) {
       if (await recoverErroredThread(holder.thread_id, holder.project_id, holder) === null) failedRoles += 1;
     }
+    let failedLanes = 0;
+    for (const lane of lanes) {
+      if (await recoverErroredThread(lane.thread_id, lane.project_id) === null) failedLanes += 1;
+    }
     const roleRestart = failedRoles === 0 ? "armed" : "degraded";
-    bb.log.error(`error-recovery coverage=blind event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=blind unboundOpenWorkItems=${openWorkItems} reason=work-items-have-no-thread-binding:GH-300`);
+    const laneRestart = failedLanes === 0 ? "armed" : "degraded";
+    const coverage = failedRoles === 0 && failedLanes === 0 ? "armed" : "degraded";
+    const reason = coverage === "armed" ? "none" : `recovery-failed:roles=${failedRoles},lanes=${failedLanes}`;
+    bb.log.error(`error-recovery coverage=${coverage} event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=${laneRestart} lanes=${lanes.length} failedLanes=${failedLanes} unboundOpenWorkItems=${openWorkItems} reason=${reason}`);
   };
 
   const readPendingExternalWait = async (threadId: string, signal?: AbortSignal) => {

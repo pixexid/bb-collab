@@ -23191,26 +23191,48 @@ async function plugin(bb, options = {}) {
   };
   const reconcileErrorRecovery = async () => {
     if (db === null) {
-      bb.log.error("error-recovery coverage=blind event=blind roleRestart=blind roles=unknown laneRestart=blind unboundOpenWorkItems=unknown reason=canonical-store-unreadable;work-items-have-no-thread-binding:GH-300");
+      const coverage2 = "blind";
+      const roleRestart2 = "blind";
+      const laneRestart2 = "blind";
+      bb.log.error(`error-recovery coverage=${coverage2} event=blind roleRestart=${roleRestart2} roles=unknown laneRestart=${laneRestart2} lanes=unknown unboundOpenWorkItems=unknown reason=canonical-store-unreadable`);
       return;
     }
     let holders;
+    let lanes;
     let openWorkItems;
     try {
       holders = readRoleHolderStates(db);
+      lanes = db.prepare(
+        `SELECT attempts.project_id, attempts.thread_id FROM execution_attempts AS attempts
+         JOIN work_items AS items ON items.project_id = attempts.project_id AND items.work_item_id = attempts.work_item_id
+         WHERE attempts.origin = 'work_item' AND attempts.assignment_kind = 'write' AND attempts.thread_id IS NOT NULL
+           AND attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+           AND items.lifecycle_state IN (${WORK_ITEM_CAPACITY_LIFECYCLE_STATES.map(() => "?").join(", ")})
+         ORDER BY attempts.project_id, attempts.thread_id`
+      ).all(...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES);
       openWorkItems = db.prepare(
         "SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')"
       ).get().count;
     } catch (error48) {
-      bb.log.error(`error-recovery coverage=blind event=armed roleRestart=blind roles=unknown laneRestart=blind unboundOpenWorkItems=unknown reason=role-inventory-unreadable:${String(error48)};work-items-have-no-thread-binding:GH-300`);
+      const coverage2 = "blind";
+      const roleRestart2 = "blind";
+      const laneRestart2 = "blind";
+      bb.log.error(`error-recovery coverage=${coverage2} event=armed roleRestart=${roleRestart2} roles=unknown laneRestart=${laneRestart2} lanes=unknown unboundOpenWorkItems=unknown reason=canonical-inventory-unreadable:${String(error48)}`);
       return;
     }
     let failedRoles = 0;
     for (const holder of holders) {
       if (await recoverErroredThread(holder.thread_id, holder.project_id, holder) === null) failedRoles += 1;
     }
+    let failedLanes = 0;
+    for (const lane of lanes) {
+      if (await recoverErroredThread(lane.thread_id, lane.project_id) === null) failedLanes += 1;
+    }
     const roleRestart = failedRoles === 0 ? "armed" : "degraded";
-    bb.log.error(`error-recovery coverage=blind event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=blind unboundOpenWorkItems=${openWorkItems} reason=work-items-have-no-thread-binding:GH-300`);
+    const laneRestart = failedLanes === 0 ? "armed" : "degraded";
+    const coverage = failedRoles === 0 && failedLanes === 0 ? "armed" : "degraded";
+    const reason = coverage === "armed" ? "none" : `recovery-failed:roles=${failedRoles},lanes=${failedLanes}`;
+    bb.log.error(`error-recovery coverage=${coverage} event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=${laneRestart} lanes=${lanes.length} failedLanes=${failedLanes} unboundOpenWorkItems=${openWorkItems} reason=${reason}`);
   };
   const readPendingExternalWait = async (threadId, signal) => {
     try {

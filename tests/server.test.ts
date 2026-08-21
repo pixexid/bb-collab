@@ -3270,11 +3270,11 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     expect(fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.startsWith("error-recovery coverage="))).toEqual([
       {
         level: "error",
-        message: `error-recovery coverage=blind event=armed roleRestart=armed roles=2 failedRoles=0 laneRestart=blind unboundOpenWorkItems=${openWorkItems} reason=work-items-have-no-thread-binding:GH-300`,
+        message: "error-recovery coverage=armed event=armed roleRestart=armed roles=2 failedRoles=0 laneRestart=armed lanes=0 failedLanes=0 unboundOpenWorkItems=" + openWorkItems + " reason=none",
       },
       {
         level: "error",
-        message: `error-recovery coverage=blind event=armed roleRestart=armed roles=2 failedRoles=0 laneRestart=blind unboundOpenWorkItems=${openWorkItems} reason=work-items-have-no-thread-binding:GH-300`,
+        message: "error-recovery coverage=armed event=armed roleRestart=armed roles=2 failedRoles=0 laneRestart=armed lanes=0 failedLanes=0 unboundOpenWorkItems=" + openWorkItems + " reason=none",
       },
     ]);
   });
