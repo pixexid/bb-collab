@@ -3795,7 +3795,9 @@ else console.log(JSON.stringify(blocked));
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-stale-terminal-"));
     const gh = join(bin, "gh");
     const phaseFile = join(bin, "phase");
+    const adversarialPhaseFile = join(bin, "adversarial-phase");
     writeFileSync(phaseFile, "closed-1\n");
+    writeFileSync(adversarialPhaseFile, "closed-1\n");
     writeFileSync(gh, `#!/bin/sh
 phase=$(cat "${phaseFile}")
 if [ "$1" = "pr" ]; then
@@ -3804,6 +3806,16 @@ if [ "$1" = "pr" ]; then
 fi
 if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[{"number":999,"labels":[{"name":"queue:startable"}]}]'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "207" ]; then exit 1; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "9999" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then
+  phase=$(cat "${adversarialPhaseFile}")
+  if [ "$phase" = "closed-1" ]; then printf '%s\n' '{"state":"CLOSED","updatedAt":"closed-1","closedByPullRequestsReferences":[{"number":340}]}' ; printf '%s\n' 'open-2' > "${adversarialPhaseFile}"; else printf '%s\n' '{"state":"OPEN","updatedAt":"open-2","closedByPullRequestsReferences":[]}' ; fi
+  exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "9999" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then
+  phase=$(cat "${adversarialPhaseFile}")
+  if [ "$phase" = "open-2" ]; then printf '%s\n' '{"number":9999,"title":"issue","body":"body","state":"OPEN","labels":[],"updatedAt":"open-2"}'; else printf '%s\n' '{"number":9999,"title":"issue","body":"body","state":"CLOSED","labels":[],"updatedAt":"closed-1"}'; fi
+  exit 0
+fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then
   if [ "$phase" = "open-2" ]; then printf '%s\\n' '{"state":"OPEN","updatedAt":"open-2","closedByPullRequestsReferences":[]}'; else printf '%s\\n' '{"state":"CLOSED","updatedAt":"'"$phase"'","closedByPullRequestsReferences":[{"number":340}]}'; fi
   exit 0
@@ -3853,6 +3865,12 @@ exit 1
         idempotencyKey: "never-started-work-item-create",
         workItemId: proposedWorkItemId,
         workItem: { workItemId: proposedWorkItemId, title: proposedWorkItemId, body: "absorbed before dispatch", githubIssue: { issueNumber: 210 } },
+      })).outcome).toBe("OK");
+      const adversarialWorkItemId = "adversarial-work-item";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "adversarial-work-item-create",
+        workItemId: adversarialWorkItemId,
+        workItem: { workItemId: adversarialWorkItemId, title: adversarialWorkItemId, body: "reopened during merge-close", githubIssue: { issueNumber: 9999 } },
       })).outcome).toBe("OK");
       const unreadableWorkItemId = "unreadable-work-item";
       expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
@@ -3911,6 +3929,11 @@ exit 1
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
       expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, proposedWorkItemId)).toEqual({ lifecycle_state: "cancelled" });
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, adversarialWorkItemId)).toEqual({ lifecycle_state: "proposed" });
+      const proposedTransition = fixture.db.prepare(
+        "SELECT event_json FROM state_events WHERE project_id = ? AND aggregate_id = ? AND event_type = 'work_item_transitioned' ORDER BY event_sequence DESC LIMIT 1",
+      ).get(PROJECT_ID, proposedWorkItemId) as { event_json: string };
+      expect(JSON.parse(proposedTransition.event_json).externalEvent).toMatchObject({ kind: "github_issue_closed", owner: "example", repo: "project", issueNumber: 210, externalRevision: "closed-210" });
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
       expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({

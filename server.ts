@@ -2963,7 +2963,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             linked.work_item_id,
             state,
             `fleet-watchdog:merge-close:${linked.work_item_id}:${state}:${githubSnapshot.externalRevision}`,
-            state === "succeeded" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
+            state === "succeeded" || (state === "cancelled" && workItem.lifecycle_state === "proposed")
+              ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } }
+              : {},
             githubSnapshot,
           );
           let result: FoundationResult;
@@ -2990,7 +2992,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             // A closed issue absorbs work that never started; it did not succeed.
             result = transition("cancelled");
           } else {
-            result = { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close automation requires in_progress or review_pending, found ${workItem.lifecycle_state}` };
+            result = { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close automation requires in_progress, review_pending, or proposed, found ${workItem.lifecycle_state}` };
           }
           if (result.outcome === "OK") {
             bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=${workItem.lifecycle_state === "proposed" ? "proposed-cancel" : "review_pending"}`);
