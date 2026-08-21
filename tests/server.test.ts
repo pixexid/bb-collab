@@ -8514,6 +8514,12 @@ fi
       idempotencyKey: "stale-wait-terminal",
       expectedConfigRevision: 2,
     }))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 4, null, {
+      expectedConfigRevision: 2,
+      idempotencyKey: "stale-terminal-wait-clear",
+    }))).toMatchObject({
+      outcome: "WORK_ITEM_STATE_INVALID", message: "terminal work item has no wait to clear", attempted: 0,
+    });
   });
 
   it("creates multiple targets through the resolver and rejects an ambiguous selector", async () => {
@@ -8593,34 +8599,46 @@ fi
   it("atomically swaps a blocked blocker under transition authority", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host);
-    const dependencyId = "swap-dependency";
     const github = new DeterministicGitHubIssueAdapter();
     github.put({ owner: "upstream", repo: "host", issueNumber: 1949, title: "Release API", body: "", state: "open", labels: [], externalRevision: "open-swap" });
-    const githubRead = github.read.bind(github);
+    github.put({ owner: "upstream", repo: "host", issueNumber: 1950, title: "Replacement API", body: "", state: "open", labels: [], externalRevision: "open-replacement" });
+    const reads: string[] = [];
+    const githubRead = (owner: string, repo: string, issueNumber: number) => {
+      reads.push(`${owner}/${repo}#${issueNumber}`);
+      return github.read(owner, repo, issueNumber);
+    };
     const create = (workItemId: string) => applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
       idempotencyKey: `${workItemId}-create`, workItemId,
       workItem: { workItemId, title: workItemId, body: workItemId },
     }));
     expect(create(WORK_ITEM_ID).outcome).toBe("OK");
-    expect(create(dependencyId).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1))).toMatchObject({ outcome: "OK", currentResourceRevision: 2 });
     expect(applyFixtureMutation(db, transitionRequest(fenceToken, "blocked", 2, {
       idempotencyKey: "swap-github-blocker",
       workItemWait: { kind: "github_issue_closed", owner: "upstream", repo: "host", issueNumber: 1949, declaredBySeat: "worker-seat" },
     }), null, null, null, null, githubRead)).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
 
+    const selfSwap = applyFixtureMutation(db, transitionRequest(fenceToken, "blocked", 3, {
+      idempotencyKey: "swap-to-self",
+      workItemWait: { kind: "github_issue_closed", owner: "upstream", repo: "host", issueNumber: 1949, declaredBySeat: "worker-seat" },
+      workItemUnblock: { kind: "github_issue_closed", owner: "upstream", repo: "host", issueNumber: 1949 },
+    }), null, null, null, null, githubRead);
+    expect(selfSwap).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", message: "blocked wait swap requires a different replacement blocker", attempted: 0 });
+    expect(db.prepare("SELECT resource_revision FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ resource_revision: 3 });
+
     const swapped = applyFixtureMutation(db, transitionRequest(fenceToken, "blocked", 3, {
-      idempotencyKey: "swap-to-dependency",
-      workItemWait: { kind: "work_item_succeeded", workItemId: dependencyId, declaredBySeat: "worker-seat" },
+      idempotencyKey: "swap-to-github",
+      workItemWait: { kind: "github_issue_closed", owner: "upstream", repo: "host", issueNumber: 1950, declaredBySeat: "worker-seat" },
       workItemUnblock: { kind: "github_issue_closed", owner: "upstream", repo: "host", issueNumber: 1949 },
     }), null, null, null, null, githubRead);
     expect(swapped).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(reads.slice(-2)).toEqual(["upstream/host#1950", "upstream/host#1949"]);
     expect(db.prepare("SELECT lifecycle_state FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lifecycle_state: "blocked" });
-    expect(db.prepare("SELECT COUNT(*) AS count, waker, waker_kind FROM work_item_waits WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ count: 1, waker: dependencyId, waker_kind: "work_item_succeeded" });
+    expect(db.prepare("SELECT COUNT(*) AS count, waker, waker_kind FROM work_item_waits WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ count: 1, waker: "upstream/host#1950", waker_kind: "github_issue_closed" });
     expect(db.prepare("SELECT event_type FROM state_events WHERE aggregate_id = ? ORDER BY aggregate_revision DESC LIMIT 1").get(WORK_ITEM_ID)).toEqual({ event_type: "work_item_wait_swapped" });
 
     expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 4, null, { idempotencyKey: "swap-clear-refused" }))).toMatchObject({
-      outcome: "WORK_ITEM_STATE_INVALID", message: "blocked or terminal work item cannot lose its sole machine-evaluable blocker", attempted: 0,
+      outcome: "WORK_ITEM_STATE_INVALID", message: "blocked work item cannot clear its machine-evaluable blocker through a wait mutation", attempted: 0,
     });
   });
 

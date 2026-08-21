@@ -19230,8 +19230,9 @@ function sameWorkItemBlocker(left, right) {
 }
 function workItemGithubReadTarget(request) {
   const targets = [request.workItemWait, request.workItemUnblock, request.workItemExternalEvent].flatMap((value) => value && value.kind !== "work_item_succeeded" && value.kind !== "schedule" && value.kind !== "seat" ? [{ owner: value.owner, repo: value.repo, issueNumber: value.issueNumber }] : []);
-  if (targets.length > 1) throw refusal("WORK_ITEM_STATE_INVALID", "work item transition accepts one external condition");
-  return targets[0] ?? null;
+  const swapping = request.lifecycleState === "blocked" && request.workItemWait !== void 0 && request.workItemUnblock !== void 0;
+  if (targets.length > 1 && !swapping) throw refusal("WORK_ITEM_STATE_INVALID", "work item transition accepts one external condition");
+  return targets;
 }
 function validGithubSnapshotStateReason(state, reason) {
   return state === "open" ? reason === void 0 || reason === "REOPENED" : reason === "COMPLETED" || reason === "NOT_PLANNED" || reason === "DUPLICATE";
@@ -19497,12 +19498,16 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
     if (!storedBlocker || !sameWorkItemBlocker(storedBlocker, unblock)) {
       throw refusal("WORK_ITEM_STATE_INVALID", "blocked wait swap requires the exact stored blocker");
     }
+    const replacement = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber };
+    if (sameWorkItemBlocker(storedBlocker, replacement)) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "blocked wait swap requires a different replacement blocker");
+    }
     requireBlockerCondition(db, request, machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber }, githubObservation, false);
   }
   if (wait !== void 0 && !enteringBlocked && !swappingBlockedWait) {
     if (machineWait) throw refusal("WORK_ITEM_STATE_INVALID", "machine-evaluable blocker requires an atomic transition to blocked");
     if (["blocked", "succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state)) {
-      throw refusal("WORK_ITEM_STATE_INVALID", wait === null ? "blocked or terminal work item cannot lose its sole machine-evaluable blocker" : "blocked or terminal work item cannot carry a human wait");
+      throw refusal("WORK_ITEM_STATE_INVALID", wait === null ? workItem.lifecycle_state === "blocked" ? "blocked work item cannot clear its machine-evaluable blocker through a wait mutation" : "terminal work item has no wait to clear" : "blocked or terminal work item cannot carry a human wait");
     }
     if (wait !== null && existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
     if (wait === null && !existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item carries no open wait");
@@ -20483,19 +20488,25 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
     if (request.operationClass === "decision_disposition") {
       return applyDecisionMutation(db, request, digest, reviewFactReader);
     }
-    const githubTarget = request.operationClass === "work_item_transition" ? workItemGithubReadTarget(request) : null;
+    const githubTargets = request.operationClass === "work_item_transition" ? workItemGithubReadTarget(request) : [];
     let githubObservation = null;
-    if (githubTarget) {
+    if (githubTargets.length > 0) {
       const replay = checkIdempotency(db, request, digest);
       if (replay) return replay;
       const reader = githubIssueReader ?? (githubAdapter ? githubAdapter.read.bind(githubAdapter) : null);
       if (!reader) throw refusal("EXTERNAL_TARGET_REQUIRED", "work item transition requires a live GitHub issue reader");
-      try {
-        githubObservation = reader(githubTarget.owner, githubTarget.repo, githubTarget.issueNumber);
-      } catch {
-        throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue observation is unavailable");
-      }
-      if (!githubObservation || githubObservation.owner !== githubTarget.owner || githubObservation.repo !== githubTarget.repo || githubObservation.issueNumber !== githubTarget.issueNumber) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue observation does not match the exact blocker identity");
+      const observations = githubTargets.map((target) => {
+        let observation2;
+        try {
+          observation2 = reader(target.owner, target.repo, target.issueNumber);
+        } catch {
+          throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue observation is unavailable");
+        }
+        if (!observation2 || observation2.owner !== target.owner || observation2.repo !== target.repo || observation2.issueNumber !== target.issueNumber) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue observation does not match the exact blocker identity");
+        return observation2;
+      });
+      const replacement = request.workItemWait && request.workItemWait.kind === "github_issue_closed" ? request.workItemWait : request.workItemExternalEvent;
+      githubObservation = replacement && replacement.kind === "github_issue_closed" ? observations.find((observation2) => observation2.owner === replacement.owner && observation2.repo === replacement.repo && observation2.issueNumber === replacement.issueNumber) ?? null : observations[0] ?? null;
     }
     const mutate = () => {
       const replay = checkIdempotency(db, request, digest);
