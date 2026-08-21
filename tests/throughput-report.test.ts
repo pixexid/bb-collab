@@ -80,8 +80,14 @@ describe("weekly throughput report", () => {
     const report = weeklyThroughputReport(empty, window);
     expect(report.issueOpenToClose.medianHours).toBeNull();
     expect(report.reviewLatencyByTier.A.status).toBe("unknown");
-    expect(report.defectEscape).toMatchObject({ reverts: { status: "unknown", total: null }, postMergeP0s: { status: "unknown", count: null }, postMergeP1s: { status: "unknown", count: null } });
+    expect(report.defectEscape).toMatchObject({ filed: 0, attributed: 0, unattributed: 0, attributionCoverage: null, summary: "defects filed 0; defects attributed 0; defects unattributed 0; attribution coverage unknown (empty population)", reverts: { status: "unknown", total: null }, postMergeP0s: { status: "unknown", count: null }, postMergeP1s: { status: "unknown", count: null } });
     expect(report.dialGuidance).toContain("unknown");
+  });
+
+  it("distinguishes an unused defect selector from an empty connected population", () => {
+    const report = weeklyThroughputReport({ ...empty, defectPopulation: { selector: "bug", selectorUsage: "unused" } }, window);
+    expect(report.defectEscape).toMatchObject({ filed: null, attributed: null, unattributed: null, attributionCoverage: null, population: { status: "disconnected", selector: "bug" } });
+    expect(report.defectEscape.summary).toContain("selector bug is unused repo-wide");
   });
 
   it("integrates persisted full-cap intervals only across complete known coverage", () => {

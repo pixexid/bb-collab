@@ -32,6 +32,7 @@ export type ThroughputFacts = {
     completedAtMs: number | null;
   }>;
   laneCapacityIntervals?: LaneCapacityInterval[];
+  defectPopulation?: { selector: string; selectorUsage: "used" | "unused" | "unknown" };
   defects: Array<{
     id: string;
     filedAtMs?: number | null;
@@ -71,6 +72,7 @@ export type WeeklyThroughputReport = {
     attributed: number | null;
     unattributed: number | null;
     attributionCoverage: number | null;
+    population: { status: "connected" | "disconnected" | "unknown"; selector: string | null; reason?: string };
     summary: string;
     reverts: UnknownMetric & { total: null; observedExplicitRevertIds: string[] } | { status: "known"; total: number; observedExplicitRevertIds: string[] };
     postMergeP0s: UnknownMetric & { count: null } | { status: "known"; count: number };
@@ -180,14 +182,26 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
   })) as WeeklyThroughputReport["reviewLatencyByTier"];
   const defects = facts.defects;
   const defectEscapeUnknown = facts.unknownReasons?.defectEscape;
-  const filed = defectEscapeUnknown ? null : defects.length;
-  const attributed = defectEscapeUnknown ? null : defects.filter((defect) => defect.attributionKnown !== false && defect.culpritMergeId != null).length;
+  const population = facts.defectPopulation;
+  const populationDisconnected = population?.selectorUsage === "unused";
+  const populationUnknown = population?.selectorUsage === "unknown";
+  const filed = defectEscapeUnknown || populationDisconnected || populationUnknown ? null : defects.length;
+  const attributed = filed === null ? null : defects.filter((defect) => defect.attributionKnown !== false && defect.culpritMergeId != null).length;
   const unattributed = filed === null || attributed === null ? null : filed - attributed;
-  const attributionCoverage = filed === null || attributed === null ? null : filed === 0 ? 1 : Number((attributed / filed).toFixed(3));
+  const attributionCoverage = filed === null || attributed === null || filed === 0 ? null : Number((attributed / filed).toFixed(3));
   if (filed !== null && attributed !== null && unattributed !== null && filed !== attributed + unattributed) throw new Error("defect escape attribution population does not reconcile");
-  const defectSummary = filed === null
-    ? "defects filed unknown; defects attributed unknown; defects unattributed unknown"
-    : `defects filed ${filed}; defects attributed ${attributed}; defects unattributed ${unattributed}; attribution coverage ${Number((attributionCoverage! * 100).toFixed(1))}%`;
+  const defectPopulationReport = populationDisconnected
+    ? { status: "disconnected" as const, selector: population!.selector, reason: `selector ${population!.selector} is unused repo-wide` }
+    : populationUnknown || defectEscapeUnknown
+      ? { status: "unknown" as const, selector: population?.selector ?? null, reason: defectEscapeUnknown ?? "defect population selector usage is unknown" }
+      : { status: "connected" as const, selector: population?.selector ?? null };
+  const defectSummary = populationDisconnected
+    ? `defect population disconnected: selector ${population!.selector} is unused repo-wide; defects filed unknown; defects attributed unknown; defects unattributed unknown; attribution coverage unknown`
+    : filed === null
+      ? "defects filed unknown; defects attributed unknown; defects unattributed unknown; attribution coverage unknown"
+      : filed === 0
+        ? "defects filed 0; defects attributed 0; defects unattributed 0; attribution coverage unknown (empty population)"
+        : `defects filed ${filed}; defects attributed ${attributed}; defects unattributed ${unattributed}; attribution coverage ${Number((attributionCoverage! * 100).toFixed(1))}%`;
   const explicitRevertIds = defects.filter((defect) => defect.reverted === true).map((defect) => defect.id);
   const reverts = facts.unknownReasons?.reverts || defects.length === 0 || defects.some((defect) => defect.reverted === null)
     ? { status: "unknown" as const, total: null, observedExplicitRevertIds: explicitRevertIds, reason: facts.unknownReasons?.reverts ?? "revert coverage is unavailable" }
@@ -250,7 +264,7 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
       facts.unknownReasons?.laneSlotUtilization ?? "lane slot utilization is unavailable",
     ),
     reviewLatencyByTier,
-    defectEscape: { filed, attributed, unattributed, attributionCoverage, summary: defectSummary, reverts, postMergeP0s, postMergeP1s },
+    defectEscape: { filed, attributed, unattributed, attributionCoverage, population: defectPopulationReport, summary: defectSummary, reverts, postMergeP0s, postMergeP1s },
     outlierCohorts,
     sourceCommands: facts.sourceCommands,
     dialGuidance,
