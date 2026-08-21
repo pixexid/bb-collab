@@ -1567,13 +1567,16 @@ export function reconcilePreparedWorkItemDispatches(
     const marker = attempt.reason_code?.startsWith("work_item_dispatch_intent:")
       ? attempt.reason_code.slice("work_item_dispatch_intent:".length)
       : null;
-    if (!marker) {
+    const parentMarker = marker?.lastIndexOf(":parent=") ?? -1;
+    const dispatchMarker = parentMarker >= 0 ? marker!.slice(0, parentMarker) : null;
+    const expectedParentThreadId = parentMarker >= 0 ? marker!.slice(parentMarker + ":parent=".length) : null;
+    if (!dispatchMarker || !expectedParentThreadId) {
       wedges.push({ executionAttemptId: attempt.execution_attempt_id, workItemId: attempt.work_item_id });
       continue;
     }
     const thread = threads.find((candidate) =>
-      candidate.parentThreadId !== null && candidate.archivedAt === null && candidate.deletedAt === null &&
-      candidate.title?.includes(`[dispatch:${marker}]`) === true,
+      candidate.parentThreadId === expectedParentThreadId && candidate.archivedAt === null && candidate.deletedAt === null &&
+      candidate.title?.includes(`[dispatch:${dispatchMarker}]`) === true,
     );
     const observedAtMs = now();
     if (thread) {
@@ -6281,7 +6284,7 @@ function applyWorkItemTransition(
       requestedProfile: requireWorkAttemptProfile(workAttempt),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
       state: workAttempt.threadId ? "running" : "prepared",
-      reasonCode: workAttempt.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}`,
+      reasonCode: workAttempt.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}${request.reasonCode?.startsWith("dispatch_parent:") ? `:parent=${request.reasonCode.slice("dispatch_parent:".length)}` : ""}`,
       createdAtMs,
       observedAtMs: createdAtMs,
       completedAtMs: null,
@@ -6419,7 +6422,7 @@ function applyWorkItemTransition(
       requestedProfile: requireWorkAttemptProfile(workAttempt!),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
       state: workAttempt!.threadId ? "running" : "prepared",
-      reasonCode: workAttempt!.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}`,
+      reasonCode: workAttempt!.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}${request.reasonCode?.startsWith("dispatch_parent:") ? `:parent=${request.reasonCode.slice("dispatch_parent:".length)}` : ""}`,
       createdAtMs: now(),
       observedAtMs: now(),
       completedAtMs: null,

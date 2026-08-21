@@ -15950,12 +15950,15 @@ function reconcilePreparedWorkItemDispatches(db, projectId, threads) {
   const wedges = [];
   for (const attempt of prepared) {
     const marker = attempt.reason_code?.startsWith("work_item_dispatch_intent:") ? attempt.reason_code.slice("work_item_dispatch_intent:".length) : null;
-    if (!marker) {
+    const parentMarker = marker?.lastIndexOf(":parent=") ?? -1;
+    const dispatchMarker = parentMarker >= 0 ? marker.slice(0, parentMarker) : null;
+    const expectedParentThreadId = parentMarker >= 0 ? marker.slice(parentMarker + ":parent=".length) : null;
+    if (!dispatchMarker || !expectedParentThreadId) {
       wedges.push({ executionAttemptId: attempt.execution_attempt_id, workItemId: attempt.work_item_id });
       continue;
     }
     const thread = threads.find(
-      (candidate) => candidate.parentThreadId !== null && candidate.archivedAt === null && candidate.deletedAt === null && candidate.title?.includes(`[dispatch:${marker}]`) === true
+      (candidate) => candidate.parentThreadId === expectedParentThreadId && candidate.archivedAt === null && candidate.deletedAt === null && candidate.title?.includes(`[dispatch:${dispatchMarker}]`) === true
     );
     const observedAtMs = now();
     if (thread) {
@@ -19558,7 +19561,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       requestedProfile: requireWorkAttemptProfile(workAttempt),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
       state: workAttempt.threadId ? "running" : "prepared",
-      reasonCode: workAttempt.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}`,
+      reasonCode: workAttempt.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}${request.reasonCode?.startsWith("dispatch_parent:") ? `:parent=${request.reasonCode.slice("dispatch_parent:".length)}` : ""}`,
       createdAtMs,
       observedAtMs: createdAtMs,
       completedAtMs: null,
@@ -19688,7 +19691,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       requestedProfile: requireWorkAttemptProfile(workAttempt),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
       state: workAttempt.threadId ? "running" : "prepared",
-      reasonCode: workAttempt.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}`,
+      reasonCode: workAttempt.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}${request.reasonCode?.startsWith("dispatch_parent:") ? `:parent=${request.reasonCode.slice("dispatch_parent:".length)}` : ""}`,
       createdAtMs: now(),
       observedAtMs: now(),
       completedAtMs: null,
@@ -22564,9 +22567,14 @@ async function dispatchLane(bb, db, input) {
   if (spawn.projectId !== request.projectId) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "spawn projectId must match request projectId" };
   }
+  const dispatchParentThreadId = typeof spawn.parentThreadId === "string" ? spawn.parentThreadId : null;
+  if (!dispatchParentThreadId) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "lane dispatch requires the dispatcher parent thread" };
+  }
   const { threadId: _threadId, ...intentAttempt } = request.workAttempt;
   const intent = await applyLiveAuthorizedMutation(bb, db, {
     ...request,
+    reasonCode: `dispatch_parent:${dispatchParentThreadId}`,
     workAttempt: intentAttempt
   });
   if (intent.outcome !== "OK" || intent.replay) return intent;
@@ -22588,8 +22596,34 @@ async function dispatchLane(bb, db, input) {
     workAttempt: { ...request.workAttempt, threadId: thread.id }
   });
 }
+async function requireStoppedWorkItemLane(bb, db, request) {
+  if (request.operationClass !== "work_item_transition" || request.lifecycleState !== "review_pending" || request.workAttempt !== void 0 || !db) return null;
+  const attempt = db.prepare(
+    `SELECT thread_id FROM execution_attempts
+     WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+       AND assignment_kind = 'write' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')
+     ORDER BY attempt_ordinal DESC LIMIT 1`
+  ).get(request.projectId, request.workItemId);
+  if (!attempt?.thread_id) {
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "review-pending requires a bound lane with native stop evidence" };
+  }
+  let lane;
+  try {
+    lane = await bb.sdk.threads.get({ threadId: attempt.thread_id });
+  } catch (error48) {
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane stop evidence unavailable: ${String(error48)}` };
+  }
+  if (lane.status !== "idle") {
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane has no native stopped evidence: status=${lane.status}` };
+  }
+  return null;
+}
 async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false) {
   const parsed = applyRequestSchema.safeParse(input);
+  if (parsed.success) {
+    const laneGuard = await requireStoppedWorkItemLane(bb, db, parsed.data);
+    if (laneGuard) return laneGuard;
+  }
   if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v22-rollout-receipt")) {
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }

@@ -3702,6 +3702,52 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared" });
   });
 
+  it("binds a prepared dispatch only to its recorded dispatcher parent across all six identity cases", async () => {
+    const cases = [
+      { name: "original", parentThreadId: "orchestrator-thread", title: "marker", archivedAt: null, deletedAt: null, binds: true },
+      { name: "renamed", parentThreadId: "orchestrator-thread", title: "ordinary user title", archivedAt: null, deletedAt: null, binds: false },
+      { name: "cleared parent", parentThreadId: null, title: "marker", archivedAt: null, deletedAt: null, binds: false },
+      { name: "archived", parentThreadId: "orchestrator-thread", title: "marker", archivedAt: 1, deletedAt: null, binds: false },
+      { name: "deleted", parentThreadId: "orchestrator-thread", title: "marker", archivedAt: null, deletedAt: 1, binds: false },
+      { name: "unrelated parent", parentThreadId: "other-dispatcher", title: "marker", archivedAt: null, deletedAt: null, binds: false },
+    ];
+    for (const testCase of cases) {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+      fixture.host.harness.sdk.stub("threads.spawn", (async () => { throw new Error("response lost after spawn"); }) as never);
+      await fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+        spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
+      }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId });
+      const attempt = fixture.db.prepare("SELECT reason_code FROM execution_attempts WHERE origin = 'work_item'").get() as { reason_code: string };
+      const marker = attempt.reason_code.match(/^work_item_dispatch_intent:(.*):parent=/u)?.[1];
+      expect(marker).toBeTruthy();
+      const wedges = reconcilePreparedWorkItemDispatches(fixture.db, PROJECT_ID, [{
+        id: `lane-${testCase.name}`,
+        parentThreadId: testCase.parentThreadId === "orchestrator-thread" ? fixture.orchestratorThreadId : testCase.parentThreadId,
+        title: testCase.title === "marker" ? `lane [dispatch:${marker}]` : testCase.title,
+        archivedAt: testCase.archivedAt,
+        deletedAt: testCase.deletedAt,
+      }]);
+      expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual(testCase.binds
+        ? { state: "running", thread_id: `lane-${testCase.name}` }
+        : { state: "prepared", thread_id: null });
+      expect(wedges).toHaveLength(testCase.binds ? 0 : 1);
+    }
+  });
+
+  it("refuses review-pending until the native lane is idle", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+    fixture.addNativeLane("thread-work-item-1", "active");
+    const request = { ...transitionRequest(fixture.fenceToken, "review_pending", 3), workAttempt: undefined };
+    expect(await fixture.host.harness.callRpc("apply", request)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 1, verified: 0 });
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "running" });
+    fixture.addNativeLane("thread-work-item-1", "idle");
+    expect(await fixture.host.harness.callRpc("apply", request)).toMatchObject({ outcome: "OK" });
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "done" });
+  });
+
   it("uses in-progress WorkItems for capacity and suppresses repeat intake wakes for one hour", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-queue-"));

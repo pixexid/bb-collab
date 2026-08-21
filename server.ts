@@ -839,9 +839,14 @@ async function dispatchLane(
   if (spawn.projectId !== request.projectId) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "spawn projectId must match request projectId" };
   }
+  const dispatchParentThreadId = typeof spawn.parentThreadId === "string" ? spawn.parentThreadId : null;
+  if (!dispatchParentThreadId) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "lane dispatch requires the dispatcher parent thread" };
+  }
   const { threadId: _threadId, ...intentAttempt } = request.workAttempt;
   const intent = await applyLiveAuthorizedMutation(bb, db, {
     ...request,
+    reasonCode: `dispatch_parent:${dispatchParentThreadId}`,
     workAttempt: intentAttempt,
   });
   if (intent.outcome !== "OK" || intent.replay) return intent;
@@ -866,6 +871,33 @@ async function dispatchLane(
   });
 }
 
+async function requireStoppedWorkItemLane(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  request: z.infer<typeof applyRequestSchema>,
+): Promise<FoundationResult | null> {
+  if (request.operationClass !== "work_item_transition" || request.lifecycleState !== "review_pending" || request.workAttempt !== undefined || !db) return null;
+  const attempt = db.prepare(
+    `SELECT thread_id FROM execution_attempts
+     WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+       AND assignment_kind = 'write' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')
+     ORDER BY attempt_ordinal DESC LIMIT 1`,
+  ).get(request.projectId, request.workItemId) as { thread_id: string | null } | undefined;
+  if (!attempt?.thread_id) {
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "review-pending requires a bound lane with native stop evidence" };
+  }
+  let lane: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["get"]>>;
+  try {
+    lane = await bb.sdk.threads.get({ threadId: attempt.thread_id });
+  } catch (error) {
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane stop evidence unavailable: ${String(error)}` };
+  }
+  if (lane.status !== "idle") {
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane has no native stopped evidence: status=${lane.status}` };
+  }
+  return null;
+}
+
 async function applyLiveAuthorizedMutation(
   bb: BbPluginApi,
   db: SqliteDatabase | null,
@@ -873,6 +905,10 @@ async function applyLiveAuthorizedMutation(
   allowCachedConsumerRollout = false,
 ): Promise<FoundationResult> {
   const parsed = applyRequestSchema.safeParse(input);
+  if (parsed.success) {
+    const laneGuard = await requireStoppedWorkItemLane(bb, db, parsed.data);
+    if (laneGuard) return laneGuard;
+  }
   if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v22-rollout-receipt")) {
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
