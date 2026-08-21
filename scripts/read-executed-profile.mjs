@@ -133,7 +133,7 @@ function settle(turns, profiles, source, { absentReason = "provider-native turn 
     }
     if (ambiguous.has(correlationId)) return { ...turn, status: "unknown", reason: "provider-native turn correlation is ambiguous" };
     const matches = profiles.get(correlationId) ?? [];
-    const distinct = [...new Map(matches.map((profile) => [`${profile.model}\0${profile.reasoningLevel}`, profile])).values()];
+    const distinct = [...new Map(matches.map((profile) => [JSON.stringify([profile.model, profile.reasoningLevel]), profile])).values()];
     if (distinct.length !== 1) {
       return { ...turn, status: "unknown", reason: distinct.length === 0 ? absentReason : "provider-native turn profiles conflict" };
     }

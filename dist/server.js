@@ -13866,8 +13866,11 @@ function createWaitRegistry(persistence) {
     })
   };
 }
+function roleIdlePrefix(holder) {
+  return `${JSON.stringify([holder.project_id, holder.role_id, holder.role_generation]).slice(0, -1)},`;
+}
 function roleIdleKey(holder, queueHeadId) {
-  return `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${queueHeadId}`;
+  return `${roleIdlePrefix(holder)}${JSON.stringify(queueHeadId)}]`;
 }
 function roleIdleState(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) return {};
@@ -13883,17 +13886,19 @@ function roleIdleState(input) {
     const lastRecoveryWakeAtMs = typeof record2.lastRecoveryWakeAtMs === "number" && Number.isFinite(record2.lastRecoveryWakeAtMs) ? record2.lastRecoveryWakeAtMs : null;
     const lastStartableQueueWakeAtMs = typeof record2.lastStartableQueueWakeAtMs === "number" && Number.isFinite(record2.lastStartableQueueWakeAtMs) ? record2.lastStartableQueueWakeAtMs : null;
     const lastStaleWaitWakeAtMs = typeof record2.lastStaleWaitWakeAtMs === "number" && Number.isFinite(record2.lastStaleWaitWakeAtMs) ? record2.lastStaleWaitWakeAtMs : null;
+    const lastStaleWaitExternalRevision = typeof record2.lastStaleWaitExternalRevision === "string" ? record2.lastStaleWaitExternalRevision : null;
+    const lastStaleWaitWaker = typeof record2.lastStaleWaitWaker === "string" ? record2.lastStaleWaitWaker : null;
     const lastOwedActWakeAtMs = typeof record2.lastOwedActWakeAtMs === "number" && Number.isFinite(record2.lastOwedActWakeAtMs) ? record2.lastOwedActWakeAtMs : null;
     const lastEscalationAtMs = typeof record2.lastEscalationAtMs === "number" && Number.isFinite(record2.lastEscalationAtMs) ? record2.lastEscalationAtMs : null;
     if (!Number.isInteger(record2.steerCount) || record2.steerCount < 0 || record2.steerCount > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || idleSinceMs !== null && idleSinceMs < 0 || lastSteerAtMs !== null && lastSteerAtMs < 0 || lastFleetWakeAtMs !== null && lastFleetWakeAtMs < 0 || lastRecoveryWakeAtMs !== null && lastRecoveryWakeAtMs < 0 || lastStartableQueueWakeAtMs !== null && lastStartableQueueWakeAtMs < 0 || lastStaleWaitWakeAtMs !== null && lastStaleWaitWakeAtMs < 0 || lastOwedActWakeAtMs !== null && lastOwedActWakeAtMs < 0 || lastEscalationAtMs !== null && lastEscalationAtMs < 0 || typeof record2.escalated !== "boolean") {
       throw new Error("invalid role idle state");
     }
-    state[key] = { steerCount: record2.steerCount, failedSteers, escalated: record2.escalated, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastFleetWakeAtMs, lastRecoveryWakeAtMs, lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs, lastOwedActWakeAtMs, lastEscalationAtMs };
+    state[key] = { steerCount: record2.steerCount, failedSteers, escalated: record2.escalated, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastFleetWakeAtMs, lastRecoveryWakeAtMs, lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs, lastStaleWaitExternalRevision, lastStaleWaitWaker, lastOwedActWakeAtMs, lastEscalationAtMs };
   }
   return state;
 }
 function emptyRoleIdleRecord() {
-  return { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
+  return { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastStaleWaitExternalRevision: null, lastStaleWaitWaker: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
 }
 function createRoleIdleLedger(persistence) {
   let state = {};
@@ -13937,7 +13942,7 @@ function createRoleIdleLedger(persistence) {
       await load();
       const record2 = state[key];
       if (!record2) return;
-      state[key] = { ...emptyRoleIdleRecord(), lastFleetWakeAtMs: record2.lastFleetWakeAtMs, lastRecoveryWakeAtMs: record2.lastRecoveryWakeAtMs, lastStartableQueueWakeAtMs: record2.lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs: record2.lastStaleWaitWakeAtMs, lastOwedActWakeAtMs: record2.lastOwedActWakeAtMs, lastEscalationAtMs: record2.lastEscalationAtMs };
+      state[key] = { ...emptyRoleIdleRecord(), lastFleetWakeAtMs: record2.lastFleetWakeAtMs, lastRecoveryWakeAtMs: record2.lastRecoveryWakeAtMs, lastStartableQueueWakeAtMs: record2.lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs: record2.lastStaleWaitWakeAtMs, lastStaleWaitExternalRevision: record2.lastStaleWaitExternalRevision, lastStaleWaitWaker: record2.lastStaleWaitWaker, lastOwedActWakeAtMs: record2.lastOwedActWakeAtMs, lastEscalationAtMs: record2.lastEscalationAtMs };
       await save();
     }),
     preserveAfterSteerWake: (key) => enqueue(async () => {
@@ -13995,9 +14000,9 @@ function createRoleIdleLedger(persistence) {
       await persistence?.write(structuredClone(nextState));
       state = nextState;
     }),
-    recordStaleWaitWake: (key, sentAtMs) => enqueue(async () => {
+    recordStaleWaitWake: (key, sentAtMs, externalRevision = null, waker = null) => enqueue(async () => {
       await load();
-      const nextState = { ...state, [key]: { ...state[key] ?? emptyRoleIdleRecord(), lastStaleWaitWakeAtMs: sentAtMs } };
+      const nextState = { ...state, [key]: { ...state[key] ?? emptyRoleIdleRecord(), lastStaleWaitWakeAtMs: sentAtMs, lastStaleWaitExternalRevision: externalRevision, lastStaleWaitWaker: waker } };
       await persistence?.write(structuredClone(nextState));
       state = nextState;
     }),
@@ -14016,7 +14021,8 @@ function createRoleIdleLedger(persistence) {
     }),
     clearWakeHistory: (prefix) => enqueue(async () => {
       await load();
-      for (const key of Object.keys(state)) if (key.startsWith(prefix)) state[key] = { ...state[key], idleSinceMs: null, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
+      const encodedPrefix = prefix.endsWith(":") ? `${JSON.stringify([prefix.slice(0, -1)]).slice(0, -1)},` : prefix;
+      for (const key of Object.keys(state)) if (key.startsWith(prefix) || key.startsWith(encodedPrefix)) state[key] = { ...state[key], idleSinceMs: null, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastStaleWaitExternalRevision: null, lastStaleWaitWaker: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
       await save();
     })
   };
@@ -14082,24 +14088,24 @@ function createLaneWatcher(options) {
     if (waits.length === 0) return { known: true, byWaiter: /* @__PURE__ */ new Map(), events: [] };
     const sourceStates = /* @__PURE__ */ new Map();
     for (const sourceThreadId of new Set(waits.map((wait) => wait.sourceThreadId))) {
-      let observation = null;
+      let observation2 = null;
       if (suppliedSource?.threadId === sourceThreadId) {
-        observation = {
+        observation2 = {
           status: suppliedSource.status,
           pendingExternalWait: false,
           archived: suppliedSource.archived
         };
       } else if (options.readWorker) {
         try {
-          observation = signal ? await options.readWorker(sourceThreadId, signal) : await options.readWorker(sourceThreadId);
+          observation2 = signal ? await options.readWorker(sourceThreadId, signal) : await options.readWorker(sourceThreadId);
         } catch {
-          observation = null;
+          observation2 = null;
         }
       }
       sourceStates.set(sourceThreadId, {
-        known: observation !== null,
-        terminal: observation?.archived === true || observation?.status === "error",
-        failed: observation?.archived === true || observation?.status === "error"
+        known: observation2 !== null,
+        terminal: observation2?.archived === true || observation2?.status === "error",
+        failed: observation2?.archived === true || observation2?.status === "error"
       });
     }
     const byWaiter = /* @__PURE__ */ new Map();
@@ -14175,16 +14181,16 @@ function createLaneWatcher(options) {
       if (projectHolders.length !== 1 || !holder.thread_id) continue;
       const targetThreadId = holder.thread_id;
       if (threadId && targetThreadId !== threadId) continue;
-      const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
+      const prefix = roleIdlePrefix(holder);
       const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
-      let observation;
+      let observation2;
       try {
-        observation = signal ? await options.readWorker(targetThreadId, signal) : await options.readWorker(targetThreadId);
+        observation2 = signal ? await options.readWorker(targetThreadId, signal) : await options.readWorker(targetThreadId);
       } catch {
         continue;
       }
       const waitState = waitContext?.byWaiter.get(targetThreadId) ?? "none";
-      if (observation.projectId !== holder.project_id || waitContext && !waitContext.known || waitState === "pending" || waitState === "unknown" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || !scope?.nextStartable || scope.deferredReason) {
+      if (observation2.projectId !== holder.project_id || waitContext && !waitContext.known || waitState === "pending" || waitState === "unknown" || observation2.archived || observation2.pendingExternalWait || observation2.operatorWait || observation2.operatorWaitKnown === false || !scope?.nextStartable || scope.deferredReason) {
         await roleIdleLedger.clearPrefixExcept(prefix);
         continue;
       }
@@ -14194,13 +14200,13 @@ function createLaneWatcher(options) {
       }
       const key = roleIdleKey(holder, scope.queueHeadId);
       await roleIdleLedger.clearPrefixExcept(prefix, key);
-      if (observation.status !== "idle") {
+      if (observation2.status !== "idle") {
         if (await roleIdleLedger.preserveAfterSteerWake(key)) continue;
         await roleIdleLedger.resetIdle(key);
         await roleIdleLedger.clearPrefixExcept(prefix, key);
         continue;
       }
-      if (observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) {
+      if (observation2.idleSinceMs === null || observation2.idleSinceMs === void 0 || !Number.isFinite(observation2.idleSinceMs)) {
         await roleIdleLedger.clearPrefixExcept(prefix);
         continue;
       }
@@ -14265,20 +14271,20 @@ function createLaneWatcher(options) {
     const currentHolder = resolveCurrentCanonicalHolder(holder);
     if (!currentHolder) return { attempted: false, delivered: false, refusal: currentHolder === void 0 ? "error" : "policy" };
     let scopes;
-    let observation;
+    let observation2;
     try {
       scopes = await options.readRoleScopes();
-      observation = await options.readWorker(role.threadId);
+      observation2 = await options.readWorker(role.threadId);
     } catch {
       return { attempted: false, delivered: false, refusal: "error" };
     }
     const scope = scopes.find((candidate) => candidate.projectId === role.projectId);
-    if (!scope?.nextStartable || scope.queueHeadId !== role.queueHeadId || scope.deferredReason || observation.projectId !== role.projectId || observation.status !== "idle" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) return { attempted: false, delivered: false, refusal: "policy" };
-    const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
-    const key = `${prefix}${scope.queueHeadId}`;
+    if (!scope?.nextStartable || scope.queueHeadId !== role.queueHeadId || scope.deferredReason || observation2.projectId !== role.projectId || observation2.status !== "idle" || observation2.archived || observation2.pendingExternalWait || observation2.operatorWait || observation2.operatorWaitKnown === false || observation2.idleSinceMs === null || observation2.idleSinceMs === void 0 || !Number.isFinite(observation2.idleSinceMs)) return { attempted: false, delivered: false, refusal: "policy" };
+    const prefix = roleIdlePrefix(holder);
+    const key = roleIdleKey(holder, scope.queueHeadId);
     await roleIdleLedger.clearPrefixExcept(prefix, key);
     const currentNow = now2();
-    const record2 = await roleIdleLedger.observeIdle(key, observation.idleSinceMs);
+    const record2 = await roleIdleLedger.observeIdle(key, observation2.idleSinceMs);
     const steerAgeMs = record2.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : Math.max(0, currentNow - record2.lastSteerAtMs);
     if (record2.escalated || record2.steerCount >= 2 || steerAgeMs < roleIdleThresholdMs) return { attempted: false, delivered: false, refusal: "policy" };
     const target = {
@@ -14420,18 +14426,53 @@ function createIdleFleetDetector(options) {
   let loaded = false;
   let stopped = false;
   const capacityQueues = /* @__PURE__ */ new Map();
-  const probeKey = (probe) => `${probe.projectId}:${probe.threadId}`;
+  const inFlightCapacityReads = /* @__PURE__ */ new Set();
+  let stopping;
+  const probeKey = (probe) => JSON.stringify([probe.projectId, probe.threadId]);
+  const legacyProbeKey = (probe) => `${probe.projectId}:${probe.threadId}`;
   const load = async () => {
     if (loaded) return;
     state = idleFleetWakeState(options.persistence ? await options.persistence.read() : null);
     loaded = true;
   };
   const save = () => options.persistence?.write(structuredClone(state));
-  const reportBlind = (message) => {
+  const blindReportIntervalMs = 1e3;
+  let lastBlindMessage = null;
+  let blindOccurrences = 0;
+  let lastReportedOccurrences = 0;
+  let lastBlindReportAt = 0;
+  let blindCountCutShort = false;
+  const emitBlind = (message, occurrences) => {
     try {
-      options.onBlind(message);
+      options.onBlind(`${message} occurrences=${blindCountCutShort ? `>=${occurrences} (counting cut short)` : occurrences}`);
     } catch {
     }
+  };
+  const flushBlind = () => {
+    if (lastBlindMessage !== null && blindOccurrences > lastReportedOccurrences) {
+      emitBlind(lastBlindMessage, blindOccurrences);
+    }
+    lastBlindMessage = null;
+    blindOccurrences = 0;
+    lastReportedOccurrences = 0;
+    lastBlindReportAt = 0;
+    blindCountCutShort = false;
+  };
+  const reportBlind = (message, capacityRead = false) => {
+    const marked = capacityRead && blindCountCutShort;
+    const now2 = Date.now();
+    if (message === lastBlindMessage) {
+      blindOccurrences += 1;
+      if (now2 - lastBlindReportAt < blindReportIntervalMs) return;
+    } else {
+      flushBlind();
+      lastBlindMessage = message;
+      blindOccurrences = 1;
+      if (marked) blindCountCutShort = true;
+    }
+    lastBlindReportAt = now2;
+    lastReportedOccurrences = blindOccurrences;
+    emitBlind(message, blindOccurrences);
   };
   const evaluate = async (probe) => {
     try {
@@ -14453,7 +14494,22 @@ function createIdleFleetDetector(options) {
         reportBlind(decision.message);
         return;
       }
+      const legacyKey = legacyProbeKey(probe);
+      if (state[legacyKey] !== void 0) {
+        if (state[key] !== void 0) {
+          reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=ambiguous-migration:${key}`);
+          return;
+        }
+        state[key] = state[legacyKey];
+        delete state[legacyKey];
+        await save();
+      }
       if (state[key] === decision.episodeKey) return;
+      if (decision.legacyEpisodeKey !== void 0 && state[key] === decision.legacyEpisodeKey) {
+        state[key] = decision.episodeKey;
+        await save();
+        return;
+      }
       if (!await options.wake({ ...decision, probe })) return;
       state[key] = decision.episodeKey;
       await save();
@@ -14480,9 +14536,12 @@ function createIdleFleetDetector(options) {
       return options.capacity.observe(projectId);
     });
     capacityQueues.set(projectId, next.catch(() => void 0));
-    return next.catch((error48) => {
-      reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error48)}`);
+    const read = next.catch((error48) => {
+      reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error48)}`, true);
     });
+    inFlightCapacityReads.add(read);
+    void read.then(() => inFlightCapacityReads.delete(read));
+    return read;
   };
   return {
     arm,
@@ -14500,7 +14559,7 @@ function createIdleFleetDetector(options) {
       }
     },
     stop() {
-      if (stopped) return;
+      if (stopping) return stopping;
       stopped = true;
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
@@ -14509,6 +14568,25 @@ function createIdleFleetDetector(options) {
       } catch (error48) {
         reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-close-unreadable:${String(error48)}`);
       }
+      stopping = (async () => {
+        const reads = [...inFlightCapacityReads];
+        if (reads.length > 0) {
+          let expired = true;
+          await new Promise((resolve3) => {
+            const timeout = setTimeout(resolve3, 1e3);
+            void Promise.allSettled(reads).then(() => {
+              expired = false;
+              clearTimeout(timeout);
+              resolve3();
+            });
+          });
+          flushBlind();
+          if (expired) blindCountCutShort = true;
+        } else {
+          flushBlind();
+        }
+      })();
+      return stopping;
     }
   };
 }
@@ -15530,9 +15608,9 @@ async function assembleV22CachedConsumerRolloutEvidence(input) {
   };
 }
 function cachedConsumerRolloutEvidence(observations) {
-  const names = observations.map((observation) => observation.name);
+  const names = observations.map((observation2) => observation2.name);
   const requiredNames = [...CACHED_CONSUMERS];
-  const verifiedNames = new Set(observations.filter((observation) => observation.observedSchemaVersion === SCHEMA_VERSION && observation.observedContractVersion === RUNTIME_CONTRACT_VERSION).map((observation) => observation.name));
+  const verifiedNames = new Set(observations.filter((observation2) => observation2.observedSchemaVersion === SCHEMA_VERSION && observation2.observedContractVersion === RUNTIME_CONTRACT_VERSION).map((observation2) => observation2.name));
   const verified = requiredNames.filter((name) => verifiedNames.has(name)).length;
   const reread = observations.length === requiredNames.length && verified === requiredNames.length && canonicalJson([...new Set(names)].sort()) === canonicalJson(requiredNames.slice().sort());
   const evidence = {
@@ -15799,7 +15877,7 @@ var reviewTargetSchema = external_exports.object({
   tierAEntries: sortedIdSetSchema
 }).strict();
 var reviewScopeSchema = external_exports.object({ targets: external_exports.array(reviewTargetSchema).min(1).max(32) }).strict().superRefine((scope, ctx) => {
-  const keys = scope.targets.map((target) => `${target.workItemId}\0${target.repoTargetId}`);
+  const keys = scope.targets.map((target) => JSON.stringify([target.workItemId, target.repoTargetId]));
   if (new Set(scope.targets.map((target) => target.workItemId)).size !== scope.targets.length) {
     ctx.addIssue({ code: "custom", path: ["targets"], message: "one WorkItem cannot span multiple review targets" });
   }
@@ -15810,7 +15888,7 @@ var reviewScopeSchema = external_exports.object({ targets: external_exports.arra
 var connectorPolicySchema = external_exports.enum(["required", "optional", "prohibited"]);
 var reviewConnectorSchema = external_exports.object({ repoTargetId: id, connectorId: id, policy: connectorPolicySchema }).strict();
 var reviewConnectorsSchema = external_exports.array(reviewConnectorSchema).min(1).max(128).superRefine((connectors, ctx) => {
-  const keys = connectors.map((connector) => `${connector.repoTargetId}\0${connector.connectorId}`);
+  const keys = connectors.map((connector) => JSON.stringify([connector.repoTargetId, connector.connectorId]));
   if (new Set(keys).size !== keys.length) {
     ctx.addIssue({ code: "custom", message: "review connector mappings must be duplicate-free" });
   }
@@ -15919,6 +15997,38 @@ var WORK_ITEM_CAPACITY_LIFECYCLE_STATES = ["in_progress"];
 var WORK_ITEM_CAPACITY_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
 var WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running"];
 var WORK_ITEM_IDLE_BLIND_ATTEMPT_STATES = ["dispatch_unknown"];
+function reconcilePreparedWorkItemDispatches(db, projectId, threads) {
+  const prepared = db.prepare(
+    `SELECT execution_attempt_id, work_item_id, reason_code FROM execution_attempts
+     WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
+       AND state = 'prepared' AND thread_id IS NULL`
+  ).all(projectId);
+  const wedges = [];
+  for (const attempt of prepared) {
+    const marker = attempt.reason_code?.startsWith("work_item_dispatch_intent:") ? attempt.reason_code.slice("work_item_dispatch_intent:".length) : null;
+    const parentMarker = marker?.lastIndexOf(":parent=") ?? -1;
+    const dispatchMarker = parentMarker >= 0 ? marker.slice(0, parentMarker) : null;
+    const expectedParentThreadId = parentMarker >= 0 ? marker.slice(parentMarker + ":parent=".length) : null;
+    if (!dispatchMarker || !expectedParentThreadId) {
+      wedges.push({ executionAttemptId: attempt.execution_attempt_id, workItemId: attempt.work_item_id });
+      continue;
+    }
+    const thread = threads.find(
+      (candidate) => candidate.parentThreadId === expectedParentThreadId && candidate.archivedAt === null && candidate.deletedAt === null && candidate.title?.includes(`[dispatch:${dispatchMarker}]`) === true
+    );
+    const observedAtMs = now();
+    if (thread) {
+      const result2 = db.prepare(
+        `UPDATE execution_attempts
+         SET state = 'running', thread_id = ?, lease_owner_thread_id = ?, reason_code = 'work_item_dispatch', observed_at_ms = ?
+         WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL`
+      ).run(thread.id, thread.id, observedAtMs, projectId, attempt.execution_attempt_id);
+      if (result2.changes > 0) continue;
+    }
+    wedges.push({ executionAttemptId: attempt.execution_attempt_id, workItemId: attempt.work_item_id });
+  }
+  return wedges;
+}
 function workItemCapacityLaneEvidence(db, projectId) {
   const lanes = db.prepare(
     `SELECT execution_attempts.lane_id, execution_attempts.thread_id, execution_attempts.state, execution_attempts.observed_at_ms
@@ -16952,7 +17062,9 @@ function checkIdempotency(db, request, digest) {
   if (row.request_digest !== digest) {
     throw refusal("IDEMPOTENCY_KEY_CONFLICT", "idempotency key was already used for another request");
   }
-  return JSON.parse(row.outcome_json);
+  const replay = JSON.parse(row.outcome_json);
+  Object.defineProperty(replay, "replay", { value: true });
+  return replay;
 }
 function nextEventSequence(db, projectId) {
   const row = asRow(
@@ -18459,7 +18571,7 @@ function applyQualificationObservation(db, request, digest, context) {
     outcome: observationOutcome,
     reasonCode
   }));
-  const observation = {
+  const observation2 = {
     projectId: request.projectId,
     qualificationId,
     roleRequirementId: resolved.requirement.roleRequirementId,
@@ -18475,7 +18587,7 @@ function applyQualificationObservation(db, request, digest, context) {
     evidenceDigest,
     reasonCode
   };
-  const observationDigest = sha256(canonicalJson(observation));
+  const observationDigest = sha256(canonicalJson(observation2));
   db.prepare(
     `INSERT INTO qualification_observations (
       project_id, qualification_id, role_requirement_id, config_revision, repo_target_id,
@@ -18705,10 +18817,10 @@ function applyRoleGenerationSuccession(db, request, digest, context) {
     throw refusal("ROLE_STANDBY_INVALID", "standby is reserved for the director seat");
   }
   const expectedContextDigest = qualificationContextDigest(context, resolved, request);
-  const observation = asRow(
+  const observation2 = asRow(
     db.prepare("SELECT * FROM qualification_observations WHERE project_id = ? AND qualification_id = ?").get(request.projectId, request.qualificationId)
   );
-  if (!observation) throw refusal("ROLE_UNQUALIFIED", "qualification observation is not known");
+  if (!observation2) throw refusal("ROLE_UNQUALIFIED", "qualification observation is not known");
   const projection = asRow(
     db.prepare("SELECT * FROM eligibility_projections WHERE project_id = ? AND role_requirement_id = ? AND requested_profile_digest = ?").get(
       request.projectId,
@@ -18717,18 +18829,18 @@ function applyRoleGenerationSuccession(db, request, digest, context) {
     )
   );
   if (!projection) throw refusal("CAPABILITY_UNKNOWN", "current eligibility projection is unavailable");
-  if (observation.config_revision !== configRevision || projection.config_revision !== configRevision || observation.role_requirement_digest !== resolved.digest || projection.role_requirement_digest !== resolved.digest || observation.bb_version !== context.bbVersion || observation.plugin_sdk_version !== PLUGIN_SDK_VERSION) {
+  if (observation2.config_revision !== configRevision || projection.config_revision !== configRevision || observation2.role_requirement_digest !== resolved.digest || projection.role_requirement_digest !== resolved.digest || observation2.bb_version !== context.bbVersion || observation2.plugin_sdk_version !== PLUGIN_SDK_VERSION) {
     throw refusal("ELIGIBILITY_STALE", "qualification or runtime evidence is stale");
   }
-  if (observation.role_requirement_id !== resolved.requirement.roleRequirementId || observation.repo_target_id !== resolved.requirement.repoTargetId || observation.requested_profile_digest !== request.profileDigest || observation.qualification_context_digest !== expectedContextDigest || observation.fixture_context_digest !== request.fixtureContextDigest || projection.current_qualification_id !== observation.qualification_id || projection.qualification_context_digest !== expectedContextDigest) {
+  if (observation2.role_requirement_id !== resolved.requirement.roleRequirementId || observation2.repo_target_id !== resolved.requirement.repoTargetId || observation2.requested_profile_digest !== request.profileDigest || observation2.qualification_context_digest !== expectedContextDigest || observation2.fixture_context_digest !== request.fixtureContextDigest || projection.current_qualification_id !== observation2.qualification_id || projection.qualification_context_digest !== expectedContextDigest) {
     throw refusal("QUALIFICATION_CONTEXT_FOREIGN", "qualification does not match the exact holder context");
   }
   const effectiveAtMs = now();
-  if (observation.expires_at_ms !== null && observation.expires_at_ms <= effectiveAtMs || projection.expires_at_ms !== null && projection.expires_at_ms <= effectiveAtMs) {
+  if (observation2.expires_at_ms !== null && observation2.expires_at_ms <= effectiveAtMs || projection.expires_at_ms !== null && projection.expires_at_ms <= effectiveAtMs) {
     throw refusal("ELIGIBILITY_EXPIRED", "qualification eligibility has expired");
   }
-  if (observation.outcome === "unknown" || projection.effective_status === "unknown") throw refusal("CAPABILITY_UNKNOWN", "qualification outcome is unknown");
-  if (observation.outcome !== "qualified" || projection.effective_status !== "eligible") throw refusal("ROLE_UNQUALIFIED", "qualification is not eligible");
+  if (observation2.outcome === "unknown" || projection.effective_status === "unknown") throw refusal("CAPABILITY_UNKNOWN", "qualification outcome is unknown");
+  if (observation2.outcome !== "qualified" || projection.effective_status !== "eligible") throw refusal("ROLE_UNQUALIFIED", "qualification is not eligible");
   if (request.roleId === "project-orchestrator") {
     const reconciliationIssues = workItemReconciliationIssues(db, request.projectId);
     if (reconciliationIssues.length > 0) {
@@ -19118,8 +19230,12 @@ function sameWorkItemBlocker(left, right) {
 }
 function workItemGithubReadTarget(request) {
   const targets = [request.workItemWait, request.workItemUnblock, request.workItemExternalEvent].flatMap((value) => value && value.kind !== "work_item_succeeded" && value.kind !== "schedule" && value.kind !== "seat" ? [{ owner: value.owner, repo: value.repo, issueNumber: value.issueNumber }] : []);
-  if (targets.length > 1) throw refusal("WORK_ITEM_STATE_INVALID", "work item transition accepts one external condition");
-  return targets[0] ?? null;
+  const swapping = request.lifecycleState === "blocked" && request.workItemWait !== void 0 && request.workItemUnblock !== void 0;
+  if (targets.length > 1 && !swapping) throw refusal("WORK_ITEM_STATE_INVALID", "work item transition accepts one external condition");
+  return targets;
+}
+function validGithubSnapshotStateReason(state, reason) {
+  return state === "open" ? reason === void 0 || reason === "REOPENED" : reason === "COMPLETED" || reason === "NOT_PLANNED" || reason === "DUPLICATE";
 }
 var githubSnapshotSchema = external_exports.object({
   owner: id,
@@ -19128,9 +19244,14 @@ var githubSnapshotSchema = external_exports.object({
   title: external_exports.string().max(4096),
   body: external_exports.string().max(64 * 1024),
   state: external_exports.enum(["open", "closed"]),
+  stateReason: external_exports.enum(["COMPLETED", "NOT_PLANNED", "DUPLICATE", "REOPENED"]).optional(),
   labels: external_exports.array(id).max(256),
   externalRevision: id
-}).strict();
+}).strict().superRefine((snapshot2, context) => {
+  if (!validGithubSnapshotStateReason(snapshot2.state, snapshot2.stateReason)) {
+    context.addIssue({ code: external_exports.ZodIssueCode.custom, path: ["stateReason"], message: "GitHub issue state and reason do not match" });
+  }
+});
 function storedConfigJson(db, projectId, configRevision) {
   const row = asRow(
     db.prepare("SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = ?").get(projectId, configRevision)
@@ -19340,6 +19461,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request, false);
   const nextState = request.lifecycleState;
   const workItem = requireWorkItem(
     db,
@@ -19356,7 +19478,8 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
     "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?"
   ).get(request.projectId, workItem.work_item_id));
   const machineWait = wait && (wait.kind === "work_item_succeeded" || wait.kind === "github_issue_closed") ? wait : null;
-  const enteringBlocked = nextState === "blocked";
+  const enteringBlocked = nextState === "blocked" && workItem.lifecycle_state !== "blocked";
+  const swappingBlockedWait = workItem.lifecycle_state === "blocked" && nextState === "blocked";
   if (enteringBlocked) {
     if (!machineWait || workAttempt !== void 0 || unblock !== void 0 || externalEvent !== void 0) {
       throw refusal("WORK_ITEM_STATE_INVALID", "entering blocked requires exactly one machine-evaluable blocker");
@@ -19364,13 +19487,27 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
     if (existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
     const blocker = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber };
     requireBlockerCondition(db, request, blocker, githubObservation, false);
-  } else if (wait !== void 0 && (nextState !== void 0 || workAttempt !== void 0)) {
+  } else if (wait !== void 0 && !swappingBlockedWait && (nextState !== void 0 || workAttempt !== void 0)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item wait mutation cannot change lifecycle state");
   }
-  if (wait !== void 0 && !enteringBlocked) {
+  if (swappingBlockedWait) {
+    if (!machineWait || !unblock || workAttempt !== void 0 || externalEvent !== void 0) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "blocked wait swap requires one replacement blocker and the exact stored blocker");
+    }
+    const storedBlocker = existingWait ? storedWorkItemBlocker(existingWait) : null;
+    if (!storedBlocker || !sameWorkItemBlocker(storedBlocker, unblock)) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "blocked wait swap requires the exact stored blocker");
+    }
+    const replacement = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber };
+    if (sameWorkItemBlocker(storedBlocker, replacement)) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "blocked wait swap requires a different replacement blocker");
+    }
+    requireBlockerCondition(db, request, machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber }, githubObservation, false);
+  }
+  if (wait !== void 0 && !enteringBlocked && !swappingBlockedWait) {
     if (machineWait) throw refusal("WORK_ITEM_STATE_INVALID", "machine-evaluable blocker requires an atomic transition to blocked");
     if (["blocked", "succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state)) {
-      throw refusal("WORK_ITEM_STATE_INVALID", "blocked or terminal work item cannot carry a human wait");
+      throw refusal("WORK_ITEM_STATE_INVALID", wait === null ? workItem.lifecycle_state === "blocked" ? "blocked work item cannot clear its machine-evaluable blocker through a wait mutation" : "terminal work item has no wait to clear" : "blocked or terminal work item cannot carry a human wait");
     }
     if (wait !== null && existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
     if (wait === null && !existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item carries no open wait");
@@ -19432,6 +19569,41 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
     throw refusal("WORK_ITEM_STATE_INVALID", "review re-dispatch requires one active review and the same exact PR head, replacement thread, and profile");
   }
   if (workAttempt !== void 0 && nextState === void 0) {
+    const dispatchIntent = db.prepare(
+      `SELECT execution_attempt_id FROM execution_attempts
+       WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+         AND assignment_kind = 'write' AND state = 'prepared' AND thread_id IS NULL
+       ORDER BY attempt_ordinal DESC LIMIT 1`
+    ).get(request.projectId, workItem.work_item_id);
+    if (dispatchIntent && workAttempt.threadId) {
+      const observedAtMs = now();
+      db.prepare(
+        `UPDATE execution_attempts
+         SET state = 'running', thread_id = ?, lease_owner_thread_id = ?, reason_code = 'work_item_dispatch', observed_at_ms = ?
+         WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL`
+      ).run(workAttempt.threadId, workAttempt.threadId, observedAtMs, request.projectId, dispatchIntent.execution_attempt_id);
+      return commitMutation(
+        db,
+        request,
+        digest,
+        actorReceiptId,
+        {
+          aggregateType: "work_item",
+          aggregateId: workItem.work_item_id,
+          aggregateRevision: workItem.resource_revision,
+          eventType: "work_item_attempt_armed",
+          event: { workItemId: workItem.work_item_id, executionAttemptId: dispatchIntent.execution_attempt_id, workAttempt }
+        },
+        { expected: 1, attempted: 1, verified: 1 },
+        {
+          currentConfigRevision: configRevision,
+          currentGovernanceEpoch: governor.governance_epoch,
+          currentResourceRevision: workItem.resource_revision,
+          expectedResourceRevision: request.expectedResourceRevision ?? void 0,
+          evidence: { workItemId: workItem.work_item_id, executionAttemptId: dispatchIntent.execution_attempt_id, workAttempt }
+        }
+      );
+    }
     if (workItem.lifecycle_state !== "in_progress") {
       throw refusal("WORK_ITEM_STATE_INVALID", "replacement work attempts require an in-progress work item");
     }
@@ -19461,8 +19633,8 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
-      state: "running",
-      reasonCode: "work_item_dispatch",
+      state: workAttempt.threadId ? "running" : "prepared",
+      reasonCode: workAttempt.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}${request.reasonCode?.startsWith("dispatch_parent:") ? `:parent=${request.reasonCode.slice("dispatch_parent:".length)}` : ""}`,
       createdAtMs,
       observedAtMs: createdAtMs,
       completedAtMs: null,
@@ -19497,10 +19669,13 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       }
     );
   }
-  if (!nextState || !redispatchingReview && !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
+  if (!nextState || !redispatchingReview && !swappingBlockedWait && !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
   let recordedExternalEvent = null;
+  if (githubObservation && !validGithubSnapshotStateReason(githubObservation.state, githubObservation.stateReason)) {
+    throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue state and reason do not match");
+  }
   if (workItem.lifecycle_state === "blocked") {
     const storedBlocker = existingWait ? storedWorkItemBlocker(existingWait) : null;
     if (!storedBlocker) throw refusal("WORK_ITEM_STATE_INVALID", "blocked work item has no valid machine-evaluable blocker");
@@ -19509,8 +19684,8 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
         throw refusal("WORK_ITEM_STATE_INVALID", "blocked to ready requires the exact stored blocker");
       }
       requireBlockerCondition(db, request, unblock, githubObservation, true);
-    } else if (unblock !== void 0) {
-      throw refusal("WORK_ITEM_STATE_INVALID", "work item unblock evidence only permits blocked to ready");
+    } else if (unblock !== void 0 && !swappingBlockedWait) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "work item unblock evidence only permits blocked to ready or an atomic blocker swap");
     }
   } else if (unblock !== void 0) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item unblock evidence requires a blocked work item");
@@ -19519,8 +19694,12 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
     if (!githubObservation) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub lifecycle observation is unavailable");
     requireBoundGithubIssue(db, request.projectId, workItem.work_item_id, externalEvent);
     if (externalEvent.kind === "github_issue_closed") {
-      if (nextState !== "succeeded" || githubObservation.state !== "closed") {
-        throw refusal("WORK_ITEM_STATE_INVALID", "close observation only permits a transition to succeeded");
+      const absorbedBeforeStart = workItem.lifecycle_state === "proposed" && nextState === "cancelled";
+      if (!absorbedBeforeStart && nextState !== "succeeded" || githubObservation.state !== "closed") {
+        throw refusal("WORK_ITEM_STATE_INVALID", "close observation only permits succeeded, or proposed to cancelled");
+      }
+      if (absorbedBeforeStart && githubObservation.stateReason !== "COMPLETED") {
+        throw refusal("WORK_ITEM_STATE_INVALID", "proposed cancellation requires a completed GitHub close observation");
       }
     } else {
       if (workItem.lifecycle_state !== "succeeded" || nextState !== "ready" || githubObservation.state !== "open") {
@@ -19565,6 +19744,13 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       `INSERT INTO work_item_waits (project_id, work_item_id, waker, waker_kind, declared_at_ms, declared_by_seat, note)
        VALUES (?, ?, ?, ?, ?, ?, ?)`
     ).run(request.projectId, workItem.work_item_id, workItemBlockerWaker(blocker), blocker.kind, now(), machineWait.declaredBySeat, machineWait.note ?? null);
+  } else if (swappingBlockedWait) {
+    const blocker = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber };
+    db.prepare(
+      `UPDATE work_item_waits
+       SET waker = ?, waker_kind = ?, declared_at_ms = ?, declared_by_seat = ?, note = ?
+       WHERE project_id = ? AND work_item_id = ?`
+    ).run(workItemBlockerWaker(blocker), blocker.kind, now(), machineWait.declaredBySeat, machineWait.note ?? null, request.projectId, workItem.work_item_id);
   } else if (workItem.lifecycle_state === "blocked") {
     db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
   }
@@ -19584,8 +19770,8 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
       attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
-      state: "running",
-      reasonCode: "work_item_dispatch",
+      state: workAttempt.threadId ? "running" : "prepared",
+      reasonCode: workAttempt.threadId ? "work_item_dispatch" : `work_item_dispatch_intent:${request.idempotencyKey}${request.reasonCode?.startsWith("dispatch_parent:") ? `:parent=${request.reasonCode.slice("dispatch_parent:".length)}` : ""}`,
       createdAtMs: now(),
       observedAtMs: now(),
       completedAtMs: null,
@@ -19635,7 +19821,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       aggregateType: "work_item",
       aggregateId: workItem.work_item_id,
       aggregateRevision: nextRevision,
-      eventType: "work_item_transitioned",
+      eventType: swappingBlockedWait ? "work_item_wait_swapped" : "work_item_transitioned",
       event: {
         workItemId: workItem.work_item_id,
         from: workItem.lifecycle_state,
@@ -19887,7 +20073,7 @@ function backfillWorkItemGithubIssues(db, projectId, reader, epochCreatedAtMs = 
           github: mapping.github,
           mapping: mapping.mapping,
           issueNumber,
-          idempotencyKey: `github-issue-backfill:${projectId}:${row.work_item_id}`,
+          idempotencyKey: `github-issue-backfill:${JSON.stringify([projectId, row.work_item_id])}`,
           requestDigest: sha256(canonicalJson({ projectId, workItemId: row.work_item_id, epochCreatedAtMs: result2.epochCreatedAtMs, configRevision: result2.configRevision })),
           observed: snapshot2
         });
@@ -20271,7 +20457,7 @@ function isConstraintError(error48) {
 function unavailableResult(subject, message) {
   return result("CANONICAL_STORE_UNAVAILABLE", subject, 1, 0, 0, { message });
 }
-function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null) {
+function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, dryRun = false) {
   let request;
   try {
     request = parseApplyRequest(input);
@@ -20280,9 +20466,9 @@ function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error48) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, dryRun);
 }
-function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null) {
+function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, dryRun = false) {
   let request;
   try {
     request = parseApplyRequest(input);
@@ -20302,21 +20488,27 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
     if (request.operationClass === "decision_disposition") {
       return applyDecisionMutation(db, request, digest, reviewFactReader);
     }
-    const githubTarget = request.operationClass === "work_item_transition" ? workItemGithubReadTarget(request) : null;
+    const githubTargets = request.operationClass === "work_item_transition" ? workItemGithubReadTarget(request) : [];
     let githubObservation = null;
-    if (githubTarget) {
+    if (githubTargets.length > 0) {
       const replay = checkIdempotency(db, request, digest);
       if (replay) return replay;
       const reader = githubIssueReader ?? (githubAdapter ? githubAdapter.read.bind(githubAdapter) : null);
       if (!reader) throw refusal("EXTERNAL_TARGET_REQUIRED", "work item transition requires a live GitHub issue reader");
-      try {
-        githubObservation = reader(githubTarget.owner, githubTarget.repo, githubTarget.issueNumber);
-      } catch {
-        throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue observation is unavailable");
-      }
-      if (!githubObservation || githubObservation.owner !== githubTarget.owner || githubObservation.repo !== githubTarget.repo || githubObservation.issueNumber !== githubTarget.issueNumber) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue observation does not match the exact blocker identity");
+      const observations = githubTargets.map((target) => {
+        let observation2;
+        try {
+          observation2 = reader(target.owner, target.repo, target.issueNumber);
+        } catch {
+          throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue observation is unavailable");
+        }
+        if (!observation2 || observation2.owner !== target.owner || observation2.repo !== target.repo || observation2.issueNumber !== target.issueNumber) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue observation does not match the exact blocker identity");
+        return observation2;
+      });
+      const replacement = request.workItemWait && request.workItemWait.kind === "github_issue_closed" ? request.workItemWait : request.workItemExternalEvent;
+      githubObservation = replacement && replacement.kind === "github_issue_closed" ? observations.find((observation2) => observation2.owner === replacement.owner && observation2.repo === replacement.repo && observation2.issueNumber === replacement.issueNumber) ?? null : observations[0] ?? null;
     }
-    return transaction(db, () => {
+    const mutate = () => {
       const replay = checkIdempotency(db, request, digest);
       if (replay) return replay;
       switch (request.operationClass) {
@@ -20344,7 +20536,20 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
         case "role_generation_succession":
           throw refusal("INTERNAL_ERROR", "role fact operations must not run inside the canonical transaction");
       }
-    });
+    };
+    if (!dryRun) return transaction(db, mutate);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const value = mutate();
+      db.exec("ROLLBACK");
+      return value;
+    } catch (error48) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+      }
+      throw error48;
+    }
   } catch (error48) {
     if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
     if (isConstraintError(error48)) return result("CANONICAL_STORE_UNAVAILABLE", request.projectId, 1, 0, 0, { message: String(error48) });
@@ -20525,7 +20730,7 @@ async function routingDoctorEvidence(sdk, projectId, roleGenerationHeads) {
   const buckets = /* @__PURE__ */ new Map();
   for (const { thread, profile } of workerProfiles) {
     if (!profile) continue;
-    const key = `${profile.providerId}\0${profile.model}\0${profile.reasoningLevel}`;
+    const key = JSON.stringify([profile.providerId, profile.model, profile.reasoningLevel]);
     const bucket = buckets.get(key) ?? { ...profile, count: 0, threadIds: [] };
     bucket.count += 1;
     bucket.threadIds.push(thread.id);
@@ -20981,8 +21186,16 @@ function priorArtifacts(value) {
     return null;
   }
 }
+function observation(value) {
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed.artifacts) ? { artifacts: parsed.artifacts, queueHead: parsed.queueHead, woken: parsed.woken } : null;
+  } catch {
+    return null;
+  }
+}
 function hasArtifactDelta(previous, current) {
-  const prior = priorArtifacts(previous);
+  const prior = observation(previous)?.artifacts ?? priorArtifacts(previous);
   if (!prior) return true;
   const byId = new Map(prior.map((artifact) => [artifact.id, artifact]));
   if (byId.size !== current.length || current.some((artifact) => !byId.has(artifact.id))) return true;
@@ -21011,10 +21224,28 @@ function createStallGuardCycle(options) {
       let attempted = 0;
       let verified = 0;
       let steered = 0;
+      let ambiguous = 0;
       for (const holder of holders) {
-        const key = `${holder.project_id}:${holder.role_id}`;
+        const key = JSON.stringify([holder.project_id, holder.role_id]);
+        const legacyKey = `${holder.project_id}:${holder.role_id}`;
+        if (nextState[legacyKey] !== void 0) {
+          if (nextState[key] !== void 0) {
+            ambiguous += 1;
+            options.onAmbiguous?.(`stall-guard ambiguous migration: ${key}`);
+            continue;
+          }
+          nextState[key] = nextState[legacyKey];
+          delete nextState[legacyKey];
+          changed += 1;
+        }
         const current = await readArtifacts(holder.project_id);
         if (current === null) continue;
+        const queueHead = options.readQueueHead?.(holder.project_id);
+        const queueSuppressionKey = queueHead ? roleIdleKey(holder, queueHead.workItemId) : void 0;
+        const queueAlreadyWoken = queueSuppressionKey !== void 0 && (() => {
+          const record2 = observation(nextState[queueSuppressionKey] ?? "");
+          return record2?.woken === true && record2.queueHead?.resourceRevision === queueHead.resourceRevision;
+        })();
         const next = snapshot(current);
         if (nextState[key] === void 0) {
           nextState[key] = next;
@@ -21022,7 +21253,7 @@ function createStallGuardCycle(options) {
           continue;
         }
         if (nextState[key] === next) continue;
-        if (!hasArtifactDelta(nextState[key], current)) {
+        if (queueAlreadyWoken || !hasArtifactDelta(nextState[key], current)) {
           nextState[key] = next;
           changed += 1;
           continue;
@@ -21051,6 +21282,7 @@ function createStallGuardCycle(options) {
         attempted += 1;
         if (!result2.delivered) continue;
         nextState[key] = next;
+        if (queueHead) nextState[queueSuppressionKey] = JSON.stringify({ artifacts: current, queueHead, woken: true });
         changed += 1;
         verified += 1;
         steered += 1;
@@ -21059,7 +21291,7 @@ function createStallGuardCycle(options) {
         await options.persistence.write(nextState);
         state = nextState;
       }
-      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered };
+      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered, ambiguous };
     }
   };
 }
@@ -21137,22 +21369,22 @@ async function registerBoundedWait(options) {
   } catch {
     return { outcome: "refused", message: "waker schedule registry is unreadable: declaration refused" };
   }
-  let observation;
+  let observation2;
   try {
-    observation = await options.readSource(sourceThreadId);
+    observation2 = await options.readSource(sourceThreadId);
   } catch {
-    observation = null;
+    observation2 = null;
   }
-  if (observation === null) {
+  if (observation2 === null) {
     return { outcome: "refused", message: `source thread ${sourceThreadId} is unknown: waits on an unverifiable source are refused` };
   }
-  if (observation.archived) {
+  if (observation2.archived) {
     return { outcome: "refused", message: `source thread ${sourceThreadId} is already archived: act on its outcome instead of waiting` };
   }
-  if (!THREAD_STATUSES.has(observation.status)) {
-    return { outcome: "refused", message: `source thread ${sourceThreadId} has unknown status ${String(observation.status)}` };
+  if (!THREAD_STATUSES.has(observation2.status)) {
+    return { outcome: "refused", message: `source thread ${sourceThreadId} has unknown status ${String(observation2.status)}` };
   }
-  if (observation.status === "error") {
+  if (observation2.status === "error") {
     return { outcome: "refused", message: `source thread ${sourceThreadId} has already failed: act on its failure instead of waiting` };
   }
   const declaredAtMs = now2();
@@ -21254,14 +21486,14 @@ function createWaitEscalationCycle(options) {
           continue;
         }
         if (record2.escalated) continue;
-        let observation;
+        let observation2;
         try {
-          observation = await options.readWaiter(record2.waiterThreadId);
+          observation2 = await options.readWaiter(record2.waiterThreadId);
         } catch {
           continue;
         }
-        if (observation === null) continue;
-        if (observation.status === "active") continue;
+        if (observation2 === null) continue;
+        if (observation2.status === "active") continue;
         const steerAgeMs = record2.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : currentNow - record2.lastSteerAtMs;
         if (steerAgeMs < graceMs) continue;
         if (record2.steers >= maxSteers) {
@@ -21836,7 +22068,51 @@ import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as rea
 import { execFile, spawnSync as spawnSync2 } from "node:child_process";
 import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute2, join as join5, relative as relative2, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-var fleetWatchdogReopenKey = (projectId, workItemId, externalRevision) => [projectId, workItemId, externalRevision].filter((value) => value !== void 0).join("\0");
+var ERROR_RECOVERY_IO_TIMEOUT_MS = 1e4;
+var fleetWatchdogCompositeKey = (...parts) => JSON.stringify(parts);
+var fleetWatchdogIssueReopenedKey = (workItemId, externalRevision) => `fleet-watchdog:issue-reopened:${fleetWatchdogCompositeKey(workItemId, externalRevision)}`;
+var fleetWatchdogLegacyIssueReopenedKey = (workItemId, externalRevision) => `fleet-watchdog:issue-reopened:${workItemId}:${externalRevision}`;
+var fleetWatchdogMergeCloseKey = (workItemId, state, externalRevision) => `fleet-watchdog:merge-close:${fleetWatchdogCompositeKey(workItemId, state, externalRevision)}`;
+var fleetWatchdogLegacyMergeCloseKey = (workItemId, state, externalRevision) => `fleet-watchdog:merge-close:${workItemId}:${state}:${externalRevision}`;
+var fleetWatchdogBlockerFiredKey = (workItemId, subject) => `fleet-watchdog:blocker-fired:${fleetWatchdogCompositeKey(workItemId, subject)}`;
+var fleetWatchdogLegacyBlockerFiredKey = (workItemId, subject) => `fleet-watchdog:blocker-fired:${workItemId}:${subject}`;
+var fleetWatchdogRoleLivenessKey = (holder) => fleetWatchdogCompositeKey(
+  holder.project_id,
+  holder.role_id,
+  String(holder.role_generation),
+  holder.execution_attempt_id,
+  holder.thread_id
+);
+var fleetWatchdogEpisodeKey = (holder, queueHead) => fleetWatchdogCompositeKey(
+  holder.project_id,
+  holder.role_id,
+  String(holder.role_generation),
+  holder.execution_attempt_id,
+  holder.thread_id,
+  "activeLanes=0",
+  queueHead
+);
+var fleetWatchdogLegacyEpisodeKey = (holder, queueHead) => [
+  holder.project_id,
+  holder.role_id,
+  holder.role_generation,
+  holder.execution_attempt_id,
+  holder.thread_id,
+  "activeLanes=0",
+  queueHead
+].join(":");
+var fleetWatchdogScope = (prefix, ...parts) => `${prefix}:${fleetWatchdogCompositeKey(...parts)}`;
+var fleetWatchdogScopeMessage = (scope) => {
+  const separator = scope.indexOf(":");
+  if (separator < 0) return scope;
+  try {
+    const parts = JSON.parse(scope.slice(separator + 1));
+    return `${scope.slice(0, separator)}:${Array.isArray(parts) ? parts.join(":") : scope.slice(separator + 1)}`;
+  } catch {
+    return scope;
+  }
+};
+var fleetWatchdogReopenKey = (projectId, workItemId, externalRevision) => fleetWatchdogCompositeKey(...[projectId, workItemId, externalRevision].filter((value) => value !== void 0));
 function githubRepository(remoteUrl) {
   const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
   return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : null;
@@ -21894,13 +22170,17 @@ async function startableQueueStateAsync(repositories) {
   }
   return { count, head: heads.sort()[0] ?? null, unlabelledCount, blockedCount, waitingExternalCount };
 }
+function validGithubStateReason(state, reason) {
+  return state === "OPEN" ? reason === void 0 || reason === null || reason === "" || reason === "REOPENED" : state === "CLOSED" && (reason === "COMPLETED" || reason === "NOT_PLANNED" || reason === "DUPLICATE");
+}
 async function linkedGithubObservationAsync(owner, repo, issueNumber) {
-  const issue2 = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,updatedAt,closedByPullRequestsReferences"]);
+  const issue2 = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,stateReason,updatedAt,closedByPullRequestsReferences"]);
   if (!issue2 || typeof issue2 !== "object" || Array.isArray(issue2)) return null;
   const issueState = issue2.state;
+  const stateReason = issue2.stateReason;
   const externalRevision = issue2.updatedAt;
   const closingPullRequests = issue2.closedByPullRequestsReferences;
-  if (issueState !== "OPEN" && issueState !== "CLOSED" || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
+  if (issueState !== "OPEN" && issueState !== "CLOSED" || !validGithubStateReason(issueState, stateReason) || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
   const closingPullRequest = closingPullRequests[0];
   if (closingPullRequest !== void 0 && (!closingPullRequest || typeof closingPullRequest !== "object" || Array.isArray(closingPullRequest) || typeof closingPullRequest.number !== "number" || !Number.isSafeInteger(closingPullRequest.number))) return null;
   const pullRequest = closingPullRequest === void 0 ? null : await githubJsonAsync(["pr", "view", String(closingPullRequest.number), "--repo", `${owner}/${repo}`, "--json", "state,mergedAt"]);
@@ -21915,20 +22195,21 @@ async function linkedGithubObservationAsync(owner, repo, issueNumber) {
   const issueClosed = issueState === "CLOSED";
   const issueOpen = issueState === "OPEN";
   const status = pullRequestMerged || pullRequestClosed || issueClosed ? pullRequestMerged ? "merged" : "closed" : issueOpen ? "open" : null;
-  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, externalRevision };
+  const updatedAtMs = Date.parse(externalRevision);
+  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason: stateReason === "" || stateReason === null ? void 0 : stateReason, externalRevision, updatedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : null };
 }
 async function readGithubIssueForBackfillAsync(owner, repo, issueNumber) {
-  const value = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,labels,updatedAt"]);
+  const value = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"]);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
   const record2 = value;
-  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
-  return { owner, repo, issueNumber: record2.number, title: record2.title, body: record2.body ?? "", state: record2.state === "OPEN" ? "open" : "closed", labels: record2.labels.map((label) => label.name), externalRevision: record2.updatedAt };
+  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !validGithubStateReason(record2.state, record2.stateReason) || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
+  return { owner, repo, issueNumber: record2.number, title: record2.title, body: record2.body ?? "", state: record2.state === "OPEN" ? "open" : "closed", stateReason: record2.stateReason === "" || record2.stateReason === null ? void 0 : record2.stateReason, labels: record2.labels.map((label) => label.name), externalRevision: record2.updatedAt };
 }
 function readGithubIssueForBackfill(owner, repo, issueNumber) {
-  const value = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,labels,updatedAt"]);
+  const value = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"]);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
   const record2 = value;
-  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
+  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !validGithubStateReason(record2.state, record2.stateReason) || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
   return {
     owner,
     repo,
@@ -21936,6 +22217,7 @@ function readGithubIssueForBackfill(owner, repo, issueNumber) {
     title: record2.title,
     body: record2.body ?? "",
     state: record2.state === "OPEN" ? "open" : "closed",
+    stateReason: record2.stateReason === "" || record2.stateReason === null ? void 0 : record2.stateReason,
     labels: record2.labels.map((label) => label.name),
     externalRevision: record2.updatedAt
   };
@@ -22044,12 +22326,6 @@ var registeredWaitInputSchema = external_exports.object({
 var registeredWaitSchema = registeredWaitInputSchema.extend({
   declaredAtMs: external_exports.number().int().nonnegative()
 }).strict();
-var sidebarThreadStateSchema = external_exports.string().trim().min(1).max(64);
-var sidebarThreadStateKey = (threadId) => `sidebar.thread-state:${threadId}`;
-var sidebarReasoningLevelSchema = external_exports.enum(["none", "low", "medium", "high", "xhigh", "ultracode", "max", "ultra"]);
-var sidebarThreadExecutionSchema = external_exports.object({ model: external_exports.string(), reasoning: sidebarReasoningLevelSchema }).strict();
-var sidebarCollapseKindSchema = external_exports.enum(["project", "thread"]);
-var sidebarCollapseKey = (kind, id2) => `sidebar.collapse:${kind}:${id2}`;
 var roleBriefRoleSchema = external_exports.enum(["director", "orchestrator", "worker"]);
 var roleBriefBundleSchema = external_exports.object({
   ponytail: external_exports.string().min(1),
@@ -22098,6 +22374,10 @@ var sendOperatorMessageInputSchema = external_exports.object({
   severity: operatorSeveritySchema,
   text: operatorMessageTextSchema
 }).strict();
+var dispatchLaneInputSchema = external_exports.object({
+  request: applyRequestSchema,
+  spawn: external_exports.record(external_exports.string(), external_exports.unknown())
+}).strict();
 var rpcContract = defineRpcContract({
   lanes: {
     input: external_exports.object({}).strict(),
@@ -22106,40 +22386,6 @@ var rpcContract = defineRpcContract({
   registerWait: {
     input: registeredWaitInputSchema,
     output: registeredWaitSchema
-  },
-  threadStates: {
-    input: external_exports.object({ threadIds: external_exports.array(sidebarThreadIdSchema).max(256) }).strict(),
-    output: external_exports.record(external_exports.string(), sidebarThreadStateSchema)
-  },
-  threadModels: {
-    input: external_exports.object({ threadIds: external_exports.array(sidebarThreadIdSchema).max(256) }).strict(),
-    output: external_exports.record(external_exports.string(), sidebarThreadExecutionSchema.nullable())
-  },
-  setThreadState: {
-    input: external_exports.object({ threadId: sidebarThreadIdSchema, state: sidebarThreadStateSchema.nullable() }).strict(),
-    output: external_exports.object({ state: sidebarThreadStateSchema.nullable() }).strict()
-  },
-  sidebarCollapseState: {
-    input: external_exports.object({
-      projectIds: external_exports.array(sidebarThreadIdSchema).max(256),
-      threadIds: external_exports.array(sidebarThreadIdSchema).max(256)
-    }).strict(),
-    output: external_exports.object({
-      projects: external_exports.record(external_exports.string(), external_exports.boolean()),
-      threads: external_exports.record(external_exports.string(), external_exports.boolean())
-    }).strict()
-  },
-  setSidebarCollapse: {
-    input: external_exports.object({ kind: sidebarCollapseKindSchema, id: sidebarThreadIdSchema, collapsed: external_exports.boolean() }).strict(),
-    output: external_exports.object({ kind: sidebarCollapseKindSchema, id: sidebarThreadIdSchema, collapsed: external_exports.boolean() }).strict()
-  },
-  reorderPinned: {
-    input: external_exports.object({
-      threadId: sidebarThreadIdSchema,
-      previousThreadId: sidebarThreadIdSchema.nullable(),
-      nextThreadId: sidebarThreadIdSchema.nullable()
-    }).strict(),
-    output: external_exports.object({ ok: external_exports.literal(true) }).strict()
   },
   doctor: {
     input: external_exports.object({ projectId: projectIdSchema }).strict(),
@@ -22151,6 +22397,10 @@ var rpcContract = defineRpcContract({
   },
   apply: {
     input: applyRequestSchema,
+    output: foundationResultSchema
+  },
+  dispatchLane: {
+    input: dispatchLaneInputSchema,
     output: foundationResultSchema
   },
   cachedConsumerRollout: {
@@ -22373,8 +22623,89 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
     return unavailableRoleFactReader(serverId);
   }
 }
-async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false) {
+async function dispatchLane(bb, db, input) {
+  const parsed = dispatchLaneInputSchema.safeParse(input);
+  if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "dispatch", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
+  const { request, spawn } = parsed.data;
+  if (!request.workAttempt || request.lifecycleState !== "in_progress" && request.lifecycleState !== void 0) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "lane dispatch requires a writing work attempt and an in-progress transition" };
+  }
+  if (spawn.projectId !== request.projectId) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "spawn projectId must match request projectId" };
+  }
+  const dispatchParentThreadId = typeof spawn.parentThreadId === "string" ? spawn.parentThreadId : null;
+  if (!dispatchParentThreadId) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "lane dispatch requires the dispatcher parent thread" };
+  }
+  const { threadId: _threadId, ...intentAttempt } = request.workAttempt;
+  const intent = await applyLiveAuthorizedMutation(bb, db, {
+    ...request,
+    reasonCode: `dispatch_parent:${dispatchParentThreadId}`,
+    workAttempt: intentAttempt
+  }, false, "stop-active");
+  if (intent.outcome !== "OK" || intent.replay) return intent;
+  let thread;
+  try {
+    thread = await bb.sdk.threads.spawn({
+      ...spawn,
+      title: `${String(spawn.title ?? "lane")} [dispatch:${request.idempotencyKey}]`
+    });
+  } catch (error48) {
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane spawn failed after durable dispatch intent: ${String(error48)}`, evidence: { intent } };
+  }
+  const intentEvidence = intent;
+  return applyLiveAuthorizedMutation(bb, db, {
+    ...request,
+    lifecycleState: void 0,
+    expectedResourceRevision: intentEvidence?.currentResourceRevision,
+    idempotencyKey: `${request.idempotencyKey}-finalize`,
+    workAttempt: { ...request.workAttempt, threadId: thread.id }
+  }, false, "stop-active");
+}
+async function prepareWorkItemAttemptTerminalization(bb, db, request, policy) {
+  if (request.operationClass !== "work_item_transition" || !db) return null;
+  const terminalizesWriter = request.lifecycleState === "review_pending" || ["blocked", "failed", "cancelled"].includes(request.lifecycleState ?? "") || request.lifecycleState === void 0 && request.workAttempt?.assignmentKind === "write";
+  if (!terminalizesWriter) return null;
+  const attempts = db.prepare(
+    `SELECT thread_id FROM execution_attempts
+     WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+       AND assignment_kind = 'write' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')
+     ORDER BY attempt_ordinal DESC`
+  ).all(request.projectId, request.workItemId);
+  const attempt = attempts.find((candidate) => candidate.thread_id !== null);
+  if (!attempt) {
+    if (request.lifecycleState === void 0 && request.workAttempt?.threadId && attempts.length > 0) return null;
+    if (attempts.length === 0) return null;
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "writing attempt terminalization requires a bound lane with native stop evidence" };
+  }
+  const threadId = attempt.thread_id;
+  if (!threadId) return null;
+  let lane;
+  try {
+    lane = await bb.sdk.threads.get({ threadId });
+    if (policy === "stop-active" && lane.status !== "idle") {
+      await bb.sdk.threads.stop({ threadId });
+      await bb.sdk.threads.wait({ threadId, status: "idle", timeoutMs: FLEET_WATCHDOG_STOPPING_WAIT_MS });
+      lane = await bb.sdk.threads.get({ threadId });
+    }
+  } catch (error48) {
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane stop evidence unavailable: ${String(error48)}` };
+  }
+  if (lane.status !== "idle") {
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane has no native stopped evidence: status=${lane.status}` };
+  }
+  return null;
+}
+async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = readGithubIssueForBackfill) {
   const parsed = applyRequestSchema.safeParse(input);
+  if (parsed.success && terminalizationPolicy === "stop-active") {
+    const authorized = applyAuthorizedMutation(db, input, null, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, true);
+    if (authorized.outcome !== "OK" || authorized.replay) return authorized;
+  }
+  if (parsed.success) {
+    const laneGuard = await prepareWorkItemAttemptTerminalization(bb, db, parsed.data, terminalizationPolicy);
+    if (laneGuard) return laneGuard;
+  }
   if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v22-rollout-receipt")) {
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
@@ -22389,7 +22720,7 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     }
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
-  const result2 = applyAuthorizedMutation(db, input, null, reader, null, null, readGithubIssueForBackfill);
+  const result2 = applyAuthorizedMutation(db, input, null, reader, null, null, githubIssueReader);
   await deliverSucceededSeatBrief(bb, db, input, result2);
   return result2;
 }
@@ -22831,8 +23162,8 @@ async function reportProjectWorktreeCleanup(bb, projectId) {
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "github-issue-backfill", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, github-issue-backfill, archive-sweep, worktree-cleanup, cached-consumer-rollout, role-list, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
+  if (!command || !["doctor", "export", "apply", "dispatch-lane", "github-issue-backfill", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, dispatch-lane, github-issue-backfill, archive-sweep, worktree-cleanup, cached-consumer-rollout, role-list, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
   }
   if (command === "wait-validator") {
     const unknown3 = args.find((arg) => arg !== "--cycle");
@@ -22910,6 +23241,23 @@ async function runCli(db, bb, argv, ctx, deps) {
   }
   const projectId = parseFlag(args, "--project");
   if (!projectId) return invalidCli("--project PROJECT_ID is required; CLI context is never used as a fallback");
+  if (command === "dispatch-lane") {
+    const unknown3 = unexpectedFlags(args, ["--project", "--request", "--spawn"]);
+    if (unknown3) return invalidCli(`unexpected flag ${unknown3}`);
+    const requestJson = parseFlag(args, "--request");
+    const spawnJson = parseFlag(args, "--spawn");
+    if (!requestJson || !spawnJson) return invalidCli("--request JSON and --spawn JSON are required");
+    try {
+      const request = JSON.parse(requestJson);
+      const spawn = JSON.parse(spawnJson);
+      const parsed = dispatchLaneInputSchema.safeParse({ request, spawn });
+      if (!parsed.success) return invalidCli(parsed.error.message);
+      if (parsed.data.request.projectId !== projectId) return invalidCli("request projectId must match --project");
+      return cliResult(await dispatchLane(bb, db, parsed.data));
+    } catch (error48) {
+      return invalidCli(error48 instanceof Error ? error48.message : String(error48));
+    }
+  }
   if (command === "send-to-operator") {
     const unknown3 = unexpectedFlags(args, ["--project", "--recipient", "--severity", "--message"]);
     if (unknown3) return invalidCli(`unexpected flag ${unknown3}`);
@@ -23183,20 +23531,96 @@ async function plugin(bb, options = {}) {
     db = null;
   }
   const recoveryInFlight = /* @__PURE__ */ new Set();
+  const RECOVERY_UNRECOVERABLE = "unrecoverable";
+  const withRecoveryTimeout = async (label, operation) => {
+    const controller = new AbortController();
+    let timer;
+    try {
+      return await Promise.race([
+        operation(controller.signal),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error(`error-recovery ${label} timed out after ${ERROR_RECOVERY_IO_TIMEOUT_MS}ms`));
+          }, ERROR_RECOVERY_IO_TIMEOUT_MS);
+        })
+      ]);
+    } finally {
+      if (timer !== void 0) clearTimeout(timer);
+    }
+  };
   const isCurrentRoleHolder = (holder) => db !== null && readRoleHolderStates(db).some(
     (candidate) => candidate.project_id === holder.project_id && candidate.role_id === holder.role_id && candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id
   );
-  const recoverErroredThread = async (threadId, projectId, holder) => {
-    if (recoveryInFlight.has(threadId) || db === null) return false;
+  const isCurrentLane = (lane) => db !== null && Boolean(db.prepare(
+    `SELECT 1 FROM execution_attempts AS attempts
+     JOIN work_items AS items ON items.project_id = attempts.project_id AND items.work_item_id = attempts.work_item_id
+     WHERE attempts.project_id = ? AND attempts.execution_attempt_id = ? AND attempts.thread_id = ?
+       AND attempts.origin = 'work_item' AND attempts.assignment_kind = 'write'
+       AND attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+       AND items.lifecycle_state IN (${WORK_ITEM_CAPACITY_LIFECYCLE_STATES.map(() => "?").join(", ")})`
+  ).get(lane.project_id, lane.execution_attempt_id, lane.thread_id, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES));
+  const resolveRecoveryIdentity = (projectId, threadId) => {
+    if (db === null) return {};
+    try {
+      const holder = db.prepare(
+        `SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id
+         FROM execution_attempts
+         WHERE project_id = ? AND thread_id = ? AND origin = 'role_holder'
+         ORDER BY rowid DESC LIMIT 1`
+      ).get(projectId, threadId);
+      const lane = db.prepare(
+        `SELECT project_id, thread_id, execution_attempt_id
+         FROM execution_attempts
+         WHERE project_id = ? AND thread_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
+         ORDER BY rowid DESC LIMIT 1`
+      ).get(projectId, threadId);
+      return { holder, lane };
+    } catch (error48) {
+      bb.log.warn(`error-recovery identity resolution failed: project=${projectId} thread=${threadId} ${String(error48)}`);
+      return null;
+    }
+  };
+  const withRecoverySendTimeout = async (threadId, operation) => {
+    let timer;
+    let timedOut = false;
+    try {
+      return await Promise.race([
+        operation(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(new Error(`error-recovery threads.send timed out after ${ERROR_RECOVERY_IO_TIMEOUT_MS}ms`));
+          }, ERROR_RECOVERY_IO_TIMEOUT_MS);
+        })
+      ]);
+    } catch (error48) {
+      if (timedOut) bb.log.error(`error-recovery send anomaly: thread=${threadId} reason=uncancellable-send-timeout ${String(error48)}`);
+      throw error48;
+    } finally {
+      if (timer !== void 0) clearTimeout(timer);
+    }
+  };
+  const recoverErroredThread = async (threadId, projectId, holder, lane) => {
+    if (recoveryInFlight.has(threadId)) {
+      bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=recovery-in-flight`);
+      return null;
+    }
+    if (db === null) return null;
     recoveryInFlight.add(threadId);
     try {
       if (!db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId)) return false;
-      const thread = await bb.sdk.threads.get({ threadId });
-      if (thread.id !== threadId || thread.projectId !== projectId || thread.status !== "error" || thread.archivedAt !== null || thread.deletedAt !== null || holder !== void 0 && !isCurrentRoleHolder(holder)) return false;
+      const thread = await withRecoveryTimeout("threads.get", (signal) => bb.sdk.threads.get({ threadId, signal }));
+      if (thread.id !== threadId || thread.projectId !== projectId || thread.archivedAt !== null || thread.deletedAt !== null) {
+        bb.log.error(`error-recovery target unrecoverable: project=${projectId} thread=${threadId} reason=canonical-target-invalid`);
+        return RECOVERY_UNRECOVERABLE;
+      }
+      if (thread.status !== "error" || holder !== void 0 && !isCurrentRoleHolder(holder) || lane !== void 0 && !isCurrentLane(lane)) return false;
       let head = "unavailable (re-fetch before continuing)";
       if (thread.environmentId !== null) {
+        const environmentId = thread.environmentId;
         try {
-          const status = await bb.sdk.environments.status({ environmentId: thread.environmentId });
+          const status = await withRecoveryTimeout("environments.status", (signal) => bb.sdk.environments.status({ environmentId, signal }));
           if (status.outcome === "available") {
             const checkout = status.workspace.checkout;
             if (checkout.kind === "branch" || checkout.kind === "detached") head = checkout.headSha ?? `${checkout.kind} checkout with no HEAD`;
@@ -23206,7 +23630,15 @@ async function plugin(bb, options = {}) {
           bb.log.warn(`error-recovery head unavailable: thread=${threadId} ${String(error48)}`);
         }
       }
-      await bb.sdk.threads.send({
+      if (holder !== void 0 && !isCurrentRoleHolder(holder)) {
+        bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=role-holder-no-longer-current`);
+        return false;
+      }
+      if (lane !== void 0 && !isCurrentLane(lane)) {
+        bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=lane-no-longer-current`);
+        return false;
+      }
+      await withRecoverySendTimeout(threadId, () => bb.sdk.threads.send({
         threadId,
         mode: "auto",
         input: [{
@@ -23215,7 +23647,7 @@ async function plugin(bb, options = {}) {
           text: `RECOVERY WAKE \u2014 reconcile state before resuming. The workspace and recorded conversation survived the daemon interruption, but the interrupted turn may have half-applied intent and a composed instruction may not have been delivered. Observed checkout head: ${head}. Re-fetch and confirm the current head, reconcile the frozen work order and canonical state against the conversation, identify any half-applied mutation or lost delivery, and re-run every pre-crash measurement whose command and output are not visible before continuing.`,
           mentions: []
         }]
-      });
+      }));
       bb.log.warn(`error-recovery wake sent: project=${projectId} thread=${threadId} mode=auto head=${head}`);
       return true;
     } catch (error48) {
@@ -23227,26 +23659,50 @@ async function plugin(bb, options = {}) {
   };
   const reconcileErrorRecovery = async () => {
     if (db === null) {
-      bb.log.error("error-recovery coverage=blind event=blind roleRestart=blind roles=unknown laneRestart=blind unboundOpenWorkItems=unknown reason=canonical-store-unreadable;work-items-have-no-thread-binding:GH-300");
+      const coverage2 = "blind";
+      const roleRestart2 = "blind";
+      const laneRestart2 = "blind";
+      bb.log.error(`error-recovery coverage=${coverage2} event=blind roleRestart=${roleRestart2} roles=unknown laneRestart=${laneRestart2} lanes=unknown openWorkItems=unknown reason=canonical-store-unreadable`);
       return;
     }
     let holders;
+    let lanes;
     let openWorkItems;
     try {
       holders = readRoleHolderStates(db);
+      lanes = db.prepare(
+        `SELECT attempts.project_id, attempts.thread_id, attempts.execution_attempt_id FROM execution_attempts AS attempts
+         JOIN work_items AS items ON items.project_id = attempts.project_id AND items.work_item_id = attempts.work_item_id
+         WHERE attempts.origin = 'work_item' AND attempts.assignment_kind = 'write' AND attempts.thread_id IS NOT NULL
+           AND attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+           AND items.lifecycle_state IN (${WORK_ITEM_CAPACITY_LIFECYCLE_STATES.map(() => "?").join(", ")})
+         ORDER BY attempts.project_id, attempts.thread_id`
+      ).all(...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES);
       openWorkItems = db.prepare(
         "SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')"
       ).get().count;
     } catch (error48) {
-      bb.log.error(`error-recovery coverage=blind event=armed roleRestart=blind roles=unknown laneRestart=blind unboundOpenWorkItems=unknown reason=role-inventory-unreadable:${String(error48)};work-items-have-no-thread-binding:GH-300`);
+      const coverage2 = "blind";
+      const roleRestart2 = "blind";
+      const laneRestart2 = "blind";
+      bb.log.error(`error-recovery coverage=${coverage2} event=blind roleRestart=${roleRestart2} roles=unknown laneRestart=${laneRestart2} lanes=unknown openWorkItems=unknown reason=canonical-inventory-unreadable:${String(error48)}`);
       return;
     }
     let failedRoles = 0;
     for (const holder of holders) {
-      if (await recoverErroredThread(holder.thread_id, holder.project_id, holder) === null) failedRoles += 1;
+      const outcome = await recoverErroredThread(holder.thread_id, holder.project_id, holder);
+      if (outcome === null || outcome === RECOVERY_UNRECOVERABLE) failedRoles += 1;
+    }
+    let failedLanes = 0;
+    for (const lane of lanes) {
+      const outcome = await recoverErroredThread(lane.thread_id, lane.project_id, void 0, lane);
+      if (outcome === null || outcome === RECOVERY_UNRECOVERABLE) failedLanes += 1;
     }
     const roleRestart = failedRoles === 0 ? "armed" : "degraded";
-    bb.log.error(`error-recovery coverage=blind event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=blind unboundOpenWorkItems=${openWorkItems} reason=work-items-have-no-thread-binding:GH-300`);
+    const laneRestart = failedLanes === 0 ? "armed" : "degraded";
+    const coverage = failedRoles === 0 && failedLanes === 0 ? "armed" : "degraded";
+    const reason = coverage === "armed" ? "none" : `recovery-failed:roles=${failedRoles},lanes=${failedLanes}`;
+    bb.log.error(`error-recovery coverage=${coverage} event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=${laneRestart} lanes=${lanes.length} failedLanes=${failedLanes} openWorkItems=${openWorkItems} reason=${reason}`);
   };
   const readPendingExternalWait = async (threadId, signal) => {
     try {
@@ -23312,7 +23768,7 @@ async function plugin(bb, options = {}) {
     write: (state) => bb.storage.kv.set("lane-watcher.role-idle", state)
   };
   const roleLivenessWarnings = /* @__PURE__ */ new Map();
-  const roleLivenessKey = (holder) => `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${holder.execution_attempt_id}:${holder.thread_id}`;
+  const roleLivenessKey = fleetWatchdogRoleLivenessKey;
   const warnRoleLiveness = (holder, evidence) => {
     const key = roleLivenessKey(holder);
     if (roleLivenessWarnings.get(key) === evidence) return;
@@ -23438,10 +23894,10 @@ ${thread.titleFallback ?? ""}`);
       "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE ended_at_ms IS NULL"
     ).run();
   }
-  const recordLaneCapacityInterval = (observation) => {
+  const recordLaneCapacityInterval = (observation2) => {
     if (!db) throw new Error("canonical-store-unavailable");
     db.transaction(() => {
-      const startableWork = observation.startableWork === null ? null : observation.startableWork ? 1 : 0;
+      const startableWork = observation2.startableWork === null ? null : observation2.startableWork ? 1 : 0;
       const extended = db.prepare(
         `UPDATE lane_capacity_intervals SET last_confirmed_at_ms = ?,
            lane_capacity_observation_id = COALESCE(lane_capacity_observation_id, ?)
@@ -23449,18 +23905,18 @@ ${thread.titleFallback ?? ""}`);
            AND coverage_state = ? AND active_lane_count IS ?
            AND writing_lane_ceiling IS ? AND startable_work IS ?`
       ).run(
-        observation.observedAtMs,
-        observation.laneCapacityObservationId,
-        observation.projectId,
-        observation.coverageState,
-        observation.activeLaneCount,
-        observation.writingLaneCeiling,
+        observation2.observedAtMs,
+        observation2.laneCapacityObservationId,
+        observation2.projectId,
+        observation2.coverageState,
+        observation2.activeLaneCount,
+        observation2.writingLaneCeiling,
         startableWork
       );
       if (extended.changes !== 1) {
         db.prepare(
           "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE project_id = ? AND ended_at_ms IS NULL"
-        ).run(observation.projectId);
+        ).run(observation2.projectId);
         db.prepare(
           `INSERT INTO lane_capacity_intervals (
            project_id, orchestrator_thread_id, orchestrator_role_generation,
@@ -23468,25 +23924,25 @@ ${thread.titleFallback ?? ""}`);
            reason, lane_capacity_observation_id, started_at_ms, last_confirmed_at_ms, ended_at_ms
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
         ).run(
-          observation.projectId,
-          observation.orchestratorThreadId,
-          observation.orchestratorRoleGeneration,
-          observation.coverageState,
-          observation.activeLaneCount,
-          observation.writingLaneCeiling,
+          observation2.projectId,
+          observation2.orchestratorThreadId,
+          observation2.orchestratorRoleGeneration,
+          observation2.coverageState,
+          observation2.activeLaneCount,
+          observation2.writingLaneCeiling,
           startableWork,
-          observation.reason,
-          observation.laneCapacityObservationId,
-          observation.observedAtMs,
-          observation.observedAtMs
+          observation2.reason,
+          observation2.laneCapacityObservationId,
+          observation2.observedAtMs,
+          observation2.observedAtMs
         );
       }
-      for (const executionAttemptId of observation.executionAttemptIds) {
+      for (const executionAttemptId of observation2.executionAttemptIds) {
         db.prepare(
           `INSERT OR IGNORE INTO lane_capacity_refresh_evidence (
              project_id, lane_capacity_observation_id, execution_attempt_id, observed_at_ms
            ) VALUES (?, ?, ?, ?)`
-        ).run(observation.projectId, observation.laneCapacityObservationId, executionAttemptId, observation.observedAtMs);
+        ).run(observation2.projectId, observation2.laneCapacityObservationId, executionAttemptId, observation2.observedAtMs);
       }
     })();
   };
@@ -23730,7 +24186,8 @@ ${thread.titleFallback ?? ""}`);
     };
     return {
       kind: "ready",
-      episodeKey: `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${holder.execution_attempt_id}:${holder.thread_id}:activeLanes=0:${queueHead}`,
+      episodeKey: fleetWatchdogEpisodeKey(holder, queueHead),
+      legacyEpisodeKey: fleetWatchdogLegacyEpisodeKey(holder, queueHead),
       role,
       message: `Idle fleet: queue head ${queueHead} is startable with zero active writing lanes. Dispatch it or record the blocker.`
     };
@@ -23786,6 +24243,7 @@ ${thread.titleFallback ?? ""}`);
     }
   });
   const stallGuardCycle = createStallGuardCycle({
+    onAmbiguous: (message) => bb.log.warn(message),
     readRoleHolders: () => db ? readRoleHolderStates(db) : [],
     readArtifact: async (projectId) => {
       if (!db) return null;
@@ -23804,6 +24262,15 @@ ${thread.titleFallback ?? ""}`);
         }
       }
       return artifacts;
+    },
+    readQueueHead: (projectId) => {
+      if (!db) return null;
+      const row = db.prepare(
+        `SELECT work_item_id, resource_revision FROM work_items
+         WHERE project_id = ? AND lifecycle_state IN ('proposed', 'ready')
+         ORDER BY created_at_ms, work_item_id LIMIT 1`
+      ).get(projectId);
+      return row ? { workItemId: row.work_item_id, resourceRevision: row.resource_revision } : null;
     },
     wakeRole: async (role) => {
       const result2 = await steerRole(role);
@@ -23832,7 +24299,15 @@ ${thread.titleFallback ?? ""}`);
   bb.events.on("thread.failed", async (payload) => {
     await observeCapacityAfter(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
     const { id: id2, status } = threadEventStatus(payload);
-    if (status === "error") await recoverErroredThread(id2, payload.thread.projectId);
+    if (status === "error") {
+      const identity = resolveRecoveryIdentity(payload.thread.projectId, id2);
+      if (identity === null) return;
+      if (identity.holder === void 0 && identity.lane === void 0) {
+        bb.log.warn(`error-recovery wake refused: project=${payload.thread.projectId} thread=${id2} reason=identity-unresolved`);
+        return;
+      }
+      await recoverErroredThread(id2, payload.thread.projectId, identity.holder, identity.lane);
+    }
   });
   bb.events.on("thread.archived", async (payload) => {
     await (async () => {
@@ -23995,10 +24470,12 @@ ${thread.titleFallback ?? ""}`);
            AND external_work_refs.issue_number IS NOT NULL`
       ).all(...WORK_ITEM_NON_TERMINAL_STATES, "succeeded")) projectIds.add(row.project_id);
       const lanesByProject = /* @__PURE__ */ new Map();
+      const dispatchWedgesByProject = /* @__PURE__ */ new Map();
       for (const projectId of projectIds) {
         if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
         const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? /* @__PURE__ */ new Set();
         const threads = [];
+        let threadInventoryReadable = true;
         try {
           for (let offset = 0; ; offset += 100) {
             const page = await bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset });
@@ -24006,7 +24483,15 @@ ${thread.titleFallback ?? ""}`);
             if (page.length < 100) break;
           }
         } catch (error48) {
-          degrade(`platform-parentage:${projectId}:${String(error48)}`);
+          threadInventoryReadable = false;
+          degrade(fleetWatchdogScope("platform-parentage", projectId, String(error48)));
+        }
+        if (threadInventoryReadable) {
+          const wedges = reconcilePreparedWorkItemDispatches(db, projectId, threads);
+          if (wedges.length > 0) {
+            dispatchWedgesByProject.set(projectId, wedges);
+            bb.log.warn(`fleet-watchdog dispatch wedge: project=${projectId} workItems=${wedges.map(({ workItemId }) => workItemId).join(",")}`);
+          }
         }
         const lanes = threads.filter(
           (thread) => thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null
@@ -24015,6 +24500,9 @@ ${thread.titleFallback ?? ""}`);
         lanesByProject.set(projectId, lanes);
       }
       const openWorkItemsByProject = /* @__PURE__ */ new Map();
+      const externalRevisions = /* @__PURE__ */ new Map();
+      const waitExternalRevisions = /* @__PURE__ */ new Map();
+      const waitExternalKey = (owner, repo, issueNumber) => `${owner}\0${repo}\0${issueNumber}`;
       for (const workItem of db.prepare(
         `SELECT work_items.project_id, work_items.work_item_id, work_items.lifecycle_state, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
          FROM work_items LEFT JOIN work_item_waits
@@ -24032,19 +24520,19 @@ ${thread.titleFallback ?? ""}`);
         try {
           [latest] = await bb.sdk.threads.events.list({ threadId, types: ["provider/rateLimits/updated"], order: "desc", limit: "1" });
         } catch (error48) {
-          degrade(`platform-rate-limit:${threadId}:${String(error48)}`);
+          degrade(fleetWatchdogScope("platform-rate-limit", threadId, String(error48)));
           return "unreadable";
         }
         const rateLimits = latest?.type === "provider/rateLimits/updated" ? latest.data.rateLimits : void 0;
         if (rateLimits === void 0 || rateLimits.status === "unknown") {
-          degrade(`platform-rate-limit:${threadId}:${rateLimits === void 0 ? "no-rate-limit-event-observed" : "provider-reports-unknown-rate-limit-state"}`);
+          degrade(fleetWatchdogScope("platform-rate-limit", threadId, rateLimits === void 0 ? "no-rate-limit-event-observed" : "provider-reports-unknown-rate-limit-state"));
           return "unobserved";
         }
         if (rateLimits.status !== "blocked" || rateLimits.kind !== "subscription-window") return "not-capped";
         const blocked = rateLimits.windows.filter((window) => window.status === "blocked");
         const resetsAtMs = blocked.flatMap((window) => window.resetsAtMs ?? []);
         if (blocked.length === 0 || resetsAtMs.length !== blocked.length) {
-          degrade(`platform-rate-limit:${threadId}:blocked-without-a-reset-time`);
+          degrade(fleetWatchdogScope("platform-rate-limit", threadId, "blocked-without-a-reset-time"));
           return "capped";
         }
         return resetsAtMs.every((resets) => resets <= now2) ? "not-capped" : "capped";
@@ -24060,14 +24548,14 @@ ${thread.titleFallback ?? ""}`);
             afterSeq = String(latest.seq);
           }
         } catch (error48) {
-          degrade(`platform-events:${threadId}:${String(error48)}`);
+          degrade(fleetWatchdogScope("platform-events", threadId, String(error48)));
         }
         return latest ? `${latest.type}@${latest.seq}` : "unknown";
       };
-      const wake = async (projectId, holder, key, text, requireIdle, kind, beforeSend) => {
+      const wake = async (projectId, holder, key, text, requireIdle, kind, beforeSend, staleWaitExternalRevision = null, staleWaitWaker = null, bypassNotificationFloor = false) => {
         const previous = await fleetWatchdogIdle.get(key);
         const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs : kind === "recovery" ? previous?.lastRecoveryWakeAtMs : kind === "startable-queue" ? previous?.lastStartableQueueWakeAtMs : kind === "stale-wait" ? previous?.lastStaleWaitWakeAtMs : kind === "owed-act" ? previous?.lastOwedActWakeAtMs : previous?.lastEscalationAtMs;
-        if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== void 0 && now2 - lastNotifiedAtMs < FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) return false;
+        if (!bypassNotificationFloor && lastNotifiedAtMs !== null && lastNotifiedAtMs !== void 0 && now2 - lastNotifiedAtMs < FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) return false;
         if (wakeInFlight.has(key)) return false;
         wakeInFlight.add(key);
         try {
@@ -24088,7 +24576,7 @@ ${thread.titleFallback ?? ""}`);
           if (kind === "fleet") await fleetWatchdogIdle.recordFleetWake(key, Date.now());
           else if (kind === "recovery") await fleetWatchdogIdle.recordRecoveryWake(key, now2);
           else if (kind === "startable-queue") await fleetWatchdogIdle.recordStartableQueueWake(key, Date.now());
-          else if (kind === "stale-wait") await fleetWatchdogIdle.recordStaleWaitWake(key, Date.now());
+          else if (kind === "stale-wait") await fleetWatchdogIdle.recordStaleWaitWake(key, Date.now(), staleWaitExternalRevision, staleWaitWaker);
           else if (kind === "owed-act") await fleetWatchdogIdle.recordOwedActWake(key, Date.now());
           else await fleetWatchdogIdle.recordEscalation(key, Date.now());
           return true;
@@ -24096,7 +24584,7 @@ ${thread.titleFallback ?? ""}`);
           wakeInFlight.delete(key);
         }
       };
-      const transitionWorkItem = (projectId, workItemId, state, idempotencyKey, extra = {}, githubSnapshot) => {
+      const transitionWorkItem = async (projectId, workItemId, state, idempotencyKey, extra = {}, githubSnapshot, legacyIdempotencyKey, terminalizationPolicy = "refuse-active") => {
         const actor = db.prepare(
           `SELECT receipt_id FROM actor_receipts
            WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
@@ -24116,7 +24604,7 @@ ${thread.titleFallback ?? ""}`);
         if (!actor || !governor || !config2 || !workItem) {
           return { outcome: "WORK_ITEM_STATE_INVALID", subject: workItemId, expected: 1, attempted: 0, verified: 0, message: "authority or work item unavailable" };
         }
-        return applyAuthorizedMutation(db, {
+        const request = {
           projectId,
           operationClass: "work_item_transition",
           idempotencyKey,
@@ -24129,7 +24617,27 @@ ${thread.titleFallback ?? ""}`);
           workItemId,
           lifecycleState: state,
           ...extra
-        }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
+        };
+        const compatibleKey = legacyIdempotencyKey !== void 0 && db.prepare(
+          "SELECT 1 FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ? AND request_digest = ?"
+        ).get(projectId, legacyIdempotencyKey, mutationRequestDigest({ ...request, idempotencyKey: legacyIdempotencyKey })) !== void 0 ? legacyIdempotencyKey : idempotencyKey;
+        return applyLiveAuthorizedMutation(bb, db, { ...request, idempotencyKey: compatibleKey }, false, terminalizationPolicy, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
+      };
+      const inspectWaitTargets = async (projectId) => {
+        for (const workItem of openWorkItemsByProject.get(projectId) ?? []) {
+          if (workItem.wakerKind !== "github_issue_closed" || workItem.waker === null) continue;
+          const match = workItem.waker.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u);
+          const issueNumber = match?.[3] === void 0 ? NaN : Number(match[3]);
+          if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
+            degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
+            continue;
+          }
+          const key = waitExternalKey(match[1], match[2], issueNumber);
+          if (waitExternalRevisions.has(key)) continue;
+          const observation2 = await linkedGithubObservationAsync(match[1], match[2], issueNumber);
+          if (observation2 === null) degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
+          else waitExternalRevisions.set(key, observation2);
+        }
       };
       const inspectLinkedWorkItems = async (projectId) => {
         const linkedWorkItems = db.prepare(
@@ -24144,15 +24652,16 @@ ${thread.titleFallback ?? ""}`);
            ORDER BY work_items.work_item_id`
         ).all(projectId, ...WORK_ITEM_NON_TERMINAL_STATES, "succeeded");
         for (const linked of linkedWorkItems) {
-          const observation = await linkedGithubObservationAsync(linked.owner, linked.repo, linked.issue_number);
-          if (observation === null) {
-            degrade(`github-work-item-status:${projectId}:${linked.work_item_id}`);
+          const observation2 = await linkedGithubObservationAsync(linked.owner, linked.repo, linked.issue_number);
+          if (observation2 === null) {
+            degrade(fleetWatchdogScope("github-work-item-status", projectId, linked.work_item_id));
             continue;
           }
+          externalRevisions.set(`${projectId}\0${linked.work_item_id}`, observation2);
           if (linked.lifecycle_state === "succeeded") {
-            if (!observation.issueOpen) continue;
+            if (!observation2.issueOpen) continue;
             const permanentReopenKey = fleetWatchdogReopenKey(projectId, linked.work_item_id);
-            const pendingReopenKey = fleetWatchdogReopenKey(projectId, linked.work_item_id, observation.externalRevision);
+            const pendingReopenKey = fleetWatchdogReopenKey(projectId, linked.work_item_id, observation2.externalRevision);
             const permanentRefusalReason = permanentlyRefusedReopens.get(permanentReopenKey);
             const pendingRefusalReason = pendingRefusedReopens.get(pendingReopenKey);
             const refusalReason = permanentRefusalReason ?? pendingRefusalReason;
@@ -24164,47 +24673,48 @@ ${thread.titleFallback ?? ""}`);
             try {
               githubSnapshot2 = await readGithubIssueForBackfillAsync(linked.owner, linked.repo, linked.issue_number);
             } catch {
-              degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
+              degrade(fleetWatchdogScope("github-work-item-reopen", projectId, linked.work_item_id));
               continue;
             }
-            const result3 = transitionWorkItem(
+            const result3 = await transitionWorkItem(
               projectId,
               linked.work_item_id,
               "ready",
-              `fleet-watchdog:issue-reopened:${linked.work_item_id}:${observation.externalRevision}`,
+              fleetWatchdogIssueReopenedKey(linked.work_item_id, observation2.externalRevision),
               { workItemExternalEvent: { kind: "github_issue_reopened", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } },
-              githubSnapshot2
+              githubSnapshot2,
+              fleetWatchdogLegacyIssueReopenedKey(linked.work_item_id, observation2.externalRevision)
             );
             if (result3.outcome === "OK") {
-              bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation.externalRevision}`);
+              bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation2.externalRevision}`);
             } else if (result3.outcome === "WORK_ITEM_STATE_INVALID" && (result3.structurallyImpossibleAtRevision === true || result3.message?.includes("GitHub reopen does not follow the exact recorded close observation"))) {
               const refusalReason2 = result3.message ?? "unknown";
               if (result3.structurallyImpossibleAtRevision === true) {
                 permanentlyRefusedReopens.set(permanentReopenKey, refusalReason2);
                 bb.log.warn(`fleet-watchdog learned permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${refusalReason2}`);
-              } else if (observation.externalRevision === githubSnapshot2.externalRevision) {
+              } else if (observation2.externalRevision === githubSnapshot2.externalRevision) {
                 pendingRefusedReopens.set(pendingReopenKey, refusalReason2);
                 bb.log.warn(`fleet-watchdog learned pending issue-reopen refusal: project=${projectId} workItem=${linked.work_item_id} reason=${refusalReason2}`);
               } else {
-                bb.log.warn(`fleet-watchdog did not learn issue-reopen refusal because GitHub revisions disagreed: project=${projectId} workItem=${linked.work_item_id} observationRevision=${observation.externalRevision} snapshotRevision=${githubSnapshot2.externalRevision} reason=${refusalReason2}`);
+                bb.log.warn(`fleet-watchdog did not learn issue-reopen refusal because GitHub revisions disagreed: project=${projectId} workItem=${linked.work_item_id} observationRevision=${observation2.externalRevision} snapshotRevision=${githubSnapshot2.externalRevision} reason=${refusalReason2}`);
               }
             } else {
-              degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
+              degrade(fleetWatchdogScope("github-work-item-reopen", projectId, linked.work_item_id));
               bb.log.warn(`fleet-watchdog issue-reopen transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result3.outcome} message=${result3.message ?? "unknown"}`);
             }
             continue;
           }
           if (linked.lifecycle_state === "blocked") continue;
-          if (observation.status !== "open") {
-            bb.log.warn(`fleet-watchdog stale-terminal work item: project=${projectId} workItem=${linked.work_item_id} linked=${linked.owner}/${linked.repo}#${linked.issue_number} status=${observation.status}`);
+          if (observation2.status !== "open") {
+            bb.log.warn(`fleet-watchdog stale-terminal work item: project=${projectId} workItem=${linked.work_item_id} linked=${linked.owner}/${linked.repo}#${linked.issue_number} status=${observation2.status}`);
           }
-          if (!observation.pullRequestMerged || !observation.issueClosed) continue;
+          if (!observation2.pullRequestMerged || !observation2.issueClosed) continue;
           const workItem = db.prepare(
             `SELECT resource_revision, lifecycle_state
              FROM work_items WHERE project_id = ? AND work_item_id = ?`
           ).get(projectId, linked.work_item_id);
           if (!workItem) {
-            degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
+            degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
             bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} reason=authority-or-work-item-unavailable`);
             continue;
           }
@@ -24212,25 +24722,27 @@ ${thread.titleFallback ?? ""}`);
           try {
             githubSnapshot = await readGithubIssueForBackfillAsync(linked.owner, linked.repo, linked.issue_number);
           } catch {
-            degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
+            degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
             continue;
           }
           const transition = (state) => transitionWorkItem(
             projectId,
             linked.work_item_id,
             state,
-            `fleet-watchdog:merge-close:${linked.work_item_id}:${state}:${githubSnapshot.externalRevision}`,
-            state === "succeeded" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
-            githubSnapshot
+            fleetWatchdogMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
+            state === "succeeded" || state === "cancelled" && workItem.lifecycle_state === "proposed" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
+            githubSnapshot,
+            fleetWatchdogLegacyMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
+            "stop-active"
           );
           let result2;
           if (workItem.lifecycle_state === "in_progress") {
-            result2 = transition("review_pending");
+            result2 = await transition("review_pending");
             if (result2.outcome === "OK") {
               const current = db.prepare(
                 "SELECT resource_revision, lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?"
               ).get(projectId, linked.work_item_id);
-              result2 = current?.lifecycle_state === "review_pending" ? transition("succeeded") : {
+              result2 = current?.lifecycle_state === "review_pending" ? await transition("succeeded") : {
                 outcome: "WORK_ITEM_REVISION_STALE",
                 subject: linked.work_item_id,
                 expected: 1,
@@ -24240,15 +24752,17 @@ ${thread.titleFallback ?? ""}`);
               };
             }
           } else if (workItem.lifecycle_state === "review_pending") {
-            result2 = transition("succeeded");
+            result2 = await transition("succeeded");
+          } else if (workItem.lifecycle_state === "proposed") {
+            result2 = await transition("cancelled");
           } else {
-            result2 = { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close automation requires in_progress or review_pending, found ${workItem.lifecycle_state}` };
+            result2 = { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close automation requires in_progress, review_pending, or proposed, found ${workItem.lifecycle_state}` };
           }
           if (result2.outcome === "OK") {
-            bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=review_pending`);
+            bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=${workItem.lifecycle_state === "proposed" ? "proposed-cancel" : "review_pending"}`);
           } else {
-            degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
-            bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result2.outcome}`);
+            degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
+            bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result2.outcome} message=${result2.message}`);
           }
         }
       };
@@ -24258,12 +24772,13 @@ ${thread.titleFallback ?? ""}`);
         try {
           if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
           await inspectLinkedWorkItems(projectId);
+          await inspectWaitTargets(projectId);
           const directors = holders.filter((holder) => holder.role_id === "director");
           const orchestrators = holders.filter((holder) => holder.role_id === "project-orchestrator");
           if (directors.length !== 1 || orchestrators.length !== 1) {
             if (directors.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active director holders=${directors.length}`);
             if (orchestrators.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active project-orchestrator holders=${orchestrators.length}`);
-            degrade(`routing:${projectId}:directors=${directors.length},orchestrators=${orchestrators.length}`);
+            degrade(fleetWatchdogScope("routing", projectId, `directors=${directors.length},orchestrators=${orchestrators.length}`));
             continue;
           }
           const director = directors[0];
@@ -24308,7 +24823,7 @@ ${thread.titleFallback ?? ""}`);
                 currentLane = await bb.sdk.threads.get({ threadId: lane.id });
               }
             } catch (error48) {
-              degrade(`platform-lane:${lane.id}:${String(error48)}`);
+              degrade(fleetWatchdogScope("platform-lane", lane.id, String(error48)));
               continue;
             }
             if (currentLane.archivedAt !== null || currentLane.deletedAt !== null) continue;
@@ -24320,7 +24835,7 @@ ${thread.titleFallback ?? ""}`);
                 const dispatcherThread = await bb.sdk.threads.get({ threadId: dispatcher.thread_id });
                 if (dispatcherThread.archivedAt !== null || dispatcherThread.deletedAt !== null || dispatcherThread.status === "error" || dispatcherThread.status === "stopping") recipient = director;
               } catch (error48) {
-                degrade(`platform-dispatcher:${dispatcher.thread_id}:${String(error48)}`);
+                degrade(fleetWatchdogScope("platform-dispatcher", dispatcher.thread_id, String(error48)));
                 recipient = director;
               }
             }
@@ -24329,16 +24844,16 @@ ${thread.titleFallback ?? ""}`);
                 (candidate) => candidate.project_id === projectId && candidate.role_id === recipient.role_id && isCurrent(candidate, recipient)
               );
               if (currentRecipients.length !== 1) {
-                degrade(`dispatcher:${lane.id}:stale-recipient`);
+                degrade(fleetWatchdogScope("dispatcher", lane.id, "stale-recipient"));
                 continue;
               }
               const recipientThread = await bb.sdk.threads.get({ threadId: recipient.thread_id });
               if (recipientThread.archivedAt !== null || recipientThread.deletedAt !== null || recipientThread.status === "error" || recipientThread.status === "stopping") {
-                degrade(`dispatcher:${lane.id}:unreachable`);
+                degrade(fleetWatchdogScope("dispatcher", lane.id, "unreachable"));
                 continue;
               }
               const event = await lastEvent(lane.id);
-              const strandedKey = `stranded:${projectId}:${lane.id}:${recipient.execution_attempt_id}`;
+              const strandedKey = JSON.stringify(["stranded", projectId, lane.id, recipient.execution_attempt_id]);
               const previous = await fleetWatchdogIdle.get(strandedKey);
               if (previous?.lastRecoveryWakeAtMs !== null && previous?.lastRecoveryWakeAtMs !== void 0 && now2 - previous.lastRecoveryWakeAtMs < FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) continue;
               await bb.sdk.threads.send({
@@ -24355,7 +24870,7 @@ ${thread.titleFallback ?? ""}`);
               brokenWakePath = true;
               bb.log.warn(`fleet-watchdog stranded lane surfaced: project=${projectId} lane=${lane.id} dispatcher=${recipient.role_id}@${recipient.role_generation} status=${observedStatus}`);
             } catch (error48) {
-              degrade(`dispatcher:${lane.id}:${String(error48)}`);
+              degrade(fleetWatchdogScope("dispatcher", lane.id, String(error48)));
             }
           }
           const workItems = openWorkItemsByProject.get(projectId) ?? [];
@@ -24386,6 +24901,16 @@ ${thread.titleFallback ?? ""}`);
                ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
              WHERE heads.project_id = ? ORDER BY targets.repo_target_id`
           ).all(projectId).map((target) => githubRepository(target.remote_url));
+          for (const wedge of dispatchWedgesByProject.get(projectId) ?? []) {
+            await wake(
+              projectId,
+              orchestrator,
+              roleIdleKey(orchestrator, `dispatch-wedge:${wedge.executionAttemptId}`),
+              `dispatch identity unresolved for WorkItem ${wedge.workItemId}; its writing slot remains held. Inspect the native thread and decide recovery or closure before dispatching another lane.`,
+              false,
+              "owed-act"
+            );
+          }
           const queue = repositories.length === 0 || repositories.some((repository) => repository === null) ? null : await startableQueueStateAsync(repositories);
           if (queue !== null) {
             const intake = `startable=${queue.count} unlabelled=${queue.unlabelledCount} blocked=${queue.blockedCount} waiting-external=${queue.waitingExternalCount}`;
@@ -24408,40 +24933,63 @@ ${thread.titleFallback ?? ""}`);
               ).get(projectId, blocked.waker);
               if (dependency?.lifecycle_state !== "succeeded") continue;
               condition = { kind: "work_item_succeeded", workItemId: blocked.waker };
-              idempotencyKey = `fleet-watchdog:blocker-fired:${blocked.workItemId}:${blocked.waker}`;
+              idempotencyKey = fleetWatchdogBlockerFiredKey(blocked.workItemId, blocked.waker);
             } else if (blocked.wakerKind === "github_issue_closed" && blocked.waker !== null) {
               const match = blocked.waker.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u);
               const issueNumber = match?.[3] === void 0 ? NaN : Number(match[3]);
               if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
-                degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
+                degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
                 continue;
               }
               try {
                 snapshot2 = await readGithubIssueForBackfillAsync(match[1], match[2], issueNumber);
               } catch {
-                degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
+                degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
                 continue;
               }
               if (snapshot2.state !== "closed") continue;
               condition = { kind: "github_issue_closed", owner: match[1], repo: match[2], issueNumber };
-              idempotencyKey = `fleet-watchdog:blocker-fired:${blocked.workItemId}:${snapshot2.externalRevision}`;
+              idempotencyKey = fleetWatchdogBlockerFiredKey(blocked.workItemId, snapshot2.externalRevision);
             } else {
-              degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
+              degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
               continue;
             }
-            const result2 = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot2);
+            const result2 = await transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot2, fleetWatchdogLegacyBlockerFiredKey(blocked.workItemId, snapshot2?.externalRevision ?? blocked.waker ?? ""));
             if (result2.outcome === "OK") {
               unblocked.add(blocked.workItemId);
               bb.log.info(`fleet-watchdog returned blocked work item to ready: project=${projectId} workItem=${blocked.workItemId} blocker=${blocked.wakerKind}`);
             } else {
-              degrade(`work-item-unblock:${projectId}:${blocked.workItemId}`);
+              degrade(fleetWatchdogScope("work-item-unblock", projectId, blocked.workItemId));
               bb.log.warn(`fleet-watchdog unblock transition refused: project=${projectId} workItem=${blocked.workItemId} outcome=${result2.outcome}`);
             }
           }
           const remainingWorkItems = workItems.filter((workItem) => !unblocked.has(workItem.workItemId));
-          const staleWait = remainingWorkItems.find((workItem) => workItem.declaredAtMs !== null && now2 - workItem.declaredAtMs >= staleWaitMs);
+          let staleWait;
+          let staleObservation;
+          let staleExternalMoved = false;
+          for (const candidate of remainingWorkItems) {
+            if (candidate.declaredAtMs === null || now2 - candidate.declaredAtMs < staleWaitMs) continue;
+            const targetMatch = candidate.wakerKind === "github_issue_closed" ? candidate.waker?.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u) ?? null : null;
+            const targetIssueNumber = targetMatch?.[3] === void 0 ? NaN : Number(targetMatch[3]);
+            const observation2 = targetMatch?.[1] && targetMatch[2] && Number.isSafeInteger(targetIssueNumber) ? waitExternalRevisions.get(waitExternalKey(targetMatch[1], targetMatch[2], targetIssueNumber)) : void 0;
+            if (!observation2) {
+              const record3 = await fleetWatchdogIdle.get(roleIdleKey(orchestrator, candidate.workItemId));
+              staleExternalMoved = record3?.lastStaleWaitWaker !== candidate.waker;
+              staleWait = candidate;
+              break;
+            }
+            const record2 = await fleetWatchdogIdle.get(roleIdleKey(orchestrator, candidate.workItemId));
+            const chased = record2?.lastStaleWaitWakeAtMs !== null && record2?.lastStaleWaitWakeAtMs !== void 0 && record2.lastStaleWaitWaker === candidate.waker && record2.lastStaleWaitExternalRevision === observation2.externalRevision;
+            const recheckMs = observation2.updatedAtMs === null || !chased ? FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS : Math.max(FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS, record2.lastStaleWaitWakeAtMs - observation2.updatedAtMs);
+            if (!chased || now2 - record2.lastStaleWaitWakeAtMs >= recheckMs) {
+              staleWait = candidate;
+              staleObservation = observation2;
+              staleExternalMoved = record2?.lastStaleWaitWaker !== candidate.waker || record2?.lastStaleWaitExternalRevision !== observation2.externalRevision;
+              break;
+            }
+          }
           if (staleWait) {
-            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait");
+            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait", void 0, staleObservation?.externalRevision ?? null, staleWait.waker, staleExternalMoved);
             continue;
           }
           const seatWait = remainingWorkItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null);
@@ -24496,16 +25044,16 @@ ${thread.titleFallback ?? ""}`);
             continue;
           }
         } catch (error48) {
-          degrade(`project:${projectId}:${String(error48)}`);
+          degrade(fleetWatchdogScope("project", projectId, String(error48)));
           bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
         }
       }
       if (!brokenWakePath && coverage === "visible") bb.log.info("fleet-watchdog healthy cycle");
     } catch (error48) {
-      degrade(`cycle:${String(error48)}`);
+      degrade(fleetWatchdogScope("cycle", String(error48)));
       bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
     } finally {
-      const message = `fleet-watchdog coverage=${coverage} seats=${visibleSeatCount} lanes=${visibleLaneCount} cannotSee=${cannotSee.size === 0 ? "none" : [...cannotSee].join("|")}`;
+      const message = `fleet-watchdog coverage=${coverage} seats=${visibleSeatCount} lanes=${visibleLaneCount} cannotSee=${cannotSee.size === 0 ? "none" : [...cannotSee].map(fleetWatchdogScopeMessage).join("|").replace(/\u0000/gu, ":")}`;
       if (coverage === "visible") bb.log.info(message);
       else bb.log.warn(message);
     }
@@ -24661,53 +25209,6 @@ ${thread.titleFallback ?? ""}`);
       await watcher.registerWait(wait);
       return wait;
     },
-    async threadStates(input) {
-      const entries = await Promise.all(input.threadIds.map(async (threadId) => {
-        const value = await bb.storage.kv.get(sidebarThreadStateKey(threadId));
-        const parsed = sidebarThreadStateSchema.safeParse(value);
-        return parsed.success ? [threadId, parsed.data] : null;
-      }));
-      return Object.fromEntries(entries.filter((entry) => entry !== null));
-    },
-    async threadModels(input) {
-      const entries = await Promise.all(input.threadIds.map(async (threadId) => {
-        try {
-          const options2 = await bb.sdk.threads.defaultExecutionOptions({ threadId });
-          return [threadId, options2 ? { model: options2.model, reasoning: options2.reasoningLevel } : null];
-        } catch {
-          return [threadId, null];
-        }
-      }));
-      return Object.fromEntries(entries);
-    },
-    async setThreadState(input) {
-      if (input.state === null) await bb.storage.kv.delete(sidebarThreadStateKey(input.threadId));
-      else await bb.storage.kv.set(sidebarThreadStateKey(input.threadId), input.state);
-      return { state: input.state };
-    },
-    async sidebarCollapseState(input) {
-      const read = async (kind, ids) => {
-        const entries = await Promise.all(ids.map(async (id2) => {
-          const value = await bb.storage.kv.get(sidebarCollapseKey(kind, id2));
-          return value === true ? [id2, true] : null;
-        }));
-        return Object.fromEntries(entries.filter((entry) => entry !== null));
-      };
-      return {
-        projects: await read("project", input.projectIds),
-        threads: await read("thread", input.threadIds)
-      };
-    },
-    async setSidebarCollapse(input) {
-      const key = sidebarCollapseKey(input.kind, input.id);
-      if (input.collapsed) await bb.storage.kv.set(key, true);
-      else await bb.storage.kv.delete(key);
-      return input;
-    },
-    async reorderPinned(input) {
-      await bb.sdk.threads.reorderPinned(input);
-      return { ok: true };
-    },
     async doctor(input) {
       return doctor(db, bb.sdk, input.projectId, readDiagnosticDivergence());
     },
@@ -24716,6 +25217,9 @@ ${thread.titleFallback ?? ""}`);
     },
     async apply(input) {
       return applyLiveAuthorizedMutation(bb, db, input);
+    },
+    async dispatchLane(input) {
+      return dispatchLane(bb, db, input);
     },
     async cachedConsumerRollout(input) {
       return applyLiveCachedConsumerRollout(bb, db, input, cliDeps);
@@ -24734,6 +25238,16 @@ ${thread.titleFallback ?? ""}`);
     }
   });
   bb.agents.registerTool({
+    name: "dispatch_lane",
+    description: "Dispatch one writing lane through the canonical registration seam.",
+    instructions: "Use this instead of spawning a lane directly. The request projectId must match the current thread project.",
+    parameters: dispatchLaneInputSchema,
+    async execute(input, context) {
+      if (input.request.projectId !== context.projectId) throw new Error("request projectId must exactly match the current thread project");
+      return JSON.stringify(await dispatchLane(bb, db, input));
+    }
+  });
+  bb.agents.registerTool({
     name: "send_to_operator",
     description: "Send a durable project-scoped message to the operator or supervisor without a model relay.",
     instructions: "Use this for actionable content directed to an external non-bb party. project_id must be the current thread's exact registered project.",
@@ -24743,7 +25257,7 @@ ${thread.titleFallback ?? ""}`);
       return JSON.stringify(await sendOperatorMessage(db, bb, input, context.threadId, notifyUrgent));
     }
   });
-  bb.agents.configure(() => ({ tools: ["send_to_operator"], skills: [] }));
+  bb.agents.configure(() => ({ tools: ["dispatch_lane", "send_to_operator"], skills: [] }));
   bb.cli.register({
     name: "collab",
     summary: "Inspect the bb-collab foundation and guarded conformance boundary",
@@ -24754,6 +25268,11 @@ ${thread.titleFallback ?? ""}`);
         name: "apply",
         summary: "Explicit foundation apply",
         usage: "bb collab apply --project PROJECT_ID --request JSON"
+      },
+      {
+        name: "dispatch-lane",
+        summary: "Spawn and register one writing lane atomically through the canonical seam",
+        usage: "bb collab dispatch-lane --project PROJECT_ID --request JSON --spawn JSON"
       },
       {
         name: "github-issue-backfill",
@@ -24823,7 +25342,14 @@ export {
   cliSchemaError,
   plugin as default,
   deployedDistFailureDetail,
+  fleetWatchdogBlockerFiredKey,
+  fleetWatchdogCompositeKey,
+  fleetWatchdogEpisodeKey,
+  fleetWatchdogIssueReopenedKey,
+  fleetWatchdogMergeCloseKey,
   fleetWatchdogReopenKey,
+  fleetWatchdogRoleLivenessKey,
+  fleetWatchdogScope,
   foundationResultSchema,
   isLiveCachedConsumerRolloutArtifact,
   readLiveRoleFactReader,

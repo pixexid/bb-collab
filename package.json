@@ -1,6 +1,7 @@
 {
   "name": "bb-plugin-bb-collab",
   "version": "0.1.0",
+  "workspaces": ["plugins/*", "packages/*"],
   "type": "module",
   "engines": {
     "bb": ">=0.37.0",
@@ -26,13 +27,16 @@
     "check:composed-pr": "node scripts/check-composed-pr.mjs",
     "executed-profile": "node scripts/read-executed-profile.mjs",
     "throughput-report": "node scripts/weekly-throughput-report.mjs",
-    "verify": "npm run typecheck && npm test && npm run build && node scripts/check-css-bundle.mjs && node scripts/role-brief-bundle.mjs && node scripts/check-dist.mjs && node scripts/check-production-reachability.mjs"
+    "verify": "npm run typecheck && npm test && npm run build && node scripts/check-css-bundle.mjs && node scripts/role-brief-bundle.mjs && node scripts/check-dist.mjs && node scripts/check-production-reachability.mjs",
+    "changeset": "changeset",
+    "version-packages": "changeset version"
   },
   "dependencies": {
     "zod": "4.3.6"
   },
   "devDependencies": {
     "@bb/plugin-sdk": "file:vendor/bb-plugin-sdk-0.4.1.tgz",
+    "@changesets/cli": "3.0.0",
     "@testing-library/react": "^16.3.2",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.0.0",
