@@ -23302,7 +23302,7 @@ async function plugin(bb, options = {}) {
       const coverage2 = "blind";
       const roleRestart2 = "blind";
       const laneRestart2 = "blind";
-      bb.log.error(`error-recovery coverage=${coverage2} event=armed roleRestart=${roleRestart2} roles=unknown laneRestart=${laneRestart2} lanes=unknown openWorkItems=unknown reason=canonical-inventory-unreadable:${String(error48)}`);
+      bb.log.error(`error-recovery coverage=${coverage2} event=blind roleRestart=${roleRestart2} roles=unknown laneRestart=${laneRestart2} lanes=unknown openWorkItems=unknown reason=canonical-inventory-unreadable:${String(error48)}`);
       return;
     }
     let failedRoles = 0;

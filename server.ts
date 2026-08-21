@@ -1855,7 +1855,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       const coverage = "blind";
       const roleRestart = "blind";
       const laneRestart = "blind";
-      bb.log.error(`error-recovery coverage=${coverage} event=armed roleRestart=${roleRestart} roles=unknown laneRestart=${laneRestart} lanes=unknown openWorkItems=unknown reason=canonical-inventory-unreadable:${String(error)}`);
+      bb.log.error(`error-recovery coverage=${coverage} event=blind roleRestart=${roleRestart} roles=unknown laneRestart=${laneRestart} lanes=unknown openWorkItems=unknown reason=canonical-inventory-unreadable:${String(error)}`);
       return;
     }
     let failedRoles = 0;

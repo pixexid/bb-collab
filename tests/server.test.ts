@@ -3274,7 +3274,7 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     const service = fixture.host.harness.runService("lane-watcher");
     await vi.waitFor(() => expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
       level: "error",
-      message: expect.stringContaining("error-recovery coverage=blind event=armed roleRestart=blind roles=unknown laneRestart=blind lanes=unknown openWorkItems=unknown reason=canonical-inventory-unreadable:"),
+      message: expect.stringContaining("error-recovery coverage=blind event=blind roleRestart=blind roles=unknown laneRestart=blind lanes=unknown openWorkItems=unknown reason=canonical-inventory-unreadable:"),
     })));
     service.controller.abort();
     await service.done;
