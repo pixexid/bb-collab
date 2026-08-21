@@ -624,6 +624,45 @@ describe("lane awareness", () => {
     }
   });
 
+  it("flushes suppressed blind occurrences on disposal without double-reporting", async () => {
+    const onBlind = vi.fn();
+    const detector = createIdleFleetDetector({
+      read: async (): Promise<IdleFleetDecision> => ({ kind: "silent" }),
+      readRearmProbes: async () => [],
+      wake: async () => true,
+      onBlind,
+      capacity: {
+        readProjectIds: async () => [],
+        observe: vi.fn().mockRejectedValue(new Error("interval read failed")),
+        close: vi.fn(),
+      },
+    });
+
+    await detector.observeCapacity("project-1");
+    await detector.observeCapacity("project-1");
+    detector.stop();
+    detector.stop();
+
+    expect(onBlind).toHaveBeenNthCalledWith(1, expect.stringContaining("occurrences=1"));
+    expect(onBlind).toHaveBeenNthCalledWith(2, expect.stringContaining("occurrences=2"));
+    expect(onBlind).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not emit an empty blind aggregate on disposal", async () => {
+    const onBlind = vi.fn();
+    const detector = createIdleFleetDetector({
+      read: async (): Promise<IdleFleetDecision> => ({ kind: "silent" }),
+      readRearmProbes: async () => [],
+      wake: async () => true,
+      onBlind,
+      capacity: { readProjectIds: async () => [], observe: vi.fn(), close: vi.fn() },
+    });
+
+    detector.stop();
+
+    expect(onBlind).not.toHaveBeenCalled();
+  });
+
   it("cancels queued capacity reads after disposal and closes once", async () => {
     let releaseFirst!: () => void;
     const first = new Promise<void>((resolve) => { releaseFirst = resolve; });

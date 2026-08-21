@@ -957,22 +957,37 @@ export function createIdleFleetDetector(options: {
   const blindReportIntervalMs = 1_000;
   let lastBlindMessage: string | null = null;
   let blindOccurrences = 0;
+  let lastReportedOccurrences = 0;
   let lastBlindReportAt = 0;
+  const emitBlind = (message: string, occurrences: number) => {
+    try {
+      options.onBlind(`${message} occurrences=${occurrences}`);
+    } catch {
+      // Coverage reporting cannot keep the detector from re-arming.
+    }
+  };
+  const flushBlind = () => {
+    if (lastBlindMessage !== null && blindOccurrences > lastReportedOccurrences) {
+      emitBlind(lastBlindMessage, blindOccurrences);
+    }
+    lastBlindMessage = null;
+    blindOccurrences = 0;
+    lastReportedOccurrences = 0;
+    lastBlindReportAt = 0;
+  };
   const reportBlind = (message: string) => {
     const now = Date.now();
     if (message === lastBlindMessage) {
       blindOccurrences += 1;
       if (now - lastBlindReportAt < blindReportIntervalMs) return;
     } else {
+      flushBlind();
       lastBlindMessage = message;
       blindOccurrences = 1;
     }
     lastBlindReportAt = now;
-    try {
-      options.onBlind(`${message} occurrences=${blindOccurrences}`);
-    } catch {
-      // Coverage reporting cannot keep the detector from re-arming.
-    }
+    lastReportedOccurrences = blindOccurrences;
+    emitBlind(message, blindOccurrences);
   };
 
   const evaluate = async (probe: IdleFleetProbe) => {
@@ -1064,6 +1079,7 @@ export function createIdleFleetDetector(options: {
       stopped = true;
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
+      flushBlind();
       try {
         options.capacity?.close();
       } catch (error) {

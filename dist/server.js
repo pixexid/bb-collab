@@ -14437,21 +14437,36 @@ function createIdleFleetDetector(options) {
   const blindReportIntervalMs = 1e3;
   let lastBlindMessage = null;
   let blindOccurrences = 0;
+  let lastReportedOccurrences = 0;
   let lastBlindReportAt = 0;
+  const emitBlind = (message, occurrences) => {
+    try {
+      options.onBlind(`${message} occurrences=${occurrences}`);
+    } catch {
+    }
+  };
+  const flushBlind = () => {
+    if (lastBlindMessage !== null && blindOccurrences > lastReportedOccurrences) {
+      emitBlind(lastBlindMessage, blindOccurrences);
+    }
+    lastBlindMessage = null;
+    blindOccurrences = 0;
+    lastReportedOccurrences = 0;
+    lastBlindReportAt = 0;
+  };
   const reportBlind = (message) => {
     const now2 = Date.now();
     if (message === lastBlindMessage) {
       blindOccurrences += 1;
       if (now2 - lastBlindReportAt < blindReportIntervalMs) return;
     } else {
+      flushBlind();
       lastBlindMessage = message;
       blindOccurrences = 1;
     }
     lastBlindReportAt = now2;
-    try {
-      options.onBlind(`${message} occurrences=${blindOccurrences}`);
-    } catch {
-    }
+    lastReportedOccurrences = blindOccurrences;
+    emitBlind(message, blindOccurrences);
   };
   const evaluate = async (probe) => {
     try {
@@ -14539,6 +14554,7 @@ function createIdleFleetDetector(options) {
       stopped = true;
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
+      flushBlind();
       try {
         options.capacity?.close();
       } catch (error48) {
