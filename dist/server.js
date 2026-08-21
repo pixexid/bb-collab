@@ -13866,8 +13866,11 @@ function createWaitRegistry(persistence) {
     })
   };
 }
+function roleIdlePrefix(holder) {
+  return `${JSON.stringify([holder.project_id, holder.role_id, holder.role_generation]).slice(0, -1)},`;
+}
 function roleIdleKey(holder, queueHeadId) {
-  return `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${queueHeadId}`;
+  return `${roleIdlePrefix(holder)}${JSON.stringify(queueHeadId)}]`;
 }
 function roleIdleState(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) return {};
@@ -14018,7 +14021,8 @@ function createRoleIdleLedger(persistence) {
     }),
     clearWakeHistory: (prefix) => enqueue(async () => {
       await load();
-      for (const key of Object.keys(state)) if (key.startsWith(prefix)) state[key] = { ...state[key], idleSinceMs: null, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastStaleWaitExternalRevision: null, lastStaleWaitWaker: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
+      const encodedPrefix = prefix.endsWith(":") ? `${JSON.stringify([prefix.slice(0, -1)]).slice(0, -1)},` : prefix;
+      for (const key of Object.keys(state)) if (key.startsWith(prefix) || key.startsWith(encodedPrefix)) state[key] = { ...state[key], idleSinceMs: null, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastStaleWaitExternalRevision: null, lastStaleWaitWaker: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
       await save();
     })
   };
@@ -14177,7 +14181,7 @@ function createLaneWatcher(options) {
       if (projectHolders.length !== 1 || !holder.thread_id) continue;
       const targetThreadId = holder.thread_id;
       if (threadId && targetThreadId !== threadId) continue;
-      const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
+      const prefix = roleIdlePrefix(holder);
       const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
       let observation2;
       try {
@@ -14276,8 +14280,8 @@ function createLaneWatcher(options) {
     }
     const scope = scopes.find((candidate) => candidate.projectId === role.projectId);
     if (!scope?.nextStartable || scope.queueHeadId !== role.queueHeadId || scope.deferredReason || observation2.projectId !== role.projectId || observation2.status !== "idle" || observation2.archived || observation2.pendingExternalWait || observation2.operatorWait || observation2.operatorWaitKnown === false || observation2.idleSinceMs === null || observation2.idleSinceMs === void 0 || !Number.isFinite(observation2.idleSinceMs)) return { attempted: false, delivered: false, refusal: "policy" };
-    const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
-    const key = `${prefix}${scope.queueHeadId}`;
+    const prefix = roleIdlePrefix(holder);
+    const key = roleIdleKey(holder, scope.queueHeadId);
     await roleIdleLedger.clearPrefixExcept(prefix, key);
     const currentNow = now2();
     const record2 = await roleIdleLedger.observeIdle(key, observation2.idleSinceMs);
@@ -14422,7 +14426,8 @@ function createIdleFleetDetector(options) {
   let loaded = false;
   let stopped = false;
   const capacityQueues = /* @__PURE__ */ new Map();
-  const probeKey = (probe) => `${probe.projectId}:${probe.threadId}`;
+  const probeKey = (probe) => JSON.stringify([probe.projectId, probe.threadId]);
+  const legacyProbeKey = (probe) => `${probe.projectId}:${probe.threadId}`;
   const load = async () => {
     if (loaded) return;
     state = idleFleetWakeState(options.persistence ? await options.persistence.read() : null);
@@ -14455,7 +14460,22 @@ function createIdleFleetDetector(options) {
         reportBlind(decision.message);
         return;
       }
+      const legacyKey = legacyProbeKey(probe);
+      if (state[legacyKey] !== void 0) {
+        if (state[key] !== void 0) {
+          reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=ambiguous-migration:${key}`);
+          return;
+        }
+        state[key] = state[legacyKey];
+        delete state[legacyKey];
+        await save();
+      }
       if (state[key] === decision.episodeKey) return;
+      if (decision.legacyEpisodeKey !== void 0 && state[key] === decision.legacyEpisodeKey) {
+        state[key] = decision.episodeKey;
+        await save();
+        return;
+      }
       if (!await options.wake({ ...decision, probe })) return;
       state[key] = decision.episodeKey;
       await save();
@@ -15801,7 +15821,7 @@ var reviewTargetSchema = external_exports.object({
   tierAEntries: sortedIdSetSchema
 }).strict();
 var reviewScopeSchema = external_exports.object({ targets: external_exports.array(reviewTargetSchema).min(1).max(32) }).strict().superRefine((scope, ctx) => {
-  const keys = scope.targets.map((target) => `${target.workItemId}\0${target.repoTargetId}`);
+  const keys = scope.targets.map((target) => JSON.stringify([target.workItemId, target.repoTargetId]));
   if (new Set(scope.targets.map((target) => target.workItemId)).size !== scope.targets.length) {
     ctx.addIssue({ code: "custom", path: ["targets"], message: "one WorkItem cannot span multiple review targets" });
   }
@@ -15812,7 +15832,7 @@ var reviewScopeSchema = external_exports.object({ targets: external_exports.arra
 var connectorPolicySchema = external_exports.enum(["required", "optional", "prohibited"]);
 var reviewConnectorSchema = external_exports.object({ repoTargetId: id, connectorId: id, policy: connectorPolicySchema }).strict();
 var reviewConnectorsSchema = external_exports.array(reviewConnectorSchema).min(1).max(128).superRefine((connectors, ctx) => {
-  const keys = connectors.map((connector) => `${connector.repoTargetId}\0${connector.connectorId}`);
+  const keys = connectors.map((connector) => JSON.stringify([connector.repoTargetId, connector.connectorId]));
   if (new Set(keys).size !== keys.length) {
     ctx.addIssue({ code: "custom", message: "review connector mappings must be duplicate-free" });
   }
@@ -19904,7 +19924,7 @@ function backfillWorkItemGithubIssues(db, projectId, reader, epochCreatedAtMs = 
           github: mapping.github,
           mapping: mapping.mapping,
           issueNumber,
-          idempotencyKey: `github-issue-backfill:${projectId}:${row.work_item_id}`,
+          idempotencyKey: `github-issue-backfill:${JSON.stringify([projectId, row.work_item_id])}`,
           requestDigest: sha256(canonicalJson({ projectId, workItemId: row.work_item_id, epochCreatedAtMs: result2.epochCreatedAtMs, configRevision: result2.configRevision })),
           observed: snapshot2
         });
@@ -20542,7 +20562,7 @@ async function routingDoctorEvidence(sdk, projectId, roleGenerationHeads) {
   const buckets = /* @__PURE__ */ new Map();
   for (const { thread, profile } of workerProfiles) {
     if (!profile) continue;
-    const key = `${profile.providerId}\0${profile.model}\0${profile.reasoningLevel}`;
+    const key = JSON.stringify([profile.providerId, profile.model, profile.reasoningLevel]);
     const bucket = buckets.get(key) ?? { ...profile, count: 0, threadIds: [] };
     bucket.count += 1;
     bucket.threadIds.push(thread.id);
@@ -21036,8 +21056,20 @@ function createStallGuardCycle(options) {
       let attempted = 0;
       let verified = 0;
       let steered = 0;
+      let ambiguous = 0;
       for (const holder of holders) {
-        const key = `${holder.project_id}:${holder.role_id}`;
+        const key = JSON.stringify([holder.project_id, holder.role_id]);
+        const legacyKey = `${holder.project_id}:${holder.role_id}`;
+        if (nextState[legacyKey] !== void 0) {
+          if (nextState[key] !== void 0) {
+            ambiguous += 1;
+            options.onAmbiguous?.(`stall-guard ambiguous migration: ${key}`);
+            continue;
+          }
+          nextState[key] = nextState[legacyKey];
+          delete nextState[legacyKey];
+          changed += 1;
+        }
         const current = await readArtifacts(holder.project_id);
         if (current === null) continue;
         const queueHead = options.readQueueHead ? options.readQueueHead(holder.project_id) : void 0;
@@ -21093,7 +21125,7 @@ function createStallGuardCycle(options) {
         await options.persistence.write(nextState);
         state = nextState;
       }
-      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered };
+      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered, ambiguous };
     }
   };
 }
@@ -21861,7 +21893,50 @@ import { execFile, spawnSync as spawnSync2 } from "node:child_process";
 import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute2, join as join5, relative as relative2, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 var ERROR_RECOVERY_IO_TIMEOUT_MS = 1e4;
-var fleetWatchdogReopenKey = (projectId, workItemId, externalRevision) => [projectId, workItemId, externalRevision].filter((value) => value !== void 0).join("\0");
+var fleetWatchdogCompositeKey = (...parts) => JSON.stringify(parts);
+var fleetWatchdogIssueReopenedKey = (workItemId, externalRevision) => `fleet-watchdog:issue-reopened:${fleetWatchdogCompositeKey(workItemId, externalRevision)}`;
+var fleetWatchdogLegacyIssueReopenedKey = (workItemId, externalRevision) => `fleet-watchdog:issue-reopened:${workItemId}:${externalRevision}`;
+var fleetWatchdogMergeCloseKey = (workItemId, state, externalRevision) => `fleet-watchdog:merge-close:${fleetWatchdogCompositeKey(workItemId, state, externalRevision)}`;
+var fleetWatchdogLegacyMergeCloseKey = (workItemId, state, externalRevision) => `fleet-watchdog:merge-close:${workItemId}:${state}:${externalRevision}`;
+var fleetWatchdogBlockerFiredKey = (workItemId, subject) => `fleet-watchdog:blocker-fired:${fleetWatchdogCompositeKey(workItemId, subject)}`;
+var fleetWatchdogLegacyBlockerFiredKey = (workItemId, subject) => `fleet-watchdog:blocker-fired:${workItemId}:${subject}`;
+var fleetWatchdogRoleLivenessKey = (holder) => fleetWatchdogCompositeKey(
+  holder.project_id,
+  holder.role_id,
+  String(holder.role_generation),
+  holder.execution_attempt_id,
+  holder.thread_id
+);
+var fleetWatchdogEpisodeKey = (holder, queueHead) => fleetWatchdogCompositeKey(
+  holder.project_id,
+  holder.role_id,
+  String(holder.role_generation),
+  holder.execution_attempt_id,
+  holder.thread_id,
+  "activeLanes=0",
+  queueHead
+);
+var fleetWatchdogLegacyEpisodeKey = (holder, queueHead) => [
+  holder.project_id,
+  holder.role_id,
+  holder.role_generation,
+  holder.execution_attempt_id,
+  holder.thread_id,
+  "activeLanes=0",
+  queueHead
+].join(":");
+var fleetWatchdogScope = (prefix, ...parts) => `${prefix}:${fleetWatchdogCompositeKey(...parts)}`;
+var fleetWatchdogScopeMessage = (scope) => {
+  const separator = scope.indexOf(":");
+  if (separator < 0) return scope;
+  try {
+    const parts = JSON.parse(scope.slice(separator + 1));
+    return `${scope.slice(0, separator)}:${Array.isArray(parts) ? parts.join(":") : scope.slice(separator + 1)}`;
+  } catch {
+    return scope;
+  }
+};
+var fleetWatchdogReopenKey = (projectId, workItemId, externalRevision) => fleetWatchdogCompositeKey(...[projectId, workItemId, externalRevision].filter((value) => value !== void 0));
 function githubRepository(remoteUrl) {
   const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
   return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : null;
@@ -22080,7 +22155,8 @@ var sidebarThreadStateKey = (threadId) => `sidebar.thread-state:${threadId}`;
 var sidebarReasoningLevelSchema = external_exports.enum(["none", "low", "medium", "high", "xhigh", "ultracode", "max", "ultra"]);
 var sidebarThreadExecutionSchema = external_exports.object({ model: external_exports.string(), reasoning: sidebarReasoningLevelSchema }).strict();
 var sidebarCollapseKindSchema = external_exports.enum(["project", "thread"]);
-var sidebarCollapseKey = (kind, id2) => `sidebar.collapse:${kind}:${id2}`;
+var sidebarCollapseKey = (kind, id2) => `sidebar.collapse:${JSON.stringify([kind, id2])}`;
+var legacySidebarCollapseKey = (kind, id2) => `sidebar.collapse:${kind}:${id2}`;
 var roleBriefRoleSchema = external_exports.enum(["director", "orchestrator", "worker"]);
 var roleBriefBundleSchema = external_exports.object({
   ponytail: external_exports.string().min(1),
@@ -23425,7 +23501,7 @@ async function plugin(bb, options = {}) {
     write: (state) => bb.storage.kv.set("lane-watcher.role-idle", state)
   };
   const roleLivenessWarnings = /* @__PURE__ */ new Map();
-  const roleLivenessKey = (holder) => `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${holder.execution_attempt_id}:${holder.thread_id}`;
+  const roleLivenessKey = fleetWatchdogRoleLivenessKey;
   const warnRoleLiveness = (holder, evidence) => {
     const key = roleLivenessKey(holder);
     if (roleLivenessWarnings.get(key) === evidence) return;
@@ -23843,7 +23919,8 @@ ${thread.titleFallback ?? ""}`);
     };
     return {
       kind: "ready",
-      episodeKey: `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${holder.execution_attempt_id}:${holder.thread_id}:activeLanes=0:${queueHead}`,
+      episodeKey: fleetWatchdogEpisodeKey(holder, queueHead),
+      legacyEpisodeKey: fleetWatchdogLegacyEpisodeKey(holder, queueHead),
       role,
       message: `Idle fleet: queue head ${queueHead} is startable with zero active writing lanes. Dispatch it or record the blocker.`
     };
@@ -23899,6 +23976,7 @@ ${thread.titleFallback ?? ""}`);
     }
   });
   const stallGuardCycle = createStallGuardCycle({
+    onAmbiguous: (message) => bb.log.warn(message),
     readRoleHolders: () => db ? readRoleHolderStates(db) : [],
     readArtifact: async (projectId) => {
       if (!db) return null;
@@ -24136,7 +24214,7 @@ ${thread.titleFallback ?? ""}`);
             if (page.length < 100) break;
           }
         } catch (error48) {
-          degrade(`platform-parentage:${projectId}:${String(error48)}`);
+          degrade(fleetWatchdogScope("platform-parentage", projectId, String(error48)));
         }
         const lanes = threads.filter(
           (thread) => thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null
@@ -24165,19 +24243,19 @@ ${thread.titleFallback ?? ""}`);
         try {
           [latest] = await bb.sdk.threads.events.list({ threadId, types: ["provider/rateLimits/updated"], order: "desc", limit: "1" });
         } catch (error48) {
-          degrade(`platform-rate-limit:${threadId}:${String(error48)}`);
+          degrade(fleetWatchdogScope("platform-rate-limit", threadId, String(error48)));
           return "unreadable";
         }
         const rateLimits = latest?.type === "provider/rateLimits/updated" ? latest.data.rateLimits : void 0;
         if (rateLimits === void 0 || rateLimits.status === "unknown") {
-          degrade(`platform-rate-limit:${threadId}:${rateLimits === void 0 ? "no-rate-limit-event-observed" : "provider-reports-unknown-rate-limit-state"}`);
+          degrade(fleetWatchdogScope("platform-rate-limit", threadId, rateLimits === void 0 ? "no-rate-limit-event-observed" : "provider-reports-unknown-rate-limit-state"));
           return "unobserved";
         }
         if (rateLimits.status !== "blocked" || rateLimits.kind !== "subscription-window") return "not-capped";
         const blocked = rateLimits.windows.filter((window) => window.status === "blocked");
         const resetsAtMs = blocked.flatMap((window) => window.resetsAtMs ?? []);
         if (blocked.length === 0 || resetsAtMs.length !== blocked.length) {
-          degrade(`platform-rate-limit:${threadId}:blocked-without-a-reset-time`);
+          degrade(fleetWatchdogScope("platform-rate-limit", threadId, "blocked-without-a-reset-time"));
           return "capped";
         }
         return resetsAtMs.every((resets) => resets <= now2) ? "not-capped" : "capped";
@@ -24193,7 +24271,7 @@ ${thread.titleFallback ?? ""}`);
             afterSeq = String(latest.seq);
           }
         } catch (error48) {
-          degrade(`platform-events:${threadId}:${String(error48)}`);
+          degrade(fleetWatchdogScope("platform-events", threadId, String(error48)));
         }
         return latest ? `${latest.type}@${latest.seq}` : "unknown";
       };
@@ -24229,7 +24307,7 @@ ${thread.titleFallback ?? ""}`);
           wakeInFlight.delete(key);
         }
       };
-      const transitionWorkItem = (projectId, workItemId, state, idempotencyKey, extra = {}, githubSnapshot) => {
+      const transitionWorkItem = (projectId, workItemId, state, idempotencyKey, extra = {}, githubSnapshot, legacyIdempotencyKey) => {
         const actor = db.prepare(
           `SELECT receipt_id FROM actor_receipts
            WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
@@ -24249,7 +24327,7 @@ ${thread.titleFallback ?? ""}`);
         if (!actor || !governor || !config2 || !workItem) {
           return { outcome: "WORK_ITEM_STATE_INVALID", subject: workItemId, expected: 1, attempted: 0, verified: 0, message: "authority or work item unavailable" };
         }
-        return applyAuthorizedMutation(db, {
+        const request = {
           projectId,
           operationClass: "work_item_transition",
           idempotencyKey,
@@ -24262,7 +24340,11 @@ ${thread.titleFallback ?? ""}`);
           workItemId,
           lifecycleState: state,
           ...extra
-        }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
+        };
+        const compatibleKey = legacyIdempotencyKey !== void 0 && db.prepare(
+          "SELECT 1 FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ? AND request_digest = ?"
+        ).get(projectId, legacyIdempotencyKey, mutationRequestDigest({ ...request, idempotencyKey: legacyIdempotencyKey })) !== void 0 ? legacyIdempotencyKey : idempotencyKey;
+        return applyAuthorizedMutation(db, { ...request, idempotencyKey: compatibleKey }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
       };
       const inspectWaitTargets = async (projectId) => {
         for (const workItem of openWorkItemsByProject.get(projectId) ?? []) {
@@ -24295,7 +24377,7 @@ ${thread.titleFallback ?? ""}`);
         for (const linked of linkedWorkItems) {
           const observation2 = await linkedGithubObservationAsync(linked.owner, linked.repo, linked.issue_number);
           if (observation2 === null) {
-            degrade(`github-work-item-status:${projectId}:${linked.work_item_id}`);
+            degrade(fleetWatchdogScope("github-work-item-status", projectId, linked.work_item_id));
             continue;
           }
           externalRevisions.set(`${projectId}\0${linked.work_item_id}`, observation2);
@@ -24314,16 +24396,17 @@ ${thread.titleFallback ?? ""}`);
             try {
               githubSnapshot2 = await readGithubIssueForBackfillAsync(linked.owner, linked.repo, linked.issue_number);
             } catch {
-              degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
+              degrade(fleetWatchdogScope("github-work-item-reopen", projectId, linked.work_item_id));
               continue;
             }
             const result3 = transitionWorkItem(
               projectId,
               linked.work_item_id,
               "ready",
-              `fleet-watchdog:issue-reopened:${linked.work_item_id}:${observation2.externalRevision}`,
+              fleetWatchdogIssueReopenedKey(linked.work_item_id, observation2.externalRevision),
               { workItemExternalEvent: { kind: "github_issue_reopened", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } },
-              githubSnapshot2
+              githubSnapshot2,
+              fleetWatchdogLegacyIssueReopenedKey(linked.work_item_id, observation2.externalRevision)
             );
             if (result3.outcome === "OK") {
               bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation2.externalRevision}`);
@@ -24339,7 +24422,7 @@ ${thread.titleFallback ?? ""}`);
                 bb.log.warn(`fleet-watchdog did not learn issue-reopen refusal because GitHub revisions disagreed: project=${projectId} workItem=${linked.work_item_id} observationRevision=${observation2.externalRevision} snapshotRevision=${githubSnapshot2.externalRevision} reason=${refusalReason2}`);
               }
             } else {
-              degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
+              degrade(fleetWatchdogScope("github-work-item-reopen", projectId, linked.work_item_id));
               bb.log.warn(`fleet-watchdog issue-reopen transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result3.outcome} message=${result3.message ?? "unknown"}`);
             }
             continue;
@@ -24354,7 +24437,7 @@ ${thread.titleFallback ?? ""}`);
              FROM work_items WHERE project_id = ? AND work_item_id = ?`
           ).get(projectId, linked.work_item_id);
           if (!workItem) {
-            degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
+            degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
             bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} reason=authority-or-work-item-unavailable`);
             continue;
           }
@@ -24362,16 +24445,17 @@ ${thread.titleFallback ?? ""}`);
           try {
             githubSnapshot = await readGithubIssueForBackfillAsync(linked.owner, linked.repo, linked.issue_number);
           } catch {
-            degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
+            degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
             continue;
           }
           const transition = (state) => transitionWorkItem(
             projectId,
             linked.work_item_id,
             state,
-            `fleet-watchdog:merge-close:${linked.work_item_id}:${state}:${githubSnapshot.externalRevision}`,
+            fleetWatchdogMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
             state === "succeeded" || state === "cancelled" && workItem.lifecycle_state === "proposed" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
-            githubSnapshot
+            githubSnapshot,
+            fleetWatchdogLegacyMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision)
           );
           let result2;
           if (workItem.lifecycle_state === "in_progress") {
@@ -24399,7 +24483,7 @@ ${thread.titleFallback ?? ""}`);
           if (result2.outcome === "OK") {
             bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=${workItem.lifecycle_state === "proposed" ? "proposed-cancel" : "review_pending"}`);
           } else {
-            degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
+            degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
             bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result2.outcome} message=${result2.message}`);
           }
         }
@@ -24416,7 +24500,7 @@ ${thread.titleFallback ?? ""}`);
           if (directors.length !== 1 || orchestrators.length !== 1) {
             if (directors.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active director holders=${directors.length}`);
             if (orchestrators.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active project-orchestrator holders=${orchestrators.length}`);
-            degrade(`routing:${projectId}:directors=${directors.length},orchestrators=${orchestrators.length}`);
+            degrade(fleetWatchdogScope("routing", projectId, `directors=${directors.length},orchestrators=${orchestrators.length}`));
             continue;
           }
           const director = directors[0];
@@ -24461,7 +24545,7 @@ ${thread.titleFallback ?? ""}`);
                 currentLane = await bb.sdk.threads.get({ threadId: lane.id });
               }
             } catch (error48) {
-              degrade(`platform-lane:${lane.id}:${String(error48)}`);
+              degrade(fleetWatchdogScope("platform-lane", lane.id, String(error48)));
               continue;
             }
             if (currentLane.archivedAt !== null || currentLane.deletedAt !== null) continue;
@@ -24473,7 +24557,7 @@ ${thread.titleFallback ?? ""}`);
                 const dispatcherThread = await bb.sdk.threads.get({ threadId: dispatcher.thread_id });
                 if (dispatcherThread.archivedAt !== null || dispatcherThread.deletedAt !== null || dispatcherThread.status === "error" || dispatcherThread.status === "stopping") recipient = director;
               } catch (error48) {
-                degrade(`platform-dispatcher:${dispatcher.thread_id}:${String(error48)}`);
+                degrade(fleetWatchdogScope("platform-dispatcher", dispatcher.thread_id, String(error48)));
                 recipient = director;
               }
             }
@@ -24482,16 +24566,16 @@ ${thread.titleFallback ?? ""}`);
                 (candidate) => candidate.project_id === projectId && candidate.role_id === recipient.role_id && isCurrent(candidate, recipient)
               );
               if (currentRecipients.length !== 1) {
-                degrade(`dispatcher:${lane.id}:stale-recipient`);
+                degrade(fleetWatchdogScope("dispatcher", lane.id, "stale-recipient"));
                 continue;
               }
               const recipientThread = await bb.sdk.threads.get({ threadId: recipient.thread_id });
               if (recipientThread.archivedAt !== null || recipientThread.deletedAt !== null || recipientThread.status === "error" || recipientThread.status === "stopping") {
-                degrade(`dispatcher:${lane.id}:unreachable`);
+                degrade(fleetWatchdogScope("dispatcher", lane.id, "unreachable"));
                 continue;
               }
               const event = await lastEvent(lane.id);
-              const strandedKey = `stranded:${projectId}:${lane.id}:${recipient.execution_attempt_id}`;
+              const strandedKey = JSON.stringify(["stranded", projectId, lane.id, recipient.execution_attempt_id]);
               const previous = await fleetWatchdogIdle.get(strandedKey);
               if (previous?.lastRecoveryWakeAtMs !== null && previous?.lastRecoveryWakeAtMs !== void 0 && now2 - previous.lastRecoveryWakeAtMs < FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) continue;
               await bb.sdk.threads.send({
@@ -24508,7 +24592,7 @@ ${thread.titleFallback ?? ""}`);
               brokenWakePath = true;
               bb.log.warn(`fleet-watchdog stranded lane surfaced: project=${projectId} lane=${lane.id} dispatcher=${recipient.role_id}@${recipient.role_generation} status=${observedStatus}`);
             } catch (error48) {
-              degrade(`dispatcher:${lane.id}:${String(error48)}`);
+              degrade(fleetWatchdogScope("dispatcher", lane.id, String(error48)));
             }
           }
           const workItems = openWorkItemsByProject.get(projectId) ?? [];
@@ -24561,33 +24645,33 @@ ${thread.titleFallback ?? ""}`);
               ).get(projectId, blocked.waker);
               if (dependency?.lifecycle_state !== "succeeded") continue;
               condition = { kind: "work_item_succeeded", workItemId: blocked.waker };
-              idempotencyKey = `fleet-watchdog:blocker-fired:${blocked.workItemId}:${blocked.waker}`;
+              idempotencyKey = fleetWatchdogBlockerFiredKey(blocked.workItemId, blocked.waker);
             } else if (blocked.wakerKind === "github_issue_closed" && blocked.waker !== null) {
               const match = blocked.waker.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u);
               const issueNumber = match?.[3] === void 0 ? NaN : Number(match[3]);
               if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
-                degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
+                degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
                 continue;
               }
               try {
                 snapshot2 = await readGithubIssueForBackfillAsync(match[1], match[2], issueNumber);
               } catch {
-                degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
+                degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
                 continue;
               }
               if (snapshot2.state !== "closed") continue;
               condition = { kind: "github_issue_closed", owner: match[1], repo: match[2], issueNumber };
-              idempotencyKey = `fleet-watchdog:blocker-fired:${blocked.workItemId}:${snapshot2.externalRevision}`;
+              idempotencyKey = fleetWatchdogBlockerFiredKey(blocked.workItemId, snapshot2.externalRevision);
             } else {
-              degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
+              degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
               continue;
             }
-            const result2 = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot2);
+            const result2 = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot2, fleetWatchdogLegacyBlockerFiredKey(blocked.workItemId, snapshot2?.externalRevision ?? blocked.waker ?? ""));
             if (result2.outcome === "OK") {
               unblocked.add(blocked.workItemId);
               bb.log.info(`fleet-watchdog returned blocked work item to ready: project=${projectId} workItem=${blocked.workItemId} blocker=${blocked.wakerKind}`);
             } else {
-              degrade(`work-item-unblock:${projectId}:${blocked.workItemId}`);
+              degrade(fleetWatchdogScope("work-item-unblock", projectId, blocked.workItemId));
               bb.log.warn(`fleet-watchdog unblock transition refused: project=${projectId} workItem=${blocked.workItemId} outcome=${result2.outcome}`);
             }
           }
@@ -24672,16 +24756,16 @@ ${thread.titleFallback ?? ""}`);
             continue;
           }
         } catch (error48) {
-          degrade(`project:${projectId}:${String(error48)}`);
+          degrade(fleetWatchdogScope("project", projectId, String(error48)));
           bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
         }
       }
       if (!brokenWakePath && coverage === "visible") bb.log.info("fleet-watchdog healthy cycle");
     } catch (error48) {
-      degrade(`cycle:${String(error48)}`);
+      degrade(fleetWatchdogScope("cycle", String(error48)));
       bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
     } finally {
-      const message = `fleet-watchdog coverage=${coverage} seats=${visibleSeatCount} lanes=${visibleLaneCount} cannotSee=${cannotSee.size === 0 ? "none" : [...cannotSee].join("|")}`;
+      const message = `fleet-watchdog coverage=${coverage} seats=${visibleSeatCount} lanes=${visibleLaneCount} cannotSee=${cannotSee.size === 0 ? "none" : [...cannotSee].map(fleetWatchdogScopeMessage).join("|").replace(/\u0000/gu, ":")}`;
       if (coverage === "visible") bb.log.info(message);
       else bb.log.warn(message);
     }
@@ -24863,7 +24947,8 @@ ${thread.titleFallback ?? ""}`);
     async sidebarCollapseState(input) {
       const read = async (kind, ids) => {
         const entries = await Promise.all(ids.map(async (id2) => {
-          const value = await bb.storage.kv.get(sidebarCollapseKey(kind, id2));
+          const canonical = await bb.storage.kv.get(sidebarCollapseKey(kind, id2));
+          const value = canonical === void 0 ? await bb.storage.kv.get(legacySidebarCollapseKey(kind, id2)) : canonical;
           return value === true ? [id2, true] : null;
         }));
         return Object.fromEntries(entries.filter((entry) => entry !== null));
@@ -24876,7 +24961,10 @@ ${thread.titleFallback ?? ""}`);
     async setSidebarCollapse(input) {
       const key = sidebarCollapseKey(input.kind, input.id);
       if (input.collapsed) await bb.storage.kv.set(key, true);
-      else await bb.storage.kv.delete(key);
+      else {
+        await bb.storage.kv.set(key, false);
+        await bb.storage.kv.delete(legacySidebarCollapseKey(input.kind, input.id));
+      }
       return input;
     },
     async reorderPinned(input) {
@@ -24998,7 +25086,14 @@ export {
   cliSchemaError,
   plugin as default,
   deployedDistFailureDetail,
+  fleetWatchdogBlockerFiredKey,
+  fleetWatchdogCompositeKey,
+  fleetWatchdogEpisodeKey,
+  fleetWatchdogIssueReopenedKey,
+  fleetWatchdogMergeCloseKey,
   fleetWatchdogReopenKey,
+  fleetWatchdogRoleLivenessKey,
+  fleetWatchdogScope,
   foundationResultSchema,
   isLiveCachedConsumerRolloutArtifact,
   readLiveRoleFactReader,

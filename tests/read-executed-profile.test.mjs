@@ -276,6 +276,21 @@ describe("executed profile read-back", () => {
     });
   });
 
+  it("DISCRIMINATOR: treats NUL-colliding executed profiles as conflicting", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "turn_context", payload: { turn_id: "turn-1", model: "a\0b", effort: "c" } },
+      { type: "turn_context", payload: { turn_id: "turn-1", model: "a", effort: "b\0c" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "codex" },
+      events: [completion(providerThreadId, "turn-1")],
+      home,
+    });
+    expect(result).toMatchObject({ outcome: "unknown", turns: [{ status: "unknown", reason: "provider-native turn profiles conflict" }] });
+  });
+
   it("correlates Claude completion UUIDs to assistant envelopes", async () => {
     const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
     const providerThreadId = "123e4567-e89b-42d3-a456-426614174000";

@@ -34,6 +34,27 @@ describe("dist freshness gate", () => {
     }
   });
 
+  it("does not ignore a force-tracked source map", () => {
+    const root = mkdtempSync(join(tmpdir(), "bb-collab-dist-map-"));
+    try {
+      mkdirSync(join(root, "dist"));
+      writeFileSync(join(root, "dist/server.js.map"), "map\n");
+      writeFileSync(join(root, ".gitignore"), "dist/*\n");
+      execFileSync("git", ["init", "--quiet"], { cwd: root });
+      execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
+      execFileSync("git", ["add", ".gitignore"], { cwd: root });
+      execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: root });
+      execFileSync("git", ["add", "-f", "dist/server.js.map"], { cwd: root });
+      writeFileSync(join(root, "dist/server.js.map"), "changed map\n");
+      const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("dist/server.js.map");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("passes an honest artifact and names a hand-edited artifact when it fails", () => {
     const root = mkdtempSync(join(tmpdir(), "bb-collab-dist-freshness-"));
     try {

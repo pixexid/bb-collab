@@ -110,6 +110,31 @@ describe("stall-guard artifact cycle", () => {
     expect(steerRole).not.toHaveBeenCalled();
   });
 
+  it("reports ambiguous migration without steering or rewriting holder history", async () => {
+    const store = kvPersistence();
+    await store.host.bb.storage.kv.set("stall-guard.artifacts", {
+      '["project-1","project-orchestrator"]': JSON.stringify(artifact("canonical")),
+      "project-1:project-orchestrator": JSON.stringify(absentArtifact()),
+    });
+    const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
+    const onAmbiguous = vi.fn();
+    const cycle = createStallGuardCycle({
+      readRoleHolders: () => [holder(1, "current-holder")],
+      readArtifact: async () => absentArtifact(),
+      wakeRole,
+      onAmbiguous,
+      persistence: store.persistence,
+    });
+
+    await expect(cycle.cycle(PROJECT_ID)).resolves.toMatchObject({ changed: 0, attempted: 0, verified: 0, steered: 0, ambiguous: 1 });
+    expect(wakeRole).not.toHaveBeenCalled();
+    expect(onAmbiguous).toHaveBeenCalledOnce();
+    expect(await store.persistence.read()).toEqual({
+      '["project-1","project-orchestrator"]': JSON.stringify(artifact("canonical")),
+      "project-1:project-orchestrator": JSON.stringify(absentArtifact()),
+    });
+  });
+
   it("persists artifact deltas so a restart does not re-fire them", async () => {
     const store = kvPersistence();
     const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
@@ -184,7 +209,7 @@ describe("stall-guard artifact cycle", () => {
     expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 1, attempted: 0, verified: 0, steered: 0 });
     expect(wakeRole).not.toHaveBeenCalled();
     expect(await store.persistence.read()).toEqual({
-      "project-1:project-orchestrator": JSON.stringify(currentArtifact),
+      '["project-1","project-orchestrator"]': JSON.stringify(currentArtifact),
     });
   });
 
@@ -222,7 +247,7 @@ describe("stall-guard artifact cycle", () => {
     currentArtifact = artifact("changed");
     expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 0, attempted: 1, verified: 0, steered: 0 });
     expect(await store.persistence.read()).toEqual({
-      "project-1:project-orchestrator": JSON.stringify(absentArtifact()),
+      '["project-1","project-orchestrator"]': JSON.stringify(absentArtifact()),
     });
 
     failFinalRoleLivenessRead = false;
@@ -261,7 +286,7 @@ describe("stall-guard artifact cycle", () => {
       await waitForResult(first, firstResultPath);
       const firstResult = JSON.parse(readFileSync(firstResultPath, "utf8")) as Record<string, unknown>;
       expect(firstResult).toMatchObject({ sends: 1, summary: { attempted: 1, verified: 1 } });
-      expect(firstResult.persisted).toEqual(expect.objectContaining({ "project-1:project-orchestrator": expect.stringContaining('"updatedAt":"changed"') }));
+      expect(firstResult.persisted).toEqual(expect.objectContaining({ '["project-1","project-orchestrator"]': expect.stringContaining('"updatedAt":"changed"') }));
       first.kill("SIGKILL");
       await once(first, "exit");
       first = undefined;
