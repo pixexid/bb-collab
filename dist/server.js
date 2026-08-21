@@ -24128,8 +24128,12 @@ ${thread.titleFallback ?? ""}`);
               bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation.externalRevision}`);
             } else if (result3.outcome === "WORK_ITEM_STATE_INVALID" && (result3.message?.includes("succeeded work item has no recorded close observation") || result3.message?.includes("succeeded work item can return only after a proven GitHub issue reopening") || result3.message?.includes("GitHub reopen does not follow the exact recorded close observation"))) {
               const refusalReason2 = result3.message ?? "unknown";
-              permanentlyRefusedReopens.set(reopenKey, refusalReason2);
-              bb.log.warn(`fleet-watchdog learned permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${refusalReason2}`);
+              if (observation.externalRevision === githubSnapshot2.externalRevision) {
+                permanentlyRefusedReopens.set(reopenKey, refusalReason2);
+                bb.log.warn(`fleet-watchdog learned permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${refusalReason2}`);
+              } else {
+                bb.log.warn(`fleet-watchdog did not learn issue-reopen refusal because GitHub revisions disagreed: project=${projectId} workItem=${linked.work_item_id} observationRevision=${observation.externalRevision} snapshotRevision=${githubSnapshot2.externalRevision} reason=${refusalReason2}`);
+              }
             } else {
               degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
               bb.log.warn(`fleet-watchdog issue-reopen transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result3.outcome} message=${result3.message ?? "unknown"}`);

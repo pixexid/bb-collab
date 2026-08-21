@@ -4600,6 +4600,60 @@ exit 1
     }));
   });
 
+  it("does not learn a reopen refusal when lightweight and full GitHub reads disagree", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-refused-reopen-disagreement-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then
+  printf '%s\\n' '{"state":"OPEN","updatedAt":"open-y","closedByPullRequestsReferences":[]}'; exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then
+  if [ -f "$0.full-read" ]; then revision=open-y; else revision=closed-x; touch "$0.full-read"; fi
+  printf '%s\\n' '{"number":351,"title":"reopen","body":"","state":"OPEN","labels":[],"updatedAt":"'$revision'"}'; exit 0
+fi
+exit 1
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      const workItemId = "refused-reopen-disagreement";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "refused-reopen-disagreement-create", workItemId,
+        workItem: { workItemId, title: workItemId, body: workItemId, githubIssue: { issueNumber: 351 } },
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { idempotencyKey: "refused-reopen-disagreement-ready", workItemId })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+        idempotencyKey: "refused-reopen-disagreement-start", workItemId,
+        workAttempt: { laneId: "lane-refused-reopen-disagreement", threadId: "thread-refused-reopen-disagreement", assignmentKind: "write" },
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, {
+        idempotencyKey: "refused-reopen-disagreement-review", workItemId,
+        workAttempt: { laneId: "lane-refused-reopen-disagreement-review", threadId: "thread-refused-reopen-disagreement-review", assignmentKind: "review", reviewPrNumber: 200, reviewPrHeadSha: CANDIDATE_SHA },
+      })).outcome).toBe("OK");
+      const github = new DeterministicGitHubIssueAdapter();
+      github.put({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: workItemId, body: workItemId, state: "closed", labels: [], externalRevision: "closed-x" });
+      expect(applyFixtureMutation(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4, {
+        idempotencyKey: "refused-reopen-disagreement-succeeded", workItemId,
+        workItemExternalEvent: { kind: "github_issue_closed", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
+      }), null, null, null, null, github.read.bind(github))).toMatchObject({ outcome: "OK" });
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "fleet-watchdog-plugin-refused-reopen-disagreement", actorKind: "plugin", subjectId: PLUGIN_ID });
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE work_item_id = ?").get(workItemId)).toEqual({ lifecycle_state: "succeeded" });
+      expect(fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("learned permanently-refused issue-reopen transition"))).toHaveLength(0);
+      expect(fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("did not learn issue-reopen refusal because GitHub revisions disagreed"))).toHaveLength(1);
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE work_item_id = ?").get(workItemId)).toEqual({ lifecycle_state: "ready" });
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("releases a permanently refused succeeded-item reopen when externalRevision changes", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-refused-reopen-"));
     const gh = join(bin, "gh");
