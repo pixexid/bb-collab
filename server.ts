@@ -85,6 +85,9 @@ type PluginOptions = {
   runBbCommand?: (args: string[]) => Promise<void>;
 };
 type WorkItemWait = NonNullable<ApplyRequest["workItemWait"]>;
+const ERROR_RECOVERY_IO_TIMEOUT_MS = 10_000;
+
+type LaneRecoveryTarget = { project_id: string; thread_id: string; execution_attempt_id: string };
 
 export const fleetWatchdogReopenKey = (projectId: string, workItemId: string, externalRevision?: string) =>
   [projectId, workItemId, externalRevision].filter((value): value is string => value !== undefined).join("\u0000");
@@ -1691,6 +1694,23 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   }
 
   const recoveryInFlight = new Set<string>();
+  const withRecoveryTimeout = async <T>(label: string, operation: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        operation(controller.signal),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error(`error-recovery ${label} timed out after ${ERROR_RECOVERY_IO_TIMEOUT_MS}ms`));
+          }, ERROR_RECOVERY_IO_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
   const isCurrentRoleHolder = (holder: RoleHolderState) => db !== null && readRoleHolderStates(db).some((candidate) =>
     candidate.project_id === holder.project_id &&
     candidate.role_id === holder.role_id &&
@@ -1698,21 +1718,35 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     candidate.execution_attempt_id === holder.execution_attempt_id &&
     candidate.thread_id === holder.thread_id,
   );
-  const recoverErroredThread = async (threadId: string, projectId: string, holder?: RoleHolderState) => {
-    if (recoveryInFlight.has(threadId) || db === null) return false;
+  const isCurrentLane = (lane: LaneRecoveryTarget) => db !== null && Boolean(db.prepare(
+    `SELECT 1 FROM execution_attempts AS attempts
+     JOIN work_items AS items ON items.project_id = attempts.project_id AND items.work_item_id = attempts.work_item_id
+     WHERE attempts.project_id = ? AND attempts.execution_attempt_id = ? AND attempts.thread_id = ?
+       AND attempts.origin = 'work_item' AND attempts.assignment_kind = 'write'
+       AND attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+       AND items.lifecycle_state IN (${WORK_ITEM_CAPACITY_LIFECYCLE_STATES.map(() => "?").join(", ")})`,
+  ).get(lane.project_id, lane.execution_attempt_id, lane.thread_id, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES));
+  const recoverErroredThread = async (threadId: string, projectId: string, holder?: RoleHolderState, lane?: LaneRecoveryTarget) => {
+    if (recoveryInFlight.has(threadId)) {
+      bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=recovery-in-flight`);
+      return null;
+    }
+    if (db === null) return false;
     recoveryInFlight.add(threadId);
     try {
       if (!db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId)) return false;
-      const thread = await bb.sdk.threads.get({ threadId });
+      const thread = await withRecoveryTimeout("threads.get", (signal) => bb.sdk.threads.get({ threadId, signal }));
       if (
         thread.id !== threadId || thread.projectId !== projectId || thread.status !== "error" ||
-        thread.archivedAt !== null || thread.deletedAt !== null || (holder !== undefined && !isCurrentRoleHolder(holder))
+        thread.archivedAt !== null || thread.deletedAt !== null || (holder !== undefined && !isCurrentRoleHolder(holder)) ||
+        (lane !== undefined && !isCurrentLane(lane))
       ) return false;
 
       let head = "unavailable (re-fetch before continuing)";
       if (thread.environmentId !== null) {
+        const environmentId = thread.environmentId;
         try {
-          const status = await bb.sdk.environments.status({ environmentId: thread.environmentId });
+          const status = await withRecoveryTimeout("environments.status", () => bb.sdk.environments.status({ environmentId }));
           if (status.outcome === "available") {
             const checkout = status.workspace.checkout;
             if (checkout.kind === "branch" || checkout.kind === "detached") head = checkout.headSha ?? `${checkout.kind} checkout with no HEAD`;
@@ -1722,7 +1756,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           bb.log.warn(`error-recovery head unavailable: thread=${threadId} ${String(error)}`);
         }
       }
-      await bb.sdk.threads.send({
+      if (lane !== undefined && !isCurrentLane(lane)) {
+        bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=lane-no-longer-current`);
+        return false;
+      }
+      await withRecoveryTimeout("threads.send", (signal) => bb.sdk.threads.send({
         threadId,
         mode: "auto",
         input: [{
@@ -1731,7 +1769,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           text: `RECOVERY WAKE — reconcile state before resuming. The workspace and recorded conversation survived the daemon interruption, but the interrupted turn may have half-applied intent and a composed instruction may not have been delivered. Observed checkout head: ${head}. Re-fetch and confirm the current head, reconcile the frozen work order and canonical state against the conversation, identify any half-applied mutation or lost delivery, and re-run every pre-crash measurement whose command and output are not visible before continuing.`,
           mentions: [],
         }],
-      });
+      }));
       bb.log.warn(`error-recovery wake sent: project=${projectId} thread=${threadId} mode=auto head=${head}`);
       return true;
     } catch (error) {
@@ -1750,18 +1788,18 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return;
     }
     let holders: RoleHolderState[];
-    let lanes: Array<{ project_id: string; thread_id: string }>;
+    let lanes: LaneRecoveryTarget[];
     let openWorkItems: number;
     try {
       holders = readRoleHolderStates(db);
       lanes = db.prepare(
-        `SELECT attempts.project_id, attempts.thread_id FROM execution_attempts AS attempts
+        `SELECT attempts.project_id, attempts.thread_id, attempts.execution_attempt_id FROM execution_attempts AS attempts
          JOIN work_items AS items ON items.project_id = attempts.project_id AND items.work_item_id = attempts.work_item_id
          WHERE attempts.origin = 'work_item' AND attempts.assignment_kind = 'write' AND attempts.thread_id IS NOT NULL
            AND attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
            AND items.lifecycle_state IN (${WORK_ITEM_CAPACITY_LIFECYCLE_STATES.map(() => "?").join(", ")})
          ORDER BY attempts.project_id, attempts.thread_id`,
-      ).all(...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES) as Array<{ project_id: string; thread_id: string }>;
+      ).all(...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES) as LaneRecoveryTarget[];
       openWorkItems = (db.prepare(
         "SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')",
       ).get() as { count: number }).count;
@@ -1778,7 +1816,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     }
     let failedLanes = 0;
     for (const lane of lanes) {
-      if (await recoverErroredThread(lane.thread_id, lane.project_id) === null) failedLanes += 1;
+      if (await recoverErroredThread(lane.thread_id, lane.project_id, undefined, lane) !== true) failedLanes += 1;
     }
     const roleRestart = failedRoles === 0 ? "armed" : "degraded";
     const laneRestart = failedLanes === 0 ? "armed" : "degraded";

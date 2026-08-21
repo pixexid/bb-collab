@@ -3279,6 +3279,67 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     ]);
   });
 
+  it("reports a bounded recovery read timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      fixture.host.harness.sdk.stub("threads.get", (async () => new Promise<never>(() => undefined)) as never);
+      const service = fixture.host.harness.runService("lane-watcher");
+      await vi.advanceTimersByTimeAsync(10_000);
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining("error-recovery threads.get timed out after 10000ms"),
+      })));
+      service.controller.abort();
+      await service.done;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("restarts a genuinely errored canonical lane through auto mode", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    fixture.addNativeLane("thread-work-item-1", "error");
+
+    const service = fixture.host.harness.runService("lane-watcher");
+    await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toContainEqual([
+      expect.objectContaining({ threadId: "thread-work-item-1", mode: "auto" }),
+    ]));
+    service.controller.abort();
+    await service.done;
+  });
+
+  it("rechecks canonical lane identity immediately before its recovery wake", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    fixture.addNativeLane("thread-work-item-1", "error");
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      environmentId: threadId === "thread-work-item-1" ? "recovery-environment" : null,
+      status: threadId === "thread-work-item-1" ? "error" : "idle",
+      updatedAt: 1,
+    })) as never);
+    fixture.host.harness.sdk.stub("environments.status", (async () => {
+      fixture.db.prepare("UPDATE work_items SET lifecycle_state = 'review_pending' WHERE project_id = ? AND work_item_id = ?").run(PROJECT_ID, WORK_ITEM_ID);
+      return { outcome: "available", workspace: { checkout: { kind: "detached", headSha: "stale-head" } } };
+    }) as never);
+
+    const service = fixture.host.harness.runService("lane-watcher");
+    await vi.waitFor(() => expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringContaining("reason=lane-no-longer-current"),
+    })));
+    service.controller.abort();
+    await service.done;
+
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").some((call) => {
+      const input = call[0] as { threadId?: string; mode?: string } | undefined;
+      return input?.threadId === "thread-work-item-1" && input.mode === "auto";
+    })).toBe(false);
+  });
+
   it("starts and stops the lane watcher whether restart reconciliation resolves or hangs", async () => {
     for (const firstRecoveryReadHangs of [false, true]) {
       const fixture = await fleetWatchdogFixture(0);

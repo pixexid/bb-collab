@@ -21826,6 +21826,7 @@ import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as rea
 import { execFile, spawnSync as spawnSync2 } from "node:child_process";
 import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute2, join as join5, relative as relative2, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+var ERROR_RECOVERY_IO_TIMEOUT_MS = 1e4;
 var fleetWatchdogReopenKey = (projectId, workItemId, externalRevision) => [projectId, workItemId, externalRevision].filter((value) => value !== void 0).join("\0");
 function githubRepository(remoteUrl) {
   const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
@@ -23147,20 +23148,50 @@ async function plugin(bb, options = {}) {
     db = null;
   }
   const recoveryInFlight = /* @__PURE__ */ new Set();
+  const withRecoveryTimeout = async (label, operation) => {
+    const controller = new AbortController();
+    let timer;
+    try {
+      return await Promise.race([
+        operation(controller.signal),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error(`error-recovery ${label} timed out after ${ERROR_RECOVERY_IO_TIMEOUT_MS}ms`));
+          }, ERROR_RECOVERY_IO_TIMEOUT_MS);
+        })
+      ]);
+    } finally {
+      if (timer !== void 0) clearTimeout(timer);
+    }
+  };
   const isCurrentRoleHolder = (holder) => db !== null && readRoleHolderStates(db).some(
     (candidate) => candidate.project_id === holder.project_id && candidate.role_id === holder.role_id && candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id
   );
-  const recoverErroredThread = async (threadId, projectId, holder) => {
-    if (recoveryInFlight.has(threadId) || db === null) return false;
+  const isCurrentLane = (lane) => db !== null && Boolean(db.prepare(
+    `SELECT 1 FROM execution_attempts AS attempts
+     JOIN work_items AS items ON items.project_id = attempts.project_id AND items.work_item_id = attempts.work_item_id
+     WHERE attempts.project_id = ? AND attempts.execution_attempt_id = ? AND attempts.thread_id = ?
+       AND attempts.origin = 'work_item' AND attempts.assignment_kind = 'write'
+       AND attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+       AND items.lifecycle_state IN (${WORK_ITEM_CAPACITY_LIFECYCLE_STATES.map(() => "?").join(", ")})`
+  ).get(lane.project_id, lane.execution_attempt_id, lane.thread_id, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES));
+  const recoverErroredThread = async (threadId, projectId, holder, lane) => {
+    if (recoveryInFlight.has(threadId)) {
+      bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=recovery-in-flight`);
+      return null;
+    }
+    if (db === null) return false;
     recoveryInFlight.add(threadId);
     try {
       if (!db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId)) return false;
-      const thread = await bb.sdk.threads.get({ threadId });
-      if (thread.id !== threadId || thread.projectId !== projectId || thread.status !== "error" || thread.archivedAt !== null || thread.deletedAt !== null || holder !== void 0 && !isCurrentRoleHolder(holder)) return false;
+      const thread = await withRecoveryTimeout("threads.get", (signal) => bb.sdk.threads.get({ threadId, signal }));
+      if (thread.id !== threadId || thread.projectId !== projectId || thread.status !== "error" || thread.archivedAt !== null || thread.deletedAt !== null || holder !== void 0 && !isCurrentRoleHolder(holder) || lane !== void 0 && !isCurrentLane(lane)) return false;
       let head = "unavailable (re-fetch before continuing)";
       if (thread.environmentId !== null) {
+        const environmentId = thread.environmentId;
         try {
-          const status = await bb.sdk.environments.status({ environmentId: thread.environmentId });
+          const status = await withRecoveryTimeout("environments.status", () => bb.sdk.environments.status({ environmentId }));
           if (status.outcome === "available") {
             const checkout = status.workspace.checkout;
             if (checkout.kind === "branch" || checkout.kind === "detached") head = checkout.headSha ?? `${checkout.kind} checkout with no HEAD`;
@@ -23170,7 +23201,11 @@ async function plugin(bb, options = {}) {
           bb.log.warn(`error-recovery head unavailable: thread=${threadId} ${String(error48)}`);
         }
       }
-      await bb.sdk.threads.send({
+      if (lane !== void 0 && !isCurrentLane(lane)) {
+        bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=lane-no-longer-current`);
+        return false;
+      }
+      await withRecoveryTimeout("threads.send", (signal) => bb.sdk.threads.send({
         threadId,
         mode: "auto",
         input: [{
@@ -23179,7 +23214,7 @@ async function plugin(bb, options = {}) {
           text: `RECOVERY WAKE \u2014 reconcile state before resuming. The workspace and recorded conversation survived the daemon interruption, but the interrupted turn may have half-applied intent and a composed instruction may not have been delivered. Observed checkout head: ${head}. Re-fetch and confirm the current head, reconcile the frozen work order and canonical state against the conversation, identify any half-applied mutation or lost delivery, and re-run every pre-crash measurement whose command and output are not visible before continuing.`,
           mentions: []
         }]
-      });
+      }));
       bb.log.warn(`error-recovery wake sent: project=${projectId} thread=${threadId} mode=auto head=${head}`);
       return true;
     } catch (error48) {
@@ -23203,7 +23238,7 @@ async function plugin(bb, options = {}) {
     try {
       holders = readRoleHolderStates(db);
       lanes = db.prepare(
-        `SELECT attempts.project_id, attempts.thread_id FROM execution_attempts AS attempts
+        `SELECT attempts.project_id, attempts.thread_id, attempts.execution_attempt_id FROM execution_attempts AS attempts
          JOIN work_items AS items ON items.project_id = attempts.project_id AND items.work_item_id = attempts.work_item_id
          WHERE attempts.origin = 'work_item' AND attempts.assignment_kind = 'write' AND attempts.thread_id IS NOT NULL
            AND attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
@@ -23226,7 +23261,7 @@ async function plugin(bb, options = {}) {
     }
     let failedLanes = 0;
     for (const lane of lanes) {
-      if (await recoverErroredThread(lane.thread_id, lane.project_id) === null) failedLanes += 1;
+      if (await recoverErroredThread(lane.thread_id, lane.project_id, void 0, lane) !== true) failedLanes += 1;
     }
     const roleRestart = failedRoles === 0 ? "armed" : "degraded";
     const laneRestart = failedLanes === 0 ? "armed" : "degraded";
