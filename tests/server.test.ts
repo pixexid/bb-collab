@@ -7887,6 +7887,22 @@ fi
     expect(applyWithFixtureReceipt(db, { ...disposition, reason: { mechanism: "changed" } }).outcome).toBe("IDEMPOTENCY_KEY_CONFLICT");
   });
 
+  it("revalidates role standing for work-item transitions", async () => {
+    const { db, fenceToken } = await assignmentFixture();
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2, {
+      idempotencyKey: "role-standing-work-item-start",
+      actorReceiptId: "role-actor-assignment",
+    })).outcome).toBe("OK");
+
+    db.prepare("UPDATE role_generations SET status = 'retired' WHERE project_id = ? AND role_id = 'project-orchestrator' AND generation = 1").run(PROJECT_ID);
+    const before = db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID);
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3, {
+      idempotencyKey: "retired-role-work-item-review",
+      actorReceiptId: "role-actor-assignment",
+    })).outcome).toBe("ROLE_NOT_ACTIVE");
+    expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual(before);
+  });
+
   it("requires the current qualified role holder for Decision authority", async () => {
     const { db, fenceToken, holderExecutionAttemptId } = await assignmentFixture();
     expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken)).outcome).toBe("OK");

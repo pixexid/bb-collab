@@ -19460,6 +19460,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request, false);
   const nextState = request.lifecycleState;
   const workItem = requireWorkItem(
     db,

@@ -6118,6 +6118,9 @@ function applyWorkItemTransition(
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
+  // The watchdog uses a verified plugin actor rather than a role holder; role actors
+  // must still prove current standing on every revalidation, including after stop.
+  requireRoleActorBinding(db, request, false);
   const nextState = request.lifecycleState;
   const workItem = requireWorkItem(
     db,
