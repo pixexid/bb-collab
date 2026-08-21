@@ -55,6 +55,39 @@ describe("dist freshness gate", () => {
     }
   });
 
+  it("rejects a committed source-only change when a nested bundle is not rebuilt", () => {
+    const root = mkdtempSync(join(tmpdir(), "bb-collab-nested-dist-"));
+    const packageRoot = join(root, "packages", "nested");
+    try {
+      mkdirSync(join(packageRoot, "src"), { recursive: true });
+      mkdirSync(join(packageRoot, "dist"));
+      writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ scripts: { build: "node build.mjs" } }));
+      writeFileSync(join(packageRoot, "build.mjs"), [
+        'import { readFileSync, writeFileSync } from "node:fs";',
+        'const source = readFileSync("src/message.txt", "utf8");',
+        'writeFileSync("dist/bundle.js", `export default ${JSON.stringify(source)};\\n`);',
+        "",
+      ].join("\n"));
+      writeFileSync(join(packageRoot, "src/message.txt"), "first\n");
+      execFileSync("npm", ["run", "build", "--silent"], { cwd: packageRoot });
+      execFileSync("git", ["init", "--quiet"], { cwd: root });
+      execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
+      execFileSync("git", ["add", "."], { cwd: root });
+      execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: root });
+
+      writeFileSync(join(packageRoot, "src/message.txt"), "second\n");
+      execFileSync("git", ["add", "packages/nested/src/message.txt"], { cwd: root });
+      execFileSync("git", ["commit", "--quiet", "-m", "source-only change"], { cwd: root });
+
+      const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("packages/nested/dist/bundle.js");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("passes an honest artifact and names a hand-edited artifact when it fails", () => {
     const root = mkdtempSync(join(tmpdir(), "bb-collab-dist-freshness-"));
     try {
