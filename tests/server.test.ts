@@ -3170,7 +3170,7 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     }
   });
 
-  it("wakes a genuinely errored thread through auto mode and carries recovery reconciliation", async () => {
+  it("refuses an errored thread whose recovery identity cannot be resolved", async () => {
     const fixture = await fleetWatchdogFixture(0);
     const threadId = "lane-genuinely-errored";
     let status: "error" | "active" = "error";
@@ -3202,15 +3202,14 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
       error: "daemon connection lost",
     })).resolves.toEqual({ errors: [] });
 
-    expect(status).toBe("active");
+    expect(status).toBe("error");
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([
       [expect.objectContaining({ threadId, mode: "steer" })],
-      [expect.objectContaining({
-        threadId,
-        mode: "auto",
-        input: [expect.objectContaining({ text: expect.stringMatching(/reconcile state before resuming[\s\S]*35703f72-recovery-head[\s\S]*re-run every pre-crash measurement/u) })],
-      })],
     ]);
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringContaining("reason=identity-unresolved"),
+    }));
   });
 
   it("refuses recovery when an error event resolves to a healthy or foreign-project thread", async () => {
@@ -3230,6 +3229,20 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     }
 
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+
+  it("reports healthy canonical lanes as armed recovery coverage", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    fixture.addNativeLane("thread-work-item-1", "idle");
+
+    const service = fixture.host.harness.runService("lane-watcher");
+    await vi.waitFor(() => expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "error",
+      message: expect.stringContaining("laneRestart=armed lanes=1 failedLanes=0"),
+    })));
+    service.controller.abort();
+    await service.done;
   });
 
   it("re-arms role recovery on service restart and loudly reports blind lane coverage", async () => {
@@ -3295,6 +3308,35 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("holds recovery suppression until an uncancellable send settles", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    fixture.addNativeLane("thread-work-item-1", "error");
+    let releaseSend!: () => void;
+    fixture.host.harness.sdk.stub("threads.send", (async ({ mode }: { mode: string }) => {
+      if (mode === "auto") await new Promise<void>((resolve) => { releaseSend = resolve; });
+      return { ok: true };
+    }) as never);
+
+    const first = fixture.host.harness.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, status: "error", updatedAt: 1 }),
+      error: "daemon connection lost",
+    });
+    await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toContainEqual([
+      expect.objectContaining({ threadId: "thread-work-item-1", mode: "auto" }),
+    ]));
+    await fixture.host.harness.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, status: "error", updatedAt: 2 }),
+      error: "duplicate failure",
+    });
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringContaining("reason=recovery-in-flight"),
+    }));
+    releaseSend();
+    await first;
   });
 
   it("restarts a genuinely errored canonical lane through auto mode", async () => {

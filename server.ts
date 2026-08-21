@@ -1785,7 +1785,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=lane-no-longer-current`);
         return false;
       }
-      await withRecoveryTimeout("threads.send", (signal) => bb.sdk.threads.send({
+      // The SDK cannot cancel threads.send. Keep the guard until this send settles;
+      // releasing it on a local timeout would permit a duplicate live send.
+      await bb.sdk.threads.send({
         threadId,
         mode: "auto",
         input: [{
@@ -1794,7 +1796,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           text: `RECOVERY WAKE — reconcile state before resuming. The workspace and recorded conversation survived the daemon interruption, but the interrupted turn may have half-applied intent and a composed instruction may not have been delivered. Observed checkout head: ${head}. Re-fetch and confirm the current head, reconcile the frozen work order and canonical state against the conversation, identify any half-applied mutation or lost delivery, and re-run every pre-crash measurement whose command and output are not visible before continuing.`,
           mentions: [],
         }],
-      }));
+      });
       bb.log.warn(`error-recovery wake sent: project=${projectId} thread=${threadId} mode=auto head=${head}`);
       return true;
     } catch (error) {
@@ -1841,7 +1843,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     }
     let failedLanes = 0;
     for (const lane of lanes) {
-      if (await recoverErroredThread(lane.thread_id, lane.project_id, undefined, lane) !== true) failedLanes += 1;
+      if (await recoverErroredThread(lane.thread_id, lane.project_id, undefined, lane) === null) failedLanes += 1;
     }
     const roleRestart = failedRoles === 0 ? "armed" : "degraded";
     const laneRestart = failedLanes === 0 ? "armed" : "degraded";
@@ -2499,6 +2501,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     if (status === "error") {
       const identity = resolveRecoveryIdentity(payload.thread.projectId, id);
       if (identity === null) return;
+      if (identity.holder === undefined && identity.lane === undefined) {
+        bb.log.warn(`error-recovery wake refused: project=${payload.thread.projectId} thread=${id} reason=identity-unresolved`);
+        return;
+      }
       await recoverErroredThread(id, payload.thread.projectId, identity.holder, identity.lane);
     }
   });
