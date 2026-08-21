@@ -2051,7 +2051,7 @@ describe("bb-collab plugin boundary", () => {
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["idle-fleet-detector", "lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "worktree-cleanup", "thread-archive-sweep"]);
     expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "dispatchLane", "doctor", "export", "lanes", "markOperatorMessageRead", "operatorMessages", "registerWait", "reorderPinned", "replyToOperatorMessage", "roleBrief", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
-    expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["send_to_operator"]);
+    expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["dispatch_lane", "send_to_operator"]);
   });
 
   it("carries structural refusals through the apply RPC output schema", async () => {
@@ -3372,10 +3372,10 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
   it("registers the attempt through the canonical lane dispatch seam", async () => {
     const fixture = await fleetWatchdogFixture(0, true, 1, false);
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
-    const result = await fixture.host.harness.callRpc("dispatchLane", {
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
       request: transitionRequest(fixture.fenceToken, "in_progress", 2),
       spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
-    });
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
     expect(result).toMatchObject({ outcome: "OK" });
     expect(fixture.db.prepare("SELECT lane_id, thread_id, state FROM execution_attempts WHERE origin = 'work_item'").get()).toMatchObject({ lane_id: "lane-work-item-1", thread_id: "lane-1", state: "running" });
   });
@@ -3398,7 +3398,12 @@ fi
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
     try {
       const fixture = await fleetWatchdogFixture(0, true, 1, false);
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      const dispatch = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+        spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
+      }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+      expect(dispatch).toMatchObject({ outcome: "OK" });
+      fixture.addNativeLane("lane-1", "active");
       expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state = 'in_progress'").get()).toEqual({ count: 1 });
       expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'work_item' AND assignment_kind = 'write' AND state = 'running'").get()).toEqual({ count: 1 });
       expect(workItemReconciliationIssues(fixture.db, PROJECT_ID)).toEqual([]);
@@ -10481,7 +10486,7 @@ exit 1
     const host = await loadedHost();
     const registrations = host.harness.inspection.registrations;
     expect(registrations.rpcMethods).not.toContain("seed-fixture-receipt");
-    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "github-issue-backfill", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "worktree-cleanup", "send-to-operator", "inbox"]);
+    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "dispatch-lane", "github-issue-backfill", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "worktree-cleanup", "send-to-operator", "inbox"]);
     expect(registrations.httpRoutes.map((route) => route.path)).toEqual(["/lanes"]);
     expect(seedFixtureDecision).toBeTypeOf("function");
   });

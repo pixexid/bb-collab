@@ -790,7 +790,16 @@ async function dispatchLane(
     workAttempt: { ...request.workAttempt, threadId: thread.id },
   });
   if (registered.outcome !== "OK") {
-    try { await bb.sdk.threads.stop({ threadId: thread.id }); } catch { /* retain the refusal; the spawned lane is stopped best-effort */ }
+    try {
+      await bb.sdk.threads.stop({ threadId: thread.id });
+    } catch (error) {
+      return {
+        ...registered,
+        outcome: "INTERNAL_ERROR",
+        message: `${registered.message ?? registered.outcome}; spawned lane ${thread.id} could not be stopped: ${String(error)}`,
+        evidence: { registration: registered, spawnedThreadId: thread.id, stopFailed: true },
+      };
+    }
   }
   return registered;
 }
@@ -1368,8 +1377,8 @@ async function runCli(
 ) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "github-issue-backfill", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, github-issue-backfill, archive-sweep, worktree-cleanup, cached-consumer-rollout, role-list, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
+  if (!command || !["doctor", "export", "apply", "dispatch-lane", "github-issue-backfill", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, dispatch-lane, github-issue-backfill, archive-sweep, worktree-cleanup, cached-consumer-rollout, role-list, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
   }
   if (command === "wait-validator") {
     const unknown = args.find((arg) => arg !== "--cycle");
@@ -1450,6 +1459,23 @@ async function runCli(
   }
   const projectId = parseFlag(args, "--project");
   if (!projectId) return invalidCli("--project PROJECT_ID is required; CLI context is never used as a fallback");
+  if (command === "dispatch-lane") {
+    const unknown = unexpectedFlags(args, ["--project", "--request", "--spawn"]);
+    if (unknown) return invalidCli(`unexpected flag ${unknown}`);
+    const requestJson = parseFlag(args, "--request");
+    const spawnJson = parseFlag(args, "--spawn");
+    if (!requestJson || !spawnJson) return invalidCli("--request JSON and --spawn JSON are required");
+    try {
+      const request = JSON.parse(requestJson);
+      const spawn = JSON.parse(spawnJson);
+      const parsed = dispatchLaneInputSchema.safeParse({ request, spawn });
+      if (!parsed.success) return invalidCli(parsed.error.message);
+      if (parsed.data.request.projectId !== projectId) return invalidCli("request projectId must match --project");
+      return cliResult(await dispatchLane(bb, db, parsed.data));
+    } catch (error) {
+      return invalidCli(error instanceof Error ? error.message : String(error));
+    }
+  }
   if (command === "send-to-operator") {
     const unknown = unexpectedFlags(args, ["--project", "--recipient", "--severity", "--message"]);
     if (unknown) return invalidCli(`unexpected flag ${unknown}`);
@@ -3419,6 +3445,16 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   });
 
   bb.agents.registerTool({
+    name: "dispatch_lane",
+    description: "Dispatch one writing lane through the canonical registration seam.",
+    instructions: "Use this instead of spawning a lane directly. The request projectId must match the current thread project.",
+    parameters: dispatchLaneInputSchema,
+    async execute(input, context) {
+      if (input.request.projectId !== context.projectId) throw new Error("request projectId must exactly match the current thread project");
+      return JSON.stringify(await dispatchLane(bb, db, input));
+    },
+  });
+  bb.agents.registerTool({
     name: "send_to_operator",
     description: "Send a durable project-scoped message to the operator or supervisor without a model relay.",
     instructions: "Use this for actionable content directed to an external non-bb party. project_id must be the current thread's exact registered project.",
@@ -3428,7 +3464,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return JSON.stringify(await sendOperatorMessage(db, bb, input, context.threadId, notifyUrgent));
     },
   });
-  bb.agents.configure(() => ({ tools: ["send_to_operator"], skills: [] }));
+  bb.agents.configure(() => ({ tools: ["dispatch_lane", "send_to_operator"], skills: [] }));
 
   bb.cli.register({
     name: "collab",
@@ -3440,6 +3476,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         name: "apply",
         summary: "Explicit foundation apply",
         usage: "bb collab apply --project PROJECT_ID --request JSON",
+      },
+      {
+        name: "dispatch-lane",
+        summary: "Spawn and register one writing lane atomically through the canonical seam",
+        usage: "bb collab dispatch-lane --project PROJECT_ID --request JSON --spawn JSON",
       },
       {
         name: "github-issue-backfill",
