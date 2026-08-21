@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { WorktreeCleanupOptions } from "../src/worktree-cleanup.js";
 import {
@@ -10,6 +10,7 @@ import {
   defaultQuietFloorMs,
   listAllProjectThreads,
   listGitWorktrees,
+  planWorktreeCleanup,
   runWorktreeCleanup,
   worktreeCreatedAt,
 } from "../src/worktree-cleanup.js";
@@ -89,6 +90,35 @@ describe("worktree cleanup", () => {
       path: canonicalWorktreePath(paths[1]),
       reason: "no git status probe supplied; cleanliness unresolved",
     }));
+  });
+
+  it("protects a plugin subdirectory by its owning worktree", () => {
+    const { root, paths } = fixture();
+    mkdirSync(join(paths[1], "packages/plugin"), { recursive: true });
+    const result = report(root, new Set(), new Map(), { protectedEnvironmentPaths: new Set([join(paths[1], "packages/plugin")]) });
+    expect(result.wouldRemove.map(({ path }) => path)).not.toContain(canonicalWorktreePath(paths[1]));
+    expect(result.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(paths[1]), reason: "plugin source environment is protected" }));
+  });
+
+  it("refuses every removal class when the plugin source cannot be resolved", () => {
+    const { root, paths } = fixture();
+    const result = planWorktreeCleanup([
+      { path: paths[1], branch: "feature/thr_stale", head: git(paths[1], "rev-parse", "HEAD") },
+    ], {
+      liveThreadIds: new Set(),
+      pluginSourceResolved: false,
+      status: () => "",
+      originMain: git(root, "rev-parse", "refs/remotes/origin/main"),
+      reachable: () => true,
+    });
+    expect(result).toEqual([{ path: resolve(paths[1]), population: "scratch", action: "refuse", reason: "plugin source environment is unresolved" }]);
+  });
+
+  it("protects a plugin source environment claim even without a thread owner", () => {
+    const { root, paths } = fixture();
+    const result = report(root, new Set(), new Map(), { protectedEnvironmentPaths: new Set([canonicalWorktreePath(paths[1])]) });
+    expect(result.wouldRemove.map(({ path }) => path)).not.toContain(canonicalWorktreePath(paths[1]));
+    expect(result.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(paths[1]), reason: "plugin source environment is protected" }));
   });
 
   it("reports exactly the clean detached orphan and refuses live and dirty entries", () => {

@@ -1194,11 +1194,21 @@ async function reportProjectWorktreeCleanup(bb: BbPluginApi, projectId: string) 
   const source = project.sources.find((item) => item.isDefault) ?? project.sources[0];
   if (!source) throw new Error("project has no source checkout");
   const threads = await listAllProjectThreads((request) => bb.sdk.threads.list(request), projectId);
+  const protectedEnvironmentPaths = new Set<string>();
+  let environmentInventoryComplete = true;
+  let pluginSourceResolved = true;
+  try {
+    const pluginRoot = resolvedPluginRoot(await bb.sdk.plugins.getSource({ pluginId: bb.pluginId }));
+    if (pluginRoot) protectedEnvironmentPaths.add(canonicalWorktreePath(pluginRoot));
+  } catch {
+    // A missing source is handled by doctor; cleanup must refuse rather than guess.
+    pluginSourceResolved = false;
+    environmentInventoryComplete = false;
+  }
   const liveWorktreeThreadIds = new Map<string, Set<string>>();
   // Detached ownership is resolved from the absence of a claim, so an environment we
   // failed to read is not a missing claim -- it is an unknown one, and the whole
   // inventory stops being usable as evidence.
-  let environmentInventoryComplete = true;
   for (const thread of threads) {
     if (thread.environmentId === null) continue;
     try {
@@ -1215,7 +1225,7 @@ async function reportProjectWorktreeCleanup(bb: BbPluginApi, projectId: string) 
       environmentInventoryComplete = false;
     }
   }
-  return cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete);
+  return cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete, protectedEnvironmentPaths, pluginSourceResolved);
 }
 
 async function runCli(

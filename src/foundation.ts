@@ -2476,6 +2476,7 @@ export type FoundationCode =
   | "INVALID_INPUT"
   | "BB_VERSION_INCOMPATIBLE"
   | "BB_FACTS_UNAVAILABLE"
+  | "PLUGIN_SOURCE_UNAVAILABLE"
   | "HOST_UNAVAILABLE"
   | "EXPORT_BOUNDED"
   | "SOURCE_FREEZE_UNPROVEN"
@@ -8041,9 +8042,14 @@ export async function doctor(
       ? undefined
       : incompatiblePlugins.map((plugin) => plugin.message).join("; ");
     const routing = await routingDoctorEvidence(sdk, projectId, roleGenerationHeads);
-    const doctorMessage = [pluginCompatibilityMessage, ...routing.messages].filter(Boolean).join("; ");
+    const pluginSourceUnavailable = checkoutDivergence?.verdict === "unavailable";
+    const doctorMessage = [
+      pluginCompatibilityMessage,
+      ...routing.messages,
+      ...(pluginSourceUnavailable ? ["plugin source checkout is unavailable"] : []),
+    ].filter(Boolean).join("; ");
     const expected = targets.length + 1;
-    return result("OK", projectId, expected, expected, expected, {
+    return result(pluginSourceUnavailable ? "PLUGIN_SOURCE_UNAVAILABLE" : "OK", projectId, expected, expected, expected, {
       currentConfigRevision: configHead.config_revision,
       currentGovernanceEpoch: governor ? Number(governor.governance_epoch) : undefined,
       message: doctorMessage,
