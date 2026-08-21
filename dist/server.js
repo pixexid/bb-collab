@@ -22137,17 +22137,6 @@ var sidebarThreadExecutionSchema = external_exports.object({ model: external_exp
 var sidebarCollapseKindSchema = external_exports.enum(["project", "thread"]);
 var sidebarCollapseKey = (kind, id2) => `sidebar.collapse:${JSON.stringify([kind, id2])}`;
 var legacySidebarCollapseKey = (kind, id2) => `sidebar.collapse:${kind}:${id2}`;
-async function migrateSidebarCollapseKeys(bb) {
-  const legacyKeys = (await bb.storage.kv.list("sidebar.collapse:")).filter((key) => /^sidebar\.collapse:(?:project|thread):.+$/u.test(key));
-  await Promise.all(legacyKeys.map(async (legacyKey) => {
-    const match = /^sidebar\.collapse:(project|thread):(.+)$/u.exec(legacyKey);
-    if (!match || await bb.storage.kv.get(legacyKey) !== true) return;
-    const canonicalKey = sidebarCollapseKey(match[1], match[2]);
-    if (await bb.storage.kv.get(canonicalKey) !== void 0) return;
-    await bb.storage.kv.set(canonicalKey, true);
-    await bb.storage.kv.delete(legacyKey);
-  }));
-}
 var roleBriefRoleSchema = external_exports.enum(["director", "orchestrator", "worker"]);
 var roleBriefBundleSchema = external_exports.object({
   ponytail: external_exports.string().min(1),
@@ -23192,7 +23181,6 @@ async function runCli(db, bb, argv, ctx, deps) {
   return cliResult(exportFoundation(db, projectId));
 }
 async function plugin(bb, options = {}) {
-  await migrateSidebarCollapseKeys(bb);
   const notifyUrgent = options.notifyUrgent ?? ((message, senderThreadId) => defaultNotifyUrgent(message, senderThreadId, options.runBbCommand ?? runBbCommand));
   const fleetWatchdogSettings = bb.settings.define({
     fleetWatchdogFloorMs: {
@@ -24886,7 +24874,8 @@ ${thread.titleFallback ?? ""}`);
     async sidebarCollapseState(input) {
       const read = async (kind, ids) => {
         const entries = await Promise.all(ids.map(async (id2) => {
-          const value = await bb.storage.kv.get(sidebarCollapseKey(kind, id2));
+          const canonical = await bb.storage.kv.get(sidebarCollapseKey(kind, id2));
+          const value = canonical === void 0 ? await bb.storage.kv.get(legacySidebarCollapseKey(kind, id2)) : canonical;
           return value === true ? [id2, true] : null;
         }));
         return Object.fromEntries(entries.filter((entry) => entry !== null));

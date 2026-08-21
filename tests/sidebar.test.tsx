@@ -958,38 +958,41 @@ describe("replacement thread list", () => {
     expect(reorderPinned).toHaveBeenCalledWith({ threadId: "thread-1", previousThreadId: null, nextThreadId: "thread-2" });
   });
 
-  it("migrates legacy collapse keys before registering RPCs", async () => {
-    const host = createFakePluginHost({ pluginId: "bb-collab" });
-    await host.bb.storage.kv.set("sidebar.collapse:project:project-a", true);
-    await plugin(host.bb);
-
-    await expect(host.harness.callRpc("sidebarCollapseState", { projectIds: ["project-a"], threadIds: [] })).resolves.toEqual({ projects: { "project-a": true }, threads: {} });
-    await expect(host.bb.storage.kv.get("sidebar.collapse:[\"project\",\"project-a\"]")).resolves.toBe(true);
-    await expect(host.bb.storage.kv.get("sidebar.collapse:project:project-a")).resolves.toBeUndefined();
-  });
-
-  it("cannot interleave a clear with startup migration", async () => {
+  it("reads legacy collapse keys without writing during reads", async () => {
     const host = createFakePluginHost({ pluginId: "bb-collab" });
     const legacyKey = "sidebar.collapse:project:project-a";
     const canonicalKey = "sidebar.collapse:[\"project\",\"project-a\"]";
     await host.bb.storage.kv.set(legacyKey, true);
+    await plugin(host.bb);
 
-    let releaseList!: () => void;
-    const listReleased = new Promise<void>((resolve) => { releaseList = resolve; });
-    const originalList = host.bb.storage.kv.list.bind(host.bb.storage.kv);
-    host.bb.storage.kv.list = async (prefix) => {
-      const keys = await originalList(prefix);
-      if (prefix === "sidebar.collapse:") await listReleased;
-      return keys;
+    await expect(host.harness.callRpc("sidebarCollapseState", { projectIds: ["project-a"], threadIds: [] })).resolves.toEqual({ projects: { "project-a": true }, threads: {} });
+    await expect(host.bb.storage.kv.get(canonicalKey)).resolves.toBeUndefined();
+    await expect(host.bb.storage.kv.get(legacyKey)).resolves.toBe(true);
+  });
+
+  it("does not resurrect a clear while a prior generation read is in flight", async () => {
+    const host = createFakePluginHost({ pluginId: "bb-collab" });
+    const legacyKey = "sidebar.collapse:project:project-a";
+    const canonicalKey = "sidebar.collapse:[\"project\",\"project-a\"]";
+    await host.bb.storage.kv.set(legacyKey, true);
+    await plugin(host.bb);
+
+    let releaseCanonicalRead!: () => void;
+    const canonicalReadReleased = new Promise<void>((resolve) => { releaseCanonicalRead = resolve; });
+    const originalGet = host.bb.storage.kv.get.bind(host.bb.storage.kv);
+    host.bb.storage.kv.get = async function <T>(key: string) {
+      const value = await originalGet<T>(key);
+      if (key === canonicalKey) await canonicalReadReleased;
+      return value;
     };
 
-    const loading = plugin(host.bb);
+    const state = host.harness.callRpc("sidebarCollapseState", { projectIds: ["project-a"], threadIds: [] });
     await Promise.resolve();
-    await expect(host.harness.callRpc("setSidebarCollapse", { kind: "project", id: "project-a", collapsed: false })).rejects.toThrow();
-    releaseList();
-    await loading;
-    await expect(host.harness.callRpc("sidebarCollapseState", { projectIds: ["project-a"], threadIds: [] })).resolves.toEqual({ projects: { "project-a": true }, threads: {} });
-    await expect(host.bb.storage.kv.get(canonicalKey)).resolves.toBe(true);
+    await host.harness.callRpc("setSidebarCollapse", { kind: "project", id: "project-a", collapsed: false });
+    releaseCanonicalRead();
+
+    await expect(state).resolves.toEqual({ projects: {}, threads: {} });
+    await expect(host.bb.storage.kv.get(legacyKey)).resolves.toBeUndefined();
   });
 
   it("accepts the live sidebar population across every batched RPC input", async () => {
