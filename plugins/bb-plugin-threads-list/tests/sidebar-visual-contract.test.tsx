@@ -7,10 +7,8 @@ import { installTestPluginRuntime, loadPluginApp, renderSlot } from "@get-bb/plu
 import type { PluginSidebarProject, PluginSidebarThread, PluginThreadListProps } from "@get-bb/plugin-sdk/app";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-// The operator correction: a distinct colored running spinner, a small
-// unread/attention dot at the native slot and geometry, no left accent rail at
-// all, and real currentColor marks for the provider ids the fleet actually
-// reports.
+// The operator correction: one native-width left slot switches between a
+// colored spinner, an accent unread dot, and a grey read dot.
 
 function props(overrides: Partial<PluginThreadListProps> = {}): PluginThreadListProps {
   // bb-app 0.39.0 made experimental_Original required: the host's own thread
@@ -116,9 +114,8 @@ describe("sidebar visual contract", () => {
     // It leads the title group rather than floating somewhere else in the row.
     expect(anchor.parentElement!.firstElementChild).toBe(slot);
 
-    // An idle row reserves no space for it.
     const idle = rendered.container.querySelector('[data-sidebar-thread-id="idle"]')!;
-    expect(idle.previousElementSibling).toBeNull();
+    expect(idle.previousElementSibling?.getAttribute("data-sidebar-thread-signal")).toBe("idle");
   });
 
   it("keeps the spinner and the dot distinct and mutually exclusive", async () => {
@@ -136,24 +133,25 @@ describe("sidebar visual contract", () => {
     }
   });
 
-  it("places the dot in the native trailing slot at native geometry", async () => {
+  it("places every state cue in one native-width leading slot", async () => {
     list = await registration();
-    const rendered = render([{ ...thread("unread"), indicator: "unread-success", indicatorLabel: "Unread" }]);
-
+    const rendered = render([{ ...thread("unread"), isUnread: true }]);
     const slot = rendered.container.querySelector("[data-sidebar-thread-signal]")! as HTMLElement;
     const dot = slot.querySelector("[data-sidebar-thread-dot]")! as HTMLElement;
-    // Native measurements, read off the built-in list in the running app.
-    expect(slot.className).toContain("size-4");
+    expect(slot.className).toContain("inline-flex");
+    expect(slot.className).toContain("h-4");
+    expect(slot.className).toContain("w-4");
+    expect(slot.className).toContain("max-md:pointer-coarse:h-5");
+    expect(slot.className).toContain("max-md:pointer-coarse:w-5");
     expect(dot.className).toContain("size-[5px]");
-    expect(dot.className).toContain("rounded-full");
-    expect(dot.className).not.toMatch(/size-1\.5(?!\s|$)/u);
-
-    // After the title, and NOT inside the meta cluster that holds the badge.
+    expect(dot.className).toContain("bg-primary");
     const anchor = rendered.container.querySelector('[data-sidebar-thread-id="unread"]')!;
-    expect(anchor.compareDocumentPosition(slot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    const badge = rendered.container.querySelector("[data-thread-execution-badge]");
-    expect(badge && slot.contains(badge)).toBeFalsy();
-    expect(badge?.parentElement?.contains(slot)).toBeFalsy();
+    expect(anchor.previousElementSibling).toBe(slot);
+
+    cleanup();
+    const read = render([thread("read")]);
+    const readDot = read.container.querySelector("[data-sidebar-thread-dot]")! as HTMLElement;
+    expect(readDot.className).toContain("bg-muted-foreground/60");
   });
 
   it("draws no left accent rail, ornament, or spacer on any row", async () => {
@@ -168,12 +166,10 @@ describe("sidebar visual contract", () => {
       const row = anchor.closest("div")!;
       expect(row.className).not.toMatch(/border-l/u);
     }
-    // Only the working row leads with anything, and that thing is the spinner —
-    // never a rail, a bullet, or a blank box holding space.
+    // Every row has the same leading slot; only its glyph/colour changes.
     for (const id of ["failed", "idle"]) {
       const anchor = rendered.container.querySelector(`[data-sidebar-thread-id="${id}"]`)!;
-      expect(anchor.previousElementSibling, id).toBeNull();
-      expect(anchor.parentElement!.firstElementChild, id).toBe(anchor);
+      expect(anchor.previousElementSibling?.getAttribute("data-sidebar-thread-signal"), id).toBeTruthy();
     }
 
     // Belt and braces: the rail classes must not survive anywhere in source.

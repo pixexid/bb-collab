@@ -29,7 +29,7 @@ export const rpcContract = defineRpcContract({
   },
   reorderPinned: {
     input: z.object({ threadId: id, previousThreadId: id.nullable(), nextThreadId: id.nullable() }).strict(),
-    output: z.object({ ok: z.literal(true) }).strict(),
+    output: z.array(id),
   },
 });
 
@@ -72,8 +72,8 @@ export default function plugin(bb: BbPluginApi) {
       return input;
     },
     async reorderPinned(input) {
-      await bb.sdk.threads.reorderPinned(input);
-      return { ok: true as const };
+      const threads = await bb.sdk.threads.reorderPinned(input);
+      return threads.map((thread) => thread.id);
     },
   });
 }

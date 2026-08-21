@@ -112,13 +112,11 @@ function isError(thread: PluginSidebarThread): boolean {
   return thread.indicator === "unread-error";
 }
 
-// The native list gives status one 16px box at the row's trailing edge holding
-// exactly one glyph. Measured off the built-in list in the running app: the
-// wrapper is `size-4` (`size-5` on coarse pointers) and the dot inside it is
-// 5px. Matching those numbers is the whole point — a different size or slot
-// reads as a different control.
-const TRAILING_SLOT = "inline-flex size-4 shrink-0 items-center justify-center max-md:pointer-coarse:size-5";
-const LEADING_SLOT = "inline-flex size-3.5 shrink-0 items-center justify-center";
+// The native list gives status one fixed box holding exactly one glyph. Measured
+// off the built-in list in the running app: it is `h-4 w-4` (`h-5 w-5` on
+// coarse pointers) and the dot inside it is 5px. Matching those numbers is the
+// whole point — a different size or slot reads as a different control.
+const LEADING_SLOT = "inline-flex h-4 w-4 shrink-0 items-center justify-center max-md:pointer-coarse:h-5 max-md:pointer-coarse:w-5";
 const NATIVE_DOT = "size-[5px] rounded-full max-md:pointer-coarse:size-1.5";
 
 export function signalDotClasses(thread: PluginSidebarThread, kind: SidebarThreadSignal): string {
@@ -156,34 +154,22 @@ function RunningSpinner({ label }: { label: string }) {
 }
 
 // Working state leads the row, ahead of the session name, so a scan down the
-// left edge answers "what is running" without reading across. Nothing is
-// reserved when idle: the spinner is absent, not invisible, so a still row
-// never carries a blank gutter.
-function ThreadRunningSpinner({ thread }: { thread: PluginSidebarThread }) {
+// left edge answers "what is running" without reading across. One fixed
+// native-width slot is always reserved; state changes only replace its
+// glyph/colour.
+function ThreadSignal({ thread }: { thread: PluginSidebarThread }) {
   const signal = threadSignal(thread);
-  if (signal.kind !== "running") return null;
   return (
-    <span className={LEADING_SLOT} data-sidebar-thread-signal="running">
-      <RunningSpinner label={signal.label} />
-    </span>
-  );
-}
-
-// State stays a small colour-only dot in the native trailing slot, the way the
-// built-in list does it. Working rows are the spinner's job, so the dot never
-// doubles as one; an idle read row draws nothing.
-function ThreadStateDot({ thread }: { thread: PluginSidebarThread }) {
-  const signal = threadSignal(thread);
-  if (signal.kind === "idle" || signal.kind === "running") return null;
-  return (
-    <span className={TRAILING_SLOT} data-sidebar-thread-signal={signal.kind}>
-      <span
-        className={`${NATIVE_DOT} ${signalDotClasses(thread, signal.kind)}`}
-        role="img"
-        aria-label={signal.label}
-        title={signal.label}
-        data-sidebar-thread-dot=""
-      />
+    <span className={LEADING_SLOT} data-sidebar-thread-signal={signal.kind}>
+      {signal.kind === "running" ? <RunningSpinner label={signal.label} /> : (
+        <span
+          className={`${NATIVE_DOT} ${signal.kind === "idle" && thread.isUnread ? "bg-primary" : signalDotClasses(thread, signal.kind)}`}
+          role="img"
+          aria-label={signal.kind === "idle" && thread.isUnread ? "Unread" : signal.label}
+          title={signal.kind === "idle" && thread.isUnread ? "Unread" : signal.label}
+          data-sidebar-thread-dot=""
+        />
+      )}
     </span>
   );
 }
@@ -399,7 +385,7 @@ function ThreadRow({
         <input autoFocus className="min-w-0 flex-1 rounded border border-border bg-background px-1 text-sm text-foreground" aria-label={`Rename ${title}`} value={renameValue} onChange={(event) => setRenameValue(event.target.value)} onBlur={finishRename} onKeyDown={(event) => { if (event.key === "Enter") finishRename(); if (event.key === "Escape") setRenaming(false); }} />
       ) : (
         <span className="flex min-w-0 flex-1 items-center gap-1.5">
-          <ThreadRunningSpinner thread={thread} />
+          <ThreadSignal thread={thread} />
           <a
             href="#"
             className="min-w-0 truncate rounded-md text-foreground outline-none focus-visible:ring-2 focus-visible:ring-primary"
@@ -415,11 +401,6 @@ function ThreadRow({
           {hasChildren ? <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded text-xs leading-none text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none" aria-label={`${collapsed ? "Expand" : "Collapse"} ${title} children`} aria-expanded={!collapsed} onClick={onToggleChildren}>{collapsed ? "›" : "⌄"}</button> : null}
         </span>
       )}
-      {/* Status sits outside the cross-fading cluster below. Native lets its
-          indicator fade under the hover actions; here the row is denser and a
-          working thread you are pointing at is exactly the one whose state you
-          still want to read, so it stays put. */}
-      <ThreadStateDot thread={thread} />
       {/* Meta and actions share one slot and only cross-fade: hovering a row
           must not reflow it, or whatever you were aiming at moves. Capped so
           the title keeps the majority of the row. */}
@@ -470,6 +451,7 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   const reportedBreak = useRef<string | null>(null);
   const dragTargetId = useRef<string | null>(null);
   const [customStates, setCustomStates] = useState<ThreadStates>({});
+  const [optimisticPinnedOrders, setOptimisticPinnedOrders] = useState<Record<string, string[]>>({});
   const [indicatorBroken, setIndicatorBroken] = useState<string | null>(null);
   const [threadModels, setThreadModels] = useState<ThreadModels>({});
   const [stateMigrationNotice, setStateMigrationNotice] = useState(migrationNoticeVisible);
@@ -516,7 +498,12 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     return () => { mounted = false; };
   }, [projectIdsKey, rpc, threadIdsKey]);
 
-  const groups = groupThreads(sidebar.projects, sidebar.threads, searchQuery);
+  const displayThreads = [...sidebar.threads].sort((a, b) => {
+    const order = optimisticPinnedOrders[a.projectId];
+    if (!order || a.projectId !== b.projectId || !a.isPinned || !b.isPinned) return 0;
+    return order.indexOf(a.id) - order.indexOf(b.id);
+  });
+  const groups = groupThreads(sidebar.projects, displayThreads, searchQuery);
   if (sidebar.status === "loading") return <><p className="p-3 text-sm text-muted-foreground">Loading threads…</p></>;
   if (sidebar.status === "error") return <><p className="p-3 text-sm text-destructive">Unable to load threads.</p></>;
   if (groups.length === 0) return <><p className="p-3 text-sm text-muted-foreground">No matching threads.</p></>;
@@ -544,13 +531,24 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     // neighbours handed to the host come from that group. A global pinned list
     // names neighbours the user never saw next to the row.
     if (dragged.projectId !== target.projectId) return;
-    const order = sidebar.threads.filter((thread) => thread.isPinned && thread.projectId === dragged.projectId).map((thread) => thread.id);
+    const order = displayThreads.filter((thread) => thread.isPinned && thread.projectId === dragged.projectId).map((thread) => thread.id);
     const from = order.indexOf(draggedId);
     const to = order.indexOf(targetId);
     if (from < 0 || to < 0) return;
     const remaining = order.filter((id) => id !== draggedId);
     const insertionIndex = remaining.indexOf(targetId) + (from < to ? 1 : 0);
-    void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: remaining[insertionIndex - 1] ?? null, nextThreadId: remaining[insertionIndex] ?? null }).catch(() => undefined);
+    const nextOrder = [...remaining];
+    nextOrder.splice(insertionIndex, 0, draggedId);
+    setOptimisticPinnedOrders((current) => ({ ...current, [dragged.projectId]: nextOrder }));
+    void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: remaining[insertionIndex - 1] ?? null, nextThreadId: remaining[insertionIndex] ?? null }).then((authoritativeOrder) => {
+      setOptimisticPinnedOrders((current) => current[dragged.projectId] === nextOrder
+        ? { ...current, [dragged.projectId]: authoritativeOrder.filter((id) => order.includes(id)) }
+        : current);
+    }).catch(() => {
+      setOptimisticPinnedOrders((current) => current[dragged.projectId] === nextOrder
+        ? Object.fromEntries(Object.entries(current).filter(([projectId]) => projectId !== dragged.projectId))
+        : current);
+    });
   };
   const startPinnedDrag = (threadId: string) => {
     draggingThreadId.current = threadId;
@@ -568,11 +566,16 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     window.addEventListener("pointerup", settle);
     window.addEventListener("pointercancel", settle);
   };
-  const trackPinnedDrag = (threadId: string) => { if (draggingThreadId.current) dragTargetId.current = threadId; };
+  const trackPinnedDrag = (threadId: string) => {
+    if (!draggingThreadId.current || threadId === draggingThreadId.current) return;
+    reorderPinned(draggingThreadId.current, threadId);
+    dragTargetId.current = threadId;
+  };
   const finishPinnedDrag = (targetId: string) => {
     const draggedId = draggingThreadId.current ?? "";
+    const target = targetId || dragTargetId.current || "";
     draggingThreadId.current = null;
-    reorderPinned(draggedId, targetId || dragTargetId.current || "");
+    if (target && target !== dragTargetId.current) reorderPinned(draggedId, target);
     dragTargetId.current = null;
   };
 
