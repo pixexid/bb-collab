@@ -141,6 +141,28 @@ describe("worktree cleanup", () => {
     expect(runWorktreeCleanup(threaded, { liveThreadIds: new Set(), attestation: { coverage: "blind", reason: "reader-unreadable" } }).attestation).toEqual({ coverage: "blind", reason: "reader-unreadable" });
   });
 
+  it("counts provider path mismatches but keeps generic absence blind", () => {
+    for (const reason of [
+      "Codex session_meta does not match the BB session and exact environment path",
+      "active BB turn: Codex session_meta does not match the BB session and exact environment path",
+      "Pi session header does not match the exact BB environment path",
+      "active Pi session header does not match the exact BB environment path",
+    ]) {
+      expect(cleanupAttestationFromProfile("thr_expired", { outcome: "unknown", reason })).toEqual({
+        coverage: "known",
+        expiredThreadIds: new Set(["thr_expired"]),
+      });
+    }
+    expect(cleanupAttestationFromProfile("thr_healthy", { outcome: "unknown", reason: "provider-native turn profile is absent" })).toEqual({
+      coverage: "blind",
+      reason: "executed-profile thread=\"thr_healthy\" reason=\"provider-native turn profile is absent\"",
+    });
+    expect(cleanupAttestationFromProfile("thr_healthy", { outcome: "unknown", reason: "expected one Claude session log, found 0" })).toEqual({
+      coverage: "blind",
+      reason: "executed-profile thread=\"thr_healthy\" reason=\"expected one Claude session log, found 0\"",
+    });
+  });
+
   it("classifies a real reader refusal as blind instead of expired", async () => {
     const profile = await readExecutedProfiles({
       thread: { providerId: "unsupported-provider", status: "idle" },
@@ -155,7 +177,7 @@ describe("worktree cleanup", () => {
     expect(profile.outcome).toBe("unknown");
     expect(cleanupAttestationFromProfile("thr_unreadable", profile)).toEqual({
       coverage: "blind",
-      reason: "executed-profile:thr_unreadable:provider unsupported-provider has no measured native read-back",
+      reason: "executed-profile thread=\"thr_unreadable\" reason=\"provider unsupported-provider has no measured native read-back\"",
     });
   });
 

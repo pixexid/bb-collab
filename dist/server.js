@@ -21309,12 +21309,18 @@ function livenessDecision(state, alerted) {
 import { execFileSync } from "node:child_process";
 import { readFileSync as readFileSync2, realpathSync as realpathSync2, statSync } from "node:fs";
 import { resolve } from "node:path";
+var expiredCorrelationReasons = /* @__PURE__ */ new Set([
+  "Codex session_meta does not match the BB session and exact environment path",
+  "active BB turn: Codex session_meta does not match the BB session and exact environment path",
+  "Pi session header does not match the exact BB environment path",
+  "active Pi session header does not match the exact BB environment path"
+]);
 function cleanupAttestationFromProfile(threadId, profile) {
   const reason = profile.reason ?? profile.turns?.find((turn) => turn.reason)?.reason;
-  if (profile.outcome === "unknown" && reason === "provider-native turn profile is absent") {
+  if (profile.outcome === "unknown" && reason && expiredCorrelationReasons.has(reason)) {
     return { coverage: "known", expiredThreadIds: /* @__PURE__ */ new Set([threadId]) };
   }
-  if (profile.outcome === "unknown") return { coverage: "blind", reason: `executed-profile:${threadId}:${reason ?? "unknown-cause"}` };
+  if (profile.outcome === "unknown") return { coverage: "blind", reason: `executed-profile thread=${JSON.stringify(threadId)} reason=${JSON.stringify(reason ?? "unknown-cause")}` };
   return { coverage: "known", expiredThreadIds: /* @__PURE__ */ new Set() };
 }
 var threadPattern = /thr_[a-z0-9]+/u;

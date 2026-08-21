@@ -30,13 +30,20 @@ export type WorktreeCleanupReport = {
 
 export type ExecutedProfileRead = { outcome?: string; reason?: string; turns?: ReadonlyArray<{ reason?: string }> };
 
+const expiredCorrelationReasons = new Set([
+  "Codex session_meta does not match the BB session and exact environment path",
+  "active BB turn: Codex session_meta does not match the BB session and exact environment path",
+  "Pi session header does not match the exact BB environment path",
+  "active Pi session header does not match the exact BB environment path",
+]);
+
 export function cleanupAttestationFromProfile(threadId: string, profile: ExecutedProfileRead):
   { coverage: "known"; expiredThreadIds: ReadonlySet<string> } | { coverage: "blind"; reason: string } {
   const reason = profile.reason ?? profile.turns?.find((turn) => turn.reason)?.reason;
-  if (profile.outcome === "unknown" && reason === "provider-native turn profile is absent") {
+  if (profile.outcome === "unknown" && reason && expiredCorrelationReasons.has(reason)) {
     return { coverage: "known", expiredThreadIds: new Set([threadId]) };
   }
-  if (profile.outcome === "unknown") return { coverage: "blind", reason: `executed-profile:${threadId}:${reason ?? "unknown-cause"}` };
+  if (profile.outcome === "unknown") return { coverage: "blind", reason: `executed-profile thread=${JSON.stringify(threadId)} reason=${JSON.stringify(reason ?? "unknown-cause")}` };
   return { coverage: "known", expiredThreadIds: new Set() };
 }
 
