@@ -1975,7 +1975,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   const recordLaneCapacityInterval = (observation: LaneCapacityObservation) => {
     if (!db) throw new Error("canonical-store-unavailable");
     // Keep this transaction to roll back partial evidence when a later attempt row fails.
-    // Orphan absence is separately guaranteed by interval-before-evidence ordering; the current fixture yields one native attempt, so no test covers this partial case.
+    // Orphan absence is separately guaranteed by interval-before-evidence ordering; the fixture covers rollback when the second attempt row fails.
     db.transaction(() => {
       const startableWork = observation.startableWork === null ? null : observation.startableWork ? 1 : 0;
       const extended = db!.prepare(
