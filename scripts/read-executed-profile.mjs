@@ -39,12 +39,16 @@ function filesNamed(root, directory, predicate) {
   });
 }
 
-function codexSessionDirectory(home, providerThreadId) {
+function codexSessionDirectories(home, providerThreadId) {
   const compact = providerThreadId.replaceAll("-", "");
-  if (!/^[0-9a-f]{32}$/iu.test(compact)) return null;
+  if (!/^[0-9a-f]{32}$/iu.test(compact)) return [];
   const date = new Date(Number.parseInt(compact.slice(0, 12), 16));
-  if (Number.isNaN(date.valueOf())) return null;
-  return join(home, ".codex", "sessions", String(date.getUTCFullYear()), String(date.getUTCMonth() + 1).padStart(2, "0"), String(date.getUTCDate()).padStart(2, "0"));
+  if (Number.isNaN(date.valueOf())) return [];
+  return [0, -1, 1].map((offset) => {
+    const candidate = new Date(date);
+    candidate.setUTCDate(candidate.getUTCDate() + offset);
+    return join(home, ".codex", "sessions", String(candidate.getUTCFullYear()), String(candidate.getUTCMonth() + 1).padStart(2, "0"), String(candidate.getUTCDate()).padStart(2, "0"));
+  });
 }
 
 function claudeProjectDirectory(home, environmentPath, providerThreadId) {
@@ -170,8 +174,12 @@ export async function readExecutedProfiles({ thread, environment, events, home =
   if (thread.providerId === "codex") {
     try {
       const root = join(home, ".codex", "sessions");
-      const directory = codexSessionDirectory(home, providerThreadId);
-      const files = directory ? filesNamed(root, directory, (name) => name.endsWith(`-${providerThreadId}.jsonl`)) : [];
+      const directories = codexSessionDirectories(home, providerThreadId);
+      let files = [];
+      for (const directory of directories) {
+        files = filesNamed(root, directory, (name) => name.endsWith(`-${providerThreadId}.jsonl`));
+        if (files.length > 0) break;
+      }
       if (files.length !== 1) return { ...settle(turns, profiles, "codex turn_context"), reason: `${active ? "active BB turn: " : ""}expected one Codex session log, found ${files.length}` };
       const activeProfiles = [];
       let activeSessionMatches = !active;
