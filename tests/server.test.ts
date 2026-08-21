@@ -36,6 +36,7 @@ import {
   backfillWorkItemAttempts,
   cachedConsumerRolloutEvidence,
   canonicalJson,
+  mutationRequestDigest,
   contractDigest,
   databaseIsReady,
   doctor,
@@ -2652,7 +2653,27 @@ describe("bb-collab plugin boundary", () => {
     expect(fleetWatchdogBlockerFiredKey("a\u0000b", "c")).not.toBe(fleetWatchdogBlockerFiredKey("a", "b\u0000c"));
     expect(fleetWatchdogRoleLivenessKey(holder("a\u0000b", "c", 1, "d", "e"))).not.toBe(fleetWatchdogRoleLivenessKey(holder("a", "b\u0000c", 1, "d", "e")));
     expect(fleetWatchdogEpisodeKey(holder("a", "b", 1, "c", "d"), "e\u0000f")).not.toBe(fleetWatchdogEpisodeKey(holder("a", "b", 1, "c", "d\u0000e"), "f"));
-    expect(fleetWatchdogScope("degrade", "a\u0000b", "c")).not.toBe(fleetWatchdogScope("degrade", "a", "b\u0000c"));
+    expect(fleetWatchdogScope("degrade", "a:b", "c")).not.toBe(fleetWatchdogScope("degrade", "a", "b:c"));
+  });
+
+  it("proves legacy receipts by transition identity, not their ambiguous key", () => {
+    const transition = {
+      projectId: PROJECT_ID,
+      operationClass: "work_item_transition",
+      idempotencyKey: "fleet-watchdog:blocker-fired:a:b:c",
+      actorReceiptId: RECEIPT_ID,
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: "fence",
+      repoTargetId: TARGET_ID,
+      expectedResourceRevision: 3,
+      workItemId: "a:b",
+      lifecycleState: "ready",
+      workItemUnblock: { kind: "work_item_succeeded", workItemId: "c" },
+    } as ApplyRequest;
+    const foreign: ApplyRequest = { ...transition, workItemId: "a", workItemUnblock: { kind: "work_item_succeeded", workItemId: "b:c" } };
+    expect(transition.idempotencyKey).toBe("fleet-watchdog:blocker-fired:a:b:c");
+    expect(mutationRequestDigest(transition)).not.toBe(mutationRequestDigest(foreign));
   });
 
   it("learns permanent reopen refusals instead of retrying them", () => {

@@ -2986,7 +2986,7 @@ function actorReceiptDigest(input: {
   }));
 }
 
-function mutationRequestDigest(request: ApplyRequest): string {
+export function mutationRequestDigest(request: ApplyRequest): string {
   return sha256(canonicalJson(Object.fromEntries(Object.entries(request).filter(([, value]) => value !== undefined))));
 }
 

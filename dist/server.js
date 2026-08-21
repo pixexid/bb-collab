@@ -21879,7 +21879,17 @@ var fleetWatchdogLegacyEpisodeKey = (holder, queueHead) => [
   "activeLanes=0",
   queueHead
 ].join(":");
-var fleetWatchdogScope = (prefix, ...parts) => `${prefix}:${parts.join(":")}`;
+var fleetWatchdogScope = (prefix, ...parts) => `${prefix}:${fleetWatchdogCompositeKey(...parts)}`;
+var fleetWatchdogScopeMessage = (scope) => {
+  const separator = scope.indexOf(":");
+  if (separator < 0) return scope;
+  try {
+    const parts = JSON.parse(scope.slice(separator + 1));
+    return `${scope.slice(0, separator)}:${Array.isArray(parts) ? parts.join(":") : scope.slice(separator + 1)}`;
+  } catch {
+    return scope;
+  }
+};
 var fleetWatchdogReopenKey = (projectId, workItemId, externalRevision) => fleetWatchdogCompositeKey(...[projectId, workItemId, externalRevision].filter((value) => value !== void 0));
 function githubRepository(remoteUrl) {
   const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
@@ -24256,13 +24266,10 @@ ${thread.titleFallback ?? ""}`);
         if (!actor || !governor || !config2 || !workItem) {
           return { outcome: "WORK_ITEM_STATE_INVALID", subject: workItemId, expected: 1, attempted: 0, verified: 0, message: "authority or work item unavailable" };
         }
-        const compatibleKey = legacyIdempotencyKey !== void 0 && db.prepare(
-          "SELECT 1 FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?"
-        ).get(projectId, legacyIdempotencyKey) !== void 0 ? legacyIdempotencyKey : idempotencyKey;
-        return applyAuthorizedMutation(db, {
+        const request = {
           projectId,
           operationClass: "work_item_transition",
-          idempotencyKey: compatibleKey,
+          idempotencyKey,
           actorReceiptId: actor.receipt_id,
           expectedConfigRevision: config2.config_revision,
           expectedGovernanceEpoch: governor.governance_epoch,
@@ -24272,7 +24279,11 @@ ${thread.titleFallback ?? ""}`);
           workItemId,
           lifecycleState: state,
           ...extra
-        }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
+        };
+        const compatibleKey = legacyIdempotencyKey !== void 0 && db.prepare(
+          "SELECT 1 FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ? AND request_digest = ?"
+        ).get(projectId, legacyIdempotencyKey, mutationRequestDigest({ ...request, idempotencyKey: legacyIdempotencyKey })) !== void 0 ? legacyIdempotencyKey : idempotencyKey;
+        return applyAuthorizedMutation(db, { ...request, idempotencyKey: compatibleKey }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
       };
       const inspectLinkedWorkItems = async (projectId) => {
         const linkedWorkItems = db.prepare(
@@ -24652,7 +24663,7 @@ ${thread.titleFallback ?? ""}`);
       degrade(fleetWatchdogScope("cycle", String(error48)));
       bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
     } finally {
-      const message = `fleet-watchdog coverage=${coverage} seats=${visibleSeatCount} lanes=${visibleLaneCount} cannotSee=${cannotSee.size === 0 ? "none" : [...cannotSee].join("|").replace(/\u0000/gu, ":")}`;
+      const message = `fleet-watchdog coverage=${coverage} seats=${visibleSeatCount} lanes=${visibleLaneCount} cannotSee=${cannotSee.size === 0 ? "none" : [...cannotSee].map(fleetWatchdogScopeMessage).join("|").replace(/\u0000/gu, ":")}`;
       if (coverage === "visible") bb.log.info(message);
       else bb.log.warn(message);
     }

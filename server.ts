@@ -33,6 +33,7 @@ import {
   doctor,
   exportFoundation,
   canonicalJson,
+  mutationRequestDigest,
   isRefusal,
   probeV21NewLegacyApplyProvenanceRefusal,
   probeV21ConsumedLegacyReplay,
@@ -111,7 +112,17 @@ export const fleetWatchdogEpisodeKey = (holder: RoleHolderState, queueHead: stri
 const fleetWatchdogLegacyEpisodeKey = (holder: RoleHolderState, queueHead: string) => [
   holder.project_id, holder.role_id, holder.role_generation, holder.execution_attempt_id, holder.thread_id, "activeLanes=0", queueHead,
 ].join(":");
-export const fleetWatchdogScope = (prefix: string, ...parts: string[]) => `${prefix}:${parts.join(":")}`;
+export const fleetWatchdogScope = (prefix: string, ...parts: string[]) => `${prefix}:${fleetWatchdogCompositeKey(...parts)}`;
+const fleetWatchdogScopeMessage = (scope: string) => {
+  const separator = scope.indexOf(":");
+  if (separator < 0) return scope;
+  try {
+    const parts = JSON.parse(scope.slice(separator + 1)) as unknown;
+    return `${scope.slice(0, separator)}:${Array.isArray(parts) ? parts.join(":") : scope.slice(separator + 1)}`;
+  } catch {
+    return scope;
+  }
+};
 
 export const fleetWatchdogReopenKey = (projectId: string, workItemId: string, externalRevision?: string) =>
   fleetWatchdogCompositeKey(...[projectId, workItemId, externalRevision].filter((value): value is string => value !== undefined));
@@ -2898,13 +2909,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         if (!actor || !governor || !config || !workItem) {
           return { outcome: "WORK_ITEM_STATE_INVALID", subject: workItemId, expected: 1, attempted: 0, verified: 0, message: "authority or work item unavailable" };
         }
-        const compatibleKey = legacyIdempotencyKey !== undefined && db.prepare(
-          "SELECT 1 FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
-        ).get(projectId, legacyIdempotencyKey) !== undefined ? legacyIdempotencyKey : idempotencyKey;
-        return applyAuthorizedMutation(db, {
+        const request: ApplyRequest = {
           projectId,
           operationClass: "work_item_transition",
-          idempotencyKey: compatibleKey,
+          idempotencyKey,
           actorReceiptId: actor.receipt_id,
           expectedConfigRevision: config.config_revision,
           expectedGovernanceEpoch: governor.governance_epoch,
@@ -2914,7 +2922,13 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           workItemId,
           lifecycleState: state,
           ...extra,
-        }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
+        };
+        const compatibleKey = legacyIdempotencyKey !== undefined && db.prepare(
+          "SELECT 1 FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ? AND request_digest = ?",
+        ).get(projectId, legacyIdempotencyKey, mutationRequestDigest({ ...request, idempotencyKey: legacyIdempotencyKey })) !== undefined
+          ? legacyIdempotencyKey
+          : idempotencyKey;
+        return applyAuthorizedMutation(db, { ...request, idempotencyKey: compatibleKey }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
       };
       const inspectLinkedWorkItems = async (projectId: string) => {
         // The handoff gate owns canonical ledger/attempt drift; this existing watchdog owns
@@ -3306,7 +3320,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       degrade(fleetWatchdogScope("cycle", String(error)));
       bb.log.warn(`fleet-watchdog failed: ${String(error)}`);
     } finally {
-      const message = `fleet-watchdog coverage=${coverage} seats=${visibleSeatCount} lanes=${visibleLaneCount} cannotSee=${cannotSee.size === 0 ? "none" : [...cannotSee].join("|").replace(/\u0000/gu, ":")}`;
+      const message = `fleet-watchdog coverage=${coverage} seats=${visibleSeatCount} lanes=${visibleLaneCount} cannotSee=${cannotSee.size === 0 ? "none" : [...cannotSee].map(fleetWatchdogScopeMessage).join("|").replace(/\u0000/gu, ":")}`;
       if (coverage === "visible") bb.log.info(message);
       else bb.log.warn(message);
     }
