@@ -52,6 +52,21 @@ describe("pull-request review tier policy", () => {
     expect(correctlyDeclared.stdout).toContain("Review tier A: cold exact-head review before merge");
   });
 
+  it("classifies every enforced review input with a fail-closed declaration table", () => {
+    for (const file of [
+      "scripts/check-production-reachability.mjs",
+      "scripts/read-executed-profile.mjs",
+      "scripts/check-css-bundle.mjs",
+      "package.json",
+    ]) {
+      expect(check("Review tier: A", [file]).status, `${file} Tier A`).toBe(0);
+      expect(check("Review tier: B", [file]).status, `${file} Tier B`).toBe(1);
+      expect(check("Review tier: C", [file]).status, `${file} Tier C`).toBe(1);
+      expect(check("", [file]).status, `${file} missing`).toBe(1);
+      expect(check("Review tier: A\nReview tier: A", [file]).status, `${file} duplicate`).toBe(1);
+    }
+  });
+
   it("fails under-declarations, permits over-declarations, and prints the stricter rule", () => {
     const result = check("Review tier: C", ["src/foundation.ts"]);
     expect(result.status).toBe(1);
