@@ -20835,9 +20835,14 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
     }));
     const pluginCompatibilityMessage = incompatiblePlugins.length === 0 ? void 0 : incompatiblePlugins.map((plugin2) => plugin2.message).join("; ");
     const routing = await routingDoctorEvidence(sdk, projectId, roleGenerationHeads);
-    const doctorMessage = [pluginCompatibilityMessage, ...routing.messages].filter(Boolean).join("; ");
+    const pluginSourceUnavailable = checkoutDivergence?.verdict === "unavailable";
+    const doctorMessage = [
+      pluginCompatibilityMessage,
+      ...routing.messages,
+      ...pluginSourceUnavailable ? ["plugin source checkout is unavailable"] : []
+    ].filter(Boolean).join("; ");
     const expected = targets.length + 1;
-    return result("OK", projectId, expected, expected, expected, {
+    return result(pluginSourceUnavailable ? "PLUGIN_SOURCE_UNAVAILABLE" : "OK", projectId, expected, expected, expected, {
       currentConfigRevision: configHead.config_revision,
       currentGovernanceEpoch: governor ? Number(governor.governance_epoch) : void 0,
       message: doctorMessage,
@@ -21288,6 +21293,18 @@ function planWorktreeCleanup(entries, options) {
   for (const entry of entries) {
     const population = entry.population ?? classifyWorktree(entry.path, options.home);
     const threadId = entry.threadId === void 0 ? threadIdFromBranch(entry.branch) : entry.threadId;
+    const entryPath = canonicalWorktreePath(entry.path);
+    if (options.pluginSourceResolved === false) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "plugin source environment is unresolved" });
+      continue;
+    }
+    if ([...options.protectedEnvironmentPaths ?? []].some((protectedPath) => {
+      const normalized = canonicalWorktreePath(protectedPath);
+      return normalized === entryPath || normalized.startsWith(`${entryPath}/`);
+    })) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "plugin source environment is protected" });
+      continue;
+    }
     if (population === "candidate") {
       decisions.push({ path: entry.path, population, action: "refuse", reason: "per-thread candidate checkout is protected" });
       continue;
@@ -21387,13 +21404,15 @@ function listGitWorktrees(repoRoot) {
   if (current) entries.push(current);
   return entries;
 }
-function cleanupGitWorktrees(repoRoot, liveThreadIds, liveWorktreeThreadIds = /* @__PURE__ */ new Map(), environmentInventoryComplete = false) {
+function cleanupGitWorktrees(repoRoot, liveThreadIds, liveWorktreeThreadIds = /* @__PURE__ */ new Map(), environmentInventoryComplete = false, protectedEnvironmentPaths = /* @__PURE__ */ new Set(), pluginSourceResolved = true) {
   const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
   const status = (path) => git(["status", "--porcelain", "--untracked-files=all"], path);
   return runWorktreeCleanup(listGitWorktrees(repoRoot), {
     liveThreadIds,
     liveWorktreeThreadIds,
     environmentInventoryComplete,
+    protectedEnvironmentPaths,
+    pluginSourceResolved,
     createdAt: worktreeCreatedAt,
     originMain,
     status,
@@ -22657,8 +22676,17 @@ async function reportProjectWorktreeCleanup(bb, projectId) {
   const source = project.sources.find((item) => item.isDefault) ?? project.sources[0];
   if (!source) throw new Error("project has no source checkout");
   const threads = await listAllProjectThreads((request) => bb.sdk.threads.list(request), projectId);
-  const liveWorktreeThreadIds = /* @__PURE__ */ new Map();
+  const protectedEnvironmentPaths = /* @__PURE__ */ new Set();
   let environmentInventoryComplete = true;
+  let pluginSourceResolved = true;
+  try {
+    const pluginRoot = resolvedPluginRoot(await bb.sdk.plugins.getSource({ pluginId: bb.pluginId }));
+    if (pluginRoot) protectedEnvironmentPaths.add(canonicalWorktreePath(pluginRoot));
+  } catch {
+    pluginSourceResolved = false;
+    environmentInventoryComplete = false;
+  }
+  const liveWorktreeThreadIds = /* @__PURE__ */ new Map();
   for (const thread of threads) {
     if (thread.environmentId === null) continue;
     try {
@@ -22675,7 +22703,7 @@ async function reportProjectWorktreeCleanup(bb, projectId) {
       environmentInventoryComplete = false;
     }
   }
-  return cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete);
+  return cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete, protectedEnvironmentPaths, pluginSourceResolved);
 }
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];

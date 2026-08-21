@@ -34,6 +34,10 @@ export type WorktreeCleanupOptions = {
   status?: (path: string) => string;
   reachable?: (path: string, head: string) => boolean;
   environmentInventoryComplete?: boolean;
+  /** False when the plugin source could not be resolved; no removal is safe then. */
+  pluginSourceResolved?: boolean;
+  /** Environment-level claims, including environments not attached to a thread. */
+  protectedEnvironmentPaths?: ReadonlySet<string>;
   createdAt?: (path: string) => number | null;
   now?: number;
   quietFloorMs?: number;
@@ -94,6 +98,18 @@ export function planWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeC
   for (const entry of entries) {
     const population = entry.population ?? classifyWorktree(entry.path, options.home);
     const threadId = entry.threadId === undefined ? threadIdFromBranch(entry.branch) : entry.threadId;
+    const entryPath = canonicalWorktreePath(entry.path);
+    if (options.pluginSourceResolved === false) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "plugin source environment is unresolved" });
+      continue;
+    }
+    if ([...(options.protectedEnvironmentPaths ?? [])].some((protectedPath) => {
+      const normalized = canonicalWorktreePath(protectedPath);
+      return normalized === entryPath || normalized.startsWith(`${entryPath}/`);
+    })) {
+      decisions.push({ path: entry.path, population, action: "refuse", reason: "plugin source environment is protected" });
+      continue;
+    }
     if (population === "candidate") {
       decisions.push({ path: entry.path, population, action: "refuse", reason: "per-thread candidate checkout is protected" });
       continue;
@@ -209,6 +225,8 @@ export function cleanupGitWorktrees(
   liveThreadIds: ReadonlySet<string>,
   liveWorktreeThreadIds: ReadonlyMap<string, ReadonlySet<string>> = new Map(),
   environmentInventoryComplete = false,
+  protectedEnvironmentPaths: ReadonlySet<string> = new Set(),
+  pluginSourceResolved = true,
 ): WorktreeCleanupReport {
   const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
   const status = (path: string) => git(["status", "--porcelain", "--untracked-files=all"], path);
@@ -216,6 +234,8 @@ export function cleanupGitWorktrees(
     liveThreadIds,
     liveWorktreeThreadIds,
     environmentInventoryComplete,
+    protectedEnvironmentPaths,
+    pluginSourceResolved,
     createdAt: worktreeCreatedAt,
     originMain,
     status,

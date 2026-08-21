@@ -1006,9 +1006,11 @@ describe("checkout divergence detection", () => {
       seedAndBootstrap(host);
       const expected = { checkoutHead: null, originMainRef: null, behindCount: null, verdict: "unavailable" };
       const rpc = await host.harness.callRpc("doctor", { projectId: PROJECT_ID }) as FoundationResult;
+      expect(rpc.outcome).toBe("PLUGIN_SOURCE_UNAVAILABLE");
+      expect(rpc.message).toContain("plugin source checkout is unavailable");
       expect(rpc.evidence).toMatchObject({ checkoutDivergence: expected });
       const cli = await host.harness.runCli(["doctor", "--project", PROJECT_ID]);
-      expect(JSON.parse(cli.stdout).evidence).toMatchObject({ checkoutDivergence: expected });
+      expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "PLUGIN_SOURCE_UNAVAILABLE", message: expect.stringContaining("plugin source checkout is unavailable"), evidence: { checkoutDivergence: expected } });
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -1227,6 +1229,7 @@ exit 0
       const host = await loadedHost();
       seedAndBootstrap(host);
       const result = await doctor(host.bb.storage.database(), host.bb.sdk, PROJECT_ID, divergence);
+      expect(result.outcome).toBe("OK");
       expect(result.evidence).toMatchObject({ checkoutDivergence: { checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 1, verdict: "diverged" } });
       const cli = await host.harness.runCli(["doctor", "--project", PROJECT_ID]);
       const currentCheckout = readCheckoutDivergence(findCheckoutRoot(process.cwd()));
@@ -10000,6 +10003,7 @@ exit 1
 
       const host = await loadedHost();
       host.harness.sdk.stub("projects.get", (async () => ({ sources: [{ isDefault: true, path: root }] })) as never);
+      host.harness.sdk.stub("plugins.getSource", (async () => ({ resolved: `path:${root}`, engines: {} })) as never);
       host.harness.sdk.stub("threads.list", (async ({ offset }: { offset: number }) => (offset === 0 ? [{ id: "thr_elsewhere", environmentId: "env_elsewhere" }] : [])) as never);
 
       host.harness.sdk.stub("environments.get", (async () => ({ path: join(root, "unrelated") })) as never);
@@ -10018,6 +10022,12 @@ exit 1
       const pathless = JSON.parse((await host.harness.runCli(["worktree-cleanup", "--project", PROJECT_ID])).stdout) as { wouldRemove: unknown[]; refused: { path: string; reason: string }[] };
       expect(pathless.wouldRemove).toEqual([]);
       expect(pathless.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(orphan), reason: "bb environment inventory is incomplete; detached ownership unresolved" }));
+
+      host.harness.sdk.stub("environments.get", (async () => ({ path: join(root, "unrelated") })) as never);
+      host.harness.sdk.stub("plugins.getSource", (async () => { throw new Error("plugin source lookup timed out"); }) as never);
+      const sourceUnavailable = JSON.parse((await host.harness.runCli(["worktree-cleanup", "--project", PROJECT_ID])).stdout) as { wouldRemove: unknown[]; refused: { path: string; reason: string }[] };
+      expect(sourceUnavailable.wouldRemove).toEqual([]);
+      expect(sourceUnavailable.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(orphan), reason: "plugin source environment is unresolved" }));
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
