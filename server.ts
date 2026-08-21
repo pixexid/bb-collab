@@ -2509,6 +2509,15 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       }
       return artifacts;
     },
+    readQueueHead: (projectId) => {
+      if (!db) return null;
+      const row = db.prepare(
+        `SELECT work_item_id, resource_revision FROM work_items
+         WHERE project_id = ? AND lifecycle_state IN ('proposed', 'ready')
+         ORDER BY created_at_ms, work_item_id LIMIT 1`,
+      ).get(projectId) as { work_item_id: string; resource_revision: number } | undefined;
+      return row ? { workItemId: row.work_item_id, resourceRevision: row.resource_revision } : null;
+    },
     wakeRole: async (role) => {
       const result = await steerRole(role);
       return result === true

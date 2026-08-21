@@ -14084,24 +14084,24 @@ function createLaneWatcher(options) {
     if (waits.length === 0) return { known: true, byWaiter: /* @__PURE__ */ new Map(), events: [] };
     const sourceStates = /* @__PURE__ */ new Map();
     for (const sourceThreadId of new Set(waits.map((wait) => wait.sourceThreadId))) {
-      let observation = null;
+      let observation2 = null;
       if (suppliedSource?.threadId === sourceThreadId) {
-        observation = {
+        observation2 = {
           status: suppliedSource.status,
           pendingExternalWait: false,
           archived: suppliedSource.archived
         };
       } else if (options.readWorker) {
         try {
-          observation = signal ? await options.readWorker(sourceThreadId, signal) : await options.readWorker(sourceThreadId);
+          observation2 = signal ? await options.readWorker(sourceThreadId, signal) : await options.readWorker(sourceThreadId);
         } catch {
-          observation = null;
+          observation2 = null;
         }
       }
       sourceStates.set(sourceThreadId, {
-        known: observation !== null,
-        terminal: observation?.archived === true || observation?.status === "error",
-        failed: observation?.archived === true || observation?.status === "error"
+        known: observation2 !== null,
+        terminal: observation2?.archived === true || observation2?.status === "error",
+        failed: observation2?.archived === true || observation2?.status === "error"
       });
     }
     const byWaiter = /* @__PURE__ */ new Map();
@@ -14179,14 +14179,14 @@ function createLaneWatcher(options) {
       if (threadId && targetThreadId !== threadId) continue;
       const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
       const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
-      let observation;
+      let observation2;
       try {
-        observation = signal ? await options.readWorker(targetThreadId, signal) : await options.readWorker(targetThreadId);
+        observation2 = signal ? await options.readWorker(targetThreadId, signal) : await options.readWorker(targetThreadId);
       } catch {
         continue;
       }
       const waitState = waitContext?.byWaiter.get(targetThreadId) ?? "none";
-      if (observation.projectId !== holder.project_id || waitContext && !waitContext.known || waitState === "pending" || waitState === "unknown" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || !scope?.nextStartable || scope.deferredReason) {
+      if (observation2.projectId !== holder.project_id || waitContext && !waitContext.known || waitState === "pending" || waitState === "unknown" || observation2.archived || observation2.pendingExternalWait || observation2.operatorWait || observation2.operatorWaitKnown === false || !scope?.nextStartable || scope.deferredReason) {
         await roleIdleLedger.clearPrefixExcept(prefix);
         continue;
       }
@@ -14196,13 +14196,13 @@ function createLaneWatcher(options) {
       }
       const key = roleIdleKey(holder, scope.queueHeadId);
       await roleIdleLedger.clearPrefixExcept(prefix, key);
-      if (observation.status !== "idle") {
+      if (observation2.status !== "idle") {
         if (await roleIdleLedger.preserveAfterSteerWake(key)) continue;
         await roleIdleLedger.resetIdle(key);
         await roleIdleLedger.clearPrefixExcept(prefix, key);
         continue;
       }
-      if (observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) {
+      if (observation2.idleSinceMs === null || observation2.idleSinceMs === void 0 || !Number.isFinite(observation2.idleSinceMs)) {
         await roleIdleLedger.clearPrefixExcept(prefix);
         continue;
       }
@@ -14267,20 +14267,20 @@ function createLaneWatcher(options) {
     const currentHolder = resolveCurrentCanonicalHolder(holder);
     if (!currentHolder) return { attempted: false, delivered: false, refusal: currentHolder === void 0 ? "error" : "policy" };
     let scopes;
-    let observation;
+    let observation2;
     try {
       scopes = await options.readRoleScopes();
-      observation = await options.readWorker(role.threadId);
+      observation2 = await options.readWorker(role.threadId);
     } catch {
       return { attempted: false, delivered: false, refusal: "error" };
     }
     const scope = scopes.find((candidate) => candidate.projectId === role.projectId);
-    if (!scope?.nextStartable || scope.queueHeadId !== role.queueHeadId || scope.deferredReason || observation.projectId !== role.projectId || observation.status !== "idle" || observation.archived || observation.pendingExternalWait || observation.operatorWait || observation.operatorWaitKnown === false || observation.idleSinceMs === null || observation.idleSinceMs === void 0 || !Number.isFinite(observation.idleSinceMs)) return { attempted: false, delivered: false, refusal: "policy" };
+    if (!scope?.nextStartable || scope.queueHeadId !== role.queueHeadId || scope.deferredReason || observation2.projectId !== role.projectId || observation2.status !== "idle" || observation2.archived || observation2.pendingExternalWait || observation2.operatorWait || observation2.operatorWaitKnown === false || observation2.idleSinceMs === null || observation2.idleSinceMs === void 0 || !Number.isFinite(observation2.idleSinceMs)) return { attempted: false, delivered: false, refusal: "policy" };
     const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
     const key = `${prefix}${scope.queueHeadId}`;
     await roleIdleLedger.clearPrefixExcept(prefix, key);
     const currentNow = now2();
-    const record2 = await roleIdleLedger.observeIdle(key, observation.idleSinceMs);
+    const record2 = await roleIdleLedger.observeIdle(key, observation2.idleSinceMs);
     const steerAgeMs = record2.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : Math.max(0, currentNow - record2.lastSteerAtMs);
     if (record2.escalated || record2.steerCount >= 2 || steerAgeMs < roleIdleThresholdMs) return { attempted: false, delivered: false, refusal: "policy" };
     const target = {
@@ -15532,9 +15532,9 @@ async function assembleV22CachedConsumerRolloutEvidence(input) {
   };
 }
 function cachedConsumerRolloutEvidence(observations) {
-  const names = observations.map((observation) => observation.name);
+  const names = observations.map((observation2) => observation2.name);
   const requiredNames = [...CACHED_CONSUMERS];
-  const verifiedNames = new Set(observations.filter((observation) => observation.observedSchemaVersion === SCHEMA_VERSION && observation.observedContractVersion === RUNTIME_CONTRACT_VERSION).map((observation) => observation.name));
+  const verifiedNames = new Set(observations.filter((observation2) => observation2.observedSchemaVersion === SCHEMA_VERSION && observation2.observedContractVersion === RUNTIME_CONTRACT_VERSION).map((observation2) => observation2.name));
   const verified = requiredNames.filter((name) => verifiedNames.has(name)).length;
   const reread = observations.length === requiredNames.length && verified === requiredNames.length && canonicalJson([...new Set(names)].sort()) === canonicalJson(requiredNames.slice().sort());
   const evidence = {
@@ -18461,7 +18461,7 @@ function applyQualificationObservation(db, request, digest, context) {
     outcome: observationOutcome,
     reasonCode
   }));
-  const observation = {
+  const observation2 = {
     projectId: request.projectId,
     qualificationId,
     roleRequirementId: resolved.requirement.roleRequirementId,
@@ -18477,7 +18477,7 @@ function applyQualificationObservation(db, request, digest, context) {
     evidenceDigest,
     reasonCode
   };
-  const observationDigest = sha256(canonicalJson(observation));
+  const observationDigest = sha256(canonicalJson(observation2));
   db.prepare(
     `INSERT INTO qualification_observations (
       project_id, qualification_id, role_requirement_id, config_revision, repo_target_id,
@@ -18707,10 +18707,10 @@ function applyRoleGenerationSuccession(db, request, digest, context) {
     throw refusal("ROLE_STANDBY_INVALID", "standby is reserved for the director seat");
   }
   const expectedContextDigest = qualificationContextDigest(context, resolved, request);
-  const observation = asRow(
+  const observation2 = asRow(
     db.prepare("SELECT * FROM qualification_observations WHERE project_id = ? AND qualification_id = ?").get(request.projectId, request.qualificationId)
   );
-  if (!observation) throw refusal("ROLE_UNQUALIFIED", "qualification observation is not known");
+  if (!observation2) throw refusal("ROLE_UNQUALIFIED", "qualification observation is not known");
   const projection = asRow(
     db.prepare("SELECT * FROM eligibility_projections WHERE project_id = ? AND role_requirement_id = ? AND requested_profile_digest = ?").get(
       request.projectId,
@@ -18719,18 +18719,18 @@ function applyRoleGenerationSuccession(db, request, digest, context) {
     )
   );
   if (!projection) throw refusal("CAPABILITY_UNKNOWN", "current eligibility projection is unavailable");
-  if (observation.config_revision !== configRevision || projection.config_revision !== configRevision || observation.role_requirement_digest !== resolved.digest || projection.role_requirement_digest !== resolved.digest || observation.bb_version !== context.bbVersion || observation.plugin_sdk_version !== PLUGIN_SDK_VERSION) {
+  if (observation2.config_revision !== configRevision || projection.config_revision !== configRevision || observation2.role_requirement_digest !== resolved.digest || projection.role_requirement_digest !== resolved.digest || observation2.bb_version !== context.bbVersion || observation2.plugin_sdk_version !== PLUGIN_SDK_VERSION) {
     throw refusal("ELIGIBILITY_STALE", "qualification or runtime evidence is stale");
   }
-  if (observation.role_requirement_id !== resolved.requirement.roleRequirementId || observation.repo_target_id !== resolved.requirement.repoTargetId || observation.requested_profile_digest !== request.profileDigest || observation.qualification_context_digest !== expectedContextDigest || observation.fixture_context_digest !== request.fixtureContextDigest || projection.current_qualification_id !== observation.qualification_id || projection.qualification_context_digest !== expectedContextDigest) {
+  if (observation2.role_requirement_id !== resolved.requirement.roleRequirementId || observation2.repo_target_id !== resolved.requirement.repoTargetId || observation2.requested_profile_digest !== request.profileDigest || observation2.qualification_context_digest !== expectedContextDigest || observation2.fixture_context_digest !== request.fixtureContextDigest || projection.current_qualification_id !== observation2.qualification_id || projection.qualification_context_digest !== expectedContextDigest) {
     throw refusal("QUALIFICATION_CONTEXT_FOREIGN", "qualification does not match the exact holder context");
   }
   const effectiveAtMs = now();
-  if (observation.expires_at_ms !== null && observation.expires_at_ms <= effectiveAtMs || projection.expires_at_ms !== null && projection.expires_at_ms <= effectiveAtMs) {
+  if (observation2.expires_at_ms !== null && observation2.expires_at_ms <= effectiveAtMs || projection.expires_at_ms !== null && projection.expires_at_ms <= effectiveAtMs) {
     throw refusal("ELIGIBILITY_EXPIRED", "qualification eligibility has expired");
   }
-  if (observation.outcome === "unknown" || projection.effective_status === "unknown") throw refusal("CAPABILITY_UNKNOWN", "qualification outcome is unknown");
-  if (observation.outcome !== "qualified" || projection.effective_status !== "eligible") throw refusal("ROLE_UNQUALIFIED", "qualification is not eligible");
+  if (observation2.outcome === "unknown" || projection.effective_status === "unknown") throw refusal("CAPABILITY_UNKNOWN", "qualification outcome is unknown");
+  if (observation2.outcome !== "qualified" || projection.effective_status !== "eligible") throw refusal("ROLE_UNQUALIFIED", "qualification is not eligible");
   if (request.roleId === "project-orchestrator") {
     const reconciliationIssues = workItemReconciliationIssues(db, request.projectId);
     if (reconciliationIssues.length > 0) {
@@ -20998,8 +20998,16 @@ function priorArtifacts(value) {
     return null;
   }
 }
+function observation(value) {
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed.artifacts) ? { artifacts: parsed.artifacts, queueHead: parsed.queueHead ?? null, woken: parsed.woken === true } : null;
+  } catch {
+    return null;
+  }
+}
 function hasArtifactDelta(previous, current) {
-  const prior = priorArtifacts(previous);
+  const prior = observation(previous)?.artifacts ?? priorArtifacts(previous);
   if (!prior) return true;
   const byId = new Map(prior.map((artifact) => [artifact.id, artifact]));
   if (byId.size !== current.length || current.some((artifact) => !byId.has(artifact.id))) return true;
@@ -21032,14 +21040,21 @@ function createStallGuardCycle(options) {
         const key = `${holder.project_id}:${holder.role_id}`;
         const current = await readArtifacts(holder.project_id);
         if (current === null) continue;
-        const next = snapshot(current);
+        const queueHead = options.readQueueHead ? options.readQueueHead(holder.project_id) : void 0;
+        const prior = nextState[key] === void 0 ? null : observation(nextState[key]);
+        const queueChanged = queueHead !== void 0 && (prior?.queueHead?.workItemId !== queueHead?.workItemId || prior?.queueHead?.resourceRevision !== queueHead?.resourceRevision);
+        const queueAlreadyWoken = queueHead !== void 0 && queueHead !== null && Object.values(nextState).some((value) => {
+          const record2 = observation(value);
+          return record2?.woken === true && record2.queueHead?.workItemId === queueHead.workItemId && record2.queueHead.resourceRevision === queueHead.resourceRevision;
+        });
+        const next = queueHead === void 0 ? snapshot(current) : JSON.stringify({ artifacts: current, queueHead, woken: prior?.woken === true && !queueChanged });
         if (nextState[key] === void 0) {
           nextState[key] = next;
           changed += 1;
           continue;
         }
         if (nextState[key] === next) continue;
-        if (!hasArtifactDelta(nextState[key], current)) {
+        if (queueAlreadyWoken || !hasArtifactDelta(nextState[key], current)) {
           nextState[key] = next;
           changed += 1;
           continue;
@@ -21067,7 +21082,7 @@ function createStallGuardCycle(options) {
         }
         attempted += 1;
         if (!result2.delivered) continue;
-        nextState[key] = next;
+        nextState[key] = queueHead === void 0 ? next : JSON.stringify({ artifacts: current, queueHead, woken: true });
         changed += 1;
         verified += 1;
         steered += 1;
@@ -21154,22 +21169,22 @@ async function registerBoundedWait(options) {
   } catch {
     return { outcome: "refused", message: "waker schedule registry is unreadable: declaration refused" };
   }
-  let observation;
+  let observation2;
   try {
-    observation = await options.readSource(sourceThreadId);
+    observation2 = await options.readSource(sourceThreadId);
   } catch {
-    observation = null;
+    observation2 = null;
   }
-  if (observation === null) {
+  if (observation2 === null) {
     return { outcome: "refused", message: `source thread ${sourceThreadId} is unknown: waits on an unverifiable source are refused` };
   }
-  if (observation.archived) {
+  if (observation2.archived) {
     return { outcome: "refused", message: `source thread ${sourceThreadId} is already archived: act on its outcome instead of waiting` };
   }
-  if (!THREAD_STATUSES.has(observation.status)) {
-    return { outcome: "refused", message: `source thread ${sourceThreadId} has unknown status ${String(observation.status)}` };
+  if (!THREAD_STATUSES.has(observation2.status)) {
+    return { outcome: "refused", message: `source thread ${sourceThreadId} has unknown status ${String(observation2.status)}` };
   }
-  if (observation.status === "error") {
+  if (observation2.status === "error") {
     return { outcome: "refused", message: `source thread ${sourceThreadId} has already failed: act on its failure instead of waiting` };
   }
   const declaredAtMs = now2();
@@ -21271,14 +21286,14 @@ function createWaitEscalationCycle(options) {
           continue;
         }
         if (record2.escalated) continue;
-        let observation;
+        let observation2;
         try {
-          observation = await options.readWaiter(record2.waiterThreadId);
+          observation2 = await options.readWaiter(record2.waiterThreadId);
         } catch {
           continue;
         }
-        if (observation === null) continue;
-        if (observation.status === "active") continue;
+        if (observation2 === null) continue;
+        if (observation2.status === "active") continue;
         const steerAgeMs = record2.lastSteerAtMs === null ? Number.POSITIVE_INFINITY : currentNow - record2.lastSteerAtMs;
         if (steerAgeMs < graceMs) continue;
         if (record2.steers >= maxSteers) {
@@ -23534,10 +23549,10 @@ ${thread.titleFallback ?? ""}`);
       "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE ended_at_ms IS NULL"
     ).run();
   }
-  const recordLaneCapacityInterval = (observation) => {
+  const recordLaneCapacityInterval = (observation2) => {
     if (!db) throw new Error("canonical-store-unavailable");
     db.transaction(() => {
-      const startableWork = observation.startableWork === null ? null : observation.startableWork ? 1 : 0;
+      const startableWork = observation2.startableWork === null ? null : observation2.startableWork ? 1 : 0;
       const extended = db.prepare(
         `UPDATE lane_capacity_intervals SET last_confirmed_at_ms = ?,
            lane_capacity_observation_id = COALESCE(lane_capacity_observation_id, ?)
@@ -23545,18 +23560,18 @@ ${thread.titleFallback ?? ""}`);
            AND coverage_state = ? AND active_lane_count IS ?
            AND writing_lane_ceiling IS ? AND startable_work IS ?`
       ).run(
-        observation.observedAtMs,
-        observation.laneCapacityObservationId,
-        observation.projectId,
-        observation.coverageState,
-        observation.activeLaneCount,
-        observation.writingLaneCeiling,
+        observation2.observedAtMs,
+        observation2.laneCapacityObservationId,
+        observation2.projectId,
+        observation2.coverageState,
+        observation2.activeLaneCount,
+        observation2.writingLaneCeiling,
         startableWork
       );
       if (extended.changes !== 1) {
         db.prepare(
           "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE project_id = ? AND ended_at_ms IS NULL"
-        ).run(observation.projectId);
+        ).run(observation2.projectId);
         db.prepare(
           `INSERT INTO lane_capacity_intervals (
            project_id, orchestrator_thread_id, orchestrator_role_generation,
@@ -23564,25 +23579,25 @@ ${thread.titleFallback ?? ""}`);
            reason, lane_capacity_observation_id, started_at_ms, last_confirmed_at_ms, ended_at_ms
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
         ).run(
-          observation.projectId,
-          observation.orchestratorThreadId,
-          observation.orchestratorRoleGeneration,
-          observation.coverageState,
-          observation.activeLaneCount,
-          observation.writingLaneCeiling,
+          observation2.projectId,
+          observation2.orchestratorThreadId,
+          observation2.orchestratorRoleGeneration,
+          observation2.coverageState,
+          observation2.activeLaneCount,
+          observation2.writingLaneCeiling,
           startableWork,
-          observation.reason,
-          observation.laneCapacityObservationId,
-          observation.observedAtMs,
-          observation.observedAtMs
+          observation2.reason,
+          observation2.laneCapacityObservationId,
+          observation2.observedAtMs,
+          observation2.observedAtMs
         );
       }
-      for (const executionAttemptId of observation.executionAttemptIds) {
+      for (const executionAttemptId of observation2.executionAttemptIds) {
         db.prepare(
           `INSERT OR IGNORE INTO lane_capacity_refresh_evidence (
              project_id, lane_capacity_observation_id, execution_attempt_id, observed_at_ms
            ) VALUES (?, ?, ?, ?)`
-        ).run(observation.projectId, observation.laneCapacityObservationId, executionAttemptId, observation.observedAtMs);
+        ).run(observation2.projectId, observation2.laneCapacityObservationId, executionAttemptId, observation2.observedAtMs);
       }
     })();
   };
@@ -23900,6 +23915,15 @@ ${thread.titleFallback ?? ""}`);
         }
       }
       return artifacts;
+    },
+    readQueueHead: (projectId) => {
+      if (!db) return null;
+      const row = db.prepare(
+        `SELECT work_item_id, resource_revision FROM work_items
+         WHERE project_id = ? AND lifecycle_state IN ('proposed', 'ready')
+         ORDER BY created_at_ms, work_item_id LIMIT 1`
+      ).get(projectId);
+      return row ? { workItemId: row.work_item_id, resourceRevision: row.resource_revision } : null;
     },
     wakeRole: async (role) => {
       const result2 = await steerRole(role);
@@ -24249,9 +24273,9 @@ ${thread.titleFallback ?? ""}`);
           }
           const key = waitExternalKey(match[1], match[2], issueNumber);
           if (waitExternalRevisions.has(key)) continue;
-          const observation = await linkedGithubObservationAsync(match[1], match[2], issueNumber);
-          if (observation === null) degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
-          else waitExternalRevisions.set(key, observation);
+          const observation2 = await linkedGithubObservationAsync(match[1], match[2], issueNumber);
+          if (observation2 === null) degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
+          else waitExternalRevisions.set(key, observation2);
         }
       };
       const inspectLinkedWorkItems = async (projectId) => {
@@ -24267,16 +24291,16 @@ ${thread.titleFallback ?? ""}`);
            ORDER BY work_items.work_item_id`
         ).all(projectId, ...WORK_ITEM_NON_TERMINAL_STATES, "succeeded");
         for (const linked of linkedWorkItems) {
-          const observation = await linkedGithubObservationAsync(linked.owner, linked.repo, linked.issue_number);
-          if (observation === null) {
+          const observation2 = await linkedGithubObservationAsync(linked.owner, linked.repo, linked.issue_number);
+          if (observation2 === null) {
             degrade(`github-work-item-status:${projectId}:${linked.work_item_id}`);
             continue;
           }
-          externalRevisions.set(`${projectId}\0${linked.work_item_id}`, observation);
+          externalRevisions.set(`${projectId}\0${linked.work_item_id}`, observation2);
           if (linked.lifecycle_state === "succeeded") {
-            if (!observation.issueOpen) continue;
+            if (!observation2.issueOpen) continue;
             const permanentReopenKey = fleetWatchdogReopenKey(projectId, linked.work_item_id);
-            const pendingReopenKey = fleetWatchdogReopenKey(projectId, linked.work_item_id, observation.externalRevision);
+            const pendingReopenKey = fleetWatchdogReopenKey(projectId, linked.work_item_id, observation2.externalRevision);
             const permanentRefusalReason = permanentlyRefusedReopens.get(permanentReopenKey);
             const pendingRefusalReason = pendingRefusedReopens.get(pendingReopenKey);
             const refusalReason = permanentRefusalReason ?? pendingRefusalReason;
@@ -24295,22 +24319,22 @@ ${thread.titleFallback ?? ""}`);
               projectId,
               linked.work_item_id,
               "ready",
-              `fleet-watchdog:issue-reopened:${linked.work_item_id}:${observation.externalRevision}`,
+              `fleet-watchdog:issue-reopened:${linked.work_item_id}:${observation2.externalRevision}`,
               { workItemExternalEvent: { kind: "github_issue_reopened", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } },
               githubSnapshot2
             );
             if (result3.outcome === "OK") {
-              bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation.externalRevision}`);
+              bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation2.externalRevision}`);
             } else if (result3.outcome === "WORK_ITEM_STATE_INVALID" && (result3.structurallyImpossibleAtRevision === true || result3.message?.includes("GitHub reopen does not follow the exact recorded close observation"))) {
               const refusalReason2 = result3.message ?? "unknown";
               if (result3.structurallyImpossibleAtRevision === true) {
                 permanentlyRefusedReopens.set(permanentReopenKey, refusalReason2);
                 bb.log.warn(`fleet-watchdog learned permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${refusalReason2}`);
-              } else if (observation.externalRevision === githubSnapshot2.externalRevision) {
+              } else if (observation2.externalRevision === githubSnapshot2.externalRevision) {
                 pendingRefusedReopens.set(pendingReopenKey, refusalReason2);
                 bb.log.warn(`fleet-watchdog learned pending issue-reopen refusal: project=${projectId} workItem=${linked.work_item_id} reason=${refusalReason2}`);
               } else {
-                bb.log.warn(`fleet-watchdog did not learn issue-reopen refusal because GitHub revisions disagreed: project=${projectId} workItem=${linked.work_item_id} observationRevision=${observation.externalRevision} snapshotRevision=${githubSnapshot2.externalRevision} reason=${refusalReason2}`);
+                bb.log.warn(`fleet-watchdog did not learn issue-reopen refusal because GitHub revisions disagreed: project=${projectId} workItem=${linked.work_item_id} observationRevision=${observation2.externalRevision} snapshotRevision=${githubSnapshot2.externalRevision} reason=${refusalReason2}`);
               }
             } else {
               degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
@@ -24319,10 +24343,10 @@ ${thread.titleFallback ?? ""}`);
             continue;
           }
           if (linked.lifecycle_state === "blocked") continue;
-          if (observation.status !== "open") {
-            bb.log.warn(`fleet-watchdog stale-terminal work item: project=${projectId} workItem=${linked.work_item_id} linked=${linked.owner}/${linked.repo}#${linked.issue_number} status=${observation.status}`);
+          if (observation2.status !== "open") {
+            bb.log.warn(`fleet-watchdog stale-terminal work item: project=${projectId} workItem=${linked.work_item_id} linked=${linked.owner}/${linked.repo}#${linked.issue_number} status=${observation2.status}`);
           }
-          if (!observation.pullRequestMerged || !observation.issueClosed) continue;
+          if (!observation2.pullRequestMerged || !observation2.issueClosed) continue;
           const workItem = db.prepare(
             `SELECT resource_revision, lifecycle_state
              FROM work_items WHERE project_id = ? AND work_item_id = ?`
@@ -24573,20 +24597,20 @@ ${thread.titleFallback ?? ""}`);
             if (candidate.declaredAtMs === null || now2 - candidate.declaredAtMs < staleWaitMs) continue;
             const targetMatch = candidate.wakerKind === "github_issue_closed" ? candidate.waker?.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u) ?? null : null;
             const targetIssueNumber = targetMatch?.[3] === void 0 ? NaN : Number(targetMatch[3]);
-            const observation = targetMatch?.[1] && targetMatch[2] && Number.isSafeInteger(targetIssueNumber) ? waitExternalRevisions.get(waitExternalKey(targetMatch[1], targetMatch[2], targetIssueNumber)) : void 0;
-            if (!observation) {
+            const observation2 = targetMatch?.[1] && targetMatch[2] && Number.isSafeInteger(targetIssueNumber) ? waitExternalRevisions.get(waitExternalKey(targetMatch[1], targetMatch[2], targetIssueNumber)) : void 0;
+            if (!observation2) {
               const record3 = await fleetWatchdogIdle.get(roleIdleKey(orchestrator, candidate.workItemId));
               staleExternalMoved = record3?.lastStaleWaitWaker !== candidate.waker;
               staleWait = candidate;
               break;
             }
             const record2 = await fleetWatchdogIdle.get(roleIdleKey(orchestrator, candidate.workItemId));
-            const chased = record2?.lastStaleWaitWakeAtMs !== null && record2?.lastStaleWaitWakeAtMs !== void 0 && record2.lastStaleWaitWaker === candidate.waker && record2.lastStaleWaitExternalRevision === observation.externalRevision;
-            const recheckMs = observation.updatedAtMs === null || !chased ? FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS : Math.max(FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS, record2.lastStaleWaitWakeAtMs - observation.updatedAtMs);
+            const chased = record2?.lastStaleWaitWakeAtMs !== null && record2?.lastStaleWaitWakeAtMs !== void 0 && record2.lastStaleWaitWaker === candidate.waker && record2.lastStaleWaitExternalRevision === observation2.externalRevision;
+            const recheckMs = observation2.updatedAtMs === null || !chased ? FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS : Math.max(FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS, record2.lastStaleWaitWakeAtMs - observation2.updatedAtMs);
             if (!chased || now2 - record2.lastStaleWaitWakeAtMs >= recheckMs) {
               staleWait = candidate;
-              staleObservation = observation;
-              staleExternalMoved = record2?.lastStaleWaitWaker !== candidate.waker || record2?.lastStaleWaitExternalRevision !== observation.externalRevision;
+              staleObservation = observation2;
+              staleExternalMoved = record2?.lastStaleWaitWaker !== candidate.waker || record2?.lastStaleWaitExternalRevision !== observation2.externalRevision;
               break;
             }
           }

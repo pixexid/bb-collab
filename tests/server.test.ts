@@ -2796,6 +2796,9 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
         })],
       }),
     ]]));
+    artifact = "third";
+    await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID]);
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
   });
 
   it("does not fire wrongful-idle when canonical WorkItems are only in progress", async () => {
