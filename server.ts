@@ -2943,23 +2943,30 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     await fleetWatchdogIdle.clearWakeHistory(`${projectId}:`);
     bb.log.warn(`fleet-watchdog history reset: project=${projectId} invokedBy=${invokedBy} at=${Date.now()}`);
   };
+  let deployedDistCheckRunning = false;
   const checkDeployedDist = options.checkDeployedDist ?? (() => {
+    if (deployedDistCheckRunning) {
+      bb.log.warn("deployed-dist automatic check skipped: previous check still running");
+      return;
+    }
     const root = findCheckoutRoot(dirname(fileURLToPath(import.meta.url)));
     if (!root) {
       bb.log.error("deployed-dist automatic check failed: cannot find plugin checkout root");
       return;
     }
+    deployedDistCheckRunning = true;
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "BB_CLI"));
-    const result = spawnSync(process.execPath, [join(root, "scripts", "check-dist.mjs"), "--deployed"], {
+    execFile(process.execPath, [join(root, "scripts", "check-dist.mjs"), "--deployed"], {
       cwd: root,
       encoding: "utf8",
       env,
-      stdio: ["ignore", "pipe", "pipe"],
       timeout: 10_000,
+    }, (error, stdout, stderr) => {
+      deployedDistCheckRunning = false;
+      if (!error) return;
+      const detail = [error.message, stderr.trim(), stdout.trim()].filter(Boolean).join(" ");
+      bb.log.error(`deployed-dist automatic check failed: ${detail || "child process failed"}`);
     });
-    if (result.status === 0 && !result.error) return;
-    const detail = [result.error?.message, result.stderr?.trim(), result.stdout?.trim()].filter(Boolean).join(" ");
-    bb.log.error(`deployed-dist automatic check failed: ${detail || `exit ${String(result.status)}`}`);
   });
   // Report-only: this never rebuilds, writes, or repairs the deployed checkout.
   bb.background.schedule("fleet-watchdog", "*/5 * * * *", () => {

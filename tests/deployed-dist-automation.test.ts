@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFakePluginHost } from "@bb/plugin-sdk/testing";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import plugin from "../server.js";
 import { PLUGIN_ID } from "../src/foundation.js";
 
@@ -39,10 +39,10 @@ describe("deployed dist automation", () => {
       });
       await plugin(host.bb);
       await host.harness.runSchedule("fleet-watchdog");
-      expect(host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      await vi.waitFor(() => expect(host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
         level: "error",
         message: expect.stringContaining(`deployed working tree dist/ at ${root} differs from commit`),
-      }));
+      })));
       await host.harness.lifecycle.dispose();
     } finally {
       if (originalPath === undefined) delete process.env.PATH;

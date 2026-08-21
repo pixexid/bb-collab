@@ -24306,23 +24306,30 @@ ${thread.titleFallback ?? ""}`);
     await fleetWatchdogIdle.clearWakeHistory(`${projectId}:`);
     bb.log.warn(`fleet-watchdog history reset: project=${projectId} invokedBy=${invokedBy} at=${Date.now()}`);
   };
+  let deployedDistCheckRunning = false;
   const checkDeployedDist = options.checkDeployedDist ?? (() => {
+    if (deployedDistCheckRunning) {
+      bb.log.warn("deployed-dist automatic check skipped: previous check still running");
+      return;
+    }
     const root = findCheckoutRoot(dirname3(fileURLToPath(import.meta.url)));
     if (!root) {
       bb.log.error("deployed-dist automatic check failed: cannot find plugin checkout root");
       return;
     }
+    deployedDistCheckRunning = true;
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "BB_CLI"));
-    const result2 = spawnSync2(process.execPath, [join5(root, "scripts", "check-dist.mjs"), "--deployed"], {
+    execFile(process.execPath, [join5(root, "scripts", "check-dist.mjs"), "--deployed"], {
       cwd: root,
       encoding: "utf8",
       env,
-      stdio: ["ignore", "pipe", "pipe"],
       timeout: 1e4
+    }, (error48, stdout, stderr) => {
+      deployedDistCheckRunning = false;
+      if (!error48) return;
+      const detail = [error48.message, stderr.trim(), stdout.trim()].filter(Boolean).join(" ");
+      bb.log.error(`deployed-dist automatic check failed: ${detail || "child process failed"}`);
     });
-    if (result2.status === 0 && !result2.error) return;
-    const detail = [result2.error?.message, result2.stderr?.trim(), result2.stdout?.trim()].filter(Boolean).join(" ");
-    bb.log.error(`deployed-dist automatic check failed: ${detail || `exit ${String(result2.status)}`}`);
   });
   bb.background.schedule("fleet-watchdog", "*/5 * * * *", () => {
     checkDeployedDist();

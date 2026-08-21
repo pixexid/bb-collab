@@ -2576,6 +2576,12 @@ describe("bb-collab plugin boundary", () => {
     expect(warnings.at(-1)?.message).toMatch(/occurrencesSinceReload=2 cyclesSinceReload=2 projectsSinceReload=0 sinceReloadAt=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u);
   });
 
+  it("runs the deployed-dist check asynchronously", () => {
+    const source = readFileSync(join(PLUGIN_ROOT, "server.ts"), "utf8");
+    expect(source).toMatch(/execFile\(process\.execPath, \[join\(root, "scripts", "check-dist\.mjs"\)/u);
+    expect(source).not.toMatch(/spawnSync\(process\.execPath, \[join\(root, "scripts", "check-dist\.mjs"\)/u);
+  });
+
   it("runs the fleet watchdog every five minutes without waking a quiet director seat", async () => {
     const fixture = await fleetWatchdogFixture();
     const cron = fixture.host.harness.inspection.registrations.schedules.find((schedule) => schedule.name === "fleet-watchdog")?.cron;
