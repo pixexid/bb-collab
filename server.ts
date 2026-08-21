@@ -458,6 +458,11 @@ const sendOperatorMessageInputSchema = z.object({
   severity: operatorSeveritySchema,
   text: operatorMessageTextSchema,
 }).strict();
+const dispatchLaneInputSchema = z.object({
+  request: applyRequestSchema,
+  spawn: z.record(z.string(), z.unknown()),
+}).strict();
+
 export const rpcContract = defineRpcContract({
   lanes: {
     input: z.object({}).strict(),
@@ -511,6 +516,10 @@ export const rpcContract = defineRpcContract({
   },
   apply: {
     input: applyRequestSchema,
+    output: foundationResultSchema,
+  },
+  dispatchLane: {
+    input: dispatchLaneInputSchema,
     output: foundationResultSchema,
   },
   cachedConsumerRollout: {
@@ -754,6 +763,36 @@ export async function readLiveRoleFactReader(
   } catch {
     return unavailableRoleFactReader(serverId);
   }
+}
+
+async function dispatchLane(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  input: unknown,
+): Promise<FoundationResult> {
+  const parsed = dispatchLaneInputSchema.safeParse(input);
+  if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "dispatch", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
+  const { request, spawn } = parsed.data;
+  if (!request.workAttempt || (request.lifecycleState !== "in_progress" && request.lifecycleState !== undefined)) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "lane dispatch requires a writing work attempt and an in-progress transition" };
+  }
+  if (spawn.projectId !== request.projectId) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "spawn projectId must match request projectId" };
+  }
+  let thread: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["spawn"]>>;
+  try {
+    thread = await bb.sdk.threads.spawn(spawn as unknown as Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]);
+  } catch (error) {
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane spawn failed: ${String(error)}` };
+  }
+  const registered = await applyLiveAuthorizedMutation(bb, db, {
+    ...request,
+    workAttempt: { ...request.workAttempt, threadId: thread.id },
+  });
+  if (registered.outcome !== "OK") {
+    try { await bb.sdk.threads.stop({ threadId: thread.id }); } catch { /* retain the refusal; the spawned lane is stopped best-effort */ }
+  }
+  return registered;
 }
 
 async function applyLiveAuthorizedMutation(
@@ -3358,6 +3397,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     },
     async apply(input) {
       return applyLiveAuthorizedMutation(bb, db, input);
+    },
+    async dispatchLane(input) {
+      return dispatchLane(bb, db, input);
     },
     async cachedConsumerRollout(input) {
       return applyLiveCachedConsumerRollout(bb, db, input, cliDeps);

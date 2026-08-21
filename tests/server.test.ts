@@ -2050,7 +2050,7 @@ describe("bb-collab plugin boundary", () => {
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "ACTOR_RECEIPT_UNKNOWN" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["idle-fleet-detector", "lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "worktree-cleanup", "thread-archive-sweep"]);
-    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "doctor", "export", "lanes", "markOperatorMessageRead", "operatorMessages", "registerWait", "reorderPinned", "replyToOperatorMessage", "roleBrief", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
+    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "dispatchLane", "doctor", "export", "lanes", "markOperatorMessageRead", "operatorMessages", "registerWait", "reorderPinned", "replyToOperatorMessage", "roleBrief", "setSidebarCollapse", "setThreadState", "sidebarCollapseState", "threadModels", "threadStates"]);
     expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["send_to_operator"]);
   });
 
@@ -3369,6 +3369,17 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     expect(fixture.host.harness.inspection.logEntries.slice(logCount)).toContainEqual(expect.objectContaining({ level: "info", message: "fleet-watchdog healthy cycle" }));
   });
 
+  it("registers the attempt through the canonical lane dispatch seam", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const result = await fixture.host.harness.callRpc("dispatchLane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane", prompt: "lane brief" },
+    });
+    expect(result).toMatchObject({ outcome: "OK" });
+    expect(fixture.db.prepare("SELECT lane_id, thread_id, state FROM execution_attempts WHERE origin = 'work_item'").get()).toMatchObject({ lane_id: "lane-work-item-1", thread_id: "lane-1", state: "running" });
+  });
+
   it("uses in-progress WorkItems for capacity and suppresses repeat intake wakes for one hour", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-queue-"));
@@ -3389,6 +3400,8 @@ fi
       const fixture = await fleetWatchdogFixture(0, true, 1, false);
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
       expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state = 'in_progress'").get()).toEqual({ count: 1 });
+      expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'work_item' AND assignment_kind = 'write' AND state = 'running'").get()).toEqual({ count: 1 });
+      expect(workItemReconciliationIssues(fixture.db, PROJECT_ID)).toEqual([]);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3))).toMatchObject({ outcome: "OK" });

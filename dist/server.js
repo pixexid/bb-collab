@@ -22088,6 +22088,10 @@ var sendOperatorMessageInputSchema = external_exports.object({
   severity: operatorSeveritySchema,
   text: operatorMessageTextSchema
 }).strict();
+var dispatchLaneInputSchema = external_exports.object({
+  request: applyRequestSchema,
+  spawn: external_exports.record(external_exports.string(), external_exports.unknown())
+}).strict();
 var rpcContract = defineRpcContract({
   lanes: {
     input: external_exports.object({}).strict(),
@@ -22141,6 +22145,10 @@ var rpcContract = defineRpcContract({
   },
   apply: {
     input: applyRequestSchema,
+    output: foundationResultSchema
+  },
+  dispatchLane: {
+    input: dispatchLaneInputSchema,
     output: foundationResultSchema
   },
   cachedConsumerRollout: {
@@ -22362,6 +22370,34 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
   } catch {
     return unavailableRoleFactReader(serverId);
   }
+}
+async function dispatchLane(bb, db, input) {
+  const parsed = dispatchLaneInputSchema.safeParse(input);
+  if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "dispatch", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
+  const { request, spawn } = parsed.data;
+  if (!request.workAttempt || request.lifecycleState !== "in_progress" && request.lifecycleState !== void 0) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "lane dispatch requires a writing work attempt and an in-progress transition" };
+  }
+  if (spawn.projectId !== request.projectId) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "spawn projectId must match request projectId" };
+  }
+  let thread;
+  try {
+    thread = await bb.sdk.threads.spawn(spawn);
+  } catch (error48) {
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane spawn failed: ${String(error48)}` };
+  }
+  const registered = await applyLiveAuthorizedMutation(bb, db, {
+    ...request,
+    workAttempt: { ...request.workAttempt, threadId: thread.id }
+  });
+  if (registered.outcome !== "OK") {
+    try {
+      await bb.sdk.threads.stop({ threadId: thread.id });
+    } catch {
+    }
+  }
+  return registered;
 }
 async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false) {
   const parsed = applyRequestSchema.safeParse(input);
@@ -24679,6 +24715,9 @@ ${thread.titleFallback ?? ""}`);
     },
     async apply(input) {
       return applyLiveAuthorizedMutation(bb, db, input);
+    },
+    async dispatchLane(input) {
+      return dispatchLane(bb, db, input);
     },
     async cachedConsumerRollout(input) {
       return applyLiveCachedConsumerRollout(bb, db, input, cliDeps);
