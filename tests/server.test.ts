@@ -2059,7 +2059,7 @@ describe("bb-collab plugin boundary", () => {
     const { db, fenceToken } = seedAndBootstrap(host);
     const github = new DeterministicGitHubIssueAdapter();
     const githubRead = github.read.bind(github);
-    github.put({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: "Reopenable", body: "", state: "closed", labels: [], externalRevision: "closed-x" });
+    github.put({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: "Reopenable", body: "", state: "closed", stateReason: "COMPLETED", labels: [], externalRevision: "closed-x" });
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
       workItem: { workItemId: WORK_ITEM_ID, title: "Reopenable", body: "", githubIssue: { issueNumber: 351 } },
     })).outcome).toBe("OK");
@@ -3791,11 +3791,13 @@ else console.log(JSON.stringify(blocked));
     }
   });
 
-  it("auto-terminalizes a stale in_progress WorkItem through review_pending -> succeeded when its linked issue is merged and closed", async () => {
+  it("does not cancel a proposed item for a DUPLICATE issue with a merged PR", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-stale-terminal-"));
     const gh = join(bin, "gh");
     const phaseFile = join(bin, "phase");
+    const adversarialPhaseFile = join(bin, "adversarial-phase");
     writeFileSync(phaseFile, "closed-1\n");
+    writeFileSync(adversarialPhaseFile, "closed-1\n");
     writeFileSync(gh, `#!/bin/sh
 phase=$(cat "${phaseFile}")
 if [ "$1" = "pr" ]; then
@@ -3804,18 +3806,29 @@ if [ "$1" = "pr" ]; then
 fi
 if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[{"number":999,"labels":[{"name":"queue:startable"}]}]'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "207" ]; then exit 1; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then
-  if [ "$phase" = "open-2" ]; then printf '%s\\n' '{"state":"OPEN","updatedAt":"open-2","closedByPullRequestsReferences":[]}'; else printf '%s\\n' '{"state":"CLOSED","updatedAt":"'"$phase"'","closedByPullRequestsReferences":[{"number":340}]}'; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "9999" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then
+  phase=$(cat "${adversarialPhaseFile}")
+  if [ "$phase" = "closed-1" ]; then printf '%s\n' '{"state":"OPEN","stateReason":"COMPLETED","updatedAt":"impossible-open","closedByPullRequestsReferences":[]}' ; else printf '%s\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"open-2","closedByPullRequestsReferences":[]}' ; fi
   exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then
-  if [ "$phase" = "open-2" ]; then printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"OPEN","labels":[],"updatedAt":"open-2"}'; else printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"CLOSED","labels":[],"updatedAt":"'"$phase"'"}'; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "9999" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then
+  phase=$(cat "${adversarialPhaseFile}")
+  if [ "$phase" = "open-2" ]; then printf '%s\n' '{"number":9999,"title":"issue","body":"body","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"open-2"}'; else printf '%s\n' '{"number":9999,"title":"issue","body":"body","state":"OPEN","stateReason":"COMPLETED","labels":[],"updatedAt":"impossible-open"}'; fi
   exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then printf '%s\\n' '{"number":'"$3"',"title":"issue","body":"body","state":"CLOSED","labels":[],"updatedAt":"closed-'"$3"'"}'; exit 0; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" != "state,updatedAt,closedByPullRequestsReferences" ]; then exit 1; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && { [ "$3" = "206" ] || [ "$3" = "208" ]; }; then printf '%s\\n' '{"state":"CLOSED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[{"number":340}]}'; exit 0; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"state":"CLOSED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then
+  if [ "$phase" = "open-2" ]; then printf '%s\\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"open-2","closedByPullRequestsReferences":[]}'; else printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"'"$phase"'","closedByPullRequestsReferences":[{"number":340}]}'; fi
+  exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then
+  if [ "$phase" = "open-2" ]; then printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"open-2"}'; else printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"'"$phase"'"}'; fi
+  exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "210" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then printf '%s\\n' '{"number":210,"title":"issue","body":"body","state":"CLOSED","stateReason":"DUPLICATE","labels":[],"updatedAt":"closed-210"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then printf '%s\\n' '{"number":'"$3"',"title":"issue","body":"body","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"closed-'"$3"'"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" != "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then exit 1; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && { [ "$3" = "206" ] || [ "$3" = "208" ] || [ "$3" = "209" ] || [ "$3" = "210" ]; }; then printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[{"number":340}]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[]}'; exit 0; fi
 exit 1
 `);
     chmodSync(gh, 0o755);
@@ -3847,6 +3860,24 @@ exit 1
         idempotencyKey: "racy-work-item-start",
         workItemId: racyWorkItemId,
         workAttempt: { laneId: "lane-racy", threadId: "thread-racy", assignmentKind: "write" },
+      })).outcome).toBe("OK");
+      const proposedWorkItemId = "never-started-work-item";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "never-started-work-item-create",
+        workItemId: proposedWorkItemId,
+        workItem: { workItemId: proposedWorkItemId, title: proposedWorkItemId, body: "absorbed before dispatch", githubIssue: { issueNumber: 210 } },
+      })).outcome).toBe("OK");
+      const absorbedWorkItemId = "absorbed-work-item";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "absorbed-work-item-create",
+        workItemId: absorbedWorkItemId,
+        workItem: { workItemId: absorbedWorkItemId, title: absorbedWorkItemId, body: "absorbed by completed merge", githubIssue: { issueNumber: 209 } },
+      })).outcome).toBe("OK");
+      const adversarialWorkItemId = "adversarial-work-item";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "adversarial-work-item-create",
+        workItemId: adversarialWorkItemId,
+        workItem: { workItemId: adversarialWorkItemId, title: adversarialWorkItemId, body: "reopened during merge-close", githubIssue: { issueNumber: 9999 } },
       })).outcome).toBe("OK");
       const unreadableWorkItemId = "unreadable-work-item";
       expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
@@ -3904,6 +3935,16 @@ exit 1
 
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, proposedWorkItemId)).toEqual({ lifecycle_state: "proposed" });
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, absorbedWorkItemId)).toEqual({ lifecycle_state: "cancelled" });
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, adversarialWorkItemId)).toEqual({ lifecycle_state: "proposed" });
+      expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ? AND aggregate_id = ? AND event_type = 'work_item_transitioned'").get(PROJECT_ID, proposedWorkItemId)).toEqual({ count: 0 });
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining("workItem=never-started-work-item outcome=WORK_ITEM_STATE_INVALID message=proposed cancellation requires a completed GitHub close observation"),
+      }));
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
       expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
         level: "warn",
         message: expect.stringContaining("stale-terminal work item: project=proj_test workItem=work-item-1 linked=example/project#205 status=closed"),
@@ -3933,7 +3974,7 @@ exit 1
       }));
       expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
         level: "warn",
-        message: expect.stringContaining("cannotSee=github-work-item-terminalize:proj_test:racy-work-item"),
+        message: expect.stringContaining("cannotSee=github-work-item-status:proj_test:adversarial-work-item|github-work-item-terminalize:proj_test:never-started-work-item|github-work-item-terminalize:proj_test:racy-work-item"),
       }));
       expect(fixture.host.harness.inspection.logEntries).not.toContainEqual(expect.objectContaining({
         level: "info",
@@ -4949,12 +4990,12 @@ exit 1
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-refused-reopen-disagreement-"));
     const gh = join(bin, "gh");
     writeFileSync(gh, `#!/bin/sh
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then
-  printf '%s\\n' '{"state":"OPEN","updatedAt":"open-y","closedByPullRequestsReferences":[]}'; exit 0
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then
+  printf '%s\\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"open-y","closedByPullRequestsReferences":[]}'; exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then
   if [ -f "$0.full-read" ]; then revision=open-y; else revision=closed-x; touch "$0.full-read"; fi
-  printf '%s\\n' '{"number":351,"title":"reopen","body":"","state":"OPEN","labels":[],"updatedAt":"'$revision'"}'; exit 0
+  printf '%s\\n' '{"number":351,"title":"reopen","body":"","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"'$revision'"}'; exit 0
 fi
 exit 1
 `);
@@ -4978,7 +5019,7 @@ exit 1
         workAttempt: { laneId: "lane-refused-reopen-disagreement-review", threadId: "thread-refused-reopen-disagreement-review", assignmentKind: "review", reviewPrNumber: 200, reviewPrHeadSha: CANDIDATE_SHA },
       })).outcome).toBe("OK");
       const github = new DeterministicGitHubIssueAdapter();
-      github.put({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: workItemId, body: workItemId, state: "closed", labels: [], externalRevision: "closed-x" });
+      github.put({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: workItemId, body: workItemId, state: "closed", stateReason: "COMPLETED", labels: [], externalRevision: "closed-x" });
       expect(applyFixtureMutation(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4, {
         idempotencyKey: "refused-reopen-disagreement-succeeded", workItemId,
         workItemExternalEvent: { kind: "github_issue_closed", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
@@ -5005,14 +5046,14 @@ exit 1
     writeFileSync(gh, `#!/bin/sh
 revision=open-y
 if [ -f "$0.count" ]; then count=$(cat "$0.count"); else count=0; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then
   count=$((count + 1)); printf '%s\\n' "$count" > "$0.count"
   if [ "$count" -ge 3 ]; then revision=open-z; fi
-  printf '%s\\n' '{"state":"OPEN","updatedAt":"'$revision'","closedByPullRequestsReferences":[]}'; exit 0
+  printf '%s\\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"'$revision'","closedByPullRequestsReferences":[]}'; exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then
   if [ "$count" -ge 3 ]; then revision=open-z; fi
-  printf '%s\\n' '{"number":'"$3"',"title":"reopen","body":"","state":"OPEN","labels":[],"updatedAt":"'$revision'"}'; exit 0
+  printf '%s\\n' '{"number":'"$3"',"title":"reopen","body":"","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"'$revision'"}'; exit 0
 fi
 exit 1
 `);
@@ -5039,7 +5080,7 @@ exit 1
         workAttempt: { laneId: "lane-permanently-refused-reopen-review", threadId: "thread-permanently-refused-reopen-review", assignmentKind: "review", reviewPrNumber: 200, reviewPrHeadSha: CANDIDATE_SHA },
       })).outcome).toBe("OK");
       const github = new DeterministicGitHubIssueAdapter();
-      github.put({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: workItemId, body: workItemId, state: "closed", labels: [], externalRevision: "open-y" });
+      github.put({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: workItemId, body: workItemId, state: "closed", stateReason: "COMPLETED", labels: [], externalRevision: "open-y" });
       expect(applyFixtureMutation(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4, {
         idempotencyKey: "permanently-refused-reopen-succeeded", workItemId,
         workItemExternalEvent: { kind: "github_issue_closed", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
@@ -5078,8 +5119,8 @@ exit 1
     const gh = join(bin, "gh");
     writeFileSync(gh, `#!/bin/sh
 if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\n' '[]'; exit 0; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\n' '{"state":"OPEN","updatedAt":"open-y","closedByPullRequestsReferences":[]}'; exit 0; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then printf '%s\n' '{"number":'"$3"',"title":"reopened","body":"","state":"OPEN","labels":[],"updatedAt":"open-y"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"open-y","closedByPullRequestsReferences":[]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then printf '%s\n' '{"number":'"$3"',"title":"reopened","body":"","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"open-y"}'; exit 0; fi
 exit 1
 `);
     chmodSync(gh, 0o755);
@@ -5103,7 +5144,7 @@ exit 1
         workAttempt: { laneId: "lane-reopened-review", threadId: "thread-reopened-review", assignmentKind: "review", reviewPrNumber: 200, reviewPrHeadSha: CANDIDATE_SHA },
       })).outcome).toBe("OK");
       const github = new DeterministicGitHubIssueAdapter();
-      github.put({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: workItemId, body: "reopened", state: "closed", labels: [], externalRevision: "closed-x" });
+      github.put({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: workItemId, body: "reopened", state: "closed", stateReason: "COMPLETED", labels: [], externalRevision: "closed-x" });
       expect(applyFixtureMutation(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4, {
         idempotencyKey: "reopened-work-item-succeeded", workItemId,
         workItemExternalEvent: { kind: "github_issue_closed", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
@@ -8355,7 +8396,7 @@ exit 1
     expect(db.prepare("SELECT state FROM execution_attempts WHERE work_item_id = ? ORDER BY attempt_ordinal DESC LIMIT 1").get(WORK_ITEM_ID)).toEqual({ state: "blocked" });
     expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 6, { idempotencyKey: "project-blocked-work-item" }), github)).toMatchObject({ outcome: "OK" });
     expect(github.snapshot(GITHUB_OWNER, GITHUB_REPO, 1950)?.state).toBe("open");
-    github.put({ owner: "upstream", repo: "host", issueNumber: 1949, title: "Release API", body: "", state: "closed", labels: [], externalRevision: "closed-y" });
+    github.put({ owner: "upstream", repo: "host", issueNumber: 1949, title: "Release API", body: "", state: "closed", stateReason: "COMPLETED", labels: [], externalRevision: "closed-y" });
     expect(applyFixtureMutation(db, transitionRequest(fenceToken, "ready", 6, {
       idempotencyKey: "work-item-github-unblocked",
       workItemUnblock: { kind: "github_issue_closed", owner: "upstream", repo: "host", issueNumber: 1949 },
@@ -8380,7 +8421,7 @@ exit 1
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host);
     const github = new DeterministicGitHubIssueAdapter();
-    const closed = { owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: "Reopenable", body: "", state: "closed" as const, labels: [], externalRevision: "closed-x" };
+    const closed = { owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: "Reopenable", body: "", state: "closed" as const, stateReason: "COMPLETED" as const, labels: [], externalRevision: "closed-x" };
     github.put(closed);
     const githubRead = github.read.bind(github);
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
@@ -8389,13 +8430,30 @@ exit 1
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3)).outcome).toBe("OK");
+    github.put({ ...closed, state: "closed", stateReason: "REOPENED", externalRevision: "closed-impossible" });
+    const impossibleCloseRefusal = applyFixtureMutation(db, transitionRequest(fenceToken, "succeeded", 4, {
+      idempotencyKey: "impossible-close",
+      workItemExternalEvent: { kind: "github_issue_closed", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
+    }), null, null, null, null, githubRead);
+    expect(impossibleCloseRefusal).toMatchObject({ outcome: "EXTERNAL_RESPONSE_INVALID", attempted: 0 });
+
+    github.put(closed);
     expect(applyFixtureMutation(db, transitionRequest(fenceToken, "succeeded", 4, {
+      idempotencyKey: "valid-close",
       workItemExternalEvent: { kind: "github_issue_closed", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
     }), null, null, null, null, githubRead)).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
 
     const succeededSnapshot = exportFoundation(db, PROJECT_ID);
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 5))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
-    github.put({ ...closed, state: "open", externalRevision: "closed-x" });
+    github.put({ ...closed, state: "open", stateReason: "COMPLETED", externalRevision: "open-impossible" });
+    const impossibleReopenRefusal = applyFixtureMutation(db, transitionRequest(fenceToken, "ready", 5, {
+      idempotencyKey: "impossible-reopen",
+      workItemExternalEvent: { kind: "github_issue_reopened", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
+    }), null, null, null, null, githubRead);
+    expect(impossibleReopenRefusal).toMatchObject({ outcome: "EXTERNAL_RESPONSE_INVALID", attempted: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(succeededSnapshot);
+
+    github.put({ ...closed, state: "open", stateReason: "REOPENED", externalRevision: "closed-x" });
     const sameRevisionRefusal = applyFixtureMutation(db, transitionRequest(fenceToken, "ready", 5, {
       idempotencyKey: "same-revision-reopen",
       workItemExternalEvent: { kind: "github_issue_reopened", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
@@ -8404,7 +8462,7 @@ exit 1
     expect(sameRevisionRefusal.structurallyImpossibleAtRevision).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(succeededSnapshot);
 
-    github.put({ ...closed, state: "open", externalRevision: "open-y" });
+    github.put({ ...closed, state: "open", stateReason: "REOPENED", externalRevision: "open-y" });
     const reopened = transitionRequest(fenceToken, "ready", 5, {
       idempotencyKey: "later-reopen",
       workItemExternalEvent: { kind: "github_issue_reopened", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
@@ -8881,6 +8939,7 @@ exit 1
       title: "[bb] Ship projection",
       body: "canonical: Keep canonical state local.",
       state: "closed",
+      stateReason: "COMPLETED",
       labels: ["work-proposed"],
       externalRevision: "manual-close",
     });
@@ -9019,7 +9078,7 @@ exit 1
     const driftAdapter = new DeterministicGitHubIssueAdapter();
     expect(applyWithFixtureReceipt(driftDb, projectionRequest(driftFence, 1), driftAdapter).outcome).toBe("OK");
     const drifted = driftAdapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)!;
-    driftAdapter.put({ ...drifted, state: "closed", externalRevision: "manual-close" });
+    driftAdapter.put({ ...drifted, state: "closed", stateReason: "COMPLETED", externalRevision: "manual-close" });
     const read = driftAdapter.read.bind(driftAdapter);
     driftAdapter.read = (owner, repo, issueNumber) => {
       const snapshot = read(owner, repo, issueNumber);
@@ -10621,7 +10680,7 @@ exit 1
     const calls = join(bin, "calls");
     writeFileSync(gh, `#!/bin/sh
 printf '%s\n' "$@" >> "${calls}"
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "401" ]; then printf '%s\n' '{"number":401,"title":"Existing","body":"Existing","state":"OPEN","labels":[],"updatedAt":"2026-08-19T00:00:00Z"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "401" ]; then printf '%s\n' '{"number":401,"title":"Existing","body":"Existing","state":"OPEN","stateReason":"","labels":[],"updatedAt":"2026-08-19T00:00:00Z"}'; exit 0; fi
 exit 1
 `);
     chmodSync(gh, 0o755);
