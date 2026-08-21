@@ -3468,13 +3468,24 @@ else console.log(JSON.stringify(blocked));
   it("auto-terminalizes a stale in_progress WorkItem through review_pending -> succeeded when its linked issue is merged and closed", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-stale-terminal-"));
     const gh = join(bin, "gh");
+    const phaseFile = join(bin, "phase");
+    writeFileSync(phaseFile, "closed-1\n");
     writeFileSync(gh, `#!/bin/sh
+phase=$(cat "${phaseFile}")
 if [ "$1" = "pr" ]; then
   if [ "$3" = "340" ] && [ "$7" = "state,mergedAt" ]; then printf '%s\\n' '{"state":"MERGED","mergedAt":"2026-08-19T00:00:00Z"}'; exit 0; fi
   exit 1
 fi
 if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[{"number":999,"labels":[{"name":"queue:startable"}]}]'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "207" ]; then exit 1; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then
+  if [ "$phase" = "open-2" ]; then printf '%s\\n' '{"state":"OPEN","updatedAt":"open-2","closedByPullRequestsReferences":[]}'; else printf '%s\\n' '{"state":"CLOSED","updatedAt":"'"$phase"'","closedByPullRequestsReferences":[{"number":340}]}'; fi
+  exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then
+  if [ "$phase" = "open-2" ]; then printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"OPEN","labels":[],"updatedAt":"open-2"}'; else printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"CLOSED","labels":[],"updatedAt":"'"$phase"'"}'; fi
+  exit 0
+fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then printf '%s\\n' '{"number":'"$3"',"title":"issue","body":"body","state":"CLOSED","labels":[],"updatedAt":"closed-'"$3"'"}'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" != "state,updatedAt,closedByPullRequestsReferences" ]; then exit 1; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && { [ "$3" = "206" ] || [ "$3" = "208" ]; }; then printf '%s\\n' '{"state":"CLOSED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[{"number":340}]}'; exit 0; fi
@@ -3576,7 +3587,15 @@ exit 1
         message: expect.stringContaining("stale-terminal work item: project=proj_test workItem=merged-work-item linked=example/project#206 status=merged"),
       }));
       expect(fixture.db.prepare("SELECT config_revision, lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, mergedWorkItemId)).toEqual({ config_revision: 1, lifecycle_state: "succeeded", resource_revision: 5 });
-      expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal").all(PROJECT_ID, mergedWorkItemId)).toEqual([{ state: "done" }]);
+      writeFileSync(phaseFile, "open-2\n");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, mergedWorkItemId)).toEqual({ lifecycle_state: "ready" });
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 6, { idempotencyKey: "merged-work-item-restart", workItemId: mergedWorkItemId, expectedConfigRevision: 2, workAttempt: { laneId: "lane-merged-2", threadId: "thread-merged-2", assignmentKind: "write" } })).outcome).toBe("OK");
+      writeFileSync(phaseFile, "closed-3\n");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, mergedWorkItemId)).toEqual({ lifecycle_state: "succeeded" });
+      expect(fixture.host.harness.inspection.logEntries).not.toContainEqual(expect.objectContaining({ message: expect.stringContaining("workItem=merged-work-item outcome=IDEMPOTENCY_KEY_CONFLICT") }));
+      expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal").all(PROJECT_ID, mergedWorkItemId)).toEqual([{ state: "done" }, { state: "done" }]);
       expect(fixture.db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, racyWorkItemId)).toEqual({ lifecycle_state: "in_progress", resource_revision: 5 });
       expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
         level: "warn",

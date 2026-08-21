@@ -2821,7 +2821,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             projectId,
             linked.work_item_id,
             state,
-            `fleet-watchdog:merge-close:${linked.work_item_id}:${state}`,
+            `fleet-watchdog:merge-close:${linked.work_item_id}:${state}:${githubSnapshot.externalRevision}`,
             state === "succeeded" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
             githubSnapshot,
           );
