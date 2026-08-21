@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@bb/plugin-sdk": ["../../types/bb-plugin-sdk.d.ts"],
+      "@bb/plugin-sdk/app": ["../../types/bb-plugin-sdk-app.d.ts"]
+    }
+  },
+  "include": ["app.tsx", "server.ts", "src", "tests"]
+}

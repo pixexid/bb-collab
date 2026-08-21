@@ -1,0 +1,6 @@
+{
+  "$schema": "https://getbb.app/schemas/plugins.schema.json",
+  "schemaVersion": 1,
+  "name": "bb-collab plugins",
+  "plugins": [{ "name": "threads-list", "source": "./packages/bb-plugin-threads-list" }]
+}

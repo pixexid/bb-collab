@@ -1,6 +1,7 @@
 {
   "name": "bb-plugin-bb-collab",
   "version": "0.1.0",
+  "workspaces": ["packages/*"],
   "type": "module",
   "engines": {
     "bb": ">=0.37.0",
