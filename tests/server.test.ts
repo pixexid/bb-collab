@@ -5263,6 +5263,57 @@ exit 1
     }
   });
 
+  it("re-chases an unchanged GitHub wait by target age and wakes on target movement", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-stale-wait-"));
+    const gh = join(bin, "gh");
+    const revision = join(bin, "revision");
+    writeFileSync(revision, "1970-01-01T00:00:00.000Z");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+  printf '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"%s","closedByPullRequestsReferences":[]}' "$(cat "${revision}")"
+elif [ "$1" = "api" ]; then
+  printf '%s\\n' '[[ ]]'
+else
+  printf '%s\\n' '[]'
+fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture();
+      await addPendingReview(fixture);
+      expect(applyWithFixtureReceipt(fixture.db, workItemWaitRequest(fixture.fenceToken, 3, { kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat" })).outcome).toBe("OK");
+      fixture.db.prepare("UPDATE work_item_waits SET waker = ?, waker_kind = 'github_issue_closed' WHERE work_item_id = ?").run("upstream/dependency#1949", WORK_ITEM_ID);
+
+      clock.mockReturnValue(25 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      const staleSends = () => fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([request]) =>
+        (request as { input: Array<{ text: string }> }).input[0]?.text === "wait went stale: chase the external or re-plan",
+      );
+      expect(staleSends()).toHaveLength(1);
+
+      clock.mockReturnValue(25 * 60 * 60_000 + 1 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(staleSends()).toHaveLength(1);
+
+      fixture.db.prepare("UPDATE work_item_waits SET waker = ? WHERE work_item_id = ?").run("other/repository#1949", WORK_ITEM_ID);
+      clock.mockReturnValue(25 * 60 * 60_000 + 5 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(staleSends()).toHaveLength(2);
+
+      writeFileSync(revision, "1970-01-02T01:00:00.000Z");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(staleSends()).toHaveLength(3);
+    } finally {
+      clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("surfaces a stale declared wait to the orchestrator", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {

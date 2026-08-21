@@ -199,6 +199,7 @@ type LinkedGithubObservation = {
   issueOpen: boolean;
   stateReason?: GithubStateReason;
   externalRevision: string;
+  updatedAtMs: number | null;
 };
 
 async function linkedGithubObservationAsync(owner: string, repo: string, issueNumber: number): Promise<LinkedGithubObservation | null> {
@@ -227,7 +228,8 @@ async function linkedGithubObservationAsync(owner: string, repo: string, issueNu
   const issueClosed = issueState === "CLOSED";
   const issueOpen = issueState === "OPEN";
   const status = pullRequestMerged || pullRequestClosed || issueClosed ? pullRequestMerged ? "merged" : "closed" : issueOpen ? "open" : null;
-  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason: stateReason === "" || stateReason === null ? undefined : stateReason as GithubStateReason, externalRevision };
+  const updatedAtMs = Date.parse(externalRevision);
+  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason: stateReason === "" || stateReason === null ? undefined : stateReason as GithubStateReason, externalRevision, updatedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : null };
 }
 
 async function readGithubIssueForBackfillAsync(owner: string, repo: string, issueNumber: number): Promise<GitHubIssueSnapshot> {
@@ -270,7 +272,8 @@ function linkedGithubObservation(owner: string, repo: string, issueNumber: numbe
   const status = pullRequestMerged || pullRequestClosed || issueClosed
     ? pullRequestMerged ? "merged" : "closed"
     : issueOpen ? "open" : null;
-  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason: stateReason === "" || stateReason === null ? undefined : stateReason as GithubStateReason, externalRevision };
+  const updatedAtMs = Date.parse(externalRevision);
+  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason: stateReason === "" || stateReason === null ? undefined : stateReason as GithubStateReason, externalRevision, updatedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : null };
 }
 
 function readGithubIssueForBackfill(owner: string, repo: string, issueNumber: number): GitHubIssueSnapshot {
@@ -2743,6 +2746,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         lanesByProject.set(projectId, lanes);
       }
       const openWorkItemsByProject = new Map<string, Array<{ workItemId: string; lifecycleState: string; waker: string | null; wakerKind: "schedule" | "seat" | "work_item_succeeded" | "github_issue_closed" | null; declaredAtMs: number | null }>>();
+      const externalRevisions = new Map<string, LinkedGithubObservation>();
+      const waitExternalRevisions = new Map<string, LinkedGithubObservation>();
+      const waitExternalKey = (owner: string, repo: string, issueNumber: number) => `${owner}\u0000${repo}\u0000${issueNumber}`;
       for (const workItem of db.prepare(
         `SELECT work_items.project_id, work_items.work_item_id, work_items.lifecycle_state, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
          FROM work_items LEFT JOIN work_item_waits
@@ -2808,7 +2814,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         }
         return latest ? `${latest.type}@${latest.seq}` : "unknown";
       };
-      const wake = async (projectId: string, holder: RoleHolderState, key: string, text: string, requireIdle: boolean, kind: "fleet" | "recovery" | "startable-queue" | "stale-wait" | "owed-act" | "escalation", beforeSend?: () => Promise<boolean>) => {
+      const wake = async (projectId: string, holder: RoleHolderState, key: string, text: string, requireIdle: boolean, kind: "fleet" | "recovery" | "startable-queue" | "stale-wait" | "owed-act" | "escalation", beforeSend?: () => Promise<boolean>, staleWaitExternalRevision: string | null = null, staleWaitWaker: string | null = null, bypassNotificationFloor = false) => {
         const previous = await fleetWatchdogIdle.get(key);
         const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs
           : kind === "recovery" ? previous?.lastRecoveryWakeAtMs
@@ -2816,7 +2822,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               : kind === "stale-wait" ? previous?.lastStaleWaitWakeAtMs
                 : kind === "owed-act" ? previous?.lastOwedActWakeAtMs
                   : previous?.lastEscalationAtMs;
-        if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== undefined && now - lastNotifiedAtMs < FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) return false;
+        if (!bypassNotificationFloor && lastNotifiedAtMs !== null && lastNotifiedAtMs !== undefined && now - lastNotifiedAtMs < FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) return false;
         if (wakeInFlight.has(key)) return false;
         wakeInFlight.add(key);
         try {
@@ -2837,7 +2843,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           if (kind === "fleet") await fleetWatchdogIdle.recordFleetWake(key, Date.now());
           else if (kind === "recovery") await fleetWatchdogIdle.recordRecoveryWake(key, now);
           else if (kind === "startable-queue") await fleetWatchdogIdle.recordStartableQueueWake(key, Date.now());
-          else if (kind === "stale-wait") await fleetWatchdogIdle.recordStaleWaitWake(key, Date.now());
+          else if (kind === "stale-wait") await fleetWatchdogIdle.recordStaleWaitWake(key, Date.now(), staleWaitExternalRevision, staleWaitWaker);
           else if (kind === "owed-act") await fleetWatchdogIdle.recordOwedActWake(key, Date.now());
           else await fleetWatchdogIdle.recordEscalation(key, Date.now());
           return true;
@@ -2887,6 +2893,22 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           ...extra,
         }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
       };
+      const inspectWaitTargets = async (projectId: string) => {
+        for (const workItem of openWorkItemsByProject.get(projectId) ?? []) {
+          if (workItem.wakerKind !== "github_issue_closed" || workItem.waker === null) continue;
+          const match = workItem.waker.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u);
+          const issueNumber = match?.[3] === undefined ? NaN : Number(match[3]);
+          if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
+            degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
+            continue;
+          }
+          const key = waitExternalKey(match[1], match[2], issueNumber);
+          if (waitExternalRevisions.has(key)) continue;
+          const observation = await linkedGithubObservationAsync(match[1], match[2], issueNumber);
+          if (observation === null) degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
+          else waitExternalRevisions.set(key, observation);
+        }
+      };
       const inspectLinkedWorkItems = async (projectId: string) => {
         // The handoff gate owns canonical ledger/attempt drift; this existing watchdog owns
         // external terminal drift. The active writer indexes remain the duplicate-claim detector.
@@ -2907,6 +2929,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             degrade(`github-work-item-status:${projectId}:${linked.work_item_id}`);
             continue;
           }
+          externalRevisions.set(`${projectId}\u0000${linked.work_item_id}`, observation);
           if (linked.lifecycle_state === "succeeded") {
             if (!observation.issueOpen) continue;
             const permanentReopenKey = fleetWatchdogReopenKey(projectId, linked.work_item_id);
@@ -3023,6 +3046,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         try {
           if (onlyProjectId !== undefined && projectId !== onlyProjectId) continue;
           await inspectLinkedWorkItems(projectId);
+          await inspectWaitTargets(projectId);
           const directors = holders.filter((holder) => holder.role_id === "director");
           const orchestrators = holders.filter((holder) => holder.role_id === "project-orchestrator");
           if (directors.length !== 1 || orchestrators.length !== 1) {
@@ -3209,9 +3233,35 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             }
           }
           const remainingWorkItems = workItems.filter((workItem) => !unblocked.has(workItem.workItemId));
-          const staleWait = remainingWorkItems.find((workItem) => workItem.declaredAtMs !== null && now - workItem.declaredAtMs >= staleWaitMs);
+          let staleWait: (typeof remainingWorkItems)[number] | undefined;
+          let staleObservation: LinkedGithubObservation | undefined;
+          let staleExternalMoved = false;
+          for (const candidate of remainingWorkItems) {
+            if (candidate.declaredAtMs === null || now - candidate.declaredAtMs < staleWaitMs) continue;
+            const targetMatch = candidate.wakerKind === "github_issue_closed" ? candidate.waker?.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u) ?? null : null;
+            const targetIssueNumber = targetMatch?.[3] === undefined ? NaN : Number(targetMatch[3]);
+            const observation = targetMatch?.[1] && targetMatch[2] && Number.isSafeInteger(targetIssueNumber)
+              ? waitExternalRevisions.get(waitExternalKey(targetMatch[1], targetMatch[2], targetIssueNumber))
+              : undefined;
+            if (!observation) {
+              const record = await fleetWatchdogIdle.get(roleIdleKey(orchestrator, candidate.workItemId));
+              staleExternalMoved = record?.lastStaleWaitWaker !== candidate.waker;
+              staleWait = candidate;
+              break;
+            }
+            const record = await fleetWatchdogIdle.get(roleIdleKey(orchestrator, candidate.workItemId));
+            const chased = record?.lastStaleWaitWakeAtMs !== null && record?.lastStaleWaitWakeAtMs !== undefined && record.lastStaleWaitWaker === candidate.waker && record.lastStaleWaitExternalRevision === observation.externalRevision;
+            // now - chaseAt >= max(floor, chaseAt - externalUpdatedAt); the interval is fixed at chase time.
+            const recheckMs = observation.updatedAtMs === null || !chased ? FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS : Math.max(FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS, record!.lastStaleWaitWakeAtMs! - observation.updatedAtMs);
+            if (!chased || now - record!.lastStaleWaitWakeAtMs! >= recheckMs) {
+              staleWait = candidate;
+              staleObservation = observation;
+              staleExternalMoved = record?.lastStaleWaitWaker !== candidate.waker || record?.lastStaleWaitExternalRevision !== observation.externalRevision;
+              break;
+            }
+          }
           if (staleWait) {
-            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait");
+            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait", undefined, staleObservation?.externalRevision ?? null, staleWait.waker, staleExternalMoved);
             continue;
           }
           const seatWait = remainingWorkItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null);

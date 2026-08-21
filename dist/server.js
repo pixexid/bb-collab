@@ -13883,17 +13883,19 @@ function roleIdleState(input) {
     const lastRecoveryWakeAtMs = typeof record2.lastRecoveryWakeAtMs === "number" && Number.isFinite(record2.lastRecoveryWakeAtMs) ? record2.lastRecoveryWakeAtMs : null;
     const lastStartableQueueWakeAtMs = typeof record2.lastStartableQueueWakeAtMs === "number" && Number.isFinite(record2.lastStartableQueueWakeAtMs) ? record2.lastStartableQueueWakeAtMs : null;
     const lastStaleWaitWakeAtMs = typeof record2.lastStaleWaitWakeAtMs === "number" && Number.isFinite(record2.lastStaleWaitWakeAtMs) ? record2.lastStaleWaitWakeAtMs : null;
+    const lastStaleWaitExternalRevision = typeof record2.lastStaleWaitExternalRevision === "string" ? record2.lastStaleWaitExternalRevision : null;
+    const lastStaleWaitWaker = typeof record2.lastStaleWaitWaker === "string" ? record2.lastStaleWaitWaker : null;
     const lastOwedActWakeAtMs = typeof record2.lastOwedActWakeAtMs === "number" && Number.isFinite(record2.lastOwedActWakeAtMs) ? record2.lastOwedActWakeAtMs : null;
     const lastEscalationAtMs = typeof record2.lastEscalationAtMs === "number" && Number.isFinite(record2.lastEscalationAtMs) ? record2.lastEscalationAtMs : null;
     if (!Number.isInteger(record2.steerCount) || record2.steerCount < 0 || record2.steerCount > 2 || !Number.isInteger(failedSteers) || failedSteers < 0 || failedSteers > 2 || idleSinceMs !== null && idleSinceMs < 0 || lastSteerAtMs !== null && lastSteerAtMs < 0 || lastFleetWakeAtMs !== null && lastFleetWakeAtMs < 0 || lastRecoveryWakeAtMs !== null && lastRecoveryWakeAtMs < 0 || lastStartableQueueWakeAtMs !== null && lastStartableQueueWakeAtMs < 0 || lastStaleWaitWakeAtMs !== null && lastStaleWaitWakeAtMs < 0 || lastOwedActWakeAtMs !== null && lastOwedActWakeAtMs < 0 || lastEscalationAtMs !== null && lastEscalationAtMs < 0 || typeof record2.escalated !== "boolean") {
       throw new Error("invalid role idle state");
     }
-    state[key] = { steerCount: record2.steerCount, failedSteers, escalated: record2.escalated, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastFleetWakeAtMs, lastRecoveryWakeAtMs, lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs, lastOwedActWakeAtMs, lastEscalationAtMs };
+    state[key] = { steerCount: record2.steerCount, failedSteers, escalated: record2.escalated, idleSinceMs, lastSteerAtMs, awaitingSteerOutcome, lastFleetWakeAtMs, lastRecoveryWakeAtMs, lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs, lastStaleWaitExternalRevision, lastStaleWaitWaker, lastOwedActWakeAtMs, lastEscalationAtMs };
   }
   return state;
 }
 function emptyRoleIdleRecord() {
-  return { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
+  return { steerCount: 0, failedSteers: 0, escalated: false, idleSinceMs: null, lastSteerAtMs: null, awaitingSteerOutcome: false, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastStaleWaitExternalRevision: null, lastStaleWaitWaker: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
 }
 function createRoleIdleLedger(persistence) {
   let state = {};
@@ -13937,7 +13939,7 @@ function createRoleIdleLedger(persistence) {
       await load();
       const record2 = state[key];
       if (!record2) return;
-      state[key] = { ...emptyRoleIdleRecord(), lastFleetWakeAtMs: record2.lastFleetWakeAtMs, lastRecoveryWakeAtMs: record2.lastRecoveryWakeAtMs, lastStartableQueueWakeAtMs: record2.lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs: record2.lastStaleWaitWakeAtMs, lastOwedActWakeAtMs: record2.lastOwedActWakeAtMs, lastEscalationAtMs: record2.lastEscalationAtMs };
+      state[key] = { ...emptyRoleIdleRecord(), lastFleetWakeAtMs: record2.lastFleetWakeAtMs, lastRecoveryWakeAtMs: record2.lastRecoveryWakeAtMs, lastStartableQueueWakeAtMs: record2.lastStartableQueueWakeAtMs, lastStaleWaitWakeAtMs: record2.lastStaleWaitWakeAtMs, lastStaleWaitExternalRevision: record2.lastStaleWaitExternalRevision, lastStaleWaitWaker: record2.lastStaleWaitWaker, lastOwedActWakeAtMs: record2.lastOwedActWakeAtMs, lastEscalationAtMs: record2.lastEscalationAtMs };
       await save();
     }),
     preserveAfterSteerWake: (key) => enqueue(async () => {
@@ -13995,9 +13997,9 @@ function createRoleIdleLedger(persistence) {
       await persistence?.write(structuredClone(nextState));
       state = nextState;
     }),
-    recordStaleWaitWake: (key, sentAtMs) => enqueue(async () => {
+    recordStaleWaitWake: (key, sentAtMs, externalRevision = null, waker = null) => enqueue(async () => {
       await load();
-      const nextState = { ...state, [key]: { ...state[key] ?? emptyRoleIdleRecord(), lastStaleWaitWakeAtMs: sentAtMs } };
+      const nextState = { ...state, [key]: { ...state[key] ?? emptyRoleIdleRecord(), lastStaleWaitWakeAtMs: sentAtMs, lastStaleWaitExternalRevision: externalRevision, lastStaleWaitWaker: waker } };
       await persistence?.write(structuredClone(nextState));
       state = nextState;
     }),
@@ -14016,7 +14018,7 @@ function createRoleIdleLedger(persistence) {
     }),
     clearWakeHistory: (prefix) => enqueue(async () => {
       await load();
-      for (const key of Object.keys(state)) if (key.startsWith(prefix)) state[key] = { ...state[key], idleSinceMs: null, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
+      for (const key of Object.keys(state)) if (key.startsWith(prefix)) state[key] = { ...state[key], idleSinceMs: null, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastStaleWaitExternalRevision: null, lastStaleWaitWaker: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
       await save();
     })
   };
@@ -21925,7 +21927,8 @@ async function linkedGithubObservationAsync(owner, repo, issueNumber) {
   const issueClosed = issueState === "CLOSED";
   const issueOpen = issueState === "OPEN";
   const status = pullRequestMerged || pullRequestClosed || issueClosed ? pullRequestMerged ? "merged" : "closed" : issueOpen ? "open" : null;
-  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason: stateReason === "" || stateReason === null ? void 0 : stateReason, externalRevision };
+  const updatedAtMs = Date.parse(externalRevision);
+  return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason: stateReason === "" || stateReason === null ? void 0 : stateReason, externalRevision, updatedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : null };
 }
 async function readGithubIssueForBackfillAsync(owner, repo, issueNumber) {
   const value = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"]);
@@ -24116,6 +24119,9 @@ ${thread.titleFallback ?? ""}`);
         lanesByProject.set(projectId, lanes);
       }
       const openWorkItemsByProject = /* @__PURE__ */ new Map();
+      const externalRevisions = /* @__PURE__ */ new Map();
+      const waitExternalRevisions = /* @__PURE__ */ new Map();
+      const waitExternalKey = (owner, repo, issueNumber) => `${owner}\0${repo}\0${issueNumber}`;
       for (const workItem of db.prepare(
         `SELECT work_items.project_id, work_items.work_item_id, work_items.lifecycle_state, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
          FROM work_items LEFT JOIN work_item_waits
@@ -24165,10 +24171,10 @@ ${thread.titleFallback ?? ""}`);
         }
         return latest ? `${latest.type}@${latest.seq}` : "unknown";
       };
-      const wake = async (projectId, holder, key, text, requireIdle, kind, beforeSend) => {
+      const wake = async (projectId, holder, key, text, requireIdle, kind, beforeSend, staleWaitExternalRevision = null, staleWaitWaker = null, bypassNotificationFloor = false) => {
         const previous = await fleetWatchdogIdle.get(key);
         const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs : kind === "recovery" ? previous?.lastRecoveryWakeAtMs : kind === "startable-queue" ? previous?.lastStartableQueueWakeAtMs : kind === "stale-wait" ? previous?.lastStaleWaitWakeAtMs : kind === "owed-act" ? previous?.lastOwedActWakeAtMs : previous?.lastEscalationAtMs;
-        if (lastNotifiedAtMs !== null && lastNotifiedAtMs !== void 0 && now2 - lastNotifiedAtMs < FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) return false;
+        if (!bypassNotificationFloor && lastNotifiedAtMs !== null && lastNotifiedAtMs !== void 0 && now2 - lastNotifiedAtMs < FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) return false;
         if (wakeInFlight.has(key)) return false;
         wakeInFlight.add(key);
         try {
@@ -24189,7 +24195,7 @@ ${thread.titleFallback ?? ""}`);
           if (kind === "fleet") await fleetWatchdogIdle.recordFleetWake(key, Date.now());
           else if (kind === "recovery") await fleetWatchdogIdle.recordRecoveryWake(key, now2);
           else if (kind === "startable-queue") await fleetWatchdogIdle.recordStartableQueueWake(key, Date.now());
-          else if (kind === "stale-wait") await fleetWatchdogIdle.recordStaleWaitWake(key, Date.now());
+          else if (kind === "stale-wait") await fleetWatchdogIdle.recordStaleWaitWake(key, Date.now(), staleWaitExternalRevision, staleWaitWaker);
           else if (kind === "owed-act") await fleetWatchdogIdle.recordOwedActWake(key, Date.now());
           else await fleetWatchdogIdle.recordEscalation(key, Date.now());
           return true;
@@ -24232,6 +24238,22 @@ ${thread.titleFallback ?? ""}`);
           ...extra
         }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
       };
+      const inspectWaitTargets = async (projectId) => {
+        for (const workItem of openWorkItemsByProject.get(projectId) ?? []) {
+          if (workItem.wakerKind !== "github_issue_closed" || workItem.waker === null) continue;
+          const match = workItem.waker.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u);
+          const issueNumber = match?.[3] === void 0 ? NaN : Number(match[3]);
+          if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
+            degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
+            continue;
+          }
+          const key = waitExternalKey(match[1], match[2], issueNumber);
+          if (waitExternalRevisions.has(key)) continue;
+          const observation = await linkedGithubObservationAsync(match[1], match[2], issueNumber);
+          if (observation === null) degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
+          else waitExternalRevisions.set(key, observation);
+        }
+      };
       const inspectLinkedWorkItems = async (projectId) => {
         const linkedWorkItems = db.prepare(
           `SELECT work_items.work_item_id, work_items.lifecycle_state, external_work_refs.owner, external_work_refs.repo, external_work_refs.issue_number
@@ -24250,6 +24272,7 @@ ${thread.titleFallback ?? ""}`);
             degrade(`github-work-item-status:${projectId}:${linked.work_item_id}`);
             continue;
           }
+          externalRevisions.set(`${projectId}\0${linked.work_item_id}`, observation);
           if (linked.lifecycle_state === "succeeded") {
             if (!observation.issueOpen) continue;
             const permanentReopenKey = fleetWatchdogReopenKey(projectId, linked.work_item_id);
@@ -24361,6 +24384,7 @@ ${thread.titleFallback ?? ""}`);
         try {
           if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
           await inspectLinkedWorkItems(projectId);
+          await inspectWaitTargets(projectId);
           const directors = holders.filter((holder) => holder.role_id === "director");
           const orchestrators = holders.filter((holder) => holder.role_id === "project-orchestrator");
           if (directors.length !== 1 || orchestrators.length !== 1) {
@@ -24542,9 +24566,32 @@ ${thread.titleFallback ?? ""}`);
             }
           }
           const remainingWorkItems = workItems.filter((workItem) => !unblocked.has(workItem.workItemId));
-          const staleWait = remainingWorkItems.find((workItem) => workItem.declaredAtMs !== null && now2 - workItem.declaredAtMs >= staleWaitMs);
+          let staleWait;
+          let staleObservation;
+          let staleExternalMoved = false;
+          for (const candidate of remainingWorkItems) {
+            if (candidate.declaredAtMs === null || now2 - candidate.declaredAtMs < staleWaitMs) continue;
+            const targetMatch = candidate.wakerKind === "github_issue_closed" ? candidate.waker?.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u) ?? null : null;
+            const targetIssueNumber = targetMatch?.[3] === void 0 ? NaN : Number(targetMatch[3]);
+            const observation = targetMatch?.[1] && targetMatch[2] && Number.isSafeInteger(targetIssueNumber) ? waitExternalRevisions.get(waitExternalKey(targetMatch[1], targetMatch[2], targetIssueNumber)) : void 0;
+            if (!observation) {
+              const record3 = await fleetWatchdogIdle.get(roleIdleKey(orchestrator, candidate.workItemId));
+              staleExternalMoved = record3?.lastStaleWaitWaker !== candidate.waker;
+              staleWait = candidate;
+              break;
+            }
+            const record2 = await fleetWatchdogIdle.get(roleIdleKey(orchestrator, candidate.workItemId));
+            const chased = record2?.lastStaleWaitWakeAtMs !== null && record2?.lastStaleWaitWakeAtMs !== void 0 && record2.lastStaleWaitWaker === candidate.waker && record2.lastStaleWaitExternalRevision === observation.externalRevision;
+            const recheckMs = observation.updatedAtMs === null || !chased ? FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS : Math.max(FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS, record2.lastStaleWaitWakeAtMs - observation.updatedAtMs);
+            if (!chased || now2 - record2.lastStaleWaitWakeAtMs >= recheckMs) {
+              staleWait = candidate;
+              staleObservation = observation;
+              staleExternalMoved = record2?.lastStaleWaitWaker !== candidate.waker || record2?.lastStaleWaitExternalRevision !== observation.externalRevision;
+              break;
+            }
+          }
           if (staleWait) {
-            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait");
+            await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait", void 0, staleObservation?.externalRevision ?? null, staleWait.waker, staleExternalMoved);
             continue;
           }
           const seatWait = remainingWorkItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null);
