@@ -34,6 +34,27 @@ describe("dist freshness gate", () => {
     }
   });
 
+  it("rejects a build artifact omitted from the commit", () => {
+    const root = mkdtempSync(join(tmpdir(), "bb-collab-dist-omission-"));
+    try {
+      mkdirSync(join(root, "dist"));
+      writeFileSync(join(root, "dist/server.js"), "//# sourceMappingURL=server.js.map\n");
+      writeFileSync(join(root, "dist/server.meta.json"), "{}\n");
+      writeFileSync(join(root, "dist/server.js.map"), "map\n");
+      execFileSync("git", ["init", "--quiet"], { cwd: root });
+      execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
+      execFileSync("git", ["add", "dist/server.js", "dist/server.meta.json"], { cwd: root });
+      execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: root });
+
+      const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("dist/server.js.map");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("passes an honest artifact and names a hand-edited artifact when it fails", () => {
     const root = mkdtempSync(join(tmpdir(), "bb-collab-dist-freshness-"));
     try {
