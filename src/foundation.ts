@@ -1935,7 +1935,7 @@ export interface GitHubIssueSnapshot {
   title: string;
   body: string;
   state: "open" | "closed";
-  stateReason?: "COMPLETED" | "NOT_PLANNED" | "REOPENED";
+  stateReason?: "COMPLETED" | "NOT_PLANNED" | "DUPLICATE" | "REOPENED";
   labels: string[];
   externalRevision: string;
 }
@@ -5796,7 +5796,7 @@ const githubSnapshotSchema = z
     title: z.string().max(4096),
     body: z.string().max(64 * 1024),
     state: z.enum(["open", "closed"]),
-    stateReason: z.enum(["COMPLETED", "NOT_PLANNED", "REOPENED"]).optional(),
+    stateReason: z.enum(["COMPLETED", "NOT_PLANNED", "DUPLICATE", "REOPENED"]).optional(),
     labels: z.array(id).max(256),
     externalRevision: id,
   })

@@ -188,7 +188,7 @@ type LinkedGithubObservation = {
   pullRequestMerged: boolean;
   issueClosed: boolean;
   issueOpen: boolean;
-  stateReason: "COMPLETED" | "NOT_PLANNED" | "REOPENED";
+  stateReason: "COMPLETED" | "NOT_PLANNED" | "DUPLICATE" | "REOPENED";
   externalRevision: string;
 };
 
@@ -199,7 +199,7 @@ async function linkedGithubObservationAsync(owner: string, repo: string, issueNu
   const stateReason = (issue as { stateReason?: unknown }).stateReason;
   const externalRevision = (issue as { updatedAt?: unknown }).updatedAt;
   const closingPullRequests = (issue as { closedByPullRequestsReferences?: unknown }).closedByPullRequestsReferences;
-  if ((issueState !== "OPEN" && issueState !== "CLOSED") || (stateReason !== "COMPLETED" && stateReason !== "NOT_PLANNED" && stateReason !== "REOPENED") || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
+  if ((issueState !== "OPEN" && issueState !== "CLOSED") || (stateReason !== "COMPLETED" && stateReason !== "NOT_PLANNED" && stateReason !== "DUPLICATE" && stateReason !== "REOPENED") || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
   const closingPullRequest = closingPullRequests[0];
   if (closingPullRequest !== undefined && (!closingPullRequest || typeof closingPullRequest !== "object" || Array.isArray(closingPullRequest)
     || typeof (closingPullRequest as { number?: unknown }).number !== "number"
@@ -227,10 +227,10 @@ async function readGithubIssueForBackfillAsync(owner: string, repo: string, issu
   const record = value as { number?: unknown; title?: unknown; body?: unknown; state?: unknown; stateReason?: unknown; labels?: unknown; updatedAt?: unknown };
   if (typeof record.number !== "number" || !Number.isSafeInteger(record.number) || typeof record.title !== "string"
     || (record.body !== null && typeof record.body !== "string") || (record.state !== "OPEN" && record.state !== "CLOSED")
-    || (record.stateReason !== "COMPLETED" && record.stateReason !== "NOT_PLANNED" && record.stateReason !== "REOPENED")
+    || (record.stateReason !== "COMPLETED" && record.stateReason !== "NOT_PLANNED" && record.stateReason !== "DUPLICATE" && record.stateReason !== "REOPENED")
     || !Array.isArray(record.labels) || !record.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof (label as { name?: unknown }).name === "string")
     || typeof record.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
-  return { owner, repo, issueNumber: record.number, title: record.title, body: record.body ?? "", state: record.state === "OPEN" ? "open" : "closed", stateReason: record.stateReason as "COMPLETED" | "NOT_PLANNED" | "REOPENED", labels: (record.labels as Array<{ name: string }>).map((label) => label.name), externalRevision: record.updatedAt };
+  return { owner, repo, issueNumber: record.number, title: record.title, body: record.body ?? "", state: record.state === "OPEN" ? "open" : "closed", stateReason: record.stateReason as "COMPLETED" | "NOT_PLANNED" | "DUPLICATE" | "REOPENED", labels: (record.labels as Array<{ name: string }>).map((label) => label.name), externalRevision: record.updatedAt };
 }
 
 function linkedGithubObservation(owner: string, repo: string, issueNumber: number): LinkedGithubObservation | null {
@@ -240,7 +240,7 @@ function linkedGithubObservation(owner: string, repo: string, issueNumber: numbe
   const stateReason = (issue as { stateReason?: unknown }).stateReason;
   const externalRevision = (issue as { updatedAt?: unknown }).updatedAt;
   const closingPullRequests = (issue as { closedByPullRequestsReferences?: unknown }).closedByPullRequestsReferences;
-  if ((issueState !== "OPEN" && issueState !== "CLOSED") || (stateReason !== "COMPLETED" && stateReason !== "NOT_PLANNED" && stateReason !== "REOPENED") || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
+  if ((issueState !== "OPEN" && issueState !== "CLOSED") || (stateReason !== "COMPLETED" && stateReason !== "NOT_PLANNED" && stateReason !== "DUPLICATE" && stateReason !== "REOPENED") || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
   const closingPullRequest = closingPullRequests[0];
   if (closingPullRequest !== undefined && (!closingPullRequest || typeof closingPullRequest !== "object" || Array.isArray(closingPullRequest)
     || typeof (closingPullRequest as { number?: unknown }).number !== "number"
@@ -274,7 +274,7 @@ function readGithubIssueForBackfill(owner: string, repo: string, issueNumber: nu
     typeof record.title !== "string" ||
     (record.body !== null && typeof record.body !== "string") ||
     (record.state !== "OPEN" && record.state !== "CLOSED") ||
-    (record.stateReason !== "COMPLETED" && record.stateReason !== "NOT_PLANNED" && record.stateReason !== "REOPENED") ||
+    (record.stateReason !== "COMPLETED" && record.stateReason !== "NOT_PLANNED" && record.stateReason !== "DUPLICATE" && record.stateReason !== "REOPENED") ||
     !Array.isArray(record.labels) ||
     !record.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof (label as { name?: unknown }).name === "string") ||
     typeof record.updatedAt !== "string"
@@ -286,7 +286,7 @@ function readGithubIssueForBackfill(owner: string, repo: string, issueNumber: nu
     title: record.title,
     body: record.body ?? "",
     state: record.state === "OPEN" ? "open" : "closed",
-    stateReason: record.stateReason as "COMPLETED" | "NOT_PLANNED" | "REOPENED",
+    stateReason: record.stateReason as "COMPLETED" | "NOT_PLANNED" | "DUPLICATE" | "REOPENED",
     labels: record.labels.map((label) => (label as { name: string }).name),
     externalRevision: record.updatedAt,
   };
@@ -3004,7 +3004,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=${workItem.lifecycle_state === "proposed" ? "proposed-cancel" : "review_pending"}`);
           } else {
             degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
-            bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result.outcome}`);
+            bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result.outcome} message=${result.message}`);
           }
         }
       };

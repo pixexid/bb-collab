@@ -3791,7 +3791,7 @@ else console.log(JSON.stringify(blocked));
     }
   });
 
-  it("does not cancel a proposed item for a NOT_PLANNED issue with a merged PR", async () => {
+  it("does not cancel a proposed item for a DUPLICATE issue with a merged PR", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-stale-terminal-"));
     const gh = join(bin, "gh");
     const phaseFile = join(bin, "phase");
@@ -3824,7 +3824,7 @@ if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "numb
   if [ "$phase" = "open-2" ]; then printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"open-2"}'; else printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"'"$phase"'"}'; fi
   exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "210" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then printf '%s\\n' '{"number":210,"title":"issue","body":"body","state":"CLOSED","stateReason":"NOT_PLANNED","labels":[],"updatedAt":"closed-210"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "210" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then printf '%s\\n' '{"number":210,"title":"issue","body":"body","state":"CLOSED","stateReason":"DUPLICATE","labels":[],"updatedAt":"closed-210"}'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then printf '%s\\n' '{"number":'"$3"',"title":"issue","body":"body","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"closed-'"$3"'"}'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" != "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then exit 1; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && { [ "$3" = "206" ] || [ "$3" = "208" ] || [ "$3" = "209" ] || [ "$3" = "210" ]; }; then printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[{"number":340}]}'; exit 0; fi
@@ -3939,6 +3939,10 @@ exit 1
       expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, absorbedWorkItemId)).toEqual({ lifecycle_state: "cancelled" });
       expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, adversarialWorkItemId)).toEqual({ lifecycle_state: "proposed" });
       expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ? AND aggregate_id = ? AND event_type = 'work_item_transitioned'").get(PROJECT_ID, proposedWorkItemId)).toEqual({ count: 0 });
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining("workItem=never-started-work-item outcome=WORK_ITEM_STATE_INVALID message=proposed cancellation requires a completed GitHub close observation"),
+      }));
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
       expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
