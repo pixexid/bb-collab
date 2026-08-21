@@ -11050,6 +11050,17 @@ exit 1
     expect(seedFixtureDecision).toBeTypeOf("function");
   });
 
+  it("keeps the scheduled cleanup report shape when project inventory is unreadable", async () => {
+    const host = hostFor();
+    host.harness.sdk.stub("projects.list", (async () => { throw new Error("project inventory unavailable"); }) as never);
+    await plugin(host.bb);
+    await host.harness.runSchedule("worktree-cleanup");
+    expect(host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringContaining('"removableCandidateCount":0'),
+    }));
+  });
+
   it("runs worktree cleanup through the registered report-only CLI", async () => {
     const host = await loadedHost();
     host.harness.sdk.stub("threads.list", (async () => []) as never);
@@ -11059,7 +11070,7 @@ exit 1
     const reported = await host.harness.runCli(["worktree-cleanup", "--project", PROJECT_ID]);
     const output = JSON.parse(reported.stdout) as Record<string, unknown>;
     expect(reported.exitCode).toBe(2);
-    expect(output).toMatchObject({ outcome: "refused", wouldRemove: [], environmentRecordsReleased: false });
+    expect(output).toMatchObject({ outcome: "refused", wouldRemove: [], removableCandidateCount: 0, environmentRecordsReleased: false });
     expect(output).not.toHaveProperty("removed");
   });
 

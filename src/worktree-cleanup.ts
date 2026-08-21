@@ -20,13 +20,18 @@ export type WorktreeDecision = {
   reason: string;
 };
 
+export type CleanupAttestation =
+  { coverage: "known" }
+  | { coverage: "at-risk"; reason: string }
+  | { coverage: "blind"; reason: string };
+
 export type WorktreeCleanupReport = {
   outcome: "reported" | "refused";
   wouldRemove: WorktreeDecision[];
   removableCandidateCount: number;
   refused: WorktreeDecision[];
   environmentRecordsReleased: false;
-  attestation: { coverage: "known" } | { coverage: "blind"; reason: string };
+  attestation: CleanupAttestation;
 };
 
 type ExecutedProfileRead = {
@@ -36,12 +41,11 @@ type ExecutedProfileRead = {
   turns?: ReadonlyArray<{ phase?: string; environmentDependent?: boolean; reason?: string }>;
 };
 
-export function cleanupAttestationFromProfile(profile: ExecutedProfileRead):
-  { coverage: "known" } | { coverage: "blind"; reason: string } {
+export function cleanupAttestationFromProfile(profile: ExecutedProfileRead): CleanupAttestation {
   const environmentDependent = profile.environmentDependent ?? profile.turns?.some((turn) => turn.environmentDependent) ?? false;
   if (environmentDependent) {
     if (profile.outcome === "unknown") return { coverage: "blind", reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134" };
-    return { coverage: "known" };
+    return { coverage: "at-risk", reason: "environment reaping removes the path needed to correlate this attestation; preserve correlation or retain the environment" };
   }
   return { coverage: "known" };
 }
@@ -62,7 +66,7 @@ export type WorktreeCleanupOptions = {
   createdAt?: (path: string) => number | null;
   now?: number;
   quietFloorMs?: number;
-  attestation?: { coverage: "known" } | { coverage: "blind"; reason: string };
+  attestation?: CleanupAttestation;
 };
 
 const threadPattern = /thr_[a-z0-9]+/u;
@@ -113,6 +117,10 @@ export function classifyWorktree(path: string, home = process.env.HOME ?? ""): W
 
 export function threadIdFromBranch(branch: string | null): string | null {
   return branch?.match(threadPattern)?.[0] ?? null;
+}
+
+export function cleanupCandidateThreadIds(decisions: readonly WorktreeDecision[]): ReadonlySet<string> {
+  return new Set(decisions.filter((decision) => decision.action === "remove").map((decision) => decision.threadId).filter((id): id is string => id !== null && id !== undefined));
 }
 
 export function planWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeCleanupOptions): WorktreeDecision[] {

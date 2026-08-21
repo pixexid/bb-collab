@@ -21545,7 +21545,7 @@ function cleanupAttestationFromProfile(profile) {
   const environmentDependent = profile.environmentDependent ?? profile.turns?.some((turn) => turn.environmentDependent) ?? false;
   if (environmentDependent) {
     if (profile.outcome === "unknown") return { coverage: "blind", reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134" };
-    return { coverage: "known" };
+    return { coverage: "at-risk", reason: "environment reaping removes the path needed to correlate this attestation; preserve correlation or retain the environment" };
   }
   return { coverage: "known" };
 }
@@ -21581,6 +21581,9 @@ function classifyWorktree(path, home = process.env.HOME ?? "") {
 }
 function threadIdFromBranch(branch) {
   return branch?.match(threadPattern)?.[0] ?? null;
+}
+function cleanupCandidateThreadIds(decisions) {
+  return new Set(decisions.filter((decision) => decision.action === "remove").map((decision) => decision.threadId).filter((id2) => id2 !== null && id2 !== void 0));
 }
 function planWorktreeCleanup(entries, options) {
   const decisions = [];
@@ -23103,6 +23106,7 @@ async function readCleanupAttestation(projectId, threadIds) {
   if (threadIds.size === 0) return { coverage: "known" };
   const root = findCheckoutRoot(dirname3(fileURLToPath(import.meta.url)));
   if (!root) return { coverage: "blind", reason: "reader-unavailable:checkout-root-unresolved" };
+  let atRisk = null;
   for (const threadId of threadIds) {
     const result2 = await new Promise((resolve3) => {
       execFile(process.execPath, [join5(root, "scripts", "read-executed-profile.mjs"), "--project", projectId, "--thread", threadId], {
@@ -23116,11 +23120,12 @@ async function readCleanupAttestation(projectId, threadIds) {
       const profile = JSON.parse(result2.output);
       const attestation = cleanupAttestationFromProfile(profile);
       if (attestation.coverage === "blind") return attestation;
+      if (attestation.coverage === "at-risk") atRisk = attestation;
     } catch {
       return { coverage: "blind", reason: `reader-unreadable:${threadId}` };
     }
   }
-  return { coverage: "known" };
+  return atRisk ?? { coverage: "known" };
 }
 async function reportProjectWorktreeCleanup(bb, projectId) {
   const project = await bb.sdk.projects.get({ projectId });
@@ -23155,9 +23160,11 @@ async function reportProjectWorktreeCleanup(bb, projectId) {
     }
   }
   const entries = listGitWorktrees(source.path);
-  const candidateThreadIds = new Set(entries.map((entry) => threadIdFromBranch(entry.branch)).filter((id2) => id2 !== null));
+  const cleanupArgs = [source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete, protectedEnvironmentPaths, pluginSourceResolved];
+  const preliminary = cleanupGitWorktrees(...cleanupArgs, { coverage: "known" }, entries);
+  const candidateThreadIds = cleanupCandidateThreadIds(preliminary.wouldRemove);
   const attestation = await readCleanupAttestation(projectId, candidateThreadIds);
-  return cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete, protectedEnvironmentPaths, pluginSourceResolved, attestation, entries);
+  return cleanupGitWorktrees(...cleanupArgs, attestation, entries);
 }
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];
@@ -25096,7 +25103,7 @@ ${thread.titleFallback ?? ""}`);
     try {
       projects = await bb.sdk.projects.list({ includePersonal: true });
     } catch (error48) {
-      const report = { outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: `project inventory unavailable: ${String(error48)}` }], environmentRecordsReleased: false, attestation: { coverage: "blind", reason: "cleanup-inventory-unreadable" } };
+      const report = { outcome: "refused", wouldRemove: [], removableCandidateCount: 0, refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: `project inventory unavailable: ${String(error48)}` }], environmentRecordsReleased: false, attestation: { coverage: "blind", reason: "cleanup-inventory-unreadable" } };
       bb.log.warn(`worktree-cleanup report: ${JSON.stringify(report)}`);
       bb.realtime.publish("worktree-cleanup", report);
       return;

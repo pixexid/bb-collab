@@ -6,6 +6,7 @@ import type { WorktreeCleanupOptions } from "../src/worktree-cleanup.js";
 import {
   canonicalWorktreePath,
   cleanupAttestationFromProfile,
+  cleanupCandidateThreadIds,
   classifyWorktree,
   cleanupGitWorktrees,
   defaultQuietFloorMs,
@@ -122,8 +123,12 @@ describe("worktree cleanup", () => {
     expect(result.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(paths[1]), reason: "plugin source environment is protected" }));
   });
 
-  it("preserves the reader's provider and turn-state distinction", () => {
+  it("distinguishes safe, at-risk, and unreadable attestation evidence", () => {
     expect(cleanupAttestationFromProfile({ outcome: "unknown", environmentDependent: false })).toEqual({ coverage: "known" });
+    expect(cleanupAttestationFromProfile({ outcome: "known", environmentDependent: true })).toEqual({
+      coverage: "at-risk",
+      reason: "environment reaping removes the path needed to correlate this attestation; preserve correlation or retain the environment",
+    });
     expect(cleanupAttestationFromProfile({ outcome: "unknown", environmentDependent: true })).toEqual({
       coverage: "blind",
       reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134",
@@ -131,13 +136,20 @@ describe("worktree cleanup", () => {
     expect(cleanupAttestationFromProfile({ outcome: "unknown", turns: [{ phase: "active", environmentDependent: true }] })).toMatchObject({ coverage: "blind" });
   });
 
-  it("reports removable candidates with blind expiry attestation", () => {
+  it("attests only removable thread-bearing worktrees", () => {
+    expect([...cleanupCandidateThreadIds([
+      { path: "live", threadId: "thr_live", population: "scratch", action: "refuse", reason: "live thread" },
+      { path: "old", threadId: "thr_old", population: "scratch", action: "remove", reason: "clean" },
+    ])]).toEqual(["thr_old"]);
+  });
+
+  it("reports removable candidates with at-risk expiry attestation", () => {
     const { root, paths } = fixture();
     const result = report(root, new Set(["thr_live"]), new Map([[canonicalWorktreePath(paths[0]), new Set(["thr_live"])] ]), {
-      attestation: { coverage: "blind", reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134" },
+      attestation: { coverage: "at-risk", reason: "environment reaping removes the path needed to correlate this attestation; preserve correlation or retain the environment" },
     });
     expect(result.removableCandidateCount).toBe(1);
-    expect(result.attestation).toEqual({ coverage: "blind", reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134" });
+    expect(result.attestation).toEqual({ coverage: "at-risk", reason: "environment reaping removes the path needed to correlate this attestation; preserve correlation or retain the environment" });
     expect(result.environmentRecordsReleased).toBe(false);
     expect(result.wouldRemove.map(({ path }) => path)).toEqual([canonicalWorktreePath(paths[1])]);
   });
