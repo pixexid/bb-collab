@@ -1,5 +1,4 @@
 ---
-"bb-plugin-bb-collab": minor
 "bb-plugin-threads-list": minor
 ---
 

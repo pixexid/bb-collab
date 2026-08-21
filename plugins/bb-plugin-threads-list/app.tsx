@@ -15,6 +15,26 @@ type ThreadExecution = NonNullable<ThreadModels[string]>;
 type SidebarCollapseState = PluginRpcResult<typeof rpcContract["sidebarCollapseState"]>;
 
 const SETTINGS_ACTION_TITLE = "bb-collab settings";
+const STATE_MIGRATION_NOTICE_KEY = "bb-plugin-threads-list.state-migration-notice";
+
+function migrationNoticeVisible(): boolean {
+  try {
+    return window.localStorage.getItem(STATE_MIGRATION_NOTICE_KEY) !== "dismissed";
+  } catch {
+    // Unavailable storage must not hide the notice or take down the sidebar.
+    return true;
+  }
+}
+
+export function dismissMigrationNotice(): boolean {
+  try {
+    window.localStorage.setItem(STATE_MIGRATION_NOTICE_KEY, "dismissed");
+    return true;
+  } catch {
+    // Keep the notice visible when persistence is unavailable.
+    return false;
+  }
+}
 
 function age(ms: number): string {
   const minutes = Math.floor(ms / 60_000);
@@ -452,7 +472,7 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   const [customStates, setCustomStates] = useState<ThreadStates>({});
   const [indicatorBroken, setIndicatorBroken] = useState<string | null>(null);
   const [threadModels, setThreadModels] = useState<ThreadModels>({});
-  const [stateMigrationNotice, setStateMigrationNotice] = useState(() => window.localStorage.getItem("bb-plugin-threads-list.state-migration-notice") !== "dismissed");
+  const [stateMigrationNotice, setStateMigrationNotice] = useState(migrationNoticeVisible);
   const threadIds = useMemo(() => sidebar.threads.map((thread) => thread.id), [sidebar.threads]);
   const threadIdsKey = threadIds.join("\u0000");
   const projectIds = useMemo(() => sidebar.projects.map((project) => project.id), [sidebar.projects]);
@@ -566,7 +586,7 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
 
   return (
     <div className="h-full space-y-3 overflow-y-auto p-1">
-      {stateMigrationNotice ? <p role="status" className="rounded-md border border-border p-2 text-xs text-muted-foreground">Thread-list collapse and custom state were reset during the plugin move. <button type="button" className="underline" onClick={() => { window.localStorage.setItem("bb-plugin-threads-list.state-migration-notice", "dismissed"); setStateMigrationNotice(false); }}>Dismiss</button></p> : null}
+      {stateMigrationNotice ? <p role="status" className="rounded-md border border-border p-2 text-xs text-muted-foreground">Thread-list collapse and custom state were reset during the plugin move. <button type="button" className="underline" onClick={() => { if (dismissMigrationNotice()) setStateMigrationNotice(false); }}>Dismiss</button></p> : null}
       {groups.map(({ project, threads }) => {
         const tree = buildThreadTree(threads);
         const collapsed = collapsedProjects.has(project.id);

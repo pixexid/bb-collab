@@ -98,7 +98,23 @@ function okMessages<A>(handler: (input: A) => Promise<unknown[]>) {
 describe("replacement thread list", () => {
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
     window.localStorage.clear();
+  });
+
+  it("keeps the notice and sidebar visible when storage is unavailable", async () => {
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => { throw new DOMException("blocked", "SecurityError"); });
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new DOMException("blocked", "SecurityError"); });
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [thread("thread-1", "project-a", 1)] },
+      rpc: rpcHandlers(),
+    });
+
+    expect(rendered.getByRole("status").textContent).toContain("reset during the plugin move");
+    expect(rendered.getByText("thread-1")).toBeTruthy();
+    fireEvent.click(rendered.getByRole("button", { name: "Dismiss" }));
+    expect(rendered.getByRole("status")).toBeTruthy();
   });
 
   it("groups by stable project id and limits each project to five recent threads", async () => {
