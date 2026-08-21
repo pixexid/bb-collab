@@ -21582,8 +21582,8 @@ function classifyWorktree(path, home = process.env.HOME ?? "") {
 function threadIdFromBranch(branch) {
   return branch?.match(threadPattern)?.[0] ?? null;
 }
-function cleanupCandidateThreadIds(decisions) {
-  return new Set(decisions.filter((decision) => decision.action === "remove").map((decision) => decision.threadId).filter((id2) => id2 !== null && id2 !== void 0));
+function withCleanupAttestationSubjects(attestation, subjects) {
+  return attestation.coverage === "at-risk" ? { ...attestation, affected: subjects } : attestation;
 }
 function planWorktreeCleanup(entries, options) {
   const decisions = [];
@@ -23102,11 +23102,14 @@ async function replyToOperatorMessage(db, bb, projectId, messageId, replyText) {
   }
   return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0];
 }
-async function readCleanupAttestation(projectId, threadIds) {
+async function readCleanupAttestation(projectId, candidates) {
+  const subjects = candidates.filter((candidate) => typeof candidate.threadId === "string");
+  const threadIds = new Set(subjects.map((candidate) => candidate.threadId));
   if (threadIds.size === 0) return { coverage: "known" };
   const root = findCheckoutRoot(dirname3(fileURLToPath(import.meta.url)));
   if (!root) return { coverage: "blind", reason: "reader-unavailable:checkout-root-unresolved" };
   let atRisk = null;
+  const affected = /* @__PURE__ */ new Map();
   for (const threadId of threadIds) {
     const result2 = await new Promise((resolve3) => {
       execFile(process.execPath, [join5(root, "scripts", "read-executed-profile.mjs"), "--project", projectId, "--thread", threadId], {
@@ -23120,12 +23123,15 @@ async function readCleanupAttestation(projectId, threadIds) {
       const profile = JSON.parse(result2.output);
       const attestation = cleanupAttestationFromProfile(profile);
       if (attestation.coverage === "blind") return attestation;
-      if (attestation.coverage === "at-risk") atRisk = attestation;
+      if (attestation.coverage === "at-risk") {
+        atRisk = attestation;
+        for (const subject of subjects.filter((candidate) => candidate.threadId === threadId)) affected.set(`${subject.path}\0${threadId}`, subject);
+      }
     } catch {
       return { coverage: "blind", reason: `reader-unreadable:${threadId}` };
     }
   }
-  return atRisk ?? { coverage: "known" };
+  return atRisk?.coverage === "at-risk" ? withCleanupAttestationSubjects(atRisk, [...affected.values()]) : atRisk ?? { coverage: "known" };
 }
 async function reportProjectWorktreeCleanup(bb, projectId) {
   const project = await bb.sdk.projects.get({ projectId });
@@ -23162,8 +23168,7 @@ async function reportProjectWorktreeCleanup(bb, projectId) {
   const entries = listGitWorktrees(source.path);
   const cleanupArgs = [source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete, protectedEnvironmentPaths, pluginSourceResolved];
   const preliminary = cleanupGitWorktrees(...cleanupArgs, { coverage: "known" }, entries);
-  const candidateThreadIds = cleanupCandidateThreadIds(preliminary.wouldRemove);
-  const attestation = await readCleanupAttestation(projectId, candidateThreadIds);
+  const attestation = await readCleanupAttestation(projectId, preliminary.wouldRemove);
   return cleanupGitWorktrees(...cleanupArgs, attestation, entries);
 }
 async function runCli(db, bb, argv, ctx, deps) {

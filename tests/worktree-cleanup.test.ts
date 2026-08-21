@@ -15,6 +15,7 @@ import {
   planWorktreeCleanup,
   runWorktreeCleanup,
   worktreeCreatedAt,
+  withCleanupAttestationSubjects,
 } from "../src/worktree-cleanup.js";
 
 const roots: string[] = [];
@@ -143,13 +144,29 @@ describe("worktree cleanup", () => {
     ])]).toEqual(["thr_old"]);
   });
 
+  it("names the environment and thread in at-risk attestation", () => {
+    expect(withCleanupAttestationSubjects({ coverage: "at-risk", reason: "retain it" }, [{ path: "/tmp/env", threadId: "thr_dependent" }])).toEqual({
+      coverage: "at-risk",
+      reason: "retain it",
+      affected: [{ path: "/tmp/env", threadId: "thr_dependent" }],
+    });
+  });
+
   it("reports removable candidates with at-risk expiry attestation", () => {
     const { root, paths } = fixture();
     const result = report(root, new Set(["thr_live"]), new Map([[canonicalWorktreePath(paths[0]), new Set(["thr_live"])] ]), {
-      attestation: { coverage: "at-risk", reason: "environment reaping removes the path needed to correlate this attestation; preserve correlation or retain the environment" },
+      attestation: {
+        coverage: "at-risk",
+        reason: "environment reaping removes the path needed to correlate this attestation; preserve correlation or retain the environment",
+        affected: [{ path: canonicalWorktreePath(paths[1]), threadId: "thr_old" }],
+      },
     });
     expect(result.removableCandidateCount).toBe(1);
-    expect(result.attestation).toEqual({ coverage: "at-risk", reason: "environment reaping removes the path needed to correlate this attestation; preserve correlation or retain the environment" });
+    expect(result.attestation).toEqual({
+      coverage: "at-risk",
+      reason: "environment reaping removes the path needed to correlate this attestation; preserve correlation or retain the environment",
+      affected: [{ path: canonicalWorktreePath(paths[1]), threadId: "thr_old" }],
+    });
     expect(result.environmentRecordsReleased).toBe(false);
     expect(result.wouldRemove.map(({ path }) => path)).toEqual([canonicalWorktreePath(paths[1])]);
   });

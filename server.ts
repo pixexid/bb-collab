@@ -73,7 +73,7 @@ import {
   type SourceObservation,
 } from "./src/registered-waits.js";
 import { ARCHIVE_SWEEP_GUARD, createArchiveSweepRefusalCounter, runArchiveSweep, type ArchiveSweepRefusalAggregate } from "./src/archive-sweep.js";
-import { canonicalWorktreePath, cleanupAttestationFromProfile, cleanupCandidateThreadIds, cleanupGitWorktrees, listAllProjectThreads, listGitWorktrees } from "./src/worktree-cleanup.js";
+import { canonicalWorktreePath, cleanupAttestationFromProfile, cleanupGitWorktrees, listAllProjectThreads, listGitWorktrees, withCleanupAttestationSubjects } from "./src/worktree-cleanup.js";
 import { findCheckoutRoot, readCheckoutDivergence, type CheckoutDivergence } from "./src/checkout-divergence.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFile, spawnSync, type ExecFileException, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
@@ -1409,11 +1409,14 @@ async function replyToOperatorMessage(db: SqliteDatabase | null, bb: BbPluginApi
   return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0]!;
 }
 
-async function readCleanupAttestation(projectId: string, threadIds: ReadonlySet<string>) {
+async function readCleanupAttestation(projectId: string, candidates: ReadonlyArray<{ path: string; threadId?: string | null }>) {
+  const subjects = candidates.filter((candidate): candidate is { path: string; threadId: string } => typeof candidate.threadId === "string");
+  const threadIds = new Set(subjects.map((candidate) => candidate.threadId));
   if (threadIds.size === 0) return { coverage: "known" as const };
   const root = findCheckoutRoot(dirname(fileURLToPath(import.meta.url)));
   if (!root) return { coverage: "blind" as const, reason: "reader-unavailable:checkout-root-unresolved" };
   let atRisk: Awaited<ReturnType<typeof cleanupAttestationFromProfile>> | null = null;
+  const affected = new Map<string, { path: string; threadId: string }>();
   for (const threadId of threadIds) {
     const result = await new Promise<{ output: string }>((resolve) => {
       execFile(process.execPath, [join(root, "scripts", "read-executed-profile.mjs"), "--project", projectId, "--thread", threadId], {
@@ -1424,12 +1427,15 @@ async function readCleanupAttestation(projectId: string, threadIds: ReadonlySet<
       const profile = JSON.parse(result.output) as { environmentDependent?: boolean; outcome?: string; turns?: ReadonlyArray<{ environmentDependent?: boolean }> };
       const attestation = cleanupAttestationFromProfile(profile);
       if (attestation.coverage === "blind") return attestation;
-      if (attestation.coverage === "at-risk") atRisk = attestation;
+      if (attestation.coverage === "at-risk") {
+        atRisk = attestation;
+        for (const subject of subjects.filter((candidate) => candidate.threadId === threadId)) affected.set(`${subject.path}\u0000${threadId}`, subject);
+      }
     } catch {
       return { coverage: "blind" as const, reason: `reader-unreadable:${threadId}` };
     }
   }
-  return atRisk ?? { coverage: "known" as const };
+  return atRisk?.coverage === "at-risk" ? withCleanupAttestationSubjects(atRisk, [...affected.values()]) : atRisk ?? { coverage: "known" as const };
 }
 
 async function reportProjectWorktreeCleanup(bb: BbPluginApi, projectId: string) {
@@ -1471,8 +1477,7 @@ async function reportProjectWorktreeCleanup(bb: BbPluginApi, projectId: string) 
   const entries = listGitWorktrees(source.path);
   const cleanupArgs = [source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete, protectedEnvironmentPaths, pluginSourceResolved] as const;
   const preliminary = cleanupGitWorktrees(...cleanupArgs, { coverage: "known" }, entries);
-  const candidateThreadIds = cleanupCandidateThreadIds(preliminary.wouldRemove);
-  const attestation = await readCleanupAttestation(projectId, candidateThreadIds);
+  const attestation = await readCleanupAttestation(projectId, preliminary.wouldRemove);
   return cleanupGitWorktrees(...cleanupArgs, attestation, entries);
 }
 

@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { readExecutedProfiles } from "../scripts/read-executed-profile.mjs";
+import { environmentDependentFromEvents, readExecutedProfiles } from "../scripts/read-executed-profile.mjs";
 
 const completion = (providerThreadId, checkpointId) => ({
   id: `event-${checkpointId}`,
@@ -29,6 +29,17 @@ const piBridgeLog = (home, providerThreadId, directory = join(home, ".bb", "pi-b
   join(directory, `${providerThreadId.replace(/[^A-Za-z0-9._-]/gu, "_")}.jsonl`);
 
 describe("executed profile read-back", () => {
+  it("does not call an idle snapshot known after a turn starts during pagination", async () => {
+    const events = activeEvents("idle-then-active");
+    const result = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "idle" },
+      environment: { path: "/test/project" },
+      events,
+    });
+    expect(environmentDependentFromEvents({ providerId: "codex", status: "idle" }, events)).toBe(true);
+    expect(result.outcome).not.toBe("known");
+  });
+
   it("DISCRIMINATOR: reads the active Codex turn from its provider-native rollout", async () => {
     const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
     const providerThreadId = "018cc251-f400-7000-8000-000000000000";

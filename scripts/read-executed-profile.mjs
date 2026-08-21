@@ -89,6 +89,15 @@ function completedTurns(events) {
   });
 }
 
+export function environmentDependentFromEvents(thread, events) {
+  if (thread.status === "active" || thread.providerId !== "codex") return true;
+  const starts = events
+    .filter((event) => event?.type === "turn/started" && typeof event.data?.providerThreadId === "string" && event.data.providerThreadId !== "")
+    .sort((left, right) => left.seq - right.seq);
+  const start = starts.at(-1);
+  return Boolean(start && !events.some((event) => event?.type === "turn/completed" && event.seq > start.seq && event.data?.providerThreadId === start.data.providerThreadId));
+}
+
 function activeTurn(thread, events) {
   if (thread.status !== "active") return null;
   const start = events
@@ -373,8 +382,9 @@ export async function main(argv = process.argv.slice(2)) {
   const { projectId, threadId } = parseArgs(argv);
   const shown = bbJson(["thread", "show", threadId, "--json"]);
   if (shown?.thread?.id !== threadId || shown.thread.projectId !== projectId) throw new Error("thread does not belong to the exact project");
-  const result = await readExecutedProfiles({ thread: shown.thread, environment: shown.environment, events: readAllEvents(threadId) });
-  const environmentDependent = shown.thread.status === "active" || shown.thread.providerId !== "codex";
+  const events = readAllEvents(threadId);
+  const result = await readExecutedProfiles({ thread: shown.thread, environment: shown.environment, events });
+  const environmentDependent = environmentDependentFromEvents(shown.thread, events);
   console.log(JSON.stringify({ threadId, projectId, providerId: shown.thread.providerId, environmentDependent, ...result }, null, 2));
   if (result.outcome === "unknown") process.exitCode = 2;
 }
