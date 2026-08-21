@@ -145,6 +145,20 @@ describe("replacement thread list", () => {
     expect(rendered.getByRole("heading", { name: "Project A" })).toBeTruthy();
   });
 
+  it("refreshes with archived messages after Show archived is checked", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const operatorMessages = vi.fn(async () => []);
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(operatorMessages) } as never,
+    });
+
+    await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a", withSenderTitles: true }));
+    fireEvent.click(rendered.getByLabelText("Show archived"));
+    await waitFor(() => expect(operatorMessages).toHaveBeenLastCalledWith({ projectId: "project-a", withSenderTitles: true, includeArchived: true }));
+  });
+
   it("aggregates every project by default, sorts unread first, and filters by project", async () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;

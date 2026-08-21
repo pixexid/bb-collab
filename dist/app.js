@@ -330,7 +330,7 @@ function InboxPanel(_props) {
       setMessages(loaded);
       setErrors(failed);
     });
-  }, [projects, projectId, recipient, rpc]);
+  }, [projects, projectId, recipient, rpc, showArchived]);
   useEffect(refresh, [refresh]);
   const updateMessage = (next) => setMessages((current) => current.map((message) => messageKey(message) === messageKey(next) ? next : message));
   return /* @__PURE__ */ jsx("main", { className: "h-full overflow-y-auto p-5", children: /* @__PURE__ */ jsxs("div", { className: "mx-auto max-w-4xl", children: [

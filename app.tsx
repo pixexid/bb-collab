@@ -143,7 +143,7 @@ function InboxPanel(_props: PluginNavPanelProps) {
         setMessages(loaded);
         setErrors(failed);
       });
-  }, [projects, projectId, recipient, rpc]);
+  }, [projects, projectId, recipient, rpc, showArchived]);
 
   useEffect(refresh, [refresh]);
 
