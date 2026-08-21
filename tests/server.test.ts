@@ -3268,7 +3268,19 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     await service.done;
   });
 
-  it("re-arms role recovery on service restart and loudly reports blind lane coverage", async () => {
+  it("reports blind recovery coverage when the canonical inventory is unreadable", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    fixture.db.close();
+    const service = fixture.host.harness.runService("lane-watcher");
+    await vi.waitFor(() => expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "error",
+      message: expect.stringContaining("error-recovery coverage=blind event=armed roleRestart=blind roles=unknown laneRestart=blind lanes=unknown openWorkItems=unknown reason=canonical-inventory-unreadable:"),
+    })));
+    service.controller.abort();
+    await service.done;
+  });
+
+  it("re-arms role recovery on service restart and reports measured lane coverage", async () => {
     const fixture = await fleetWatchdogFixture(0);
     const statuses = new Map([[fixture.orchestratorThreadId, "error" as "error" | "active"]]);
     fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
@@ -3306,11 +3318,11 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     expect(fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.startsWith("error-recovery coverage="))).toEqual([
       {
         level: "error",
-        message: "error-recovery coverage=armed event=armed roleRestart=armed roles=2 failedRoles=0 laneRestart=armed lanes=0 failedLanes=0 unboundOpenWorkItems=" + openWorkItems + " reason=none",
+        message: "error-recovery coverage=armed event=armed roleRestart=armed roles=2 failedRoles=0 laneRestart=armed lanes=0 failedLanes=0 openWorkItems=" + openWorkItems + " reason=none",
       },
       {
         level: "error",
-        message: "error-recovery coverage=armed event=armed roleRestart=armed roles=2 failedRoles=0 laneRestart=armed lanes=0 failedLanes=0 unboundOpenWorkItems=" + openWorkItems + " reason=none",
+        message: "error-recovery coverage=armed event=armed roleRestart=armed roles=2 failedRoles=0 laneRestart=armed lanes=0 failedLanes=0 openWorkItems=" + openWorkItems + " reason=none",
       },
     ]);
   });
