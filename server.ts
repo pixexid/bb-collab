@@ -463,6 +463,18 @@ const sidebarThreadExecutionSchema = z
 const sidebarCollapseKindSchema = z.enum(["project", "thread"]);
 const sidebarCollapseKey = (kind: "project" | "thread", id: string) => `sidebar.collapse:${JSON.stringify([kind, id])}`;
 const legacySidebarCollapseKey = (kind: "project" | "thread", id: string) => `sidebar.collapse:${kind}:${id}`;
+
+async function migrateSidebarCollapseKeys(bb: BbPluginApi) {
+  const legacyKeys = (await bb.storage.kv.list("sidebar.collapse:")).filter((key) => /^sidebar\.collapse:(?:project|thread):.+$/u.test(key));
+  await Promise.all(legacyKeys.map(async (legacyKey) => {
+    const match = /^sidebar\.collapse:(project|thread):(.+)$/u.exec(legacyKey);
+    if (!match || await bb.storage.kv.get<unknown>(legacyKey) !== true) return;
+    const canonicalKey = sidebarCollapseKey(match[1] as "project" | "thread", match[2]);
+    if (await bb.storage.kv.get<unknown>(canonicalKey) !== undefined) return;
+    await bb.storage.kv.set(canonicalKey, true);
+    await bb.storage.kv.delete(legacyKey);
+  }));
+}
 const roleBriefRoleSchema = z.enum(["director", "orchestrator", "worker"]);
 const roleBriefBundleSchema = z.object({
   ponytail: z.string().min(1),
@@ -1681,6 +1693,8 @@ async function runCli(
 }
 
 export default async function plugin(bb: BbPluginApi, options: PluginOptions = {}) {
+  // Migrate before registering RPCs; reads no longer race UI clears.
+  await migrateSidebarCollapseKeys(bb);
   const notifyUrgent = options.notifyUrgent ?? ((message, senderThreadId) => defaultNotifyUrgent(message, senderThreadId, options.runBbCommand ?? runBbCommand));
   const fleetWatchdogSettings = bb.settings.define({
     fleetWatchdogFloorMs: {
@@ -3517,16 +3531,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     async sidebarCollapseState(input) {
       const read = async (kind: "project" | "thread", ids: readonly string[]) => {
         const entries = await Promise.all(ids.map(async (id) => {
-          const key = sidebarCollapseKey(kind, id);
-          const value = await bb.storage.kv.get<unknown>(key);
-          if (value !== undefined) return value === true ? [id, true] as const : null;
-          const legacyKey = legacySidebarCollapseKey(kind, id);
-          if (await bb.storage.kv.get<unknown>(legacyKey) !== true) return null;
-          // A clear leaves a false tombstone so this check cannot resurrect it.
-          if (await bb.storage.kv.get<unknown>(key) !== undefined) return null;
-          await bb.storage.kv.set(key, true);
-          await bb.storage.kv.delete(legacyKey);
-          return [id, true] as const;
+          const value = await bb.storage.kv.get<unknown>(sidebarCollapseKey(kind, id));
+          return value === true ? [id, true] as const : null;
         }));
         return Object.fromEntries(entries.filter((entry): entry is readonly [string, true] => entry !== null));
       };
