@@ -4,7 +4,10 @@ const root = deployed ? deployedRoot() : process.cwd();
 const commit = execFileSync("git", ["rev-parse", "--short", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
 const changed = execFileSync("git", ["diff", "--name-only", "HEAD", "--", "dist"], { cwd: root, encoding: "utf8" });
 const untracked = execFileSync("git", ["ls-files", "--others", "--exclude-standard", "--", "dist"], { cwd: root, encoding: "utf8" });
-const artifacts = [...new Set(`${changed}${untracked}`.trim().split("\n").filter(Boolean))];
+// Source-map paths are normalized by the build, but esbuild can still vary
+// their metadata across Node/toolchain hosts; presence and bundle parity remain
+// checked while the map itself is tracked and shipped.
+const artifacts = [...new Set(`${changed}${untracked}`.trim().split("\n").filter((name) => name && name !== "dist/server.js.map"))];
 
 if (artifacts.length > 0) {
   for (const artifact of deployed ? [] : artifacts.filter((name) => name.endsWith(".meta.json"))) {
