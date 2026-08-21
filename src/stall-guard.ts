@@ -62,12 +62,12 @@ function priorArtifacts(value: string): StallGuardArtifact[] | null {
   }
 }
 
-type StallGuardObservation = { artifacts: StallGuardArtifact[]; queueHead: { workItemId: string; resourceRevision: number } | null; woken: boolean };
+type StallGuardObservation = { artifacts: StallGuardArtifact[]; queueHead?: { workItemId: string; resourceRevision: number } | null; woken?: boolean };
 
 function observation(value: string): StallGuardObservation | null {
   try {
     const parsed = JSON.parse(value) as Partial<StallGuardObservation>;
-    return Array.isArray(parsed.artifacts) ? { artifacts: parsed.artifacts, queueHead: parsed.queueHead ?? null, woken: parsed.woken === true } : null;
+    return Array.isArray(parsed.artifacts) ? { artifacts: parsed.artifacts, queueHead: parsed.queueHead, woken: parsed.woken } : null;
   } catch {
     return null;
   }
@@ -122,16 +122,14 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
         }
         const current = await readArtifacts(holder.project_id);
         if (current === null) continue;
-        const queueHead = options.readQueueHead ? options.readQueueHead(holder.project_id) : undefined;
-        const prior = nextState[key] === undefined ? null : observation(nextState[key]);
-        const queueChanged = queueHead !== undefined && (prior?.queueHead?.workItemId !== queueHead?.workItemId
-          || prior?.queueHead?.resourceRevision !== queueHead?.resourceRevision);
-        const queueSuppressionKey = queueHead === undefined || queueHead === null ? undefined : roleIdleKey(holder, queueHead.workItemId);
+        // Queue-head detection belongs to fleet-watchdog; this read only preserves #533 suppression.
+        const queueHead = options.readQueueHead?.(holder.project_id);
+        const queueSuppressionKey = queueHead ? roleIdleKey(holder, queueHead.workItemId) : undefined;
         const queueAlreadyWoken = queueSuppressionKey !== undefined && (() => {
           const record = observation(nextState[queueSuppressionKey] ?? "");
           return record?.woken === true && record.queueHead?.resourceRevision === queueHead!.resourceRevision;
         })();
-        const next = queueHead === undefined ? snapshot(current) : JSON.stringify({ artifacts: current, queueHead, woken: prior?.woken === true && !queueChanged });
+        const next = snapshot(current);
         if (nextState[key] === undefined) {
           nextState[key] = next;
           changed += 1;
@@ -168,7 +166,7 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
         attempted += 1;
         if (!result.delivered) continue;
         nextState[key] = next;
-        if (queueSuppressionKey !== undefined) nextState[queueSuppressionKey] = JSON.stringify({ artifacts: current, queueHead, woken: true });
+        if (queueHead) nextState[queueSuppressionKey!] = JSON.stringify({ artifacts: current, queueHead, woken: true });
         changed += 1;
         verified += 1;
         steered += 1;

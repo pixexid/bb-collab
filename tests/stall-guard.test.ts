@@ -154,6 +154,42 @@ describe("stall-guard artifact cycle", () => {
     expect(wakeRole).toHaveBeenCalledTimes(1);
   });
 
+  it("does not persist head-only changes and re-arms suppression after a revision bump", async () => {
+    const store = kvPersistence();
+    let currentArtifact = absentArtifact();
+    let queueHead = { workItemId: "queue-head", resourceRevision: 1 };
+    const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
+    const cycle = createStallGuardCycle({
+      readRoleHolders: () => [holder(1, "current-holder")],
+      readArtifact: async () => currentArtifact,
+      readQueueHead: () => queueHead,
+      wakeRole,
+      persistence: store.persistence,
+    });
+
+    await cycle.cycle(PROJECT_ID);
+    const baseline = await store.persistence.read();
+    queueHead = { workItemId: "new-queue-head", resourceRevision: 1 };
+    expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 0 });
+    expect(await store.persistence.read()).toEqual(baseline);
+
+    queueHead = { workItemId: "new-queue-head", resourceRevision: 2 };
+    expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 0 });
+    expect(await store.persistence.read()).toEqual(baseline);
+
+    currentArtifact = artifact("changed");
+    expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 1, verified: 1, steered: 1 });
+    expect(wakeRole).toHaveBeenCalledTimes(1);
+    currentArtifact = artifact("changed-again");
+    expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 1, verified: 0, steered: 0 });
+    expect(wakeRole).toHaveBeenCalledTimes(1);
+
+    queueHead = { workItemId: "new-queue-head", resourceRevision: 3 };
+    currentArtifact = artifact("rearmed");
+    expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 1, verified: 1, steered: 1 });
+    expect(wakeRole).toHaveBeenCalledTimes(2);
+  });
+
   it("scopes wrongful-idle suppression to each role recipient", async () => {
     const store = kvPersistence();
     let currentArtifact = absentArtifact();
