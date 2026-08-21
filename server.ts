@@ -84,7 +84,8 @@ type PluginOptions = {
 };
 type WorkItemWait = NonNullable<ApplyRequest["workItemWait"]>;
 
-export const fleetWatchdogReopenKey = (projectId: string, workItemId: string) => `${projectId}\u0000${workItemId}`;
+export const fleetWatchdogReopenKey = (projectId: string, workItemId: string, externalRevision?: string) =>
+  [projectId, workItemId, externalRevision].filter((value): value is string => value !== undefined).join("\u0000");
 
 function githubRepository(remoteUrl: string | null): string | null {
   const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
@@ -2773,7 +2774,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           if (linked.lifecycle_state === "succeeded") {
             if (!observation.issueOpen) continue;
             const permanentReopenKey = fleetWatchdogReopenKey(projectId, linked.work_item_id);
-            const pendingReopenKey = `${permanentReopenKey}:${observation.externalRevision}`;
+            const pendingReopenKey = fleetWatchdogReopenKey(projectId, linked.work_item_id, observation.externalRevision);
             const permanentRefusalReason = permanentlyRefusedReopens.get(permanentReopenKey);
             const pendingRefusalReason = pendingRefusedReopens.get(pendingReopenKey);
             const refusalReason = permanentRefusalReason ?? pendingRefusalReason;

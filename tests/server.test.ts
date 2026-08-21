@@ -2616,9 +2616,9 @@ describe("bb-collab plugin boundary", () => {
     expect(script).not.toContain("BB_COLLAB_DEPLOYED_ROOT");
   });
 
-  it("keeps colon-containing reopen subjects distinct", () => {
-    const first = fleetWatchdogReopenKey("proj:a", "wi");
-    const second = fleetWatchdogReopenKey("proj", "a:wi");
+  it("keeps pending reopen subjects distinct through the revision segment", () => {
+    const first = fleetWatchdogReopenKey("proj", "a:2026-01-01T00:00:00Z", "R");
+    const second = fleetWatchdogReopenKey("proj", "a", "2026-01-01T00:00:00Z:R");
     expect(first).not.toBe(second);
   });
 
