@@ -21043,10 +21043,11 @@ function createStallGuardCycle(options) {
         const queueHead = options.readQueueHead ? options.readQueueHead(holder.project_id) : void 0;
         const prior = nextState[key] === void 0 ? null : observation(nextState[key]);
         const queueChanged = queueHead !== void 0 && (prior?.queueHead?.workItemId !== queueHead?.workItemId || prior?.queueHead?.resourceRevision !== queueHead?.resourceRevision);
-        const queueAlreadyWoken = queueHead !== void 0 && queueHead !== null && Object.values(nextState).some((value) => {
-          const record2 = observation(value);
-          return record2?.woken === true && record2.queueHead?.workItemId === queueHead.workItemId && record2.queueHead.resourceRevision === queueHead.resourceRevision;
-        });
+        const queueSuppressionKey = queueHead === void 0 || queueHead === null ? void 0 : roleIdleKey(holder, queueHead.workItemId);
+        const queueAlreadyWoken = queueSuppressionKey !== void 0 && (() => {
+          const record2 = observation(nextState[queueSuppressionKey] ?? "");
+          return record2?.woken === true && record2.queueHead?.resourceRevision === queueHead.resourceRevision;
+        })();
         const next = queueHead === void 0 ? snapshot(current) : JSON.stringify({ artifacts: current, queueHead, woken: prior?.woken === true && !queueChanged });
         if (nextState[key] === void 0) {
           nextState[key] = next;
@@ -21082,7 +21083,8 @@ function createStallGuardCycle(options) {
         }
         attempted += 1;
         if (!result2.delivered) continue;
-        nextState[key] = queueHead === void 0 ? next : JSON.stringify({ artifacts: current, queueHead, woken: true });
+        nextState[key] = next;
+        if (queueSuppressionKey !== void 0) nextState[queueSuppressionKey] = JSON.stringify({ artifacts: current, queueHead, woken: true });
         changed += 1;
         verified += 1;
         steered += 1;

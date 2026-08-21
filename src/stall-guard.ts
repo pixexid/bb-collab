@@ -1,4 +1,4 @@
-import type { RoleHolderState, RoleIdleView, RoleWakeResult } from "./awareness.js";
+import { roleIdleKey, type RoleHolderState, type RoleIdleView, type RoleWakeResult } from "./awareness.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -112,10 +112,11 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
         const prior = nextState[key] === undefined ? null : observation(nextState[key]);
         const queueChanged = queueHead !== undefined && (prior?.queueHead?.workItemId !== queueHead?.workItemId
           || prior?.queueHead?.resourceRevision !== queueHead?.resourceRevision);
-        const queueAlreadyWoken = queueHead !== undefined && queueHead !== null && Object.values(nextState).some((value) => {
-          const record = observation(value);
-          return record?.woken === true && record.queueHead?.workItemId === queueHead.workItemId && record.queueHead.resourceRevision === queueHead.resourceRevision;
-        });
+        const queueSuppressionKey = queueHead === undefined || queueHead === null ? undefined : roleIdleKey(holder, queueHead.workItemId);
+        const queueAlreadyWoken = queueSuppressionKey !== undefined && (() => {
+          const record = observation(nextState[queueSuppressionKey] ?? "");
+          return record?.woken === true && record.queueHead?.resourceRevision === queueHead!.resourceRevision;
+        })();
         const next = queueHead === undefined ? snapshot(current) : JSON.stringify({ artifacts: current, queueHead, woken: prior?.woken === true && !queueChanged });
         if (nextState[key] === undefined) {
           nextState[key] = next;
@@ -152,7 +153,8 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
         }
         attempted += 1;
         if (!result.delivered) continue;
-        nextState[key] = queueHead === undefined ? next : JSON.stringify({ artifacts: current, queueHead, woken: true });
+        nextState[key] = next;
+        if (queueSuppressionKey !== undefined) nextState[queueSuppressionKey] = JSON.stringify({ artifacts: current, queueHead, woken: true });
         changed += 1;
         verified += 1;
         steered += 1;
