@@ -12,10 +12,10 @@ import { createStallGuardCycle, type StallGuardArtifact } from "../src/stall-gua
 
 const PROJECT_ID = "project-1";
 
-function holder(generation: number, threadId: string): RoleHolderState {
+function holder(generation: number, threadId: string, projectId = PROJECT_ID, roleId = "project-orchestrator"): RoleHolderState {
   return {
-    project_id: PROJECT_ID,
-    role_id: "project-orchestrator",
+    project_id: projectId,
+    role_id: roleId,
     role_generation: generation,
     execution_attempt_id: `attempt-${generation}`,
     thread_id: threadId,
@@ -110,6 +110,31 @@ describe("stall-guard artifact cycle", () => {
     expect(steerRole).not.toHaveBeenCalled();
   });
 
+  it("reports ambiguous migration without steering or rewriting holder history", async () => {
+    const store = kvPersistence();
+    await store.host.bb.storage.kv.set("stall-guard.artifacts", {
+      '["project-1","project-orchestrator"]': JSON.stringify(artifact("canonical")),
+      "project-1:project-orchestrator": JSON.stringify(absentArtifact()),
+    });
+    const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
+    const onAmbiguous = vi.fn();
+    const cycle = createStallGuardCycle({
+      readRoleHolders: () => [holder(1, "current-holder")],
+      readArtifact: async () => absentArtifact(),
+      wakeRole,
+      onAmbiguous,
+      persistence: store.persistence,
+    });
+
+    await expect(cycle.cycle(PROJECT_ID)).resolves.toMatchObject({ changed: 0, attempted: 0, verified: 0, steered: 0, ambiguous: 1 });
+    expect(wakeRole).not.toHaveBeenCalled();
+    expect(onAmbiguous).toHaveBeenCalledOnce();
+    expect(await store.persistence.read()).toEqual({
+      '["project-1","project-orchestrator"]': JSON.stringify(artifact("canonical")),
+      "project-1:project-orchestrator": JSON.stringify(absentArtifact()),
+    });
+  });
+
   it("persists artifact deltas so a restart does not re-fire them", async () => {
     const store = kvPersistence();
     const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
@@ -129,6 +154,83 @@ describe("stall-guard artifact cycle", () => {
     expect(wakeRole).toHaveBeenCalledTimes(1);
   });
 
+  it("does not persist head-only changes and re-arms suppression after a revision bump", async () => {
+    const store = kvPersistence();
+    let currentArtifact = absentArtifact();
+    let queueHead = { workItemId: "queue-head", resourceRevision: 1 };
+    const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
+    const cycle = createStallGuardCycle({
+      readRoleHolders: () => [holder(1, "current-holder")],
+      readArtifact: async () => currentArtifact,
+      readQueueHead: () => queueHead,
+      wakeRole,
+      persistence: store.persistence,
+    });
+
+    await cycle.cycle(PROJECT_ID);
+    const baseline = await store.persistence.read();
+    queueHead = { workItemId: "new-queue-head", resourceRevision: 1 };
+    expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 0 });
+    expect(await store.persistence.read()).toEqual(baseline);
+
+    queueHead = { workItemId: "new-queue-head", resourceRevision: 2 };
+    expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 0 });
+    expect(await store.persistence.read()).toEqual(baseline);
+
+    currentArtifact = artifact("changed");
+    expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 1, verified: 1, steered: 1 });
+    expect(wakeRole).toHaveBeenCalledTimes(1);
+    currentArtifact = artifact("changed-again");
+    expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 1, verified: 0, steered: 0 });
+    expect(wakeRole).toHaveBeenCalledTimes(1);
+
+    queueHead = { workItemId: "new-queue-head", resourceRevision: 3 };
+    currentArtifact = artifact("rearmed");
+    expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 1, verified: 1, steered: 1 });
+    expect(wakeRole).toHaveBeenCalledTimes(2);
+  });
+
+  it("scopes wrongful-idle suppression to each role recipient", async () => {
+    const store = kvPersistence();
+    let currentArtifact = absentArtifact();
+    const holders = [holder(1, "director", PROJECT_ID, "director"), holder(1, "orchestrator")];
+    const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
+    const cycle = createStallGuardCycle({
+      readRoleHolders: () => holders,
+      readArtifact: async () => currentArtifact,
+      readQueueHead: () => ({ workItemId: "queue-head", resourceRevision: 1 }),
+      wakeRole,
+      persistence: store.persistence,
+    });
+
+    await cycle.cycle();
+    currentArtifact = artifact("changed");
+    await cycle.cycle();
+
+    expect(wakeRole).toHaveBeenCalledTimes(2);
+    expect(wakeRole.mock.calls.map(([role]) => role.roleId)).toEqual(["director", "project-orchestrator"]);
+  });
+
+  it("scopes wrongful-idle suppression to each project", async () => {
+    const store = kvPersistence();
+    let currentArtifact = absentArtifact();
+    const holders = [holder(1, "project-one", PROJECT_ID), holder(1, "project-two", "project-2")];
+    const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
+    const cycle = createStallGuardCycle({
+      readRoleHolders: () => holders,
+      readArtifact: async () => currentArtifact,
+      readQueueHead: () => ({ workItemId: "queue-head", resourceRevision: 1 }),
+      wakeRole,
+      persistence: store.persistence,
+    });
+
+    await cycle.cycle();
+    currentArtifact = artifact("changed");
+    await cycle.cycle();
+
+    expect(wakeRole).toHaveBeenCalledTimes(2);
+  });
+
   it("baselines a first artifact snapshot without waking", async () => {
     const store = kvPersistence();
     const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
@@ -143,7 +245,7 @@ describe("stall-guard artifact cycle", () => {
     expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 1, attempted: 0, verified: 0, steered: 0 });
     expect(wakeRole).not.toHaveBeenCalled();
     expect(await store.persistence.read()).toEqual({
-      "project-1:project-orchestrator": JSON.stringify(currentArtifact),
+      '["project-1","project-orchestrator"]': JSON.stringify(currentArtifact),
     });
   });
 
@@ -181,7 +283,7 @@ describe("stall-guard artifact cycle", () => {
     currentArtifact = artifact("changed");
     expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 0, attempted: 1, verified: 0, steered: 0 });
     expect(await store.persistence.read()).toEqual({
-      "project-1:project-orchestrator": JSON.stringify(absentArtifact()),
+      '["project-1","project-orchestrator"]': JSON.stringify(absentArtifact()),
     });
 
     failFinalRoleLivenessRead = false;
@@ -220,7 +322,7 @@ describe("stall-guard artifact cycle", () => {
       await waitForResult(first, firstResultPath);
       const firstResult = JSON.parse(readFileSync(firstResultPath, "utf8")) as Record<string, unknown>;
       expect(firstResult).toMatchObject({ sends: 1, summary: { attempted: 1, verified: 1 } });
-      expect(firstResult.persisted).toEqual(expect.objectContaining({ "project-1:project-orchestrator": expect.stringContaining('"updatedAt":"changed"') }));
+      expect(firstResult.persisted).toEqual(expect.objectContaining({ '["project-1","project-orchestrator"]': expect.stringContaining('"updatedAt":"changed"') }));
       first.kill("SIGKILL");
       await once(first, "exit");
       first = undefined;
