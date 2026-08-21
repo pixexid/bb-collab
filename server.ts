@@ -868,27 +868,46 @@ async function dispatchLane(
     expectedResourceRevision: intentEvidence?.currentResourceRevision,
     idempotencyKey: `${request.idempotencyKey}-finalize`,
     workAttempt: { ...request.workAttempt, threadId: thread.id },
-  });
+  }, false, "stop-active");
 }
 
-async function requireStoppedWorkItemLane(
+type WorkItemAttemptTerminalizationPolicy = "refuse-active" | "stop-active";
+
+async function prepareWorkItemAttemptTerminalization(
   bb: BbPluginApi,
   db: SqliteDatabase | null,
   request: z.infer<typeof applyRequestSchema>,
+  policy: WorkItemAttemptTerminalizationPolicy,
 ): Promise<FoundationResult | null> {
-  if (request.operationClass !== "work_item_transition" || request.lifecycleState !== "review_pending" || !db) return null;
-  const attempt = db.prepare(
+  if (request.operationClass !== "work_item_transition" || !db) return null;
+  const terminalizesWriter = request.lifecycleState === "review_pending" ||
+    ["blocked", "failed", "cancelled"].includes(request.lifecycleState ?? "") ||
+    (request.lifecycleState === undefined && request.workAttempt?.assignmentKind === "write");
+  if (!terminalizesWriter) return null;
+  const attempts = db.prepare(
     `SELECT thread_id FROM execution_attempts
      WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
        AND assignment_kind = 'write' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')
-     ORDER BY attempt_ordinal DESC LIMIT 1`,
-  ).get(request.projectId, request.workItemId) as { thread_id: string | null } | undefined;
-  if (!attempt?.thread_id) {
-    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "review-pending requires a bound lane with native stop evidence" };
+     ORDER BY attempt_ordinal DESC`,
+  ).all(request.projectId, request.workItemId) as Array<{ thread_id: string | null }>;
+  const attempt = attempts.find((candidate) => candidate.thread_id !== null);
+  if (!attempt) {
+    // A dispatch finalization is itself the terminalization point for the old writer;
+    // its newly prepared replacement has no native thread yet and is not the old lane.
+    if (request.lifecycleState === undefined && request.workAttempt?.threadId && attempts.length > 0) return null;
+    if (attempts.length === 0) return null;
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "writing attempt terminalization requires a bound lane with native stop evidence" };
   }
+  const threadId = attempt.thread_id;
+  if (!threadId) return null;
   let lane: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["get"]>>;
   try {
-    lane = await bb.sdk.threads.get({ threadId: attempt.thread_id });
+    lane = await bb.sdk.threads.get({ threadId });
+    if (policy === "stop-active" && lane.status !== "idle") {
+      await bb.sdk.threads.stop({ threadId });
+      await bb.sdk.threads.wait({ threadId, status: "idle", timeoutMs: FLEET_WATCHDOG_STOPPING_WAIT_MS });
+      lane = await bb.sdk.threads.get({ threadId });
+    }
   } catch (error) {
     return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane stop evidence unavailable: ${String(error)}` };
   }
@@ -903,10 +922,12 @@ async function applyLiveAuthorizedMutation(
   db: SqliteDatabase | null,
   input: unknown,
   allowCachedConsumerRollout = false,
+  terminalizationPolicy: WorkItemAttemptTerminalizationPolicy = "refuse-active",
+  githubIssueReader: (owner: string, repo: string, issueNumber: number) => GitHubIssueSnapshot = readGithubIssueForBackfill,
 ): Promise<FoundationResult> {
   const parsed = applyRequestSchema.safeParse(input);
   if (parsed.success) {
-    const laneGuard = await requireStoppedWorkItemLane(bb, db, parsed.data);
+    const laneGuard = await prepareWorkItemAttemptTerminalization(bb, db, parsed.data, terminalizationPolicy);
     if (laneGuard) return laneGuard;
   }
   if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v22-rollout-receipt")) {
@@ -924,7 +945,7 @@ async function applyLiveAuthorizedMutation(
     }
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
-  const result = applyAuthorizedMutation(db, input, null, reader, null, null, readGithubIssueForBackfill);
+  const result = applyAuthorizedMutation(db, input, null, reader, null, null, githubIssueReader);
   await deliverSucceededSeatBrief(bb, db, input, result);
   return result;
 }
@@ -3012,7 +3033,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           wakeInFlight.delete(key);
         }
       };
-      const transitionWorkItem = (
+      const transitionWorkItem = async (
         projectId: string,
         workItemId: string,
         state: "ready" | "review_pending" | "succeeded" | "cancelled",
@@ -3020,7 +3041,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         extra: Pick<ApplyRequest, "workItemUnblock" | "workItemExternalEvent"> = {},
         githubSnapshot?: GitHubIssueSnapshot,
         legacyIdempotencyKey?: string,
-      ): FoundationResult => {
+        terminalizationPolicy: WorkItemAttemptTerminalizationPolicy = "refuse-active",
+      ): Promise<FoundationResult> => {
         const actor = db.prepare(
           `SELECT receipt_id FROM actor_receipts
            WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
@@ -3059,7 +3081,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         ).get(projectId, legacyIdempotencyKey, mutationRequestDigest({ ...request, idempotencyKey: legacyIdempotencyKey })) !== undefined
           ? legacyIdempotencyKey
           : idempotencyKey;
-        return applyAuthorizedMutation(db, { ...request, idempotencyKey: compatibleKey }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
+        return applyLiveAuthorizedMutation(bb, db, { ...request, idempotencyKey: compatibleKey }, false, terminalizationPolicy, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
       };
       const inspectWaitTargets = async (projectId: string) => {
         for (const workItem of openWorkItemsByProject.get(projectId) ?? []) {
@@ -3116,7 +3138,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               degrade(fleetWatchdogScope("github-work-item-reopen", projectId, linked.work_item_id));
               continue;
             }
-            const result = transitionWorkItem(
+            const result = await transitionWorkItem(
               projectId,
               linked.work_item_id,
               "ready",
@@ -3175,16 +3197,17 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               : {},
             githubSnapshot,
             fleetWatchdogLegacyMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
+            "stop-active",
           );
           let result: FoundationResult;
           if (workItem.lifecycle_state === "in_progress") {
-            result = transition("review_pending");
+            result = await transition("review_pending");
             if (result.outcome === "OK") {
               const current = db.prepare(
                 "SELECT resource_revision, lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?",
               ).get(projectId, linked.work_item_id) as { resource_revision: number; lifecycle_state: string } | undefined;
               result = current?.lifecycle_state === "review_pending"
-                ? transition("succeeded")
+                ? await transition("succeeded")
                 : {
                   outcome: "WORK_ITEM_REVISION_STALE",
                   subject: linked.work_item_id,
@@ -3195,10 +3218,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
                 };
             }
           } else if (workItem.lifecycle_state === "review_pending") {
-            result = transition("succeeded");
+            result = await transition("succeeded");
           } else if (workItem.lifecycle_state === "proposed") {
             // A closed issue absorbs work that never started; it did not succeed.
-            result = transition("cancelled");
+            result = await transition("cancelled");
           } else {
             result = { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close automation requires in_progress, review_pending, or proposed, found ${workItem.lifecycle_state}` };
           }
@@ -3403,7 +3426,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
               continue;
             }
-            const result = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot, fleetWatchdogLegacyBlockerFiredKey(blocked.workItemId, snapshot?.externalRevision ?? blocked.waker ?? ""));
+            const result = await transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot, fleetWatchdogLegacyBlockerFiredKey(blocked.workItemId, snapshot?.externalRevision ?? blocked.waker ?? ""));
             if (result.outcome === "OK") {
               unblocked.add(blocked.workItemId);
               bb.log.info(`fleet-watchdog returned blocked work item to ready: project=${projectId} workItem=${blocked.workItemId} blocker=${blocked.wakerKind}`);

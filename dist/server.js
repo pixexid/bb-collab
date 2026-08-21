@@ -22650,22 +22650,34 @@ async function dispatchLane(bb, db, input) {
     expectedResourceRevision: intentEvidence?.currentResourceRevision,
     idempotencyKey: `${request.idempotencyKey}-finalize`,
     workAttempt: { ...request.workAttempt, threadId: thread.id }
-  });
+  }, false, "stop-active");
 }
-async function requireStoppedWorkItemLane(bb, db, request) {
-  if (request.operationClass !== "work_item_transition" || request.lifecycleState !== "review_pending" || !db) return null;
-  const attempt = db.prepare(
+async function prepareWorkItemAttemptTerminalization(bb, db, request, policy) {
+  if (request.operationClass !== "work_item_transition" || !db) return null;
+  const terminalizesWriter = request.lifecycleState === "review_pending" || ["blocked", "failed", "cancelled"].includes(request.lifecycleState ?? "") || request.lifecycleState === void 0 && request.workAttempt?.assignmentKind === "write";
+  if (!terminalizesWriter) return null;
+  const attempts = db.prepare(
     `SELECT thread_id FROM execution_attempts
      WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
        AND assignment_kind = 'write' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')
-     ORDER BY attempt_ordinal DESC LIMIT 1`
-  ).get(request.projectId, request.workItemId);
-  if (!attempt?.thread_id) {
-    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "review-pending requires a bound lane with native stop evidence" };
+     ORDER BY attempt_ordinal DESC`
+  ).all(request.projectId, request.workItemId);
+  const attempt = attempts.find((candidate) => candidate.thread_id !== null);
+  if (!attempt) {
+    if (request.lifecycleState === void 0 && request.workAttempt?.threadId && attempts.length > 0) return null;
+    if (attempts.length === 0) return null;
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "writing attempt terminalization requires a bound lane with native stop evidence" };
   }
+  const threadId = attempt.thread_id;
+  if (!threadId) return null;
   let lane;
   try {
-    lane = await bb.sdk.threads.get({ threadId: attempt.thread_id });
+    lane = await bb.sdk.threads.get({ threadId });
+    if (policy === "stop-active" && lane.status !== "idle") {
+      await bb.sdk.threads.stop({ threadId });
+      await bb.sdk.threads.wait({ threadId, status: "idle", timeoutMs: FLEET_WATCHDOG_STOPPING_WAIT_MS });
+      lane = await bb.sdk.threads.get({ threadId });
+    }
   } catch (error48) {
     return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane stop evidence unavailable: ${String(error48)}` };
   }
@@ -22674,10 +22686,10 @@ async function requireStoppedWorkItemLane(bb, db, request) {
   }
   return null;
 }
-async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false) {
+async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = readGithubIssueForBackfill) {
   const parsed = applyRequestSchema.safeParse(input);
   if (parsed.success) {
-    const laneGuard = await requireStoppedWorkItemLane(bb, db, parsed.data);
+    const laneGuard = await prepareWorkItemAttemptTerminalization(bb, db, parsed.data, terminalizationPolicy);
     if (laneGuard) return laneGuard;
   }
   if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v22-rollout-receipt")) {
@@ -22694,7 +22706,7 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     }
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
-  const result2 = applyAuthorizedMutation(db, input, null, reader, null, null, readGithubIssueForBackfill);
+  const result2 = applyAuthorizedMutation(db, input, null, reader, null, null, githubIssueReader);
   await deliverSucceededSeatBrief(bb, db, input, result2);
   return result2;
 }
@@ -24532,7 +24544,7 @@ ${thread.titleFallback ?? ""}`);
           wakeInFlight.delete(key);
         }
       };
-      const transitionWorkItem = (projectId, workItemId, state, idempotencyKey, extra = {}, githubSnapshot, legacyIdempotencyKey) => {
+      const transitionWorkItem = async (projectId, workItemId, state, idempotencyKey, extra = {}, githubSnapshot, legacyIdempotencyKey, terminalizationPolicy = "refuse-active") => {
         const actor = db.prepare(
           `SELECT receipt_id FROM actor_receipts
            WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
@@ -24569,7 +24581,7 @@ ${thread.titleFallback ?? ""}`);
         const compatibleKey = legacyIdempotencyKey !== void 0 && db.prepare(
           "SELECT 1 FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ? AND request_digest = ?"
         ).get(projectId, legacyIdempotencyKey, mutationRequestDigest({ ...request, idempotencyKey: legacyIdempotencyKey })) !== void 0 ? legacyIdempotencyKey : idempotencyKey;
-        return applyAuthorizedMutation(db, { ...request, idempotencyKey: compatibleKey }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
+        return applyLiveAuthorizedMutation(bb, db, { ...request, idempotencyKey: compatibleKey }, false, terminalizationPolicy, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
       };
       const inspectWaitTargets = async (projectId) => {
         for (const workItem of openWorkItemsByProject.get(projectId) ?? []) {
@@ -24624,7 +24636,7 @@ ${thread.titleFallback ?? ""}`);
               degrade(fleetWatchdogScope("github-work-item-reopen", projectId, linked.work_item_id));
               continue;
             }
-            const result3 = transitionWorkItem(
+            const result3 = await transitionWorkItem(
               projectId,
               linked.work_item_id,
               "ready",
@@ -24680,16 +24692,17 @@ ${thread.titleFallback ?? ""}`);
             fleetWatchdogMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
             state === "succeeded" || state === "cancelled" && workItem.lifecycle_state === "proposed" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
             githubSnapshot,
-            fleetWatchdogLegacyMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision)
+            fleetWatchdogLegacyMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
+            "stop-active"
           );
           let result2;
           if (workItem.lifecycle_state === "in_progress") {
-            result2 = transition("review_pending");
+            result2 = await transition("review_pending");
             if (result2.outcome === "OK") {
               const current = db.prepare(
                 "SELECT resource_revision, lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?"
               ).get(projectId, linked.work_item_id);
-              result2 = current?.lifecycle_state === "review_pending" ? transition("succeeded") : {
+              result2 = current?.lifecycle_state === "review_pending" ? await transition("succeeded") : {
                 outcome: "WORK_ITEM_REVISION_STALE",
                 subject: linked.work_item_id,
                 expected: 1,
@@ -24699,9 +24712,9 @@ ${thread.titleFallback ?? ""}`);
               };
             }
           } else if (workItem.lifecycle_state === "review_pending") {
-            result2 = transition("succeeded");
+            result2 = await transition("succeeded");
           } else if (workItem.lifecycle_state === "proposed") {
-            result2 = transition("cancelled");
+            result2 = await transition("cancelled");
           } else {
             result2 = { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close automation requires in_progress, review_pending, or proposed, found ${workItem.lifecycle_state}` };
           }
@@ -24901,7 +24914,7 @@ ${thread.titleFallback ?? ""}`);
               degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
               continue;
             }
-            const result2 = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot2, fleetWatchdogLegacyBlockerFiredKey(blocked.workItemId, snapshot2?.externalRevision ?? blocked.waker ?? ""));
+            const result2 = await transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot2, fleetWatchdogLegacyBlockerFiredKey(blocked.workItemId, snapshot2?.externalRevision ?? blocked.waker ?? ""));
             if (result2.outcome === "OK") {
               unblocked.add(blocked.workItemId);
               bb.log.info(`fleet-watchdog returned blocked work item to ready: project=${projectId} workItem=${blocked.workItemId} blocker=${blocked.wakerKind}`);
