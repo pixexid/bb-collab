@@ -906,6 +906,16 @@ export interface IdleFleetPersistence {
   write(state: Record<string, string>): Promise<void>;
 }
 
+export class IdleFleetCapacityReadError extends Error {
+  constructor(private readonly original: unknown, readonly closedByDisposal: boolean) {
+    super(String(original));
+  }
+
+  override toString(): string {
+    return String(this.original);
+  }
+}
+
 export interface IdleFleetCapacityRecorder {
   readProjectIds(): Promise<string[]>;
   observe(projectId: string): Promise<void>;
@@ -1040,9 +1050,9 @@ export function createIdleFleetDetector(options: {
     });
     capacityQueues.set(projectId, next.catch(() => undefined));
     return next.catch((error) => {
-      // An in-flight read may finish after disposal closes the recorder.
-      // That is lifecycle teardown, not a live capacity-read failure.
-      if (!stopped) reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error)}`);
+      if (!(error instanceof IdleFleetCapacityReadError && error.closedByDisposal)) {
+        reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error)}`);
+      }
     });
   };
 

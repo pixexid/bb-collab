@@ -14409,6 +14409,18 @@ function subscribeToThreadChanges(sdk, observe) {
   }
 }
 var IDLE_FLEET_DEBOUNCE_MS = 2 * 6e4;
+var IdleFleetCapacityReadError = class extends Error {
+  constructor(original, closedByDisposal) {
+    super(String(original));
+    this.original = original;
+    this.closedByDisposal = closedByDisposal;
+  }
+  original;
+  closedByDisposal;
+  toString() {
+    return String(this.original);
+  }
+};
 function idleFleetWakeState(input) {
   if (input === void 0 || input === null) return {};
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid idle-fleet wake state");
@@ -14516,7 +14528,9 @@ function createIdleFleetDetector(options) {
     });
     capacityQueues.set(projectId, next.catch(() => void 0));
     return next.catch((error48) => {
-      if (!stopped) reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error48)}`);
+      if (!(error48 instanceof IdleFleetCapacityReadError && error48.closedByDisposal)) {
+        reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error48)}`);
+      }
     });
   };
   return {
@@ -23939,6 +23953,7 @@ ${thread.titleFallback ?? ""}`);
     };
   };
   const capacityObservationLocks = /* @__PURE__ */ new Map();
+  let capacityClosed = false;
   const idleFleetDetector = createIdleFleetDetector({
     read: readIdleFleet,
     readRearmProbes: readIdleFleetProbes,
@@ -23961,12 +23976,17 @@ ${thread.titleFallback ?? ""}`);
         await previous;
         try {
           recordLaneCapacityInterval(await readLaneCapacityObservation(projectId));
+        } catch (error48) {
+          throw new IdleFleetCapacityReadError(error48, capacityClosed);
         } finally {
           release();
           if (capacityObservationLocks.get(projectId) === queued) capacityObservationLocks.delete(projectId);
         }
       },
-      close: closeLaneCapacityCoverage
+      close: () => {
+        capacityClosed = true;
+        closeLaneCapacityCoverage();
+      }
     },
     debounceMs: IDLE_FLEET_DEBOUNCE_MS,
     onBlind: (message) => bb.log.warn(message),
