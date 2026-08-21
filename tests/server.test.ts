@@ -3378,14 +3378,14 @@ fi
         expect.objectContaining({
           threadId: fixture.orchestratorThreadId,
           mode: "queue-if-active",
-          input: [expect.objectContaining({ text: "startable queue has 1 issue; 0 open issues have no queue label; 0/1 writing lanes active" })],
+          input: [expect.objectContaining({ text: "startable queue has 1 issue; 0 open issues have no queue label; 0 blocked; 0 waiting-external; 0/1 writing lanes active" })],
         }),
         ],
         [
           expect.objectContaining({
             threadId: fixture.orchestratorThreadId,
             mode: "queue-if-active",
-            input: [expect.objectContaining({ text: "startable queue has 1 issue; 0 open issues have no queue label; 0/1 writing lanes active" })],
+            input: [expect.objectContaining({ text: "startable queue has 1 issue; 0 open issues have no queue label; 0 blocked; 0 waiting-external; 0/1 writing lanes active" })],
           }),
         ],
       ]);
@@ -3422,7 +3422,37 @@ fi
         expect.objectContaining({
           threadId: fixture.orchestratorThreadId,
           mode: "queue-if-active",
-          input: [expect.objectContaining({ text: "startable queue has 0 issues; 1 open issue has no queue label; 0/1 writing lanes active" })],
+          input: [expect.objectContaining({ text: "startable queue has 0 issues; 1 open issue has no queue label; 1 blocked; 0 waiting-external; 0/1 writing lanes active" })],
+        }),
+      ]]);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("counts blocked and waiting-external issues beside startable intake", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-parked-queue-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "api" ]; then
+  printf '%s\\n' '[[{"number":492,"labels":[{"name":"queue:startable"}]},{"number":493,"labels":[{"name":"queue:blocked"}]},{"number":494,"labels":[{"name":"queue:waiting-external"}]}]]'
+else
+  printf '%s\\n' '[{"number":492,"labels":[{"name":"queue:startable"}]}]'
+fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({
+          threadId: fixture.orchestratorThreadId,
+          mode: "queue-if-active",
+          input: [expect.objectContaining({ text: "startable queue has 1 issue; 0 open issues have no queue label; 1 blocked; 1 waiting-external; 0/1 writing lanes active" })],
         }),
       ]]);
     } finally {
@@ -3455,7 +3485,7 @@ else console.log(JSON.stringify(blocked));
         expect.objectContaining({
           threadId: fixture.orchestratorThreadId,
           mode: "queue-if-active",
-          input: [expect.objectContaining({ text: "startable queue has 1 issue; 0 open issues have no queue label; 0/1 writing lanes active" })],
+          input: [expect.objectContaining({ text: "startable queue has 1 issue; 0 open issues have no queue label; 1000 blocked; 0 waiting-external; 0/1 writing lanes active" })],
         }),
       ]]);
     } finally {
@@ -4331,7 +4361,7 @@ exit 1
         expect.objectContaining({
           threadId: fixture.orchestratorThreadId,
           mode: "queue-if-active",
-          input: [expect.objectContaining({ text: "startable queue has 1 issue; 0 open issues have no queue label; 0/3 writing lanes active" })],
+          input: [expect.objectContaining({ text: "startable queue has 1 issue; 0 open issues have no queue label; 0 blocked; 0 waiting-external; 0/3 writing lanes active" })],
         }),
       ]]);
       expect(fixture.host.harness.inspection.logEntries.slice(logCount)).toContainEqual(expect.objectContaining({
