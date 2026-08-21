@@ -21826,6 +21826,7 @@ import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as rea
 import { execFile, spawnSync as spawnSync2 } from "node:child_process";
 import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute2, join as join5, relative as relative2, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+var ERROR_RECOVERY_IO_TIMEOUT_MS = 1e4;
 var fleetWatchdogReopenKey = (projectId, workItemId, externalRevision) => [projectId, workItemId, externalRevision].filter((value) => value !== void 0).join("\0");
 function githubRepository(remoteUrl) {
   const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
@@ -23147,20 +23148,96 @@ async function plugin(bb, options = {}) {
     db = null;
   }
   const recoveryInFlight = /* @__PURE__ */ new Set();
+  const RECOVERY_UNRECOVERABLE = "unrecoverable";
+  const withRecoveryTimeout = async (label, operation) => {
+    const controller = new AbortController();
+    let timer;
+    try {
+      return await Promise.race([
+        operation(controller.signal),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error(`error-recovery ${label} timed out after ${ERROR_RECOVERY_IO_TIMEOUT_MS}ms`));
+          }, ERROR_RECOVERY_IO_TIMEOUT_MS);
+        })
+      ]);
+    } finally {
+      if (timer !== void 0) clearTimeout(timer);
+    }
+  };
   const isCurrentRoleHolder = (holder) => db !== null && readRoleHolderStates(db).some(
     (candidate) => candidate.project_id === holder.project_id && candidate.role_id === holder.role_id && candidate.role_generation === holder.role_generation && candidate.execution_attempt_id === holder.execution_attempt_id && candidate.thread_id === holder.thread_id
   );
-  const recoverErroredThread = async (threadId, projectId, holder) => {
-    if (recoveryInFlight.has(threadId) || db === null) return false;
+  const isCurrentLane = (lane) => db !== null && Boolean(db.prepare(
+    `SELECT 1 FROM execution_attempts AS attempts
+     JOIN work_items AS items ON items.project_id = attempts.project_id AND items.work_item_id = attempts.work_item_id
+     WHERE attempts.project_id = ? AND attempts.execution_attempt_id = ? AND attempts.thread_id = ?
+       AND attempts.origin = 'work_item' AND attempts.assignment_kind = 'write'
+       AND attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+       AND items.lifecycle_state IN (${WORK_ITEM_CAPACITY_LIFECYCLE_STATES.map(() => "?").join(", ")})`
+  ).get(lane.project_id, lane.execution_attempt_id, lane.thread_id, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES));
+  const resolveRecoveryIdentity = (projectId, threadId) => {
+    if (db === null) return {};
+    try {
+      const holder = db.prepare(
+        `SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id
+         FROM execution_attempts
+         WHERE project_id = ? AND thread_id = ? AND origin = 'role_holder'
+         ORDER BY rowid DESC LIMIT 1`
+      ).get(projectId, threadId);
+      const lane = db.prepare(
+        `SELECT project_id, thread_id, execution_attempt_id
+         FROM execution_attempts
+         WHERE project_id = ? AND thread_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
+         ORDER BY rowid DESC LIMIT 1`
+      ).get(projectId, threadId);
+      return { holder, lane };
+    } catch (error48) {
+      bb.log.warn(`error-recovery identity resolution failed: project=${projectId} thread=${threadId} ${String(error48)}`);
+      return null;
+    }
+  };
+  const withRecoverySendTimeout = async (threadId, operation) => {
+    let timer;
+    let timedOut = false;
+    try {
+      return await Promise.race([
+        operation(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(new Error(`error-recovery threads.send timed out after ${ERROR_RECOVERY_IO_TIMEOUT_MS}ms`));
+          }, ERROR_RECOVERY_IO_TIMEOUT_MS);
+        })
+      ]);
+    } catch (error48) {
+      if (timedOut) bb.log.error(`error-recovery send anomaly: thread=${threadId} reason=uncancellable-send-timeout ${String(error48)}`);
+      throw error48;
+    } finally {
+      if (timer !== void 0) clearTimeout(timer);
+    }
+  };
+  const recoverErroredThread = async (threadId, projectId, holder, lane) => {
+    if (recoveryInFlight.has(threadId)) {
+      bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=recovery-in-flight`);
+      return null;
+    }
+    if (db === null) return null;
     recoveryInFlight.add(threadId);
     try {
       if (!db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId)) return false;
-      const thread = await bb.sdk.threads.get({ threadId });
-      if (thread.id !== threadId || thread.projectId !== projectId || thread.status !== "error" || thread.archivedAt !== null || thread.deletedAt !== null || holder !== void 0 && !isCurrentRoleHolder(holder)) return false;
+      const thread = await withRecoveryTimeout("threads.get", (signal) => bb.sdk.threads.get({ threadId, signal }));
+      if (thread.id !== threadId || thread.projectId !== projectId || thread.archivedAt !== null || thread.deletedAt !== null) {
+        bb.log.error(`error-recovery target unrecoverable: project=${projectId} thread=${threadId} reason=canonical-target-invalid`);
+        return RECOVERY_UNRECOVERABLE;
+      }
+      if (thread.status !== "error" || holder !== void 0 && !isCurrentRoleHolder(holder) || lane !== void 0 && !isCurrentLane(lane)) return false;
       let head = "unavailable (re-fetch before continuing)";
       if (thread.environmentId !== null) {
+        const environmentId = thread.environmentId;
         try {
-          const status = await bb.sdk.environments.status({ environmentId: thread.environmentId });
+          const status = await withRecoveryTimeout("environments.status", (signal) => bb.sdk.environments.status({ environmentId, signal }));
           if (status.outcome === "available") {
             const checkout = status.workspace.checkout;
             if (checkout.kind === "branch" || checkout.kind === "detached") head = checkout.headSha ?? `${checkout.kind} checkout with no HEAD`;
@@ -23170,7 +23247,15 @@ async function plugin(bb, options = {}) {
           bb.log.warn(`error-recovery head unavailable: thread=${threadId} ${String(error48)}`);
         }
       }
-      await bb.sdk.threads.send({
+      if (holder !== void 0 && !isCurrentRoleHolder(holder)) {
+        bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=role-holder-no-longer-current`);
+        return false;
+      }
+      if (lane !== void 0 && !isCurrentLane(lane)) {
+        bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=lane-no-longer-current`);
+        return false;
+      }
+      await withRecoverySendTimeout(threadId, () => bb.sdk.threads.send({
         threadId,
         mode: "auto",
         input: [{
@@ -23179,7 +23264,7 @@ async function plugin(bb, options = {}) {
           text: `RECOVERY WAKE \u2014 reconcile state before resuming. The workspace and recorded conversation survived the daemon interruption, but the interrupted turn may have half-applied intent and a composed instruction may not have been delivered. Observed checkout head: ${head}. Re-fetch and confirm the current head, reconcile the frozen work order and canonical state against the conversation, identify any half-applied mutation or lost delivery, and re-run every pre-crash measurement whose command and output are not visible before continuing.`,
           mentions: []
         }]
-      });
+      }));
       bb.log.warn(`error-recovery wake sent: project=${projectId} thread=${threadId} mode=auto head=${head}`);
       return true;
     } catch (error48) {
@@ -23191,26 +23276,50 @@ async function plugin(bb, options = {}) {
   };
   const reconcileErrorRecovery = async () => {
     if (db === null) {
-      bb.log.error("error-recovery coverage=blind event=blind roleRestart=blind roles=unknown laneRestart=blind unboundOpenWorkItems=unknown reason=canonical-store-unreadable;work-items-have-no-thread-binding:GH-300");
+      const coverage2 = "blind";
+      const roleRestart2 = "blind";
+      const laneRestart2 = "blind";
+      bb.log.error(`error-recovery coverage=${coverage2} event=blind roleRestart=${roleRestart2} roles=unknown laneRestart=${laneRestart2} lanes=unknown unboundOpenWorkItems=unknown reason=canonical-store-unreadable`);
       return;
     }
     let holders;
+    let lanes;
     let openWorkItems;
     try {
       holders = readRoleHolderStates(db);
+      lanes = db.prepare(
+        `SELECT attempts.project_id, attempts.thread_id, attempts.execution_attempt_id FROM execution_attempts AS attempts
+         JOIN work_items AS items ON items.project_id = attempts.project_id AND items.work_item_id = attempts.work_item_id
+         WHERE attempts.origin = 'work_item' AND attempts.assignment_kind = 'write' AND attempts.thread_id IS NOT NULL
+           AND attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+           AND items.lifecycle_state IN (${WORK_ITEM_CAPACITY_LIFECYCLE_STATES.map(() => "?").join(", ")})
+         ORDER BY attempts.project_id, attempts.thread_id`
+      ).all(...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES);
       openWorkItems = db.prepare(
         "SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state NOT IN ('succeeded', 'failed', 'cancelled')"
       ).get().count;
     } catch (error48) {
-      bb.log.error(`error-recovery coverage=blind event=armed roleRestart=blind roles=unknown laneRestart=blind unboundOpenWorkItems=unknown reason=role-inventory-unreadable:${String(error48)};work-items-have-no-thread-binding:GH-300`);
+      const coverage2 = "blind";
+      const roleRestart2 = "blind";
+      const laneRestart2 = "blind";
+      bb.log.error(`error-recovery coverage=${coverage2} event=armed roleRestart=${roleRestart2} roles=unknown laneRestart=${laneRestart2} lanes=unknown unboundOpenWorkItems=unknown reason=canonical-inventory-unreadable:${String(error48)}`);
       return;
     }
     let failedRoles = 0;
     for (const holder of holders) {
-      if (await recoverErroredThread(holder.thread_id, holder.project_id, holder) === null) failedRoles += 1;
+      const outcome = await recoverErroredThread(holder.thread_id, holder.project_id, holder);
+      if (outcome === null || outcome === RECOVERY_UNRECOVERABLE) failedRoles += 1;
+    }
+    let failedLanes = 0;
+    for (const lane of lanes) {
+      const outcome = await recoverErroredThread(lane.thread_id, lane.project_id, void 0, lane);
+      if (outcome === null || outcome === RECOVERY_UNRECOVERABLE) failedLanes += 1;
     }
     const roleRestart = failedRoles === 0 ? "armed" : "degraded";
-    bb.log.error(`error-recovery coverage=blind event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=blind unboundOpenWorkItems=${openWorkItems} reason=work-items-have-no-thread-binding:GH-300`);
+    const laneRestart = failedLanes === 0 ? "armed" : "degraded";
+    const coverage = failedRoles === 0 && failedLanes === 0 ? "armed" : "degraded";
+    const reason = coverage === "armed" ? "none" : `recovery-failed:roles=${failedRoles},lanes=${failedLanes}`;
+    bb.log.error(`error-recovery coverage=${coverage} event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=${laneRestart} lanes=${lanes.length} failedLanes=${failedLanes} unboundOpenWorkItems=${openWorkItems} reason=${reason}`);
   };
   const readPendingExternalWait = async (threadId, signal) => {
     try {
@@ -23796,7 +23905,15 @@ ${thread.titleFallback ?? ""}`);
   bb.events.on("thread.failed", async (payload) => {
     await observeCapacityAfter(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
     const { id: id2, status } = threadEventStatus(payload);
-    if (status === "error") await recoverErroredThread(id2, payload.thread.projectId);
+    if (status === "error") {
+      const identity = resolveRecoveryIdentity(payload.thread.projectId, id2);
+      if (identity === null) return;
+      if (identity.holder === void 0 && identity.lane === void 0) {
+        bb.log.warn(`error-recovery wake refused: project=${payload.thread.projectId} thread=${id2} reason=identity-unresolved`);
+        return;
+      }
+      await recoverErroredThread(id2, payload.thread.projectId, identity.holder, identity.lane);
+    }
   });
   bb.events.on("thread.archived", async (payload) => {
     await (async () => {
