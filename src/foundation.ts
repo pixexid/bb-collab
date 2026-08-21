@@ -1935,6 +1935,7 @@ export interface GitHubIssueSnapshot {
   title: string;
   body: string;
   state: "open" | "closed";
+  stateReason?: "COMPLETED" | "NOT_PLANNED" | "REOPENED";
   labels: string[];
   externalRevision: string;
 }
@@ -5795,6 +5796,7 @@ const githubSnapshotSchema = z
     title: z.string().max(4096),
     body: z.string().max(64 * 1024),
     state: z.enum(["open", "closed"]),
+    stateReason: z.enum(["COMPLETED", "NOT_PLANNED", "REOPENED"]).optional(),
     labels: z.array(id).max(256),
     externalRevision: id,
   })
@@ -6239,6 +6241,9 @@ function applyWorkItemTransition(
       const absorbedBeforeStart = workItem.lifecycle_state === "proposed" && nextState === "cancelled";
       if ((!absorbedBeforeStart && nextState !== "succeeded") || githubObservation.state !== "closed") {
         throw refusal("WORK_ITEM_STATE_INVALID", "close observation only permits succeeded, or proposed to cancelled");
+      }
+      if (absorbedBeforeStart && githubObservation.stateReason !== "COMPLETED") {
+        throw refusal("WORK_ITEM_STATE_INVALID", "proposed cancellation requires a completed GitHub close observation");
       }
     } else {
       if (workItem.lifecycle_state !== "succeeded" || nextState !== "ready" || githubObservation.state !== "open") {

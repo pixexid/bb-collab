@@ -3791,7 +3791,7 @@ else console.log(JSON.stringify(blocked));
     }
   });
 
-  it("auto-terminalizes merged and closed issues for stale in_progress and never-started proposed WorkItems", async () => {
+  it("does not cancel a proposed item for a NOT_PLANNED issue with a merged PR", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-stale-terminal-"));
     const gh = join(bin, "gh");
     const phaseFile = join(bin, "phase");
@@ -3806,28 +3806,29 @@ if [ "$1" = "pr" ]; then
 fi
 if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[{"number":999,"labels":[{"name":"queue:startable"}]}]'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "207" ]; then exit 1; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "9999" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "9999" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then
   phase=$(cat "${adversarialPhaseFile}")
-  if [ "$phase" = "closed-1" ]; then printf '%s\n' '{"state":"CLOSED","updatedAt":"closed-1","closedByPullRequestsReferences":[{"number":340}]}' ; printf '%s\n' 'open-2' > "${adversarialPhaseFile}"; else printf '%s\n' '{"state":"OPEN","updatedAt":"open-2","closedByPullRequestsReferences":[]}' ; fi
+  if [ "$phase" = "closed-1" ]; then printf '%s\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"closed-1","closedByPullRequestsReferences":[{"number":340}]}' ; printf '%s\n' 'open-2' > "${adversarialPhaseFile}"; else printf '%s\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"open-2","closedByPullRequestsReferences":[]}' ; fi
   exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "9999" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "9999" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then
   phase=$(cat "${adversarialPhaseFile}")
-  if [ "$phase" = "open-2" ]; then printf '%s\n' '{"number":9999,"title":"issue","body":"body","state":"OPEN","labels":[],"updatedAt":"open-2"}'; else printf '%s\n' '{"number":9999,"title":"issue","body":"body","state":"CLOSED","labels":[],"updatedAt":"closed-1"}'; fi
+  if [ "$phase" = "open-2" ]; then printf '%s\n' '{"number":9999,"title":"issue","body":"body","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"open-2"}'; else printf '%s\n' '{"number":9999,"title":"issue","body":"body","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"closed-1"}'; fi
   exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then
-  if [ "$phase" = "open-2" ]; then printf '%s\\n' '{"state":"OPEN","updatedAt":"open-2","closedByPullRequestsReferences":[]}'; else printf '%s\\n' '{"state":"CLOSED","updatedAt":"'"$phase"'","closedByPullRequestsReferences":[{"number":340}]}'; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then
+  if [ "$phase" = "open-2" ]; then printf '%s\\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"open-2","closedByPullRequestsReferences":[]}'; else printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"'"$phase"'","closedByPullRequestsReferences":[{"number":340}]}'; fi
   exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then
-  if [ "$phase" = "open-2" ]; then printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"OPEN","labels":[],"updatedAt":"open-2"}'; else printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"CLOSED","labels":[],"updatedAt":"'"$phase"'"}'; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then
+  if [ "$phase" = "open-2" ]; then printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"open-2"}'; else printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"'"$phase"'"}'; fi
   exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then printf '%s\\n' '{"number":'"$3"',"title":"issue","body":"body","state":"CLOSED","labels":[],"updatedAt":"closed-'"$3"'"}'; exit 0; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" != "state,updatedAt,closedByPullRequestsReferences" ]; then exit 1; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && { [ "$3" = "206" ] || [ "$3" = "208" ] || [ "$3" = "210" ]; }; then printf '%s\\n' '{"state":"CLOSED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[{"number":340}]}'; exit 0; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"state":"CLOSED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "210" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then printf '%s\\n' '{"number":210,"title":"issue","body":"body","state":"CLOSED","stateReason":"NOT_PLANNED","labels":[],"updatedAt":"closed-210"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then printf '%s\\n' '{"number":'"$3"',"title":"issue","body":"body","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"closed-'"$3"'"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" != "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then exit 1; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && { [ "$3" = "206" ] || [ "$3" = "208" ] || [ "$3" = "209" ] || [ "$3" = "210" ]; }; then printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[{"number":340}]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[]}'; exit 0; fi
 exit 1
 `);
     chmodSync(gh, 0o755);
@@ -3865,6 +3866,12 @@ exit 1
         idempotencyKey: "never-started-work-item-create",
         workItemId: proposedWorkItemId,
         workItem: { workItemId: proposedWorkItemId, title: proposedWorkItemId, body: "absorbed before dispatch", githubIssue: { issueNumber: 210 } },
+      })).outcome).toBe("OK");
+      const absorbedWorkItemId = "absorbed-work-item";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "absorbed-work-item-create",
+        workItemId: absorbedWorkItemId,
+        workItem: { workItemId: absorbedWorkItemId, title: absorbedWorkItemId, body: "absorbed by completed merge", githubIssue: { issueNumber: 209 } },
       })).outcome).toBe("OK");
       const adversarialWorkItemId = "adversarial-work-item";
       expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
@@ -3928,12 +3935,10 @@ exit 1
 
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
-      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, proposedWorkItemId)).toEqual({ lifecycle_state: "cancelled" });
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, proposedWorkItemId)).toEqual({ lifecycle_state: "proposed" });
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, absorbedWorkItemId)).toEqual({ lifecycle_state: "cancelled" });
       expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, adversarialWorkItemId)).toEqual({ lifecycle_state: "proposed" });
-      const proposedTransition = fixture.db.prepare(
-        "SELECT event_json FROM state_events WHERE project_id = ? AND aggregate_id = ? AND event_type = 'work_item_transitioned' ORDER BY event_sequence DESC LIMIT 1",
-      ).get(PROJECT_ID, proposedWorkItemId) as { event_json: string };
-      expect(JSON.parse(proposedTransition.event_json).externalEvent).toMatchObject({ kind: "github_issue_closed", owner: "example", repo: "project", issueNumber: 210, externalRevision: "closed-210" });
+      expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ? AND aggregate_id = ? AND event_type = 'work_item_transitioned'").get(PROJECT_ID, proposedWorkItemId)).toEqual({ count: 0 });
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
       expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
@@ -3965,7 +3970,7 @@ exit 1
       }));
       expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
         level: "warn",
-        message: expect.stringContaining("cannotSee=github-work-item-terminalize:proj_test:racy-work-item"),
+        message: expect.stringContaining("cannotSee=github-work-item-terminalize:proj_test:adversarial-work-item|github-work-item-terminalize:proj_test:never-started-work-item|github-work-item-terminalize:proj_test:racy-work-item"),
       }));
       expect(fixture.host.harness.inspection.logEntries).not.toContainEqual(expect.objectContaining({
         level: "info",
@@ -3980,10 +3985,6 @@ exit 1
       expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
         level: "info",
         message: expect.stringContaining("auto-terminalized merged and closed work item: project=proj_test workItem=merged-work-item via=review_pending"),
-      }));
-      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
-        level: "info",
-        message: expect.stringContaining("auto-terminalized merged and closed work item: project=proj_test workItem=never-started-work-item via=proposed-cancel"),
       }));
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
@@ -4985,12 +4986,12 @@ exit 1
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-refused-reopen-disagreement-"));
     const gh = join(bin, "gh");
     writeFileSync(gh, `#!/bin/sh
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then
-  printf '%s\\n' '{"state":"OPEN","updatedAt":"open-y","closedByPullRequestsReferences":[]}'; exit 0
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then
+  printf '%s\\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"open-y","closedByPullRequestsReferences":[]}'; exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then
   if [ -f "$0.full-read" ]; then revision=open-y; else revision=closed-x; touch "$0.full-read"; fi
-  printf '%s\\n' '{"number":351,"title":"reopen","body":"","state":"OPEN","labels":[],"updatedAt":"'$revision'"}'; exit 0
+  printf '%s\\n' '{"number":351,"title":"reopen","body":"","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"'$revision'"}'; exit 0
 fi
 exit 1
 `);
@@ -5041,14 +5042,14 @@ exit 1
     writeFileSync(gh, `#!/bin/sh
 revision=open-y
 if [ -f "$0.count" ]; then count=$(cat "$0.count"); else count=0; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then
   count=$((count + 1)); printf '%s\\n' "$count" > "$0.count"
   if [ "$count" -ge 3 ]; then revision=open-z; fi
-  printf '%s\\n' '{"state":"OPEN","updatedAt":"'$revision'","closedByPullRequestsReferences":[]}'; exit 0
+  printf '%s\\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"'$revision'","closedByPullRequestsReferences":[]}'; exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then
   if [ "$count" -ge 3 ]; then revision=open-z; fi
-  printf '%s\\n' '{"number":'"$3"',"title":"reopen","body":"","state":"OPEN","labels":[],"updatedAt":"'$revision'"}'; exit 0
+  printf '%s\\n' '{"number":'"$3"',"title":"reopen","body":"","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"'$revision'"}'; exit 0
 fi
 exit 1
 `);
@@ -5114,8 +5115,8 @@ exit 1
     const gh = join(bin, "gh");
     writeFileSync(gh, `#!/bin/sh
 if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\n' '[]'; exit 0; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\n' '{"state":"OPEN","updatedAt":"open-y","closedByPullRequestsReferences":[]}'; exit 0; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then printf '%s\n' '{"number":'"$3"',"title":"reopened","body":"","state":"OPEN","labels":[],"updatedAt":"open-y"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"open-y","closedByPullRequestsReferences":[]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then printf '%s\n' '{"number":'"$3"',"title":"reopened","body":"","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"open-y"}'; exit 0; fi
 exit 1
 `);
     chmodSync(gh, 0o755);
@@ -10657,7 +10658,7 @@ exit 1
     const calls = join(bin, "calls");
     writeFileSync(gh, `#!/bin/sh
 printf '%s\n' "$@" >> "${calls}"
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "401" ]; then printf '%s\n' '{"number":401,"title":"Existing","body":"Existing","state":"OPEN","labels":[],"updatedAt":"2026-08-19T00:00:00Z"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "401" ]; then printf '%s\n' '{"number":401,"title":"Existing","body":"Existing","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"2026-08-19T00:00:00Z"}'; exit 0; fi
 exit 1
 `);
     chmodSync(gh, 0o755);

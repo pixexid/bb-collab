@@ -171,6 +171,7 @@ export class DeterministicGitHubIssueAdapter implements GitHubIssueAdapter {
       title: input.title,
       body: input.body,
       state: input.state,
+      stateReason: input.state === "closed" ? "COMPLETED" : "REOPENED",
       labels: [...labels].sort(),
       externalRevision: `fixture-${this.mutationCalls.length}`,
     };
