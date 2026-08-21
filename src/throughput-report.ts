@@ -34,11 +34,14 @@ export type ThroughputFacts = {
   laneCapacityIntervals?: LaneCapacityInterval[];
   defects: Array<{
     id: string;
-    reverted: boolean | null;
-    postMergeSeverity: "P0" | "P1" | null;
+    filedAtMs?: number | null;
+    culpritMergeId?: string | null;
+    attributionKnown?: boolean;
+    reverted?: boolean | null;
+    postMergeSeverity?: "P0" | "P1" | null;
   }>;
   outlierCohorts?: Array<{ label: string; startAtMs: number; endAtMs: number }>;
-  unknownReasons?: Partial<Record<"laneSlotUtilization" | "reviewLatency" | "reverts" | "postMergeSeverity", string>>;
+  unknownReasons?: Partial<Record<"laneSlotUtilization" | "reviewLatency" | "reverts" | "postMergeSeverity" | "defectEscape", string>>;
   sourceCommands?: Partial<Record<"issues" | "merges" | "reviewTiers" | "reviewLatency" | "laneSlotUtilization" | "defectEscape", string>>;
 };
 
@@ -64,6 +67,11 @@ export type WeeklyThroughputReport = {
   };
   reviewLatencyByTier: Record<ReportTier, UnknownMetric | { status: "known" | "partial"; medianHours: number | null; completed: number; unknown: number }>;
   defectEscape: {
+    filed: number | null;
+    attributed: number | null;
+    unattributed: number | null;
+    attributionCoverage: number | null;
+    summary: string;
     reverts: UnknownMetric & { total: null; observedExplicitRevertIds: string[] } | { status: "known"; total: number; observedExplicitRevertIds: string[] };
     postMergeP0s: UnknownMetric & { count: null } | { status: "known"; count: number };
     postMergeP1s: UnknownMetric & { count: null } | { status: "known"; count: number };
@@ -171,6 +179,15 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
     return [tier, { status: unknown === 0 ? "known" : "partial", medianHours: median(completed.map((review) => hours(review.completedAtMs! - review.submittedAtMs!))), completed: completed.length, unknown }];
   })) as WeeklyThroughputReport["reviewLatencyByTier"];
   const defects = facts.defects;
+  const defectEscapeUnknown = facts.unknownReasons?.defectEscape;
+  const filed = defectEscapeUnknown ? null : defects.length;
+  const attributed = defectEscapeUnknown ? null : defects.filter((defect) => defect.attributionKnown !== false && defect.culpritMergeId != null).length;
+  const unattributed = filed === null || attributed === null ? null : filed - attributed;
+  const attributionCoverage = filed === null || attributed === null ? null : filed === 0 ? 1 : Number((attributed / filed).toFixed(3));
+  if (filed !== null && attributed !== null && unattributed !== null && filed !== attributed + unattributed) throw new Error("defect escape attribution population does not reconcile");
+  const defectSummary = filed === null
+    ? "defects filed unknown; defects attributed unknown; defects unattributed unknown"
+    : `defects filed ${filed}; defects attributed ${attributed}; defects unattributed ${unattributed}; attribution coverage ${Number((attributionCoverage! * 100).toFixed(1))}%`;
   const explicitRevertIds = defects.filter((defect) => defect.reverted === true).map((defect) => defect.id);
   const reverts = facts.unknownReasons?.reverts || defects.length === 0 || defects.some((defect) => defect.reverted === null)
     ? { status: "unknown" as const, total: null, observedExplicitRevertIds: explicitRevertIds, reason: facts.unknownReasons?.reverts ?? "revert coverage is unavailable" }
@@ -219,7 +236,7 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
       laneSlotUtilization: "Known, contiguous lane_capacity_intervals covering the entire window; denominator is covered orchestrator time and numerator is full cap while startable work existed.",
       reviewLatencyByTier: "Canonically linked review attempts submitted or completed in the window, grouped by declared PR tier; incomplete timestamps are unknown.",
       dataQuality: "GitHub timestamps are the issue/merge boundary; store-backed timestamps are used as recorded, with no correction for retroactive WorkItem registration, so affected windows may be distorted.",
-      defectEscape: "Merged PRs in the window with explicit observable revert or canonical post-merge severity evidence; missing coverage remains unknown.",
+      defectEscape: "Bug-labeled GitHub issues in the window; attribution uses observable cross-reference, revert, or hotfix signals. Every filed defect is attributed or unattributed; unreadable surfaces are unknown.",
     },
     firstReportAtMs: facts.dialsLandedAtMs === null ? null : facts.dialsLandedAtMs + 7 * 86_400_000,
     benchmark: { issueOpenToCloseMedianHours: 0.8 },
@@ -233,7 +250,7 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
       facts.unknownReasons?.laneSlotUtilization ?? "lane slot utilization is unavailable",
     ),
     reviewLatencyByTier,
-    defectEscape: { reverts, postMergeP0s, postMergeP1s },
+    defectEscape: { filed, attributed, unattributed, attributionCoverage, summary: defectSummary, reverts, postMergeP0s, postMergeP1s },
     outlierCohorts,
     sourceCommands: facts.sourceCommands,
     dialGuidance,
