@@ -1832,7 +1832,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       const coverage = "blind";
       const roleRestart = "blind";
       const laneRestart = "blind";
-      bb.log.error(`error-recovery coverage=${coverage} event=blind roleRestart=${roleRestart} roles=unknown laneRestart=${laneRestart} lanes=unknown unboundOpenWorkItems=unknown reason=canonical-store-unreadable`);
+      bb.log.error(`error-recovery coverage=${coverage} event=blind roleRestart=${roleRestart} roles=unknown laneRestart=${laneRestart} lanes=unknown openWorkItems=unknown reason=canonical-store-unreadable`);
       return;
     }
     let holders: RoleHolderState[];
@@ -1855,7 +1855,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       const coverage = "blind";
       const roleRestart = "blind";
       const laneRestart = "blind";
-      bb.log.error(`error-recovery coverage=${coverage} event=armed roleRestart=${roleRestart} roles=unknown laneRestart=${laneRestart} lanes=unknown unboundOpenWorkItems=unknown reason=canonical-inventory-unreadable:${String(error)}`);
+      bb.log.error(`error-recovery coverage=${coverage} event=blind roleRestart=${roleRestart} roles=unknown laneRestart=${laneRestart} lanes=unknown openWorkItems=unknown reason=canonical-inventory-unreadable:${String(error)}`);
       return;
     }
     let failedRoles = 0;
@@ -1872,7 +1872,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     const laneRestart = failedLanes === 0 ? "armed" : "degraded";
     const coverage = failedRoles === 0 && failedLanes === 0 ? "armed" : "degraded";
     const reason = coverage === "armed" ? "none" : `recovery-failed:roles=${failedRoles},lanes=${failedLanes}`;
-    bb.log.error(`error-recovery coverage=${coverage} event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=${laneRestart} lanes=${lanes.length} failedLanes=${failedLanes} unboundOpenWorkItems=${openWorkItems} reason=${reason}`);
+    bb.log.error(`error-recovery coverage=${coverage} event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=${laneRestart} lanes=${lanes.length} failedLanes=${failedLanes} openWorkItems=${openWorkItems} reason=${reason}`);
   };
 
   const readPendingExternalWait = async (threadId: string, signal?: AbortSignal) => {

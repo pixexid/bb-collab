@@ -23279,7 +23279,7 @@ async function plugin(bb, options = {}) {
       const coverage2 = "blind";
       const roleRestart2 = "blind";
       const laneRestart2 = "blind";
-      bb.log.error(`error-recovery coverage=${coverage2} event=blind roleRestart=${roleRestart2} roles=unknown laneRestart=${laneRestart2} lanes=unknown unboundOpenWorkItems=unknown reason=canonical-store-unreadable`);
+      bb.log.error(`error-recovery coverage=${coverage2} event=blind roleRestart=${roleRestart2} roles=unknown laneRestart=${laneRestart2} lanes=unknown openWorkItems=unknown reason=canonical-store-unreadable`);
       return;
     }
     let holders;
@@ -23302,7 +23302,7 @@ async function plugin(bb, options = {}) {
       const coverage2 = "blind";
       const roleRestart2 = "blind";
       const laneRestart2 = "blind";
-      bb.log.error(`error-recovery coverage=${coverage2} event=armed roleRestart=${roleRestart2} roles=unknown laneRestart=${laneRestart2} lanes=unknown unboundOpenWorkItems=unknown reason=canonical-inventory-unreadable:${String(error48)}`);
+      bb.log.error(`error-recovery coverage=${coverage2} event=blind roleRestart=${roleRestart2} roles=unknown laneRestart=${laneRestart2} lanes=unknown openWorkItems=unknown reason=canonical-inventory-unreadable:${String(error48)}`);
       return;
     }
     let failedRoles = 0;
@@ -23319,7 +23319,7 @@ async function plugin(bb, options = {}) {
     const laneRestart = failedLanes === 0 ? "armed" : "degraded";
     const coverage = failedRoles === 0 && failedLanes === 0 ? "armed" : "degraded";
     const reason = coverage === "armed" ? "none" : `recovery-failed:roles=${failedRoles},lanes=${failedLanes}`;
-    bb.log.error(`error-recovery coverage=${coverage} event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=${laneRestart} lanes=${lanes.length} failedLanes=${failedLanes} unboundOpenWorkItems=${openWorkItems} reason=${reason}`);
+    bb.log.error(`error-recovery coverage=${coverage} event=armed roleRestart=${roleRestart} roles=${holders.length} failedRoles=${failedRoles} laneRestart=${laneRestart} lanes=${lanes.length} failedLanes=${failedLanes} openWorkItems=${openWorkItems} reason=${reason}`);
   };
   const readPendingExternalWait = async (threadId, signal) => {
     try {
