@@ -139,7 +139,10 @@ describe("sidebar visual contract", () => {
     const slot = rendered.container.querySelector("[data-sidebar-thread-signal]")! as HTMLElement;
     const dot = slot.querySelector("[data-sidebar-thread-dot]")! as HTMLElement;
     expect(slot.className).toContain("inline-flex");
+    expect(slot.className).toContain("h-4");
     expect(slot.className).toContain("w-4");
+    expect(slot.className).toContain("max-md:pointer-coarse:h-5");
+    expect(slot.className).toContain("max-md:pointer-coarse:w-5");
     expect(dot.className).toContain("size-[5px]");
     expect(dot.className).toContain("bg-primary");
     const anchor = rendered.container.querySelector('[data-sidebar-thread-id="unread"]')!;

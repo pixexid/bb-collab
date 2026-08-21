@@ -13809,7 +13809,7 @@ var rpcContract = defineRpcContract({
   },
   reorderPinned: {
     input: external_exports.object({ threadId: id, previousThreadId: id.nullable(), nextThreadId: id.nullable() }).strict(),
-    output: external_exports.object({ ok: external_exports.literal(true) }).strict()
+    output: external_exports.array(id)
   }
 });
 var stateKey = (threadId) => `thread-state:${threadId}`;
@@ -13852,8 +13852,8 @@ function plugin(bb) {
       return input;
     },
     async reorderPinned(input) {
-      await bb.sdk.threads.reorderPinned(input);
-      return { ok: true };
+      const threads = await bb.sdk.threads.reorderPinned(input);
+      return threads.map((thread) => thread.id);
     }
   });
 }

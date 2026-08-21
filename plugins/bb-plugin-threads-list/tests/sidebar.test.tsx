@@ -77,7 +77,7 @@ function rpcHandlers(states: Record<string, string> = {}, models: Record<string,
     threadModels: async () => models,
     sidebarCollapseState: async () => ({ projects: {}, threads: {} }),
     setSidebarCollapse: async (input: { kind: "project" | "thread"; id: string; collapsed: boolean }) => input,
-    reorderPinned: async () => ({ ok: true }),
+    reorderPinned: async () => [],
     setThreadState: async (input: { threadId: string; state: string | null }) => ({ state: input.state }),
     operatorMessages: async () => ({ outcome: "OK", messages: [] }),
     markOperatorMessageRead: async () => ({}),
@@ -453,6 +453,34 @@ describe("replacement thread list", () => {
     }));
   });
 
+  it("reverts a rejected pinned reorder", async () => {
+    const list = await registration();
+    const first = { ...thread("pinned-1", "project-a", 3), isPinned: true };
+    const second = { ...thread("pinned-2", "project-a", 2), isPinned: true };
+    const third = { ...thread("pinned-3", "project-a", 1), isPinned: true };
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [first, second, third] },
+      rpc: { ...rpcHandlers(), reorderPinned: async () => { throw new Error("rejected"); } } as never,
+    });
+    fireEvent.pointerDown(rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!, { button: 0 });
+    fireEvent.pointerEnter(rendered.container.querySelector('[data-sidebar-thread-id="pinned-2"]')!.closest("div")!);
+    await waitFor(() => expect(Array.from(rendered.container.querySelectorAll("[data-sidebar-thread-id]"), (node) => node.getAttribute("data-sidebar-thread-id"))).toEqual(["pinned-1", "pinned-2", "pinned-3"]));
+  });
+
+  it("reconciles a pinned reorder to the server order", async () => {
+    const list = await registration();
+    const first = { ...thread("pinned-1", "project-a", 3), isPinned: true };
+    const second = { ...thread("pinned-2", "project-a", 2), isPinned: true };
+    const third = { ...thread("pinned-3", "project-a", 1), isPinned: true };
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [first, second, third] },
+      rpc: { ...rpcHandlers(), reorderPinned: async () => ["pinned-2", "pinned-3", "pinned-1"] } as never,
+    });
+    fireEvent.pointerDown(rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!, { button: 0 });
+    fireEvent.pointerEnter(rendered.container.querySelector('[data-sidebar-thread-id="pinned-2"]')!.closest("div")!);
+    await waitFor(() => expect(Array.from(rendered.container.querySelectorAll("[data-sidebar-thread-id]"), (node) => node.getAttribute("data-sidebar-thread-id"))).toEqual(["pinned-2", "pinned-3", "pinned-1"]));
+  });
+
   it("visually reorders pinned rows live while dragging downward", async () => {
     const list = await registration();
     const first = { ...thread("pinned-1", "project-a", 3), isPinned: true };
@@ -603,7 +631,7 @@ describe("replacement thread list", () => {
 
 
   it("persists project/thread collapse in plugin KV and forwards typed reorder to BB", async () => {
-    const reorderPinned = vi.fn(async () => ({}) as never);
+    const reorderPinned = vi.fn(async () => []);
     const host = createFakePluginHost({ pluginId: "bb-collab", sdk: { threads: { reorderPinned } } });
     await plugin(host.bb);
 

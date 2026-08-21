@@ -190,7 +190,7 @@ function threadSignal(thread) {
 function isError(thread) {
   return thread.indicator === "unread-error";
 }
-var LEADING_SLOT = "inline-flex w-4 shrink-0 items-center justify-center";
+var LEADING_SLOT = "inline-flex h-4 w-4 shrink-0 items-center justify-center max-md:pointer-coarse:h-5 max-md:pointer-coarse:w-5";
 var NATIVE_DOT = "size-[5px] rounded-full max-md:pointer-coarse:size-1.5";
 function signalDotClasses(thread, kind) {
   if (kind === "attention" && isError(thread)) return "bg-destructive";
@@ -582,7 +582,11 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
     const nextOrder = [...remaining];
     nextOrder.splice(insertionIndex, 0, draggedId);
     setOptimisticPinnedOrders((current) => ({ ...current, [dragged.projectId]: nextOrder }));
-    void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: remaining[insertionIndex - 1] ?? null, nextThreadId: remaining[insertionIndex] ?? null }).catch(() => void 0);
+    void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: remaining[insertionIndex - 1] ?? null, nextThreadId: remaining[insertionIndex] ?? null }).then((authoritativeOrder) => {
+      setOptimisticPinnedOrders((current) => current[dragged.projectId] === nextOrder ? { ...current, [dragged.projectId]: authoritativeOrder.filter((id) => order.includes(id)) } : current);
+    }).catch(() => {
+      setOptimisticPinnedOrders((current) => current[dragged.projectId] === nextOrder ? Object.fromEntries(Object.entries(current).filter(([projectId]) => projectId !== dragged.projectId)) : current);
+    });
   };
   const startPinnedDrag = (threadId) => {
     draggingThreadId.current = threadId;

@@ -112,12 +112,11 @@ function isError(thread: PluginSidebarThread): boolean {
   return thread.indicator === "unread-error";
 }
 
-// The native list gives status one 16px box at the row's trailing edge holding
-// exactly one glyph. Measured off the built-in list in the running app: the
-// wrapper is `size-4` (`size-5` on coarse pointers) and the dot inside it is
-// 5px. Matching those numbers is the whole point — a different size or slot
-// reads as a different control.
-const LEADING_SLOT = "inline-flex w-4 shrink-0 items-center justify-center";
+// The native list gives status one fixed box holding exactly one glyph. Measured
+// off the built-in list in the running app: it is `h-4 w-4` (`h-5 w-5` on
+// coarse pointers) and the dot inside it is 5px. Matching those numbers is the
+// whole point — a different size or slot reads as a different control.
+const LEADING_SLOT = "inline-flex h-4 w-4 shrink-0 items-center justify-center max-md:pointer-coarse:h-5 max-md:pointer-coarse:w-5";
 const NATIVE_DOT = "size-[5px] rounded-full max-md:pointer-coarse:size-1.5";
 
 export function signalDotClasses(thread: PluginSidebarThread, kind: SidebarThreadSignal): string {
@@ -541,7 +540,15 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     const nextOrder = [...remaining];
     nextOrder.splice(insertionIndex, 0, draggedId);
     setOptimisticPinnedOrders((current) => ({ ...current, [dragged.projectId]: nextOrder }));
-    void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: remaining[insertionIndex - 1] ?? null, nextThreadId: remaining[insertionIndex] ?? null }).catch(() => undefined);
+    void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: remaining[insertionIndex - 1] ?? null, nextThreadId: remaining[insertionIndex] ?? null }).then((authoritativeOrder) => {
+      setOptimisticPinnedOrders((current) => current[dragged.projectId] === nextOrder
+        ? { ...current, [dragged.projectId]: authoritativeOrder.filter((id) => order.includes(id)) }
+        : current);
+    }).catch(() => {
+      setOptimisticPinnedOrders((current) => current[dragged.projectId] === nextOrder
+        ? Object.fromEntries(Object.entries(current).filter(([projectId]) => projectId !== dragged.projectId))
+        : current);
+    });
   };
   const startPinnedDrag = (threadId: string) => {
     draggingThreadId.current = threadId;
