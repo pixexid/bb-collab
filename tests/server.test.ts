@@ -2618,8 +2618,8 @@ describe("bb-collab plugin boundary", () => {
 
   it("learns permanent reopen refusals instead of retrying them", () => {
     const source = readFileSync(join(PLUGIN_ROOT, "server.ts"), "utf8");
-    expect(source).toContain("permanentlyRefusedReopens.has(reopenKey)");
-    expect(source).toContain("permanentlyRefusedReopens.add(reopenKey)");
+    expect(source).toContain("permanentlyRefusedReopens.get(reopenKey)");
+    expect(source).toContain("permanentlyRefusedReopens.set(reopenKey, refusalReason)");
     expect(source).toContain("succeeded work item can return only after a proven GitHub issue reopening");
     expect(source).toContain("skipped permanently-refused issue-reopen transition");
   });
@@ -4600,12 +4600,21 @@ exit 1
     }));
   });
 
-  it("skips a permanently refused succeeded-item reopen on the next cycle", async () => {
+  it("releases a permanently refused succeeded-item reopen when externalRevision changes", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-refused-reopen-"));
     const gh = join(bin, "gh");
     writeFileSync(gh, `#!/bin/sh
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\\n' '{"state":"OPEN","updatedAt":"open-y","closedByPullRequestsReferences":[]}'; exit 0; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then printf '%s\\n' '{"number":'"$3"',"title":"reopen","body":"","state":"OPEN","labels":[],"updatedAt":"open-y"}'; exit 0; fi
+revision=open-y
+if [ -f "$0.count" ]; then count=$(cat "$0.count"); else count=0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then
+  count=$((count + 1)); printf '%s\\n' "$count" > "$0.count"
+  if [ "$count" -ge 3 ]; then revision=open-z; fi
+  printf '%s\\n' '{"state":"OPEN","updatedAt":"'$revision'","closedByPullRequestsReferences":[]}'; exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then
+  if [ "$count" -ge 3 ]; then revision=open-z; fi
+  printf '%s\\n' '{"number":'"$3"',"title":"reopen","body":"","state":"OPEN","labels":[],"updatedAt":"'$revision'"}'; exit 0
+fi
 exit 1
 `);
     chmodSync(gh, 0o755);
@@ -4646,9 +4655,18 @@ exit 1
       const skips = fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("skipped permanently-refused issue-reopen transition"));
       expect(refusals).toHaveLength(0);
       expect(learned).toHaveLength(1);
-      expect(learned[0]?.message).toContain("GitHub reopen does not follow the exact recorded close observation");
+      const reason = "GitHub reopen does not follow the exact recorded close observation";
+      expect(learned[0]?.message).toContain(reason);
       expect(learned.length + refusals.length).toBe(1);
       expect(skips).toHaveLength(1);
+      expect(skips[0]?.message).toContain(`reason=${reason}`);
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE work_item_id = ?").get(workItemId)).toEqual({ lifecycle_state: "ready" });
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "info",
+        message: expect.stringContaining("externalRevision=open-z"),
+      }));
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
