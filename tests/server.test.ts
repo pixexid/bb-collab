@@ -3462,6 +3462,35 @@ fi
     }
   });
 
+  it("reports parked intake counts when no wake fires", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-parked-queue-quiet-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "api" ]; then
+  printf '%s\\n' '[[{"number":493,"labels":[{"name":"queue:blocked"}]},{"number":494,"labels":[{"name":"queue:waiting-external"}]}]]'
+else
+  printf '%s\\n' '[]'
+fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "info",
+        message: `fleet-watchdog intake counts: project=${PROJECT_ID} startable=0 unlabelled=0 blocked=1 waiting-external=1`,
+      }));
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("preserves server-side startable filtering beyond the unlabelled scan page limit", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-startable-page-limit-"));
     const gh = join(bin, "gh");
