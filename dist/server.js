@@ -21805,14 +21805,29 @@ function githubJson(args) {
     return null;
   }
 }
-function startableQueueState(repositories) {
+function githubJsonAsync(args) {
+  return new Promise((resolve3) => {
+    execFile("gh", args, { encoding: "utf8", timeout: 1e4, killSignal: "SIGKILL" }, (error48, stdout) => {
+      if (error48) {
+        resolve3(null);
+        return;
+      }
+      try {
+        resolve3(JSON.parse(stdout));
+      } catch {
+        resolve3(null);
+      }
+    });
+  });
+}
+async function startableQueueStateAsync(repositories) {
   let count = 0;
   let unlabelledCount = 0;
   const heads = [];
   const isIssue = (issue2) => Boolean(issue2 && typeof issue2 === "object" && !Array.isArray(issue2) && typeof issue2.number === "number" && Array.isArray(issue2.labels) && issue2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string"));
   for (const repository of repositories) {
-    const startable = githubJson(["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number,labels", "--limit", "1000"]);
-    const pages = githubJson(["api", `repos/${repository}/issues`, "--paginate", "--slurp", "--method", "GET", "-f", "state=open", "-f", "per_page=100"]);
+    const startable = await githubJsonAsync(["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number,labels", "--limit", "1000"]);
+    const pages = await githubJsonAsync(["api", `repos/${repository}/issues`, "--paginate", "--slurp", "--method", "GET", "-f", "state=open", "-f", "per_page=100"]);
     if (!Array.isArray(startable) || !startable.every(isIssue) || !Array.isArray(pages) || !pages.every((page) => Array.isArray(page) && page.every(isIssue))) return null;
     count += startable.length;
     unlabelledCount += pages.flat().filter((issue2) => !("pull_request" in issue2) && !issue2.labels.some((label) => label.name.startsWith("queue:"))).length;
@@ -21821,8 +21836,8 @@ function startableQueueState(repositories) {
   }
   return { count, head: heads.sort()[0] ?? null, unlabelledCount };
 }
-function linkedGithubObservation(owner, repo, issueNumber) {
-  const issue2 = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,updatedAt,closedByPullRequestsReferences"]);
+async function linkedGithubObservationAsync(owner, repo, issueNumber) {
+  const issue2 = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,updatedAt,closedByPullRequestsReferences"]);
   if (!issue2 || typeof issue2 !== "object" || Array.isArray(issue2)) return null;
   const issueState = issue2.state;
   const externalRevision = issue2.updatedAt;
@@ -21830,7 +21845,7 @@ function linkedGithubObservation(owner, repo, issueNumber) {
   if (issueState !== "OPEN" && issueState !== "CLOSED" || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
   const closingPullRequest = closingPullRequests[0];
   if (closingPullRequest !== void 0 && (!closingPullRequest || typeof closingPullRequest !== "object" || Array.isArray(closingPullRequest) || typeof closingPullRequest.number !== "number" || !Number.isSafeInteger(closingPullRequest.number))) return null;
-  const pullRequest = closingPullRequest === void 0 ? null : githubJson(["pr", "view", String(closingPullRequest.number), "--repo", `${owner}/${repo}`, "--json", "state,mergedAt"]);
+  const pullRequest = closingPullRequest === void 0 ? null : await githubJsonAsync(["pr", "view", String(closingPullRequest.number), "--repo", `${owner}/${repo}`, "--json", "state,mergedAt"]);
   let pullRequestMerged = false;
   let pullRequestClosed = false;
   if (pullRequest && typeof pullRequest === "object" && !Array.isArray(pullRequest)) {
@@ -21843,6 +21858,13 @@ function linkedGithubObservation(owner, repo, issueNumber) {
   const issueOpen = issueState === "OPEN";
   const status = pullRequestMerged || pullRequestClosed || issueClosed ? pullRequestMerged ? "merged" : "closed" : issueOpen ? "open" : null;
   return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, externalRevision };
+}
+async function readGithubIssueForBackfillAsync(owner, repo, issueNumber) {
+  const value = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,labels,updatedAt"]);
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
+  const record2 = value;
+  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
+  return { owner, repo, issueNumber: record2.number, title: record2.title, body: record2.body ?? "", state: record2.state === "OPEN" ? "open" : "closed", labels: record2.labels.map((label) => label.name), externalRevision: record2.updatedAt };
 }
 function readGithubIssueForBackfill(owner, repo, issueNumber) {
   const value = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,labels,updatedAt"]);
@@ -23448,7 +23470,7 @@ ${thread.titleFallback ?? ""}`);
       return { known: false, reason: `native-lanes-unreadable:${String(error48)}` };
     }
   };
-  const readIdleFleetStartable = (projectId) => {
+  const readIdleFleetStartable = async (projectId) => {
     if (!db) return { known: false, reason: "canonical-store-unavailable" };
     try {
       const repositories = db.prepare(
@@ -23460,7 +23482,7 @@ ${thread.titleFallback ?? ""}`);
       if (repositories.length === 0 || repositories.some((repository) => repository === null)) {
         return { known: false, reason: "configured-repositories-unreadable" };
       }
-      const queue = startableQueueState(repositories);
+      const queue = await startableQueueStateAsync(repositories);
       return queue === null ? { known: false, reason: "startable-queue-unreadable" } : { known: true, value: queue };
     } catch (error48) {
       return { known: false, reason: `startable-queue-unreadable:${String(error48)}` };
@@ -23713,7 +23735,7 @@ ${thread.titleFallback ?? ""}`);
       }
     }
   });
-  bb.background.schedule("wait-validator-liveness", "*/5 * * * *", async () => {
+  bb.background.schedule("wait-validator-liveness", "1-59/5 * * * *", async () => {
     try {
       const stateDir = waitValidatorStateDir();
       const markerPath = join5(stateDir, LIVENESS_MARKER_FILENAME);
@@ -23745,7 +23767,7 @@ ${thread.titleFallback ?? ""}`);
       bb.log.warn(`wait-validator liveness check failed: ${String(error48)}`);
     }
   });
-  bb.background.schedule("stall-guard-liveness", "*/5 * * * *", async () => {
+  bb.background.schedule("stall-guard-liveness", "2-59/5 * * * *", async () => {
     try {
       const stateDir = stallGuardStateDir();
       const markerPath = join5(stateDir, STALL_GUARD_LIVENESS_MARKER_FILENAME);
@@ -23778,6 +23800,7 @@ ${thread.titleFallback ?? ""}`);
     }
   });
   const wakeInFlight = /* @__PURE__ */ new Set();
+  const permanentlyRefusedReopens = /* @__PURE__ */ new Set();
   const fleetWatchdogCycle = async (onlyProjectId) => {
     let coverage = "blind";
     let visibleSeatCount = 0;
@@ -23934,7 +23957,7 @@ ${thread.titleFallback ?? ""}`);
           wakeInFlight.delete(key);
         }
       };
-      const transitionWorkItem = (projectId, workItemId, state, idempotencyKey, extra = {}) => {
+      const transitionWorkItem = (projectId, workItemId, state, idempotencyKey, extra = {}, githubSnapshot) => {
         const actor = db.prepare(
           `SELECT receipt_id FROM actor_receipts
            WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
@@ -23967,9 +23990,9 @@ ${thread.titleFallback ?? ""}`);
           workItemId,
           lifecycleState: state,
           ...extra
-        }, null, null, null, null, readGithubIssueForBackfill);
+        }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
       };
-      const inspectLinkedWorkItems = (projectId) => {
+      const inspectLinkedWorkItems = async (projectId) => {
         const linkedWorkItems = db.prepare(
           `SELECT work_items.work_item_id, work_items.lifecycle_state, external_work_refs.owner, external_work_refs.repo, external_work_refs.issue_number
            FROM work_items JOIN external_work_refs
@@ -23982,22 +24005,38 @@ ${thread.titleFallback ?? ""}`);
            ORDER BY work_items.work_item_id`
         ).all(projectId, ...WORK_ITEM_NON_TERMINAL_STATES, "succeeded");
         for (const linked of linkedWorkItems) {
-          const observation = linkedGithubObservation(linked.owner, linked.repo, linked.issue_number);
+          const observation = await linkedGithubObservationAsync(linked.owner, linked.repo, linked.issue_number);
           if (observation === null) {
             degrade(`github-work-item-status:${projectId}:${linked.work_item_id}`);
             continue;
           }
           if (linked.lifecycle_state === "succeeded") {
             if (!observation.issueOpen) continue;
+            const reopenKey = `${projectId}:${linked.work_item_id}`;
+            if (permanentlyRefusedReopens.has(reopenKey)) {
+              bb.log.info(`fleet-watchdog skipped permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=succeeded-work-item-has-no-recorded-close-observation`);
+              continue;
+            }
+            let githubSnapshot2;
+            try {
+              githubSnapshot2 = await readGithubIssueForBackfillAsync(linked.owner, linked.repo, linked.issue_number);
+            } catch {
+              degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
+              continue;
+            }
             const result3 = transitionWorkItem(
               projectId,
               linked.work_item_id,
               "ready",
               `fleet-watchdog:issue-reopened:${linked.work_item_id}:${observation.externalRevision}`,
-              { workItemExternalEvent: { kind: "github_issue_reopened", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } }
+              { workItemExternalEvent: { kind: "github_issue_reopened", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } },
+              githubSnapshot2
             );
             if (result3.outcome === "OK") {
               bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation.externalRevision}`);
+            } else if (result3.outcome === "WORK_ITEM_STATE_INVALID" && (result3.message?.includes("succeeded work item has no recorded close observation") || result3.message?.includes("succeeded work item can return only after a proven GitHub issue reopening"))) {
+              permanentlyRefusedReopens.add(reopenKey);
+              bb.log.warn(`fleet-watchdog learned permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${result3.message}`);
             } else {
               degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
               bb.log.warn(`fleet-watchdog issue-reopen transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result3.outcome}`);
@@ -24018,12 +24057,20 @@ ${thread.titleFallback ?? ""}`);
             bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} reason=authority-or-work-item-unavailable`);
             continue;
           }
+          let githubSnapshot;
+          try {
+            githubSnapshot = await readGithubIssueForBackfillAsync(linked.owner, linked.repo, linked.issue_number);
+          } catch {
+            degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
+            continue;
+          }
           const transition = (state) => transitionWorkItem(
             projectId,
             linked.work_item_id,
             state,
             `fleet-watchdog:merge-close:${linked.work_item_id}:${state}`,
-            state === "succeeded" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {}
+            state === "succeeded" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
+            githubSnapshot
           );
           let result2;
           if (workItem.lifecycle_state === "in_progress") {
@@ -24059,7 +24106,7 @@ ${thread.titleFallback ?? ""}`);
         const holders = holdersByProject.get(projectId) ?? [];
         try {
           if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
-          inspectLinkedWorkItems(projectId);
+          await inspectLinkedWorkItems(projectId);
           const directors = holders.filter((holder) => holder.role_id === "director");
           const orchestrators = holders.filter((holder) => holder.role_id === "project-orchestrator");
           if (directors.length !== 1 || orchestrators.length !== 1) {
@@ -24188,7 +24235,7 @@ ${thread.titleFallback ?? ""}`);
                ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
              WHERE heads.project_id = ? ORDER BY targets.repo_target_id`
           ).all(projectId).map((target) => githubRepository(target.remote_url));
-          const queue = repositories.length === 0 || repositories.some((repository) => repository === null) ? null : startableQueueState(repositories);
+          const queue = repositories.length === 0 || repositories.some((repository) => repository === null) ? null : await startableQueueStateAsync(repositories);
           if (queue !== null && (queue.count > 0 || queue.unlabelledCount > 0) && writingLaneCeiling !== null && activeLaneCount < writingLaneCeiling) {
             await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${queue.count} issue${queue.count === 1 ? "" : "s"}; ${queue.unlabelledCount} open issue${queue.unlabelledCount === 1 ? " has" : "s have"} no queue label; ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
           }
@@ -24197,6 +24244,7 @@ ${thread.titleFallback ?? ""}`);
           for (const blocked of workItems.filter((workItem) => workItem.lifecycleState === "blocked")) {
             let condition;
             let idempotencyKey;
+            let snapshot2;
             if (blocked.wakerKind === "work_item_succeeded" && blocked.waker !== null) {
               const dependency = db.prepare(
                 "SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?"
@@ -24211,9 +24259,8 @@ ${thread.titleFallback ?? ""}`);
                 degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
                 continue;
               }
-              let snapshot2;
               try {
-                snapshot2 = readGithubIssueForBackfill(match[1], match[2], issueNumber);
+                snapshot2 = await readGithubIssueForBackfillAsync(match[1], match[2], issueNumber);
               } catch {
                 degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
                 continue;
@@ -24225,7 +24272,7 @@ ${thread.titleFallback ?? ""}`);
               degrade(`work-item-blocker:${projectId}:${blocked.workItemId}`);
               continue;
             }
-            const result2 = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition });
+            const result2 = transitionWorkItem(projectId, blocked.workItemId, "ready", idempotencyKey, { workItemUnblock: condition }, snapshot2);
             if (result2.outcome === "OK") {
               unblocked.add(blocked.workItemId);
               bb.log.info(`fleet-watchdog returned blocked work item to ready: project=${projectId} workItem=${blocked.workItemId} blocker=${blocked.wakerKind}`);
@@ -24335,11 +24382,11 @@ ${thread.titleFallback ?? ""}`);
       bb.log.error(`deployed-dist automatic check failed: ${detail || "child process failed"}`);
     });
   });
-  bb.background.schedule("fleet-watchdog", "*/5 * * * *", () => {
+  bb.background.schedule("fleet-watchdog", "3-59/5 * * * *", () => {
     checkDeployedDist();
     return fleetWatchdogCycle();
   });
-  bb.background.schedule("worktree-cleanup", "0 * * * *", async () => {
+  bb.background.schedule("worktree-cleanup", "4 * * * *", async () => {
     let projects;
     try {
       projects = await bb.sdk.projects.list({ includePersonal: true });
@@ -24363,7 +24410,7 @@ ${thread.titleFallback ?? ""}`);
     }
   });
   const archiveSweepRefusalCounter = createArchiveSweepRefusalCounter();
-  bb.background.schedule("thread-archive-sweep", "0 * * * *", async () => {
+  bb.background.schedule("thread-archive-sweep", "5 * * * *", async () => {
     archiveSweepRefusalCounter.beginCycle();
     const refusalsThisCycle = /* @__PURE__ */ new Map();
     const refusalMessage = (aggregate) => `${ARCHIVE_SWEEP_GUARD} coverage=degraded guard=${aggregate.guard} reason=${aggregate.reason} occurrencesSinceReload=${aggregate.occurrencesSinceReload} cyclesSinceReload=${aggregate.cyclesSinceReload} projectsSinceReload=${aggregate.projectsSinceReload} sinceReloadAt=${new Date(aggregate.sinceReloadAtMs).toISOString()}`;

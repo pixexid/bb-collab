@@ -2586,17 +2586,121 @@ describe("bb-collab plugin boundary", () => {
     expect(deployedDistFailureDetail(timeout, "", "")).not.toBe(deployedDistFailureDetail(exit, "", ""));
   });
 
-  it("runs the deployed-dist check asynchronously", () => {
+  it("runs the deployed-dist check asynchronously from the resolved checkout", () => {
     const source = readFileSync(join(PLUGIN_ROOT, "server.ts"), "utf8");
+    const script = readFileSync(join(PLUGIN_ROOT, "scripts", "check-dist.mjs"), "utf8");
     expect(source).toMatch(/execFile\(process\.execPath, \[join\(root, "scripts", "check-dist\.mjs"\)/u);
     expect(source).not.toMatch(/spawnSync\(process\.execPath, \[join\(root, "scripts", "check-dist\.mjs"\)/u);
+    expect(source).toContain("cwd: root");
+    expect(script).toContain("return process.cwd();");
+    expect(script).not.toContain("BB_COLLAB_DEPLOYED_ROOT");
+  });
+
+  it("learns permanent reopen refusals instead of retrying them", () => {
+    const source = readFileSync(join(PLUGIN_ROOT, "server.ts"), "utf8");
+    expect(source).toContain("permanentlyRefusedReopens.has(reopenKey)");
+    expect(source).toContain("permanentlyRefusedReopens.add(reopenKey)");
+    expect(source).toContain("succeeded work item can return only after a proven GitHub issue reopening");
+    expect(source).toContain("skipped permanently-refused issue-reopen transition");
+  });
+
+  it("keeps recurring schedules on distinct cron phases", () => {
+    const source = readFileSync(join(PLUGIN_ROOT, "server.ts"), "utf8");
+    expect(source).toContain('"1-59/5 * * * *"');
+    expect(source).toContain('"2-59/5 * * * *"');
+    expect(source).toContain('"3-59/5 * * * *"');
+    expect(source).toContain('"4 * * * *"');
+    expect(source).toContain('"5 * * * *"');
+  });
+
+  it("does not block the event loop on scheduled GitHub reads", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-slow-gh-"));
+    const gh = join(bin, "gh");
+    const marker = join(bin, "called");
+    writeFileSync(gh, `#!/bin/sh
+printf '%s\\n' started >> ${marker}
+sleep 0.4
+printf '%s\\n' finished >> ${marker}
+printf '%s\\n' '[]'
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      const workItemId = "slow-github-read";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "slow-github-read-create",
+        workItemId,
+        workItem: { workItemId, title: workItemId, body: workItemId, githubIssue: { issueNumber: 351 } },
+      })).outcome).toBe("OK");
+      fixture.db.prepare("UPDATE work_items SET lifecycle_state = 'succeeded' WHERE project_id = ? AND work_item_id = ?").run(PROJECT_ID, workItemId);
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "slow-github-read-plugin", actorKind: "plugin", subjectId: PLUGIN_ID });
+      expect(fixture.db.prepare("SELECT provider, issue_number FROM external_work_refs WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, workItemId)).toEqual({ provider: "github", issue_number: 351 });
+      let timerAt = Number.POSITIVE_INFINITY;
+      setTimeout(() => { timerAt = Date.now(); }, 300);
+      const cycle = fixture.host.harness.runSchedule("fleet-watchdog");
+      let finishedAt = Number.POSITIVE_INFINITY;
+      for (let attempt = 0; attempt < 150; attempt += 1) {
+        if (existsSync(marker) && readFileSync(marker, "utf8").includes("finished")) {
+          finishedAt = Date.now();
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(Number.isFinite(finishedAt)).toBe(true);
+      expect(timerAt).toBeLessThan(finishedAt);
+      await cycle;
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("does not block the event loop on idle-fleet capacity reads", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-slow-gh-"));
+    const gh = join(bin, "gh");
+    const marker = join(bin, "called");
+    writeFileSync(gh, `#!/bin/sh
+printf '%s\\n' started >> ${marker}
+sleep 0.4
+printf '%s\\n' finished >> ${marker}
+if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; else printf '%s\\n' '[{"number":305,"labels":[{"name":"queue:startable"}]}]'; fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      let timerAt = Number.POSITIVE_INFINITY;
+      setTimeout(() => { timerAt = Date.now(); }, 300);
+      const observation = fixture.host.harness.emitThreadEvent("thread.active", {
+        thread: makeThreadResponse({ id: "lane-capacity", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active", updatedAt: 1 }),
+      });
+      let finishedAt = Number.POSITIVE_INFINITY;
+      for (let attempt = 0; attempt < 150; attempt += 1) {
+        if (existsSync(marker) && readFileSync(marker, "utf8").includes("finished")) {
+          finishedAt = Date.now();
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(Number.isFinite(finishedAt)).toBe(true);
+      expect(timerAt).toBeLessThan(finishedAt);
+      await observation;
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
   });
 
   it("runs the fleet watchdog every five minutes without waking a quiet director seat", async () => {
     const fixture = await fleetWatchdogFixture();
     const cron = fixture.host.harness.inspection.registrations.schedules.find((schedule) => schedule.name === "fleet-watchdog")?.cron;
-    if (cron !== "*/5 * * * *") {
-      throw new Error(`expected registered fleet-watchdog cron "*/5 * * * *", got "${cron}"`);
+    if (cron !== "3-59/5 * * * *") {
+      throw new Error(`expected registered fleet-watchdog cron "3-59/5 * * * *", got "${cron}"`);
     }
     await fixture.host.harness.runSchedule("fleet-watchdog");
     expect(fixture.host.checkDeployedDist).toHaveBeenCalledOnce();
@@ -3504,6 +3608,9 @@ exit 1
           lastAssistantText: null,
         });
         await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+        vi.useRealTimers();
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        vi.useFakeTimers();
 
         expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
           expect.objectContaining({
@@ -3543,6 +3650,9 @@ exit 1
             lastAssistantText: null,
           });
           await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+        vi.useRealTimers();
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        vi.useFakeTimers();
         };
         await emitIdle(1);
         expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
@@ -3584,6 +3694,9 @@ exit 1
           lastAssistantText: null,
         });
         await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+        vi.useRealTimers();
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        vi.useFakeTimers();
         expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
       } finally {
         vi.useRealTimers();
@@ -3614,6 +3727,9 @@ exit 1
           lastAssistantText: null,
         });
         await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+        vi.useRealTimers();
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        vi.useFakeTimers();
 
         expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
           expect.objectContaining({
@@ -3931,6 +4047,9 @@ exit 1
           lastAssistantText: null,
         });
         await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+        vi.useRealTimers();
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        vi.useFakeTimers();
 
         expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
         expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
@@ -3975,6 +4094,9 @@ exit 1
           lastAssistantText: null,
         });
         await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+        vi.useRealTimers();
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        vi.useFakeTimers();
 
         expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
         expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
@@ -4044,6 +4166,9 @@ exit 1
           lastAssistantText: null,
         });
         await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+        vi.useRealTimers();
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        vi.useFakeTimers();
 
         expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
         expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
@@ -4354,6 +4479,45 @@ exit 1
       level: "info",
       message: expect.stringContaining("returned blocked work item to ready: project=proj_test workItem=work-item-1 blocker=work_item_succeeded"),
     }));
+  });
+
+  it("skips a permanently refused succeeded-item reopen on the next cycle", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-refused-reopen-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\\n' '{"state":"OPEN","updatedAt":"open-y","closedByPullRequestsReferences":[]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then printf '%s\\n' '{"number":'"$3"',"title":"reopen","body":"","state":"OPEN","labels":[],"updatedAt":"open-y"}'; exit 0; fi
+exit 1
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      const workItemId = "permanently-refused-reopen";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "permanently-refused-reopen-create",
+        workItemId,
+        workItem: { workItemId, title: workItemId, body: workItemId, githubIssue: { issueNumber: 351 } },
+      })).outcome).toBe("OK");
+      fixture.db.prepare("UPDATE work_items SET lifecycle_state = 'succeeded' WHERE project_id = ? AND work_item_id = ?").run(PROJECT_ID, workItemId);
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "fleet-watchdog-plugin-refused-reopen", actorKind: "plugin", subjectId: PLUGIN_ID });
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      const refusals = fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("fleet-watchdog issue-reopen transition refused"));
+      const learned = fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("learned permanently-refused issue-reopen transition"));
+      const skips = fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("skipped permanently-refused issue-reopen transition"));
+      expect(refusals).toHaveLength(0);
+      expect(learned).toHaveLength(1);
+      expect(learned.length + refusals.length).toBe(1);
+      expect(skips).toHaveLength(1);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
   });
 
   it("returns succeeded to ready when the watchdog observes the exact bound GitHub issue reopened", async () => {
@@ -9996,7 +10160,7 @@ exit 1
       host.harness.sdk.stub("projects.get", (async () => ({ ...projectFacts(), sources: [{ ...projectFacts().sources[0], path: root }] })) as never);
       await plugin(host.bb);
 
-      expect(host.harness.inspection.registrations.schedules.find((schedule) => schedule.name === "worktree-cleanup")?.cron).toBe("0 * * * *");
+      expect(host.harness.inspection.registrations.schedules.find((schedule) => schedule.name === "worktree-cleanup")?.cron).toBe("4 * * * *");
       await host.harness.runSchedule("worktree-cleanup");
 
       expect(existsSync(orphan)).toBe(true);
