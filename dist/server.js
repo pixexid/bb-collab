@@ -14458,9 +14458,14 @@ function createIdleFleetDetector(options) {
         reportBlind(decision.message);
         return;
       }
-      if (state[legacyProbeKey(probe)] !== void 0) {
-        state[key] = state[legacyProbeKey(probe)];
-        delete state[legacyProbeKey(probe)];
+      const legacyKey = legacyProbeKey(probe);
+      if (state[legacyKey] !== void 0) {
+        if (state[key] !== void 0) {
+          reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=ambiguous-migration:${key}`);
+          return;
+        }
+        state[key] = state[legacyKey];
+        delete state[legacyKey];
         await save();
       }
       if (state[key] === decision.episodeKey) return;
@@ -21041,10 +21046,16 @@ function createStallGuardCycle(options) {
       let attempted = 0;
       let verified = 0;
       let steered = 0;
+      let ambiguous = 0;
       for (const holder of holders) {
         const key = JSON.stringify([holder.project_id, holder.role_id]);
         const legacyKey = `${holder.project_id}:${holder.role_id}`;
         if (nextState[legacyKey] !== void 0) {
+          if (nextState[key] !== void 0) {
+            ambiguous += 1;
+            options.onAmbiguous?.(`stall-guard ambiguous migration: ${key}`);
+            continue;
+          }
           nextState[key] = nextState[legacyKey];
           delete nextState[legacyKey];
           changed += 1;
@@ -21095,7 +21106,7 @@ function createStallGuardCycle(options) {
         await options.persistence.write(nextState);
         state = nextState;
       }
-      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered };
+      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered, ambiguous };
     }
   };
 }
@@ -22125,6 +22136,7 @@ var sidebarReasoningLevelSchema = external_exports.enum(["none", "low", "medium"
 var sidebarThreadExecutionSchema = external_exports.object({ model: external_exports.string(), reasoning: sidebarReasoningLevelSchema }).strict();
 var sidebarCollapseKindSchema = external_exports.enum(["project", "thread"]);
 var sidebarCollapseKey = (kind, id2) => `sidebar.collapse:${JSON.stringify([kind, id2])}`;
+var legacySidebarCollapseKey = (kind, id2) => `sidebar.collapse:${kind}:${id2}`;
 var roleBriefRoleSchema = external_exports.enum(["director", "orchestrator", "worker"]);
 var roleBriefBundleSchema = external_exports.object({
   ponytail: external_exports.string().min(1),
@@ -23944,6 +23956,7 @@ ${thread.titleFallback ?? ""}`);
     }
   });
   const stallGuardCycle = createStallGuardCycle({
+    onAmbiguous: (message) => bb.log.warn(message),
     readRoleHolders: () => db ? readRoleHolderStates(db) : [],
     readArtifact: async (projectId) => {
       if (!db) return null;
@@ -24861,8 +24874,14 @@ ${thread.titleFallback ?? ""}`);
     async sidebarCollapseState(input) {
       const read = async (kind, ids) => {
         const entries = await Promise.all(ids.map(async (id2) => {
-          const value = await bb.storage.kv.get(sidebarCollapseKey(kind, id2));
-          return value === true ? [id2, true] : null;
+          const key = sidebarCollapseKey(kind, id2);
+          const value = await bb.storage.kv.get(key);
+          if (value === true) return [id2, true];
+          const legacyKey = legacySidebarCollapseKey(kind, id2);
+          if (await bb.storage.kv.get(legacyKey) !== true) return null;
+          await bb.storage.kv.set(key, true);
+          await bb.storage.kv.delete(legacyKey);
+          return [id2, true];
         }));
         return Object.fromEntries(entries.filter((entry) => entry !== null));
       };
