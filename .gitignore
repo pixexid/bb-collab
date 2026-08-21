@@ -7,5 +7,5 @@ dist/*
 !dist/app.js
 !dist/app.css
 !dist/app.meta.json
-/plugins/**/dist/
+/plugins/**/dist/*.map
 npm-debug.log*
