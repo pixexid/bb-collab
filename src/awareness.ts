@@ -954,9 +954,22 @@ export function createIdleFleetDetector(options: {
     loaded = true;
   };
   const save = () => options.persistence?.write(structuredClone(state));
+  const blindReportIntervalMs = 1_000;
+  let lastBlindMessage: string | null = null;
+  let blindOccurrences = 0;
+  let lastBlindReportAt = 0;
   const reportBlind = (message: string) => {
+    const now = Date.now();
+    if (message === lastBlindMessage) {
+      blindOccurrences += 1;
+      if (now - lastBlindReportAt < blindReportIntervalMs) return;
+    } else {
+      lastBlindMessage = message;
+      blindOccurrences = 1;
+    }
+    lastBlindReportAt = now;
     try {
-      options.onBlind(message);
+      options.onBlind(`${message} occurrences=${blindOccurrences}`);
     } catch {
       // Coverage reporting cannot keep the detector from re-arming.
     }
@@ -1027,7 +1040,9 @@ export function createIdleFleetDetector(options: {
     });
     capacityQueues.set(projectId, next.catch(() => undefined));
     return next.catch((error) => {
-      reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error)}`);
+      // An in-flight read may finish after disposal closes the recorder.
+      // That is lifecycle teardown, not a live capacity-read failure.
+      if (!stopped) reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error)}`);
     });
   };
 

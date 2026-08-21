@@ -597,6 +597,53 @@ describe("lane awareness", () => {
     }
   });
 
+  it("bounds repeated blind capacity reports and counts occurrences", async () => {
+    vi.useFakeTimers();
+    try {
+      const onBlind = vi.fn();
+      const observe = vi.fn().mockRejectedValue(new Error("interval read failed"));
+      const detector = createIdleFleetDetector({
+        read: async (): Promise<IdleFleetDecision> => ({ kind: "silent" }),
+        readRearmProbes: async () => [],
+        wake: async () => true,
+        onBlind,
+        capacity: { readProjectIds: async () => [], observe, close: vi.fn() },
+      });
+
+      await detector.observeCapacity("project-1");
+      await detector.observeCapacity("project-1");
+      expect(onBlind).toHaveBeenCalledOnce();
+      expect(onBlind).toHaveBeenLastCalledWith(expect.stringContaining("occurrences=1"));
+      await vi.advanceTimersByTimeAsync(1_000);
+      await detector.observeCapacity("project-1");
+      expect(onBlind).toHaveBeenCalledTimes(2);
+      expect(onBlind).toHaveBeenLastCalledWith(expect.stringContaining("occurrences=3"));
+      detector.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not report an in-flight capacity read closed by disposal", async () => {
+    let rejectFirst!: (error: Error) => void;
+    const first = new Promise<void>((_, reject) => { rejectFirst = reject; });
+    const onBlind = vi.fn();
+    const detector = createIdleFleetDetector({
+      read: async (): Promise<IdleFleetDecision> => ({ kind: "silent" }),
+      readRearmProbes: async () => [],
+      wake: async () => true,
+      onBlind,
+      capacity: { readProjectIds: async () => [], observe: async () => first, close: vi.fn() },
+    });
+
+    const read = detector.observeCapacity("project-1");
+    await Promise.resolve();
+    detector.stop();
+    rejectFirst(new Error("The database connection is not open"));
+    await read;
+    expect(onBlind).not.toHaveBeenCalled();
+  });
+
   it("cancels queued capacity reads after disposal and closes once", async () => {
     let releaseFirst!: () => void;
     const first = new Promise<void>((resolve) => { releaseFirst = resolve; });
@@ -696,7 +743,7 @@ describe("lane awareness", () => {
       await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
 
       expect(wake).not.toHaveBeenCalled();
-      expect(onBlind).toHaveBeenCalledExactlyOnceWith(message);
+      expect(onBlind).toHaveBeenCalledExactlyOnceWith(`${message} occurrences=1`);
       detector.stop();
     } finally {
       vi.useRealTimers();

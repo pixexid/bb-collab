@@ -14434,9 +14434,22 @@ function createIdleFleetDetector(options) {
     loaded = true;
   };
   const save = () => options.persistence?.write(structuredClone(state));
+  const blindReportIntervalMs = 1e3;
+  let lastBlindMessage = null;
+  let blindOccurrences = 0;
+  let lastBlindReportAt = 0;
   const reportBlind = (message) => {
+    const now2 = Date.now();
+    if (message === lastBlindMessage) {
+      blindOccurrences += 1;
+      if (now2 - lastBlindReportAt < blindReportIntervalMs) return;
+    } else {
+      lastBlindMessage = message;
+      blindOccurrences = 1;
+    }
+    lastBlindReportAt = now2;
     try {
-      options.onBlind(message);
+      options.onBlind(`${message} occurrences=${blindOccurrences}`);
     } catch {
     }
   };
@@ -14503,7 +14516,7 @@ function createIdleFleetDetector(options) {
     });
     capacityQueues.set(projectId, next.catch(() => void 0));
     return next.catch((error48) => {
-      reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error48)}`);
+      if (!stopped) reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error48)}`);
     });
   };
   return {
