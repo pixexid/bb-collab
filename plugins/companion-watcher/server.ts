@@ -11,6 +11,7 @@ type Finding = { condition: Condition; text: string; key: string };
 type StartableIssue = { number: number; title: string; labels: readonly string[] };
 type PullRequest = { number: number; state?: string; mergeStateStatus?: string; reviewDecision?: string; headCommitOid?: string; approvedCommitOids?: readonly string[]; checks?: readonly string[] };
 type Snapshot = { sentAt: number; fingerprint: string; turns: number; escalated?: boolean };
+const STARTUP_RETRY_ATTEMPTS = 3;
 
 export function isMergeReady(pr: PullRequest): boolean {
   return pr.state === "OPEN" && pr.mergeStateStatus === "CLEAN" && pr.reviewDecision === "APPROVED" && !!pr.headCommitOid && pr.approvedCommitOids?.includes(pr.headCommitOid) === true && !!pr.checks?.length && pr.checks.every((check) => check === "SUCCESS");
@@ -57,6 +58,29 @@ export function parsePullRequests(value: unknown, onInvalid: (error: unknown) =>
 export function shouldEscalate(prior: Snapshot | undefined, turnStartedAt: number | undefined, fingerprint: string): boolean {
   return !!prior && prior.fingerprint === fingerprint && !prior.escalated && turnStartedAt !== undefined && turnStartedAt > prior.sentAt;
 }
+export function reserveSnapshot(snapshots: Map<string, Snapshot>, key: string, next: Snapshot): { commit: () => void; rollback: () => void } {
+  const prior = snapshots.get(key);
+  let settled = false;
+  snapshots.set(key, next);
+  return {
+    commit: () => { settled = true; },
+    rollback: () => {
+      if (settled) return;
+      if (prior) snapshots.set(key, prior);
+      else snapshots.delete(key);
+      settled = true;
+    },
+  };
+}
+
+export async function retryStartup(reconcile: () => Promise<void>, attempts: number): Promise<unknown | undefined> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try { await reconcile(); return undefined; } catch (error) { lastError = error; }
+  }
+  return lastError;
+}
+
 export function dispatchPlan(findings: readonly Finding[], snapshots: ReadonlyMap<string, Snapshot>, projectId: string, now: number, turnStartedAt: number | undefined): { send: Finding[]; escalations: Finding[] } {
   const escalations = findings.filter((finding) => shouldEscalate(snapshots.get(`${projectId}:${finding.condition}`), turnStartedAt, finding.key));
   const escalationKeys = new Set(escalations.map((finding) => finding.condition));
@@ -103,14 +127,32 @@ function repoName(remote: string | null): string | null {
   const match = remote?.match(/github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?$/u);
   return match?.[1] ?? null;
 }
+export function parseStartableIssues(value: unknown, onInvalid: (error: unknown) => void = () => {}): StartableIssue[] {
+  if (!Array.isArray(value)) throw new Error("github-payload-invalid:startable-not-array");
+  return value.flatMap((item, index) => {
+    try {
+      if (!item || typeof item !== "object") throw new Error(`github-payload-invalid:startable-${index}-not-object`);
+      const issue = item as Record<string, unknown>;
+      for (const field of ["number", "title", "labels"]) if (!(field in issue)) throw missing(`startable-${index}-${field}`);
+      if (typeof issue.number !== "number" || typeof issue.title !== "string" || !Array.isArray(issue.labels)) throw new Error(`github-payload-invalid:startable-${index}-field-type`);
+      const labels = issue.labels.map((label, labelIndex) => {
+        if (!label || typeof label !== "object" || typeof (label as { name?: unknown }).name !== "string") throw new Error(`github-payload-invalid:startable-${index}-label-${labelIndex}`);
+        return (label as { name: string }).name;
+      });
+      return [{ number: issue.number, title: issue.title, labels }];
+    } catch (error) {
+      onInvalid(error);
+      return [];
+    }
+  });
+}
+
 async function github(repo: string, onInvalid: (error: unknown) => void): Promise<{ issues: StartableIssue[]; prs: PullRequest[] }> {
   const [issues, prs] = await Promise.all([
     json(["issue", "list", "--repo", repo, "--label", "queue:startable", "--state", "open", "--json", "number,title,labels", "--limit", "1000"]),
     json(["pr", "list", "--repo", repo, "--state", "open", "--json", "number,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup", "--limit", "1000"]),
   ]);
-  const startable = Array.isArray(issues) ? issues.flatMap((x) => typeof x === "object" && x && typeof (x as { number?: unknown }).number === "number" && typeof (x as { title?: unknown }).title === "string" && Array.isArray((x as { labels?: unknown }).labels) ? [{ number: (x as { number: number }).number, title: (x as { title: string }).title, labels: (x as { labels: Array<{ name?: unknown }> }).labels.flatMap((label) => typeof label?.name === "string" ? [label.name] : []) }] : []) : [];
-  const green = parsePullRequests(prs, onInvalid);
-  return { issues: startable, prs: green };
+  return { issues: parseStartableIssues(issues, onInvalid), prs: parsePullRequests(prs, onInvalid) };
 }
 
 export default function companionWatcher(bb: BbPluginApi) {
@@ -175,19 +217,25 @@ export default function companionWatcher(bb: BbPluginApi) {
       const now = Date.now();
       const { send, escalations } = dispatchPlan(findings, snapshots, target.project_id, now, turnStartedAt);
       if (!send.length && !escalations.length) return;
+      const reservations = new Map<string, ReturnType<typeof reserveSnapshot>>();
+      const reserve = (key: string, snapshot: Snapshot) => reservations.set(key, reserveSnapshot(snapshots, key, snapshot));
+      const commit = (keys: readonly string[]) => keys.forEach((key) => reservations.get(key)?.commit());
+      const rollback = () => reservations.forEach((reservation) => reservation.rollback());
       for (const finding of send) {
         const key = `${target.project_id}:${finding.condition}`;
         const prior = snapshots.get(key);
-        snapshots.set(key, { sentAt: now, fingerprint: finding.key, turns: (prior?.fingerprint === finding.key ? prior.turns : 0) + 1 });
+        reserve(key, { sentAt: now, fingerprint: finding.key, turns: (prior?.fingerprint === finding.key ? prior.turns : 0) + 1 });
       }
       if (send.length) {
         const message = send.map((f) => f.text).join("; ");
         try {
           await bb.sdk.threads.send({ threadId: thread.id, mode: "auto", input: [{ type: "text", text: `Companion watcher: ${message}.`, mentions: [] }] });
         } catch (error) {
+          rollback();
           bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("wake", error)}`);
           return;
         }
+        commit(send.map((finding) => `${target.project_id}:${finding.condition}`));
       }
       for (const finding of escalations) {
         const key = `${target.project_id}:${finding.condition}`;
@@ -197,10 +245,12 @@ export default function companionWatcher(bb: BbPluginApi) {
           bb.log.warn("companion-watcher coverage=blind event=thread.idle reason=director-unavailable");
           continue;
         }
+        reserve(key, { ...prior, escalated: true });
         try {
           await bb.sdk.threads.send({ threadId: director.thread_id, mode: "auto", input: [{ type: "text", text: `Companion watcher escalation: ${finding.text}; unchanged after a wake and full turn.`, mentions: [] }] });
-          snapshots.set(key, { ...prior, escalated: true });
+          commit([key]);
         } catch (error) {
+          rollback();
           bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("wake", error)}`);
           return;
         }
@@ -217,15 +267,14 @@ export default function companionWatcher(bb: BbPluginApi) {
   bb.events.on("thread.idle", ({ thread }) => handleIdle(thread, activeTurns.get(thread.id)));
   bb.background.service("startup-reconciliation", {
     start: async (signal) => {
-      try {
+      const startupError = await retryStartup(async () => {
         for (let offset = 0; ; offset += 1000) {
           const threads = await bb.sdk.threads.list({ archived: false, limit: 1000, offset });
           for (const thread of threads) if (thread.status === "idle") await handleIdle(thread);
           if (threads.length < 1000) break;
         }
-      } catch (error) {
-        bb.log.warn(`companion-watcher coverage=blind event=startup reason=${coverageReason("sdk", error)}`);
-      }
+      }, STARTUP_RETRY_ATTEMPTS);
+      if (startupError) bb.log.warn(`companion-watcher coverage=blind event=startup reason=${coverageReason("sdk", startupError)}`);
       await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
     },
   });

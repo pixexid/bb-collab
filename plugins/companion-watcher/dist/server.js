@@ -12,6 +12,7 @@ import { promisify } from "node:util";
 var exec = promisify(execFile);
 var BACKOFF_MS = 10 * 6e4;
 var ACTIVE = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
+var STARTUP_RETRY_ATTEMPTS = 3;
 function isMergeReady(pr) {
   return pr.state === "OPEN" && pr.mergeStateStatus === "CLEAN" && pr.reviewDecision === "APPROVED" && !!pr.headCommitOid && pr.approvedCommitOids?.includes(pr.headCommitOid) === true && !!pr.checks?.length && pr.checks.every((check) => check === "SUCCESS");
 }
@@ -55,6 +56,34 @@ function parsePullRequests(value, onInvalid = () => {
 }
 function shouldEscalate(prior, turnStartedAt, fingerprint) {
   return !!prior && prior.fingerprint === fingerprint && !prior.escalated && turnStartedAt !== void 0 && turnStartedAt > prior.sentAt;
+}
+function reserveSnapshot(snapshots, key, next) {
+  const prior = snapshots.get(key);
+  let settled = false;
+  snapshots.set(key, next);
+  return {
+    commit: () => {
+      settled = true;
+    },
+    rollback: () => {
+      if (settled) return;
+      if (prior) snapshots.set(key, prior);
+      else snapshots.delete(key);
+      settled = true;
+    }
+  };
+}
+async function retryStartup(reconcile, attempts) {
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      await reconcile();
+      return void 0;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  return lastError;
 }
 function dispatchPlan(findings, snapshots, projectId, now, turnStartedAt) {
   const escalations = findings.filter((finding) => shouldEscalate(snapshots.get(`${projectId}:${finding.condition}`), turnStartedAt, finding.key));
@@ -104,14 +133,32 @@ function repoName(remote) {
   const match = remote?.match(/github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?$/u);
   return match?.[1] ?? null;
 }
+function parseStartableIssues(value, onInvalid = () => {
+}) {
+  if (!Array.isArray(value)) throw new Error("github-payload-invalid:startable-not-array");
+  return value.flatMap((item, index) => {
+    try {
+      if (!item || typeof item !== "object") throw new Error(`github-payload-invalid:startable-${index}-not-object`);
+      const issue = item;
+      for (const field of ["number", "title", "labels"]) if (!(field in issue)) throw missing(`startable-${index}-${field}`);
+      if (typeof issue.number !== "number" || typeof issue.title !== "string" || !Array.isArray(issue.labels)) throw new Error(`github-payload-invalid:startable-${index}-field-type`);
+      const labels = issue.labels.map((label, labelIndex) => {
+        if (!label || typeof label !== "object" || typeof label.name !== "string") throw new Error(`github-payload-invalid:startable-${index}-label-${labelIndex}`);
+        return label.name;
+      });
+      return [{ number: issue.number, title: issue.title, labels }];
+    } catch (error) {
+      onInvalid(error);
+      return [];
+    }
+  });
+}
 async function github(repo, onInvalid) {
   const [issues, prs] = await Promise.all([
     json(["issue", "list", "--repo", repo, "--label", "queue:startable", "--state", "open", "--json", "number,title,labels", "--limit", "1000"]),
     json(["pr", "list", "--repo", repo, "--state", "open", "--json", "number,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup", "--limit", "1000"])
   ]);
-  const startable = Array.isArray(issues) ? issues.flatMap((x) => typeof x === "object" && x && typeof x.number === "number" && typeof x.title === "string" && Array.isArray(x.labels) ? [{ number: x.number, title: x.title, labels: x.labels.flatMap((label) => typeof label?.name === "string" ? [label.name] : []) }] : []) : [];
-  const green = parsePullRequests(prs, onInvalid);
-  return { issues: startable, prs: green };
+  return { issues: parseStartableIssues(issues, onInvalid), prs: parsePullRequests(prs, onInvalid) };
 }
 function companionWatcher(bb) {
   const snapshots = /* @__PURE__ */ new Map();
@@ -175,19 +222,25 @@ function companionWatcher(bb) {
       const now = Date.now();
       const { send, escalations } = dispatchPlan(findings, snapshots, target.project_id, now, turnStartedAt);
       if (!send.length && !escalations.length) return;
+      const reservations = /* @__PURE__ */ new Map();
+      const reserve = (key, snapshot) => reservations.set(key, reserveSnapshot(snapshots, key, snapshot));
+      const commit = (keys) => keys.forEach((key) => reservations.get(key)?.commit());
+      const rollback = () => reservations.forEach((reservation) => reservation.rollback());
       for (const finding of send) {
         const key = `${target.project_id}:${finding.condition}`;
         const prior = snapshots.get(key);
-        snapshots.set(key, { sentAt: now, fingerprint: finding.key, turns: (prior?.fingerprint === finding.key ? prior.turns : 0) + 1 });
+        reserve(key, { sentAt: now, fingerprint: finding.key, turns: (prior?.fingerprint === finding.key ? prior.turns : 0) + 1 });
       }
       if (send.length) {
         const message = send.map((f) => f.text).join("; ");
         try {
           await bb.sdk.threads.send({ threadId: thread.id, mode: "auto", input: [{ type: "text", text: `Companion watcher: ${message}.`, mentions: [] }] });
         } catch (error) {
+          rollback();
           bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("wake", error)}`);
           return;
         }
+        commit(send.map((finding) => `${target.project_id}:${finding.condition}`));
       }
       for (const finding of escalations) {
         const key = `${target.project_id}:${finding.condition}`;
@@ -197,10 +250,12 @@ function companionWatcher(bb) {
           bb.log.warn("companion-watcher coverage=blind event=thread.idle reason=director-unavailable");
           continue;
         }
+        reserve(key, { ...prior, escalated: true });
         try {
           await bb.sdk.threads.send({ threadId: director.thread_id, mode: "auto", input: [{ type: "text", text: `Companion watcher escalation: ${finding.text}; unchanged after a wake and full turn.`, mentions: [] }] });
-          snapshots.set(key, { ...prior, escalated: true });
+          commit([key]);
         } catch (error) {
+          rollback();
           bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("wake", error)}`);
           return;
         }
@@ -219,15 +274,14 @@ function companionWatcher(bb) {
   bb.events.on("thread.idle", ({ thread }) => handleIdle(thread, activeTurns.get(thread.id)));
   bb.background.service("startup-reconciliation", {
     start: async (signal) => {
-      try {
+      const startupError = await retryStartup(async () => {
         for (let offset = 0; ; offset += 1e3) {
           const threads = await bb.sdk.threads.list({ archived: false, limit: 1e3, offset });
           for (const thread of threads) if (thread.status === "idle") await handleIdle(thread);
           if (threads.length < 1e3) break;
         }
-      } catch (error) {
-        bb.log.warn(`companion-watcher coverage=blind event=startup reason=${coverageReason("sdk", error)}`);
-      }
+      }, STARTUP_RETRY_ATTEMPTS);
+      if (startupError) bb.log.warn(`companion-watcher coverage=blind event=startup reason=${coverageReason("sdk", startupError)}`);
       await new Promise((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
     }
   });
@@ -240,7 +294,10 @@ export {
   isMergeReady,
   openStore,
   parsePullRequests,
+  parseStartableIssues,
   readOrchestrator,
+  reserveSnapshot,
+  retryStartup,
   shouldEscalate
 };
 //# sourceMappingURL=server.js.map

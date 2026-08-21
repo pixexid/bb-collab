@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
-import { coverageReason, dispatchPlan, evaluate, isMergeReady, openStore, parsePullRequests, readOrchestrator, shouldEscalate } from "../server.js";
+import { coverageReason, dispatchPlan, evaluate, isMergeReady, openStore, parsePullRequests, parseStartableIssues, readOrchestrator, reserveSnapshot, retryStartup, shouldEscalate } from "../server.js";
 
 const dbs: Database.Database[] = [];
 function db(active = 0, ceiling = 3) {
@@ -61,6 +61,12 @@ describe("mechanical conditions", () => {
     expect(invalid).toHaveLength(1);
     expect(String(invalid[0])).toContain("missing-pr-1-mergeStateStatus");
   });
+  it("rejects malformed startable rows instead of treating them as clean silence", () => {
+    const invalid: unknown[] = [];
+    expect(parseStartableIssues([{ number: 1, labels: [{ name: "queue:startable" }] }, { number: 2, title: "ready", labels: [] }], (error) => invalid.push(error))).toEqual([{ number: 2, title: "ready", labels: [] }]);
+    expect(invalid).toHaveLength(1);
+    expect(String(invalid[0])).toContain("missing-startable-0-title");
+  });
   it("accepts CheckRun conclusions and StatusContext states without suppressing other PRs", () => {
     const invalid: unknown[] = [];
     const prs = parsePullRequests([
@@ -97,6 +103,22 @@ describe("mechanical conditions", () => {
     expect(shouldEscalate(prior, undefined, "same")).toBe(false);
     expect(shouldEscalate(prior, 100, "same")).toBe(false);
     expect(shouldEscalate(prior, 101, "same")).toBe(true);
+  });
+  it("rolls back an undelivered reservation but commits a delivered one", () => {
+    const snapshots = new Map([['p:queue', { sentAt: 100, fingerprint: "old", turns: 1 }]]);
+    const reservation = reserveSnapshot(snapshots, "p:queue", { sentAt: 200, fingerprint: "new", turns: 2 });
+    reservation.rollback();
+    expect(snapshots.get("p:queue")?.fingerprint).toBe("old");
+    const committed = reserveSnapshot(snapshots, "p:queue", { sentAt: 300, fingerprint: "new", turns: 2 });
+    committed.commit();
+    committed.rollback();
+    expect(snapshots.get("p:queue")?.fingerprint).toBe("new");
+  });
+  it("retries startup reconciliation and returns the final failure", async () => {
+    let calls = 0;
+    expect(await retryStartup(async () => { calls++; if (calls < 2) throw new Error("transient"); }, 3)).toBeUndefined();
+    expect(calls).toBe(2);
+    expect(String(await retryStartup(async () => { throw new Error("permanent"); }, 2))).toContain("permanent");
   });
   it("makes the backoff cap terminal instead of sending and escalating together", () => {
     const finding = { condition: "queue" as const, text: "owed", key: "same" };
