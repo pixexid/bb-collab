@@ -119,10 +119,6 @@ export function threadIdFromBranch(branch: string | null): string | null {
   return branch?.match(threadPattern)?.[0] ?? null;
 }
 
-export function cleanupCandidateThreadIds(decisions: readonly WorktreeDecision[]): ReadonlySet<string> {
-  return new Set(decisions.filter((decision) => decision.action === "remove").map((decision) => decision.threadId).filter((id): id is string => id !== null && id !== undefined));
-}
-
 export function withCleanupAttestationSubjects(attestation: CleanupAttestation, subjects: ReadonlyArray<{ path: string; threadId: string }>): CleanupAttestation {
   return attestation.coverage === "at-risk" ? { ...attestation, affected: subjects } : attestation;
 }

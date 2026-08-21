@@ -23133,7 +23133,7 @@ async function readCleanupAttestation(projectId, candidates) {
   }
   return atRisk?.coverage === "at-risk" ? withCleanupAttestationSubjects(atRisk, [...affected.values()]) : atRisk ?? { coverage: "known" };
 }
-async function reportProjectWorktreeCleanup(bb, projectId) {
+async function reportProjectWorktreeCleanup(bb, projectId, cleanup = cleanupGitWorktrees) {
   const project = await bb.sdk.projects.get({ projectId });
   const source = project.sources.find((item) => item.isDefault) ?? project.sources[0];
   if (!source) throw new Error("project has no source checkout");
@@ -23167,7 +23167,7 @@ async function reportProjectWorktreeCleanup(bb, projectId) {
   }
   const entries = listGitWorktrees(source.path);
   const cleanupArgs = [source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete, protectedEnvironmentPaths, pluginSourceResolved];
-  const preliminary = cleanupGitWorktrees(...cleanupArgs, { coverage: "known" }, entries);
+  const preliminary = cleanup(...cleanupArgs, { coverage: "known" }, entries);
   const attestation = await readCleanupAttestation(projectId, preliminary.wouldRemove);
   return { ...preliminary, attestation };
 }
@@ -25365,6 +25365,7 @@ export {
   foundationResultSchema,
   isLiveCachedConsumerRolloutArtifact,
   readLiveRoleFactReader,
+  reportProjectWorktreeCleanup,
   rpcContract
 };
 //# sourceMappingURL=server.js.map
