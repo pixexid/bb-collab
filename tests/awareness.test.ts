@@ -624,8 +624,12 @@ describe("lane awareness", () => {
     }
   });
 
-  it("flushes suppressed blind occurrences on disposal without double-reporting", async () => {
+  it("flushes close-triggered blind occurrences after in-flight reads settle", async () => {
     const onBlind = vi.fn();
+    const rejects = new Map<string, (error: Error) => void>();
+    const observe = vi.fn((projectId: string) => new Promise<void>((_, reject) => {
+      rejects.set(projectId, reject);
+    }));
     const detector = createIdleFleetDetector({
       read: async (): Promise<IdleFleetDecision> => ({ kind: "silent" }),
       readRearmProbes: async () => [],
@@ -633,15 +637,18 @@ describe("lane awareness", () => {
       onBlind,
       capacity: {
         readProjectIds: async () => [],
-        observe: vi.fn().mockRejectedValue(new Error("interval read failed")),
-        close: vi.fn(),
+        observe,
+        close: vi.fn(() => {
+          for (const reject of rejects.values()) reject(new Error("closed"));
+        }),
       },
     });
 
-    await detector.observeCapacity("project-1");
-    await detector.observeCapacity("project-1");
-    detector.stop();
-    detector.stop();
+    const reads = [detector.observeCapacity("project-1"), detector.observeCapacity("project-2")];
+    await Promise.resolve();
+    expect(observe).toHaveBeenCalledTimes(2);
+    await detector.stop();
+    await Promise.all(reads);
 
     expect(onBlind).toHaveBeenNthCalledWith(1, expect.stringContaining("occurrences=1"));
     expect(onBlind).toHaveBeenNthCalledWith(2, expect.stringContaining("occurrences=2"));
@@ -658,7 +665,7 @@ describe("lane awareness", () => {
       capacity: { readProjectIds: async () => [], observe: vi.fn(), close: vi.fn() },
     });
 
-    detector.stop();
+    await detector.stop();
 
     expect(onBlind).not.toHaveBeenCalled();
   });
@@ -681,9 +688,10 @@ describe("lane awareness", () => {
     const firstRead = detector.observeCapacity("project-1");
     await Promise.resolve();
     const secondRead = detector.observeCapacity("project-1");
-    detector.stop();
-    detector.stop();
+    const stopping = detector.stop();
     releaseFirst();
+    await stopping;
+    await detector.stop();
     await Promise.all([firstRead, secondRead]);
 
     expect(observe).toHaveBeenCalledExactlyOnceWith("project-1");

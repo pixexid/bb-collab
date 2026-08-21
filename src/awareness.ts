@@ -935,7 +935,7 @@ export function createIdleFleetDetector(options: {
   arm(probe: IdleFleetProbe): void;
   observeCapacity(projectId: string): Promise<void>;
   rearm(): Promise<void>;
-  stop(): void;
+  stop(): Promise<void>;
 } {
   const debounceMs = Number.isInteger(options.debounceMs) && (options.debounceMs ?? 0) >= 0
     ? options.debounceMs as number
@@ -945,6 +945,8 @@ export function createIdleFleetDetector(options: {
   let loaded = false;
   let stopped = false;
   const capacityQueues = new Map<string, Promise<void>>();
+  const inFlightCapacityReads = new Set<Promise<void>>();
+  let stopping: Promise<void> | undefined;
   const probeKey = (probe: IdleFleetProbe) => JSON.stringify([probe.projectId, probe.threadId]);
   const legacyProbeKey = (probe: IdleFleetProbe) => `${probe.projectId}:${probe.threadId}`;
 
@@ -1054,9 +1056,12 @@ export function createIdleFleetDetector(options: {
       return options.capacity!.observe(projectId);
     });
     capacityQueues.set(projectId, next.catch(() => undefined));
-    return next.catch((error) => {
+    const read = next.catch((error) => {
       reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:${String(error)}`);
     });
+    inFlightCapacityReads.add(read);
+    void read.then(() => inFlightCapacityReads.delete(read));
+    return read;
   };
 
   return {
@@ -1075,16 +1080,27 @@ export function createIdleFleetDetector(options: {
       }
     },
     stop() {
-      if (stopped) return;
+      if (stopping) return stopping;
       stopped = true;
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
-      flushBlind();
       try {
         options.capacity?.close();
       } catch (error) {
         reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-close-unreadable:${String(error)}`);
       }
+      stopping = (async () => {
+        const reads = [...inFlightCapacityReads];
+        if (reads.length > 0) await new Promise<void>((resolve) => {
+          const timeout = setTimeout(resolve, 1_000);
+          void Promise.allSettled(reads).then(() => {
+            clearTimeout(timeout);
+            resolve();
+          });
+        });
+        flushBlind();
+      })();
+      return stopping;
     },
   };
 }
