@@ -6066,7 +6066,9 @@ function applyWorkItemTransition(
     if (!machineWait || workAttempt !== undefined || unblock !== undefined || externalEvent !== undefined) {
       throw refusal("WORK_ITEM_STATE_INVALID", "entering blocked requires exactly one machine-evaluable blocker");
     }
-    if (existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
+    if (existingWait && !(existingWait.waker_kind === "seat" && workItem.lifecycle_state === "review_pending")) {
+      throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
+    }
     const blocker: WorkItemBlocker = machineWait.kind === "work_item_succeeded"
       ? { kind: machineWait.kind, workItemId: machineWait.workItemId }
       : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber };
@@ -6261,7 +6263,8 @@ function applyWorkItemTransition(
   if (workItem.lifecycle_state === "review_pending" && activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
     throw refusal("WORK_ITEM_STATE_INVALID", "review-pending cannot carry an active writing attempt");
   }
-  if (["succeeded", "failed", "cancelled"].includes(nextState) && existingWait && workItem.lifecycle_state !== "blocked") {
+  if (["succeeded", "failed", "cancelled"].includes(nextState) && existingWait && workItem.lifecycle_state !== "blocked"
+    && !(existingWait.waker_kind === "seat" && workItem.lifecycle_state === "review_pending" && nextState === "succeeded")) {
     throw refusal("WORK_ITEM_WAIT_OPEN", "resolve the work item wait before terminalizing it");
   }
   const nextRevision = workItem.resource_revision + 1;
@@ -6279,11 +6282,21 @@ function applyWorkItemTransition(
     const blocker: WorkItemBlocker = machineWait!.kind === "work_item_succeeded"
       ? { kind: machineWait!.kind, workItemId: machineWait!.workItemId }
       : { kind: machineWait!.kind, owner: machineWait!.owner, repo: machineWait!.repo, issueNumber: machineWait!.issueNumber };
+    if (existingWait) db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
     db.prepare(
       `INSERT INTO work_item_waits (project_id, work_item_id, waker, waker_kind, declared_at_ms, declared_by_seat, note)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).run(request.projectId, workItem.work_item_id, workItemBlockerWaker(blocker), blocker.kind, now(), machineWait!.declaredBySeat, machineWait!.note ?? null);
-  } else if (workItem.lifecycle_state === "blocked") {
+  } else if (nextState === "review_pending" && workAttempt?.reviewPrNumber !== undefined && !existingWait
+    && db.prepare("SELECT 1 FROM external_work_refs WHERE project_id = ? AND work_item_id = ? AND provider = 'github' AND issue_number IS NOT NULL").get(request.projectId, workItem.work_item_id)) {
+    // A linked review PR leaves the orchestrator owing the merge decision; carry
+    // that obligation through the existing watchdog owed-act ladder.
+    db.prepare(
+      `INSERT INTO work_item_waits (project_id, work_item_id, waker, waker_kind, declared_at_ms, declared_by_seat, note)
+       VALUES (?, ?, 'project-orchestrator', 'seat', ?, 'project-orchestrator', NULL)`,
+    ).run(request.projectId, workItem.work_item_id, now());
+  } else if (workItem.lifecycle_state === "blocked"
+    || (workItem.lifecycle_state === "review_pending" && nextState === "succeeded" && existingWait?.waker_kind === "seat")) {
     db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
   }
   let executionAttemptId: string | null = null;
