@@ -69,7 +69,7 @@ import {
   type SourceObservation,
 } from "./src/registered-waits.js";
 import { ARCHIVE_SWEEP_GUARD, createArchiveSweepRefusalCounter, runArchiveSweep, type ArchiveSweepRefusalAggregate } from "./src/archive-sweep.js";
-import { canonicalWorktreePath, cleanupAttestationFromProfile, cleanupGitWorktrees, listAllProjectThreads, listGitWorktrees, threadIdFromBranch } from "./src/worktree-cleanup.js";
+import { canonicalWorktreePath, cleanupGitWorktrees, listAllProjectThreads, listGitWorktrees, threadIdFromBranch } from "./src/worktree-cleanup.js";
 import { findCheckoutRoot, readCheckoutDivergence, type CheckoutDivergence } from "./src/checkout-divergence.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFile, spawnSync, type ExecFileException, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
@@ -1281,27 +1281,12 @@ async function replyToOperatorMessage(db: SqliteDatabase | null, bb: BbPluginApi
   return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0]!;
 }
 
-async function readCleanupAttestation(projectId: string, threadIds: ReadonlySet<string>) {
-  if (threadIds.size === 0) return { coverage: "known" as const, expiredThreadIds: new Set<string>() };
-  const root = findCheckoutRoot(dirname(fileURLToPath(import.meta.url)));
-  if (!root) return { coverage: "blind" as const, reason: "reader-unavailable:checkout-root-unresolved" };
-  const expiredThreadIds = new Set<string>();
-  for (const threadId of threadIds) {
-    const result = await new Promise<{ output: string; error: Error | null }>((resolve) => {
-      execFile(process.execPath, [join(root, "scripts", "read-executed-profile.mjs"), "--project", projectId, "--thread", threadId], {
-        cwd: root, encoding: "utf8", timeout: 30_000, maxBuffer: 64 * 1024 * 1024,
-      }, (error, stdout) => resolve({ output: stdout, error: error ?? null }));
-    });
-    try {
-      const profile = JSON.parse(result.output) as { outcome?: string; reason?: string; turns?: ReadonlyArray<{ reason?: string }> };
-      const attestation = cleanupAttestationFromProfile(threadId, profile);
-      if (attestation.coverage === "blind") return attestation;
-      for (const expiredThreadId of attestation.expiredThreadIds) expiredThreadIds.add(expiredThreadId);
-    } catch {
-      return { coverage: "blind" as const, reason: `reader-unreadable:${threadId}` };
-    }
-  }
-  return { coverage: "known" as const, expiredThreadIds };
+async function readCleanupAttestation(_projectId: string, threadIds: ReadonlySet<string>) {
+  if (threadIds.size === 0) return { coverage: "known" as const };
+  return {
+    coverage: "blind" as const,
+    reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134",
+  };
 }
 
 async function reportProjectWorktreeCleanup(bb: BbPluginApi, projectId: string) {
@@ -1508,7 +1493,7 @@ async function runCli(
       const result = await reportProjectWorktreeCleanup(bb, projectId);
       return { exitCode: result.refused.length === 0 ? 0 : 2, stdout: JSON.stringify(result) };
     } catch (error) {
-      return { exitCode: 2, stdout: JSON.stringify({ outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error instanceof Error ? error.message : String(error) }], environmentRecordsReleased: false, attestation: { coverage: "blind", reason: "cleanup-inventory-unreadable" } }) };
+      return { exitCode: 2, stdout: JSON.stringify({ outcome: "refused", wouldRemove: [], removableCandidateCount: 0, refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error instanceof Error ? error.message : String(error) }], environmentRecordsReleased: false, attestation: { coverage: "blind", reason: "cleanup-inventory-unreadable" } }) };
     }
   }
   if (command === "role-list") {
@@ -3216,10 +3201,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         const report = await reportProjectWorktreeCleanup(bb, project.id);
         if (report.wouldRemove.length > 0) bb.log.warn(`worktree-cleanup report: project=${project.id} ${JSON.stringify(report)}`);
         else if (report.attestation.coverage === "blind") bb.log.warn(`worktree-cleanup coverage=blind project=${project.id} reason=${report.attestation.reason}`);
-        else bb.log.info(`worktree-cleanup healthy cycle: project=${project.id} refused=${report.refused.length} attestationExpired=${report.attestation.expiredExecutedProfileCount}`);
+        else bb.log.info(`worktree-cleanup healthy cycle: project=${project.id} candidates=${report.removableCandidateCount} refused=${report.refused.length}`);
         bb.realtime.publish("worktree-cleanup", { projectId: project.id, ...report });
       } catch (error) {
-        const report = { projectId: project.id, outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error instanceof Error ? error.message : String(error) }], environmentRecordsReleased: false, attestation: { coverage: "blind" as const, reason: "cleanup-inventory-unreadable" } };
+        const report = { projectId: project.id, outcome: "refused", wouldRemove: [], removableCandidateCount: 0, refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error instanceof Error ? error.message : String(error) }], environmentRecordsReleased: false, attestation: { coverage: "blind" as const, reason: "cleanup-inventory-unreadable" } };
         bb.log.warn(`worktree-cleanup report: project=${project.id} ${JSON.stringify(report)}`);
         bb.realtime.publish("worktree-cleanup", report);
       }

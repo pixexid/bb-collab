@@ -2,12 +2,9 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-// @ts-expect-error JavaScript reader has no declaration file; this test intentionally exercises its real result.
-import { readExecutedProfiles } from "../scripts/read-executed-profile.mjs";
 import type { WorktreeCleanupOptions } from "../src/worktree-cleanup.js";
 import {
   canonicalWorktreePath,
-  cleanupAttestationFromProfile,
   classifyWorktree,
   cleanupGitWorktrees,
   defaultQuietFloorMs,
@@ -124,68 +121,21 @@ describe("worktree cleanup", () => {
     expect(result.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(paths[1]), reason: "plugin source environment is protected" }));
   });
 
-  it("counts expired executed-profile correlation on removable threaded worktrees", () => {
-    const { root } = fixture();
-    const threaded = listGitWorktrees(root).map((entry, index) => index === 1 ? { ...entry, branch: "lane/thr_expired" } : entry);
-    const counted = runWorktreeCleanup(threaded, {
-      liveThreadIds: new Set(),
-      attestation: { coverage: "known", expiredThreadIds: new Set(["thr_expired"]) },
-      status: () => "",
-      originMain: git(root, "rev-parse", "refs/remotes/origin/main"),
-      reachable: () => true,
-      environmentInventoryComplete: true,
-      now: Date.now() + defaultQuietFloorMs,
-      createdAt: worktreeCreatedAt,
+  it("reports removable candidates with blind expiry attestation", () => {
+    const { root, paths } = fixture();
+    const result = report(root, new Set(["thr_live"]), new Map([[canonicalWorktreePath(paths[0]), new Set(["thr_live"])] ]), {
+      attestation: { coverage: "blind", reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134" },
     });
-    expect(counted.attestation).toEqual({ coverage: "known", expiredExecutedProfileCount: 1 });
-    expect(runWorktreeCleanup(threaded, { liveThreadIds: new Set(), attestation: { coverage: "blind", reason: "reader-unreadable" } }).attestation).toEqual({ coverage: "blind", reason: "reader-unreadable" });
-  });
-
-  it("counts provider path mismatches but keeps generic absence blind", () => {
-    for (const reason of [
-      "Codex session_meta does not match the BB session and exact environment path",
-      "active BB turn: Codex session_meta does not match the BB session and exact environment path",
-      "Pi session header does not match the exact BB environment path",
-      "active Pi session header does not match the exact BB environment path",
-    ]) {
-      expect(cleanupAttestationFromProfile("thr_expired", { outcome: "unknown", reason })).toEqual({
-        coverage: "known",
-        expiredThreadIds: new Set(["thr_expired"]),
-      });
-    }
-    expect(cleanupAttestationFromProfile("thr_healthy", { outcome: "unknown", reason: "provider-native turn profile is absent" })).toEqual({
-      coverage: "blind",
-      reason: "executed-profile thread=\"thr_healthy\" reason=\"provider-native turn profile is absent\"",
-    });
-    expect(cleanupAttestationFromProfile("thr_healthy", { outcome: "unknown", reason: "expected one Claude session log, found 0" })).toEqual({
-      coverage: "blind",
-      reason: "executed-profile thread=\"thr_healthy\" reason=\"expected one Claude session log, found 0\"",
-    });
-  });
-
-  it("classifies a real reader refusal as blind instead of expired", async () => {
-    const profile = await readExecutedProfiles({
-      thread: { providerId: "unsupported-provider", status: "idle" },
-      environment: { path: "/test/project" },
-      events: [{
-        id: "event-completed",
-        seq: 1,
-        type: "turn/completed",
-        data: { status: "completed", providerThreadId: "provider-session", providerCheckpointId: "checkpoint" },
-      }],
-    });
-    expect(profile.outcome).toBe("unknown");
-    expect(cleanupAttestationFromProfile("thr_unreadable", profile)).toEqual({
-      coverage: "blind",
-      reason: "executed-profile thread=\"thr_unreadable\" reason=\"provider unsupported-provider has no measured native read-back\"",
-    });
+    expect(result.removableCandidateCount).toBe(1);
+    expect(result.attestation).toEqual({ coverage: "blind", reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134" });
+    expect(result.environmentRecordsReleased).toBe(false);
+    expect(result.wouldRemove.map(({ path }) => path)).toEqual([canonicalWorktreePath(paths[1])]);
   });
 
   it("uses the measured worktree snapshot for cleanup decisions", () => {
     const { root, paths } = fixture();
     const result = cleanupGitWorktrees(root, new Set(), new Map(), true, new Set(), true, {
       coverage: "known",
-      expiredThreadIds: new Set(),
     }, []);
     expect(result.wouldRemove).toEqual([]);
     expect(result.refused).toEqual([]);

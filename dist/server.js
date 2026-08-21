@@ -21309,20 +21309,6 @@ function livenessDecision(state, alerted) {
 import { execFileSync } from "node:child_process";
 import { readFileSync as readFileSync2, realpathSync as realpathSync2, statSync } from "node:fs";
 import { resolve } from "node:path";
-var expiredCorrelationReasons = /* @__PURE__ */ new Set([
-  "Codex session_meta does not match the BB session and exact environment path",
-  "active BB turn: Codex session_meta does not match the BB session and exact environment path",
-  "Pi session header does not match the exact BB environment path",
-  "active Pi session header does not match the exact BB environment path"
-]);
-function cleanupAttestationFromProfile(threadId, profile) {
-  const reason = profile.reason ?? profile.turns?.find((turn) => turn.reason)?.reason;
-  if (profile.outcome === "unknown" && reason && expiredCorrelationReasons.has(reason)) {
-    return { coverage: "known", expiredThreadIds: /* @__PURE__ */ new Set([threadId]) };
-  }
-  if (profile.outcome === "unknown") return { coverage: "blind", reason: `executed-profile thread=${JSON.stringify(threadId)} reason=${JSON.stringify(reason ?? "unknown-cause")}` };
-  return { coverage: "known", expiredThreadIds: /* @__PURE__ */ new Set() };
-}
 var threadPattern = /thr_[a-z0-9]+/u;
 var defaultQuietFloorMs = 24 * 60 * 60 * 1e3;
 var reflogCreation = /^\S+ \S+ .* (\d+) [-+]\d{4}(?:\t|$)/u;
@@ -21453,8 +21439,8 @@ function runWorktreeCleanup(entries, options) {
   const decisions = planWorktreeCleanup(entries, options);
   const wouldRemove = decisions.filter((decision) => decision.action === "remove");
   const refused = decisions.filter((decision) => decision.action === "refuse");
-  const attestation = options.attestation?.coverage === "blind" ? options.attestation : { coverage: "known", expiredExecutedProfileCount: wouldRemove.filter((decision) => decision.threadId && options.attestation?.coverage === "known" && options.attestation.expiredThreadIds.has(decision.threadId)).length };
-  return { outcome: refused.length > 0 ? "refused" : "reported", wouldRemove, refused, environmentRecordsReleased: false, attestation };
+  const attestation = options.attestation ?? { coverage: "known" };
+  return { outcome: refused.length > 0 ? "refused" : "reported", wouldRemove, removableCandidateCount: wouldRemove.length, refused, environmentRecordsReleased: false, attestation };
 }
 function git(args, cwd) {
   return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } }).trim();
@@ -22774,30 +22760,12 @@ async function replyToOperatorMessage(db, bb, projectId, messageId, replyText) {
   }
   return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0];
 }
-async function readCleanupAttestation(projectId, threadIds) {
-  if (threadIds.size === 0) return { coverage: "known", expiredThreadIds: /* @__PURE__ */ new Set() };
-  const root = findCheckoutRoot(dirname3(fileURLToPath(import.meta.url)));
-  if (!root) return { coverage: "blind", reason: "reader-unavailable:checkout-root-unresolved" };
-  const expiredThreadIds = /* @__PURE__ */ new Set();
-  for (const threadId of threadIds) {
-    const result2 = await new Promise((resolve3) => {
-      execFile(process.execPath, [join5(root, "scripts", "read-executed-profile.mjs"), "--project", projectId, "--thread", threadId], {
-        cwd: root,
-        encoding: "utf8",
-        timeout: 3e4,
-        maxBuffer: 64 * 1024 * 1024
-      }, (error48, stdout) => resolve3({ output: stdout, error: error48 ?? null }));
-    });
-    try {
-      const profile = JSON.parse(result2.output);
-      const attestation = cleanupAttestationFromProfile(threadId, profile);
-      if (attestation.coverage === "blind") return attestation;
-      for (const expiredThreadId of attestation.expiredThreadIds) expiredThreadIds.add(expiredThreadId);
-    } catch {
-      return { coverage: "blind", reason: `reader-unreadable:${threadId}` };
-    }
-  }
-  return { coverage: "known", expiredThreadIds };
+async function readCleanupAttestation(_projectId, threadIds) {
+  if (threadIds.size === 0) return { coverage: "known" };
+  return {
+    coverage: "blind",
+    reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134"
+  };
 }
 async function reportProjectWorktreeCleanup(bb, projectId) {
   const project = await bb.sdk.projects.get({ projectId });
@@ -22986,7 +22954,7 @@ async function runCli(db, bb, argv, ctx, deps) {
       const result2 = await reportProjectWorktreeCleanup(bb, projectId);
       return { exitCode: result2.refused.length === 0 ? 0 : 2, stdout: JSON.stringify(result2) };
     } catch (error48) {
-      return { exitCode: 2, stdout: JSON.stringify({ outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error48 instanceof Error ? error48.message : String(error48) }], environmentRecordsReleased: false, attestation: { coverage: "blind", reason: "cleanup-inventory-unreadable" } }) };
+      return { exitCode: 2, stdout: JSON.stringify({ outcome: "refused", wouldRemove: [], removableCandidateCount: 0, refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error48 instanceof Error ? error48.message : String(error48) }], environmentRecordsReleased: false, attestation: { coverage: "blind", reason: "cleanup-inventory-unreadable" } }) };
     }
   }
   if (command === "role-list") {
@@ -24566,10 +24534,10 @@ ${thread.titleFallback ?? ""}`);
         const report = await reportProjectWorktreeCleanup(bb, project.id);
         if (report.wouldRemove.length > 0) bb.log.warn(`worktree-cleanup report: project=${project.id} ${JSON.stringify(report)}`);
         else if (report.attestation.coverage === "blind") bb.log.warn(`worktree-cleanup coverage=blind project=${project.id} reason=${report.attestation.reason}`);
-        else bb.log.info(`worktree-cleanup healthy cycle: project=${project.id} refused=${report.refused.length} attestationExpired=${report.attestation.expiredExecutedProfileCount}`);
+        else bb.log.info(`worktree-cleanup healthy cycle: project=${project.id} candidates=${report.removableCandidateCount} refused=${report.refused.length}`);
         bb.realtime.publish("worktree-cleanup", { projectId: project.id, ...report });
       } catch (error48) {
-        const report = { projectId: project.id, outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error48 instanceof Error ? error48.message : String(error48) }], environmentRecordsReleased: false, attestation: { coverage: "blind", reason: "cleanup-inventory-unreadable" } };
+        const report = { projectId: project.id, outcome: "refused", wouldRemove: [], removableCandidateCount: 0, refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error48 instanceof Error ? error48.message : String(error48) }], environmentRecordsReleased: false, attestation: { coverage: "blind", reason: "cleanup-inventory-unreadable" } };
         bb.log.warn(`worktree-cleanup report: project=${project.id} ${JSON.stringify(report)}`);
         bb.realtime.publish("worktree-cleanup", report);
       }

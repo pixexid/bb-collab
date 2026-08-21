@@ -23,29 +23,12 @@ export type WorktreeDecision = {
 export type WorktreeCleanupReport = {
   outcome: "reported" | "refused";
   wouldRemove: WorktreeDecision[];
+  removableCandidateCount: number;
   refused: WorktreeDecision[];
   environmentRecordsReleased: false;
-  attestation: { coverage: "known"; expiredExecutedProfileCount: number } | { coverage: "blind"; reason: string };
+  attestation: { coverage: "known" } | { coverage: "blind"; reason: string };
 };
 
-export type ExecutedProfileRead = { outcome?: string; reason?: string; turns?: ReadonlyArray<{ reason?: string }> };
-
-const expiredCorrelationReasons = new Set([
-  "Codex session_meta does not match the BB session and exact environment path",
-  "active BB turn: Codex session_meta does not match the BB session and exact environment path",
-  "Pi session header does not match the exact BB environment path",
-  "active Pi session header does not match the exact BB environment path",
-]);
-
-export function cleanupAttestationFromProfile(threadId: string, profile: ExecutedProfileRead):
-  { coverage: "known"; expiredThreadIds: ReadonlySet<string> } | { coverage: "blind"; reason: string } {
-  const reason = profile.reason ?? profile.turns?.find((turn) => turn.reason)?.reason;
-  if (profile.outcome === "unknown" && reason && expiredCorrelationReasons.has(reason)) {
-    return { coverage: "known", expiredThreadIds: new Set([threadId]) };
-  }
-  if (profile.outcome === "unknown") return { coverage: "blind", reason: `executed-profile thread=${JSON.stringify(threadId)} reason=${JSON.stringify(reason ?? "unknown-cause")}` };
-  return { coverage: "known", expiredThreadIds: new Set() };
-}
 
 export type WorktreeCleanupOptions = {
   liveThreadIds: ReadonlySet<string>;
@@ -62,7 +45,7 @@ export type WorktreeCleanupOptions = {
   createdAt?: (path: string) => number | null;
   now?: number;
   quietFloorMs?: number;
-  attestation?: { coverage: "known"; expiredThreadIds: ReadonlySet<string> } | { coverage: "blind"; reason: string };
+  attestation?: { coverage: "known" } | { coverage: "blind"; reason: string };
 };
 
 const threadPattern = /thr_[a-z0-9]+/u;
@@ -220,10 +203,8 @@ export function runWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeCl
   const decisions = planWorktreeCleanup(entries, options);
   const wouldRemove = decisions.filter((decision) => decision.action === "remove");
   const refused = decisions.filter((decision) => decision.action === "refuse");
-  const attestation = options.attestation?.coverage === "blind"
-    ? options.attestation
-    : { coverage: "known" as const, expiredExecutedProfileCount: wouldRemove.filter((decision) => decision.threadId && options.attestation?.coverage === "known" && options.attestation.expiredThreadIds.has(decision.threadId)).length };
-  return { outcome: refused.length > 0 ? "refused" : "reported", wouldRemove, refused, environmentRecordsReleased: false, attestation };
+  const attestation = options.attestation ?? { coverage: "known" as const };
+  return { outcome: refused.length > 0 ? "refused" : "reported", wouldRemove, removableCandidateCount: wouldRemove.length, refused, environmentRecordsReleased: false, attestation };
 }
 
 function git(args: string[], cwd: string): string {
