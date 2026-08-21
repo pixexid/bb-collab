@@ -2,9 +2,11 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { reportProjectWorktreeCleanup } from "../server.js";
 import type { WorktreeCleanupOptions } from "../src/worktree-cleanup.js";
 import {
   canonicalWorktreePath,
+  cleanupAttestationFromProfile,
   classifyWorktree,
   cleanupGitWorktrees,
   defaultQuietFloorMs,
@@ -13,6 +15,7 @@ import {
   planWorktreeCleanup,
   runWorktreeCleanup,
   worktreeCreatedAt,
+  withCleanupAttestationSubjects,
 } from "../src/worktree-cleanup.js";
 
 const roots: string[] = [];
@@ -119,6 +122,74 @@ describe("worktree cleanup", () => {
     const result = report(root, new Set(), new Map(), { protectedEnvironmentPaths: new Set([canonicalWorktreePath(paths[1])]) });
     expect(result.wouldRemove.map(({ path }) => path)).not.toContain(canonicalWorktreePath(paths[1]));
     expect(result.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(paths[1]), reason: "plugin source environment is protected" }));
+  });
+
+  it("distinguishes safe, at-risk, and unreadable attestation evidence", () => {
+    expect(cleanupAttestationFromProfile({ outcome: "unknown", environmentDependent: false })).toEqual({ coverage: "known" });
+    expect(cleanupAttestationFromProfile({ outcome: "known", environmentDependent: true })).toEqual({
+      coverage: "at-risk",
+      reason: "environment reaping removes the path needed to correlate this attestation; preserve correlation or retain the environment",
+    });
+    expect(cleanupAttestationFromProfile({ outcome: "unknown", environmentDependent: true })).toEqual({
+      coverage: "blind",
+      reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134",
+    });
+    expect(cleanupAttestationFromProfile({ outcome: "unknown", turns: [{ phase: "active", environmentDependent: true }] })).toMatchObject({ coverage: "blind" });
+  });
+
+  it("names the environment and thread in at-risk attestation", () => {
+    expect(withCleanupAttestationSubjects({ coverage: "at-risk", reason: "retain it" }, [{ path: "/tmp/env", threadId: "thr_dependent" }])).toEqual({
+      coverage: "at-risk",
+      reason: "retain it",
+      affected: [{ path: "/tmp/env", threadId: "thr_dependent" }],
+    });
+  });
+
+  it("reports removable candidates with at-risk expiry attestation", () => {
+    const { root, paths } = fixture();
+    const result = report(root, new Set(["thr_live"]), new Map([[canonicalWorktreePath(paths[0]), new Set(["thr_live"])] ]), {
+      attestation: {
+        coverage: "at-risk",
+        reason: "environment reaping removes the path needed to correlate this attestation; preserve correlation or retain the environment",
+        affected: [{ path: canonicalWorktreePath(paths[1]), threadId: "thr_old" }],
+      },
+    });
+    expect(result.removableCandidateCount).toBe(1);
+    expect(result.attestation).toEqual({
+      coverage: "at-risk",
+      reason: "environment reaping removes the path needed to correlate this attestation; preserve correlation or retain the environment",
+      affected: [{ path: canonicalWorktreePath(paths[1]), threadId: "thr_old" }],
+    });
+    expect(result.environmentRecordsReleased).toBe(false);
+    expect(result.wouldRemove.map(({ path }) => path)).toEqual([canonicalWorktreePath(paths[1])]);
+  });
+
+  it("uses the measured worktree snapshot for cleanup decisions", () => {
+    const { root, paths } = fixture();
+    const result = cleanupGitWorktrees(root, new Set(), new Map(), true, new Set(), true, {
+      coverage: "known",
+    }, []);
+    expect(result.wouldRemove).toEqual([]);
+    expect(result.refused).toEqual([]);
+  });
+
+  it("does not expand an attested report when cleanup predicates change", async () => {
+    const { root } = fixture();
+    const preliminary = { outcome: "reported" as const, wouldRemove: [], removableCandidateCount: 0, refused: [], environmentRecordsReleased: false as const, attestation: { coverage: "known" as const } };
+    const secondPass = { ...preliminary, wouldRemove: [{ path: join(root, "orphan"), population: "scratch" as const, action: "remove" as const, reason: "clean" }], removableCandidateCount: 1 };
+    let calls = 0;
+    const bb = {
+      pluginId: "test-plugin",
+      sdk: {
+        projects: { get: async () => ({ sources: [{ isDefault: true, path: root }] }) },
+        threads: { list: async () => [] },
+        plugins: { getSource: async () => ({ resolved: "path:/nowhere" }) },
+      },
+    };
+    const result = await reportProjectWorktreeCleanup(bb as never, "proj_test", (() => calls++ === 0 ? preliminary : secondPass) as never);
+    expect(calls).toBe(1);
+    expect(result.wouldRemove).toEqual([]);
+    expect(result.removableCandidateCount).toBe(0);
   });
 
   it("reports exactly the clean detached orphan and refuses live and dirty entries", () => {

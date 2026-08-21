@@ -21541,6 +21541,14 @@ function livenessDecision(state, alerted) {
 import { execFileSync } from "node:child_process";
 import { readFileSync as readFileSync2, realpathSync as realpathSync2, statSync } from "node:fs";
 import { resolve } from "node:path";
+function cleanupAttestationFromProfile(profile) {
+  const environmentDependent = profile.environmentDependent ?? profile.turns?.some((turn) => turn.environmentDependent) ?? false;
+  if (environmentDependent) {
+    if (profile.outcome === "unknown") return { coverage: "blind", reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134" };
+    return { coverage: "at-risk", reason: "environment reaping removes the path needed to correlate this attestation; preserve correlation or retain the environment" };
+  }
+  return { coverage: "known" };
+}
 var threadPattern = /thr_[a-z0-9]+/u;
 var defaultQuietFloorMs = 24 * 60 * 60 * 1e3;
 var reflogCreation = /^\S+ \S+ .* (\d+) [-+]\d{4}(?:\t|$)/u;
@@ -21573,6 +21581,9 @@ function classifyWorktree(path, home = process.env.HOME ?? "") {
 }
 function threadIdFromBranch(branch) {
   return branch?.match(threadPattern)?.[0] ?? null;
+}
+function withCleanupAttestationSubjects(attestation, subjects) {
+  return attestation.coverage === "at-risk" ? { ...attestation, affected: subjects } : attestation;
 }
 function planWorktreeCleanup(entries, options) {
   const decisions = [];
@@ -21663,7 +21674,7 @@ function planWorktreeCleanup(entries, options) {
       continue;
     }
     const unclaimed = unclaimedAgeMs === null ? "" : `, unclaimed by any live bb environment and created ${(unclaimedAgeMs / 36e5).toFixed(1)}h ago`;
-    decisions.push({ path: entry.path, population, action: "remove", reason: `clean and fully reachable from origin/main${unclaimed}` });
+    decisions.push({ path: entry.path, population, action: "remove", reason: `clean and fully reachable from origin/main${unclaimed}`, ...threadId ? { threadId } : {} });
   }
   return decisions;
 }
@@ -21671,7 +21682,8 @@ function runWorktreeCleanup(entries, options) {
   const decisions = planWorktreeCleanup(entries, options);
   const wouldRemove = decisions.filter((decision) => decision.action === "remove");
   const refused = decisions.filter((decision) => decision.action === "refuse");
-  return { outcome: refused.length > 0 ? "refused" : "reported", wouldRemove, refused, environmentRecordsReleased: false };
+  const attestation = options.attestation ?? { coverage: "known" };
+  return { outcome: refused.length > 0 ? "refused" : "reported", wouldRemove, removableCandidateCount: wouldRemove.length, refused, environmentRecordsReleased: false, attestation };
 }
 function git(args, cwd) {
   return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } }).trim();
@@ -21690,15 +21702,16 @@ function listGitWorktrees(repoRoot) {
   if (current) entries.push(current);
   return entries;
 }
-function cleanupGitWorktrees(repoRoot, liveThreadIds, liveWorktreeThreadIds = /* @__PURE__ */ new Map(), environmentInventoryComplete = false, protectedEnvironmentPaths = /* @__PURE__ */ new Set(), pluginSourceResolved = true) {
+function cleanupGitWorktrees(repoRoot, liveThreadIds, liveWorktreeThreadIds = /* @__PURE__ */ new Map(), environmentInventoryComplete = false, protectedEnvironmentPaths = /* @__PURE__ */ new Set(), pluginSourceResolved = true, attestation, entries) {
   const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
   const status = (path) => git(["status", "--porcelain", "--untracked-files=all"], path);
-  return runWorktreeCleanup(listGitWorktrees(repoRoot), {
+  return runWorktreeCleanup(entries ?? listGitWorktrees(repoRoot), {
     liveThreadIds,
     liveWorktreeThreadIds,
     environmentInventoryComplete,
     protectedEnvironmentPaths,
     pluginSourceResolved,
+    attestation,
     createdAt: worktreeCreatedAt,
     originMain,
     status,
@@ -23089,7 +23102,38 @@ async function replyToOperatorMessage(db, bb, projectId, messageId, replyText) {
   }
   return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0];
 }
-async function reportProjectWorktreeCleanup(bb, projectId) {
+async function readCleanupAttestation(projectId, candidates) {
+  const subjects = candidates.filter((candidate) => typeof candidate.threadId === "string");
+  const threadIds = new Set(subjects.map((candidate) => candidate.threadId));
+  if (threadIds.size === 0) return { coverage: "known" };
+  const root = findCheckoutRoot(dirname3(fileURLToPath(import.meta.url)));
+  if (!root) return { coverage: "blind", reason: "reader-unavailable:checkout-root-unresolved" };
+  let atRisk = null;
+  const affected = /* @__PURE__ */ new Map();
+  for (const threadId of threadIds) {
+    const result2 = await new Promise((resolve3) => {
+      execFile(process.execPath, [join5(root, "scripts", "read-executed-profile.mjs"), "--project", projectId, "--thread", threadId], {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 3e4,
+        maxBuffer: 64 * 1024 * 1024
+      }, (_error, stdout) => resolve3({ output: stdout }));
+    });
+    try {
+      const profile = JSON.parse(result2.output);
+      const attestation = cleanupAttestationFromProfile(profile);
+      if (attestation.coverage === "blind") return attestation;
+      if (attestation.coverage === "at-risk") {
+        atRisk = attestation;
+        for (const subject of subjects.filter((candidate) => candidate.threadId === threadId)) affected.set(`${subject.path}\0${threadId}`, subject);
+      }
+    } catch {
+      return { coverage: "blind", reason: `reader-unreadable:${threadId}` };
+    }
+  }
+  return atRisk?.coverage === "at-risk" ? withCleanupAttestationSubjects(atRisk, [...affected.values()]) : atRisk ?? { coverage: "known" };
+}
+async function reportProjectWorktreeCleanup(bb, projectId, cleanup = cleanupGitWorktrees) {
   const project = await bb.sdk.projects.get({ projectId });
   const source = project.sources.find((item) => item.isDefault) ?? project.sources[0];
   if (!source) throw new Error("project has no source checkout");
@@ -23121,7 +23165,11 @@ async function reportProjectWorktreeCleanup(bb, projectId) {
       environmentInventoryComplete = false;
     }
   }
-  return cleanupGitWorktrees(source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete, protectedEnvironmentPaths, pluginSourceResolved);
+  const entries = listGitWorktrees(source.path);
+  const cleanupArgs = [source.path, new Set(threads.map((thread) => thread.id)), liveWorktreeThreadIds, environmentInventoryComplete, protectedEnvironmentPaths, pluginSourceResolved];
+  const preliminary = cleanup(...cleanupArgs, { coverage: "known" }, entries);
+  const attestation = await readCleanupAttestation(projectId, preliminary.wouldRemove);
+  return { ...preliminary, attestation };
 }
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];
@@ -23290,7 +23338,7 @@ async function runCli(db, bb, argv, ctx, deps) {
       const result2 = await reportProjectWorktreeCleanup(bb, projectId);
       return { exitCode: result2.refused.length === 0 ? 0 : 2, stdout: JSON.stringify(result2) };
     } catch (error48) {
-      return { exitCode: 2, stdout: JSON.stringify({ outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error48 instanceof Error ? error48.message : String(error48) }], environmentRecordsReleased: false }) };
+      return { exitCode: 2, stdout: JSON.stringify({ outcome: "refused", wouldRemove: [], removableCandidateCount: 0, refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error48 instanceof Error ? error48.message : String(error48) }], environmentRecordsReleased: false, attestation: { coverage: "blind", reason: "cleanup-inventory-unreadable" } }) };
     }
   }
   if (command === "role-list") {
@@ -25060,7 +25108,7 @@ ${thread.titleFallback ?? ""}`);
     try {
       projects = await bb.sdk.projects.list({ includePersonal: true });
     } catch (error48) {
-      const report = { outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: `project inventory unavailable: ${String(error48)}` }], environmentRecordsReleased: false };
+      const report = { outcome: "refused", wouldRemove: [], removableCandidateCount: 0, refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: `project inventory unavailable: ${String(error48)}` }], environmentRecordsReleased: false, attestation: { coverage: "blind", reason: "cleanup-inventory-unreadable" } };
       bb.log.warn(`worktree-cleanup report: ${JSON.stringify(report)}`);
       bb.realtime.publish("worktree-cleanup", report);
       return;
@@ -25069,10 +25117,11 @@ ${thread.titleFallback ?? ""}`);
       try {
         const report = await reportProjectWorktreeCleanup(bb, project.id);
         if (report.wouldRemove.length > 0) bb.log.warn(`worktree-cleanup report: project=${project.id} ${JSON.stringify(report)}`);
-        else bb.log.info(`worktree-cleanup healthy cycle: project=${project.id} refused=${report.refused.length}`);
+        else if (report.attestation.coverage === "blind") bb.log.warn(`worktree-cleanup coverage=blind project=${project.id} reason=${report.attestation.reason}`);
+        else bb.log.info(`worktree-cleanup healthy cycle: project=${project.id} candidates=${report.removableCandidateCount} refused=${report.refused.length}`);
         bb.realtime.publish("worktree-cleanup", { projectId: project.id, ...report });
       } catch (error48) {
-        const report = { projectId: project.id, outcome: "refused", wouldRemove: [], refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error48 instanceof Error ? error48.message : String(error48) }], environmentRecordsReleased: false };
+        const report = { projectId: project.id, outcome: "refused", wouldRemove: [], removableCandidateCount: 0, refused: [{ path: "<inventory>", population: "unknown", action: "refuse", reason: error48 instanceof Error ? error48.message : String(error48) }], environmentRecordsReleased: false, attestation: { coverage: "blind", reason: "cleanup-inventory-unreadable" } };
         bb.log.warn(`worktree-cleanup report: project=${project.id} ${JSON.stringify(report)}`);
         bb.realtime.publish("worktree-cleanup", report);
       }
@@ -25316,6 +25365,7 @@ export {
   foundationResultSchema,
   isLiveCachedConsumerRolloutArtifact,
   readLiveRoleFactReader,
+  reportProjectWorktreeCleanup,
   rpcContract
 };
 //# sourceMappingURL=server.js.map

@@ -14,17 +14,42 @@ export type WorktreeEntry = {
 
 export type WorktreeDecision = {
   path: string;
+  threadId?: string | null;
   population: WorktreePopulation;
   action: "remove" | "refuse";
   reason: string;
 };
 
+export type CleanupAttestation =
+  { coverage: "known" }
+  | { coverage: "at-risk"; reason: string; affected?: ReadonlyArray<{ path: string; threadId: string }> }
+  | { coverage: "blind"; reason: string };
+
 export type WorktreeCleanupReport = {
   outcome: "reported" | "refused";
   wouldRemove: WorktreeDecision[];
+  removableCandidateCount: number;
   refused: WorktreeDecision[];
   environmentRecordsReleased: false;
+  attestation: CleanupAttestation;
 };
+
+type ExecutedProfileRead = {
+  outcome?: string;
+  environmentDependent?: boolean;
+  reason?: string;
+  turns?: ReadonlyArray<{ phase?: string; environmentDependent?: boolean; reason?: string }>;
+};
+
+export function cleanupAttestationFromProfile(profile: ExecutedProfileRead): CleanupAttestation {
+  const environmentDependent = profile.environmentDependent ?? profile.turns?.some((turn) => turn.environmentDependent) ?? false;
+  if (environmentDependent) {
+    if (profile.outcome === "unknown") return { coverage: "blind", reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134" };
+    return { coverage: "at-risk", reason: "environment reaping removes the path needed to correlate this attestation; preserve correlation or retain the environment" };
+  }
+  return { coverage: "known" };
+}
+
 
 export type WorktreeCleanupOptions = {
   liveThreadIds: ReadonlySet<string>;
@@ -41,6 +66,7 @@ export type WorktreeCleanupOptions = {
   createdAt?: (path: string) => number | null;
   now?: number;
   quietFloorMs?: number;
+  attestation?: CleanupAttestation;
 };
 
 const threadPattern = /thr_[a-z0-9]+/u;
@@ -91,6 +117,10 @@ export function classifyWorktree(path: string, home = process.env.HOME ?? ""): W
 
 export function threadIdFromBranch(branch: string | null): string | null {
   return branch?.match(threadPattern)?.[0] ?? null;
+}
+
+export function withCleanupAttestationSubjects(attestation: CleanupAttestation, subjects: ReadonlyArray<{ path: string; threadId: string }>): CleanupAttestation {
+  return attestation.coverage === "at-risk" ? { ...attestation, affected: subjects } : attestation;
 }
 
 export function planWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeCleanupOptions): WorktreeDecision[] {
@@ -189,7 +219,7 @@ export function planWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeC
       continue;
     }
     const unclaimed = unclaimedAgeMs === null ? "" : `, unclaimed by any live bb environment and created ${(unclaimedAgeMs / 3_600_000).toFixed(1)}h ago`;
-    decisions.push({ path: entry.path, population, action: "remove", reason: `clean and fully reachable from origin/main${unclaimed}` });
+    decisions.push({ path: entry.path, population, action: "remove", reason: `clean and fully reachable from origin/main${unclaimed}`, ...(threadId ? { threadId } : {}) });
   }
   return decisions;
 }
@@ -198,7 +228,8 @@ export function runWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeCl
   const decisions = planWorktreeCleanup(entries, options);
   const wouldRemove = decisions.filter((decision) => decision.action === "remove");
   const refused = decisions.filter((decision) => decision.action === "refuse");
-  return { outcome: refused.length > 0 ? "refused" : "reported", wouldRemove, refused, environmentRecordsReleased: false };
+  const attestation = options.attestation ?? { coverage: "known" as const };
+  return { outcome: refused.length > 0 ? "refused" : "reported", wouldRemove, removableCandidateCount: wouldRemove.length, refused, environmentRecordsReleased: false, attestation };
 }
 
 function git(args: string[], cwd: string): string {
@@ -227,15 +258,18 @@ export function cleanupGitWorktrees(
   environmentInventoryComplete = false,
   protectedEnvironmentPaths: ReadonlySet<string> = new Set(),
   pluginSourceResolved = true,
+  attestation?: WorktreeCleanupOptions["attestation"],
+  entries?: WorktreeEntry[],
 ): WorktreeCleanupReport {
   const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
   const status = (path: string) => git(["status", "--porcelain", "--untracked-files=all"], path);
-  return runWorktreeCleanup(listGitWorktrees(repoRoot), {
+  return runWorktreeCleanup(entries ?? listGitWorktrees(repoRoot), {
     liveThreadIds,
     liveWorktreeThreadIds,
     environmentInventoryComplete,
     protectedEnvironmentPaths,
     pluginSourceResolved,
+    attestation,
     createdAt: worktreeCreatedAt,
     originMain,
     status,
