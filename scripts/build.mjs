@@ -35,11 +35,14 @@ try {
     if (/^\/\/ .*?\/node_modules\//mu.test(normalized)) {
       throw new Error(`${artifact} contains an unnormalized node_modules path comment`);
     }
-    writeFileSync(
-      artifactPath,
-      normalized,
-    );
+    writeFileSync(artifactPath, normalized);
   }
+  const sourceMapPath = join(root, "dist/server.js.map");
+  const sourceMap = JSON.parse(readFileSync(sourceMapPath, "utf8"));
+  sourceMap.sources = sourceMap.sources.map((source) => source
+    .replace(/^.*?bb-collab-build-[^/]+\//u, "")
+    .replace(/^.*?node_modules\//u, "node_modules/"));
+  writeFileSync(sourceMapPath, `${JSON.stringify(sourceMap)}\n`);
 } finally {
   rmSync(stage, { recursive: true, force: true });
 }
