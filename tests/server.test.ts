@@ -4369,7 +4369,7 @@ exit 1
       });
       await vi.waitFor(() => expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
         level: "warn",
-        message: "idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:Error: interval write failed",
+        message: "idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=capacity-interval-unreadable:Error: interval write failed occurrences=1",
       })));
       expect(fixture.db.prepare("SELECT * FROM lane_capacity_intervals").all()).toEqual([]);
       expect(fixture.db.prepare("SELECT * FROM lane_capacity_refresh_evidence").all()).toEqual([]);
@@ -4749,7 +4749,7 @@ exit 1
         expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
         expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
           level: "warn",
-          message: "idle-fleet coverage=blind orchestrator=known activeLanes=blind startable=known reason=active-lanes-unreadable:Error: lane read failed",
+          message: "idle-fleet coverage=blind orchestrator=known activeLanes=blind startable=known reason=active-lanes-unreadable:Error: lane read failed occurrences=1",
         }));
       } finally {
         vi.useRealTimers();
@@ -4796,7 +4796,7 @@ exit 1
         expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
         expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
           level: "warn",
-          message: `idle-fleet coverage=blind orchestrator=known activeLanes=blind startable=known reason=${reason}`,
+          message: `idle-fleet coverage=blind orchestrator=known activeLanes=blind startable=known reason=${reason} occurrences=1`,
         }));
       } finally {
         vi.useRealTimers();
@@ -4870,7 +4870,7 @@ exit 1
         expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
         expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
           level: "warn",
-          message: "idle-fleet coverage=blind orchestrator=known activeLanes=blind startable=known reason=active-lanes-disagreement:canonical=0:native=3",
+          message: "idle-fleet coverage=blind orchestrator=known activeLanes=blind startable=known reason=active-lanes-disagreement:canonical=0:native=3 occurrences=1",
         }));
       } finally {
         vi.useRealTimers();

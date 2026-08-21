@@ -597,6 +597,125 @@ describe("lane awareness", () => {
     }
   });
 
+  it("bounds repeated blind capacity reports and counts occurrences", async () => {
+    vi.useFakeTimers();
+    try {
+      const onBlind = vi.fn();
+      const observe = vi.fn().mockRejectedValue(new Error("interval read failed"));
+      const detector = createIdleFleetDetector({
+        read: async (): Promise<IdleFleetDecision> => ({ kind: "silent" }),
+        readRearmProbes: async () => [],
+        wake: async () => true,
+        onBlind,
+        capacity: { readProjectIds: async () => [], observe, close: vi.fn() },
+      });
+
+      await detector.observeCapacity("project-1");
+      await detector.observeCapacity("project-1");
+      expect(onBlind).toHaveBeenCalledOnce();
+      expect(onBlind).toHaveBeenLastCalledWith(expect.stringContaining("occurrences=1"));
+      await vi.advanceTimersByTimeAsync(1_000);
+      await detector.observeCapacity("project-1");
+      expect(onBlind).toHaveBeenCalledTimes(2);
+      expect(onBlind).toHaveBeenLastCalledWith(expect.stringContaining("occurrences=3"));
+      detector.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("marks close-triggered blind occurrences when the disposal bound expires", async () => {
+    vi.useFakeTimers();
+    try {
+      const onBlind = vi.fn();
+      const rejects = new Map<string, (error: Error) => void>();
+      const observe = vi.fn((projectId: string) => new Promise<void>((_, reject) => {
+        rejects.set(projectId, reject);
+      }));
+      const detector = createIdleFleetDetector({
+        read: async (): Promise<IdleFleetDecision> => ({ kind: "silent" }),
+        readRearmProbes: async () => [],
+        wake: async () => true,
+        onBlind,
+        capacity: {
+          readProjectIds: async () => [],
+          observe,
+          close: vi.fn(() => {
+            setTimeout(() => {
+              for (const reject of rejects.values()) reject(new Error("closed"));
+            }, 1_001);
+          }),
+        },
+      });
+
+      const reads = [detector.observeCapacity("project-1"), detector.observeCapacity("project-2")];
+      await Promise.resolve();
+      expect(observe).toHaveBeenCalledTimes(2);
+      const stopping = detector.stop();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await stopping;
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.all(reads);
+
+      expect(onBlind).toHaveBeenCalledOnce();
+      expect(onBlind).toHaveBeenCalledWith(expect.stringContaining("occurrences=>=1 (counting cut short)"));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("scopes the cut-short marker to the aggregate that expired", async () => {
+    vi.useFakeTimers();
+    try {
+      const onBlind = vi.fn();
+      let rejectDetectorRead!: (error: Error) => void;
+      const detectorRead = new Promise<IdleFleetDecision>((_, reject) => { rejectDetectorRead = reject; });
+      const detector = createIdleFleetDetector({
+        read: async () => detectorRead,
+        readRearmProbes: async () => [],
+        wake: async () => true,
+        onBlind,
+        capacity: {
+          readProjectIds: async () => [],
+          observe: async () => new Promise<void>(() => {}),
+          close: vi.fn(),
+        },
+        debounceMs: 1,
+      });
+
+      detector.arm({ projectId: "project-1", threadId: "orchestrator-1", idleEpisode: "episode-1" });
+      detector.observeCapacity("project-1");
+      await vi.advanceTimersByTimeAsync(1);
+      const stopping = detector.stop();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await stopping;
+
+      rejectDetectorRead(new Error("detector read failed"));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(onBlind).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("reason=detector-unreadable:Error: detector read failed occurrences=1"));
+      expect(onBlind.mock.calls[0]?.[0]).not.toContain("counting cut short");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not emit an empty blind aggregate on disposal", async () => {
+    const onBlind = vi.fn();
+    const detector = createIdleFleetDetector({
+      read: async (): Promise<IdleFleetDecision> => ({ kind: "silent" }),
+      readRearmProbes: async () => [],
+      wake: async () => true,
+      onBlind,
+      capacity: { readProjectIds: async () => [], observe: vi.fn(), close: vi.fn() },
+    });
+
+    await detector.stop();
+
+    expect(onBlind).not.toHaveBeenCalled();
+  });
+
   it("cancels queued capacity reads after disposal and closes once", async () => {
     let releaseFirst!: () => void;
     const first = new Promise<void>((resolve) => { releaseFirst = resolve; });
@@ -615,9 +734,10 @@ describe("lane awareness", () => {
     const firstRead = detector.observeCapacity("project-1");
     await Promise.resolve();
     const secondRead = detector.observeCapacity("project-1");
-    detector.stop();
-    detector.stop();
+    const stopping = detector.stop();
     releaseFirst();
+    await stopping;
+    await detector.stop();
     await Promise.all([firstRead, secondRead]);
 
     expect(observe).toHaveBeenCalledExactlyOnceWith("project-1");
@@ -696,7 +816,7 @@ describe("lane awareness", () => {
       await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
 
       expect(wake).not.toHaveBeenCalled();
-      expect(onBlind).toHaveBeenCalledExactlyOnceWith(message);
+      expect(onBlind).toHaveBeenCalledExactlyOnceWith(`${message} occurrences=1`);
       detector.stop();
     } finally {
       vi.useRealTimers();
