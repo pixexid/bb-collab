@@ -2577,6 +2577,8 @@ describe("bb-collab plugin boundary", () => {
   });
 
   it("keeps deployed-dist timeout and exit failures distinguishable", () => {
+    const source = readFileSync(join(PLUGIN_ROOT, "server.ts"), "utf8");
+    expect(source).toContain("const detail = deployedDistFailureDetail(error, stdout, stderr);");
     const timeout = Object.assign(new Error("Command failed"), { code: null, killed: true, signal: "SIGTERM" as const });
     const exit = Object.assign(new Error("Command failed"), { code: 1, killed: false, signal: undefined });
     expect(deployedDistFailureDetail(timeout, "", "")).toContain("code=null killed=true signal=SIGTERM");
