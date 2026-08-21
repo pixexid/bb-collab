@@ -121,6 +121,23 @@ describe("worktree cleanup", () => {
     expect(result.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(paths[1]), reason: "plugin source environment is protected" }));
   });
 
+  it("counts expired executed-profile correlation on removable threaded worktrees", () => {
+    const { root } = fixture();
+    const threaded = listGitWorktrees(root).map((entry, index) => index === 1 ? { ...entry, branch: "lane/thr_expired" } : entry);
+    const counted = runWorktreeCleanup(threaded, {
+      liveThreadIds: new Set(),
+      attestation: { coverage: "known", expiredThreadIds: new Set(["thr_expired"]) },
+      status: () => "",
+      originMain: git(root, "rev-parse", "refs/remotes/origin/main"),
+      reachable: () => true,
+      environmentInventoryComplete: true,
+      now: Date.now() + defaultQuietFloorMs,
+      createdAt: worktreeCreatedAt,
+    });
+    expect(counted.attestation).toEqual({ coverage: "known", expiredExecutedProfileCount: 1 });
+    expect(runWorktreeCleanup(threaded, { liveThreadIds: new Set(), attestation: { coverage: "blind", reason: "reader-unreadable" } }).attestation).toEqual({ coverage: "blind", reason: "reader-unreadable" });
+  });
+
   it("reports exactly the clean detached orphan and refuses live and dirty entries", () => {
     const { root, paths } = fixture();
     const ownership = new Map([[canonicalWorktreePath(paths[0]), new Set(["thr_live"])]]);

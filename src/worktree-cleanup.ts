@@ -14,6 +14,7 @@ export type WorktreeEntry = {
 
 export type WorktreeDecision = {
   path: string;
+  threadId?: string | null;
   population: WorktreePopulation;
   action: "remove" | "refuse";
   reason: string;
@@ -24,6 +25,7 @@ export type WorktreeCleanupReport = {
   wouldRemove: WorktreeDecision[];
   refused: WorktreeDecision[];
   environmentRecordsReleased: false;
+  attestation: { coverage: "known"; expiredExecutedProfileCount: number } | { coverage: "blind"; reason: string };
 };
 
 export type WorktreeCleanupOptions = {
@@ -41,6 +43,7 @@ export type WorktreeCleanupOptions = {
   createdAt?: (path: string) => number | null;
   now?: number;
   quietFloorMs?: number;
+  attestation?: { coverage: "known"; expiredThreadIds: ReadonlySet<string> } | { coverage: "blind"; reason: string };
 };
 
 const threadPattern = /thr_[a-z0-9]+/u;
@@ -189,7 +192,7 @@ export function planWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeC
       continue;
     }
     const unclaimed = unclaimedAgeMs === null ? "" : `, unclaimed by any live bb environment and created ${(unclaimedAgeMs / 3_600_000).toFixed(1)}h ago`;
-    decisions.push({ path: entry.path, population, action: "remove", reason: `clean and fully reachable from origin/main${unclaimed}` });
+    decisions.push({ path: entry.path, population, action: "remove", reason: `clean and fully reachable from origin/main${unclaimed}`, ...(threadId ? { threadId } : {}) });
   }
   return decisions;
 }
@@ -198,7 +201,10 @@ export function runWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeCl
   const decisions = planWorktreeCleanup(entries, options);
   const wouldRemove = decisions.filter((decision) => decision.action === "remove");
   const refused = decisions.filter((decision) => decision.action === "refuse");
-  return { outcome: refused.length > 0 ? "refused" : "reported", wouldRemove, refused, environmentRecordsReleased: false };
+  const attestation = options.attestation?.coverage === "blind"
+    ? options.attestation
+    : { coverage: "known" as const, expiredExecutedProfileCount: wouldRemove.filter((decision) => decision.threadId && options.attestation?.coverage === "known" && options.attestation.expiredThreadIds.has(decision.threadId)).length };
+  return { outcome: refused.length > 0 ? "refused" : "reported", wouldRemove, refused, environmentRecordsReleased: false, attestation };
 }
 
 function git(args: string[], cwd: string): string {
@@ -227,6 +233,7 @@ export function cleanupGitWorktrees(
   environmentInventoryComplete = false,
   protectedEnvironmentPaths: ReadonlySet<string> = new Set(),
   pluginSourceResolved = true,
+  attestation?: WorktreeCleanupOptions["attestation"],
 ): WorktreeCleanupReport {
   const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
   const status = (path: string) => git(["status", "--porcelain", "--untracked-files=all"], path);
@@ -236,6 +243,7 @@ export function cleanupGitWorktrees(
     environmentInventoryComplete,
     protectedEnvironmentPaths,
     pluginSourceResolved,
+    attestation,
     createdAt: worktreeCreatedAt,
     originMain,
     status,
