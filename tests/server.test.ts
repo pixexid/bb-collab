@@ -3791,7 +3791,7 @@ else console.log(JSON.stringify(blocked));
     }
   });
 
-  it("auto-terminalizes a stale in_progress WorkItem through review_pending -> succeeded when its linked issue is merged and closed", async () => {
+  it("auto-terminalizes merged and closed issues for stale in_progress and never-started proposed WorkItems", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-stale-terminal-"));
     const gh = join(bin, "gh");
     const phaseFile = join(bin, "phase");
@@ -3814,7 +3814,7 @@ if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "numb
 fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,labels,updatedAt" ]; then printf '%s\\n' '{"number":'"$3"',"title":"issue","body":"body","state":"CLOSED","labels":[],"updatedAt":"closed-'"$3"'"}'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" != "state,updatedAt,closedByPullRequestsReferences" ]; then exit 1; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && { [ "$3" = "206" ] || [ "$3" = "208" ]; }; then printf '%s\\n' '{"state":"CLOSED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[{"number":340}]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && { [ "$3" = "206" ] || [ "$3" = "208" ] || [ "$3" = "210" ]; }; then printf '%s\\n' '{"state":"CLOSED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[{"number":340}]}'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"state":"CLOSED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[]}'; exit 0; fi
 exit 1
 `);
@@ -3847,6 +3847,12 @@ exit 1
         idempotencyKey: "racy-work-item-start",
         workItemId: racyWorkItemId,
         workAttempt: { laneId: "lane-racy", threadId: "thread-racy", assignmentKind: "write" },
+      })).outcome).toBe("OK");
+      const proposedWorkItemId = "never-started-work-item";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "never-started-work-item-create",
+        workItemId: proposedWorkItemId,
+        workItem: { workItemId: proposedWorkItemId, title: proposedWorkItemId, body: "absorbed before dispatch", githubIssue: { issueNumber: 210 } },
       })).outcome).toBe("OK");
       const unreadableWorkItemId = "unreadable-work-item";
       expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
@@ -3904,6 +3910,9 @@ exit 1
 
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, proposedWorkItemId)).toEqual({ lifecycle_state: "cancelled" });
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
       expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
         level: "warn",
         message: expect.stringContaining("stale-terminal work item: project=proj_test workItem=work-item-1 linked=example/project#205 status=closed"),
@@ -3948,6 +3957,10 @@ exit 1
       expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
         level: "info",
         message: expect.stringContaining("auto-terminalized merged and closed work item: project=proj_test workItem=merged-work-item via=review_pending"),
+      }));
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "info",
+        message: expect.stringContaining("auto-terminalized merged and closed work item: project=proj_test workItem=never-started-work-item via=proposed-cancel"),
       }));
     } finally {
       if (originalPath === undefined) delete process.env.PATH;

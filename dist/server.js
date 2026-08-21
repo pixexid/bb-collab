@@ -24322,11 +24322,13 @@ ${thread.titleFallback ?? ""}`);
             }
           } else if (workItem.lifecycle_state === "review_pending") {
             result2 = transition("succeeded");
+          } else if (workItem.lifecycle_state === "proposed") {
+            result2 = transition("cancelled");
           } else {
             result2 = { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close automation requires in_progress or review_pending, found ${workItem.lifecycle_state}` };
           }
           if (result2.outcome === "OK") {
-            bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=review_pending`);
+            bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=${workItem.lifecycle_state === "proposed" ? "proposed-cancel" : "review_pending"}`);
           } else {
             degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
             bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result2.outcome}`);

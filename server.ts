@@ -2833,7 +2833,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       const transitionWorkItem = (
         projectId: string,
         workItemId: string,
-        state: "ready" | "review_pending" | "succeeded",
+        state: "ready" | "review_pending" | "succeeded" | "cancelled",
         idempotencyKey: string,
         extra: Pick<ApplyRequest, "workItemUnblock" | "workItemExternalEvent"> = {},
         githubSnapshot?: GitHubIssueSnapshot,
@@ -2958,7 +2958,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
             continue;
           }
-          const transition = (state: "review_pending" | "succeeded") => transitionWorkItem(
+          const transition = (state: "review_pending" | "succeeded" | "cancelled") => transitionWorkItem(
             projectId,
             linked.work_item_id,
             state,
@@ -2986,11 +2986,14 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             }
           } else if (workItem.lifecycle_state === "review_pending") {
             result = transition("succeeded");
+          } else if (workItem.lifecycle_state === "proposed") {
+            // A closed issue absorbs work that never started; it did not succeed.
+            result = transition("cancelled");
           } else {
             result = { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close automation requires in_progress or review_pending, found ${workItem.lifecycle_state}` };
           }
           if (result.outcome === "OK") {
-            bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=review_pending`);
+            bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=${workItem.lifecycle_state === "proposed" ? "proposed-cancel" : "review_pending"}`);
           } else {
             degrade(`github-work-item-terminalize:${projectId}:${linked.work_item_id}`);
             bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result.outcome}`);
