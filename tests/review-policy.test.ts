@@ -40,6 +40,18 @@ describe("pull-request review tier policy", () => {
     }
   });
 
+  it("classifies the artifact-provenance gate as Tier A", () => {
+    const underDeclared = check("Review tier: B", ["scripts/check-dist.mjs"]);
+    expect(underDeclared.status).toBe(1);
+    expect(underDeclared.stderr).toContain("::error::Review finding: declared Tier B, but touched surfaces require Tier A.");
+    expect(underDeclared.stdout).toContain("Review tier A: cold exact-head review before merge");
+
+    const correctlyDeclared = check("Review tier: A", ["scripts/check-dist.mjs"]);
+    expect(correctlyDeclared.status).toBe(0);
+    expect(correctlyDeclared.stderr).not.toContain("Review finding");
+    expect(correctlyDeclared.stdout).toContain("Review tier A: cold exact-head review before merge");
+  });
+
   it("fails under-declarations, permits over-declarations, and prints the stricter rule", () => {
     const result = check("Review tier: C", ["src/foundation.ts"]);
     expect(result.status).toBe(1);

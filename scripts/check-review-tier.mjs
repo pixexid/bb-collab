@@ -26,6 +26,7 @@ const tierA = [
   /^scripts\/pr-lifecycle\.d\.mts$/u,
   /^scripts\/pr-lifecycle\.mjs$/u,
   /^scripts\/check-review-tier\.mjs$/u,
+  /^scripts\/check-dist\.mjs$/u,
   /^server\.ts$/u,
   /(?:^|\/|[-_.])(?:authority|approval|atomicity|concurrenc(?:y|ies)|cutover|migrations?|provenance|receipts?|spend)(?:[-_.\/]|$)/iu,
   /(^|\/)foundation\.ts$/u,
