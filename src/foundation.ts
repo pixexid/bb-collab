@@ -10,13 +10,13 @@ export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
 export const RUNTIME_CONTRACT_VERSION = 22;
-export const SCHEMA_VERSION = 26;
+export const SCHEMA_VERSION = 27;
 // v22 establishes the director's exact accepted-profile set.
 const PREVIOUS_RUNTIME_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-// Schema v26 enforces append-only lane-refresh evidence; runtime policy remains v22.
-const PREVIOUS_SCHEMA_VERSION = 25;
+// Schema v27 adds the operator inbox archive state; runtime policy remains v22.
+const PREVIOUS_SCHEMA_VERSION = 26;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatPrimaryProfile = {
@@ -964,6 +964,8 @@ export const MIGRATIONS: string[] = [
    CREATE TRIGGER lane_capacity_refresh_evidence_immutable_delete
      BEFORE DELETE ON lane_capacity_refresh_evidence
      BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;`,
+  `ALTER TABLE operator_messages ADD COLUMN archived_at_ms INTEGER
+   CHECK (archived_at_ms IS NULL OR archived_at_ms >= created_at_ms)`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));

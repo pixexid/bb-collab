@@ -14599,11 +14599,11 @@ var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
 var RUNTIME_CONTRACT_VERSION = 22;
-var SCHEMA_VERSION = 26;
+var SCHEMA_VERSION = 27;
 var PREVIOUS_RUNTIME_CONTRACT_VERSION = 21;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
-var PREVIOUS_SCHEMA_VERSION = 25;
+var PREVIOUS_SCHEMA_VERSION = 26;
 var ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"];
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
 var directorSeatPrimaryProfile = {
@@ -15547,7 +15547,9 @@ var MIGRATIONS = [
      BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;
    CREATE TRIGGER lane_capacity_refresh_evidence_immutable_delete
      BEFORE DELETE ON lane_capacity_refresh_evidence
-     BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;`
+     BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;`,
+  `ALTER TABLE operator_messages ADD COLUMN archived_at_ms INTEGER
+   CHECK (archived_at_ms IS NULL OR archived_at_ms >= created_at_ms)`
 ];
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var GH300_BACKFILL_MIGRATION_ID = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE execution_attempts_gh300"));
@@ -22357,6 +22359,7 @@ var operatorMessageSchema = external_exports.object({
   text: operatorMessageTextSchema,
   createdAtMs: external_exports.number().int().nonnegative(),
   readAtMs: external_exports.number().int().nonnegative().nullable(),
+  archivedAtMs: external_exports.number().int().nonnegative().nullable(),
   senderTitle: external_exports.string().nullable(),
   repliedAtMs: external_exports.number().int().nonnegative().nullable(),
   replyText: operatorMessageTextSchema.nullable(),
@@ -22418,6 +22421,7 @@ var rpcContract = defineRpcContract({
     input: external_exports.object({
       projectId: projectIdSchema,
       recipient: operatorRecipientSchema.optional(),
+      includeArchived: external_exports.boolean().optional(),
       withSenderTitles: external_exports.boolean().optional()
     }).strict(),
     output: operatorMessagesResultSchema
@@ -22892,6 +22896,7 @@ function operatorMessage(row) {
     text: row.message_text,
     createdAtMs: row.created_at_ms,
     readAtMs: row.read_at_ms,
+    archivedAtMs: row.archived_at_ms,
     senderTitle: null,
     repliedAtMs: row.replied_at_ms,
     replyText: row.reply_text,
@@ -22952,18 +22957,28 @@ async function resolveSenderTitles(bb, messages) {
   })));
   return messages.map((message) => ({ ...message, senderTitle: titles.get(message.senderThreadId) ?? null }));
 }
-async function listOperatorMessages(db, bb, projectId, recipient, withSenderTitles = false) {
+async function listOperatorMessages(db, bb, projectId, recipient, withSenderTitles = false, includeArchived = false) {
   const store = requireInboxStore(db);
   if (!inboxProjectIsRegistered(store, projectId)) {
     return { outcome: "PROJECT_CONFIG_REQUIRED", message: UNREGISTERED_INBOX_MESSAGE, messages: [] };
   }
   const recipientClause = recipient === void 0 ? "" : " AND message.recipient = ?";
+  const archivedClause = includeArchived ? "" : " AND message.archived_at_ms IS NULL";
   const rows = store.prepare(`${operatorMessageSelect}
-    WHERE message.project_id = ?${recipientClause}
+    WHERE message.project_id = ?${recipientClause}${archivedClause}
     ORDER BY (message.read_at_ms IS NULL) DESC, message.created_at_ms DESC, message.message_id DESC
     LIMIT ${OPERATOR_MESSAGE_LIMIT}`).all(...recipient === void 0 ? [projectId] : [projectId, recipient]);
   const messages = rows.map(operatorMessage);
   return { outcome: "OK", messages: withSenderTitles ? await resolveSenderTitles(bb, messages) : messages };
+}
+async function archiveOperatorMessage(db, bb, projectId, messageId) {
+  const store = requireRegisteredInboxProject(db, projectId);
+  const now2 = Date.now();
+  const result2 = store.prepare(`UPDATE operator_messages
+    SET read_at_ms = COALESCE(read_at_ms, ?), archived_at_ms = COALESCE(archived_at_ms, ?)
+    WHERE project_id = ? AND message_id = ?`).run(now2, now2, projectId, messageId);
+  if (result2.changes !== 1) throw refusal("RESOURCE_UNKNOWN", "operator message does not exist in the requested project");
+  return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0];
 }
 async function markOperatorMessageRead(db, bb, projectId, messageId) {
   const store = requireRegisteredInboxProject(db, projectId);
@@ -23294,17 +23309,19 @@ async function runCli(db, bb, argv, ctx, deps) {
     }
   }
   if (command === "inbox") {
-    const unknown3 = unexpectedFlags(args, ["--project", "--recipient", "--mark-read"]);
+    const unknown3 = unexpectedFlags(args, ["--project", "--recipient", "--mark-read", "--archive"]);
     if (unknown3) return invalidCli(`unexpected flag ${unknown3}`);
     const recipient = parseFlag(args, "--recipient");
     const markRead = parseFlag(args, "--mark-read");
-    if (markRead !== null) {
-      if (recipient !== null) return invalidCli("--recipient cannot be used with --mark-read");
-      const messageId = external_exports.coerce.number().int().positive().safeParse(markRead);
+    const archive = parseFlag(args, "--archive");
+    if (markRead !== null || archive !== null) {
+      if (markRead !== null && archive !== null) return invalidCli("--mark-read and --archive cannot be used together");
+      if (recipient !== null) return invalidCli(`--recipient cannot be used with ${archive !== null ? "--archive" : "--mark-read"}`);
+      const messageId = external_exports.coerce.number().int().positive().safeParse(archive ?? markRead);
       if (!messageId.success) return invalidCli(messageId.error.message);
       try {
-        const marked = await markOperatorMessageRead(db, bb, projectId, messageId.data);
-        return operatorMessagesCliResult(projectId, [marked], "operator message marked read");
+        const marked = archive !== null ? await archiveOperatorMessage(db, bb, projectId, messageId.data) : await markOperatorMessageRead(db, bb, projectId, messageId.data);
+        return operatorMessagesCliResult(projectId, [marked], archive !== null ? "operator message archived" : "operator message marked read");
       } catch (error48) {
         return invalidCli(error48 instanceof Error ? error48.message : String(error48), isRefusal(error48) ? error48.data.code : "INVALID_INPUT");
       }
@@ -25240,7 +25257,7 @@ ${thread.titleFallback ?? ""}`);
       return composeRoleBrief(bb, db, input);
     },
     operatorMessages(input) {
-      return listOperatorMessages(db, bb, input.projectId, input.recipient, input.withSenderTitles);
+      return listOperatorMessages(db, bb, input.projectId, input.recipient, input.withSenderTitles, input.includeArchived);
     },
     markOperatorMessageRead(input) {
       return markOperatorMessageRead(db, bb, input.projectId, input.messageId);
@@ -25335,8 +25352,8 @@ ${thread.titleFallback ?? ""}`);
       },
       {
         name: "inbox",
-        summary: "Read or mark read in one exact registered project's operator inbox",
-        usage: "bb collab inbox --project PROJECT_ID [--recipient operator|supervisor | --mark-read MESSAGE_ID]"
+        summary: "Read, mark read, or archive in one exact registered project's operator inbox",
+        usage: "bb collab inbox --project PROJECT_ID [--recipient operator|supervisor | --mark-read MESSAGE_ID | --archive MESSAGE_ID]"
       }
     ],
     run(argv, context) {

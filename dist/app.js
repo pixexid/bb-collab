@@ -197,9 +197,9 @@ function isUnregisteredInboxProject(result) {
 function readInboxFilters() {
   try {
     const value = JSON.parse(window.localStorage.getItem(INBOX_FILTER_STORAGE_KEY) ?? "null");
-    return { projectId: typeof value?.projectId === "string" ? value.projectId : "", recipient: value?.recipient === "operator" || value?.recipient === "supervisor" ? value.recipient : "" };
+    return { projectId: typeof value?.projectId === "string" ? value.projectId : "", recipient: value?.recipient === "operator" || value?.recipient === "supervisor" ? value.recipient : "", showArchived: value?.showArchived === true };
   } catch {
-    return { projectId: "", recipient: "" };
+    return { projectId: "", recipient: "", showArchived: false };
   }
 }
 function writeInboxFilters(filters) {
@@ -249,7 +249,7 @@ function InboxPanel(_props) {
   const rpc = useRpc();
   const [filters, setFilters] = useState(readInboxFilters);
   const projectId = filters.projectId && sidebar.projects.some((project) => project.id === filters.projectId) ? filters.projectId : "";
-  const { recipient } = filters;
+  const { recipient, showArchived } = filters;
   const [messages, setMessages] = useState([]);
   const [drafts, setDrafts] = useState({});
   const [replyingMessageKey, setReplyingMessageKey] = useState(null);
@@ -314,7 +314,8 @@ function InboxPanel(_props) {
     void Promise.allSettled(projects.map((project) => rpc.call("operatorMessages", {
       projectId: project.id,
       ...recipient ? { recipient } : {},
-      withSenderTitles: true
+      withSenderTitles: true,
+      ...showArchived ? { includeArchived: true } : {}
     }))).then((results) => {
       if (sequence !== refreshSequence.current) return;
       const loaded = [];
@@ -329,7 +330,7 @@ function InboxPanel(_props) {
       setMessages(loaded);
       setErrors(failed);
     });
-  }, [projects, projectId, recipient, rpc]);
+  }, [projects, projectId, recipient, rpc, showArchived]);
   useEffect(refresh, [refresh]);
   const updateMessage = (next) => setMessages((current) => current.map((message) => messageKey(message) === messageKey(next) ? next : message));
   return /* @__PURE__ */ jsx("main", { className: "h-full overflow-y-auto p-5", children: /* @__PURE__ */ jsxs("div", { className: "mx-auto max-w-4xl", children: [
@@ -341,7 +342,7 @@ function InboxPanel(_props) {
     /* @__PURE__ */ jsxs("div", { className: "mb-5 flex flex-wrap items-end gap-3", children: [
       /* @__PURE__ */ jsxs("label", { className: "grid gap-1 text-sm", children: [
         /* @__PURE__ */ jsx("span", { className: "text-muted-foreground", children: "Project" }),
-        /* @__PURE__ */ jsxs("select", { className: "rounded-md border border-border bg-background px-3 py-2", value: projectId, onChange: (event) => setFiltersAndPersist({ projectId: event.target.value, recipient }), children: [
+        /* @__PURE__ */ jsxs("select", { className: "rounded-md border border-border bg-background px-3 py-2", value: projectId, onChange: (event) => setFiltersAndPersist({ projectId: event.target.value, recipient, showArchived }), children: [
           /* @__PURE__ */ jsx("option", { value: "", children: "All projects" }),
           sidebar.projects.map((candidate) => /* @__PURE__ */ jsxs("option", { value: candidate.id, children: [
             candidate.name,
@@ -352,11 +353,15 @@ function InboxPanel(_props) {
       ] }),
       /* @__PURE__ */ jsxs("label", { className: "grid gap-1 text-sm", children: [
         /* @__PURE__ */ jsx("span", { className: "text-muted-foreground", children: "Recipient" }),
-        /* @__PURE__ */ jsxs("select", { className: "rounded-md border border-border bg-background px-3 py-2", value: recipient, onChange: (event) => setFiltersAndPersist({ projectId, recipient: event.target.value }), children: [
+        /* @__PURE__ */ jsxs("select", { className: "rounded-md border border-border bg-background px-3 py-2", value: recipient, onChange: (event) => setFiltersAndPersist({ projectId, recipient: event.target.value, showArchived }), children: [
           /* @__PURE__ */ jsx("option", { value: "", children: "All recipients" }),
           /* @__PURE__ */ jsx("option", { value: "operator", children: "Operator" }),
           /* @__PURE__ */ jsx("option", { value: "supervisor", children: "Supervisor" })
         ] })
+      ] }),
+      /* @__PURE__ */ jsxs("label", { className: "flex items-center gap-2 py-2 text-sm", children: [
+        /* @__PURE__ */ jsx("input", { type: "checkbox", checked: showArchived, onChange: (event) => setFiltersAndPersist({ projectId, recipient, showArchived: event.target.checked }) }),
+        "Show archived"
       ] }),
       /* @__PURE__ */ jsx("button", { type: "button", className: "rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-muted hover:text-foreground", onClick: refresh, children: "Refresh" })
     ] }),

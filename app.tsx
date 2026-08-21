@@ -17,10 +17,10 @@ const MAX_VISIBLE_INBOX_MESSAGES = 256;
 const INBOX_FILTER_STORAGE_KEY = "bb-collab.inbox-filters";
 const UNREGISTERED_INBOX_PROJECT = "PROJECT_CONFIG_REQUIRED" satisfies OperatorMessagesResult["outcome"];
 function isUnregisteredInboxProject(result: OperatorMessagesResult): boolean { return result.outcome === UNREGISTERED_INBOX_PROJECT; }
-type InboxFilters = { projectId: string; recipient: "" | OperatorMessage["recipient"] };
+type InboxFilters = { projectId: string; recipient: "" | OperatorMessage["recipient"]; showArchived: boolean };
 function readInboxFilters(): InboxFilters {
-  try { const value = JSON.parse(window.localStorage.getItem(INBOX_FILTER_STORAGE_KEY) ?? "null") as Partial<InboxFilters> | null; return { projectId: typeof value?.projectId === "string" ? value.projectId : "", recipient: value?.recipient === "operator" || value?.recipient === "supervisor" ? value.recipient : "" }; }
-  catch { return { projectId: "", recipient: "" }; }
+  try { const value = JSON.parse(window.localStorage.getItem(INBOX_FILTER_STORAGE_KEY) ?? "null") as Partial<InboxFilters> | null; return { projectId: typeof value?.projectId === "string" ? value.projectId : "", recipient: value?.recipient === "operator" || value?.recipient === "supervisor" ? value.recipient : "", showArchived: value?.showArchived === true }; }
+  catch { return { projectId: "", recipient: "", showArchived: false }; }
 }
 function writeInboxFilters(filters: InboxFilters): void { try { window.localStorage.setItem(INBOX_FILTER_STORAGE_KEY, JSON.stringify(filters)); } catch {} }
 function LanesPanel(_props: PluginNavPanelProps) {
@@ -73,7 +73,7 @@ function InboxPanel(_props: PluginNavPanelProps) {
   const rpc = useRpc<typeof rpcContract>();
   const [filters, setFilters] = useState<InboxFilters>(readInboxFilters);
   const projectId = filters.projectId && sidebar.projects.some((project) => project.id === filters.projectId) ? filters.projectId : "";
-  const { recipient } = filters;
+  const { recipient, showArchived } = filters;
   const [messages, setMessages] = useState<readonly OperatorMessage[]>([]);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [replyingMessageKey, setReplyingMessageKey] = useState<string | null>(null);
@@ -127,6 +127,7 @@ function InboxPanel(_props: PluginNavPanelProps) {
       projectId: project.id,
       ...(recipient ? { recipient } : {}),
       withSenderTitles: true,
+      ...(showArchived ? { includeArchived: true } : {}),
     })))
       .then((results) => {
         if (sequence !== refreshSequence.current) return;
@@ -142,7 +143,7 @@ function InboxPanel(_props: PluginNavPanelProps) {
         setMessages(loaded);
         setErrors(failed);
       });
-  }, [projects, projectId, recipient, rpc]);
+  }, [projects, projectId, recipient, rpc, showArchived]);
 
   useEffect(refresh, [refresh]);
 
@@ -155,18 +156,22 @@ function InboxPanel(_props: PluginNavPanelProps) {
         <div className="mb-5 flex flex-wrap items-end gap-3">
           <label className="grid gap-1 text-sm">
             <span className="text-muted-foreground">Project</span>
-            <select className="rounded-md border border-border bg-background px-3 py-2" value={projectId} onChange={(event) => setFiltersAndPersist({ projectId: event.target.value, recipient })}>
+            <select className="rounded-md border border-border bg-background px-3 py-2" value={projectId} onChange={(event) => setFiltersAndPersist({ projectId: event.target.value, recipient, showArchived })}>
               <option value="">All projects</option>
               {sidebar.projects.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name} · {candidate.id}</option>)}
             </select>
           </label>
           <label className="grid gap-1 text-sm">
             <span className="text-muted-foreground">Recipient</span>
-            <select className="rounded-md border border-border bg-background px-3 py-2" value={recipient} onChange={(event) => setFiltersAndPersist({ projectId, recipient: event.target.value as InboxFilters["recipient"] })}>
+            <select className="rounded-md border border-border bg-background px-3 py-2" value={recipient} onChange={(event) => setFiltersAndPersist({ projectId, recipient: event.target.value as InboxFilters["recipient"], showArchived })}>
               <option value="">All recipients</option>
               <option value="operator">Operator</option>
               <option value="supervisor">Supervisor</option>
             </select>
+          </label>
+          <label className="flex items-center gap-2 py-2 text-sm">
+            <input type="checkbox" checked={showArchived} onChange={(event) => setFiltersAndPersist({ projectId, recipient, showArchived: event.target.checked })} />
+            Show archived
           </label>
           <button type="button" className="rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-muted hover:text-foreground" onClick={refresh}>Refresh</button>
         </div>

@@ -486,6 +486,7 @@ const operatorMessageSchema = z.object({
   text: operatorMessageTextSchema,
   createdAtMs: z.number().int().nonnegative(),
   readAtMs: z.number().int().nonnegative().nullable(),
+  archivedAtMs: z.number().int().nonnegative().nullable(),
   senderTitle: z.string().nullable(),
   repliedAtMs: z.number().int().nonnegative().nullable(),
   replyText: operatorMessageTextSchema.nullable(),
@@ -551,6 +552,7 @@ export const rpcContract = defineRpcContract({
     input: z.object({
       projectId: projectIdSchema,
       recipient: operatorRecipientSchema.optional(),
+      includeArchived: z.boolean().optional(),
       withSenderTitles: z.boolean().optional(),
     }).strict(),
     output: operatorMessagesResultSchema,
@@ -1141,6 +1143,7 @@ type OperatorMessageRow = {
   message_text: string;
   created_at_ms: number;
   read_at_ms: number | null;
+  archived_at_ms: number | null;
   replied_at_ms: number | null;
   reply_text: string | null;
   reply_delivery_error: string | null;
@@ -1159,6 +1162,7 @@ function operatorMessage(row: OperatorMessageRow) {
     text: row.message_text,
     createdAtMs: row.created_at_ms,
     readAtMs: row.read_at_ms,
+    archivedAtMs: row.archived_at_ms,
     senderTitle: null,
     repliedAtMs: row.replied_at_ms,
     replyText: row.reply_text,
@@ -1243,6 +1247,7 @@ async function listOperatorMessages(
   projectId: string,
   recipient?: z.infer<typeof operatorRecipientSchema>,
   withSenderTitles = false,
+  includeArchived = false,
 ): Promise<z.infer<typeof operatorMessagesResultSchema>> {
   const store = requireInboxStore(db);
   // The unregistered-inbox condition is an answer, not a rejection: the app's
@@ -1255,12 +1260,24 @@ async function listOperatorMessages(
     return { outcome: "PROJECT_CONFIG_REQUIRED", message: UNREGISTERED_INBOX_MESSAGE, messages: [] };
   }
   const recipientClause = recipient === undefined ? "" : " AND message.recipient = ?";
+  const archivedClause = includeArchived ? "" : " AND message.archived_at_ms IS NULL";
   const rows = store.prepare(`${operatorMessageSelect}
-    WHERE message.project_id = ?${recipientClause}
+    WHERE message.project_id = ?${recipientClause}${archivedClause}
     ORDER BY (message.read_at_ms IS NULL) DESC, message.created_at_ms DESC, message.message_id DESC
     LIMIT ${OPERATOR_MESSAGE_LIMIT}`).all(...(recipient === undefined ? [projectId] : [projectId, recipient])) as OperatorMessageRow[];
   const messages = rows.map(operatorMessage);
   return { outcome: "OK", messages: withSenderTitles ? await resolveSenderTitles(bb, messages) : messages };
+}
+
+async function archiveOperatorMessage(db: SqliteDatabase | null, bb: BbPluginApi, projectId: string, messageId: number) {
+  const store = requireRegisteredInboxProject(db, projectId);
+  const now = Date.now();
+  // ponytail: archive implies read only for this explicit per-message CLI seam; do not reuse from automation or bulk callers.
+  const result = store.prepare(`UPDATE operator_messages
+    SET read_at_ms = COALESCE(read_at_ms, ?), archived_at_ms = COALESCE(archived_at_ms, ?)
+    WHERE project_id = ? AND message_id = ?`).run(now, now, projectId, messageId);
+  if (result.changes !== 1) throw refusal("RESOURCE_UNKNOWN", "operator message does not exist in the requested project");
+  return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0]!;
 }
 
 async function markOperatorMessageRead(db: SqliteDatabase | null, bb: BbPluginApi, projectId: string, messageId: number) {
@@ -1613,17 +1630,21 @@ async function runCli(
     }
   }
   if (command === "inbox") {
-    const unknown = unexpectedFlags(args, ["--project", "--recipient", "--mark-read"]);
+    const unknown = unexpectedFlags(args, ["--project", "--recipient", "--mark-read", "--archive"]);
     if (unknown) return invalidCli(`unexpected flag ${unknown}`);
     const recipient = parseFlag(args, "--recipient");
     const markRead = parseFlag(args, "--mark-read");
-    if (markRead !== null) {
-      if (recipient !== null) return invalidCli("--recipient cannot be used with --mark-read");
-      const messageId = z.coerce.number().int().positive().safeParse(markRead);
+    const archive = parseFlag(args, "--archive");
+    if (markRead !== null || archive !== null) {
+      if (markRead !== null && archive !== null) return invalidCli("--mark-read and --archive cannot be used together");
+      if (recipient !== null) return invalidCli(`--recipient cannot be used with ${archive !== null ? "--archive" : "--mark-read"}`);
+      const messageId = z.coerce.number().int().positive().safeParse(archive ?? markRead);
       if (!messageId.success) return invalidCli(messageId.error.message);
       try {
-        const marked = await markOperatorMessageRead(db, bb, projectId, messageId.data);
-        return operatorMessagesCliResult(projectId, [marked], "operator message marked read");
+        const marked = archive !== null
+          ? await archiveOperatorMessage(db, bb, projectId, messageId.data)
+          : await markOperatorMessageRead(db, bb, projectId, messageId.data);
+        return operatorMessagesCliResult(projectId, [marked], archive !== null ? "operator message archived" : "operator message marked read");
       } catch (error) {
         return invalidCli(error instanceof Error ? error.message : String(error), isRefusal(error) ? error.data.code : "INVALID_INPUT");
       }
@@ -3708,7 +3729,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return composeRoleBrief(bb, db, input);
     },
     operatorMessages(input) {
-      return listOperatorMessages(db, bb, input.projectId, input.recipient, input.withSenderTitles);
+      return listOperatorMessages(db, bb, input.projectId, input.recipient, input.withSenderTitles, input.includeArchived);
     },
     markOperatorMessageRead(input) {
       return markOperatorMessageRead(db, bb, input.projectId, input.messageId);
@@ -3805,8 +3826,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       },
       {
         name: "inbox",
-        summary: "Read or mark read in one exact registered project's operator inbox",
-        usage: "bb collab inbox --project PROJECT_ID [--recipient operator|supervisor | --mark-read MESSAGE_ID]",
+        summary: "Read, mark read, or archive in one exact registered project's operator inbox",
+        usage: "bb collab inbox --project PROJECT_ID [--recipient operator|supervisor | --mark-read MESSAGE_ID | --archive MESSAGE_ID]",
       },
     ],
     run(argv, context) {
