@@ -29,6 +29,23 @@ export type WorktreeCleanupReport = {
   attestation: { coverage: "known" } | { coverage: "blind"; reason: string };
 };
 
+type ExecutedProfileRead = {
+  outcome?: string;
+  environmentDependent?: boolean;
+  reason?: string;
+  turns?: ReadonlyArray<{ phase?: string; environmentDependent?: boolean; reason?: string }>;
+};
+
+export function cleanupAttestationFromProfile(profile: ExecutedProfileRead):
+  { coverage: "known" } | { coverage: "blind"; reason: string } {
+  const environmentDependent = profile.environmentDependent ?? profile.turns?.some((turn) => turn.environmentDependent) ?? false;
+  if (environmentDependent) {
+    if (profile.outcome === "unknown") return { coverage: "blind", reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134" };
+    return { coverage: "known" };
+  }
+  return { coverage: "known" };
+}
+
 
 export type WorktreeCleanupOptions = {
   liveThreadIds: ReadonlySet<string>;

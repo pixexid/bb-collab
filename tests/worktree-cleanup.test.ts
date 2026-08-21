@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { WorktreeCleanupOptions } from "../src/worktree-cleanup.js";
 import {
   canonicalWorktreePath,
+  cleanupAttestationFromProfile,
   classifyWorktree,
   cleanupGitWorktrees,
   defaultQuietFloorMs,
@@ -119,6 +120,15 @@ describe("worktree cleanup", () => {
     const result = report(root, new Set(), new Map(), { protectedEnvironmentPaths: new Set([canonicalWorktreePath(paths[1])]) });
     expect(result.wouldRemove.map(({ path }) => path)).not.toContain(canonicalWorktreePath(paths[1]));
     expect(result.refused).toContainEqual(expect.objectContaining({ path: canonicalWorktreePath(paths[1]), reason: "plugin source environment is protected" }));
+  });
+
+  it("preserves the reader's provider and turn-state distinction", () => {
+    expect(cleanupAttestationFromProfile({ outcome: "unknown", environmentDependent: false })).toEqual({ coverage: "known" });
+    expect(cleanupAttestationFromProfile({ outcome: "unknown", environmentDependent: true })).toEqual({
+      coverage: "blind",
+      reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134",
+    });
+    expect(cleanupAttestationFromProfile({ outcome: "unknown", turns: [{ phase: "active", environmentDependent: true }] })).toMatchObject({ coverage: "blind" });
   });
 
   it("reports removable candidates with blind expiry attestation", () => {

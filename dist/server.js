@@ -21309,6 +21309,14 @@ function livenessDecision(state, alerted) {
 import { execFileSync } from "node:child_process";
 import { readFileSync as readFileSync2, realpathSync as realpathSync2, statSync } from "node:fs";
 import { resolve } from "node:path";
+function cleanupAttestationFromProfile(profile) {
+  const environmentDependent = profile.environmentDependent ?? profile.turns?.some((turn) => turn.environmentDependent) ?? false;
+  if (environmentDependent) {
+    if (profile.outcome === "unknown") return { coverage: "blind", reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134" };
+    return { coverage: "known" };
+  }
+  return { coverage: "known" };
+}
 var threadPattern = /thr_[a-z0-9]+/u;
 var defaultQuietFloorMs = 24 * 60 * 60 * 1e3;
 var reflogCreation = /^\S+ \S+ .* (\d+) [-+]\d{4}(?:\t|$)/u;
@@ -22760,12 +22768,28 @@ async function replyToOperatorMessage(db, bb, projectId, messageId, replyText) {
   }
   return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0];
 }
-async function readCleanupAttestation(_projectId, threadIds) {
+async function readCleanupAttestation(projectId, threadIds) {
   if (threadIds.size === 0) return { coverage: "known" };
-  return {
-    coverage: "blind",
-    reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134"
-  };
+  const root = findCheckoutRoot(dirname3(fileURLToPath(import.meta.url)));
+  if (!root) return { coverage: "blind", reason: "reader-unavailable:checkout-root-unresolved" };
+  for (const threadId of threadIds) {
+    const result2 = await new Promise((resolve3) => {
+      execFile(process.execPath, [join5(root, "scripts", "read-executed-profile.mjs"), "--project", projectId, "--thread", threadId], {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 3e4,
+        maxBuffer: 64 * 1024 * 1024
+      }, (_error, stdout) => resolve3({ output: stdout }));
+    });
+    try {
+      const profile = JSON.parse(result2.output);
+      const attestation = cleanupAttestationFromProfile(profile);
+      if (attestation.coverage === "blind") return attestation;
+    } catch {
+      return { coverage: "blind", reason: `reader-unreadable:${threadId}` };
+    }
+  }
+  return { coverage: "known" };
 }
 async function reportProjectWorktreeCleanup(bb, projectId) {
   const project = await bb.sdk.projects.get({ projectId });

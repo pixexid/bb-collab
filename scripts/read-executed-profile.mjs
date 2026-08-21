@@ -374,7 +374,8 @@ export async function main(argv = process.argv.slice(2)) {
   const shown = bbJson(["thread", "show", threadId, "--json"]);
   if (shown?.thread?.id !== threadId || shown.thread.projectId !== projectId) throw new Error("thread does not belong to the exact project");
   const result = await readExecutedProfiles({ thread: shown.thread, environment: shown.environment, events: readAllEvents(threadId) });
-  console.log(JSON.stringify({ threadId, projectId, providerId: shown.thread.providerId, ...result }, null, 2));
+  const environmentDependent = shown.thread.status === "active" || shown.thread.providerId !== "codex";
+  console.log(JSON.stringify({ threadId, projectId, providerId: shown.thread.providerId, environmentDependent, ...result }, null, 2));
   if (result.outcome === "unknown") process.exitCode = 2;
 }
 

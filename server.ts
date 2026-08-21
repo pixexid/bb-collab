@@ -69,7 +69,7 @@ import {
   type SourceObservation,
 } from "./src/registered-waits.js";
 import { ARCHIVE_SWEEP_GUARD, createArchiveSweepRefusalCounter, runArchiveSweep, type ArchiveSweepRefusalAggregate } from "./src/archive-sweep.js";
-import { canonicalWorktreePath, cleanupGitWorktrees, listAllProjectThreads, listGitWorktrees, threadIdFromBranch } from "./src/worktree-cleanup.js";
+import { canonicalWorktreePath, cleanupAttestationFromProfile, cleanupGitWorktrees, listAllProjectThreads, listGitWorktrees, threadIdFromBranch } from "./src/worktree-cleanup.js";
 import { findCheckoutRoot, readCheckoutDivergence, type CheckoutDivergence } from "./src/checkout-divergence.js";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFile, spawnSync, type ExecFileException, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
@@ -1281,12 +1281,25 @@ async function replyToOperatorMessage(db: SqliteDatabase | null, bb: BbPluginApi
   return (await resolveSenderTitles(bb, [readOperatorMessage(store, projectId, messageId)]))[0]!;
 }
 
-async function readCleanupAttestation(_projectId: string, threadIds: ReadonlySet<string>) {
+async function readCleanupAttestation(projectId: string, threadIds: ReadonlySet<string>) {
   if (threadIds.size === 0) return { coverage: "known" as const };
-  return {
-    coverage: "blind" as const,
-    reason: "expiry is not distinguishable from the executed-profile reader today; pending upstream get-bb/bb#2134",
-  };
+  const root = findCheckoutRoot(dirname(fileURLToPath(import.meta.url)));
+  if (!root) return { coverage: "blind" as const, reason: "reader-unavailable:checkout-root-unresolved" };
+  for (const threadId of threadIds) {
+    const result = await new Promise<{ output: string }>((resolve) => {
+      execFile(process.execPath, [join(root, "scripts", "read-executed-profile.mjs"), "--project", projectId, "--thread", threadId], {
+        cwd: root, encoding: "utf8", timeout: 30_000, maxBuffer: 64 * 1024 * 1024,
+      }, (_error, stdout) => resolve({ output: stdout }));
+    });
+    try {
+      const profile = JSON.parse(result.output) as { environmentDependent?: boolean; outcome?: string; turns?: ReadonlyArray<{ environmentDependent?: boolean }> };
+      const attestation = cleanupAttestationFromProfile(profile);
+      if (attestation.coverage === "blind") return attestation;
+    } catch {
+      return { coverage: "blind" as const, reason: `reader-unreadable:${threadId}` };
+    }
+  }
+  return { coverage: "known" as const };
 }
 
 async function reportProjectWorktreeCleanup(bb: BbPluginApi, projectId: string) {
