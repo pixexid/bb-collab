@@ -180,6 +180,26 @@ describe("worktree cleanup", () => {
     expect(result.refused).toEqual([]);
   });
 
+  it("does not expand an attested report when cleanup predicates change", () => {
+    const { root, paths } = fixture();
+    const entry = { path: paths[1], branch: "feature/thr_stale", head: git(paths[1], "rev-parse", "HEAD") };
+    let statusReads = 0;
+    const options: WorktreeCleanupOptions = {
+      liveThreadIds: new Set(),
+      environmentInventoryComplete: true,
+      createdAt: () => Date.now() - defaultQuietFloorMs - 1,
+      originMain: git(root, "rev-parse", "refs/remotes/origin/main"),
+      status: () => statusReads++ === 0 ? "dirty" : "",
+      reachable: () => true,
+    };
+    const preliminary = runWorktreeCleanup([entry], options);
+    expect(preliminary.wouldRemove).toEqual([]);
+    expect(runWorktreeCleanup([entry], options).wouldRemove).toHaveLength(1);
+
+    const reported = { ...preliminary, attestation: { coverage: "known" as const } };
+    expect(reported.wouldRemove).toEqual([]);
+  });
+
   it("reports exactly the clean detached orphan and refuses live and dirty entries", () => {
     const { root, paths } = fixture();
     const ownership = new Map([[canonicalWorktreePath(paths[0]), new Set(["thr_live"])]]);
