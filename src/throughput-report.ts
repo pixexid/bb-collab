@@ -186,7 +186,7 @@ export function weeklyThroughputReport(facts: ThroughputFacts, window: { startAt
   const populationDisconnected = population?.selectorUsage === "unused";
   const populationUnknown = population?.selectorUsage === "unknown";
   const filed = defectEscapeUnknown || populationDisconnected || populationUnknown ? null : defects.length;
-  const attributed = defectEscapeUnknown ? null : defects.filter((defect) => defect.attributionKnown !== false && defect.culpritMergeId != null).length;
+  const attributed = filed === null ? null : defects.filter((defect) => defect.attributionKnown !== false && defect.culpritMergeId != null).length;
   const unattributed = filed === null || attributed === null ? null : filed - attributed;
   const attributionCoverage = filed === null || attributed === null || filed === 0 ? null : Number((attributed / filed).toFixed(3));
   if (filed !== null && attributed !== null && unattributed !== null && filed !== attributed + unattributed) throw new Error("defect escape attribution population does not reconcile");

@@ -86,7 +86,7 @@ describe("weekly throughput report", () => {
 
   it("distinguishes an unused defect selector from an empty connected population", () => {
     const report = weeklyThroughputReport({ ...empty, defectPopulation: { selector: "bug", selectorUsage: "unused" } }, window);
-    expect(report.defectEscape).toMatchObject({ filed: null, attributionCoverage: null, population: { status: "disconnected", selector: "bug" } });
+    expect(report.defectEscape).toMatchObject({ filed: null, attributed: null, unattributed: null, attributionCoverage: null, population: { status: "disconnected", selector: "bug" } });
     expect(report.defectEscape.summary).toContain("selector bug is unused repo-wide");
   });
 
