@@ -8,7 +8,7 @@ import type { CheckoutDivergence } from "./checkout-divergence.js";
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
-// Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION: 34 in AGENTS.md.
+// Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
 export const RUNTIME_CONTRACT_VERSION = 22;
 export const SCHEMA_VERSION = 26;
 // v22 establishes the director's exact accepted-profile set.
