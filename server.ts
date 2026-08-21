@@ -354,6 +354,7 @@ export const foundationResultSchema = z
     expectedGovernanceEpoch: z.number().int().nonnegative().optional(),
     currentResourceRevision: z.number().int().positive().optional(),
     expectedResourceRevision: z.number().int().positive().optional(),
+    structurallyImpossibleAtRevision: z.boolean().optional(),
     mutationReceipt: mutationReceiptSchema.optional(),
     actorReceiptId: z.string().optional(),
     eventSequence: z.number().int().positive().optional(),

@@ -2054,6 +2054,30 @@ describe("bb-collab plugin boundary", () => {
     expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["send_to_operator"]);
   });
 
+  it("carries structural refusals through the apply RPC output schema", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const github = new DeterministicGitHubIssueAdapter();
+    const githubRead = github.read.bind(github);
+    github.put({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: "Reopenable", body: "", state: "closed", labels: [], externalRevision: "closed-x" });
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      workItem: { workItemId: WORK_ITEM_ID, title: "Reopenable", body: "", githubIssue: { issueNumber: 351 } },
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3)).outcome).toBe("OK");
+    expect(applyFixtureMutation(db, transitionRequest(fenceToken, "succeeded", 4, {
+      workItemExternalEvent: { kind: "github_issue_closed", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
+    }), null, null, null, null, githubRead)).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
+
+    await expect(host.harness.callRpc("apply", transitionRequest(fenceToken, "ready", 5, {
+      idempotencyKey: "rpc-structural-refusal",
+    }))).resolves.toMatchObject({
+      outcome: "WORK_ITEM_STATE_INVALID",
+      structurallyImpossibleAtRevision: true,
+    });
+  });
+
   it("bounds idle-fleet disposal when capacity closure is busy", async () => {
     const host = await loadedHost();
     const db = host.bb.storage.database();

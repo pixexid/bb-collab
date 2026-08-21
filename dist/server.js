@@ -21994,6 +21994,7 @@ var foundationResultSchema = external_exports.object({
   expectedGovernanceEpoch: external_exports.number().int().nonnegative().optional(),
   currentResourceRevision: external_exports.number().int().positive().optional(),
   expectedResourceRevision: external_exports.number().int().positive().optional(),
+  structurallyImpossibleAtRevision: external_exports.boolean().optional(),
   mutationReceipt: mutationReceiptSchema.optional(),
   actorReceiptId: external_exports.string().optional(),
   eventSequence: external_exports.number().int().positive().optional(),
