@@ -14458,7 +14458,7 @@ function createIdleFleetDetector(options) {
         reportBlind(decision.message);
         return;
       }
-      if (state[key] === void 0 && state[legacyProbeKey(probe)] !== void 0) {
+      if (state[legacyProbeKey(probe)] !== void 0) {
         state[key] = state[legacyProbeKey(probe)];
         delete state[legacyProbeKey(probe)];
         await save();
@@ -21044,7 +21044,7 @@ function createStallGuardCycle(options) {
       for (const holder of holders) {
         const key = JSON.stringify([holder.project_id, holder.role_id]);
         const legacyKey = `${holder.project_id}:${holder.role_id}`;
-        if (nextState[key] === void 0 && nextState[legacyKey] !== void 0) {
+        if (nextState[legacyKey] !== void 0) {
           nextState[key] = nextState[legacyKey];
           delete nextState[legacyKey];
           changed += 1;

@@ -95,7 +95,8 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
       for (const holder of holders) {
         const key = JSON.stringify([holder.project_id, holder.role_id]);
         const legacyKey = `${holder.project_id}:${holder.role_id}`;
-        if (nextState[key] === undefined && nextState[legacyKey] !== undefined) {
+        if (nextState[legacyKey] !== undefined) {
+          // Legacy wins when both exist: an interrupted migration may have left a stale canonical copy.
           nextState[key] = nextState[legacyKey]!;
           delete nextState[legacyKey];
           changed += 1;

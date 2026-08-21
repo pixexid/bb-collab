@@ -110,6 +110,27 @@ describe("stall-guard artifact cycle", () => {
     expect(steerRole).not.toHaveBeenCalled();
   });
 
+  it("prefers legacy history when partial migration left both holder keys", async () => {
+    const store = kvPersistence();
+    await store.host.bb.storage.kv.set("stall-guard.artifacts", {
+      '["project-1","project-orchestrator"]': JSON.stringify(artifact("stale-canonical")),
+      "project-1:project-orchestrator": JSON.stringify(absentArtifact()),
+    });
+    const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
+    const cycle = createStallGuardCycle({
+      readRoleHolders: () => [holder(1, "current-holder")],
+      readArtifact: async () => absentArtifact(),
+      wakeRole,
+      persistence: store.persistence,
+    });
+
+    await expect(cycle.cycle(PROJECT_ID)).resolves.toMatchObject({ changed: 1, attempted: 0, verified: 0, steered: 0 });
+    expect(wakeRole).not.toHaveBeenCalled();
+    expect(await store.persistence.read()).toEqual({
+      '["project-1","project-orchestrator"]': JSON.stringify(absentArtifact()),
+    });
+  });
+
   it("persists artifact deltas so a restart does not re-fire them", async () => {
     const store = kvPersistence();
     const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });

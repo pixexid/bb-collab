@@ -978,7 +978,8 @@ export function createIdleFleetDetector(options: {
         reportBlind(decision.message);
         return;
       }
-      if (state[key] === undefined && state[legacyProbeKey(probe)] !== undefined) {
+      if (state[legacyProbeKey(probe)] !== undefined) {
+        // Legacy wins when both exist: an interrupted migration may have left a stale canonical copy.
         state[key] = state[legacyProbeKey(probe)]!;
         delete state[legacyProbeKey(probe)];
         await save();
