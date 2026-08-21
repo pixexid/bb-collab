@@ -21905,12 +21905,12 @@ async function linkedGithubObservationAsync(owner, repo, issueNumber) {
   const status = pullRequestMerged || pullRequestClosed || issueClosed ? pullRequestMerged ? "merged" : "closed" : issueOpen ? "open" : null;
   return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, externalRevision };
 }
-async function readGithubPullRequestMergeReadiness(owner, repo, prNumber) {
-  const value = await githubJsonAsync(["pr", "view", String(prNumber), "--repo", `${owner}/${repo}`, "--json", "state,mergeStateStatus,reviewDecision,statusCheckRollup"]);
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+async function readGithubPullRequestMergeReadiness(owner, repo, prNumber, reviewedHeadSha) {
+  const value = await githubJsonAsync(["pr", "view", String(prNumber), "--repo", `${owner}/${repo}`, "--json", "state,mergeStateStatus,reviewDecision,statusCheckRollup,headRefOid,repository"]);
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub pull request readiness unavailable");
   const record2 = value;
   const checks = record2.statusCheckRollup;
-  return record2.state === "OPEN" && record2.mergeStateStatus === "CLEAN" && record2.reviewDecision === "APPROVED" && Array.isArray(checks) && checks.every((check2) => check2 && typeof check2 === "object" && !Array.isArray(check2) && (check2.conclusion === "SUCCESS" || check2.state === "SUCCESS"));
+  return record2.state === "OPEN" && record2.repository?.nameWithOwner === `${owner}/${repo}` && record2.headRefOid === reviewedHeadSha && record2.mergeStateStatus === "CLEAN" && record2.reviewDecision === "APPROVED" && Array.isArray(checks) && checks.every((check2) => check2 && typeof check2 === "object" && !Array.isArray(check2) && (check2.conclusion === "SUCCESS" || check2.state === "SUCCESS"));
 }
 async function readGithubIssueForBackfillAsync(owner, repo, issueNumber) {
   const value = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,labels,updatedAt"]);
@@ -24098,6 +24098,30 @@ ${thread.titleFallback ?? ""}`);
           ...extra
         }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
       };
+      const clearMergeWait = (projectId, workItemId, idempotencyKey) => {
+        const actor = db.prepare(
+          `SELECT receipt_id FROM actor_receipts
+           WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
+             AND verification_state = 'verified' ORDER BY issued_at_ms DESC LIMIT 1`
+        ).get(projectId, PLUGIN_ID);
+        const governor = db.prepare("SELECT governance_epoch, fence_token FROM project_governorship_heads WHERE project_id = ?").get(projectId);
+        const config2 = db.prepare("SELECT config_revision FROM project_config_heads WHERE project_id = ?").get(projectId);
+        const workItem = db.prepare("SELECT repo_target_id, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, workItemId);
+        if (!actor || !governor || !config2 || !workItem) return { outcome: "WORK_ITEM_STATE_INVALID", subject: workItemId, expected: 1, attempted: 0, verified: 0, message: "authority or work item unavailable" };
+        return applyAuthorizedMutation(db, {
+          projectId,
+          operationClass: "work_item_transition",
+          idempotencyKey,
+          actorReceiptId: actor.receipt_id,
+          expectedConfigRevision: config2.config_revision,
+          expectedGovernanceEpoch: governor.governance_epoch,
+          expectedFenceToken: governor.fence_token,
+          repoTargetId: workItem.repo_target_id,
+          expectedResourceRevision: workItem.resource_revision,
+          workItemId,
+          workItemWait: null
+        }, null, null, null, null, readGithubIssueForBackfill);
+      };
       const declareMergeWait = (projectId, workItemId, idempotencyKey) => {
         const actor = db.prepare(
           `SELECT receipt_id FROM actor_receipts
@@ -24418,20 +24442,35 @@ ${thread.titleFallback ?? ""}`);
             }
           }
           const remainingWorkItems = workItems.filter((workItem) => !unblocked.has(workItem.workItemId));
+          const unreadableMergeWaits = /* @__PURE__ */ new Set();
           for (const workItem of remainingWorkItems.filter((candidate) => candidate.lifecycleState === "review_pending")) {
-            if (workItem.waker != null) continue;
-            const review = db.prepare("SELECT review_pr_number FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'review' ORDER BY attempt_ordinal DESC LIMIT 1").get(projectId, workItem.workItemId);
-            if (review?.review_pr_number == null) continue;
+            const review = db.prepare("SELECT review_pr_number, review_pr_head_sha FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'review' ORDER BY attempt_ordinal DESC LIMIT 1").get(projectId, workItem.workItemId);
+            if (review?.review_pr_number == null || review.review_pr_head_sha == null) continue;
             let mergeOwed = false;
             try {
               const github = db.prepare("SELECT owner, repo FROM external_work_refs WHERE project_id = ? AND work_item_id = ? AND provider = 'github' AND issue_number IS NOT NULL").get(projectId, workItem.workItemId);
               if (!github) continue;
-              mergeOwed = await readGithubPullRequestMergeReadiness(github.owner, github.repo, review.review_pr_number);
-            } catch {
+              mergeOwed = await readGithubPullRequestMergeReadiness(github.owner, github.repo, review.review_pr_number, review.review_pr_head_sha);
+            } catch (error48) {
+              unreadableMergeWaits.add(workItem.workItemId);
               degrade(`github-pull-request-readiness:${projectId}:${workItem.workItemId}`);
+              bb.log.warn(`fleet-watchdog coverage=blind project=${projectId} workItem=${workItem.workItemId} reason=github-pull-request-readiness-unreadable:${String(error48)}`);
               continue;
             }
-            if (!mergeOwed) continue;
+            if (!mergeOwed) {
+              if (workItem.wakerKind === "seat") {
+                const result3 = clearMergeWait(projectId, workItem.workItemId, `fleet-watchdog:merge-no-longer-owed:${workItem.workItemId}:${review.review_pr_number}`);
+                if (result3.outcome === "OK") {
+                  workItem.waker = null;
+                  workItem.wakerKind = null;
+                  workItem.declaredAtMs = null;
+                } else {
+                  degrade(`work-item-merge-wait-clear:${projectId}:${workItem.workItemId}`);
+                }
+              }
+              continue;
+            }
+            if (workItem.waker != null) continue;
             const result2 = declareMergeWait(projectId, workItem.workItemId, `fleet-watchdog:merge-owed:${workItem.workItemId}:${review.review_pr_number}`);
             if (result2.outcome === "OK") {
               workItem.waker = "project-orchestrator";
@@ -24447,7 +24486,7 @@ ${thread.titleFallback ?? ""}`);
             await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait");
             continue;
           }
-          const seatWait = remainingWorkItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null);
+          const seatWait = remainingWorkItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null && !unreadableMergeWaits.has(workItem.workItemId));
           if (seatWait) {
             const owing = holders.find((holder) => holder.role_id === seatWait.waker);
             if (!owing) continue;

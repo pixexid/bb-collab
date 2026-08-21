@@ -5291,7 +5291,7 @@ exit 1
     writeFileSync(gh, `#!/bin/sh
 if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[]'; exit 0; fi
 if [ "$1" = "api" ]; then printf '%s\\n' '[[]]'; exit 0; fi
-if [ "$1" = "pr" ]; then printf '%s\\n' '{"state":"OPEN","mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","statusCheckRollup":[{"state":"SUCCESS"}]}'; exit 0; fi
+if [ "$1" = "pr" ]; then printf '%s\\n' '{"state":"OPEN","mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","statusCheckRollup":[{"state":"SUCCESS"}],"headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":{"nameWithOwner":"example/project"}}'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\\n' '{"state":"OPEN","updatedAt":"open-green","closedByPullRequestsReferences":[{"number":501}]}'; exit 0; fi
 printf '%s\\n' '{"number":501,"title":"merge","body":"","state":"OPEN","labels":[],"updatedAt":"open-green"}'
 `);
@@ -5332,6 +5332,105 @@ printf '%s\\n' '{"number":501,"title":"merge","body":"","state":"OPEN","labels":
       ]);
     } finally {
       clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("withdraws a merge wait when readiness becomes false", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-owed-merge-revalidate-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[]'; exit 0; fi
+if [ "$1" = "api" ]; then printf '%s\\n' '[[]]'; exit 0; fi
+if [ "$1" = "pr" ]; then
+  if [ -f "$0.called" ]; then printf '%s\\n' '{"state":"OPEN","mergeStateStatus":"UNSTABLE","reviewDecision":"APPROVED","statusCheckRollup":[{"state":"FAILURE"}],"headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":{"nameWithOwner":"example/project"}}';
+  else touch "$0.called"; printf '%s\\n' '{"state":"OPEN","mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","statusCheckRollup":[{"state":"SUCCESS"}],"headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","repository":{"nameWithOwner":"example/project"}}'; fi
+  exit 0
+fi
+printf '%s\\n' '{"number":501,"title":"merge","body":"","state":"OPEN","labels":[],"updatedAt":"open-green"}'
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      const workItemId = "revalidate-merge";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, { idempotencyKey: "revalidate-create", workItemId, workItem: { workItemId, title: workItemId, body: workItemId, githubIssue: { issueNumber: 501 } } })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { workItemId, idempotencyKey: "revalidate-ready" })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, { workItemId, idempotencyKey: "revalidate-start" })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { workItemId, idempotencyKey: "revalidate-review", workAttempt: { laneId: "lane-revalidate", threadId: "thread-revalidate", assignmentKind: "review", reviewPrNumber: 501, reviewPrHeadSha: CANDIDATE_SHA } })).outcome).toBe("OK");
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "fleet-watchdog-plugin-revalidate", actorKind: "plugin", subjectId: PLUGIN_ID });
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.db.prepare("SELECT 1 FROM work_item_waits WHERE work_item_id = ?").get(workItemId)).toBeDefined();
+      clock.mockReturnValue(300_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.db.prepare("SELECT 1 FROM work_item_waits WHERE work_item_id = ?").get(workItemId)).toBeUndefined();
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([input]) => JSON.stringify(input).includes("owed act"))).toHaveLength(0);
+    } finally {
+      clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("does not owe a PR whose live head differs from the reviewed head", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-owed-merge-head-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[]'; exit 0; fi
+if [ "$1" = "api" ]; then printf '%s\\n' '[[]]'; exit 0; fi
+if [ "$1" = "pr" ]; then printf '%s\\n' '{"state":"OPEN","mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","statusCheckRollup":[{"state":"SUCCESS"}],"headRefOid":"cccccccccccccccccccccccccccccccccccccccc","repository":{"nameWithOwner":"example/project"}}'; exit 0; fi
+printf '%s\\n' '{"number":501,"title":"merge","body":"","state":"OPEN","labels":[],"updatedAt":"open-green"}'
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      const workItemId = "wrong-head-merge";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, { idempotencyKey: "wrong-head-create", workItemId, workItem: { workItemId, title: workItemId, body: workItemId, githubIssue: { issueNumber: 501 } } })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { workItemId, idempotencyKey: "wrong-head-ready" })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, { workItemId, idempotencyKey: "wrong-head-start" })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { workItemId, idempotencyKey: "wrong-head-review", workAttempt: { laneId: "lane-wrong-head", threadId: "thread-wrong-head", assignmentKind: "review", reviewPrNumber: 501, reviewPrHeadSha: CANDIDATE_SHA } })).outcome).toBe("OK");
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "fleet-watchdog-plugin-wrong-head", actorKind: "plugin", subjectId: PLUGIN_ID });
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.db.prepare("SELECT 1 FROM work_item_waits WHERE work_item_id = ?").get(workItemId)).toBeUndefined();
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("marks merge-readiness coverage blind when GitHub returns malformed data", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-owed-merge-blind-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[]'; exit 0; fi
+if [ "$1" = "api" ]; then printf '%s\\n' '[[]]'; exit 0; fi
+if [ "$1" = "pr" ]; then printf '%s\\n' 'not-json'; exit 0; fi
+printf '%s\\n' '{"number":501,"title":"merge","body":"","state":"OPEN","labels":[],"updatedAt":"open-green"}'
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      const workItemId = "blind-merge";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, { idempotencyKey: "blind-create", workItemId, workItem: { workItemId, title: workItemId, body: workItemId, githubIssue: { issueNumber: 501 } } })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { workItemId, idempotencyKey: "blind-ready" })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, { workItemId, idempotencyKey: "blind-start" })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { workItemId, idempotencyKey: "blind-review", workAttempt: { laneId: "lane-blind", threadId: "thread-blind", assignmentKind: "review", reviewPrNumber: 501, reviewPrHeadSha: CANDIDATE_SHA } })).outcome).toBe("OK");
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "fleet-watchdog-plugin-blind", actorKind: "plugin", subjectId: PLUGIN_ID });
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({ level: "warn", message: expect.stringContaining("fleet-watchdog coverage=blind") }));
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
       rmSync(bin, { recursive: true, force: true });
