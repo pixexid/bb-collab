@@ -19477,7 +19477,8 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
     "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?"
   ).get(request.projectId, workItem.work_item_id));
   const machineWait = wait && (wait.kind === "work_item_succeeded" || wait.kind === "github_issue_closed") ? wait : null;
-  const enteringBlocked = nextState === "blocked";
+  const enteringBlocked = nextState === "blocked" && workItem.lifecycle_state !== "blocked";
+  const swappingBlockedWait = workItem.lifecycle_state === "blocked" && nextState === "blocked";
   if (enteringBlocked) {
     if (!machineWait || workAttempt !== void 0 || unblock !== void 0 || externalEvent !== void 0) {
       throw refusal("WORK_ITEM_STATE_INVALID", "entering blocked requires exactly one machine-evaluable blocker");
@@ -19485,13 +19486,23 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
     if (existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
     const blocker = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber };
     requireBlockerCondition(db, request, blocker, githubObservation, false);
-  } else if (wait !== void 0 && (nextState !== void 0 || workAttempt !== void 0)) {
+  } else if (wait !== void 0 && !swappingBlockedWait && (nextState !== void 0 || workAttempt !== void 0)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item wait mutation cannot change lifecycle state");
   }
-  if (wait !== void 0 && !enteringBlocked) {
+  if (swappingBlockedWait) {
+    if (!machineWait || !unblock || workAttempt !== void 0 || externalEvent !== void 0) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "blocked wait swap requires one replacement blocker and the exact stored blocker");
+    }
+    const storedBlocker = existingWait ? storedWorkItemBlocker(existingWait) : null;
+    if (!storedBlocker || !sameWorkItemBlocker(storedBlocker, unblock)) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "blocked wait swap requires the exact stored blocker");
+    }
+    requireBlockerCondition(db, request, machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber }, githubObservation, false);
+  }
+  if (wait !== void 0 && !enteringBlocked && !swappingBlockedWait) {
     if (machineWait) throw refusal("WORK_ITEM_STATE_INVALID", "machine-evaluable blocker requires an atomic transition to blocked");
     if (["blocked", "succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state)) {
-      throw refusal("WORK_ITEM_STATE_INVALID", "blocked or terminal work item cannot carry a human wait");
+      throw refusal("WORK_ITEM_STATE_INVALID", wait === null ? "blocked or terminal work item cannot lose its sole machine-evaluable blocker" : "blocked or terminal work item cannot carry a human wait");
     }
     if (wait !== null && existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
     if (wait === null && !existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item carries no open wait");
@@ -19653,7 +19664,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       }
     );
   }
-  if (!nextState || !redispatchingReview && !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
+  if (!nextState || !redispatchingReview && !swappingBlockedWait && !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
   let recordedExternalEvent = null;
@@ -19668,8 +19679,8 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
         throw refusal("WORK_ITEM_STATE_INVALID", "blocked to ready requires the exact stored blocker");
       }
       requireBlockerCondition(db, request, unblock, githubObservation, true);
-    } else if (unblock !== void 0) {
-      throw refusal("WORK_ITEM_STATE_INVALID", "work item unblock evidence only permits blocked to ready");
+    } else if (unblock !== void 0 && !swappingBlockedWait) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "work item unblock evidence only permits blocked to ready or an atomic blocker swap");
     }
   } else if (unblock !== void 0) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item unblock evidence requires a blocked work item");
@@ -19728,6 +19739,13 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       `INSERT INTO work_item_waits (project_id, work_item_id, waker, waker_kind, declared_at_ms, declared_by_seat, note)
        VALUES (?, ?, ?, ?, ?, ?, ?)`
     ).run(request.projectId, workItem.work_item_id, workItemBlockerWaker(blocker), blocker.kind, now(), machineWait.declaredBySeat, machineWait.note ?? null);
+  } else if (swappingBlockedWait) {
+    const blocker = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber };
+    db.prepare(
+      `UPDATE work_item_waits
+       SET waker = ?, waker_kind = ?, declared_at_ms = ?, declared_by_seat = ?, note = ?
+       WHERE project_id = ? AND work_item_id = ?`
+    ).run(workItemBlockerWaker(blocker), blocker.kind, now(), machineWait.declaredBySeat, machineWait.note ?? null, request.projectId, workItem.work_item_id);
   } else if (workItem.lifecycle_state === "blocked") {
     db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
   }
@@ -19798,7 +19816,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       aggregateType: "work_item",
       aggregateId: workItem.work_item_id,
       aggregateRevision: nextRevision,
-      eventType: "work_item_transitioned",
+      eventType: swappingBlockedWait ? "work_item_wait_swapped" : "work_item_transitioned",
       event: {
         workItemId: workItem.work_item_id,
         from: workItem.lifecycle_state,
