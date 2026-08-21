@@ -458,15 +458,6 @@ const registeredWaitInputSchema = z.object({
 const registeredWaitSchema = registeredWaitInputSchema.extend({
   declaredAtMs: z.number().int().nonnegative(),
 }).strict();
-const sidebarThreadStateSchema = z.string().trim().min(1).max(64);
-const sidebarThreadStateKey = (threadId: string) => `sidebar.thread-state:${threadId}`;
-const sidebarReasoningLevelSchema = z.enum(["none", "low", "medium", "high", "xhigh", "ultracode", "max", "ultra"]);
-const sidebarThreadExecutionSchema = z
-  .object({ model: z.string(), reasoning: sidebarReasoningLevelSchema })
-  .strict();
-const sidebarCollapseKindSchema = z.enum(["project", "thread"]);
-const sidebarCollapseKey = (kind: "project" | "thread", id: string) => `sidebar.collapse:${JSON.stringify([kind, id])}`;
-const legacySidebarCollapseKey = (kind: "project" | "thread", id: string) => `sidebar.collapse:${kind}:${id}`;
 const roleBriefRoleSchema = z.enum(["director", "orchestrator", "worker"]);
 const roleBriefBundleSchema = z.object({
   ponytail: z.string().min(1),
@@ -531,40 +522,6 @@ export const rpcContract = defineRpcContract({
   registerWait: {
     input: registeredWaitInputSchema,
     output: registeredWaitSchema,
-  },
-  threadStates: {
-    input: z.object({ threadIds: z.array(sidebarThreadIdSchema).max(256) }).strict(),
-    output: z.record(z.string(), sidebarThreadStateSchema),
-  },
-  threadModels: {
-    input: z.object({ threadIds: z.array(sidebarThreadIdSchema).max(256) }).strict(),
-    output: z.record(z.string(), sidebarThreadExecutionSchema.nullable()),
-  },
-  setThreadState: {
-    input: z.object({ threadId: sidebarThreadIdSchema, state: sidebarThreadStateSchema.nullable() }).strict(),
-    output: z.object({ state: sidebarThreadStateSchema.nullable() }).strict(),
-  },
-  sidebarCollapseState: {
-    input: z.object({
-      projectIds: z.array(sidebarThreadIdSchema).max(256),
-      threadIds: z.array(sidebarThreadIdSchema).max(256),
-    }).strict(),
-    output: z.object({
-      projects: z.record(z.string(), z.boolean()),
-      threads: z.record(z.string(), z.boolean()),
-    }).strict(),
-  },
-  setSidebarCollapse: {
-    input: z.object({ kind: sidebarCollapseKindSchema, id: sidebarThreadIdSchema, collapsed: z.boolean() }).strict(),
-    output: z.object({ kind: sidebarCollapseKindSchema, id: sidebarThreadIdSchema, collapsed: z.boolean() }).strict(),
-  },
-  reorderPinned: {
-    input: z.object({
-      threadId: sidebarThreadIdSchema,
-      previousThreadId: sidebarThreadIdSchema.nullable(),
-      nextThreadId: sidebarThreadIdSchema.nullable(),
-    }).strict(),
-    output: z.object({ ok: z.literal(true) }).strict(),
   },
   doctor: {
     input: z.object({ projectId: projectIdSchema }).strict(),
@@ -3697,59 +3654,6 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       const wait = { ...input, declaredAtMs: Date.now() };
       await watcher.registerWait(wait);
       return wait;
-    },
-    async threadStates(input) {
-      const entries = await Promise.all(input.threadIds.map(async (threadId) => {
-        const value = await bb.storage.kv.get<unknown>(sidebarThreadStateKey(threadId));
-        const parsed = sidebarThreadStateSchema.safeParse(value);
-        return parsed.success ? ([threadId, parsed.data] as const) : null;
-      }));
-      return Object.fromEntries(entries.filter((entry): entry is readonly [string, string] => entry !== null));
-    },
-    async threadModels(input) {
-      const entries = await Promise.all(input.threadIds.map(async (threadId) => {
-        try {
-          const options = await bb.sdk.threads.defaultExecutionOptions({ threadId });
-          // Model and reasoning are only ever the host's resolved facts; an
-          // absent option set stays absent rather than becoming a default.
-          return [threadId, options ? { model: options.model, reasoning: options.reasoningLevel } : null] as const;
-        } catch {
-          return [threadId, null] as const;
-        }
-      }));
-      return Object.fromEntries(entries);
-    },
-    async setThreadState(input) {
-      if (input.state === null) await bb.storage.kv.delete(sidebarThreadStateKey(input.threadId));
-      else await bb.storage.kv.set(sidebarThreadStateKey(input.threadId), input.state);
-      return { state: input.state };
-    },
-    async sidebarCollapseState(input) {
-      const read = async (kind: "project" | "thread", ids: readonly string[]) => {
-        const entries = await Promise.all(ids.map(async (id) => {
-          const canonical = await bb.storage.kv.get<unknown>(sidebarCollapseKey(kind, id));
-          const value = canonical === undefined ? await bb.storage.kv.get<unknown>(legacySidebarCollapseKey(kind, id)) : canonical;
-          return value === true ? [id, true] as const : null;
-        }));
-        return Object.fromEntries(entries.filter((entry): entry is readonly [string, true] => entry !== null));
-      };
-      return {
-        projects: await read("project", input.projectIds),
-        threads: await read("thread", input.threadIds),
-      };
-    },
-    async setSidebarCollapse(input) {
-      const key = sidebarCollapseKey(input.kind, input.id);
-      if (input.collapsed) await bb.storage.kv.set(key, true);
-      else {
-        await bb.storage.kv.set(key, false);
-        await bb.storage.kv.delete(legacySidebarCollapseKey(input.kind, input.id));
-      }
-      return input;
-    },
-    async reorderPinned(input) {
-      await bb.sdk.threads.reorderPinned(input);
-      return { ok: true as const };
     },
     async doctor(input) {
       return doctor(db, bb.sdk, input.projectId, readDiagnosticDivergence());

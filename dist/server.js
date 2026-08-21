@@ -22287,13 +22287,6 @@ var registeredWaitInputSchema = external_exports.object({
 var registeredWaitSchema = registeredWaitInputSchema.extend({
   declaredAtMs: external_exports.number().int().nonnegative()
 }).strict();
-var sidebarThreadStateSchema = external_exports.string().trim().min(1).max(64);
-var sidebarThreadStateKey = (threadId) => `sidebar.thread-state:${threadId}`;
-var sidebarReasoningLevelSchema = external_exports.enum(["none", "low", "medium", "high", "xhigh", "ultracode", "max", "ultra"]);
-var sidebarThreadExecutionSchema = external_exports.object({ model: external_exports.string(), reasoning: sidebarReasoningLevelSchema }).strict();
-var sidebarCollapseKindSchema = external_exports.enum(["project", "thread"]);
-var sidebarCollapseKey = (kind, id2) => `sidebar.collapse:${JSON.stringify([kind, id2])}`;
-var legacySidebarCollapseKey = (kind, id2) => `sidebar.collapse:${kind}:${id2}`;
 var roleBriefRoleSchema = external_exports.enum(["director", "orchestrator", "worker"]);
 var roleBriefBundleSchema = external_exports.object({
   ponytail: external_exports.string().min(1),
@@ -22354,40 +22347,6 @@ var rpcContract = defineRpcContract({
   registerWait: {
     input: registeredWaitInputSchema,
     output: registeredWaitSchema
-  },
-  threadStates: {
-    input: external_exports.object({ threadIds: external_exports.array(sidebarThreadIdSchema).max(256) }).strict(),
-    output: external_exports.record(external_exports.string(), sidebarThreadStateSchema)
-  },
-  threadModels: {
-    input: external_exports.object({ threadIds: external_exports.array(sidebarThreadIdSchema).max(256) }).strict(),
-    output: external_exports.record(external_exports.string(), sidebarThreadExecutionSchema.nullable())
-  },
-  setThreadState: {
-    input: external_exports.object({ threadId: sidebarThreadIdSchema, state: sidebarThreadStateSchema.nullable() }).strict(),
-    output: external_exports.object({ state: sidebarThreadStateSchema.nullable() }).strict()
-  },
-  sidebarCollapseState: {
-    input: external_exports.object({
-      projectIds: external_exports.array(sidebarThreadIdSchema).max(256),
-      threadIds: external_exports.array(sidebarThreadIdSchema).max(256)
-    }).strict(),
-    output: external_exports.object({
-      projects: external_exports.record(external_exports.string(), external_exports.boolean()),
-      threads: external_exports.record(external_exports.string(), external_exports.boolean())
-    }).strict()
-  },
-  setSidebarCollapse: {
-    input: external_exports.object({ kind: sidebarCollapseKindSchema, id: sidebarThreadIdSchema, collapsed: external_exports.boolean() }).strict(),
-    output: external_exports.object({ kind: sidebarCollapseKindSchema, id: sidebarThreadIdSchema, collapsed: external_exports.boolean() }).strict()
-  },
-  reorderPinned: {
-    input: external_exports.object({
-      threadId: sidebarThreadIdSchema,
-      previousThreadId: sidebarThreadIdSchema.nullable(),
-      nextThreadId: sidebarThreadIdSchema.nullable()
-    }).strict(),
-    output: external_exports.object({ ok: external_exports.literal(true) }).strict()
   },
   doctor: {
     input: external_exports.object({ projectId: projectIdSchema }).strict(),
@@ -25183,57 +25142,6 @@ ${thread.titleFallback ?? ""}`);
       const wait = { ...input, declaredAtMs: Date.now() };
       await watcher.registerWait(wait);
       return wait;
-    },
-    async threadStates(input) {
-      const entries = await Promise.all(input.threadIds.map(async (threadId) => {
-        const value = await bb.storage.kv.get(sidebarThreadStateKey(threadId));
-        const parsed = sidebarThreadStateSchema.safeParse(value);
-        return parsed.success ? [threadId, parsed.data] : null;
-      }));
-      return Object.fromEntries(entries.filter((entry) => entry !== null));
-    },
-    async threadModels(input) {
-      const entries = await Promise.all(input.threadIds.map(async (threadId) => {
-        try {
-          const options2 = await bb.sdk.threads.defaultExecutionOptions({ threadId });
-          return [threadId, options2 ? { model: options2.model, reasoning: options2.reasoningLevel } : null];
-        } catch {
-          return [threadId, null];
-        }
-      }));
-      return Object.fromEntries(entries);
-    },
-    async setThreadState(input) {
-      if (input.state === null) await bb.storage.kv.delete(sidebarThreadStateKey(input.threadId));
-      else await bb.storage.kv.set(sidebarThreadStateKey(input.threadId), input.state);
-      return { state: input.state };
-    },
-    async sidebarCollapseState(input) {
-      const read = async (kind, ids) => {
-        const entries = await Promise.all(ids.map(async (id2) => {
-          const canonical = await bb.storage.kv.get(sidebarCollapseKey(kind, id2));
-          const value = canonical === void 0 ? await bb.storage.kv.get(legacySidebarCollapseKey(kind, id2)) : canonical;
-          return value === true ? [id2, true] : null;
-        }));
-        return Object.fromEntries(entries.filter((entry) => entry !== null));
-      };
-      return {
-        projects: await read("project", input.projectIds),
-        threads: await read("thread", input.threadIds)
-      };
-    },
-    async setSidebarCollapse(input) {
-      const key = sidebarCollapseKey(input.kind, input.id);
-      if (input.collapsed) await bb.storage.kv.set(key, true);
-      else {
-        await bb.storage.kv.set(key, false);
-        await bb.storage.kv.delete(legacySidebarCollapseKey(input.kind, input.id));
-      }
-      return input;
-    },
-    async reorderPinned(input) {
-      await bb.sdk.threads.reorderPinned(input);
-      return { ok: true };
     },
     async doctor(input) {
       return doctor(db, bb.sdk, input.projectId, readDiagnosticDivergence());

@@ -2,7 +2,7 @@
 
 import { cleanup, waitFor } from "@testing-library/react";
 import { installTestPluginRuntime, loadPluginApp, renderSlot } from "@bb/plugin-sdk/testing/app";
-import type { PluginThreadListProps } from "@bb/plugin-sdk/app";
+
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   INBOX_INDICATOR_BROKEN_TITLE,
@@ -81,27 +81,14 @@ function rpcHandlers(operatorMessages: (input: { projectId: string }) => Promise
   } as never;
 }
 
-function props(): PluginThreadListProps {
-  return {
-    activeThreadId: null,
-    activeProjectId: null,
-    isCompactViewport: false,
-    onNavigate: vi.fn(),
-    searchQuery: "",
-    // bb-app 0.39.0 made experimental_Original required: the host's own thread
-    // list, which a plugin may render to defer to default behaviour.
-    experimental_Original: () => null,
-  };
-}
-
 async function threadList() {
   installTestPluginRuntime();
   const app = await loadPluginApp(() => import("../app"));
-  return app.threadLists[0]!;
+  return app.navPanels.find((panel) => panel.id === "inbox")!;
 }
 
 function renderList(operatorMessages: (input: { projectId: string }) => Promise<InboxReply>) {
-  return renderSlot(threadListRegistration!, props(), {
+  return renderSlot(threadListRegistration!, { subPath: "" }, {
     sidebarThreads: { status: "ready", projects: [{ id: "project-a", name: "Project A", isPersonal: false }], threads: [] },
     rpc: rpcHandlers(operatorMessages),
   });
