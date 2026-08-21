@@ -2781,12 +2781,12 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             );
             if (result.outcome === "OK") {
               bb.log.info(`fleet-watchdog returned succeeded work item to ready: project=${projectId} workItem=${linked.work_item_id} externalRevision=${observation.externalRevision}`);
-            } else if (result.outcome === "WORK_ITEM_STATE_INVALID" && (result.message?.includes("succeeded work item has no recorded close observation") || result.message?.includes("succeeded work item can return only after a proven GitHub issue reopening"))) {
+            } else if (result.outcome === "WORK_ITEM_STATE_INVALID" && (result.message?.includes("succeeded work item has no recorded close observation") || result.message?.includes("succeeded work item can return only after a proven GitHub issue reopening") || result.message?.includes("GitHub reopen does not follow the exact recorded close observation"))) {
               permanentlyRefusedReopens.add(reopenKey);
               bb.log.warn(`fleet-watchdog learned permanently-refused issue-reopen transition: project=${projectId} workItem=${linked.work_item_id} reason=${result.message}`);
             } else {
               degrade(`github-work-item-reopen:${projectId}:${linked.work_item_id}`);
-              bb.log.warn(`fleet-watchdog issue-reopen transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result.outcome}`);
+              bb.log.warn(`fleet-watchdog issue-reopen transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result.outcome} message=${result.message ?? "unknown"}`);
             }
             continue;
           }

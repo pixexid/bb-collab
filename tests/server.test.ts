@@ -4619,7 +4619,23 @@ exit 1
         workItemId,
         workItem: { workItemId, title: workItemId, body: workItemId, githubIssue: { issueNumber: 351 } },
       })).outcome).toBe("OK");
-      fixture.db.prepare("UPDATE work_items SET lifecycle_state = 'succeeded' WHERE project_id = ? AND work_item_id = ?").run(PROJECT_ID, workItemId);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, {
+        idempotencyKey: "permanently-refused-reopen-ready", workItemId,
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+        idempotencyKey: "permanently-refused-reopen-start", workItemId,
+        workAttempt: { laneId: "lane-permanently-refused-reopen", threadId: "thread-permanently-refused-reopen", assignmentKind: "write" },
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, {
+        idempotencyKey: "permanently-refused-reopen-review", workItemId,
+        workAttempt: { laneId: "lane-permanently-refused-reopen-review", threadId: "thread-permanently-refused-reopen-review", assignmentKind: "review", reviewPrNumber: 200, reviewPrHeadSha: CANDIDATE_SHA },
+      })).outcome).toBe("OK");
+      const github = new DeterministicGitHubIssueAdapter();
+      github.put({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: workItemId, body: workItemId, state: "closed", labels: [], externalRevision: "open-y" });
+      expect(applyFixtureMutation(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4, {
+        idempotencyKey: "permanently-refused-reopen-succeeded", workItemId,
+        workItemExternalEvent: { kind: "github_issue_closed", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
+      }), null, null, null, null, github.read.bind(github))).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
       seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "fleet-watchdog-plugin-refused-reopen", actorKind: "plugin", subjectId: PLUGIN_ID });
 
       await fixture.host.harness.runSchedule("fleet-watchdog");
@@ -4630,6 +4646,7 @@ exit 1
       const skips = fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("skipped permanently-refused issue-reopen transition"));
       expect(refusals).toHaveLength(0);
       expect(learned).toHaveLength(1);
+      expect(learned[0]?.message).toContain("GitHub reopen does not follow the exact recorded close observation");
       expect(learned.length + refusals.length).toBe(1);
       expect(skips).toHaveLength(1);
     } finally {
