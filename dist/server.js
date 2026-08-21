@@ -14301,10 +14301,17 @@ function createLaneWatcher(options) {
     if (updated.steerCount === 2 && updated.failedSteers === 2) await escalateRole(key, target);
     return { attempted: true, delivered: !failed };
   };
-  const enqueue = (work) => {
+  const enqueue = (work, signal) => {
     const result2 = queue.then(work);
     queue = result2.then(() => void 0, () => void 0);
-    return result2;
+    if (!signal) return result2;
+    if (signal.aborted) return Promise.resolve(void 0);
+    let onAbort;
+    const aborted2 = new Promise((resolve3) => {
+      onAbort = () => resolve3(void 0);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    return Promise.race([result2, aborted2]).finally(() => signal.removeEventListener("abort", onAbort));
   };
   const emitWaitEvents = async (context) => {
     for (const event of context.events) await options.onWaitEvent?.(event);
@@ -14350,7 +14357,7 @@ function createLaneWatcher(options) {
             }
           }
         }
-      });
+      }, signal);
     },
     wakeRole(role) {
       return enqueue(() => wakeRoleNow(role));

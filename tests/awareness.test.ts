@@ -47,6 +47,32 @@ function registeredWait(overrides: Partial<RegisteredWait> = {}): RegisteredWait
 }
 
 describe("lane awareness", () => {
+  it("lets an aborted poll bypass a hung signal-less observation", async () => {
+    let release!: () => void;
+    let observationStarted!: () => void;
+    const observation = new Promise<void>((resolve) => { observationStarted = resolve; });
+    const releaseObservation = new Promise<void>((resolve) => { release = resolve; });
+    const watcher = createLaneWatcher({
+      readRoleHolders: () => [roleHolder()],
+      readRoleScopes: () => [],
+      readWorker: async () => {
+        observationStarted();
+        await releaseObservation;
+        return roleObservation(0);
+      },
+      steerRole: async () => undefined,
+    });
+
+    const first = watcher.observe("director-1", "idle");
+    await observation;
+    const controller = new AbortController();
+    const poll = watcher.poll(controller.signal);
+    controller.abort();
+    await poll;
+    release();
+    await first;
+  });
+
   it("detects only a startable, non-deferred queue for a role", async () => {
     const steerRole = vi.fn<(role: RoleIdleView) => Promise<void>>().mockResolvedValue(undefined);
     let scopes = [roleScope(null, "awaiting_operator")];

@@ -747,10 +747,17 @@ export function createLaneWatcher(options: {
     return { attempted: true, delivered: !failed };
   };
 
-  const enqueue = <T>(work: () => Promise<T>): Promise<T> => {
+  const enqueue = <T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
     const result = queue.then(work);
     queue = result.then(() => undefined, () => undefined);
-    return result;
+    if (!signal) return result;
+    if (signal.aborted) return Promise.resolve(undefined as T);
+    let onAbort!: () => void;
+    const aborted = new Promise<T>((resolve) => {
+      onAbort = () => resolve(undefined as T);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    return Promise.race([result, aborted]).finally(() => signal.removeEventListener("abort", onAbort));
   };
 
   const emitWaitEvents = async (context: WaitContext) => {
@@ -801,7 +808,7 @@ export function createLaneWatcher(options: {
             }
           }
         }
-      });
+      }, signal);
     },
     wakeRole(role) {
       return enqueue(() => wakeRoleNow(role));
