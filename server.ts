@@ -2747,6 +2747,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       }
       const openWorkItemsByProject = new Map<string, Array<{ workItemId: string; lifecycleState: string; waker: string | null; wakerKind: "schedule" | "seat" | "work_item_succeeded" | "github_issue_closed" | null; declaredAtMs: number | null }>>();
       const externalRevisions = new Map<string, LinkedGithubObservation>();
+      const waitExternalRevisions = new Map<string, LinkedGithubObservation>();
+      const waitExternalKey = (owner: string, repo: string, issueNumber: number) => `${owner}\u0000${repo}\u0000${issueNumber}`;
       for (const workItem of db.prepare(
         `SELECT work_items.project_id, work_items.work_item_id, work_items.lifecycle_state, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
          FROM work_items LEFT JOIN work_item_waits
@@ -2891,6 +2893,22 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           ...extra,
         }, null, null, null, null, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
       };
+      const inspectWaitTargets = async (projectId: string) => {
+        for (const workItem of openWorkItemsByProject.get(projectId) ?? []) {
+          if (workItem.wakerKind !== "github_issue_closed" || workItem.waker === null) continue;
+          const match = workItem.waker.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u);
+          const issueNumber = match?.[3] === undefined ? NaN : Number(match[3]);
+          if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
+            degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
+            continue;
+          }
+          const key = waitExternalKey(match[1], match[2], issueNumber);
+          if (waitExternalRevisions.has(key)) continue;
+          const observation = await linkedGithubObservationAsync(match[1], match[2], issueNumber);
+          if (observation === null) degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
+          else waitExternalRevisions.set(key, observation);
+        }
+      };
       const inspectLinkedWorkItems = async (projectId: string) => {
         // The handoff gate owns canonical ledger/attempt drift; this existing watchdog owns
         // external terminal drift. The active writer indexes remain the duplicate-claim detector.
@@ -3028,6 +3046,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         try {
           if (onlyProjectId !== undefined && projectId !== onlyProjectId) continue;
           await inspectLinkedWorkItems(projectId);
+          await inspectWaitTargets(projectId);
           const directors = holders.filter((holder) => holder.role_id === "director");
           const orchestrators = holders.filter((holder) => holder.role_id === "project-orchestrator");
           if (directors.length !== 1 || orchestrators.length !== 1) {
@@ -3219,13 +3238,17 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           let staleExternalMoved = false;
           for (const candidate of remainingWorkItems) {
             if (candidate.declaredAtMs === null || now - candidate.declaredAtMs < staleWaitMs) continue;
-            const observation = externalRevisions.get(`${projectId}\u0000${candidate.workItemId}`);
+            const targetMatch = candidate.wakerKind === "github_issue_closed" ? candidate.waker?.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u) ?? null : null;
+            const targetIssueNumber = targetMatch?.[3] === undefined ? NaN : Number(targetMatch[3]);
+            const observation = targetMatch?.[1] && targetMatch[2] && Number.isSafeInteger(targetIssueNumber)
+              ? waitExternalRevisions.get(waitExternalKey(targetMatch[1], targetMatch[2], targetIssueNumber))
+              : undefined;
             if (!observation) { staleWait = candidate; break; }
             const record = await fleetWatchdogIdle.get(roleIdleKey(orchestrator, candidate.workItemId));
             const chased = record?.lastStaleWaitWakeAtMs !== null && record?.lastStaleWaitWakeAtMs !== undefined && record.lastStaleWaitExternalRevision === observation.externalRevision;
-            // ponytail: age-based recheck; use revision history if external change cadence needs finer control.
-            const recheckMs = observation.updatedAtMs === null ? FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS : Math.max(FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS, now - observation.updatedAtMs);
-            if (!chased || now - (record?.lastStaleWaitWakeAtMs ?? 0) >= recheckMs) {
+            // now - chaseAt >= max(floor, chaseAt - externalUpdatedAt); the interval is fixed at chase time.
+            const recheckMs = observation.updatedAtMs === null || !chased ? FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS : Math.max(FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS, record!.lastStaleWaitWakeAtMs! - observation.updatedAtMs);
+            if (!chased || now - record!.lastStaleWaitWakeAtMs! >= recheckMs) {
               staleWait = candidate;
               staleObservation = observation;
               staleExternalMoved = record?.lastStaleWaitExternalRevision !== null && record?.lastStaleWaitExternalRevision !== undefined && record.lastStaleWaitExternalRevision !== observation.externalRevision;
