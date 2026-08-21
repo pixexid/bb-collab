@@ -958,6 +958,43 @@ describe("replacement thread list", () => {
     expect(reorderPinned).toHaveBeenCalledWith({ threadId: "thread-1", previousThreadId: null, nextThreadId: "thread-2" });
   });
 
+  it("reads legacy collapse keys without writing during reads", async () => {
+    const host = createFakePluginHost({ pluginId: "bb-collab" });
+    const legacyKey = "sidebar.collapse:project:project-a";
+    const canonicalKey = "sidebar.collapse:[\"project\",\"project-a\"]";
+    await host.bb.storage.kv.set(legacyKey, true);
+    await plugin(host.bb);
+
+    await expect(host.harness.callRpc("sidebarCollapseState", { projectIds: ["project-a"], threadIds: [] })).resolves.toEqual({ projects: { "project-a": true }, threads: {} });
+    await expect(host.bb.storage.kv.get(canonicalKey)).resolves.toBeUndefined();
+    await expect(host.bb.storage.kv.get(legacyKey)).resolves.toBe(true);
+  });
+
+  it("does not resurrect a clear while a prior generation read is in flight", async () => {
+    const host = createFakePluginHost({ pluginId: "bb-collab" });
+    const legacyKey = "sidebar.collapse:project:project-a";
+    const canonicalKey = "sidebar.collapse:[\"project\",\"project-a\"]";
+    await host.bb.storage.kv.set(legacyKey, true);
+    await plugin(host.bb);
+
+    let releaseCanonicalRead!: () => void;
+    const canonicalReadReleased = new Promise<void>((resolve) => { releaseCanonicalRead = resolve; });
+    const originalGet = host.bb.storage.kv.get.bind(host.bb.storage.kv);
+    host.bb.storage.kv.get = async function <T>(key: string) {
+      const value = await originalGet<T>(key);
+      if (key === canonicalKey) await canonicalReadReleased;
+      return value;
+    };
+
+    const state = host.harness.callRpc("sidebarCollapseState", { projectIds: ["project-a"], threadIds: [] });
+    await Promise.resolve();
+    await host.harness.callRpc("setSidebarCollapse", { kind: "project", id: "project-a", collapsed: false });
+    releaseCanonicalRead();
+
+    await expect(state).resolves.toEqual({ projects: {}, threads: {} });
+    await expect(host.bb.storage.kv.get(legacyKey)).resolves.toBeUndefined();
+  });
+
   it("accepts the live sidebar population across every batched RPC input", async () => {
     const host = createFakePluginHost({ pluginId: "bb-collab" });
     await plugin(host.bb);

@@ -1381,7 +1381,7 @@ const reviewScopeSchema = z
   .object({ targets: z.array(reviewTargetSchema).min(1).max(32) })
   .strict()
   .superRefine((scope, ctx) => {
-    const keys = scope.targets.map((target) => `${target.workItemId}\u0000${target.repoTargetId}`);
+    const keys = scope.targets.map((target) => JSON.stringify([target.workItemId, target.repoTargetId]));
     if (new Set(scope.targets.map((target) => target.workItemId)).size !== scope.targets.length) {
       ctx.addIssue({ code: "custom", path: ["targets"], message: "one WorkItem cannot span multiple review targets" });
     }
@@ -1398,7 +1398,7 @@ const reviewConnectorsSchema = z
   .min(1)
   .max(128)
   .superRefine((connectors, ctx) => {
-    const keys = connectors.map((connector) => `${connector.repoTargetId}\u0000${connector.connectorId}`);
+    const keys = connectors.map((connector) => JSON.stringify([connector.repoTargetId, connector.connectorId]));
     if (new Set(keys).size !== keys.length) {
       ctx.addIssue({ code: "custom", message: "review connector mappings must be duplicate-free" });
     }
@@ -2986,7 +2986,7 @@ function actorReceiptDigest(input: {
   }));
 }
 
-function mutationRequestDigest(request: ApplyRequest): string {
+export function mutationRequestDigest(request: ApplyRequest): string {
   return sha256(canonicalJson(Object.fromEntries(Object.entries(request).filter(([, value]) => value !== undefined))));
 }
 
@@ -6742,7 +6742,7 @@ export function backfillWorkItemGithubIssues(
           github: mapping.github,
           mapping: mapping.mapping,
           issueNumber,
-          idempotencyKey: `github-issue-backfill:${projectId}:${row.work_item_id}`,
+          idempotencyKey: `github-issue-backfill:${JSON.stringify([projectId, row.work_item_id])}`,
           requestDigest: sha256(canonicalJson({ projectId, workItemId: row.work_item_id, epochCreatedAtMs: result.epochCreatedAtMs, configRevision: result.configRevision })),
           observed: snapshot!,
         });
@@ -7674,7 +7674,7 @@ async function routingDoctorEvidence(
   const buckets = new Map<string, RoutingProfile & { count: number; threadIds: string[] }>();
   for (const { thread, profile } of workerProfiles) {
     if (!profile) continue;
-    const key = `${profile.providerId}\0${profile.model}\0${profile.reasoningLevel}`;
+    const key = JSON.stringify([profile.providerId, profile.model, profile.reasoningLevel]);
     const bucket = buckets.get(key) ?? { ...profile, count: 0, threadIds: [] };
     bucket.count += 1;
     bucket.threadIds.push(thread.id);

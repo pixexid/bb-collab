@@ -161,8 +161,12 @@ export type CurrentRoleBindingResolution =
   | { standing: "refused"; reason: "multiple-active-bindings" }
   | { standing: "unknown"; reason: CurrentRoleBindingUnknownReason };
 
+function roleIdlePrefix(holder: RoleHolderState): string {
+  return `${JSON.stringify([holder.project_id, holder.role_id, holder.role_generation]).slice(0, -1)},`;
+}
+
 export function roleIdleKey(holder: RoleHolderState, queueHeadId: string): string {
-  return `${holder.project_id}:${holder.role_id}:${holder.role_generation}:${queueHeadId}`;
+  return `${roleIdlePrefix(holder)}${JSON.stringify(queueHeadId)}]`;
 }
 
 export interface RoleQueueScope {
@@ -363,7 +367,10 @@ export function createRoleIdleLedger(persistence?: RoleIdlePersistence) {
     }),
     clearWakeHistory: (prefix: string) => enqueue(async () => {
       await load();
-      for (const key of Object.keys(state)) if (key.startsWith(prefix)) state[key] = { ...state[key]!, idleSinceMs: null, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastStaleWaitExternalRevision: null, lastStaleWaitWaker: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
+      const encodedPrefix = prefix.endsWith(":")
+        ? `${JSON.stringify([prefix.slice(0, -1)]).slice(0, -1)},`
+        : prefix;
+      for (const key of Object.keys(state)) if (key.startsWith(prefix) || key.startsWith(encodedPrefix)) state[key] = { ...state[key]!, idleSinceMs: null, lastFleetWakeAtMs: null, lastRecoveryWakeAtMs: null, lastStartableQueueWakeAtMs: null, lastStaleWaitWakeAtMs: null, lastStaleWaitExternalRevision: null, lastStaleWaitWaker: null, lastOwedActWakeAtMs: null, lastEscalationAtMs: null };
       await save();
     }),
   };
@@ -604,7 +611,7 @@ export function createLaneWatcher(options: {
       if (projectHolders.length !== 1 || !holder.thread_id) continue;
       const targetThreadId = holder.thread_id;
       if (threadId && targetThreadId !== threadId) continue;
-      const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
+      const prefix = roleIdlePrefix(holder);
       const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
       let observation: WorkerObservation;
       try {
@@ -721,8 +728,8 @@ export function createLaneWatcher(options: {
       !Number.isFinite(observation.idleSinceMs)
     ) return { attempted: false, delivered: false, refusal: "policy" };
 
-    const prefix = `${holder.project_id}:${holder.role_id}:${holder.role_generation}:`;
-    const key = `${prefix}${scope.queueHeadId}`;
+    const prefix = roleIdlePrefix(holder);
+    const key = roleIdleKey(holder, scope.queueHeadId);
     await roleIdleLedger.clearPrefixExcept(prefix, key);
     const currentNow = now();
     const record = await roleIdleLedger.observeIdle(key, observation.idleSinceMs);
@@ -884,6 +891,7 @@ export interface IdleFleetProbe {
 export interface IdleFleetReady {
   probe: IdleFleetProbe;
   episodeKey: string;
+  legacyEpisodeKey?: string;
   role: RoleIdleView;
   message: string;
 }
@@ -891,7 +899,7 @@ export interface IdleFleetReady {
 export type IdleFleetDecision =
   | { kind: "silent" }
   | { kind: "blind"; message: string }
-  | { kind: "ready"; episodeKey: string; role: RoleIdleView; message: string };
+  | { kind: "ready"; episodeKey: string; legacyEpisodeKey?: string; role: RoleIdleView; message: string };
 
 export interface IdleFleetPersistence {
   read(): Promise<unknown>;
@@ -937,7 +945,8 @@ export function createIdleFleetDetector(options: {
   let loaded = false;
   let stopped = false;
   const capacityQueues = new Map<string, Promise<void>>();
-  const probeKey = (probe: IdleFleetProbe) => `${probe.projectId}:${probe.threadId}`;
+  const probeKey = (probe: IdleFleetProbe) => JSON.stringify([probe.projectId, probe.threadId]);
+  const legacyProbeKey = (probe: IdleFleetProbe) => `${probe.projectId}:${probe.threadId}`;
 
   const load = async () => {
     if (loaded) return;
@@ -973,7 +982,22 @@ export function createIdleFleetDetector(options: {
         reportBlind(decision.message);
         return;
       }
+      const legacyKey = legacyProbeKey(probe);
+      if (state[legacyKey] !== undefined) {
+        if (state[key] !== undefined) {
+          reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=ambiguous-migration:${key}`);
+          return;
+        }
+        state[key] = state[legacyKey]!;
+        delete state[legacyKey];
+        await save();
+      }
       if (state[key] === decision.episodeKey) return;
+      if (decision.legacyEpisodeKey !== undefined && state[key] === decision.legacyEpisodeKey) {
+        state[key] = decision.episodeKey;
+        await save();
+        return;
+      }
       if (!await options.wake({ ...decision, probe })) return;
       state[key] = decision.episodeKey;
       await save();
