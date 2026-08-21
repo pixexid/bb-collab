@@ -3117,9 +3117,12 @@ describe("bb-collab plugin boundary", () => {
       const firstInteractionRead = new Promise<void>((resolve) => {
         interactionReadStarted = resolve;
       });
-      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => {
+      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId, signal }: { threadId: string; signal?: AbortSignal }) => {
         threadReads += 1;
-        if (threadReads === 1 && firstRecoveryReadHangs) await new Promise<never>(() => undefined);
+        if (threadReads === 1 && firstRecoveryReadHangs) {
+          await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+          throw new DOMException("Aborted", "AbortError");
+        }
         if (threadReads === 1) firstReadSettled = true;
         return makeThreadResponse({ id: threadId, projectId: PROJECT_ID, status: "idle", updatedAt: 1 });
       }) as never);

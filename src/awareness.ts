@@ -374,7 +374,7 @@ export interface LaneWatcher {
     archived?: boolean,
     operatorWait?: OperatorWait | null,
   ): Promise<void>;
-  poll(): Promise<void>;
+  poll(signal?: AbortSignal): Promise<void>;
   wakeRole(role: RoleIdleView): Promise<RoleWakeResult>;
   recover(): Promise<void>;
   readRoleIdle(key: string): Promise<RoleIdleRecord | null>;
@@ -458,7 +458,7 @@ export function readCurrentRoleBindings(db: SqliteDatabase | null, projectId: st
 }
 
 export function createLaneWatcher(options: {
-  readWorker?: (threadId: string) => Promise<WorkerObservation>;
+  readWorker?: (threadId: string, signal?: AbortSignal) => Promise<WorkerObservation>;
   waitRegistry?: WaitRegistry;
   readRegisteredWaits?: () => RegisteredWait[] | Promise<RegisteredWait[]>;
   onWaitEvent?: (event: WaitEvent) => void | Promise<void>;
@@ -481,6 +481,7 @@ export function createLaneWatcher(options: {
 
   const readWaitContext = async (
     suppliedSource?: { threadId: string; status: ThreadStatus; archived: boolean },
+    signal?: AbortSignal,
   ): Promise<WaitContext> => {
     let waits: RegisteredWait[];
     try {
@@ -503,7 +504,7 @@ export function createLaneWatcher(options: {
         };
       } else if (options.readWorker) {
         try {
-          observation = await options.readWorker(sourceThreadId);
+          observation = signal ? await options.readWorker(sourceThreadId, signal) : await options.readWorker(sourceThreadId);
         } catch {
           observation = null;
         }
@@ -573,7 +574,7 @@ export function createLaneWatcher(options: {
     options.onRoleSuccessionRequired?.(role);
   };
 
-  const observeRoleNow = async (threadId?: string, suppliedScopes?: RoleQueueScope[], waitContext?: WaitContext): Promise<void> => {
+  const observeRoleNow = async (threadId?: string, suppliedScopes?: RoleQueueScope[], waitContext?: WaitContext, signal?: AbortSignal): Promise<void> => {
     if (!options.readRoleHolders || !options.readRoleScopes || !options.readWorker || !options.steerRole) return;
     let holders: RoleHolderState[];
     try {
@@ -594,6 +595,7 @@ export function createLaneWatcher(options: {
     }
 
     for (const holder of holders) {
+      if (signal?.aborted) return;
       const projectHolders = holders.filter((candidate) => candidate.project_id === holder.project_id && candidate.role_id === holder.role_id);
       if (projectHolders.length !== 1 || !holder.thread_id) continue;
       const targetThreadId = holder.thread_id;
@@ -602,7 +604,7 @@ export function createLaneWatcher(options: {
       const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
       let observation: WorkerObservation;
       try {
-        observation = await options.readWorker(targetThreadId);
+        observation = signal ? await options.readWorker(targetThreadId, signal) : await options.readWorker(targetThreadId);
       } catch {
         continue;
       }
@@ -774,9 +776,10 @@ export function createLaneWatcher(options: {
         }
       });
     },
-    poll() {
+    poll(signal) {
       return enqueue(async () => {
-        const context = await readWaitContext();
+        if (signal?.aborted) return;
+        const context = await readWaitContext(undefined, signal);
         await emitWaitEvents(context);
         if (!options.readWorker) return;
 
@@ -792,7 +795,10 @@ export function createLaneWatcher(options: {
             }
           }
           if (roleScopes) {
-            for (const threadId of roleThreadIds) await observeRoleNow(threadId, roleScopes, context);
+            for (const threadId of roleThreadIds) {
+              if (signal?.aborted) return;
+              await observeRoleNow(threadId, roleScopes, context, signal);
+            }
           }
         }
       });
