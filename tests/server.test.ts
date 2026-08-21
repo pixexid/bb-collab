@@ -3848,6 +3848,69 @@ exit 1
     }
   });
 
+  it("rolls back the interval and first evidence row when the second attempt evidence write fails", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-lane-capacity-rollback-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(1, true, 2);
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "work-item-create-2",
+        workItem: { workItemId: "work-item-2", title: "Second work item", body: "Exercise native attempt coverage." },
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, {
+        idempotencyKey: "work-item-2-ready",
+        workItemId: "work-item-2",
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+        idempotencyKey: "work-item-1-in-progress",
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+        idempotencyKey: "work-item-2-in-progress",
+        workItemId: "work-item-2",
+        workAttempt: { laneId: "lane-work-item-2", threadId: "thread-work-item-2", assignmentKind: "write" },
+      })).outcome).toBe("OK");
+      fixture.addNativeLane("thread-work-item-1");
+      fixture.addNativeLane("thread-work-item-2");
+      const attempts = fixture.db.prepare(
+        "SELECT execution_attempt_id, thread_id FROM execution_attempts WHERE project_id = ? AND origin = 'work_item' AND state = 'running' ORDER BY thread_id",
+      ).all(PROJECT_ID) as Array<{ execution_attempt_id: string; thread_id: string }>;
+      expect(attempts).toHaveLength(2);
+      expect(attempts.map((attempt) => attempt.thread_id)).toEqual(["thread-work-item-1", "thread-work-item-2"]);
+
+      const originalPrepare = fixture.db.prepare.bind(fixture.db);
+      let evidenceInsertPrepares = 0;
+      const brokenWrite = vi.spyOn(fixture.db, "prepare").mockImplementation(((sql: string) => {
+        if (sql.includes("INSERT OR IGNORE INTO lane_capacity_refresh_evidence")) {
+          evidenceInsertPrepares += 1;
+          if (evidenceInsertPrepares === 2) throw new Error("second evidence write failed");
+        }
+        return originalPrepare(sql);
+      }) as never);
+      try {
+        await fixture.host.harness.emitThreadEvent("thread.active", {
+          thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active", updatedAt: 1 }),
+        });
+        await vi.waitFor(() => expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+          level: "warn",
+          message: expect.stringContaining("capacity-interval-unreadable:Error: second evidence write failed"),
+        })));
+      } finally {
+        brokenWrite.mockRestore();
+      }
+      expect(evidenceInsertPrepares).toBe(2);
+      expect(fixture.db.prepare("SELECT * FROM lane_capacity_intervals WHERE project_id = ?").all(PROJECT_ID)).toEqual([]);
+      expect(fixture.db.prepare("SELECT * FROM lane_capacity_refresh_evidence WHERE project_id = ?").all(PROJECT_ID)).toEqual([]);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("does not extend lane-capacity fact coverage from service liveness", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-lane-capacity-liveness-"));
     const gh = join(bin, "gh");
