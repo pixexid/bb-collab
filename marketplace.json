@@ -14,8 +14,7 @@
         "git": {
           "url": "https://github.com/pixexid/bb-collab.git",
           "subdir": "plugins/bb-plugin-threads-list",
-          "range": "*",
-          "tagPrefix": "threads-list/"
+          "ref": "main"
         }
       }
     }
