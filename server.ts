@@ -16,7 +16,6 @@ import {
   type IdleFleetDecision,
   type IdleFleetProbe,
   type IdleFleetReady,
-  type RoleIdleRecord,
 } from "./src/awareness.js";
 import {
   BB_VERSION_RANGE,
@@ -1992,11 +1991,6 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   });
   await escalationCycle.recover().catch((error) => bb.log.error(`wait escalation state is unreadable: ${String(error)}`));
 
-  const roleIdlePersistence = {
-    read: () => bb.storage.kv.get<unknown>("lane-watcher.role-idle"),
-    write: (state: Record<string, RoleIdleRecord>) => bb.storage.kv.set("lane-watcher.role-idle", state),
-  };
-
   const roleLivenessWarnings = new Map<string, string>();
   const roleLivenessKey = fleetWatchdogRoleLivenessKey;
   const warnRoleLiveness = (holder: RoleHolderState, evidence: string) => {
@@ -2087,10 +2081,12 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     return sendRoleWake(role, `Wrongful idle: queue head ${startable.work_item_id} is startable. Inspect the queue and act or record the blocker.`);
   };
 
+  // Queue-head role wakes belong to stall-guard, whose persisted suppression
+  // includes the queue revision. Lane-watcher only owns waits and lane recovery;
+  // giving it queue scopes would create a second unsuppressed wake path.
   const watcher = createLaneWatcher({
     readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
     readRoleScopes,
-    roleIdlePersistence,
     waitRegistry,
     onAlert: (alert) => bb.log.warn(`role awareness ${alert.kind}: ${alert.role.roleId}@${alert.role.roleGeneration} queue ${alert.role.queueHeadId}`),
     onRoleSuccessionRequired: (role) => bb.log.warn(`role succession required: ${role.roleId}@${role.roleGeneration}`),

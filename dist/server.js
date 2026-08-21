@@ -23552,10 +23552,6 @@ async function plugin(bb, options = {}) {
     }
   });
   await escalationCycle.recover().catch((error48) => bb.log.error(`wait escalation state is unreadable: ${String(error48)}`));
-  const roleIdlePersistence = {
-    read: () => bb.storage.kv.get("lane-watcher.role-idle"),
-    write: (state) => bb.storage.kv.set("lane-watcher.role-idle", state)
-  };
   const roleLivenessWarnings = /* @__PURE__ */ new Map();
   const roleLivenessKey = fleetWatchdogRoleLivenessKey;
   const warnRoleLiveness = (holder, evidence) => {
@@ -23636,7 +23632,6 @@ ${thread.titleFallback ?? ""}`);
   const watcher = createLaneWatcher({
     readRoleHolders: () => db ? readRoleHolderStates(db) : [],
     readRoleScopes,
-    roleIdlePersistence,
     waitRegistry,
     onAlert: (alert) => bb.log.warn(`role awareness ${alert.kind}: ${alert.role.roleId}@${alert.role.roleGeneration} queue ${alert.role.queueHeadId}`),
     onRoleSuccessionRequired: (role) => bb.log.warn(`role succession required: ${role.roleId}@${role.roleGeneration}`),
