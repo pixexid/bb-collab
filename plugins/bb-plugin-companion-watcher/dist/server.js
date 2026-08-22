@@ -200,6 +200,19 @@ function githubChecks(value) {
   });
   return checks.every((check) => typeof check === "string") ? checks : void 0;
 }
+function githubClosingIssueNumber(value, repository) {
+  if (!repository || !value || typeof value !== "object" || Array.isArray(value)) return void 0;
+  const reference = value;
+  const refRepository = reference.repository;
+  if (!refRepository || typeof refRepository !== "object" || Array.isArray(refRepository)) return void 0;
+  const repo = refRepository;
+  const owner = repo.owner;
+  if (!owner || typeof owner !== "object" || Array.isArray(owner)) return void 0;
+  const ownerLogin = owner.login;
+  const name = repo.name;
+  const number = reference.number;
+  return typeof ownerLogin === "string" && typeof name === "string" && `${ownerLogin}/${name}` === repository && typeof number === "number" && Number.isSafeInteger(number) && number > 0 ? number : void 0;
+}
 function parseGithubEvidence(value, onInvalid = () => {
 }) {
   if (!value || typeof value !== "object") throw new Error("github-payload-invalid");
@@ -231,13 +244,15 @@ function parseGithubEvidence(value, onInvalid = () => {
     const pr = item;
     const checks = githubChecks(pr.statusCheckRollup);
     const updatedAt = timestamp(pr.updatedAt);
-    if (typeof pr.number !== "number" || typeof pr.state !== "string" || typeof pr.mergeStateStatus !== "string" || typeof pr.reviewDecision !== "string" || typeof pr.headRefOid !== "string" || !Array.isArray(pr.reviews) || !checks || updatedAt === void 0) {
+    const closingIssues = pr.closingIssuesReferences;
+    const closingIssueNumber = typeof raw.repository === "string" && Array.isArray(closingIssues) && closingIssues.length === 1 ? githubClosingIssueNumber(closingIssues[0], raw.repository) : void 0;
+    if (typeof pr.number !== "number" || !Number.isSafeInteger(pr.number) || typeof pr.state !== "string" || typeof pr.mergeStateStatus !== "string" || typeof pr.reviewDecision !== "string" || typeof pr.headRefOid !== "string" || !Array.isArray(pr.reviews) || !checks || updatedAt === void 0 || closingIssueNumber === void 0) {
       onInvalid(`pr-${index}`);
       complete = false;
       return [];
     }
     const ready = pr.state === "OPEN" && pr.mergeStateStatus === "CLEAN" && pr.reviewDecision === "" && pr.reviews.length === 0 && checks.length > 0 && checks.every((check) => check === "SUCCESS");
-    return [{ number: pr.number, headSha: pr.headRefOid, updatedAt, ready }];
+    return [{ number: pr.number, closingIssueNumber, headSha: pr.headRefOid, updatedAt, ready }];
   });
   return { issues, prs, complete };
 }
@@ -287,7 +302,7 @@ function extractCandidates(snapshot) {
   }
   for (const pr of sourcesKnown("canonical", "github") ? githubPrs : []) {
     if (!pr.ready || observedAt - pr.updatedAt < DECISION_THRESHOLD_MS) continue;
-    const linkedWorkItems = projectRefs.filter((ref) => ref.provider === "github" && ref.issue_number === pr.number).map((ref) => projectWorkItems.find((workItem) => workItem.work_item_id === ref.work_item_id)).filter((workItem) => workItem !== void 0);
+    const linkedWorkItems = projectRefs.filter((ref) => ref.provider === "github" && ref.issue_number === pr.closingIssueNumber).map((ref) => projectWorkItems.find((workItem) => workItem.work_item_id === ref.work_item_id)).filter((workItem) => workItem !== void 0);
     if (linkedWorkItems.length !== 1) continue;
     const workItemId = linkedWorkItems[0].work_item_id;
     const runningReview = activeAttempts.some(
@@ -295,7 +310,7 @@ function extractCandidates(snapshot) {
     );
     if (runningReview) continue;
     const anchors = { projectId, kind: "pull_request", number: pr.number, headSha: pr.headSha };
-    candidates.push({ id: `${projectId}:pr:${pr.number}:${pr.headSha}`, kind: anchors.kind, anchors, finding: `PR #${pr.number} at ${pr.headSha} is green, mergeable, decisionless, and unchanged past the five-minute decision threshold.`, evidence: { projectId, workItemId, updatedAt: pr.updatedAt } });
+    candidates.push({ id: `${projectId}:pr:${pr.number}:${pr.headSha}`, kind: anchors.kind, anchors, finding: `PR #${pr.number} at ${pr.headSha} is green, mergeable, decisionless, and unchanged past the five-minute decision threshold.`, evidence: { projectId, workItemId, closingIssueNumber: pr.closingIssueNumber, updatedAt: pr.updatedAt } });
   }
   const queueCutoff = cycleStartedAt ?? observedAt - DECISION_THRESHOLD_MS;
   for (const message of sourcesKnown("queue", "timeline") ? snapshot.queued : []) {
@@ -326,9 +341,9 @@ async function githubEvidence(remote) {
   if (!repo) throw new Error("github-repository-unresolved");
   const [issues, prs] = await Promise.all([
     exec("gh", ["issue", "list", "--repo", repo, "--state", "open", "--label", "queue:startable", "--json", "number,title,labels,updatedAt", "--limit", String(SNAPSHOT_LIMIT)], { timeout: 1e4 }),
-    exec("gh", ["pr", "list", "--repo", repo, "--state", "open", "--json", "number,title,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup,updatedAt", "--limit", String(SNAPSHOT_LIMIT)], { timeout: 1e4 })
+    exec("gh", ["pr", "list", "--repo", repo, "--state", "open", "--json", "number,title,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup,updatedAt,closingIssuesReferences", "--limit", String(SNAPSHOT_LIMIT)], { timeout: 1e4 })
   ]);
-  return { issues: JSON.parse(issues.stdout), prs: JSON.parse(prs.stdout) };
+  return { repository: repo, issues: JSON.parse(issues.stdout), prs: JSON.parse(prs.stdout) };
 }
 var prompt = (projectId) => `Judge ONLY the verified candidates returned by ${TOOL}; do not discover or invent other work, and do not assert coverage because code computes it. Call the tool exactly once and do not mutate or message anything. If no candidate warrants a wake, output exactly SILENCE. Otherwise copy the selected candidate's id, anchors, and finding exactly into one line per candidate as FINDING: {"candidateId":"supplied id","anchors":supplied anchors,"finding":"supplied finding"}, followed by exactly ESCALATE: yes. Project: ${projectId}.`;
 function companionWatcher(bb, readExport = readCanonicalExport, readGithub = githubEvidence, listProjects = async () => await bb.sdk.projects.list()) {

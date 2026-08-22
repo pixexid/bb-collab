@@ -35,7 +35,7 @@ type CanonicalReader = (projectId: string, exportRoot: string) => Promise<Canoni
 type GithubReader = (remote: string | null) => Promise<unknown>;
 type QueuedMessage = Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["queuedMessages"]["list"]>>[number];
 type GithubIssue = { number: number; title: string; labels: string[]; updatedAt: number };
-type GithubPr = { number: number; headSha: string; updatedAt: number; ready: boolean };
+type GithubPr = { number: number; closingIssueNumber: number; headSha: string; updatedAt: number; ready: boolean };
 type Source = "canonical" | "timeline" | "github" | "queue";
 type SourceCoverage = Record<Source, "known" | "blind">;
 type ProjectInventoryItem = { id: string; gitRemoteUrl: string | null };
@@ -223,9 +223,23 @@ function githubChecks(value: unknown): string[] | undefined {
   return checks.every((check): check is string => typeof check === "string") ? checks : undefined;
 }
 
+function githubClosingIssueNumber(value: unknown, repository: string | undefined): number | undefined {
+  if (!repository || !value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const reference = value as Record<string, unknown>;
+  const refRepository = reference.repository;
+  if (!refRepository || typeof refRepository !== "object" || Array.isArray(refRepository)) return undefined;
+  const repo = refRepository as Record<string, unknown>;
+  const owner = repo.owner;
+  if (!owner || typeof owner !== "object" || Array.isArray(owner)) return undefined;
+  const ownerLogin = (owner as Record<string, unknown>).login;
+  const name = repo.name;
+  const number = reference.number;
+  return typeof ownerLogin === "string" && typeof name === "string" && `${ownerLogin}/${name}` === repository && typeof number === "number" && Number.isSafeInteger(number) && number > 0 ? number : undefined;
+}
+
 export function parseGithubEvidence(value: unknown, onInvalid: (reason: string) => void = () => {}): { issues: GithubIssue[]; prs: GithubPr[]; complete: boolean } {
   if (!value || typeof value !== "object") throw new Error("github-payload-invalid");
-  const raw = value as { issues?: unknown; prs?: unknown };
+  const raw = value as { repository?: unknown; issues?: unknown; prs?: unknown };
   if (!Array.isArray(raw.issues) || !Array.isArray(raw.prs)) throw new Error("github-payload-invalid");
   let complete = raw.issues.length < SNAPSHOT_LIMIT && raw.prs.length < SNAPSHOT_LIMIT;
   const issues = raw.issues.flatMap((item, index) => {
@@ -241,9 +255,11 @@ export function parseGithubEvidence(value: unknown, onInvalid: (reason: string) 
     const pr = item as Record<string, unknown>;
     const checks = githubChecks(pr.statusCheckRollup);
     const updatedAt = timestamp(pr.updatedAt);
-    if (typeof pr.number !== "number" || typeof pr.state !== "string" || typeof pr.mergeStateStatus !== "string" || typeof pr.reviewDecision !== "string" || typeof pr.headRefOid !== "string" || !Array.isArray(pr.reviews) || !checks || updatedAt === undefined) { onInvalid(`pr-${index}`); complete = false; return []; }
+    const closingIssues = pr.closingIssuesReferences;
+    const closingIssueNumber = typeof raw.repository === "string" && Array.isArray(closingIssues) && closingIssues.length === 1 ? githubClosingIssueNumber(closingIssues[0], raw.repository) : undefined;
+    if (typeof pr.number !== "number" || !Number.isSafeInteger(pr.number) || typeof pr.state !== "string" || typeof pr.mergeStateStatus !== "string" || typeof pr.reviewDecision !== "string" || typeof pr.headRefOid !== "string" || !Array.isArray(pr.reviews) || !checks || updatedAt === undefined || closingIssueNumber === undefined) { onInvalid(`pr-${index}`); complete = false; return []; }
     const ready = pr.state === "OPEN" && pr.mergeStateStatus === "CLEAN" && pr.reviewDecision === "" && pr.reviews.length === 0 && checks.length > 0 && checks.every((check) => check === "SUCCESS");
-    return [{ number: pr.number, headSha: pr.headRefOid, updatedAt, ready }];
+    return [{ number: pr.number, closingIssueNumber, headSha: pr.headRefOid, updatedAt, ready }];
   });
   return { issues, prs, complete };
 }
@@ -288,7 +304,7 @@ export function extractCandidates(snapshot: CandidateSnapshot): Candidate[] {
   for (const pr of sourcesKnown("canonical", "github") ? githubPrs : []) {
     if (!pr.ready || observedAt - pr.updatedAt < DECISION_THRESHOLD_MS) continue;
     const linkedWorkItems = projectRefs
-      .filter((ref) => ref.provider === "github" && ref.issue_number === pr.number)
+      .filter((ref) => ref.provider === "github" && ref.issue_number === pr.closingIssueNumber)
       .map((ref) => projectWorkItems.find((workItem) => workItem.work_item_id === ref.work_item_id))
       .filter((workItem): workItem is ExportRow => workItem !== undefined);
     if (linkedWorkItems.length !== 1) continue;
@@ -302,7 +318,7 @@ export function extractCandidates(snapshot: CandidateSnapshot): Candidate[] {
     );
     if (runningReview) continue;
     const anchors = { projectId, kind: "pull_request", number: pr.number, headSha: pr.headSha } as const;
-    candidates.push({ id: `${projectId}:pr:${pr.number}:${pr.headSha}`, kind: anchors.kind, anchors, finding: `PR #${pr.number} at ${pr.headSha} is green, mergeable, decisionless, and unchanged past the five-minute decision threshold.`, evidence: { projectId, workItemId, updatedAt: pr.updatedAt } });
+    candidates.push({ id: `${projectId}:pr:${pr.number}:${pr.headSha}`, kind: anchors.kind, anchors, finding: `PR #${pr.number} at ${pr.headSha} is green, mergeable, decisionless, and unchanged past the five-minute decision threshold.`, evidence: { projectId, workItemId, closingIssueNumber: pr.closingIssueNumber, updatedAt: pr.updatedAt } });
   }
   const queueCutoff = cycleStartedAt ?? observedAt - DECISION_THRESHOLD_MS;
   for (const message of sourcesKnown("queue", "timeline") ? snapshot.queued : []) {
@@ -335,9 +351,9 @@ async function githubEvidence(remote: string | null): Promise<unknown> {
   if (!repo) throw new Error("github-repository-unresolved");
   const [issues, prs] = await Promise.all([
     exec("gh", ["issue", "list", "--repo", repo, "--state", "open", "--label", "queue:startable", "--json", "number,title,labels,updatedAt", "--limit", String(SNAPSHOT_LIMIT)], { timeout: 10_000 }),
-    exec("gh", ["pr", "list", "--repo", repo, "--state", "open", "--json", "number,title,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup,updatedAt", "--limit", String(SNAPSHOT_LIMIT)], { timeout: 10_000 }),
+    exec("gh", ["pr", "list", "--repo", repo, "--state", "open", "--json", "number,title,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup,updatedAt,closingIssuesReferences", "--limit", String(SNAPSHOT_LIMIT)], { timeout: 10_000 }),
   ]);
-  return { issues: JSON.parse(issues.stdout), prs: JSON.parse(prs.stdout) };
+  return { repository: repo, issues: JSON.parse(issues.stdout), prs: JSON.parse(prs.stdout) };
 }
 
 const prompt = (projectId: string) => `Judge ONLY the verified candidates returned by ${TOOL}; do not discover or invent other work, and do not assert coverage because code computes it. Call the tool exactly once and do not mutate or message anything. If no candidate warrants a wake, output exactly SILENCE. Otherwise copy the selected candidate's id, anchors, and finding exactly into one line per candidate as FINDING: {"candidateId":"supplied id","anchors":supplied anchors,"finding":"supplied finding"}, followed by exactly ESCALATE: yes. Project: ${projectId}.`;
