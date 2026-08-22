@@ -6,8 +6,9 @@ var __filename = __fileURLToPath(import.meta.url);
 var __dirname = __pathDirname(__filename);
 
 // server.ts
-import Database from "better-sqlite3";
 import { execFile } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { isAbsolute, join, relative } from "node:path";
 import { promisify } from "node:util";
 var exec = promisify(execFile);
 var ACTIVE = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
@@ -16,6 +17,31 @@ var ESCALATION_HOLD_MS = 24 * 60 * 6e4;
 var SNAPSHOT_LIMIT = 100;
 var TOOL = "companion_read_snapshot";
 var TITLE = "Alzheimer companion judgment";
+var REQUIRED_FIELDS = {
+  execution_attempts: {
+    execution_attempt_id: (value) => typeof value === "string",
+    observed_at_ms: (value) => typeof value === "number",
+    origin: (value) => typeof value === "string",
+    project_id: (value) => typeof value === "string",
+    state: (value) => typeof value === "string",
+    thread_id: (value) => typeof value === "string",
+    work_item_id: (value) => value === null || typeof value === "string"
+  },
+  role_generation_heads: {
+    current_generation: (value) => typeof value === "number",
+    project_id: (value) => typeof value === "string",
+    role_id: (value) => typeof value === "string"
+  },
+  role_generations: {
+    generation: (value) => typeof value === "number",
+    holder_execution_attempt_id: (value) => typeof value === "string",
+    project_id: (value) => typeof value === "string",
+    role_id: (value) => typeof value === "string"
+  },
+  work_items: {
+    updated_at_ms: (value) => typeof value === "number"
+  }
+};
 function parseJudgment(output) {
   const coverages = [...output.matchAll(/^COVERAGE:\s*(known|partial|blind)\s*$/gimu)];
   const escalations = [...output.matchAll(/^ESCALATE:\s*yes\s*$/gimu)];
@@ -32,18 +58,61 @@ function routeJudgment(prior, judgment, now, turnStartedAt) {
   if (unchanged && prior?.escalatedAt && now - prior.escalatedAt < ESCALATION_HOLD_MS) return void 0;
   return !unchanged || !prior || now - prior.sentAt >= BACKOFF_MS ? "orchestrator" : void 0;
 }
-function openStore(path) {
-  return new Database(path, { readonly: true, fileMustExist: true });
+async function parseCanonicalExport(output, exportRoot, projectId) {
+  const result = JSON.parse(output);
+  if (result.outcome !== "OK") throw new Error(`canonical-export-${result.outcome ?? "invalid"}`);
+  const inlineRecords = result.export?.recordsNdjson;
+  const fileExport = result.evidence?.exportFile;
+  const manifest = typeof inlineRecords === "string" ? result.export?.manifest : fileExport?.manifest;
+  let recordsNdjson;
+  if (typeof inlineRecords === "string") recordsNdjson = inlineRecords;
+  else {
+    if (fileExport?.complete !== true || typeof fileExport.directory !== "string") throw new Error("canonical-export-records-missing");
+    const path = join(exportRoot, fileExport.directory, "records.ndjson");
+    if (isAbsolute(fileExport.directory) || relative(exportRoot, path).startsWith("..")) throw new Error("canonical-export-directory-invalid");
+    recordsNdjson = await readFile(path, "utf8");
+  }
+  if (manifest?.projectId !== projectId || !manifest.tableCounts || typeof manifest.tableCounts !== "object" || Array.isArray(manifest.tableCounts)) throw new Error("canonical-export-manifest-invalid");
+  const tables = /* @__PURE__ */ new Map();
+  for (const line of recordsNdjson.split("\n")) {
+    if (!line) continue;
+    const record = JSON.parse(line);
+    if (typeof record.table !== "string" || !record.row || typeof record.row !== "object" || Array.isArray(record.row)) throw new Error("canonical-export-record-invalid");
+    const rows = tables.get(record.table) ?? [];
+    rows.push(record.row);
+    tables.set(record.table, rows);
+  }
+  const canonical = {
+    executionAttempts: tables.get("execution_attempts") ?? [],
+    roleGenerationHeads: tables.get("role_generation_heads") ?? [],
+    roleGenerations: tables.get("role_generations") ?? [],
+    workItems: tables.get("work_items") ?? []
+  };
+  const counts = manifest.tableCounts;
+  for (const [table, rows] of [["execution_attempts", canonical.executionAttempts], ["role_generation_heads", canonical.roleGenerationHeads], ["role_generations", canonical.roleGenerations], ["work_items", canonical.workItems]]) {
+    if (counts[table] !== rows.length) throw new Error(`canonical-export-${table}-count-mismatch`);
+    for (const row of rows) {
+      for (const [field, valid] of Object.entries(REQUIRED_FIELDS[table])) {
+        if (!valid(row[field])) throw new Error(`canonical-export-${table}-${field}-invalid`);
+      }
+    }
+  }
+  const head = canonical.roleGenerationHeads.find((row) => row.project_id === projectId && row.role_id === "project-orchestrator");
+  if (!head) throw new Error("canonical-export-orchestrator-head-missing");
+  if (!readRoleThread(canonical, projectId, "project-orchestrator")) throw new Error("canonical-export-orchestrator-thread-unresolved");
+  return canonical;
 }
-function readRoleThread(db, projectId, roleId) {
-  return db.prepare(`SELECT a.thread_id AS thread_id FROM role_generation_heads h JOIN role_generations g ON g.project_id=h.project_id AND g.role_id=h.role_id AND g.generation=h.current_generation JOIN execution_attempts a ON a.project_id=g.project_id AND a.execution_attempt_id=g.holder_execution_attempt_id WHERE h.project_id=? AND h.role_id=?`).get(projectId, roleId)?.thread_id;
+async function readCanonicalExport(projectId, exportRoot) {
+  const { stdout } = await exec(process.env.BB_CLI?.trim() || "bb", ["collab", "export", "--project", projectId], { timeout: 1e4 });
+  return parseCanonicalExport(stdout, exportRoot, projectId);
 }
-function hasActiveWorkers(db, projectId) {
-  const row = db.prepare(`SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id=? AND origin='work_item' AND state IN (${ACTIVE.map(() => "?").join(",")})`).get(projectId, ...ACTIVE);
-  return Number(row.count) > 0;
+function readRoleThread(canonical, projectId, roleId) {
+  const head = canonical.roleGenerationHeads.find((row) => row.project_id === projectId && row.role_id === roleId);
+  const generation = canonical.roleGenerations.find((row) => row.project_id === projectId && row.role_id === roleId && row.generation === head?.current_generation);
+  return canonical.executionAttempts.find((row) => row.project_id === projectId && row.execution_attempt_id === generation?.holder_execution_attempt_id)?.thread_id;
 }
-function rows(db, sql, projectId) {
-  return db.prepare(sql).all(projectId, SNAPSHOT_LIMIT);
+function hasActiveWorkers(canonical, projectId) {
+  return canonical.executionAttempts.some((row) => row.project_id === projectId && row.work_item_id != null && row.origin === "work_item" && ACTIVE.includes(row.state));
 }
 async function githubEvidence(remote) {
   const repo = remote?.match(/github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?$/u)?.[1];
@@ -52,7 +121,7 @@ async function githubEvidence(remote) {
   return JSON.parse(stdout);
 }
 var prompt = (projectId) => `Judge whether the project orchestrator's current idleness is illegitimate: compare its stated intentions with outcomes and identify undone stated work or work parked without cause. Call ${TOOL} exactly once; do not infer liveness from silence and do not mutate or message anything. Output exactly one anchored line COVERAGE: known|partial|blind. If and only if idleness is illegitimate, add one or more anchored FINDING: lines and the optional anchored affirmative line ESCALATE: yes. Project: ${projectId}.`;
-function companionWatcher(bb) {
+function companionWatcher(bb, readExport = readCanonicalExport) {
   const snapshots = /* @__PURE__ */ new Map();
   const companions = /* @__PURE__ */ new Map();
   const pending = /* @__PURE__ */ new Map();
@@ -66,6 +135,10 @@ function companionWatcher(bb) {
     if (savedCompanions) for (const [key, value] of Object.entries(savedCompanions)) companions.set(key, value);
     loaded = true;
   };
+  const canonical = async (projectId) => {
+    const config = await bb.sdk.system.config();
+    return readExport(projectId, join(config.dataDir, "plugins", "bb-collab"));
+  };
   bb.agents.registerTool({
     name: TOOL,
     description: "Read one bounded canonical snapshot for semantic idle judgment.",
@@ -74,19 +147,17 @@ function companionWatcher(bb) {
       await load();
       const caller = await bb.sdk.threads.get({ threadId: context.threadId });
       if (caller.projectId !== context.projectId || caller.title !== TITLE || caller.originPluginId !== bb.pluginId) return { isError: true, content: [{ type: "text", text: "companion-thread-mismatch" }] };
-      let db;
       try {
-        const config = await bb.sdk.system.config();
-        db = openStore(`${config.dataDir}/plugins/bb-collab/data.db`);
-        const orchestratorId = readRoleThread(db, context.projectId, "project-orchestrator");
+        const exported = await canonical(context.projectId);
+        const orchestratorId = readRoleThread(exported, context.projectId, "project-orchestrator");
         if (!orchestratorId) throw new Error("orchestrator-head-unresolved");
         const project = await bb.sdk.projects.get({ projectId: context.projectId });
         const recentTimeline = await bb.sdk.threads.timeline({ threadId: orchestratorId, segmentLimit: String(SNAPSHOT_LIMIT) });
         const queued = await bb.sdk.threads.queuedMessages.list({ threadId: orchestratorId });
-        const executionAttempts = rows(db, "SELECT execution_attempt_id, thread_id, assignment_kind, state, lane_id, work_item_id, observed_at_ms FROM execution_attempts WHERE project_id=? ORDER BY observed_at_ms DESC LIMIT ?", context.projectId);
-        const workItems = rows(db, "SELECT work_item_id, title, body, lifecycle_state, updated_at_ms FROM work_items WHERE project_id=? ORDER BY updated_at_ms DESC LIMIT ?", context.projectId);
+        const executionAttempts = [...exported.executionAttempts].sort((a, b) => Number(b.observed_at_ms) - Number(a.observed_at_ms)).slice(0, SNAPSHOT_LIMIT);
+        const workItems = [...exported.workItems].sort((a, b) => Number(b.updated_at_ms) - Number(a.updated_at_ms)).slice(0, SNAPSHOT_LIMIT);
         let github;
-        let coverage = queued.length >= SNAPSHOT_LIMIT || executionAttempts.length >= SNAPSHOT_LIMIT || workItems.length >= SNAPSHOT_LIMIT ? "partial" : "known";
+        let coverage = queued.length >= SNAPSHOT_LIMIT || exported.executionAttempts.length >= SNAPSHOT_LIMIT || exported.workItems.length >= SNAPSHOT_LIMIT ? "partial" : "known";
         try {
           github = await githubEvidence(project.gitRemoteUrl);
         } catch (error) {
@@ -95,10 +166,10 @@ function companionWatcher(bb) {
         }
         return JSON.stringify({ coverage, orchestratorId, recentTimeline, queued: queued.slice(0, SNAPSHOT_LIMIT), executionAttempts, workItems, github });
       } catch (error) {
+        const reason = String(error);
+        bb.log.warn(`companion-watcher coverage=blind event=snapshot reason=${reason}`);
         return { isError: true, content: [{ type: "text", text: `COVERAGE: blind
-snapshot read failed: ${String(error)}` }] };
-      } finally {
-        db?.close();
+snapshot read failed: ${reason}` }] };
       }
     }
   });
@@ -135,19 +206,15 @@ snapshot read failed: ${String(error)}` }] };
     const route = routeJudgment(prior, judgment, now, request.turnStartedAt);
     bb.log.info(`companion-watcher coverage=${judgment.coverage} event=judgment illegitimate=${judgment.illegitimate} route=${route ?? "silence"}`);
     if (!route) return;
-    let db;
     try {
-      const config = await bb.sdk.system.config();
-      db = openStore(`${config.dataDir}/plugins/bb-collab/data.db`);
-      const target = route === "director" ? readRoleThread(db, request.projectId, "director") : readRoleThread(db, request.projectId, "project-orchestrator");
+      const exported = await canonical(request.projectId);
+      const target = route === "director" ? readRoleThread(exported, request.projectId, "director") : readRoleThread(exported, request.projectId, "project-orchestrator");
       if (!target || route === "orchestrator" && target !== request.orchestratorId) throw new Error(`${route}-head-unresolved`);
       await bb.sdk.threads.send({ threadId: target, mode: "auto", input: [{ type: "text", text: `Alzheimer companion ${route === "director" ? "escalation" : "wake"}: ${judgment.findings} (coverage: ${judgment.coverage}).`, mentions: [] }] });
       snapshots.set(request.projectId, { sentAt: now, fingerprint: judgment.fingerprint, escalatedAt: route === "director" ? now : prior?.fingerprint === judgment.fingerprint ? prior.escalatedAt : void 0 });
       await bb.storage.kv.set("backoff", Object.fromEntries(snapshots));
     } catch (error) {
       bb.log.warn(`companion-watcher coverage=blind event=${route} reason=${String(error)}`);
-    } finally {
-      db?.close();
     }
   };
   bb.events.on("thread.active", ({ thread }) => {
@@ -160,25 +227,22 @@ snapshot read failed: ${String(error)}` }] };
     }
     const turnStartedAt = activeTurns.get(thread.id);
     activeTurns.delete(thread.id);
-    let db;
     try {
-      const config = await bb.sdk.system.config();
-      db = openStore(`${config.dataDir}/plugins/bb-collab/data.db`);
-      const orchestratorId = readRoleThread(db, thread.projectId, "project-orchestrator");
-      if (thread.id !== orchestratorId || hasActiveWorkers(db, thread.projectId)) return;
+      const exported = await canonical(thread.projectId);
+      const orchestratorId = readRoleThread(exported, thread.projectId, "project-orchestrator");
+      if (thread.id !== orchestratorId || hasActiveWorkers(exported, thread.projectId)) return;
       await judge(thread.projectId, orchestratorId, turnStartedAt);
     } catch (error) {
       bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${String(error)}`);
-    } finally {
-      db?.close();
     }
   });
 }
 export {
   companionWatcher as default,
   hasActiveWorkers,
-  openStore,
+  parseCanonicalExport,
   parseJudgment,
+  readCanonicalExport,
   readRoleThread,
   routeJudgment
 };
