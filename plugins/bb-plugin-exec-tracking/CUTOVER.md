@@ -22,6 +22,7 @@ umask 077
 PLUGIN_ID=exec-tracking
 CANDIDATE_PATH="$DEPLOYED_CHECKOUT/plugins/bb-plugin-exec-tracking"
 STATE_HELPER="$CANDIDATE_PATH/scripts/cutover-state.mjs"
+CANDIDATE_MANIFEST="$CANDIDATE_PATH/package.json"
 
 case "$EXPECTED_HEAD" in (*[!0-9a-f]*|'') exit 64;; esac
 test "${#EXPECTED_HEAD}" -eq 40
@@ -164,7 +165,9 @@ around it discriminates an accidental write.
 
 ```zsh
 bb plugin source "$PLUGIN_ID" --json > "$CUTOVER_EVIDENCE_DIR/source.after.json"
-cmp "$CUTOVER_EVIDENCE_DIR/source.before.json" "$CUTOVER_EVIDENCE_DIR/source.after.json"
+node "$STATE_HELPER" compare-source \
+  "$CUTOVER_EVIDENCE_DIR/source.before.json" \
+  "$CUTOVER_EVIDENCE_DIR/source.after.json" "$CANDIDATE_MANIFEST"
 bb plugin config "$PLUGIN_ID" --json > "$CUTOVER_EVIDENCE_DIR/settings.after.json"
 cmp "$CUTOVER_EVIDENCE_DIR/settings.before.json" "$CUTOVER_EVIDENCE_DIR/settings.after.json"
 bb plugin list --json > "$CUTOVER_EVIDENCE_DIR/plugins.after.json"
@@ -230,7 +233,9 @@ sleep 7
 bb plugin config "$PLUGIN_ID" --json > "$CUTOVER_EVIDENCE_DIR/settings.rollback.json"
 cmp "$CUTOVER_EVIDENCE_DIR/settings.before.json" "$CUTOVER_EVIDENCE_DIR/settings.rollback.json"
 bb plugin source "$PLUGIN_ID" --json > "$CUTOVER_EVIDENCE_DIR/source.rollback.json"
-cmp "$CUTOVER_EVIDENCE_DIR/source.before.json" "$CUTOVER_EVIDENCE_DIR/source.rollback.json"
+node "$STATE_HELPER" compare-source \
+  "$CUTOVER_EVIDENCE_DIR/source.before.json" \
+  "$CUTOVER_EVIDENCE_DIR/source.rollback.json" "$REGISTERED_PATH/package.json"
 node "$STATE_HELPER" capture "$DATA_DB" "$CUTOVER_EVIDENCE_DIR/state.rollback.json"
 node "$STATE_HELPER" compare \
   "$CUTOVER_EVIDENCE_DIR/state.before.json" "$CUTOVER_EVIDENCE_DIR/state.rollback.json"
@@ -272,7 +277,9 @@ sleep 7
 bb plugin config "$PLUGIN_ID" --json > "$CUTOVER_EVIDENCE_DIR/settings.restored.json"
 cmp "$CUTOVER_EVIDENCE_DIR/settings.before.json" "$CUTOVER_EVIDENCE_DIR/settings.restored.json"
 bb plugin source "$PLUGIN_ID" --json > "$CUTOVER_EVIDENCE_DIR/source.restored.json"
-cmp "$CUTOVER_EVIDENCE_DIR/source.before.json" "$CUTOVER_EVIDENCE_DIR/source.restored.json"
+node "$STATE_HELPER" compare-source \
+  "$CUTOVER_EVIDENCE_DIR/source.before.json" \
+  "$CUTOVER_EVIDENCE_DIR/source.restored.json" "$REGISTERED_PATH/package.json"
 node "$STATE_HELPER" capture "$DATA_DB" "$CUTOVER_EVIDENCE_DIR/state.restored.json"
 node "$STATE_HELPER" compare \
   "$CUTOVER_EVIDENCE_DIR/state.before.json" "$CUTOVER_EVIDENCE_DIR/state.restored.json"
