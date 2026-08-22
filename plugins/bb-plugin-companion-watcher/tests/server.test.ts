@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { describe, expect, it } from "vitest";
-import companionWatcher, { hasActiveWorkers, parseCanonicalExport, parseJudgment, readRoleThread, routeJudgment, snapshotCanonical } from "../server.js";
+import companionWatcher, { composeTimeline, hasActiveWorkers, parseCanonicalExport, parseJudgment, readRoleThread, routeJudgment, snapshotCanonical } from "../server.js";
 
 const fixtureRoot = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 const projectId = "proj_a8zzfsx36j";
@@ -49,6 +49,7 @@ describe("semantic idle guard", () => {
   it("keeps the native timeline page bounded and reports older rows as partial", async () => {
     let tool: { execute(params: unknown, context: { threadId: string; projectId: string }): Promise<unknown> } | undefined;
     let hasOlderRows = true;
+    let timelineCalls = 0;
     let timelineArgs: { segmentLimit?: string } | undefined;
     const bb = {
       pluginId: "companion-watcher",
@@ -60,7 +61,7 @@ describe("semantic idle guard", () => {
         projects: { get: async () => ({ gitRemoteUrl: null }) },
         threads: {
           get: async () => ({ projectId, title: "Alzheimer companion judgment", originPluginId: "companion-watcher" }),
-          timeline: async (args: typeof timelineArgs) => { timelineArgs = args; return { rows: [], timelinePage: { hasOlderRows, kind: "latest", segmentLimit: Number(args.segmentLimit), returnedSegmentCount: 0, olderCursor: null }, maxSeq: 0 }; },
+          timeline: async (args: typeof timelineArgs) => { timelineArgs = args; timelineCalls += 1; return { rows: [], timelinePage: { hasOlderRows, kind: "latest", segmentLimit: Number(args?.segmentLimit), returnedSegmentCount: 0, olderCursor: hasOlderRows ? { anchorSeq: timelineCalls, anchorId: `anchor-${timelineCalls}` } : null }, maxSeq: 0 }; },
           queuedMessages: { list: async () => [] },
         },
       },
@@ -70,6 +71,7 @@ describe("semantic idle guard", () => {
     const run = async () => JSON.parse(await tool!.execute({}, { threadId: "companion", projectId }) as string) as { coverage: string };
     expect((await run()).coverage).toBe("partial");
     expect(timelineArgs?.segmentLimit).toBe("100");
+    expect(timelineCalls).toBe(10);
     hasOlderRows = false;
     expect((await run()).coverage).toBe("known");
   });
@@ -101,11 +103,47 @@ describe("semantic idle guard", () => {
     companionWatcher(bb, capturedExport, async () => []);
     const result = JSON.parse(await tool!.execute({}, { threadId: "companion", projectId }) as string) as { coverage: string; recentTimeline: { rows: Array<{ id: string }> } };
     expect(result.coverage).toBe("known");
-    expect(result.recentTimeline.rows.map((row) => row.id)).toEqual(["new", "old"]);
+    expect(result.recentTimeline.rows.map((row) => row.id)).toEqual(["old", "new"]);
     expect(calls).toEqual([
       { threadId: "thr_7bjw9e7mgd", segmentLimit: "100" },
       { threadId: "thr_7bjw9e7mgd", segmentLimit: "100", beforeAnchorSeq: "9", beforeAnchorId: "old-anchor" },
     ]);
+  });
+
+  it("composes paged timelines in native order with latest metadata and envelope", () => {
+    const latest = {
+      rows: [{ id: "boundary", text: "new boundary" }, { id: "newest", text: "newest" }],
+      activePromptMode: { mode: "plan", providerId: "codex", prompt: "latest" },
+      activeThinking: { id: "thinking", text: "latest", startedAt: 3, updatedAt: 4 },
+      activeWorkflows: [{ id: "workflow-latest" }],
+      activeBackgroundCommands: [{ id: "command-latest" }],
+      contextWindowUsage: { usedTokens: 9, modelContextWindow: 10, estimated: false },
+      pendingTodos: { sourceSeq: 8, updatedAt: 8, items: [] },
+      modelFallback: { sourceSeq: 8, detectedAt: 8, originalModel: "old", fallbackModel: "latest", reason: "provider", message: "latest" },
+      timelinePage: { kind: "latest", segmentLimit: 100, returnedSegmentCount: 2, hasOlderRows: true, olderCursor: { anchorSeq: 2, anchorId: "anchor" } },
+      maxSeq: 100,
+    } as unknown as Parameters<typeof composeTimeline>[0];
+    const older = {
+      rows: [{ id: "oldest", text: "oldest" }, { id: "boundary", text: "old boundary" }],
+      activePromptMode: null,
+      activeThinking: null,
+      activeWorkflows: [],
+      activeBackgroundCommands: [],
+      contextWindowUsage: { usedTokens: 1, modelContextWindow: 2, estimated: true },
+      pendingTodos: null,
+      modelFallback: null,
+      timelinePage: { kind: "older", segmentLimit: 100, returnedSegmentCount: 2, hasOlderRows: false, olderCursor: null },
+      maxSeq: 2,
+    } as unknown as Parameters<typeof composeTimeline>[0];
+    const oldest = {
+      ...older,
+      rows: [{ id: "very-old", text: "very old" }],
+      timelinePage: { ...older.timelinePage, hasOlderRows: false, olderCursor: null },
+    } as unknown as Parameters<typeof composeTimeline>[0];
+    const composed = composeTimeline(latest, [older, oldest]);
+    expect(composed.rows.map((row) => row.id)).toEqual(["very-old", "oldest", "boundary", "newest"]);
+    expect(composed.rows.find((row) => row.id === "boundary")).toMatchObject({ text: "new boundary" });
+    expect(composed).toMatchObject({ activePromptMode: latest.activePromptMode, activeThinking: latest.activeThinking, activeWorkflows: latest.activeWorkflows, activeBackgroundCommands: latest.activeBackgroundCommands, contextWindowUsage: latest.contextWindowUsage, pendingTodos: latest.pendingTodos, modelFallback: latest.modelFallback, maxSeq: 100, timelinePage: { hasOlderRows: false, returnedSegmentCount: 4 } });
   });
 
   it("rejects a non-OK canonical export outcome", async () => {
