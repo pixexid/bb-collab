@@ -7,6 +7,12 @@ import { pathToFileURL } from "node:url";
 
 const PAGE_SIZE = 1_000;
 const ACTIVE_PROFILE = Symbol("active profile");
+const TERMINAL_TURN_STATUSES = new Set(["completed", "failed", "interrupted"]);
+const CODEX_SCOPE_TURN_ID = /^bta[0-9a-z]{7}-[1-9][0-9]*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/iu;
+
+function isTerminalTurnEvent(event) {
+  return event?.type === "turn/completed" && TERMINAL_TURN_STATUSES.has(event.data?.status);
+}
 
 function realPathInside(root, candidate) {
   try {
@@ -79,7 +85,7 @@ function completedTurns(events) {
   return events.flatMap((event) => {
     const checkpointId = event?.data?.providerCheckpointId;
     const providerThreadId = event?.data?.providerThreadId;
-    if (event?.type !== "turn/completed" || typeof event.data?.status !== "string" || event.data.status === "") return [];
+    if (!isTerminalTurnEvent(event)) return [];
     return [{
       eventId: event.id,
       eventSeq: event.seq,
@@ -96,7 +102,7 @@ export function environmentDependentFromEvents(thread, events) {
     .filter((event) => event?.type === "turn/started" && typeof event.data?.providerThreadId === "string" && event.data.providerThreadId !== "")
     .sort((left, right) => left.seq - right.seq);
   const start = starts.at(-1);
-  return Boolean(start && !events.some((event) => event?.type === "turn/completed" && event.seq > start.seq && event.data?.providerThreadId === start.data.providerThreadId));
+  return Boolean(start && !events.some((event) => isTerminalTurnEvent(event) && event.seq > start.seq && event.data?.providerThreadId === start.data.providerThreadId));
 }
 
 function activeTurn(thread, events) {
@@ -107,7 +113,7 @@ function activeTurn(thread, events) {
     .at(-1);
   if (!start) return { reason: "BB thread is active but its current turn start is missing" };
   if (typeof start.scope?.turnId !== "string" || start.scope.turnId === "") return { reason: "BB active turn identity is unavailable" };
-  const completedAfterStart = events.some((event) => event?.type === "turn/completed" && event.seq > start.seq && event.data?.providerThreadId === start.data.providerThreadId);
+  const completedAfterStart = events.some((event) => isTerminalTurnEvent(event) && event.seq > start.seq && event.data?.providerThreadId === start.data.providerThreadId);
   if (completedAfterStart) return { reason: "BB thread is active but its latest provider turn is already terminal" };
   const requested = new Map(events
     .filter((event) => event?.type === "client/turn/requested" && typeof event.data?.requestId === "string")
@@ -136,7 +142,7 @@ function activeTurn(thread, events) {
 
 function codexTurnIdFromScope(turn) {
   if (!turn.scopeTurnId || !turn.providerThreadId) return null;
-  return turn.scopeTurnId.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu)?.[0] ?? null;
+  return turn.scopeTurnId.match(CODEX_SCOPE_TURN_ID)?.[1] ?? null;
 }
 
 function recordAtOrAfter(record, timestampMs) {
@@ -195,23 +201,23 @@ export async function readExecutedProfiles({ thread, environment, events, home =
     try {
       const root = join(home, ".codex", "sessions");
       const directories = codexSessionDirectories(home, providerThreadId);
-      let files = [];
-      for (const directory of directories) {
-        files = filesNamed(root, directory, (name) => name.endsWith(`-${providerThreadId}.jsonl`));
-        if (files.length > 0) break;
-      }
+      const files = directories.flatMap((directory) => filesNamed(root, directory, (name) => name.endsWith(`-${providerThreadId}.jsonl`)));
       if (files.length !== 1) return { ...settle(codexTurns, profiles, "codex turn_context"), reason: `${active ? "active BB turn: " : ""}expected one Codex session log, found ${files.length}` };
       const activeProfiles = [];
       const requiresSessionMatch = active || turns.some((turn) => !turn.checkpointId && codexTurnIdFromScope(turn));
-      let activeSessionMatches = !requiresSessionMatch;
+      const sessionMetas = [];
       await readJsonLines(files[0], (record) => {
-        if (record?.type === "session_meta" && record.payload?.id === providerThreadId && record.payload?.originator === "bb" && record.payload?.cwd === environment?.path) activeSessionMatches = true;
+        if (record?.type === "session_meta") sessionMetas.push(record.payload);
         if (record?.type === "turn_context") {
           add(record.payload?.turn_id, record.payload?.model, record.payload?.effort);
           if (active && typeof record.payload?.turn_id === "string" && recordAtOrAfter(record, active.requestedAtMs) && active.scopeTurnId.endsWith(`-${record.payload.turn_id}`)) activeProfiles.push(record.payload);
         }
       });
-      if (!activeSessionMatches) {
+      const exactSession = sessionMetas.length === 1
+        && sessionMetas[0]?.id === providerThreadId
+        && sessionMetas[0]?.originator === "bb"
+        && sessionMetas[0]?.cwd === environment?.path;
+      if (requiresSessionMatch && !exactSession) {
         profiles.clear();
         return { ...settle(codexTurns, profiles, "codex turn_context"), reason: `${active ? "active BB turn: " : ""}Codex session_meta does not match the BB session and exact environment path` };
       }
