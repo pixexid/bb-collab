@@ -41,13 +41,13 @@ describe("semantic idle guard", () => {
         record.row.execution_attempt_id = "fd94c2f39e7bc72ecc454bb3cf5b5d6b95d7a5b44dcf7942bd846e3c3565dd2c";
         record.row.state = "superseded";
         record.row.thread_id = null;
-        record.row.work_item_id = null;
+        record.row.work_item_id = "wi-gh-559";
       }
       return JSON.stringify(record);
     }).join("\n");
     const canonical = await parseCanonicalExport(inlineExport(records, { execution_attempts: 2, role_generation_heads: 1, role_generations: 1, work_items: 1 }), fixtureRoot, projectId);
     expect(canonical.parseIssues).toEqual([]);
-    expect(canonical.executionAttempts.find((row) => row.execution_attempt_id === "fd94c2f39e7bc72ecc454bb3cf5b5d6b95d7a5b44dcf7942bd846e3c3565dd2c")).toMatchObject({ thread_id: null, work_item_id: null, state: "superseded" });
+    expect(canonical.executionAttempts.find((row) => row.execution_attempt_id === "fd94c2f39e7bc72ecc454bb3cf5b5d6b95d7a5b44dcf7942bd846e3c3565dd2c")).toMatchObject({ thread_id: null, work_item_id: "wi-gh-559", state: "superseded" });
   });
 
   it("keeps a canonical population over 100 rows bounded and fully known below the ceiling", async () => {
