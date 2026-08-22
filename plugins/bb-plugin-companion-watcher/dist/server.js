@@ -23,18 +23,23 @@ var TOOL = "companion_read_snapshot";
 var TITLE = "Alzheimer companion judgment";
 var REQUIRED_FIELDS = {
   execution_attempts: {
+    assignment_kind: (value) => value === null || value === "write" || value === "review" || value === "probe",
     execution_attempt_id: (value) => typeof value === "string",
     observed_at_ms: (value) => typeof value === "number",
     origin: (value) => typeof value === "string",
     project_id: (value) => typeof value === "string",
+    review_pr_head_sha: (value) => value === null || typeof value === "string",
+    review_pr_number: (value) => value === null || typeof value === "number",
     state: (value) => typeof value === "string",
     thread_id: (value) => value === null || typeof value === "string",
     work_item_id: (value) => value === null || typeof value === "string"
   },
   external_work_refs: {
     issue_number: (value) => value === null || typeof value === "number",
+    owner: (value) => typeof value === "string" && value.length > 0,
     project_id: (value) => typeof value === "string",
     provider: (value) => value === "github",
+    repo: (value) => typeof value === "string" && value.length > 0,
     work_item_id: (value) => typeof value === "string"
   },
   role_generation_heads: {
@@ -197,16 +202,30 @@ function githubChecks(value) {
   });
   return checks.every((check) => typeof check === "string") ? checks : void 0;
 }
+function githubClosingIssueNumber(value, repository) {
+  if (!repository || !value || typeof value !== "object" || Array.isArray(value)) return void 0;
+  const reference = value;
+  const refRepository = reference.repository;
+  if (!refRepository || typeof refRepository !== "object" || Array.isArray(refRepository)) return void 0;
+  const repo = refRepository;
+  const owner = repo.owner;
+  if (!owner || typeof owner !== "object" || Array.isArray(owner)) return void 0;
+  const ownerLogin = owner.login;
+  const name = repo.name;
+  const number = reference.number;
+  return typeof ownerLogin === "string" && typeof name === "string" && `${ownerLogin}/${name}` === repository && typeof number === "number" && Number.isSafeInteger(number) && number > 0 ? number : void 0;
+}
 function parseGithubEvidence(value, onInvalid = () => {
 }) {
   if (!value || typeof value !== "object") throw new Error("github-payload-invalid");
   const raw = value;
   if (!Array.isArray(raw.issues) || !Array.isArray(raw.prs)) throw new Error("github-payload-invalid");
-  let complete = raw.issues.length < SNAPSHOT_LIMIT && raw.prs.length < SNAPSHOT_LIMIT;
+  let issuesComplete = raw.issues.length < SNAPSHOT_LIMIT;
+  let prsComplete = raw.prs.length < SNAPSHOT_LIMIT;
   const issues = raw.issues.flatMap((item, index) => {
     if (!item || typeof item !== "object") {
       onInvalid(`issue-${index}`);
-      complete = false;
+      issuesComplete = false;
       return [];
     }
     const issue = item;
@@ -214,7 +233,7 @@ function parseGithubEvidence(value, onInvalid = () => {
     const updatedAt = timestamp(issue.updatedAt);
     if (typeof issue.number !== "number" || typeof issue.title !== "string" || !labels || updatedAt === void 0) {
       onInvalid(`issue-${index}`);
-      complete = false;
+      issuesComplete = false;
       return [];
     }
     return [{ number: issue.number, title: issue.title, labels, updatedAt }];
@@ -222,21 +241,23 @@ function parseGithubEvidence(value, onInvalid = () => {
   const prs = raw.prs.flatMap((item, index) => {
     if (!item || typeof item !== "object") {
       onInvalid(`pr-${index}`);
-      complete = false;
+      prsComplete = false;
       return [];
     }
     const pr = item;
     const checks = githubChecks(pr.statusCheckRollup);
     const updatedAt = timestamp(pr.updatedAt);
-    if (typeof pr.number !== "number" || typeof pr.state !== "string" || typeof pr.mergeStateStatus !== "string" || typeof pr.reviewDecision !== "string" || typeof pr.headRefOid !== "string" || !Array.isArray(pr.reviews) || !checks || updatedAt === void 0) {
+    const closingIssues = pr.closingIssuesReferences;
+    const closingIssueNumber = typeof raw.repository === "string" && Array.isArray(closingIssues) && closingIssues.length === 1 ? githubClosingIssueNumber(closingIssues[0], raw.repository) : void 0;
+    if (typeof pr.number !== "number" || !Number.isSafeInteger(pr.number) || typeof pr.state !== "string" || typeof pr.mergeStateStatus !== "string" || typeof pr.reviewDecision !== "string" || typeof pr.headRefOid !== "string" || !Array.isArray(pr.reviews) || !checks || updatedAt === void 0 || closingIssueNumber === void 0) {
       onInvalid(`pr-${index}`);
-      complete = false;
+      prsComplete = false;
       return [];
     }
     const ready = pr.state === "OPEN" && pr.mergeStateStatus === "CLEAN" && pr.reviewDecision === "" && pr.reviews.length === 0 && checks.length > 0 && checks.every((check) => check === "SUCCESS");
-    return [{ number: pr.number, headSha: pr.headRefOid, updatedAt, ready }];
+    return [{ number: pr.number, closingIssueNumber, headSha: pr.headRefOid, updatedAt, ready }];
   });
-  return { issues, prs, complete };
+  return { repository: typeof raw.repository === "string" ? raw.repository : void 0, issues, prs, complete: issuesComplete && prsComplete, issuesComplete, prsComplete };
 }
 function queuedFirstLine(message) {
   return message.content.find((part) => part.type === "text")?.text.split("\n", 1)[0]?.slice(0, 200) ?? "(non-text obligation)";
@@ -266,11 +287,16 @@ function extractCandidates(snapshot) {
   const { projectId, canonical, githubIssues, githubPrs, observedAt, cycleStartedAt } = snapshot;
   if (canonical.projectId !== projectId) return [];
   const candidates = [];
-  const sourcesKnown = (...sources) => sources.every((source) => (snapshot.sourceCoverage?.[source] ?? (snapshot.coverage === "known" ? "known" : "blind")) === "known");
-  const activeAttempts = canonical.executionAttempts.filter((attempt) => ACTIVE.includes(attempt.state));
+  const sourcesKnown = (...sources) => sources.every((source) => {
+    const sourceCoverage = source === "githubIssues" || source === "githubPrs" ? snapshot.sourceCoverage?.[source] ?? snapshot.sourceCoverage?.github : snapshot.sourceCoverage?.[source];
+    return (sourceCoverage ?? (snapshot.coverage === "known" ? "known" : "blind")) === "known";
+  });
+  const activeAttempts = canonical.executionAttempts.filter((attempt) => attempt.project_id === projectId && ACTIVE.includes(attempt.state));
   const startableNumbers = new Set(githubIssues.filter((issue) => issue.labels.includes("queue:startable")).map((issue) => issue.number));
-  for (const workItem of sourcesKnown("canonical", "github") ? canonical.workItems : []) {
-    const ref = canonical.externalWorkRefs.find((row) => row.work_item_id === workItem.work_item_id && row.provider === "github" && typeof row.issue_number === "number");
+  const projectWorkItems = canonical.workItems.filter((workItem) => workItem.project_id === projectId);
+  const projectRefs = canonical.externalWorkRefs.filter((row) => row.project_id === projectId);
+  for (const workItem of sourcesKnown("canonical", "githubIssues") ? projectWorkItems : []) {
+    const ref = projectRefs.find((row) => row.work_item_id === workItem.work_item_id && row.provider === "github" && typeof row.issue_number === "number");
     if (workItem.lifecycle_state !== "ready" || !ref || !startableNumbers.has(ref.issue_number) || activeAttempts.some((attempt) => attempt.work_item_id === workItem.work_item_id)) continue;
     const anchors = { projectId, kind: "work_item", workItemId: String(workItem.work_item_id), resourceRevision: Number(workItem.resource_revision) };
     candidates.push({ id: `${projectId}:work-item:${anchors.workItemId}:${anchors.resourceRevision}`, kind: anchors.kind, anchors, finding: `Work item ${anchors.workItemId} (revision ${anchors.resourceRevision}; issue #${ref.issue_number}) is queue:startable with zero active attempts.`, evidence: { projectId, lifecycleState: workItem.lifecycle_state, issueNumber: ref.issue_number, activeAttemptCount: 0 } });
@@ -280,10 +306,21 @@ function extractCandidates(snapshot) {
     const anchors = { projectId, kind: "attempt", executionAttemptId: attempt.execution_attempt_id };
     candidates.push({ id: `${projectId}:attempt:${anchors.executionAttemptId}`, kind: anchors.kind, anchors, finding: `Active attempt ${anchors.executionAttemptId} for work item ${String(attempt.work_item_id)} has produced no canonical evidence for at least ten minutes.`, evidence: { projectId, workItemId: attempt.work_item_id, state: attempt.state, observedAtMs: attempt.observed_at_ms } });
   }
-  for (const pr of sourcesKnown("github") ? githubPrs : []) {
+  const repository = snapshot.githubRepository?.match(/^(?<owner>[^/]+)\/(?<repo>[^/]+)$/u)?.groups;
+  if (repository && sourcesKnown("canonical", "githubPrs")) for (const pr of githubPrs) {
     if (!pr.ready || observedAt - pr.updatedAt < DECISION_THRESHOLD_MS) continue;
+    const linkedWorkItems = projectRefs.filter((ref) => ref.provider === "github" && ref.owner === repository.owner && ref.repo === repository.repo && ref.issue_number === pr.closingIssueNumber).map((ref) => projectWorkItems.find((workItem) => workItem.work_item_id === ref.work_item_id)).filter((workItem) => workItem !== void 0);
+    if (linkedWorkItems.length !== 1) continue;
+    const workItemId = linkedWorkItems[0].work_item_id;
+    const activeWriter = activeAttempts.some(
+      (attempt) => attempt.origin === "work_item" && attempt.work_item_id === workItemId && attempt.assignment_kind === "write"
+    );
+    const runningReview = activeAttempts.some(
+      (attempt) => attempt.origin === "work_item" && attempt.work_item_id === workItemId && attempt.assignment_kind === "review" && attempt.review_pr_number === pr.number && attempt.review_pr_head_sha === pr.headSha
+    );
+    if (activeWriter || runningReview) continue;
     const anchors = { projectId, kind: "pull_request", number: pr.number, headSha: pr.headSha };
-    candidates.push({ id: `${projectId}:pr:${pr.number}:${pr.headSha}`, kind: anchors.kind, anchors, finding: `PR #${pr.number} at ${pr.headSha} is green, mergeable, decisionless, and unchanged past the five-minute decision threshold.`, evidence: { projectId, updatedAt: pr.updatedAt } });
+    candidates.push({ id: `${projectId}:pr:${pr.number}:${pr.headSha}`, kind: anchors.kind, anchors, finding: `PR #${pr.number} at ${pr.headSha} is green, mergeable, decisionless, and unchanged past the five-minute decision threshold.`, evidence: { projectId, workItemId, closingIssueNumber: pr.closingIssueNumber, updatedAt: pr.updatedAt } });
   }
   const queueCutoff = cycleStartedAt ?? observedAt - DECISION_THRESHOLD_MS;
   for (const message of sourcesKnown("queue", "timeline") ? snapshot.queued : []) {
@@ -314,9 +351,9 @@ async function githubEvidence(remote) {
   if (!repo) throw new Error("github-repository-unresolved");
   const [issues, prs] = await Promise.all([
     exec("gh", ["issue", "list", "--repo", repo, "--state", "open", "--label", "queue:startable", "--json", "number,title,labels,updatedAt", "--limit", String(SNAPSHOT_LIMIT)], { timeout: 1e4 }),
-    exec("gh", ["pr", "list", "--repo", repo, "--state", "open", "--json", "number,title,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup,updatedAt", "--limit", String(SNAPSHOT_LIMIT)], { timeout: 1e4 })
+    exec("gh", ["pr", "list", "--repo", repo, "--state", "open", "--json", "number,title,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup,updatedAt,closingIssuesReferences", "--limit", String(SNAPSHOT_LIMIT)], { timeout: 1e4 })
   ]);
-  return { issues: JSON.parse(issues.stdout), prs: JSON.parse(prs.stdout) };
+  return { repository: repo, issues: JSON.parse(issues.stdout), prs: JSON.parse(prs.stdout) };
 }
 var prompt = (projectId) => `Judge ONLY the verified candidates returned by ${TOOL}; do not discover or invent other work, and do not assert coverage because code computes it. Call the tool exactly once and do not mutate or message anything. If no candidate warrants a wake, output exactly SILENCE. Otherwise copy the selected candidate's id, anchors, and finding exactly into one line per candidate as FINDING: {"candidateId":"supplied id","anchors":supplied anchors,"finding":"supplied finding"}, followed by exactly ESCALATE: yes. Project: ${projectId}.`;
 function companionWatcher(bb, readExport = readCanonicalExport, readGithub = githubEvidence, listProjects = async () => await bb.sdk.projects.list()) {
@@ -375,6 +412,7 @@ function companionWatcher(bb, readExport = readCanonicalExport, readGithub = git
         if (parseIssues.length > 0) bb.log.warn(`companion-watcher coverage=partial event=snapshot reason=malformed-canonical-rows count=${parseIssues.length} fields=${parseIssues.join(",")}`);
         let githubIssues = [];
         let githubPrs = [];
+        let githubRepository;
         const sourceCoverage = {
           canonical: canonicalComplete ? "known" : "blind",
           timeline: recentTimeline.timelinePage.hasOlderRows ? "blind" : "known",
@@ -389,8 +427,11 @@ function companionWatcher(bb, readExport = readCanonicalExport, readGithub = git
         try {
           const githubIssuesFound = [];
           const github = parseGithubEvidence(await readGithub(project.gitRemoteUrl), (reason) => githubIssuesFound.push(reason));
+          githubRepository = github.repository;
           githubIssues = github.issues;
           githubPrs = github.prs;
+          sourceCoverage.githubIssues = github.issuesComplete ? "known" : "blind";
+          sourceCoverage.githubPrs = github.prsComplete ? "known" : "blind";
           if (!github.complete || githubIssuesFound.length > 0) {
             sourceCoverage.github = "blind";
             coverage = "partial";
@@ -398,10 +439,12 @@ function companionWatcher(bb, readExport = readCanonicalExport, readGithub = git
           }
         } catch (error) {
           sourceCoverage.github = "blind";
+          sourceCoverage.githubIssues = "blind";
+          sourceCoverage.githubPrs = "blind";
           coverage = "blind";
           bb.log.warn(`companion-watcher coverage=blind event=snapshot reason=${String(error)}`);
         }
-        const snapshot = { projectId: context.projectId, canonical: { ...exported, executionAttempts, externalWorkRefs, workItems }, queued: queued.messages.slice(0, SNAPSHOT_LIMIT), githubIssues, githubPrs, coverage, sourceCoverage, observedAt: Date.now(), cycleStartedAt: pending.get(context.threadId)?.turnStartedAt };
+        const snapshot = { projectId: context.projectId, canonical: { ...exported, executionAttempts, externalWorkRefs, workItems }, queued: queued.messages.slice(0, SNAPSHOT_LIMIT), githubRepository, githubIssues, githubPrs, coverage, sourceCoverage, observedAt: Date.now(), cycleStartedAt: pending.get(context.threadId)?.turnStartedAt };
         candidateSnapshots.set(context.threadId, snapshot);
         return JSON.stringify({ coverage, candidates: extractCandidates(snapshot) });
       } catch (error) {
