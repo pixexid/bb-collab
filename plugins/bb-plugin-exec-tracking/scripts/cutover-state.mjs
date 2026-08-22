@@ -125,14 +125,25 @@ function validateEngines(value, label) {
   }
 }
 
+function validateHistory(value, label) {
+  if (!Array.isArray(value)) throw new Error(`refused: malformed ${label} history`);
+  for (const entry of value) {
+    if (!isRecord(entry) || Object.keys(entry).length !== 2
+      || typeof entry.version !== "string" || !entry.version
+      || !Number.isSafeInteger(entry.activatedAt) || entry.activatedAt < 0) {
+      throw new Error(`refused: malformed ${label} history`);
+    }
+  }
+}
+
 function validateSource(value, label) {
   if (!isRecord(value) || typeof value.requested !== "string" || !value.requested
     || typeof value.resolved !== "string" || !value.resolved
     || value.requested !== value.resolved
-    || !Number.isSafeInteger(value.installedAt) || value.installedAt < 0
-    || !Array.isArray(value.history)) {
+    || !Number.isSafeInteger(value.installedAt) || value.installedAt < 0) {
     throw new Error(`refused: malformed ${label} source`);
   }
+  validateHistory(value.history, label);
   validateEngines(value.engines, label);
 }
 

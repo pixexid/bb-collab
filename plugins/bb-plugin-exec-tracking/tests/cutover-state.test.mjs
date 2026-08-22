@@ -68,7 +68,7 @@ test("source comparison accepts manifest engine advancement and rejects identity
   const source = {
     requested: "path:/legacy/exec-tracking",
     resolved: "path:/legacy/exec-tracking",
-    installedAt: 1_786_597_816_830,
+    installedAt: 42,
     history: [],
   };
   writeFileSync(before, JSON.stringify({ ...source, engines: legacyEngines }));
@@ -81,7 +81,7 @@ test("source comparison accepts manifest engine advancement and rejects identity
     ["requested", "path:/changed"],
     ["resolved", "path:/changed"],
     ["installedAt", source.installedAt + 1],
-    ["history", [{ source: "changed" }]],
+    ["history", [{ version: "0.1.0", activatedAt: 1 }]],
   ]) {
     const mutant = { ...source, [field]: value, engines: candidateEngines };
     writeFileSync(after, JSON.stringify(mutant));
@@ -109,6 +109,34 @@ test("source comparison refuses malformed source and manifest shapes", () => {
   assert.throws(() => run("compare-source", before, after, manifest), /malformed post-source source/);
   writeFileSync(after, readFileSync(before));
   assert.throws(() => run("compare-source", before, after, manifest), /malformed candidate package engines/);
+});
+
+test("source comparison rejects malformed history entries, including identical before-after bypasses", () => {
+  const directory = mkdtempSync(join(tmpdir(), "exec-source-history-"));
+  const before = join(directory, "source.before.json");
+  const after = join(directory, "source.after.json");
+  const manifest = join(directory, "package.json");
+  const source = {
+    requested: "path:/x",
+    resolved: "path:/x",
+    installedAt: 42,
+    engines: { bb: ">=1", bbPluginSdk: ">=1" },
+  };
+  writeFileSync(manifest, JSON.stringify({ engines: source.engines }));
+  const cases = [
+    ["null", [null]],
+    ["missing version", [{ activatedAt: 1 }]],
+    ["empty version", [{ version: "", activatedAt: 1 }]],
+    ["missing timestamp", [{ version: "0.1.0" }]],
+    ["invalid timestamp type", [{ version: "0.1.0", activatedAt: "1" }]],
+    ["unsafe timestamp", [{ version: "0.1.0", activatedAt: Number.MAX_SAFE_INTEGER + 1 }]],
+    ["extra field", [{ version: "0.1.0", activatedAt: 1, extra: true }]],
+  ];
+  for (const [, history] of cases) {
+    writeFileSync(before, JSON.stringify({ ...source, history }));
+    writeFileSync(after, JSON.stringify({ ...source, history }));
+    assert.throws(() => run("compare-source", before, after, manifest), /malformed pre-source history/);
+  }
 });
 
 test("abnormal preflight blocks only live owned candidates", () => {
