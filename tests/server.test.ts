@@ -2125,7 +2125,7 @@ describe("bb-collab plugin boundary", () => {
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "ACTOR_RECEIPT_UNKNOWN" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["idle-fleet-detector", "lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "worktree-cleanup", "thread-archive-sweep"]);
-    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "dispatchLane", "doctor", "export", "lanes", "markOperatorMessageRead", "operatorMessages", "registerWait", "replyToOperatorMessage", "roleBrief"]);
+    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "dispatchLane", "doctor", "export", "markOperatorMessageRead", "operatorMessages", "registerWait", "replyToOperatorMessage", "roleBrief", "v1-lanes"]);
     expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["dispatch_lane", "send_to_operator"]);
   });
 
@@ -2886,7 +2886,7 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     }));
   });
 
-  it("populates /lanes from the current canonical WorkItem attempt and native thread", async () => {
+  it("populates the versioned lane read seam from the current canonical WorkItem attempt and native thread", async () => {
     const fixture = await fleetWatchdogFixture(0);
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
     fixture.addNativeLane("thread-work-item-1", "active");
@@ -2904,10 +2904,7 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
       tone: "running",
       queueState: "running",
     });
-    await expect(fixture.host.harness.callRpc("lanes", {})).resolves.toEqual([expected]);
-    const response = await fixture.host.harness.fetchHttp("GET", "/lanes");
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual([expected]);
+    await expect(fixture.host.harness.callRpc("v1-lanes", {})).resolves.toEqual([expected]);
   });
 
   it("preserves a current prepared null-thread lane and visibly degrades a malformed running one", async () => {
@@ -2916,16 +2913,16 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
       workAttempt: { laneId: "lane-prepared", assignmentKind: "write" },
     }))).toMatchObject({ outcome: "OK" });
 
-    await expect(fixture.host.harness.callRpc("lanes", {})).resolves.toEqual([
+    await expect(fixture.host.harness.callRpc("v1-lanes", {})).resolves.toEqual([
       expect.objectContaining({ assignmentId: null, laneId: "lane-prepared", threadId: null, attemptState: "prepared", workerStatus: null, tone: "default" }),
     ]);
     fixture.db.prepare("UPDATE execution_attempts SET state = 'running' WHERE origin = 'work_item' AND work_item_id = ?").run(WORK_ITEM_ID);
-    await expect(fixture.host.harness.callRpc("lanes", {})).resolves.toEqual([
+    await expect(fixture.host.harness.callRpc("v1-lanes", {})).resolves.toEqual([
       expect.objectContaining({ assignmentId: null, laneId: "lane-prepared", threadId: null, attemptState: "running", workerStatus: null, tone: "error" }),
     ]);
   });
 
-  it.each(["terminal", "foreign", "historical", "archived", "unusable-holder"] as const)("excludes a %s WorkItem lane from both population surfaces", async (kind) => {
+  it.each(["terminal", "foreign", "historical", "archived", "unusable-holder"] as const)("excludes a %s WorkItem lane from the versioned read seam", async (kind) => {
     const fixture = await fleetWatchdogFixture(0);
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
     if (kind === "foreign") {
@@ -2948,17 +2945,14 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
       }
     }
 
-    await expect(fixture.host.harness.callRpc("lanes", {})).resolves.toEqual([]);
-    const response = await fixture.host.harness.fetchHttp("GET", "/lanes");
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual([]);
+    await expect(fixture.host.harness.callRpc("v1-lanes", {})).resolves.toEqual([]);
   });
 
   it("fails closed visibly when current native lane evidence is unreadable or ambiguous", async () => {
     const unreadable = await fleetWatchdogFixture(0);
     expect(applyWithFixtureReceipt(unreadable.db, transitionRequest(unreadable.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
     unreadable.host.harness.sdk.stub("threads.list", (async () => { throw new Error("native inventory failed"); }) as never);
-    await expect(unreadable.host.harness.callRpc("lanes", {})).rejects.toThrow("native inventory failed");
+    await expect(unreadable.host.harness.callRpc("v1-lanes", {})).rejects.toThrow("native inventory failed");
     expect(unreadable.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
       level: "warn",
       message: expect.stringContaining("reason=native-lane-inventory-unreadable"),
@@ -2968,7 +2962,7 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     expect(applyWithFixtureReceipt(ambiguous.db, transitionRequest(ambiguous.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
     const duplicate = makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: ambiguous.orchestratorThreadId, status: "active" });
     ambiguous.host.harness.sdk.stub("threads.list", (async () => [duplicate, duplicate]) as never);
-    await expect(ambiguous.host.harness.callRpc("lanes", {})).rejects.toThrow("native lane identity is ambiguous");
+    await expect(ambiguous.host.harness.callRpc("v1-lanes", {})).rejects.toThrow("native lane identity is ambiguous");
     expect(ambiguous.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
       level: "warn",
       message: expect.stringContaining("reason=native-lane-ambiguous"),
@@ -4360,7 +4354,7 @@ fi
         workAttempt: { laneId: "lane-review-successor", threadId: "thread-review-successor", assignmentKind: "review", reviewPrNumber: 507, reviewPrHeadSha: CANDIDATE_SHA },
       }))).toMatchObject({ outcome: "OK" });
       fixture.addNativeLane("thread-review-successor", "idle");
-      await expect(fixture.host.harness.callRpc("lanes", {})).resolves.toEqual([
+      await expect(fixture.host.harness.callRpc("v1-lanes", {})).resolves.toEqual([
         expect.objectContaining({
           assignmentId: null,
           assignmentKind: "review",
@@ -11713,7 +11707,7 @@ exit 1
     const registrations = host.harness.inspection.registrations;
     expect(registrations.rpcMethods).not.toContain("seed-fixture-receipt");
     expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "dispatch-lane", "github-issue-backfill", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "worktree-cleanup", "send-to-operator", "inbox"]);
-    expect(registrations.httpRoutes.map((route) => route.path)).toEqual(["/lanes"]);
+    expect(registrations.httpRoutes).toEqual([]);
     expect(seedFixtureDecision).toBeTypeOf("function");
   });
 
