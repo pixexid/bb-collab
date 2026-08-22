@@ -3900,6 +3900,43 @@ fi
     }
   });
 
+  it("leaves a visible errored dispatched lane to the existing stranded detector", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-dispatched-error-separation-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = issue ] && [ "$2" = list ]; then printf '%s\n' '[]';
+elif [ "$1" = api ]; then printf '%s\n' '[[{"number":205,"labels":[{"name":"queue:dispatched"}]}]]';
+else printf '%s\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"fixture","closedByPullRequestsReferences":[]}'; fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(7, true, 3, false);
+      bindFixtureGithubIssue(fixture.db, 205);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      fixture.addNativeLane("thread-work-item-1", "error");
+      fixture.recordRateLimits("thread-work-item-1", { providerId: "codex", status: "allowed", kind: "credits", windows: [], reachedReason: null, overageStatus: null, overageReason: null });
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      const sends = fixture.host.harness.inspection.sdk.callsTo("threads.send");
+      expect(sends.filter(([request]) =>
+        (request as { input: Array<{ text: string }> }).input[0]?.text.startsWith("stranded lane detected"),
+      )).toHaveLength(1);
+      expect(sends.filter(([request]) =>
+        (request as { input: Array<{ text: string }> }).input[0]?.text.startsWith("queue:dispatched has no live current lane"),
+      )).toHaveLength(0);
+      expect(fixture.db.prepare(
+        "SELECT assignment_kind, state, thread_id FROM execution_attempts WHERE origin = 'work_item'",
+      ).all()).toEqual([{ assignment_kind: "write", state: "running", thread_id: "thread-work-item-1" }]);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("fails closed when dispatched ownership or native lane evidence is incomplete", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-dispatched-blind-"));
     const gh = join(bin, "gh");

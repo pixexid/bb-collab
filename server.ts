@@ -228,9 +228,9 @@ function dispatchedWithoutLiveLane(
   db: SqliteDatabase,
   projectId: string,
   issues: GithubQueueIssue[],
-  lanes: ReadonlyArray<{ id: string; status: "active" | "error" | "idle" | "starting" | "stopping" }>,
+  lanes: ReadonlyArray<{ id: string }>,
 ): GithubQueueIssue[] | null {
-  const liveThreadIds = new Set(lanes.filter((lane) => lane.status === "active" || lane.status === "starting" || lane.status === "idle").map((lane) => lane.id));
+  const visibleThreadIds = new Set(lanes.map((lane) => lane.id));
   const unowned: GithubQueueIssue[] = [];
   for (const issue of issues) {
     const [owner, repo, extra] = issue.repository.split("/");
@@ -252,7 +252,7 @@ function dispatchedWithoutLiveLane(
          AND attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
          AND work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})`,
     ).all(projectId, refs[0]!.work_item_id, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_NON_TERMINAL_STATES) as Array<{ state: string; thread_id: string | null }>;
-    if (attempts.some((attempt) => attempt.thread_id !== null && liveThreadIds.has(attempt.thread_id))) continue;
+    if (attempts.some((attempt) => attempt.thread_id !== null && visibleThreadIds.has(attempt.thread_id))) continue;
     if (attempts.some((attempt) => attempt.state === "dispatch_unknown")) return null;
     unowned.push(issue);
   }

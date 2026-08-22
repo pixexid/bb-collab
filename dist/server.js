@@ -22178,7 +22178,7 @@ async function startableQueueStateAsync(repositories) {
   return { count, head: heads.sort()[0] ?? null, unlabelledCount, blockedCount, waitingExternalCount, dispatched: dispatched.sort((left, right) => left.repository.localeCompare(right.repository) || left.number - right.number) };
 }
 function dispatchedWithoutLiveLane(db, projectId, issues, lanes) {
-  const liveThreadIds = new Set(lanes.filter((lane) => lane.status === "active" || lane.status === "starting" || lane.status === "idle").map((lane) => lane.id));
+  const visibleThreadIds = new Set(lanes.map((lane) => lane.id));
   const unowned = [];
   for (const issue2 of issues) {
     const [owner, repo, extra] = issue2.repository.split("/");
@@ -22200,7 +22200,7 @@ function dispatchedWithoutLiveLane(db, projectId, issues, lanes) {
          AND attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
          AND work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})`
     ).all(projectId, refs[0].work_item_id, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_NON_TERMINAL_STATES);
-    if (attempts.some((attempt) => attempt.thread_id !== null && liveThreadIds.has(attempt.thread_id))) continue;
+    if (attempts.some((attempt) => attempt.thread_id !== null && visibleThreadIds.has(attempt.thread_id))) continue;
     if (attempts.some((attempt) => attempt.state === "dispatch_unknown")) return null;
     unowned.push(issue2);
   }
