@@ -20,12 +20,8 @@ umask 077
 : "${CUTOVER_EVIDENCE_DIR:?set to a new absolute evidence directory}"
 
 PLUGIN_ID=exec-tracking
-REGISTERED_PATH=/Users/pixexid/.local/share/llm-collab/runtime/main/bb-plugins/exec-tracking
-DATA_DB=/Users/pixexid/.bb/plugins/exec-tracking/data.db
 CANDIDATE_PATH="$DEPLOYED_CHECKOUT/plugins/bb-plugin-exec-tracking"
-RETAINED_PATH="${REGISTERED_PATH}.rollback-gh575-${EXPECTED_HEAD}"
 STATE_HELPER="$CANDIDATE_PATH/scripts/cutover-state.mjs"
-EXPECTED_SOURCE="path:${REGISTERED_PATH}"
 
 case "$EXPECTED_HEAD" in (*[!0-9a-f]*|'') exit 64;; esac
 test "${#EXPECTED_HEAD}" -eq 40
@@ -33,12 +29,27 @@ case "$DEPLOYED_CHECKOUT" in (/*) ;; (*) exit 64;; esac
 case "$CUTOVER_EVIDENCE_DIR" in (/*) ;; (*) exit 64;; esac
 test ! -e "$CUTOVER_EVIDENCE_DIR" && test ! -L "$CUTOVER_EVIDENCE_DIR"
 mkdir -m 700 "$CUTOVER_EVIDENCE_DIR"
-test -f "$DATA_DB"
-test -d "$REGISTERED_PATH" && test ! -L "$REGISTERED_PATH"
-test ! -e "$RETAINED_PATH" && test ! -L "$RETAINED_PATH"
 test -x "$(command -v bb)"
 test -x "$(command -v jq)"
 test -x "$(command -v curl)"
+
+bb plugin source "$PLUGIN_ID" --json > "$CUTOVER_EVIDENCE_DIR/source.before.json"
+EXPECTED_SOURCE="$(jq -er '.resolved | select(startswith("path:"))' \
+  "$CUTOVER_EVIDENCE_DIR/source.before.json")"
+REGISTERED_PATH="${EXPECTED_SOURCE#path:}"
+bb status --json > "$CUTOVER_EVIDENCE_DIR/status.before.json"
+BB_DATA_ROOT="$(jq -er '.dataDir | select(type == "string" and startswith("/"))' \
+  "$CUTOVER_EVIDENCE_DIR/status.before.json")"
+DATA_DB="$BB_DATA_ROOT/plugins/$PLUGIN_ID/data.db"
+RETAINED_PATH="${REGISTERED_PATH}.rollback-gh575-${EXPECTED_HEAD}"
+
+case "$REGISTERED_PATH" in (/*) ;; (*) exit 64;; esac
+jq -e --arg source "$EXPECTED_SOURCE" \
+  '.requested == $source and .resolved == $source' \
+  "$CUTOVER_EVIDENCE_DIR/source.before.json" >/dev/null
+test -f "$DATA_DB"
+test -d "$REGISTERED_PATH" && test ! -L "$REGISTERED_PATH"
+test ! -e "$RETAINED_PATH" && test ! -L "$RETAINED_PATH"
 ```
 
 ## Bind the reviewed checkout and registration
@@ -58,10 +69,6 @@ env -u BB_CLI node "$DEPLOYED_CHECKOUT/scripts/check-dist.mjs"
 git -C "$DEPLOYED_CHECKOUT" diff --exit-code
 test -z "$(git -C "$DEPLOYED_CHECKOUT" status --porcelain=v1 --untracked-files=all)"
 
-bb plugin source "$PLUGIN_ID" --json > "$CUTOVER_EVIDENCE_DIR/source.before.json"
-jq -e --arg source "$EXPECTED_SOURCE" \
-  '.requested == $source and .resolved == $source' \
-  "$CUTOVER_EVIDENCE_DIR/source.before.json" >/dev/null
 test "$(realpath "$REGISTERED_PATH")" = "$REGISTERED_PATH"
 bb plugin config "$PLUGIN_ID" --json > "$CUTOVER_EVIDENCE_DIR/settings.before.json"
 jq -e '.ok == true and (.values | keys | sort) == ["checkoutPath", "pythonPath"]
@@ -80,13 +87,17 @@ jq -e '[.plugins[] | select(.id == "exec-tracking")] | length == 1
 ## Establish the lull and capture source state
 
 The Lanes HTTP surface reports every registered collaboration lane across
-projects, rather than the active-writer proxy. Refuse unless it is empty. Also
-refuse an open abnormal thread because reload reconciliation would otherwise
-deliver a real wake. The state helper records the complete `sqlite_master`
-schema, migrations, and every row of every table in stable order; it refuses
-any nonzero pending row. Waiting seven seconds covers the resolver's enforced
-lifetime (five-second external registry bound plus two seconds) before state is
-recaptured and backed up online.
+projects, rather than the active-writer proxy. Refuse unless it is empty.
+Reload reconciliation considers only non-archived, non-deleted `error` or
+`stopping` threads, then asks the configured external role resolver whether
+each native project has a wake owner. The preflight blocks any successfully
+resolved candidate and permits only the resolver's exact ordinary unowned
+refusal; timeouts, malformed output, and every other error fail closed. The
+state helper also records the complete `sqlite_master` schema, migrations, and
+every row of every table in stable order, refusing any nonzero pending row.
+Waiting seven seconds covers the resolver's enforced lifetime (five-second
+external registry bound plus two seconds) before state is recaptured and
+backed up online.
 
 ```zsh
 LANES_TOKEN="$(bb plugin token lanes)"
@@ -96,8 +107,10 @@ curl -fsS -H "Authorization: Bearer $LANES_TOKEN" \
 jq -e 'type == "array" and length == 0' "$CUTOVER_EVIDENCE_DIR/lanes.before.json" >/dev/null
 unset LANES_TOKEN
 bb thread list --include-hidden --json > "$CUTOVER_EVIDENCE_DIR/threads.before.json"
-jq -e '[.[] | select(.status == "error" or .status == "stopping")] | length == 0' \
-  "$CUTOVER_EVIDENCE_DIR/threads.before.json" >/dev/null
+node "$STATE_HELPER" abnormal-candidates \
+  "$CUTOVER_EVIDENCE_DIR/threads.before.json" \
+  "$CUTOVER_EVIDENCE_DIR/settings.before.json" \
+  "$CUTOVER_EVIDENCE_DIR/abnormal-candidates.before.json"
 
 node "$STATE_HELPER" capture "$DATA_DB" "$CUTOVER_EVIDENCE_DIR/state.initial.json"
 sleep 7
@@ -155,9 +168,10 @@ cmp "$CUTOVER_EVIDENCE_DIR/source.before.json" "$CUTOVER_EVIDENCE_DIR/source.aft
 bb plugin config "$PLUGIN_ID" --json > "$CUTOVER_EVIDENCE_DIR/settings.after.json"
 cmp "$CUTOVER_EVIDENCE_DIR/settings.before.json" "$CUTOVER_EVIDENCE_DIR/settings.after.json"
 bb plugin list --json > "$CUTOVER_EVIDENCE_DIR/plugins.after.json"
-jq -e '[.plugins[] | select(.id == "exec-tracking")] | length == 1
-  and .[0].source == "path:/Users/pixexid/.local/share/llm-collab/runtime/main/bb-plugins/exec-tracking"
-  and .[0].rootDir == "/Users/pixexid/.local/share/llm-collab/runtime/main/bb-plugins/exec-tracking"
+jq -e --arg source "$EXPECTED_SOURCE" --arg root "$REGISTERED_PATH" \
+  '[.plugins[] | select(.id == "exec-tracking")] | length == 1
+  and .[0].source == $source
+  and .[0].rootDir == $root
   and .[0].status == "running"
   and .[0].cliCommand.name == "silent-wake"
   and .[0].app.hasApp == false' "$CUTOVER_EVIDENCE_DIR/plugins.after.json" >/dev/null

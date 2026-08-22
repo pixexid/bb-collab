@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { lstatSync, readFileSync, writeFileSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { backup, DatabaseSync } from "node:sqlite";
 
 const quote = (name) => `"${name.replaceAll('"', '""')}"`;
@@ -57,6 +59,52 @@ function snapshot(databasePath) {
   }
 }
 
+function abnormalCandidates(threadsPath, settingsPath) {
+  const threads = JSON.parse(readFileSync(threadsPath, "utf8"));
+  const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+  if (!Array.isArray(threads)) throw new Error("refused: thread list is not an array");
+  const checkoutPath = settings?.values?.checkoutPath;
+  const pythonPath = settings?.values?.pythonPath;
+  if (typeof checkoutPath !== "string" || !isAbsolute(checkoutPath)
+    || typeof pythonPath !== "string" || !isAbsolute(pythonPath)) {
+    throw new Error("refused: resolver settings are absent");
+  }
+  const candidates = threads.filter((thread) => {
+    if (!thread || typeof thread !== "object"
+      || typeof thread.id !== "string" || typeof thread.projectId !== "string"
+      || !("archivedAt" in thread) || !("deletedAt" in thread) || typeof thread.status !== "string") {
+      throw new Error("refused: malformed thread list row");
+    }
+    return thread.archivedAt === null && thread.deletedAt === null
+      && (thread.status === "error" || thread.status === "stopping");
+  });
+  const unowned = [];
+  for (const thread of candidates) {
+    if (!/^proj_[a-z0-9]+$/u.test(thread.projectId)) throw new Error("refused: invalid native project id");
+    const result = spawnSync(
+      pythonPath,
+      [join(checkoutPath, "bin", "resolve_role_wake.py"), "--thread-project", thread.projectId],
+      { cwd: checkoutPath, encoding: "utf8", timeout: 7_000, maxBuffer: 8_192 },
+    );
+    if (result.error) throw new Error(`refused: resolver process failed: ${result.error.message}`);
+    if (result.status === 0) {
+      let target;
+      try { target = JSON.parse(result.stdout); } catch { throw new Error("refused: resolver returned malformed JSON"); }
+      if (!target || typeof target.project_id !== "string" || !target.project_id
+        || typeof target.thread_id !== "string" || !target.thread_id || result.stderr !== "") {
+        throw new Error("refused: resolver returned an invalid target");
+      }
+      throw new Error(`refused: live abnormal thread ${thread.id} resolves to a wake owner`);
+    }
+    const ordinary = `native bb project '${thread.projectId}' has no registered collab owner; refusing wake\n`;
+    if (result.status !== 1 || result.stdout !== "" || result.stderr !== ordinary) {
+      throw new Error(`refused: resolver failed unexpectedly for thread ${thread.id}`);
+    }
+    unowned.push({ id: thread.id, projectId: thread.projectId, status: thread.status });
+  }
+  return { liveAbnormalCount: candidates.length, unowned };
+}
+
 const [mode, ...args] = process.argv.slice(2);
 if (mode === "capture" && args.length === 2) {
   const [databasePath, outputPath] = args;
@@ -76,6 +124,10 @@ if (mode === "capture" && args.length === 2) {
   if (readFileSync(beforePath, "utf8") !== readFileSync(afterPath, "utf8")) {
     throw new Error("refused: deterministic database snapshots differ");
   }
+} else if (mode === "abnormal-candidates" && args.length === 3) {
+  const [threadsPath, settingsPath, outputPath] = args;
+  if (exists(outputPath)) throw new Error(`refused: output already exists: ${outputPath}`);
+  writeFileSync(outputPath, `${JSON.stringify(abnormalCandidates(threadsPath, settingsPath), null, 2)}\n`, { flag: "wx", mode: 0o600 });
 } else {
-  throw new Error("usage: cutover-state.mjs capture|backup|compare <source> <target>");
+  throw new Error("usage: cutover-state.mjs capture|backup|compare|abnormal-candidates <inputs...>");
 }

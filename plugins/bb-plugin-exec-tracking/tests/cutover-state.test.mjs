@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -50,9 +50,47 @@ test("cutover helper proves backup, pending refusal, and exact ordered state", (
 test("runbook is symlink-only and invokes every cutover-state control", () => {
   const runbook = readFileSync(join(root, "CUTOVER.md"), "utf8");
   assert.doesNotMatch(runbook, /bb plugin (?:remove|install)/);
+  assert.doesNotMatch(runbook, /(?:path:\/|\/(?:Users|home|private|Volumes|opt|usr\/local)\/|^[A-Z_]+=\/(?!\/))/m);
   for (const mode of ["capture", "backup", "compare"]) {
     assert.match(runbook, new RegExp(`STATE_HELPER\" ${mode}`));
   }
   assert.match(runbook, /ln -s/);
   assert.match(runbook, /unlink/);
+});
+
+test("abnormal preflight blocks only live owned candidates", () => {
+  const directory = mkdtempSync(join(tmpdir(), "exec-candidates-"));
+  mkdirSync(join(directory, "bin"));
+  writeFileSync(join(directory, "bin", "resolve_role_wake.py"), `
+const project = process.argv.at(-1);
+if (project === "proj_owned") {
+  process.stdout.write(JSON.stringify({ project_id: "collab-a", thread_id: "role-a" }));
+} else {
+  process.stderr.write(\`native bb project '\${project}' has no registered collab owner; refusing wake\\n\`);
+  process.exitCode = 1;
+}
+`);
+  const settings = join(directory, "settings.json");
+  writeFileSync(settings, JSON.stringify({ values: { checkoutPath: directory, pythonPath: process.execPath } }));
+  const rows = [
+    { id: "archived-owned", projectId: "proj_owned", status: "error", archivedAt: 1, deletedAt: null },
+    { id: "deleted-owned", projectId: "proj_owned", status: "stopping", archivedAt: null, deletedAt: 2 },
+    { id: "live-unowned", projectId: "proj_unowned", status: "error", archivedAt: null, deletedAt: null },
+  ];
+  const threads = join(directory, "threads.json");
+  writeFileSync(threads, JSON.stringify(rows));
+  const allowed = join(directory, "allowed.json");
+  run("abnormal-candidates", threads, settings, allowed);
+  assert.deepEqual(JSON.parse(readFileSync(allowed, "utf8")), {
+    liveAbnormalCount: 1,
+    unowned: [{ id: "live-unowned", projectId: "proj_unowned", status: "error" }],
+  });
+
+  writeFileSync(threads, JSON.stringify([...rows,
+    { id: "live-owned", projectId: "proj_owned", status: "stopping", archivedAt: null, deletedAt: null },
+  ]));
+  assert.throws(
+    () => run("abnormal-candidates", threads, settings, join(directory, "blocked.json")),
+    /live abnormal thread live-owned resolves to a wake owner/,
+  );
 });
