@@ -2581,11 +2581,80 @@ describe("bb-collab plugin boundary", () => {
       const bootstrapped = applyFixtureMutation(db, bootstrapRequest(legacyProject, {
         idempotencyKey: "legacy-v28-bootstrap",
         actorReceiptId: legacyGenesis,
+        config: roleConfig(),
       }));
       expect(bootstrapped).toMatchObject({ outcome: "OK" });
       const legacyFence = (bootstrapped.evidence as { fenceToken: string }).fenceToken;
 
-      db.pragma("foreign_keys = OFF");
+      const legacyRoleFacts = () => roleReader((facts) => {
+        facts.thread.projectId = legacyProject;
+        facts.environment.projectId = legacyProject;
+        facts.project = projectFacts(legacyProject);
+      });
+      const legacyQualification = applyFixtureMutation(db, qualificationRequest(legacyFence, {
+        projectId: legacyProject,
+        idempotencyKey: "legacy-v28-qualification",
+        actorReceiptId: legacyGenesis,
+        qualificationId: "legacy-v28-qualification",
+      }), null, legacyRoleFacts());
+      expect(legacyQualification).toMatchObject({ outcome: "OK" });
+      const legacySuccession = applyFixtureMutation(db, successionRequest(legacyFence, {
+        projectId: legacyProject,
+        idempotencyKey: "legacy-v28-succession",
+        actorReceiptId: legacyGenesis,
+        qualificationId: "legacy-v28-qualification",
+      }), null, legacyRoleFacts());
+      expect(legacySuccession).toMatchObject({ outcome: "OK" });
+      const legacyRoleActor = "legacy-v28-role-actor";
+      seedVerifiedFixtureReceipt(db, {
+        projectId: legacyProject,
+        receiptId: legacyRoleActor,
+        actorKind: "role",
+        subjectId: (legacySuccession.evidence as { holderExecutionAttemptId: string }).holderExecutionAttemptId,
+        roleId: "project-orchestrator",
+        roleGeneration: 1,
+      });
+      const legacyDecisionId = "legacy-v28-bootstrap-decision";
+      const legacyDecisionScope = {
+        operation: "cross_project_bootstrap",
+        sourceProjectId: legacyProject,
+        targetProjectId: "proj_legacy_child",
+        repoTargetId: null,
+      };
+      expect(applyFixtureMutation(db, {
+        projectId: legacyProject,
+        operationClass: "decision_create",
+        idempotencyKey: "legacy-v28-decision-create",
+        actorReceiptId: legacyRoleActor,
+        expectedConfigRevision: 1,
+        configRevision: 1,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: legacyFence,
+        repoTargetId: null,
+        decision: {
+          decisionId: legacyDecisionId,
+          repoTargetId: null,
+          scope: legacyDecisionScope,
+          decisionClass: "operator_only",
+          options: { rootOfTrust: "host_local_operator" },
+          resourceRevision: 1,
+        },
+      })).toMatchObject({ outcome: "OK" });
+      expect(applyFixtureMutation(db, {
+        projectId: legacyProject,
+        operationClass: "decision_disposition",
+        idempotencyKey: "legacy-v28-decision-adopt",
+        actorReceiptId: legacyRoleActor,
+        expectedConfigRevision: 1,
+        configRevision: 1,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: legacyFence,
+        repoTargetId: null,
+        decisionId: legacyDecisionId,
+        disposition: "adopted",
+        expectedResourceRevision: 1,
+        reason: { mechanism: "public-fixture" },
+      })).toMatchObject({ outcome: "OK" });
       db.prepare(
         `INSERT INTO bootstrap_derivation_receipts (
            project_id, derivation_id, genesis_receipt_id, source_project_id, source_governance_epoch,
@@ -2594,24 +2663,9 @@ describe("bb-collab plugin boundary", () => {
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         legacyProject, "legacy-v28-derivation", legacyGenesis, legacyProject, 1, legacyFence,
-        legacyGenesis, "legacy-decision", 1, "legacy-request", 1,
+        legacyGenesis, legacyDecisionId, 1, "legacy-request", 1,
       );
-      db.pragma("foreign_keys = ON");
       db.exec(MIGRATIONS.at(-1)!);
-
-      expect(applyFixtureMutation(db, {
-        projectId: legacyProject,
-        operationClass: "config_revision",
-        idempotencyKey: "legacy-v28-post-upgrade-config",
-        actorReceiptId: legacyGenesis,
-        expectedConfigRevision: 1,
-        configRevision: 2,
-        expectedGovernanceEpoch: 1,
-        expectedFenceToken: legacyFence,
-        repoTargetId: null,
-        config: bootstrapRequest().config,
-        targets: bootstrapRequest().targets,
-      })).toMatchObject({ outcome: "OK", currentConfigRevision: 2 });
 
       const refusedSource = applyFixtureMutation(db, {
         projectId: "proj_legacy_child",
@@ -2631,12 +2685,26 @@ describe("bb-collab plugin boundary", () => {
           sourceProjectId: legacyProject,
           sourceGovernanceEpoch: 1,
           sourceFenceToken: legacyFence,
-          authorizingDecisionId: "legacy-decision",
+          authorizingDecisionId: legacyDecisionId,
           authorizingDispositionSequence: 1,
         },
       });
       expect(refusedSource).toMatchObject({ outcome: "BOOTSTRAP_SOURCE_INVALID", attempted: 0, verified: 0 });
       expect(db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = 'proj_legacy_child'").get()).toBeUndefined();
+
+      expect(applyFixtureMutation(db, {
+        projectId: legacyProject,
+        operationClass: "config_revision",
+        idempotencyKey: "legacy-v28-post-upgrade-config",
+        actorReceiptId: legacyGenesis,
+        expectedConfigRevision: 1,
+        configRevision: 2,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: legacyFence,
+        repoTargetId: null,
+        config: bootstrapRequest().config,
+        targets: bootstrapRequest().targets,
+      })).toMatchObject({ outcome: "OK", currentConfigRevision: 2 });
     } finally {
       db.close();
     }
