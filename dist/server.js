@@ -17562,7 +17562,7 @@ function migrationTargetDigest(db, projectId, configRevision) {
   if (targets.length === 0) throw refusal("REPO_TARGET_REQUIRED", "migration requires exact configured repository targets");
   return sha256(canonicalJson(targets));
 }
-function requireCurrentAdoptedDecision(db, projectId, configRevision, decisionId, dispositionSequence) {
+function requireCurrentAdoptedDecision(db, projectId, configRevision, decisionId, dispositionSequence, authorityLabel = "bootstrap") {
   const decision = asRow(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decisionId));
   if (!decision || decision.project_id !== projectId) throw refusal("RESOURCE_UNKNOWN", "authorizing Decision is not known in this project");
   if (decision.config_revision !== configRevision) throw refusal("PROJECT_CONFIG_STALE", "authorizing Decision config revision is stale");
@@ -17574,7 +17574,7 @@ function requireCurrentAdoptedDecision(db, projectId, configRevision, decisionId
      FROM decision_dispositions WHERE decision_id = ? AND disposition_sequence = ?`
   ).get(decisionId, dispositionSequence));
   if (!disposition || disposition.disposition !== "adopted" || disposition.latest_sequence !== dispositionSequence) {
-    throw refusal("DECISION_DISPOSITION_INVALID", "bootstrap authority requires the current adopted Decision disposition");
+    throw refusal(authorityLabel === "migration" ? "INVALID_INPUT" : "DECISION_DISPOSITION_INVALID", `${authorityLabel} authority requires the current adopted Decision disposition`);
   }
   const actor = asRow(db.prepare(
     "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, receipt_digest FROM actor_receipts WHERE receipt_id = ?"
@@ -17813,7 +17813,8 @@ function applyMigrationPrepare(db, request, digest) {
     request.projectId,
     configRevision,
     migration.decisionId,
-    migration.decisionDispositionSequence
+    migration.decisionDispositionSequence,
+    "migration"
   );
   if (db.prepare("SELECT 1 FROM migration_runs WHERE source_system = 'llm-collab' AND project_id = ? AND state NOT IN ('retired', 'rolled_back')").get(request.projectId)) {
     throw refusal("INVALID_INPUT", "project already has an open MigrationRun");
@@ -17919,7 +17920,7 @@ function applyMigrationStep(db, request, digest) {
   if (request.configRevision !== configRevision || run.config_revision !== configRevision) {
     throw refusal("PROJECT_CONFIG_STALE", "MigrationRun config revision is stale");
   }
-  requireCurrentAdoptedDecision(db, request.projectId, configRevision, run.decision_id, run.decision_disposition_sequence);
+  requireCurrentAdoptedDecision(db, request.projectId, configRevision, run.decision_id, run.decision_disposition_sequence, "migration");
   const head = exactGovernor(db, request);
   const repositoryTargetsDigest = migrationTargetDigest(db, request.projectId, configRevision);
   if (step.repositoryTargetsDigest !== repositoryTargetsDigest) {
