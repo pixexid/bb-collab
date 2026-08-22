@@ -22783,23 +22783,15 @@ async function composeRoleBrief(bb, db, input) {
     currentSeats
   };
   const prompt = [
-    `# bb-collab ${input.role} brief`,
+    bundle.ponytail.trimEnd(),
     "",
-    "## Ponytail preamble",
-    bundle.ponytail,
+    bundle.roles[input.role].trimEnd(),
     "",
-    "## Role brief",
-    bundle.roles[input.role],
-    "",
-    "## Working rules",
-    bundle.rules,
+    "## Read in order",
+    `docs/roles/${input.role}.md, docs/operations-model.md, docs/ponytail.md, docs/rules.md, docs/threat-model.md.`,
     "",
     "## Live pointers",
-    `Project: ${project.name} (${project.id})`,
-    `Sources: ${project.sources.map((source) => source.id).join(", ") || "none"}`,
-    `Canonical store query: ${pointers.canonicalStoreQuery}`,
-    `Handoff file: ${pointers.handoffFile}`,
-    `Current seats: ${currentSeats.map((seat) => `${seat.roleId}@${seat.generation}:${seat.threadId}`).join(", ") || "none"}`
+    `project=${project.name} (${project.id}); sources=${project.sources.map((source) => source.id).join(", ") || "none"}; canonical=${pointers.canonicalStoreQuery}; handoff=~/.bb/thread-storage/<threadId>/handoff.md; seats=${currentSeats.map((seat) => `${seat.roleId}@${seat.generation}:${seat.threadId}`).join(", ") || "none"}`
   ].join("\n");
   return { role: input.role, roleContent: bundle.roles[input.role], ponytail: bundle.ponytail, rules: bundle.rules, project: { id: project.id, name: project.name, sourceIds: project.sources.map((source) => source.id) }, pointers, prompt };
 }
