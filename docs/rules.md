@@ -2,21 +2,17 @@
 
 > "the deletion mandate forbids CEREMONY — mechanism that asks something of the operator or the fleet; it does not forbid PLUMBING that removes the need for copies."
 
+Every rule below is enforceable law; the origin stories live in git history and the issues each rule cites. Section titles are stable anchors — other docs link to them; never rename one.
+
 ## One review pass per PR
 
-> One independent cold review; fix what it finds; the orchestrator verifies the fixed head itself; merge. Never re-request review on a fixed head; remaining edge cases become follow-up issues. A confirmed serious defect still blocks; the bar is “confirmed serious”, not “the reviewer found one more thing”.
+> One independent cold review; fix what it finds; the orchestrator verifies the fixed head itself; merge. Never re-request review on a fixed head; remaining edge cases become follow-up issues. A confirmed serious defect still blocks — the bar is "confirmed serious", not "the reviewer found one more thing".
 
 ## Proof must discriminate
 
-> Before citing evidence, ask: could this pass in a world where my claim is false? Silently skipped tests, report-only alerts, and load-lines without content checks are activity, not proof. When a signature changes, “fails against pre-fix source” degrades to a compile error and discriminates nothing.
+> Before citing evidence, ask: could this pass in a world where my claim is false? Silently skipped tests, report-only alerts, and load-lines without content checks are activity, not proof.
 
-A filtered run that matched nothing is this rule's commonest form: a test filter naming a test that does not exist exits zero and prints a passing summary, which reads as "the change is not detectable" when the truth is "the filter selected nothing". Take the exact name from the diff rather than guessing a substring, and read the executed count rather than the exit code. `vitest --passWithNoTests` does not cover this: the file has tests, so an unmatched filter reports them as skipped rather than absent.
-
-A mechanism's own status surface outranks any correlation assembled from logs. Before citing a log correlation as proof that something did not happen, [name the status surface you checked first](#a-status-read-is-evidence-about-the-moment-it-was-read); if you cannot name one, you have not checked. A negative result also needs proof the mechanism was live during the window — "nothing was delivered" and "nothing ran" are indistinguishable without receipts.
-
-Apply this to your own evidence, not only to evidence you are reviewing. Verifying that a message was really sent says nothing about whether what it said was true; provenance, delivery and truth are three separate claims.
-
-Quote what is there rather than what it means: a paraphrase inside quotation marks is a fabricated citation even when the semantics are right.
+A filtered run that matched nothing exits zero and prints a passing summary: take the exact test name from the diff and read the executed count, not the exit code. A negative result needs proof the mechanism was live during the window — "nothing was delivered" and "nothing ran" are indistinguishable without receipts. Never verify from absence without a positive control: a quiet plugin and a broken logger look identical; close deploys and watcher changes with one self-emitted line. Provenance, delivery, and truth are three separate claims. Quote what is there, not what it means — a paraphrase inside quotation marks is a fabricated citation even when the semantics are right.
 
 ## Canonical source, no restated copies
 
@@ -32,239 +28,143 @@ Quote what is there rather than what it means: a paraphrase inside quotation mar
 
 ## Delegation return path
 
-Every delegation names its return path: `do X, report DONE | BLOCKED | WAITING <what, and what event wakes me> to me`. For example: `WAITING PR-171 review; stall-guard artifact leg wakes me`. The return path makes silence attributable; the [silence/watch rule](#silence-is-a-defect-signal) makes it detectable. Neither is sufficient alone: a missing answer is not a delegation, and a wait cannot say who owes an unreported result without the return path.
+> Every delegation names its return path: `do X, report DONE | BLOCKED | WAITING <what, and what event wakes me> to me`. The return path makes silence attributable; the [silence/watch rule](#silence-is-a-defect-signal) makes it detectable.
 
-A WAITING on the same thing past about 24 hours surfaces to the orchestrator as “wait went stale: chase the external or re-plan.” A WAITING claim without a live waker is a stall from day one. When a worker declares a waker, the orchestrator confirms that the named waker exists at check time before accepting the wait. This matters because WAITING is self-declared by the party who benefits from not being chased; confirmation turns that claim into evidence. Resolve the named waker live—never maintain a list of valid wakers here.
-
-The declarer owes the same check. Before ending a turn in `WAITING`, name the event and confirm it exists; if the next step is yours, or the event has already fired, take it. Orchestrator confirmation catches a phantom wait after it exists, which is one stall too late.
+A WAITING claim without a live waker is a stall from day one. The declarer names the waking event and confirms it exists before ending the turn — if the next step is yours, or the event already fired, take it. The orchestrator confirms the named waker exists at check time before accepting the wait, because WAITING is self-declared by the party who benefits from not being chased. A WAITING on the same thing past ~24 hours surfaces to the orchestrator as "wait went stale: chase the external or re-plan." Resolve the named waker live — never maintain a list of valid wakers.
 
 ## A work order owns bounds, not method
 
-> The author owns the coordination bounds: exact scope, surfaces held elsewhere, gates, return path, and hard prohibitions, including destructive or irreversible acts and required trust-boundary protections. Those are constraints, not implementation steps.
-
-An author's implementation analysis is a reading to check, never a method the lane must follow. The lane reads the code and chooses the method within those bounds. If evidence disproves the order's reading or no compliant method exists, a well-evidenced `BLOCKED` is a successful return, not a failure to obey.
+> The author owns the coordination bounds: exact scope, surfaces held elsewhere, gates, return path, and hard prohibitions — including destructive or irreversible acts and required trust-boundary protections. Those are constraints, not implementation steps. The author's implementation analysis is a reading to check, never a method the lane must follow; the lane reads the code and chooses the method within the bounds. If evidence disproves the order's reading or no compliant method exists, a well-evidenced `BLOCKED` is a successful return, not a failure to obey.
 
 ## Silence is a defect signal
 
-When you send another seat a blocking question, set the watch in the same act: run `bb thread wait <their-thread> --status idle --timeout <bounded>`, always with an explicit bounded timeout, then check your own inbound for the answer. If their thread is idle and inbound has no answer, it was never sent or delivered: re-ask once, bundled. After the second watch, if there is still no answer, escalate to the operator or supervisor with `director unresponsive`; do not loop a third time. The same pattern applies downward to every lane blocking on you. It is one wait, one inbox check, and at most one re-ask—no polling and no timers.
+> A blocking question and its watch are one act: run `bb thread wait <their-thread> --status idle --timeout <bounded>`, always bounded, then check your own inbound for the answer. Idle plus no answer means never sent or delivered: re-ask once, bundled. Still nothing after the second watch: escalate with `director unresponsive` — never loop a third time. One wait, one inbox check, at most one re-ask: no polling, no timers. The same pattern applies downward to every lane blocking on you.
 
 ## Quiet with startable work is a defect state
 
-Intake is not a thing you do when you think of it. It fires on every wake, and the check is two counts: `startable > 0 AND lanes < cap`. If both hold, the fleet is in a defect state and the wake's first act is a dispatch. Labels are queue truth; an unlabelled issue is not in the queue, so labelling is part of filing. A defect report carries `bug` in the same act, applied by the filer and checked by the orchestrator at intake triage in the same pass that checks the queue label. A defect is shipped code behaving incorrectly; a case the code never covered is a gap. The two overlap — an uncovered case can also behave wrongly — so the tiebreak is stated rather than left to the reader: **when both readings apply, label it `bug`.** That makes the call decidable by two filers independently, and it errs toward counting defect debt rather than hiding it, which is the direction the constraint wants. Assert severity with `p0` or `p1` when you assert it at all. `bug` is the population the defect-escape metric measures, so an unlabelled defect is an unmeasured one, and the throughput constraint that throughput never silently buys defect debt cannot be evaluated without it.
+> Intake fires on every wake. The check is two counts: `startable > 0 AND lanes < cap`. If both hold, the fleet is in a defect state and the wake's first act is a dispatch.
+
+Labels are queue truth: an unlabelled issue is not in the queue, so labelling is part of filing. A watchdog sees declared work only; work nobody declared is the seat's check, not the timer's — six correctly-quiet watchdog cycles once accompanied six idle hours with eighteen startable issues. Free capacity is a ceiling, not a quota: dispatching a colliding lane to reach the cap breaks [one writer per lane](#one-writer-per-lane), and that rule wins. When every remaining item collides, that is the no-dispatch reason — say it.
 
 ## Epic decomposition and readiness
 
-An epic is planning-only: each child is independently mergeable and declares
-`sliceId`, `dependsOn`, `readiness`, and `estimateHours`. A child is startable
-only when every dependency is merged and readiness is true. Deferred or
-operator-wait children keep `queueBlocked: false`; no child estimate may exceed
-8 hours.
-
-Silence proves nothing here. On 2026-08-18 the fleet sat idle for about six hours, silent for the last four and a half, with eighteen startable issues, zero lanes, and six hourly watchdog cycles that were all correctly quiet — the ledger was all-terminal, so the watchdog had nothing to see. The state was found by the operator. A mechanism that only watches declared work cannot detect work nobody has declared yet, which is why the check belongs to the seat and not only to the timer.
-
-Free capacity is a ceiling, not a quota. Dispatching a colliding lane to reach the cap breaks [one writer per lane](#one-writer-per-lane), and that rule wins: an idle seat is cheaper than two writers on one surface. When capacity is free but every remaining item collides, that is the no-dispatch reason — say it.
-
-This rule exists in the repository because the same rule lived in chat first and evaporated with the context that held it. A rule in a conversation is a cache with no source.
+> An epic is planning-only: each child is independently mergeable and declares `sliceId`, `dependsOn`, `readiness`, and `estimateHours`. A child is startable only when every dependency is merged and readiness is true. Deferred or operator-wait children keep `queueBlocked: false`; no child estimate may exceed 8 hours.
 
 ## A lane-completion turn ends with a dispatch or a reason
 
-> An orchestrator's turn that reports a lane finishing never ends there. It ends with the next dispatch, or with the explicit reason there is none.
-
-A bare completion reads as progress while leaving the fleet stopped, and it hides the intake check rather than failing it. The reason, when there is one, is a specific claim someone can check — every startable item collides with a held surface, the board is empty, capacity is full — never "nothing obvious right now".
+> An orchestrator's turn that reports a lane finishing ends with the next dispatch, or with the explicit reason there is none — a specific checkable claim (every startable item collides with a held surface, the board is empty, capacity is full), never "nothing obvious right now".
 
 ## Completion is native; the verdict is ours
 
-bb already tells a parent thread when a child finishes: it emits `child-completed`, `child-failed`, `child-interrupted`, and `child-outcome-batch`, and `threads.childSummary` reads the same ground. Do not build completion notification — wire the native signal.
-
-What the platform does not tell you is the part that matters. bb tells you a child finished; it does not tell you whether the child succeeded. The notification is native; the verdict is ours. That is what the `DONE | BLOCKED | WAITING` return path carries, and why the vocabulary stands on top of a signal we no longer write ourselves.
+> bb natively emits `child-completed`, `child-failed`, `child-interrupted`, and `child-outcome-batch`; `threads.childSummary` reads the same ground. Never build completion notification — wire the native signal. bb tells you a child finished; it does not tell you whether the child succeeded. The notification is native; the verdict is ours, and it is what the `DONE | BLOCKED | WAITING` return path carries.
 
 ## A message is delivered when it lands, consumed when the reply addresses it
 
-A message is delivered when it lands in the recipient's thread, and consumed when their reply addresses it. The sender owns both checks.
+> Delivery is confirmed at the recipient's log, never at your own send result — a transport can accept a message and never deliver it. Consumption is a reply that addresses what was asked; an acknowledge-and-dismiss counts as not consumed — chase it, do not count it.
 
-Delivery is not the same as sending: a transport can accept a message and never deliver it, so confirm at the recipient's log rather than at your own send. Consumption is not the same as delivery: a reply that ignores what was asked — the coalescing shape, where a directive is acknowledged and dismissed — counts as not consumed. Chase it; do not count it.
+Any tell requiring action names its expected reply in `DONE | BLOCKED | WAITING`; the sender tracks what it is owed and chases it like any other stall. No read receipts, no acknowledgement packets.
 
-Any tell requiring action names its expected reply in the `DONE | BLOCKED | WAITING` vocabulary, and the sender carries an open item until that reply arrives. An unanswered directive past the timer floor is chased exactly like any other stall: an owed reply sits alongside an owed `DONE`. No read receipts, no acknowledgement packets, no ceremony — the three-word vocabulary and the timer already close the loop. The only change is that senders track what they are owed.
+Modes: `auto` is the default tell — delivers now, starts a turn on an idle thread. `queue` is for genuinely batch-later payloads to a busy recipient; queue arrival does not wake. `steer` when the payload bears on the turn running right now. Queue-awareness is a standing duty: open every busy stretch with a queue check on yourself; held messages outrank self-imposed work; no turn ends with an unread queue it had the chance to read. Results flow push, not pull: a finishing worker sends its report; if you are polling a session to learn an outcome, that delegation's return path was missing — fix the brief, not your ticker.
 
 ## External-party content uses the inbox
 
-> Once the inbox tool is available to the session, actionable content intended for the operator outside the current conversation goes through `send_to_operator`; leaving it only in a turn output is a delivery defect.
+> Actionable content intended for the operator outside the current conversation goes through `send_to_operator`; leaving it only in a turn output is a delivery defect.
 
-The bound is the intended delivery path, not the word “operator.” A direct reply to an operator who is participating in the current conversation stays in that conversation; a lane receipt still goes to its named fleet return path; and decisions and evidence still land in their canonical stores. The same inbox surface carries messages addressed to the supervisor, while the existing `SUPERVISOR-REPORT` marker convention remains in force until its separately governed retirement.
-
-If the tool is absent or refuses the send, report that failure through the existing return path. Printing the intended message and calling it delivered would repeat the defect the inbox exists to remove.
+The bound is the intended delivery path, not the word "operator": a direct reply to an operator participating in the current conversation stays in it; a lane receipt goes to its named fleet return path; decisions and evidence land in their canonical stores. The same inbox surface carries messages to the supervisor, while the `SUPERVISOR-REPORT` marker convention remains in force until its separately governed retirement. If the tool is absent or refuses, report that failure through the return path — printing the intended message and calling it delivered repeats the defect the inbox exists to remove.
 
 ## Project-agnostic by construction
 
-> New or changed surfaces that store, read, or route project-owned data require the exact `project_id` as an explicit dimension and never substitute an ambient, default, or hardcoded project.
-
-Project boundaries apply on every write and read: a missing or null project never matches. The rule does not attach a fake project to genuinely global state, and it does not require a retroactive audit of untouched surfaces. It binds the project-owned behavior introduced or changed by the current work.
+> New or changed surfaces that store, read, or route project-owned data require the exact `project_id` as an explicit dimension; never substitute an ambient, default, or hardcoded project. A missing or null project never matches. The rule does not attach a fake project to genuinely global state, does not require a retroactive audit of untouched surfaces, and binds the project-owned behavior introduced or changed by the current work.
 
 ## Lifecycle disposition
 
-Every pull request carries exactly one disposition line: `Closes #NN` plus `Acceptance: complete`, or `Related GH-NN` naming an OPEN issue, or `No issue:` followed by a reason. Run both canonical body gates before pushing: `scripts/pr-lifecycle.mjs` for disposition and `scripts/check-review-tier.mjs` for exactly one line matching its `Review tier` declaration pattern. Tier A is forced by any path matched by that script's `tierA` patterns, including its authority/approval/atomicity/concurrency/cutover/migration/provenance/receipt/spend keyword pattern; Tier C applies only when no Tier-A path matches and every path matches its `tierC` patterns. Because `dist/` is Tier A, a docs-only `docs/rules.md` edit that regenerates `dist/role-briefs.json` requires Tier A.
+> Every pull request carries exactly one disposition line: `Closes #NN` plus `Acceptance: complete`, or `Related GH-NN` naming an OPEN issue, or `No issue:` followed by a reason. Run both canonical body gates before pushing: `scripts/pr-lifecycle.mjs` and `scripts/check-review-tier.mjs` (exactly one line matching its `Review tier` pattern). Tier A is forced by any path matched by that script's `tierA` patterns; Tier C applies only when no Tier-A path matches and every path matches `tierC`. Because `dist/` is Tier A, a docs-only `docs/rules.md` edit that regenerates `dist/role-briefs.json` requires Tier A.
 
-Commit messages carry no linkage at all unless the pull request closes an issue and the commit names that same issue with a closing keyword. A `Related` or `Ref` mention in a commit message fails the gate even when the pull-request body is correct, because the checker treats any commit-side mention that is not an exact closing match as a conflict.
+Commit messages carry no linkage at all unless the PR closes an issue and the commit names that same issue with a closing keyword; any other commit-side mention fails the gate even when the body is correct.
 
 ## Platform check before you design
 
-Before writing a coordination rule or a line of coordination code, enumerate what bb natively does in that area — from the actual docs, CLI help, and plugin API, not from memory. A native mechanism replaces building; prose that duplicates a native signal is a stale copy waiting to diverge. This is the ladder's "does the platform already do it" rung, made explicit: the check is step one of designing any coordination mechanism, not a review afterthought.
+> Before writing a coordination rule or a line of coordination code, enumerate what bb natively does in that area — from the actual docs, CLI help, and plugin API, not from memory. A native mechanism replaces building; prose that duplicates a native signal is a stale copy waiting to diverge. This is step one of designing any coordination mechanism, not a review afterthought.
 
 ## One writer per lane
 
-> One branch, one owner. Stakeholders coordinate by message; nobody opens a parallel edit of the same lane.
-
-Check what is already assigned before dispatching. Keeping the fleet busy is not a reason to open a second writer on a surface someone already holds; an idle seat is cheaper than duplicated work.
+> One branch, one owner. Stakeholders coordinate by message; nobody opens a parallel edit of the same lane. Check what is already assigned before dispatching: an idle seat is cheaper than two writers on one surface.
 
 ## Off-matrix work stands on its evidence
 
-> Off-matrix AUTHORING that later receives a valid matrix-qualified independent review stands on its evidence and is never re-run for provenance alone. The deviation is recorded in the pull-request body as it merged.
+> Off-matrix AUTHORING that later receives a valid matrix-qualified independent review stands on its evidence and is never re-run for provenance alone; the deviation is recorded in the pull-request body as it merged.
 
-Discovering that an implementation lane ran on an unratified model, or at the wrong reasoning level, does not retroactively make its output wrong. The review and the tests still discriminate; re-running would cost real work to buy a receipt that says nothing they do not already say.
-
-The rule stops at the gate. It does NOT extend to a review, a qualification, or a release artifact, because there the off-matrix work IS the gate and no later check stands behind it. An unqualified reviewer's thoroughness is not a substitute for qualification: [absent or contradictory qualification cannot satisfy a review gate](threat-model.md). Requested-profile mismatch fails closed at dispatch; executed-profile conformance is currently unverifiable after the fact, so the dispatch-time matrix binding and reviewer attestation in [the operations model](operations-model.md) remain mandatory. A Tier-A review dispatched outside the matrix leaves the gate unsatisfied however good the review was, and the remedy is a qualified review, not an argument about quality.
-
-This cuts the other way too. "It worked out" is not ratification, and a good outcome from an unplaced model is evidence for a probe to weigh, never a substitute for one.
+The rule stops at the gate: it does NOT extend to a review, qualification, or release artifact, where the off-matrix work IS the gate ([threat model](threat-model.md)); the remedy is a qualified review, never an argument about quality. Requested-profile mismatch fails closed at dispatch. A provider-native executed-profile readback returning UNKNOWN is retried once — the echo is metadata about the verdict, not a new review; persistent UNKNOWN escalates to the director. "It worked out" is not ratification: a good outcome from an unplaced model is evidence for a probe, never a substitute for one.
 
 ## A ruling disposes its own subordinate instances
 
-> When the same pattern surfaces again below a ruling that already covers it, apply the ruling — but only when the instance falls inside the ruling's own stated subject AND inside the applying seat's existing authority. Uncertainty about either goes back up.
+> When the same pattern surfaces again below a ruling that already covers it, apply the ruling — but only when the instance falls inside the ruling's own stated subject AND inside your existing authority. Uncertainty about either goes back up.
 
-Re-asking a settled question costs a round trip and buys nothing, and it teaches the seat below to stop thinking at the first resemblance. But "the reasoning reaches this case" is the applying seat's own conclusion, and a rule resting on it alone is not a boundary — it is permission to expand quietly. Both conditions are required, and neither is satisfied by the seat finding the new case similar.
-
-Inside the ruling's stated subject means the instance sits within what the ruling actually addressed, not within an extension the seat infers from its rationale. A model unratified for placement is still unratified when its name appears inside a row about something else — ratification-by-containment does not exist — so that instance is disposed. A question the ruling never reached is escalated even when the same reasoning would plainly settle it.
-
-Inside existing authority means the act is one the seat could already take under its role and its current work order. A ruling does not enlarge a seat; it settles a question a seat was already entitled to act on.
-
-Saying which ruling was applied is disclosure, not a guard — it makes the decision auditable afterwards and does nothing to bound it beforehand. The two conditions bound it; the disclosure records it. A seat owes both.
+Inside the stated subject means inside what the ruling actually addressed, not an extension you infer from its rationale — ratification-by-containment does not exist. Inside existing authority means the act is one you could already take under your role and current work order; a ruling settles a question, it never enlarges a seat. Naming the ruling you applied is disclosure for audit, not a guard; a seat owes both conditions and the disclosure.
 
 ## Merge is not deploy is not reload
 
-> A change is not live until a deployed revision CONTAINING it is what host supervision is running. The deploy layer is part of the change, not a step after it.
+> A change is not live until a deployed revision CONTAINING it is what host supervision is running. Merged, deployed, and loaded are three states; reporting the first as the third is the most comfortable error available.
 
-A merged PR changes what the repository says. It changes nothing about what is running until the deployed artifact is built from a commit containing it and whatever supervises it on the host is running that artifact. Those are three states, and reporting the first as though it were the third is the most comfortable error available.
-
-The check is per-change and cheap: name the deployed revision, and establish that it contains the change and that supervision is on it. Equality with `main` is not the test — it proves a stronger claim than any single change needs, and it fails true ones. A deploy at `60e830a` really does have that revision's watchdog live even after `main` advances past it; demanding equality would call that claim false.
-
-When the deployed revision does not contain the change, say so. "Merged, not deployed" is a complete and honest terminal status, and a fleet can act on it. Loading it on the host is an operator act; this rule governs what a seat may claim, not who may deploy.
+The check is per-change: name the deployed revision, establish containment and supervision — equality with `main` is not the test. "Merged, not deployed" is a complete and honest terminal status. Deploys run under the standing policy: orchestrator-run under standing authorization, zero-lane lull, store snapshot before, store-verified after, deployed SHA recorded in the handoff. Path plugins update via checkout-advance plus `bb plugin reload <id>`; `bb plugin update` refuses pinned sources.
 
 ## An escalation's premises are checkable claims
 
-> Verify the MATERIAL premises before executing — the ones that, if false, change what the act does. Each needs an identified authoritative check; a material premise you cannot resolve goes back up instead of being assumed.
+> Verify the MATERIAL premises before executing — the ones that, if false, change what the act does. Each needs an identified authoritative check; a material premise you cannot resolve goes back up, named unresolved, instead of being assumed.
 
-An escalation arrives with urgency attached, and urgency is exactly what makes its premises feel settled. They are not. A seat that executes on a relayed fact inherits it: if the fact was wrong, the act was wrong, whoever supplied the premise.
-
-Material is the whole bound, and without it this rule is unfollowable and will be applied selectively after the fact. "These scripts were deleted from `main`" is material to an order to retire them, and one existence test settles it. The spelling of a reporter's name in the same message is not material and has no authoritative check worth running. Ask what the act becomes if the fact is false: if the answer is "the same act", stop checking.
-
-A material premise with no authoritative check available, or one that can only be sampled and may have changed since, is not verified by trying harder. Name it as unresolved and return it upward; executing on it anyway is the defect this rule exists to stop.
-
-It binds downward, where a frozen work order carries facts a lane cannot easily question, and the seat writing the order owes the checks. It binds upward too: a premise handed to a deciding seat determines what it decides, so handing up an unchecked material fact is the same defect wearing a different hat.
+Ask what the act becomes if the fact is false: if "the same act", stop checking. A seat that executes on a relayed fact inherits it. This binds downward — the seat writing a frozen work order owes the checks a lane cannot easily question — and upward: an unchecked material fact handed to a decider is the same defect. Reading is an act-time discipline: re-read live inputs, including an issue's fresh comments, in the same breath as the act — step-zero is a dispatch-time act, not a composition-time one.
 
 ## A completeness search names its surfaces
 
-> A completeness claim states which surfaces it searched and under which names, and the surfaces have to be the ones its own claim depends on.
+> A completeness claim states which surfaces it searched and under which names — and the surfaces have to be the ones its own claim depends on.
 
-A claim about current canonical state is complete from the canonical live surface, and archived material is irrelevant to it — going wider there would contradict [canonical source, no restated copies](#canonical-source-no-restated-copies).
-
-A claim about whether something has happened before is different, and that is where live-only searching fails. Fleet history lives in threads, and threads archive. Issues and documents are the surfaces a seat reaches for first, and they are the ones least likely to hold the thing that already happened. Work that ran, decided something, and finished leaves its record where nobody is looking.
-
-Search the concept's names, not one spelling. A thing renamed between its introduction and your search hides its own introduction: searching for the current name finds where it was made explicit, not where it began, and the gap is invisible because the search returns results.
-
-State the surfaces and the names. "I searched" is not a finding; "I searched open issues, docs, and archived threads, for both X and its earlier bare form" is one a reader can check and extend.
+A claim about current canonical state is complete from the canonical live surface; archived material is irrelevant to it. A claim about whether something has happened before is different: fleet history lives in threads, and threads archive — issues and docs are the surfaces least likely to hold finished work. Search the concept's names, not one spelling: a renamed thing hides its own introduction, and the gap is invisible because the search returns results. "I searched" is not a finding; "I searched open issues, docs, and archived threads, for both X and its earlier bare form" is one a reader can check and extend.
 
 ## A candidate in production is a drill instrument with two stamps
 
 > Unmerged code reaches the production deploy worktree only as a pre-authorized drill instrument, and the pull-request body records both the deploy and the event that ENDED the unmerged exposure. An exposure window without a documented end is an unaudited window.
 
-Installing a candidate to prove it works is legitimate and sometimes the only way to prove it. What is not legitimate is leaving the record with an opening and no closing, because a reader then cannot tell a twenty-five-minute drill from code that quietly stayed.
-
-A restore is the usual closing event and carries a reload stamp. It is not the only one: a candidate that is reviewed and merged while its exact SHA keeps running has ended its unmerged exposure without anything being reloaded, and that closure is auditable from git containment rather than from a stamp. Record whichever event actually ended it, and say which kind it was — demanding a restore stamp for a window that closed by merge would demand a stamp that does not exist.
-
-Where the closing event is a restore, verify it independently of its own stamp — the deployed revision, the build artifact's mtime, and the absence of a string that exists only in the candidate. A restore claimed by the party that deployed is the claim most worth a second surface.
-
-This says nothing about who may deploy. Host loading is an operator act; this governs what may be installed unmerged, and what the record must show afterwards.
+The closing event is usually a restore (a reload stamp, verified independently — deployed revision, artifact mtime, absence of a candidate-only string) or a merge of the exact running SHA (auditable from git containment). Record which kind actually ended it; demanding a restore stamp for a window that closed by merge demands a stamp that does not exist. Host loading is an operator act; this rule governs the record.
 
 ## A recovery timebox starts at the observed failure
 
-> A clock measuring RECOVERY starts at the first native observation of the failure, never at a scheduled or presumed start.
-
-A recovery timebox counted from when the failure was supposed to happen measures the wrong interval, and if the failure never happened it manufactures a mechanism failure out of nothing. That enters the record as "the mechanism did not recover the seat in twenty minutes" when the true statement is "the seat was never in the failure state" — a false negative indistinguishable from a real finding.
-
-This binds the recovery clock only. A drill may legitimately run other clocks from a scheduled start: an injection-phase timebox begins when the injector was supposed to fire, and its expiry is a real result — it proves the injection failed. Do not collapse the two. One clock asks whether the mechanism recovered the seat; the other asks whether anything broke it in the first place, and they start at different events because they measure different claims.
-
-The same discipline that keeps a wake from being credited to the wrong signal keeps a clock from being counted against the wrong state.
+> A clock measuring RECOVERY starts at the first native observation of the failure, never at a scheduled or presumed start — otherwise a failure that never happened manufactures a false mechanism-failure finding. A drill's other clocks (an injection-phase timebox) legitimately start at the scheduled event; do not collapse the two. One clock asks whether the mechanism recovered the seat, the other whether anything broke it, and they start at different events because they measure different claims.
 
 ## A seat is the worst witness to its own outage
 
-> Liveness comes from native state, never from a seat's account of its own continuity. A seat's report about itself is a premise like any other, and a material one gets the authoritative check.
-
-A killed seat cannot observe its own death. A recovered seat remembers working through its own outage, because the only account it can produce is generated by the process whose absence is in question — so "I was working the whole time" is not weak evidence of liveness, it is an artifact of the thing being asked about. From inside there is no signal at all.
-
-This is the [premise rule](#an-escalations-premises-are-checkable-claims) applied where it is hardest to remember it applies. An inference about your own state feels like observation rather than inference, which is what makes it the last premise anyone thinks to check. When the question is whether a seat was reachable, alive, or interrupted, the answer comes from the native record and the seat's narrative is not admitted.
+> Liveness comes from native state, never from a seat's account of its own continuity. A recovered seat's "I was working the whole time" is generated by the very process whose absence is in question — an artifact of the thing being asked about. This is the [premise rule](#an-escalations-premises-are-checkable-claims) applied to yourself: when the question is whether a seat was reachable, alive, or interrupted, the answer comes from the native record and the seat's narrative is not admitted.
 
 ## Write for a stranger
 
-> Every issue, pull request, comment and commit message on a public repository is written for a stranger's eyes. Credentials, private-project internals and personal data stay out of them, along with host details that map an environment rather than describe a reproducible fact.
+> Credentials, private-project internals, personal data, and host details stay out of issues, PRs, comments, and commits. Credentials includes locations, key names, shapes, lengths, and ports — individually harmless, collectively a map. Internals means designs, schemas, business content; naming a project is fine. Host details means usernames, home paths, tooling layout — not the OS, architecture, tool version, or loopback binding a reproducible record needs. Where specifics are genuinely needed: the public artifact carries the abstract record and disposition; specifics live in local durable state by id. An issue unreadable without a credential-adjacent detail is a finding about the issue, not a licence to publish one.
 
-Operator directive: public repo, write for a stranger.
-
-Credentials means more than values. Locations, key names, shapes, lengths and ports are individually harmless and collectively a map, and the map is the thing worth withholding. Private-project internals means designs, schemas and business content; naming a project is unavoidable and fine. Host details means usernames, home paths and tooling layout — not the operating system, an architecture, a tool version or a loopback binding, which a reproducible bug or deployment record needs and which reveal nothing an attacker could not assume.
-
-Where specifics are genuinely needed, the public artifact carries the abstract record and its disposition, and the specifics live in local durable state, referenced by id. That bound matters: an artifact still has to explain its own decision. An issue that cannot be understood without a credential-adjacent detail is a finding about the issue, not a licence to publish one.
-
-Two techniques worth keeping, because both were learned the hard way. Both narrow a question; neither settles one, and stating which is which is part of using them.
-
-A disclosure claim can be **checked by shape without re-disclosing**. Length distribution, character class and padding report whether *credential-shaped patterns* are present — not whether a secret is. A short passphrase, a PIN, or a value that looks like ordinary text passes a shape check untouched, so a clean result means "no conventionally-shaped credential found", never "no credential". Say which bound your check carried. The value of the method is that an auditor who reads the artifact to verify becomes another copy of the exposure, and shape avoids that.
-
-A **live-versus-fixture** question is narrowed by looking for the value everywhere it would matter, rather than by reading the artifact that mentions it. Absence across the surfaces you searched is evidence about those surfaces at that moment — it does not prove the value is illustrative. It may be revoked, live somewhere you cannot search, or simply unknown. Treat a clean search as shifting the burden, not as a verdict, and name the surfaces per [completeness search](#a-completeness-search-names-its-surfaces) and the moment per [status read](#a-status-read-is-evidence-about-the-moment-it-was-read).
-
-And when reading a credential file for any reason: ask for shape, not contents. A search for key *names* that prints matching *lines* prints the values too.
+Two narrowing techniques, neither of which settles a question: check disclosure by shape without re-disclosing (length, character class, padding — a clean result means "no conventionally-shaped credential found", never "no credential"); narrow live-versus-fixture by searching every surface where the value would matter (absence shifts the burden, never proves illustrative). Reading a credential file: ask for shape, not contents — a search for key *names* that prints matching *lines* prints the values.
 
 ## Spawn against a fetched ref
 
-> Fleet spawns pass `--base-branch origin/main`; never bare `main`, which silently resolves the stale local ref. The trap is silent, material, and recurring: measured 2026-08-19, local `main` was `aea7054933e08bddc16fef2f2ef9386f93c04645` while `origin/main` was `c513770a2c3647c7ab40686600326da5282027b6` (14 commits behind). Until [get-bb/bb#1917](https://github.com/get-bb/bb/issues/1917) lands, refresh a stale base with `git fetch origin main:main`; if `main` is checked out and that refuses by design, use `git pull --ff-only` instead.
+> Fleet spawns pass `--base-branch origin/main`; never bare `main`, which silently resolves the stale local ref (measured 14 commits behind on 2026-08-19). Refresh a stale base with `git fetch origin main:main`; if `main` is checked out and that refuses by design, use `git pull --ff-only`. Standing until [get-bb/bb#1917](https://github.com/get-bb/bb/issues/1917) lands.
 
 ## The no-dispatch reason is the second half of the intake check
 
-> The wake asks whether there is capacity and startable work. The seat answers whether any of it is reachable, and the answer is recorded either way. An unanswered wake is incomplete, not silent.
-
-`startable > 0 AND lanes < cap` is not the condition that decides whether dispatch is possible. Surface collision is, and no canonical source can compute it — the seat holding the lanes is the only party that can. So the collision map in a no-dispatch reason is not courtesy; it is the missing half of the check, supplied where it can be supplied.
-
-A reason may point at a standing one. Restating an unchanged collision map every hour is noise, and this asks for an answer rather than a recital.
-
-What this deliberately does **not** do is encode surface occupancy into the wake condition. That would require the mechanism to know which files a lane holds, which no canonical source can currently claim, and a confident condition on an unverifiable input is exactly how a permanently-true wake and a dead-source counter both happened. A wake that fires slightly too often, answered by a seat that states the map, is cheaper than a mechanism that computes collisions and gets them wrong in silence.
+> `startable > 0 AND lanes < cap` asks whether there is capacity and startable work; surface collision decides whether dispatch is possible, and only the seat holding the lanes can answer. The collision map in a no-dispatch reason is the missing half of the check, not courtesy. A reason may point at a standing one unchanged — restating an identical map hourly is noise. Surface occupancy is deliberately NOT encoded into the wake condition: no canonical source can compute it, and a confident condition on an unverifiable input is how permanently-true wakes happen.
 
 ## A ruling names its seat and its surface
 
-> Before ruling an act executable, name both the seat that will perform it and the surface it will perform it through. A ruling missing either routes upward or waits — it never routes to improvisation.
+> Before ruling an act executable, name both the seat that will perform it and the surface it will perform it through. A ruling missing either routes upward or waits — it never routes to improvisation, because the improvisation nearest to hand is usually the thing the ruling was trying to prevent.
 
-Naming a seat is not enough on its own: a named seat can lack a usable surface, and a named surface can be held by someone else. The pair is the check.
-
-Twice in one evening a ruling named an act with no surface behind it. Setting the project's sticky spawn default has no command — `bb settings` exposes general preferences, experiments, keyboard, usage, version and reload, and nothing for spawn defaults; the only affordance is the app's model picker. A deploy was executable only because a repointable worktree happened to exist, which is availability rather than design. Both were discovered by a seat going to do the thing and finding no way — the expensive moment, because the work is planned and the lane is dispatched or about to be.
-
-A third apparent instance was not one, and it is the more useful lesson. A ruling to create a project was reported unexecutable because `bb project` seemed to have no create command. It has one; the seat had read a truncated help listing and concluded absence from a list it had cut short. So this rule cuts both ways: name the surface, and establish it is really absent before saying so, because a false absence defers real work and a doctrine written on one carries the error forward.
-
-The failure mode is not the missing surface. It is what a seat does next: the improvisation nearest to hand is usually the thing the ruling was trying to prevent, and it presents itself as the pragmatic option.
-
-This rule met its first real case within the hour. A ruling to bootstrap a project into governance turned out to need an actor receipt that no shipped surface can mint — every production reference reads, only test fixtures write, and the ceremony that once minted them was deliberately removed. The improvisation available was inserting a receipt into the store by hand, which would have fabricated exactly the authority the resolver exists to verify and would have passed every check the system has. The gap and the temptation arrived together, and the temptation was the more dangerous half.
-
-This is not detectable mechanically and should not be built. A ruling's named act lives in prose, not in canonical or platform state, so identifying it would mean interpreting text, and interpretation needs a model in a path that is deliberately model-free. It is a check made when the ruling is written, by the seat writing it.
-
-Naming the seat and its surface is usually one line, and sometimes reveals that one of them is missing — which is the point, provided the absence is checked rather than assumed.
+Establish that a surface is really absent before saying so — a truncated help listing is not absence, and a false absence defers real work and writes the error into doctrine. This check is made when the ruling is written, by the seat writing it; it is prose about intent and is deliberately not mechanized.
 
 ## Blast radius
 
-> Every decision sweeps its own blast radius in the same act. Open issues, open PRs, and queued lane specs are caches of older decisions; a decision changing an artifact’s existence, owner, shape, or terminology invalidates them silently. Each affected item gets a one-line update or closure at decision time, not when someone trips over it. A sweep that names artifacts reads them; relayed labels are unverified by definition.
+> Every decision sweeps its own blast radius in the same act. Open issues, open PRs, and queued lane specs are caches of older decisions; a decision changing an artifact's existence, owner, shape, or terminology invalidates them silently. Each affected item gets a one-line update or closure at decision time, not when someone trips over it. A sweep that names artifacts reads them; relayed labels are unverified by definition.
 
-Closing an issue is a decision with blast radius: an open PR whose disposition line says `Related GH-N` fails its lifecycle gate the moment N closes.
-
-A governance-level change — a severance, a contract bump, a matrix re-ratification — sweeps **before its pull request merges**, not afterwards. One severance left six issues describing mechanisms that no longer existed, four of them still labelled startable. The sweep is proportional to what the change touches: a bump that renames nothing and removes no mechanism sweeps nothing, and says so.
+Closing an issue is a decision with blast radius: an open PR whose disposition line says `Related GH-N` fails its lifecycle gate the moment N closes. A governance-level change — a severance, a contract bump, a matrix re-ratification — sweeps BEFORE its pull request merges. A change that renames nothing and removes no mechanism sweeps nothing, and says so.
 
 ## A status read is evidence about the moment it was read
 
-> Registry state and live state are different substrates. Before acting on "X is dead", re-read or address X directly — a status field is already history when you read it; [the status surface you cite must be the one you checked](#proof-must-discriminate). The same gap applies to your checkout versus the repo, and to a source file versus the deployed artifact.
+> Registry state and live state are different substrates. Before acting on "X is dead", re-read or address X directly — a status field is already history when you read it. The same gap applies to your checkout versus the repo, and to a source file versus the deployed artifact.
 
-A read does not reserve what it read. Two callers gated on "the target is idle" both cleared the check, and the second sent while the first had already made it active. Narrowing that window is not closing it: name a mechanism that closes or tolerates the race and state what remains open. Serialising a sender closes it among that sender's own callers and cannot make another process's state and your send atomic.
+A read does not reserve what it read: two callers gated on "the target is idle" can both clear the check. Narrowing the window is not closing it — name a mechanism that closes or tolerates the race and state what remains open; serialising a sender closes it among that sender's callers only.
 
 ## Two notions of one fact
 
@@ -272,13 +172,11 @@ A read does not reserve what it read. Two callers gated on "the target is idle" 
 
 ## Test the claim, not the routing
 
-> Where a mechanism asserts a condition, assert that the condition is true when asserted. Tests that check the right inputs select the right branch all pass while the emitted sentence is false, and they keep passing if a later path reaches the same output another way.
-
-A late mechanism is recoverable; a lying one is not. In anything that notifies, the failure that matters most is not silence — it is a false assertion at the highest-authority tier, because that tier is trained to act on what arrives.
+> Where a mechanism asserts a condition, assert that the condition is true when asserted. Tests that check the right inputs select the right branch all pass while the emitted sentence is false. A late mechanism is recoverable; a lying one is not. In anything that notifies, the failure that matters most is a false assertion at the highest-authority tier, because that tier is trained to act on what arrives.
 
 ## A mechanism under investigation stops talking
 
-> Freezing the investigation is not freezing the subject. A mechanism being examined for asserting false conditions is silenced while it is examined, or it keeps emitting into the record you are trying to read.
+> A mechanism being examined for asserting false conditions is silenced while it is examined, or it keeps emitting into the record you are trying to read. Freezing the investigation is not freezing the subject.
 
 ## The ladder applies to operations
 
@@ -286,110 +184,84 @@ A late mechanism is recoverable; a lying one is not. In anything that notifies, 
 
 ## A spawn's return value is not evidence its order arrived
 
-> [Delivery is confirmed at the recipient's log](#a-message-is-delivered-when-it-lands-consumed-when-the-reply-addresses-it), not at your own send. Spawn is that rule's hardest case and adds two obligations it does not cover. First, prompt loss at spawn is invisible to its victim: the first instruction an agent would ever receive is the one that can vanish, so it has no prior context to notice the gap against, and the thread is alive, idle, producing output on whatever it finds, and indistinguishable on every status surface from one that received its order. Second, delivery is not acceptance. An agent can receive an order, correctly refuse it as malformed, and go idle looking exactly like one that finished — action, but with the delegated work undone. So the check is not that the text arrived, nor merely that the recipient did something, but that a valid order was accepted and its [owed outcome](#delegation-return-path) is pending or reported: `DONE`, `BLOCKED` or `WAITING`. A thread that spent its startup exploring unprompted is not reusable as a cold reviewer; archive it and spawn again.
+> [Delivery is confirmed at the recipient's log](#a-message-is-delivered-when-it-lands-consumed-when-the-reply-addresses-it), and spawn adds two obligations. Prompt loss is invisible to its victim: the first instruction is the one that can vanish, the thread has no context to notice the gap against, and it idles indistinguishably from an ordered thread on every status surface. Delivery is not acceptance: a correctly refused malformed order idles exactly like a finished one. The check is that a valid order was accepted and its [owed outcome](#delegation-return-path) is pending or reported. A thread that spent its startup exploring unprompted is not reusable as a cold reviewer: archive it and spawn again.
 
 ## A dispatched lane is seated by its dispatch prompt
 
-> A lane dispatched with a work prompt is seated by that prompt: the dispatcher must include the complete role brief in it. Plugin role-brief delivery is supplementary and must not be treated as first-turn seating.
-
-The dispatch prompt is the only mechanism that can bind the brief to the lane before its first turn. The plugin's `thread.created` callback observes a completed creation; it cannot intercept or delay spawn. Even when it queues a role brief for an active thread, delivery may occur only at the next turn boundary. Therefore this rule does not claim that plugin delivery seats a lane on its first turn, and a dispatcher that omits the role brief has made a dispatch defect, not delegated seating to the plugin.
-
-The successful canonical succession path is different: `deliverSucceededSeatBrief` sends the exact seat brief after a successful role-generation succession. That path supplements succession; it does not replace the role brief in a lane-dispatch prompt. A lane may be unseated in the canonical role store while its per-work-order dispatch is valid, as the [worker brief](roles/worker.md) says; the prompt is what seats that dispatched work for the turn.
-
-This adds a dispatcher obligation rather than merely changing wording: a session following the old instructions could omit the brief and still dispatch. Under the [version-bump test](#version-bump-test), that requires the instruction-contract version bump.
+> A lane dispatched with a work prompt is seated by that prompt: the dispatcher must include the complete role brief in it. Plugin role-brief delivery is supplementary and can never seat a first turn — the `thread.created` callback observes a completed creation and delivers at a later turn boundary at best. A dispatcher that omits the brief has made a dispatch defect, not delegated seating. The succession path's `deliverSucceededSeatBrief` supplements succession; it does not replace the role brief in a lane-dispatch prompt.
 
 ## A check that agrees with nobody is a plumbing suspect
 
-> When your check contradicts two independent verifications, audit your check's wiring before you report the claim false. Three times in one night the plumbing of a check, not its subject, produced the wrong answer: a test-name filter that selected a different test, a dist comparison that compared two build outputs to each other, and an exit code swallowed by a pipe. Each printed a confident result in the same words a sound check would have used. Disagreement is a triage signal about where to look first; it is not proof either way. Agreement is not proof either — roles can reuse one broken mechanism, and counting how many agreed measures votes rather than evidence. The bar remains [discriminating](#proof-must-discriminate), mechanism-independent evidence.
+> When your check contradicts two independent verifications, audit your check's wiring before reporting the claim false — wrong test-name filters, dist-compared-to-dist, and exit codes swallowed by pipes all print confident results in a sound check's words. Disagreement is a triage signal about where to look first, not proof either way. Agreement is not proof either — roles can reuse one broken mechanism; counting agreement measures votes, not evidence. The bar remains [discriminating](#proof-must-discriminate), mechanism-independent evidence.
 
 ## A fix to an observable surface verifies itself in production
 
-> Where the surface can be observed safely, with authority, and without provoking the failure, the fix is not confirmed until that surface shows the correction in production. A capacity field that reported hardcoded zeros is confirmed when the deployed system names the real lanes, not when a test asserts it would — one read after deploy, and it is the difference between believing the mechanism works and having watched it work. Where observation would require a destructive act, an external notification, a security-relevant path, or reproducing a rare failure, do not stage it to satisfy this rule: say plainly what was confirmed in test and what remains unobserved in production.
+> Where the surface can be observed safely, with authority, and without provoking the failure, the fix is not confirmed until that surface shows the correction in production — one read after deploy is the difference between believing the mechanism works and having watched it work. Where observation would require a destructive act, an external notification, a security-relevant path, or reproducing a rare failure, do not stage it: say plainly what was confirmed in test and what remains unobserved in production.
 
 ## Label the proof class, because a safety test is not a discrimination test
 
-> A test that passes both before and after a change is not evidence the change did anything — but it can still be worth keeping, as a guard on an invariant that must not later break. Say which one it is. A test written to guard atomicity that also passes against the unfixed code proves the property holds, not that this work established it. Presenting a guard as discrimination inflates the evidence; discarding it because it does not discriminate loses a real check.
+> A test that passes both before and after a change is not evidence the change did anything — but it can be worth keeping as a guard on an invariant. Say which one it is: presenting a guard as discrimination inflates the evidence; discarding it because it does not discriminate loses a real check.
 
 ## A fix must not weaken the check it fixes
 
-> Do not remove the bound the check enforced, do not write a guard that sees only the instance you were shown, and do not drop the cap the spill path was meant to replace. The cleanest phrasing came from a reviewer: *half the [#237](https://github.com/pixexid/bb-collab/pull/237) precedent — spill path added, cap dropped.* Three lanes in one night produced the same shape in three forms: array bounds deleted rather than the caller chunked, a leak guard hardcoded to the single word it had been shown, and a trust-boundary cap removed alongside the pagination that replaced it. Each fixed the symptom the test could see and weakened the check the test could not. A bound can be genuinely wrong and need relaxing — [#237](https://github.com/pixexid/bb-collab/pull/237) itself relaxed a false aggregate row refusal, and was right to. The rule is not that protection may never loosen; it is that the protection the fix was not meant to remove must survive it, by preservation or by replacement, deliberately and said out loud. What is forbidden is losing it as a side effect of fixing what it failed to catch.
+> The protection the fix was not meant to remove must survive it — by preservation or by replacement, deliberately and said out loud. The canonical precedent is [#237](https://github.com/pixexid/bb-collab/pull/237): spill path added, cap dropped. A bound can be genuinely wrong and need relaxing — #237 itself relaxed a false refusal, rightly. What is forbidden is losing a protection as a side effect of fixing what it failed to catch.
 
 ## Where an order's input crosses a trust boundary, its protections are not optional
 
-> The author-side of the rule above, and it is bounded to that case rather than to caller input generally. A brief that called a total-work ceiling "fine and probably wanted" made a mandatory protection optional on input the caller controls, and the lane that omitted it had followed the order. Not every constraint on ordinary input is mandatory and not every scalar needs a ceiling; what is mandatory is the protection guarding the boundary the input crosses, stated in those words. If a lane's defect traces to a permissive brief, name which part is the order's fault before asking for the fix — it is not a moved goalpost when the order admits its own error.
+> The author-side of the rule above, bounded to that case: a protection guarding the boundary that caller-controlled input crosses is mandatory and is stated in those words in the order. Not every scalar needs a ceiling; what is mandatory is the boundary protection. If a lane's defect traces to a permissive brief, name which part is the order's fault before asking for the fix — it is not a moved goalpost when the order admits its own error.
 
 ## Worked example: a constraint is not a bound until you check the violating path
 
-> An application of [Proof must discriminate](#proof-must-discriminate) and [the material-premise rule](#an-escalations-premises-are-checkable-claims), not a new obligation — kept because the instance is instructive. Finding a real constraint and reasoning from it to a limit is not the same as establishing the limit. A cited completion event must exist and must follow the request, which is true — but nothing required it to be *that request's* completion, so a citation naming two real far-apart events walked hundreds of pages the constraint appeared to forbid. Check the constraint against the code path that would violate it, and match the flagging language to what was established: "implicit and fragile" reads as established-then-worried when the honest state was unestablished-and-worried.
+> Finding a real constraint and reasoning from it to a limit is not establishing the limit: check the constraint against the code path that would violate it — two real far-apart events once satisfied a citation that nothing bound to *that request*. Match the flagging language to what was established: "unestablished-and-worried", not "implicit and fragile".
 
 ## A check written against an assumed shape has never been tested
 
-> A guard is only as good as the mechanism it actually observes. A reply-delivery confirmation waited for an event type that the transport never emits, so it recorded every successful delivery as a failure; a CSS leak guard matched an assumed substring rather than an observed class token, so it passed leaks whose names collided with unrelated source text. Both were written from a plausible model of the mechanism instead of a captured example of it. Before trusting a check, exercise it against a captured instance of the shape it must catch and a captured instance of the near-miss it must tolerate, and confirm it fires on the first and stays silent on the second. Captured means taken from the mechanism, not imagined from a model of it; a test fixture recording a real payload counts, and staging a live failure to satisfy this does not.
+> Before trusting a check, exercise it against a captured instance of the shape it must catch and a captured instance of the near-miss it must tolerate; confirm it fires on the first and stays silent on the second. Captured means taken from the mechanism, not imagined from a model of it; a fixture recording a real payload counts, staging a live failure to satisfy this does not.
 
 ## A written warning is not a mechanism
 
-> Where a rule can be enforced by something that runs, prefer that to something a reader must remember. A lane was told in its own brief not to commit locally-rebuilt artifact metadata; it committed it anyway, and the freshness gate — landed hours earlier on a synthetic proof — caught it on the first real mistake and named the diverged fields. The brief and the gate said the same thing; only one of them stopped it. This is a preference about where to spend effort, not a claim that instructions are worthless: the gate exists because someone wrote the rule down first.
+> Where a rule can be enforced by something that runs, prefer that to something a reader must remember — a brief said "don't commit rebuilt artifact metadata", the lane did it anyway, and the freshness gate stopped it; the brief and the gate said the same thing and only one of them worked. This is a preference about where to spend effort, not a claim instructions are worthless: the gate exists because someone wrote the rule down first.
 
 ## A test that injects a guard's answer does not cover that guard
 
-> Injection is ordinary and often proves plenty — a test that supplies page responses while executing the real pagination loop is genuine evidence about that loop. The narrow failure is injecting the answer of the very guard whose correctness is being claimed. A destructive tool passed its suite while every safety guard was dead in production: an inverted reachability command that would delete a worktree ahead of `origin/main`, a live-thread check that could not resolve its own target population, and an inventory bounded to one page. Each fixture supplied that guard's verdict directly, so the suite exercised the fixture instead. Before citing a green test as coverage of a guard, name the guard's own code path and say whether the test executed it.
+> Injection is ordinary and often proves plenty — supplying page responses while executing the real pagination loop is genuine evidence about that loop. The narrow failure is injecting the answer of the very guard whose correctness is being claimed: the suite then exercises the fixture instead of the guard. Before citing a green test as coverage of a guard, name the guard's own code path and say whether the test executed it.
 
 ## Coverage is an epistemic state
 
-Do not report armed until the persisted eligible-thread inventory has been reconciled; unreadable inventory is blind and loud.
-
-Keep unobserved, unreadable, and known outcomes distinct. A partial detector names the population it cannot cover and why instead of presenting partial coverage as fleet-wide certainty.
+> Do not report armed until the persisted eligible-thread inventory has been reconciled; unreadable inventory is blind and loud. Keep unobserved, unreadable, and known outcomes distinct: a partial detector names the population it cannot cover and why, instead of presenting partial coverage as fleet-wide certainty.
 
 ## A caller-controlled check is not a check
 
-> When the caller controls every input a check uses, it cannot establish the property it claims to check.
-
-`receipt_digest` is SHA-256 over public row fields, so a sanctioned writer that controls every checked public row field can choose them all and compute the digest that `requireActor` accepts. A mint endpoint would make `requireActor` decorative only if its caller likewise controlled every checked field or the endpoint added no independent authority; being callable from inside the system alone proves neither. This is the third appearance of the same shape, after stubbed guards and a standby profile reporting coverage that nothing consumed.
+> When the caller controls every input a check uses, it cannot establish the property it claims to check. A digest over public row fields is decorative against a writer who chooses all of them.
 
 ## Fallback-only routing observability is blind to uniformity
 
-> A routing signal that only records fallback cannot observe a path where no decision was made.
-
-The tier note fired zero times during the cap storm, correctly: no fallback happened, and no routing decision happened either. The instrument and the failure were disjoint.
+> A routing signal that only records fallback cannot observe a path where no decision was made; the instrument and the failure are disjoint.
 
 ## Spawn flags are a choice, not a template
 
-> Spawn flags record a routing choice, not a reusable template. If the note explaining them is hard to write, the routing is wrong.
-
-Copied flags hide whether the selected route was actually considered. The note is the evidence that the flags express a choice rather than inherited defaults.
+> Spawn flags record a routing choice, not a reusable template; the note explaining them is the evidence that a choice was made rather than inherited. If the note is hard to write, the routing is wrong.
 
 ## A rebase invalidates a head-bound approval
 
-> An approval bound to a pre-rebase head is evidence about a head that no longer exists.
-
-Both #289 and #321 rebased onto merged work touching the same surfaces. In #289, the first post-rebase verify was red in two tests that had auto-merged without a conflict and were still semantically wrong. Re-run the checks that exercise the changed surface; a clean merge is not semantic equivalence.
+> An approval bound to a pre-rebase head is evidence about a head that no longer exists. A clean merge is not semantic equivalence — tests can auto-merge without conflict and still be semantically wrong. Re-run the checks that exercise the changed surface.
 
 ## A reconstructed mutant head is evidence-class reduced
 
-> A head rebuilt from context after a self-reverted mutant proves the reconstruction is self-consistent, not that it is the work.
-
-In #320, `git checkout HEAD --` was used against uncommitted work while restoring a mutant. Keep scratch commits or a stash as mutant restore points so the tested head remains identifiable.
+> A head rebuilt from context after a self-reverted mutant proves the reconstruction is self-consistent, not that it is the work. Keep scratch commits or a stash as mutant restore points so the tested head remains identifiable.
 
 ## A migration cannot pin a live population
 
-> A migration that pins a population number is wrong about the population by the time it runs.
-
-The measured population changed from 38 of 42 at filing to 37 of 41 at dry-run because the fleet was live. A count copied from an earlier read is not the population at migration time.
+> A migration that pins a population number is wrong about the population by the time it runs; a count copied from an earlier read is not the population at migration time.
 
 ## An active-thread tell is not a durable send
 
-> A tell into an active thread is not durable delivery merely because the send returned success.
-
-An active-thread tell returned success while the message landed in neither the event log nor the queue. Verify delivery at the recipient's log, never at the sender's send result.
+> A tell into an active thread has returned success while the message landed in neither the event log nor the queue. Verify delivery at the recipient's log, never at the sender's send result.
 
 ## An unexercisable capability is an unexploded claim
 
-> A capability that cannot be exercised through a sanctioned path is not dormant value; it is an unexploded claim on the record.
-
-An API or field is not evidence of coverage when no sanctioned path can exercise it. Its existence records a claim the system cannot currently substantiate.
+> A capability that cannot be exercised through a sanctioned path is not dormant value; it is an unexploded claim on the record. An API or field's existence is not evidence of coverage when no sanctioned path can exercise it.
 
 ## Report the term that governs the latency
 
-> When two terms govern a latency, changing the minor one and reporting the major one's units is the same shape as a check answering the wrong question.
-
-The watchdog cadence change moved worst-case notice only from about 65 to about 61 minutes because the floor was the dominant term. Report and change the term that governs the observed latency, not merely the term that is easiest to edit.
+> When two terms govern a latency, change and report the dominant one; moving the minor term and reporting in the major term's units is a check answering the wrong question.

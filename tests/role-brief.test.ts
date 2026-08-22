@@ -14,19 +14,34 @@ function project(projectId: string) {
 }
 
 describe("role briefs", () => {
-  it("composes canonical docs with live project pointers", async () => {
+  it("composes slim prompts with canonical reading order", async () => {
     const host = createFakePluginHost({ pluginId: "bb-collab" });
     host.harness.sdk.stub("projects.get", (async ({ projectId }: { projectId: string }) => project(projectId)) as never);
     await plugin(host.bb);
 
-    await expect(host.harness.callRpc("roleBrief", { projectId: "project-brief", role: "worker" })).resolves.toMatchObject({
-      role: "worker",
-      project: { id: "project-brief", name: "Brief project", sourceIds: ["source-main"] },
-      pointers: { canonicalStoreQuery: "role_generation_heads joined to role_generations", currentSeats: [] },
-      ponytail: expect.stringContaining("Does this need to exist at all?"),
-      roleContent: expect.stringContaining("# Worker"),
-      prompt: expect.stringContaining("## Ponytail preamble"),
-    });
+    for (const role of ["director", "orchestrator", "worker"] as const) {
+      const brief = await host.harness.callRpc("roleBrief", { projectId: "project-brief", role }) as {
+        role: string;
+        roleContent: string;
+        ponytail: string;
+        rules: string;
+        prompt: string;
+      };
+      expect(brief).toMatchObject({
+        role,
+        project: { id: "project-brief", name: "Brief project", sourceIds: ["source-main"] },
+        pointers: { canonicalStoreQuery: "role_generation_heads joined to role_generations", currentSeats: [] },
+        ponytail: expect.stringContaining("Does this need to exist at all?"),
+        roleContent: expect.stringContaining(`# ${role === "orchestrator" ? "Orchestrator" : role[0].toUpperCase() + role.slice(1)}`),
+        rules: expect.stringContaining("the deletion mandate forbids CEREMONY"),
+      });
+      expect(Buffer.byteLength(brief.prompt, "utf8")).toBeLessThan(4_000);
+      expect(brief.prompt).toContain(brief.ponytail.trimEnd());
+      expect(brief.prompt).toContain(brief.roleContent.trimEnd());
+      expect(brief.prompt).toContain(`docs/roles/${role}.md, docs/operations-model.md, docs/ponytail.md, docs/rules.md, docs/threat-model.md.`);
+      expect(brief.prompt).toContain("project=Brief project (project-brief); sources=source-main; canonical=role_generation_heads joined to role_generations; handoff=~/.bb/thread-storage/<threadId>/handoff.md; seats=none");
+      expect(brief.prompt).not.toContain("the deletion mandate forbids CEREMONY");
+    }
   });
 
   it("queues a created worker brief while its first turn is active", async () => {
