@@ -23,10 +23,13 @@ var TOOL = "companion_read_snapshot";
 var TITLE = "Alzheimer companion judgment";
 var REQUIRED_FIELDS = {
   execution_attempts: {
+    assignment_kind: (value) => value === null || value === "write" || value === "review" || value === "probe",
     execution_attempt_id: (value) => typeof value === "string",
     observed_at_ms: (value) => typeof value === "number",
     origin: (value) => typeof value === "string",
     project_id: (value) => typeof value === "string",
+    review_pr_head_sha: (value) => value === null || typeof value === "string",
+    review_pr_number: (value) => value === null || typeof value === "number",
     state: (value) => typeof value === "string",
     thread_id: (value) => value === null || typeof value === "string",
     work_item_id: (value) => value === null || typeof value === "string"
@@ -267,10 +270,12 @@ function extractCandidates(snapshot) {
   if (canonical.projectId !== projectId) return [];
   const candidates = [];
   const sourcesKnown = (...sources) => sources.every((source) => (snapshot.sourceCoverage?.[source] ?? (snapshot.coverage === "known" ? "known" : "blind")) === "known");
-  const activeAttempts = canonical.executionAttempts.filter((attempt) => ACTIVE.includes(attempt.state));
+  const activeAttempts = canonical.executionAttempts.filter((attempt) => attempt.project_id === projectId && ACTIVE.includes(attempt.state));
   const startableNumbers = new Set(githubIssues.filter((issue) => issue.labels.includes("queue:startable")).map((issue) => issue.number));
-  for (const workItem of sourcesKnown("canonical", "github") ? canonical.workItems : []) {
-    const ref = canonical.externalWorkRefs.find((row) => row.work_item_id === workItem.work_item_id && row.provider === "github" && typeof row.issue_number === "number");
+  const projectWorkItems = canonical.workItems.filter((workItem) => workItem.project_id === projectId);
+  const projectRefs = canonical.externalWorkRefs.filter((row) => row.project_id === projectId);
+  for (const workItem of sourcesKnown("canonical", "github") ? projectWorkItems : []) {
+    const ref = projectRefs.find((row) => row.work_item_id === workItem.work_item_id && row.provider === "github" && typeof row.issue_number === "number");
     if (workItem.lifecycle_state !== "ready" || !ref || !startableNumbers.has(ref.issue_number) || activeAttempts.some((attempt) => attempt.work_item_id === workItem.work_item_id)) continue;
     const anchors = { projectId, kind: "work_item", workItemId: String(workItem.work_item_id), resourceRevision: Number(workItem.resource_revision) };
     candidates.push({ id: `${projectId}:work-item:${anchors.workItemId}:${anchors.resourceRevision}`, kind: anchors.kind, anchors, finding: `Work item ${anchors.workItemId} (revision ${anchors.resourceRevision}; issue #${ref.issue_number}) is queue:startable with zero active attempts.`, evidence: { projectId, lifecycleState: workItem.lifecycle_state, issueNumber: ref.issue_number, activeAttemptCount: 0 } });
@@ -280,10 +285,17 @@ function extractCandidates(snapshot) {
     const anchors = { projectId, kind: "attempt", executionAttemptId: attempt.execution_attempt_id };
     candidates.push({ id: `${projectId}:attempt:${anchors.executionAttemptId}`, kind: anchors.kind, anchors, finding: `Active attempt ${anchors.executionAttemptId} for work item ${String(attempt.work_item_id)} has produced no canonical evidence for at least ten minutes.`, evidence: { projectId, workItemId: attempt.work_item_id, state: attempt.state, observedAtMs: attempt.observed_at_ms } });
   }
-  for (const pr of sourcesKnown("github") ? githubPrs : []) {
+  for (const pr of sourcesKnown("canonical", "github") ? githubPrs : []) {
     if (!pr.ready || observedAt - pr.updatedAt < DECISION_THRESHOLD_MS) continue;
+    const linkedWorkItems = projectRefs.filter((ref) => ref.provider === "github" && ref.issue_number === pr.number).map((ref) => projectWorkItems.find((workItem) => workItem.work_item_id === ref.work_item_id)).filter((workItem) => workItem !== void 0);
+    if (linkedWorkItems.length !== 1) continue;
+    const workItemId = linkedWorkItems[0].work_item_id;
+    const runningReview = activeAttempts.some(
+      (attempt) => attempt.origin === "work_item" && attempt.work_item_id === workItemId && attempt.assignment_kind === "review" && attempt.review_pr_number === pr.number && attempt.review_pr_head_sha === pr.headSha
+    );
+    if (runningReview) continue;
     const anchors = { projectId, kind: "pull_request", number: pr.number, headSha: pr.headSha };
-    candidates.push({ id: `${projectId}:pr:${pr.number}:${pr.headSha}`, kind: anchors.kind, anchors, finding: `PR #${pr.number} at ${pr.headSha} is green, mergeable, decisionless, and unchanged past the five-minute decision threshold.`, evidence: { projectId, updatedAt: pr.updatedAt } });
+    candidates.push({ id: `${projectId}:pr:${pr.number}:${pr.headSha}`, kind: anchors.kind, anchors, finding: `PR #${pr.number} at ${pr.headSha} is green, mergeable, decisionless, and unchanged past the five-minute decision threshold.`, evidence: { projectId, workItemId, updatedAt: pr.updatedAt } });
   }
   const queueCutoff = cycleStartedAt ?? observedAt - DECISION_THRESHOLD_MS;
   for (const message of sourcesKnown("queue", "timeline") ? snapshot.queued : []) {
