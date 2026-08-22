@@ -133,7 +133,8 @@ function githubRepository(remoteUrl: string | null): string | null {
   return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : null;
 }
 
-type StartableQueueState = { count: number; head: string | null; unlabelledCount: number; blockedCount: number; waitingExternalCount: number };
+type GithubQueueIssue = { repository: string; number: number };
+type StartableQueueState = { count: number; head: string | null; unlabelledCount: number; blockedCount: number; waitingExternalCount: number; dispatched: GithubQueueIssue[] };
 
 function githubJson(args: string[]): unknown | null {
   try {
@@ -171,8 +172,9 @@ async function startableQueueStateAsync(repositories: string[]): Promise<Startab
   let blockedCount = 0;
   let waitingExternalCount = 0;
   const heads: string[] = [];
+  const dispatched: GithubQueueIssue[] = [];
   const isIssue = (issue: unknown): issue is { number: number; labels: Array<{ name: string }> } => Boolean(issue && typeof issue === "object" && !Array.isArray(issue)
-    && typeof (issue as { number?: unknown }).number === "number"
+    && typeof (issue as { number?: unknown }).number === "number" && Number.isSafeInteger((issue as { number: number }).number) && (issue as { number: number }).number > 0
     && Array.isArray((issue as { labels?: unknown }).labels)
     && (issue as { labels: unknown[] }).labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof (label as { name?: unknown }).name === "string"));
   for (const repository of repositories) {
@@ -185,10 +187,12 @@ async function startableQueueStateAsync(repositories: string[]): Promise<Startab
     unlabelledCount += issues.filter((issue) => !issue.labels.some((label) => label.name.startsWith("queue:"))).length;
     blockedCount += issues.filter((issue) => issue.labels.some((label) => label.name === "queue:blocked")).length;
     waitingExternalCount += issues.filter((issue) => issue.labels.some((label) => label.name === "queue:waiting-external")).length;
+    dispatched.push(...issues.filter((issue) => issue.labels.filter((label) => label.name.startsWith("queue:")).every((label) => label.name === "queue:dispatched")
+      && issue.labels.some((label) => label.name === "queue:dispatched")).map((issue) => ({ repository, number: issue.number })));
     const numbers = startable.map((issue) => issue.number);
     if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
   }
-  return { count, head: heads.sort()[0] ?? null, unlabelledCount, blockedCount, waitingExternalCount };
+  return { count, head: heads.sort()[0] ?? null, unlabelledCount, blockedCount, waitingExternalCount, dispatched: dispatched.sort((left, right) => left.repository.localeCompare(right.repository) || left.number - right.number) };
 }
 
 function startableQueueState(repositories: string[]): StartableQueueState | null {
@@ -197,8 +201,9 @@ function startableQueueState(repositories: string[]): StartableQueueState | null
   let blockedCount = 0;
   let waitingExternalCount = 0;
   const heads: string[] = [];
+  const dispatched: GithubQueueIssue[] = [];
   const isIssue = (issue: unknown): issue is { number: number; labels: Array<{ name: string }> } => Boolean(issue && typeof issue === "object" && !Array.isArray(issue)
-    && typeof (issue as { number?: unknown }).number === "number"
+    && typeof (issue as { number?: unknown }).number === "number" && Number.isSafeInteger((issue as { number: number }).number) && (issue as { number: number }).number > 0
     && Array.isArray((issue as { labels?: unknown }).labels)
     && (issue as { labels: unknown[] }).labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof (label as { name?: unknown }).name === "string"));
   for (const repository of repositories) {
@@ -211,10 +216,47 @@ function startableQueueState(repositories: string[]): StartableQueueState | null
     unlabelledCount += issues.filter((issue) => !issue.labels.some((label) => label.name.startsWith("queue:"))).length;
     blockedCount += issues.filter((issue) => issue.labels.some((label) => label.name === "queue:blocked")).length;
     waitingExternalCount += issues.filter((issue) => issue.labels.some((label) => label.name === "queue:waiting-external")).length;
+    dispatched.push(...issues.filter((issue) => issue.labels.filter((label) => label.name.startsWith("queue:")).every((label) => label.name === "queue:dispatched")
+      && issue.labels.some((label) => label.name === "queue:dispatched")).map((issue) => ({ repository, number: issue.number })));
     const numbers = startable.map((issue) => issue.number);
     if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
   }
-  return { count, head: heads.sort()[0] ?? null, unlabelledCount, blockedCount, waitingExternalCount };
+  return { count, head: heads.sort()[0] ?? null, unlabelledCount, blockedCount, waitingExternalCount, dispatched: dispatched.sort((left, right) => left.repository.localeCompare(right.repository) || left.number - right.number) };
+}
+
+function dispatchedWithoutLiveLane(
+  db: SqliteDatabase,
+  projectId: string,
+  issues: GithubQueueIssue[],
+  lanes: ReadonlyArray<{ id: string }>,
+): GithubQueueIssue[] | null {
+  const visibleThreadIds = new Set(lanes.map((lane) => lane.id));
+  const unowned: GithubQueueIssue[] = [];
+  for (const issue of issues) {
+    const [owner, repo, extra] = issue.repository.split("/");
+    if (!owner || !repo || extra !== undefined) return null;
+    const refs = db.prepare(
+      `SELECT work_item_id FROM external_work_refs
+       WHERE project_id = ? AND provider = 'github' AND owner = ? AND repo = ? AND issue_number = ?`,
+    ).all(projectId, owner, repo, issue.number) as Array<{ work_item_id: string }>;
+    if (refs.length > 1) return null;
+    if (refs.length === 0) {
+      unowned.push(issue);
+      continue;
+    }
+    const attempts = db.prepare(
+      `SELECT attempts.state, attempts.thread_id FROM execution_attempts AS attempts
+       JOIN work_items ON work_items.project_id = attempts.project_id AND work_items.work_item_id = attempts.work_item_id
+       WHERE attempts.project_id = ? AND attempts.work_item_id = ? AND attempts.origin = 'work_item'
+         AND attempts.assignment_kind IN ('write', 'review')
+         AND attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+         AND work_items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})`,
+    ).all(projectId, refs[0]!.work_item_id, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_NON_TERMINAL_STATES) as Array<{ state: string; thread_id: string | null }>;
+    if (attempts.some((attempt) => attempt.thread_id !== null && visibleThreadIds.has(attempt.thread_id))) continue;
+    if (attempts.some((attempt) => attempt.state === "dispatch_unknown")) return null;
+    unowned.push(issue);
+  }
+  return unowned;
 }
 
 type LinkedGithubStatus = "open" | "closed" | "merged";
@@ -2902,23 +2944,29 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
            AND external_work_refs.issue_number IS NOT NULL`,
       ).all(...WORK_ITEM_NON_TERMINAL_STATES, "succeeded") as Array<{ project_id: string }>) projectIds.add(row.project_id);
       const lanesByProject = new Map<string, Awaited<ReturnType<typeof bb.sdk.threads.list>>>();
+      const readableLaneProjects = new Set<string>();
+      const listProjectChildThreads = async (projectId: string) => {
+        const threads: Awaited<ReturnType<typeof bb.sdk.threads.list>> = [];
+        for (let offset = 0; ; offset += 100) {
+          const page = await bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset });
+          threads.push(...page);
+          if (page.length < 100) return threads;
+        }
+      };
       const dispatchWedgesByProject = new Map<string, Array<{ executionAttemptId: string; workItemId: string }>>();
       for (const projectId of projectIds) {
         if (onlyProjectId !== undefined && projectId !== onlyProjectId) continue;
         const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? new Set<string>();
-        const threads: Awaited<ReturnType<typeof bb.sdk.threads.list>> = [];
+        let threads: Awaited<ReturnType<typeof bb.sdk.threads.list>> = [];
         let threadInventoryReadable = true;
         try {
-          for (let offset = 0; ; offset += 100) {
-            const page = await bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset });
-            threads.push(...page);
-            if (page.length < 100) break;
-          }
+          threads = await listProjectChildThreads(projectId);
         } catch (error) {
           threadInventoryReadable = false;
           degrade(fleetWatchdogScope("platform-parentage", projectId, String(error)));
         }
         if (threadInventoryReadable) {
+          readableLaneProjects.add(projectId);
           const wedges = reconcilePreparedWorkItemDispatches(db, projectId, threads);
           if (wedges.length > 0) {
             dispatchWedgesByProject.set(projectId, wedges);
@@ -3396,6 +3444,49 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             bb.log.info(`fleet-watchdog intake counts: project=${projectId} ${intake}`);
             if ((queue.count > 0 || queue.unlabelledCount > 0) && writingLaneCeiling !== null && activeLaneCount < writingLaneCeiling) {
               await wake(projectId, orchestrator, roleIdleKey(orchestrator, "queue:startable"), `startable queue has ${queue.count} issue${queue.count === 1 ? "" : "s"}; ${queue.unlabelledCount} open issue${queue.unlabelledCount === 1 ? " has" : "s have"} no queue label; ${queue.blockedCount} blocked; ${queue.waitingExternalCount} waiting-external; ${activeLaneCount}/${writingLaneCeiling} writing lanes active`, false, "startable-queue");
+            }
+            const episodePrefix = fleetWatchdogScope("dispatched-without-live-lane", projectId);
+            if (!readableLaneProjects.has(projectId)) {
+              bb.log.warn(`fleet-watchdog dispatched-lane coverage=blind project=${projectId} reason=native-lane-inventory-unreadable`);
+            } else {
+              const unowned = dispatchedWithoutLiveLane(db, projectId, queue.dispatched, lanesByProject.get(projectId) ?? []);
+              if (unowned === null) {
+                degrade(fleetWatchdogScope("dispatched-lane", projectId, "canonical-ownership-unreadable"));
+                bb.log.warn(`fleet-watchdog dispatched-lane coverage=blind project=${projectId} reason=canonical-ownership-unreadable`);
+              } else {
+                const issueIdentities = unowned.map((issue) => `${issue.repository}#${issue.number}`);
+                const episodeKey = `${episodePrefix}:${fleetWatchdogCompositeKey(...issueIdentities)}`;
+                await fleetWatchdogIdle.clearPrefixExcept(episodePrefix, unowned.length > 0 ? episodeKey : undefined);
+                if (unowned.length > 0) {
+                  await wake(
+                    projectId,
+                    orchestrator,
+                    episodeKey,
+                    `queue:dispatched has no live current lane for ${issueIdentities.join(", ")}; inspect exact canonical attempt/native thread identity and recover or close the work.`,
+                    false,
+                    "owed-act",
+                    async () => {
+                      try {
+                        const freshQueue = await startableQueueStateAsync(repositories as string[]);
+                        if (freshQueue === null) {
+                          degrade(fleetWatchdogScope("dispatched-lane-revalidation", projectId, "queue-unreadable"));
+                          return false;
+                        }
+                        const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? new Set<string>();
+                        const freshLanes = (await listProjectChildThreads(projectId)).filter((thread) =>
+                          thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) &&
+                          thread.archivedAt === null && thread.deletedAt === null,
+                        );
+                        const freshUnowned = dispatchedWithoutLiveLane(db, projectId, freshQueue.dispatched, freshLanes);
+                        return freshUnowned !== null && JSON.stringify(freshUnowned) === JSON.stringify(unowned);
+                      } catch (error) {
+                        degrade(fleetWatchdogScope("dispatched-lane-revalidation", projectId, String(error)));
+                        return false;
+                      }
+                    },
+                  );
+                }
+              }
             }
           } else {
             bb.log.warn(`fleet-watchdog intake coverage=blind project=${projectId} reason=startable-queue-unreadable`);

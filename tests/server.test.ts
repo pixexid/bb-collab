@@ -763,11 +763,26 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
         environmentBranchName: null,
       }));
     },
+    archiveNativeLane(threadId: string) {
+      const lane = lanes.get(threadId);
+      if (lane) lane.archivedAt = 1;
+    },
     recordRateLimits,
     setUsageCapped(threadId: string, resetsAtMs: number | null = 9_999_999_999_999) {
       recordRateLimits(threadId, { providerId: "codex", status: "blocked", kind: "subscription-window", windows: [{ label: "Five-hour limit", providerKey: "five_hour", status: "blocked", resetsAtMs }], reachedReason: "usage cap", overageStatus: null, overageReason: null });
     },
   };
+}
+
+function bindFixtureGithubIssue(db: Database.Database, issueNumber: number) {
+  db.prepare(
+    `INSERT INTO external_work_refs (
+       project_id, work_item_id, provider, owner, repo, issue_number, projection_state,
+       attempted_resource_revision, projected_resource_revision, desired_digest,
+       observed_external_revision, observed_external_digest, last_idempotency_key,
+       last_request_digest, created_at_ms, updated_at_ms
+     ) VALUES (?, ?, 'github', ?, ?, ?, 'current', 2, 2, ?, 'fixture', ?, 'fixture-ref', ?, 1, 1)`,
+  ).run(PROJECT_ID, WORK_ITEM_ID, GITHUB_OWNER, GITHUB_REPO, issueNumber, sha256("fixture-desired"), sha256("fixture-observed"), sha256("fixture-request"));
 }
 
 function insertFixtureAssignment(db: Database.Database, fenceToken: string, options: {
@@ -3779,6 +3794,185 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
       { assignment_kind: "write", state: "done" },
       { assignment_kind: "review", state: "running" },
     ]);
+  });
+
+  it("wakes once for an unchanged dispatched issue without a live lane and resets after queue movement", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-dispatched-unowned-"));
+    const gh = join(bin, "gh");
+    const mode = join(bin, "mode");
+    writeFileSync(mode, "dispatched");
+    writeFileSync(gh, `#!/bin/sh
+mode=$(cat "${mode}")
+if [ "$mode" = unreadable ]; then exit 1; fi
+if [ "$1" = issue ] && [ "$2" = list ]; then
+  if [ "$mode" = startable ]; then printf '%s\n' '[{"number":205,"labels":[{"name":"queue:startable"}]}]'; else printf '%s\n' '[]'; fi
+elif [ "$1" = api ]; then
+  if [ "$mode" = closed ]; then printf '%s\n' '[[]]'; else printf '%s\n' '[[{"number":205,"labels":[{"name":"queue:'"$mode"'"}]}]]'; fi
+else
+  printf '%s\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"fixture","closedByPullRequestsReferences":[]}'
+fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 3, false);
+      const dispatchedSends = () => fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([request]) =>
+        (request as { input: Array<{ text: string }> }).input[0]?.text.startsWith("queue:dispatched has no live current lane"),
+      );
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(dispatchedSends()).toEqual([[
+        expect.objectContaining({
+          threadId: fixture.orchestratorThreadId,
+          mode: "queue-if-active",
+          input: [expect.objectContaining({ text: expect.stringContaining("example/project#205") })],
+        }),
+      ]]);
+
+      for (const parked of ["blocked", "waiting-external", "startable", "closed", "unreadable"]) {
+        writeFileSync(mode, parked);
+        await fixture.host.harness.runSchedule("fleet-watchdog");
+      }
+      expect(dispatchedSends()).toHaveLength(1);
+
+      writeFileSync(mode, "dispatched");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(dispatchedSends()).toHaveLength(2);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a dispatched issue silent when a live successor owns its current attempt", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-dispatched-successor-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = issue ] && [ "$2" = list ]; then
+  printf '%s\n' '[]'
+elif [ "$1" = api ]; then
+  printf '%s\n' '[[{"number":205,"labels":[{"name":"queue:dispatched"}]}]]'
+else
+  printf '%s\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"fixture","closedByPullRequestsReferences":[]}'
+fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 3, false);
+      bindFixtureGithubIssue(fixture.db, 205);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      fixture.addNativeLane("thread-work-item-1", "error");
+      fixture.archiveNativeLane("thread-work-item-1");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, undefined, 3, {
+        idempotencyKey: "dispatched-live-successor",
+        workAttempt: { laneId: "lane-successor", threadId: "thread-successor", assignmentKind: "write" },
+      }))).toMatchObject({ outcome: "OK" });
+
+      fixture.addNativeLane("thread-successor", "active");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      fixture.addNativeLane("thread-successor", "idle");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 4, {
+        idempotencyKey: "dispatched-live-review",
+        workAttempt: { laneId: "lane-review-successor", threadId: "thread-review-successor", assignmentKind: "review", reviewPrNumber: 507, reviewPrHeadSha: CANDIDATE_SHA },
+      }))).toMatchObject({ outcome: "OK" });
+      fixture.addNativeLane("thread-review-successor", "idle");
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.includes("fleet-watchdog intake counts"))).toHaveLength(3);
+      expect(fixture.db.prepare(
+        "SELECT assignment_kind, state, thread_id, continuation_of_attempt_id FROM execution_attempts WHERE origin = 'work_item' ORDER BY attempt_ordinal",
+      ).all()).toEqual([
+        { assignment_kind: "write", state: "superseded", thread_id: "thread-work-item-1", continuation_of_attempt_id: null },
+        { assignment_kind: "write", state: "done", thread_id: "thread-successor", continuation_of_attempt_id: expect.any(String) },
+        { assignment_kind: "review", state: "running", thread_id: "thread-review-successor", continuation_of_attempt_id: expect.any(String) },
+      ]);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves a visible errored dispatched lane to the existing stranded detector", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-dispatched-error-separation-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = issue ] && [ "$2" = list ]; then printf '%s\n' '[]';
+elif [ "$1" = api ]; then printf '%s\n' '[[{"number":205,"labels":[{"name":"queue:dispatched"}]}]]';
+else printf '%s\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"fixture","closedByPullRequestsReferences":[]}'; fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(7, true, 3, false);
+      bindFixtureGithubIssue(fixture.db, 205);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      fixture.addNativeLane("thread-work-item-1", "error");
+      fixture.recordRateLimits("thread-work-item-1", { providerId: "codex", status: "allowed", kind: "credits", windows: [], reachedReason: null, overageStatus: null, overageReason: null });
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      const sends = fixture.host.harness.inspection.sdk.callsTo("threads.send");
+      expect(sends.filter(([request]) =>
+        (request as { input: Array<{ text: string }> }).input[0]?.text.startsWith("stranded lane detected"),
+      )).toHaveLength(1);
+      expect(sends.filter(([request]) =>
+        (request as { input: Array<{ text: string }> }).input[0]?.text.startsWith("queue:dispatched has no live current lane"),
+      )).toHaveLength(0);
+      expect(fixture.db.prepare(
+        "SELECT assignment_kind, state, thread_id FROM execution_attempts WHERE origin = 'work_item'",
+      ).all()).toEqual([{ assignment_kind: "write", state: "running", thread_id: "thread-work-item-1" }]);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when dispatched ownership or native lane evidence is incomplete", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-dispatched-blind-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = issue ] && [ "$2" = list ]; then printf '%s\n' '[]';
+elif [ "$1" = api ]; then printf '%s\n' '[[{"number":205,"labels":[{"name":"queue:dispatched"}]}]]';
+else printf '%s\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"fixture","closedByPullRequestsReferences":[]}'; fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const canonicalBlind = await fleetWatchdogFixture(0, true, 3, false);
+      bindFixtureGithubIssue(canonicalBlind.db, 205);
+      expect(applyWithFixtureReceipt(canonicalBlind.db, transitionRequest(canonicalBlind.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      canonicalBlind.db.prepare("UPDATE execution_attempts SET state = 'dispatch_unknown' WHERE origin = 'work_item'").run();
+      await canonicalBlind.host.harness.runSchedule("fleet-watchdog");
+      expect(canonicalBlind.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(canonicalBlind.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: "fleet-watchdog dispatched-lane coverage=blind project=proj_test reason=canonical-ownership-unreadable",
+      }));
+
+      const nativeBlind = await fleetWatchdogFixture(0, true, 3, false);
+      nativeBlind.host.harness.sdk.stub("threads.list", (async () => { throw new Error("lane inventory failed"); }) as never);
+      await nativeBlind.host.harness.runSchedule("fleet-watchdog");
+      expect(nativeBlind.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(nativeBlind.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: "fleet-watchdog dispatched-lane coverage=blind project=proj_test reason=native-lane-inventory-unreadable",
+      }));
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
   });
 
   it("uses in-progress WorkItems for capacity and suppresses repeat intake wakes for one hour", async () => {
