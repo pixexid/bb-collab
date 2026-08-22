@@ -334,6 +334,10 @@ function moveBetween(order, draggedId, targetId) {
   nextOrder.splice(insertionIndex, 0, draggedId);
   return { nextOrder, previousId: remaining[insertionIndex - 1] ?? null, nextId: remaining[insertionIndex] ?? null };
 }
+function isCompleteProjectOrder(order, projectIds) {
+  const remaining = new Set(projectIds);
+  return order.length === projectIds.length && order.every((id) => remaining.delete(id)) && remaining.size === 0;
+}
 function buildThreadTree(threads) {
   const nodes = new Map(threads.map((thread) => [thread.id, { thread, children: [] }]));
   const roots = [];
@@ -515,6 +519,8 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
   const reportedBreak = useRef(null);
   const dragTargetId = useRef(null);
   const projectDragTargetId = useRef(null);
+  const projectReorderQueue = useRef([]);
+  const projectReorderRunning = useRef(false);
   const [customStates, setCustomStates] = useState({});
   const [optimisticPinnedOrders, setOptimisticPinnedOrders] = useState({});
   const [optimisticProjectOrder, setOptimisticProjectOrder] = useState(null);
@@ -524,6 +530,8 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
   const threadIds = useMemo(() => sidebar.threads.map((thread) => thread.id), [sidebar.threads]);
   const threadIdsKey = threadIds.join("\0");
   const projectIds = useMemo(() => sidebar.projects.map((project) => project.id), [sidebar.projects]);
+  const projectIdsRef = useRef(projectIds);
+  projectIdsRef.current = projectIds;
   const projectIdsKey = projectIds.join("\0");
   useEffect(() => {
     let mounted = true;
@@ -643,16 +651,30 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
     const targetId = order[order.indexOf(threadId) + offset];
     if (targetId) reorderPinned(threadId, targetId);
   };
+  const runProjectReorders = async () => {
+    if (projectReorderRunning.current) return;
+    projectReorderRunning.current = true;
+    try {
+      while (projectReorderQueue.current.length > 0) {
+        const input = projectReorderQueue.current.shift();
+        const authoritativeOrder = await rpc.call("reorderProjects", input);
+        if (!isCompleteProjectOrder(authoritativeOrder, projectIdsRef.current)) throw new Error("invalid project order");
+        if (projectReorderQueue.current.length === 0) setOptimisticProjectOrder(authoritativeOrder);
+      }
+    } catch {
+      projectReorderQueue.current.length = 0;
+      setOptimisticProjectOrder(null);
+    } finally {
+      projectReorderRunning.current = false;
+    }
+  };
   const reorderProject = (draggedId, targetId) => {
     const order = displayProjects.map((project) => project.id);
     const move = moveBetween(order, draggedId, targetId);
     if (!move) return;
     setOptimisticProjectOrder(move.nextOrder);
-    void rpc.call("reorderProjects", { projectId: draggedId, previousProjectId: move.previousId, nextProjectId: move.nextId }).then((authoritativeOrder) => {
-      setOptimisticProjectOrder((current) => current === move.nextOrder ? authoritativeOrder.filter((id) => order.includes(id)) : current);
-    }).catch(() => {
-      setOptimisticProjectOrder((current) => current === move.nextOrder ? null : current);
-    });
+    projectReorderQueue.current.push({ projectId: draggedId, previousProjectId: move.previousId, nextProjectId: move.nextId });
+    void runProjectReorders();
   };
   const startProjectDrag = (projectId) => {
     draggingProjectId.current = projectId;
@@ -747,6 +769,7 @@ export {
   dismissMigrationNotice,
   executionBadgeLabel,
   groupThreads,
+  isCompleteProjectOrder,
   moveBetween,
   reasoningLetter,
   shortModelName,

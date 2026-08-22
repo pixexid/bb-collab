@@ -70,6 +70,12 @@ async function registration() {
 
 type ThreadExecution = { model: string; reasoning: string };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((onResolve) => { resolve = onResolve; });
+  return { promise, resolve };
+}
+
 function rpcHandlers(states: Record<string, string> = {}, models: Record<string, ThreadExecution | null> = {}) {
   return {
     lanes: async () => [],
@@ -584,6 +590,59 @@ describe("replacement thread list", () => {
       method: "reorderProjects",
       input: { projectId: "project-a", previousProjectId: null, nextProjectId: "project-b" },
     }));
+  });
+
+  it("serializes rapid A-to-B-to-C project reorders and ends at host truth", async () => {
+    const list = await registration();
+    const calls: Array<{ input: unknown; result: ReturnType<typeof deferred<string[]>> }> = [];
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A"), project("project-b", "Project B"), project("project-c", "Project C")], threads: [
+        thread("a", "project-a", 3), thread("b", "project-b", 2), thread("c", "project-c", 1),
+      ] },
+      rpc: { ...rpcHandlers(), reorderProjects: async (input: unknown) => { const result = deferred<string[]>(); calls.push({ input, result }); return result.promise; } } as never,
+    });
+    const section = (id: string) => rendered.container.querySelector(`[data-sidebar-project-id="${id}"]`)!;
+    const projectIds = () => Array.from(rendered.container.querySelectorAll("[data-sidebar-project-id]"), (node) => node.getAttribute("data-sidebar-project-id"));
+    fireEvent.pointerDown(rendered.getByText("Project A"), { button: 0 });
+    fireEvent.pointerEnter(section("project-b"));
+    fireEvent.pointerEnter(section("project-c"));
+    expect(projectIds()).toEqual(["project-b", "project-c", "project-a"]);
+    expect(calls).toHaveLength(1);
+    calls[0]!.result.resolve(["project-b", "project-a", "project-c"]);
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1]!.input).toEqual({ projectId: "project-a", previousProjectId: "project-c", nextProjectId: null });
+    calls[1]!.result.resolve(["project-b", "project-c", "project-a"]);
+    await waitFor(() => expect(projectIds()).toEqual(["project-b", "project-c", "project-a"]));
+  });
+
+  it.each([
+    ["partial", ["project-b", "project-a"]],
+    ["duplicate", ["project-b", "project-b", "project-a"]],
+    ["missing", ["project-b", "project-a", "project-x"]],
+  ])("rolls back a %s authoritative project response", async (_case, response) => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A"), project("project-b", "Project B"), project("project-c", "Project C")], threads: [
+        thread("a", "project-a", 3), thread("b", "project-b", 2), thread("c", "project-c", 1),
+      ] },
+      rpc: { ...rpcHandlers(), reorderProjects: async () => response } as never,
+    });
+    const projectIds = () => Array.from(rendered.container.querySelectorAll("[data-sidebar-project-id]"), (node) => node.getAttribute("data-sidebar-project-id"));
+    fireEvent.click(rendered.getByRole("button", { name: "Move Project A project down" }));
+    await waitFor(() => expect(projectIds()).toEqual(["project-a", "project-b", "project-c"]));
+  });
+
+  it("rolls back a rejected project reorder", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A"), project("project-b", "Project B")], threads: [
+        thread("a", "project-a", 2), thread("b", "project-b", 1),
+      ] },
+      rpc: { ...rpcHandlers(), reorderProjects: async () => { throw new Error("rejected"); } } as never,
+    });
+    const projectIds = () => Array.from(rendered.container.querySelectorAll("[data-sidebar-project-id]"), (node) => node.getAttribute("data-sidebar-project-id"));
+    fireEvent.click(rendered.getByRole("button", { name: "Move Project A project down" }));
+    await waitFor(() => expect(projectIds()).toEqual(["project-a", "project-b"]));
   });
 
   it("sends typed pinned reorder args for an upward pointer drag", async () => {
