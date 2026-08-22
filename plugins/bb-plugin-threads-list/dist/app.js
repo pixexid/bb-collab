@@ -225,7 +225,7 @@ function RunningSpinner({ label }) {
 }
 function ThreadSignal({ thread }) {
   const signal = threadSignal(thread);
-  return /* @__PURE__ */ jsx("span", { className: LEADING_SLOT, "data-sidebar-thread-signal": signal.kind, children: signal.kind === "running" ? /* @__PURE__ */ jsx(RunningSpinner, { label: signal.label }) : /* @__PURE__ */ jsx(
+  return /* @__PURE__ */ jsx("span", { className: LEADING_SLOT, "data-sidebar-thread-signal": signal.kind, children: signal.kind === "running" ? /* @__PURE__ */ jsx(RunningSpinner, { label: signal.label }) : signal.kind === "idle" && !thread.isUnread ? null : /* @__PURE__ */ jsx(
     "span",
     {
       className: `${NATIVE_DOT} ${signal.kind === "idle" && thread.isUnread ? "bg-primary" : signalDotClasses(thread, signal.kind)}`,
@@ -321,7 +321,18 @@ function groupThreads(projects, threads, searchQuery = "") {
     group.threads.push(thread);
     groups.set(project.id, group);
   }
-  return [...groups.values()].map((group) => ({ ...group, threads: sortSidebarThreads(group.threads) }));
+  const projectOrder = new Map(projects.map((project, index) => [project.id, index]));
+  return [...groups.values()].sort((a, b) => (projectOrder.get(a.project.id) ?? Number.MAX_SAFE_INTEGER) - (projectOrder.get(b.project.id) ?? Number.MAX_SAFE_INTEGER)).map((group) => ({ ...group, threads: sortSidebarThreads(group.threads) }));
+}
+function moveBetween(order, draggedId, targetId) {
+  const from = order.indexOf(draggedId);
+  const to = order.indexOf(targetId);
+  if (from < 0 || to < 0 || from === to) return null;
+  const remaining = order.filter((id) => id !== draggedId);
+  const insertionIndex = remaining.indexOf(targetId) + (from < to ? 1 : 0);
+  const nextOrder = [...remaining];
+  nextOrder.splice(insertionIndex, 0, draggedId);
+  return { nextOrder, previousId: remaining[insertionIndex - 1] ?? null, nextId: remaining[insertionIndex] ?? null };
 }
 function buildThreadTree(threads) {
   const nodes = new Map(threads.map((thread) => [thread.id, { thread, children: [] }]));
@@ -359,6 +370,7 @@ function ThreadRow({
   onPinnedDragStart,
   onPinnedDragOver,
   onPinnedDragEnd,
+  onMovePinned,
   onNavigate
 }) {
   const actions = experimental_useSidebarThreadActions();
@@ -422,6 +434,7 @@ function ThreadRow({
               onClick: (event) => {
                 event.preventDefault();
                 actions.open(thread.id);
+                void actions.setRead(thread.id, true).catch(() => void 0);
                 onNavigate();
               },
               children: title
@@ -469,6 +482,10 @@ function ThreadRow({
               /* @__PURE__ */ jsx("button", { type: "button", role: "menuitem", className: MENU_ITEM, onClick: () => menuAction(() => {
                 void actions.setPinned(thread.id, !thread.isPinned).catch(() => void 0);
               }), children: thread.isPinned ? "Unpin" : "Pin" }),
+              thread.isPinned ? /* @__PURE__ */ jsxs(Fragment2, { children: [
+                /* @__PURE__ */ jsx("button", { type: "button", role: "menuitem", className: MENU_ITEM, onClick: () => menuAction(() => onMovePinned(thread.id, -1)), children: "Move up" }),
+                /* @__PURE__ */ jsx("button", { type: "button", role: "menuitem", className: MENU_ITEM, onClick: () => menuAction(() => onMovePinned(thread.id, 1)), children: "Move down" })
+              ] }) : null,
               /* @__PURE__ */ jsx("button", { type: "button", role: "menuitem", className: MENU_ITEM, onClick: () => menuAction(() => setRenaming(true)), children: "Rename" }),
               /* @__PURE__ */ jsx("button", { type: "button", role: "menuitem", className: MENU_ITEM, onClick: () => menuAction(() => actions.archive(thread.id)), children: "Archive" }),
               /* @__PURE__ */ jsx("span", { role: "separator", className: "my-1 border-t border-border" }),
@@ -487,11 +504,14 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
   const [collapsedProjects, setCollapsedProjects] = useState(() => /* @__PURE__ */ new Set());
   const [collapsedThreads, setCollapsedThreads] = useState(() => /* @__PURE__ */ new Set());
   const draggingThreadId = useRef(null);
+  const draggingProjectId = useRef(null);
   const provenUnread = useRef(/* @__PURE__ */ new Map());
   const reportedBreak = useRef(null);
   const dragTargetId = useRef(null);
+  const projectDragTargetId = useRef(null);
   const [customStates, setCustomStates] = useState({});
   const [optimisticPinnedOrders, setOptimisticPinnedOrders] = useState({});
+  const [optimisticProjectOrder, setOptimisticProjectOrder] = useState(null);
   const [indicatorBroken, setIndicatorBroken] = useState(null);
   const [threadModels, setThreadModels] = useState({});
   const [stateMigrationNotice, setStateMigrationNotice] = useState(migrationNoticeVisible);
@@ -542,7 +562,8 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
     if (!order || a.projectId !== b.projectId || !a.isPinned || !b.isPinned) return 0;
     return order.indexOf(a.id) - order.indexOf(b.id);
   });
-  const groups = groupThreads(sidebar.projects, displayThreads, searchQuery);
+  const displayProjects = [...sidebar.projects].sort((a, b) => optimisticProjectOrder ? optimisticProjectOrder.indexOf(a.id) - optimisticProjectOrder.indexOf(b.id) : 0);
+  const groups = groupThreads(displayProjects, displayThreads, searchQuery);
   if (sidebar.status === "loading") return /* @__PURE__ */ jsx(Fragment2, { children: /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-muted-foreground", children: "Loading threads\u2026" }) });
   if (sidebar.status === "error") return /* @__PURE__ */ jsx(Fragment2, { children: /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-destructive", children: "Unable to load threads." }) });
   if (groups.length === 0) return /* @__PURE__ */ jsx(Fragment2, { children: /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-muted-foreground", children: "No matching threads." }) });
@@ -574,15 +595,11 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
     if (!dragged?.isPinned || !target?.isPinned) return;
     if (dragged.projectId !== target.projectId) return;
     const order = displayThreads.filter((thread) => thread.isPinned && thread.projectId === dragged.projectId).map((thread) => thread.id);
-    const from = order.indexOf(draggedId);
-    const to = order.indexOf(targetId);
-    if (from < 0 || to < 0) return;
-    const remaining = order.filter((id) => id !== draggedId);
-    const insertionIndex = remaining.indexOf(targetId) + (from < to ? 1 : 0);
-    const nextOrder = [...remaining];
-    nextOrder.splice(insertionIndex, 0, draggedId);
+    const move = moveBetween(order, draggedId, targetId);
+    if (!move) return;
+    const { nextOrder } = move;
     setOptimisticPinnedOrders((current) => ({ ...current, [dragged.projectId]: nextOrder }));
-    void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: remaining[insertionIndex - 1] ?? null, nextThreadId: remaining[insertionIndex] ?? null }).then((authoritativeOrder) => {
+    void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: move.previousId, nextThreadId: move.nextId }).then((authoritativeOrder) => {
       setOptimisticPinnedOrders((current) => current[dragged.projectId] === nextOrder ? { ...current, [dragged.projectId]: authoritativeOrder.filter((id) => order.includes(id)) } : current);
     }).catch(() => {
       setOptimisticPinnedOrders((current) => current[dragged.projectId] === nextOrder ? Object.fromEntries(Object.entries(current).filter(([projectId]) => projectId !== dragged.projectId)) : current);
@@ -613,10 +630,59 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
     if (target && target !== dragTargetId.current) reorderPinned(draggedId, target);
     dragTargetId.current = null;
   };
+  const movePinnedBy = (threadId, offset) => {
+    const thread = displayThreads.find((candidate) => candidate.id === threadId);
+    if (!thread?.isPinned) return;
+    const order = displayThreads.filter((candidate) => candidate.isPinned && candidate.projectId === thread.projectId).map((candidate) => candidate.id);
+    const targetId = order[order.indexOf(threadId) + offset];
+    if (targetId) reorderPinned(threadId, targetId);
+  };
+  const reorderProject = (draggedId, targetId) => {
+    const order = displayProjects.map((project) => project.id);
+    const move = moveBetween(order, draggedId, targetId);
+    const threadId = sidebar.threads.find((thread) => thread.projectId === draggedId)?.id;
+    if (!move || !threadId) return;
+    setOptimisticProjectOrder(move.nextOrder);
+    void rpc.call("reorderProjects", { projectId: draggedId, threadId, previousProjectId: move.previousId, nextProjectId: move.nextId }).then((authoritativeOrder) => {
+      setOptimisticProjectOrder((current) => current === move.nextOrder ? authoritativeOrder.filter((id) => order.includes(id)) : current);
+    }).catch(() => {
+      setOptimisticProjectOrder((current) => current === move.nextOrder ? null : current);
+    });
+  };
+  const startProjectDrag = (projectId) => {
+    draggingProjectId.current = projectId;
+    projectDragTargetId.current = null;
+    const settle = (event) => {
+      if (event.type === "pointerup" && draggingProjectId.current) finishProjectDrag("");
+      draggingProjectId.current = null;
+      projectDragTargetId.current = null;
+      window.removeEventListener("pointerup", settle);
+      window.removeEventListener("pointercancel", settle);
+    };
+    window.addEventListener("pointerup", settle);
+    window.addEventListener("pointercancel", settle);
+  };
+  const trackProjectDrag = (projectId) => {
+    if (!draggingProjectId.current || projectId === draggingProjectId.current) return;
+    reorderProject(draggingProjectId.current, projectId);
+    projectDragTargetId.current = projectId;
+  };
+  const finishProjectDrag = (targetId) => {
+    const draggedId = draggingProjectId.current ?? "";
+    const target = targetId || projectDragTargetId.current || "";
+    draggingProjectId.current = null;
+    if (target && target !== projectDragTargetId.current) reorderProject(draggedId, target);
+    projectDragTargetId.current = null;
+  };
+  const moveProjectBy = (projectId, offset) => {
+    const order = displayProjects.map((project) => project.id);
+    const targetId = order[order.indexOf(projectId) + offset];
+    if (targetId) reorderProject(projectId, targetId);
+  };
   const renderNode = (node, execution, depth) => {
     const childrenCollapsed = collapsedThreads.has(node.thread.id);
     return /* @__PURE__ */ jsxs("div", { className: "space-y-px", children: [
-      /* @__PURE__ */ jsx(ThreadRow, { thread: node.thread, execution, active: node.thread.id === activeThreadId, customState: customStates[node.thread.id], depth, collapsed: childrenCollapsed, hasChildren: node.children.length > 0, onToggleChildren: () => toggleThread(node.thread.id), onPinnedDragStart: startPinnedDrag, onPinnedDragOver: trackPinnedDrag, onPinnedDragEnd: finishPinnedDrag, onNavigate }),
+      /* @__PURE__ */ jsx(ThreadRow, { thread: node.thread, execution, active: node.thread.id === activeThreadId, customState: customStates[node.thread.id], depth, collapsed: childrenCollapsed, hasChildren: node.children.length > 0, onToggleChildren: () => toggleThread(node.thread.id), onPinnedDragStart: startPinnedDrag, onPinnedDragOver: trackPinnedDrag, onPinnedDragEnd: finishPinnedDrag, onMovePinned: movePinnedBy, onNavigate }),
       !childrenCollapsed ? node.children.map((child) => renderNode(child, threadModels[child.thread.id] ?? null, depth + 1)) : null
     ] }, node.thread.id);
   };
@@ -634,11 +700,15 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
       const expanded = expandedProjects.has(project.id);
       const visibleThreads = expanded ? tree : tree.slice(0, MAX_VISIBLE_THREADS);
       const projectName = asText(project.name) ?? asText(project.id) ?? "Untitled project";
-      return /* @__PURE__ */ jsxs("section", { "aria-labelledby": `project-${project.id}`, children: [
-        /* @__PURE__ */ jsxs("div", { className: "flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-normal text-muted-foreground", children: [
+      return /* @__PURE__ */ jsxs("section", { "aria-labelledby": `project-${project.id}`, "data-sidebar-project-id": project.id, onPointerEnter: () => trackProjectDrag(project.id), onPointerUp: () => finishProjectDrag(project.id), children: [
+        /* @__PURE__ */ jsxs("div", { className: "flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-semibold text-foreground", onPointerDown: (event) => {
+          if (event.button === 0 && !event.target.closest("button")) startProjectDrag(project.id);
+        }, children: [
           /* @__PURE__ */ jsx("span", { className: "flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground", "aria-hidden": "true", children: projectAvatar(projectName) }),
           /* @__PURE__ */ jsx("span", { id: `project-${project.id}`, className: "min-w-0 truncate", children: projectName }),
           /* @__PURE__ */ jsx("span", { className: "ml-auto shrink-0", "data-project-thread-count": "", children: threads.length }),
+          /* @__PURE__ */ jsx("button", { type: "button", className: "inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground disabled:opacity-30 motion-reduce:transition-none", "aria-label": `Move ${projectName} project up`, disabled: displayProjects[0]?.id === project.id, onClick: () => moveProjectBy(project.id, -1), children: "\u2191" }),
+          /* @__PURE__ */ jsx("button", { type: "button", className: "inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground disabled:opacity-30 motion-reduce:transition-none", "aria-label": `Move ${projectName} project down`, disabled: displayProjects.at(-1)?.id === project.id, onClick: () => moveProjectBy(project.id, 1), children: "\u2193" }),
           /* @__PURE__ */ jsx("button", { type: "button", className: "inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none", "aria-label": `${collapsed ? "Expand" : "Collapse"} ${projectName} section`, "aria-expanded": !collapsed, onClick: () => toggleProject(project.id), children: collapsed ? "\u203A" : "\u2304" })
         ] }),
         !collapsed ? /* @__PURE__ */ jsxs("div", { className: "mt-0.5 space-y-px", children: [
@@ -672,6 +742,7 @@ export {
   dismissMigrationNotice,
   executionBadgeLabel,
   groupThreads,
+  moveBetween,
   reasoningLetter,
   shortModelName,
   sidebarRpcBatches,

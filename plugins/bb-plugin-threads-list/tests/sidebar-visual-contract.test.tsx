@@ -61,6 +61,7 @@ function rpcHandlers() {
     sidebarCollapseState: async () => ({ projects: {}, threads: {} }),
     setSidebarCollapse: async (input: unknown) => input,
     reorderPinned: async () => ({ ok: true }),
+    reorderProjects: async () => [],
     setThreadState: async () => ({ state: null }),
     doctor: async () => ({}) as never,
     export: async () => ({}) as never,
@@ -150,8 +151,7 @@ describe("sidebar visual contract", () => {
 
     cleanup();
     const read = render([thread("read")]);
-    const readDot = read.container.querySelector("[data-sidebar-thread-dot]")! as HTMLElement;
-    expect(readDot.className).toContain("bg-muted-foreground/60");
+    expect(read.container.querySelector("[data-sidebar-thread-dot]")).toBeNull();
   });
 
   it("draws no left accent rail, ornament, or spacer on any row", async () => {

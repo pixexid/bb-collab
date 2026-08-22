@@ -57,6 +57,7 @@ function rpcHandlers(states: Record<string, unknown>, models: Record<string, unk
     sidebarCollapseState: async () => ({ projects: {}, threads: {} }),
     setSidebarCollapse: async (input: unknown) => input,
     reorderPinned: async () => ({ ok: true }),
+    reorderProjects: async () => [],
     setThreadState: async () => ({ state: null }),
     doctor: async () => ({}) as never,
     export: async () => ({}) as never,

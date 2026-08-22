@@ -11,7 +11,7 @@
     --text-xs--line-height: calc(1 / 0.75);
     --text-sm: 0.8125rem;
     --text-sm--line-height: calc(1.25 / 0.875);
-    --font-weight-normal: 400;
+    --font-weight-semibold: 600;
     --shadow-2xs: var(--shadow-2xs);
     --shadow-xs: var(--shadow-xs);
     --shadow-sm: var(--shadow-sm);
@@ -351,9 +351,9 @@
       --tw-leading: 1;
       line-height: 1;
     }
-    .font-normal {
-      --tw-font-weight: var(--font-weight-normal);
-      font-weight: var(--font-weight-normal);
+    .font-semibold {
+      --tw-font-weight: var(--font-weight-semibold);
+      font-weight: var(--font-weight-semibold);
     }
     .text-destructive {
       color: var(--destructive);
@@ -468,6 +468,11 @@
       &:focus-visible {
         --tw-outline-style: none;
         outline-style: none;
+      }
+    }
+    .disabled\:opacity-30 {
+      &:disabled {
+        opacity: 30%;
       }
     }
     .motion-reduce\:animate-none {
