@@ -424,7 +424,10 @@ export default function companionWatcher(bb: BbPluginApi, readExport: CanonicalR
     if (threadId) {
       try {
         const thread = await bb.sdk.threads.get({ threadId });
-        if (thread.projectId !== projectId || thread.status !== "idle") return;
+        if (thread.projectId !== projectId) {
+          companions.delete(projectId);
+          threadId = undefined;
+        } else if (thread.status !== "idle") return;
       } catch { companions.delete(projectId); threadId = undefined; }
     }
     if (!threadId) {
@@ -438,9 +441,12 @@ export default function companionWatcher(bb: BbPluginApi, readExport: CanonicalR
     pending.set(threadId, { projectId, orchestratorId, turnStartedAt });
   };
 
-  const handleJudgment = async (threadId: string, output: string) => {
+  const handleJudgment = async (threadId: string, projectId: string, output: string) => {
     const request = pending.get(threadId);
-    if (!request) return;
+    if (!request || request.projectId !== projectId) {
+      if (request) bb.log.warn(`companion-watcher coverage=blind event=post-check reason=project-mismatch expected=${request.projectId} actual=${projectId}`);
+      return;
+    }
     pending.delete(threadId);
     const snapshot = candidateSnapshots.get(threadId);
     candidateSnapshots.delete(threadId);
@@ -473,7 +479,7 @@ export default function companionWatcher(bb: BbPluginApi, readExport: CanonicalR
   bb.events.on("thread.active", ({ thread }) => { activeTurns.set(thread.id, Date.now()); });
   // ponytail: idle-triggered judgment cannot detect silent plugin death; liveness currently relies on existing schedule-health monitoring (doctor schedule last-run checks / fleet-watchdog / launchd stall-guard); add interval receipts only if silent death is observed.
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
-    if (pending.has(thread.id)) { await handleJudgment(thread.id, lastAssistantText ?? ""); return; }
+    if (pending.has(thread.id)) { await handleJudgment(thread.id, thread.projectId, lastAssistantText ?? ""); return; }
     const turnStartedAt = activeTurns.get(thread.id);
     activeTurns.delete(thread.id);
     let projects: readonly ProjectInventoryItem[];
@@ -484,17 +490,20 @@ export default function companionWatcher(bb: BbPluginApi, readExport: CanonicalR
       return;
     }
     const project = projects.find((candidate) => candidate.id === thread.projectId);
-    if (!project || inFlight.has(project.id)) return;
-    inFlight.add(project.id);
+    if (!project) return;
+    let acquired = false;
     try {
       const exported = await canonical(project.id);
       const orchestratorId = readRoleThread(exported, project.id, "project-orchestrator");
       if (thread.id !== orchestratorId || !shouldJudgeOnIdle(exported, project.id, Date.now())) return;
+      if (inFlight.has(project.id)) return;
+      inFlight.add(project.id);
+      acquired = true;
       await judge(project.id, orchestratorId, turnStartedAt);
     } catch (error) {
       bb.log.warn(`companion-watcher coverage=blind event=thread.idle project=${project.id} reason=${String(error)}`);
     } finally {
-      inFlight.delete(project.id);
+      if (acquired) inFlight.delete(project.id);
     }
   });
 }

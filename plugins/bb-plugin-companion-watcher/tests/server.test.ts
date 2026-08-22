@@ -210,6 +210,113 @@ describe("semantic idle guard", () => {
     expect(spawns).toBe(1);
   });
 
+  it("keeps a concurrent holder event alive when a non-holder read is outstanding", async () => {
+    const base = await capturedExport();
+    const canonical = { ...base, executionAttempts: [base.executionAttempts[0]!, { ...base.executionAttempts[1], observed_at_ms: 0, state: "running" }] };
+    let idle: ((event: { thread: { id: string; projectId: string }; lastAssistantText?: string }) => Promise<void>) | undefined;
+    let readCount = 0;
+    let releaseNonHolder!: (value: typeof canonical) => void;
+    let markFirstRead!: () => void;
+    const firstReadStarted = new Promise<void>((resolve) => { markFirstRead = resolve; });
+    const nonHolderRead = new Promise<typeof canonical>((resolve) => { releaseNonHolder = resolve; });
+    const spawned: string[] = [];
+    const bb = {
+      pluginId: "companion-watcher",
+      log: { info: () => undefined, warn: () => undefined },
+      storage: { kv: { get: async () => undefined, set: async () => undefined } },
+      agents: { registerTool: () => undefined, configure: () => undefined },
+      sdk: {
+        system: { config: async () => ({ dataDir: "/unused" }) },
+        projects: { list: async () => [{ id: projectId, gitRemoteUrl: null }] },
+        threads: {
+          spawn: async ({ projectId: id }: { projectId: string }) => { spawned.push(id); return { id: "companion" }; },
+          get: async () => ({ projectId, status: "idle" }),
+          send: async () => undefined,
+        },
+      },
+      events: { on: (event: string, handler: typeof idle) => { if (event === "thread.idle") idle = handler; } },
+    } as unknown as BbPluginApi;
+    companionWatcher(bb, async () => {
+      readCount += 1;
+      if (readCount === 1) { markFirstRead(); return nonHolderRead; }
+      return canonical;
+    }, async () => ({ issues: [], prs: [] }));
+    const nonHolder = idle!({ thread: { id: "thread-a-other", projectId } });
+    await firstReadStarted;
+    await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+    expect(spawned).toEqual([projectId]);
+    releaseNonHolder(canonical);
+    await nonHolder;
+    expect(spawned).toEqual([projectId]);
+  });
+
+  it("replaces a persisted foreign companion but suppresses an active local one", async () => {
+    const base = await capturedExport();
+    const canonical = { ...base, executionAttempts: [base.executionAttempts[0]!, { ...base.executionAttempts[1], observed_at_ms: 0, state: "running" }] };
+    const run = async (savedThreadId: string, companionProjectId: string, status: string) => {
+      let idle: ((event: { thread: { id: string; projectId: string }; lastAssistantText?: string }) => Promise<void>) | undefined;
+      const spawned: string[] = [];
+      const bb = {
+        pluginId: "companion-watcher",
+        log: { info: () => undefined, warn: () => undefined },
+        storage: { kv: { get: async (key: string) => key === "companions" ? { [projectId]: savedThreadId } : undefined, set: async () => undefined } },
+        agents: { registerTool: () => undefined, configure: () => undefined },
+        sdk: {
+          system: { config: async () => ({ dataDir: "/unused" }) },
+          projects: { list: async () => [{ id: projectId, gitRemoteUrl: null }] },
+          threads: {
+            spawn: async ({ projectId: id }: { projectId: string }) => { spawned.push(id); return { id: "replacement" }; },
+            get: async () => ({ projectId: companionProjectId, status }),
+            send: async () => undefined,
+          },
+        },
+        events: { on: (event: string, handler: typeof idle) => { if (event === "thread.idle") idle = handler; } },
+      } as unknown as BbPluginApi;
+      companionWatcher(bb, async () => canonical, async () => ({ issues: [], prs: [] }));
+      await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+      return spawned;
+    };
+    expect(await run("foreign-companion", "proj_foreign", "idle")).toEqual([projectId]);
+    expect(await run("active-companion", projectId, "active")).toEqual([]);
+  });
+
+  it("does not consume a pending judgment from a wrong-project completion", async () => {
+    const base = await capturedExport();
+    const canonical = { ...base, executionAttempts: [base.executionAttempts[0]!, { ...base.executionAttempts[1], observed_at_ms: 0, state: "running" }] };
+    let idle: ((event: { thread: { id: string; projectId: string }; lastAssistantText?: string }) => Promise<void>) | undefined;
+    let tool: { execute(params: unknown, context: { threadId: string; projectId: string }): Promise<unknown> } | undefined;
+    const sent: string[] = [];
+    const bb = {
+      pluginId: "companion-watcher",
+      log: { info: () => undefined, warn: () => undefined },
+      storage: { kv: { get: async () => undefined, set: async () => undefined } },
+      agents: { registerTool: (value: typeof tool) => { tool = value; }, configure: () => undefined },
+      sdk: {
+        system: { config: async () => ({ dataDir: "/unused" }) },
+        projects: { list: async () => [{ id: projectId, gitRemoteUrl: null }], get: async () => ({ gitRemoteUrl: null }) },
+        threads: {
+          spawn: async () => ({ id: "companion" }),
+          get: async ({ threadId }: { threadId: string }) => threadId === "companion"
+            ? { projectId, title: "Alzheimer companion judgment", originPluginId: "companion-watcher", status: "idle" }
+            : { projectId, status: "idle" },
+          send: async ({ threadId }: { threadId: string }) => { sent.push(threadId); },
+          timeline: async () => ({ rows: [], timelinePage: { hasOlderRows: false, kind: "latest", segmentLimit: 100, returnedSegmentCount: 0, olderCursor: null }, maxSeq: 0 }),
+          queuedMessages: { list: async () => [] },
+        },
+      },
+      events: { on: (event: string, handler: typeof idle) => { if (event === "thread.idle") idle = handler; } },
+    } as unknown as BbPluginApi;
+    companionWatcher(bb, async () => canonical, async () => ({ issues: [], prs: [] }));
+    await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+    const snapshot = JSON.parse(await tool!.execute({}, { threadId: "companion", projectId }) as string) as { candidates: Array<{ id: string; anchors: unknown; finding: string }> };
+    const candidate = snapshot.candidates[0]!;
+    const output = `FINDING: ${JSON.stringify({ candidateId: candidate.id, anchors: candidate.anchors, finding: candidate.finding })}\nESCALATE: yes`;
+    await idle!({ thread: { id: "companion", projectId: "proj_foreign" }, lastAssistantText: output });
+    expect(sent).toEqual([]);
+    await idle!({ thread: { id: "companion", projectId }, lastAssistantText: output });
+    expect(sent).toEqual(["thr_7bjw9e7mgd"]);
+  });
+
   it("keeps project failure isolation on independent project-scoped events", async () => {
     const base = await capturedExport();
     const projectB = "proj_two";
