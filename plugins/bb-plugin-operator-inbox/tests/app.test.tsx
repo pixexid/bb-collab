@@ -2,7 +2,7 @@
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { cleanup, fireEvent, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { installTestPluginRuntime, loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import type { PluginSidebarProject } from "@get-bb/plugin-sdk/app";
@@ -141,6 +141,21 @@ describe("Operator Inbox app", () => {
     expect((reopened.getByLabelText("Project") as HTMLSelectElement).value).toBe("project-a");
     expect((reopened.getByLabelText("Show archived") as HTMLInputElement).checked).toBe(true);
     expect(reopened.queryByLabelText("Recipient")).toBeNull();
+  });
+
+  it("fails the panel read closed when an operator-filtered response contains a non-operator row", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const operator = { messageId: 1, projectId: "project-a", recipient: "operator" as const, senderThreadId: "operator-sender", senderLaneId: null, severity: "routine" as const, text: "operator row must also stay closed", createdAtMs: 2, readAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null };
+    const supervisor = { ...operator, messageId: 2, recipient: "supervisor" as const, senderThreadId: "supervisor-sender", text: "hostile supervisor row" };
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(async () => [operator, supervisor]) } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText(/Unable to read inbox: Project A \(project-a\): Error: operator inbox response included a non-operator message/)).toBeTruthy());
+    expect(rendered.queryByText("operator row must also stay closed")).toBeNull();
+    expect(rendered.queryByText("hostile supervisor row")).toBeNull();
   });
 
   it("falls back to all projects when a persisted project no longer exists", async () => {
@@ -464,6 +479,53 @@ describe("Operator Inbox app", () => {
     await waitFor(() => expect(archiveOperatorMessage).toHaveBeenCalledWith({ projectId: "project-a", messageId: 10 }));
     expect(rendered.getByRole("status").textContent).toBe("Archived.");
     expect(rendered.queryByText("archive me")).toBeNull();
+  });
+
+  it("keeps a newer archived-filter refresh authoritative when an older archive result settles", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const message = { messageId: 11, projectId: "project-a", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, senderTitle: "Before archive", severity: "routine" as const, text: "archive race", createdAtMs: 1, readAtMs: null, archivedAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null };
+    const refreshed = { ...message, senderTitle: "Refreshed archived row", archivedAtMs: 5 };
+    let resolveArchive!: (value: typeof refreshed) => void;
+    const archiveResult = new Promise<typeof refreshed>((resolve) => { resolveArchive = resolve; });
+    const operatorMessages = okMessages(async (input: { includeArchived?: boolean }) => input.includeArchived ? [refreshed] : [message]);
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages, archiveOperatorMessage: async () => archiveResult } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("archive race")).toBeTruthy());
+    fireEvent.click(rendered.getByRole("button", { name: "Archive" }));
+    fireEvent.click(rendered.getByLabelText("Show archived"));
+    await waitFor(() => expect(rendered.getAllByText("Refreshed archived row").length).toBeGreaterThan(0));
+    await act(async () => resolveArchive({ ...message, senderTitle: "Late archive result", archivedAtMs: 5 }));
+
+    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Archived."));
+    expect(rendered.getAllByText("Refreshed archived row").length).toBeGreaterThan(0);
+    expect(rendered.queryByText("Late archive result")).toBeNull();
+  });
+
+  it("surfaces a late archive failure without disturbing the newer archived-filter refresh", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const message = { messageId: 12, projectId: "project-a", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, senderTitle: "Before failed archive", severity: "routine" as const, text: "failed archive race", createdAtMs: 1, readAtMs: null, archivedAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null };
+    const refreshed = { ...message, senderTitle: "Refresh survived failure", archivedAtMs: 5 };
+    let rejectArchive!: (reason: unknown) => void;
+    const archiveResult = new Promise<typeof refreshed>((_resolve, reject) => { rejectArchive = reject; });
+    const operatorMessages = okMessages(async (input: { includeArchived?: boolean }) => input.includeArchived ? [refreshed] : [message]);
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages, archiveOperatorMessage: async () => archiveResult } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("failed archive race")).toBeTruthy());
+    fireEvent.click(rendered.getByRole("button", { name: "Archive" }));
+    fireEvent.click(rendered.getByLabelText("Show archived"));
+    await waitFor(() => expect(rendered.getAllByText("Refresh survived failure").length).toBeGreaterThan(0));
+    await act(async () => rejectArchive(new Error("archive unavailable")));
+
+    await waitFor(() => expect(rendered.getByText("Unable to read inbox: Error: archive unavailable")).toBeTruthy());
+    expect(rendered.getAllByText("Refresh survived failure").length).toBeGreaterThan(0);
   });
 
   it("discloses and caps the aggregate display spill", async () => {

@@ -177,6 +177,20 @@ describe("inbox unread nav indicator", () => {
     expect(rendered.queryByRole("alert")).toBeNull();
   });
 
+  it("does not count a schema-valid non-operator row from an operator-filtered response", async () => {
+    // #given
+    threadListRegistration = await threadList();
+    navRegion();
+    const hostile = { ...message(1, null), recipient: "supervisor" as const, text: "hostile supervisor indicator row" };
+
+    // #when
+    const rendered = renderList(async () => [hostile] as never);
+
+    // #then the panel error also proves the shared response has settled
+    await waitFor(() => expect(rendered.getByText(/operator inbox response included a non-operator message/)).toBeTruthy());
+    expect(inboxDot()).toBeNull();
+  });
+
   it("surfaces a visible broken state and records the error when the coupling dies", async () => {
     // #given
     threadListRegistration = await threadList();

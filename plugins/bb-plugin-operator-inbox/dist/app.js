@@ -179,8 +179,15 @@ function asText(value) {
 var MAX_VISIBLE_INBOX_MESSAGES = 256;
 var INBOX_FILTER_STORAGE_KEY = "bb-collab.inbox-filters";
 var UNREGISTERED_INBOX_PROJECT = "PROJECT_CONFIG_REQUIRED";
+var NON_OPERATOR_MESSAGE_ERROR = "operator inbox response included a non-operator message";
 function isUnregisteredInboxProject(result) {
   return result.outcome === UNREGISTERED_INBOX_PROJECT;
+}
+function operatorOnlyMessages(result) {
+  if (result.messages.some((message) => message.recipient !== "operator")) {
+    throw new Error(NON_OPERATOR_MESSAGE_ERROR);
+  }
+  return result.messages;
 }
 function readInboxFilters() {
   try {
@@ -214,6 +221,8 @@ function InboxPanel(_props) {
   const provenUnread = useRef(/* @__PURE__ */ new Map());
   const reportedBreak = useRef(null);
   const refreshSequence = useRef(0);
+  const showArchivedRef = useRef(showArchived);
+  showArchivedRef.current = showArchived;
   const projects = useMemo(() => projectId ? sidebar.projects.filter((candidate) => candidate.id === projectId) : sidebar.projects, [projectId, sidebar.projects]);
   const projectNames = useMemo(() => new Map(sidebar.projects.map((candidate) => [candidate.id, candidate.name])), [sidebar.projects]);
   const messageKey = (message) => `${message.projectId}:${message.messageId}`;
@@ -228,9 +237,13 @@ function InboxPanel(_props) {
       const unread = results.reduce((total, result, index) => {
         const projectId2 = sidebar.projects[index].id;
         if (result.status === "fulfilled") {
-          const count = result.value.messages.filter((message) => message.readAtMs === null).length;
-          provenUnread.current.set(projectId2, count);
-          return total + count;
+          try {
+            const count = operatorOnlyMessages(result.value).filter((message) => message.readAtMs === null).length;
+            provenUnread.current.set(projectId2, count);
+            return total + count;
+          } catch {
+            return total + (provenUnread.current.get(projectId2) ?? 0);
+          }
         }
         return total + (provenUnread.current.get(projectId2) ?? 0);
       }, 0);
@@ -276,8 +289,13 @@ function InboxPanel(_props) {
       results.forEach((result, index) => {
         const label = `${projects[index].name} (${projects[index].id})`;
         if (result.status === "rejected") failed.push(`${label}: ${String(result.reason)}`);
-        else if (!isUnregisteredInboxProject(result.value)) loaded.push(...result.value.messages);
-        else if (projectId !== "") failed.push(`${label}: ${result.value.outcome}`);
+        else if (!isUnregisteredInboxProject(result.value)) {
+          try {
+            loaded.push(...operatorOnlyMessages(result.value));
+          } catch (reason) {
+            failed.push(`${label}: ${String(reason)}`);
+          }
+        } else if (projectId !== "") failed.push(`${label}: ${result.value.outcome}`);
       });
       loaded.sort((left, right) => Number(left.readAtMs !== null) - Number(right.readAtMs !== null) || right.createdAtMs - left.createdAtMs || right.messageId - left.messageId);
       setMessages(loaded);
@@ -421,10 +439,11 @@ function InboxPanel(_props) {
                   }).catch((reason) => setErrors([String(reason)]));
                 }, children: "Mark read" }) : null,
                 message.archivedAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", className: "rounded-md bg-transparent px-3 py-1.5 text-sm text-muted-foreground transition-colors duration-150 hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none", onClick: () => {
+                  const sequence = refreshSequence.current;
                   setErrors([]);
                   setNotice(null);
                   void rpc.call("archiveOperatorMessage", { projectId: message.projectId, messageId: message.messageId }).then((archived) => {
-                    setMessages((current) => showArchived ? current.map((item) => messageKey(item) === key ? archived : item) : current.filter((item) => messageKey(item) !== key));
+                    if (sequence === refreshSequence.current) setMessages((current) => showArchivedRef.current ? current.map((item) => messageKey(item) === key ? archived : item) : current.filter((item) => messageKey(item) !== key));
                     setNotice("Archived.");
                   }).catch((reason) => setErrors([String(reason)]));
                 }, children: "Archive" }) : null

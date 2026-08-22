@@ -11,7 +11,14 @@ function asText(value: unknown): string | null { return typeof value === "string
 const MAX_VISIBLE_INBOX_MESSAGES = 256;
 const INBOX_FILTER_STORAGE_KEY = "bb-collab.inbox-filters";
 const UNREGISTERED_INBOX_PROJECT = "PROJECT_CONFIG_REQUIRED" satisfies OperatorMessagesResult["outcome"];
+const NON_OPERATOR_MESSAGE_ERROR = "operator inbox response included a non-operator message";
 function isUnregisteredInboxProject(result: OperatorMessagesResult): boolean { return result.outcome === UNREGISTERED_INBOX_PROJECT; }
+function operatorOnlyMessages(result: OperatorMessagesResult): readonly OperatorMessage[] {
+  if (result.messages.some((message) => message.recipient !== "operator")) {
+    throw new Error(NON_OPERATOR_MESSAGE_ERROR);
+  }
+  return result.messages;
+}
 function readInboxFilters(): InboxFilters {
   try { const value = JSON.parse(window.localStorage.getItem(INBOX_FILTER_STORAGE_KEY) ?? "null") as Partial<InboxFilters> | null; return { projectId: typeof value?.projectId === "string" ? value.projectId : "", showArchived: value?.showArchived === true }; }
   catch { return { projectId: "", showArchived: false }; }
@@ -36,6 +43,8 @@ function InboxPanel(_props: PluginNavPanelProps) {
   const provenUnread = useRef(new Map<string, number>());
   const reportedBreak = useRef<string | null>(null);
   const refreshSequence = useRef(0);
+  const showArchivedRef = useRef(showArchived);
+  showArchivedRef.current = showArchived;
   const projects = useMemo(() => projectId ? sidebar.projects.filter((candidate) => candidate.id === projectId) : sidebar.projects, [projectId, sidebar.projects]);
   const projectNames = useMemo(() => new Map(sidebar.projects.map((candidate) => [candidate.id, candidate.name])), [sidebar.projects]);
   const messageKey = (message: OperatorMessage) => `${message.projectId}:${message.messageId}`;
@@ -52,7 +61,10 @@ function InboxPanel(_props: PluginNavPanelProps) {
       if (cancelled) return;
       const unread = results.reduce((total, result, index) => {
         const projectId = sidebar.projects[index]!.id;
-        if (result.status === "fulfilled") { const count = result.value.messages.filter((message) => message.readAtMs === null).length; provenUnread.current.set(projectId, count); return total + count; }
+        if (result.status === "fulfilled") {
+          try { const count = operatorOnlyMessages(result.value).filter((message) => message.readAtMs === null).length; provenUnread.current.set(projectId, count); return total + count; }
+          catch { return total + (provenUnread.current.get(projectId) ?? 0); }
+        }
         return total + (provenUnread.current.get(projectId) ?? 0);
       }, 0);
       const painted = paintInboxNavUnread(document, unread);
@@ -80,7 +92,10 @@ function InboxPanel(_props: PluginNavPanelProps) {
         results.forEach((result, index) => {
           const label = `${projects[index]!.name} (${projects[index]!.id})`;
           if (result.status === "rejected") failed.push(`${label}: ${String(result.reason)}`);
-          else if (!isUnregisteredInboxProject(result.value)) loaded.push(...result.value.messages);
+          else if (!isUnregisteredInboxProject(result.value)) {
+            try { loaded.push(...operatorOnlyMessages(result.value)); }
+            catch (reason) { failed.push(`${label}: ${String(reason)}`); }
+          }
           else if (projectId !== "") failed.push(`${label}: ${result.value.outcome}`);
         });
         loaded.sort((left, right) => Number(left.readAtMs !== null) - Number(right.readAtMs !== null) || right.createdAtMs - left.createdAtMs || right.messageId - left.messageId);
@@ -123,7 +138,7 @@ function InboxPanel(_props: PluginNavPanelProps) {
             {message.repliedAtMs !== null ? <div className="border-l-2 border-border pl-3"><p className="text-xs font-medium text-muted-foreground">Reply delivered</p><p className="mt-1 whitespace-pre-wrap break-words text-sm">{message.replyText}</p></div> : <div className="grid gap-2 border-t border-border pt-3">
               {message.replyInProgress ? <p className="text-xs text-primary">Reply delivery is still in progress; outcome is not yet known.</p> : null}{message.replyDeliveryError ? <p role="alert" className="text-xs text-destructive">Reply delivery failed: {message.replyDeliveryError}</p> : null}
               <label className="text-xs font-medium text-muted-foreground" htmlFor={`operator-reply-${key}`}>Reply</label><textarea id={`operator-reply-${key}`} className="min-h-24 w-full rounded-md border border-border bg-background p-2.5 text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" value={drafts[key] ?? message.replyText ?? ""} onChange={(event) => setDrafts((current) => ({ ...current, [key]: event.target.value }))} />
-              <div className="flex flex-wrap gap-2"><button type="button" disabled={replyingMessageKey !== null} className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground transition-opacity duration-150 hover:opacity-90 active:opacity-80 disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none" onClick={() => { const text = (drafts[key] ?? message.replyText ?? "").trim(); if (!text) return; setErrors([]); setNotice(null); setReplyingMessageKey(key); void rpc.call("replyToOperatorMessage", { projectId: message.projectId, messageId: message.messageId, text }).then((replied) => { updateMessage(replied); setNotice(replied.repliedAtMs !== null ? "Reply delivered." : replied.replyInProgress ? "Reply delivery is still in progress; outcome is not yet known." : replied.replyDeliveryError ? "Reply delivery failed." : "Reply delivery is not confirmed."); }).catch((reason: unknown) => setErrors([String(reason)])).finally(() => setReplyingMessageKey(null)); }}>{replyingMessageKey === key ? "Delivering…" : message.replyDeliveryError ? "Retry reply" : "Reply"}</button>{message.readAtMs === null ? <button type="button" className="rounded-md bg-transparent px-3 py-1.5 text-sm text-muted-foreground transition-colors duration-150 hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none" onClick={() => { setErrors([]); setNotice(null); void rpc.call("markOperatorMessageRead", { projectId: message.projectId, messageId: message.messageId }).then((read) => { updateMessage(read); setNotice("Marked read."); }).catch((reason: unknown) => setErrors([String(reason)])); }}>Mark read</button> : null}{message.archivedAtMs === null ? <button type="button" className="rounded-md bg-transparent px-3 py-1.5 text-sm text-muted-foreground transition-colors duration-150 hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none" onClick={() => { setErrors([]); setNotice(null); void rpc.call("archiveOperatorMessage", { projectId: message.projectId, messageId: message.messageId }).then((archived) => { setMessages((current) => showArchived ? current.map((item) => messageKey(item) === key ? archived : item) : current.filter((item) => messageKey(item) !== key)); setNotice("Archived."); }).catch((reason: unknown) => setErrors([String(reason)])); }}>Archive</button> : null}</div>
+              <div className="flex flex-wrap gap-2"><button type="button" disabled={replyingMessageKey !== null} className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground transition-opacity duration-150 hover:opacity-90 active:opacity-80 disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none" onClick={() => { const text = (drafts[key] ?? message.replyText ?? "").trim(); if (!text) return; setErrors([]); setNotice(null); setReplyingMessageKey(key); void rpc.call("replyToOperatorMessage", { projectId: message.projectId, messageId: message.messageId, text }).then((replied) => { updateMessage(replied); setNotice(replied.repliedAtMs !== null ? "Reply delivered." : replied.replyInProgress ? "Reply delivery is still in progress; outcome is not yet known." : replied.replyDeliveryError ? "Reply delivery failed." : "Reply delivery is not confirmed."); }).catch((reason: unknown) => setErrors([String(reason)])).finally(() => setReplyingMessageKey(null)); }}>{replyingMessageKey === key ? "Delivering…" : message.replyDeliveryError ? "Retry reply" : "Reply"}</button>{message.readAtMs === null ? <button type="button" className="rounded-md bg-transparent px-3 py-1.5 text-sm text-muted-foreground transition-colors duration-150 hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none" onClick={() => { setErrors([]); setNotice(null); void rpc.call("markOperatorMessageRead", { projectId: message.projectId, messageId: message.messageId }).then((read) => { updateMessage(read); setNotice("Marked read."); }).catch((reason: unknown) => setErrors([String(reason)])); }}>Mark read</button> : null}{message.archivedAtMs === null ? <button type="button" className="rounded-md bg-transparent px-3 py-1.5 text-sm text-muted-foreground transition-colors duration-150 hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none" onClick={() => { const sequence = refreshSequence.current; setErrors([]); setNotice(null); void rpc.call("archiveOperatorMessage", { projectId: message.projectId, messageId: message.messageId }).then((archived) => { if (sequence === refreshSequence.current) setMessages((current) => showArchivedRef.current ? current.map((item) => messageKey(item) === key ? archived : item) : current.filter((item) => messageKey(item) !== key)); setNotice("Archived."); }).catch((reason: unknown) => setErrors([String(reason)])); }}>Archive</button> : null}</div>
             </div>}
           </div> : null}
         </article>;
