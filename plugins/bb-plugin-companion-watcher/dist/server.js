@@ -18,18 +18,17 @@ var TOOL = "companion_read_snapshot";
 var TITLE = "Alzheimer companion judgment";
 function parseJudgment(output) {
   const coverages = [...output.matchAll(/^COVERAGE:\s*(known|partial|blind)\s*$/gimu)];
-  const verdicts = [...output.matchAll(/^ILLEGITIMATE:\s*(yes|no)\s*$/gimu)];
   const escalations = [...output.matchAll(/^ESCALATE:\s*yes\s*$/gimu)];
   const findings = [...output.matchAll(/^FINDING:\s*(.+)\s*$/gimu)].map((match) => match[1].trim());
   const coverage = coverages.length === 1 ? coverages[0][1].toLowerCase() : "blind";
-  const illegitimate = verdicts.length === 1 && verdicts[0][1].toLowerCase() === "yes" && findings.length > 0;
+  const illegitimate = escalations.length === 1 && findings.length > 0;
   const text = findings.join("; ").slice(0, 8e3);
-  return { coverage, illegitimate, escalate: escalations.length === 1, findings: text, fingerprint: text.toLowerCase() };
+  return { coverage, illegitimate, findings: text, fingerprint: text.toLowerCase() };
 }
 function routeJudgment(prior, judgment, now, turnStartedAt) {
   if (!judgment.illegitimate) return void 0;
   const unchanged = prior?.fingerprint === judgment.fingerprint;
-  if ((judgment.escalate || unchanged && turnStartedAt !== void 0 && turnStartedAt > prior.sentAt) && (!unchanged || !prior?.escalatedAt || now - prior.escalatedAt >= ESCALATION_HOLD_MS)) return "director";
+  if (unchanged && turnStartedAt !== void 0 && turnStartedAt > prior.sentAt && (!prior?.escalatedAt || now - prior.escalatedAt >= ESCALATION_HOLD_MS)) return "director";
   if (unchanged && prior?.escalatedAt && now - prior.escalatedAt < ESCALATION_HOLD_MS) return void 0;
   return !unchanged || !prior || now - prior.sentAt >= BACKOFF_MS ? "orchestrator" : void 0;
 }
@@ -52,7 +51,7 @@ async function githubEvidence(remote) {
   const { stdout } = await exec("gh", ["pr", "list", "--repo", repo, "--state", "open", "--json", "number,title,state,mergeStateStatus,reviewDecision,headRefOid,statusCheckRollup", "--limit", String(SNAPSHOT_LIMIT)], { timeout: 1e4 });
   return JSON.parse(stdout);
 }
-var prompt = (projectId) => `Judge whether the project orchestrator's current idleness is illegitimate: compare its stated intentions with outcomes and identify undone stated work or work parked without cause. Call ${TOOL} exactly once; do not infer liveness from silence and do not mutate or message anything. Output exactly one anchored line ILLEGITIMATE: yes|no, exactly one anchored line COVERAGE: known|partial|blind, one or more anchored FINDING: lines when yes, and optionally the anchored line ESCALATE: yes when the director should receive this finding. Project: ${projectId}.`;
+var prompt = (projectId) => `Judge whether the project orchestrator's current idleness is illegitimate: compare its stated intentions with outcomes and identify undone stated work or work parked without cause. Call ${TOOL} exactly once; do not infer liveness from silence and do not mutate or message anything. Output exactly one anchored line COVERAGE: known|partial|blind. If and only if idleness is illegitimate, add one or more anchored FINDING: lines and the optional anchored affirmative line ESCALATE: yes. Project: ${projectId}.`;
 function companionWatcher(bb) {
   const snapshots = /* @__PURE__ */ new Map();
   const companions = /* @__PURE__ */ new Map();

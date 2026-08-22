@@ -16,14 +16,14 @@ function db(active = 0) {
 }
 afterEach(() => { while (dbs.length) dbs.pop()!.close(); });
 
-const affirmative = parseJudgment("ILLEGITIMATE: yes\nCOVERAGE: known\nFINDING: promised follow-up was not done");
+const affirmative = parseJudgment("COVERAGE: known\nFINDING: promised follow-up was not done\nESCALATE: yes");
 
 describe("semantic idle guard", () => {
   it("parses only anchored judgments and degrades malformed coverage to blind", () => {
-    expect(affirmative).toMatchObject({ illegitimate: true, coverage: "known", escalate: false });
-    expect(parseJudgment("prefix COVERAGE: known\nILLEGITIMATE: yes\nFINDING: parked")).toMatchObject({ illegitimate: true, coverage: "blind" });
-    expect(parseJudgment("ILLEGITIMATE: yes\nCOVERAGE: partial")).toMatchObject({ illegitimate: false, coverage: "partial" });
-    expect(parseJudgment("ILLEGITIMATE: no\nCOVERAGE: known\nESCALATE: yes")).toMatchObject({ illegitimate: false, escalate: true });
+    expect(affirmative).toMatchObject({ illegitimate: true, coverage: "known" });
+    expect(parseJudgment("prefix COVERAGE: known\nFINDING: parked\nESCALATE: yes")).toMatchObject({ illegitimate: true, coverage: "blind" });
+    expect(parseJudgment("COVERAGE: partial\nFINDING: parked")).toMatchObject({ illegitimate: false, coverage: "partial" });
+    expect(parseJudgment("COVERAGE: known\nESCALATE: yes")).toMatchObject({ illegitimate: false });
   });
 
   it("silences active workers using the existing non-terminal predicate", () => {
