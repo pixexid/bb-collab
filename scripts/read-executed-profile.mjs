@@ -79,12 +79,13 @@ function completedTurns(events) {
   return events.flatMap((event) => {
     const checkpointId = event?.data?.providerCheckpointId;
     const providerThreadId = event?.data?.providerThreadId;
-    if (event?.type !== "turn/completed" || event.data?.status !== "completed") return [];
+    if (event?.type !== "turn/completed" || typeof event.data?.status !== "string" || event.data.status === "") return [];
     return [{
       eventId: event.id,
       eventSeq: event.seq,
       checkpointId: typeof checkpointId === "string" && checkpointId !== "" ? checkpointId : null,
       providerThreadId: typeof providerThreadId === "string" && providerThreadId !== "" ? providerThreadId : null,
+      scopeTurnId: typeof event.scope?.turnId === "string" && event.scope.turnId !== "" ? event.scope.turnId : null,
     }];
   });
 }
@@ -108,9 +109,13 @@ function activeTurn(thread, events) {
   if (typeof start.scope?.turnId !== "string" || start.scope.turnId === "") return { reason: "BB active turn identity is unavailable" };
   const completedAfterStart = events.some((event) => event?.type === "turn/completed" && event.seq > start.seq && event.data?.providerThreadId === start.data.providerThreadId);
   if (completedAfterStart) return { reason: "BB thread is active but its latest provider turn is already terminal" };
+  const requested = new Map(events
+    .filter((event) => event?.type === "client/turn/requested" && typeof event.data?.requestId === "string")
+    .map((event) => [event.data.requestId, event]));
   const accepted = events.filter((event) => event?.type === "turn/input/accepted"
     && event.data?.providerThreadId === start.data.providerThreadId
-    && event.scope?.turnId === start.scope?.turnId);
+    && event.scope?.turnId === start.scope?.turnId
+    && requested.get(event.data?.clientRequestId)?.seq <= start.seq);
   if (accepted.length !== 1 || typeof accepted[0].data?.clientRequestId !== "string" || accepted[0].data.clientRequestId === "") {
     return { reason: "BB active turn input correlation is missing or ambiguous" };
   }
@@ -127,6 +132,11 @@ function activeTurn(thread, events) {
       phase: "active",
     },
   };
+}
+
+function codexTurnIdFromScope(turn) {
+  if (!turn.scopeTurnId || !turn.providerThreadId) return null;
+  return turn.scopeTurnId.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu)?.[0] ?? null;
 }
 
 function recordAtOrAfter(record, timestampMs) {
@@ -181,6 +191,7 @@ export async function readExecutedProfiles({ thread, environment, events, home =
   };
 
   if (thread.providerId === "codex") {
+    const codexTurns = turns.map((turn) => turn.checkpointId ? turn : { ...turn, checkpointId: codexTurnIdFromScope(turn) });
     try {
       const root = join(home, ".codex", "sessions");
       const directories = codexSessionDirectories(home, providerThreadId);
@@ -189,9 +200,10 @@ export async function readExecutedProfiles({ thread, environment, events, home =
         files = filesNamed(root, directory, (name) => name.endsWith(`-${providerThreadId}.jsonl`));
         if (files.length > 0) break;
       }
-      if (files.length !== 1) return { ...settle(turns, profiles, "codex turn_context"), reason: `${active ? "active BB turn: " : ""}expected one Codex session log, found ${files.length}` };
+      if (files.length !== 1) return { ...settle(codexTurns, profiles, "codex turn_context"), reason: `${active ? "active BB turn: " : ""}expected one Codex session log, found ${files.length}` };
       const activeProfiles = [];
-      let activeSessionMatches = !active;
+      const requiresSessionMatch = active || turns.some((turn) => !turn.checkpointId && codexTurnIdFromScope(turn));
+      let activeSessionMatches = !requiresSessionMatch;
       await readJsonLines(files[0], (record) => {
         if (record?.type === "session_meta" && record.payload?.id === providerThreadId && record.payload?.originator === "bb" && record.payload?.cwd === environment?.path) activeSessionMatches = true;
         if (record?.type === "turn_context") {
@@ -199,12 +211,15 @@ export async function readExecutedProfiles({ thread, environment, events, home =
           if (active && typeof record.payload?.turn_id === "string" && recordAtOrAfter(record, active.requestedAtMs) && active.scopeTurnId.endsWith(`-${record.payload.turn_id}`)) activeProfiles.push(record.payload);
         }
       });
-      if (!activeSessionMatches) return { ...settle(turns, profiles, "codex turn_context"), reason: "active BB turn: Codex session_meta does not match the BB session and exact environment path" };
+      if (!activeSessionMatches) {
+        profiles.clear();
+        return { ...settle(codexTurns, profiles, "codex turn_context"), reason: `${active ? "active BB turn: " : ""}Codex session_meta does not match the BB session and exact environment path` };
+      }
       for (const profile of activeProfiles) add(ACTIVE_PROFILE, profile.model, profile.effort);
-      return settle(turns, profiles, "codex turn_context", { absentReason: active ? "active Codex turn_context at or after the BB turn request is absent" : undefined });
+      return settle(codexTurns, profiles, "codex turn_context", { absentReason: active ? "active Codex turn_context at or after the BB turn request is absent" : undefined });
     } catch {
       profiles.clear();
-      return { ...settle(turns, profiles, "codex turn_context"), reason: `${active ? "active BB turn: " : ""}Codex session log is unreadable` };
+      return { ...settle(codexTurns, profiles, "codex turn_context"), reason: `${active ? "active BB turn: " : ""}Codex session log is unreadable` };
     }
   }
 

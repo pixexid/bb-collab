@@ -11,12 +11,28 @@ const completion = (providerThreadId, checkpointId) => ({
   data: { status: "completed", providerThreadId, providerCheckpointId: checkpointId },
 });
 
+const interrupted = (providerThreadId, scopeTurnId) => ({
+  id: "event-interrupted",
+  seq: 20,
+  scope: { kind: "turn", turnId: scopeTurnId },
+  type: "turn/completed",
+  data: { status: "interrupted", providerThreadId, providerCheckpointId: null },
+});
+
 function activeEvents(providerThreadId, nativeTurnId = "active-turn") {
   const scope = { kind: "turn", turnId: `bb-turn-${nativeTurnId}` };
   return [
     { id: "event-requested", seq: 10, type: "client/turn/requested", data: { requestId: "request-active" }, createdAt: Date.parse("2026-08-20T00:00:10.000Z") },
     { id: "event-active", seq: 11, type: "turn/started", data: { providerThreadId }, scope, createdAt: Date.parse("2026-08-20T00:00:11.000Z") },
     { id: "event-accepted", seq: 12, type: "turn/input/accepted", data: { providerThreadId, clientRequestId: "request-active" }, scope, createdAt: Date.parse("2026-08-20T00:00:11.000Z") },
+  ];
+}
+
+function stoppedEvents(providerThreadId, nativeTurnId) {
+  const scopeTurnId = `bb-turn-${nativeTurnId}`;
+  return [
+    { id: "event-started", seq: 10, type: "turn/started", data: { providerThreadId }, scope: { kind: "turn", turnId: scopeTurnId } },
+    interrupted(providerThreadId, scopeTurnId),
   ];
 }
 
@@ -62,6 +78,79 @@ describe("executed profile read-back", () => {
         executedProfile: { providerId: "codex", model: "gpt-5.6-sol", reasoningLevel: "medium", kind: "executed-provider-native" },
       }],
     });
+  });
+
+  it("DISCRIMINATOR: ignores a queued input and resolves a stopped Codex turn from its BB scope", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    const nativeTurnId = "123e4567-e89b-42d3-a456-426614174000";
+    const events = [
+      ...activeEvents(providerThreadId, nativeTurnId),
+      { id: "event-queued-request", seq: 20, type: "client/turn/requested", data: { requestId: "request-queued" } },
+      { id: "event-queued-accepted", seq: 21, type: "turn/input/accepted", data: { providerThreadId, clientRequestId: "request-queued" }, scope: { kind: "turn", turnId: `bb-turn-${nativeTurnId}` } },
+    ];
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/test/project" } },
+      { type: "turn_context", timestamp: "2026-08-20T00:00:10.500Z", payload: { turn_id: nativeTurnId, model: "gpt-stopped", effort: "medium" } },
+    ]);
+    const active = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "active" },
+      environment: { path: "/test/project" },
+      events,
+      home,
+    });
+    expect(active).toMatchObject({ outcome: "known", coverage: { activeTurns: 1, knownTurns: 1 } });
+
+    const stopped = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "idle" },
+      environment: { path: "/test/project" },
+      events: stoppedEvents(providerThreadId, nativeTurnId),
+      home,
+    });
+    expect(stopped).toMatchObject({
+      outcome: "known",
+      coverage: { completedTurns: 1, knownTurns: 1, unknownTurns: 0 },
+      turns: [{ status: "known", executedProfile: { model: "gpt-stopped", reasoningLevel: "medium" } }],
+    });
+  });
+
+  it("GUARD: stopped Codex scope correlation requires the exact native session", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    const nativeTurnId = "123e4567-e89b-42d3-a456-426614174000";
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/other/project" } },
+      { type: "turn_context", payload: { turn_id: nativeTurnId, model: "DO_NOT_EMIT", effort: "medium" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "idle" },
+      environment: { path: "/test/project" },
+      events: stoppedEvents(providerThreadId, nativeTurnId),
+      home,
+    });
+    expect(result).toMatchObject({ outcome: "unknown", reason: "Codex session_meta does not match the BB session and exact environment path" });
+    expect(JSON.stringify(result)).not.toMatch(/DO_NOT_EMIT|other\/project|executedProfile/u);
+  });
+
+  it("GUARD: stopped Codex scope correlation never substitutes requested or default profile fields", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    const nativeTurnId = "123e4567-e89b-42d3-a456-426614174000";
+    const result = await readExecutedProfiles({
+      thread: {
+        providerId: "codex",
+        status: "idle",
+        requestedModel: "REQUESTED_MODEL_DO_NOT_EMIT",
+        requestedReasoningLevel: "REQUESTED_REASONING_DO_NOT_EMIT",
+        model: "DEFAULT_MODEL_DO_NOT_EMIT",
+        reasoningLevel: "DEFAULT_REASONING_DO_NOT_EMIT",
+      },
+      environment: { path: "/test/project" },
+      events: stoppedEvents(providerThreadId, nativeTurnId),
+      home,
+    });
+    expect(result).toMatchObject({ outcome: "unknown", coverage: { completedTurns: 1, knownTurns: 0 } });
+    expect(JSON.stringify(result)).not.toMatch(/REQUESTED_|DEFAULT_|executedProfile/u);
   });
 
   it("DISCRIMINATOR: finds a Codex rollout in the adjacent writer-date directory", async () => {
