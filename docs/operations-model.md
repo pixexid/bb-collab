@@ -4,6 +4,14 @@ This is the canonical role and review matrix. It describes operating choices, no
 
 Governance scope is deliberate: canonical config defines role-generation seat profiles; this matrix defines lane routing, enforced by the dispatch-time naming and executed-profile attestation protocol below.
 
+Tenant topology is per-project: each governed project has its own director and
+project-orchestrator seat, while worker and independent-reviewer seats bind to
+that project's exact repository targets. A native director thread cannot hold
+multiple tenant governorships because current role context requires an exact
+thread/environment/project match. Bootstrap derivation therefore transfers no
+seat; it only creates the target tenant's first plugin actor from a current
+source governor claim and adopted Decision.
+
 ## Role matrix
 
 | Role or lane | Harness/provider | Model | Reasoning |

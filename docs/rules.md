@@ -108,6 +108,23 @@ Inside the stated subject means inside what the ruling actually addressed, not a
 
 The check is per-change: name the deployed revision, establish containment and supervision — equality with `main` is not the test. "Merged, not deployed" is a complete and honest terminal status. Deploys run under the standing policy: orchestrator-run under standing authorization, zero-lane lull, store snapshot before, store-verified after, deployed SHA recorded in the handoff. Path plugins update via checkout-advance plus `bb plugin reload <id>`; `bb plugin update` refuses pinned sources.
 
+The deploy policy splits by surface. Canonical/store/fleet-state plugins retain
+the zero-lane lull, pre-deploy snapshot, and post-deploy store verification.
+For view-only threads, lanes, and inbox plugins, visibility is evaluated first:
+Tier-A gates are the merge gate, then deploy immediately with the pre-deploy
+snapshot, exact checkout advance, reload of only that plugin ID, verification
+of live asset-route bytes, and a recorded deployed SHA plus snapshot. The
+operator evaluates the live interactive surface; feedback becomes a fix-forward
+issue.
+
+## Directional UI/UX changes require an operator checkpoint
+
+> A pre-merge visual checkpoint is required only when the operator explicitly asks for it or the change is a directional redesign. Then show synthetic screenshots or a live demo, give a one-line summary, and ask explicitly for `APPROVE` or `ADJUST`. Operator silence holds the merge; it is not approval.
+
+The canonical evidence is attached to the PR or its governed handoff. A
+view-only plugin that is not an explicit-request or directional-redesign case
+uses the live deployment path above rather than a pre-merge screenshot gate.
+
 ## An escalation's premises are checkable claims
 
 > Verify the MATERIAL premises before executing — the ones that, if false, change what the act does. Each needs an identified authoritative check; a material premise you cannot resolve goes back up, named unresolved, instead of being assumed.

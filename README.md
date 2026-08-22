@@ -313,6 +313,7 @@ conformance, governorship and resolver seams exist.
 | [Sidebar navigation limitation](docs/sidebar-plugin-nav-collapse.md) | Current host-support boundary. |
 | [Sidebar provider logos](docs/sidebar-provider-logos.md) | Provider-branding implementation boundary. |
 | [Canonical WorkItem registration](docs/workitem-registration.md) | Authorized registration procedure. |
+| [Project registration and bootstrap](docs/project-bootstrap.md) | Strict second-tenant bootstrap seam and seat-topology evidence. |
 | [Role succession runbook](docs/succession-runbook.md) | Current project-agnostic succession method. |
 | [Thread archive sweep](docs/thread-archive-sweep.md) | Current fail-closed archive capability. |
 | [Archived documentation](docs/incidents/README.md) | Issue-linked historical records. |

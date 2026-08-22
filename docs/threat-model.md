@@ -21,6 +21,7 @@ worker.
 | BB core | Native project, source, host, environment, thread, provider and event facts | bb-collab records exact references and receipts; it does not replace BB core authority. |
 | bb-collab plugin database | Project configuration, repository targets, governorship, roles, WorkItems, assignments, decisions, qualifications, evidence, migration, current projections and operator-inbox messages | One transactional store; unavailable or corrupt means governed writes and inbox delivery stop. Inbox text is communication, never decision authority. |
 | Governorship fence | Current runtime, epoch, token and mutation sequence | Every sanctioned source, target, import and projection mutation presents the same expected epoch/token. |
+| Cross-project bootstrap authority | Source governor claim, exact adopted Decision, target genesis receipt, and operational actor receipt | A source must be `target_active` at the exact fence/epoch and bound to a verified bb-collab plugin actor; an exact `operator_only` project-scoped Decision names the cross-project source/target scope; one audited genesis receipt is atomically consumed for one named target and cannot authorize later mutations; a distinct audited operational actor receipt owns the target governorship. |
 | Project repository and worktrees | Versioned project extensions, candidate code and human documentation | Exact target, branch, base and candidate identity are required; a checkout never proves authority. A native ready managed worktree may use a derived path, but its exact project/host/source binding and both source and environment paths are retained. |
 | GitHub, BB Tasks and Markdown | External projections or evidence | They may not activate work, satisfy a gate or close a WorkItem independently. |
 | Operator/admin/raw BB activity | Unmanaged activity on a full-trust host | It may be detected as evidence or discrepancy, but it acquires no canonical authority by observation. |
@@ -101,6 +102,30 @@ writes. This seam is fixture-tested and does not claim live cutover.
 The plugin database is the sole canonical governance/work store. A second task
 ledger, role store, decision store, migration registry, daemon or mutable
 Markdown authority would recreate the split-state threat.
+
+Cross-project bootstrap is intentionally narrow. The current root of trust is
+host-local operator control represented by the verified bb-collab plugin actor
+and an exact adopted `operator_only` Decision whose immutable project-scoped
+scope names `cross_project_bootstrap`, the source project, target project, and
+`repoTargetId: null`; its options must name `host_local_operator`. The resolver
+derives separate target genesis and operational plugin actors and writes
+`bootstrap_derivation_receipts` in the same transaction as the target config,
+repository targets, governorship, state event, and mutation receipt. The
+genesis receipt is single-use and `requireActor` rejects it for governor,
+config, Decision, qualification, succession, and every other later mutation;
+only the distinct operational receipt owns the target governorship. Stale
+source fences/epochs, frozen or missing source governorship, non-plugin or
+invalid source actors, unrelated classes, wrong source/target/scope/options,
+unadopted Decisions, reused/retargeted genesis receipts, and existing target
+state fail closed.
+Host-issued operator receipts from get-bb/bb#1541 are the preferred future root
+and require a new authority ruling before this derivation path changes.
+The v29 migration has an explicit predecessor rule for v28 rows with a
+genesis-backed epoch-1 governorship: the legacy receipt may continue ordinary
+mutations only while it remains the current target governor, but the shared
+genesis detector still refuses it as a source governor. The generic `apply`
+boundary enforces the same exact `registerProject` projection and rejects
+target Decisions or other excluded fields before any bootstrap write.
 
 ## Assets and security goals
 
