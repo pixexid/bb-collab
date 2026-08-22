@@ -1,122 +1,53 @@
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { coverageReason, dispatchPlan, evaluate, isMergeReady, openStore, parsePullRequests, readOrchestrator, reserveSnapshot, retryStartup, shouldEscalate } from "../server.js";
+import { hasActiveWorkers, parseJudgment, readRoleThread, routeJudgment } from "../server.js";
 
 const dbs: Database.Database[] = [];
-function db(active = 0, ceiling = 3) {
+function db(active = 0) {
   const value = new Database(":memory:"); dbs.push(value);
   value.exec(`CREATE TABLE role_generation_heads (project_id TEXT, role_id TEXT, current_generation INTEGER);
     CREATE TABLE role_generations (project_id TEXT, role_id TEXT, generation INTEGER, holder_execution_attempt_id TEXT);
-    CREATE TABLE execution_attempts (project_id TEXT, execution_attempt_id TEXT, thread_id TEXT, origin TEXT, state TEXT);
-    CREATE TABLE project_config_heads (project_id TEXT, config_revision INTEGER);
-    CREATE TABLE project_config_revisions (project_id TEXT, config_revision INTEGER, canonical_config_json TEXT);`);
+    CREATE TABLE execution_attempts (project_id TEXT, execution_attempt_id TEXT, thread_id TEXT, origin TEXT, state TEXT);`);
   value.prepare("INSERT INTO role_generation_heads VALUES ('p','project-orchestrator',1)").run();
   value.prepare("INSERT INTO role_generations VALUES ('p','project-orchestrator',1,'o')").run();
   value.prepare("INSERT INTO execution_attempts VALUES ('p','o','orch','role_holder','done')").run();
-  value.prepare("INSERT INTO project_config_heads VALUES ('p',1)").run();
-  value.prepare("INSERT INTO project_config_revisions VALUES ('p',1,?)").run(JSON.stringify({ extensions: { bbCollab: { writingLaneCeiling: ceiling } } }));
   for (let i = 0; i < active; i++) value.prepare("INSERT INTO execution_attempts VALUES ('p',?,?,'work_item','running')").run(`a${i}`, `lane${i}`);
   return value;
 }
 afterEach(() => { while (dbs.length) dbs.pop()!.close(); });
 
-describe("mechanical conditions", () => {
-  it("wakes with each condition's contents", () => {
-    const findings = evaluate(db(), "p", [{ id: "m1", content: [{ type: "text", text: "ping\nmore" }] }], [{ number: 493, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }]);
-    expect(findings.map((f) => f.condition)).toEqual(["queue", "pr"]);
-    expect(findings.map((f) => f.text).join("; ")).toContain('"ping"');
-    expect(findings.map((f) => f.text).join("; ")).toContain("PR #493 merge-ready and unmerged");
+const affirmative = parseJudgment("ILLEGITIMATE: yes\nCOVERAGE: known\nFINDING: promised follow-up was not done");
+
+describe("semantic idle guard", () => {
+  it("parses only anchored judgments and degrades malformed coverage to blind", () => {
+    expect(affirmative).toMatchObject({ illegitimate: true, coverage: "known", escalate: false });
+    expect(parseJudgment("prefix COVERAGE: known\nILLEGITIMATE: yes\nFINDING: parked")).toMatchObject({ illegitimate: true, coverage: "blind" });
+    expect(parseJudgment("ILLEGITIMATE: yes\nCOVERAGE: partial")).toMatchObject({ illegitimate: false, coverage: "partial" });
+    expect(parseJudgment("ILLEGITIMATE: no\nCOVERAGE: known\nESCALATE: yes")).toMatchObject({ illegitimate: false, escalate: true });
   });
-  it("stays silent for legitimate operator waiting", () => {
-    expect(evaluate(db(), "p", [], [])).toEqual([]);
+
+  it("silences active workers using the existing non-terminal predicate", () => {
+    expect(hasActiveWorkers(db(1), "p")).toBe(true);
+    expect(hasActiveWorkers(db(), "p")).toBe(false);
   });
-  it("stays silent when all work is blocked", () => {
-    expect(evaluate(db(), "p", [], [])).toEqual([]);
-  });
-  it("stays silent when lanes are active, while reaching the evaluation", () => {
-    expect(evaluate(db(1), "p", [{ id: "m1" }], [{ number: 493, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }])).toEqual([]);
-  });
-  it("does not wake for parked queues or non-green PRs", () => {
-    expect(evaluate(db(), "p", [], [{ number: 493, state: "OPEN", mergeStateStatus: "DIRTY", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] }])).toEqual([]);
-  });
-  it("requires clean merge readiness, approval, and successful checks", () => {
-    expect(isMergeReady({ number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"] })).toBe(true);
-    for (const pr of [
-      { mergeStateStatus: "DIRTY" },
-      { reviewDecision: "REVIEW_REQUIRED" },
-      { checks: ["SUCCESS", "FAILURE"] },
-    ]) expect(isMergeReady({ number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["head"], checks: ["SUCCESS"], ...pr })).toBe(false);
-  });
-  it("changes the PR suppression fingerprint when the approved head changes", () => {
-    const first = { condition: "pr" as const, text: "ready", key: JSON.stringify([[493, "head-a", ["head-a"], ["SUCCESS"]]]) };
-    const second = { ...first, key: JSON.stringify([[493, "head-b", ["head-b"], ["SUCCESS"]]]) };
-    const snapshots = new Map([["p:pr", { sentAt: 100, fingerprint: first.key, turns: 1 }]]);
-    expect(dispatchPlan([second], snapshots, "p", 200, 101)).toEqual({ send: [second], escalations: [] });
-  });
-  it("requires an approval for the current head", () => {
-    const pr = { number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headCommitOid: "head", approvedCommitOids: ["old"], checks: ["SUCCESS"] };
-    expect(isMergeReady(pr)).toBe(false);
-    expect(isMergeReady({ ...pr, approvedCommitOids: ["head"] })).toBe(true);
-  });
-  it("rejects incomplete GitHub payloads instead of treating them as not owed", () => {
-    const invalid: unknown[] = [];
-    const valid = { number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headRefOid: "head", reviews: [], statusCheckRollup: [] };
-    expect(parsePullRequests([valid, { number: 2, state: "OPEN" }], (error) => invalid.push(error))).toEqual([expect.objectContaining({ number: 1 })]);
-    expect(invalid).toHaveLength(1);
-    expect(String(invalid[0])).toContain("missing-pr-1-mergeStateStatus");
-  });
-  it("accepts CheckRun conclusions and StatusContext states without suppressing other PRs", () => {
-    const invalid: unknown[] = [];
-    const prs = parsePullRequests([
-      { number: 1, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headRefOid: "head", reviews: [], statusCheckRollup: [{ state: "SUCCESS" }] },
-      { number: 2, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headRefOid: "head", reviews: [], statusCheckRollup: [{ conclusion: "SUCCESS" }] },
-      { number: 3, state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headRefOid: "head", reviews: [], statusCheckRollup: [{ name: "unknown" }] },
-    ], (error) => invalid.push(error));
-    expect(prs).toHaveLength(2);
-    expect(prs.every((pr) => pr.checks?.[0] === "SUCCESS")).toBe(true);
-    expect(invalid).toHaveLength(1);
-  });
-  it("opens unavailable stores defensively and rereads the current orchestrator head", () => {
-    const errors: unknown[] = [];
-    expect(openStore("/missing/bb-collab.db", (error) => errors.push(error))).toBeUndefined();
-    expect(errors).toHaveLength(1);
+
+  it("rereads the canonical orchestrator head", () => {
     const store = db();
-    expect(readOrchestrator(store, "p")).toBe("orch");
+    expect(readRoleThread(store, "p", "project-orchestrator")).toBe("orch");
     store.prepare("UPDATE execution_attempts SET thread_id='successor' WHERE execution_attempt_id='o'").run();
-    expect(readOrchestrator(store, "p")).toBe("successor");
+    expect(readRoleThread(store, "p", "project-orchestrator")).toBe("successor");
   });
-  it("labels store, GitHub, SDK, and wake failures by the caught cause", () => {
-    expect(coverageReason("store", "read failed")).toContain("canonical-store-unavailable");
-    expect(coverageReason("github", "timeout")).toContain("github-unavailable");
-    expect(coverageReason("sdk", "request failed")).toContain("sdk-unavailable");
-    expect(coverageReason("wake", "send failed")).toContain("wake-delivery-failed");
+
+  it("backs off unchanged findings, then routes a post-turn repeat to the director", () => {
+    const prior = { sentAt: 100, fingerprint: affirmative.fingerprint };
+    expect(routeJudgment(prior, affirmative, 200, undefined)).toBeUndefined();
+    expect(routeJudgment(prior, affirmative, 600_100, undefined)).toBe("orchestrator");
+    expect(routeJudgment(prior, affirmative, 200, 101)).toBe("director");
   });
-  it("requires evidence of a completed turn before escalating", () => {
-    const prior = { sentAt: 100, fingerprint: "same", turns: 1 };
-    expect(shouldEscalate(prior, undefined, "same")).toBe(false);
-    expect(shouldEscalate(prior, 100, "same")).toBe(false);
-    expect(shouldEscalate(prior, 101, "same")).toBe(true);
-  });
-  it("rolls back an undelivered reservation but commits a delivered one", () => {
-    const snapshots = new Map([['p:queue', { sentAt: 100, fingerprint: "old", turns: 1 }]]);
-    const reservation = reserveSnapshot(snapshots, "p:queue", { sentAt: 200, fingerprint: "new", turns: 2 });
-    reservation.rollback();
-    expect(snapshots.get("p:queue")?.fingerprint).toBe("old");
-    const committed = reserveSnapshot(snapshots, "p:queue", { sentAt: 300, fingerprint: "new", turns: 2 });
-    committed.commit();
-    committed.rollback();
-    expect(snapshots.get("p:queue")?.fingerprint).toBe("new");
-  });
-  it("retries startup reconciliation and returns the final failure", async () => {
-    let calls = 0;
-    expect(await retryStartup(async () => { calls++; if (calls < 2) throw new Error("transient"); }, 3)).toBeUndefined();
-    expect(calls).toBe(2);
-    expect(String(await retryStartup(async () => { throw new Error("permanent"); }, 2))).toContain("permanent");
-  });
-  it("makes the backoff cap terminal instead of sending and escalating together", () => {
-    const finding = { condition: "queue" as const, text: "owed", key: "same" };
-    const plan = dispatchPlan([finding], new Map([["p:queue", { sentAt: 100, fingerprint: "same", turns: 1 }]]), "p", 600_100, 101);
-    expect(plan.send).toEqual([]);
-    expect(plan.escalations).toEqual([finding]);
+
+  it("holds repeated director escalations for 24 hours", () => {
+    const prior = { sentAt: 100, fingerprint: affirmative.fingerprint, escalatedAt: 150 };
+    expect(routeJudgment(prior, affirmative, 23 * 60 * 60_000, 200)).toBeUndefined();
+    expect(routeJudgment(prior, affirmative, 25 * 60 * 60_000, 200)).toBe("director");
   });
 });

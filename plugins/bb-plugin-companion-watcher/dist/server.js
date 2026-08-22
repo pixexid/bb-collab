@@ -10,272 +10,177 @@ import Database from "better-sqlite3";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 var exec = promisify(execFile);
-var BACKOFF_MS = 10 * 6e4;
 var ACTIVE = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
-var STARTUP_RETRY_ATTEMPTS = 3;
-function isMergeReady(pr) {
-  return pr.state === "OPEN" && pr.mergeStateStatus === "CLEAN" && pr.reviewDecision === "APPROVED" && !!pr.headCommitOid && pr.approvedCommitOids?.includes(pr.headCommitOid) === true && !!pr.checks?.length && pr.checks.every((check) => check === "SUCCESS");
+var BACKOFF_MS = 10 * 6e4;
+var ESCALATION_HOLD_MS = 24 * 60 * 6e4;
+var SNAPSHOT_LIMIT = 100;
+var TOOL = "companion_read_snapshot";
+var TITLE = "Alzheimer companion judgment";
+function parseJudgment(output) {
+  const coverages = [...output.matchAll(/^COVERAGE:\s*(known|partial|blind)\s*$/gimu)];
+  const verdicts = [...output.matchAll(/^ILLEGITIMATE:\s*(yes|no)\s*$/gimu)];
+  const escalations = [...output.matchAll(/^ESCALATE:\s*yes\s*$/gimu)];
+  const findings = [...output.matchAll(/^FINDING:\s*(.+)\s*$/gimu)].map((match) => match[1].trim());
+  const coverage = coverages.length === 1 ? coverages[0][1].toLowerCase() : "blind";
+  const illegitimate = verdicts.length === 1 && verdicts[0][1].toLowerCase() === "yes" && findings.length > 0;
+  const text = findings.join("; ").slice(0, 8e3);
+  return { coverage, illegitimate, escalate: escalations.length === 1, findings: text, fingerprint: text.toLowerCase() };
 }
-function missing(path) {
-  return new Error(`github-payload-invalid:missing-${path}`);
+function routeJudgment(prior, judgment, now, turnStartedAt) {
+  if (!judgment.illegitimate) return void 0;
+  const unchanged = prior?.fingerprint === judgment.fingerprint;
+  if ((judgment.escalate || unchanged && turnStartedAt !== void 0 && turnStartedAt > prior.sentAt) && (!unchanged || !prior?.escalatedAt || now - prior.escalatedAt >= ESCALATION_HOLD_MS)) return "director";
+  if (unchanged && prior?.escalatedAt && now - prior.escalatedAt < ESCALATION_HOLD_MS) return void 0;
+  return !unchanged || !prior || now - prior.sentAt >= BACKOFF_MS ? "orchestrator" : void 0;
 }
-function parsePullRequests(value, onInvalid = () => {
-}) {
-  if (!Array.isArray(value)) throw new Error("github-payload-invalid:pull-requests-not-array");
-  return value.flatMap((item, index) => {
-    try {
-      if (!item || typeof item !== "object") throw new Error(`github-payload-invalid:pr-${index}-not-object`);
-      const pr = item;
-      for (const field of ["number", "state", "mergeStateStatus", "reviewDecision", "headRefOid", "reviews", "statusCheckRollup"]) {
-        if (!(field in pr)) throw missing(`pr-${index}-${field}`);
-      }
-      if (typeof pr.number !== "number" || typeof pr.state !== "string" || pr.mergeStateStatus !== null && typeof pr.mergeStateStatus !== "string" || pr.reviewDecision !== null && typeof pr.reviewDecision !== "string" || typeof pr.headRefOid !== "string" || !Array.isArray(pr.reviews) || !Array.isArray(pr.statusCheckRollup)) throw new Error(`github-payload-invalid:pr-${index}-field-type`);
-      const approvedCommitOids = pr.reviews.map((review, reviewIndex) => {
-        if (!review || typeof review !== "object" || typeof review.state !== "string") throw new Error(`github-payload-invalid:pr-${index}-review-${reviewIndex}`);
-        if (review.state !== "APPROVED") return null;
-        const oid = review.commit?.oid;
-        if (typeof oid !== "string") throw missing(`pr-${index}-approved-review-${reviewIndex}-commit`);
-        return oid;
-      }).filter((oid) => oid !== null);
-      const checks = pr.statusCheckRollup.map((check, checkIndex) => {
-        if (!check || typeof check !== "object") throw new Error(`github-payload-invalid:pr-${index}-check-${checkIndex}`);
-        if ("conclusion" in check) {
-          const conclusion = check.conclusion;
-          if (conclusion !== null && typeof conclusion !== "string") throw new Error(`github-payload-invalid:pr-${index}-check-${checkIndex}`);
-          return conclusion ?? "";
-        }
-        if ("state" in check && typeof check.state === "string") return check.state;
-        throw new Error(`github-payload-invalid:pr-${index}-check-${checkIndex}`);
-      });
-      return [{ number: pr.number, state: pr.state, mergeStateStatus: pr.mergeStateStatus ?? void 0, reviewDecision: pr.reviewDecision ?? void 0, headCommitOid: pr.headRefOid, approvedCommitOids, checks }];
-    } catch (error) {
-      onInvalid(error);
-      return [];
-    }
-  });
+function openStore(path) {
+  return new Database(path, { readonly: true, fileMustExist: true });
 }
-function shouldEscalate(prior, turnStartedAt, fingerprint) {
-  return !!prior && prior.fingerprint === fingerprint && !prior.escalated && turnStartedAt !== void 0 && turnStartedAt > prior.sentAt;
+function readRoleThread(db, projectId, roleId) {
+  return db.prepare(`SELECT a.thread_id AS thread_id FROM role_generation_heads h JOIN role_generations g ON g.project_id=h.project_id AND g.role_id=h.role_id AND g.generation=h.current_generation JOIN execution_attempts a ON a.project_id=g.project_id AND a.execution_attempt_id=g.holder_execution_attempt_id WHERE h.project_id=? AND h.role_id=?`).get(projectId, roleId)?.thread_id;
 }
-function reserveSnapshot(snapshots, key, next) {
-  const prior = snapshots.get(key);
-  let settled = false;
-  snapshots.set(key, next);
-  return {
-    commit: () => {
-      settled = true;
-    },
-    rollback: () => {
-      if (settled) return;
-      if (prior) snapshots.set(key, prior);
-      else snapshots.delete(key);
-      settled = true;
-    }
-  };
+function hasActiveWorkers(db, projectId) {
+  const row = db.prepare(`SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id=? AND origin='work_item' AND state IN (${ACTIVE.map(() => "?").join(",")})`).get(projectId, ...ACTIVE);
+  return Number(row.count) > 0;
 }
-async function retryStartup(reconcile, attempts) {
-  let lastError;
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    try {
-      await reconcile();
-      return void 0;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  return lastError;
+function rows(db, sql, projectId) {
+  return db.prepare(sql).all(projectId, SNAPSHOT_LIMIT);
 }
-function dispatchPlan(findings, snapshots, projectId, now, turnStartedAt) {
-  const escalations = findings.filter((finding) => shouldEscalate(snapshots.get(`${projectId}:${finding.condition}`), turnStartedAt, finding.key));
-  const escalationKeys = new Set(escalations.map((finding) => finding.condition));
-  const send = findings.filter((finding) => {
-    const prior = snapshots.get(`${projectId}:${finding.condition}`);
-    return !escalationKeys.has(finding.condition) && (!prior || prior.fingerprint !== finding.key || !prior.escalated && now - prior.sentAt >= BACKOFF_MS);
-  });
-  return { send, escalations };
-}
-function openStore(path, onUnavailable) {
-  try {
-    return new Database(path, { readonly: true, fileMustExist: true });
-  } catch (error) {
-    onUnavailable(error);
-    return void 0;
-  }
-}
-function readOrchestrator(db, projectId) {
-  return db.prepare(`SELECT a.thread_id AS thread_id FROM role_generation_heads h JOIN role_generations g ON g.project_id=h.project_id AND g.role_id=h.role_id AND g.generation=h.current_generation JOIN execution_attempts a ON a.project_id=g.project_id AND a.execution_attempt_id=g.holder_execution_attempt_id WHERE h.project_id=? AND h.role_id='project-orchestrator'`).get(projectId)?.thread_id;
-}
-function coverageReason(kind, error) {
-  return `${kind === "store" ? "canonical-store-unavailable" : kind === "github" ? "github-unavailable" : kind === "wake" ? "wake-delivery-failed" : "sdk-unavailable"}:${String(error)}`;
-}
-function firstLine(content) {
-  const text = typeof content === "string" ? content : Array.isArray(content) ? content.find((part) => part && typeof part === "object" && typeof part.text === "string")?.text : void 0;
-  return typeof text === "string" ? text.split("\n", 1)[0] : "(unreadable)";
-}
-function evaluate(db, projectId, queued, prs) {
-  const holder = db.prepare(`SELECT a.thread_id AS thread_id FROM role_generation_heads h JOIN role_generations g ON g.project_id=h.project_id AND g.role_id=h.role_id AND g.generation=h.current_generation JOIN execution_attempts a ON a.project_id=g.project_id AND a.execution_attempt_id=g.holder_execution_attempt_id WHERE h.project_id=? AND h.role_id='project-orchestrator'`).get(projectId);
-  if (!holder) return [];
-  const lane = db.prepare(`SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id=? AND origin='work_item' AND state IN (${ACTIVE.map(() => "?").join(",")})`).get(projectId, ...ACTIVE);
-  if (Number(lane.count) > 0) return [];
-  const findings = [];
-  if (queued.length) findings.push({ condition: "queue", text: `${queued.length} unconsumed queued message${queued.length === 1 ? "" : "s"}: ${queued.map((m) => `"${firstLine(m.content)}"`).join(", ")}`, key: JSON.stringify(queued.map((m) => [m.id, m.content])) });
-  const green = prs.filter(isMergeReady);
-  if (green.length) findings.push({
-    condition: "pr",
-    text: green.map((pr) => `PR #${pr.number} merge-ready and unmerged`).join("; "),
-    key: JSON.stringify(green.map((pr) => [pr.number, pr.headCommitOid, pr.approvedCommitOids, pr.checks]))
-  });
-  return findings;
-}
-async function json(args) {
-  const { stdout } = await exec("gh", args, { timeout: 1e4 });
+async function githubEvidence(remote) {
+  const repo = remote?.match(/github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?$/u)?.[1];
+  if (!repo) throw new Error("github-repository-unresolved");
+  const { stdout } = await exec("gh", ["pr", "list", "--repo", repo, "--state", "open", "--json", "number,title,state,mergeStateStatus,reviewDecision,headRefOid,statusCheckRollup", "--limit", String(SNAPSHOT_LIMIT)], { timeout: 1e4 });
   return JSON.parse(stdout);
 }
-function repoName(remote) {
-  const match = remote?.match(/github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?$/u);
-  return match?.[1] ?? null;
-}
-async function github(repo, onInvalid) {
-  const prs = await json(["pr", "list", "--repo", repo, "--state", "open", "--json", "number,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup", "--limit", "1000"]);
-  return parsePullRequests(prs, onInvalid);
-}
+var prompt = (projectId) => `Judge whether the project orchestrator's current idleness is illegitimate: compare its stated intentions with outcomes and identify undone stated work or work parked without cause. Call ${TOOL} exactly once; do not infer liveness from silence and do not mutate or message anything. Output exactly one anchored line ILLEGITIMATE: yes|no, exactly one anchored line COVERAGE: known|partial|blind, one or more anchored FINDING: lines when yes, and optionally the anchored line ESCALATE: yes when the director should receive this finding. Project: ${projectId}.`;
 function companionWatcher(bb) {
   const snapshots = /* @__PURE__ */ new Map();
+  const companions = /* @__PURE__ */ new Map();
+  const pending = /* @__PURE__ */ new Map();
   const activeTurns = /* @__PURE__ */ new Map();
   let loaded = false;
   const load = async () => {
     if (loaded) return;
     const saved = await bb.storage.kv.get("backoff");
+    const savedCompanions = await bb.storage.kv.get("companions");
     if (saved) for (const [key, value] of Object.entries(saved)) snapshots.set(key, value);
+    if (savedCompanions) for (const [key, value] of Object.entries(savedCompanions)) companions.set(key, value);
     loaded = true;
+  };
+  bb.agents.registerTool({
+    name: TOOL,
+    description: "Read one bounded canonical snapshot for semantic idle judgment.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    execute: async (_params, context) => {
+      await load();
+      const caller = await bb.sdk.threads.get({ threadId: context.threadId });
+      if (caller.projectId !== context.projectId || caller.title !== TITLE || caller.originPluginId !== bb.pluginId) return { isError: true, content: [{ type: "text", text: "companion-thread-mismatch" }] };
+      let db;
+      try {
+        const config = await bb.sdk.system.config();
+        db = openStore(`${config.dataDir}/plugins/bb-collab/data.db`);
+        const orchestratorId = readRoleThread(db, context.projectId, "project-orchestrator");
+        if (!orchestratorId) throw new Error("orchestrator-head-unresolved");
+        const project = await bb.sdk.projects.get({ projectId: context.projectId });
+        const recentTimeline = await bb.sdk.threads.timeline({ threadId: orchestratorId, segmentLimit: String(SNAPSHOT_LIMIT) });
+        const queued = await bb.sdk.threads.queuedMessages.list({ threadId: orchestratorId });
+        const executionAttempts = rows(db, "SELECT execution_attempt_id, thread_id, assignment_kind, state, lane_id, work_item_id, observed_at_ms FROM execution_attempts WHERE project_id=? ORDER BY observed_at_ms DESC LIMIT ?", context.projectId);
+        const workItems = rows(db, "SELECT work_item_id, title, body, lifecycle_state, updated_at_ms FROM work_items WHERE project_id=? ORDER BY updated_at_ms DESC LIMIT ?", context.projectId);
+        let github;
+        let coverage = queued.length >= SNAPSHOT_LIMIT || executionAttempts.length >= SNAPSHOT_LIMIT || workItems.length >= SNAPSHOT_LIMIT ? "partial" : "known";
+        try {
+          github = await githubEvidence(project.gitRemoteUrl);
+        } catch (error) {
+          coverage = "blind";
+          github = { error: String(error) };
+        }
+        return JSON.stringify({ coverage, orchestratorId, recentTimeline, queued: queued.slice(0, SNAPSHOT_LIMIT), executionAttempts, workItems, github });
+      } catch (error) {
+        return { isError: true, content: [{ type: "text", text: `COVERAGE: blind
+snapshot read failed: ${String(error)}` }] };
+      } finally {
+        db?.close();
+      }
+    }
+  });
+  bb.agents.configure((context) => context.origin.pluginId === bb.pluginId && context.thread.title === TITLE ? { tools: [TOOL], skills: [] } : { tools: [], skills: [] });
+  const judge = async (projectId, orchestratorId, turnStartedAt) => {
+    await load();
+    let threadId = companions.get(projectId);
+    if (threadId) {
+      try {
+        const thread = await bb.sdk.threads.get({ threadId });
+        if (thread.projectId !== projectId || thread.status !== "idle") return;
+      } catch {
+        companions.delete(projectId);
+        threadId = void 0;
+      }
+    }
+    if (!threadId) {
+      const thread = await bb.sdk.threads.spawn({ projectId, environment: { type: "project-default" }, title: TITLE, visibility: "hidden", providerId: "codex", model: "gpt-5.6-luna", reasoningLevel: "medium", permissionMode: "auto", executionInputSources: { providerId: "explicit", model: "explicit", reasoningLevel: "explicit", permissionMode: "explicit" }, prompt: prompt(projectId) });
+      threadId = thread.id;
+      companions.set(projectId, threadId);
+      await bb.storage.kv.set("companions", Object.fromEntries(companions));
+    } else {
+      await bb.sdk.threads.send({ threadId, mode: "auto", input: [{ type: "text", text: prompt(projectId), mentions: [] }] });
+    }
+    pending.set(threadId, { projectId, orchestratorId, turnStartedAt });
+  };
+  const handleJudgment = async (threadId, output) => {
+    const request = pending.get(threadId);
+    if (!request) return;
+    pending.delete(threadId);
+    const judgment = parseJudgment(output);
+    const prior = snapshots.get(request.projectId);
+    const now = Date.now();
+    const route = routeJudgment(prior, judgment, now, request.turnStartedAt);
+    bb.log.info(`companion-watcher coverage=${judgment.coverage} event=judgment illegitimate=${judgment.illegitimate} route=${route ?? "silence"}`);
+    if (!route) return;
+    let db;
+    try {
+      const config = await bb.sdk.system.config();
+      db = openStore(`${config.dataDir}/plugins/bb-collab/data.db`);
+      const target = route === "director" ? readRoleThread(db, request.projectId, "director") : readRoleThread(db, request.projectId, "project-orchestrator");
+      if (!target || route === "orchestrator" && target !== request.orchestratorId) throw new Error(`${route}-head-unresolved`);
+      await bb.sdk.threads.send({ threadId: target, mode: "auto", input: [{ type: "text", text: `Alzheimer companion ${route === "director" ? "escalation" : "wake"}: ${judgment.findings} (coverage: ${judgment.coverage}).`, mentions: [] }] });
+      snapshots.set(request.projectId, { sentAt: now, fingerprint: judgment.fingerprint, escalatedAt: route === "director" ? now : prior?.fingerprint === judgment.fingerprint ? prior.escalatedAt : void 0 });
+      await bb.storage.kv.set("backoff", Object.fromEntries(snapshots));
+    } catch (error) {
+      bb.log.warn(`companion-watcher coverage=blind event=${route} reason=${String(error)}`);
+    } finally {
+      db?.close();
+    }
   };
   bb.events.on("thread.active", ({ thread }) => {
     activeTurns.set(thread.id, Date.now());
   });
-  const handleIdle = async (thread, turnStartedAt) => {
-    try {
-      await load();
-    } catch (error) {
-      bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("sdk", error)}`);
+  bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
+    if (pending.has(thread.id)) {
+      await handleJudgment(thread.id, lastAssistantText ?? "");
       return;
     }
-    const projectId = thread.projectId;
+    const turnStartedAt = activeTurns.get(thread.id);
     activeTurns.delete(thread.id);
-    let store;
+    let db;
     try {
-      let config;
-      try {
-        config = await bb.sdk.system.config();
-      } catch (error) {
-        bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("sdk", error)}`);
-        return;
-      }
-      store = openStore(`${config.dataDir}/plugins/bb-collab/data.db`, (error) => bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("store", error)}`));
-      if (!store) return;
-      const orchestrator = readOrchestrator(store, projectId);
-      if (!orchestrator) {
-        bb.log.warn("companion-watcher coverage=blind event=thread.idle reason=orchestrator-head-unresolved");
-        return;
-      }
-      if (orchestrator !== thread.id) return;
-      const target = { project_id: projectId };
-      const unknown = store.prepare(`SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id=? AND origin='work_item' AND state='dispatch_unknown'`).get(projectId);
-      if (Number(unknown.count) > 0) bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=dispatch_unknown-attempts:${unknown.count}`);
-      let queued;
-      let remote;
-      try {
-        queued = await bb.sdk.threads.queuedMessages.list({ threadId: thread.id });
-        remote = (await bb.sdk.projects.get({ projectId: target.project_id })).gitRemoteUrl;
-      } catch (error) {
-        bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("sdk", error)}`);
-        return;
-      }
-      let prs;
-      try {
-        prs = await github(repoName(remote) ?? "", (error) => bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("github", error)}`));
-      } catch (error) {
-        bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("github", error)}`);
-        return;
-      }
-      const findings = evaluate(store, target.project_id, queued, prs);
-      const now = Date.now();
-      const { send, escalations } = dispatchPlan(findings, snapshots, target.project_id, now, turnStartedAt);
-      if (!send.length && !escalations.length) return;
-      const reservations = /* @__PURE__ */ new Map();
-      const reserve = (key, snapshot) => reservations.set(key, reserveSnapshot(snapshots, key, snapshot));
-      const commit = (keys) => keys.forEach((key) => reservations.get(key)?.commit());
-      const rollback = () => reservations.forEach((reservation) => reservation.rollback());
-      for (const finding of send) {
-        const key = `${target.project_id}:${finding.condition}`;
-        const prior = snapshots.get(key);
-        reserve(key, { sentAt: now, fingerprint: finding.key, turns: (prior?.fingerprint === finding.key ? prior.turns : 0) + 1 });
-      }
-      if (send.length) {
-        const message = send.map((f) => f.text).join("; ");
-        try {
-          await bb.sdk.threads.send({ threadId: thread.id, mode: "auto", input: [{ type: "text", text: `Companion watcher: ${message}.`, mentions: [] }] });
-        } catch (error) {
-          rollback();
-          bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("wake", error)}`);
-          return;
-        }
-        commit(send.map((finding) => `${target.project_id}:${finding.condition}`));
-      }
-      for (const finding of escalations) {
-        const key = `${target.project_id}:${finding.condition}`;
-        const prior = snapshots.get(key);
-        const director = store.prepare(`SELECT a.thread_id AS thread_id FROM role_generation_heads h JOIN role_generations g ON g.project_id=h.project_id AND g.role_id=h.role_id AND g.generation=h.current_generation JOIN execution_attempts a ON a.project_id=g.project_id AND a.execution_attempt_id=g.holder_execution_attempt_id WHERE h.project_id=? AND h.role_id='director'`).get(target.project_id);
-        if (!director) {
-          bb.log.warn("companion-watcher coverage=blind event=thread.idle reason=director-unavailable");
-          continue;
-        }
-        reserve(key, { ...prior, escalated: true });
-        try {
-          await bb.sdk.threads.send({ threadId: director.thread_id, mode: "auto", input: [{ type: "text", text: `Companion watcher escalation: ${finding.text}; unchanged after a wake and full turn.`, mentions: [] }] });
-          commit([key]);
-        } catch (error) {
-          rollback();
-          bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("wake", error)}`);
-          return;
-        }
-      }
-      try {
-        await bb.storage.kv.set("backoff", Object.fromEntries(snapshots));
-      } catch (error) {
-        bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("sdk", error)}`);
-      }
+      const config = await bb.sdk.system.config();
+      db = openStore(`${config.dataDir}/plugins/bb-collab/data.db`);
+      const orchestratorId = readRoleThread(db, thread.projectId, "project-orchestrator");
+      if (thread.id !== orchestratorId || hasActiveWorkers(db, thread.projectId)) return;
+      await judge(thread.projectId, orchestratorId, turnStartedAt);
     } catch (error) {
-      bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${coverageReason("store", error)}`);
+      bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${String(error)}`);
     } finally {
-      store?.close();
-    }
-  };
-  bb.events.on("thread.idle", ({ thread }) => handleIdle(thread, activeTurns.get(thread.id)));
-  bb.background.service("startup-reconciliation", {
-    start: async (signal) => {
-      const startupError = await retryStartup(async () => {
-        for (let offset = 0; ; offset += 1e3) {
-          const threads = await bb.sdk.threads.list({ archived: false, limit: 1e3, offset });
-          for (const thread of threads) if (thread.status === "idle") await handleIdle(thread);
-          if (threads.length < 1e3) break;
-        }
-      }, STARTUP_RETRY_ATTEMPTS);
-      if (startupError) bb.log.warn(`companion-watcher coverage=blind event=startup reason=${coverageReason("sdk", startupError)}`);
-      await new Promise((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      db?.close();
     }
   });
 }
 export {
-  coverageReason,
   companionWatcher as default,
-  dispatchPlan,
-  evaluate,
-  isMergeReady,
+  hasActiveWorkers,
   openStore,
-  parsePullRequests,
-  readOrchestrator,
-  reserveSnapshot,
-  retryStartup,
-  shouldEscalate
+  parseJudgment,
+  readRoleThread,
+  routeJudgment
 };
 //# sourceMappingURL=server.js.map
