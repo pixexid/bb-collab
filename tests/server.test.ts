@@ -2154,8 +2154,131 @@ describe("bb-collab plugin boundary", () => {
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "ACTOR_RECEIPT_UNKNOWN" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["idle-fleet-detector", "lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "worktree-cleanup", "thread-archive-sweep"]);
-    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "dispatchLane", "doctor", "export", "registerWait", "roleBrief", "v1-inbox-archive", "v1-inbox-mark-read", "v1-inbox-read", "v1-inbox-reply", "v1-lanes"]);
+    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "dispatchLane", "doctor", "export", "registerProject", "registerWait", "roleBrief", "v1-inbox-archive", "v1-inbox-mark-read", "v1-inbox-read", "v1-inbox-reply", "v1-lanes"]);
     expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["dispatch_lane", "send_to_operator"]);
+  });
+
+  it("registers a second synthetic project through the strict seam and preserves tenant isolation", async () => {
+    const host = await loadedHost();
+    const db = host.bb.storage.database();
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
+    expect(applyFixtureMutation(db, bootstrapRequest(PROJECT_ID, { config: roleConfig() })).outcome).toBe("OK");
+    const existingBefore = exportFoundation(db, PROJECT_ID);
+
+    const secondProject = "proj_second_tenant";
+    const secondActor = "second-tenant-actor";
+    seedVerifiedFixtureReceipt(db, { projectId: secondProject, receiptId: secondActor });
+    const input = {
+      projectId: secondProject,
+      idempotencyKey: "register-second-tenant",
+      actorReceiptId: secondActor,
+      config: roleConfig(),
+      targets: bootstrapRequest().targets!,
+    };
+    const registered = await host.harness.callRpc("registerProject", input) as FoundationResult;
+    expect(registered).toMatchObject({ outcome: "OK", subject: secondProject, currentConfigRevision: 1, currentGovernanceEpoch: 1 });
+    expect(registered.mutationReceipt).toMatchObject({ projectId: secondProject, operationClass: "bootstrap", idempotencyKey: input.idempotencyKey });
+    const beforeMalformed = exportFoundation(db, secondProject);
+    const malformed = await host.harness.runCli([
+      "register-project", "--project", secondProject, "--request", JSON.stringify({ ...input, unexpected: true }),
+    ]);
+    expect(malformed.exitCode).toBe(2);
+    expect(JSON.parse(malformed.stdout)).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
+    expect(exportFoundation(db, secondProject)).toEqual(beforeMalformed);
+
+    const replay = await host.harness.callRpc("registerProject", input) as FoundationResult;
+    expect(replay).toEqual(registered);
+    const cliReplay = await host.harness.runCli([
+      "register-project", "--project", secondProject, "--request", JSON.stringify(input),
+    ]);
+    expect(JSON.parse(cliReplay.stdout)).toMatchObject({ outcome: "OK", mutationReceipt: registered.mutationReceipt });
+
+    const conflict = await host.harness.callRpc("registerProject", {
+      ...input,
+      config: { ...(input.config as Record<string, unknown>), permissionMode: "auto" },
+    }) as FoundationResult;
+    expect(conflict).toMatchObject({ outcome: "IDEMPOTENCY_KEY_CONFLICT", attempted: 0, verified: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(existingBefore);
+
+    const registerEvidence = registered.evidence as { fenceToken: string };
+    const claimed = applyFixtureMutation(db, {
+      projectId: secondProject,
+      operationClass: "governor_claim",
+      idempotencyKey: "claim-second-tenant",
+      actorReceiptId: secondActor,
+      expectedConfigRevision: 1,
+      configRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: registerEvidence.fenceToken,
+      repoTargetId: null,
+    });
+    expect(claimed).toMatchObject({ outcome: "OK", currentGovernanceEpoch: 2 });
+
+    const roles = [
+      { roleId: "project-orchestrator", roleRequirementId: "orchestrator-v1", repoTargetId: null },
+      { roleId: "worker", roleRequirementId: "worker-v1", repoTargetId: TARGET_ID },
+      { roleId: "independent-reviewer", roleRequirementId: "reviewer-v1", repoTargetId: TARGET_ID },
+    ] as const;
+    const claimedFenceToken = (claimed.evidence as { fenceToken: string }).fenceToken;
+    for (const role of roles) {
+      const suffix = role.roleId.replaceAll("-", "_");
+      const roleContext = {
+        threadId: `second-${suffix}-thread`,
+        requestEventId: `second-${suffix}-request`,
+        requestEventSeq: 1,
+        completionEventId: `second-${suffix}-completion`,
+        completionEventSeq: 4,
+      };
+      const facts = roleReader((value) => {
+        value.thread.id = roleContext.threadId;
+        value.thread.projectId = secondProject;
+        value.thread.environmentId = `second-${suffix}-environment`;
+        value.events[0]!.id = roleContext.requestEventId;
+        value.events[0]!.data.requestId = `second-${suffix}-request-id`;
+        value.events[1]!.data.clientRequestId = `second-${suffix}-request-id`;
+        value.events[1]!.data.providerThreadId = `second-${suffix}-provider-thread`;
+        value.events[2]!.data.providerThreadId = `second-${suffix}-provider-thread`;
+        value.events[3]!.id = roleContext.completionEventId;
+        value.events[3]!.data.providerThreadId = `second-${suffix}-provider-thread`;
+        value.environment.id = roleContext.threadId.replace("-thread", "-environment");
+        value.environment.projectId = secondProject;
+        value.project = projectFacts(secondProject);
+      });
+      const qualificationId = `second-${suffix}-qualification`;
+      expect(applyFixtureMutation(db, qualificationRequest(claimedFenceToken, {
+        projectId: secondProject,
+        idempotencyKey: `${qualificationId}-apply`,
+        actorReceiptId: secondActor,
+        expectedGovernanceEpoch: 2,
+        expectedFenceToken: claimedFenceToken,
+        roleId: role.roleId,
+        roleRequirementId: role.roleRequirementId,
+        repoTargetId: role.repoTargetId,
+        qualificationId,
+        roleContext,
+      }), null, facts)).toMatchObject({ outcome: "OK" });
+      expect(applyFixtureMutation(db, successionRequest(claimedFenceToken, {
+        projectId: secondProject,
+        idempotencyKey: `${qualificationId}-succession`,
+        actorReceiptId: secondActor,
+        expectedGovernanceEpoch: 2,
+        expectedFenceToken: claimedFenceToken,
+        roleId: role.roleId,
+        roleRequirementId: role.roleRequirementId,
+        repoTargetId: role.repoTargetId,
+        qualificationId,
+        roleContext,
+      }), null, facts)).toMatchObject({ outcome: "OK", currentResourceRevision: 1 });
+    }
+
+    expect(db.prepare(
+      "SELECT project_id, role_id, current_generation FROM role_generation_heads WHERE project_id = ? ORDER BY role_id",
+    ).all(secondProject)).toEqual([
+      { project_id: secondProject, role_id: "independent-reviewer", current_generation: 1 },
+      { project_id: secondProject, role_id: "project-orchestrator", current_generation: 1 },
+      { project_id: secondProject, role_id: "worker", current_generation: 1 },
+    ]);
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(existingBefore);
   });
 
   it("carries structural refusals through the apply RPC output schema", async () => {
@@ -11839,7 +11962,7 @@ exit 1
     const host = await loadedHost();
     const registrations = host.harness.inspection.registrations;
     expect(registrations.rpcMethods).not.toContain("seed-fixture-receipt");
-    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "dispatch-lane", "github-issue-backfill", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "worktree-cleanup", "send-to-operator", "inbox"]);
+    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "register-project", "dispatch-lane", "github-issue-backfill", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "worktree-cleanup", "send-to-operator", "inbox"]);
     expect(registrations.httpRoutes).toEqual([]);
     expect(seedFixtureDecision).toBeTypeOf("function");
   });

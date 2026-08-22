@@ -16359,6 +16359,27 @@ var applyRequestSchema = external_exports.object({
   migration: migrationPrepareSchema.optional(),
   migrationStep: migrationStepSchema.optional()
 }).strict();
+var registerProjectRequestSchema = external_exports.object({
+  projectId: id,
+  idempotencyKey: id,
+  actorReceiptId: id,
+  runtimeId: id.optional(),
+  config: external_exports.unknown(),
+  targets: targetCollectionSchema
+}).strict();
+function parseRegisterProjectRequest(input) {
+  const parsed = registerProjectRequestSchema.safeParse(input);
+  if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
+  return parseApplyRequest({
+    ...parsed.data,
+    operationClass: "bootstrap",
+    expectedConfigRevision: null,
+    configRevision: 1,
+    expectedGovernanceEpoch: null,
+    expectedFenceToken: null,
+    repoTargetId: null
+  });
+}
 var reviewFactsSchema = external_exports.object({
   projectId: id,
   workItemId: id,
@@ -22450,6 +22471,10 @@ var rpcContract = defineRpcContract({
     input: applyRequestSchema,
     output: foundationResultSchema
   },
+  registerProject: {
+    input: registerProjectRequestSchema,
+    output: foundationResultSchema
+  },
   dispatchLane: {
     input: dispatchLaneInputSchema,
     output: foundationResultSchema
@@ -23230,8 +23255,8 @@ async function reportProjectWorktreeCleanup(bb, projectId, cleanup = cleanupGitW
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "dispatch-lane", "github-issue-backfill", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, dispatch-lane, github-issue-backfill, archive-sweep, worktree-cleanup, cached-consumer-rollout, role-list, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
+  if (!command || !["doctor", "export", "apply", "register-project", "dispatch-lane", "github-issue-backfill", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, register-project, dispatch-lane, github-issue-backfill, archive-sweep, worktree-cleanup, cached-consumer-rollout, role-list, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
   }
   if (command === "wait-validator") {
     const unknown3 = args.find((arg) => arg !== "--cycle");
@@ -23482,6 +23507,19 @@ async function runCli(db, bb, argv, ctx, deps) {
       const request = parseApplyRequest(rawRequest);
       if (request.projectId !== projectId) return invalidCli("--project does not match request.projectId");
       return cliResult(await applyLiveAuthorizedMutation(bb, db, rawRequest));
+    } catch (error48) {
+      return invalidCli(error48 instanceof Error ? error48.message : String(error48));
+    }
+  }
+  if (command === "register-project") {
+    const unknown3 = unexpectedFlags(args, ["--project", "--request"]);
+    if (unknown3) return invalidCli(`unexpected flag ${unknown3}`);
+    const requestJson = parseFlag(args, "--request");
+    if (!requestJson) return invalidCli("--request JSON is required");
+    try {
+      const request = parseRegisterProjectRequest(JSON.parse(requestJson));
+      if (request.projectId !== projectId) return invalidCli("--project does not match request.projectId");
+      return cliResult(await applyLiveAuthorizedMutation(bb, db, request));
     } catch (error48) {
       return invalidCli(error48 instanceof Error ? error48.message : String(error48));
     }
@@ -25526,6 +25564,11 @@ ${thread.titleFallback ?? ""}`);
     async apply(input) {
       return applyLiveAuthorizedMutation(bb, db, input);
     },
+    async registerProject(input) {
+      return applyLiveAuthorizedMutation(bb, db, {
+        ...parseRegisterProjectRequest(input)
+      });
+    },
     async dispatchLane(input) {
       return dispatchLane(bb, db, input);
     },
@@ -25579,6 +25622,11 @@ ${thread.titleFallback ?? ""}`);
         name: "apply",
         summary: "Explicit foundation apply",
         usage: "bb collab apply --project PROJECT_ID --request JSON"
+      },
+      {
+        name: "register-project",
+        summary: "Bootstrap one project and its first config revision through the canonical resolver",
+        usage: "bb collab register-project --project PROJECT_ID --request JSON"
       },
       {
         name: "dispatch-lane",

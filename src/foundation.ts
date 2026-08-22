@@ -1981,6 +1981,32 @@ export const applyRequestSchema = z
   .strict();
 
 export type ApplyRequest = z.infer<typeof applyRequestSchema>;
+export const registerProjectRequestSchema = z
+  .object({
+    projectId: id,
+    idempotencyKey: id,
+    actorReceiptId: id,
+    runtimeId: id.optional(),
+    config: z.unknown(),
+    targets: targetCollectionSchema,
+  })
+  .strict();
+export type RegisterProjectRequest = z.infer<typeof registerProjectRequestSchema>;
+
+export function parseRegisterProjectRequest(input: unknown): ApplyRequest {
+  const parsed = registerProjectRequestSchema.safeParse(input);
+  if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
+  return parseApplyRequest({
+    ...parsed.data,
+    operationClass: "bootstrap",
+    expectedConfigRevision: null,
+    configRevision: 1,
+    expectedGovernanceEpoch: null,
+    expectedFenceToken: null,
+    repoTargetId: null,
+  });
+}
+
 type DecisionEvidenceInput = z.infer<typeof decisionEvidenceSchema>;
 export type SqliteDatabase = Database.Database;
 
