@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { definePluginApp, experimental_useSidebarThreadActions, experimental_useSidebarThreads, useRpc } from "@get-bb/plugin-sdk/app";
+import { definePluginApp, experimental_useSidebarThreadActions, experimental_useSidebarThreadSplit, experimental_useSidebarThreads, useRpc } from "@get-bb/plugin-sdk/app";
 import type {
   PluginRpcResult,
   PluginSidebarProject,
@@ -301,8 +301,20 @@ export function moveBetween(order: readonly string[], draggedId: string, targetI
 }
 
 export function isCompleteProjectOrder(order: readonly string[], projectIds: readonly string[]) {
-  const remaining = new Set(projectIds);
-  return order.length === projectIds.length && order.every((id) => remaining.delete(id)) && remaining.size === 0;
+  const expected = new Set(projectIds);
+  return expected.size === projectIds.length && order.length === projectIds.length && new Set(order).size === order.length && order.every((id) => expected.has(id));
+}
+
+function getReorderableProjectIds(projects: readonly PluginSidebarProject[]): string[] {
+  return projects.filter((project) => !project.isPersonal).map((project) => project.id);
+}
+
+function projectOrderWithPersonal(order: readonly string[], projects: readonly PluginSidebarProject[]): string[] {
+  const next = [...order];
+  projects.forEach((project, index) => {
+    if (project.isPersonal) next.splice(Math.min(index, next.length), 0, project.id);
+  });
+  return next;
 }
 
 type ProjectReorderInput = { projectId: string; previousProjectId: string | null; nextProjectId: string | null };
@@ -336,6 +348,107 @@ function collapseMap(values: Record<string, boolean>): Set<string> {
 
 const MENU_ITEM = "flex h-7 w-full shrink-0 items-center rounded px-2 text-left text-xs transition-colors duration-150 hover:bg-muted motion-reduce:transition-none";
 
+function isInteractivePointerTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement && Boolean(target.closest("a,button,input,textarea,select,[contenteditable=\"true\"]"));
+}
+
+function ProjectHeader({
+  projectId,
+  projectName,
+  threadCount,
+  collapsed,
+  first,
+  last,
+  dragging,
+  dragOver,
+  reorderable,
+  onDragStart,
+  onToggle,
+  onMove,
+}: {
+  projectId: string;
+  projectName: string;
+  threadCount: number;
+  collapsed: boolean;
+  first: boolean;
+  last: boolean;
+  dragging: boolean;
+  dragOver: boolean;
+  reorderable: boolean;
+  onDragStart: () => void;
+  onToggle: () => void;
+  onMove: (offset: -1 | 1) => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const closeOnOutside = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (menuRef.current?.contains(target) || triggerRef.current?.contains(target)) return;
+      setMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutside);
+    return () => document.removeEventListener("pointerdown", closeOnOutside);
+  }, [menuOpen]);
+  useEffect(() => {
+    if (!menuOpen) return;
+    menuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')?.focus();
+  }, [menuOpen]);
+  const menuAction = (run: () => void) => {
+    setMenuOpen(false);
+    triggerRef.current?.focus();
+    run();
+  };
+  return (
+    <div
+      className={`group/project relative flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-semibold text-foreground ${dragging ? "opacity-60 ring-1 ring-primary" : ""} ${dragOver ? "bg-muted ring-1 ring-primary" : ""}`}
+      data-sidebar-project-dragging={dragging ? "true" : undefined}
+      data-sidebar-project-drag-over={dragOver ? "true" : undefined}
+      onPointerDown={(event) => { if (reorderable && event.button === 0 && !(event.target as HTMLElement).closest("button")) onDragStart(); }}
+    >
+      <span className="flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground" aria-hidden="true">{projectAvatar(projectName)}</span>
+      <span id={`project-${projectId}`} className="min-w-0 truncate">{projectName}</span>
+      <span className="ml-auto shrink-0" data-project-thread-count="">{threadCount}</span>
+      {reorderable ? <button
+        ref={triggerRef}
+        type="button"
+        className={`inline-flex size-5 shrink-0 items-center justify-center rounded text-xs leading-none text-muted-foreground transition-opacity duration-150 hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary group-hover/project:opacity-100 motion-reduce:transition-none ${menuOpen ? "opacity-100" : "opacity-0"}`}
+        aria-label={`${projectName} project actions`}
+        aria-haspopup="menu"
+        aria-expanded={menuOpen}
+        onClick={() => setMenuOpen((open) => !open)}
+      >
+        ⋯
+      </button> : null}
+      <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none" aria-label={`${collapsed ? "Expand" : "Collapse"} ${projectName} section`} aria-expanded={!collapsed} onClick={onToggle}>{collapsed ? "›" : "⌄"}</button>
+      {menuOpen ? <div
+        ref={menuRef}
+        role="menu"
+        aria-label={`${projectName} project actions`}
+        className="absolute right-1 top-6 z-20 flex w-44 flex-col rounded-md border border-border bg-background p-1 shadow"
+        onKeyDown={(event) => {
+          const items = Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? []);
+          if (event.key === "Escape") { event.preventDefault(); setMenuOpen(false); triggerRef.current?.focus(); return; }
+          if (!items.length) return;
+          const current = items.indexOf(document.activeElement as HTMLButtonElement);
+          const index = event.key === "ArrowDown" || event.key === "ArrowRight" ? (current + 1 + items.length) % items.length
+            : event.key === "ArrowUp" || event.key === "ArrowLeft" ? (current - 1 + items.length) % items.length
+              : event.key === "Home" ? 0
+                : event.key === "End" ? items.length - 1 : -1;
+          if (index < 0) return;
+          event.preventDefault();
+          items[index]?.focus();
+        }}
+      >
+        <button type="button" role="menuitem" className={MENU_ITEM} disabled={first} onClick={() => menuAction(() => onMove(-1))}>Move up</button>
+        <button type="button" role="menuitem" className={MENU_ITEM} disabled={last} onClick={() => menuAction(() => onMove(1))}>Move down</button>
+      </div> : null}
+    </div>
+  );
+}
+
 function ThreadRow({
   thread,
   execution,
@@ -350,6 +463,8 @@ function ThreadRow({
   onPinnedDragEnd,
   onMovePinned,
   onNavigate,
+  dragging,
+  dragOver,
 }: {
   thread: PluginSidebarThread;
   execution: ThreadExecution | null;
@@ -364,8 +479,11 @@ function ThreadRow({
   onPinnedDragEnd: (threadId: string) => void;
   onMovePinned: (threadId: string, offset: -1 | 1) => void;
   onNavigate: () => void;
+  dragging: boolean;
+  dragOver: boolean;
 }) {
   const actions = experimental_useSidebarThreadActions();
+  const split = experimental_useSidebarThreadSplit(thread.id);
   const title = threadTitle(thread);
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -404,9 +522,12 @@ function ThreadRow({
   };
   return (
     <div
-      className={`group/row relative flex h-7 items-center gap-1.5 rounded-md pr-1 text-left text-sm transition-colors duration-150 select-none hover:bg-muted/50 motion-reduce:transition-none ${active ? "bg-muted" : ""}`}
+      className={`group/row relative flex h-7 items-center gap-1.5 rounded-md pr-1 text-left text-sm transition-colors duration-150 select-none hover:bg-muted/50 motion-reduce:transition-none ${active ? "bg-muted" : ""} ${dragging ? "opacity-60 ring-1 ring-primary" : ""} ${dragOver ? "bg-muted ring-1 ring-primary" : ""} ${split.isAvailable || thread.isPinned ? "cursor-grab active:cursor-grabbing" : ""}`}
       style={{ paddingLeft: `${8 + depth * 16}px` }}
-      onPointerDown={(event) => { if (thread.isPinned && event.button === 0) onPinnedDragStart(thread.id); }}
+      data-sidebar-thread-dragging={dragging ? "true" : undefined}
+      data-sidebar-thread-drag-over={dragOver ? "true" : undefined}
+      aria-roledescription={split.isAvailable || thread.isPinned ? "Draggable session" : undefined}
+      onPointerDown={(event) => { if (thread.isPinned && event.button === 0 && !isInteractivePointerTarget(event.target)) onPinnedDragStart(thread.id); split.splitProps.onPointerDown?.(event); }}
       onPointerEnter={() => onPinnedDragOver(thread.id)}
       onPointerUp={() => onPinnedDragEnd(thread.id)}
     >
@@ -481,6 +602,10 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   const [collapsedThreads, setCollapsedThreads] = useState<Set<string>>(() => new Set());
   const draggingThreadId = useRef<string | null>(null);
   const draggingProjectId = useRef<string | null>(null);
+  const [activeDragThreadId, setActiveDragThreadId] = useState<string | null>(null);
+  const [activeDragThreadTargetId, setActiveDragThreadTargetId] = useState<string | null>(null);
+  const [activeDragProjectId, setActiveDragProjectId] = useState<string | null>(null);
+  const [activeDragProjectTargetId, setActiveDragProjectTargetId] = useState<string | null>(null);
   const provenUnread = useRef(new Map<string, number>());
   const reportedBreak = useRef<string | null>(null);
   const dragTargetId = useRef<string | null>(null);
@@ -496,8 +621,11 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   const threadIds = useMemo(() => sidebar.threads.map((thread) => thread.id), [sidebar.threads]);
   const threadIdsKey = threadIds.join("\u0000");
   const projectIds = useMemo(() => sidebar.projects.map((project) => project.id), [sidebar.projects]);
-  const projectIdsRef = useRef(projectIds);
-  projectIdsRef.current = projectIds;
+  const publicProjectIds = useMemo(() => getReorderableProjectIds(sidebar.projects), [sidebar.projects]);
+  const publicProjectIdsRef = useRef(publicProjectIds);
+  publicProjectIdsRef.current = publicProjectIds;
+  const projectsRef = useRef(sidebar.projects);
+  projectsRef.current = sidebar.projects;
   const projectIdsKey = projectIds.join("\u0000");
 
   useEffect(() => {
@@ -546,6 +674,7 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   const displayProjects = [...sidebar.projects].sort((a, b) => optimisticProjectOrder
     ? optimisticProjectOrder.indexOf(a.id) - optimisticProjectOrder.indexOf(b.id)
     : 0);
+  const displayPublicProjectIds = displayProjects.filter((project) => !project.isPersonal).map((project) => project.id);
   const groups = groupThreads(displayProjects, displayThreads, searchQuery);
   if (sidebar.status === "loading") return <><p className="p-3 text-sm text-muted-foreground">Loading threads…</p></>;
   if (sidebar.status === "error") return <><p className="p-3 text-sm text-destructive">Unable to load threads.</p></>;
@@ -580,8 +709,10 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     const { nextOrder } = move;
     setOptimisticPinnedOrders((current) => ({ ...current, [dragged.projectId]: nextOrder }));
     void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: move.previousId, nextThreadId: move.nextId }).then((authoritativeOrder) => {
+      const localAuthoritativeOrder = authoritativeOrder.filter((threadId) => order.includes(threadId));
+      if (!isCompleteProjectOrder(localAuthoritativeOrder, order)) throw new Error("invalid pinned order");
       setOptimisticPinnedOrders((current) => current[dragged.projectId] === nextOrder
-        ? { ...current, [dragged.projectId]: authoritativeOrder.filter((id) => order.includes(id)) }
+        ? { ...current, [dragged.projectId]: localAuthoritativeOrder }
         : current);
     }).catch(() => {
       setOptimisticPinnedOrders((current) => current[dragged.projectId] === nextOrder
@@ -591,6 +722,8 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   };
   const startPinnedDrag = (threadId: string) => {
     draggingThreadId.current = threadId;
+    setActiveDragThreadId(threadId);
+    setActiveDragThreadTargetId(null);
     dragTargetId.current = null;
     // The row's own handler runs first. Reaching here with a source still armed
     // means the release missed every row: commit to the last row crossed on a
@@ -599,6 +732,8 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
       if (event.type === "pointerup" && draggingThreadId.current) finishPinnedDrag("");
       draggingThreadId.current = null;
       dragTargetId.current = null;
+      setActiveDragThreadId(null);
+      setActiveDragThreadTargetId(null);
       window.removeEventListener("pointerup", settle);
       window.removeEventListener("pointercancel", settle);
     };
@@ -609,6 +744,7 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     if (!draggingThreadId.current || threadId === draggingThreadId.current) return;
     reorderPinned(draggingThreadId.current, threadId);
     dragTargetId.current = threadId;
+    setActiveDragThreadTargetId(threadId);
   };
   const finishPinnedDrag = (targetId: string) => {
     const draggedId = draggingThreadId.current ?? "";
@@ -616,6 +752,8 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     draggingThreadId.current = null;
     if (target && target !== dragTargetId.current) reorderPinned(draggedId, target);
     dragTargetId.current = null;
+    setActiveDragThreadId(null);
+    setActiveDragThreadTargetId(null);
   };
   const movePinnedBy = (threadId: string, offset: -1 | 1) => {
     const thread = displayThreads.find((candidate) => candidate.id === threadId);
@@ -632,8 +770,8 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
       while (projectReorderQueue.current.length > 0) {
         const input = projectReorderQueue.current.shift()!;
         const authoritativeOrder = await rpc.call("reorderProjects", input);
-        if (!isCompleteProjectOrder(authoritativeOrder, projectIdsRef.current)) throw new Error("invalid project order");
-        if (projectReorderQueue.current.length === 0) setOptimisticProjectOrder(authoritativeOrder);
+      if (!isCompleteProjectOrder(authoritativeOrder, publicProjectIdsRef.current)) throw new Error("invalid project order");
+        if (projectReorderQueue.current.length === 0) setOptimisticProjectOrder(projectOrderWithPersonal(authoritativeOrder, projectsRef.current));
       }
     } catch {
       projectReorderQueue.current.length = 0;
@@ -644,20 +782,25 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   };
 
   const reorderProject = (draggedId: string, targetId: string) => {
-    const order = displayProjects.map((project) => project.id);
+    const order = displayProjects.filter((project) => !project.isPersonal).map((project) => project.id);
     const move = moveBetween(order, draggedId, targetId);
     if (!move) return;
-    setOptimisticProjectOrder(move.nextOrder);
+    setOptimisticProjectOrder(projectOrderWithPersonal(move.nextOrder, projectsRef.current));
     projectReorderQueue.current.push({ projectId: draggedId, previousProjectId: move.previousId, nextProjectId: move.nextId });
     void runProjectReorders();
   };
   const startProjectDrag = (projectId: string) => {
+    if (!publicProjectIdsRef.current.includes(projectId)) return;
     draggingProjectId.current = projectId;
+    setActiveDragProjectId(projectId);
+    setActiveDragProjectTargetId(null);
     projectDragTargetId.current = null;
     const settle = (event: Event) => {
       if (event.type === "pointerup" && draggingProjectId.current) finishProjectDrag("");
       draggingProjectId.current = null;
       projectDragTargetId.current = null;
+      setActiveDragProjectId(null);
+      setActiveDragProjectTargetId(null);
       window.removeEventListener("pointerup", settle);
       window.removeEventListener("pointercancel", settle);
     };
@@ -665,9 +808,11 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     window.addEventListener("pointercancel", settle);
   };
   const trackProjectDrag = (projectId: string) => {
+    if (!publicProjectIdsRef.current.includes(projectId)) return;
     if (!draggingProjectId.current || projectId === draggingProjectId.current) return;
     reorderProject(draggingProjectId.current, projectId);
     projectDragTargetId.current = projectId;
+    setActiveDragProjectTargetId(projectId);
   };
   const finishProjectDrag = (targetId: string) => {
     const draggedId = draggingProjectId.current ?? "";
@@ -675,9 +820,11 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     draggingProjectId.current = null;
     if (target && target !== projectDragTargetId.current) reorderProject(draggedId, target);
     projectDragTargetId.current = null;
+    setActiveDragProjectId(null);
+    setActiveDragProjectTargetId(null);
   };
   const moveProjectBy = (projectId: string, offset: -1 | 1) => {
-    const order = displayProjects.map((project) => project.id);
+    const order = displayProjects.filter((project) => !project.isPersonal).map((project) => project.id);
     const targetId = order[order.indexOf(projectId) + offset];
     if (targetId) reorderProject(projectId, targetId);
   };
@@ -685,7 +832,7 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   const renderNode = (node: ThreadTreeNode, execution: ThreadExecution | null, depth: number): ReactNode => {
     const childrenCollapsed = collapsedThreads.has(node.thread.id);
     return <div key={node.thread.id} className="space-y-px">
-      <ThreadRow thread={node.thread} execution={execution} active={node.thread.id === activeThreadId} customState={customStates[node.thread.id]} depth={depth} collapsed={childrenCollapsed} hasChildren={node.children.length > 0} onToggleChildren={() => toggleThread(node.thread.id)} onPinnedDragStart={startPinnedDrag} onPinnedDragOver={trackPinnedDrag} onPinnedDragEnd={finishPinnedDrag} onMovePinned={movePinnedBy} onNavigate={onNavigate} />
+      <ThreadRow thread={node.thread} execution={execution} active={node.thread.id === activeThreadId} customState={customStates[node.thread.id]} depth={depth} collapsed={childrenCollapsed} hasChildren={node.children.length > 0} onToggleChildren={() => toggleThread(node.thread.id)} onPinnedDragStart={startPinnedDrag} onPinnedDragOver={trackPinnedDrag} onPinnedDragEnd={finishPinnedDrag} onMovePinned={movePinnedBy} onNavigate={onNavigate} dragging={activeDragThreadId === node.thread.id} dragOver={activeDragThreadTargetId === node.thread.id} />
       {!childrenCollapsed ? node.children.map((child) => renderNode(child, threadModels[child.thread.id] ?? null, depth + 1)) : null}
     </div>;
   };
@@ -701,16 +848,7 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
         const projectName = asText(project.name) ?? asText(project.id) ?? "Untitled project";
         return (
           <section key={project.id} aria-labelledby={`project-${project.id}`} data-sidebar-project-id={project.id} onPointerEnter={() => trackProjectDrag(project.id)} onPointerUp={() => finishProjectDrag(project.id)}>
-            <div className="flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-semibold text-foreground" onPointerDown={(event) => { if (event.button === 0 && !(event.target as HTMLElement).closest("button")) startProjectDrag(project.id); }}>
-              <span className="flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground" aria-hidden="true">{projectAvatar(projectName)}</span>
-              <span id={`project-${project.id}`} className="min-w-0 truncate">{projectName}</span>
-              {/* No type utilities of its own: the counter inherits the header's
-                  size, weight, colour and baseline so it never outweighs the name. */}
-              <span className="ml-auto shrink-0" data-project-thread-count="">{threads.length}</span>
-              <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground disabled:opacity-30 motion-reduce:transition-none" aria-label={`Move ${projectName} project up`} disabled={displayProjects[0]?.id === project.id} onClick={() => moveProjectBy(project.id, -1)}>↑</button>
-              <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground disabled:opacity-30 motion-reduce:transition-none" aria-label={`Move ${projectName} project down`} disabled={displayProjects.at(-1)?.id === project.id} onClick={() => moveProjectBy(project.id, 1)}>↓</button>
-              <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none" aria-label={`${collapsed ? "Expand" : "Collapse"} ${projectName} section`} aria-expanded={!collapsed} onClick={() => toggleProject(project.id)}>{collapsed ? "›" : "⌄"}</button>
-            </div>
+            <ProjectHeader projectId={project.id} projectName={projectName} threadCount={threads.length} collapsed={collapsed} first={displayPublicProjectIds[0] === project.id} last={displayPublicProjectIds.at(-1) === project.id} dragging={activeDragProjectId === project.id} dragOver={activeDragProjectTargetId === project.id} reorderable={!project.isPersonal} onDragStart={() => startProjectDrag(project.id)} onToggle={() => toggleProject(project.id)} onMove={(offset) => moveProjectBy(project.id, offset)} />
             {!collapsed ? <div className="mt-0.5 space-y-px">
               {visibleThreads.map((node) => renderNode(node, threadModels[node.thread.id] ?? null, 0))}
               {tree.length > MAX_VISIBLE_THREADS ? (

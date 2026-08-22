@@ -335,8 +335,18 @@ function moveBetween(order, draggedId, targetId) {
   return { nextOrder, previousId: remaining[insertionIndex - 1] ?? null, nextId: remaining[insertionIndex] ?? null };
 }
 function isCompleteProjectOrder(order, projectIds) {
-  const remaining = new Set(projectIds);
-  return order.length === projectIds.length && order.every((id) => remaining.delete(id)) && remaining.size === 0;
+  const expected = new Set(projectIds);
+  return expected.size === projectIds.length && order.length === projectIds.length && new Set(order).size === order.length && order.every((id) => expected.has(id));
+}
+function getReorderableProjectIds(projects) {
+  return projects.filter((project) => !project.isPersonal).map((project) => project.id);
+}
+function projectOrderWithPersonal(order, projects) {
+  const next = [...order];
+  projects.forEach((project, index) => {
+    if (project.isPersonal) next.splice(Math.min(index, next.length), 0, project.id);
+  });
+  return next;
 }
 function buildThreadTree(threads) {
   const nodes = new Map(threads.map((thread) => [thread.id, { thread, children: [] }]));
@@ -362,6 +372,104 @@ function collapseMap(values) {
   return new Set(Object.entries(values).filter(([, collapsed]) => collapsed).map(([id]) => id));
 }
 var MENU_ITEM = "flex h-7 w-full shrink-0 items-center rounded px-2 text-left text-xs transition-colors duration-150 hover:bg-muted motion-reduce:transition-none";
+function isInteractivePointerTarget(target) {
+  return target instanceof HTMLElement && Boolean(target.closest('a,button,input,textarea,select,[contenteditable="true"]'));
+}
+function ProjectHeader({
+  projectId,
+  projectName,
+  threadCount,
+  collapsed,
+  first,
+  last,
+  dragging,
+  dragOver,
+  reorderable,
+  onDragStart,
+  onToggle,
+  onMove
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef(null);
+  const triggerRef = useRef(null);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const closeOnOutside = (event) => {
+      const target = event.target;
+      if (menuRef.current?.contains(target) || triggerRef.current?.contains(target)) return;
+      setMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutside);
+    return () => document.removeEventListener("pointerdown", closeOnOutside);
+  }, [menuOpen]);
+  useEffect(() => {
+    if (!menuOpen) return;
+    menuRef.current?.querySelector('[role="menuitem"]:not(:disabled)')?.focus();
+  }, [menuOpen]);
+  const menuAction = (run) => {
+    setMenuOpen(false);
+    triggerRef.current?.focus();
+    run();
+  };
+  return /* @__PURE__ */ jsxs(
+    "div",
+    {
+      className: `group/project relative flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-semibold text-foreground ${dragging ? "opacity-60 ring-1 ring-primary" : ""} ${dragOver ? "bg-muted ring-1 ring-primary" : ""}`,
+      "data-sidebar-project-dragging": dragging ? "true" : void 0,
+      "data-sidebar-project-drag-over": dragOver ? "true" : void 0,
+      onPointerDown: (event) => {
+        if (reorderable && event.button === 0 && !event.target.closest("button")) onDragStart();
+      },
+      children: [
+        /* @__PURE__ */ jsx("span", { className: "flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground", "aria-hidden": "true", children: projectAvatar(projectName) }),
+        /* @__PURE__ */ jsx("span", { id: `project-${projectId}`, className: "min-w-0 truncate", children: projectName }),
+        /* @__PURE__ */ jsx("span", { className: "ml-auto shrink-0", "data-project-thread-count": "", children: threadCount }),
+        reorderable ? /* @__PURE__ */ jsx(
+          "button",
+          {
+            ref: triggerRef,
+            type: "button",
+            className: `inline-flex size-5 shrink-0 items-center justify-center rounded text-xs leading-none text-muted-foreground transition-opacity duration-150 hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary group-hover/project:opacity-100 motion-reduce:transition-none ${menuOpen ? "opacity-100" : "opacity-0"}`,
+            "aria-label": `${projectName} project actions`,
+            "aria-haspopup": "menu",
+            "aria-expanded": menuOpen,
+            onClick: () => setMenuOpen((open) => !open),
+            children: "\u22EF"
+          }
+        ) : null,
+        /* @__PURE__ */ jsx("button", { type: "button", className: "inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none", "aria-label": `${collapsed ? "Expand" : "Collapse"} ${projectName} section`, "aria-expanded": !collapsed, onClick: onToggle, children: collapsed ? "\u203A" : "\u2304" }),
+        menuOpen ? /* @__PURE__ */ jsxs(
+          "div",
+          {
+            ref: menuRef,
+            role: "menu",
+            "aria-label": `${projectName} project actions`,
+            className: "absolute right-1 top-6 z-20 flex w-44 flex-col rounded-md border border-border bg-background p-1 shadow",
+            onKeyDown: (event) => {
+              const items = Array.from(menuRef.current?.querySelectorAll('[role="menuitem"]:not(:disabled)') ?? []);
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setMenuOpen(false);
+                triggerRef.current?.focus();
+                return;
+              }
+              if (!items.length) return;
+              const current = items.indexOf(document.activeElement);
+              const index = event.key === "ArrowDown" || event.key === "ArrowRight" ? (current + 1 + items.length) % items.length : event.key === "ArrowUp" || event.key === "ArrowLeft" ? (current - 1 + items.length) % items.length : event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : -1;
+              if (index < 0) return;
+              event.preventDefault();
+              items[index]?.focus();
+            },
+            children: [
+              /* @__PURE__ */ jsx("button", { type: "button", role: "menuitem", className: MENU_ITEM, disabled: first, onClick: () => menuAction(() => onMove(-1)), children: "Move up" }),
+              /* @__PURE__ */ jsx("button", { type: "button", role: "menuitem", className: MENU_ITEM, disabled: last, onClick: () => menuAction(() => onMove(1)), children: "Move down" })
+            ]
+          }
+        ) : null
+      ]
+    }
+  );
+}
 function ThreadRow({
   thread,
   execution,
@@ -375,9 +483,12 @@ function ThreadRow({
   onPinnedDragOver,
   onPinnedDragEnd,
   onMovePinned,
-  onNavigate
+  onNavigate,
+  dragging,
+  dragOver
 }) {
   const actions = experimental_useSidebarThreadActions();
+  const split = experimental_useSidebarThreadSplit(thread.id);
   const title = threadTitle(thread);
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -409,8 +520,8 @@ function ThreadRow({
     triggerRef.current?.focus();
     run();
   };
-  const visit = (split = false) => {
-    if (split) actions.open(thread.id, { split: true });
+  const visit = (split2 = false) => {
+    if (split2) actions.open(thread.id, { split: true });
     else {
       actions.open(thread.id);
       onNavigate();
@@ -420,10 +531,14 @@ function ThreadRow({
   return /* @__PURE__ */ jsxs(
     "div",
     {
-      className: `group/row relative flex h-7 items-center gap-1.5 rounded-md pr-1 text-left text-sm transition-colors duration-150 select-none hover:bg-muted/50 motion-reduce:transition-none ${active ? "bg-muted" : ""}`,
+      className: `group/row relative flex h-7 items-center gap-1.5 rounded-md pr-1 text-left text-sm transition-colors duration-150 select-none hover:bg-muted/50 motion-reduce:transition-none ${active ? "bg-muted" : ""} ${dragging ? "opacity-60 ring-1 ring-primary" : ""} ${dragOver ? "bg-muted ring-1 ring-primary" : ""} ${split.isAvailable || thread.isPinned ? "cursor-grab active:cursor-grabbing" : ""}`,
       style: { paddingLeft: `${8 + depth * 16}px` },
+      "data-sidebar-thread-dragging": dragging ? "true" : void 0,
+      "data-sidebar-thread-drag-over": dragOver ? "true" : void 0,
+      "aria-roledescription": split.isAvailable || thread.isPinned ? "Draggable session" : void 0,
       onPointerDown: (event) => {
-        if (thread.isPinned && event.button === 0) onPinnedDragStart(thread.id);
+        if (thread.isPinned && event.button === 0 && !isInteractivePointerTarget(event.target)) onPinnedDragStart(thread.id);
+        split.splitProps.onPointerDown?.(event);
       },
       onPointerEnter: () => onPinnedDragOver(thread.id),
       onPointerUp: () => onPinnedDragEnd(thread.id),
@@ -515,6 +630,10 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
   const [collapsedThreads, setCollapsedThreads] = useState(() => /* @__PURE__ */ new Set());
   const draggingThreadId = useRef(null);
   const draggingProjectId = useRef(null);
+  const [activeDragThreadId, setActiveDragThreadId] = useState(null);
+  const [activeDragThreadTargetId, setActiveDragThreadTargetId] = useState(null);
+  const [activeDragProjectId, setActiveDragProjectId] = useState(null);
+  const [activeDragProjectTargetId, setActiveDragProjectTargetId] = useState(null);
   const provenUnread = useRef(/* @__PURE__ */ new Map());
   const reportedBreak = useRef(null);
   const dragTargetId = useRef(null);
@@ -530,8 +649,11 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
   const threadIds = useMemo(() => sidebar.threads.map((thread) => thread.id), [sidebar.threads]);
   const threadIdsKey = threadIds.join("\0");
   const projectIds = useMemo(() => sidebar.projects.map((project) => project.id), [sidebar.projects]);
-  const projectIdsRef = useRef(projectIds);
-  projectIdsRef.current = projectIds;
+  const publicProjectIds = useMemo(() => getReorderableProjectIds(sidebar.projects), [sidebar.projects]);
+  const publicProjectIdsRef = useRef(publicProjectIds);
+  publicProjectIdsRef.current = publicProjectIds;
+  const projectsRef = useRef(sidebar.projects);
+  projectsRef.current = sidebar.projects;
   const projectIdsKey = projectIds.join("\0");
   useEffect(() => {
     let mounted = true;
@@ -577,6 +699,7 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
     return order.indexOf(a.id) - order.indexOf(b.id);
   });
   const displayProjects = [...sidebar.projects].sort((a, b) => optimisticProjectOrder ? optimisticProjectOrder.indexOf(a.id) - optimisticProjectOrder.indexOf(b.id) : 0);
+  const displayPublicProjectIds = displayProjects.filter((project) => !project.isPersonal).map((project) => project.id);
   const groups = groupThreads(displayProjects, displayThreads, searchQuery);
   if (sidebar.status === "loading") return /* @__PURE__ */ jsx(Fragment2, { children: /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-muted-foreground", children: "Loading threads\u2026" }) });
   if (sidebar.status === "error") return /* @__PURE__ */ jsx(Fragment2, { children: /* @__PURE__ */ jsx("p", { className: "p-3 text-sm text-destructive", children: "Unable to load threads." }) });
@@ -614,18 +737,24 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
     const { nextOrder } = move;
     setOptimisticPinnedOrders((current) => ({ ...current, [dragged.projectId]: nextOrder }));
     void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: move.previousId, nextThreadId: move.nextId }).then((authoritativeOrder) => {
-      setOptimisticPinnedOrders((current) => current[dragged.projectId] === nextOrder ? { ...current, [dragged.projectId]: authoritativeOrder.filter((id) => order.includes(id)) } : current);
+      const localAuthoritativeOrder = authoritativeOrder.filter((threadId) => order.includes(threadId));
+      if (!isCompleteProjectOrder(localAuthoritativeOrder, order)) throw new Error("invalid pinned order");
+      setOptimisticPinnedOrders((current) => current[dragged.projectId] === nextOrder ? { ...current, [dragged.projectId]: localAuthoritativeOrder } : current);
     }).catch(() => {
       setOptimisticPinnedOrders((current) => current[dragged.projectId] === nextOrder ? Object.fromEntries(Object.entries(current).filter(([projectId]) => projectId !== dragged.projectId)) : current);
     });
   };
   const startPinnedDrag = (threadId) => {
     draggingThreadId.current = threadId;
+    setActiveDragThreadId(threadId);
+    setActiveDragThreadTargetId(null);
     dragTargetId.current = null;
     const settle = (event) => {
       if (event.type === "pointerup" && draggingThreadId.current) finishPinnedDrag("");
       draggingThreadId.current = null;
       dragTargetId.current = null;
+      setActiveDragThreadId(null);
+      setActiveDragThreadTargetId(null);
       window.removeEventListener("pointerup", settle);
       window.removeEventListener("pointercancel", settle);
     };
@@ -636,6 +765,7 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
     if (!draggingThreadId.current || threadId === draggingThreadId.current) return;
     reorderPinned(draggingThreadId.current, threadId);
     dragTargetId.current = threadId;
+    setActiveDragThreadTargetId(threadId);
   };
   const finishPinnedDrag = (targetId) => {
     const draggedId = draggingThreadId.current ?? "";
@@ -643,6 +773,8 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
     draggingThreadId.current = null;
     if (target && target !== dragTargetId.current) reorderPinned(draggedId, target);
     dragTargetId.current = null;
+    setActiveDragThreadId(null);
+    setActiveDragThreadTargetId(null);
   };
   const movePinnedBy = (threadId, offset) => {
     const thread = displayThreads.find((candidate) => candidate.id === threadId);
@@ -658,8 +790,8 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
       while (projectReorderQueue.current.length > 0) {
         const input = projectReorderQueue.current.shift();
         const authoritativeOrder = await rpc.call("reorderProjects", input);
-        if (!isCompleteProjectOrder(authoritativeOrder, projectIdsRef.current)) throw new Error("invalid project order");
-        if (projectReorderQueue.current.length === 0) setOptimisticProjectOrder(authoritativeOrder);
+        if (!isCompleteProjectOrder(authoritativeOrder, publicProjectIdsRef.current)) throw new Error("invalid project order");
+        if (projectReorderQueue.current.length === 0) setOptimisticProjectOrder(projectOrderWithPersonal(authoritativeOrder, projectsRef.current));
       }
     } catch {
       projectReorderQueue.current.length = 0;
@@ -669,20 +801,25 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
     }
   };
   const reorderProject = (draggedId, targetId) => {
-    const order = displayProjects.map((project) => project.id);
+    const order = displayProjects.filter((project) => !project.isPersonal).map((project) => project.id);
     const move = moveBetween(order, draggedId, targetId);
     if (!move) return;
-    setOptimisticProjectOrder(move.nextOrder);
+    setOptimisticProjectOrder(projectOrderWithPersonal(move.nextOrder, projectsRef.current));
     projectReorderQueue.current.push({ projectId: draggedId, previousProjectId: move.previousId, nextProjectId: move.nextId });
     void runProjectReorders();
   };
   const startProjectDrag = (projectId) => {
+    if (!publicProjectIdsRef.current.includes(projectId)) return;
     draggingProjectId.current = projectId;
+    setActiveDragProjectId(projectId);
+    setActiveDragProjectTargetId(null);
     projectDragTargetId.current = null;
     const settle = (event) => {
       if (event.type === "pointerup" && draggingProjectId.current) finishProjectDrag("");
       draggingProjectId.current = null;
       projectDragTargetId.current = null;
+      setActiveDragProjectId(null);
+      setActiveDragProjectTargetId(null);
       window.removeEventListener("pointerup", settle);
       window.removeEventListener("pointercancel", settle);
     };
@@ -690,9 +827,11 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
     window.addEventListener("pointercancel", settle);
   };
   const trackProjectDrag = (projectId) => {
+    if (!publicProjectIdsRef.current.includes(projectId)) return;
     if (!draggingProjectId.current || projectId === draggingProjectId.current) return;
     reorderProject(draggingProjectId.current, projectId);
     projectDragTargetId.current = projectId;
+    setActiveDragProjectTargetId(projectId);
   };
   const finishProjectDrag = (targetId) => {
     const draggedId = draggingProjectId.current ?? "";
@@ -700,16 +839,18 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
     draggingProjectId.current = null;
     if (target && target !== projectDragTargetId.current) reorderProject(draggedId, target);
     projectDragTargetId.current = null;
+    setActiveDragProjectId(null);
+    setActiveDragProjectTargetId(null);
   };
   const moveProjectBy = (projectId, offset) => {
-    const order = displayProjects.map((project) => project.id);
+    const order = displayProjects.filter((project) => !project.isPersonal).map((project) => project.id);
     const targetId = order[order.indexOf(projectId) + offset];
     if (targetId) reorderProject(projectId, targetId);
   };
   const renderNode = (node, execution, depth) => {
     const childrenCollapsed = collapsedThreads.has(node.thread.id);
     return /* @__PURE__ */ jsxs("div", { className: "space-y-px", children: [
-      /* @__PURE__ */ jsx(ThreadRow, { thread: node.thread, execution, active: node.thread.id === activeThreadId, customState: customStates[node.thread.id], depth, collapsed: childrenCollapsed, hasChildren: node.children.length > 0, onToggleChildren: () => toggleThread(node.thread.id), onPinnedDragStart: startPinnedDrag, onPinnedDragOver: trackPinnedDrag, onPinnedDragEnd: finishPinnedDrag, onMovePinned: movePinnedBy, onNavigate }),
+      /* @__PURE__ */ jsx(ThreadRow, { thread: node.thread, execution, active: node.thread.id === activeThreadId, customState: customStates[node.thread.id], depth, collapsed: childrenCollapsed, hasChildren: node.children.length > 0, onToggleChildren: () => toggleThread(node.thread.id), onPinnedDragStart: startPinnedDrag, onPinnedDragOver: trackPinnedDrag, onPinnedDragEnd: finishPinnedDrag, onMovePinned: movePinnedBy, onNavigate, dragging: activeDragThreadId === node.thread.id, dragOver: activeDragThreadTargetId === node.thread.id }),
       !childrenCollapsed ? node.children.map((child) => renderNode(child, threadModels[child.thread.id] ?? null, depth + 1)) : null
     ] }, node.thread.id);
   };
@@ -728,16 +869,7 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
       const visibleThreads = expanded ? tree : tree.slice(0, MAX_VISIBLE_THREADS);
       const projectName = asText(project.name) ?? asText(project.id) ?? "Untitled project";
       return /* @__PURE__ */ jsxs("section", { "aria-labelledby": `project-${project.id}`, "data-sidebar-project-id": project.id, onPointerEnter: () => trackProjectDrag(project.id), onPointerUp: () => finishProjectDrag(project.id), children: [
-        /* @__PURE__ */ jsxs("div", { className: "flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-semibold text-foreground", onPointerDown: (event) => {
-          if (event.button === 0 && !event.target.closest("button")) startProjectDrag(project.id);
-        }, children: [
-          /* @__PURE__ */ jsx("span", { className: "flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground", "aria-hidden": "true", children: projectAvatar(projectName) }),
-          /* @__PURE__ */ jsx("span", { id: `project-${project.id}`, className: "min-w-0 truncate", children: projectName }),
-          /* @__PURE__ */ jsx("span", { className: "ml-auto shrink-0", "data-project-thread-count": "", children: threads.length }),
-          /* @__PURE__ */ jsx("button", { type: "button", className: "inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground disabled:opacity-30 motion-reduce:transition-none", "aria-label": `Move ${projectName} project up`, disabled: displayProjects[0]?.id === project.id, onClick: () => moveProjectBy(project.id, -1), children: "\u2191" }),
-          /* @__PURE__ */ jsx("button", { type: "button", className: "inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground disabled:opacity-30 motion-reduce:transition-none", "aria-label": `Move ${projectName} project down`, disabled: displayProjects.at(-1)?.id === project.id, onClick: () => moveProjectBy(project.id, 1), children: "\u2193" }),
-          /* @__PURE__ */ jsx("button", { type: "button", className: "inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none", "aria-label": `${collapsed ? "Expand" : "Collapse"} ${projectName} section`, "aria-expanded": !collapsed, onClick: () => toggleProject(project.id), children: collapsed ? "\u203A" : "\u2304" })
-        ] }),
+        /* @__PURE__ */ jsx(ProjectHeader, { projectId: project.id, projectName, threadCount: threads.length, collapsed, first: displayPublicProjectIds[0] === project.id, last: displayPublicProjectIds.at(-1) === project.id, dragging: activeDragProjectId === project.id, dragOver: activeDragProjectTargetId === project.id, reorderable: !project.isPersonal, onDragStart: () => startProjectDrag(project.id), onToggle: () => toggleProject(project.id), onMove: (offset) => moveProjectBy(project.id, offset) }),
         !collapsed ? /* @__PURE__ */ jsxs("div", { className: "mt-0.5 space-y-px", children: [
           visibleThreads.map((node) => renderNode(node, threadModels[node.thread.id] ?? null, 0)),
           tree.length > MAX_VISIBLE_THREADS ? /* @__PURE__ */ jsx(
