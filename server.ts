@@ -1437,9 +1437,9 @@ async function replyToOperatorMessage(db: SqliteDatabase | null, bb: BbPluginApi
     const afterSeq = await latestThreadEventSeq(bb, message.senderThreadId);
     const replyPrefix = `[bb-collab inbox reply ${message.messageId} to ${message.recipient}]\n`;
     const deliveredText = `${replyPrefix}${replyText}`;
-    await sendWhenThreadIdle(bb, {
+    await sendWhenThreadReady(bb, {
       threadId: message.senderThreadId,
-      mode: "steer",
+      mode: "steer-if-active",
       input: [{ type: "text", text: deliveredText, mentions: [] }],
     });
     await confirmReplyDelivery(bb, message.senderThreadId, afterSeq, replyPrefix);
