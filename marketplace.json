@@ -43,6 +43,19 @@
           "ref": "main"
         }
       }
+    },
+    {
+      "id": "exec-tracking",
+      "displayName": "Exec Tracking",
+      "description": "Records executed-triple evidence and coalesces silent abnormal-thread wakes.",
+      "author": { "name": "bb-collab" },
+      "source": {
+        "git": {
+          "url": "https://github.com/pixexid/bb-collab.git",
+          "subdir": "plugins/bb-plugin-exec-tracking",
+          "ref": "main"
+        }
+      }
     }
   ]
 }
