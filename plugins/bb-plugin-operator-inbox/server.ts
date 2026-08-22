@@ -11,6 +11,7 @@ import {
 
 const CORE_PLUGIN_ID = "bb-collab";
 const READ_TIMEOUT_MS = 4_000;
+const REPLY_TIMEOUT_MS = 50_000;
 const CORE_METHODS = {
   read: "v1-inbox-read",
   markRead: "v1-inbox-mark-read",
@@ -18,13 +19,13 @@ const CORE_METHODS = {
   reply: "v1-inbox-reply",
 } as const;
 
-async function withTimeout<T>(promise: Promise<T>, method: string): Promise<T> {
+async function withTimeout<T>(promise: Promise<T>, method: string, timeoutMs = READ_TIMEOUT_MS, timeoutMessage = `bb-collab ${method} timed out after ${timeoutMs}ms`): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       promise,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`bb-collab ${method} timed out after ${READ_TIMEOUT_MS}ms`)), READ_TIMEOUT_MS);
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
       }),
     ]);
   } finally {
@@ -76,7 +77,7 @@ export default function plugin(bb: BbPluginApi) {
     archiveOperatorMessage(input) { return mutate(CORE_METHODS.archive, input); },
     replyToOperatorMessage(input: z.infer<typeof replyInputSchema>) {
       // Core may validly wait 30s for idle and another 10s for delivery proof.
-      // An uncancellable outer timeout would turn that into an ambiguous retry.
+      // The caller gets 10s margin; the uncancellable call remains shared until settlement.
       const key = JSON.stringify([input.projectId, input.messageId]);
       let call = replies.get(key);
       if (!call) {
@@ -88,7 +89,8 @@ export default function plugin(bb: BbPluginApi) {
         }).finally(() => { replies.delete(key); });
         replies.set(key, call);
       }
-      return call.then((result) => operatorMessageSchema.parse(result));
+      return withTimeout(call, CORE_METHODS.reply, REPLY_TIMEOUT_MS, `bb-collab ${CORE_METHODS.reply} is still pending after ${REPLY_TIMEOUT_MS}ms; delivery outcome is not yet known and retry will rejoin the same attempt`)
+        .then((result) => operatorMessageSchema.parse(result));
     },
   });
 }

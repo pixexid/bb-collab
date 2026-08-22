@@ -135,6 +135,24 @@ describe("Operator Inbox backend", () => {
     await expect(duplicate).resolves.toEqual({ ...message, readAtMs: 2, repliedAtMs: 3, replyText: "answer" });
   });
 
+  it("bounds hung reply callers while retries rejoin the same late-settling core call", async () => {
+    vi.useFakeTimers();
+    let rejectCore!: (reason: Error) => void;
+    const core = new Promise((_, reject) => { rejectCore = reject; });
+    const fixture = host(() => core);
+    const first = fixture.harness.callRpc("replyToOperatorMessage", { projectId: "project-1", messageId: 1, text: "answer" }).then(() => null, String);
+
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(await first).toContain("still pending after 50000ms; delivery outcome is not yet known and retry will rejoin the same attempt");
+    const retry = fixture.harness.callRpc("replyToOperatorMessage", { projectId: "project-1", messageId: 1, text: "retry" }).then(() => null, String);
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(await retry).toContain("still pending after 50000ms; delivery outcome is not yet known and retry will rejoin the same attempt");
+    expect(fixture.callRpc).toHaveBeenCalledTimes(1);
+
+    rejectCore(new Error("late core rejection"));
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
   it("contains missing core failure to Operator Inbox", async () => {
     const fixture = host(() => { throw new Error("core unavailable"); });
     await expect(fixture.harness.callRpc("operatorMessages", { projectId: "project-1" })).rejects.toThrow("core unavailable");

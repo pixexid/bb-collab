@@ -13827,19 +13827,20 @@ var rpcContract = defineRpcContract({
 // server.ts
 var CORE_PLUGIN_ID = "bb-collab";
 var READ_TIMEOUT_MS = 4e3;
+var REPLY_TIMEOUT_MS = 5e4;
 var CORE_METHODS = {
   read: "v1-inbox-read",
   markRead: "v1-inbox-mark-read",
   archive: "v1-inbox-archive",
   reply: "v1-inbox-reply"
 };
-async function withTimeout(promise2, method) {
+async function withTimeout(promise2, method, timeoutMs = READ_TIMEOUT_MS, timeoutMessage = `bb-collab ${method} timed out after ${timeoutMs}ms`) {
   let timer;
   try {
     return await Promise.race([
       promise2,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`bb-collab ${method} timed out after ${READ_TIMEOUT_MS}ms`)), READ_TIMEOUT_MS);
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
       })
     ]);
   } finally {
@@ -13904,7 +13905,7 @@ function plugin(bb) {
         });
         replies.set(key, call);
       }
-      return call.then((result) => operatorMessageSchema.parse(result));
+      return withTimeout(call, CORE_METHODS.reply, REPLY_TIMEOUT_MS, `bb-collab ${CORE_METHODS.reply} is still pending after ${REPLY_TIMEOUT_MS}ms; delivery outcome is not yet known and retry will rejoin the same attempt`).then((result) => operatorMessageSchema.parse(result));
     }
   });
 }
