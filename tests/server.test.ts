@@ -3188,6 +3188,177 @@ describe("bb-collab plugin boundary", () => {
     ]]);
   });
 
+  it("bypasses an unresolved automated idle predecessor for an Inbox reply", async () => {
+    const restoreGithub = installStartableQueueFixture(205);
+    try {
+      const fixture = await fleetWatchdogFixture(0, true);
+      bindFixtureGithubIssue(fixture.db, 205);
+      let artifact = "before";
+      fixture.host.harness.sdk.stub("environments.pullRequest", (async () => artifact === "before"
+        ? { outcome: "absent" }
+        : { outcome: "available", pullRequest: { updatedAt: artifact } }) as never);
+      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+        id: threadId,
+        projectId: PROJECT_ID,
+        status: "idle",
+        environmentId: `environment-${threadId}`,
+        updatedAt: 0,
+      })) as never);
+      let releaseIdle!: () => void;
+      const idle = new Promise<void>((resolve) => { releaseIdle = resolve; });
+      fixture.host.harness.sdk.stub("threads.wait", (async () => { await idle; return { matched: true }; }) as never);
+      let releaseConfirmation!: () => void;
+      const confirmation = new Promise<void>((resolve) => { releaseConfirmation = resolve; });
+      fixture.host.harness.sdk.stub("threads.events.wait", (async ({ threadId }: { threadId: string }) => {
+        await confirmation;
+        return {
+          id: "event-inbox-reply",
+          threadId,
+          seq: 99,
+          type: "client/turn/requested",
+          scope: { kind: "thread" },
+          data: { source: "tell", input: [{ type: "text", text: "[bb-collab inbox reply 1 to operator]\nanswer", mentions: [] }] },
+          createdAt: 99,
+        };
+      }) as never);
+
+      expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
+      artifact = "after";
+      const automatedCycle = fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID]);
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.wait")).toHaveLength(1));
+
+      const message = JSON.parse(await fixture.host.harness.callAgentTool("send_to_operator", {
+        project_id: PROJECT_ID,
+        recipient: "operator",
+        severity: "routine",
+        text: "reply while automated wake is waiting",
+      }, { threadId: fixture.orchestratorThreadId, projectId: PROJECT_ID }) as string);
+      const reply = fixture.host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toContainEqual([
+        expect.objectContaining({ threadId: fixture.orchestratorThreadId, mode: "steer-if-active" }),
+      ]));
+      expect(fixture.db.prepare("SELECT replied_at_ms FROM operator_messages WHERE project_id = ? AND message_id = ?").get(PROJECT_ID, message.messageId)).toEqual({ replied_at_ms: null });
+
+      releaseConfirmation();
+      await expect(reply).resolves.toMatchObject({ repliedAtMs: expect.any(Number), replyDeliveryError: null });
+      releaseIdle();
+      await expect(automatedCycle).resolves.toMatchObject({ exitCode: 0 });
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual(expect.arrayContaining([
+        [expect.objectContaining({ threadId: fixture.orchestratorThreadId, mode: "steer-if-active" })],
+      ]));
+    } finally {
+      restoreGithub();
+    }
+  });
+
+  it("ignores a wrong-source post-send event before the matching tell", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    let sentText = "";
+    let releaseMatching!: () => void;
+    const matching = new Promise<void>((resolve) => { releaseMatching = resolve; });
+    host.harness.sdk.stub("threads.send", (async (input: { input: Array<{ text: string }> }) => {
+      sentText = input.input[0]!.text;
+      return { ok: true };
+    }) as never);
+    const waits: Array<{ afterSeq: string; type: string }> = [];
+    host.harness.sdk.stub("threads.events.wait", (async ({ threadId, afterSeq, type }: { threadId: string; afterSeq: string; type: string }) => {
+      waits.push({ afterSeq, type });
+      if (waits.length === 1) {
+        return {
+          id: "event-wrong-source",
+          threadId,
+          seq: 100,
+          type: "client/turn/requested",
+          scope: { kind: "thread" },
+          data: { source: "user", input: [{ type: "text", text: sentText, mentions: [] }] },
+          createdAt: 100,
+        };
+      }
+      await matching;
+      return {
+        id: "event-matching-tell",
+        threadId,
+        seq: 101,
+        type,
+        scope: { kind: "thread" },
+        data: { source: "tell", input: [{ type: "text", text: sentText, mentions: [] }] },
+        createdAt: 101,
+      };
+    }) as never);
+    const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
+      project_id: PROJECT_ID,
+      recipient: "operator",
+      severity: "routine",
+      text: "wrong source control",
+    }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
+
+    const reply = host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
+    await vi.waitFor(() => expect(waits).toHaveLength(2));
+    expect(host.bb.storage.database().prepare("SELECT replied_at_ms FROM operator_messages WHERE project_id = ? AND message_id = ?").get(PROJECT_ID, message.messageId)).toEqual({ replied_at_ms: null });
+    expect(waits).toEqual([
+      { afterSeq: expect.any(String), type: "client/turn/requested" },
+      { afterSeq: "100", type: "client/turn/requested" },
+    ]);
+    releaseMatching();
+    await expect(reply).resolves.toMatchObject({ repliedAtMs: expect.any(Number), replyDeliveryError: null });
+  });
+
+  it("ignores a wrong-prefix post-send event before the matching tell", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    let sentText = "";
+    let releaseMatching!: () => void;
+    const matching = new Promise<void>((resolve) => { releaseMatching = resolve; });
+    host.harness.sdk.stub("threads.send", (async (input: { input: Array<{ text: string }> }) => {
+      sentText = input.input[0]!.text;
+      return { ok: true };
+    }) as never);
+    const waits: Array<{ afterSeq: string; type: string }> = [];
+    host.harness.sdk.stub("threads.events.wait", (async ({ threadId, afterSeq, type }: { threadId: string; afterSeq: string; type: string }) => {
+      waits.push({ afterSeq, type });
+      if (waits.length === 1) {
+        return {
+          id: "event-wrong-prefix",
+          threadId,
+          seq: 100,
+          type: "client/turn/requested",
+          scope: { kind: "thread" },
+          data: { source: "tell", input: [{ type: "text", text: "unrelated tell input", mentions: [] }] },
+          createdAt: 100,
+        };
+      }
+      await matching;
+      return {
+        id: "event-matching-tell",
+        threadId,
+        seq: 101,
+        type,
+        scope: { kind: "thread" },
+        data: { source: "tell", input: [{ type: "text", text: sentText, mentions: [] }] },
+        createdAt: 101,
+      };
+    }) as never);
+    const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
+      project_id: PROJECT_ID,
+      recipient: "operator",
+      severity: "routine",
+      text: "wrong prefix control",
+    }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
+
+    const reply = host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
+    await vi.waitFor(() => expect(waits).toHaveLength(2));
+    expect(host.bb.storage.database().prepare("SELECT replied_at_ms FROM operator_messages WHERE project_id = ? AND message_id = ?").get(PROJECT_ID, message.messageId)).toEqual({ replied_at_ms: null });
+    expect(waits).toEqual([
+      { afterSeq: expect.any(String), type: "client/turn/requested" },
+      { afterSeq: "100", type: "client/turn/requested" },
+    ]);
+    releaseMatching();
+    await expect(reply).resolves.toMatchObject({ repliedAtMs: expect.any(Number), replyDeliveryError: null });
+  });
+
   it("persists an inbox reply failure and releases its in-process guard for retry", async () => {
     const host = hostFor();
     await plugin(host.bb, { notifyUrgent: async () => undefined });

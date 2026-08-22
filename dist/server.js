@@ -23430,7 +23430,7 @@ async function replyToOperatorMessage(db, bb, projectId, messageId, replyText) {
     const replyPrefix = `[bb-collab inbox reply ${message.messageId} to ${message.recipient}]
 `;
     const deliveredText = `${replyPrefix}${replyText}`;
-    await sendWhenThreadReady(bb, {
+    await bb.sdk.threads.send({
       threadId: message.senderThreadId,
       mode: "steer-if-active",
       input: [{ type: "text", text: deliveredText, mentions: [] }]
