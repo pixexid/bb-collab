@@ -1,22 +1,16 @@
-import Database from "better-sqlite3";
-import { afterEach, describe, expect, it } from "vitest";
-import { hasActiveWorkers, parseJudgment, readRoleThread, routeJudgment } from "../server.js";
+import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { BbPluginApi } from "@bb/plugin-sdk";
+import { describe, expect, it } from "vitest";
+import companionWatcher, { hasActiveWorkers, parseCanonicalExport, parseJudgment, readRoleThread, routeJudgment } from "../server.js";
 
-const dbs: Database.Database[] = [];
-function db(active = 0) {
-  const value = new Database(":memory:"); dbs.push(value);
-  value.exec(`CREATE TABLE role_generation_heads (project_id TEXT, role_id TEXT, current_generation INTEGER);
-    CREATE TABLE role_generations (project_id TEXT, role_id TEXT, generation INTEGER, holder_execution_attempt_id TEXT);
-    CREATE TABLE execution_attempts (project_id TEXT, execution_attempt_id TEXT, thread_id TEXT, origin TEXT, state TEXT);`);
-  value.prepare("INSERT INTO role_generation_heads VALUES ('p','project-orchestrator',1)").run();
-  value.prepare("INSERT INTO role_generations VALUES ('p','project-orchestrator',1,'o')").run();
-  value.prepare("INSERT INTO execution_attempts VALUES ('p','o','orch','role_holder','done')").run();
-  for (let i = 0; i < active; i++) value.prepare("INSERT INTO execution_attempts VALUES ('p',?,?,'work_item','running')").run(`a${i}`, `lane${i}`);
-  return value;
-}
-afterEach(() => { while (dbs.length) dbs.pop()!.close(); });
-
+const fixtureRoot = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 const affirmative = parseJudgment("COVERAGE: known\nFINDING: promised follow-up was not done\nESCALATE: yes");
+
+async function capturedExport() {
+  return parseCanonicalExport(await readFile(join(fixtureRoot, "live-export.json"), "utf8"), fixtureRoot);
+}
 
 describe("semantic idle guard", () => {
   it("parses only anchored judgments and degrades malformed coverage to blind", () => {
@@ -26,16 +20,29 @@ describe("semantic idle guard", () => {
     expect(parseJudgment("COVERAGE: known\nESCALATE: yes")).toMatchObject({ illegitimate: false });
   });
 
-  it("silences active workers using the existing non-terminal predicate", () => {
-    expect(hasActiveWorkers(db(1), "p")).toBe(true);
-    expect(hasActiveWorkers(db(), "p")).toBe(false);
+  it("parses the captured canonical export shape", async () => {
+    const canonical = await capturedExport();
+    expect(readRoleThread(canonical, "proj_a8zzfsx36j", "project-orchestrator")).toBe("thr_7bjw9e7mgd");
+    expect(hasActiveWorkers(canonical, "proj_a8zzfsx36j")).toBe(true);
+    expect(hasActiveWorkers({ ...canonical, executionAttempts: canonical.executionAttempts.filter((row) => row.state !== "running") }, "proj_a8zzfsx36j")).toBe(false);
   });
 
-  it("rereads the canonical orchestrator head", () => {
-    const store = db();
-    expect(readRoleThread(store, "p", "project-orchestrator")).toBe("orch");
-    store.prepare("UPDATE execution_attempts SET thread_id='successor' WHERE execution_attempt_id='o'").run();
-    expect(readRoleThread(store, "p", "project-orchestrator")).toBe("successor");
+  it("degrades the snapshot to blind when the export CLI fails", async () => {
+    let tool: { execute(params: unknown, context: { threadId: string; projectId: string }): Promise<unknown> } | undefined;
+    const bb = {
+      pluginId: "companion-watcher",
+      storage: { kv: { get: async () => undefined, set: async () => undefined } },
+      agents: { registerTool: (value: typeof tool) => { tool = value; }, configure: () => undefined },
+      sdk: {
+        system: { config: async () => ({ dataDir: "/unused" }) },
+        threads: { get: async () => ({ projectId: "p", title: "Alzheimer companion judgment", originPluginId: "companion-watcher" }) },
+      },
+      events: { on: () => undefined },
+    } as unknown as BbPluginApi;
+    companionWatcher(bb, async () => { throw new Error("export CLI failed"); });
+    const result = await tool!.execute({}, { threadId: "companion", projectId: "p" });
+    expect(result).toMatchObject({ isError: true, content: [{ text: expect.stringContaining("COVERAGE: blind") }] });
+    expect(result).toMatchObject({ content: [{ text: expect.stringContaining("export CLI failed") }] });
   });
 
   it("backs off unchanged findings, then routes a post-turn repeat to the director", () => {

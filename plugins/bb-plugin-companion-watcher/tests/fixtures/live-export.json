@@ -1,0 +1,14 @@
+{
+  "outcome": "OK",
+  "subject": "proj_a8zzfsx36j",
+  "expected": 154,
+  "attempted": 154,
+  "verified": 154,
+  "evidence": {
+    "exportFile": {
+      "kind": "canonical-export-files",
+      "complete": true,
+      "directory": "live-export"
+    }
+  }
+}
