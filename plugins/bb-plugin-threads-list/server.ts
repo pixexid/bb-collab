@@ -32,7 +32,7 @@ export const rpcContract = defineRpcContract({
     output: z.array(id),
   },
   reorderProjects: {
-    input: z.object({ projectId: id, threadId: id, previousProjectId: id.nullable(), nextProjectId: id.nullable() }).strict(),
+    input: z.object({ projectId: id, previousProjectId: id.nullable(), nextProjectId: id.nullable() }).strict(),
     output: z.array(id),
   },
 });

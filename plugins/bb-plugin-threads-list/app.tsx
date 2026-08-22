@@ -390,6 +390,11 @@ function ThreadRow({
     triggerRef.current?.focus();
     run();
   };
+  const visit = (split = false) => {
+    if (split) actions.open(thread.id, { split: true });
+    else { actions.open(thread.id); onNavigate(); }
+    void actions.setRead(thread.id, true).catch(() => undefined);
+  };
   return (
     <div
       className={`group/row relative flex h-7 items-center gap-1.5 rounded-md pr-1 text-left text-sm transition-colors duration-150 select-none hover:bg-muted/50 motion-reduce:transition-none ${active ? "bg-muted" : ""}`}
@@ -411,7 +416,7 @@ function ThreadRow({
             data-sidebar-thread-id={thread.id}
             draggable={false}
             title={thread.environment?.branchName ? `${title} — ${thread.environment.branchName}` : title}
-            onClick={(event) => { event.preventDefault(); actions.open(thread.id); void actions.setRead(thread.id, true).catch(() => undefined); onNavigate(); }}
+            onClick={(event) => { event.preventDefault(); visit(); }}
           >
             {title}
           </a>
@@ -445,7 +450,7 @@ function ThreadRow({
         className="absolute right-1 top-7 z-20 flex w-44 flex-col rounded-md border border-border bg-background p-1 shadow"
         onKeyDown={(event) => { if (event.key === "Escape") { setMenuOpen(false); triggerRef.current?.focus(); } }}
       >
-        <button autoFocus type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => actions.open(thread.id, { split: true }))}>Open in split</button>
+        <button autoFocus type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => visit(true))}>Open in split</button>
         <button type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => { void actions.setRead(thread.id, thread.isUnread).catch(() => undefined); })}>{thread.isUnread ? "Mark read" : "Mark unread"}</button>
         <button type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => { void actions.setPinned(thread.id, !thread.isPinned).catch(() => undefined); })}>{thread.isPinned ? "Unpin" : "Pin"}</button>
         {thread.isPinned ? <>
@@ -612,10 +617,9 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   const reorderProject = (draggedId: string, targetId: string) => {
     const order = displayProjects.map((project) => project.id);
     const move = moveBetween(order, draggedId, targetId);
-    const threadId = sidebar.threads.find((thread) => thread.projectId === draggedId)?.id;
-    if (!move || !threadId) return;
+    if (!move) return;
     setOptimisticProjectOrder(move.nextOrder);
-    void rpc.call("reorderProjects", { projectId: draggedId, threadId, previousProjectId: move.previousId, nextProjectId: move.nextId }).then((authoritativeOrder) => {
+    void rpc.call("reorderProjects", { projectId: draggedId, previousProjectId: move.previousId, nextProjectId: move.nextId }).then((authoritativeOrder) => {
       setOptimisticProjectOrder((current) => current === move.nextOrder ? authoritativeOrder.filter((id) => order.includes(id)) : current);
     }).catch(() => {
       setOptimisticProjectOrder((current) => current === move.nextOrder ? null : current);

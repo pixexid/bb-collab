@@ -405,6 +405,14 @@ function ThreadRow({
     triggerRef.current?.focus();
     run();
   };
+  const visit = (split = false) => {
+    if (split) actions.open(thread.id, { split: true });
+    else {
+      actions.open(thread.id);
+      onNavigate();
+    }
+    void actions.setRead(thread.id, true).catch(() => void 0);
+  };
   return /* @__PURE__ */ jsxs(
     "div",
     {
@@ -433,9 +441,7 @@ function ThreadRow({
               title: thread.environment?.branchName ? `${title} \u2014 ${thread.environment.branchName}` : title,
               onClick: (event) => {
                 event.preventDefault();
-                actions.open(thread.id);
-                void actions.setRead(thread.id, true).catch(() => void 0);
-                onNavigate();
+                visit();
               },
               children: title
             }
@@ -475,7 +481,7 @@ function ThreadRow({
               }
             },
             children: [
-              /* @__PURE__ */ jsx("button", { autoFocus: true, type: "button", role: "menuitem", className: MENU_ITEM, onClick: () => menuAction(() => actions.open(thread.id, { split: true })), children: "Open in split" }),
+              /* @__PURE__ */ jsx("button", { autoFocus: true, type: "button", role: "menuitem", className: MENU_ITEM, onClick: () => menuAction(() => visit(true)), children: "Open in split" }),
               /* @__PURE__ */ jsx("button", { type: "button", role: "menuitem", className: MENU_ITEM, onClick: () => menuAction(() => {
                 void actions.setRead(thread.id, thread.isUnread).catch(() => void 0);
               }), children: thread.isUnread ? "Mark read" : "Mark unread" }),
@@ -640,10 +646,9 @@ function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }) {
   const reorderProject = (draggedId, targetId) => {
     const order = displayProjects.map((project) => project.id);
     const move = moveBetween(order, draggedId, targetId);
-    const threadId = sidebar.threads.find((thread) => thread.projectId === draggedId)?.id;
-    if (!move || !threadId) return;
+    if (!move) return;
     setOptimisticProjectOrder(move.nextOrder);
-    void rpc.call("reorderProjects", { projectId: draggedId, threadId, previousProjectId: move.previousId, nextProjectId: move.nextId }).then((authoritativeOrder) => {
+    void rpc.call("reorderProjects", { projectId: draggedId, previousProjectId: move.previousId, nextProjectId: move.nextId }).then((authoritativeOrder) => {
       setOptimisticProjectOrder((current) => current === move.nextOrder ? authoritativeOrder.filter((id) => order.includes(id)) : current);
     }).catch(() => {
       setOptimisticProjectOrder((current) => current === move.nextOrder ? null : current);

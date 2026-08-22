@@ -221,6 +221,20 @@ describe("replacement thread list", () => {
     expect(newer.getByRole("img", { name: "Unread" })).toBeTruthy();
   });
 
+  it("acknowledges a split-open visit through the native read action", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [{ ...thread("thread-1", "project-a", 1), isUnread: true }] },
+      rpc: rpcHandlers(),
+    });
+    fireEvent.click(rendered.getByRole("button", { name: "Thread actions" }));
+    fireEvent.click(rendered.getByRole("menuitem", { name: "Open in split" }));
+    expect(rendered.inspection.sidebarActionCalls).toEqual([
+      { method: "open", threadId: "thread-1", options: { split: true } },
+      { method: "setRead", threadId: "thread-1", read: true },
+    ]);
+  });
+
   it("renders the row actions as a compact stacked dropdown that closes on Escape", async () => {
     const list = await registration();
     const rendered = renderSlot(list, props(), {
@@ -562,13 +576,13 @@ describe("replacement thread list", () => {
     expect(projectIds()).toEqual(["project-b", "project-a"]);
     await waitFor(() => expect(rendered.inspection.rpcCalls).toContainEqual({
       method: "reorderProjects",
-      input: { projectId: "project-a", threadId: "a", previousProjectId: "project-b", nextProjectId: null },
+      input: { projectId: "project-a", previousProjectId: "project-b", nextProjectId: null },
     }));
 
     fireEvent.click(rendered.getByRole("button", { name: "Move Project A project up" }));
     await waitFor(() => expect(rendered.inspection.rpcCalls).toContainEqual({
       method: "reorderProjects",
-      input: { projectId: "project-a", threadId: "a", previousProjectId: null, nextProjectId: "project-b" },
+      input: { projectId: "project-a", previousProjectId: null, nextProjectId: "project-b" },
     }));
   });
 
@@ -718,8 +732,8 @@ describe("replacement thread list", () => {
 
     await host.harness.callRpc("reorderPinned", { threadId: "thread-1", previousThreadId: null, nextThreadId: "thread-2" });
     expect(reorderPinned).toHaveBeenCalledWith({ threadId: "thread-1", previousThreadId: null, nextThreadId: "thread-2" });
-    await expect(host.harness.callRpc("reorderProjects", { projectId: "project-a", threadId: "thread-1", previousProjectId: null, nextProjectId: "project-b" })).resolves.toEqual(["project-a", "project-b"]);
-    expect(reorderProjects).toHaveBeenCalledWith({ projectId: "project-a", threadId: "thread-1", previousProjectId: null, nextProjectId: "project-b" });
+    await expect(host.harness.callRpc("reorderProjects", { projectId: "project-a", previousProjectId: null, nextProjectId: "project-b" })).resolves.toEqual(["project-a", "project-b"]);
+    expect(reorderProjects).toHaveBeenCalledWith({ projectId: "project-a", previousProjectId: null, nextProjectId: "project-b" });
   });
 
 

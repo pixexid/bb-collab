@@ -13812,7 +13812,7 @@ var rpcContract = defineRpcContract({
     output: external_exports.array(id)
   },
   reorderProjects: {
-    input: external_exports.object({ projectId: id, threadId: id, previousProjectId: id.nullable(), nextProjectId: id.nullable() }).strict(),
+    input: external_exports.object({ projectId: id, previousProjectId: id.nullable(), nextProjectId: id.nullable() }).strict(),
     output: external_exports.array(id)
   }
 });
