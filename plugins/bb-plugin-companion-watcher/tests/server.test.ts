@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { describe, expect, it } from "vitest";
-import companionWatcher, { hasActiveWorkers, parseCanonicalExport, parseJudgment, readRoleThread, routeJudgment } from "../server.js";
+import companionWatcher, { hasActiveWorkers, parseCanonicalExport, parseJudgment, readRoleThread, routeJudgment, snapshotCanonical } from "../server.js";
 
 const fixtureRoot = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 const projectId = "proj_a8zzfsx36j";
@@ -31,6 +31,47 @@ describe("semantic idle guard", () => {
     expect(readRoleThread(canonical, projectId, "project-orchestrator")).toBe("thr_7bjw9e7mgd");
     expect(hasActiveWorkers(canonical, projectId)).toBe(true);
     expect(hasActiveWorkers({ ...canonical, executionAttempts: canonical.executionAttempts.filter((row) => row.state !== "running") }, projectId)).toBe(false);
+  });
+
+  it("keeps a canonical population over 100 rows bounded and fully known below the ceiling", async () => {
+    const canonical = await capturedExport();
+    const expanded = {
+      ...canonical,
+      executionAttempts: Array.from({ length: 150 }, (_, index) => ({ ...canonical.executionAttempts[0], execution_attempt_id: `attempt-${index}` })),
+      workItems: Array.from({ length: 125 }, (_, index) => ({ ...canonical.workItems[0], work_item_id: `work-item-${index}` })),
+    };
+    const snapshot = snapshotCanonical(expanded, 0);
+    expect(snapshot).toMatchObject({ coverage: "known" });
+    expect(snapshot.executionAttempts).toHaveLength(150);
+    expect(snapshot.workItems).toHaveLength(125);
+  });
+
+  it("keeps the native timeline page bounded and reports older rows as partial", async () => {
+    let tool: { execute(params: unknown, context: { threadId: string; projectId: string }): Promise<unknown> } | undefined;
+    let hasOlderRows = true;
+    let timelineArgs: { segmentLimit?: string } | undefined;
+    const bb = {
+      pluginId: "companion-watcher",
+      log: { warn: () => undefined },
+      storage: { kv: { get: async () => undefined, set: async () => undefined } },
+      agents: { registerTool: (value: typeof tool) => { tool = value; }, configure: () => undefined },
+      sdk: {
+        system: { config: async () => ({ dataDir: "/unused" }) },
+        projects: { get: async () => ({ gitRemoteUrl: null }) },
+        threads: {
+          get: async () => ({ projectId, title: "Alzheimer companion judgment", originPluginId: "companion-watcher" }),
+          timeline: async (args: typeof timelineArgs) => { timelineArgs = args; return { rows: [], timelinePage: { hasOlderRows, kind: "latest", segmentLimit: Number(args.segmentLimit), returnedSegmentCount: 0, olderCursor: null }, maxSeq: 0 }; },
+          queuedMessages: { list: async () => [] },
+        },
+      },
+      events: { on: () => undefined },
+    } as unknown as BbPluginApi;
+    companionWatcher(bb, capturedExport, async () => []);
+    const run = async () => JSON.parse(await tool!.execute({}, { threadId: "companion", projectId }) as string) as { coverage: string };
+    expect((await run()).coverage).toBe("partial");
+    expect(timelineArgs?.segmentLimit).toBe("100");
+    hasOlderRows = false;
+    expect((await run()).coverage).toBe("known");
   });
 
   it("rejects a non-OK canonical export outcome", async () => {

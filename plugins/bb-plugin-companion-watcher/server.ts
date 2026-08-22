@@ -8,7 +8,9 @@ const exec = promisify(execFile);
 const ACTIVE = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
 const BACKOFF_MS = 10 * 60_000;
 const ESCALATION_HOLD_MS = 24 * 60 * 60_000;
-const SNAPSHOT_LIMIT = 100;
+// ponytail: one export has no paging seam; 200 is the bounded ceiling, page the export when population exceeds it.
+const SNAPSHOT_LIMIT = 200;
+const TIMELINE_PAGE_LIMIT = 100;
 const TOOL = "companion_read_snapshot";
 const TITLE = "Alzheimer companion judgment";
 type Coverage = "known" | "partial" | "blind";
@@ -19,6 +21,7 @@ type ExportRow = Record<string, unknown>;
 type CanonicalExport = { executionAttempts: ExportRow[]; roleGenerationHeads: ExportRow[]; roleGenerations: ExportRow[]; workItems: ExportRow[] };
 type ExportManifest = { projectId?: unknown; tableCounts?: unknown };
 type CanonicalReader = (projectId: string, exportRoot: string) => Promise<CanonicalExport>;
+type GithubReader = (remote: string | null) => Promise<unknown>;
 
 type FieldCheck = (value: unknown) => boolean;
 const REQUIRED_FIELDS: Record<string, Record<string, FieldCheck>> = {
@@ -129,6 +132,13 @@ export function hasActiveWorkers(canonical: CanonicalExport, projectId: string):
   return canonical.executionAttempts.some((row) => row.project_id === projectId && row.work_item_id != null && row.origin === "work_item" && ACTIVE.includes(row.state as typeof ACTIVE[number]));
 }
 
+export function snapshotCanonical(canonical: CanonicalExport, queuedCount: number) {
+  const executionAttempts = [...canonical.executionAttempts].sort((a, b) => Number(b.observed_at_ms) - Number(a.observed_at_ms)).slice(0, SNAPSHOT_LIMIT);
+  const workItems = [...canonical.workItems].sort((a, b) => Number(b.updated_at_ms) - Number(a.updated_at_ms)).slice(0, SNAPSHOT_LIMIT);
+  const coverage: Coverage = queuedCount >= SNAPSHOT_LIMIT || canonical.executionAttempts.length > SNAPSHOT_LIMIT || canonical.workItems.length > SNAPSHOT_LIMIT ? "partial" : "known";
+  return { coverage, executionAttempts, workItems };
+}
+
 async function githubEvidence(remote: string | null): Promise<unknown> {
   const repo = remote?.match(/github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?$/u)?.[1];
   if (!repo) throw new Error("github-repository-unresolved");
@@ -138,7 +148,7 @@ async function githubEvidence(remote: string | null): Promise<unknown> {
 
 const prompt = (projectId: string) => `Judge whether the project orchestrator's current idleness is illegitimate: compare its stated intentions with outcomes and identify undone stated work or work parked without cause. Call ${TOOL} exactly once; do not infer liveness from silence and do not mutate or message anything. Output exactly one anchored line COVERAGE: known|partial|blind. If and only if idleness is illegitimate, add one or more anchored FINDING: lines and the optional anchored affirmative line ESCALATE: yes. Project: ${projectId}.`;
 
-export default function companionWatcher(bb: BbPluginApi, readExport: CanonicalReader = readCanonicalExport) {
+export default function companionWatcher(bb: BbPluginApi, readExport: CanonicalReader = readCanonicalExport, readGithub: GithubReader = githubEvidence) {
   const snapshots = new Map<string, Snapshot>();
   const companions = new Map<string, string>();
   const pending = new Map<string, Pending>();
@@ -172,13 +182,13 @@ export default function companionWatcher(bb: BbPluginApi, readExport: CanonicalR
         const orchestratorId = readRoleThread(exported, context.projectId, "project-orchestrator");
         if (!orchestratorId) throw new Error("orchestrator-head-unresolved");
         const project = await bb.sdk.projects.get({ projectId: context.projectId });
-        const recentTimeline = await bb.sdk.threads.timeline({ threadId: orchestratorId, segmentLimit: String(SNAPSHOT_LIMIT) });
+        const recentTimeline = await bb.sdk.threads.timeline({ threadId: orchestratorId, segmentLimit: String(TIMELINE_PAGE_LIMIT) });
         const queued = await bb.sdk.threads.queuedMessages.list({ threadId: orchestratorId });
-        const executionAttempts = [...exported.executionAttempts].sort((a, b) => Number(b.observed_at_ms) - Number(a.observed_at_ms)).slice(0, SNAPSHOT_LIMIT);
-        const workItems = [...exported.workItems].sort((a, b) => Number(b.updated_at_ms) - Number(a.updated_at_ms)).slice(0, SNAPSHOT_LIMIT);
+        const { coverage: canonicalCoverage, executionAttempts, workItems } = snapshotCanonical(exported, queued.length);
         let github: unknown;
-        let coverage: Coverage = queued.length >= SNAPSHOT_LIMIT || exported.executionAttempts.length >= SNAPSHOT_LIMIT || exported.workItems.length >= SNAPSHOT_LIMIT ? "partial" : "known";
-        try { github = await githubEvidence(project.gitRemoteUrl); } catch (error) { coverage = "blind"; github = { error: String(error) }; }
+        let coverage: Coverage = canonicalCoverage;
+        if (recentTimeline.timelinePage.hasOlderRows) coverage = "partial";
+        try { github = await readGithub(project.gitRemoteUrl); } catch (error) { coverage = "blind"; github = { error: String(error) }; }
         return JSON.stringify({ coverage, orchestratorId, recentTimeline, queued: queued.slice(0, SNAPSHOT_LIMIT), executionAttempts, workItems, github });
       } catch (error) {
         const reason = String(error);

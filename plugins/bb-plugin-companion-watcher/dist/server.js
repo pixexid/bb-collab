@@ -14,7 +14,8 @@ var exec = promisify(execFile);
 var ACTIVE = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
 var BACKOFF_MS = 10 * 6e4;
 var ESCALATION_HOLD_MS = 24 * 60 * 6e4;
-var SNAPSHOT_LIMIT = 100;
+var SNAPSHOT_LIMIT = 200;
+var TIMELINE_PAGE_LIMIT = 100;
 var TOOL = "companion_read_snapshot";
 var TITLE = "Alzheimer companion judgment";
 var REQUIRED_FIELDS = {
@@ -114,6 +115,12 @@ function readRoleThread(canonical, projectId, roleId) {
 function hasActiveWorkers(canonical, projectId) {
   return canonical.executionAttempts.some((row) => row.project_id === projectId && row.work_item_id != null && row.origin === "work_item" && ACTIVE.includes(row.state));
 }
+function snapshotCanonical(canonical, queuedCount) {
+  const executionAttempts = [...canonical.executionAttempts].sort((a, b) => Number(b.observed_at_ms) - Number(a.observed_at_ms)).slice(0, SNAPSHOT_LIMIT);
+  const workItems = [...canonical.workItems].sort((a, b) => Number(b.updated_at_ms) - Number(a.updated_at_ms)).slice(0, SNAPSHOT_LIMIT);
+  const coverage = queuedCount >= SNAPSHOT_LIMIT || canonical.executionAttempts.length > SNAPSHOT_LIMIT || canonical.workItems.length > SNAPSHOT_LIMIT ? "partial" : "known";
+  return { coverage, executionAttempts, workItems };
+}
 async function githubEvidence(remote) {
   const repo = remote?.match(/github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?$/u)?.[1];
   if (!repo) throw new Error("github-repository-unresolved");
@@ -121,7 +128,7 @@ async function githubEvidence(remote) {
   return JSON.parse(stdout);
 }
 var prompt = (projectId) => `Judge whether the project orchestrator's current idleness is illegitimate: compare its stated intentions with outcomes and identify undone stated work or work parked without cause. Call ${TOOL} exactly once; do not infer liveness from silence and do not mutate or message anything. Output exactly one anchored line COVERAGE: known|partial|blind. If and only if idleness is illegitimate, add one or more anchored FINDING: lines and the optional anchored affirmative line ESCALATE: yes. Project: ${projectId}.`;
-function companionWatcher(bb, readExport = readCanonicalExport) {
+function companionWatcher(bb, readExport = readCanonicalExport, readGithub = githubEvidence) {
   const snapshots = /* @__PURE__ */ new Map();
   const companions = /* @__PURE__ */ new Map();
   const pending = /* @__PURE__ */ new Map();
@@ -152,14 +159,14 @@ function companionWatcher(bb, readExport = readCanonicalExport) {
         const orchestratorId = readRoleThread(exported, context.projectId, "project-orchestrator");
         if (!orchestratorId) throw new Error("orchestrator-head-unresolved");
         const project = await bb.sdk.projects.get({ projectId: context.projectId });
-        const recentTimeline = await bb.sdk.threads.timeline({ threadId: orchestratorId, segmentLimit: String(SNAPSHOT_LIMIT) });
+        const recentTimeline = await bb.sdk.threads.timeline({ threadId: orchestratorId, segmentLimit: String(TIMELINE_PAGE_LIMIT) });
         const queued = await bb.sdk.threads.queuedMessages.list({ threadId: orchestratorId });
-        const executionAttempts = [...exported.executionAttempts].sort((a, b) => Number(b.observed_at_ms) - Number(a.observed_at_ms)).slice(0, SNAPSHOT_LIMIT);
-        const workItems = [...exported.workItems].sort((a, b) => Number(b.updated_at_ms) - Number(a.updated_at_ms)).slice(0, SNAPSHOT_LIMIT);
+        const { coverage: canonicalCoverage, executionAttempts, workItems } = snapshotCanonical(exported, queued.length);
         let github;
-        let coverage = queued.length >= SNAPSHOT_LIMIT || exported.executionAttempts.length >= SNAPSHOT_LIMIT || exported.workItems.length >= SNAPSHOT_LIMIT ? "partial" : "known";
+        let coverage = canonicalCoverage;
+        if (recentTimeline.timelinePage.hasOlderRows) coverage = "partial";
         try {
-          github = await githubEvidence(project.gitRemoteUrl);
+          github = await readGithub(project.gitRemoteUrl);
         } catch (error) {
           coverage = "blind";
           github = { error: String(error) };
@@ -244,6 +251,7 @@ export {
   parseJudgment,
   readCanonicalExport,
   readRoleThread,
-  routeJudgment
+  routeJudgment,
+  snapshotCanonical
 };
 //# sourceMappingURL=server.js.map
