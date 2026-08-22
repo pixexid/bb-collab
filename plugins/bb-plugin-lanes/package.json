@@ -1,0 +1,38 @@
+{
+  "name": "bb-plugin-lanes",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "bb": ">=0.37.0",
+    "bbPluginSdk": ">=0.4.8"
+  },
+  "bb": {
+    "name": "Collaboration Lanes",
+    "description": "Open collaboration lanes and their thread-row activity pulse.",
+    "branding": {
+      "icon": "GitBranch"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx",
+    "skills": []
+  },
+  "scripts": {
+    "build": "bb plugin build && node ../../scripts/normalize-plugin-dist.mjs lanes --strip-trailing",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.4.8",
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "jsdom": "^29.0.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.1"
+  }
+}

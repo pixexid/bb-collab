@@ -4,6 +4,7 @@
   "name": "bb-collab-plugins",
   "plugins": [
     { "name": "threads-list", "source": "./plugins/bb-plugin-threads-list" },
+    { "name": "collaboration-lanes", "source": "./plugins/bb-plugin-lanes" },
     { "name": "companion-watcher", "source": "./plugins/bb-plugin-companion-watcher" }
   ]
 }

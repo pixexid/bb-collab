@@ -17,6 +17,19 @@
           "ref": "main"
         }
       }
+    },
+    {
+      "id": "collaboration-lanes",
+      "displayName": "Collaboration Lanes",
+      "description": "Open collaboration lanes and their thread-row activity pulse.",
+      "author": { "name": "bb-collab" },
+      "source": {
+        "git": {
+          "url": "https://github.com/pixexid/bb-collab.git",
+          "subdir": "plugins/bb-plugin-lanes",
+          "ref": "main"
+        }
+      }
     }
   ]
 }

@@ -545,7 +545,7 @@ const dispatchLaneInputSchema = z.object({
 }).strict();
 
 export const rpcContract = defineRpcContract({
-  lanes: {
+  "v1-lanes": {
     input: z.object({}).strict(),
     output: laneListSchema,
   },
@@ -3952,12 +3952,6 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     }
   });
 
-  bb.http.route("GET", "/lanes", async () =>
-    new Response(JSON.stringify(await readOpenLaneViews()), {
-      headers: { "content-type": "application/json" },
-    }),
-  );
-
   // Counts only. A sidebar glyph needs how many are waiting and on which
   // thread; it has no use for the project, candidate head, digest or
   // idempotency key those requests carry, so this surface never carries them.
@@ -3981,7 +3975,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   };
 
   bb.rpc.register(rpcContract, {
-    lanes() {
+    "v1-lanes"() {
       return readOpenLaneViews();
     },
     async registerWait(input) {

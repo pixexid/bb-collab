@@ -22430,7 +22430,7 @@ var dispatchLaneInputSchema = external_exports.object({
   spawn: external_exports.record(external_exports.string(), external_exports.unknown())
 }).strict();
 var rpcContract = defineRpcContract({
-  lanes: {
+  "v1-lanes": {
     input: external_exports.object({}).strict(),
     output: laneListSchema
   },
@@ -25470,13 +25470,6 @@ ${thread.titleFallback ?? ""}`);
       bb.log.error(`role brief seating failed for thread=${thread.id}: ${String(error48)}`);
     }
   });
-  bb.http.route(
-    "GET",
-    "/lanes",
-    async () => new Response(JSON.stringify(await readOpenLaneViews()), {
-      headers: { "content-type": "application/json" }
-    })
-  );
   const cliDeps = {
     watcher,
     registerBoundedWaitForCli: (input, ctxThreadId) => registerBoundedWait({
@@ -25499,7 +25492,7 @@ ${thread.titleFallback ?? ""}`);
     notifyUrgent
   };
   bb.rpc.register(rpcContract, {
-    lanes() {
+    "v1-lanes"() {
       return readOpenLaneViews();
     },
     async registerWait(input) {

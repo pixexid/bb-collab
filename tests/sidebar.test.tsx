@@ -72,7 +72,6 @@ type ThreadExecution = { model: string; reasoning: string };
 
 function rpcHandlers(states: Record<string, string> = {}, models: Record<string, ThreadExecution | null> = {}) {
   return {
-    lanes: async () => [],
     threadStates: async () => states,
     threadModels: async () => models,
     sidebarCollapseState: async () => ({ projects: {}, threads: {} }),
@@ -108,9 +107,10 @@ describe("replacement thread list", () => {
     await loadedApp();
   });
 
-  it("keeps the Lane 1 content-script fallback registered", async () => {
+  it("leaves Collaboration Lanes registrations to its independent plugin", async () => {
     const app = await loadedApp();
-    expect(app.contentScripts.map((script) => script.id)).toContain("lane-thread-status");
+    expect(app.navPanels.map((panel) => panel.id)).toEqual(["inbox"]);
+    expect(app.contentScripts).toEqual([]);
   });
 
   it("registers a project-exact Inbox panel and surfaces reply delivery failures", async () => {

@@ -174,19 +174,8 @@ var {
 
 // app.tsx
 var SETTINGS_ACTION_TITLE = "bb-collab settings";
-function age(ms) {
-  const minutes = Math.floor(ms / 6e4);
-  if (minutes < 1) return "just now";
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  return hours < 24 ? `${hours}h ${minutes % 60}m` : `${Math.floor(hours / 24)}d`;
-}
 function asText(value) {
   return typeof value === "string" && value.trim() ? value : null;
-}
-function laneQueueLabel(lane) {
-  if (lane.queueState !== "deferred" && !lane.deferredReason) return lane.nextStartable ? "next startable" : lane.waitingOn ?? "worker";
-  return `Deferred \xB7 ${lane.deferredReason?.replace(/_/gu, " ") ?? "reason unavailable"}${typeof lane.deferredAgeMs === "number" ? ` \xB7 ${age(lane.deferredAgeMs)}` : ""}`;
 }
 var MAX_VISIBLE_INBOX_MESSAGES = 256;
 var INBOX_FILTER_STORAGE_KEY = "bb-collab.inbox-filters";
@@ -207,41 +196,6 @@ function writeInboxFilters(filters) {
     window.localStorage.setItem(INBOX_FILTER_STORAGE_KEY, JSON.stringify(filters));
   } catch {
   }
-}
-function LanesPanel(_props) {
-  const rpc = useRpc();
-  const [lanes, setLanes] = useState([]);
-  const [error, setError] = useState(null);
-  const refresh = useCallback(() => {
-    void rpc.call("lanes", {}).then((next) => setLanes(next)).catch((reason) => setError(String(reason)));
-  }, [rpc]);
-  useEffect(() => {
-    refresh();
-    const timer = window.setInterval(refresh, 5e3);
-    return () => window.clearInterval(timer);
-  }, [refresh]);
-  return /* @__PURE__ */ jsx("main", { className: "h-full overflow-y-auto p-5", children: /* @__PURE__ */ jsxs("div", { className: "mx-auto max-w-4xl", children: [
-    /* @__PURE__ */ jsxs("div", { className: "mb-5 flex items-center justify-between", children: [
-      /* @__PURE__ */ jsxs("div", { children: [
-        /* @__PURE__ */ jsx("h1", { className: "text-lg font-semibold", children: "Lanes" }),
-        /* @__PURE__ */ jsx("p", { className: "text-sm text-muted-foreground", children: "Open lanes from bb-collab storage." })
-      ] }),
-      /* @__PURE__ */ jsx("button", { className: "text-sm text-muted-foreground hover:text-foreground", onClick: refresh, children: "Refresh" })
-    ] }),
-    error ? /* @__PURE__ */ jsxs("p", { className: "text-sm text-destructive", children: [
-      "Unable to read lanes: ",
-      error
-    ] }) : null,
-    lanes.length === 0 ? /* @__PURE__ */ jsx("p", { className: "text-sm text-muted-foreground", children: "No open lanes." }) : null,
-    /* @__PURE__ */ jsx("div", { className: "divide-y divide-border border-y border-border", children: lanes.map((lane) => /* @__PURE__ */ jsxs("div", { className: "grid grid-cols-[minmax(0,1fr)_auto_auto] gap-4 py-3 text-sm", children: [
-      /* @__PURE__ */ jsxs("div", { className: "min-w-0", children: [
-        /* @__PURE__ */ jsx("div", { className: "truncate font-medium", children: lane.laneId }),
-        /* @__PURE__ */ jsx("div", { className: "truncate text-xs text-muted-foreground", children: lane.threadId ?? "worker not attached" })
-      ] }),
-      /* @__PURE__ */ jsx("div", { className: "text-muted-foreground", children: laneQueueLabel(lane) }),
-      /* @__PURE__ */ jsx("time", { className: "text-muted-foreground", title: `${lane.ageMs}ms old`, children: age(lane.ageMs) })
-    ] }, lane.executionAttemptId)) })
-  ] }) });
 }
 function InboxPanel(_props) {
   const sidebar = experimental_useSidebarThreads();
@@ -457,35 +411,6 @@ function InboxPanel(_props) {
     ] }) : null
   ] }) });
 }
-async function readPluginHttp(path, signal) {
-  const response = await fetch(`/api/v1/plugins/bb-collab/http/${path}`, { credentials: "same-origin", signal });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return await response.json();
-}
-function mountLanePulse({ signal, setStatus }) {
-  let previous = /* @__PURE__ */ new Set();
-  const refresh = async () => {
-    try {
-      const lanes = await readPluginHttp("lanes", signal);
-      const next = /* @__PURE__ */ new Set();
-      for (const lane of lanes) {
-        if (!lane.threadId) continue;
-        next.add(lane.threadId);
-        setStatus(lane.threadId, {
-          icon: lane.tone === "error" ? "AlertTriangle" : "GitBranch",
-          label: lane.waitingOn ? `Lane ${lane.laneId}: waiting on ${lane.waitingOn}` : `Lane ${lane.laneId}: open`,
-          tone: lane.tone
-        });
-      }
-      for (const threadId of previous) if (!next.has(threadId)) setStatus(threadId, null);
-      previous = next;
-    } catch {
-    }
-  };
-  void refresh();
-  const timer = window.setInterval(refresh, 5e3);
-  return () => window.clearInterval(timer);
-}
 var app_default = definePluginApp((app) => {
   app.slots.sidebarFooterAction({
     id: "bb-collab-settings",
@@ -494,25 +419,11 @@ var app_default = definePluginApp((app) => {
     run: ({ openSettings }) => openSettings()
   });
   app.slots.navPanel({
-    id: "lanes",
-    title: "Lanes",
-    icon: "GitBranch",
-    path: "lanes",
-    component: LanesPanel
-  });
-  app.slots.navPanel({
     id: "inbox",
     title: "Inbox",
     icon: "Mail",
     path: "inbox",
     component: InboxPanel
-  });
-  app.contentScripts.register({
-    id: "lane-thread-status",
-    mount: ({ signal, experimental_setThreadRowStatus }) => {
-      if (!experimental_setThreadRowStatus) return;
-      return mountLanePulse({ signal, setStatus: experimental_setThreadRowStatus });
-    }
   });
 });
 export {
