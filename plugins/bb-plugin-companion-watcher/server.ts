@@ -11,6 +11,8 @@ const ESCALATION_HOLD_MS = 24 * 60 * 60_000;
 // ponytail: one export has no paging seam; 200 is the bounded ceiling, page the export when population exceeds it.
 const SNAPSHOT_LIMIT = 200;
 const TIMELINE_PAGE_LIMIT = 100;
+// ponytail: ten pages is the bounded history ceiling; raise only with a smaller model input budget.
+const TIMELINE_PAGE_MAX = 10;
 const TOOL = "companion_read_snapshot";
 const TITLE = "Alzheimer companion judgment";
 type Coverage = "known" | "partial" | "blind";
@@ -182,7 +184,15 @@ export default function companionWatcher(bb: BbPluginApi, readExport: CanonicalR
         const orchestratorId = readRoleThread(exported, context.projectId, "project-orchestrator");
         if (!orchestratorId) throw new Error("orchestrator-head-unresolved");
         const project = await bb.sdk.projects.get({ projectId: context.projectId });
-        const recentTimeline = await bb.sdk.threads.timeline({ threadId: orchestratorId, segmentLimit: String(TIMELINE_PAGE_LIMIT) });
+        let recentTimeline = await bb.sdk.threads.timeline({ threadId: orchestratorId, segmentLimit: String(TIMELINE_PAGE_LIMIT) });
+        const timelineRows = [...recentTimeline.rows];
+        for (let page = 1; recentTimeline.timelinePage.hasOlderRows && page < TIMELINE_PAGE_MAX; page += 1) {
+          const cursor = recentTimeline.timelinePage.olderCursor;
+          if (!cursor) break;
+          recentTimeline = await bb.sdk.threads.timeline({ threadId: orchestratorId, segmentLimit: String(TIMELINE_PAGE_LIMIT), beforeAnchorSeq: String(cursor.anchorSeq), beforeAnchorId: cursor.anchorId });
+          timelineRows.push(...recentTimeline.rows);
+        }
+        recentTimeline = { ...recentTimeline, rows: timelineRows, timelinePage: { ...recentTimeline.timelinePage, returnedSegmentCount: timelineRows.length, hasOlderRows: recentTimeline.timelinePage.hasOlderRows } };
         const queued = await bb.sdk.threads.queuedMessages.list({ threadId: orchestratorId });
         const { coverage: canonicalCoverage, executionAttempts, workItems } = snapshotCanonical(exported, queued.length);
         let github: unknown;

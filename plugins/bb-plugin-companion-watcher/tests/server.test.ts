@@ -74,6 +74,40 @@ describe("semantic idle guard", () => {
     expect((await run()).coverage).toBe("known");
   });
 
+  it("follows native timeline cursors to recover the bounded current history", async () => {
+    let tool: { execute(params: unknown, context: { threadId: string; projectId: string }): Promise<unknown> } | undefined;
+    const calls: Array<Record<string, string>> = [];
+    const bb = {
+      pluginId: "companion-watcher",
+      log: { warn: () => undefined },
+      storage: { kv: { get: async () => undefined, set: async () => undefined } },
+      agents: { registerTool: (value: typeof tool) => { tool = value; }, configure: () => undefined },
+      sdk: {
+        system: { config: async () => ({ dataDir: "/unused" }) },
+        projects: { get: async () => ({ gitRemoteUrl: null }) },
+        threads: {
+          get: async () => ({ projectId, title: "Alzheimer companion judgment", originPluginId: "companion-watcher" }),
+          timeline: async (args: Record<string, string>) => {
+            calls.push(args);
+            return calls.length === 1
+              ? { rows: [{ id: "new" }], timelinePage: { hasOlderRows: true, kind: "latest", segmentLimit: 100, returnedSegmentCount: 1, olderCursor: { anchorSeq: 9, anchorId: "old-anchor" } }, maxSeq: 10 }
+              : { rows: [{ id: "old" }], timelinePage: { hasOlderRows: false, kind: "older", segmentLimit: 100, returnedSegmentCount: 1, olderCursor: null }, maxSeq: 10 };
+          },
+          queuedMessages: { list: async () => [] },
+        },
+      },
+      events: { on: () => undefined },
+    } as unknown as BbPluginApi;
+    companionWatcher(bb, capturedExport, async () => []);
+    const result = JSON.parse(await tool!.execute({}, { threadId: "companion", projectId }) as string) as { coverage: string; recentTimeline: { rows: Array<{ id: string }> } };
+    expect(result.coverage).toBe("known");
+    expect(result.recentTimeline.rows.map((row) => row.id)).toEqual(["new", "old"]);
+    expect(calls).toEqual([
+      { threadId: "thr_7bjw9e7mgd", segmentLimit: "100" },
+      { threadId: "thr_7bjw9e7mgd", segmentLimit: "100", beforeAnchorSeq: "9", beforeAnchorId: "old-anchor" },
+    ]);
+  });
+
   it("rejects a non-OK canonical export outcome", async () => {
     await expect(parseCanonicalExport('{"outcome":"CANONICAL_STORE_UNAVAILABLE"}', fixtureRoot, projectId)).rejects.toThrow("canonical-export-CANONICAL_STORE_UNAVAILABLE");
   });
