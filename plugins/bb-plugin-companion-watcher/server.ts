@@ -20,6 +20,33 @@ type CanonicalExport = { executionAttempts: ExportRow[]; roleGenerationHeads: Ex
 type ExportManifest = { projectId?: unknown; tableCounts?: unknown };
 type CanonicalReader = (projectId: string, exportRoot: string) => Promise<CanonicalExport>;
 
+type FieldCheck = (value: unknown) => boolean;
+const REQUIRED_FIELDS: Record<string, Record<string, FieldCheck>> = {
+  execution_attempts: {
+    execution_attempt_id: (value) => typeof value === "string",
+    observed_at_ms: (value) => typeof value === "number",
+    origin: (value) => typeof value === "string",
+    project_id: (value) => typeof value === "string",
+    state: (value) => typeof value === "string",
+    thread_id: (value) => typeof value === "string",
+    work_item_id: (value) => value === null || typeof value === "string",
+  },
+  role_generation_heads: {
+    current_generation: (value) => typeof value === "number",
+    project_id: (value) => typeof value === "string",
+    role_id: (value) => typeof value === "string",
+  },
+  role_generations: {
+    generation: (value) => typeof value === "number",
+    holder_execution_attempt_id: (value) => typeof value === "string",
+    project_id: (value) => typeof value === "string",
+    role_id: (value) => typeof value === "string",
+  },
+  work_items: {
+    updated_at_ms: (value) => typeof value === "number",
+  },
+};
+
 export function parseJudgment(output: string): Judgment {
   const coverages = [...output.matchAll(/^COVERAGE:\s*(known|partial|blind)\s*$/gimu)];
   const escalations = [...output.matchAll(/^ESCALATE:\s*yes\s*$/gimu)];
@@ -75,6 +102,11 @@ export async function parseCanonicalExport(output: string, exportRoot: string, p
   const counts = manifest.tableCounts as Record<string, unknown>;
   for (const [table, rows] of [["execution_attempts", canonical.executionAttempts], ["role_generation_heads", canonical.roleGenerationHeads], ["role_generations", canonical.roleGenerations], ["work_items", canonical.workItems]] as const) {
     if (counts[table] !== rows.length) throw new Error(`canonical-export-${table}-count-mismatch`);
+    for (const row of rows) {
+      for (const [field, valid] of Object.entries(REQUIRED_FIELDS[table]!)) {
+        if (!valid(row[field])) throw new Error(`canonical-export-${table}-${field}-invalid`);
+      }
+    }
   }
   const head = canonical.roleGenerationHeads.find((row) => row.project_id === projectId && row.role_id === "project-orchestrator");
   if (!head) throw new Error("canonical-export-orchestrator-head-missing");

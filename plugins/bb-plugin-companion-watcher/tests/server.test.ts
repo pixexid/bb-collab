@@ -60,6 +60,15 @@ describe("semantic idle guard", () => {
     await expect(parseCanonicalExport(inlineExport(records, { execution_attempts: 2, role_generation_heads: 1, role_generations: 1, work_items: 1 }), fixtureRoot, projectId)).rejects.toThrow("canonical-export-work_items-count-mismatch");
   });
 
+  it("degrades a count-consistent export with a missing consumed attempt field to blind", async () => {
+    const records = (await readFile(join(fixtureRoot, "live-export", "records.ndjson"), "utf8")).split("\n").filter(Boolean).map((line) => {
+      const record = JSON.parse(line) as { table: string; row: Record<string, unknown> };
+      if (record.table === "execution_attempts" && record.row.origin === "work_item") delete record.row.state;
+      return JSON.stringify(record);
+    }).join("\n");
+    await expect(parseCanonicalExport(inlineExport(records, { execution_attempts: 2, role_generation_heads: 1, role_generations: 1, work_items: 1 }), fixtureRoot, projectId)).rejects.toThrow("canonical-export-execution_attempts-state-invalid");
+  });
+
   it("degrades the snapshot to blind and logs the reason when the export CLI fails", async () => {
     let tool: { execute(params: unknown, context: { threadId: string; projectId: string }): Promise<unknown> } | undefined;
     const warnings: string[] = [];

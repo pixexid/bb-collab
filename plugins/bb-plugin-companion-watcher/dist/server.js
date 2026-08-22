@@ -17,6 +17,31 @@ var ESCALATION_HOLD_MS = 24 * 60 * 6e4;
 var SNAPSHOT_LIMIT = 100;
 var TOOL = "companion_read_snapshot";
 var TITLE = "Alzheimer companion judgment";
+var REQUIRED_FIELDS = {
+  execution_attempts: {
+    execution_attempt_id: (value) => typeof value === "string",
+    observed_at_ms: (value) => typeof value === "number",
+    origin: (value) => typeof value === "string",
+    project_id: (value) => typeof value === "string",
+    state: (value) => typeof value === "string",
+    thread_id: (value) => typeof value === "string",
+    work_item_id: (value) => value === null || typeof value === "string"
+  },
+  role_generation_heads: {
+    current_generation: (value) => typeof value === "number",
+    project_id: (value) => typeof value === "string",
+    role_id: (value) => typeof value === "string"
+  },
+  role_generations: {
+    generation: (value) => typeof value === "number",
+    holder_execution_attempt_id: (value) => typeof value === "string",
+    project_id: (value) => typeof value === "string",
+    role_id: (value) => typeof value === "string"
+  },
+  work_items: {
+    updated_at_ms: (value) => typeof value === "number"
+  }
+};
 function parseJudgment(output) {
   const coverages = [...output.matchAll(/^COVERAGE:\s*(known|partial|blind)\s*$/gimu)];
   const escalations = [...output.matchAll(/^ESCALATE:\s*yes\s*$/gimu)];
@@ -66,6 +91,11 @@ async function parseCanonicalExport(output, exportRoot, projectId) {
   const counts = manifest.tableCounts;
   for (const [table, rows] of [["execution_attempts", canonical.executionAttempts], ["role_generation_heads", canonical.roleGenerationHeads], ["role_generations", canonical.roleGenerations], ["work_items", canonical.workItems]]) {
     if (counts[table] !== rows.length) throw new Error(`canonical-export-${table}-count-mismatch`);
+    for (const row of rows) {
+      for (const [field, valid] of Object.entries(REQUIRED_FIELDS[table])) {
+        if (!valid(row[field])) throw new Error(`canonical-export-${table}-${field}-invalid`);
+      }
+    }
   }
   const head = canonical.roleGenerationHeads.find((row) => row.project_id === projectId && row.role_id === "project-orchestrator");
   if (!head) throw new Error("canonical-export-orchestrator-head-missing");
