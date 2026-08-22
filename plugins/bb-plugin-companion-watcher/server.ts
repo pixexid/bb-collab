@@ -21,7 +21,7 @@ type Snapshot = { sentAt: number; fingerprint: string; escalatedAt?: number };
 type Judgment = { coverage: Coverage; illegitimate: boolean; findings: string; fingerprint: string };
 type Pending = { projectId: string; orchestratorId: string; turnStartedAt?: number };
 type ExportRow = Record<string, unknown>;
-type CanonicalExport = { executionAttempts: ExportRow[]; roleGenerationHeads: ExportRow[]; roleGenerations: ExportRow[]; workItems: ExportRow[] };
+type CanonicalExport = { executionAttempts: ExportRow[]; roleGenerationHeads: ExportRow[]; roleGenerations: ExportRow[]; workItems: ExportRow[]; parseIssues: string[] };
 type ExportManifest = { projectId?: unknown; tableCounts?: unknown };
 type CanonicalReader = (projectId: string, exportRoot: string) => Promise<CanonicalExport>;
 type GithubReader = (remote: string | null) => Promise<unknown>;
@@ -34,7 +34,7 @@ const REQUIRED_FIELDS: Record<string, Record<string, FieldCheck>> = {
     origin: (value) => typeof value === "string",
     project_id: (value) => typeof value === "string",
     state: (value) => typeof value === "string",
-    thread_id: (value) => typeof value === "string",
+    thread_id: (value) => value === null || typeof value === "string",
     work_item_id: (value) => value === null || typeof value === "string",
   },
   role_generation_heads: {
@@ -104,15 +104,22 @@ export async function parseCanonicalExport(output: string, exportRoot: string, p
     roleGenerationHeads: tables.get("role_generation_heads") ?? [],
     roleGenerations: tables.get("role_generations") ?? [],
     workItems: tables.get("work_items") ?? [],
+    parseIssues: [] as string[],
   };
   const counts = manifest.tableCounts as Record<string, unknown>;
   for (const [table, rows] of [["execution_attempts", canonical.executionAttempts], ["role_generation_heads", canonical.roleGenerationHeads], ["role_generations", canonical.roleGenerations], ["work_items", canonical.workItems]] as const) {
     if (counts[table] !== rows.length) throw new Error(`canonical-export-${table}-count-mismatch`);
+    const validRows: ExportRow[] = [];
     for (const row of rows) {
-      for (const [field, valid] of Object.entries(REQUIRED_FIELDS[table]!)) {
-        if (!valid(row[field])) throw new Error(`canonical-export-${table}-${field}-invalid`);
+      const invalidField = Object.entries(REQUIRED_FIELDS[table]!).find(([field, valid]) => !valid(row[field]))?.[0];
+      if (!invalidField) {
+        validRows.push(row);
+        continue;
       }
+      if (table !== "execution_attempts") throw new Error(`canonical-export-${table}-${invalidField}-invalid`);
+      canonical.parseIssues.push(`execution_attempts.${invalidField}`);
     }
+    if (table === "execution_attempts") canonical.executionAttempts = validRows;
   }
   const head = canonical.roleGenerationHeads.find((row) => row.project_id === projectId && row.role_id === "project-orchestrator");
   if (!head) throw new Error("canonical-export-orchestrator-head-missing");
@@ -128,7 +135,8 @@ export async function readCanonicalExport(projectId: string, exportRoot: string)
 export function readRoleThread(canonical: CanonicalExport, projectId: string, roleId: "project-orchestrator" | "director"): string | undefined {
   const head = canonical.roleGenerationHeads.find((row) => row.project_id === projectId && row.role_id === roleId);
   const generation = canonical.roleGenerations.find((row) => row.project_id === projectId && row.role_id === roleId && row.generation === head?.current_generation);
-  return canonical.executionAttempts.find((row) => row.project_id === projectId && row.execution_attempt_id === generation?.holder_execution_attempt_id)?.thread_id as string | undefined;
+  const threadId = canonical.executionAttempts.find((row) => row.project_id === projectId && row.execution_attempt_id === generation?.holder_execution_attempt_id)?.thread_id;
+  return typeof threadId === "string" && threadId.length > 0 ? threadId : undefined;
 }
 
 export function hasActiveWorkers(canonical: CanonicalExport, projectId: string): boolean {
@@ -138,8 +146,8 @@ export function hasActiveWorkers(canonical: CanonicalExport, projectId: string):
 export function snapshotCanonical(canonical: CanonicalExport, queuedCount: number) {
   const executionAttempts = [...canonical.executionAttempts].sort((a, b) => Number(b.observed_at_ms) - Number(a.observed_at_ms)).slice(0, SNAPSHOT_LIMIT);
   const workItems = [...canonical.workItems].sort((a, b) => Number(b.updated_at_ms) - Number(a.updated_at_ms)).slice(0, SNAPSHOT_LIMIT);
-  const coverage: Coverage = queuedCount >= SNAPSHOT_LIMIT || canonical.executionAttempts.length > SNAPSHOT_LIMIT || canonical.workItems.length > SNAPSHOT_LIMIT ? "partial" : "known";
-  return { coverage, executionAttempts, workItems };
+  const coverage: Coverage = canonical.parseIssues.length > 0 || queuedCount >= SNAPSHOT_LIMIT || canonical.executionAttempts.length > SNAPSHOT_LIMIT || canonical.workItems.length > SNAPSHOT_LIMIT ? "partial" : "known";
+  return { coverage, executionAttempts, workItems, parseIssues: canonical.parseIssues };
 }
 
 export function composeTimeline(latest: TimelineResponse, olderPages: TimelineResponse[]): TimelineResponse {
@@ -213,12 +221,13 @@ export default function companionWatcher(bb: BbPluginApi, readExport: CanonicalR
         }
         recentTimeline = composeTimeline(latestTimeline, olderPages);
         const queued = await bb.sdk.threads.queuedMessages.list({ threadId: orchestratorId });
-        const { coverage: canonicalCoverage, executionAttempts, workItems } = snapshotCanonical(exported, queued.length);
+        const { coverage: canonicalCoverage, executionAttempts, workItems, parseIssues } = snapshotCanonical(exported, queued.length);
+        if (parseIssues.length > 0) bb.log.warn(`companion-watcher coverage=partial event=snapshot reason=malformed-canonical-rows count=${parseIssues.length} fields=${parseIssues.join(",")}`);
         let github: unknown;
         let coverage: Coverage = canonicalCoverage;
         if (recentTimeline.timelinePage.hasOlderRows) coverage = "partial";
         try { github = await readGithub(project.gitRemoteUrl); } catch (error) { coverage = "blind"; github = { error: String(error) }; }
-        return JSON.stringify({ coverage, orchestratorId, recentTimeline, queued: queued.slice(0, SNAPSHOT_LIMIT), executionAttempts, workItems, github });
+        return JSON.stringify({ coverage, orchestratorId, recentTimeline, queued: queued.slice(0, SNAPSHOT_LIMIT), executionAttempts, workItems, parseIssues, github });
       } catch (error) {
         const reason = String(error);
         bb.log.warn(`companion-watcher coverage=blind event=snapshot reason=${reason}`);
