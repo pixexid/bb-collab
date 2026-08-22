@@ -2324,6 +2324,30 @@ describe("bb-collab plugin boundary", () => {
     ]);
     expect(callerReceipt.exitCode).toBe(2);
     expect(JSON.parse(callerReceipt.stdout)).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
+    const genericBootstrap = {
+      ...input,
+      operationClass: "bootstrap" as const,
+      actorReceiptId: null,
+      expectedConfigRevision: null,
+      configRevision: 1,
+      expectedGovernanceEpoch: null,
+      expectedFenceToken: null,
+      repoTargetId: null,
+    };
+    const beforeGenericProjection = exportFoundation(db, secondProject);
+    for (const [suffix, excluded] of [
+      ["decision", { decision: { ...bootstrapDecision("smuggled-target-decision"), decisionClass: "assignment_admission" } }],
+      ["reason", { reason: { smuggled: true } }],
+      ["decision-id", { decisionId: "smuggled-target-decision" }],
+    ] as const) {
+      const smuggled = await host.harness.callRpc("apply", {
+        ...genericBootstrap,
+        idempotencyKey: `generic-bootstrap-${suffix}`,
+        ...excluded,
+      }) as FoundationResult;
+      expect(smuggled).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
+      expect(exportFoundation(db, secondProject)).toEqual(beforeGenericProjection);
+    }
     const registered = await host.harness.callRpc("registerProject", input) as FoundationResult;
     expect(registered).toMatchObject({
       outcome: "OK", subject: secondProject, currentConfigRevision: 1, currentGovernanceEpoch: 1,
@@ -2537,6 +2561,85 @@ describe("bb-collab plugin boundary", () => {
       { project_id: secondProject, role_id: "worker", current_generation: 1 },
     ]);
     expect(exportFoundation(db, PROJECT_ID)).toEqual(existingBefore);
+  });
+
+  it("keeps a v28 genesis governorship writable after v29 while refusing it as a bootstrap source", () => {
+    const db = new Database(":memory:");
+    databaseIsReady(db);
+    const legacyProject = "proj_legacy_v28";
+    const legacyGenesis = "legacy-v28-genesis";
+    try {
+      db.transaction(() => {
+        for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement);
+      })();
+      seedVerifiedFixtureReceipt(db, {
+        projectId: legacyProject,
+        receiptId: legacyGenesis,
+        actorKind: "plugin",
+        subjectId: PLUGIN_ID,
+      });
+      const bootstrapped = applyFixtureMutation(db, bootstrapRequest(legacyProject, {
+        idempotencyKey: "legacy-v28-bootstrap",
+        actorReceiptId: legacyGenesis,
+      }));
+      expect(bootstrapped).toMatchObject({ outcome: "OK" });
+      const legacyFence = (bootstrapped.evidence as { fenceToken: string }).fenceToken;
+
+      db.pragma("foreign_keys = OFF");
+      db.prepare(
+        `INSERT INTO bootstrap_derivation_receipts (
+           project_id, derivation_id, genesis_receipt_id, source_project_id, source_governance_epoch,
+           source_fence_token, source_governor_actor_receipt_id, authorizing_decision_id,
+           authorizing_disposition_sequence, request_digest, consumed_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        legacyProject, "legacy-v28-derivation", legacyGenesis, legacyProject, 1, legacyFence,
+        legacyGenesis, "legacy-decision", 1, "legacy-request", 1,
+      );
+      db.pragma("foreign_keys = ON");
+      db.exec(MIGRATIONS.at(-1)!);
+
+      expect(applyFixtureMutation(db, {
+        projectId: legacyProject,
+        operationClass: "config_revision",
+        idempotencyKey: "legacy-v28-post-upgrade-config",
+        actorReceiptId: legacyGenesis,
+        expectedConfigRevision: 1,
+        configRevision: 2,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: legacyFence,
+        repoTargetId: null,
+        config: bootstrapRequest().config,
+        targets: bootstrapRequest().targets,
+      })).toMatchObject({ outcome: "OK", currentConfigRevision: 2 });
+
+      const refusedSource = applyFixtureMutation(db, {
+        projectId: "proj_legacy_child",
+        operationClass: "bootstrap",
+        idempotencyKey: "legacy-genesis-source-refusal",
+        actorReceiptId: null,
+        expectedConfigRevision: null,
+        configRevision: 1,
+        expectedGovernanceEpoch: null,
+        expectedFenceToken: null,
+        repoTargetId: null,
+        config: bootstrapRequest().config,
+        targets: bootstrapRequest().targets,
+        bootstrapAuthority: {
+          derivationId: "legacy-child-derivation",
+          genesisReceiptId: "legacy-child-genesis",
+          sourceProjectId: legacyProject,
+          sourceGovernanceEpoch: 1,
+          sourceFenceToken: legacyFence,
+          authorizingDecisionId: "legacy-decision",
+          authorizingDispositionSequence: 1,
+        },
+      });
+      expect(refusedSource).toMatchObject({ outcome: "BOOTSTRAP_SOURCE_INVALID", attempted: 0, verified: 0 });
+      expect(db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = 'proj_legacy_child'").get()).toBeUndefined();
+    } finally {
+      db.close();
+    }
   });
 
   it("carries structural refusals through the apply RPC output schema", async () => {

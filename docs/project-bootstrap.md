@@ -65,6 +65,13 @@ the exact request returns the same receipt with `replay: true`; reusing its
 idempotency key for different content returns `IDEMPOTENCY_KEY_CONFLICT`.
 Reusing or retargeting a consumed derivation/genesis receipt refuses, and a
 target conflict leaves the existing target unchanged. The seam calls no GitHub.
+The v29 migration preserves a v28 target whose epoch-1 governorship still names
+the genesis receipt: that legacy receipt remains usable only as the current
+governor for ordinary target mutations, while the same receipt is always
+refused as a bootstrap source. New derivations use the distinct operational
+receipt. The generic `apply` RPC accepts this authority only through the exact
+`registerProject` projection; target Decisions and other mutation fields are
+rejected before the transaction.
 
 The current root of trust is host-local operator control exercised through the
 verified bb-collab plugin actor and adopted Decision. Host-issued operator

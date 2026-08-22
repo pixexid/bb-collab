@@ -120,6 +120,12 @@ unadopted Decisions, reused/retargeted genesis receipts, and existing target
 state fail closed.
 Host-issued operator receipts from get-bb/bb#1541 are the preferred future root
 and require a new authority ruling before this derivation path changes.
+The v29 migration has an explicit predecessor rule for v28 rows with a
+genesis-backed epoch-1 governorship: the legacy receipt may continue ordinary
+mutations only while it remains the current target governor, but the shared
+genesis detector still refuses it as a source governor. The generic `apply`
+boundary enforces the same exact `registerProject` projection and rejects
+target Decisions or other excluded fields before any bootstrap write.
 
 ## Assets and security goals
 
