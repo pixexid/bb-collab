@@ -105,6 +105,61 @@ function abnormalCandidates(threadsPath, settingsPath) {
   return { liveAbnormalCount: candidates.length, unowned };
 }
 
+function readJson(path, label) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    throw new Error(`refused: malformed ${label}: ${error.message}`);
+  }
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateEngines(value, label) {
+  if (!isRecord(value) || typeof value.bb !== "string" || !value.bb
+    || typeof value.bbPluginSdk !== "string" || !value.bbPluginSdk
+    || Object.values(value).some((engine) => typeof engine !== "string" || !engine)) {
+    throw new Error(`refused: malformed ${label} engines`);
+  }
+}
+
+function validateSource(value, label) {
+  if (!isRecord(value) || typeof value.requested !== "string" || !value.requested
+    || typeof value.resolved !== "string" || !value.resolved
+    || value.requested !== value.resolved
+    || !Number.isSafeInteger(value.installedAt) || value.installedAt < 0
+    || !Array.isArray(value.history)) {
+    throw new Error(`refused: malformed ${label} source`);
+  }
+  validateEngines(value.engines, label);
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (isRecord(value)) return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalJson(value[key])]));
+  return value;
+}
+
+function compareSource(beforePath, afterPath, manifestPath) {
+  const before = readJson(beforePath, "pre-source JSON");
+  const after = readJson(afterPath, "post-source JSON");
+  const manifest = readJson(manifestPath, "candidate package JSON");
+  validateSource(before, "pre-source");
+  validateSource(after, "post-source");
+  if (!isRecord(manifest)) throw new Error("refused: malformed candidate package JSON");
+  validateEngines(manifest.engines, "candidate package");
+  for (const field of ["requested", "resolved", "installedAt", "history"]) {
+    if (JSON.stringify(before[field]) !== JSON.stringify(after[field])) {
+      throw new Error(`refused: source ${field} changed`);
+    }
+  }
+  if (JSON.stringify(canonicalJson(after.engines)) !== JSON.stringify(canonicalJson(manifest.engines))) {
+    throw new Error("refused: post-source engines differ from candidate manifest");
+  }
+}
+
 const [mode, ...args] = process.argv.slice(2);
 if (mode === "capture" && args.length === 2) {
   const [databasePath, outputPath] = args;
@@ -128,6 +183,8 @@ if (mode === "capture" && args.length === 2) {
   const [threadsPath, settingsPath, outputPath] = args;
   if (exists(outputPath)) throw new Error(`refused: output already exists: ${outputPath}`);
   writeFileSync(outputPath, `${JSON.stringify(abnormalCandidates(threadsPath, settingsPath), null, 2)}\n`, { flag: "wx", mode: 0o600 });
+} else if (mode === "compare-source" && args.length === 3) {
+  compareSource(...args);
 } else {
-  throw new Error("usage: cutover-state.mjs capture|backup|compare|abnormal-candidates <inputs...>");
+  throw new Error("usage: cutover-state.mjs capture|backup|compare|abnormal-candidates|compare-source <inputs...>");
 }

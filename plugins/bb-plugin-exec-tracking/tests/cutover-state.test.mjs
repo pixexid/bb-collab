@@ -58,6 +58,59 @@ test("runbook is symlink-only and invokes every cutover-state control", () => {
   assert.match(runbook, /unlink/);
 });
 
+test("source comparison accepts manifest engine advancement and rejects identity or engine mutants", () => {
+  const directory = mkdtempSync(join(tmpdir(), "exec-source-"));
+  const before = join(directory, "source.before.json");
+  const after = join(directory, "source.after.json");
+  const manifest = join(directory, "package.json");
+  const legacyEngines = { bb: ">=0.9", bbPluginSdk: "^0.4.1" };
+  const candidateEngines = { bb: ">=0.37.0", bbPluginSdk: ">=0.4.8" };
+  const source = {
+    requested: "path:/legacy/exec-tracking",
+    resolved: "path:/legacy/exec-tracking",
+    installedAt: 1_786_597_816_830,
+    history: [],
+  };
+  writeFileSync(before, JSON.stringify({ ...source, engines: legacyEngines }));
+  writeFileSync(after, JSON.stringify({ ...source, engines: candidateEngines }));
+  writeFileSync(manifest, JSON.stringify({ engines: candidateEngines }));
+
+  run("compare-source", before, after, manifest);
+
+  for (const [field, value] of [
+    ["requested", "path:/changed"],
+    ["resolved", "path:/changed"],
+    ["installedAt", source.installedAt + 1],
+    ["history", [{ source: "changed" }]],
+  ]) {
+    const mutant = { ...source, [field]: value, engines: candidateEngines };
+    writeFileSync(after, JSON.stringify(mutant));
+    const expected = field === "requested" || field === "resolved"
+      ? /malformed post-source source/
+      : new RegExp(`source ${field} changed`);
+    assert.throws(() => run("compare-source", before, after, manifest), expected);
+  }
+
+  writeFileSync(after, JSON.stringify({ ...source, engines: { ...candidateEngines, bb: "*" } }));
+  assert.throws(() => run("compare-source", before, after, manifest), /engines differ/);
+});
+
+test("source comparison refuses malformed source and manifest shapes", () => {
+  const directory = mkdtempSync(join(tmpdir(), "exec-source-shape-"));
+  const before = join(directory, "source.before.json");
+  const after = join(directory, "source.after.json");
+  const manifest = join(directory, "package.json");
+  writeFileSync(before, "not json");
+  writeFileSync(after, "{}");
+  writeFileSync(manifest, JSON.stringify({ engines: {} }));
+  assert.throws(() => run("compare-source", before, after, manifest), /malformed pre-source JSON/);
+
+  writeFileSync(before, JSON.stringify({ requested: "path:/x", resolved: "path:/x", installedAt: 1, history: [], engines: { bb: ">=1", bbPluginSdk: ">=1" } }));
+  assert.throws(() => run("compare-source", before, after, manifest), /malformed post-source source/);
+  writeFileSync(after, readFileSync(before));
+  assert.throws(() => run("compare-source", before, after, manifest), /malformed candidate package engines/);
+});
+
 test("abnormal preflight blocks only live owned candidates", () => {
   const directory = mkdtempSync(join(tmpdir(), "exec-candidates-"));
   mkdirSync(join(directory, "bin"));
