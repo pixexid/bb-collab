@@ -3,11 +3,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { describe, expect, it } from "vitest";
-import companionWatcher, { composeTimeline, hasActiveWorkers, parseCanonicalExport, parseJudgment, readRoleThread, routeJudgment, snapshotCanonical } from "../server.js";
+import companionWatcher, { composeTimeline, extractCandidates, hasActiveWorkers, parseCanonicalExport, parseGithubEvidence, parseJudgment, parseQueuedEvidence, readRoleThread, routeJudgment, snapshotCanonical, type CandidateSnapshot } from "../server.js";
 
 const fixtureRoot = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 const projectId = "proj_a8zzfsx36j";
-const affirmative = parseJudgment("COVERAGE: known\nFINDING: promised follow-up was not done\nESCALATE: yes");
+const affirmative = { coverage: "known" as const, illegitimate: true, findings: "verified finding", fingerprint: "candidate-1" };
 
 async function capturedExport() {
   return parseCanonicalExport(await readFile(join(fixtureRoot, "live-export.json"), "utf8"), fixtureRoot, projectId);
@@ -15,15 +15,139 @@ async function capturedExport() {
 
 const inlineExport = (recordsNdjson: string, tableCounts: Record<string, number>) => JSON.stringify({
   outcome: "OK",
-  export: { recordsNdjson, manifest: { projectId, tableCounts } },
+  export: { recordsNdjson, manifest: { projectId, tableCounts: { external_work_refs: 0, ...tableCounts } } },
 });
 
+async function emptySnapshot(overrides: Partial<CandidateSnapshot> = {}): Promise<CandidateSnapshot> {
+  return { canonical: await capturedExport(), queued: [], githubIssues: [], githubPrs: [], coverage: "known", observedAt: 1_000_000, ...overrides };
+}
+
+const queuedMessage = (id: string, createdAt = 1) => ({ id, content: [{ type: "text" as const, text: "merge the verified head", mentions: [] }], model: "gpt", reasoningLevel: "medium" as const, permissionMode: "auto" as const, serviceTier: "default" as const, groupWithNext: false, createdAt, updatedAt: createdAt });
+
 describe("semantic idle guard", () => {
-  it("parses only anchored judgments and degrades malformed coverage to blind", () => {
-    expect(affirmative).toMatchObject({ illegitimate: true, coverage: "known" });
-    expect(parseJudgment("prefix COVERAGE: known\nFINDING: parked\nESCALATE: yes")).toMatchObject({ illegitimate: true, coverage: "blind" });
-    expect(parseJudgment("COVERAGE: partial\nFINDING: parked")).toMatchObject({ illegitimate: false, coverage: "partial" });
-    expect(parseJudgment("COVERAGE: known\nESCALATE: yes")).toMatchObject({ illegitimate: false });
+  it("parses only verified candidate anchors and takes coverage from code", async () => {
+    const snapshot = await emptySnapshot({ queued: [queuedMessage("queue-1")], cycleStartedAt: 2 });
+    const candidate = extractCandidates(snapshot)[0]!;
+    const line = `FINDING: ${JSON.stringify({ candidateId: candidate.id, anchors: candidate.anchors, finding: candidate.finding })}\nESCALATE: yes`;
+    expect(parseJudgment(line, snapshot)).toMatchObject({ illegitimate: true, coverage: "known" });
+    expect(parseJudgment("COVERAGE: known\nFINDING: parked\nESCALATE: yes", snapshot)).toMatchObject({ illegitimate: false, coverage: "known" });
+    expect(parseJudgment("SILENCE", { ...snapshot, coverage: "partial" })).toMatchObject({ illegitimate: false, coverage: "partial" });
+  });
+
+  it("extracts a real queue:startable zero-attempt candidate with stable anchors", async () => {
+    const base = await capturedExport();
+    const workItem = { ...base.workItems[0], work_item_id: "wi-gh-560", lifecycle_state: "ready", resource_revision: 3 };
+    const snapshot = await emptySnapshot({
+      canonical: { ...base, workItems: [workItem], externalWorkRefs: [{ project_id: projectId, work_item_id: "wi-gh-560", provider: "github", issue_number: 560 }] },
+      githubIssues: [{ number: 560, title: "Companion architecture", labels: ["queue:startable"], updatedAt: 1 }],
+    });
+    expect(extractCandidates(snapshot)).toEqual([expect.objectContaining({ id: "work-item:wi-gh-560:3", anchors: { kind: "work_item", workItemId: "wi-gh-560", resourceRevision: 3 }, evidence: { lifecycleState: "ready", issueNumber: 560, activeAttemptCount: 0 } })]);
+  });
+
+  it("excludes the captured wi-gh-141 wrongful-idle control", async () => {
+    const base = await capturedExport();
+    const control = { ...base.workItems[0], work_item_id: "wi-gh-141", lifecycle_state: "ready", resource_revision: 2 };
+    const writers = [560, 564].map((issue) => ({
+      ...base.executionAttempts[1],
+      execution_attempt_id: `attempt-gh${issue}`,
+      observed_at_ms: 1_000_000,
+      state: "running",
+      work_item_id: `wi-gh-${issue}`,
+    }));
+    const snapshot = await emptySnapshot({
+      canonical: {
+        ...base,
+        executionAttempts: [base.executionAttempts[0]!, ...writers],
+        workItems: [control],
+        externalWorkRefs: [{ project_id: projectId, work_item_id: "wi-gh-141", provider: "github", issue_number: 141 }],
+      },
+      githubIssues: [
+        { number: 141, title: "Legacy queue head", labels: ["queue:blocked"], updatedAt: 1 },
+        { number: 560, title: "Companion architecture", labels: ["queue:startable"], updatedAt: 1 },
+        { number: 564, title: "Other active writer", labels: ["queue:startable"], updatedAt: 1 },
+      ],
+    });
+    const dropped: string[] = [];
+    const falseClaim = `FINDING: ${JSON.stringify({ candidateId: "work-item:wi-gh-141:2", anchors: { kind: "work_item", workItemId: "wi-gh-141", resourceRevision: 2 }, finding: "Wrongful idle: queue head wi-gh-141 is startable. Inspect the queue and act or record the blocker." })}\nESCALATE: yes`;
+    expect(hasActiveWorkers(snapshot.canonical, projectId)).toBe(true);
+    expect(extractCandidates(snapshot)).toEqual([]);
+    expect(parseJudgment(falseClaim, snapshot, (reason) => dropped.push(reason))).toMatchObject({ illegitimate: false, coverage: "known" });
+    expect(dropped).toEqual(["unknown-candidate"]);
+  });
+
+  it("drops fabricated and stale anchors while retaining and routing a valid finding", async () => {
+    const snapshot = await emptySnapshot({ queued: [queuedMessage("queue-1")], cycleStartedAt: 2 });
+    const candidate = extractCandidates(snapshot)[0]!;
+    const dropped: string[] = [];
+    const output = [
+      `FINDING: ${JSON.stringify({ candidateId: "queue-fabricated", anchors: { kind: "queue_message", queueMessageId: "fake" }, finding: "invented" })}`,
+      `FINDING: ${JSON.stringify({ candidateId: candidate.id, anchors: { kind: "queue_message", queueMessageId: "stale" }, finding: "stale" })}`,
+      `FINDING: ${JSON.stringify({ candidateId: candidate.id, anchors: candidate.anchors, finding: "The obligation was already completed." })}`,
+      `FINDING: ${JSON.stringify({ candidateId: candidate.id, anchors: candidate.anchors, finding: candidate.finding })}`,
+      "ESCALATE: yes",
+    ].join("\n");
+    const judgment = parseJudgment(output, snapshot, (reason) => dropped.push(reason));
+    expect(dropped).toEqual(["unknown-candidate", "anchor-mismatch", "claim-mismatch"]);
+    expect(judgment).toMatchObject({ illegitimate: true, findings: expect.stringContaining('"queueMessageId":"queue-1"') });
+    expect(routeJudgment(undefined, judgment, 10)).toBe("orchestrator");
+  });
+
+  it("extracts stale active-attempt and queue anchors at their established bounds", async () => {
+    const base = await capturedExport();
+    const stale = { ...base.executionAttempts[1], execution_attempt_id: "attempt-stale", state: "running", origin: "work_item", observed_at_ms: 399_999 };
+    const snapshot = await emptySnapshot({ canonical: { ...base, executionAttempts: [base.executionAttempts[0]!, stale] }, queued: [queuedMessage("queue-old", 10)], observedAt: 1_000_000, cycleStartedAt: 20 });
+    expect(extractCandidates(snapshot).map((candidate) => candidate.anchors)).toEqual([
+      { kind: "attempt", executionAttemptId: "attempt-stale" },
+      { kind: "queue_message", queueMessageId: "queue-old" },
+    ]);
+  });
+
+  it("binds the realistic green decisionless PR shape to its exact head and drops head drift", async () => {
+    const head = "a".repeat(40);
+    const nextHead = "b".repeat(40);
+    const parsed = parseGithubEvidence({ issues: [], prs: [{ number: 566, title: "Ready", state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "", headRefOid: head, reviews: [], statusCheckRollup: [{ conclusion: "SUCCESS" }], updatedAt: "1970-01-01T00:00:01.000Z" }] });
+    const snapshot = await emptySnapshot({ githubPrs: parsed.prs, observedAt: 1_000_000 });
+    const candidate = extractCandidates(snapshot)[0]!;
+    expect(candidate).toMatchObject({ anchors: { kind: "pull_request", number: 566, headSha: head }, finding: expect.stringContaining("green, mergeable, decisionless") });
+    const drops: string[] = [];
+    const drifted = parseJudgment(`FINDING: ${JSON.stringify({ candidateId: `pr:566:${nextHead}`, anchors: { kind: "pull_request", number: 566, headSha: nextHead }, finding: "stale head" })}\nESCALATE: yes`, snapshot, (reason) => drops.push(reason));
+    expect(drifted.illegitimate).toBe(false);
+    expect(drops).toEqual(["unknown-candidate"]);
+  });
+
+  it("fails closed per incomplete source through post-check and routing", async () => {
+    const base = await capturedExport();
+    const workItem = { ...base.workItems[0], work_item_id: "wi-gh-560", lifecycle_state: "ready", resource_revision: 5 };
+    const stale = { ...base.executionAttempts[1], execution_attempt_id: "attempt-stale", observed_at_ms: 399_999, state: "running", work_item_id: "wi-gh-560" };
+    const head = "a".repeat(40);
+    const github = parseGithubEvidence({ issues: [{ number: 560, title: "Ready", labels: [{ name: "queue:startable" }], updatedAt: "1970-01-01T00:00:01.000Z" }], prs: [{ number: 566, title: "Ready", state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "", headRefOid: head, reviews: [], statusCheckRollup: [{ conclusion: "SUCCESS" }], updatedAt: "1970-01-01T00:00:01.000Z" }] });
+    const known = { canonical: "known", timeline: "known", github: "known", queue: "known" } as const;
+    const snapshots = {
+      canonical: await emptySnapshot({ canonical: { ...base, executionAttempts: [base.executionAttempts[0]!], workItems: [workItem], externalWorkRefs: [{ project_id: projectId, work_item_id: "wi-gh-560", provider: "github", issue_number: 560 }] }, githubIssues: github.issues, sourceCoverage: known }),
+      timeline: await emptySnapshot({ canonical: { ...base, executionAttempts: [base.executionAttempts[0]!, stale] }, sourceCoverage: known }),
+      github: await emptySnapshot({ githubPrs: github.prs, sourceCoverage: known }),
+      queue: await emptySnapshot({ queued: [queuedMessage("queue-old", 1)], cycleStartedAt: 2, sourceCoverage: known }),
+    };
+    for (const [source, snapshot] of Object.entries(snapshots) as Array<[keyof typeof snapshots, CandidateSnapshot]>) {
+      const candidate = extractCandidates(snapshot)[0]!;
+      const output = `FINDING: ${JSON.stringify({ candidateId: candidate.id, anchors: candidate.anchors, finding: candidate.finding })}\nESCALATE: yes`;
+      const dropped: string[] = [];
+      const incomplete = { ...snapshot, coverage: "partial" as const, sourceCoverage: { ...known, [source]: "blind" as const } };
+      const judgment = parseJudgment(output, incomplete, (reason) => dropped.push(reason));
+      expect({ source, candidate: candidate.kind, dropped, route: routeJudgment(undefined, judgment, 1) }).toEqual({ source, candidate: candidate.kind, dropped: ["unknown-candidate"], route: undefined });
+    }
+  });
+
+  it("marks GitHub populations incomplete at the declared ceiling", () => {
+    const issues = Array.from({ length: 200 }, (_, number) => ({ number: number + 1, title: `Issue ${number + 1}`, labels: [{ name: "queue:startable" }], updatedAt: "1970-01-01T00:00:01.000Z" }));
+    expect(parseGithubEvidence({ issues, prs: [] }).complete).toBe(false);
+  });
+
+  it("marks queued populations blind at the declared ceiling or a malformed row", () => {
+    expect(parseQueuedEvidence(Array.from({ length: 200 }, (_, index) => queuedMessage(`queue-${index}`))).complete).toBe(false);
+    const invalid: string[] = [];
+    expect(parseQueuedEvidence([{ id: "broken" }], (reason) => invalid.push(reason))).toEqual({ messages: [], complete: false });
+    expect(invalid).toEqual(["queue-0"]);
   });
 
   it("parses the captured canonical export shape", async () => {
@@ -32,6 +156,35 @@ describe("semantic idle guard", () => {
     expect(canonical.parseIssues).toEqual([]);
     expect(hasActiveWorkers(canonical, projectId)).toBe(true);
     expect(hasActiveWorkers({ ...canonical, executionAttempts: canonical.executionAttempts.filter((row) => row.state !== "running") }, projectId)).toBe(false);
+  });
+
+  it("production idle trigger judges stale attempts but defers for healthy active writers", async () => {
+    const base = await capturedExport();
+    const now = Date.now();
+    let canonical = { ...base, executionAttempts: [base.executionAttempts[0]!, { ...base.executionAttempts[1], observed_at_ms: 0, state: "running" }] };
+    let idle: ((event: { thread: { id: string; projectId: string }; lastAssistantText?: string }) => Promise<void>) | undefined;
+    let spawns = 0;
+    const bb = {
+      pluginId: "companion-watcher",
+      log: { info: () => undefined, warn: () => undefined },
+      storage: { kv: { get: async () => undefined, set: async () => undefined } },
+      agents: { registerTool: () => undefined, configure: () => undefined },
+      sdk: {
+        system: { config: async () => ({ dataDir: "/unused" }) },
+        threads: {
+          spawn: async () => { spawns += 1; return { id: "companion" }; },
+          get: async () => ({ projectId, status: "idle" }),
+          send: async () => undefined,
+        },
+      },
+      events: { on: (event: string, handler: typeof idle) => { if (event === "thread.idle") idle = handler; } },
+    } as unknown as BbPluginApi;
+    companionWatcher(bb, async () => canonical, async () => ({ issues: [], prs: [] }));
+    await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+    expect(spawns).toBe(1);
+    canonical = { ...canonical, executionAttempts: [base.executionAttempts[0]!, { ...base.executionAttempts[1], observed_at_ms: now, state: "running" }] };
+    await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+    expect(spawns).toBe(1);
   });
 
   it("accepts nullable execution-attempt fields, including the captured review boundary", async () => {
@@ -84,7 +237,7 @@ describe("semantic idle guard", () => {
       },
       events: { on: () => undefined },
     } as unknown as BbPluginApi;
-    companionWatcher(bb, capturedExport, async () => []);
+    companionWatcher(bb, capturedExport, async () => ({ issues: [], prs: [] }));
     const run = async () => JSON.parse(await tool!.execute({}, { threadId: "companion", projectId }) as string) as { coverage: string };
     expect((await run()).coverage).toBe("partial");
     expect(timelineArgs?.segmentLimit).toBe("100");
@@ -117,10 +270,9 @@ describe("semantic idle guard", () => {
       },
       events: { on: () => undefined },
     } as unknown as BbPluginApi;
-    companionWatcher(bb, capturedExport, async () => []);
-    const result = JSON.parse(await tool!.execute({}, { threadId: "companion", projectId }) as string) as { coverage: string; recentTimeline: { rows: Array<{ id: string }> } };
+    companionWatcher(bb, capturedExport, async () => ({ issues: [], prs: [] }));
+    const result = JSON.parse(await tool!.execute({}, { threadId: "companion", projectId }) as string) as { coverage: string };
     expect(result.coverage).toBe("known");
-    expect(result.recentTimeline.rows.map((row) => row.id)).toEqual(["old", "new"]);
     expect(calls).toEqual([
       { threadId: "thr_7bjw9e7mgd", segmentLimit: "100" },
       { threadId: "thr_7bjw9e7mgd", segmentLimit: "100", beforeAnchorSeq: "9", beforeAnchorId: "old-anchor" },
