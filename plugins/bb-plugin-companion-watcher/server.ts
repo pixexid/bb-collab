@@ -17,6 +17,7 @@ type Judgment = { coverage: Coverage; illegitimate: boolean; findings: string; f
 type Pending = { projectId: string; orchestratorId: string; turnStartedAt?: number };
 type ExportRow = Record<string, unknown>;
 type CanonicalExport = { executionAttempts: ExportRow[]; roleGenerationHeads: ExportRow[]; roleGenerations: ExportRow[]; workItems: ExportRow[] };
+type ExportManifest = { projectId?: unknown; tableCounts?: unknown };
 type CanonicalReader = (projectId: string, exportRoot: string) => Promise<CanonicalExport>;
 
 export function parseJudgment(output: string): Judgment {
@@ -37,19 +38,25 @@ export function routeJudgment(prior: Snapshot | undefined, judgment: Judgment, n
   return !unchanged || !prior || now - prior.sentAt >= BACKOFF_MS ? "orchestrator" : undefined;
 }
 
-export async function parseCanonicalExport(output: string, exportRoot: string): Promise<CanonicalExport> {
-  const result = JSON.parse(output) as { outcome?: string; export?: { recordsNdjson?: unknown }; evidence?: { exportFile?: { directory?: unknown } } };
+export async function parseCanonicalExport(output: string, exportRoot: string, projectId: string): Promise<CanonicalExport> {
+  const result = JSON.parse(output) as {
+    outcome?: string;
+    export?: { recordsNdjson?: unknown; manifest?: ExportManifest };
+    evidence?: { exportFile?: { complete?: unknown; directory?: unknown; manifest?: ExportManifest } };
+  };
   if (result.outcome !== "OK") throw new Error(`canonical-export-${result.outcome ?? "invalid"}`);
   const inlineRecords = result.export?.recordsNdjson;
+  const fileExport = result.evidence?.exportFile;
+  const manifest = typeof inlineRecords === "string" ? result.export?.manifest : fileExport?.manifest;
   let recordsNdjson: string;
   if (typeof inlineRecords === "string") recordsNdjson = inlineRecords;
   else {
-    const directory = result.evidence?.exportFile?.directory;
-    if (typeof directory !== "string") throw new Error("canonical-export-records-missing");
-    const path = join(exportRoot, directory, "records.ndjson");
-    if (isAbsolute(directory) || relative(exportRoot, path).startsWith("..")) throw new Error("canonical-export-directory-invalid");
+    if (fileExport?.complete !== true || typeof fileExport.directory !== "string") throw new Error("canonical-export-records-missing");
+    const path = join(exportRoot, fileExport.directory, "records.ndjson");
+    if (isAbsolute(fileExport.directory) || relative(exportRoot, path).startsWith("..")) throw new Error("canonical-export-directory-invalid");
     recordsNdjson = await readFile(path, "utf8");
   }
+  if (manifest?.projectId !== projectId || !manifest.tableCounts || typeof manifest.tableCounts !== "object" || Array.isArray(manifest.tableCounts)) throw new Error("canonical-export-manifest-invalid");
   const tables = new Map<string, ExportRow[]>();
   for (const line of recordsNdjson.split("\n")) {
     if (!line) continue;
@@ -59,17 +66,25 @@ export async function parseCanonicalExport(output: string, exportRoot: string): 
     rows.push(record.row as ExportRow);
     tables.set(record.table, rows);
   }
-  return {
+  const canonical = {
     executionAttempts: tables.get("execution_attempts") ?? [],
     roleGenerationHeads: tables.get("role_generation_heads") ?? [],
     roleGenerations: tables.get("role_generations") ?? [],
     workItems: tables.get("work_items") ?? [],
   };
+  const counts = manifest.tableCounts as Record<string, unknown>;
+  for (const [table, rows] of [["execution_attempts", canonical.executionAttempts], ["role_generation_heads", canonical.roleGenerationHeads], ["role_generations", canonical.roleGenerations], ["work_items", canonical.workItems]] as const) {
+    if (counts[table] !== rows.length) throw new Error(`canonical-export-${table}-count-mismatch`);
+  }
+  const head = canonical.roleGenerationHeads.find((row) => row.project_id === projectId && row.role_id === "project-orchestrator");
+  if (!head) throw new Error("canonical-export-orchestrator-head-missing");
+  if (!readRoleThread(canonical, projectId, "project-orchestrator")) throw new Error("canonical-export-orchestrator-thread-unresolved");
+  return canonical;
 }
 
 export async function readCanonicalExport(projectId: string, exportRoot: string): Promise<CanonicalExport> {
   const { stdout } = await exec(process.env.BB_CLI?.trim() || "bb", ["collab", "export", "--project", projectId], { timeout: 10_000 });
-  return parseCanonicalExport(stdout, exportRoot);
+  return parseCanonicalExport(stdout, exportRoot, projectId);
 }
 
 export function readRoleThread(canonical: CanonicalExport, projectId: string, roleId: "project-orchestrator" | "director"): string | undefined {
@@ -134,7 +149,9 @@ export default function companionWatcher(bb: BbPluginApi, readExport: CanonicalR
         try { github = await githubEvidence(project.gitRemoteUrl); } catch (error) { coverage = "blind"; github = { error: String(error) }; }
         return JSON.stringify({ coverage, orchestratorId, recentTimeline, queued: queued.slice(0, SNAPSHOT_LIMIT), executionAttempts, workItems, github });
       } catch (error) {
-        return { isError: true, content: [{ type: "text", text: `COVERAGE: blind\nsnapshot read failed: ${String(error)}` }] };
+        const reason = String(error);
+        bb.log.warn(`companion-watcher coverage=blind event=snapshot reason=${reason}`);
+        return { isError: true, content: [{ type: "text", text: `COVERAGE: blind\nsnapshot read failed: ${reason}` }] };
       }
     },
   });

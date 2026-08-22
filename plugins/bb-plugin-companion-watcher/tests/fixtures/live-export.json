@@ -8,7 +8,16 @@
     "exportFile": {
       "kind": "canonical-export-files",
       "complete": true,
-      "directory": "live-export"
+      "directory": "live-export",
+      "manifest": {
+        "projectId": "proj_a8zzfsx36j",
+        "tableCounts": {
+          "execution_attempts": 2,
+          "role_generation_heads": 1,
+          "role_generations": 1,
+          "work_items": 1
+        }
+      }
     }
   }
 }

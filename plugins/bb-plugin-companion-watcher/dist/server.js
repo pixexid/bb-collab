@@ -33,19 +33,21 @@ function routeJudgment(prior, judgment, now, turnStartedAt) {
   if (unchanged && prior?.escalatedAt && now - prior.escalatedAt < ESCALATION_HOLD_MS) return void 0;
   return !unchanged || !prior || now - prior.sentAt >= BACKOFF_MS ? "orchestrator" : void 0;
 }
-async function parseCanonicalExport(output, exportRoot) {
+async function parseCanonicalExport(output, exportRoot, projectId) {
   const result = JSON.parse(output);
   if (result.outcome !== "OK") throw new Error(`canonical-export-${result.outcome ?? "invalid"}`);
   const inlineRecords = result.export?.recordsNdjson;
+  const fileExport = result.evidence?.exportFile;
+  const manifest = typeof inlineRecords === "string" ? result.export?.manifest : fileExport?.manifest;
   let recordsNdjson;
   if (typeof inlineRecords === "string") recordsNdjson = inlineRecords;
   else {
-    const directory = result.evidence?.exportFile?.directory;
-    if (typeof directory !== "string") throw new Error("canonical-export-records-missing");
-    const path = join(exportRoot, directory, "records.ndjson");
-    if (isAbsolute(directory) || relative(exportRoot, path).startsWith("..")) throw new Error("canonical-export-directory-invalid");
+    if (fileExport?.complete !== true || typeof fileExport.directory !== "string") throw new Error("canonical-export-records-missing");
+    const path = join(exportRoot, fileExport.directory, "records.ndjson");
+    if (isAbsolute(fileExport.directory) || relative(exportRoot, path).startsWith("..")) throw new Error("canonical-export-directory-invalid");
     recordsNdjson = await readFile(path, "utf8");
   }
+  if (manifest?.projectId !== projectId || !manifest.tableCounts || typeof manifest.tableCounts !== "object" || Array.isArray(manifest.tableCounts)) throw new Error("canonical-export-manifest-invalid");
   const tables = /* @__PURE__ */ new Map();
   for (const line of recordsNdjson.split("\n")) {
     if (!line) continue;
@@ -55,16 +57,24 @@ async function parseCanonicalExport(output, exportRoot) {
     rows.push(record.row);
     tables.set(record.table, rows);
   }
-  return {
+  const canonical = {
     executionAttempts: tables.get("execution_attempts") ?? [],
     roleGenerationHeads: tables.get("role_generation_heads") ?? [],
     roleGenerations: tables.get("role_generations") ?? [],
     workItems: tables.get("work_items") ?? []
   };
+  const counts = manifest.tableCounts;
+  for (const [table, rows] of [["execution_attempts", canonical.executionAttempts], ["role_generation_heads", canonical.roleGenerationHeads], ["role_generations", canonical.roleGenerations], ["work_items", canonical.workItems]]) {
+    if (counts[table] !== rows.length) throw new Error(`canonical-export-${table}-count-mismatch`);
+  }
+  const head = canonical.roleGenerationHeads.find((row) => row.project_id === projectId && row.role_id === "project-orchestrator");
+  if (!head) throw new Error("canonical-export-orchestrator-head-missing");
+  if (!readRoleThread(canonical, projectId, "project-orchestrator")) throw new Error("canonical-export-orchestrator-thread-unresolved");
+  return canonical;
 }
 async function readCanonicalExport(projectId, exportRoot) {
   const { stdout } = await exec(process.env.BB_CLI?.trim() || "bb", ["collab", "export", "--project", projectId], { timeout: 1e4 });
-  return parseCanonicalExport(stdout, exportRoot);
+  return parseCanonicalExport(stdout, exportRoot, projectId);
 }
 function readRoleThread(canonical, projectId, roleId) {
   const head = canonical.roleGenerationHeads.find((row) => row.project_id === projectId && row.role_id === roleId);
@@ -126,8 +136,10 @@ function companionWatcher(bb, readExport = readCanonicalExport) {
         }
         return JSON.stringify({ coverage, orchestratorId, recentTimeline, queued: queued.slice(0, SNAPSHOT_LIMIT), executionAttempts, workItems, github });
       } catch (error) {
+        const reason = String(error);
+        bb.log.warn(`companion-watcher coverage=blind event=snapshot reason=${reason}`);
         return { isError: true, content: [{ type: "text", text: `COVERAGE: blind
-snapshot read failed: ${String(error)}` }] };
+snapshot read failed: ${reason}` }] };
       }
     }
   });
