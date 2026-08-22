@@ -11,9 +11,12 @@ const ESCALATION_HOLD_MS = 24 * 60 * 60_000;
 // ponytail: one export has no paging seam; 200 is the bounded ceiling, page the export when population exceeds it.
 const SNAPSHOT_LIMIT = 200;
 const TIMELINE_PAGE_LIMIT = 100;
+// ponytail: ten pages is the bounded history ceiling; raise only with a smaller model input budget.
+const TIMELINE_PAGE_MAX = 10;
 const TOOL = "companion_read_snapshot";
 const TITLE = "Alzheimer companion judgment";
 type Coverage = "known" | "partial" | "blind";
+type TimelineResponse = Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["timeline"]>>;
 type Snapshot = { sentAt: number; fingerprint: string; escalatedAt?: number };
 type Judgment = { coverage: Coverage; illegitimate: boolean; findings: string; fingerprint: string };
 type Pending = { projectId: string; orchestratorId: string; turnStartedAt?: number };
@@ -139,6 +142,23 @@ export function snapshotCanonical(canonical: CanonicalExport, queuedCount: numbe
   return { coverage, executionAttempts, workItems };
 }
 
+export function composeTimeline(latest: TimelineResponse, olderPages: TimelineResponse[]): TimelineResponse {
+  const rows = [...olderPages].reverse().flatMap((page) => page.rows).concat(latest.rows);
+  const rowIndexes = new Map<string, number>();
+  const deduplicated = rows.reduce<TimelineResponse["rows"]>((result, row) => {
+    const index = rowIndexes.get(row.id);
+    if (index === undefined) {
+      rowIndexes.set(row.id, result.length);
+      result.push(row);
+    } else {
+      result[index] = row;
+    }
+    return result;
+  }, []);
+  const finalPage = olderPages.at(-1) ?? latest;
+  return { ...latest, rows: deduplicated, timelinePage: { ...finalPage.timelinePage, returnedSegmentCount: deduplicated.length } };
+}
+
 async function githubEvidence(remote: string | null): Promise<unknown> {
   const repo = remote?.match(/github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?$/u)?.[1];
   if (!repo) throw new Error("github-repository-unresolved");
@@ -182,7 +202,16 @@ export default function companionWatcher(bb: BbPluginApi, readExport: CanonicalR
         const orchestratorId = readRoleThread(exported, context.projectId, "project-orchestrator");
         if (!orchestratorId) throw new Error("orchestrator-head-unresolved");
         const project = await bb.sdk.projects.get({ projectId: context.projectId });
-        const recentTimeline = await bb.sdk.threads.timeline({ threadId: orchestratorId, segmentLimit: String(TIMELINE_PAGE_LIMIT) });
+        const latestTimeline = await bb.sdk.threads.timeline({ threadId: orchestratorId, segmentLimit: String(TIMELINE_PAGE_LIMIT) });
+        let recentTimeline = latestTimeline;
+        const olderPages: TimelineResponse[] = [];
+        for (let page = 1; recentTimeline.timelinePage.hasOlderRows && page < TIMELINE_PAGE_MAX; page += 1) {
+          const cursor = recentTimeline.timelinePage.olderCursor;
+          if (!cursor) break;
+          recentTimeline = await bb.sdk.threads.timeline({ threadId: orchestratorId, segmentLimit: String(TIMELINE_PAGE_LIMIT), beforeAnchorSeq: String(cursor.anchorSeq), beforeAnchorId: cursor.anchorId });
+          olderPages.push(recentTimeline);
+        }
+        recentTimeline = composeTimeline(latestTimeline, olderPages);
         const queued = await bb.sdk.threads.queuedMessages.list({ threadId: orchestratorId });
         const { coverage: canonicalCoverage, executionAttempts, workItems } = snapshotCanonical(exported, queued.length);
         let github: unknown;

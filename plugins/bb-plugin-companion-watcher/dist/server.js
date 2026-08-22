@@ -16,6 +16,7 @@ var BACKOFF_MS = 10 * 6e4;
 var ESCALATION_HOLD_MS = 24 * 60 * 6e4;
 var SNAPSHOT_LIMIT = 200;
 var TIMELINE_PAGE_LIMIT = 100;
+var TIMELINE_PAGE_MAX = 10;
 var TOOL = "companion_read_snapshot";
 var TITLE = "Alzheimer companion judgment";
 var REQUIRED_FIELDS = {
@@ -121,6 +122,22 @@ function snapshotCanonical(canonical, queuedCount) {
   const coverage = queuedCount >= SNAPSHOT_LIMIT || canonical.executionAttempts.length > SNAPSHOT_LIMIT || canonical.workItems.length > SNAPSHOT_LIMIT ? "partial" : "known";
   return { coverage, executionAttempts, workItems };
 }
+function composeTimeline(latest, olderPages) {
+  const rows = [...olderPages].reverse().flatMap((page) => page.rows).concat(latest.rows);
+  const rowIndexes = /* @__PURE__ */ new Map();
+  const deduplicated = rows.reduce((result, row) => {
+    const index = rowIndexes.get(row.id);
+    if (index === void 0) {
+      rowIndexes.set(row.id, result.length);
+      result.push(row);
+    } else {
+      result[index] = row;
+    }
+    return result;
+  }, []);
+  const finalPage = olderPages.at(-1) ?? latest;
+  return { ...latest, rows: deduplicated, timelinePage: { ...finalPage.timelinePage, returnedSegmentCount: deduplicated.length } };
+}
 async function githubEvidence(remote) {
   const repo = remote?.match(/github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?$/u)?.[1];
   if (!repo) throw new Error("github-repository-unresolved");
@@ -159,7 +176,16 @@ function companionWatcher(bb, readExport = readCanonicalExport, readGithub = git
         const orchestratorId = readRoleThread(exported, context.projectId, "project-orchestrator");
         if (!orchestratorId) throw new Error("orchestrator-head-unresolved");
         const project = await bb.sdk.projects.get({ projectId: context.projectId });
-        const recentTimeline = await bb.sdk.threads.timeline({ threadId: orchestratorId, segmentLimit: String(TIMELINE_PAGE_LIMIT) });
+        const latestTimeline = await bb.sdk.threads.timeline({ threadId: orchestratorId, segmentLimit: String(TIMELINE_PAGE_LIMIT) });
+        let recentTimeline = latestTimeline;
+        const olderPages = [];
+        for (let page = 1; recentTimeline.timelinePage.hasOlderRows && page < TIMELINE_PAGE_MAX; page += 1) {
+          const cursor = recentTimeline.timelinePage.olderCursor;
+          if (!cursor) break;
+          recentTimeline = await bb.sdk.threads.timeline({ threadId: orchestratorId, segmentLimit: String(TIMELINE_PAGE_LIMIT), beforeAnchorSeq: String(cursor.anchorSeq), beforeAnchorId: cursor.anchorId });
+          olderPages.push(recentTimeline);
+        }
+        recentTimeline = composeTimeline(latestTimeline, olderPages);
         const queued = await bb.sdk.threads.queuedMessages.list({ threadId: orchestratorId });
         const { coverage: canonicalCoverage, executionAttempts, workItems } = snapshotCanonical(exported, queued.length);
         let github;
@@ -245,6 +271,7 @@ snapshot read failed: ${reason}` }] };
   });
 }
 export {
+  composeTimeline,
   companionWatcher as default,
   hasActiveWorkers,
   parseCanonicalExport,
