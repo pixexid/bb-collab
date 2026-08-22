@@ -3090,12 +3090,11 @@ describe("bb-collab plugin boundary", () => {
     expect(JSON.parse(result.stdout)).toMatchObject({ outcome: "CANONICAL_STORE_UNAVAILABLE", message: "operator inbox store is unavailable" });
   });
 
-  it("delivers replies through platform steer only after the matching sender event lands", async () => {
+  it("delivers replies through host steer-if-active only after the matching sender event lands", async () => {
     const host = hostFor();
     await plugin(host.bb, { notifyUrgent: async () => undefined });
     seedAndBootstrap(host);
     const sent: Array<{ mode: string; text: string }> = [];
-    host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
     host.harness.sdk.stub("threads.send", (async (input: { mode: string; input: Array<{ text: string }> }) => {
       sent.push({ mode: input.mode, text: input.input[0]!.text });
       return { ok: true };
@@ -3117,7 +3116,8 @@ describe("bb-collab plugin boundary", () => {
     }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
 
     const replied = await host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
-    expect(sent).toEqual([{ mode: "steer", text: `[bb-collab inbox reply ${message.messageId} to operator]\nanswer` }]);
+    expect(sent).toEqual([{ mode: "steer-if-active", text: `[bb-collab inbox reply ${message.messageId} to operator]\nanswer` }]);
+    expect(host.harness.inspection.sdk.callsTo("threads.wait")).toHaveLength(0);
     expect(replied).toMatchObject({ repliedAtMs: expect.any(Number), replyText: "answer", replyDeliveryError: null, readAtMs: expect.any(Number) });
     await expect(host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "duplicate" }))
       .rejects.toThrow("already has a delivered reply");
@@ -3128,7 +3128,6 @@ describe("bb-collab plugin boundary", () => {
     await plugin(host.bb, { notifyUrgent: async () => undefined });
     seedAndBootstrap(host);
     const sent: string[] = [];
-    host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
     host.harness.sdk.stub("threads.send", (async (input: { input: Array<{ text: string }> }) => {
       sent.push(input.input[0]!.text);
       return { ok: true };
@@ -3160,13 +3159,10 @@ describe("bb-collab plugin boundary", () => {
     ]));
   });
 
-  it("waits for the inbox sender thread to become idle before delivering its reply", async () => {
-    const host = hostFor();
+  it("delivers an active-sender reply without waiting for idle", async () => {
+    const host = hostFor(PROJECT_ID, (facts) => { facts.thread.status = "active"; });
     await plugin(host.bb, { notifyUrgent: async () => undefined });
     seedAndBootstrap(host);
-    let releaseIdle!: () => void;
-    const idle = new Promise<void>((resolve) => { releaseIdle = resolve; });
-    host.harness.sdk.stub("threads.wait", (async () => { await idle; return { matched: true }; }) as never);
     host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
     host.harness.sdk.stub("threads.events.wait", (async ({ threadId }: { threadId: string }) => ({
       id: "event-delivered",
@@ -3184,17 +3180,183 @@ describe("bb-collab plugin boundary", () => {
       text: "reply while active",
     }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
 
-    const delivery = host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
-    await vi.waitFor(() => expect(
-      host.harness.inspection.sdk.callsTo("threads.wait").length + host.harness.inspection.sdk.callsTo("threads.send").length,
-    ).toBeGreaterThan(0));
-    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
-    releaseIdle();
-    await expect(delivery).resolves.toMatchObject({ repliedAtMs: expect.any(Number), replyDeliveryError: null });
-    expect(host.harness.inspection.sdk.callsTo("threads.wait")).toEqual([[
-      { threadId: ROLE_THREAD_ID, status: "idle", timeoutMs: 30_000 },
+    await expect(host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" }))
+      .resolves.toMatchObject({ repliedAtMs: expect.any(Number), replyDeliveryError: null });
+    expect(host.harness.inspection.sdk.callsTo("threads.wait")).toHaveLength(0);
+    expect(host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+      expect.objectContaining({ threadId: ROLE_THREAD_ID, mode: "steer-if-active" }),
     ]]);
-    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+  });
+
+  it("bypasses an unresolved automated idle predecessor for an Inbox reply", async () => {
+    const restoreGithub = installStartableQueueFixture(205);
+    try {
+      const fixture = await fleetWatchdogFixture(0, true);
+      bindFixtureGithubIssue(fixture.db, 205);
+      let artifact = "before";
+      fixture.host.harness.sdk.stub("environments.pullRequest", (async () => artifact === "before"
+        ? { outcome: "absent" }
+        : { outcome: "available", pullRequest: { updatedAt: artifact } }) as never);
+      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+        id: threadId,
+        projectId: PROJECT_ID,
+        status: "idle",
+        environmentId: `environment-${threadId}`,
+        updatedAt: 0,
+      })) as never);
+      let releaseIdle!: () => void;
+      const idle = new Promise<void>((resolve) => { releaseIdle = resolve; });
+      fixture.host.harness.sdk.stub("threads.wait", (async () => { await idle; return { matched: true }; }) as never);
+      let releaseConfirmation!: () => void;
+      const confirmation = new Promise<void>((resolve) => { releaseConfirmation = resolve; });
+      fixture.host.harness.sdk.stub("threads.events.wait", (async ({ threadId }: { threadId: string }) => {
+        await confirmation;
+        return {
+          id: "event-inbox-reply",
+          threadId,
+          seq: 99,
+          type: "client/turn/requested",
+          scope: { kind: "thread" },
+          data: { source: "tell", input: [{ type: "text", text: "[bb-collab inbox reply 1 to operator]\nanswer", mentions: [] }] },
+          createdAt: 99,
+        };
+      }) as never);
+
+      expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
+      artifact = "after";
+      const automatedCycle = fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID]);
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.wait")).toHaveLength(1));
+
+      const message = JSON.parse(await fixture.host.harness.callAgentTool("send_to_operator", {
+        project_id: PROJECT_ID,
+        recipient: "operator",
+        severity: "routine",
+        text: "reply while automated wake is waiting",
+      }, { threadId: fixture.orchestratorThreadId, projectId: PROJECT_ID }) as string);
+      const reply = fixture.host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toContainEqual([
+        expect.objectContaining({ threadId: fixture.orchestratorThreadId, mode: "steer-if-active" }),
+      ]));
+      expect(fixture.db.prepare("SELECT replied_at_ms FROM operator_messages WHERE project_id = ? AND message_id = ?").get(PROJECT_ID, message.messageId)).toEqual({ replied_at_ms: null });
+
+      releaseConfirmation();
+      await expect(reply).resolves.toMatchObject({ repliedAtMs: expect.any(Number), replyDeliveryError: null });
+      releaseIdle();
+      await expect(automatedCycle).resolves.toMatchObject({ exitCode: 0 });
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual(expect.arrayContaining([
+        [expect.objectContaining({ threadId: fixture.orchestratorThreadId, mode: "steer-if-active" })],
+      ]));
+    } finally {
+      restoreGithub();
+    }
+  });
+
+  it("ignores a wrong-source post-send event before the matching tell", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    let sentText = "";
+    let releaseMatching!: () => void;
+    const matching = new Promise<void>((resolve) => { releaseMatching = resolve; });
+    host.harness.sdk.stub("threads.send", (async (input: { input: Array<{ text: string }> }) => {
+      sentText = input.input[0]!.text;
+      return { ok: true };
+    }) as never);
+    const waits: Array<{ afterSeq: string; type: string }> = [];
+    host.harness.sdk.stub("threads.events.wait", (async ({ threadId, afterSeq, type }: { threadId: string; afterSeq: string; type: string }) => {
+      waits.push({ afterSeq, type });
+      if (waits.length === 1) {
+        return {
+          id: "event-wrong-source",
+          threadId,
+          seq: 100,
+          type: "client/turn/requested",
+          scope: { kind: "thread" },
+          data: { source: "user", input: [{ type: "text", text: sentText, mentions: [] }] },
+          createdAt: 100,
+        };
+      }
+      await matching;
+      return {
+        id: "event-matching-tell",
+        threadId,
+        seq: 101,
+        type,
+        scope: { kind: "thread" },
+        data: { source: "tell", input: [{ type: "text", text: sentText, mentions: [] }] },
+        createdAt: 101,
+      };
+    }) as never);
+    const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
+      project_id: PROJECT_ID,
+      recipient: "operator",
+      severity: "routine",
+      text: "wrong source control",
+    }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
+
+    const reply = host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
+    await vi.waitFor(() => expect(waits).toHaveLength(2));
+    expect(host.bb.storage.database().prepare("SELECT replied_at_ms FROM operator_messages WHERE project_id = ? AND message_id = ?").get(PROJECT_ID, message.messageId)).toEqual({ replied_at_ms: null });
+    expect(waits).toEqual([
+      { afterSeq: expect.any(String), type: "client/turn/requested" },
+      { afterSeq: "100", type: "client/turn/requested" },
+    ]);
+    releaseMatching();
+    await expect(reply).resolves.toMatchObject({ repliedAtMs: expect.any(Number), replyDeliveryError: null });
+  });
+
+  it("ignores a wrong-prefix post-send event before the matching tell", async () => {
+    const host = hostFor();
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    let sentText = "";
+    let releaseMatching!: () => void;
+    const matching = new Promise<void>((resolve) => { releaseMatching = resolve; });
+    host.harness.sdk.stub("threads.send", (async (input: { input: Array<{ text: string }> }) => {
+      sentText = input.input[0]!.text;
+      return { ok: true };
+    }) as never);
+    const waits: Array<{ afterSeq: string; type: string }> = [];
+    host.harness.sdk.stub("threads.events.wait", (async ({ threadId, afterSeq, type }: { threadId: string; afterSeq: string; type: string }) => {
+      waits.push({ afterSeq, type });
+      if (waits.length === 1) {
+        return {
+          id: "event-wrong-prefix",
+          threadId,
+          seq: 100,
+          type: "client/turn/requested",
+          scope: { kind: "thread" },
+          data: { source: "tell", input: [{ type: "text", text: "unrelated tell input", mentions: [] }] },
+          createdAt: 100,
+        };
+      }
+      await matching;
+      return {
+        id: "event-matching-tell",
+        threadId,
+        seq: 101,
+        type,
+        scope: { kind: "thread" },
+        data: { source: "tell", input: [{ type: "text", text: sentText, mentions: [] }] },
+        createdAt: 101,
+      };
+    }) as never);
+    const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
+      project_id: PROJECT_ID,
+      recipient: "operator",
+      severity: "routine",
+      text: "wrong prefix control",
+    }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
+
+    const reply = host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
+    await vi.waitFor(() => expect(waits).toHaveLength(2));
+    expect(host.bb.storage.database().prepare("SELECT replied_at_ms FROM operator_messages WHERE project_id = ? AND message_id = ?").get(PROJECT_ID, message.messageId)).toEqual({ replied_at_ms: null });
+    expect(waits).toEqual([
+      { afterSeq: expect.any(String), type: "client/turn/requested" },
+      { afterSeq: "100", type: "client/turn/requested" },
+    ]);
+    releaseMatching();
+    await expect(reply).resolves.toMatchObject({ repliedAtMs: expect.any(Number), replyDeliveryError: null });
   });
 
   it("persists an inbox reply failure and releases its in-process guard for retry", async () => {
@@ -3202,11 +3364,10 @@ describe("bb-collab plugin boundary", () => {
     await plugin(host.bb, { notifyUrgent: async () => undefined });
     seedAndBootstrap(host);
     let timeout = true;
-    host.harness.sdk.stub("threads.wait", (async () => {
-      if (timeout) throw new Error("idle wait timed out");
-      return { matched: true };
+    host.harness.sdk.stub("threads.send", (async () => {
+      if (timeout) throw new Error("platform send timed out");
+      return { ok: true };
     }) as never);
-    host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
     host.harness.sdk.stub("threads.events.wait", (async ({ threadId }: { threadId: string }) => ({
       id: "event-delivered",
       threadId,
@@ -3220,16 +3381,16 @@ describe("bb-collab plugin boundary", () => {
       project_id: PROJECT_ID,
       recipient: "operator",
       severity: "routine",
-      text: "reply while never idle",
+      text: "reply while send times out",
     }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
 
     const replied = await host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
-    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
     expect(replied).toMatchObject({
       readAtMs: expect.any(Number),
       repliedAtMs: null,
       replyText: "answer",
-      replyDeliveryError: "Error: idle wait timed out",
+      replyDeliveryError: "Error: platform send timed out",
       replyInProgress: false,
     });
 
@@ -3239,14 +3400,30 @@ describe("bb-collab plugin boundary", () => {
       messageId: message.messageId,
       text: "retry",
     })).resolves.toMatchObject({ repliedAtMs: expect.any(Number), replyText: "retry", replyInProgress: false });
-    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
+  });
+
+  it("persists a stopping-sender refusal without claiming delivery", async () => {
+    const host = hostFor(PROJECT_ID, (facts) => { facts.thread.status = "stopping"; });
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    seedAndBootstrap(host);
+    host.harness.sdk.stub("threads.send", (async () => { throw new Error("Thread is stopping"); }) as never);
+    const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
+      project_id: PROJECT_ID,
+      recipient: "operator",
+      severity: "routine",
+      text: "reply to stopping sender",
+    }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
+
+    await expect(host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "cannot interrupt" }))
+      .resolves.toMatchObject({ repliedAtMs: null, replyText: "cannot interrupt", replyDeliveryError: "Error: Thread is stopping" });
+    expect(host.harness.inspection.sdk.callsTo("threads.wait")).toHaveLength(0);
   });
 
   it("records an accepted reply tell as failed when no matching sender event lands", async () => {
     const host = hostFor();
     await plugin(host.bb, { notifyUrgent: async () => undefined });
     seedAndBootstrap(host);
-    host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
     host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
     host.harness.sdk.stub("threads.events.wait", (async () => null) as never);
     const message = JSON.parse(await host.harness.callAgentTool("send_to_operator", {
