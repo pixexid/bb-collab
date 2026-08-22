@@ -30,6 +30,19 @@
           "ref": "main"
         }
       }
+    },
+    {
+      "id": "operator-inbox",
+      "displayName": "Operator Inbox",
+      "description": "Project-scoped operator and supervisor messages with delivery-aware replies.",
+      "author": { "name": "bb-collab" },
+      "source": {
+        "git": {
+          "url": "https://github.com/pixexid/bb-collab.git",
+          "subdir": "plugins/bb-plugin-operator-inbox",
+          "ref": "main"
+        }
+      }
     }
   ]
 }

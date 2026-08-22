@@ -2125,7 +2125,7 @@ describe("bb-collab plugin boundary", () => {
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "ACTOR_RECEIPT_UNKNOWN" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["idle-fleet-detector", "lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "worktree-cleanup", "thread-archive-sweep"]);
-    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "dispatchLane", "doctor", "export", "markOperatorMessageRead", "operatorMessages", "registerWait", "replyToOperatorMessage", "roleBrief", "v1-lanes"]);
+    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "dispatchLane", "doctor", "export", "registerWait", "roleBrief", "v1-inbox-archive", "v1-inbox-mark-read", "v1-inbox-read", "v1-inbox-reply", "v1-lanes"]);
     expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["dispatch_lane", "send_to_operator"]);
   });
 
@@ -2245,16 +2245,16 @@ describe("bb-collab plugin boundary", () => {
         evidence: { messages: [{ projectId: PROJECT_ID, recipient: "supervisor", notificationStatus: "not-requested" }] },
       });
       const titleReadsBeforeList = host.harness.inspection.sdk.callsTo("threads.get").length;
-      expect((await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID }) as { messages: unknown[] }).messages).toHaveLength(6);
+      expect((await host.harness.callRpc("v1-inbox-read", { projectId: PROJECT_ID }) as { messages: unknown[] }).messages).toHaveLength(6);
       expect(host.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(titleReadsBeforeList);
-      expect((await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, withSenderTitles: true }) as { messages: unknown[] }).messages).toEqual(
+      expect((await host.harness.callRpc("v1-inbox-read", { projectId: PROJECT_ID, withSenderTitles: true }) as { messages: unknown[] }).messages).toEqual(
         expect.arrayContaining([expect.objectContaining({ senderThreadId: ROLE_THREAD_ID, senderTitle: "Managed role holder" })]),
       );
       expect(host.harness.inspection.sdk.callsTo("threads.get")).toHaveLength(titleReadsBeforeList + 1);
-      expect((await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, recipient: "supervisor" }) as { messages: unknown[] }).messages).toHaveLength(2);
+      expect((await host.harness.callRpc("v1-inbox-read", { projectId: PROJECT_ID, recipient: "supervisor" }) as { messages: unknown[] }).messages).toHaveLength(2);
       // #280: the unregistered project is an outcome code, not a rejection. The
       // exact project match still gates the read — no foreign row is returned.
-      expect(await host.harness.callRpc("operatorMessages", { projectId: FOREIGN_PROJECT_ID }))
+      expect(await host.harness.callRpc("v1-inbox-read", { projectId: FOREIGN_PROJECT_ID }))
         .toEqual({ outcome: "PROJECT_CONFIG_REQUIRED", message: "operator inbox project is not registered", messages: [] });
       await expect(host.harness.callAgentTool("send_to_operator", {
         project_id: FOREIGN_PROJECT_ID,
@@ -2332,7 +2332,7 @@ describe("bb-collab plugin boundary", () => {
     }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID });
     host.harness.sdk.stub("threads.get", async () => { throw new Error("thread no longer exists"); });
 
-    await expect(host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, withSenderTitles: true })).resolves.toEqual({
+    await expect(host.harness.callRpc("v1-inbox-read", { projectId: PROJECT_ID, withSenderTitles: true })).resolves.toEqual({
       outcome: "OK",
       messages: [expect.objectContaining({ senderThreadId: ROLE_THREAD_ID, senderTitle: null })],
     });
@@ -2356,7 +2356,7 @@ describe("bb-collab plugin boundary", () => {
     expect(message).toMatchObject({ notificationStatus: "failed", notificationError: expect.stringContaining("desktop unavailable") });
   });
 
-  it("marks an inbox message read through the project-exact CLI without moving its timestamp", async () => {
+  it("marks an inbox message read through project-exact RPC and CLI without moving its timestamp", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
     try {
       const host = hostFor();
@@ -2370,6 +2370,10 @@ describe("bb-collab plugin boundary", () => {
       }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
 
       clock.mockReturnValue(1_100_000);
+      await expect(host.harness.callRpc("v1-inbox-mark-read", { projectId: PROJECT_ID, messageId: message.messageId }))
+        .resolves.toMatchObject({ projectId: PROJECT_ID, messageId: message.messageId, readAtMs: 1_100_000 });
+      await expect(host.harness.callRpc("v1-inbox-mark-read", { projectId: FOREIGN_PROJECT_ID, messageId: message.messageId }))
+        .rejects.toThrow("operator inbox project is not registered");
       const first = await host.harness.runCli(["inbox", "--project", PROJECT_ID, "--mark-read", String(message.messageId)]);
       expect(first.exitCode).toBe(0);
       expect(JSON.parse(first.stdout)).toMatchObject({
@@ -2409,15 +2413,19 @@ describe("bb-collab plugin boundary", () => {
       await plugin(host.bb, { notifyUrgent: async () => undefined });
       const { db } = seedAndBootstrap(host);
       const sent = JSON.parse(await host.harness.callAgentTool("send_to_operator", { project_id: PROJECT_ID, recipient: "operator", severity: "routine", text: "archive me" }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
+      await expect(host.harness.callRpc("v1-inbox-archive", { projectId: PROJECT_ID, messageId: sent.messageId }))
+        .resolves.toMatchObject({ archivedAtMs: 1_100_000, readAtMs: 1_100_000 });
+      await expect(host.harness.callRpc("v1-inbox-archive", { projectId: FOREIGN_PROJECT_ID, messageId: sent.messageId }))
+        .rejects.toThrow("operator inbox project is not registered");
       const archived = await host.harness.runCli(["inbox", "--project", PROJECT_ID, "--archive", String(sent.messageId)]);
       expect(archived.exitCode).toBe(0);
       expect(JSON.parse(archived.stdout)).toMatchObject({ evidence: { messages: [{ archivedAtMs: 1_100_000, readAtMs: 1_100_000 }] } });
       clock.mockReturnValue(1_200_000);
       const repeated = await host.harness.runCli(["inbox", "--project", PROJECT_ID, "--archive", String(sent.messageId)]);
       expect(JSON.parse(repeated.stdout)).toMatchObject({ evidence: { messages: [{ archivedAtMs: 1_100_000, readAtMs: 1_100_000 }] } });
-      const hidden = await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID }) as { messages: unknown[] };
+      const hidden = await host.harness.callRpc("v1-inbox-read", { projectId: PROJECT_ID }) as { messages: unknown[] };
       expect(hidden.messages).toHaveLength(0);
-      const shown = await host.harness.callRpc("operatorMessages", { projectId: PROJECT_ID, includeArchived: true }) as { messages: unknown[] };
+      const shown = await host.harness.callRpc("v1-inbox-read", { projectId: PROJECT_ID, includeArchived: true }) as { messages: unknown[] };
       expect(shown.messages).toHaveLength(1);
     } finally { clock.mockRestore(); }
   });
@@ -2527,10 +2535,10 @@ describe("bb-collab plugin boundary", () => {
       text: "needs an answer",
     }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
 
-    const replied = await host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
+    const replied = await host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
     expect(sent).toEqual([{ mode: "steer", text: `[bb-collab inbox reply ${message.messageId} to operator]\nanswer` }]);
     expect(replied).toMatchObject({ repliedAtMs: expect.any(Number), replyText: "answer", replyDeliveryError: null, readAtMs: expect.any(Number) });
-    await expect(host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "duplicate" }))
+    await expect(host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "duplicate" }))
       .rejects.toThrow("already has a delivered reply");
   });
 
@@ -2561,8 +2569,8 @@ describe("bb-collab plugin boundary", () => {
     }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
 
     const replies = await Promise.all([
-      host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "first" }),
-      host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "second" }),
+      host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "first" }),
+      host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "second" }),
     ]);
     expect(sent).toHaveLength(1);
     expect(replies).toEqual(expect.arrayContaining([
@@ -2595,7 +2603,7 @@ describe("bb-collab plugin boundary", () => {
       text: "reply while active",
     }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
 
-    const delivery = host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
+    const delivery = host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
     await vi.waitFor(() => expect(
       host.harness.inspection.sdk.callsTo("threads.wait").length + host.harness.inspection.sdk.callsTo("threads.send").length,
     ).toBeGreaterThan(0));
@@ -2634,7 +2642,7 @@ describe("bb-collab plugin boundary", () => {
       text: "reply while never idle",
     }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
 
-    const replied = await host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
+    const replied = await host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "answer" });
     expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
     expect(replied).toMatchObject({
       readAtMs: expect.any(Number),
@@ -2645,7 +2653,7 @@ describe("bb-collab plugin boundary", () => {
     });
 
     timeout = false;
-    await expect(host.harness.callRpc("replyToOperatorMessage", {
+    await expect(host.harness.callRpc("v1-inbox-reply", {
       projectId: PROJECT_ID,
       messageId: message.messageId,
       text: "retry",
@@ -2667,7 +2675,7 @@ describe("bb-collab plugin boundary", () => {
       text: "needs delivery proof",
     }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
 
-    const replied = await host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "unconfirmed" });
+    const replied = await host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "unconfirmed" });
     expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
     expect(replied).toMatchObject({ repliedAtMs: null, replyText: "unconfirmed", replyDeliveryError: expect.stringContaining("no matching sender-thread input event") });
   });
@@ -2684,7 +2692,7 @@ describe("bb-collab plugin boundary", () => {
     }, { threadId: ROLE_THREAD_ID, projectId: PROJECT_ID }) as string);
     host.harness.sdk.stub("environments.get", (async () => { throw new Error("environment deleted"); }) as never);
 
-    const replied = await host.harness.callRpc("replyToOperatorMessage", { projectId: PROJECT_ID, messageId: message.messageId, text: "cannot vanish" });
+    const replied = await host.harness.callRpc("v1-inbox-reply", { projectId: PROJECT_ID, messageId: message.messageId, text: "cannot vanish" });
     expect(replied).toMatchObject({ repliedAtMs: null, replyText: "cannot vanish", replyDeliveryError: expect.stringContaining("environment deleted") });
     expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });
