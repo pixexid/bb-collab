@@ -172,7 +172,7 @@ describe("inbox unread nav indicator", () => {
     const rendered = renderList(operatorMessages);
 
     // #then
-    await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a" }));
+    await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a", recipient: "operator" }));
     expect(inboxDot()).toBeNull();
     expect(rendered.queryByRole("alert")).toBeNull();
   });
