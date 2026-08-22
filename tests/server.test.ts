@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { defineRpcContract } from "@bb/plugin-sdk";
 import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing";
 import Database from "better-sqlite3";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import plugin, { cliSchemaError, deployedDistFailureDetail, fleetWatchdogBlockerFiredKey, fleetWatchdogCompositeKey, fleetWatchdogEpisodeKey, fleetWatchdogIssueReopenedKey, fleetWatchdogMergeCloseKey, fleetWatchdogReopenKey, fleetWatchdogRoleLivenessKey, fleetWatchdogScope, IDLE_FLEET_ATTEMPT_STALE_MS, ROLE_QUEUE_CACHE_MS, ROLE_QUEUE_DECISION_BOUND_MS, ROLE_QUEUE_IDLE_THRESHOLD_MS, ROLE_QUEUE_MAX_REPOSITORIES, ROLE_QUEUE_OBSERVATION_MS, ROLE_QUEUE_REFRESH_TIMEOUT_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
 import { canonicalWorktreePath } from "../src/worktree-cleanup.js";
@@ -888,7 +888,31 @@ function insertFixtureAssignment(db: Database.Database, fenceToken: string, opti
   return executionAttemptId;
 }
 
-async function addPendingReview(fixture: Awaited<ReturnType<typeof fleetWatchdogFixture>>) {
+async function addPendingReview(fixture: Awaited<ReturnType<typeof fleetWatchdogFixture>>, startableQueue = true) {
+  const target = fixture.db.prepare("SELECT remote_url FROM repository_targets WHERE project_id = ? AND repo_target_id = ?").get(PROJECT_ID, TARGET_ID) as { remote_url: string | null };
+  if (startableQueue) {
+    const config = fixture.db.prepare("SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = 1").get(PROJECT_ID) as { canonical_config_json: string };
+    const canonicalConfig = JSON.parse(config.canonical_config_json) as { extensions: { bbCollab: Record<string, unknown> } };
+    canonicalConfig.extensions.bbCollab.writingLaneCeiling = 0;
+    fixture.db.prepare("UPDATE project_config_revisions SET canonical_config_json = ? WHERE project_id = ? AND config_revision = 1").run(canonicalJson(canonicalConfig), PROJECT_ID);
+  }
+  if (startableQueue && target.remote_url === null) {
+    fixture.db.prepare("UPDATE repository_targets SET remote_url = 'https://github.com/example/project.git' WHERE project_id = ? AND repo_target_id = ?").run(PROJECT_ID, TARGET_ID);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-pending-review-queue-"));
+    const gh = join(bin, "gh");
+    const delegatedGh = execFileSync("which", ["gh"], { encoding: "utf8" }).trim();
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = api ]; then printf '%s\\n' '[[{"number":205,"labels":[{"name":"queue:startable"}]}]]'; else exec '${delegatedGh}' "$@"; fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    pendingReviewQueueCleanups.push(() => {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    });
+  }
   activateReviewer(fixture.db, fixture.fenceToken);
   expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
   return insertFixtureAssignment(fixture.db, fixture.fenceToken, {
@@ -903,6 +927,11 @@ async function addPendingReview(fixture: Awaited<ReturnType<typeof fleetWatchdog
     executionAttemptId: "pending-review-attempt",
   });
 }
+
+const pendingReviewQueueCleanups: Array<() => void> = [];
+afterEach(() => {
+  while (pendingReviewQueueCleanups.length > 0) pendingReviewQueueCleanups.pop()!();
+});
 
 // Parses a watchdog quiet line the way a recipient would: every timestamp must
 // name the evidence class that backs it. Quiet is only ever proven at a cycle
@@ -6089,6 +6118,78 @@ exit 1
     }
   });
 
+  it("derives fleet quiet episodes from complete queue labels, not canonical nonterminal rows", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-fleet-queue-truth-"));
+    const gh = join(bin, "gh");
+    const mode = join(bin, "mode");
+    writeFileSync(mode, "empty\n");
+    writeFileSync(gh, `#!/bin/sh
+mode=$(cat "${mode}")
+if [ "$1" != api ]; then printf '%s\n' '[]'; exit 0; fi
+if [ "$mode" = malformed ]; then printf '%s\n' '[[{"number":205,"labels":[{"name":"queue:startable"},{"name":"queue:blocked"}]}]]'; exit 0; fi
+if [ "$mode" = startable ]; then printf '%s\n' '[[{"number":205,"labels":[{"name":"queue:startable"}]}]]'; exit 0; fi
+printf '%s\n' '[[{"number":301,"labels":[{"name":"queue:blocked"}]},{"number":302,"labels":[{"name":"queue:waiting-external"}]},{"number":303,"labels":[{"name":"queue:dispatched"}]},{"number":304,"labels":[]}]]'
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      const controlId = "ready-control";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "ready-control-create",
+        workItemId: controlId,
+        workItem: { workItemId: controlId, title: "Ready control", body: "Synthetic canonical control." },
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, {
+        idempotencyKey: "ready-control-ready", workItemId: controlId,
+      })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "blocked", 2, {
+        idempotencyKey: "blocked-control",
+        workItemWait: { kind: "work_item_succeeded", workItemId: controlId, declaredBySeat: "worker-seat" },
+      }))).toMatchObject({ outcome: "OK" });
+
+      const fleetTexts = () => fixture.host.harness.inspection.sdk.callsTo("threads.send")
+        .map(([input]) => (input as { input: Array<{ text: string }> }).input[0]!.text)
+        .filter((text) => text.startsWith("fleet quiet") || text.startsWith("fleet still quiet"));
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fleetTexts()).toEqual([]);
+
+      writeFileSync(mode, "startable\n");
+      clock.mockReturnValue(2 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      clock.mockReturnValue(3 * 60 * 60_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fleetTexts()).toEqual([
+        "fleet quiet at cycle 1970-01-01T03:00:00.000Z with open work since 1970-01-01T02:00:00.000Z",
+      ]);
+
+      writeFileSync(mode, "empty\n");
+      clock.mockReturnValue(3 * 60 * 60_000 + 1);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      writeFileSync(mode, "malformed\n");
+      clock.mockReturnValue(4 * 60 * 60_000 + 1);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fleetTexts()).toHaveLength(1);
+      const orchestrator = readRoleHolderStates(fixture.db).find((holder) => holder.role_id === "project-orchestrator")!;
+      expect(await fixture.host.bb.storage.kv.get<Record<string, RoleIdleRecord>>("fleet-watchdog.role-idle"))
+        .toHaveProperty(`${roleIdleKey(orchestrator, "fleet:queue:startable")}.idleSinceMs`, null);
+      expect(fixture.db.prepare("SELECT work_item_id, lifecycle_state FROM work_items WHERE lifecycle_state IN ('ready', 'blocked') ORDER BY work_item_id").all()).toEqual([
+        { work_item_id: "ready-control", lifecycle_state: "ready" },
+        { work_item_id: WORK_ITEM_ID, lifecycle_state: "blocked" },
+      ]);
+    } finally {
+      clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("wakes the orchestrator first when the fleet is quietly stalled", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
@@ -6147,7 +6248,7 @@ exit 1
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     try {
       const fixture = await fleetWatchdogFixture(0);
-      await addPendingReview(fixture);
+      await addPendingReview(fixture, false);
       expect(await fixture.host.harness.callRpc("apply", workItemWaitRequest(fixture.fenceToken, 3, { kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat" }))).toMatchObject({ outcome: "OK" });
       for (const now of [0, 60 * 60_000, 2 * 60 * 60_000]) {
         clock.mockReturnValue(now);
@@ -6569,7 +6670,7 @@ fi
       expect(claim, "tier-1 line must claim quiet only at its cycle receipt").not.toBeNull();
       const cycleAtMs = 60 * 60_000;
       const orchestrator = fixture.db.prepare("SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'project-orchestrator'").get() as Parameters<typeof roleIdleKey>[0];
-      const ledgerKey = roleIdleKey(orchestrator, WORK_ITEM_ID);
+      const ledgerKey = roleIdleKey(orchestrator, "fleet:queue:startable");
       const persisted = await fixture.host.bb.storage.kv.get<Record<string, { idleSinceMs: number | null; lastFleetWakeAtMs: number | null }>>("fleet-watchdog.role-idle");
       expect(claim!.quietAtMs).toBe(cycleAtMs);
       expect(claim!.openSinceMs).toBe(persisted?.[ledgerKey]?.idleSinceMs);
@@ -6606,8 +6707,8 @@ fi
       const cycleAtMs = 2 * 60 * 60_000;
       const orchestrator = fixture.db.prepare("SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'project-orchestrator'").get() as Parameters<typeof roleIdleKey>[0];
       const director = fixture.db.prepare("SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'director'").get() as Parameters<typeof roleIdleKey>[0];
-      const anchorKey = roleIdleKey(orchestrator, WORK_ITEM_ID);
-      const wakeKey = roleIdleKey(director, WORK_ITEM_ID);
+      const anchorKey = roleIdleKey(orchestrator, "fleet:queue:startable");
+      const wakeKey = roleIdleKey(director, "fleet:queue:startable");
       const persisted = await fixture.host.bb.storage.kv.get<Record<string, { idleSinceMs: number | null; lastEscalationAtMs: number | null }>>("fleet-watchdog.role-idle");
       expect(claim!.quietAtMs).toBe(cycleAtMs);
       expect(claim!.openSinceMs).toBe(persisted?.[anchorKey]?.idleSinceMs);
@@ -6653,8 +6754,14 @@ fi
 
   it("continues processing other projects when one project's interactions read rejects", async () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-multi-project-queue-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s\\n' '[[{\"number\":205,\"labels\":[{\"name\":\"queue:startable\"}]}]]'; else printf '%s\\n' '[]'; fi\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
     try {
-      const fixture = await fleetWatchdogFixture(0);
+      const fixture = await fleetWatchdogFixture(0, true);
       cloneProject(fixture.db, PROJECT_ID, "project-two");
       fixture.setThreadProject("director-two", "project-two");
       fixture.setThreadProject("orchestrator-two", "project-two");
@@ -6675,6 +6782,9 @@ fi
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { threadId: string }).threadId).filter((threadId) => threadId === "director-two")).toEqual(["director-two"]);
     } finally {
       clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
     }
   });
 

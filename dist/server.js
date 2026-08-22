@@ -25041,7 +25041,10 @@ ${thread.titleFallback ?? ""}`);
             }
           }
           const workItems = openWorkItemsByProject.get(projectId) ?? [];
-          const resetIdle = () => Promise.all(holders.flatMap((holder) => workItems.map((workItem) => fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workItem.workItemId)))));
+          const resetIdle = () => Promise.all(holders.flatMap((holder) => [
+            fleetWatchdogIdle.resetIdle(roleIdleKey(holder, "fleet:queue:startable")),
+            ...workItems.map((workItem) => fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workItem.workItemId)))
+          ]));
           const config2 = db.prepare(
             `SELECT revisions.canonical_config_json
              FROM project_config_heads AS heads
@@ -25130,7 +25133,6 @@ ${thread.titleFallback ?? ""}`);
           } else {
             bb.log.warn(`fleet-watchdog intake coverage=blind project=${projectId} reason=startable-queue-unreadable`);
           }
-          if (workItems.length === 0) continue;
           const unblocked = /* @__PURE__ */ new Set();
           for (const blocked of workItems.filter((workItem) => workItem.lifecycleState === "blocked")) {
             let condition;
@@ -25222,12 +25224,11 @@ ${thread.titleFallback ?? ""}`);
             }
             continue;
           }
-          const openWorkItem = remainingWorkItems.find((workItem) => workItem.declaredAtMs === null);
-          if (!openWorkItem) {
+          if (queue === null || queue.count === 0 || workItems.length > 0 && remainingWorkItems.every((workItem) => workItem.declaredAtMs !== null)) {
             await resetIdle();
             continue;
           }
-          const workKey = openWorkItem.workItemId;
+          const workKey = "fleet:queue:startable";
           const orchestratorKey = roleIdleKey(orchestrator, workKey);
           const priorOrchestratorRecord = await fleetWatchdogIdle.get(orchestratorKey);
           if (priorOrchestratorRecord?.lastFleetWakeAtMs !== null && priorOrchestratorRecord?.lastFleetWakeAtMs !== void 0 && now2 - priorOrchestratorRecord.lastFleetWakeAtMs >= FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) {

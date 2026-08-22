@@ -3492,7 +3492,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             }
           }
           const workItems = openWorkItemsByProject.get(projectId) ?? [];
-          const resetIdle = () => Promise.all(holders.flatMap((holder) => workItems.map((workItem) => fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workItem.workItemId)))));
+          const resetIdle = () => Promise.all(holders.flatMap((holder) => [
+            fleetWatchdogIdle.resetIdle(roleIdleKey(holder, "fleet:queue:startable")),
+            ...workItems.map((workItem) => fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workItem.workItemId))),
+          ]));
           const config = db.prepare(
             `SELECT revisions.canonical_config_json
              FROM project_config_heads AS heads
@@ -3584,7 +3587,6 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           } else {
             bb.log.warn(`fleet-watchdog intake coverage=blind project=${projectId} reason=startable-queue-unreadable`);
           }
-          if (workItems.length === 0) continue;
           const unblocked = new Set<string>();
           for (const blocked of workItems.filter((workItem) => workItem.lifecycleState === "blocked")) {
             let condition: ApplyRequest["workItemUnblock"];
@@ -3679,12 +3681,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             }
             continue;
           }
-          const openWorkItem = remainingWorkItems.find((workItem) => workItem.declaredAtMs === null);
-          if (!openWorkItem) {
+          if (queue === null || queue.count === 0 || (workItems.length > 0 && remainingWorkItems.every((workItem) => workItem.declaredAtMs !== null))) {
             await resetIdle();
             continue;
           }
-          const workKey = openWorkItem.workItemId;
+          const workKey = "fleet:queue:startable";
           const orchestratorKey = roleIdleKey(orchestrator, workKey);
           const priorOrchestratorRecord = await fleetWatchdogIdle.get(orchestratorKey);
           if (priorOrchestratorRecord?.lastFleetWakeAtMs !== null && priorOrchestratorRecord?.lastFleetWakeAtMs !== undefined && now - priorOrchestratorRecord.lastFleetWakeAtMs >= FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) {
