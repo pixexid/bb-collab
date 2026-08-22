@@ -415,6 +415,7 @@ snapshot read failed: ${reason}` }] };
   bb.agents.configure((context) => context.origin.pluginId === bb.pluginId && context.thread.title === TITLE ? { tools: [TOOL], skills: [] } : { tools: [], skills: [] });
   const judge = async (projectId, orchestratorId, turnStartedAt) => {
     await load();
+    if ([...pending.values()].some((request) => request.projectId === projectId)) return;
     let threadId = companions.get(projectId);
     if (threadId) {
       try {
@@ -444,24 +445,24 @@ snapshot read failed: ${reason}` }] };
       if (request) bb.log.warn(`companion-watcher coverage=blind event=post-check reason=project-mismatch expected=${request.projectId} actual=${projectId}`);
       return;
     }
-    pending.delete(threadId);
-    const snapshot = candidateSnapshots.get(threadId);
-    candidateSnapshots.delete(threadId);
-    if (!snapshot) {
-      bb.log.warn("companion-watcher coverage=blind event=post-check reason=snapshot-missing");
-      return;
-    }
-    if (snapshot.projectId !== request.projectId || snapshot.canonical.projectId !== request.projectId) {
-      bb.log.warn(`companion-watcher coverage=blind event=post-check reason=project-mismatch expected=${request.projectId} actual=${snapshot.projectId}`);
-      return;
-    }
-    const judgment = parseJudgment(output, snapshot, (reason) => bb.log.warn(`companion-watcher coverage=${snapshot.coverage} event=post-check reason=${reason}`));
-    const prior = snapshots.get(request.projectId);
-    const now = Date.now();
-    const route = routeJudgment(prior, judgment, now, request.turnStartedAt);
-    bb.log.info(`companion-watcher coverage=${judgment.coverage} event=judgment illegitimate=${judgment.illegitimate} route=${route ?? "silence"}`);
-    if (!route) return;
+    let route;
     try {
+      const snapshot = candidateSnapshots.get(threadId);
+      candidateSnapshots.delete(threadId);
+      if (!snapshot) {
+        bb.log.warn("companion-watcher coverage=blind event=post-check reason=snapshot-missing");
+        return;
+      }
+      if (snapshot.projectId !== request.projectId || snapshot.canonical.projectId !== request.projectId) {
+        bb.log.warn(`companion-watcher coverage=blind event=post-check reason=project-mismatch expected=${request.projectId} actual=${snapshot.projectId}`);
+        return;
+      }
+      const judgment = parseJudgment(output, snapshot, (reason) => bb.log.warn(`companion-watcher coverage=${snapshot.coverage} event=post-check reason=${reason}`));
+      const prior = snapshots.get(request.projectId);
+      const now = Date.now();
+      route = routeJudgment(prior, judgment, now, request.turnStartedAt);
+      bb.log.info(`companion-watcher coverage=${judgment.coverage} event=judgment illegitimate=${judgment.illegitimate} route=${route ?? "silence"}`);
+      if (!route) return;
       const exported = await canonical(request.projectId);
       const target = route === "director" ? readRoleThread(exported, request.projectId, "director") : readRoleThread(exported, request.projectId, "project-orchestrator");
       if (!target || route === "orchestrator" && target !== request.orchestratorId) throw new Error(`${route}-head-unresolved`);
@@ -470,6 +471,8 @@ snapshot read failed: ${reason}` }] };
       await bb.storage.kv.set("backoff", Object.fromEntries(snapshots));
     } catch (error) {
       bb.log.warn(`companion-watcher coverage=blind event=${route} reason=${String(error)}`);
+    } finally {
+      pending.delete(threadId);
     }
   };
   bb.events.on("thread.active", ({ thread }) => {

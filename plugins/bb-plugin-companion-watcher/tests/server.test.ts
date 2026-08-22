@@ -317,6 +317,126 @@ describe("semantic idle guard", () => {
     expect(sent).toEqual(["thr_7bjw9e7mgd"]);
   });
 
+  it("coalesces sequential repeated holder events through companion completion", async () => {
+    const base = await capturedExport();
+    const canonical = { ...base, executionAttempts: [base.executionAttempts[0]!, { ...base.executionAttempts[1], observed_at_ms: 0, state: "running" }] };
+    let idle: ((event: { thread: { id: string; projectId: string }; lastAssistantText?: string }) => Promise<void>) | undefined;
+    let sends = 0;
+    let totalTurnRequests = 0;
+    const bb = {
+      pluginId: "companion-watcher",
+      log: { info: () => undefined, warn: () => undefined },
+      storage: { kv: { get: async (key: string) => key === "companions" ? { [projectId]: "companion" } : undefined, set: async () => undefined } },
+      agents: { registerTool: () => undefined, configure: () => undefined },
+      sdk: {
+        system: { config: async () => ({ dataDir: "/unused" }) },
+        projects: { list: async () => [{ id: projectId, gitRemoteUrl: null }] },
+        threads: {
+          spawn: async () => { totalTurnRequests += 1; return { id: "companion" }; },
+          get: async () => ({ projectId, status: "idle" }),
+          send: async () => { sends += 1; totalTurnRequests += 1; },
+        },
+      },
+      events: { on: (event: string, handler: typeof idle) => { if (event === "thread.idle") idle = handler; } },
+    } as unknown as BbPluginApi;
+    companionWatcher(bb, async () => canonical, async () => ({ issues: [], prs: [] }));
+    await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+    await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+    expect({ sends, totalTurnRequests }).toEqual({ sends: 1, totalTurnRequests: 1 });
+  });
+
+  it("coalesces concurrent repeated holder events while the send is outstanding", async () => {
+    const base = await capturedExport();
+    const canonical = { ...base, executionAttempts: [base.executionAttempts[0]!, { ...base.executionAttempts[1], observed_at_ms: 0, state: "running" }] };
+    let idle: ((event: { thread: { id: string; projectId: string }; lastAssistantText?: string }) => Promise<void>) | undefined;
+    let sends = 0;
+    let markSendStarted!: () => void;
+    let releaseSend!: () => void;
+    const sendStarted = new Promise<void>((resolve) => { markSendStarted = resolve; });
+    const sendResult = new Promise<void>((resolve) => { releaseSend = resolve; });
+    const bb = {
+      pluginId: "companion-watcher",
+      log: { info: () => undefined, warn: () => undefined },
+      storage: { kv: { get: async (key: string) => key === "companions" ? { [projectId]: "companion" } : undefined, set: async () => undefined } },
+      agents: { registerTool: () => undefined, configure: () => undefined },
+      sdk: {
+        system: { config: async () => ({ dataDir: "/unused" }) },
+        projects: { list: async () => [{ id: projectId, gitRemoteUrl: null }] },
+        threads: {
+          spawn: async () => ({ id: "companion" }),
+          get: async () => ({ projectId, status: "idle" }),
+          send: async () => { sends += 1; markSendStarted(); await sendResult; },
+        },
+      },
+      events: { on: (event: string, handler: typeof idle) => { if (event === "thread.idle") idle = handler; } },
+    } as unknown as BbPluginApi;
+    companionWatcher(bb, async () => canonical, async () => ({ issues: [], prs: [] }));
+    const first = idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+    await sendStarted;
+    const second = idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+    await second;
+    expect(sends).toBe(1);
+    releaseSend();
+    await first;
+    expect(sends).toBe(1);
+  });
+
+  it("retries a repeated holder event after terminal companion failure", async () => {
+    const base = await capturedExport();
+    const canonical = { ...base, executionAttempts: [base.executionAttempts[0]!, { ...base.executionAttempts[1], observed_at_ms: 0, state: "running" }] };
+    let idle: ((event: { thread: { id: string; projectId: string }; lastAssistantText?: string }) => Promise<void>) | undefined;
+    let sends = 0;
+    const bb = {
+      pluginId: "companion-watcher",
+      log: { info: () => undefined, warn: () => undefined },
+      storage: { kv: { get: async (key: string) => key === "companions" ? { [projectId]: "companion" } : undefined, set: async () => undefined } },
+      agents: { registerTool: () => undefined, configure: () => undefined },
+      sdk: {
+        system: { config: async () => ({ dataDir: "/unused" }) },
+        projects: { list: async () => [{ id: projectId, gitRemoteUrl: null }] },
+        threads: {
+          spawn: async () => ({ id: "companion" }),
+          get: async () => ({ projectId, status: "idle" }),
+          send: async () => { sends += 1; if (sends === 1) throw new Error("companion timeout"); },
+        },
+      },
+      events: { on: (event: string, handler: typeof idle) => { if (event === "thread.idle") idle = handler; } },
+    } as unknown as BbPluginApi;
+    companionWatcher(bb, async () => canonical, async () => ({ issues: [], prs: [] }));
+    await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+    await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+    expect(sends).toBe(2);
+  });
+
+  it("releases coalescing after a terminal empty companion completion", async () => {
+    const base = await capturedExport();
+    const canonical = { ...base, executionAttempts: [base.executionAttempts[0]!, { ...base.executionAttempts[1], observed_at_ms: 0, state: "running" }] };
+    let idle: ((event: { thread: { id: string; projectId: string }; lastAssistantText?: string }) => Promise<void>) | undefined;
+    let spawns = 0;
+    let sends = 0;
+    const bb = {
+      pluginId: "companion-watcher",
+      log: { info: () => undefined, warn: () => undefined },
+      storage: { kv: { get: async () => undefined, set: async () => undefined } },
+      agents: { registerTool: () => undefined, configure: () => undefined },
+      sdk: {
+        system: { config: async () => ({ dataDir: "/unused" }) },
+        projects: { list: async () => [{ id: projectId, gitRemoteUrl: null }] },
+        threads: {
+          spawn: async () => { spawns += 1; return { id: "companion" }; },
+          get: async () => ({ projectId, status: "idle" }),
+          send: async () => { sends += 1; },
+        },
+      },
+      events: { on: (event: string, handler: typeof idle) => { if (event === "thread.idle") idle = handler; } },
+    } as unknown as BbPluginApi;
+    companionWatcher(bb, async () => canonical, async () => ({ issues: [], prs: [] }));
+    await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+    await idle!({ thread: { id: "companion", projectId } });
+    await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+    expect({ spawns, sends }).toEqual({ spawns: 1, sends: 1 });
+  });
+
   it("keeps project failure isolation on independent project-scoped events", async () => {
     const base = await capturedExport();
     const projectB = "proj_two";
