@@ -5,7 +5,7 @@
   "engines": { "bb": ">=0.37.0", "bbPluginSdk": "^0.4.1" },
   "bb": {
     "name": "Companion watcher",
-    "description": "Wakes an idle orchestrator when mechanical work remains undone.",
+    "description": "Semantically judges whether an orchestrator's idleness is illegitimate.",
     "branding": { "icon": "Eye" },
     "server": "./server.ts"
   },
