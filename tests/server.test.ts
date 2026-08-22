@@ -6129,6 +6129,7 @@ mode=$(cat "${mode}")
 if [ "$1" != api ]; then printf '%s\n' '[]'; exit 0; fi
 if [ "$mode" = malformed ]; then printf '%s\n' '[[{"number":205,"labels":[{"name":"queue:startable"},{"name":"queue:blocked"}]}]]'; exit 0; fi
 if [ "$mode" = startable ]; then printf '%s\n' '[[{"number":205,"labels":[{"name":"queue:startable"}]}]]'; exit 0; fi
+if [ "$mode" = startable-b ]; then printf '%s\n' '[[{"number":206,"labels":[{"name":"queue:startable"}]}]]'; exit 0; fi
 printf '%s\n' '[[{"number":301,"labels":[{"name":"queue:blocked"}]},{"number":302,"labels":[{"name":"queue:waiting-external"}]},{"number":303,"labels":[{"name":"queue:dispatched"}]},{"number":304,"labels":[]}]]'
 `);
     chmodSync(gh, 0o755);
@@ -6145,6 +6146,9 @@ printf '%s\n' '[[{"number":301,"labels":[{"name":"queue:blocked"}]},{"number":30
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, {
         idempotencyKey: "ready-control-ready", workItemId: controlId,
       })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, workItemWaitRequest(fixture.fenceToken, 2, {
+        kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat",
+      }, { idempotencyKey: "ready-control-wait", workItemId: controlId }))).toMatchObject({ outcome: "OK" });
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "blocked", 2, {
         idempotencyKey: "blocked-control",
         workItemWait: { kind: "work_item_succeeded", workItemId: controlId, declaredBySeat: "worker-seat" },
@@ -6168,16 +6172,27 @@ printf '%s\n' '[[{"number":301,"labels":[{"name":"queue:blocked"}]},{"number":30
         "fleet quiet at cycle 1970-01-01T03:00:00.000Z with open work since 1970-01-01T02:00:00.000Z",
       ]);
 
-      writeFileSync(mode, "empty\n");
+      writeFileSync(mode, "startable-b\n");
       clock.mockReturnValue(3 * 60 * 60_000 + 1);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      writeFileSync(mode, "malformed\n");
       clock.mockReturnValue(4 * 60 * 60_000 + 1);
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(fleetTexts()).toHaveLength(1);
+      expect(fleetTexts()).toEqual([
+        "fleet quiet at cycle 1970-01-01T03:00:00.000Z with open work since 1970-01-01T02:00:00.000Z",
+        "fleet quiet at cycle 1970-01-01T04:00:00.001Z with open work since 1970-01-01T03:00:00.001Z",
+      ]);
+
+      writeFileSync(mode, "empty\n");
+      clock.mockReturnValue(4 * 60 * 60_000 + 2);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      writeFileSync(mode, "malformed\n");
+      clock.mockReturnValue(5 * 60 * 60_000 + 2);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fleetTexts()).toHaveLength(2);
       const orchestrator = readRoleHolderStates(fixture.db).find((holder) => holder.role_id === "project-orchestrator")!;
-      expect(await fixture.host.bb.storage.kv.get<Record<string, RoleIdleRecord>>("fleet-watchdog.role-idle"))
-        .toHaveProperty(`${roleIdleKey(orchestrator, "fleet:queue:startable")}.idleSinceMs`, null);
+      const idleState = await fixture.host.bb.storage.kv.get<Record<string, RoleIdleRecord>>("fleet-watchdog.role-idle");
+      expect(idleState).not.toHaveProperty(roleIdleKey(orchestrator, "fleet:queue:example/project#205"));
+      expect(idleState).not.toHaveProperty(roleIdleKey(orchestrator, "fleet:queue:example/project#206"));
       expect(fixture.db.prepare("SELECT work_item_id, lifecycle_state FROM work_items WHERE lifecycle_state IN ('ready', 'blocked') ORDER BY work_item_id").all()).toEqual([
         { work_item_id: "ready-control", lifecycle_state: "ready" },
         { work_item_id: WORK_ITEM_ID, lifecycle_state: "blocked" },
@@ -6670,7 +6685,7 @@ fi
       expect(claim, "tier-1 line must claim quiet only at its cycle receipt").not.toBeNull();
       const cycleAtMs = 60 * 60_000;
       const orchestrator = fixture.db.prepare("SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'project-orchestrator'").get() as Parameters<typeof roleIdleKey>[0];
-      const ledgerKey = roleIdleKey(orchestrator, "fleet:queue:startable");
+      const ledgerKey = roleIdleKey(orchestrator, "fleet:queue:example/project#205");
       const persisted = await fixture.host.bb.storage.kv.get<Record<string, { idleSinceMs: number | null; lastFleetWakeAtMs: number | null }>>("fleet-watchdog.role-idle");
       expect(claim!.quietAtMs).toBe(cycleAtMs);
       expect(claim!.openSinceMs).toBe(persisted?.[ledgerKey]?.idleSinceMs);
@@ -6707,8 +6722,8 @@ fi
       const cycleAtMs = 2 * 60 * 60_000;
       const orchestrator = fixture.db.prepare("SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'project-orchestrator'").get() as Parameters<typeof roleIdleKey>[0];
       const director = fixture.db.prepare("SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'director'").get() as Parameters<typeof roleIdleKey>[0];
-      const anchorKey = roleIdleKey(orchestrator, "fleet:queue:startable");
-      const wakeKey = roleIdleKey(director, "fleet:queue:startable");
+      const anchorKey = roleIdleKey(orchestrator, "fleet:queue:example/project#205");
+      const wakeKey = roleIdleKey(director, "fleet:queue:example/project#205");
       const persisted = await fixture.host.bb.storage.kv.get<Record<string, { idleSinceMs: number | null; lastEscalationAtMs: number | null }>>("fleet-watchdog.role-idle");
       expect(claim!.quietAtMs).toBe(cycleAtMs);
       expect(claim!.openSinceMs).toBe(persisted?.[anchorKey]?.idleSinceMs);

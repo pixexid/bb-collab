@@ -3492,10 +3492,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             }
           }
           const workItems = openWorkItemsByProject.get(projectId) ?? [];
-          const resetIdle = () => Promise.all(holders.flatMap((holder) => [
-            fleetWatchdogIdle.resetIdle(roleIdleKey(holder, "fleet:queue:startable")),
-            ...workItems.map((workItem) => fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workItem.workItemId))),
-          ]));
+          const resetIdle = () => Promise.all(holders.flatMap((holder) => workItems.map((workItem) => fleetWatchdogIdle.resetIdle(roleIdleKey(holder, workItem.workItemId)))));
           const config = db.prepare(
             `SELECT revisions.canonical_config_json
              FROM project_config_heads AS heads
@@ -3535,6 +3532,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           const queue = repositories.length === 0 || repositories.some((repository) => repository === null)
             ? null
             : await startableQueueStateAsync(repositories as string[]);
+          const fleetQueueHead = queue?.head === null || queue?.head === undefined ? null : `fleet:queue:${queue.head}`;
+          await Promise.all(holders.map((holder) => fleetWatchdogIdle.clearPrefixExcept(
+            roleIdleKey(holder, "fleet:queue:").slice(0, -2),
+            fleetQueueHead === null ? undefined : roleIdleKey(holder, fleetQueueHead),
+          )));
           if (queue !== null) {
             const intake = `startable=${queue.count} unlabelled=${queue.unlabelledCount} blocked=${queue.blockedCount} waiting-external=${queue.waitingExternalCount}`;
             bb.log.info(`fleet-watchdog intake counts: project=${projectId} ${intake}`);
@@ -3681,11 +3683,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             }
             continue;
           }
-          if (queue === null || queue.count === 0 || (workItems.length > 0 && remainingWorkItems.every((workItem) => workItem.declaredAtMs !== null))) {
+          if (queue === null || queue.count === 0 || queue.head === null) {
             await resetIdle();
             continue;
           }
-          const workKey = "fleet:queue:startable";
+          const workKey = `fleet:queue:${queue.head}`;
           const orchestratorKey = roleIdleKey(orchestrator, workKey);
           const priorOrchestratorRecord = await fleetWatchdogIdle.get(orchestratorKey);
           if (priorOrchestratorRecord?.lastFleetWakeAtMs !== null && priorOrchestratorRecord?.lastFleetWakeAtMs !== undefined && now - priorOrchestratorRecord.lastFleetWakeAtMs >= FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) {
