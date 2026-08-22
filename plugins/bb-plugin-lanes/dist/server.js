@@ -13814,13 +13814,35 @@ var rpcContract = defineRpcContract({
 // server.ts
 var CORE_PLUGIN_ID = "bb-collab";
 var CORE_LANES_METHOD = "v1-lanes";
+var CORE_RPC_TIMEOUT_MS = 4e3;
+async function withTimeout(promise2) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise2,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`bb-collab ${CORE_LANES_METHOD} timed out after ${CORE_RPC_TIMEOUT_MS}ms`)), CORE_RPC_TIMEOUT_MS);
+      })
+    ]);
+  } finally {
+    if (timer !== void 0) clearTimeout(timer);
+  }
+}
 function plugin(bb) {
-  const readLanes = async () => laneListSchema.parse(await bb.sdk.plugins.callRpc({
-    pluginId: CORE_PLUGIN_ID,
-    method: CORE_LANES_METHOD,
-    input: {},
-    outputSchema: laneListSchema
-  }));
+  let coreRead = null;
+  const readLanes = async () => {
+    if (coreRead === null) {
+      coreRead = bb.sdk.plugins.callRpc({
+        pluginId: CORE_PLUGIN_ID,
+        method: CORE_LANES_METHOD,
+        input: {},
+        outputSchema: laneListSchema
+      }).finally(() => {
+        coreRead = null;
+      });
+    }
+    return laneListSchema.parse(await withTimeout(coreRead));
+  };
   bb.rpc.register(rpcContract, {
     lanes: readLanes
   });

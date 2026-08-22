@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import plugin from "../server.js";
 
 const lane = {
@@ -36,6 +36,11 @@ function host(result: unknown = [lane]) {
 }
 
 describe("Collaboration Lanes backend", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
   it("is independently packaged, listed, and built", () => {
     const root = resolve(import.meta.dirname, "../../..");
     const collection = JSON.parse(readFileSync(resolve(root, ".bb/plugins.json"), "utf8"));
@@ -75,5 +80,27 @@ describe("Collaboration Lanes backend", () => {
 
     await expect(fixture.harness.callRpc("lanes", {})).rejects.toThrow("core unavailable");
     expect((await fixture.harness.fetchHttp("GET", "/lanes")).status).toBe(503);
+  });
+
+  it("bounds a never-settling core read across RPC and HTTP pollers", async () => {
+    vi.useFakeTimers();
+    let rejectCore!: (reason: Error) => void;
+    const fixture = host(new Promise((_, reject) => { rejectCore = reject; }));
+    const rpc = fixture.harness.callRpc("lanes", {}).then(() => null, (error: unknown) => error);
+    const http = fixture.harness.fetchHttp("GET", "/lanes");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fixture.callRpc).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(String(await rpc)).toContain("timed out after 4000ms");
+    expect((await http).status).toBe(503);
+
+    const next = fixture.harness.callRpc("lanes", {}).then(() => null, (error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(String(await next)).toContain("timed out after 4000ms");
+    expect(fixture.callRpc).toHaveBeenCalledTimes(1);
+
+    rejectCore(new Error("late core rejection"));
+    await vi.advanceTimersByTimeAsync(0);
   });
 });
