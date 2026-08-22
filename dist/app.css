@@ -6,14 +6,6 @@
     --font-sans: var(--font-sans);
     --font-serif: var(--font-serif);
     --font-mono: var(--font-mono);
-    --spacing: 0.25rem;
-    --container-4xl: 56rem;
-    --text-xs: 0.75rem;
-    --text-xs--line-height: calc(1 / 0.75);
-    --text-sm: 0.8125rem;
-    --text-sm--line-height: calc(1.25 / 0.875);
-    --font-weight-medium: 500;
-    --font-weight-semibold: 600;
     --shadow-2xs: var(--shadow-2xs);
     --shadow-xs: var(--shadow-xs);
     --shadow-sm: var(--shadow-sm);
@@ -119,32 +111,8 @@
     .relative {
       position: relative;
     }
-    .mx-auto {
-      margin-inline: auto;
-    }
-    .my-3 {
-      margin-block: calc(var(--spacing) * 3);
-    }
-    .mb-2 {
-      margin-bottom: calc(var(--spacing) * 2);
-    }
-    .mb-3 {
-      margin-bottom: calc(var(--spacing) * 3);
-    }
-    .mb-5 {
-      margin-bottom: calc(var(--spacing) * 5);
-    }
-    .ml-auto {
-      margin-left: auto;
-    }
     .block {
       display: block;
-    }
-    .flex {
-      display: flex;
-    }
-    .grid {
-      display: grid;
     }
     .hidden {
       display: none;
@@ -152,137 +120,8 @@
     .inline {
       display: inline;
     }
-    .inline-grid {
-      display: inline-grid;
-    }
     .table {
       display: table;
-    }
-    .h-full {
-      height: 100%;
-    }
-    .min-h-20 {
-      min-height: calc(var(--spacing) * 20);
-    }
-    .max-w-4xl {
-      max-width: var(--container-4xl);
-    }
-    .transform {
-      transform: var(--tw-rotate-x,) var(--tw-rotate-y,) var(--tw-rotate-z,) var(--tw-skew-x,) var(--tw-skew-y,);
-    }
-    .flex-wrap {
-      flex-wrap: wrap;
-    }
-    .items-center {
-      align-items: center;
-    }
-    .items-end {
-      align-items: flex-end;
-    }
-    .gap-1 {
-      gap: calc(var(--spacing) * 1);
-    }
-    .gap-2 {
-      gap: calc(var(--spacing) * 2);
-    }
-    .gap-3 {
-      gap: calc(var(--spacing) * 3);
-    }
-    .space-y-3 {
-      :where(& > :not(:last-child)) {
-        --tw-space-y-reverse: 0;
-        margin-block-start: calc(calc(var(--spacing) * 3) * var(--tw-space-y-reverse));
-        margin-block-end: calc(calc(var(--spacing) * 3) * calc(1 - var(--tw-space-y-reverse)));
-      }
-    }
-    .overflow-y-auto {
-      overflow-y: auto;
-    }
-    .rounded-lg {
-      border-radius: var(--radius);
-    }
-    .rounded-md {
-      border-radius: calc(var(--radius) - 2px);
-    }
-    .border {
-      border-style: var(--tw-border-style);
-      border-width: 1px;
-    }
-    .border-border {
-      border-color: var(--border);
-    }
-    .border-primary\/50 {
-      border-color: var(--primary);
-      @supports (color: color-mix(in lab, red, red)) {
-        border-color: color-mix(in oklab, var(--primary) 50%, transparent);
-      }
-    }
-    .bg-background {
-      background-color: var(--background);
-    }
-    .bg-primary {
-      background-color: var(--primary);
-    }
-    .p-2 {
-      padding: calc(var(--spacing) * 2);
-    }
-    .p-4 {
-      padding: calc(var(--spacing) * 4);
-    }
-    .p-5 {
-      padding: calc(var(--spacing) * 5);
-    }
-    .px-3 {
-      padding-inline: calc(var(--spacing) * 3);
-    }
-    .py-2 {
-      padding-block: calc(var(--spacing) * 2);
-    }
-    .text-sm {
-      font-size: var(--text-sm);
-      line-height: var(--tw-leading, var(--text-sm--line-height));
-    }
-    .text-xs {
-      font-size: var(--text-xs);
-      line-height: var(--tw-leading, var(--text-xs--line-height));
-    }
-    .font-medium {
-      --tw-font-weight: var(--font-weight-medium);
-      font-weight: var(--font-weight-medium);
-    }
-    .font-semibold {
-      --tw-font-weight: var(--font-weight-semibold);
-      font-weight: var(--font-weight-semibold);
-    }
-    .whitespace-pre-wrap {
-      white-space: pre-wrap;
-    }
-    .text-destructive {
-      color: var(--destructive);
-    }
-    .text-foreground {
-      color: var(--foreground);
-    }
-    .text-muted-foreground {
-      color: var(--muted-foreground);
-    }
-    .text-primary {
-      color: var(--primary);
-    }
-    .text-primary-foreground {
-      color: var(--primary-foreground);
-    }
-    .underline {
-      text-decoration-line: underline;
-    }
-    .decoration-muted-foreground\/50 {
-      text-decoration-color: var(--muted-foreground);
-      @supports (color: color-mix(in lab, red, red)) {
-        text-decoration-color: color-mix(in oklab, var(--muted-foreground) 50%, transparent);
-      }
-    }
-    .underline-offset-2 {
-      text-underline-offset: 2px;
     }
     .transition {
       transition-property: color, background-color, border-color, outline-color, text-decoration-color, fill, stroke, --tw-gradient-from, --tw-gradient-via, --tw-gradient-to, opacity, box-shadow, transform, translate, scale, rotate, filter, -webkit-backdrop-filter, backdrop-filter, display, content-visibility, overlay, pointer-events;
@@ -292,60 +131,7 @@
     .running {
       animation-play-state: running;
     }
-    .hover\:bg-muted {
-      &:hover {
-        @media (hover: hover) {
-          background-color: var(--muted);
-        }
-      }
-    }
-    .hover\:text-foreground {
-      &:hover {
-        @media (hover: hover) {
-          color: var(--foreground);
-        }
-      }
-    }
-    .disabled\:opacity-50 {
-      &:disabled {
-        opacity: 50%;
-      }
-    }
   }
-}
-@property --tw-rotate-x {
-  syntax: "*";
-  inherits: false;
-}
-@property --tw-rotate-y {
-  syntax: "*";
-  inherits: false;
-}
-@property --tw-rotate-z {
-  syntax: "*";
-  inherits: false;
-}
-@property --tw-skew-x {
-  syntax: "*";
-  inherits: false;
-}
-@property --tw-skew-y {
-  syntax: "*";
-  inherits: false;
-}
-@property --tw-space-y-reverse {
-  syntax: "*";
-  inherits: false;
-  initial-value: 0;
-}
-@property --tw-border-style {
-  syntax: "*";
-  inherits: false;
-  initial-value: solid;
-}
-@property --tw-font-weight {
-  syntax: "*";
-  inherits: false;
 }
 @layer properties {
   @supports ((-webkit-hyphens: none) and (not (margin-trim: inline))) or ((-moz-orient: inline) and (not (color:rgb(from red r g b)))) {
@@ -367,14 +153,6 @@
       --tw-exit-scale: 1;
       --tw-exit-translate-x: 0;
       --tw-exit-translate-y: 0;
-      --tw-rotate-x: initial;
-      --tw-rotate-y: initial;
-      --tw-rotate-z: initial;
-      --tw-skew-x: initial;
-      --tw-skew-y: initial;
-      --tw-space-y-reverse: 0;
-      --tw-border-style: solid;
-      --tw-font-weight: initial;
     }
   }
 }

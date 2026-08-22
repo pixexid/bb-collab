@@ -3,9 +3,9 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { cleanup, fireEvent, waitFor } from "@testing-library/react";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
-import { installTestPluginRuntime, loadPluginApp, renderSlot } from "@bb/plugin-sdk/testing/app";
-import type { PluginSidebarProject, PluginSidebarThread, PluginThreadListProps } from "@bb/plugin-sdk/app";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { installTestPluginRuntime, loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
+import type { PluginSidebarProject } from "@get-bb/plugin-sdk/app";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import plugin from "../server.js";
 
@@ -13,77 +13,17 @@ function project(id: string, name: string): PluginSidebarProject {
   return { id, name, isPersonal: false };
 }
 
-function thread(id: string, projectId: string, updatedAt: number): PluginSidebarThread {
-  return {
-    id,
-    projectId,
-    title: id,
-    titleFallback: null,
-    parentThreadId: null,
-    sectionId: null,
-    originKind: null,
-    originPluginId: null,
-    providerId: "codex",
-    hasPendingInteraction: false,
-    activity: { workflows: 0, backgroundAgents: 0, backgroundCommands: 0, planMode: 0, goals: 0 },
-    indicator: "none",
-    indicatorLabel: null,
-    isUnread: false,
-    isPinned: false,
-    isArchived: false,
-    environment: null,
-    host: null,
-    createdAt: updatedAt - 1,
-    updatedAt,
-    lastReadAt: updatedAt,
-    latestAttentionAt: updatedAt,
-  };
-}
-
-function childThread(id: string, projectId: string, parentThreadId: string, updatedAt: number): PluginSidebarThread {
-  return { ...thread(id, projectId, updatedAt), parentThreadId, originKind: "fork" };
-}
-
-function props(overrides: Partial<PluginThreadListProps> = {}): PluginThreadListProps {
-  return {
-    activeThreadId: null,
-    activeProjectId: null,
-    isCompactViewport: false,
-    onNavigate: vi.fn(),
-    searchQuery: "",
-    // bb-app 0.39.0 made experimental_Original required: the host's own thread
-    // list, which a plugin may render to defer to default behaviour.
-    experimental_Original: () => null,
-    ...overrides,
-  };
-}
-
 async function loadedApp() {
   installTestPluginRuntime();
   return loadPluginApp(() => import("../app"));
 }
 
-async function registration() {
-  const app = await loadedApp();
-  return app.threadLists[0]!;
-}
-
-type ThreadExecution = { model: string; reasoning: string };
-
-function rpcHandlers(states: Record<string, string> = {}, models: Record<string, ThreadExecution | null> = {}) {
+function rpcHandlers() {
   return {
-    threadStates: async () => states,
-    threadModels: async () => models,
-    sidebarCollapseState: async () => ({ projects: {}, threads: {} }),
-    setSidebarCollapse: async (input: { kind: "project" | "thread"; id: string; collapsed: boolean }) => input,
-    reorderPinned: async () => ({ ok: true }),
-    setThreadState: async (input: { threadId: string; state: string | null }) => ({ state: input.state }),
     operatorMessages: async () => ({ outcome: "OK", messages: [] }),
     markOperatorMessageRead: async () => ({}),
+    archiveOperatorMessage: async () => ({}),
     replyToOperatorMessage: async () => ({}),
-    doctor: async () => ({}) as never,
-    export: async () => ({}) as never,
-    apply: async () => ({}) as never,
   } as never;
 }
 
@@ -94,20 +34,20 @@ function okMessages<A>(handler: (input: A) => Promise<unknown[]>) {
   return async (input: A) => ({ outcome: "OK", messages: await handler(input) });
 }
 
-describe("replacement thread list", () => {
+describe("Operator Inbox app", () => {
   afterEach(() => {
     cleanup();
     window.localStorage.clear();
   });
 
   it("keeps path-install app packaging independent from server imports", async () => {
-    const appSource = readFileSync(resolve("app.tsx"), "utf8");
-    expect(appSource).toMatch(/import\s+type\s+\{\s*rpcContract\s*\}\s+from\s+["']\.\/server["']/);
-    expect(appSource).not.toMatch(/import\s+\{[^}]*rpcContract[^}]*\}\s+from\s+["']\.\/server["']/);
+    const appSource = readFileSync(resolve(import.meta.dirname, "../app.tsx"), "utf8");
+    expect(appSource).toMatch(/import\s+type\s+\{\s*rpcContract\s*\}\s+from\s+["']\.\/contract["']/);
+    expect(appSource).not.toMatch(/import\s+\{[^}]*rpcContract[^}]*\}\s+from\s+["']\.\/contract["']/);
     await loadedApp();
   });
 
-  it("leaves Collaboration Lanes registrations to its independent plugin", async () => {
+  it("owns only the Inbox panel", async () => {
     const app = await loadedApp();
     expect(app.navPanels.map((panel) => panel.id)).toEqual(["inbox"]);
     expect(app.contentScripts).toEqual([]);
@@ -353,7 +293,10 @@ describe("replacement thread list", () => {
   });
 
   it("binds the skip to the outcome code the server itself produces, and only in aggregate mode", async () => {
-    const host = createFakePluginHost({ pluginId: "bb-collab" });
+    const host = createFakePluginHost({
+      pluginId: "operator-inbox",
+      sdk: { plugins: { callRpc: async () => ({ outcome: "PROJECT_CONFIG_REQUIRED", message: "operator inbox project is not registered", messages: [] }) } },
+    });
     await plugin(host.bb);
     // The result is taken from the running server rather than authored here, so
     // a server that stopped answering PROJECT_CONFIG_REQUIRED for this
@@ -444,7 +387,7 @@ describe("replacement thread list", () => {
   it("confirms a delivered reply and a mark-read with visible success feedback", async () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
-    const message = { messageId: 9, projectId: "project-a", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "answer me", createdAtMs: 1, readAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null };
+    const message = { messageId: 9, projectId: "project-a", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "answer me", createdAtMs: 1, readAtMs: null, archivedAtMs: null, senderTitle: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null };
     const rendered = renderSlot(inbox, { subPath: "" }, {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
       rpc: {
@@ -462,6 +405,60 @@ describe("replacement thread list", () => {
     fireEvent.change(rendered.getByLabelText("Reply"), { target: { value: "on it" } });
     fireEvent.click(rendered.getByRole("button", { name: "Reply" }));
     await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Reply delivered."));
+  });
+
+  it("does not claim delivery for pending or explicitly failed reply results", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const message = { messageId: 10, projectId: "project-a", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "answer me", createdAtMs: 1, readAtMs: null, archivedAtMs: null, senderTitle: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null };
+    const replyToOperatorMessage = vi.fn()
+      .mockResolvedValueOnce({ ...message, replyInProgress: true })
+      .mockResolvedValueOnce({ ...message, readAtMs: 5, replyText: "on it", replyDeliveryError: "environment deleted" })
+      .mockResolvedValueOnce({ ...message, readAtMs: 5, replyText: "on it" });
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: {
+        ...(rpcHandlers() as unknown as Record<string, unknown>),
+        operatorMessages: okMessages(async () => [message]),
+        replyToOperatorMessage,
+      } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("answer me")).toBeTruthy());
+    fireEvent.change(rendered.getByLabelText("Reply"), { target: { value: "on it" } });
+    fireEvent.click(rendered.getByRole("button", { name: "Reply" }));
+    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Reply delivery is still in progress; outcome is not yet known."));
+    expect(rendered.queryByText("Reply delivered.")).toBeNull();
+
+    fireEvent.click(rendered.getByRole("button", { name: "Reply" }));
+    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Reply delivery failed."));
+    expect(rendered.getByText("Reply delivery failed: environment deleted")).toBeTruthy();
+    expect(rendered.queryByText("Reply delivered.")).toBeNull();
+
+    fireEvent.click(rendered.getByRole("button", { name: "Reply" }));
+    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Reply delivery is not confirmed."));
+    expect(rendered.queryByText("Reply delivered.")).toBeNull();
+  });
+
+  it("archives a message with visible success feedback", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const message = { messageId: 10, projectId: "project-a", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "archive me", createdAtMs: 1, readAtMs: null, archivedAtMs: null, senderTitle: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null };
+    const archiveOperatorMessage = vi.fn(async () => ({ ...message, archivedAtMs: 5 }));
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: {
+        ...(rpcHandlers() as unknown as Record<string, unknown>),
+        operatorMessages: okMessages(async () => [message]),
+        archiveOperatorMessage,
+      } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("archive me")).toBeTruthy());
+    fireEvent.click(rendered.getByRole("button", { name: "Archive" }));
+    await waitFor(() => expect(archiveOperatorMessage).toHaveBeenCalledWith({ projectId: "project-a", messageId: 10 }));
+    expect(rendered.getByRole("status").textContent).toBe("Archived.");
+    expect(rendered.queryByText("archive me")).toBeNull();
   });
 
   it("discloses and caps the aggregate display spill", async () => {

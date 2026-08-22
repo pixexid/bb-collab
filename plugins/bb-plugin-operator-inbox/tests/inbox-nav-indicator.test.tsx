@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { cleanup, waitFor } from "@testing-library/react";
-import { installTestPluginRuntime, loadPluginApp, renderSlot } from "@bb/plugin-sdk/testing/app";
+import { installTestPluginRuntime, loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -51,9 +51,12 @@ function message(messageId: number, readAtMs: number | null) {
     text: `message ${messageId}`,
     createdAtMs: messageId,
     readAtMs,
+    archivedAtMs: null,
+    senderTitle: null,
     repliedAtMs: null,
     replyText: null,
     replyDeliveryError: null,
+    replyInProgress: false,
     notificationStatus: "not-requested" as const,
     notificationError: null,
   };
@@ -77,6 +80,7 @@ function rpcHandlers(operatorMessages: (input: { projectId: string }) => Promise
       return Array.isArray(reply) ? { outcome: "OK", messages: reply } : reply;
     },
     markOperatorMessageRead: async () => ({}),
+    archiveOperatorMessage: async () => ({}),
     replyToOperatorMessage: async () => ({}),
   } as never;
 }

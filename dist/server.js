@@ -22462,7 +22462,7 @@ var rpcContract = defineRpcContract({
     input: external_exports.object({ projectId: projectIdSchema, role: roleBriefRoleSchema }).strict(),
     output: roleBriefSchema
   },
-  operatorMessages: {
+  "v1-inbox-read": {
     input: external_exports.object({
       projectId: projectIdSchema,
       recipient: operatorRecipientSchema.optional(),
@@ -22471,11 +22471,15 @@ var rpcContract = defineRpcContract({
     }).strict(),
     output: operatorMessagesResultSchema
   },
-  markOperatorMessageRead: {
+  "v1-inbox-mark-read": {
     input: external_exports.object({ projectId: projectIdSchema, messageId: external_exports.number().int().positive() }).strict(),
     output: operatorMessageSchema
   },
-  replyToOperatorMessage: {
+  "v1-inbox-archive": {
+    input: external_exports.object({ projectId: projectIdSchema, messageId: external_exports.number().int().positive() }).strict(),
+    output: operatorMessageSchema
+  },
+  "v1-inbox-reply": {
     input: external_exports.object({ projectId: projectIdSchema, messageId: external_exports.number().int().positive(), text: operatorMessageTextSchema }).strict(),
     output: operatorMessageSchema
   }
@@ -25528,13 +25532,16 @@ ${thread.titleFallback ?? ""}`);
     async roleBrief(input) {
       return composeRoleBrief(bb, db, input);
     },
-    operatorMessages(input) {
+    "v1-inbox-read"(input) {
       return listOperatorMessages(db, bb, input.projectId, input.recipient, input.withSenderTitles, input.includeArchived);
     },
-    markOperatorMessageRead(input) {
+    "v1-inbox-mark-read"(input) {
       return markOperatorMessageRead(db, bb, input.projectId, input.messageId);
     },
-    replyToOperatorMessage(input) {
+    "v1-inbox-archive"(input) {
+      return archiveOperatorMessage(db, bb, input.projectId, input.messageId);
+    },
+    "v1-inbox-reply"(input) {
       return replyToOperatorMessage(db, bb, input.projectId, input.messageId, input.text);
     }
   });

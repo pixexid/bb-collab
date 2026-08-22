@@ -81,7 +81,8 @@ narrow-viewport default. Both are host-owned.
 One use, and one only, is exempted from the refusals above. The operator ruled
 that the Inbox nav row must carry unread state before the panel is opened;
 `PluginNavPanelRegistration` still has no badge, count, or attention field, and
-the gap is filed upstream as get-bb/bb#1852. `src/inbox-nav-indicator.ts`
+the gap is filed upstream as get-bb/bb#1852.
+`plugins/bb-plugin-operator-inbox/src/inbox-nav-indicator.ts`
 therefore matches the host `data-testid` region and the row's visible title, and
 paints a dot on it.
 
@@ -128,12 +129,12 @@ icons end up identical.* A single row drawing a wrong-but-unique glyph is not
 caught, and `inspectInboxNavGlyph` returns `null` rather than a verdict whenever
 the control row or the geometry is unreadable.
 
-`tests/inbox-nav-indicator.test.tsx` fires the switch on every detectable mode:
+`plugins/bb-plugin-operator-inbox/tests/inbox-nav-indicator.test.tsx` fires the switch on every detectable mode:
 renamed test id, relabelled row, duplicate row, and collapsed glyph.
 
 **RETIREMENT: when get-bb/bb#1852 is resolved upstream, replace this with the
-real affordance and re-close the exception.** Delete `src/inbox-nav-indicator.ts`,
-its test, the poll in `SidebarThreadList`, and this section.
+real affordance and re-close the exception.** Delete the Operator Inbox plugin's
+`src/inbox-nav-indicator.ts`, its test, the poll in its app, and this section.
 
 ## Why this plugin declares no `branding.icon`
 

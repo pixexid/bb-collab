@@ -577,7 +577,7 @@ export const rpcContract = defineRpcContract({
     input: z.object({ projectId: projectIdSchema, role: roleBriefRoleSchema }).strict(),
     output: roleBriefSchema,
   },
-  operatorMessages: {
+  "v1-inbox-read": {
     input: z.object({
       projectId: projectIdSchema,
       recipient: operatorRecipientSchema.optional(),
@@ -586,11 +586,15 @@ export const rpcContract = defineRpcContract({
     }).strict(),
     output: operatorMessagesResultSchema,
   },
-  markOperatorMessageRead: {
+  "v1-inbox-mark-read": {
     input: z.object({ projectId: projectIdSchema, messageId: z.number().int().positive() }).strict(),
     output: operatorMessageSchema,
   },
-  replyToOperatorMessage: {
+  "v1-inbox-archive": {
+    input: z.object({ projectId: projectIdSchema, messageId: z.number().int().positive() }).strict(),
+    output: operatorMessageSchema,
+  },
+  "v1-inbox-reply": {
     input: z.object({ projectId: projectIdSchema, messageId: z.number().int().positive(), text: operatorMessageTextSchema }).strict(),
     output: operatorMessageSchema,
   },
@@ -4011,13 +4015,16 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     async roleBrief(input) {
       return composeRoleBrief(bb, db, input);
     },
-    operatorMessages(input) {
+    "v1-inbox-read"(input) {
       return listOperatorMessages(db, bb, input.projectId, input.recipient, input.withSenderTitles, input.includeArchived);
     },
-    markOperatorMessageRead(input) {
+    "v1-inbox-mark-read"(input) {
       return markOperatorMessageRead(db, bb, input.projectId, input.messageId);
     },
-    replyToOperatorMessage(input) {
+    "v1-inbox-archive"(input) {
+      return archiveOperatorMessage(db, bb, input.projectId, input.messageId);
+    },
+    "v1-inbox-reply"(input) {
       return replyToOperatorMessage(db, bb, input.projectId, input.messageId, input.text);
     },
   });

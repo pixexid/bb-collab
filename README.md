@@ -132,8 +132,11 @@ new-thread, search, navigation rows, and the footer.
 
 ## Operator inbox
 
-The Inbox nav panel is a durable, model-free message surface for `operator` and
-`supervisor` recipients. Seats send with the `send_to_operator` tool or
+The independently disableable Operator Inbox plugin owns the Inbox nav panel,
+unread indicator, and the existing `bb-collab.inbox-filters` browser state.
+The bb-collab core remains the sole owner of durable messages and mutations;
+the plugin reaches its strict versioned read/mark/archive/reply boundary only
+through host-mediated plugin RPC. Seats send with the `send_to_operator` tool or
 `bb collab send-to-operator`; host-side pickup is available through the panel
 or `bb collab inbox`. Every send and read requires an exact registered project
 id. Urgent messages dispatch through the installed desktop and phone
