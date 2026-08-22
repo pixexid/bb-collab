@@ -16960,7 +16960,29 @@ function normalizeRequest(request) {
 function parseApplyRequest(input) {
   const parsed = applyRequestSchema.safeParse(input);
   if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
-  return normalizeRequest(parsed.data);
+  const request = normalizeRequest(parsed.data);
+  if (request.bootstrapAuthority) {
+    const allowedKeys = /* @__PURE__ */ new Set([
+      "projectId",
+      "operationClass",
+      "idempotencyKey",
+      "runtimeId",
+      "config",
+      "targets",
+      "bootstrapAuthority",
+      "actorReceiptId",
+      "expectedConfigRevision",
+      "configRevision",
+      "expectedGovernanceEpoch",
+      "expectedFenceToken",
+      "repoTargetId"
+    ]);
+    const unexpectedKeys = Object.entries(parsed.data).filter(([key, value]) => value !== void 0 && value !== null && !allowedKeys.has(key)).map(([key]) => key);
+    if (request.operationClass !== "bootstrap" || request.actorReceiptId !== null || request.expectedConfigRevision !== null || request.configRevision !== 1 || request.expectedGovernanceEpoch !== null || request.expectedFenceToken !== null || request.repoTargetId !== null || unexpectedKeys.length > 0) {
+      throw refusal("INVALID_INPUT", "bootstrapAuthority requires the exact registerProject request projection");
+    }
+  }
+  return request;
 }
 function result(outcome, subject, expected, attempted, verified, extra = {}) {
   return Object.fromEntries(
@@ -17032,6 +17054,27 @@ function requireConfig(db, request) {
   }
   return head.config_revision;
 }
+function isBootstrapGenesisReceipt(db, receiptId) {
+  return Boolean(db.prepare(
+    "SELECT 1 FROM bootstrap_derivation_receipts WHERE genesis_receipt_id = ?"
+  ).get(receiptId));
+}
+function isLegacyBootstrapGovernor(db, projectId, receiptId) {
+  return Boolean(db.prepare(
+    `SELECT 1
+     FROM bootstrap_derivation_receipts AS derivations
+     JOIN project_governorships AS governors
+       ON governors.project_id = derivations.project_id
+      AND governors.actor_receipt_id = derivations.genesis_receipt_id
+     JOIN project_governorship_heads AS heads
+       ON heads.project_id = governors.project_id
+      AND heads.governance_epoch = governors.governance_epoch
+     WHERE derivations.project_id = ?
+       AND derivations.genesis_receipt_id = ?
+       AND derivations.operational_actor_receipt_id IS NULL
+       AND heads.state = 'target_active'`
+  ).get(projectId, receiptId));
+}
 function requireActor(db, request) {
   if (!request.actorReceiptId) throw refusal("ACTOR_RECEIPT_REQUIRED", "a typed actor receipt is required");
   const row = asRow(
@@ -17039,7 +17082,7 @@ function requireActor(db, request) {
   );
   if (!row) throw refusal("ACTOR_RECEIPT_UNKNOWN", "actor receipt is not known");
   if (row.project_id !== request.projectId) throw refusal("ACTOR_RECEIPT_FOREIGN", "actor receipt belongs to another project");
-  if (db.prepare("SELECT 1 FROM bootstrap_derivation_receipts WHERE genesis_receipt_id = ?").get(request.actorReceiptId)) {
+  if (isBootstrapGenesisReceipt(db, request.actorReceiptId) && !isLegacyBootstrapGovernor(db, request.projectId, request.actorReceiptId)) {
     throw refusal("BOOTSTRAP_GENESIS_REUSED", "bootstrap genesis receipt is single-use and cannot authorize a later mutation");
   }
   if (row.verification_state !== "verified") throw refusal("ACTOR_RECEIPT_UNVERIFIED", "actor receipt is not verified");
@@ -17211,6 +17254,9 @@ function deriveBootstrapActor(db, request, digest) {
      WHERE project_id = ? AND governance_epoch = ? AND fence_token = ? AND state = 'target_active'`
   ).get(authority.sourceProjectId, authority.sourceGovernanceEpoch, authority.sourceFenceToken));
   if (!sourceGovernor) throw refusal("BOOTSTRAP_SOURCE_INVALID", "bootstrap source governorship claim is incomplete");
+  if (isBootstrapGenesisReceipt(db, sourceGovernor.actor_receipt_id)) {
+    throw refusal("BOOTSTRAP_SOURCE_INVALID", "bootstrap source governor cannot be a consumed genesis receipt");
+  }
   const sourceActor = asRow(db.prepare(
     "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, receipt_digest FROM actor_receipts WHERE project_id = ? AND receipt_id = ?"
   ).get(authority.sourceProjectId, sourceGovernor.actor_receipt_id));
