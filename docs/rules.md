@@ -110,19 +110,20 @@ The check is per-change: name the deployed revision, establish containment and s
 
 The deploy policy splits by surface. Canonical/store/fleet-state plugins retain
 the zero-lane lull, pre-deploy snapshot, and post-deploy store verification.
-View-only threads, lanes, and inbox plugins may deploy without a zero-lane lull,
-but still require the pre-deploy snapshot, exact checkout advance, reload of
-only that plugin ID, verification of live asset-route bytes, and a recorded
-deployed SHA plus snapshot.
+For view-only threads, lanes, and inbox plugins, visibility is evaluated first:
+Tier-A gates are the merge gate, then deploy immediately with the pre-deploy
+snapshot, exact checkout advance, reload of only that plugin ID, verification
+of live asset-route bytes, and a recorded deployed SHA plus snapshot. The
+operator evaluates the live interactive surface; feedback becomes a fix-forward
+issue.
 
-## User-visible UI/UX requires an operator checkpoint
+## Directional UI/UX changes require an operator checkpoint
 
-> A Tier-A code gate does not approve a visual effect. Before merging a PR that changes user-visible UI/UX, show synthetic screenshots or a live demo, give a one-line summary, and ask explicitly for `APPROVE` or `ADJUST`. Operator silence holds the merge; it is not approval.
+> A pre-merge visual checkpoint is required only when the operator explicitly asks for it or the change is a directional redesign. Then show synthetic screenshots or a live demo, give a one-line summary, and ask explicitly for `APPROVE` or `ADJUST`. Operator silence holds the merge; it is not approval.
 
-The canonical evidence is attached to the PR or its governed handoff. The
-checkpoint is required before merge even when automated Tier-A checks pass;
-the code gate establishes implementation safety, while the operator's explicit
-approval establishes the visual decision.
+The canonical evidence is attached to the PR or its governed handoff. A
+view-only plugin that is not an explicit-request or directional-redesign case
+uses the live deployment path above rather than a pre-merge screenshot gate.
 
 ## An escalation's premises are checkable claims
 
