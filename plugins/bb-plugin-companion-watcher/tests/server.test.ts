@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { describe, expect, it } from "vitest";
-import companionWatcher, { hasActiveWorkers, parseCanonicalExport, parseJudgment, readRoleThread, routeJudgment } from "../server.js";
+import companionWatcher, { hasActiveWorkers, parseCanonicalExport, parseJudgment, readRoleThread, routeJudgment, snapshotCanonical } from "../server.js";
 
 const fixtureRoot = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 const projectId = "proj_a8zzfsx36j";
@@ -31,6 +31,19 @@ describe("semantic idle guard", () => {
     expect(readRoleThread(canonical, projectId, "project-orchestrator")).toBe("thr_7bjw9e7mgd");
     expect(hasActiveWorkers(canonical, projectId)).toBe(true);
     expect(hasActiveWorkers({ ...canonical, executionAttempts: canonical.executionAttempts.filter((row) => row.state !== "running") }, projectId)).toBe(false);
+  });
+
+  it("keeps a canonical population over 100 rows bounded and fully known below the ceiling", async () => {
+    const canonical = await capturedExport();
+    const expanded = {
+      ...canonical,
+      executionAttempts: Array.from({ length: 150 }, (_, index) => ({ ...canonical.executionAttempts[0], execution_attempt_id: `attempt-${index}` })),
+      workItems: Array.from({ length: 125 }, (_, index) => ({ ...canonical.workItems[0], work_item_id: `work-item-${index}` })),
+    };
+    const snapshot = snapshotCanonical(expanded, 0);
+    expect(snapshot).toMatchObject({ coverage: "known" });
+    expect(snapshot.executionAttempts).toHaveLength(150);
+    expect(snapshot.workItems).toHaveLength(125);
   });
 
   it("rejects a non-OK canonical export outcome", async () => {
