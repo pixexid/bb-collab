@@ -150,8 +150,8 @@ async function parseCanonicalExport(output, exportRoot, projectId) {
   }
   const head = canonical.roleGenerationHeads.find((row) => row.project_id === projectId && row.role_id === "project-orchestrator");
   if (!head) throw new Error("canonical-export-orchestrator-head-missing");
-  if (!readRoleThread(canonical, projectId, "project-orchestrator")) throw new Error("canonical-export-orchestrator-thread-unresolved");
-  return canonical;
+  if (!readRoleThread({ projectId, ...canonical }, projectId, "project-orchestrator")) throw new Error("canonical-export-orchestrator-thread-unresolved");
+  return { projectId, ...canonical };
 }
 async function readCanonicalExport(projectId, exportRoot) {
   const { stdout } = await exec(process.env.BB_CLI?.trim() || "bb", ["collab", "export", "--project", projectId], { timeout: 1e4 });
@@ -263,7 +263,8 @@ function parseQueuedEvidence(value, onInvalid = () => {
   return { messages, complete };
 }
 function extractCandidates(snapshot) {
-  const { canonical, githubIssues, githubPrs, observedAt, cycleStartedAt } = snapshot;
+  const { projectId, canonical, githubIssues, githubPrs, observedAt, cycleStartedAt } = snapshot;
+  if (canonical.projectId !== projectId) return [];
   const candidates = [];
   const sourcesKnown = (...sources) => sources.every((source) => (snapshot.sourceCoverage?.[source] ?? (snapshot.coverage === "known" ? "known" : "blind")) === "known");
   const activeAttempts = canonical.executionAttempts.filter((attempt) => ACTIVE.includes(attempt.state));
@@ -271,24 +272,24 @@ function extractCandidates(snapshot) {
   for (const workItem of sourcesKnown("canonical", "github") ? canonical.workItems : []) {
     const ref = canonical.externalWorkRefs.find((row) => row.work_item_id === workItem.work_item_id && row.provider === "github" && typeof row.issue_number === "number");
     if (workItem.lifecycle_state !== "ready" || !ref || !startableNumbers.has(ref.issue_number) || activeAttempts.some((attempt) => attempt.work_item_id === workItem.work_item_id)) continue;
-    const anchors = { kind: "work_item", workItemId: String(workItem.work_item_id), resourceRevision: Number(workItem.resource_revision) };
-    candidates.push({ id: `work-item:${anchors.workItemId}:${anchors.resourceRevision}`, kind: anchors.kind, anchors, finding: `Work item ${anchors.workItemId} (revision ${anchors.resourceRevision}; issue #${ref.issue_number}) is queue:startable with zero active attempts.`, evidence: { lifecycleState: workItem.lifecycle_state, issueNumber: ref.issue_number, activeAttemptCount: 0 } });
+    const anchors = { projectId, kind: "work_item", workItemId: String(workItem.work_item_id), resourceRevision: Number(workItem.resource_revision) };
+    candidates.push({ id: `${projectId}:work-item:${anchors.workItemId}:${anchors.resourceRevision}`, kind: anchors.kind, anchors, finding: `Work item ${anchors.workItemId} (revision ${anchors.resourceRevision}; issue #${ref.issue_number}) is queue:startable with zero active attempts.`, evidence: { projectId, lifecycleState: workItem.lifecycle_state, issueNumber: ref.issue_number, activeAttemptCount: 0 } });
   }
   for (const attempt of sourcesKnown("canonical", "timeline") ? activeAttempts : []) {
     if (attempt.origin !== "work_item" || typeof attempt.execution_attempt_id !== "string" || typeof attempt.observed_at_ms !== "number" || observedAt - attempt.observed_at_ms < STALE_ATTEMPT_MS) continue;
-    const anchors = { kind: "attempt", executionAttemptId: attempt.execution_attempt_id };
-    candidates.push({ id: `attempt:${anchors.executionAttemptId}`, kind: anchors.kind, anchors, finding: `Active attempt ${anchors.executionAttemptId} for work item ${String(attempt.work_item_id)} has produced no canonical evidence for at least ten minutes.`, evidence: { workItemId: attempt.work_item_id, state: attempt.state, observedAtMs: attempt.observed_at_ms } });
+    const anchors = { projectId, kind: "attempt", executionAttemptId: attempt.execution_attempt_id };
+    candidates.push({ id: `${projectId}:attempt:${anchors.executionAttemptId}`, kind: anchors.kind, anchors, finding: `Active attempt ${anchors.executionAttemptId} for work item ${String(attempt.work_item_id)} has produced no canonical evidence for at least ten minutes.`, evidence: { projectId, workItemId: attempt.work_item_id, state: attempt.state, observedAtMs: attempt.observed_at_ms } });
   }
   for (const pr of sourcesKnown("github") ? githubPrs : []) {
     if (!pr.ready || observedAt - pr.updatedAt < DECISION_THRESHOLD_MS) continue;
-    const anchors = { kind: "pull_request", number: pr.number, headSha: pr.headSha };
-    candidates.push({ id: `pr:${pr.number}:${pr.headSha}`, kind: anchors.kind, anchors, finding: `PR #${pr.number} at ${pr.headSha} is green, mergeable, decisionless, and unchanged past the five-minute decision threshold.`, evidence: { updatedAt: pr.updatedAt } });
+    const anchors = { projectId, kind: "pull_request", number: pr.number, headSha: pr.headSha };
+    candidates.push({ id: `${projectId}:pr:${pr.number}:${pr.headSha}`, kind: anchors.kind, anchors, finding: `PR #${pr.number} at ${pr.headSha} is green, mergeable, decisionless, and unchanged past the five-minute decision threshold.`, evidence: { projectId, updatedAt: pr.updatedAt } });
   }
   const queueCutoff = cycleStartedAt ?? observedAt - DECISION_THRESHOLD_MS;
   for (const message of sourcesKnown("queue", "timeline") ? snapshot.queued : []) {
     if (message.createdAt >= queueCutoff) continue;
-    const anchors = { kind: "queue_message", queueMessageId: message.id };
-    candidates.push({ id: `queue:${message.id}`, kind: anchors.kind, anchors, finding: `Queued obligation ${message.id} remained unconsumed across the orchestrator cycle: "${queuedFirstLine(message)}".`, evidence: { createdAt: message.createdAt, updatedAt: message.updatedAt } });
+    const anchors = { projectId, kind: "queue_message", queueMessageId: message.id };
+    candidates.push({ id: `${projectId}:queue:${message.id}`, kind: anchors.kind, anchors, finding: `Queued obligation ${message.id} remained unconsumed across the orchestrator cycle: "${queuedFirstLine(message)}".`, evidence: { projectId, createdAt: message.createdAt, updatedAt: message.updatedAt } });
   }
   return candidates;
 }
@@ -318,20 +319,22 @@ async function githubEvidence(remote) {
   return { issues: JSON.parse(issues.stdout), prs: JSON.parse(prs.stdout) };
 }
 var prompt = (projectId) => `Judge ONLY the verified candidates returned by ${TOOL}; do not discover or invent other work, and do not assert coverage because code computes it. Call the tool exactly once and do not mutate or message anything. If no candidate warrants a wake, output exactly SILENCE. Otherwise copy the selected candidate's id, anchors, and finding exactly into one line per candidate as FINDING: {"candidateId":"supplied id","anchors":supplied anchors,"finding":"supplied finding"}, followed by exactly ESCALATE: yes. Project: ${projectId}.`;
-function companionWatcher(bb, readExport = readCanonicalExport, readGithub = githubEvidence) {
+function companionWatcher(bb, readExport = readCanonicalExport, readGithub = githubEvidence, listProjects = async () => await bb.sdk.projects.list()) {
   const snapshots = /* @__PURE__ */ new Map();
   const companions = /* @__PURE__ */ new Map();
   const pending = /* @__PURE__ */ new Map();
   const candidateSnapshots = /* @__PURE__ */ new Map();
   const activeTurns = /* @__PURE__ */ new Map();
-  let loaded = false;
-  const load = async () => {
-    if (loaded) return;
-    const saved = await bb.storage.kv.get("backoff");
-    const savedCompanions = await bb.storage.kv.get("companions");
-    if (saved) for (const [key, value] of Object.entries(saved)) snapshots.set(key, value);
-    if (savedCompanions) for (const [key, value] of Object.entries(savedCompanions)) companions.set(key, value);
-    loaded = true;
+  const inFlight = /* @__PURE__ */ new Set();
+  let loadPromise;
+  const load = () => {
+    loadPromise ??= (async () => {
+      const saved = await bb.storage.kv.get("backoff");
+      const savedCompanions = await bb.storage.kv.get("companions");
+      if (saved) for (const [key, value] of Object.entries(saved)) snapshots.set(key, value);
+      if (savedCompanions) for (const [key, value] of Object.entries(savedCompanions)) companions.set(key, value);
+    })();
+    return loadPromise;
   };
   const canonical = async (projectId) => {
     const config = await bb.sdk.system.config();
@@ -392,7 +395,7 @@ function companionWatcher(bb, readExport = readCanonicalExport, readGithub = git
           coverage = "blind";
           bb.log.warn(`companion-watcher coverage=blind event=snapshot reason=${String(error)}`);
         }
-        const snapshot = { canonical: { ...exported, executionAttempts, externalWorkRefs, workItems }, queued: queued.messages.slice(0, SNAPSHOT_LIMIT), githubIssues, githubPrs, coverage, sourceCoverage, observedAt: Date.now(), cycleStartedAt: pending.get(context.threadId)?.turnStartedAt };
+        const snapshot = { projectId: context.projectId, canonical: { ...exported, executionAttempts, externalWorkRefs, workItems }, queued: queued.messages.slice(0, SNAPSHOT_LIMIT), githubIssues, githubPrs, coverage, sourceCoverage, observedAt: Date.now(), cycleStartedAt: pending.get(context.threadId)?.turnStartedAt };
         candidateSnapshots.set(context.threadId, snapshot);
         return JSON.stringify({ coverage, candidates: extractCandidates(snapshot) });
       } catch (error) {
@@ -436,6 +439,10 @@ snapshot read failed: ${reason}` }] };
       bb.log.warn("companion-watcher coverage=blind event=post-check reason=snapshot-missing");
       return;
     }
+    if (snapshot.projectId !== request.projectId || snapshot.canonical.projectId !== request.projectId) {
+      bb.log.warn(`companion-watcher coverage=blind event=post-check reason=project-mismatch expected=${request.projectId} actual=${snapshot.projectId}`);
+      return;
+    }
     const judgment = parseJudgment(output, snapshot, (reason) => bb.log.warn(`companion-watcher coverage=${snapshot.coverage} event=post-check reason=${reason}`));
     const prior = snapshots.get(request.projectId);
     const now = Date.now();
@@ -463,14 +470,27 @@ snapshot read failed: ${reason}` }] };
     }
     const turnStartedAt = activeTurns.get(thread.id);
     activeTurns.delete(thread.id);
+    let projects;
     try {
-      const exported = await canonical(thread.projectId);
-      const orchestratorId = readRoleThread(exported, thread.projectId, "project-orchestrator");
-      if (thread.id !== orchestratorId || !shouldJudgeOnIdle(exported, thread.projectId, Date.now())) return;
-      await judge(thread.projectId, orchestratorId, turnStartedAt);
+      projects = await listProjects();
     } catch (error) {
-      bb.log.warn(`companion-watcher coverage=blind event=thread.idle reason=${String(error)}`);
+      bb.log.warn(`companion-watcher coverage=blind event=project-inventory reason=${String(error)}`);
+      return;
     }
+    await Promise.allSettled(projects.map(async (project) => {
+      if (!project.id || inFlight.has(project.id)) return;
+      inFlight.add(project.id);
+      try {
+        const exported = await canonical(project.id);
+        const orchestratorId = readRoleThread(exported, project.id, "project-orchestrator");
+        if (!orchestratorId || project.id === thread.projectId && thread.id !== orchestratorId || !shouldJudgeOnIdle(exported, project.id, Date.now())) return;
+        await judge(project.id, orchestratorId, project.id === thread.projectId ? turnStartedAt : void 0);
+      } catch (error) {
+        bb.log.warn(`companion-watcher coverage=blind event=thread.idle project=${project.id} reason=${String(error)}`);
+      } finally {
+        inFlight.delete(project.id);
+      }
+    }));
   });
 }
 export {

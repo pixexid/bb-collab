@@ -19,7 +19,7 @@ const inlineExport = (recordsNdjson: string, tableCounts: Record<string, number>
 });
 
 async function emptySnapshot(overrides: Partial<CandidateSnapshot> = {}): Promise<CandidateSnapshot> {
-  return { canonical: await capturedExport(), queued: [], githubIssues: [], githubPrs: [], coverage: "known", observedAt: 1_000_000, ...overrides };
+  return { projectId, canonical: await capturedExport(), queued: [], githubIssues: [], githubPrs: [], coverage: "known", observedAt: 1_000_000, ...overrides };
 }
 
 const queuedMessage = (id: string, createdAt = 1) => ({ id, content: [{ type: "text" as const, text: "merge the verified head", mentions: [] }], model: "gpt", reasoningLevel: "medium" as const, permissionMode: "auto" as const, serviceTier: "default" as const, groupWithNext: false, createdAt, updatedAt: createdAt });
@@ -41,7 +41,7 @@ describe("semantic idle guard", () => {
       canonical: { ...base, workItems: [workItem], externalWorkRefs: [{ project_id: projectId, work_item_id: "wi-gh-560", provider: "github", issue_number: 560 }] },
       githubIssues: [{ number: 560, title: "Companion architecture", labels: ["queue:startable"], updatedAt: 1 }],
     });
-    expect(extractCandidates(snapshot)).toEqual([expect.objectContaining({ id: "work-item:wi-gh-560:3", anchors: { kind: "work_item", workItemId: "wi-gh-560", resourceRevision: 3 }, evidence: { lifecycleState: "ready", issueNumber: 560, activeAttemptCount: 0 } })]);
+    expect(extractCandidates(snapshot)).toEqual([expect.objectContaining({ id: `${projectId}:work-item:wi-gh-560:3`, anchors: { projectId, kind: "work_item", workItemId: "wi-gh-560", resourceRevision: 3 }, evidence: { projectId, lifecycleState: "ready", issueNumber: 560, activeAttemptCount: 0 } })]);
   });
 
   it("excludes the captured wi-gh-141 wrongful-idle control", async () => {
@@ -97,8 +97,8 @@ describe("semantic idle guard", () => {
     const stale = { ...base.executionAttempts[1], execution_attempt_id: "attempt-stale", state: "running", origin: "work_item", observed_at_ms: 399_999 };
     const snapshot = await emptySnapshot({ canonical: { ...base, executionAttempts: [base.executionAttempts[0]!, stale] }, queued: [queuedMessage("queue-old", 10)], observedAt: 1_000_000, cycleStartedAt: 20 });
     expect(extractCandidates(snapshot).map((candidate) => candidate.anchors)).toEqual([
-      { kind: "attempt", executionAttemptId: "attempt-stale" },
-      { kind: "queue_message", queueMessageId: "queue-old" },
+      { projectId, kind: "attempt", executionAttemptId: "attempt-stale" },
+      { projectId, kind: "queue_message", queueMessageId: "queue-old" },
     ]);
   });
 
@@ -110,8 +110,30 @@ describe("semantic idle guard", () => {
     const candidate = extractCandidates(snapshot)[0]!;
     expect(candidate).toMatchObject({ anchors: { kind: "pull_request", number: 566, headSha: head }, finding: expect.stringContaining("green, mergeable, decisionless") });
     const drops: string[] = [];
-    const drifted = parseJudgment(`FINDING: ${JSON.stringify({ candidateId: `pr:566:${nextHead}`, anchors: { kind: "pull_request", number: 566, headSha: nextHead }, finding: "stale head" })}\nESCALATE: yes`, snapshot, (reason) => drops.push(reason));
+    const drifted = parseJudgment(`FINDING: ${JSON.stringify({ candidateId: `${projectId}:pr:566:${nextHead}`, anchors: { projectId, kind: "pull_request", number: 566, headSha: nextHead }, finding: "stale head" })}\nESCALATE: yes`, snapshot, (reason) => drops.push(reason));
     expect(drifted.illegitimate).toBe(false);
+    expect(drops).toEqual(["unknown-candidate"]);
+  });
+
+  it("keeps duplicate tenant identifiers and findings isolated", async () => {
+    const base = await capturedExport();
+    const projectB = "proj_two";
+    const workItem = { ...base.workItems[0], work_item_id: "wi-shared", lifecycle_state: "ready", resource_revision: 3 };
+    const make = (id: string) => emptySnapshot({
+      projectId: id,
+      canonical: { ...base, projectId: id, workItems: [workItem], externalWorkRefs: [{ project_id: id, work_item_id: "wi-shared", provider: "github", issue_number: 591 }] },
+      githubIssues: [{ number: 591, title: "Shared number", labels: ["queue:startable"], updatedAt: 1 }],
+    });
+    const a = await make(projectId);
+    const b = await make(projectB);
+    const aCandidate = extractCandidates(a)[0]!;
+    const bCandidate = extractCandidates(b)[0]!;
+    expect(aCandidate.id).not.toBe(bCandidate.id);
+    expect(aCandidate.anchors.projectId).toBe(projectId);
+    expect(bCandidate.anchors.projectId).toBe(projectB);
+    const drops: string[] = [];
+    const crossProject = parseJudgment(`FINDING: ${JSON.stringify({ candidateId: aCandidate.id, anchors: aCandidate.anchors, finding: aCandidate.finding })}\nESCALATE: yes`, b, (reason) => drops.push(reason));
+    expect(crossProject.illegitimate).toBe(false);
     expect(drops).toEqual(["unknown-candidate"]);
   });
 
@@ -171,6 +193,7 @@ describe("semantic idle guard", () => {
       agents: { registerTool: () => undefined, configure: () => undefined },
       sdk: {
         system: { config: async () => ({ dataDir: "/unused" }) },
+        projects: { list: async () => [{ id: projectId, gitRemoteUrl: null }] },
         threads: {
           spawn: async () => { spawns += 1; return { id: "companion" }; },
           get: async () => ({ projectId, status: "idle" }),
@@ -185,6 +208,44 @@ describe("semantic idle guard", () => {
     canonical = { ...canonical, executionAttempts: [base.executionAttempts[0]!, { ...base.executionAttempts[1], observed_at_ms: now, state: "running" }] };
     await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
     expect(spawns).toBe(1);
+  });
+
+  it("does not let one project failure suppress another project's wake", async () => {
+    const base = await capturedExport();
+    const projectB = "proj_two";
+    const projectBExport = {
+      ...base,
+      projectId: projectB,
+      executionAttempts: base.executionAttempts.filter((row) => row.origin !== "work_item").map((row) => ({ ...row, project_id: projectB })),
+      externalWorkRefs: base.externalWorkRefs.map((row) => ({ ...row, project_id: projectB })),
+      roleGenerationHeads: base.roleGenerationHeads.map((row) => ({ ...row, project_id: projectB })),
+      roleGenerations: base.roleGenerations.map((row) => ({ ...row, project_id: projectB })),
+      workItems: base.workItems.map((row) => ({ ...row, project_id: projectB })),
+    };
+    let idle: ((event: { thread: { id: string; projectId: string }; lastAssistantText?: string }) => Promise<void>) | undefined;
+    const spawned: string[] = [];
+    const bb = {
+      pluginId: "companion-watcher",
+      log: { info: () => undefined, warn: () => undefined },
+      storage: { kv: { get: async () => undefined, set: async () => undefined } },
+      agents: { registerTool: () => undefined, configure: () => undefined },
+      sdk: {
+        system: { config: async () => ({ dataDir: "/unused" }) },
+        projects: { list: async () => [{ id: projectId, gitRemoteUrl: null }, { id: projectB, gitRemoteUrl: null }] },
+        threads: {
+          spawn: async ({ projectId: id }: { projectId: string }) => { spawned.push(id); return { id: `companion-${id}` }; },
+          get: async () => ({ projectId: "unused", status: "idle" }),
+          send: async () => undefined,
+        },
+      },
+      events: { on: (event: string, handler: typeof idle) => { if (event === "thread.idle") idle = handler; } },
+    } as unknown as BbPluginApi;
+    companionWatcher(bb, async (id) => {
+      if (id === projectId) throw new Error("project-a-unavailable");
+      return projectBExport;
+    }, async () => ({ issues: [], prs: [] }));
+    await idle!({ thread: { id: "thread-a", projectId } });
+    expect(spawned).toEqual([projectB]);
   });
 
   it("accepts nullable execution-attempt fields, including the captured review boundary", async () => {
