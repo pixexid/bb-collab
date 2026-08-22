@@ -108,6 +108,22 @@ Inside the stated subject means inside what the ruling actually addressed, not a
 
 The check is per-change: name the deployed revision, establish containment and supervision — equality with `main` is not the test. "Merged, not deployed" is a complete and honest terminal status. Deploys run under the standing policy: orchestrator-run under standing authorization, zero-lane lull, store snapshot before, store-verified after, deployed SHA recorded in the handoff. Path plugins update via checkout-advance plus `bb plugin reload <id>`; `bb plugin update` refuses pinned sources.
 
+The deploy policy splits by surface. Canonical/store/fleet-state plugins retain
+the zero-lane lull, pre-deploy snapshot, and post-deploy store verification.
+View-only threads, lanes, and inbox plugins may deploy without a zero-lane lull,
+but still require the pre-deploy snapshot, exact checkout advance, reload of
+only that plugin ID, verification of live asset-route bytes, and a recorded
+deployed SHA plus snapshot.
+
+## User-visible UI/UX requires an operator checkpoint
+
+> A Tier-A code gate does not approve a visual effect. Before merging a PR that changes user-visible UI/UX, show synthetic screenshots or a live demo, give a one-line summary, and ask explicitly for `APPROVE` or `ADJUST`. Operator silence holds the merge; it is not approval.
+
+The canonical evidence is attached to the PR or its governed handoff. The
+checkpoint is required before merge even when automated Tier-A checks pass;
+the code gate establishes implementation safety, while the operator's explicit
+approval establishes the visual decision.
+
 ## An escalation's premises are checkable claims
 
 > Verify the MATERIAL premises before executing — the ones that, if false, change what the act does. Each needs an identified authoritative check; a material premise you cannot resolve goes back up, named unresolved, instead of being assumed.

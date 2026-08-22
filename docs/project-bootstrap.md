@@ -4,7 +4,8 @@
 fields in `registerProjectRequestSchema` and delegates to the existing
 `bootstrap` resolver. A new tenant is authorized by a current source-tenant
 governor claim and an adopted source Decision; the resolver atomically derives
-the target's verified bb-collab plugin actor and records its genesis receipt.
+a one-shot target genesis receipt and a distinct verified bb-collab operational
+actor.
 
 ```sh
 bb collab register-project --project PROJECT_ID --request '{
@@ -40,17 +41,26 @@ target identity, source authority identity, adopted Decision identity, config,
 and idempotency key; the target actor receipt is not caller-supplied. The
 source head must still be `target_active` at the supplied exact fence and epoch,
 its governor actor must be a verified bb-collab plugin actor, and the Decision
-must be the current adopted disposition in that source tenant. Unknown fields,
-missing fields, duplicate target IDs, malformed config, secret values, foreign
-config mappings, stale source fences, non-plugin source actors, and wrong or
-unadopted Decisions refuse before a write. The RPC equivalent is
+must be the current adopted disposition in that source tenant. The Decision
+must also be `operator_only`, project-scoped (`repoTargetId: null`), and have
+the exact immutable scope `{ operation: "cross_project_bootstrap",
+sourceProjectId, targetProjectId, repoTargetId: null }` plus options
+`{ rootOfTrust: "host_local_operator" }`. Unknown fields, missing fields,
+duplicate target IDs, malformed config, secret values, foreign config mappings,
+stale source fences, non-plugin source actors, unrelated Decision classes, and
+wrong source/target/scope/options or unadopted Decisions refuse before a write.
+The RPC equivalent is
 `registerProject` with the same input object.
 
 An `OK` result includes `currentConfigRevision: 1`,
 `currentGovernanceEpoch: 1`, exact target digests, the fence token, and a
-canonical mutation receipt plus the source governor, Decision, derivation, and
-genesis receipt identities. The `bootstrap_derivation_receipts` audit row binds
-one genesis receipt to exactly one named target and source authority. Repeating
+canonical mutation receipt plus the source governor, Decision, derivation,
+genesis receipt, and distinct operational actor identities. The
+`bootstrap_derivation_receipts` audit row binds one genesis receipt and one
+operational actor to exactly one named target and source authority. The genesis
+receipt is never the target governorship actor and `requireActor` rejects it for
+every later mutation class; post-bootstrap mutations use only the returned
+operational actor receipt. Repeating
 the exact request returns the same receipt with `replay: true`; reusing its
 idempotency key for different content returns `IDEMPOTENCY_KEY_CONFLICT`.
 Reusing or retargeting a consumed derivation/genesis receipt refuses, and a

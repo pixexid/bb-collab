@@ -10,13 +10,13 @@ export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
 export const RUNTIME_CONTRACT_VERSION = 22;
-export const SCHEMA_VERSION = 28;
+export const SCHEMA_VERSION = 29;
 // v22 establishes the director's exact accepted-profile set.
 const PREVIOUS_RUNTIME_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-// Schema v27 adds the operator inbox archive state; runtime policy remains v22.
-const PREVIOUS_SCHEMA_VERSION = 27;
+// Schema v29 separates one-shot bootstrap genesis receipts from operational actors.
+const PREVIOUS_SCHEMA_VERSION = 28;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatPrimaryProfile = {
@@ -989,6 +989,7 @@ export const MIGRATIONS: string[] = [
   );
   CREATE UNIQUE INDEX IF NOT EXISTS bootstrap_derivation_one_per_target
     ON bootstrap_derivation_receipts(project_id);`,
+  `ALTER TABLE bootstrap_derivation_receipts ADD COLUMN operational_actor_receipt_id TEXT;`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -2569,6 +2570,8 @@ export type FoundationCode =
   | "BOOTSTRAP_SOURCE_INVALID"
   | "BOOTSTRAP_DERIVATION_CONFLICT"
   | "BOOTSTRAP_DERIVATION_REUSED"
+  | "BOOTSTRAP_GENESIS_REUSED"
+  | "BOOTSTRAP_AUTHORITY_INVALID"
   | "DECISION_IDENTITY_CONFLICT"
   | "DECISION_CLASS_UNKNOWN"
   | "DECISION_DISPOSITION_INVALID"
@@ -3187,6 +3190,9 @@ function requireActor(db: SqliteDatabase, request: ApplyRequest): string {
   );
   if (!row) throw refusal("ACTOR_RECEIPT_UNKNOWN", "actor receipt is not known");
   if (row.project_id !== request.projectId) throw refusal("ACTOR_RECEIPT_FOREIGN", "actor receipt belongs to another project");
+  if (db.prepare("SELECT 1 FROM bootstrap_derivation_receipts WHERE genesis_receipt_id = ?").get(request.actorReceiptId)) {
+    throw refusal("BOOTSTRAP_GENESIS_REUSED", "bootstrap genesis receipt is single-use and cannot authorize a later mutation");
+  }
   if (row.verification_state !== "verified") throw refusal("ACTOR_RECEIPT_UNVERIFIED", "actor receipt is not verified");
   const expectedDigest = actorReceiptDigest({
     projectId: row.project_id,
@@ -3393,6 +3399,11 @@ function deriveBootstrapActor(
   const authority = request.bootstrapAuthority;
   if (!authority || request.actorReceiptId) throw refusal("BOOTSTRAP_AUTHORITY_REQUIRED", "bootstrap derivation requires one source authority and no target actor receipt");
   if (authority.sourceProjectId === request.projectId) throw refusal("BOOTSTRAP_SOURCE_INVALID", "bootstrap derivation requires a distinct source project");
+  if (db.prepare(
+    "SELECT 1 FROM bootstrap_derivation_receipts WHERE derivation_id = ? OR project_id = ? OR genesis_receipt_id = ?",
+  ).get(authority.derivationId, request.projectId, authority.genesisReceiptId)) {
+    throw refusal("BOOTSTRAP_DERIVATION_REUSED", "bootstrap genesis receipt or derivation is already consumed");
+  }
   const sourceHead = asRow<{ governance_epoch: number; fence_token: string; state: string }>(
     db.prepare("SELECT governance_epoch, fence_token, state FROM project_governorship_heads WHERE project_id = ?").get(authority.sourceProjectId),
   );
@@ -3432,12 +3443,14 @@ function deriveBootstrapActor(
   }
   const sourceConfig = currentConfig(db, authority.sourceProjectId);
   if (!sourceConfig) throw refusal("PROJECT_CONFIG_REQUIRED", "bootstrap source has no current config revision");
-  requireCurrentAdoptedDecision(
+  requireBootstrapDecisionAuthority(
     db,
     authority.sourceProjectId,
     sourceConfig.config_revision,
     authority.authorizingDecisionId,
     authority.authorizingDispositionSequence,
+    authority.sourceProjectId,
+    request.projectId,
   );
   if (db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ? OR EXISTS (SELECT 1 FROM project_governorship_heads WHERE project_id = ?)").get(request.projectId, request.projectId)) {
     throw refusal("BOOTSTRAP_DERIVATION_CONFLICT", "bootstrap target already has canonical state");
@@ -3446,7 +3459,12 @@ function deriveBootstrapActor(
     "SELECT project_id, genesis_receipt_id FROM bootstrap_derivation_receipts WHERE derivation_id = ? OR project_id = ? OR genesis_receipt_id = ?",
   ).get(authority.derivationId, request.projectId, authority.genesisReceiptId));
   if (existingDerivation) throw refusal("BOOTSTRAP_DERIVATION_REUSED", "bootstrap genesis receipt or derivation is already consumed");
-  if (db.prepare("SELECT 1 FROM actor_receipts WHERE receipt_id = ?").get(authority.genesisReceiptId)) {
+  const operationalActorReceiptId = sha256(canonicalJson({
+    projectId: request.projectId,
+    genesisReceiptId: authority.genesisReceiptId,
+    purpose: "bootstrap_operational_actor",
+  }));
+  if (db.prepare("SELECT 1 FROM actor_receipts WHERE receipt_id = ? OR receipt_id = ?").get(authority.genesisReceiptId, operationalActorReceiptId)) {
     throw refusal("BOOTSTRAP_DERIVATION_CONFLICT", "bootstrap genesis receipt id is already bound");
   }
   const createdAtMs = now();
@@ -3475,16 +3493,42 @@ function deriveBootstrapActor(
     actorReceiptDigest(targetActor),
     createdAtMs,
   );
+  const operationalActor = {
+    projectId: request.projectId,
+    receiptId: operationalActorReceiptId,
+    actorKind: "plugin",
+    subjectId: PLUGIN_ID,
+    roleId: null,
+    roleGeneration: null,
+    verificationState: "verified",
+    operatorReceiptId: null,
+    retirementCondition: null,
+  };
+  db.prepare(
+    `INSERT INTO actor_receipts
+      (project_id, receipt_id, actor_kind, subject_id, role_id, role_generation, verification_state,
+       receipt_digest, issued_at_ms, operator_receipt_id, retirement_condition)
+     VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, NULL, NULL)`,
+  ).run(
+    operationalActor.projectId,
+    operationalActor.receiptId,
+    operationalActor.actorKind,
+    operationalActor.subjectId,
+    operationalActor.verificationState,
+    actorReceiptDigest(operationalActor),
+    createdAtMs,
+  );
   db.prepare(
     `INSERT INTO bootstrap_derivation_receipts
-      (project_id, derivation_id, genesis_receipt_id, source_project_id, source_governance_epoch,
+      (project_id, derivation_id, genesis_receipt_id, operational_actor_receipt_id, source_project_id, source_governance_epoch,
        source_fence_token, source_governor_actor_receipt_id, authorizing_decision_id,
        authorizing_disposition_sequence, request_digest, consumed_at_ms)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     request.projectId,
     authority.derivationId,
     authority.genesisReceiptId,
+    operationalActorReceiptId,
     authority.sourceProjectId,
     authority.sourceGovernanceEpoch,
     authority.sourceFenceToken,
@@ -3495,10 +3539,11 @@ function deriveBootstrapActor(
     createdAtMs,
   );
   return {
-    actorReceiptId: authority.genesisReceiptId,
+    actorReceiptId: operationalActorReceiptId,
     evidence: {
       derivationId: authority.derivationId,
       genesisReceiptId: authority.genesisReceiptId,
+      operationalActorReceiptId,
       sourceProjectId: authority.sourceProjectId,
       sourceGovernanceEpoch: authority.sourceGovernanceEpoch,
       sourceFenceToken: authority.sourceFenceToken,
@@ -3611,7 +3656,7 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
       eventType: "foundation_bootstrapped",
       event: { configRevision: 1, repoTargetIds: targets.map((target) => target.repoTargetId), governanceEpoch: 1 },
     },
-    { expected: targets.length + 2 + (derived ? 2 : 0), attempted: targets.length + 2 + (derived ? 2 : 0), verified: targets.length + 2 + (derived ? 2 : 0) },
+    { expected: targets.length + 2 + (derived ? 3 : 0), attempted: targets.length + 2 + (derived ? 3 : 0), verified: targets.length + 2 + (derived ? 3 : 0) },
     {
       currentConfigRevision: 1,
       currentGovernanceEpoch: 1,
@@ -3815,6 +3860,47 @@ function migrationTargetDigest(db: SqliteDatabase, projectId: string, configRevi
   ).all(projectId, configRevision);
   if (targets.length === 0) throw refusal("REPO_TARGET_REQUIRED", "migration requires exact configured repository targets");
   return sha256(canonicalJson(targets));
+}
+
+function requireBootstrapDecisionAuthority(
+  db: SqliteDatabase,
+  projectId: string,
+  configRevision: number,
+  decisionId: string,
+  dispositionSequence: number,
+  sourceProjectId: string,
+  targetProjectId: string,
+): void {
+  requireCurrentAdoptedDecision(db, projectId, configRevision, decisionId, dispositionSequence);
+  const decision = asRow<{
+    decision_class: string | null;
+    repo_target_id: string | null;
+    scope_json: string;
+    options_json: string | null;
+  }>(db.prepare("SELECT decision_class, repo_target_id, scope_json, options_json FROM decisions WHERE decision_id = ?").get(decisionId));
+  let scope: unknown;
+  let options: unknown;
+  try {
+    scope = JSON.parse(decision?.scope_json ?? "null");
+    options = JSON.parse(decision?.options_json ?? "null");
+  } catch {
+    throw refusal("BOOTSTRAP_AUTHORITY_INVALID", "bootstrap authorizing Decision scope or options are malformed");
+  }
+  const expectedScope = {
+    operation: "cross_project_bootstrap",
+    sourceProjectId,
+    targetProjectId,
+    repoTargetId: null,
+  };
+  const expectedOptions = { rootOfTrust: "host_local_operator" };
+  if (
+    decision?.decision_class !== "operator_only" ||
+    decision?.repo_target_id !== null ||
+    canonicalJson(scope) !== canonicalJson(expectedScope) ||
+    canonicalJson(options) !== canonicalJson(expectedOptions)
+  ) {
+    throw refusal("BOOTSTRAP_AUTHORITY_INVALID", "bootstrap authorizing Decision is not the exact operator-scoped source-to-target authority");
+  }
 }
 
 function requireCurrentAdoptedDecision(
