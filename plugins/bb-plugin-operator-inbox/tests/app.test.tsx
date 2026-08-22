@@ -387,7 +387,7 @@ describe("Operator Inbox app", () => {
   it("confirms a delivered reply and a mark-read with visible success feedback", async () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
-    const message = { messageId: 9, projectId: "project-a", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "answer me", createdAtMs: 1, readAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null };
+    const message = { messageId: 9, projectId: "project-a", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "answer me", createdAtMs: 1, readAtMs: null, archivedAtMs: null, senderTitle: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null };
     const rendered = renderSlot(inbox, { subPath: "" }, {
       sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
       rpc: {
@@ -405,6 +405,39 @@ describe("Operator Inbox app", () => {
     fireEvent.change(rendered.getByLabelText("Reply"), { target: { value: "on it" } });
     fireEvent.click(rendered.getByRole("button", { name: "Reply" }));
     await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Reply delivered."));
+  });
+
+  it("does not claim delivery for pending or explicitly failed reply results", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const message = { messageId: 10, projectId: "project-a", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "answer me", createdAtMs: 1, readAtMs: null, archivedAtMs: null, senderTitle: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null };
+    const replyToOperatorMessage = vi.fn()
+      .mockResolvedValueOnce({ ...message, replyInProgress: true })
+      .mockResolvedValueOnce({ ...message, readAtMs: 5, replyText: "on it", replyDeliveryError: "environment deleted" })
+      .mockResolvedValueOnce({ ...message, readAtMs: 5, replyText: "on it" });
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: {
+        ...(rpcHandlers() as unknown as Record<string, unknown>),
+        operatorMessages: okMessages(async () => [message]),
+        replyToOperatorMessage,
+      } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("answer me")).toBeTruthy());
+    fireEvent.change(rendered.getByLabelText("Reply"), { target: { value: "on it" } });
+    fireEvent.click(rendered.getByRole("button", { name: "Reply" }));
+    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Reply delivery is still in progress; outcome is not yet known."));
+    expect(rendered.queryByText("Reply delivered.")).toBeNull();
+
+    fireEvent.click(rendered.getByRole("button", { name: "Reply" }));
+    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Reply delivery failed."));
+    expect(rendered.getByText("Reply delivery failed: environment deleted")).toBeTruthy();
+    expect(rendered.queryByText("Reply delivered.")).toBeNull();
+
+    fireEvent.click(rendered.getByRole("button", { name: "Reply" }));
+    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Reply delivery is not confirmed."));
+    expect(rendered.queryByText("Reply delivered.")).toBeNull();
   });
 
   it("archives a message with visible success feedback", async () => {

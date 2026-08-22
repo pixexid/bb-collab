@@ -390,7 +390,7 @@ function InboxPanel(_props) {
               setReplyingMessageKey(messageKey(message));
               void rpc.call("replyToOperatorMessage", { projectId: message.projectId, messageId: message.messageId, text }).then((replied) => {
                 updateMessage(replied);
-                setNotice("Reply delivered.");
+                setNotice(replied.repliedAtMs !== null ? "Reply delivered." : replied.replyInProgress ? "Reply delivery is still in progress; outcome is not yet known." : replied.replyDeliveryError ? "Reply delivery failed." : "Reply delivery is not confirmed.");
               }).catch((reason) => setErrors([String(reason)])).finally(() => setReplyingMessageKey(null));
             }, children: replyingMessageKey === messageKey(message) ? "Delivering\u2026" : "Reply" }),
             message.readAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", className: "rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-muted", onClick: () => {

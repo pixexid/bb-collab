@@ -181,7 +181,16 @@ function InboxPanel(_props: PluginNavPanelProps) {
                           setNotice(null);
                           setReplyingMessageKey(messageKey(message));
                           void rpc.call("replyToOperatorMessage", { projectId: message.projectId, messageId: message.messageId, text })
-                            .then((replied) => { updateMessage(replied); setNotice("Reply delivered."); })
+                            .then((replied) => {
+                              updateMessage(replied);
+                              setNotice(replied.repliedAtMs !== null
+                                ? "Reply delivered."
+                                : replied.replyInProgress
+                                  ? "Reply delivery is still in progress; outcome is not yet known."
+                                  : replied.replyDeliveryError
+                                    ? "Reply delivery failed."
+                                    : "Reply delivery is not confirmed.");
+                            })
                             .catch((reason: unknown) => setErrors([String(reason)]))
                             .finally(() => setReplyingMessageKey(null));
                         }}>{replyingMessageKey === messageKey(message) ? "Delivering…" : "Reply"}</button>
