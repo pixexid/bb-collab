@@ -13,6 +13,8 @@ import { promisify } from "node:util";
 var exec = promisify(execFile);
 var ACTIVE = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
 var BACKOFF_MS = 10 * 6e4;
+var DECISION_THRESHOLD_MS = 5 * 6e4;
+var STALE_ATTEMPT_MS = 10 * 6e4;
 var ESCALATION_HOLD_MS = 24 * 60 * 6e4;
 var SNAPSHOT_LIMIT = 200;
 var TIMELINE_PAGE_LIMIT = 100;
@@ -29,6 +31,12 @@ var REQUIRED_FIELDS = {
     thread_id: (value) => value === null || typeof value === "string",
     work_item_id: (value) => value === null || typeof value === "string"
   },
+  external_work_refs: {
+    issue_number: (value) => value === null || typeof value === "number",
+    project_id: (value) => typeof value === "string",
+    provider: (value) => value === "github",
+    work_item_id: (value) => typeof value === "string"
+  },
   role_generation_heads: {
     current_generation: (value) => typeof value === "number",
     project_id: (value) => typeof value === "string",
@@ -41,17 +49,50 @@ var REQUIRED_FIELDS = {
     role_id: (value) => typeof value === "string"
   },
   work_items: {
-    updated_at_ms: (value) => typeof value === "number"
+    lifecycle_state: (value) => typeof value === "string",
+    project_id: (value) => typeof value === "string",
+    resource_revision: (value) => typeof value === "number",
+    updated_at_ms: (value) => typeof value === "number",
+    work_item_id: (value) => typeof value === "string"
   }
 };
-function parseJudgment(output) {
-  const coverages = [...output.matchAll(/^COVERAGE:\s*(known|partial|blind)\s*$/gimu)];
+function parseJudgment(output, snapshot, onDrop = () => {
+}) {
+  const candidates = extractCandidates(snapshot);
+  const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
   const escalations = [...output.matchAll(/^ESCALATE:\s*yes\s*$/gimu)];
-  const findings = [...output.matchAll(/^FINDING:\s*(.+)\s*$/gimu)].map((match) => match[1].trim());
-  const coverage = coverages.length === 1 ? coverages[0][1].toLowerCase() : "blind";
-  const illegitimate = escalations.length === 1 && findings.length > 0;
+  const retained = [];
+  const retainedIds = /* @__PURE__ */ new Set();
+  for (const match of output.matchAll(/^FINDING:\s*(\{.+\})\s*$/gimu)) {
+    try {
+      const finding = JSON.parse(match[1]);
+      const candidate = typeof finding.candidateId === "string" ? byId.get(finding.candidateId) : void 0;
+      if (!candidate) {
+        onDrop("unknown-candidate");
+        continue;
+      }
+      if (JSON.stringify(finding.anchors) !== JSON.stringify(candidate.anchors)) {
+        onDrop("anchor-mismatch");
+        continue;
+      }
+      if (finding.finding !== candidate.finding) {
+        onDrop("claim-mismatch");
+        continue;
+      }
+      if (retainedIds.has(candidate.id)) {
+        onDrop("candidate-duplicate");
+        continue;
+      }
+      retainedIds.add(candidate.id);
+      retained.push({ ...candidate, finding: finding.finding.trim() });
+    } catch {
+      onDrop("finding-malformed");
+    }
+  }
+  const findings = retained.map((candidate) => `${candidate.finding} anchors=${JSON.stringify(candidate.anchors)}`);
+  const illegitimate = escalations.length === 1 && retained.length > 0;
   const text = findings.join("; ").slice(0, 8e3);
-  return { coverage, illegitimate, findings: text, fingerprint: text.toLowerCase() };
+  return { coverage: snapshot.coverage, illegitimate, findings: text, fingerprint: retained.map((candidate) => candidate.id).sort().join(";") };
 }
 function routeJudgment(prior, judgment, now, turnStartedAt) {
   if (!judgment.illegitimate) return void 0;
@@ -86,17 +127,18 @@ async function parseCanonicalExport(output, exportRoot, projectId) {
   }
   const canonical = {
     executionAttempts: tables.get("execution_attempts") ?? [],
+    externalWorkRefs: tables.get("external_work_refs") ?? [],
     roleGenerationHeads: tables.get("role_generation_heads") ?? [],
     roleGenerations: tables.get("role_generations") ?? [],
     workItems: tables.get("work_items") ?? [],
     parseIssues: []
   };
   const counts = manifest.tableCounts;
-  for (const [table, rows] of [["execution_attempts", canonical.executionAttempts], ["role_generation_heads", canonical.roleGenerationHeads], ["role_generations", canonical.roleGenerations], ["work_items", canonical.workItems]]) {
+  for (const [table, rows] of [["execution_attempts", canonical.executionAttempts], ["external_work_refs", canonical.externalWorkRefs], ["role_generation_heads", canonical.roleGenerationHeads], ["role_generations", canonical.roleGenerations], ["work_items", canonical.workItems]]) {
     if (counts[table] !== rows.length) throw new Error(`canonical-export-${table}-count-mismatch`);
     const validRows = [];
     for (const row of rows) {
-      const invalidField = Object.entries(REQUIRED_FIELDS[table]).find(([field, valid]) => !valid(row[field]))?.[0];
+      const invalidField = row.project_id !== void 0 && row.project_id !== projectId ? "project_id" : Object.entries(REQUIRED_FIELDS[table]).find(([field, valid]) => !valid(row[field]))?.[0];
       if (!invalidField) {
         validRows.push(row);
         continue;
@@ -130,6 +172,105 @@ function snapshotCanonical(canonical, queuedCount) {
   const coverage = canonical.parseIssues.length > 0 || queuedCount >= SNAPSHOT_LIMIT || canonical.executionAttempts.length > SNAPSHOT_LIMIT || canonical.workItems.length > SNAPSHOT_LIMIT ? "partial" : "known";
   return { coverage, executionAttempts, workItems, parseIssues: canonical.parseIssues };
 }
+function timestamp(value) {
+  if (typeof value !== "string") return void 0;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : void 0;
+}
+function githubLabels(value) {
+  if (!Array.isArray(value)) return void 0;
+  const labels = value.map((label) => label && typeof label === "object" ? label.name : void 0);
+  return labels.every((label) => typeof label === "string") ? labels : void 0;
+}
+function githubChecks(value) {
+  if (!Array.isArray(value)) return void 0;
+  const checks = value.map((check) => {
+    if (!check || typeof check !== "object") return void 0;
+    if ("conclusion" in check) return check.conclusion;
+    return check.state;
+  });
+  return checks.every((check) => typeof check === "string") ? checks : void 0;
+}
+function parseGithubEvidence(value, onInvalid = () => {
+}) {
+  if (!value || typeof value !== "object") throw new Error("github-payload-invalid");
+  const raw = value;
+  if (!Array.isArray(raw.issues) || !Array.isArray(raw.prs)) throw new Error("github-payload-invalid");
+  let complete = raw.issues.length < SNAPSHOT_LIMIT && raw.prs.length < SNAPSHOT_LIMIT;
+  const issues = raw.issues.flatMap((item, index) => {
+    if (!item || typeof item !== "object") {
+      onInvalid(`issue-${index}`);
+      complete = false;
+      return [];
+    }
+    const issue = item;
+    const labels = githubLabels(issue.labels);
+    const updatedAt = timestamp(issue.updatedAt);
+    if (typeof issue.number !== "number" || typeof issue.title !== "string" || !labels || updatedAt === void 0) {
+      onInvalid(`issue-${index}`);
+      complete = false;
+      return [];
+    }
+    return [{ number: issue.number, title: issue.title, labels, updatedAt }];
+  });
+  const prs = raw.prs.flatMap((item, index) => {
+    if (!item || typeof item !== "object") {
+      onInvalid(`pr-${index}`);
+      complete = false;
+      return [];
+    }
+    const pr = item;
+    const checks = githubChecks(pr.statusCheckRollup);
+    const updatedAt = timestamp(pr.updatedAt);
+    if (typeof pr.number !== "number" || typeof pr.state !== "string" || typeof pr.headRefOid !== "string" || !Array.isArray(pr.reviews) || !checks || updatedAt === void 0) {
+      onInvalid(`pr-${index}`);
+      complete = false;
+      return [];
+    }
+    const malformedApprovedReview = pr.reviews.some((review) => review && typeof review === "object" && review.state === "APPROVED" && typeof review.commit?.oid !== "string");
+    if (malformedApprovedReview) {
+      onInvalid(`pr-${index}-approved-head`);
+      complete = false;
+      return [];
+    }
+    const approvedHeads = pr.reviews.flatMap((review) => review && typeof review === "object" && review.state === "APPROVED" ? [review.commit.oid] : []);
+    const ready = pr.state === "OPEN" && pr.mergeStateStatus === "CLEAN" && pr.reviewDecision === "APPROVED" && approvedHeads.includes(pr.headRefOid) && checks.length > 0 && checks.every((check) => check === "SUCCESS");
+    return [{ number: pr.number, headSha: pr.headRefOid, updatedAt, ready }];
+  });
+  return { issues, prs, complete };
+}
+function queuedFirstLine(message) {
+  return message.content.find((part) => part.type === "text")?.text.split("\n", 1)[0]?.slice(0, 200) ?? "(non-text obligation)";
+}
+function extractCandidates(snapshot) {
+  const { canonical, githubIssues, githubPrs, observedAt, cycleStartedAt } = snapshot;
+  const candidates = [];
+  const activeAttempts = canonical.executionAttempts.filter((attempt) => ACTIVE.includes(attempt.state));
+  const startableNumbers = new Set(githubIssues.filter((issue) => issue.labels.includes("queue:startable")).map((issue) => issue.number));
+  for (const workItem of canonical.workItems) {
+    const ref = canonical.externalWorkRefs.find((row) => row.work_item_id === workItem.work_item_id && row.provider === "github" && typeof row.issue_number === "number");
+    if (workItem.lifecycle_state !== "ready" || !ref || !startableNumbers.has(ref.issue_number) || activeAttempts.some((attempt) => attempt.work_item_id === workItem.work_item_id)) continue;
+    const anchors = { kind: "work_item", workItemId: String(workItem.work_item_id), resourceRevision: Number(workItem.resource_revision) };
+    candidates.push({ id: `work-item:${anchors.workItemId}:${anchors.resourceRevision}`, kind: anchors.kind, anchors, finding: `Work item ${anchors.workItemId} (revision ${anchors.resourceRevision}; issue #${ref.issue_number}) is queue:startable with zero active attempts.`, evidence: { lifecycleState: workItem.lifecycle_state, issueNumber: ref.issue_number, activeAttemptCount: 0 } });
+  }
+  for (const attempt of activeAttempts) {
+    if (attempt.origin !== "work_item" || typeof attempt.execution_attempt_id !== "string" || typeof attempt.observed_at_ms !== "number" || observedAt - attempt.observed_at_ms < STALE_ATTEMPT_MS) continue;
+    const anchors = { kind: "attempt", executionAttemptId: attempt.execution_attempt_id };
+    candidates.push({ id: `attempt:${anchors.executionAttemptId}`, kind: anchors.kind, anchors, finding: `Active attempt ${anchors.executionAttemptId} for work item ${String(attempt.work_item_id)} has produced no canonical evidence for at least ten minutes.`, evidence: { workItemId: attempt.work_item_id, state: attempt.state, observedAtMs: attempt.observed_at_ms } });
+  }
+  for (const pr of githubPrs) {
+    if (!pr.ready || observedAt - pr.updatedAt < DECISION_THRESHOLD_MS) continue;
+    const anchors = { kind: "pull_request", number: pr.number, headSha: pr.headSha };
+    candidates.push({ id: `pr:${pr.number}:${pr.headSha}`, kind: anchors.kind, anchors, finding: `PR #${pr.number} at ${pr.headSha} is approved on that head, green, mergeable, and unchanged past the five-minute decision threshold.`, evidence: { updatedAt: pr.updatedAt } });
+  }
+  const queueCutoff = cycleStartedAt ?? observedAt - DECISION_THRESHOLD_MS;
+  for (const message of snapshot.queued) {
+    if (message.createdAt >= queueCutoff) continue;
+    const anchors = { kind: "queue_message", queueMessageId: message.id };
+    candidates.push({ id: `queue:${message.id}`, kind: anchors.kind, anchors, finding: `Queued obligation ${message.id} remained unconsumed across the orchestrator cycle: "${queuedFirstLine(message)}".`, evidence: { createdAt: message.createdAt, updatedAt: message.updatedAt } });
+  }
+  return candidates;
+}
 function composeTimeline(latest, olderPages) {
   const rows = [...olderPages].reverse().flatMap((page) => page.rows).concat(latest.rows);
   const rowIndexes = /* @__PURE__ */ new Map();
@@ -149,14 +290,18 @@ function composeTimeline(latest, olderPages) {
 async function githubEvidence(remote) {
   const repo = remote?.match(/github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?$/u)?.[1];
   if (!repo) throw new Error("github-repository-unresolved");
-  const { stdout } = await exec("gh", ["pr", "list", "--repo", repo, "--state", "open", "--json", "number,title,state,mergeStateStatus,reviewDecision,headRefOid,statusCheckRollup", "--limit", String(SNAPSHOT_LIMIT)], { timeout: 1e4 });
-  return JSON.parse(stdout);
+  const [issues, prs] = await Promise.all([
+    exec("gh", ["issue", "list", "--repo", repo, "--state", "open", "--label", "queue:startable", "--json", "number,title,labels,updatedAt", "--limit", String(SNAPSHOT_LIMIT)], { timeout: 1e4 }),
+    exec("gh", ["pr", "list", "--repo", repo, "--state", "open", "--json", "number,title,state,mergeStateStatus,reviewDecision,headRefOid,reviews,statusCheckRollup,updatedAt", "--limit", String(SNAPSHOT_LIMIT)], { timeout: 1e4 })
+  ]);
+  return { issues: JSON.parse(issues.stdout), prs: JSON.parse(prs.stdout) };
 }
-var prompt = (projectId) => `Judge whether the project orchestrator's current idleness is illegitimate: compare its stated intentions with outcomes and identify undone stated work or work parked without cause. Call ${TOOL} exactly once; do not infer liveness from silence and do not mutate or message anything. Output exactly one anchored line COVERAGE: known|partial|blind. If and only if idleness is illegitimate, add one or more anchored FINDING: lines and the optional anchored affirmative line ESCALATE: yes. Project: ${projectId}.`;
+var prompt = (projectId) => `Judge ONLY the verified candidates returned by ${TOOL}; do not discover or invent other work, and do not assert coverage because code computes it. Call the tool exactly once and do not mutate or message anything. If no candidate warrants a wake, output exactly SILENCE. Otherwise copy the selected candidate's id, anchors, and finding exactly into one line per candidate as FINDING: {"candidateId":"supplied id","anchors":supplied anchors,"finding":"supplied finding"}, followed by exactly ESCALATE: yes. Project: ${projectId}.`;
 function companionWatcher(bb, readExport = readCanonicalExport, readGithub = githubEvidence) {
   const snapshots = /* @__PURE__ */ new Map();
   const companions = /* @__PURE__ */ new Map();
   const pending = /* @__PURE__ */ new Map();
+  const candidateSnapshots = /* @__PURE__ */ new Map();
   const activeTurns = /* @__PURE__ */ new Map();
   let loaded = false;
   const load = async () => {
@@ -197,16 +342,29 @@ function companionWatcher(bb, readExport = readCanonicalExport, readGithub = git
         const queued = await bb.sdk.threads.queuedMessages.list({ threadId: orchestratorId });
         const { coverage: canonicalCoverage, executionAttempts, workItems, parseIssues } = snapshotCanonical(exported, queued.length);
         if (parseIssues.length > 0) bb.log.warn(`companion-watcher coverage=partial event=snapshot reason=malformed-canonical-rows count=${parseIssues.length} fields=${parseIssues.join(",")}`);
-        let github;
+        let githubIssues = [];
+        let githubPrs = [];
         let coverage = canonicalCoverage;
-        if (recentTimeline.timelinePage.hasOlderRows) coverage = "partial";
+        if (recentTimeline.timelinePage.hasOlderRows) {
+          coverage = "partial";
+          bb.log.warn(`companion-watcher coverage=partial event=snapshot reason=timeline-${recentTimeline.timelinePage.olderCursor ? "ceiling" : "cursor-missing"}`);
+        }
         try {
-          github = await readGithub(project.gitRemoteUrl);
+          const githubIssuesFound = [];
+          const github = parseGithubEvidence(await readGithub(project.gitRemoteUrl), (reason) => githubIssuesFound.push(reason));
+          githubIssues = github.issues;
+          githubPrs = github.prs;
+          if (!github.complete || githubIssuesFound.length > 0) {
+            coverage = "partial";
+            bb.log.warn(`companion-watcher coverage=partial event=snapshot reason=github-population-incomplete details=${githubIssuesFound.join(",") || "ceiling"}`);
+          }
         } catch (error) {
           coverage = "blind";
-          github = { error: String(error) };
+          bb.log.warn(`companion-watcher coverage=blind event=snapshot reason=${String(error)}`);
         }
-        return JSON.stringify({ coverage, orchestratorId, recentTimeline, queued: queued.slice(0, SNAPSHOT_LIMIT), executionAttempts, workItems, parseIssues, github });
+        const snapshot = { canonical: { ...exported, executionAttempts, workItems }, queued: queued.slice(0, SNAPSHOT_LIMIT), githubIssues, githubPrs, coverage, observedAt: Date.now(), cycleStartedAt: pending.get(context.threadId)?.turnStartedAt };
+        candidateSnapshots.set(context.threadId, snapshot);
+        return JSON.stringify({ coverage, candidates: extractCandidates(snapshot) });
       } catch (error) {
         const reason = String(error);
         bb.log.warn(`companion-watcher coverage=blind event=snapshot reason=${reason}`);
@@ -242,7 +400,13 @@ snapshot read failed: ${reason}` }] };
     const request = pending.get(threadId);
     if (!request) return;
     pending.delete(threadId);
-    const judgment = parseJudgment(output);
+    const snapshot = candidateSnapshots.get(threadId);
+    candidateSnapshots.delete(threadId);
+    if (!snapshot) {
+      bb.log.warn("companion-watcher coverage=blind event=post-check reason=snapshot-missing");
+      return;
+    }
+    const judgment = parseJudgment(output, snapshot, (reason) => bb.log.warn(`companion-watcher coverage=${snapshot.coverage} event=post-check reason=${reason}`));
     const prior = snapshots.get(request.projectId);
     const now = Date.now();
     const route = routeJudgment(prior, judgment, now, request.turnStartedAt);
@@ -282,8 +446,10 @@ snapshot read failed: ${reason}` }] };
 export {
   composeTimeline,
   companionWatcher as default,
+  extractCandidates,
   hasActiveWorkers,
   parseCanonicalExport,
+  parseGithubEvidence,
   parseJudgment,
   readCanonicalExport,
   readRoleThread,
