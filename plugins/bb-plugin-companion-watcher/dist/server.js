@@ -26,7 +26,7 @@ var REQUIRED_FIELDS = {
     origin: (value) => typeof value === "string",
     project_id: (value) => typeof value === "string",
     state: (value) => typeof value === "string",
-    thread_id: (value) => typeof value === "string",
+    thread_id: (value) => value === null || typeof value === "string",
     work_item_id: (value) => value === null || typeof value === "string"
   },
   role_generation_heads: {
@@ -88,16 +88,23 @@ async function parseCanonicalExport(output, exportRoot, projectId) {
     executionAttempts: tables.get("execution_attempts") ?? [],
     roleGenerationHeads: tables.get("role_generation_heads") ?? [],
     roleGenerations: tables.get("role_generations") ?? [],
-    workItems: tables.get("work_items") ?? []
+    workItems: tables.get("work_items") ?? [],
+    parseIssues: []
   };
   const counts = manifest.tableCounts;
   for (const [table, rows] of [["execution_attempts", canonical.executionAttempts], ["role_generation_heads", canonical.roleGenerationHeads], ["role_generations", canonical.roleGenerations], ["work_items", canonical.workItems]]) {
     if (counts[table] !== rows.length) throw new Error(`canonical-export-${table}-count-mismatch`);
+    const validRows = [];
     for (const row of rows) {
-      for (const [field, valid] of Object.entries(REQUIRED_FIELDS[table])) {
-        if (!valid(row[field])) throw new Error(`canonical-export-${table}-${field}-invalid`);
+      const invalidField = Object.entries(REQUIRED_FIELDS[table]).find(([field, valid]) => !valid(row[field]))?.[0];
+      if (!invalidField) {
+        validRows.push(row);
+        continue;
       }
+      if (table !== "execution_attempts") throw new Error(`canonical-export-${table}-${invalidField}-invalid`);
+      canonical.parseIssues.push(`execution_attempts.${invalidField}`);
     }
+    if (table === "execution_attempts") canonical.executionAttempts = validRows;
   }
   const head = canonical.roleGenerationHeads.find((row) => row.project_id === projectId && row.role_id === "project-orchestrator");
   if (!head) throw new Error("canonical-export-orchestrator-head-missing");
@@ -111,7 +118,8 @@ async function readCanonicalExport(projectId, exportRoot) {
 function readRoleThread(canonical, projectId, roleId) {
   const head = canonical.roleGenerationHeads.find((row) => row.project_id === projectId && row.role_id === roleId);
   const generation = canonical.roleGenerations.find((row) => row.project_id === projectId && row.role_id === roleId && row.generation === head?.current_generation);
-  return canonical.executionAttempts.find((row) => row.project_id === projectId && row.execution_attempt_id === generation?.holder_execution_attempt_id)?.thread_id;
+  const threadId = canonical.executionAttempts.find((row) => row.project_id === projectId && row.execution_attempt_id === generation?.holder_execution_attempt_id)?.thread_id;
+  return typeof threadId === "string" && threadId.length > 0 ? threadId : void 0;
 }
 function hasActiveWorkers(canonical, projectId) {
   return canonical.executionAttempts.some((row) => row.project_id === projectId && row.work_item_id != null && row.origin === "work_item" && ACTIVE.includes(row.state));
@@ -119,8 +127,8 @@ function hasActiveWorkers(canonical, projectId) {
 function snapshotCanonical(canonical, queuedCount) {
   const executionAttempts = [...canonical.executionAttempts].sort((a, b) => Number(b.observed_at_ms) - Number(a.observed_at_ms)).slice(0, SNAPSHOT_LIMIT);
   const workItems = [...canonical.workItems].sort((a, b) => Number(b.updated_at_ms) - Number(a.updated_at_ms)).slice(0, SNAPSHOT_LIMIT);
-  const coverage = queuedCount >= SNAPSHOT_LIMIT || canonical.executionAttempts.length > SNAPSHOT_LIMIT || canonical.workItems.length > SNAPSHOT_LIMIT ? "partial" : "known";
-  return { coverage, executionAttempts, workItems };
+  const coverage = canonical.parseIssues.length > 0 || queuedCount >= SNAPSHOT_LIMIT || canonical.executionAttempts.length > SNAPSHOT_LIMIT || canonical.workItems.length > SNAPSHOT_LIMIT ? "partial" : "known";
+  return { coverage, executionAttempts, workItems, parseIssues: canonical.parseIssues };
 }
 function composeTimeline(latest, olderPages) {
   const rows = [...olderPages].reverse().flatMap((page) => page.rows).concat(latest.rows);
@@ -187,7 +195,8 @@ function companionWatcher(bb, readExport = readCanonicalExport, readGithub = git
         }
         recentTimeline = composeTimeline(latestTimeline, olderPages);
         const queued = await bb.sdk.threads.queuedMessages.list({ threadId: orchestratorId });
-        const { coverage: canonicalCoverage, executionAttempts, workItems } = snapshotCanonical(exported, queued.length);
+        const { coverage: canonicalCoverage, executionAttempts, workItems, parseIssues } = snapshotCanonical(exported, queued.length);
+        if (parseIssues.length > 0) bb.log.warn(`companion-watcher coverage=partial event=snapshot reason=malformed-canonical-rows count=${parseIssues.length} fields=${parseIssues.join(",")}`);
         let github;
         let coverage = canonicalCoverage;
         if (recentTimeline.timelinePage.hasOlderRows) coverage = "partial";
@@ -197,7 +206,7 @@ function companionWatcher(bb, readExport = readCanonicalExport, readGithub = git
           coverage = "blind";
           github = { error: String(error) };
         }
-        return JSON.stringify({ coverage, orchestratorId, recentTimeline, queued: queued.slice(0, SNAPSHOT_LIMIT), executionAttempts, workItems, github });
+        return JSON.stringify({ coverage, orchestratorId, recentTimeline, queued: queued.slice(0, SNAPSHOT_LIMIT), executionAttempts, workItems, parseIssues, github });
       } catch (error) {
         const reason = String(error);
         bb.log.warn(`companion-watcher coverage=blind event=snapshot reason=${reason}`);

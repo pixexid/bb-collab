@@ -29,8 +29,25 @@ describe("semantic idle guard", () => {
   it("parses the captured canonical export shape", async () => {
     const canonical = await capturedExport();
     expect(readRoleThread(canonical, projectId, "project-orchestrator")).toBe("thr_7bjw9e7mgd");
+    expect(canonical.parseIssues).toEqual([]);
     expect(hasActiveWorkers(canonical, projectId)).toBe(true);
     expect(hasActiveWorkers({ ...canonical, executionAttempts: canonical.executionAttempts.filter((row) => row.state !== "running") }, projectId)).toBe(false);
+  });
+
+  it("accepts nullable execution-attempt fields, including the captured review boundary", async () => {
+    const records = (await readFile(join(fixtureRoot, "live-export", "records.ndjson"), "utf8")).split("\n").filter(Boolean).map((line) => {
+      const record = JSON.parse(line) as { table: string; row: Record<string, unknown> };
+      if (record.table === "execution_attempts" && record.row.origin === "work_item") {
+        record.row.execution_attempt_id = "fd94c2f39e7bc72ecc454bb3cf5b5d6b95d7a5b44dcf7942bd846e3c3565dd2c";
+        record.row.state = "superseded";
+        record.row.thread_id = null;
+        record.row.work_item_id = null;
+      }
+      return JSON.stringify(record);
+    }).join("\n");
+    const canonical = await parseCanonicalExport(inlineExport(records, { execution_attempts: 2, role_generation_heads: 1, role_generations: 1, work_items: 1 }), fixtureRoot, projectId);
+    expect(canonical.parseIssues).toEqual([]);
+    expect(canonical.executionAttempts.find((row) => row.execution_attempt_id === "fd94c2f39e7bc72ecc454bb3cf5b5d6b95d7a5b44dcf7942bd846e3c3565dd2c")).toMatchObject({ thread_id: null, work_item_id: null, state: "superseded" });
   });
 
   it("keeps a canonical population over 100 rows bounded and fully known below the ceiling", async () => {
@@ -173,13 +190,25 @@ describe("semantic idle guard", () => {
     await expect(parseCanonicalExport(inlineExport(records, { execution_attempts: 2, role_generation_heads: 1, role_generations: 1, work_items: 1 }), fixtureRoot, projectId)).rejects.toThrow("canonical-export-work_items-count-mismatch");
   });
 
-  it("degrades a count-consistent export with a missing consumed attempt field to blind", async () => {
+  it("skips a malformed non-holder attempt and marks the snapshot partial", async () => {
     const records = (await readFile(join(fixtureRoot, "live-export", "records.ndjson"), "utf8")).split("\n").filter(Boolean).map((line) => {
       const record = JSON.parse(line) as { table: string; row: Record<string, unknown> };
       if (record.table === "execution_attempts" && record.row.origin === "work_item") delete record.row.state;
       return JSON.stringify(record);
     }).join("\n");
-    await expect(parseCanonicalExport(inlineExport(records, { execution_attempts: 2, role_generation_heads: 1, role_generations: 1, work_items: 1 }), fixtureRoot, projectId)).rejects.toThrow("canonical-export-execution_attempts-state-invalid");
+    const canonical = await parseCanonicalExport(inlineExport(records, { execution_attempts: 2, role_generation_heads: 1, role_generations: 1, work_items: 1 }), fixtureRoot, projectId);
+    expect(canonical.executionAttempts).toHaveLength(1);
+    expect(canonical.parseIssues).toEqual(["execution_attempts.state"]);
+    expect(snapshotCanonical(canonical, 0)).toMatchObject({ coverage: "partial", parseIssues: ["execution_attempts.state"] });
+  });
+
+  it("fails closed when a malformed attempt is the current orchestrator holder", async () => {
+    const records = (await readFile(join(fixtureRoot, "live-export", "records.ndjson"), "utf8")).split("\n").filter(Boolean).map((line) => {
+      const record = JSON.parse(line) as { table: string; row: Record<string, unknown> };
+      if (record.table === "execution_attempts" && record.row.origin === "role_holder") delete record.row.state;
+      return JSON.stringify(record);
+    }).join("\n");
+    await expect(parseCanonicalExport(inlineExport(records, { execution_attempts: 2, role_generation_heads: 1, role_generations: 1, work_items: 1 }), fixtureRoot, projectId)).rejects.toThrow("canonical-export-orchestrator-thread-unresolved");
   });
 
   it("degrades the snapshot to blind and logs the reason when the export CLI fails", async () => {
