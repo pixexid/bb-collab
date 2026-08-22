@@ -10,13 +10,13 @@ export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
 export const RUNTIME_CONTRACT_VERSION = 22;
-export const SCHEMA_VERSION = 27;
+export const SCHEMA_VERSION = 28;
 // v22 establishes the director's exact accepted-profile set.
 const PREVIOUS_RUNTIME_CONTRACT_VERSION = 21;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
 // Schema v27 adds the operator inbox archive state; runtime policy remains v22.
-const PREVIOUS_SCHEMA_VERSION = 26;
+const PREVIOUS_SCHEMA_VERSION = 27;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatPrimaryProfile = {
@@ -62,6 +62,7 @@ export const TABLES = [
   "project_governorship_heads",
   "migration_runs",
   "actor_receipts",
+  "bootstrap_derivation_receipts",
   "operator_receipts",
   "authorized_approvers",
   "decisions",
@@ -966,6 +967,28 @@ export const MIGRATIONS: string[] = [
      BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;`,
   `ALTER TABLE operator_messages ADD COLUMN archived_at_ms INTEGER
    CHECK (archived_at_ms IS NULL OR archived_at_ms >= created_at_ms)`,
+  `CREATE TABLE IF NOT EXISTS bootstrap_derivation_receipts (
+    project_id TEXT NOT NULL,
+    derivation_id TEXT NOT NULL UNIQUE,
+    genesis_receipt_id TEXT NOT NULL UNIQUE,
+    source_project_id TEXT NOT NULL,
+    source_governance_epoch INTEGER NOT NULL CHECK (source_governance_epoch > 0),
+    source_fence_token TEXT NOT NULL,
+    source_governor_actor_receipt_id TEXT NOT NULL,
+    authorizing_decision_id TEXT NOT NULL,
+    authorizing_disposition_sequence INTEGER NOT NULL CHECK (authorizing_disposition_sequence > 0),
+    request_digest TEXT NOT NULL,
+    consumed_at_ms INTEGER NOT NULL CHECK (consumed_at_ms >= 0),
+    FOREIGN KEY (source_project_id, source_governance_epoch)
+      REFERENCES project_governorships(project_id, governance_epoch),
+    FOREIGN KEY (source_project_id, source_governor_actor_receipt_id)
+      REFERENCES actor_receipts(project_id, receipt_id),
+    FOREIGN KEY (authorizing_decision_id, authorizing_disposition_sequence)
+      REFERENCES decision_dispositions(decision_id, disposition_sequence),
+    PRIMARY KEY (project_id, derivation_id)
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS bootstrap_derivation_one_per_target
+    ON bootstrap_derivation_receipts(project_id);`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -1518,6 +1541,17 @@ const decisionEvidenceSchema = z
     nativeReceiptDigest: digestSchema.optional(),
   })
   .strict();
+const bootstrapAuthoritySchema = z
+  .object({
+    derivationId: id,
+    genesisReceiptId: id,
+    sourceProjectId: id,
+    sourceGovernanceEpoch: z.number().int().positive(),
+    sourceFenceToken: id,
+    authorizingDecisionId: id,
+    authorizingDispositionSequence: z.number().int().positive(),
+  })
+  .strict();
 
 export const WORK_ITEM_STATES = ["proposed", "ready", "in_progress", "review_pending", "blocked", "succeeded", "failed", "cancelled"] as const;
 // review_pending is authorship-complete but non-terminal: it covers human review and CI-only waiting.
@@ -1926,6 +1960,7 @@ export const applyRequestSchema = z
     operationClass: z.enum(CANONICAL_MUTATION_CLASSES),
     idempotencyKey: id,
     actorReceiptId: id.nullable().optional(),
+    bootstrapAuthority: bootstrapAuthoritySchema.optional(),
     expectedConfigRevision: z.number().int().nonnegative().nullable().optional(),
     configRevision: z.number().int().positive().nullable().optional(),
     expectedGovernanceEpoch: z.number().int().nonnegative().nullable().optional(),
@@ -1985,10 +2020,10 @@ export const registerProjectRequestSchema = z
   .object({
     projectId: id,
     idempotencyKey: id,
-    actorReceiptId: id,
     runtimeId: id.optional(),
     config: z.unknown(),
     targets: targetCollectionSchema,
+    bootstrapAuthority: bootstrapAuthoritySchema,
   })
   .strict();
 export type RegisterProjectRequest = z.infer<typeof registerProjectRequestSchema>;
@@ -1999,6 +2034,7 @@ export function parseRegisterProjectRequest(input: unknown): ApplyRequest {
   return parseApplyRequest({
     ...parsed.data,
     operationClass: "bootstrap",
+    actorReceiptId: null,
     expectedConfigRevision: null,
     configRevision: 1,
     expectedGovernanceEpoch: null,
@@ -2529,6 +2565,10 @@ export type FoundationCode =
   | "ACTOR_RECEIPT_FOREIGN"
   | "ACTOR_RECEIPT_UNKNOWN"
   | "ACTOR_RECEIPT_UNVERIFIED"
+  | "BOOTSTRAP_AUTHORITY_REQUIRED"
+  | "BOOTSTRAP_SOURCE_INVALID"
+  | "BOOTSTRAP_DERIVATION_CONFLICT"
+  | "BOOTSTRAP_DERIVATION_REUSED"
   | "DECISION_IDENTITY_CONFLICT"
   | "DECISION_CLASS_UNKNOWN"
   | "DECISION_DISPOSITION_INVALID"
@@ -3345,20 +3385,130 @@ function commitMutation(
   return output;
 }
 
-// Multi-project is the product direction, so this path is live rather than dead: it is
-// unexercisable today only because requireActor below rejects a receipt from a foreign
-// project and nothing in the shipped system mints one for a new project. The blocking
-// precondition is upstream get-bb/bb#1541, which exposes a host-issued OPERATOR receipt
-// to plugin invocation contexts. That is not itself the actor_receipts row requireActor
-// consumes: a replacement would still need a production surface here that validates the
-// host receipt and atomically derives the same-project actor row. Note the removed
-// ceremony spine did NOT consume such a receipt: it minted its own with provenance
-// "console" and derived from that, so it is precedent for no host-issued authority and
-// #1541 is what a sanctioned replacement would derive from instead. It IS structural
-// precedent for the derivation plumbing, though -- same-project derivation, mutation-class
-// and caller-plugin validation, receipt validation and reuse prevention were all enforced
-// there, and it remains the only implementation of those safeguards. #1541 is also what
-// every existing actor receipt names as its retirement condition.
+function deriveBootstrapActor(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+): { actorReceiptId: string; evidence: Record<string, unknown> } {
+  const authority = request.bootstrapAuthority;
+  if (!authority || request.actorReceiptId) throw refusal("BOOTSTRAP_AUTHORITY_REQUIRED", "bootstrap derivation requires one source authority and no target actor receipt");
+  if (authority.sourceProjectId === request.projectId) throw refusal("BOOTSTRAP_SOURCE_INVALID", "bootstrap derivation requires a distinct source project");
+  const sourceHead = asRow<{ governance_epoch: number; fence_token: string; state: string }>(
+    db.prepare("SELECT governance_epoch, fence_token, state FROM project_governorship_heads WHERE project_id = ?").get(authority.sourceProjectId),
+  );
+  if (!sourceHead) throw refusal("GOVERNOR_UNAVAILABLE", "bootstrap source has no current governorship head");
+  if (sourceHead.governance_epoch !== authority.sourceGovernanceEpoch || sourceHead.fence_token !== authority.sourceFenceToken) {
+    throw refusal("GOVERNOR_EPOCH_STALE", "bootstrap source governorship fence or epoch is stale", {
+      currentGovernanceEpoch: sourceHead.governance_epoch,
+      expectedGovernanceEpoch: authority.sourceGovernanceEpoch,
+    });
+  }
+  if (sourceHead.state !== "target_active") throw refusal("PROJECT_FROZEN", "bootstrap source governorship is not writable");
+  const sourceGovernor = asRow<{ actor_receipt_id: string }>(db.prepare(
+    `SELECT actor_receipt_id FROM project_governorships
+     WHERE project_id = ? AND governance_epoch = ? AND fence_token = ? AND state = 'target_active'`,
+  ).get(authority.sourceProjectId, authority.sourceGovernanceEpoch, authority.sourceFenceToken));
+  if (!sourceGovernor) throw refusal("BOOTSTRAP_SOURCE_INVALID", "bootstrap source governorship claim is incomplete");
+  const sourceActor = asRow<{
+    project_id: string; actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null;
+    verification_state: string; operator_receipt_id: string | null; retirement_condition: string | null; receipt_digest: string;
+  }>(db.prepare(
+    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, receipt_digest FROM actor_receipts WHERE project_id = ? AND receipt_id = ?",
+  ).get(authority.sourceProjectId, sourceGovernor.actor_receipt_id));
+  const sourceActorDigest = sourceActor && actorReceiptDigest({
+    projectId: sourceActor.project_id,
+    receiptId: sourceGovernor.actor_receipt_id,
+    actorKind: sourceActor.actor_kind,
+    subjectId: sourceActor.subject_id,
+    roleId: sourceActor.role_id,
+    roleGeneration: sourceActor.role_generation,
+    verificationState: sourceActor.verification_state,
+    operatorReceiptId: sourceActor.operator_receipt_id,
+    retirementCondition: sourceActor.retirement_condition,
+  });
+  if (!sourceActor || sourceActor.project_id !== authority.sourceProjectId || sourceActor.actor_kind !== "plugin" ||
+      sourceActor.subject_id !== PLUGIN_ID || sourceActor.verification_state !== "verified" || sourceActor.receipt_digest !== sourceActorDigest) {
+    throw refusal("BOOTSTRAP_SOURCE_INVALID", "bootstrap source governor is not bound to the verified bb-collab plugin actor");
+  }
+  const sourceConfig = currentConfig(db, authority.sourceProjectId);
+  if (!sourceConfig) throw refusal("PROJECT_CONFIG_REQUIRED", "bootstrap source has no current config revision");
+  requireCurrentAdoptedDecision(
+    db,
+    authority.sourceProjectId,
+    sourceConfig.config_revision,
+    authority.authorizingDecisionId,
+    authority.authorizingDispositionSequence,
+  );
+  if (db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ? OR EXISTS (SELECT 1 FROM project_governorship_heads WHERE project_id = ?)").get(request.projectId, request.projectId)) {
+    throw refusal("BOOTSTRAP_DERIVATION_CONFLICT", "bootstrap target already has canonical state");
+  }
+  const existingDerivation = asRow<{ project_id: string; genesis_receipt_id: string }>(db.prepare(
+    "SELECT project_id, genesis_receipt_id FROM bootstrap_derivation_receipts WHERE derivation_id = ? OR project_id = ? OR genesis_receipt_id = ?",
+  ).get(authority.derivationId, request.projectId, authority.genesisReceiptId));
+  if (existingDerivation) throw refusal("BOOTSTRAP_DERIVATION_REUSED", "bootstrap genesis receipt or derivation is already consumed");
+  if (db.prepare("SELECT 1 FROM actor_receipts WHERE receipt_id = ?").get(authority.genesisReceiptId)) {
+    throw refusal("BOOTSTRAP_DERIVATION_CONFLICT", "bootstrap genesis receipt id is already bound");
+  }
+  const createdAtMs = now();
+  const targetActor = {
+    projectId: request.projectId,
+    receiptId: authority.genesisReceiptId,
+    actorKind: "plugin",
+    subjectId: PLUGIN_ID,
+    roleId: null,
+    roleGeneration: null,
+    verificationState: "verified",
+    operatorReceiptId: null,
+    retirementCondition: null,
+  };
+  db.prepare(
+    `INSERT INTO actor_receipts
+      (project_id, receipt_id, actor_kind, subject_id, role_id, role_generation, verification_state,
+       receipt_digest, issued_at_ms, operator_receipt_id, retirement_condition)
+     VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, NULL, NULL)`,
+  ).run(
+    targetActor.projectId,
+    targetActor.receiptId,
+    targetActor.actorKind,
+    targetActor.subjectId,
+    targetActor.verificationState,
+    actorReceiptDigest(targetActor),
+    createdAtMs,
+  );
+  db.prepare(
+    `INSERT INTO bootstrap_derivation_receipts
+      (project_id, derivation_id, genesis_receipt_id, source_project_id, source_governance_epoch,
+       source_fence_token, source_governor_actor_receipt_id, authorizing_decision_id,
+       authorizing_disposition_sequence, request_digest, consumed_at_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    request.projectId,
+    authority.derivationId,
+    authority.genesisReceiptId,
+    authority.sourceProjectId,
+    authority.sourceGovernanceEpoch,
+    authority.sourceFenceToken,
+    sourceGovernor.actor_receipt_id,
+    authority.authorizingDecisionId,
+    authority.authorizingDispositionSequence,
+    digest,
+    createdAtMs,
+  );
+  return {
+    actorReceiptId: authority.genesisReceiptId,
+    evidence: {
+      derivationId: authority.derivationId,
+      genesisReceiptId: authority.genesisReceiptId,
+      sourceProjectId: authority.sourceProjectId,
+      sourceGovernanceEpoch: authority.sourceGovernanceEpoch,
+      sourceFenceToken: authority.sourceFenceToken,
+      sourceGovernorActorReceiptId: sourceGovernor.actor_receipt_id,
+      authorizingDecisionId: authority.authorizingDecisionId,
+      authorizingDispositionSequence: authority.authorizingDispositionSequence,
+    },
+  };
+}
+
 function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
   if (request.expectedConfigRevision !== null) {
     throw refusal("PROJECT_CONFIG_STALE", "bootstrap requires an empty config head");
@@ -3371,7 +3521,6 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
   if (request.expectedGovernanceEpoch !== null || request.expectedFenceToken !== null) {
     throw refusal("GOVERNOR_CAS_FAILED", "bootstrap requires an empty governorship head");
   }
-  const actorReceiptId = requireActor(db, request);
   const config = request.config === undefined ? undefined : validateConfig(request.config);
   if (!config) throw refusal("INVALID_INPUT", "bootstrap requires a config object");
   const targets = requireTargetCollection(request, "bootstrap");
@@ -3380,7 +3529,11 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
   const existingGovernor = db
     .prepare("SELECT 1 FROM project_governorship_heads WHERE project_id = ?")
     .get(request.projectId);
-  if (existingConfig || existingGovernor) throw refusal("GOVERNOR_CAS_FAILED", "bootstrap head already exists");
+  if (existingConfig || existingGovernor) {
+    throw refusal(request.bootstrapAuthority ? "BOOTSTRAP_DERIVATION_CONFLICT" : "GOVERNOR_CAS_FAILED", "bootstrap head already exists");
+  }
+  const derived = request.bootstrapAuthority ? deriveBootstrapActor(db, request, digest) : null;
+  const actorReceiptId = derived?.actorReceiptId ?? requireActor(db, request);
   const createdAtMs = now();
   db.prepare(
     `INSERT INTO project_config_revisions
@@ -3458,7 +3611,7 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
       eventType: "foundation_bootstrapped",
       event: { configRevision: 1, repoTargetIds: targets.map((target) => target.repoTargetId), governanceEpoch: 1 },
     },
-    { expected: targets.length + 2, attempted: targets.length + 2, verified: targets.length + 2 },
+    { expected: targets.length + 2 + (derived ? 2 : 0), attempted: targets.length + 2 + (derived ? 2 : 0), verified: targets.length + 2 + (derived ? 2 : 0) },
     {
       currentConfigRevision: 1,
       currentGovernanceEpoch: 1,
@@ -3466,6 +3619,7 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
         configDigest: sha256(config),
         targetDigests: targets.map((target) => ({ repoTargetId: target.repoTargetId, digest: targetDigest(target) })),
         fenceToken,
+        ...(derived ? { bootstrapDerivation: derived.evidence } : {}),
       },
     },
   );
@@ -3663,12 +3817,13 @@ function migrationTargetDigest(db: SqliteDatabase, projectId: string, configRevi
   return sha256(canonicalJson(targets));
 }
 
-function requireAdoptedMigrationDecision(
+function requireCurrentAdoptedDecision(
   db: SqliteDatabase,
   projectId: string,
   configRevision: number,
   decisionId: string,
   dispositionSequence: number,
+  authorityLabel = "bootstrap",
 ): void {
   const decision = asRow<{
     decision_id: string; project_id: string; config_revision: number; repo_target_id: string | null; scope_json: string;
@@ -3689,7 +3844,7 @@ function requireAdoptedMigrationDecision(
      FROM decision_dispositions WHERE decision_id = ? AND disposition_sequence = ?`,
   ).get(decisionId, dispositionSequence));
   if (!disposition || disposition.disposition !== "adopted" || disposition.latest_sequence !== dispositionSequence) {
-    throw refusal("INVALID_INPUT", "migration requires the current adopted Decision disposition");
+    throw refusal(authorityLabel === "migration" ? "INVALID_INPUT" : "DECISION_DISPOSITION_INVALID", `${authorityLabel} authority requires the current adopted Decision disposition`);
   }
   const actor = asRow<{
     project_id: string; actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null;
@@ -3990,8 +4145,9 @@ function applyMigrationPrepare(db: SqliteDatabase, request: ApplyRequest, digest
   if (migration.targetRuntimeId !== PLUGIN_ID || migration.retentionUntilMs <= now()) {
     throw refusal("INVALID_INPUT", "migration prepare requires the exact target runtime and future retention");
   }
-  requireAdoptedMigrationDecision(
+  requireCurrentAdoptedDecision(
     db, request.projectId, configRevision, migration.decisionId, migration.decisionDispositionSequence,
+    "migration",
   );
   if (db.prepare("SELECT 1 FROM migration_runs WHERE source_system = 'llm-collab' AND project_id = ? AND state NOT IN ('retired', 'rolled_back')").get(request.projectId)) {
     throw refusal("INVALID_INPUT", "project already has an open MigrationRun");
@@ -4078,7 +4234,7 @@ function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: s
   if (request.configRevision !== configRevision || run.config_revision !== configRevision) {
     throw refusal("PROJECT_CONFIG_STALE", "MigrationRun config revision is stale");
   }
-  requireAdoptedMigrationDecision(db, request.projectId, configRevision, run.decision_id, run.decision_disposition_sequence);
+  requireCurrentAdoptedDecision(db, request.projectId, configRevision, run.decision_id, run.decision_disposition_sequence, "migration");
   const head = exactGovernor(db, request);
   const repositoryTargetsDigest = migrationTargetDigest(db, request.projectId, configRevision);
   if (step.repositoryTargetsDigest !== repositoryTargetsDigest) {
@@ -7630,6 +7786,7 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     project_governorship_heads: "project_id",
     migration_runs: "migration_id",
     actor_receipts: "receipt_id",
+    bootstrap_derivation_receipts: "derivation_id",
     operator_receipts: "receipt_id",
     authorized_approvers: "approver_id, authorizing_decision_id, authorizing_disposition_sequence",
     decisions: "decision_id",

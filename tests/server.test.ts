@@ -2161,24 +2161,150 @@ describe("bb-collab plugin boundary", () => {
   it("registers a second synthetic project through the strict seam and preserves tenant isolation", async () => {
     const host = await loadedHost();
     const db = host.bb.storage.database();
-    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
-    expect(applyFixtureMutation(db, bootstrapRequest(PROJECT_ID, { config: roleConfig() })).outcome).toBe("OK");
+    const sourceActor = RECEIPT_ID;
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: sourceActor, actorKind: "plugin", subjectId: PLUGIN_ID });
+    const sourceBootstrap = applyFixtureMutation(db, bootstrapRequest(PROJECT_ID, { config: roleConfig(), actorReceiptId: sourceActor }));
+    expect(sourceBootstrap).toMatchObject({ outcome: "OK" });
+    const sourceBootstrapFence = (sourceBootstrap.evidence as { fenceToken: string }).fenceToken;
+    const sourceClaim = applyFixtureMutation(db, {
+      projectId: PROJECT_ID,
+      operationClass: "governor_claim",
+      idempotencyKey: "claim-source-tenant",
+      actorReceiptId: sourceActor,
+      expectedConfigRevision: 1,
+      configRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: sourceBootstrapFence,
+      repoTargetId: null,
+    });
+    expect(sourceClaim).toMatchObject({ outcome: "OK", currentGovernanceEpoch: 2 });
+    const sourceFence = (sourceClaim.evidence as { fenceToken: string }).fenceToken;
+    const sourceQualification = applyFixtureMutation(db, qualificationRequest(sourceFence, {
+      actorReceiptId: sourceActor,
+      idempotencyKey: "source-orchestrator-qualification",
+      qualificationId: "source-orchestrator-qualification",
+      expectedGovernanceEpoch: 2,
+      expectedFenceToken: sourceFence,
+    }), null, roleReader());
+    expect(sourceQualification).toMatchObject({ outcome: "OK" });
+    const sourceSuccession = applyFixtureMutation(db, successionRequest(sourceFence, {
+      actorReceiptId: sourceActor,
+      idempotencyKey: "source-orchestrator-succession",
+      qualificationId: "source-orchestrator-qualification",
+      expectedGovernanceEpoch: 2,
+      expectedFenceToken: sourceFence,
+    }), null, roleReader());
+    expect(sourceSuccession).toMatchObject({ outcome: "OK" });
+    const sourceRoleActor = "source-orchestrator-actor";
+    seedVerifiedFixtureReceipt(db, {
+      projectId: PROJECT_ID,
+      receiptId: sourceRoleActor,
+      actorKind: "role",
+      subjectId: (sourceSuccession.evidence as { holderExecutionAttemptId: string }).holderExecutionAttemptId,
+      roleId: "project-orchestrator",
+      roleGeneration: 1,
+    });
+    expect(applyFixtureMutation(db, decisionCreateRequest(sourceFence, "source-bootstrap-decision", {
+      actorReceiptId: sourceRoleActor,
+      expectedGovernanceEpoch: 2,
+      expectedFenceToken: sourceFence,
+      idempotencyKey: "create-source-bootstrap-decision",
+    }))).toMatchObject({ outcome: "OK" });
+    expect(applyFixtureMutation(db, decisionDispositionRequest(sourceFence, "source-bootstrap-decision", 1, {
+      actorReceiptId: sourceRoleActor,
+      expectedGovernanceEpoch: 2,
+      expectedFenceToken: sourceFence,
+      idempotencyKey: "adopt-source-bootstrap-decision",
+    }))).toMatchObject({ outcome: "OK" });
     const existingBefore = exportFoundation(db, PROJECT_ID);
 
     const secondProject = "proj_second_tenant";
-    const secondActor = "second-tenant-actor";
-    seedVerifiedFixtureReceipt(db, { projectId: secondProject, receiptId: secondActor });
+    const secondActor = "second-tenant-genesis";
     const input = {
       projectId: secondProject,
       idempotencyKey: "register-second-tenant",
-      actorReceiptId: secondActor,
       config: roleConfig(),
       targets: bootstrapRequest().targets!,
+      bootstrapAuthority: {
+        derivationId: "derive-second-tenant",
+        genesisReceiptId: secondActor,
+        sourceProjectId: PROJECT_ID,
+        sourceGovernanceEpoch: 2,
+        sourceFenceToken: sourceFence,
+        authorizingDecisionId: "source-bootstrap-decision",
+        authorizingDispositionSequence: 1,
+      },
     };
+    const stale = await host.harness.callRpc("registerProject", {
+      ...input,
+      idempotencyKey: "register-stale-source",
+      bootstrapAuthority: { ...input.bootstrapAuthority, sourceGovernanceEpoch: 1, sourceFenceToken: sourceBootstrapFence },
+    }) as FoundationResult;
+    expect(stale).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE", attempted: 0, verified: 0 });
+    const unadopted = await host.harness.callRpc("registerProject", {
+      ...input,
+      idempotencyKey: "register-unadopted-decision",
+      bootstrapAuthority: { ...input.bootstrapAuthority, authorizingDispositionSequence: 99 },
+    }) as FoundationResult;
+    expect(unadopted).toMatchObject({ outcome: "DECISION_DISPOSITION_INVALID", attempted: 0, verified: 0 });
+    const nonPluginSource = "proj_non_plugin_source";
+    const nonPluginActor = "non-plugin-source-actor";
+    seedVerifiedFixtureReceipt(db, { projectId: nonPluginSource, receiptId: nonPluginActor });
+    const nonPluginBootstrap = applyFixtureMutation(db, bootstrapRequest(nonPluginSource, { actorReceiptId: nonPluginActor, config: roleConfig() }));
+    expect(nonPluginBootstrap).toMatchObject({ outcome: "OK" });
+    const nonPlugin = await host.harness.callRpc("registerProject", {
+      ...input,
+      projectId: "proj_non_plugin_target",
+      idempotencyKey: "register-non-plugin-source",
+      bootstrapAuthority: {
+        ...input.bootstrapAuthority,
+        derivationId: "derive-non-plugin-target",
+        genesisReceiptId: "non-plugin-target-genesis",
+        sourceProjectId: nonPluginSource,
+        sourceGovernanceEpoch: 1,
+        sourceFenceToken: (nonPluginBootstrap.evidence as { fenceToken: string }).fenceToken,
+      },
+    }) as FoundationResult;
+    expect(nonPlugin).toMatchObject({ outcome: "BOOTSTRAP_SOURCE_INVALID", attempted: 0, verified: 0 });
+    const callerReceipt = await host.harness.runCli([
+      "register-project", "--project", secondProject, "--request", JSON.stringify({
+        ...input,
+        idempotencyKey: "register-caller-receipt",
+        actorReceiptId: "foreign-target-receipt",
+      }),
+    ]);
+    expect(callerReceipt.exitCode).toBe(2);
+    expect(JSON.parse(callerReceipt.stdout)).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
     const registered = await host.harness.callRpc("registerProject", input) as FoundationResult;
-    expect(registered).toMatchObject({ outcome: "OK", subject: secondProject, currentConfigRevision: 1, currentGovernanceEpoch: 1 });
+    expect(registered).toMatchObject({
+      outcome: "OK", subject: secondProject, currentConfigRevision: 1, currentGovernanceEpoch: 1,
+      evidence: { bootstrapDerivation: { sourceProjectId: PROJECT_ID, authorizingDecisionId: "source-bootstrap-decision" } },
+    });
     expect(registered.mutationReceipt).toMatchObject({ projectId: secondProject, operationClass: "bootstrap", idempotencyKey: input.idempotencyKey });
+    expect(db.prepare("SELECT project_id, genesis_receipt_id, source_project_id, source_governance_epoch, authorizing_decision_id, authorizing_disposition_sequence FROM bootstrap_derivation_receipts WHERE project_id = ?").get(secondProject)).toEqual({
+      project_id: secondProject,
+      genesis_receipt_id: secondActor,
+      source_project_id: PROJECT_ID,
+      source_governance_epoch: 2,
+      authorizing_decision_id: "source-bootstrap-decision",
+      authorizing_disposition_sequence: 1,
+    });
+    expect(db.prepare("SELECT actor_kind, subject_id, verification_state FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(secondProject, secondActor)).toEqual({ actor_kind: "plugin", subject_id: PLUGIN_ID, verification_state: "verified" });
     const beforeMalformed = exportFoundation(db, secondProject);
+    const otherProject = "proj_other_tenant";
+    const otherRegistered = await host.harness.callRpc("registerProject", {
+      ...input,
+      projectId: otherProject,
+      idempotencyKey: "register-other-tenant",
+      bootstrapAuthority: {
+        ...input.bootstrapAuthority,
+        derivationId: "derive-other-tenant",
+        genesisReceiptId: "other-tenant-genesis",
+      },
+    }) as FoundationResult;
+    expect(otherRegistered).toMatchObject({ outcome: "OK", subject: otherProject });
+    expect(exportFoundation(db, secondProject)).toEqual(beforeMalformed);
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(existingBefore);
     const malformed = await host.harness.runCli([
       "register-project", "--project", secondProject, "--request", JSON.stringify({ ...input, unexpected: true }),
     ]);
@@ -2192,6 +2318,20 @@ describe("bb-collab plugin boundary", () => {
       "register-project", "--project", secondProject, "--request", JSON.stringify(input),
     ]);
     expect(JSON.parse(cliReplay.stdout)).toMatchObject({ outcome: "OK", mutationReceipt: registered.mutationReceipt });
+
+    const reused = await host.harness.callRpc("registerProject", {
+      ...input,
+      projectId: "proj_retargeted_tenant",
+      idempotencyKey: "register-reused-genesis",
+    }) as FoundationResult;
+    expect(reused).toMatchObject({ outcome: "BOOTSTRAP_DERIVATION_REUSED", attempted: 0, verified: 0 });
+    const retargeted = await host.harness.callRpc("registerProject", {
+      ...input,
+      projectId: "proj_retargeted_tenant",
+      idempotencyKey: "register-retargeted-genesis",
+      bootstrapAuthority: { ...input.bootstrapAuthority, derivationId: "derive-retargeted-tenant" },
+    }) as FoundationResult;
+    expect(retargeted).toMatchObject({ outcome: "BOOTSTRAP_DERIVATION_REUSED", attempted: 0, verified: 0 });
 
     const conflict = await host.harness.callRpc("registerProject", {
       ...input,
@@ -7139,24 +7279,25 @@ fi
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-      for (const statement of MIGRATIONS.slice(0, -12)) db.exec(statement);
+    for (const statement of MIGRATIONS.slice(0, -13)) db.exec(statement);
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, '{}', ?, 1)").run(PROJECT_ID, sha256("{}"));
       db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 1)").run(PROJECT_ID);
       db.prepare(`INSERT INTO operator_messages (project_id, recipient, sender_thread_id, severity, message_text, created_at_ms, reply_text, reply_delivery_error) VALUES (?, 'operator', 'fixture-thread', 'routine', 'failed delivery', 10, 'reply retained', 'delivery failed')`).run(PROJECT_ID);
-      db.exec(MIGRATIONS.at(-1)!);
+      db.exec(MIGRATIONS.at(-2)!);
       expect(db.prepare("SELECT reply_text, reply_delivery_error, replied_at_ms, archived_at_ms FROM operator_messages").get()).toEqual({ reply_text: "reply retained", reply_delivery_error: "delivery failed", replied_at_ms: null, archived_at_ms: null });
     } finally { db.close(); }
   });
 
   it("appends operator inbox archive schema without bumping runtime contract v22", () => {
-    expect(SCHEMA_VERSION).toBe(27);
+    expect(SCHEMA_VERSION).toBe(28);
     expect(RUNTIME_CONTRACT_VERSION).toBe(22);
-    expect(MIGRATIONS).toHaveLength(40);
+    expect(MIGRATIONS).toHaveLength(41);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
-    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("5896b8eaaddf17a015a70ce104bd2172c39525dadc2a54f409351d076f956fe2");
-    expect(schemaDigest).toBe("27f336d0a98e5d5007ee1250f8bf4193f9e7bc17eb1b90d965bc7cac053bdca6");
-    expect(MIGRATIONS.at(-1)).toContain("ALTER TABLE operator_messages ADD COLUMN archived_at_ms");
+    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("27f336d0a98e5d5007ee1250f8bf4193f9e7bc17eb1b90d965bc7cac053bdca6");
+    expect(schemaDigest).toBe("bf7fc787a2e44193f0523c640f2ca57d4e56ee7e5366b89d7ef3b577b85bce88");
+    expect(MIGRATIONS.at(-2)).toContain("ALTER TABLE operator_messages ADD COLUMN archived_at_ms");
+    expect(MIGRATIONS.at(-1)).toContain("CREATE TABLE IF NOT EXISTS bootstrap_derivation_receipts");
     expect(TABLES).toContain("migration_runs");
     expect(TABLES).toContain("lane_capacity_intervals");
     expect(TABLES).toContain("operator_messages");
@@ -7168,8 +7309,8 @@ fi
     ]);
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 26,
-      newSchemaVersion: 27,
+      oldSchemaVersion: 27,
+      newSchemaVersion: 28,
       oldContractVersion: 21,
       newContractVersion: 22,
       action: "refused",
@@ -7178,8 +7319,8 @@ fi
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(20, 22))).toMatchObject({
-      oldSchemaVersion: 26,
-      newSchemaVersion: 27,
+      oldSchemaVersion: 27,
+      newSchemaVersion: 28,
       oldContractVersion: 21,
       newContractVersion: 22,
       action: "refused",
@@ -7188,11 +7329,11 @@ fi
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "refused", verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(27, 22))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(28, 22))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 26,
-      newSchemaVersion: 27,
+      oldSchemaVersion: 27,
+      newSchemaVersion: 28,
       oldContractVersion: 21,
       newContractVersion: 22,
       action: "refused",
@@ -7275,7 +7416,7 @@ fi
          WHERE work_items.project_id = ? ORDER BY work_items.work_item_id`,
       ).all(projectId);
       const before = snapshot();
-      db.transaction(() => db.exec(MIGRATIONS.at(-6)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-7)!))();
       expect(snapshot()).toEqual(before);
       expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
       expect(db.prepare("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
@@ -7299,7 +7440,7 @@ fi
       db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'historical', 1, 'target-main', 'Historical', 'preserve me', 'in_progress', 3, 10, 20)").run(projectId);
       const beforeRows = db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId);
       const priorStatementDigests = MIGRATIONS.slice(0, -11).map(sha256);
-      db.transaction(() => db.exec(MIGRATIONS.at(-11)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-12)!))();
       expect(MIGRATIONS.slice(0, -11).map(sha256)).toEqual(priorStatementDigests);
       expect(db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId)).toEqual(beforeRows);
       expect(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'work_items'").get()).toMatchObject({ sql: expect.stringContaining("review_pending") });
@@ -7316,7 +7457,7 @@ fi
     databaseIsReady(db);
     const projectId = "proj_review_linkage_migration";
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -8)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -9)) db.exec(statement); })();
       const configJson = "{}";
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, ?, ?, 1)").run(projectId, configJson, sha256(configJson));
       db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 1)").run(projectId);
@@ -7331,7 +7472,7 @@ fi
       const before = db.prepare(`SELECT ${existingColumns.join(", ")} FROM execution_attempts`).all();
       const rowCount = (db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get() as { count: number }).count;
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-8)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-9)!))();
 
       expect((db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get() as { count: number }).count).toBe(rowCount);
       expect(db.prepare(`SELECT ${existingColumns.join(", ")} FROM execution_attempts`).all()).toEqual(before);
@@ -7347,7 +7488,7 @@ fi
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -7)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -8)) db.exec(statement); })();
       db.pragma("foreign_keys = OFF");
       db.prepare("INSERT INTO project_config_revisions VALUES ('project', 1, '{}', 'config-digest', 1)").run();
       db.prepare("INSERT INTO repository_targets VALUES ('project', 'target', 1, 'source', 'host', '/target', NULL, 'main', 'target-digest')").run();
@@ -7381,7 +7522,7 @@ fi
       };
       const priorStatementDigests = MIGRATIONS.slice(0, -7).map(sha256);
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-7)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-8)!))();
 
       expect(MIGRATIONS.slice(0, -7).map(sha256)).toEqual(priorStatementDigests);
       expect(db.prepare("SELECT requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode, requested_service_tier, requested_visibility, requested_profile_digest, attempt_digest FROM execution_attempts").get()).toEqual(Object.fromEntries(Object.entries(before.attempt as Record<string, unknown>).map(([name, value]) => [name.replace(/^actual_/u, "requested_"), value])));
@@ -7427,7 +7568,7 @@ fi
     databaseIsReady(db);
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -9)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -10)) db.exec(statement);
       })();
       const legacyResult = JSON.stringify({
         projectId: "proj_backfill_legacy",
@@ -7448,7 +7589,7 @@ fi
         "SELECT project_id, epoch_created_at_ms, state, result_json, created_at_ms, updated_at_ms FROM work_item_github_backfills",
       ).get();
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-9)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-10)!))();
 
       expect((db.prepare("PRAGMA table_info(work_item_github_backfills)").all() as Array<{ name: string }>).map((column) => column.name)).toEqual([
         "project_id", "epoch_created_at_ms", "state", "result_json", "created_at_ms", "updated_at_ms", "config_revision", "attempt_reason",
@@ -7464,8 +7605,8 @@ fi
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
     expect(RUNTIME_CONTRACT_VERSION).toBe(22);
-    expect(SCHEMA_VERSION).toBe(27);
-    expect(MIGRATIONS).toHaveLength(40);
+    expect(SCHEMA_VERSION).toBe(28);
+    expect(MIGRATIONS).toHaveLength(41);
     expect(contractDigest).toBe("f6b0ecbda7e8afd986d46e0eda77662815a737dadc94e268ef00b7d74ba18ed4");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -7482,7 +7623,7 @@ fi
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 27, observedContractVersion: 22 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 28, observedContractVersion: 22 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -7640,7 +7781,7 @@ fi
     const projectId = "proj_gh300_rebuild";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -12)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -13)) db.exec(statement);
       })();
       db.pragma("foreign_keys = OFF");
       const insert = (table: string, row: Record<string, unknown>) => {
@@ -7698,7 +7839,7 @@ fi
       const before = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.values(before).every((value) => value !== null)).toBe(true);
       expect(new Set(Object.values(before).map((value) => String(value))).size).toBeGreaterThan(20);
-      db.transaction(() => db.exec(MIGRATIONS.at(-12)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-13)!))();
       const after = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.fromEntries(columns.map((column) => [column, after[column]]))).toEqual(Object.fromEntries(columns.map((column) => [column, before[column]])));
       expect(after.progress_json).toBe("{}");
@@ -7752,7 +7893,7 @@ fi
     const before = exportFoundation(db, PROJECT_ID);
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
-      observedSchemaVersion: 27,
+      observedSchemaVersion: 28,
       observedContractVersion: 22,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
@@ -7983,7 +8124,7 @@ fi
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 27, schemaDigest, contractVersion: 22, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 28, schemaDigest, contractVersion: 22, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -9078,8 +9219,8 @@ fi
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 26, newSchemaVersion: 27, action: "unknown", expected: 4, attempted: 0, verified: 0 },
-        schema: { version: 27 },
+        cachedConsumers: { oldSchemaVersion: 27, newSchemaVersion: 28, action: "unknown", expected: 4, attempted: 0, verified: 0 },
+        schema: { version: 28 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -11508,7 +11649,7 @@ fi
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
     db.exec(MIGRATIONS.find((statement) => statement.includes("CREATE TABLE IF NOT EXISTS assignments"))!);
-    for (const statement of MIGRATIONS.at(-7)!.split(";").filter((statement) => statement.includes("ALTER TABLE execution_attempts"))) db.exec(statement);
+    for (const statement of MIGRATIONS.at(-8)!.split(";").filter((statement) => statement.includes("ALTER TABLE execution_attempts"))) db.exec(statement);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -11528,10 +11669,10 @@ fi
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 26, newSchemaVersion: 27, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 26, newSchemaVersion: 27, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 26, newSchemaVersion: 27, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(27, 22))).toMatchObject({ oldSchemaVersion: 26, newSchemaVersion: 27, oldContractVersion: 21, newContractVersion: 22, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 27, newSchemaVersion: 28, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 27, newSchemaVersion: 28, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 27, newSchemaVersion: 28, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(28, 22))).toMatchObject({ oldSchemaVersion: 27, newSchemaVersion: 28, oldContractVersion: 21, newContractVersion: 22, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 
