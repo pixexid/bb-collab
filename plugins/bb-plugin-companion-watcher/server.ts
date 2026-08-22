@@ -309,6 +309,11 @@ export function extractCandidates(snapshot: CandidateSnapshot): Candidate[] {
       .filter((workItem): workItem is ExportRow => workItem !== undefined);
     if (linkedWorkItems.length !== 1) continue;
     const workItemId = linkedWorkItems[0]!.work_item_id;
+    const activeWriter = activeAttempts.some((attempt) =>
+      attempt.origin === "work_item" &&
+      attempt.work_item_id === workItemId &&
+      attempt.assignment_kind === "write",
+    );
     const runningReview = activeAttempts.some((attempt) =>
       attempt.origin === "work_item" &&
       attempt.work_item_id === workItemId &&
@@ -316,7 +321,7 @@ export function extractCandidates(snapshot: CandidateSnapshot): Candidate[] {
       attempt.review_pr_number === pr.number &&
       attempt.review_pr_head_sha === pr.headSha,
     );
-    if (runningReview) continue;
+    if (activeWriter || runningReview) continue;
     const anchors = { projectId, kind: "pull_request", number: pr.number, headSha: pr.headSha } as const;
     candidates.push({ id: `${projectId}:pr:${pr.number}:${pr.headSha}`, kind: anchors.kind, anchors, finding: `PR #${pr.number} at ${pr.headSha} is green, mergeable, decisionless, and unchanged past the five-minute decision threshold.`, evidence: { projectId, workItemId, closingIssueNumber: pr.closingIssueNumber, updatedAt: pr.updatedAt } });
   }

@@ -148,6 +148,32 @@ describe("semantic idle guard", () => {
     expect(extractCandidates(snapshot).filter((candidate) => candidate.kind === "pull_request")).toEqual([]);
   });
 
+  it("suppresses only the PR joined to an active writer's work item", async () => {
+    const base = await capturedExport();
+    const snapshot = await emptySnapshot({
+      canonical: {
+        ...base,
+        workItems: [
+          { ...base.workItems[0], work_item_id: "wi-gh-582", project_id: projectId },
+          { ...base.workItems[0], work_item_id: "wi-gh-583", project_id: projectId },
+        ],
+        externalWorkRefs: [
+          { project_id: projectId, work_item_id: "wi-gh-582", provider: "github", issue_number: 582 },
+          { project_id: projectId, work_item_id: "wi-gh-583", provider: "github", issue_number: 583 },
+        ],
+        executionAttempts: [{ ...base.executionAttempts[1], assignment_kind: "write", execution_attempt_id: "writer-live", project_id: projectId, state: "running", work_item_id: "wi-gh-582" }],
+      },
+      githubPrs: [
+        { number: 584, closingIssueNumber: 582, headSha: "a".repeat(40), updatedAt: 1, ready: true },
+        { number: 585, closingIssueNumber: 583, headSha: "b".repeat(40), updatedAt: 1, ready: true },
+      ],
+      observedAt: 1_000_000,
+    });
+    expect(extractCandidates(snapshot).filter((candidate) => candidate.kind === "pull_request").map((candidate) => candidate.anchors)).toEqual([
+      { projectId, kind: "pull_request", number: 585, headSha: "b".repeat(40) },
+    ]);
+  });
+
   it("silences the PR class when canonical attempt coverage is partial", async () => {
     const base = await capturedExport();
     const head = "a".repeat(40);
