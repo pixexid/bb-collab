@@ -536,6 +536,21 @@ describe("replacement thread list", () => {
     await waitFor(() => expect(Array.from(rendered.container.querySelectorAll("[data-sidebar-thread-id]"), (node) => node.getAttribute("data-sidebar-thread-id"))).toEqual(["pinned-2", "pinned-3", "pinned-1"]));
   });
 
+  it("rolls back a malformed pinned authoritative response", async () => {
+    const list = await registration();
+    const first = { ...thread("pinned-1", "project-a", 2), isPinned: true };
+    const second = { ...thread("pinned-2", "project-a", 1), isPinned: true };
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [first, second] },
+      rpc: { ...rpcHandlers(), reorderPinned: async () => ["pinned-2", "pinned-2", "pinned-1"] } as never,
+    });
+    const row = (id: string) => rendered.container.querySelector(`[data-sidebar-thread-id="${id}"]`)!.closest("div")!;
+    fireEvent.pointerDown(rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!, { button: 0 });
+    fireEvent.pointerEnter(row("pinned-2"));
+    await waitFor(() => expect(rendered.inspection.rpcCalls.filter((call) => call.method === "reorderPinned")).toHaveLength(1));
+    await waitFor(() => expect(Array.from(rendered.container.querySelectorAll("[data-sidebar-thread-id]"), (node) => node.getAttribute("data-sidebar-thread-id"))).toEqual(["pinned-1", "pinned-2"]));
+  });
+
   it("visually reorders pinned rows live while dragging downward", async () => {
     const list = await registration();
     const first = { ...thread("pinned-1", "project-a", 3), isPinned: true };
@@ -577,6 +592,8 @@ describe("replacement thread list", () => {
       rpc: { ...rpcHandlers(), reorderProjects: async ({ previousProjectId }: { previousProjectId: string | null }) => previousProjectId === "project-b" ? ["project-b", "project-a"] : ["project-a", "project-b"] } as never,
     });
     const projectIds = () => Array.from(rendered.container.querySelectorAll("[data-sidebar-project-id]"), (node) => node.getAttribute("data-sidebar-project-id"));
+    expect(rendered.queryByRole("button", { name: "Move Project A project up" })).toBeNull();
+    expect(rendered.queryByRole("button", { name: "Move Project A project down" })).toBeNull();
     fireEvent.pointerDown(rendered.getByText("Project A"), { button: 0 });
     fireEvent.pointerEnter(rendered.container.querySelector('[data-sidebar-project-id="project-b"]')!);
     expect(projectIds()).toEqual(["project-b", "project-a"]);
@@ -585,7 +602,8 @@ describe("replacement thread list", () => {
       input: { projectId: "project-a", previousProjectId: "project-b", nextProjectId: null },
     }));
 
-    fireEvent.click(rendered.getByRole("button", { name: "Move Project A project up" }));
+    fireEvent.click(rendered.getByRole("button", { name: "Project A project actions" }));
+    fireEvent.click(rendered.getByRole("menuitem", { name: "Move up" }));
     await waitFor(() => expect(rendered.inspection.rpcCalls).toContainEqual({
       method: "reorderProjects",
       input: { projectId: "project-a", previousProjectId: null, nextProjectId: "project-b" },
@@ -628,7 +646,8 @@ describe("replacement thread list", () => {
       rpc: { ...rpcHandlers(), reorderProjects: async () => response } as never,
     });
     const projectIds = () => Array.from(rendered.container.querySelectorAll("[data-sidebar-project-id]"), (node) => node.getAttribute("data-sidebar-project-id"));
-    fireEvent.click(rendered.getByRole("button", { name: "Move Project A project down" }));
+    fireEvent.click(rendered.getByRole("button", { name: "Project A project actions" }));
+    fireEvent.click(rendered.getByRole("menuitem", { name: "Move down" }));
     await waitFor(() => expect(projectIds()).toEqual(["project-a", "project-b", "project-c"]));
   });
 
@@ -641,7 +660,8 @@ describe("replacement thread list", () => {
       rpc: { ...rpcHandlers(), reorderProjects: async () => { throw new Error("rejected"); } } as never,
     });
     const projectIds = () => Array.from(rendered.container.querySelectorAll("[data-sidebar-project-id]"), (node) => node.getAttribute("data-sidebar-project-id"));
-    fireEvent.click(rendered.getByRole("button", { name: "Move Project A project down" }));
+    fireEvent.click(rendered.getByRole("button", { name: "Project A project actions" }));
+    fireEvent.click(rendered.getByRole("menuitem", { name: "Move down" }));
     await waitFor(() => expect(projectIds()).toEqual(["project-a", "project-b"]));
   });
 
@@ -730,6 +750,7 @@ describe("replacement thread list", () => {
     });
     const pinnedRow = rendered.container.querySelector('[data-sidebar-thread-id="pinned-1"]')!;
     const looseRow = rendered.container.querySelector('[data-sidebar-thread-id="loose-1"]')!;
+    expect(rendered.container.querySelectorAll('[aria-roledescription="Draggable session"]')).toHaveLength(2);
     fireEvent.pointerDown(pinnedRow, { button: 0 });
     fireEvent.pointerUp(pinnedRow, { button: 0 });
     fireEvent.pointerDown(looseRow, { button: 0 });
