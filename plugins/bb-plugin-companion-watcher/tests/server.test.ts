@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { describe, expect, it } from "vitest";
-import companionWatcher, { composeTimeline, extractCandidates, hasActiveWorkers, parseCanonicalExport, parseGithubEvidence, parseJudgment, readRoleThread, routeJudgment, snapshotCanonical, type CandidateSnapshot } from "../server.js";
+import companionWatcher, { composeTimeline, extractCandidates, hasActiveWorkers, parseCanonicalExport, parseGithubEvidence, parseJudgment, parseQueuedEvidence, readRoleThread, routeJudgment, snapshotCanonical, type CandidateSnapshot } from "../server.js";
 
 const fixtureRoot = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 const projectId = "proj_a8zzfsx36j";
@@ -102,22 +102,52 @@ describe("semantic idle guard", () => {
     ]);
   });
 
-  it("binds green PR candidates to the approved exact head and drops head drift", async () => {
+  it("binds the realistic green decisionless PR shape to its exact head and drops head drift", async () => {
     const head = "a".repeat(40);
     const nextHead = "b".repeat(40);
-    const parsed = parseGithubEvidence({ issues: [], prs: [{ number: 42, title: "Ready", state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", headRefOid: head, reviews: [{ state: "APPROVED", commit: { oid: head } }], statusCheckRollup: [{ conclusion: "SUCCESS" }], updatedAt: "1970-01-01T00:00:01.000Z" }] });
+    const parsed = parseGithubEvidence({ issues: [], prs: [{ number: 566, title: "Ready", state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "", headRefOid: head, reviews: [], statusCheckRollup: [{ conclusion: "SUCCESS" }], updatedAt: "1970-01-01T00:00:01.000Z" }] });
     const snapshot = await emptySnapshot({ githubPrs: parsed.prs, observedAt: 1_000_000 });
     const candidate = extractCandidates(snapshot)[0]!;
-    expect(candidate.anchors).toEqual({ kind: "pull_request", number: 42, headSha: head });
+    expect(candidate).toMatchObject({ anchors: { kind: "pull_request", number: 566, headSha: head }, finding: expect.stringContaining("green, mergeable, decisionless") });
     const drops: string[] = [];
-    const drifted = parseJudgment(`FINDING: ${JSON.stringify({ candidateId: `pr:42:${nextHead}`, anchors: { kind: "pull_request", number: 42, headSha: nextHead }, finding: "stale head" })}\nESCALATE: yes`, snapshot, (reason) => drops.push(reason));
+    const drifted = parseJudgment(`FINDING: ${JSON.stringify({ candidateId: `pr:566:${nextHead}`, anchors: { kind: "pull_request", number: 566, headSha: nextHead }, finding: "stale head" })}\nESCALATE: yes`, snapshot, (reason) => drops.push(reason));
     expect(drifted.illegitimate).toBe(false);
     expect(drops).toEqual(["unknown-candidate"]);
+  });
+
+  it("fails closed per incomplete source through post-check and routing", async () => {
+    const base = await capturedExport();
+    const workItem = { ...base.workItems[0], work_item_id: "wi-gh-560", lifecycle_state: "ready", resource_revision: 5 };
+    const stale = { ...base.executionAttempts[1], execution_attempt_id: "attempt-stale", observed_at_ms: 399_999, state: "running", work_item_id: "wi-gh-560" };
+    const head = "a".repeat(40);
+    const github = parseGithubEvidence({ issues: [{ number: 560, title: "Ready", labels: [{ name: "queue:startable" }], updatedAt: "1970-01-01T00:00:01.000Z" }], prs: [{ number: 566, title: "Ready", state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "", headRefOid: head, reviews: [], statusCheckRollup: [{ conclusion: "SUCCESS" }], updatedAt: "1970-01-01T00:00:01.000Z" }] });
+    const known = { canonical: "known", timeline: "known", github: "known", queue: "known" } as const;
+    const snapshots = {
+      canonical: await emptySnapshot({ canonical: { ...base, executionAttempts: [base.executionAttempts[0]!], workItems: [workItem], externalWorkRefs: [{ project_id: projectId, work_item_id: "wi-gh-560", provider: "github", issue_number: 560 }] }, githubIssues: github.issues, sourceCoverage: known }),
+      timeline: await emptySnapshot({ canonical: { ...base, executionAttempts: [base.executionAttempts[0]!, stale] }, sourceCoverage: known }),
+      github: await emptySnapshot({ githubPrs: github.prs, sourceCoverage: known }),
+      queue: await emptySnapshot({ queued: [queuedMessage("queue-old", 1)], cycleStartedAt: 2, sourceCoverage: known }),
+    };
+    for (const [source, snapshot] of Object.entries(snapshots) as Array<[keyof typeof snapshots, CandidateSnapshot]>) {
+      const candidate = extractCandidates(snapshot)[0]!;
+      const output = `FINDING: ${JSON.stringify({ candidateId: candidate.id, anchors: candidate.anchors, finding: candidate.finding })}\nESCALATE: yes`;
+      const dropped: string[] = [];
+      const incomplete = { ...snapshot, coverage: "partial" as const, sourceCoverage: { ...known, [source]: "blind" as const } };
+      const judgment = parseJudgment(output, incomplete, (reason) => dropped.push(reason));
+      expect({ source, candidate: candidate.kind, dropped, route: routeJudgment(undefined, judgment, 1) }).toEqual({ source, candidate: candidate.kind, dropped: ["unknown-candidate"], route: undefined });
+    }
   });
 
   it("marks GitHub populations incomplete at the declared ceiling", () => {
     const issues = Array.from({ length: 200 }, (_, number) => ({ number: number + 1, title: `Issue ${number + 1}`, labels: [{ name: "queue:startable" }], updatedAt: "1970-01-01T00:00:01.000Z" }));
     expect(parseGithubEvidence({ issues, prs: [] }).complete).toBe(false);
+  });
+
+  it("marks queued populations blind at the declared ceiling or a malformed row", () => {
+    expect(parseQueuedEvidence(Array.from({ length: 200 }, (_, index) => queuedMessage(`queue-${index}`))).complete).toBe(false);
+    const invalid: string[] = [];
+    expect(parseQueuedEvidence([{ id: "broken" }], (reason) => invalid.push(reason))).toEqual({ messages: [], complete: false });
+    expect(invalid).toEqual(["queue-0"]);
   });
 
   it("parses the captured canonical export shape", async () => {
@@ -126,6 +156,35 @@ describe("semantic idle guard", () => {
     expect(canonical.parseIssues).toEqual([]);
     expect(hasActiveWorkers(canonical, projectId)).toBe(true);
     expect(hasActiveWorkers({ ...canonical, executionAttempts: canonical.executionAttempts.filter((row) => row.state !== "running") }, projectId)).toBe(false);
+  });
+
+  it("production idle trigger judges stale attempts but defers for healthy active writers", async () => {
+    const base = await capturedExport();
+    const now = Date.now();
+    let canonical = { ...base, executionAttempts: [base.executionAttempts[0]!, { ...base.executionAttempts[1], observed_at_ms: 0, state: "running" }] };
+    let idle: ((event: { thread: { id: string; projectId: string }; lastAssistantText?: string }) => Promise<void>) | undefined;
+    let spawns = 0;
+    const bb = {
+      pluginId: "companion-watcher",
+      log: { info: () => undefined, warn: () => undefined },
+      storage: { kv: { get: async () => undefined, set: async () => undefined } },
+      agents: { registerTool: () => undefined, configure: () => undefined },
+      sdk: {
+        system: { config: async () => ({ dataDir: "/unused" }) },
+        threads: {
+          spawn: async () => { spawns += 1; return { id: "companion" }; },
+          get: async () => ({ projectId, status: "idle" }),
+          send: async () => undefined,
+        },
+      },
+      events: { on: (event: string, handler: typeof idle) => { if (event === "thread.idle") idle = handler; } },
+    } as unknown as BbPluginApi;
+    companionWatcher(bb, async () => canonical, async () => ({ issues: [], prs: [] }));
+    await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+    expect(spawns).toBe(1);
+    canonical = { ...canonical, executionAttempts: [base.executionAttempts[0]!, { ...base.executionAttempts[1], observed_at_ms: now, state: "running" }] };
+    await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+    expect(spawns).toBe(1);
   });
 
   it("accepts nullable execution-attempt fields, including the captured review boundary", async () => {
