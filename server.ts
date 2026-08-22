@@ -135,6 +135,11 @@ function githubRepository(remoteUrl: string | null): string | null {
 
 type GithubQueueIssue = { repository: string; number: number };
 type StartableQueueState = { count: number; head: string | null; unlabelledCount: number; blockedCount: number; waitingExternalCount: number; dispatched: GithubQueueIssue[] };
+export const ROLE_QUEUE_MAX_REPOSITORIES = 4;
+export const ROLE_QUEUE_REFRESH_TIMEOUT_MS = 8_000;
+export const ROLE_QUEUE_CACHE_MS = 20_000;
+export const ROLE_QUEUE_IDLE_THRESHOLD_MS = 30_000;
+export const ROLE_QUEUE_OBSERVATION_MS = 1_000;
 
 function githubJson(args: string[]): unknown | null {
   try {
@@ -156,7 +161,7 @@ function githubJson(args: string[]): unknown | null {
 
 function githubJsonAsync(args: string[]): Promise<unknown | null> {
   return new Promise((resolve) => {
-    execFile("gh", args, { encoding: "utf8", timeout: 10_000, killSignal: "SIGKILL" }, (error, stdout) => {
+    execFile("gh", args, { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL" }, (error, stdout) => {
       if (error) {
         resolve(null);
         return;
@@ -167,58 +172,37 @@ function githubJsonAsync(args: string[]): Promise<unknown | null> {
 }
 
 async function startableQueueStateAsync(repositories: string[]): Promise<StartableQueueState | null> {
+  if (repositories.length > ROLE_QUEUE_MAX_REPOSITORIES || new Set(repositories).size !== repositories.length) return null;
   let count = 0;
   let unlabelledCount = 0;
   let blockedCount = 0;
   let waitingExternalCount = 0;
   const heads: string[] = [];
   const dispatched: GithubQueueIssue[] = [];
-  const isIssue = (issue: unknown): issue is { number: number; labels: Array<{ name: string }> } => Boolean(issue && typeof issue === "object" && !Array.isArray(issue)
+  type QueueInventoryIssue = { number: number; labels: Array<{ name: string }>; [key: string]: unknown };
+  const isIssue = (issue: unknown): issue is QueueInventoryIssue => Boolean(issue && typeof issue === "object" && !Array.isArray(issue)
     && typeof (issue as { number?: unknown }).number === "number" && Number.isSafeInteger((issue as { number: number }).number) && (issue as { number: number }).number > 0
     && Array.isArray((issue as { labels?: unknown }).labels)
     && (issue as { labels: unknown[] }).labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof (label as { name?: unknown }).name === "string"));
-  for (const repository of repositories) {
-    const startable = await githubJsonAsync(["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number,labels", "--limit", "1000"]);
-    const pages = await githubJsonAsync(["api", `repos/${repository}/issues`, "--paginate", "--slurp", "--method", "GET", "-f", "state=open", "-f", "per_page=100"]);
-    if (!Array.isArray(startable) || !startable.every(isIssue)
-      || !Array.isArray(pages) || !pages.every((page) => Array.isArray(page) && page.every(isIssue))) return null;
-    count += startable.length;
-    const issues = pages.flat().filter((issue) => !("pull_request" in issue));
+  const inventories = await Promise.all(repositories.map(async (repository) => ({
+    repository,
+    pages: await githubJsonAsync(["api", `repos/${repository}/issues`, "--paginate", "--slurp", "--method", "GET", "-f", "state=open", "-f", "per_page=100"]),
+  })));
+  for (const { repository, pages } of inventories) {
+    if (!Array.isArray(pages) || !pages.every((page, index) => Array.isArray(page) && page.length <= 100
+      && (index === pages.length - 1 || page.length === 100) && page.every(isIssue))) return null;
+    const inventory = (pages as QueueInventoryIssue[][]).flat();
+    if (new Set(inventory.map((issue) => issue.number)).size !== inventory.length) return null;
+    const issues = inventory.filter((issue) => !("pull_request" in issue));
+    if (issues.some((issue) => issue.labels.filter((label) => label.name.startsWith("queue:")).length > 1)) return null;
+    const exactStartable = issues.filter((issue) => issue.labels.some((label) => label.name === "queue:startable"));
+    count += exactStartable.length;
     unlabelledCount += issues.filter((issue) => !issue.labels.some((label) => label.name.startsWith("queue:"))).length;
     blockedCount += issues.filter((issue) => issue.labels.some((label) => label.name === "queue:blocked")).length;
     waitingExternalCount += issues.filter((issue) => issue.labels.some((label) => label.name === "queue:waiting-external")).length;
     dispatched.push(...issues.filter((issue) => issue.labels.filter((label) => label.name.startsWith("queue:")).every((label) => label.name === "queue:dispatched")
       && issue.labels.some((label) => label.name === "queue:dispatched")).map((issue) => ({ repository, number: issue.number })));
-    const numbers = startable.map((issue) => issue.number);
-    if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
-  }
-  return { count, head: heads.sort()[0] ?? null, unlabelledCount, blockedCount, waitingExternalCount, dispatched: dispatched.sort((left, right) => left.repository.localeCompare(right.repository) || left.number - right.number) };
-}
-
-function startableQueueState(repositories: string[]): StartableQueueState | null {
-  let count = 0;
-  let unlabelledCount = 0;
-  let blockedCount = 0;
-  let waitingExternalCount = 0;
-  const heads: string[] = [];
-  const dispatched: GithubQueueIssue[] = [];
-  const isIssue = (issue: unknown): issue is { number: number; labels: Array<{ name: string }> } => Boolean(issue && typeof issue === "object" && !Array.isArray(issue)
-    && typeof (issue as { number?: unknown }).number === "number" && Number.isSafeInteger((issue as { number: number }).number) && (issue as { number: number }).number > 0
-    && Array.isArray((issue as { labels?: unknown }).labels)
-    && (issue as { labels: unknown[] }).labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof (label as { name?: unknown }).name === "string"));
-  for (const repository of repositories) {
-    const startable = githubJson(["issue", "list", "--repo", repository, "--label", "queue:startable", "--state", "open", "--json", "number,labels", "--limit", "1000"]);
-    const pages = githubJson(["api", `repos/${repository}/issues`, "--paginate", "--slurp", "--method", "GET", "-f", "state=open", "-f", "per_page=100"]);
-    if (!Array.isArray(startable) || !startable.every(isIssue)
-      || !Array.isArray(pages) || !pages.every((page) => Array.isArray(page) && page.every(isIssue))) return null;
-    count += startable.length;
-    const issues = pages.flat().filter((issue) => !("pull_request" in issue));
-    unlabelledCount += issues.filter((issue) => !issue.labels.some((label) => label.name.startsWith("queue:"))).length;
-    blockedCount += issues.filter((issue) => issue.labels.some((label) => label.name === "queue:blocked")).length;
-    waitingExternalCount += issues.filter((issue) => issue.labels.some((label) => label.name === "queue:waiting-external")).length;
-    dispatched.push(...issues.filter((issue) => issue.labels.filter((label) => label.name.startsWith("queue:")).every((label) => label.name === "queue:dispatched")
-      && issue.labels.some((label) => label.name === "queue:dispatched")).map((issue) => ({ repository, number: issue.number })));
-    const numbers = startable.map((issue) => issue.number);
+    const numbers = exactStartable.map((issue) => issue.number);
     if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
   }
   return { count, head: heads.sort()[0] ?? null, unlabelledCount, blockedCount, waitingExternalCount, dispatched: dispatched.sort((left, right) => left.repository.localeCompare(right.repository) || left.number - right.number) };
@@ -390,6 +374,8 @@ const FLEET_WATCHDOG_FLOOR_MIGRATION_KEY = "fleet-watchdog.floor-default-v2-migr
 export const FLEET_WATCHDOG_STALE_WAIT_MS = 24 * 60 * 60_000;
 const FLEET_WATCHDOG_STOPPING_WAIT_MS = 30_000;
 const AUTOMATED_TELL_IDLE_WAIT_MS = 30_000;
+export const ROLE_QUEUE_DECISION_BOUND_MS = ROLE_QUEUE_CACHE_MS + (2 * ROLE_QUEUE_REFRESH_TIMEOUT_MS)
+  + (2 * ROLE_QUEUE_OBSERVATION_MS) + ROLE_QUEUE_IDLE_THRESHOLD_MS + AUTOMATED_TELL_IDLE_WAIT_MS;
 const automatedTellQueues = new Map<string, Promise<void>>();
 const operatorRepliesInFlight = new Set<string>();
 const projectIdSchema = z.string().trim().min(1).max(256);
@@ -468,7 +454,8 @@ const laneViewSchema = z
   .object({
     projectId: projectIdSchema,
     laneId: projectIdSchema,
-    assignmentId: projectIdSchema,
+    // null means exactly an origin=work_item attempt, which has no Assignment.
+    assignmentId: projectIdSchema.nullable(),
     assignmentKind: z.enum(["write", "review", "probe"]),
     workItemId: projectIdSchema,
     threadId: projectIdSchema.nullable(),
@@ -1858,6 +1845,7 @@ async function runCli(
 }
 
 export default async function plugin(bb: BbPluginApi, options: PluginOptions = {}) {
+  if (ROLE_QUEUE_DECISION_BOUND_MS >= 120_000) throw new Error("project queue decision bound must remain below two minutes");
   const notifyUrgent = options.notifyUrgent ?? ((message, senderThreadId) => defaultNotifyUrgent(message, senderThreadId, options.runBbCommand ?? runBbCommand));
   const fleetWatchdogSettings = bb.settings.define({
     fleetWatchdogFloorMs: {
@@ -2192,7 +2180,117 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       : `observedProject=${thread.projectId} archivedAt=${thread.archivedAt ?? "null"} deletedAt=${thread.deletedAt ?? "null"} status=${thread.status} witness=${witness}`;
   };
 
-  const readRoleScopes = async () => [];
+  type RoleQueueRead = {
+    observedAtMs: number;
+    configIdentity: string;
+    known: boolean;
+    head: { workItemId: string; resourceRevision: number } | null;
+  };
+  type RoleQueueConfig = { identity: string; repositories: string[]; reason: string | null };
+  const roleQueueCache = new Map<string, RoleQueueRead>();
+  const roleQueueRefreshes = new Map<string, { configIdentity: string; promise: Promise<RoleQueueRead> }>();
+  const readProjectQueueRoleHolders = () => db
+    ? readRoleHolderStates(db).filter((holder) => holder.role_id === "project-orchestrator")
+    : [];
+  const readRoleQueueConfig = (projectId: string): RoleQueueConfig => {
+    if (!db) return { identity: "canonical-store-unavailable", repositories: [], reason: "canonical-store-unavailable" };
+    try {
+      const head = db.prepare("SELECT config_revision FROM project_config_heads WHERE project_id = ?").get(projectId) as { config_revision: number } | undefined;
+      if (!head) return { identity: "project-config-missing", repositories: [], reason: "configured-repositories-unreadable" };
+      const targets = db.prepare(
+        `SELECT repo_target_id, remote_url FROM repository_targets
+         WHERE project_id = ? AND config_revision = ? ORDER BY repo_target_id`,
+      ).all(projectId, head.config_revision) as Array<{ repo_target_id: string; remote_url: string | null }>;
+      const identity = canonicalJson({ configRevision: head.config_revision, targets });
+      const repositories = targets.map((target) => githubRepository(target.remote_url));
+      if (repositories.length === 0 || repositories.some((repository) => repository === null)) {
+        return { identity, repositories: [], reason: "configured-repositories-unreadable" };
+      }
+      if (repositories.length > ROLE_QUEUE_MAX_REPOSITORIES) {
+        return { identity, repositories: [], reason: `configured-repository-ceiling:${repositories.length}>${ROLE_QUEUE_MAX_REPOSITORIES}` };
+      }
+      if (new Set(repositories).size !== repositories.length) {
+        return { identity, repositories: [], reason: "configured-repositories-duplicate" };
+      }
+      return { identity, repositories: repositories as string[], reason: null };
+    } catch (error) {
+      return { identity: `config-unreadable:${String(error)}`, repositories: [], reason: `role-queue-unreadable:${String(error)}` };
+    }
+  };
+  const readProjectRoleQueue = async (projectId: string, refresh = false): Promise<RoleQueueRead> => {
+    const now = Date.now();
+    const config = readRoleQueueConfig(projectId);
+    const cached = roleQueueCache.get(projectId);
+    const cacheAgeMs = cached ? now - cached.observedAtMs : Number.POSITIVE_INFINITY;
+    if (!refresh && cached && cached.configIdentity === config.identity && cacheAgeMs >= 0 && cacheAgeMs < ROLE_QUEUE_CACHE_MS) return cached;
+    const refreshing = roleQueueRefreshes.get(projectId);
+    if (refreshing) {
+      if (refreshing.configIdentity === config.identity) return refreshing.promise;
+      const reason = "project-config-superseded-in-flight";
+      bb.log.warn(`role queue coverage=degraded project=${projectId} reason=${reason}`);
+      return { observedAtMs: now, configIdentity: config.identity, known: false, head: null };
+    }
+    const next = (async (): Promise<RoleQueueRead> => {
+      let reason = config.reason;
+      let head: RoleQueueRead["head"] = null;
+      try {
+        if (reason === null) {
+          if (!db) throw new Error("canonical-store-unavailable");
+          const queue = await startableQueueStateAsync(config.repositories);
+          if (queue === null) {
+            reason = "startable-queue-unreadable";
+          } else if (queue.head !== null) {
+            const match = queue.head.match(/^([^/]+)\/([^/#]+)#([1-9][0-9]*)$/u);
+            const issueNumber = match?.[3] === undefined ? Number.NaN : Number(match[3]);
+            if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
+              reason = "startable-queue-head-malformed";
+            } else {
+              const matches = db.prepare(
+                `SELECT items.work_item_id, items.resource_revision
+                 FROM work_items AS items JOIN external_work_refs AS refs
+                   ON refs.project_id = items.project_id AND refs.work_item_id = items.work_item_id
+                 WHERE items.project_id = ? AND items.lifecycle_state IN ('proposed', 'ready')
+                   AND refs.provider = 'github' AND refs.owner = ? AND refs.repo = ? AND refs.issue_number = ?`,
+              ).all(projectId, match[1], match[2], issueNumber) as Array<{ work_item_id: string; resource_revision: number }>;
+              if (matches.length === 1) head = { workItemId: matches[0]!.work_item_id, resourceRevision: matches[0]!.resource_revision };
+              else reason = `startable-queue-head-bindings:${matches.length}`;
+            }
+          }
+        }
+      } catch (error) {
+        reason = `role-queue-unreadable:${String(error)}`;
+      }
+      const currentConfig = readRoleQueueConfig(projectId);
+      if (currentConfig.identity !== config.identity) {
+        reason = "project-config-moved-during-refresh";
+        head = null;
+      }
+      const result = { observedAtMs: Date.now(), configIdentity: config.identity, known: reason === null, head };
+      if (currentConfig.identity === config.identity) roleQueueCache.set(projectId, result);
+      if (reason !== null) bb.log.warn(`role queue coverage=degraded project=${projectId} reason=${reason}`);
+      return result;
+    })();
+    roleQueueRefreshes.set(projectId, { configIdentity: config.identity, promise: next });
+    try {
+      return await next;
+    } finally {
+      if (roleQueueRefreshes.get(projectId)?.promise === next) roleQueueRefreshes.delete(projectId);
+    }
+  };
+
+  const readRoleScopes = async () => {
+    if (!db) throw new Error("canonical role scope unavailable");
+    const projectIds = [...new Set(readProjectQueueRoleHolders().map((holder) => holder.project_id))];
+    return Promise.all(projectIds.map(async (projectId) => {
+      const queue = await readProjectRoleQueue(projectId);
+      return {
+        projectId,
+        nextStartable: queue.known && queue.head !== null,
+        queueHeadId: queue.known ? queue.head?.workItemId ?? null : null,
+        deferredReason: null,
+      };
+    }));
+  };
 
   const sendRoleWake = async (role: import("./src/awareness.js").RoleIdleView, text: string) => {
     if (!db) return "error" as const;
@@ -2205,7 +2303,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     };
     let holders: RoleHolderState[];
     try {
-      holders = readRoleHolderStates(db).filter((holder) =>
+      holders = readProjectQueueRoleHolders().filter((holder) =>
         holder.project_id === role.projectId &&
         holder.role_id === role.roleId &&
         holder.role_generation === role.roleGeneration &&
@@ -2245,26 +2343,19 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     return true;
   };
 
-  const steerRole = async (role: import("./src/awareness.js").RoleIdleView) => {
-    if (!db) return "error" as const;
-    let startable: { work_item_id: string } | undefined;
-    try {
-      startable = db.prepare(
-        `SELECT work_item_id FROM work_items
-         WHERE project_id = ? AND lifecycle_state IN ('proposed', 'ready')
-         ORDER BY created_at_ms, work_item_id LIMIT 1`,
-      ).get(role.projectId) as { work_item_id: string } | undefined;
-    } catch {
-      return "error" as const;
-    }
-    if (!startable) return false;
-    return sendRoleWake(role, `Wrongful idle: queue head ${startable.work_item_id} is startable. Inspect the queue and act or record the blocker.`);
+  const steerRole = async (role: import("./src/awareness.js").RoleIdleView, queue?: RoleQueueRead) => {
+    if (role.roleId !== "project-orchestrator") return false;
+    const current = queue ?? await readProjectRoleQueue(role.projectId, true);
+    if (!current.known) return "error" as const;
+    if (!current.head || current.head.workItemId !== role.queueHeadId) return false;
+    return sendRoleWake(role, `Wrongful idle: queue head ${current.head.workItemId} is startable. Inspect the queue and act or record the blocker.`);
   };
 
   const watcher = createLaneWatcher({
-    readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
+    readRoleHolders: readProjectQueueRoleHolders,
     readRoleScopes,
     roleIdlePersistence,
+    roleIdleThresholdMs: ROLE_QUEUE_IDLE_THRESHOLD_MS,
     waitRegistry,
     onAlert: (alert) => bb.log.warn(`role awareness ${alert.kind}: ${alert.role.roleId}@${alert.role.roleGeneration} queue ${alert.role.queueHeadId}`),
     onRoleSuccessionRequired: (role) => bb.log.warn(`role succession required: ${role.roleId}@${role.roleGeneration}`),
@@ -2700,7 +2791,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   const stallGuardCycle = createStallGuardCycle({
     onAmbiguous: (message) => bb.log.warn(message),
-    readRoleHolders: () => (db ? readRoleHolderStates(db) : []),
+    readRoleHolders: readProjectQueueRoleHolders,
     readArtifact: async (projectId) => {
       if (!db) return null;
       const artifacts = [];
@@ -2722,16 +2813,14 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return artifacts;
     },
     readQueueHead: (projectId) => {
-      if (!db) return null;
-      const row = db.prepare(
-        `SELECT work_item_id, resource_revision FROM work_items
-         WHERE project_id = ? AND lifecycle_state IN ('proposed', 'ready')
-         ORDER BY created_at_ms, work_item_id LIMIT 1`,
-      ).get(projectId) as { work_item_id: string; resource_revision: number } | undefined;
-      return row ? { workItemId: row.work_item_id, resourceRevision: row.resource_revision } : null;
+      const queue = roleQueueCache.get(projectId);
+      const ageMs = queue ? Date.now() - queue.observedAtMs : Number.POSITIVE_INFINITY;
+      return queue?.known === true && queue.configIdentity === readRoleQueueConfig(projectId).identity
+        && ageMs >= 0 && ageMs < ROLE_QUEUE_CACHE_MS ? queue.head : null;
     },
     wakeRole: async (role) => {
-      const result = await steerRole(role);
+      const queue = await readProjectRoleQueue(role.projectId, true);
+      const result = queue.head ? await steerRole({ ...role, queueHeadId: queue.head.workItemId }, queue) : queue.known ? false : "error";
       return result === true
         ? { attempted: true, delivered: true }
         : { attempted: false, delivered: false, refusal: result === "error" ? "error" : "policy" };
@@ -2803,7 +2892,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             signal.removeEventListener("abort", done);
             resolve();
           };
-          timer = setTimeout(done, 1_000);
+          timer = setTimeout(done, ROLE_QUEUE_OBSERVATION_MS);
           signal.addEventListener("abort", done, { once: true });
         });
       }
@@ -3733,7 +3822,124 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     reportRefusals();
   });
 
-  const readOpenLaneViews = async () => [];
+  const readOpenLaneViews = async () => {
+    if (!db) throw new Error("canonical lane population unavailable");
+    const attempts = db.prepare(
+      `SELECT attempts.project_id, attempts.assignment_id, attempts.lane_id,
+              attempts.assignment_kind, attempts.work_item_id, attempts.thread_id,
+              attempts.execution_attempt_id, attempts.state, attempts.created_at_ms
+       FROM execution_attempts AS attempts
+       JOIN work_items AS items
+         ON items.project_id = attempts.project_id
+        AND items.work_item_id = attempts.work_item_id
+       WHERE attempts.origin = 'work_item'
+         AND attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+         AND items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
+       ORDER BY attempts.project_id, attempts.created_at_ms, attempts.execution_attempt_id`,
+    ).all(...WORK_ITEM_CAPACITY_ATTEMPT_STATES, ...WORK_ITEM_NON_TERMINAL_STATES) as Array<{
+      project_id: string;
+      assignment_id: null;
+      lane_id: string;
+      assignment_kind: "write" | "review" | "probe";
+      work_item_id: string;
+      thread_id: string | null;
+      execution_attempt_id: string;
+      state: (typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES)[number];
+      created_at_ms: number;
+    }>;
+    const currentHolders = readRoleHolderStates(db);
+    const holderThreadIdsByProject = new Map<string, Set<string>>();
+    for (const holder of currentHolders) {
+      const threadIds = holderThreadIdsByProject.get(holder.project_id) ?? new Set<string>();
+      threadIds.add(holder.thread_id);
+      holderThreadIdsByProject.set(holder.project_id, threadIds);
+    }
+    const attemptsByProject = new Map<string, typeof attempts>();
+    for (const attempt of attempts) {
+      if (attempt.assignment_id !== null) throw new Error(`work-item lane ${attempt.execution_attempt_id} has an Assignment`);
+      const projectAttempts = attemptsByProject.get(attempt.project_id) ?? [];
+      projectAttempts.push(attempt);
+      attemptsByProject.set(attempt.project_id, projectAttempts);
+    }
+
+    const views: Array<z.infer<typeof laneViewSchema>> = [];
+    for (const [projectId, projectAttempts] of attemptsByProject) {
+      const holderThreadIds = holderThreadIdsByProject.get(projectId);
+      if (!holderThreadIds || holderThreadIds.size === 0) {
+        bb.log.warn(`lane population refused: project=${projectId} reason=current-role-holder-unavailable`);
+        continue;
+      }
+      const workItemIds = new Set<string>();
+      for (const attempt of projectAttempts) {
+        if (workItemIds.has(attempt.work_item_id)) {
+          bb.log.warn(`lane population refused: project=${projectId} workItem=${attempt.work_item_id} reason=current-attempt-ambiguous`);
+          throw new Error(`current work-item lane identity is ambiguous: ${attempt.work_item_id}`);
+        }
+        workItemIds.add(attempt.work_item_id);
+      }
+      let threads: Awaited<ReturnType<typeof bb.sdk.threads.list>>;
+      try {
+        threads = await listAllProjectThreads((request) => bb.sdk.threads.list(request), projectId);
+      } catch (error) {
+        bb.log.warn(`lane population refused: project=${projectId} reason=native-lane-inventory-unreadable:${String(error)}`);
+        throw error;
+      }
+      const threadsById = new Map<string, typeof threads>();
+      for (const thread of threads) {
+        const matches = threadsById.get(thread.id) ?? [];
+        matches.push(thread);
+        threadsById.set(thread.id, matches);
+      }
+      for (const attempt of projectAttempts) {
+        let workerStatus: z.infer<typeof laneViewSchema>["workerStatus"] = null;
+        if (attempt.thread_id !== null) {
+          const matches = threadsById.get(attempt.thread_id) ?? [];
+          if (matches.length > 1) {
+            bb.log.warn(`lane population refused: project=${projectId} attempt=${attempt.execution_attempt_id} thread=${attempt.thread_id} reason=native-lane-ambiguous`);
+            throw new Error(`native lane identity is ambiguous: ${attempt.thread_id}`);
+          }
+          const thread = matches[0];
+          if (!thread || thread.projectId !== projectId || thread.archivedAt !== null || thread.deletedAt !== null ||
+              thread.parentThreadId === null || !holderThreadIds.has(thread.parentThreadId)) {
+            bb.log.warn(`lane population refused: project=${projectId} attempt=${attempt.execution_attempt_id} thread=${attempt.thread_id} reason=native-lane-not-current`);
+            continue;
+          }
+          const holderMatches = threadsById.get(thread.parentThreadId) ?? [];
+          const holder = holderMatches[0];
+          if (holderMatches.length !== 1 || !holder || holder.projectId !== projectId || holder.archivedAt !== null || holder.deletedAt !== null ||
+              holder.status !== "idle" && holder.status !== "active") {
+            bb.log.warn(`lane population refused: project=${projectId} attempt=${attempt.execution_attempt_id} thread=${attempt.thread_id} reason=current-role-holder-unusable`);
+            continue;
+          }
+          workerStatus = thread.status;
+        }
+        const running = workerStatus === "active" || workerStatus === "starting" || attempt.state === "running";
+        const errored = workerStatus === "error" || workerStatus === "stopping" || attempt.state === "dispatch_unknown" ||
+          attempt.thread_id === null && attempt.state !== "prepared";
+        views.push({
+          projectId,
+          laneId: attempt.lane_id,
+          assignmentId: attempt.assignment_id,
+          assignmentKind: attempt.assignment_kind,
+          workItemId: attempt.work_item_id,
+          threadId: attempt.thread_id,
+          executionAttemptId: attempt.execution_attempt_id,
+          attemptState: attempt.state,
+          workerStatus,
+          waitingOn: null,
+          ageMs: Math.max(0, Date.now() - attempt.created_at_ms),
+          tone: errored ? "error" : running ? "running" : "default",
+          queueState: running ? "running" : "ready",
+          queueBlocked: false,
+          nextStartable: false,
+          deferredReason: null,
+          deferredAtMs: null,
+          deferredAgeMs: null,
+        });
+      }
+    }
+    return views;
+  };
 
   // Lifecycle callbacks observe a completed creation; they cannot intercept a
   // spawn. An unseated thread receives its worker brief here at seating;

@@ -8,7 +8,7 @@ import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import plugin, { cliSchemaError, deployedDistFailureDetail, fleetWatchdogBlockerFiredKey, fleetWatchdogCompositeKey, fleetWatchdogEpisodeKey, fleetWatchdogIssueReopenedKey, fleetWatchdogMergeCloseKey, fleetWatchdogReopenKey, fleetWatchdogRoleLivenessKey, fleetWatchdogScope, IDLE_FLEET_ATTEMPT_STALE_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
+import plugin, { cliSchemaError, deployedDistFailureDetail, fleetWatchdogBlockerFiredKey, fleetWatchdogCompositeKey, fleetWatchdogEpisodeKey, fleetWatchdogIssueReopenedKey, fleetWatchdogMergeCloseKey, fleetWatchdogReopenKey, fleetWatchdogRoleLivenessKey, fleetWatchdogScope, IDLE_FLEET_ATTEMPT_STALE_MS, ROLE_QUEUE_CACHE_MS, ROLE_QUEUE_DECISION_BOUND_MS, ROLE_QUEUE_IDLE_THRESHOLD_MS, ROLE_QUEUE_MAX_REPOSITORIES, ROLE_QUEUE_OBSERVATION_MS, ROLE_QUEUE_REFRESH_TIMEOUT_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
 import { canonicalWorktreePath } from "../src/worktree-cleanup.js";
 import {
   CACHED_CONSUMERS,
@@ -722,8 +722,15 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
     parentThreadId: lanes.get(threadId)?.parentThreadId ?? null,
     updatedAt: lanes.get(threadId)?.updatedAt ?? nativeUpdatedAt,
   })) as never);
-  fixture.host.harness.sdk.stub("threads.list", (async ({ projectId }: { projectId?: string }) =>
-    [...lanes.values()].filter((lane) => projectId === undefined || lane.projectId === projectId)) as never);
+  fixture.host.harness.sdk.stub("threads.list", (async ({ projectId }: { projectId?: string }) => [
+    ...[director.thread_id, orchestrator.thread_id].map((threadId) => makeThreadResponse({
+      id: threadId,
+      projectId: threadProjects.get(threadId) ?? PROJECT_ID,
+      status: threadStatus,
+      updatedAt: nativeUpdatedAt,
+    })),
+    ...lanes.values(),
+  ].filter((thread) => projectId === undefined || thread.projectId === projectId)) as never);
   fixture.host.harness.sdk.stub("threads.spawn", (async ({ projectId, parentThreadId, title }: { projectId: string; parentThreadId?: string; title?: string }) => {
     const id = `lane-${lanes.size + 1}`;
     const lane = Object.assign(makeThreadResponse({ id, projectId, parentThreadId: parentThreadId ?? null, title: title ?? null, status: "error", updatedAt: nativeUpdatedAt }), {
@@ -774,7 +781,7 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
   };
 }
 
-function bindFixtureGithubIssue(db: Database.Database, issueNumber: number) {
+function bindFixtureGithubIssue(db: Database.Database, issueNumber: number, workItemId = WORK_ITEM_ID) {
   db.prepare(
     `INSERT INTO external_work_refs (
        project_id, work_item_id, provider, owner, repo, issue_number, projection_state,
@@ -782,7 +789,24 @@ function bindFixtureGithubIssue(db: Database.Database, issueNumber: number) {
        observed_external_revision, observed_external_digest, last_idempotency_key,
        last_request_digest, created_at_ms, updated_at_ms
      ) VALUES (?, ?, 'github', ?, ?, ?, 'current', 2, 2, ?, 'fixture', ?, 'fixture-ref', ?, 1, 1)`,
-  ).run(PROJECT_ID, WORK_ITEM_ID, GITHUB_OWNER, GITHUB_REPO, issueNumber, sha256("fixture-desired"), sha256("fixture-observed"), sha256("fixture-request"));
+  ).run(PROJECT_ID, workItemId, GITHUB_OWNER, GITHUB_REPO, issueNumber, sha256("fixture-desired"), sha256("fixture-observed"), sha256("fixture-request"));
+}
+
+function installStartableQueueFixture(issueNumber: number) {
+  const bin = mkdtempSync(join(tmpdir(), "bb-collab-role-queue-"));
+  const gh = join(bin, "gh");
+  const issue = JSON.stringify({ number: issueNumber, labels: [{ name: "queue:startable" }] });
+  writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "api" ]; then printf '%s\\n' '[[${issue}]]'; else printf '%s\\n' '[${issue}]'; fi
+`);
+  chmodSync(gh, 0o755);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${bin}:${originalPath ?? ""}`;
+  return () => {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    rmSync(bin, { recursive: true, force: true });
+  };
 }
 
 function insertFixtureAssignment(db: Database.Database, fenceToken: string, options: {
@@ -1838,6 +1862,40 @@ function activateReviewer(db: Database.Database, fenceToken: string) {
   });
 }
 
+function activateScopedRole(db: Database.Database, fenceToken: string, roleId: "worker", slug: string) {
+  const roleContext = {
+    threadId: `thread-${slug}`,
+    requestEventId: `event-${slug}-request`,
+    requestEventSeq: 1,
+    completionEventId: `event-${slug}-completion`,
+    completionEventSeq: 4,
+  };
+  const facts = () => roleReader((input) => {
+    input.thread.id = roleContext.threadId;
+    input.thread.environmentId = `environment-${slug}`;
+    input.environment.id = `environment-${slug}`;
+    input.events[0]!.id = roleContext.requestEventId;
+    input.events[3]!.id = roleContext.completionEventId;
+  });
+  expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+    idempotencyKey: `qualification-${slug}`,
+    repoTargetId: TARGET_ID,
+    roleId,
+    roleRequirementId: "worker-v1",
+    qualificationId: `qualification-${slug}`,
+    roleContext,
+  }), null, facts()).outcome).toBe("OK");
+  expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+    idempotencyKey: `succession-${slug}`,
+    repoTargetId: TARGET_ID,
+    roleId,
+    roleRequirementId: "worker-v1",
+    qualificationId: `qualification-${slug}`,
+    roleContext,
+  }), null, facts()).outcome).toBe("OK");
+  return roleContext.threadId;
+}
+
 function advanceOrchestrator(db: Database.Database, fenceToken: string): string {
   const roleContext = {
     threadId: "thread-orchestrator-successor",
@@ -2828,49 +2886,459 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     }));
   });
 
-  it("waits for a wrongful-idle target to become idle and names its canonical startable WorkItem", async () => {
+  it("populates /lanes from the current canonical WorkItem attempt and native thread", async () => {
     const fixture = await fleetWatchdogFixture(0);
-    let artifact = "before";
-    fixture.host.harness.sdk.stub("environments.pullRequest", (async () => artifact === "before"
-      ? { outcome: "absent" }
-      : { outcome: "available", pullRequest: { updatedAt: artifact } }) as never);
-    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
-      id: threadId,
-      projectId: PROJECT_ID,
-      status: "idle",
-      environmentId: `environment-${threadId}`,
-      updatedAt: 0,
-    })) as never);
-    let releaseIdle!: () => void;
-    const idle = new Promise<void>((resolve) => { releaseIdle = resolve; });
-    fixture.host.harness.sdk.stub("threads.wait", (async () => { await idle; return { matched: true }; }) as never);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+    fixture.addNativeLane("thread-work-item-1", "active");
 
-    expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
-    artifact = "after";
-    const cycle = fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID]);
-    await vi.waitFor(() => expect(
-      fixture.host.harness.inspection.sdk.callsTo("threads.wait").length + fixture.host.harness.inspection.sdk.callsTo("threads.send").length,
-    ).toBeGreaterThan(0));
-    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
-    releaseIdle();
-    await expect(cycle).resolves.toMatchObject({ exitCode: 0 });
-    expect(fixture.host.harness.inspection.sdk.callsTo("threads.wait").length).toBeGreaterThan(0);
-    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual(expect.arrayContaining([[
-      expect.objectContaining({
-        threadId: fixture.orchestratorThreadId,
-        input: [expect.objectContaining({
-          text: `Wrongful idle: queue head ${WORK_ITEM_ID} is startable. Inspect the queue and act or record the blocker.`,
-        })],
-      }),
-    ]]));
-    artifact = "third";
-    await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID]);
-    const sends = fixture.host.harness.inspection.sdk.callsTo("threads.send");
-    expect(sends).toHaveLength(2);
-    expect(sends.map(([input]) => (input as { threadId: string }).threadId)).toEqual(expect.arrayContaining([
-      fixture.orchestratorThreadId,
-      fixture.directorThreadId,
-    ]));
+    const expected = expect.objectContaining({
+      projectId: PROJECT_ID,
+      laneId: "lane-work-item-1",
+      assignmentId: null,
+      assignmentKind: "write",
+      workItemId: WORK_ITEM_ID,
+      threadId: "thread-work-item-1",
+      executionAttemptId: expect.any(String),
+      attemptState: "running",
+      workerStatus: "active",
+      tone: "running",
+      queueState: "running",
+    });
+    await expect(fixture.host.harness.callRpc("lanes", {})).resolves.toEqual([expected]);
+    const response = await fixture.host.harness.fetchHttp("GET", "/lanes");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual([expected]);
+  });
+
+  it("preserves a current prepared null-thread lane and visibly degrades a malformed running one", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+      workAttempt: { laneId: "lane-prepared", assignmentKind: "write" },
+    }))).toMatchObject({ outcome: "OK" });
+
+    await expect(fixture.host.harness.callRpc("lanes", {})).resolves.toEqual([
+      expect.objectContaining({ assignmentId: null, laneId: "lane-prepared", threadId: null, attemptState: "prepared", workerStatus: null, tone: "default" }),
+    ]);
+    fixture.db.prepare("UPDATE execution_attempts SET state = 'running' WHERE origin = 'work_item' AND work_item_id = ?").run(WORK_ITEM_ID);
+    await expect(fixture.host.harness.callRpc("lanes", {})).resolves.toEqual([
+      expect.objectContaining({ assignmentId: null, laneId: "lane-prepared", threadId: null, attemptState: "running", workerStatus: null, tone: "error" }),
+    ]);
+  });
+
+  it.each(["terminal", "foreign", "historical", "archived", "unusable-holder"] as const)("excludes a %s WorkItem lane from both population surfaces", async (kind) => {
+    const fixture = await fleetWatchdogFixture(0);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+    if (kind === "foreign") {
+      fixture.host.harness.sdk.stub("threads.list", (async () => [makeThreadResponse({
+        id: "thread-work-item-1",
+        projectId: FOREIGN_PROJECT_ID,
+        parentThreadId: fixture.orchestratorThreadId,
+        status: "active",
+      })]) as never);
+    } else if (kind === "unusable-holder") {
+      fixture.host.harness.sdk.stub("threads.list", (async () => [
+        makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active" }),
+        makeThreadResponse({ id: fixture.orchestratorThreadId, projectId: PROJECT_ID, status: "idle", archivedAt: 1 }),
+      ]) as never);
+    } else {
+      fixture.addNativeLane("thread-work-item-1", "active", kind === "historical" ? "retired-holder" : fixture.orchestratorThreadId);
+      if (kind === "archived") fixture.archiveNativeLane("thread-work-item-1");
+      if (kind === "terminal") {
+        expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "cancelled", 3))).toMatchObject({ outcome: "OK" });
+      }
+    }
+
+    await expect(fixture.host.harness.callRpc("lanes", {})).resolves.toEqual([]);
+    const response = await fixture.host.harness.fetchHttp("GET", "/lanes");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual([]);
+  });
+
+  it("fails closed visibly when current native lane evidence is unreadable or ambiguous", async () => {
+    const unreadable = await fleetWatchdogFixture(0);
+    expect(applyWithFixtureReceipt(unreadable.db, transitionRequest(unreadable.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+    unreadable.host.harness.sdk.stub("threads.list", (async () => { throw new Error("native inventory failed"); }) as never);
+    await expect(unreadable.host.harness.callRpc("lanes", {})).rejects.toThrow("native inventory failed");
+    expect(unreadable.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringContaining("reason=native-lane-inventory-unreadable"),
+    }));
+
+    const ambiguous = await fleetWatchdogFixture(0);
+    expect(applyWithFixtureReceipt(ambiguous.db, transitionRequest(ambiguous.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+    const duplicate = makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: ambiguous.orchestratorThreadId, status: "active" });
+    ambiguous.host.harness.sdk.stub("threads.list", (async () => [duplicate, duplicate]) as never);
+    await expect(ambiguous.host.harness.callRpc("lanes", {})).rejects.toThrow("native lane identity is ambiguous");
+    expect(ambiguous.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: expect.stringContaining("reason=native-lane-ambiguous"),
+    }));
+  });
+
+  it("keeps a blocked canonical control silent and wakes only for an exact queue:startable binding", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-role-queue-control-"));
+    const gh = join(bin, "gh");
+    const mode = join(bin, "mode");
+    const calls = join(bin, "calls");
+    writeFileSync(mode, "blocked\n");
+    writeFileSync(gh, `#!/bin/sh
+printf 'call\\n' >> '${calls}'
+read mode < '${mode}'
+if [ "$1" = "api" ]; then
+  if [ "$mode" = "blocked" ]; then printf '%s\\n' '[[{"number":141,"labels":[{"name":"queue:blocked"}]}]]'; else printf '%s\\n' '[[{"number":141,"labels":[{"name":"queue:blocked"}]},{"number":205,"labels":[{"name":"queue:startable"}]}]]'; fi
+else
+  if [ "$mode" = "blocked" ]; then printf '%s\\n' '[]'; else printf '%s\\n' '[{"number":205,"labels":[{"name":"queue:startable"}]}]'; fi
+fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    let service: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "cancelled", 2))).toMatchObject({ outcome: "OK" });
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "create-wi-gh-141",
+        workItem: { workItemId: "wi-gh-141", title: "Preserved blocked control", body: "Must remain blocked." },
+      }))).toMatchObject({ outcome: "OK" });
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, {
+        idempotencyKey: "ready-wi-gh-141",
+        workItemId: "wi-gh-141",
+      }))).toMatchObject({ outcome: "OK" });
+      bindFixtureGithubIssue(fixture.db, 141, "wi-gh-141");
+      fixture.host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
+
+      service = fixture.host.harness.runService("lane-watcher");
+      await vi.waitFor(() => expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(2));
+      const initialCalls = readFileSync(calls, "utf8");
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      expect(readFileSync(calls, "utf8")).toBe(initialCalls);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      clock.mockReturnValue(600_000);
+      await vi.waitFor(() => expect(readFileSync(calls, "utf8").trim().split("\n").length).toBeGreaterThanOrEqual(3), { timeout: 3_000 });
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE work_item_id = 'wi-gh-141'").get()).toEqual({ lifecycle_state: "ready" });
+
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "create-wi-gh-205",
+        workItem: { workItemId: "wi-gh-205", title: "Real startable work", body: "Exact positive control." },
+      }))).toMatchObject({ outcome: "OK" });
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, {
+        idempotencyKey: "ready-wi-gh-205",
+        workItemId: "wi-gh-205",
+      }))).toMatchObject({ outcome: "OK" });
+      bindFixtureGithubIssue(fixture.db, 205, "wi-gh-205");
+      writeFileSync(mode, "startable\n");
+      clock.mockReturnValue(660_000);
+      const orchestrator = readRoleHolderStates(fixture.db).find((holder) => holder.role_id === "project-orchestrator")!;
+      const idleKey = roleIdleKey(orchestrator, "wi-gh-205");
+      await vi.waitFor(async () => expect(await fixture.host.bb.storage.kv.get<Record<string, RoleIdleRecord>>("lane-watcher.role-idle")).toHaveProperty(idleKey));
+
+      clock.mockReturnValue(1_260_000);
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toContainEqual([
+        expect.objectContaining({
+          threadId: fixture.orchestratorThreadId,
+          input: [expect.objectContaining({ text: "Wrongful idle: queue head wi-gh-205 is startable. Inspect the queue and act or record the blocker." })],
+        }),
+      ]), { timeout: 3_000 });
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE work_item_id = 'wi-gh-141'").get()).toEqual({ lifecycle_state: "ready" });
+    } finally {
+      service?.controller.abort();
+      await service?.done;
+      clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("wakes only the project orchestrator from the complete current-role matrix", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    const restoreGithub = installStartableQueueFixture(205);
+    let service: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true);
+      bindFixtureGithubIssue(fixture.db, 205);
+      activateReviewer(fixture.db, fixture.fenceToken);
+      const workerThreadId = activateScopedRole(fixture.db, fixture.fenceToken, "worker", "worker-role-matrix");
+      fixture.host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
+      expect(readRoleHolderStates(fixture.db).map((holder) => holder.role_id).sort()).toEqual([
+        "director", "independent-reviewer", "project-orchestrator", "worker",
+      ]);
+
+      service = fixture.host.harness.runService("lane-watcher");
+      const orchestrator = readRoleHolderStates(fixture.db).find((holder) => holder.role_id === "project-orchestrator")!;
+      await vi.waitFor(async () => expect(await fixture.host.bb.storage.kv.get<Record<string, RoleIdleRecord>>("lane-watcher.role-idle"))
+        .toHaveProperty(roleIdleKey(orchestrator, WORK_ITEM_ID)));
+      expect(Object.keys(await fixture.host.bb.storage.kv.get<Record<string, RoleIdleRecord>>("lane-watcher.role-idle") ?? {}))
+        .toEqual([roleIdleKey(orchestrator, WORK_ITEM_ID)]);
+      clock.mockReturnValue(ROLE_QUEUE_IDLE_THRESHOLD_MS);
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([request]) =>
+        (request as { input: Array<{ text: string }> }).input[0]?.text.startsWith("Wrongful idle:"),
+      )).toEqual([[
+        expect.objectContaining({ threadId: fixture.orchestratorThreadId }),
+      ]]), { timeout: 3_000 });
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").some(([request]) =>
+        [fixture.directorThreadId, "thread-reviewer-successor", workerThreadId].includes((request as { threadId: string }).threadId)
+        && (request as { input: Array<{ text: string }> }).input[0]?.text.startsWith("Wrongful idle:"),
+      )).toBe(false);
+    } finally {
+      service?.controller.abort();
+      await service?.done;
+      restoreGithub();
+      clock.mockRestore();
+    }
+  });
+
+  it("selects issue one as the canonical role head from a complete 1001-issue inventory", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-role-queue-complete-"));
+    const gh = join(bin, "gh");
+    const inventory = join(bin, "inventory.json");
+    const issues = Array.from({ length: 1001 }, (_, index) => ({ number: index + 1, labels: [{ name: "queue:startable" }] }));
+    writeFileSync(inventory, JSON.stringify(Array.from({ length: 11 }, (_, index) => issues.slice(index * 100, (index + 1) * 100))));
+    writeFileSync(gh, `#!/bin/sh
+exec /bin/cat '${inventory}'
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    let service: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true);
+      bindFixtureGithubIssue(fixture.db, 1);
+      fixture.host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
+      service = fixture.host.harness.runService("lane-watcher");
+      const orchestrator = readRoleHolderStates(fixture.db).find((holder) => holder.role_id === "project-orchestrator")!;
+      await vi.waitFor(async () => expect(await fixture.host.bb.storage.kv.get<Record<string, RoleIdleRecord>>("lane-watcher.role-idle"))
+        .toHaveProperty(roleIdleKey(orchestrator, WORK_ITEM_ID)));
+      clock.mockReturnValue(ROLE_QUEUE_IDLE_THRESHOLD_MS);
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toContainEqual([
+        expect.objectContaining({
+          threadId: fixture.orchestratorThreadId,
+          input: [expect.objectContaining({ text: `Wrongful idle: queue head ${WORK_ITEM_ID} is startable. Inspect the queue and act or record the blocker.` })],
+        }),
+      ]), { timeout: 3_000 });
+    } finally {
+      service?.controller.abort();
+      await service?.done;
+      clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds accepted role-queue fanout and the complete wake decision below two minutes", () => {
+    expect(ROLE_QUEUE_MAX_REPOSITORIES).toBe(4);
+    expect(ROLE_QUEUE_REFRESH_TIMEOUT_MS).toBe(8_000);
+    expect(ROLE_QUEUE_CACHE_MS).toBe(20_000);
+    expect(ROLE_QUEUE_IDLE_THRESHOLD_MS).toBe(30_000);
+    expect(ROLE_QUEUE_OBSERVATION_MS).toBe(1_000);
+    expect(ROLE_QUEUE_DECISION_BOUND_MS).toBe(
+      ROLE_QUEUE_CACHE_MS + (2 * ROLE_QUEUE_REFRESH_TIMEOUT_MS) + (2 * ROLE_QUEUE_OBSERVATION_MS)
+      + ROLE_QUEUE_IDLE_THRESHOLD_MS + 30_000,
+    );
+    expect(ROLE_QUEUE_DECISION_BOUND_MS).toBe(98_000);
+    expect(ROLE_QUEUE_DECISION_BOUND_MS).toBeLessThan(120_000);
+    expect(readFileSync(join(PLUGIN_ROOT, "server.ts"), "utf8")).toContain("timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS");
+  });
+
+  it("accepts exactly the repository ceiling and rejects one target above it without GitHub work", async () => {
+    const installTargets = (db: Database.Database, count: number) => {
+      for (let index = 2; index <= count; index += 1) {
+        db.prepare(
+          `INSERT INTO repository_targets
+           (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest)
+           VALUES (?, ?, 1, 'source-main', 'host-main', ?, ?, 'main', ?)`,
+        ).run(PROJECT_ID, `target-${index}`, `/workspace/target-${index}`, `https://github.com/example/project-${index}.git`, `digest-${index}`);
+      }
+    };
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-role-queue-fanout-"));
+    const gh = join(bin, "gh");
+    const calls = join(bin, "calls");
+    writeFileSync(gh, `#!/bin/sh
+printf 'call\n' >> '${calls}'
+printf '%s\n' '[[{"number":205,"labels":[{"name":"queue:startable"}]}]]'
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    let acceptedService: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
+    let rejectedService: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
+    try {
+      const accepted = await fleetWatchdogFixture(0, true);
+      installTargets(accepted.db, ROLE_QUEUE_MAX_REPOSITORIES);
+      bindFixtureGithubIssue(accepted.db, 205);
+      acceptedService = accepted.host.harness.runService("lane-watcher");
+      await vi.waitFor(() => expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(ROLE_QUEUE_MAX_REPOSITORIES * 2));
+      acceptedService.controller.abort();
+      await acceptedService.done;
+      acceptedService = undefined;
+
+      writeFileSync(calls, "");
+      const rejected = await fleetWatchdogFixture(0, true);
+      installTargets(rejected.db, ROLE_QUEUE_MAX_REPOSITORIES + 1);
+      rejectedService = rejected.host.harness.runService("lane-watcher");
+      await vi.waitFor(() => expect(rejected.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: `role queue coverage=degraded project=${PROJECT_ID} reason=configured-repository-ceiling:5>4`,
+      })));
+      expect(existsSync(calls) ? readFileSync(calls, "utf8") : "").toBe("");
+      expect(rejected.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    } finally {
+      acceptedService?.controller.abort();
+      await acceptedService?.done;
+      rejectedService?.controller.abort();
+      await rejectedService?.done;
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when canonical config moves during an in-flight queue refresh", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-role-queue-config-move-"));
+    const gh = join(bin, "gh");
+    const started = join(bin, "started");
+    const release = join(bin, "release");
+    writeFileSync(gh, `#!/bin/sh
+printf 'started\n' >> '${started}'
+while [ ! -f '${release}' ]; do sleep 0.05; done
+printf '%s\n' '[[{"number":205,"labels":[{"name":"queue:startable"}]}]]'
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    let service: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true);
+      bindFixtureGithubIssue(fixture.db, 205);
+      service = fixture.host.harness.runService("lane-watcher");
+      await vi.waitFor(() => expect(readFileSync(started, "utf8").trim().split("\n").length).toBeGreaterThanOrEqual(1));
+      fixture.db.prepare(
+        `INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms)
+         SELECT project_id, 2, canonical_config_json, config_digest, created_at_ms FROM project_config_revisions
+         WHERE project_id = ? AND config_revision = 1`,
+      ).run(PROJECT_ID);
+      fixture.db.prepare(
+        `INSERT INTO repository_targets
+         (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest)
+         SELECT project_id, repo_target_id, 2, source_id, host_id, path, 'https://github.com/example/moved.git', default_branch, 'moved-digest'
+         FROM repository_targets WHERE project_id = ? AND config_revision = 1`,
+      ).run(PROJECT_ID);
+      fixture.db.prepare("UPDATE project_config_heads SET config_revision = 2 WHERE project_id = ?").run(PROJECT_ID);
+      writeFileSync(release, "go\n");
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: `role queue coverage=degraded project=${PROJECT_ID} reason=project-config-moved-during-refresh`,
+      })));
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    } finally {
+      service?.controller.abort();
+      await service?.done;
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a cached head when fresh pre-steer evidence has moved", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-role-queue-head-move-"));
+    const gh = join(bin, "gh");
+    const calls = join(bin, "calls");
+    writeFileSync(gh, `#!/bin/sh
+printf 'call\n' >> '${calls}'
+count=$(/usr/bin/wc -l < '${calls}')
+if [ "$count" -le 3 ]; then issue=205; else issue=206; fi
+printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    let service: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true);
+      bindFixtureGithubIssue(fixture.db, 205);
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+        idempotencyKey: "create-refreshed-head",
+        workItem: { workItemId: "wi-gh-206", title: "Moved head", body: "Fresh revalidation control." },
+      }))).toMatchObject({ outcome: "OK" });
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, {
+        idempotencyKey: "ready-refreshed-head",
+        workItemId: "wi-gh-206",
+      }))).toMatchObject({ outcome: "OK" });
+      bindFixtureGithubIssue(fixture.db, 206, "wi-gh-206");
+      fixture.host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
+      service = fixture.host.harness.runService("lane-watcher");
+      const orchestrator = readRoleHolderStates(fixture.db).find((holder) => holder.role_id === "project-orchestrator")!;
+      await vi.waitFor(async () => expect(await fixture.host.bb.storage.kv.get<Record<string, RoleIdleRecord>>("lane-watcher.role-idle"))
+        .toHaveProperty(roleIdleKey(orchestrator, WORK_ITEM_ID)));
+      clock.mockReturnValue(ROLE_QUEUE_IDLE_THRESHOLD_MS);
+      await vi.waitFor(() => expect(readFileSync(calls, "utf8").trim().split("\n").length).toBeGreaterThanOrEqual(4), { timeout: 3_000 });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([request]) =>
+        (request as { input: Array<{ text: string }> }).input[0]?.text.startsWith("Wrongful idle:"),
+      )).toHaveLength(0);
+    } finally {
+      service?.controller.abort();
+      await service?.done;
+      clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("waits for a wrongful-idle target to become idle and names its canonical startable WorkItem", async () => {
+    const restoreGithub = installStartableQueueFixture(205);
+    try {
+      const fixture = await fleetWatchdogFixture(0, true);
+      bindFixtureGithubIssue(fixture.db, 205);
+      let artifact = "before";
+      fixture.host.harness.sdk.stub("environments.pullRequest", (async () => artifact === "before"
+        ? { outcome: "absent" }
+        : { outcome: "available", pullRequest: { updatedAt: artifact } }) as never);
+      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+        id: threadId,
+        projectId: PROJECT_ID,
+        status: "idle",
+        environmentId: `environment-${threadId}`,
+        updatedAt: 0,
+      })) as never);
+      let releaseIdle!: () => void;
+      const idle = new Promise<void>((resolve) => { releaseIdle = resolve; });
+      fixture.host.harness.sdk.stub("threads.wait", (async () => { await idle; return { matched: true }; }) as never);
+
+      expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
+      artifact = "after";
+      const cycle = fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID]);
+      await vi.waitFor(() => expect(
+        fixture.host.harness.inspection.sdk.callsTo("threads.wait").length + fixture.host.harness.inspection.sdk.callsTo("threads.send").length,
+      ).toBeGreaterThan(0));
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      releaseIdle();
+      await expect(cycle).resolves.toMatchObject({ exitCode: 0 });
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.wait").length).toBeGreaterThan(0);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual(expect.arrayContaining([[
+        expect.objectContaining({
+          threadId: fixture.orchestratorThreadId,
+          input: [expect.objectContaining({
+            text: `Wrongful idle: queue head ${WORK_ITEM_ID} is startable. Inspect the queue and act or record the blocker.`,
+          })],
+        }),
+      ]]));
+      artifact = "third";
+      await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID]);
+      const sends = fixture.host.harness.inspection.sdk.callsTo("threads.send");
+      expect(sends).toHaveLength(1);
+      expect(sends.map(([input]) => (input as { threadId: string }).threadId)).toEqual([fixture.orchestratorThreadId]);
+    } finally {
+      restoreGithub();
+    }
   });
 
   it("does not fire wrongful-idle when canonical WorkItems are only in progress", async () => {
@@ -2895,42 +3363,52 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
 
     expect(JSON.parse(cycle.stdout)).toMatchObject({ attempted: 0, verified: 0 });
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+      level: "warn",
+      message: "role queue coverage=degraded project=proj_test reason=configured-repositories-unreadable",
+    }));
   });
 
   it("records a wrongful-idle timeout and retries its unchanged artifact later", async () => {
-    const fixture = await fleetWatchdogFixture(0);
-    let artifact = "before";
-    fixture.host.harness.sdk.stub("environments.pullRequest", (async () => artifact === "before"
-      ? { outcome: "absent" }
-      : { outcome: "available", pullRequest: { updatedAt: artifact } }) as never);
-    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
-      id: threadId,
-      projectId: PROJECT_ID,
-      status: "idle",
-      environmentId: `environment-${threadId}`,
-      updatedAt: 0,
-    })) as never);
-    let timeout = true;
-    fixture.host.harness.sdk.stub("threads.wait", (async () => {
-      if (timeout) throw new Error("idle wait timed out");
-      return { matched: true };
-    }) as never);
+    const restoreGithub = installStartableQueueFixture(205);
+    try {
+      const fixture = await fleetWatchdogFixture(0, true);
+      bindFixtureGithubIssue(fixture.db, 205);
+      let artifact = "before";
+      fixture.host.harness.sdk.stub("environments.pullRequest", (async () => artifact === "before"
+        ? { outcome: "absent" }
+        : { outcome: "available", pullRequest: { updatedAt: artifact } }) as never);
+      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+        id: threadId,
+        projectId: PROJECT_ID,
+        status: "idle",
+        environmentId: `environment-${threadId}`,
+        updatedAt: 0,
+      })) as never);
+      let timeout = true;
+      fixture.host.harness.sdk.stub("threads.wait", (async () => {
+        if (timeout) throw new Error("idle wait timed out");
+        return { matched: true };
+      }) as never);
 
-    expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
-    const baseline = await fixture.host.bb.storage.kv.get("stall-guard.artifacts");
-    artifact = "after";
-    expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
-    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
-    expect(await fixture.host.bb.storage.kv.get("stall-guard.artifacts")).toEqual(baseline);
-    expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
-      level: "warn",
-      message: expect.stringContaining("idle-wait=failed error=Error: idle wait timed out"),
-    }));
+      expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
+      const baseline = await fixture.host.bb.storage.kv.get("stall-guard.artifacts");
+      artifact = "after";
+      expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(await fixture.host.bb.storage.kv.get("stall-guard.artifacts")).toEqual(baseline);
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining("idle-wait=failed error=Error: idle wait timed out"),
+      }));
 
-    timeout = false;
-    expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
-    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").length).toBeGreaterThan(0);
-    expect(await fixture.host.bb.storage.kv.get("stall-guard.artifacts")).not.toEqual(baseline);
+      timeout = false;
+      expect((await fixture.host.harness.runCli(["stall-guard", "--cycle", "--project", PROJECT_ID])).exitCode).toBe(0);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").length).toBeGreaterThan(0);
+      expect(await fixture.host.bb.storage.kv.get("stall-guard.artifacts")).not.toEqual(baseline);
+    } finally {
+      restoreGithub();
+    }
   });
 
   it("surfaces a platform-parented stranded lane without recovering it and suppresses unchanged repeats for one hour", async () => {
@@ -3882,6 +4360,16 @@ fi
         workAttempt: { laneId: "lane-review-successor", threadId: "thread-review-successor", assignmentKind: "review", reviewPrNumber: 507, reviewPrHeadSha: CANDIDATE_SHA },
       }))).toMatchObject({ outcome: "OK" });
       fixture.addNativeLane("thread-review-successor", "idle");
+      await expect(fixture.host.harness.callRpc("lanes", {})).resolves.toEqual([
+        expect.objectContaining({
+          assignmentId: null,
+          assignmentKind: "review",
+          laneId: "lane-review-successor",
+          threadId: "thread-review-successor",
+          attemptState: "running",
+          workerStatus: "idle",
+        }),
+      ]);
       await fixture.host.harness.runSchedule("fleet-watchdog");
 
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
@@ -4035,7 +4523,7 @@ fi
       ]);
       const persisted = await fixture.host.bb.storage.kv.get<Record<string, { lastFleetWakeAtMs: number | null; lastStartableQueueWakeAtMs: number | null }>>("fleet-watchdog.role-idle");
       expect(Object.values(persisted ?? {})).toContainEqual(expect.objectContaining({ lastFleetWakeAtMs: null, lastStartableQueueWakeAtMs: expect.any(Number) }));
-      expect(readFileSync(argsLog, "utf8")).toBe("issue\nlist\n--repo\nexample/project\n--label\nqueue:startable\n--state\nopen\n--json\nnumber,labels\n--limit\n1000\napi\nrepos/example/project/issues\n--paginate\n--slurp\n--method\nGET\n-f\nstate=open\n-f\nper_page=100\n".repeat(4));
+      expect(readFileSync(argsLog, "utf8")).toBe("api\nrepos/example/project/issues\n--paginate\n--slurp\n--method\nGET\n-f\nstate=open\n-f\nper_page=100\n".repeat(4));
     } finally {
       clock.mockRestore();
       if (originalPath === undefined) delete process.env.PATH;
@@ -4171,7 +4659,7 @@ fi
 const blocked = Array.from({ length: 1000 }, (_, index) => ({ number: index + 2, labels: [{ name: "queue:blocked" }] }));
 const startable = { number: 1, labels: [{ name: "queue:startable" }] };
 const args = process.argv.slice(2);
-if (args[0] === "api") console.log(JSON.stringify([blocked, [startable]]));
+if (args[0] === "api") console.log(JSON.stringify([...Array.from({ length: 10 }, (_, index) => blocked.slice(index * 100, (index + 1) * 100)), [startable]]));
 else if (args.includes("--label")) console.log(JSON.stringify([startable]));
 else console.log(JSON.stringify(blocked));
 `);
@@ -4746,7 +5234,7 @@ exit 1
       clock.mockReturnValue(110);
       const service = fixture.host.harness.runService("lane-watcher");
       try {
-        await vi.waitFor(() => expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(2));
+        await vi.waitFor(() => expect(readFileSync(calls, "utf8").trim().split("\n").length).toBeGreaterThanOrEqual(2));
         await vi.waitFor(() => expect((fixture.db.prepare(
           "SELECT MAX(last_confirmed_at_ms) AS at_ms FROM lane_capacity_intervals",
         ).get() as { at_ms: number }).at_ms).toBe(110));
