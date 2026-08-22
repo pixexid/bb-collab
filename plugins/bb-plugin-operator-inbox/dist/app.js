@@ -220,7 +220,7 @@ function severityLabel(severity) {
   return severity === "needs-decision" ? "Needs decision" : severity[0].toUpperCase() + severity.slice(1);
 }
 function senderLabel(message) {
-  return asText(message.senderTitle) ?? asText(message.senderThreadId) ?? "Sender unavailable";
+  return asText(message.senderTitle) ?? "Sender unavailable";
 }
 function deliveryLabel(message) {
   if (message.repliedAtMs != null) return "Delivered";
@@ -369,10 +369,7 @@ function InboxPanel(_props) {
         /* @__PURE__ */ jsx("input", { type: "checkbox", checked: showArchived, onChange: (event) => setFiltersAndPersist({ projectId, showArchived: event.target.checked }) }),
         "Show archived"
       ] }),
-      /* @__PURE__ */ jsxs("button", { type: "button", "aria-label": "Refresh inbox", title: "Refresh inbox", className: "min-h-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: refresh, disabled: loading, children: [
-        /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\u21BB" }),
-        /* @__PURE__ */ jsx("span", { className: "ml-1", children: "Refresh" })
-      ] })
+      /* @__PURE__ */ jsx("button", { type: "button", "aria-label": "Refresh inbox", title: "Refresh inbox", className: "min-h-10 min-w-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: refresh, disabled: loading, children: /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\u21BB" }) })
     ] }),
     errors.map((loadError) => /* @__PURE__ */ jsxs("p", { role: "alert", className: "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive", children: [
       "Refresh failed: ",
@@ -436,33 +433,30 @@ function InboxPanel(_props) {
         }) })
       ] }),
       selectedMessage ? /* @__PURE__ */ jsxs("article", { "aria-labelledby": "selected-message-heading", className: "min-w-0 rounded-lg border border-border bg-background", children: [
-        /* @__PURE__ */ jsxs("header", { className: "grid gap-3 border-b border-border bg-muted/10 p-4", children: [
-          /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-start justify-between gap-3", children: [
-            /* @__PURE__ */ jsxs("div", { className: "min-w-0", children: [
-              /* @__PURE__ */ jsx("p", { className: "text-xs font-medium uppercase tracking-wide text-muted-foreground", children: "Selected message" }),
-              /* @__PURE__ */ jsx("h2", { id: "selected-message-heading", className: "mt-1 break-words text-lg font-semibold", children: selectedSenderId ? /* @__PURE__ */ jsx("a", { href: "#", className: "underline decoration-muted-foreground/50 underline-offset-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary", "aria-label": `Open sender session ${senderLabel(selectedMessage)}`, onClick: (event) => {
+        /* @__PURE__ */ jsx("header", { className: "grid gap-3 border-b border-border bg-muted/10 p-4", children: /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-start justify-between gap-3", children: [
+          /* @__PURE__ */ jsxs("div", { className: "min-w-0", children: [
+            /* @__PURE__ */ jsx("p", { className: "text-xs font-medium uppercase tracking-wide text-muted-foreground", children: "Selected message" }),
+            /* @__PURE__ */ jsx("h2", { id: "selected-message-heading", className: "mt-1 text-lg font-semibold", children: "Message" }),
+            /* @__PURE__ */ jsxs("p", { className: "mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground", children: [
+              /* @__PURE__ */ jsx("span", { children: "From" }),
+              selectedSenderId && asText(selectedMessage.senderTitle) ? /* @__PURE__ */ jsx("a", { href: "#", className: "min-w-0 break-words font-medium text-foreground underline decoration-muted-foreground/50 underline-offset-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary", "aria-label": `Open sender session ${selectedMessage.senderTitle}`, onClick: (event) => {
                 event.preventDefault();
                 navigate.toThread(selectedSenderId);
-              }, children: senderLabel(selectedMessage) }) : senderLabel(selectedMessage) }),
-              /* @__PURE__ */ jsxs("p", { className: "mt-1 break-words text-sm text-muted-foreground", children: [
-                selectedProjectLabel,
-                " \xB7 ",
-                severityLabel(selectedMessage.severity),
-                " \xB7 ",
-                /* @__PURE__ */ jsx("time", { dateTime: new Date(selectedMessage.createdAtMs).toISOString(), title: formatTime(selectedMessage.createdAtMs), "aria-label": `Received ${formatTime(selectedMessage.createdAtMs)}`, children: formatRelativeTime(selectedMessage.createdAtMs) })
-              ] })
-            ] }),
-            /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap gap-2 text-xs", children: [
-              /* @__PURE__ */ jsx("span", { className: `rounded-full px-2.5 py-1 font-medium ${selectedMessage.readAtMs === null ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground"}`, children: selectedMessage.readAtMs === null ? "Unread" : "Read" }),
-              selectedMessage.archivedAtMs != null ? /* @__PURE__ */ jsx("span", { className: "rounded-full bg-muted px-2.5 py-1 font-medium text-muted-foreground", children: "Archived" }) : null,
-              deliveryLabel(selectedMessage) ? /* @__PURE__ */ jsx("span", { className: `rounded-full px-2.5 py-1 font-medium ${deliveryLabel(selectedMessage) === "Delivery failed" ? "bg-destructive/10 text-destructive" : "bg-muted text-muted-foreground"}`, children: deliveryLabel(selectedMessage) }) : null
+              }, children: selectedMessage.senderTitle }) : /* @__PURE__ */ jsx("span", { children: "Sender unavailable" }),
+              /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
+              /* @__PURE__ */ jsx("span", { children: selectedProjectLabel }),
+              /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
+              /* @__PURE__ */ jsx("span", { children: severityLabel(selectedMessage.severity) }),
+              /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
+              /* @__PURE__ */ jsx("time", { dateTime: new Date(selectedMessage.createdAtMs).toISOString(), title: formatTime(selectedMessage.createdAtMs), "aria-label": `Received ${formatTime(selectedMessage.createdAtMs)}`, children: formatRelativeTime(selectedMessage.createdAtMs) })
             ] })
           ] }),
-          /* @__PURE__ */ jsx("div", { className: "flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground", children: asText(selectedMessage.senderLaneId) ? /* @__PURE__ */ jsxs("span", { children: [
-            "Lane: ",
-            asText(selectedMessage.senderLaneId)
-          ] }) : null })
-        ] }),
+          /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap gap-2 text-xs", children: [
+            /* @__PURE__ */ jsx("span", { className: `rounded-full px-2.5 py-1 font-medium ${selectedMessage.readAtMs === null ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground"}`, children: selectedMessage.readAtMs === null ? "Unread" : "Read" }),
+            selectedMessage.archivedAtMs != null ? /* @__PURE__ */ jsx("span", { className: "rounded-full bg-muted px-2.5 py-1 font-medium text-muted-foreground", children: "Archived" }) : null,
+            deliveryLabel(selectedMessage) ? /* @__PURE__ */ jsx("span", { className: `rounded-full px-2.5 py-1 font-medium ${deliveryLabel(selectedMessage) === "Delivery failed" ? "bg-destructive/10 text-destructive" : "bg-muted text-muted-foreground"}`, children: deliveryLabel(selectedMessage) }) : null
+          ] })
+        ] }) }),
         /* @__PURE__ */ jsxs("div", { className: "grid gap-5 p-4", children: [
           /* @__PURE__ */ jsxs("section", { "aria-labelledby": "message-body-heading", className: "grid gap-2", children: [
             /* @__PURE__ */ jsx("h3", { id: "message-body-heading", className: "text-xs font-semibold uppercase tracking-wide text-muted-foreground", children: "Message" }),

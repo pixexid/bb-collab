@@ -82,7 +82,7 @@ describe("Operator Inbox app", () => {
     await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a", recipient: "operator", withSenderTitles: true }));
     expect(rendered.getByText("Need an answer")).toBeTruthy();
     expect(rendered.getByText(/Delivery failed: environment deleted/)).toBeTruthy();
-    expect(rendered.getByRole("link", { name: "Open sender session sender-thread" })).toBeTruthy();
+    expect(rendered.getAllByText("Sender unavailable")).toHaveLength(2);
     expect(rendered.getAllByText("Project A").length).toBeGreaterThan(0);
   });
 
@@ -189,7 +189,7 @@ describe("Operator Inbox app", () => {
     expect((rendered.getByLabelText("Project") as HTMLSelectElement).value).toBe("");
   });
 
-  it("shows the compact sender title with lane and exact navigation without the raw id", async () => {
+  it("shows the compact linked sender title with exact navigation without raw ids", async () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
     const rendered = renderSlot(inbox, { subPath: "" }, {
@@ -215,13 +215,13 @@ describe("Operator Inbox app", () => {
 
     const sender = await waitFor(() => rendered.getByRole("link", { name: "Open sender session Inbox drill: URGENT to operator" }));
     expect(sender.textContent).toBe("Inbox drill: URGENT to operator");
-    expect(rendered.getByText(/Lane: lane-one/)).toBeTruthy();
+    expect(rendered.queryByText("lane-one")).toBeNull();
     expect(rendered.queryByText("sender-thread")).toBeNull();
     fireEvent.click(sender);
     expect(rendered.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "sender-thread" });
   });
 
-  it("falls back to the secondary sender id when its live title is unavailable", async () => {
+  it("does not expose a raw sender id when its live title is unavailable", async () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
     const rendered = renderSlot(inbox, { subPath: "" }, {
@@ -245,10 +245,8 @@ describe("Operator Inbox app", () => {
       }]) } as never,
     });
 
-    const sender = await waitFor(() => rendered.getByRole("link", { name: "Open sender session missing-sender-thread" }));
-    expect(sender.textContent).toBe("missing-sender-thread");
-    fireEvent.click(sender);
-    expect(rendered.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "missing-sender-thread" });
+    await waitFor(() => expect(rendered.getAllByText("Sender unavailable")).toHaveLength(2));
+    expect(rendered.queryByText("missing-sender-thread")).toBeNull();
   });
 
   it("keeps the inbox mounted when a sender id has a hostile shape", async () => {
