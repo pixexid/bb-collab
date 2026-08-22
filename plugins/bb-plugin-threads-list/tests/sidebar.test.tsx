@@ -70,6 +70,12 @@ async function registration() {
 
 type ThreadExecution = { model: string; reasoning: string };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((onResolve) => { resolve = onResolve; });
+  return { promise, resolve };
+}
+
 function rpcHandlers(states: Record<string, string> = {}, models: Record<string, ThreadExecution | null> = {}) {
   return {
     lanes: async () => [],
@@ -78,6 +84,7 @@ function rpcHandlers(states: Record<string, string> = {}, models: Record<string,
     sidebarCollapseState: async () => ({ projects: {}, threads: {} }),
     setSidebarCollapse: async (input: { kind: "project" | "thread"; id: string; collapsed: boolean }) => input,
     reorderPinned: async () => [],
+    reorderProjects: async () => [],
     setThreadState: async (input: { threadId: string; state: string | null }) => ({ state: input.state }),
     operatorMessages: async () => ({ outcome: "OK", messages: [] }),
     markOperatorMessageRead: async () => ({}),
@@ -85,7 +92,7 @@ function rpcHandlers(states: Record<string, string> = {}, models: Record<string,
     doctor: async () => ({}) as never,
     export: async () => ({}) as never,
     apply: async () => ({}) as never,
-  } as never;
+  } as unknown as Record<string, (input: unknown) => unknown>;
 }
 
 // #280: the reader answers { outcome, messages }. Cases that only vary the rows
@@ -132,6 +139,15 @@ describe("replacement thread list", () => {
     expect(rendered.getByText("project-a-2")).toBeTruthy();
     expect(rendered.queryByText("project-a-1")).toBeNull();
     expect(rendered.getByRole("button", { name: "Show more (1)" })).toBeTruthy();
+  });
+
+  it("preserves canonical project order when thread encounter order disagrees", async () => {
+    const { groupThreads } = await import("../app");
+    const groups = groupThreads(
+      [project("project-a", "Project A"), project("project-b", "Project B")],
+      [thread("b", "project-b", 2), thread("a", "project-a", 1)],
+    );
+    expect(groups.map(({ project }) => project.id)).toEqual(["project-a", "project-b"]);
   });
 
   it("preserves host order for pinned rows even when updatedAt disagrees", async () => {
@@ -183,6 +199,46 @@ describe("replacement thread list", () => {
     fireEvent.click(rendered.getByRole("button", { name: "Thread actions" }));
     fireEvent.click(rendered.getByRole("menuitem", { name: "Mark read" }));
     expect(rendered.inspection.sidebarActionCalls).toContainEqual({ method: "setRead", threadId: "thread-1", read: true });
+  });
+
+  it("acknowledges a visited thread from host truth and only restores unread for newer activity", async () => {
+    const list = await registration();
+    const unread = { ...thread("thread-1", "project-a", 3), isUnread: true, lastReadAt: 1, latestAttentionAt: 3 };
+    const first = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [unread] },
+      rpc: rpcHandlers(),
+    });
+    expect(first.getByRole("img", { name: "Unread" })).toBeTruthy();
+    fireEvent.click(first.getByRole("link", { name: "thread-1" }));
+    expect(first.inspection.sidebarActionCalls).toContainEqual({ method: "setRead", threadId: "thread-1", read: true });
+
+    cleanup();
+    const read = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [{ ...unread, isUnread: false, lastReadAt: 3 }] },
+      rpc: rpcHandlers(),
+    });
+    expect(read.queryByRole("img", { name: "Unread" })).toBeNull();
+
+    cleanup();
+    const newer = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [{ ...unread, updatedAt: 4, latestAttentionAt: 4, isUnread: true }] },
+      rpc: rpcHandlers(),
+    });
+    expect(newer.getByRole("img", { name: "Unread" })).toBeTruthy();
+  });
+
+  it("acknowledges a split-open visit through the native read action", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [{ ...thread("thread-1", "project-a", 1), isUnread: true }] },
+      rpc: rpcHandlers(),
+    });
+    fireEvent.click(rendered.getByRole("button", { name: "Thread actions" }));
+    fireEvent.click(rendered.getByRole("menuitem", { name: "Open in split" }));
+    expect(rendered.inspection.sidebarActionCalls).toEqual([
+      { method: "open", threadId: "thread-1", options: { split: true } },
+      { method: "setRead", threadId: "thread-1", read: true },
+    ]);
   });
 
   it("renders the row actions as a compact stacked dropdown that closes on Escape", async () => {
@@ -249,8 +305,7 @@ describe("replacement thread list", () => {
       expect(slotOf(kind).querySelector("[data-sidebar-thread-dot]")).toBeTruthy();
       expect(slotOf(kind).querySelector("[data-sidebar-thread-spinner]")).toBeNull();
     }
-    expect(slotOf("idle").querySelector("[data-sidebar-thread-dot]")).toBeTruthy();
-    expect(slotOf("idle").querySelector("[data-sidebar-thread-dot]")!.className).toContain("bg-muted-foreground/60");
+    expect(slotOf("idle").querySelector("[data-sidebar-thread-dot]")).toBeNull();
 
     // Dot colour still carries the distinction, at the native 5px geometry.
     expect(slotOf("pending").querySelector("[data-sidebar-thread-dot]")!.className).toContain("bg-primary");
@@ -285,7 +340,7 @@ describe("replacement thread list", () => {
     // Idle keeps the same leading slot and swaps only the glyph.
     const still = rendered.container.querySelector<HTMLAnchorElement>('[data-sidebar-thread-id="still"]')!;
     expect(still.previousElementSibling?.getAttribute("data-sidebar-thread-signal")).toBe("idle");
-    expect(still.previousElementSibling?.querySelector("[data-sidebar-thread-dot]")).toBeTruthy();
+    expect(still.previousElementSibling?.querySelector("[data-sidebar-thread-dot]")).toBeNull();
   });
 
   it("maps host model and reasoning facts to short badge text with safe fallbacks", async () => {
@@ -496,6 +551,100 @@ describe("replacement thread list", () => {
     expect(Array.from(rendered.container.querySelectorAll("[data-sidebar-thread-id]")).map((node) => node.getAttribute("data-sidebar-thread-id"))).toEqual(["pinned-2", "pinned-1", "pinned-3"]);
   });
 
+  it("offers keyboard fallback controls for pinned reorder", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [
+        { ...thread("pinned-1", "project-a", 2), isPinned: true },
+        { ...thread("pinned-2", "project-a", 1), isPinned: true },
+      ] },
+      rpc: rpcHandlers(),
+    });
+    fireEvent.click(rendered.getAllByRole("button", { name: "Thread actions" })[0]!);
+    fireEvent.click(rendered.getByRole("menuitem", { name: "Move down" }));
+    await waitFor(() => expect(rendered.inspection.rpcCalls).toContainEqual({
+      method: "reorderPinned",
+      input: { threadId: "pinned-1", previousThreadId: "pinned-2", nextThreadId: null },
+    }));
+  });
+
+  it("reorders projects live by pointer and exposes keyboard fallback controls", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A"), project("project-b", "Project B")], threads: [
+        thread("a", "project-a", 2), thread("b", "project-b", 1),
+      ] },
+      rpc: { ...rpcHandlers(), reorderProjects: async ({ previousProjectId }: { previousProjectId: string | null }) => previousProjectId === "project-b" ? ["project-b", "project-a"] : ["project-a", "project-b"] } as never,
+    });
+    const projectIds = () => Array.from(rendered.container.querySelectorAll("[data-sidebar-project-id]"), (node) => node.getAttribute("data-sidebar-project-id"));
+    fireEvent.pointerDown(rendered.getByText("Project A"), { button: 0 });
+    fireEvent.pointerEnter(rendered.container.querySelector('[data-sidebar-project-id="project-b"]')!);
+    expect(projectIds()).toEqual(["project-b", "project-a"]);
+    await waitFor(() => expect(rendered.inspection.rpcCalls).toContainEqual({
+      method: "reorderProjects",
+      input: { projectId: "project-a", previousProjectId: "project-b", nextProjectId: null },
+    }));
+
+    fireEvent.click(rendered.getByRole("button", { name: "Move Project A project up" }));
+    await waitFor(() => expect(rendered.inspection.rpcCalls).toContainEqual({
+      method: "reorderProjects",
+      input: { projectId: "project-a", previousProjectId: null, nextProjectId: "project-b" },
+    }));
+  });
+
+  it("serializes rapid A-to-B-to-C project reorders and ends at host truth", async () => {
+    const list = await registration();
+    const calls: Array<{ input: unknown; result: ReturnType<typeof deferred<string[]>> }> = [];
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A"), project("project-b", "Project B"), project("project-c", "Project C")], threads: [
+        thread("a", "project-a", 3), thread("b", "project-b", 2), thread("c", "project-c", 1),
+      ] },
+      rpc: { ...rpcHandlers(), reorderProjects: async (input: unknown) => { const result = deferred<string[]>(); calls.push({ input, result }); return result.promise; } } as never,
+    });
+    const section = (id: string) => rendered.container.querySelector(`[data-sidebar-project-id="${id}"]`)!;
+    const projectIds = () => Array.from(rendered.container.querySelectorAll("[data-sidebar-project-id]"), (node) => node.getAttribute("data-sidebar-project-id"));
+    fireEvent.pointerDown(rendered.getByText("Project A"), { button: 0 });
+    fireEvent.pointerEnter(section("project-b"));
+    fireEvent.pointerEnter(section("project-c"));
+    expect(projectIds()).toEqual(["project-b", "project-c", "project-a"]);
+    expect(calls).toHaveLength(1);
+    calls[0]!.result.resolve(["project-b", "project-a", "project-c"]);
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1]!.input).toEqual({ projectId: "project-a", previousProjectId: "project-c", nextProjectId: null });
+    calls[1]!.result.resolve(["project-b", "project-c", "project-a"]);
+    await waitFor(() => expect(projectIds()).toEqual(["project-b", "project-c", "project-a"]));
+  });
+
+  it.each([
+    ["partial", ["project-b", "project-a"]],
+    ["duplicate", ["project-b", "project-b", "project-a"]],
+    ["missing", ["project-b", "project-a", "project-x"]],
+  ])("rolls back a %s authoritative project response", async (_case, response) => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A"), project("project-b", "Project B"), project("project-c", "Project C")], threads: [
+        thread("a", "project-a", 3), thread("b", "project-b", 2), thread("c", "project-c", 1),
+      ] },
+      rpc: { ...rpcHandlers(), reorderProjects: async () => response } as never,
+    });
+    const projectIds = () => Array.from(rendered.container.querySelectorAll("[data-sidebar-project-id]"), (node) => node.getAttribute("data-sidebar-project-id"));
+    fireEvent.click(rendered.getByRole("button", { name: "Move Project A project down" }));
+    await waitFor(() => expect(projectIds()).toEqual(["project-a", "project-b", "project-c"]));
+  });
+
+  it("rolls back a rejected project reorder", async () => {
+    const list = await registration();
+    const rendered = renderSlot(list, props(), {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A"), project("project-b", "Project B")], threads: [
+        thread("a", "project-a", 2), thread("b", "project-b", 1),
+      ] },
+      rpc: { ...rpcHandlers(), reorderProjects: async () => { throw new Error("rejected"); } } as never,
+    });
+    const projectIds = () => Array.from(rendered.container.querySelectorAll("[data-sidebar-project-id]"), (node) => node.getAttribute("data-sidebar-project-id"));
+    fireEvent.click(rendered.getByRole("button", { name: "Move Project A project down" }));
+    await waitFor(() => expect(projectIds()).toEqual(["project-a", "project-b"]));
+  });
+
   it("sends typed pinned reorder args for an upward pointer drag", async () => {
     const list = await registration();
     const first = { ...thread("pinned-1", "project-a", 3), isPinned: true };
@@ -630,9 +779,10 @@ describe("replacement thread list", () => {
   });
 
 
-  it("persists project/thread collapse in plugin KV and forwards typed reorder to BB", async () => {
+  it("persists project/thread collapse and forwards native thread/project reorder", async () => {
     const reorderPinned = vi.fn(async () => []);
-    const host = createFakePluginHost({ pluginId: "bb-collab", sdk: { threads: { reorderPinned } } });
+    const reorderProjects = vi.fn(async () => [{ id: "project-a" }, { id: "project-b" }]);
+    const host = createFakePluginHost({ pluginId: "bb-collab", sdk: { threads: { reorderPinned }, projects: { reorder: reorderProjects } } });
     await plugin(host.bb);
 
     await host.harness.callRpc("setSidebarCollapse", { kind: "project", id: "project-a", collapsed: true });
@@ -641,6 +791,8 @@ describe("replacement thread list", () => {
 
     await host.harness.callRpc("reorderPinned", { threadId: "thread-1", previousThreadId: null, nextThreadId: "thread-2" });
     expect(reorderPinned).toHaveBeenCalledWith({ threadId: "thread-1", previousThreadId: null, nextThreadId: "thread-2" });
+    await expect(host.harness.callRpc("reorderProjects", { projectId: "project-a", previousProjectId: null, nextProjectId: "project-b" })).resolves.toEqual(["project-a", "project-b"]);
+    expect(reorderProjects).toHaveBeenCalledWith({ projectId: "project-a", previousProjectId: null, nextProjectId: "project-b" });
   });
 
 

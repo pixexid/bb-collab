@@ -31,6 +31,10 @@ export const rpcContract = defineRpcContract({
     input: z.object({ threadId: id, previousThreadId: id.nullable(), nextThreadId: id.nullable() }).strict(),
     output: z.array(id),
   },
+  reorderProjects: {
+    input: z.object({ projectId: id, previousProjectId: id.nullable(), nextProjectId: id.nullable() }).strict(),
+    output: z.array(id),
+  },
 });
 
 const stateKey = (threadId: string) => `thread-state:${threadId}`;
@@ -74,6 +78,10 @@ export default function plugin(bb: BbPluginApi) {
     async reorderPinned(input) {
       const threads = await bb.sdk.threads.reorderPinned(input);
       return threads.map((thread) => thread.id);
+    },
+    async reorderProjects(input) {
+      const projects = await bb.sdk.projects.reorder(input);
+      return projects.map((project) => project.id);
     },
   });
 }

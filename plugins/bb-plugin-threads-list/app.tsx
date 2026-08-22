@@ -162,6 +162,7 @@ function ThreadSignal({ thread }: { thread: PluginSidebarThread }) {
   return (
     <span className={LEADING_SLOT} data-sidebar-thread-signal={signal.kind}>
       {signal.kind === "running" ? <RunningSpinner label={signal.label} /> : (
+        signal.kind === "idle" && !thread.isUnread ? null :
         <span
           className={`${NATIVE_DOT} ${signal.kind === "idle" && thread.isUnread ? "bg-primary" : signalDotClasses(thread, signal.kind)}`}
           role="img"
@@ -282,8 +283,29 @@ export function groupThreads(
     group.threads.push(thread);
     groups.set(project.id, group);
   }
-  return [...groups.values()].map((group) => ({ ...group, threads: sortSidebarThreads(group.threads) }));
+  const projectOrder = new Map(projects.map((project, index) => [project.id, index]));
+  return [...groups.values()]
+    .sort((a, b) => (projectOrder.get(a.project.id) ?? Number.MAX_SAFE_INTEGER) - (projectOrder.get(b.project.id) ?? Number.MAX_SAFE_INTEGER))
+    .map((group) => ({ ...group, threads: sortSidebarThreads(group.threads) }));
 }
+
+export function moveBetween(order: readonly string[], draggedId: string, targetId: string) {
+  const from = order.indexOf(draggedId);
+  const to = order.indexOf(targetId);
+  if (from < 0 || to < 0 || from === to) return null;
+  const remaining = order.filter((id) => id !== draggedId);
+  const insertionIndex = remaining.indexOf(targetId) + (from < to ? 1 : 0);
+  const nextOrder = [...remaining];
+  nextOrder.splice(insertionIndex, 0, draggedId);
+  return { nextOrder, previousId: remaining[insertionIndex - 1] ?? null, nextId: remaining[insertionIndex] ?? null };
+}
+
+export function isCompleteProjectOrder(order: readonly string[], projectIds: readonly string[]) {
+  const remaining = new Set(projectIds);
+  return order.length === projectIds.length && order.every((id) => remaining.delete(id)) && remaining.size === 0;
+}
+
+type ProjectReorderInput = { projectId: string; previousProjectId: string | null; nextProjectId: string | null };
 
 type ThreadTreeNode = { thread: PluginSidebarThread; children: ThreadTreeNode[] };
 
@@ -326,6 +348,7 @@ function ThreadRow({
   onPinnedDragStart,
   onPinnedDragOver,
   onPinnedDragEnd,
+  onMovePinned,
   onNavigate,
 }: {
   thread: PluginSidebarThread;
@@ -339,6 +362,7 @@ function ThreadRow({
   onPinnedDragStart: (threadId: string) => void;
   onPinnedDragOver: (threadId: string) => void;
   onPinnedDragEnd: (threadId: string) => void;
+  onMovePinned: (threadId: string, offset: -1 | 1) => void;
   onNavigate: () => void;
 }) {
   const actions = experimental_useSidebarThreadActions();
@@ -373,6 +397,11 @@ function ThreadRow({
     triggerRef.current?.focus();
     run();
   };
+  const visit = (split = false) => {
+    if (split) actions.open(thread.id, { split: true });
+    else { actions.open(thread.id); onNavigate(); }
+    void actions.setRead(thread.id, true).catch(() => undefined);
+  };
   return (
     <div
       className={`group/row relative flex h-7 items-center gap-1.5 rounded-md pr-1 text-left text-sm transition-colors duration-150 select-none hover:bg-muted/50 motion-reduce:transition-none ${active ? "bg-muted" : ""}`}
@@ -394,7 +423,7 @@ function ThreadRow({
             data-sidebar-thread-id={thread.id}
             draggable={false}
             title={thread.environment?.branchName ? `${title} — ${thread.environment.branchName}` : title}
-            onClick={(event) => { event.preventDefault(); actions.open(thread.id); onNavigate(); }}
+            onClick={(event) => { event.preventDefault(); visit(); }}
           >
             {title}
           </a>
@@ -428,9 +457,13 @@ function ThreadRow({
         className="absolute right-1 top-7 z-20 flex w-44 flex-col rounded-md border border-border bg-background p-1 shadow"
         onKeyDown={(event) => { if (event.key === "Escape") { setMenuOpen(false); triggerRef.current?.focus(); } }}
       >
-        <button autoFocus type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => actions.open(thread.id, { split: true }))}>Open in split</button>
+        <button autoFocus type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => visit(true))}>Open in split</button>
         <button type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => { void actions.setRead(thread.id, thread.isUnread).catch(() => undefined); })}>{thread.isUnread ? "Mark read" : "Mark unread"}</button>
         <button type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => { void actions.setPinned(thread.id, !thread.isPinned).catch(() => undefined); })}>{thread.isPinned ? "Unpin" : "Pin"}</button>
+        {thread.isPinned ? <>
+          <button type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => onMovePinned(thread.id, -1))}>Move up</button>
+          <button type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => onMovePinned(thread.id, 1))}>Move down</button>
+        </> : null}
         <button type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => setRenaming(true))}>Rename</button>
         <button type="button" role="menuitem" className={MENU_ITEM} onClick={() => menuAction(() => actions.archive(thread.id))}>Archive</button>
         <span role="separator" className="my-1 border-t border-border" />
@@ -447,17 +480,24 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set());
   const [collapsedThreads, setCollapsedThreads] = useState<Set<string>>(() => new Set());
   const draggingThreadId = useRef<string | null>(null);
+  const draggingProjectId = useRef<string | null>(null);
   const provenUnread = useRef(new Map<string, number>());
   const reportedBreak = useRef<string | null>(null);
   const dragTargetId = useRef<string | null>(null);
+  const projectDragTargetId = useRef<string | null>(null);
+  const projectReorderQueue = useRef<ProjectReorderInput[]>([]);
+  const projectReorderRunning = useRef(false);
   const [customStates, setCustomStates] = useState<ThreadStates>({});
   const [optimisticPinnedOrders, setOptimisticPinnedOrders] = useState<Record<string, string[]>>({});
+  const [optimisticProjectOrder, setOptimisticProjectOrder] = useState<string[] | null>(null);
   const [indicatorBroken, setIndicatorBroken] = useState<string | null>(null);
   const [threadModels, setThreadModels] = useState<ThreadModels>({});
   const [stateMigrationNotice, setStateMigrationNotice] = useState(migrationNoticeVisible);
   const threadIds = useMemo(() => sidebar.threads.map((thread) => thread.id), [sidebar.threads]);
   const threadIdsKey = threadIds.join("\u0000");
   const projectIds = useMemo(() => sidebar.projects.map((project) => project.id), [sidebar.projects]);
+  const projectIdsRef = useRef(projectIds);
+  projectIdsRef.current = projectIds;
   const projectIdsKey = projectIds.join("\u0000");
 
   useEffect(() => {
@@ -503,7 +543,10 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     if (!order || a.projectId !== b.projectId || !a.isPinned || !b.isPinned) return 0;
     return order.indexOf(a.id) - order.indexOf(b.id);
   });
-  const groups = groupThreads(sidebar.projects, displayThreads, searchQuery);
+  const displayProjects = [...sidebar.projects].sort((a, b) => optimisticProjectOrder
+    ? optimisticProjectOrder.indexOf(a.id) - optimisticProjectOrder.indexOf(b.id)
+    : 0);
+  const groups = groupThreads(displayProjects, displayThreads, searchQuery);
   if (sidebar.status === "loading") return <><p className="p-3 text-sm text-muted-foreground">Loading threads…</p></>;
   if (sidebar.status === "error") return <><p className="p-3 text-sm text-destructive">Unable to load threads.</p></>;
   if (groups.length === 0) return <><p className="p-3 text-sm text-muted-foreground">No matching threads.</p></>;
@@ -532,15 +575,11 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     // names neighbours the user never saw next to the row.
     if (dragged.projectId !== target.projectId) return;
     const order = displayThreads.filter((thread) => thread.isPinned && thread.projectId === dragged.projectId).map((thread) => thread.id);
-    const from = order.indexOf(draggedId);
-    const to = order.indexOf(targetId);
-    if (from < 0 || to < 0) return;
-    const remaining = order.filter((id) => id !== draggedId);
-    const insertionIndex = remaining.indexOf(targetId) + (from < to ? 1 : 0);
-    const nextOrder = [...remaining];
-    nextOrder.splice(insertionIndex, 0, draggedId);
+    const move = moveBetween(order, draggedId, targetId);
+    if (!move) return;
+    const { nextOrder } = move;
     setOptimisticPinnedOrders((current) => ({ ...current, [dragged.projectId]: nextOrder }));
-    void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: remaining[insertionIndex - 1] ?? null, nextThreadId: remaining[insertionIndex] ?? null }).then((authoritativeOrder) => {
+    void rpc.call("reorderPinned", { threadId: draggedId, previousThreadId: move.previousId, nextThreadId: move.nextId }).then((authoritativeOrder) => {
       setOptimisticPinnedOrders((current) => current[dragged.projectId] === nextOrder
         ? { ...current, [dragged.projectId]: authoritativeOrder.filter((id) => order.includes(id)) }
         : current);
@@ -578,11 +617,75 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
     if (target && target !== dragTargetId.current) reorderPinned(draggedId, target);
     dragTargetId.current = null;
   };
+  const movePinnedBy = (threadId: string, offset: -1 | 1) => {
+    const thread = displayThreads.find((candidate) => candidate.id === threadId);
+    if (!thread?.isPinned) return;
+    const order = displayThreads.filter((candidate) => candidate.isPinned && candidate.projectId === thread.projectId).map((candidate) => candidate.id);
+    const targetId = order[order.indexOf(threadId) + offset];
+    if (targetId) reorderPinned(threadId, targetId);
+  };
+
+  const runProjectReorders = async () => {
+    if (projectReorderRunning.current) return;
+    projectReorderRunning.current = true;
+    try {
+      while (projectReorderQueue.current.length > 0) {
+        const input = projectReorderQueue.current.shift()!;
+        const authoritativeOrder = await rpc.call("reorderProjects", input);
+        if (!isCompleteProjectOrder(authoritativeOrder, projectIdsRef.current)) throw new Error("invalid project order");
+        if (projectReorderQueue.current.length === 0) setOptimisticProjectOrder(authoritativeOrder);
+      }
+    } catch {
+      projectReorderQueue.current.length = 0;
+      setOptimisticProjectOrder(null);
+    } finally {
+      projectReorderRunning.current = false;
+    }
+  };
+
+  const reorderProject = (draggedId: string, targetId: string) => {
+    const order = displayProjects.map((project) => project.id);
+    const move = moveBetween(order, draggedId, targetId);
+    if (!move) return;
+    setOptimisticProjectOrder(move.nextOrder);
+    projectReorderQueue.current.push({ projectId: draggedId, previousProjectId: move.previousId, nextProjectId: move.nextId });
+    void runProjectReorders();
+  };
+  const startProjectDrag = (projectId: string) => {
+    draggingProjectId.current = projectId;
+    projectDragTargetId.current = null;
+    const settle = (event: Event) => {
+      if (event.type === "pointerup" && draggingProjectId.current) finishProjectDrag("");
+      draggingProjectId.current = null;
+      projectDragTargetId.current = null;
+      window.removeEventListener("pointerup", settle);
+      window.removeEventListener("pointercancel", settle);
+    };
+    window.addEventListener("pointerup", settle);
+    window.addEventListener("pointercancel", settle);
+  };
+  const trackProjectDrag = (projectId: string) => {
+    if (!draggingProjectId.current || projectId === draggingProjectId.current) return;
+    reorderProject(draggingProjectId.current, projectId);
+    projectDragTargetId.current = projectId;
+  };
+  const finishProjectDrag = (targetId: string) => {
+    const draggedId = draggingProjectId.current ?? "";
+    const target = targetId || projectDragTargetId.current || "";
+    draggingProjectId.current = null;
+    if (target && target !== projectDragTargetId.current) reorderProject(draggedId, target);
+    projectDragTargetId.current = null;
+  };
+  const moveProjectBy = (projectId: string, offset: -1 | 1) => {
+    const order = displayProjects.map((project) => project.id);
+    const targetId = order[order.indexOf(projectId) + offset];
+    if (targetId) reorderProject(projectId, targetId);
+  };
 
   const renderNode = (node: ThreadTreeNode, execution: ThreadExecution | null, depth: number): ReactNode => {
     const childrenCollapsed = collapsedThreads.has(node.thread.id);
     return <div key={node.thread.id} className="space-y-px">
-      <ThreadRow thread={node.thread} execution={execution} active={node.thread.id === activeThreadId} customState={customStates[node.thread.id]} depth={depth} collapsed={childrenCollapsed} hasChildren={node.children.length > 0} onToggleChildren={() => toggleThread(node.thread.id)} onPinnedDragStart={startPinnedDrag} onPinnedDragOver={trackPinnedDrag} onPinnedDragEnd={finishPinnedDrag} onNavigate={onNavigate} />
+      <ThreadRow thread={node.thread} execution={execution} active={node.thread.id === activeThreadId} customState={customStates[node.thread.id]} depth={depth} collapsed={childrenCollapsed} hasChildren={node.children.length > 0} onToggleChildren={() => toggleThread(node.thread.id)} onPinnedDragStart={startPinnedDrag} onPinnedDragOver={trackPinnedDrag} onPinnedDragEnd={finishPinnedDrag} onMovePinned={movePinnedBy} onNavigate={onNavigate} />
       {!childrenCollapsed ? node.children.map((child) => renderNode(child, threadModels[child.thread.id] ?? null, depth + 1)) : null}
     </div>;
   };
@@ -597,13 +700,15 @@ export function SidebarThreadList({ activeThreadId, onNavigate, searchQuery }: P
         const visibleThreads = expanded ? tree : tree.slice(0, MAX_VISIBLE_THREADS);
         const projectName = asText(project.name) ?? asText(project.id) ?? "Untitled project";
         return (
-          <section key={project.id} aria-labelledby={`project-${project.id}`}>
-            <div className="flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-normal text-muted-foreground">
+          <section key={project.id} aria-labelledby={`project-${project.id}`} data-sidebar-project-id={project.id} onPointerEnter={() => trackProjectDrag(project.id)} onPointerUp={() => finishProjectDrag(project.id)}>
+            <div className="flex h-6 items-center gap-1.5 rounded-md pl-2 pr-1 text-xs font-semibold text-foreground" onPointerDown={(event) => { if (event.button === 0 && !(event.target as HTMLElement).closest("button")) startProjectDrag(project.id); }}>
               <span className="flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] leading-none text-foreground" aria-hidden="true">{projectAvatar(projectName)}</span>
               <span id={`project-${project.id}`} className="min-w-0 truncate">{projectName}</span>
               {/* No type utilities of its own: the counter inherits the header's
                   size, weight, colour and baseline so it never outweighs the name. */}
               <span className="ml-auto shrink-0" data-project-thread-count="">{threads.length}</span>
+              <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground disabled:opacity-30 motion-reduce:transition-none" aria-label={`Move ${projectName} project up`} disabled={displayProjects[0]?.id === project.id} onClick={() => moveProjectBy(project.id, -1)}>↑</button>
+              <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground disabled:opacity-30 motion-reduce:transition-none" aria-label={`Move ${projectName} project down`} disabled={displayProjects.at(-1)?.id === project.id} onClick={() => moveProjectBy(project.id, 1)}>↓</button>
               <button type="button" className="inline-flex size-4 shrink-0 items-center justify-center rounded leading-none transition-colors duration-150 hover:bg-muted hover:text-foreground motion-reduce:transition-none" aria-label={`${collapsed ? "Expand" : "Collapse"} ${projectName} section`} aria-expanded={!collapsed} onClick={() => toggleProject(project.id)}>{collapsed ? "›" : "⌄"}</button>
             </div>
             {!collapsed ? <div className="mt-0.5 space-y-px">
