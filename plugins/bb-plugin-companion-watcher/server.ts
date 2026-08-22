@@ -150,7 +150,7 @@ export default function companionWatcher(bb: BbPluginApi) {
   };
 
   bb.events.on("thread.active", ({ thread }) => { activeTurns.set(thread.id, Date.now()); });
-  // ponytail: idle-triggered judgment cannot detect silent plugin death; add interval receipts only if silent death is observed.
+  // ponytail: idle-triggered judgment cannot detect silent plugin death; liveness currently relies on existing schedule-health monitoring (doctor schedule last-run checks / fleet-watchdog / launchd stall-guard); add interval receipts only if silent death is observed.
   bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
     if (pending.has(thread.id)) { await handleJudgment(thread.id, lastAssistantText ?? ""); return; }
     const turnStartedAt = activeTurns.get(thread.id);
