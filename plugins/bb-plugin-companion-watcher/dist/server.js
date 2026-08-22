@@ -326,14 +326,20 @@ function companionWatcher(bb, readExport = readCanonicalExport, readGithub = git
   const candidateSnapshots = /* @__PURE__ */ new Map();
   const activeTurns = /* @__PURE__ */ new Map();
   const inFlight = /* @__PURE__ */ new Set();
+  let loaded = false;
   let loadPromise;
   const load = () => {
-    loadPromise ??= (async () => {
+    if (loaded) return Promise.resolve();
+    if (loadPromise) return loadPromise;
+    loadPromise = (async () => {
       const saved = await bb.storage.kv.get("backoff");
       const savedCompanions = await bb.storage.kv.get("companions");
       if (saved) for (const [key, value] of Object.entries(saved)) snapshots.set(key, value);
       if (savedCompanions) for (const [key, value] of Object.entries(savedCompanions)) companions.set(key, value);
-    })();
+      loaded = true;
+    })().finally(() => {
+      loadPromise = void 0;
+    });
     return loadPromise;
   };
   const canonical = async (projectId) => {
@@ -477,20 +483,19 @@ snapshot read failed: ${reason}` }] };
       bb.log.warn(`companion-watcher coverage=blind event=project-inventory reason=${String(error)}`);
       return;
     }
-    await Promise.allSettled(projects.map(async (project) => {
-      if (!project.id || inFlight.has(project.id)) return;
-      inFlight.add(project.id);
-      try {
-        const exported = await canonical(project.id);
-        const orchestratorId = readRoleThread(exported, project.id, "project-orchestrator");
-        if (!orchestratorId || project.id === thread.projectId && thread.id !== orchestratorId || !shouldJudgeOnIdle(exported, project.id, Date.now())) return;
-        await judge(project.id, orchestratorId, project.id === thread.projectId ? turnStartedAt : void 0);
-      } catch (error) {
-        bb.log.warn(`companion-watcher coverage=blind event=thread.idle project=${project.id} reason=${String(error)}`);
-      } finally {
-        inFlight.delete(project.id);
-      }
-    }));
+    const project = projects.find((candidate) => candidate.id === thread.projectId);
+    if (!project || inFlight.has(project.id)) return;
+    inFlight.add(project.id);
+    try {
+      const exported = await canonical(project.id);
+      const orchestratorId = readRoleThread(exported, project.id, "project-orchestrator");
+      if (thread.id !== orchestratorId || !shouldJudgeOnIdle(exported, project.id, Date.now())) return;
+      await judge(project.id, orchestratorId, turnStartedAt);
+    } catch (error) {
+      bb.log.warn(`companion-watcher coverage=blind event=thread.idle project=${project.id} reason=${String(error)}`);
+    } finally {
+      inFlight.delete(project.id);
+    }
   });
 }
 export {

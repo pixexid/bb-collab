@@ -210,7 +210,7 @@ describe("semantic idle guard", () => {
     expect(spawns).toBe(1);
   });
 
-  it("does not let one project failure suppress another project's wake", async () => {
+  it("keeps project failure isolation on independent project-scoped events", async () => {
     const base = await capturedExport();
     const projectB = "proj_two";
     const projectBExport = {
@@ -245,7 +245,49 @@ describe("semantic idle guard", () => {
       return projectBExport;
     }, async () => ({ issues: [], prs: [] }));
     await idle!({ thread: { id: "thread-a", projectId } });
+    expect(spawned).toEqual([]);
+    await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId: projectB } });
     expect(spawned).toEqual([projectB]);
+  });
+
+  it("never lets a project A idle event drive project B", async () => {
+    const base = await capturedExport();
+    const projectB = "proj_two";
+    const projectAExport = { ...base, executionAttempts: base.executionAttempts.filter((row) => row.origin !== "work_item") };
+    const projectBExport = {
+      ...projectAExport,
+      projectId: projectB,
+      executionAttempts: projectAExport.executionAttempts.map((row) => ({ ...row, project_id: projectB })),
+      externalWorkRefs: projectAExport.externalWorkRefs.map((row) => ({ ...row, project_id: projectB })),
+      roleGenerationHeads: projectAExport.roleGenerationHeads.map((row) => ({ ...row, project_id: projectB })),
+      roleGenerations: projectAExport.roleGenerations.map((row) => ({ ...row, project_id: projectB })),
+      workItems: projectAExport.workItems.map((row) => ({ ...row, project_id: projectB })),
+    };
+    let idle: ((event: { thread: { id: string; projectId: string }; lastAssistantText?: string }) => Promise<void>) | undefined;
+    const spawned: string[] = [];
+    const bb = {
+      pluginId: "companion-watcher",
+      log: { info: () => undefined, warn: () => undefined },
+      storage: { kv: { get: async () => undefined, set: async () => undefined } },
+      agents: { registerTool: () => undefined, configure: () => undefined },
+      sdk: {
+        system: { config: async () => ({ dataDir: "/unused" }) },
+        projects: { list: async () => [{ id: projectId, gitRemoteUrl: null }, { id: projectB, gitRemoteUrl: null }] },
+        threads: {
+          spawn: async ({ projectId: id }: { projectId: string }) => { spawned.push(id); return { id: `companion-${id}` }; },
+          get: async () => ({ projectId: "unused", status: "idle" }),
+          send: async () => undefined,
+        },
+      },
+      events: { on: (event: string, handler: typeof idle) => { if (event === "thread.idle") idle = handler; } },
+    } as unknown as BbPluginApi;
+    companionWatcher(bb, async (id) => id === projectId ? projectAExport : projectBExport, async () => ({ issues: [], prs: [] }));
+    await idle!({ thread: { id: "thread-a-other", projectId } });
+    expect(spawned).toEqual([]);
+    await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId } });
+    expect(spawned).toEqual([projectId]);
+    await idle!({ thread: { id: "thr_7bjw9e7mgd", projectId: projectB } });
+    expect(spawned).toEqual([projectId, projectB]);
   });
 
   it("accepts nullable execution-attempt fields, including the captured review boundary", async () => {
@@ -443,6 +485,32 @@ describe("semantic idle guard", () => {
     expect(result).toMatchObject({ isError: true, content: [{ text: expect.stringContaining("COVERAGE: blind") }] });
     expect(result).toMatchObject({ content: [{ text: expect.stringContaining("export CLI failed") }] });
     expect(warnings).toEqual(["companion-watcher coverage=blind event=snapshot reason=Error: export CLI failed"]);
+  });
+
+  it("retries KV initialization after one rejection", async () => {
+    let tool: { execute(params: unknown, context: { threadId: string; projectId: string }): Promise<unknown> } | undefined;
+    let kvReads = 0;
+    const bb = {
+      pluginId: "companion-watcher",
+      log: { warn: () => undefined },
+      storage: { kv: { get: async () => { kvReads += 1; if (kvReads === 1) throw new Error("transient KV failure"); return undefined; }, set: async () => undefined } },
+      agents: { registerTool: (value: typeof tool) => { tool = value; }, configure: () => undefined },
+      sdk: {
+        system: { config: async () => ({ dataDir: "/unused" }) },
+        projects: { get: async () => ({ gitRemoteUrl: null }) },
+        threads: {
+          get: async () => ({ projectId, title: "Alzheimer companion judgment", originPluginId: "companion-watcher" }),
+          timeline: async () => ({ rows: [], timelinePage: { hasOlderRows: false, kind: "latest", segmentLimit: 100, returnedSegmentCount: 0, olderCursor: null }, maxSeq: 0 }),
+          queuedMessages: { list: async () => [] },
+        },
+      },
+      events: { on: () => undefined },
+    } as unknown as BbPluginApi;
+    companionWatcher(bb, capturedExport, async () => ({ issues: [], prs: [] }));
+    await expect(tool!.execute({}, { threadId: "companion", projectId })).rejects.toThrow("transient KV failure");
+    const result = await tool!.execute({}, { threadId: "companion", projectId });
+    expect(JSON.parse(result as string).coverage).toBe("known");
+    expect(kvReads).toBe(3);
   });
 
   it("logs the parser degradation reason", async () => {
