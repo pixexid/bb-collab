@@ -15,6 +15,7 @@ const WAKE_POINTER = "event; inspect canonical state";
 // markers; STDERR_CAP bounds the captured stderr used for failure logging.
 const STDOUT_CAP = 4096;
 const STDERR_CAP = 4096;
+export const ROLE_RESOLVER_TIMEOUT_MS = 7_000;
 // Recorder stdout lines that are observable-but-not-failure: a correctly-ignored
 // unknown native project or a correctly-conflicted re-resolution. Matched with
 // startsWith, so each marker includes its trailing space.
@@ -603,27 +604,55 @@ async function resolveRole(
 
 function boundedChild(executable: string, args: string[], cwd: string): Promise<string> {
   return new Promise((resolve, reject) => {
+    const deadlineAt = Date.now() + ROLE_RESOLVER_TIMEOUT_MS;
     let stdout = "";
     let stderr = "";
     const child = spawn(executable, args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env });
-    child.stdout?.on("data", (chunk: Buffer) => {
+    let settled = false;
+    const finish = (error?: Error, output = "") => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stdout?.off("data", onStdout);
+      child.stderr?.off("data", onStderr);
+      child.off("error", onError);
+      child.off("close", onClose);
+      error ? reject(error) : resolve(output);
+    };
+    const abort = (error: Error) => {
+      child.kill("SIGKILL");
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref();
+      finish(error);
+    };
+    const onStdout = (chunk: Buffer) => {
       stdout += chunk.toString("utf-8");
-      if (stdout.length > STDOUT_CAP) child.kill();
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
+      if (stdout.length > STDOUT_CAP) abort(new Error("role resolver output exceeded its bound"));
+    };
+    const onStderr = (chunk: Buffer) => {
       stderr += chunk.toString("utf-8");
-      if (stderr.length > STDERR_CAP) child.kill();
-    });
-    child.once("error", reject);
-    child.once("close", (code) => {
+      if (stderr.length > STDERR_CAP) abort(new Error("role resolver output exceeded its bound"));
+    };
+    const onError = (error: Error) => finish(error);
+    const onClose = (code: number | null) => {
       if (stdout.length > STDOUT_CAP || stderr.length > STDERR_CAP) {
-        reject(new Error("role resolver output exceeded its bound"));
+        finish(new Error("role resolver output exceeded its bound"));
       } else if (code !== 0) {
-        reject(new Error(stderr.trim() || `role resolver exited ${code}`));
+        finish(new Error(stderr.trim() || `role resolver exited ${code}`));
       } else {
-        resolve(stdout.trim());
+        finish(undefined, stdout.trim());
       }
-    });
+    };
+    const timer = setTimeout(
+      () => abort(new Error(`role resolver exceeded ${ROLE_RESOLVER_TIMEOUT_MS}ms`)),
+      Math.max(0, deadlineAt - Date.now()),
+    );
+    timer.unref();
+    child.stdout?.on("data", onStdout);
+    child.stderr?.on("data", onStderr);
+    child.once("error", onError);
+    child.once("close", onClose);
   });
 }
 

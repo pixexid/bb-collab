@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import plugin from "../server.js";
+import plugin, { ROLE_RESOLVER_TIMEOUT_MS } from "../server.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -119,7 +119,7 @@ describe("exec-tracking package", () => {
     ]);
   });
 
-  it("is inert during the same-id install gap when settings are absent", async () => {
+  it("is inert when required settings are absent", async () => {
     vi.useFakeTimers();
     const send = vi.fn(async () => ({ ok: true }));
     const host = createFakePluginHost({
@@ -136,4 +136,29 @@ describe("exec-tracking package", () => {
     expect(send).not.toHaveBeenCalled();
     expect(host.harness.logEntries.some(({ message }) => message.includes("must be configured"))).toBe(true);
   });
+
+  it("bounds a non-exiting production resolver for CLI and abnormal events", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "exec-tracking-stuck-resolver-"));
+    temporaryDirectories.push(directory);
+    mkdirSync(join(directory, "bin"));
+    writeFileSync(join(directory, "bin", "resolve_role_wake.py"),
+      "setTimeout(() => process.exit(0), 10_000)\n");
+    const host = fixture({ checkoutPath: directory, pythonPath: process.execPath });
+    const started = Date.now();
+    await host.harness.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: "stuck-event", projectId: "native-project", status: "error" }),
+      error: "synthetic failure",
+    });
+    const cli = await host.harness.runCli([
+      "emit", "--project", "native-project", "--producer", "heartbeat", "--semantic", "a".repeat(64),
+    ]);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(ROLE_RESOLVER_TIMEOUT_MS);
+    expect(cli).toMatchObject({
+      exitCode: 1,
+      stderr: `silent wake refused: role resolver exceeded ${ROLE_RESOLVER_TIMEOUT_MS}ms\n`,
+    });
+    expect(host.harness.logEntries.some(({ message }) =>
+      message.includes(`thread.failed wake refused for thread stuck-event: role resolver exceeded ${ROLE_RESOLVER_TIMEOUT_MS}ms`),
+    )).toBe(true);
+  }, 8_500);
 });

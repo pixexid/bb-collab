@@ -12,3 +12,9 @@ and role-generation state. The recorder accepts only SDK source
 source.
 
 See [CUTOVER.md](CUTOVER.md) for the same-id source migration and rollback.
+The cutover converges reviewed repository bytes and discipline while BB's host
+registration metadata continues to name the legacy path through a symlink.
+That explicit residual is not a second plugin owner and does not claim the
+metadata moved; the retained legacy directory remains rollback material until
+[get-bb/bb#2297](https://github.com/get-bb/bb/issues/2297) provides native
+same-id source retirement.

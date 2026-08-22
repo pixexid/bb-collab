@@ -14,6 +14,7 @@ var ROLE_RESOLVER_REL = path.join("bin", "resolve_role_wake.py");
 var WAKE_POINTER = "event; inspect canonical state";
 var STDOUT_CAP = 4096;
 var STDERR_CAP = 4096;
+var ROLE_RESOLVER_TIMEOUT_MS = 7e3;
 var INFO_MARKERS = ["ignored ", "conflict "];
 var RETRY_DELAY_MS = 1e3;
 var WAKE_SCHEMA = `CREATE TABLE IF NOT EXISTS role_wake_dedupe (
@@ -440,27 +441,55 @@ async function resolveRole(settings, scope) {
 }
 function boundedChild(executable, args, cwd) {
   return new Promise((resolve, reject) => {
+    const deadlineAt = Date.now() + ROLE_RESOLVER_TIMEOUT_MS;
     let stdout = "";
     let stderr = "";
     const child = spawn(executable, args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env });
-    child.stdout?.on("data", (chunk) => {
+    let settled = false;
+    const finish = (error, output = "") => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stdout?.off("data", onStdout);
+      child.stderr?.off("data", onStderr);
+      child.off("error", onError);
+      child.off("close", onClose);
+      error ? reject(error) : resolve(output);
+    };
+    const abort = (error) => {
+      child.kill("SIGKILL");
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref();
+      finish(error);
+    };
+    const onStdout = (chunk) => {
       stdout += chunk.toString("utf-8");
-      if (stdout.length > STDOUT_CAP) child.kill();
-    });
-    child.stderr?.on("data", (chunk) => {
+      if (stdout.length > STDOUT_CAP) abort(new Error("role resolver output exceeded its bound"));
+    };
+    const onStderr = (chunk) => {
       stderr += chunk.toString("utf-8");
-      if (stderr.length > STDERR_CAP) child.kill();
-    });
-    child.once("error", reject);
-    child.once("close", (code) => {
+      if (stderr.length > STDERR_CAP) abort(new Error("role resolver output exceeded its bound"));
+    };
+    const onError = (error) => finish(error);
+    const onClose = (code) => {
       if (stdout.length > STDOUT_CAP || stderr.length > STDERR_CAP) {
-        reject(new Error("role resolver output exceeded its bound"));
+        finish(new Error("role resolver output exceeded its bound"));
       } else if (code !== 0) {
-        reject(new Error(stderr.trim() || `role resolver exited ${code}`));
+        finish(new Error(stderr.trim() || `role resolver exited ${code}`));
       } else {
-        resolve(stdout.trim());
+        finish(void 0, stdout.trim());
       }
-    });
+    };
+    const timer = setTimeout(
+      () => abort(new Error(`role resolver exceeded ${ROLE_RESOLVER_TIMEOUT_MS}ms`)),
+      Math.max(0, deadlineAt - Date.now())
+    );
+    timer.unref();
+    child.stdout?.on("data", onStdout);
+    child.stderr?.on("data", onStderr);
+    child.once("error", onError);
+    child.once("close", onClose);
   });
 }
 function digest(value) {
@@ -487,6 +516,7 @@ function describe(error) {
   return String(error);
 }
 export {
+  ROLE_RESOLVER_TIMEOUT_MS,
   WAKE_SCHEMA,
   plugin as default,
   deliverWake,
