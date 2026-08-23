@@ -231,13 +231,22 @@ function parseGithubEvidence(value, onInvalid = () => {
     const issue = item;
     const labels = githubLabels(issue.labels);
     const updatedAt = timestamp(issue.updatedAt);
-    if (typeof issue.number !== "number" || typeof issue.title !== "string" || !labels || updatedAt === void 0) {
+    if (typeof issue.number !== "number" || !Number.isSafeInteger(issue.number) || issue.number <= 0 || typeof issue.title !== "string" || !labels || updatedAt === void 0) {
       onInvalid(`issue-${index}`);
+      issuesComplete = false;
+      return [];
+    }
+    if (labels.filter((label) => label.startsWith("queue:")).length > 1) {
+      onInvalid(`issue-${index}-queue-labels`);
       issuesComplete = false;
       return [];
     }
     return [{ number: issue.number, title: issue.title, labels, updatedAt }];
   });
+  if (new Set(issues.map((issue) => issue.number)).size !== issues.length) {
+    onInvalid("issue-duplicate");
+    issuesComplete = false;
+  }
   const prs = raw.prs.flatMap((item, index) => {
     if (!item || typeof item !== "object") {
       onInvalid(`pr-${index}`);
@@ -292,11 +301,12 @@ function extractCandidates(snapshot) {
     return (sourceCoverage ?? (snapshot.coverage === "known" ? "known" : "blind")) === "known";
   });
   const activeAttempts = canonical.executionAttempts.filter((attempt) => attempt.project_id === projectId && ACTIVE.includes(attempt.state));
+  const repository = snapshot.githubRepository?.match(/^(?<owner>[^/]+)\/(?<repo>[^/]+)$/u)?.groups;
   const startableNumbers = new Set(githubIssues.filter((issue) => issue.labels.includes("queue:startable")).map((issue) => issue.number));
   const projectWorkItems = canonical.workItems.filter((workItem) => workItem.project_id === projectId);
   const projectRefs = canonical.externalWorkRefs.filter((row) => row.project_id === projectId);
   for (const workItem of sourcesKnown("canonical", "githubIssues") ? projectWorkItems : []) {
-    const ref = projectRefs.find((row) => row.work_item_id === workItem.work_item_id && row.provider === "github" && typeof row.issue_number === "number");
+    const ref = projectRefs.find((row) => row.work_item_id === workItem.work_item_id && row.provider === "github" && row.owner === repository?.owner && row.repo === repository?.repo && typeof row.issue_number === "number");
     if (workItem.lifecycle_state !== "ready" || !ref || !startableNumbers.has(ref.issue_number) || activeAttempts.some((attempt) => attempt.work_item_id === workItem.work_item_id)) continue;
     const anchors = { projectId, kind: "work_item", workItemId: String(workItem.work_item_id), resourceRevision: Number(workItem.resource_revision) };
     candidates.push({ id: `${projectId}:work-item:${anchors.workItemId}:${anchors.resourceRevision}`, kind: anchors.kind, anchors, finding: `Work item ${anchors.workItemId} (revision ${anchors.resourceRevision}; issue #${ref.issue_number}) is queue:startable with zero active attempts.`, evidence: { projectId, lifecycleState: workItem.lifecycle_state, issueNumber: ref.issue_number, activeAttemptCount: 0 } });
@@ -306,7 +316,6 @@ function extractCandidates(snapshot) {
     const anchors = { projectId, kind: "attempt", executionAttemptId: attempt.execution_attempt_id };
     candidates.push({ id: `${projectId}:attempt:${anchors.executionAttemptId}`, kind: anchors.kind, anchors, finding: `Active attempt ${anchors.executionAttemptId} for work item ${String(attempt.work_item_id)} has produced no canonical evidence for at least ten minutes.`, evidence: { projectId, workItemId: attempt.work_item_id, state: attempt.state, observedAtMs: attempt.observed_at_ms } });
   }
-  const repository = snapshot.githubRepository?.match(/^(?<owner>[^/]+)\/(?<repo>[^/]+)$/u)?.groups;
   if (repository && sourcesKnown("canonical", "githubPrs")) for (const pr of githubPrs) {
     if (!pr.ready || observedAt - pr.updatedAt < DECISION_THRESHOLD_MS) continue;
     const linkedWorkItems = projectRefs.filter((ref) => ref.provider === "github" && ref.owner === repository.owner && ref.repo === repository.repo && ref.issue_number === pr.closingIssueNumber).map((ref) => projectWorkItems.find((workItem) => workItem.work_item_id === ref.work_item_id)).filter((workItem) => workItem !== void 0);

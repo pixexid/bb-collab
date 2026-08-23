@@ -3891,6 +3891,34 @@ exec /bin/cat '${inventory}'
     }
   });
 
+  it("fails closed when the final queue page is exactly the inventory cap", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-role-queue-capped-final-page-"));
+    const gh = join(bin, "gh");
+    const issues = Array.from({ length: 100 }, (_, index) => ({ number: index + 1, labels: [{ name: "queue:startable" }] }));
+    writeFileSync(gh, `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify([issues])}'\n`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    let service: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true);
+      service = fixture.host.harness.runService("lane-watcher");
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: `role queue coverage=degraded project=${PROJECT_ID} reason=startable-queue-unreadable`,
+      })));
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    } finally {
+      service?.controller.abort();
+      await service?.done;
+      clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("bounds accepted role-queue fanout and the complete wake decision below two minutes", () => {
     expect(ROLE_QUEUE_MAX_REPOSITORIES).toBe(4);
     expect(ROLE_QUEUE_REFRESH_TIMEOUT_MS).toBe(8_000);
@@ -5747,6 +5775,37 @@ exit 1
         expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
         fixture.addNativeLane("thread-work-item-1");
       }
+      vi.useFakeTimers();
+      try {
+        await fixture.host.harness.emitThreadEvent("thread.idle", {
+          thread: makeThreadResponse({ id: fixture.orchestratorThreadId, projectId: PROJECT_ID, status: "idle", updatedAt: 1 }),
+          lastAssistantText: null,
+        });
+        await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+        vi.useRealTimers();
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        vi.useFakeTimers();
+        expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("stays silent when the queue is startable but the configured writing capacity is zero", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-zero-capacity-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(1, true, 0);
+      fixture.host.harness.sdk.stub("threads.wait", (async () => undefined) as never);
       vi.useFakeTimers();
       try {
         await fixture.host.harness.emitThreadEvent("thread.idle", {

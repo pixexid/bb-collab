@@ -19,7 +19,7 @@ const inlineExport = (recordsNdjson: string, tableCounts: Record<string, number>
 });
 
 async function emptySnapshot(overrides: Partial<CandidateSnapshot> = {}): Promise<CandidateSnapshot> {
-  return { projectId, canonical: await capturedExport(), queued: [], githubIssues: [], githubPrs: [], coverage: "known", observedAt: 1_000_000, ...overrides };
+  return { projectId, canonical: await capturedExport(), queued: [], githubRepository, githubIssues: [], githubPrs: [], coverage: "known", observedAt: 1_000_000, ...overrides };
 }
 
 const queuedMessage = (id: string, createdAt = 1) => ({ id, content: [{ type: "text" as const, text: "merge the verified head", mentions: [] }], model: "gpt", reasoningLevel: "medium" as const, permissionMode: "auto" as const, serviceTier: "default" as const, groupWithNext: false, createdAt, updatedAt: createdAt });
@@ -41,7 +41,7 @@ describe("semantic idle guard", () => {
     const base = await capturedExport();
     const workItem = { ...base.workItems[0], work_item_id: "wi-gh-560", lifecycle_state: "ready", resource_revision: 3 };
     const snapshot = await emptySnapshot({
-      canonical: { ...base, workItems: [workItem], externalWorkRefs: [{ project_id: projectId, work_item_id: "wi-gh-560", provider: "github", issue_number: 560 }] },
+      canonical: { ...base, workItems: [workItem], externalWorkRefs: [githubExternalRef("wi-gh-560", 560)] },
       githubIssues: [{ number: 560, title: "Companion architecture", labels: ["queue:startable"], updatedAt: 1 }],
     });
     expect(extractCandidates(snapshot)).toEqual([expect.objectContaining({ id: `${projectId}:work-item:wi-gh-560:3`, anchors: { projectId, kind: "work_item", workItemId: "wi-gh-560", resourceRevision: 3 }, evidence: { projectId, lifecycleState: "ready", issueNumber: 560, activeAttemptCount: 0 } })]);
@@ -62,7 +62,7 @@ describe("semantic idle guard", () => {
         ...base,
         executionAttempts: [base.executionAttempts[0]!, ...writers],
         workItems: [control],
-        externalWorkRefs: [{ project_id: projectId, work_item_id: "wi-gh-141", provider: "github", issue_number: 141 }],
+        externalWorkRefs: [githubExternalRef("wi-gh-141", 141)],
       },
       githubIssues: [
         { number: 141, title: "Legacy queue head", labels: ["queue:blocked"], updatedAt: 1 },
@@ -139,7 +139,7 @@ describe("semantic idle guard", () => {
     const base = await capturedExport();
     const parsed = parseGithubEvidence({ repository: githubRepository, issues: [{ number: 560, title: "Ready", labels: [{ name: "queue:startable" }], updatedAt: "1970-01-01T00:00:01.000Z" }], prs: [{ number: 584, title: "Malformed linkage", state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "", headRefOid: "a".repeat(40), reviews: [], statusCheckRollup: [{ conclusion: "SUCCESS" }], updatedAt: "1970-01-01T00:00:01.000Z", closingIssuesReferences: [] }] });
     const snapshot = await emptySnapshot({
-      canonical: { ...base, executionAttempts: [base.executionAttempts[0]!], workItems: [{ ...base.workItems[0], work_item_id: "wi-gh-560", lifecycle_state: "ready", resource_revision: 5 }], externalWorkRefs: [{ project_id: projectId, work_item_id: "wi-gh-560", provider: "github", issue_number: 560 }] },
+      canonical: { ...base, executionAttempts: [base.executionAttempts[0]!], workItems: [{ ...base.workItems[0], work_item_id: "wi-gh-560", lifecycle_state: "ready", resource_revision: 5 }], externalWorkRefs: [githubExternalRef("wi-gh-560", 560)] },
       githubRepository: parsed.repository,
       githubIssues: parsed.issues,
       githubPrs: parsed.prs,
@@ -159,6 +159,34 @@ describe("semantic idle guard", () => {
       observedAt: 1_000_000,
     });
     expect(extractCandidates(snapshot).filter((candidate) => candidate.kind === "pull_request")).toEqual([]);
+  });
+
+  it("rejects a foreign same-number external ref for the current WorkItem queue label", async () => {
+    const base = await capturedExport();
+    const snapshot = await emptySnapshot({
+      canonical: {
+        ...base,
+        workItems: [{ ...base.workItems[0], work_item_id: "wi-gh-560", lifecycle_state: "ready" }],
+        externalWorkRefs: [githubExternalRef("wi-gh-560", 560, "foreign-owner", "bb-collab")],
+      },
+      githubIssues: [{ number: 560, title: "Foreign same-number issue", labels: ["queue:startable"], updatedAt: 1 }],
+    });
+    expect(extractCandidates(snapshot).filter((candidate) => candidate.kind === "work_item")).toEqual([]);
+  });
+
+  it("blinds conflicting and duplicate GitHub queue rows", () => {
+    const invalid: string[] = [];
+    const result = parseGithubEvidence({
+      repository: githubRepository,
+      issues: [
+        { number: 560, title: "conflicting", labels: [{ name: "queue:startable" }, { name: "queue:blocked" }], updatedAt: "1970-01-01T00:00:01.000Z" },
+        { number: 561, title: "duplicate", labels: [{ name: "queue:startable" }], updatedAt: "1970-01-01T00:00:01.000Z" },
+        { number: 561, title: "duplicate", labels: [{ name: "queue:startable" }], updatedAt: "1970-01-01T00:00:01.000Z" },
+      ],
+      prs: [],
+    }, (reason) => invalid.push(reason));
+    expect(result).toMatchObject({ issues: [{ number: 561 }, { number: 561 }], issuesComplete: false, complete: false });
+    expect(invalid).toEqual(["issue-0-queue-labels", "issue-duplicate"]);
   });
 
   it("excludes PR584 for issue582 with a live exact-head review attempt", async () => {
@@ -250,7 +278,7 @@ describe("semantic idle guard", () => {
     const workItem = { ...base.workItems[0], work_item_id: "wi-shared", lifecycle_state: "ready", resource_revision: 3 };
     const make = (id: string) => emptySnapshot({
       projectId: id,
-      canonical: { ...base, projectId: id, workItems: [{ ...workItem, project_id: id }], externalWorkRefs: [{ project_id: id, work_item_id: "wi-shared", provider: "github", issue_number: 591 }] },
+      canonical: { ...base, projectId: id, workItems: [{ ...workItem, project_id: id }], externalWorkRefs: [{ project_id: id, work_item_id: "wi-shared", provider: "github", owner: "pixexid", repo: "bb-collab", issue_number: 591 }] },
       githubIssues: [{ number: 591, title: "Shared number", labels: ["queue:startable"], updatedAt: 1 }],
     });
     const a = await make(projectId);
@@ -274,7 +302,7 @@ describe("semantic idle guard", () => {
     const github = parseGithubEvidence({ repository: "pixexid/bb-collab", issues: [{ number: 560, title: "Ready", labels: [{ name: "queue:startable" }], updatedAt: "1970-01-01T00:00:01.000Z" }], prs: [{ number: 584, title: "Ready", state: "OPEN", mergeStateStatus: "CLEAN", reviewDecision: "", headRefOid: head, reviews: [], statusCheckRollup: [{ conclusion: "SUCCESS" }], updatedAt: "1970-01-01T00:00:01.000Z", closingIssuesReferences: [closingIssue(582)] }] });
     const known = { canonical: "known", timeline: "known", github: "known", queue: "known" } as const;
     const snapshots = {
-      canonical: await emptySnapshot({ canonical: { ...base, executionAttempts: [base.executionAttempts[0]!], workItems: [workItem], externalWorkRefs: [{ project_id: projectId, work_item_id: "wi-gh-560", provider: "github", issue_number: 560 }] }, githubIssues: github.issues, sourceCoverage: known }),
+      canonical: await emptySnapshot({ canonical: { ...base, executionAttempts: [base.executionAttempts[0]!], workItems: [workItem], externalWorkRefs: [githubExternalRef("wi-gh-560", 560)] }, githubIssues: github.issues, sourceCoverage: known }),
       timeline: await emptySnapshot({ canonical: { ...base, executionAttempts: [base.executionAttempts[0]!, stale] }, sourceCoverage: known }),
       github: await emptySnapshot({ canonical: { ...base, workItems: [{ ...workItem, work_item_id: "wi-gh-582" }], externalWorkRefs: [githubExternalRef("wi-gh-582", 582)] }, githubRepository: github.repository, githubPrs: github.prs, sourceCoverage: known }),
       queue: await emptySnapshot({ queued: [queuedMessage("queue-old", 1)], cycleStartedAt: 2, sourceCoverage: known }),

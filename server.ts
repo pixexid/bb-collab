@@ -192,7 +192,7 @@ async function startableQueueStateAsync(repositories: string[]): Promise<Startab
   })));
   for (const { repository, pages } of inventories) {
     if (!Array.isArray(pages) || !pages.every((page, index) => Array.isArray(page) && page.length <= 100
-      && (index === pages.length - 1 || page.length === 100) && page.every(isIssue))) return null;
+      && (index === pages.length - 1 ? page.length < 100 : page.length === 100) && page.every(isIssue))) return null;
     const inventory = (pages as QueueInventoryIssue[][]).flat();
     if (new Set(inventory.map((issue) => issue.number)).size !== inventory.length) return null;
     const issues = inventory.filter((issue) => !("pull_request" in issue));
@@ -2207,6 +2207,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     observedAtMs: number;
     configIdentity: string;
     known: boolean;
+    reason: string | null;
     head: { workItemId: string; resourceRevision: number } | null;
   };
   type RoleQueueConfig = { identity: string; repositories: string[]; reason: string | null };
@@ -2240,6 +2241,28 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return { identity: `config-unreadable:${String(error)}`, repositories: [], reason: `role-queue-unreadable:${String(error)}` };
     }
   };
+  const bindRoleQueueHead = (projectId: string, configIdentity: string, queue: StartableQueueState, observedAtMs: number): RoleQueueRead => {
+    let head: RoleQueueRead["head"] = null;
+    let reason: string | null = null;
+    if (queue.head !== null) {
+      const match = queue.head.match(/^([^/]+)\/([^/#]+)#([1-9][0-9]*)$/u);
+      const issueNumber = match?.[3] === undefined ? Number.NaN : Number(match[3]);
+      if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
+        reason = "startable-queue-head-malformed";
+      } else {
+        const matches = db?.prepare(
+          `SELECT items.work_item_id, items.resource_revision
+           FROM work_items AS items JOIN external_work_refs AS refs
+             ON refs.project_id = items.project_id AND refs.work_item_id = items.work_item_id
+           WHERE items.project_id = ? AND items.lifecycle_state IN ('proposed', 'ready')
+             AND refs.provider = 'github' AND refs.owner = ? AND refs.repo = ? AND refs.issue_number = ?`,
+        ).all(projectId, match[1], match[2], issueNumber) as Array<{ work_item_id: string; resource_revision: number }> | undefined;
+        if (!matches || matches.length !== 1) reason = `startable-queue-head-bindings:${matches?.length ?? 0}`;
+        else head = { workItemId: matches[0]!.work_item_id, resourceRevision: matches[0]!.resource_revision };
+      }
+    }
+    return { observedAtMs, configIdentity, known: reason === null, reason, head };
+  };
   const readProjectRoleQueue = async (projectId: string, refresh = false): Promise<RoleQueueRead> => {
     const now = Date.now();
     const config = readRoleQueueConfig(projectId);
@@ -2251,7 +2274,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       if (refreshing.configIdentity === config.identity) return refreshing.promise;
       const reason = "project-config-superseded-in-flight";
       bb.log.warn(`role queue coverage=degraded project=${projectId} reason=${reason}`);
-      return { observedAtMs: now, configIdentity: config.identity, known: false, head: null };
+      return { observedAtMs: now, configIdentity: config.identity, known: false, reason, head: null };
     }
     const next = (async (): Promise<RoleQueueRead> => {
       let reason = config.reason;
@@ -2263,21 +2286,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           if (queue === null) {
             reason = "startable-queue-unreadable";
           } else if (queue.head !== null) {
-            const match = queue.head.match(/^([^/]+)\/([^/#]+)#([1-9][0-9]*)$/u);
-            const issueNumber = match?.[3] === undefined ? Number.NaN : Number(match[3]);
-            if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
-              reason = "startable-queue-head-malformed";
-            } else {
-              const matches = db.prepare(
-                `SELECT items.work_item_id, items.resource_revision
-                 FROM work_items AS items JOIN external_work_refs AS refs
-                   ON refs.project_id = items.project_id AND refs.work_item_id = items.work_item_id
-                 WHERE items.project_id = ? AND items.lifecycle_state IN ('proposed', 'ready')
-                   AND refs.provider = 'github' AND refs.owner = ? AND refs.repo = ? AND refs.issue_number = ?`,
-              ).all(projectId, match[1], match[2], issueNumber) as Array<{ work_item_id: string; resource_revision: number }>;
-              if (matches.length === 1) head = { workItemId: matches[0]!.work_item_id, resourceRevision: matches[0]!.resource_revision };
-              else reason = `startable-queue-head-bindings:${matches.length}`;
-            }
+            const bound = bindRoleQueueHead(projectId, config.identity, queue, Date.now());
+            head = bound.head;
+            reason = bound.reason;
           }
         }
       } catch (error) {
@@ -2288,7 +2299,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         reason = "project-config-moved-during-refresh";
         head = null;
       }
-      const result = { observedAtMs: Date.now(), configIdentity: config.identity, known: reason === null, head };
+      const result = { observedAtMs: Date.now(), configIdentity: config.identity, known: reason === null, reason, head };
       if (currentConfig.identity === config.identity) roleQueueCache.set(projectId, result);
       if (reason !== null) bb.log.warn(`role queue coverage=degraded project=${projectId} reason=${reason}`);
       return result;
@@ -2366,11 +2377,16 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     return true;
   };
 
-  const steerRole = async (role: import("./src/awareness.js").RoleIdleView, queue?: RoleQueueRead) => {
+  const steerRole = async (role: import("./src/awareness.js").RoleIdleView) => {
     if (role.roleId !== "project-orchestrator") return false;
-    const current = queue ?? await readProjectRoleQueue(role.projectId, true);
+    const capacity = await readLaneCapacityObservation(role.projectId);
+    if (capacity.coverageState !== "known" || !capacity.queue || capacity.activeLaneCount === null || capacity.writingLaneCeiling === null) return "error" as const;
+    const currentConfig = readRoleQueueConfig(role.projectId);
+    if (currentConfig.identity !== capacity.configIdentity) return "error" as const;
+    const current = bindRoleQueueHead(role.projectId, capacity.configIdentity, capacity.queue, capacity.observedAtMs);
     if (!current.known) return "error" as const;
     if (!current.head || current.head.workItemId !== role.queueHeadId) return false;
+    if (capacity.activeLaneCount >= capacity.writingLaneCeiling) return false;
     return sendRoleWake(role, `Wrongful idle: queue head ${current.head.workItemId} is startable. Inspect the queue and act or record the blocker.`);
   };
 
@@ -2434,6 +2450,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     laneCapacityObservationId: string;
     observedAtMs: number;
     executionAttemptIds: string[];
+    configIdentity: string;
+    queue: StartableQueueState | null;
   };
   if (db) {
     db.prepare(
@@ -2527,6 +2545,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         if (typeof row.observed_at_ms !== "number" || !Number.isSafeInteger(row.observed_at_ms) || row.observed_at_ms < 0 || now - row.observed_at_ms > IDLE_FLEET_ATTEMPT_STALE_MS) {
           return { known: false, reason: "stale-active-attempt" };
         }
+        if (laneIds.has(row.lane_id)) return { known: false, reason: "duplicate-active-lane" };
         laneIds.add(row.lane_id);
       }
       return { known: true, value: laneIds.size };
@@ -2583,19 +2602,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return { known: false, reason: `native-lanes-unreadable:${String(error)}` };
     }
   };
-  const readIdleFleetStartable = async (projectId: string): Promise<IdleFleetFact<StartableQueueState>> => {
+  const readIdleFleetStartable = async (projectId: string, configured = readRoleQueueConfig(projectId)): Promise<IdleFleetFact<StartableQueueState>> => {
     if (!db) return { known: false, reason: "canonical-store-unavailable" };
     try {
-      const repositories = (db.prepare(
-        `SELECT targets.remote_url FROM project_config_heads AS heads
-         JOIN repository_targets AS targets
-           ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
-         WHERE heads.project_id = ? ORDER BY targets.repo_target_id`,
-      ).all(projectId) as Array<{ remote_url: string | null }>).map((target) => githubRepository(target.remote_url));
-      if (repositories.length === 0 || repositories.some((repository) => repository === null)) {
-        return { known: false, reason: "configured-repositories-unreadable" };
-      }
-      const queue = await startableQueueStateAsync(repositories as string[]);
+      if (configured.reason !== null) return { known: false, reason: configured.reason };
+      const queue = await startableQueueStateAsync(configured.repositories);
       return queue === null ? { known: false, reason: "startable-queue-unreadable" } : { known: true, value: queue };
     } catch (error) {
       return { known: false, reason: `startable-queue-unreadable:${String(error)}` };
@@ -2625,14 +2636,17 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     );
     if (orchestrators.length !== 1) throw new Error(`canonical-orchestrator-count:${orchestrators.length}`);
     const holder = orchestrators[0]!;
+    const configured = readRoleQueueConfig(projectId);
     const nativeLanes = await readIdleFleetNativeLanes(projectId);
     const [activeLanes, startable, ceiling] = await Promise.all([
       readIdleFleetActiveLanes(projectId),
-      readIdleFleetStartable(projectId),
+      readIdleFleetStartable(projectId, configured),
       readIdleFleetCeiling(projectId),
     ]);
     const observedAtMs = Date.now();
+    const currentConfig = readRoleQueueConfig(projectId);
     const reasons = [
+      currentConfig.identity !== configured.identity ? "project-config-moved-during-refresh" : null,
       !activeLanes.known ? activeLanes.reason : null,
       !nativeLanes.known ? nativeLanes.reason : null,
       !startable.known ? startable.reason : null,
@@ -2670,6 +2684,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       laneCapacityObservationId,
       observedAtMs,
       executionAttemptIds: nativeLanes.known ? nativeLanes.value.executionAttemptIds : [],
+      configIdentity: configured.identity,
+      queue: reasons.length === 0 && startable.known ? startable.value : null,
     };
   };
   const readIdleFleetProbes = async (): Promise<IdleFleetProbe[]> => {
@@ -2721,17 +2737,24 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     if (!Number.isFinite(thread.updatedAt)) return idleFleetBlind("blind", "blind", "blind", "orchestrator-unreadable");
     if (String(thread.updatedAt) !== probe.idleEpisode) return { kind: "silent" };
 
-    const [activeLanes, nativeLanes, startable] = await Promise.all([
+    const configured = readRoleQueueConfig(probe.projectId);
+    const [activeLanes, nativeLanes, startable, ceiling] = await Promise.all([
       readIdleFleetActiveLanes(probe.projectId),
       readIdleFleetNativeLanes(probe.projectId),
-      readIdleFleetStartable(probe.projectId),
+      readIdleFleetStartable(probe.projectId, configured),
+      readIdleFleetCeiling(probe.projectId),
     ]);
+    const currentConfig = readRoleQueueConfig(probe.projectId);
+    if (currentConfig.identity !== configured.identity) {
+      return idleFleetBlind("known", "blind", "blind", "project-config-moved-during-refresh");
+    }
     const laneDisagreement = activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value.count;
-    if (!activeLanes.known || !nativeLanes.known || !startable.known) {
+    if (!activeLanes.known || !nativeLanes.known || !startable.known || !ceiling.known) {
       const blindReasons = [
         !activeLanes.known ? activeLanes.reason : null,
         !nativeLanes.known ? nativeLanes.reason : null,
         !startable.known ? startable.reason : null,
+        !ceiling.known ? ceiling.reason : null,
       ].filter((reason): reason is string => reason !== null);
       return idleFleetBlind(
         "known",
@@ -2743,7 +2766,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     if (laneDisagreement) {
       return idleFleetBlind("known", "blind", "known", `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value.count}`);
     }
-    if (activeLanes.value > 0 || startable.value.count === 0) return { kind: "silent" };
+    if (activeLanes.value >= ceiling.value || startable.value.count === 0) return { kind: "silent" };
     const queueHead = startable.value.head;
     if (!queueHead) return { kind: "silent" };
     const role = {
@@ -2843,7 +2866,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     },
     wakeRole: async (role) => {
       const queue = await readProjectRoleQueue(role.projectId, true);
-      const result = queue.head ? await steerRole({ ...role, queueHeadId: queue.head.workItemId }, queue) : queue.known ? false : "error";
+      const result = queue.head ? await steerRole({ ...role, queueHeadId: queue.head.workItemId }) : queue.known ? false : "error";
       return result === true
         ? { attempted: true, delivered: true }
         : { attempted: false, delivered: false, refusal: result === "error" ? "error" : "policy" };
