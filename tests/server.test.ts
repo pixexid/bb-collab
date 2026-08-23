@@ -5769,7 +5769,7 @@ fi
       const fixture = await fleetWatchdogFixture(0, true, 1, false);
       const dispatch = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
         request: transitionRequest(fixture.fenceToken, "in_progress", 2),
-        spawn: { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" },
+        spawn: dispatchSpawn(fixture.orchestratorThreadId),
       }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
       expect(dispatch).toMatchObject({ outcome: "OK" });
       fixture.addNativeLane("lane-1", "active");
