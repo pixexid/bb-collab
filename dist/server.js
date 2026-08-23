@@ -14745,9 +14745,9 @@ function assertGithubIssueBriefBinding(brief, expected) {
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var RUNTIME_CONTRACT_VERSION = 24;
+var RUNTIME_CONTRACT_VERSION = 25;
 var SCHEMA_VERSION = 30;
-var PREVIOUS_RUNTIME_CONTRACT_VERSION = 23;
+var PREVIOUS_RUNTIME_CONTRACT_VERSION = 24;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
 var PREVIOUS_SCHEMA_VERSION = 29;
@@ -20069,6 +20069,18 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
     request.expectedResourceRevision,
     nextState !== void 0 || request.workItemWait === null
   );
+  if (request.reasonCode === "fleet-watchdog-merge-close" && nextState !== void 0) {
+    const liveAttempt = db.prepare(
+      `SELECT execution_attempt_id, assignment_id, lane_id, thread_id, state
+       FROM execution_attempts
+       WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+         AND state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+       ORDER BY attempt_ordinal DESC LIMIT 1`
+    ).get(request.projectId, workItem.work_item_id, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES);
+    if (liveAttempt) {
+      throw refusal("WORK_ITEM_STATE_INVALID", `fleet-watchdog merge-close requires no nonterminal canonical attempt: executionAttemptId=${liveAttempt.execution_attempt_id} assignmentId=${liveAttempt.assignment_id ?? "null"} laneId=${liveAttempt.lane_id ?? "null"} threadId=${liveAttempt.thread_id ?? "null"} state=${liveAttempt.state}`);
+    }
+  }
   const wait = request.workItemWait;
   const unblock = request.workItemUnblock;
   const externalEvent = request.workItemExternalEvent;
@@ -22948,6 +22960,7 @@ var fleetWatchdogCompositeKey = (...parts) => JSON.stringify(parts);
 var fleetWatchdogIssueReopenedKey = (projectId, workItemId, externalRevision) => `fleet-watchdog:issue-reopened:${fleetWatchdogCompositeKey(projectId, workItemId, externalRevision)}`;
 var fleetWatchdogLegacyIssueReopenedKey = (workItemId, externalRevision) => `fleet-watchdog:issue-reopened:${workItemId}:${externalRevision}`;
 var fleetWatchdogMergeCloseKey = (projectId, workItemId, state, externalRevision) => `fleet-watchdog:merge-close:${fleetWatchdogCompositeKey(projectId, workItemId, state, externalRevision)}`;
+var fleetWatchdogMergeCloseMismatchKey = (projectId, workItemId, externalRevision, subject) => `fleet-watchdog:merge-close-mismatch:${fleetWatchdogCompositeKey(projectId, workItemId, externalRevision, subject)}`;
 var fleetWatchdogLegacyMergeCloseKey = (workItemId, state, externalRevision) => `fleet-watchdog:merge-close:${workItemId}:${state}:${externalRevision}`;
 var fleetWatchdogBlockerFiredKey = (projectId, workItemId, subject) => `fleet-watchdog:blocker-fired:${fleetWatchdogCompositeKey(projectId, workItemId, subject)}`;
 var fleetWatchdogLegacyBlockerFiredKey = (workItemId, subject) => `fleet-watchdog:blocker-fired:${workItemId}:${subject}`;
@@ -26045,6 +26058,11 @@ ${thread.titleFallback ?? ""}`);
         const threads = [];
         for (let offset = 0; ; offset += 100) {
           const page = await bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset, signal: controller.signal });
+          const ids = new Set(threads.map((thread) => thread.id));
+          const pageIds = /* @__PURE__ */ new Set();
+          if (page.some((thread) => thread.projectId !== projectId || ids.has(thread.id) || pageIds.has(thread.id) || !pageIds.add(thread.id))) {
+            throw new Error("native-lane-inventory-is-foreign-or-ambiguous");
+          }
           threads.push(...page);
           if (page.length < 100) return threads;
         }
@@ -26067,6 +26085,54 @@ ${thread.titleFallback ?? ""}`);
     return Promise.race([entry.promise, timeout]).catch(() => null).finally(() => {
       if (timer !== void 0) clearTimeout(timer);
     });
+  };
+  const readMergeCloseSafety = async (projectId, workItemId, dispatcherThreadIds) => {
+    let attempts;
+    try {
+      attempts = db.prepare(
+        `SELECT execution_attempt_id, assignment_id, state, lane_id, thread_id
+         FROM execution_attempts
+         WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+         ORDER BY attempt_ordinal DESC`
+      ).all(projectId, workItemId).map((attempt) => ({
+        executionAttemptId: attempt.execution_attempt_id,
+        assignmentId: attempt.assignment_id,
+        state: attempt.state,
+        laneId: attempt.lane_id,
+        threadId: attempt.thread_id
+      }));
+    } catch (error48) {
+      return { safe: false, reason: `canonical-attempt-inventory-uncertain:${String(error48)}`, attempts: [], lanes: [] };
+    }
+    const nonterminal = new Set(WORK_ITEM_CAPACITY_ATTEMPT_STATES);
+    const liveAttempts = attempts.filter((attempt) => nonterminal.has(attempt.state));
+    let inventory;
+    try {
+      inventory = await readFleetWatchdogLaneInventory(projectId);
+    } catch {
+      inventory = null;
+    }
+    if (inventory === null) {
+      return { safe: false, reason: "native-lane-inventory-incomplete-or-uncertain", attempts: liveAttempts, lanes: [] };
+    }
+    const lanes = inventory.filter(
+      (thread) => thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null
+    );
+    const associatedLanes = lanes.flatMap((lane) => {
+      const attempt = attempts.find((candidate) => candidate.threadId === lane.id);
+      return attempt ? [{ threadId: lane.id, status: lane.status, laneId: attempt.laneId }] : [];
+    });
+    const unknownLanes = associatedLanes.filter((lane) => !["idle", "active", "starting", "stopping", "error"].includes(lane.status));
+    const activeLanes = associatedLanes.filter((lane) => lane.status === "active" || lane.status === "starting");
+    if (liveAttempts.length > 0 || activeLanes.length > 0 || unknownLanes.length > 0) {
+      return {
+        safe: false,
+        reason: liveAttempts.length > 0 ? "nonterminal-canonical-attempt" : unknownLanes.length > 0 ? "native-lane-status-uncertain" : "active-associated-native-lane",
+        attempts: liveAttempts,
+        lanes: [...activeLanes, ...unknownLanes]
+      };
+    }
+    return { safe: true };
   };
   const fleetWatchdogCycle = async (onlyProjectId) => {
     let coverage = "blind";
@@ -26205,7 +26271,7 @@ ${thread.titleFallback ?? ""}`);
           wakeInFlight.delete(key);
         }
       };
-      const transitionWorkItem = async (projectId, workItemId, state, idempotencyKey, extra = {}, githubSnapshot, legacyIdempotencyKey, terminalizationPolicy = "refuse-active") => {
+      const transitionWorkItem = async (projectId, workItemId, state, idempotencyKey, extra = {}, githubSnapshot, legacyIdempotencyKey, terminalizationPolicy = "refuse-active", reasonCode) => {
         const actor = db.prepare(
           `SELECT receipt_id FROM actor_receipts
            WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
@@ -26237,6 +26303,7 @@ ${thread.titleFallback ?? ""}`);
           expectedResourceRevision: workItem.resource_revision,
           workItemId,
           lifecycleState: state,
+          ...reasonCode === void 0 ? {} : { reasonCode },
           ...extra
         };
         const compatibleKey = legacyIdempotencyKey !== void 0 && db.prepare(
@@ -26265,7 +26332,7 @@ ${thread.titleFallback ?? ""}`);
           else waitExternalRevisions.set(key, observation2);
         }
       };
-      const inspectLinkedWorkItems = async (projectId) => {
+      const inspectLinkedWorkItems = async (projectId, orchestrator, dispatcherThreadIds) => {
         const linkedWorkItems = db.prepare(
           `SELECT work_items.work_item_id, work_items.lifecycle_state, external_work_refs.owner, external_work_refs.repo, external_work_refs.issue_number
            FROM work_items JOIN external_work_refs
@@ -26277,6 +26344,20 @@ ${thread.titleFallback ?? ""}`);
              AND external_work_refs.issue_number IS NOT NULL
            ORDER BY work_items.work_item_id`
         ).all(projectId, ...WORK_ITEM_NON_TERMINAL_STATES, "succeeded");
+        const reportMismatch = async (linked, snapshot2, safety) => {
+          const attempts = safety.attempts.length === 0 ? "none" : safety.attempts.map((attempt) => `executionAttemptId=${attempt.executionAttemptId}[assignmentId=${attempt.assignmentId ?? "null"},laneId=${attempt.laneId ?? "null"},threadId=${attempt.threadId ?? "null"},state=${attempt.state}]`).join(",");
+          const lanes = safety.lanes.length === 0 ? "none" : safety.lanes.map((lane) => `${lane.threadId}[laneId=${lane.laneId ?? "null"},status=${lane.status}]`).join(",");
+          const subject = `${safety.reason}|attempts=${attempts}|lanes=${lanes}`;
+          const sent = await wake(
+            projectId,
+            orchestrator,
+            fleetWatchdogMergeCloseMismatchKey(projectId, linked.work_item_id, snapshot2.externalRevision, subject),
+            `fleet-watchdog merge-close mismatch: project=${projectId} workItem=${linked.work_item_id} issue=${linked.owner}/${linked.repo}#${linked.issue_number} externalRevision=${snapshot2.externalRevision} reason=${safety.reason} attempts=${attempts} lanes=${lanes}; no stop or lifecycle transition is authorized.`,
+            false,
+            "owed-act"
+          );
+          if (sent) bb.log.warn(`fleet-watchdog merge-close mismatch reported: project=${projectId} workItem=${linked.work_item_id} reason=${safety.reason}`);
+        };
         for (const linked of linkedWorkItems) {
           const mapping = githubRepositoryMappingForWorkItem(db, projectId, linked.work_item_id, linked.owner, linked.repo);
           if (!mapping) {
@@ -26356,16 +26437,31 @@ ${thread.titleFallback ?? ""}`);
             degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
             continue;
           }
-          const transition = (state) => transitionWorkItem(
-            projectId,
-            linked.work_item_id,
-            state,
-            fleetWatchdogMergeCloseKey(projectId, linked.work_item_id, state, githubSnapshot.externalRevision),
-            state === "succeeded" || state === "cancelled" && workItem.lifecycle_state === "proposed" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
-            githubSnapshot,
-            fleetWatchdogLegacyMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
-            "stop-active"
-          );
+          const safety = await readMergeCloseSafety(projectId, linked.work_item_id, dispatcherThreadIds);
+          if (!safety.safe) {
+            degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
+            await reportMismatch(linked, githubSnapshot, safety);
+            continue;
+          }
+          const transition = async (state) => {
+            const latestSafety = await readMergeCloseSafety(projectId, linked.work_item_id, dispatcherThreadIds);
+            if (!latestSafety.safe) {
+              degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
+              await reportMismatch(linked, githubSnapshot, latestSafety);
+              return { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close safety refused: ${latestSafety.reason}` };
+            }
+            return transitionWorkItem(
+              projectId,
+              linked.work_item_id,
+              state,
+              fleetWatchdogMergeCloseKey(projectId, linked.work_item_id, state, githubSnapshot.externalRevision),
+              state === "succeeded" || state === "cancelled" && workItem.lifecycle_state === "proposed" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
+              githubSnapshot,
+              fleetWatchdogLegacyMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
+              "refuse-active",
+              "fleet-watchdog-merge-close"
+            );
+          };
           let result2;
           if (workItem.lifecycle_state === "in_progress") {
             result2 = await transition("review_pending");
@@ -26425,7 +26521,6 @@ ${thread.titleFallback ?? ""}`);
         lanesByProject.set(projectId, lanes);
         const holders = holdersByProject.get(projectId) ?? [];
         try {
-          await inspectLinkedWorkItems(projectId);
           await inspectWaitTargets(projectId);
           const directors = holders.filter((holder) => holder.role_id === "director");
           const orchestrators = holders.filter((holder) => holder.role_id === "project-orchestrator");
@@ -26437,6 +26532,7 @@ ${thread.titleFallback ?? ""}`);
           }
           const director = directors[0];
           const orchestrator = orchestrators[0];
+          await inspectLinkedWorkItems(projectId, orchestrator, dispatcherThreadIds);
           for (const holder of holders) {
             let thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
             if (thread.status !== "error" && thread.status !== "stopping") continue;
@@ -27170,6 +27266,7 @@ export {
   fleetWatchdogEpisodeKey,
   fleetWatchdogIssueReopenedKey,
   fleetWatchdogMergeCloseKey,
+  fleetWatchdogMergeCloseMismatchKey,
   fleetWatchdogReopenKey,
   fleetWatchdogRoleLivenessKey,
   fleetWatchdogScope,

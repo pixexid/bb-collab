@@ -10,10 +10,10 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
-export const RUNTIME_CONTRACT_VERSION = 24;
+export const RUNTIME_CONTRACT_VERSION = 25;
 export const SCHEMA_VERSION = 30;
-// v24 permits natural pending GitHub bindings to cross durable dispatch intent.
-const PREVIOUS_RUNTIME_CONTRACT_VERSION = 23;
+// v25 makes fleet-watchdog merge-close refuse live canonical attempts.
+const PREVIOUS_RUNTIME_CONTRACT_VERSION = 24;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
 // Schema v30 adds immutable authority-root audit fields to Decisions.
@@ -6679,6 +6679,24 @@ function applyWorkItemTransition(
     request.expectedResourceRevision,
     nextState !== undefined || request.workItemWait === null,
   );
+  if (request.reasonCode === "fleet-watchdog-merge-close" && nextState !== undefined) {
+    const liveAttempt = db.prepare(
+      `SELECT execution_attempt_id, assignment_id, lane_id, thread_id, state
+       FROM execution_attempts
+       WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+         AND state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+       ORDER BY attempt_ordinal DESC LIMIT 1`,
+    ).get(request.projectId, workItem.work_item_id, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES) as {
+      execution_attempt_id: string;
+      assignment_id: string | null;
+      lane_id: string | null;
+      thread_id: string | null;
+      state: string;
+    } | undefined;
+    if (liveAttempt) {
+      throw refusal("WORK_ITEM_STATE_INVALID", `fleet-watchdog merge-close requires no nonterminal canonical attempt: executionAttemptId=${liveAttempt.execution_attempt_id} assignmentId=${liveAttempt.assignment_id ?? "null"} laneId=${liveAttempt.lane_id ?? "null"} threadId=${liveAttempt.thread_id ?? "null"} state=${liveAttempt.state}`);
+    }
+  }
   const wait = request.workItemWait;
   const unblock = request.workItemUnblock;
   const externalEvent = request.workItemExternalEvent;
