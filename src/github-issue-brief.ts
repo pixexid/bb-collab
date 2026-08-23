@@ -30,10 +30,10 @@ export type GithubIssueBriefProjection = {
   projectionState: "pending" | "current" | "drifted" | "delivery_ambiguous";
   canonicalResourceRevision: number;
   attemptedResourceRevision: number;
-  projectedResourceRevision: number;
+  projectedResourceRevision: number | null;
   desiredDigest: string;
-  observedExternalDigest: string;
-  observedExternalRevision: string;
+  observedExternalDigest: string | null;
+  observedExternalRevision: string | null;
 };
 
 export type GithubIssueBriefAnchor = {
@@ -47,10 +47,10 @@ export type GithubIssueBriefAnchor = {
   projectionState: GithubIssueBriefProjection["projectionState"];
   canonicalResourceRevision: number;
   attemptedResourceRevision: number;
-  projectedResourceRevision: number;
+  projectedResourceRevision: number | null;
   desiredDigest: string;
-  observedExternalDigest: string;
-  observedExternalRevision: string;
+  observedExternalDigest: string | null;
+  observedExternalRevision: string | null;
 };
 
 export type GithubIssueBrief = {
@@ -113,6 +113,8 @@ export function composeGithubIssueBrief(source: GithubIssueBriefSource): GithubI
   if (source.projection.projectionState !== "current"
     || source.projection.canonicalResourceRevision !== source.projection.attemptedResourceRevision
     || source.projection.canonicalResourceRevision !== source.projection.projectedResourceRevision
+    || source.projection.observedExternalDigest === null
+    || source.projection.observedExternalRevision === null
     || source.projection.desiredDigest !== source.projection.observedExternalDigest
     || source.projection.desiredDigest.length === 0
     || source.projection.observedExternalRevision.length === 0) {
