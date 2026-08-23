@@ -856,6 +856,8 @@ function installGithubBriefGh(snapshot: { title: string; body: string; state: "o
   const calls = join(bin, "calls");
   const slowTransitioned = join(bin, "slow-transitioned");
   const fastTransitioned = join(bin, "fast-transitioned");
+  const slowStarted = join(bin, "slow-started");
+  const slowFinished = join(bin, "slow-finished");
   const issue = JSON.stringify({ number: 1, title: snapshot.title, body: snapshot.body, state: snapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: snapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: snapshot.labels.map((name) => ({ name })), updatedAt: snapshot.externalRevision });
   const transitionSnapshot = options.transitionSnapshot ?? snapshot;
   const transitionedIssue = JSON.stringify({ number: 1, title: transitionSnapshot.title, body: transitionSnapshot.body, state: transitionSnapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: transitionSnapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: transitionSnapshot.labels.map((name) => ({ name })), updatedAt: transitionSnapshot.externalRevision });
@@ -867,7 +869,7 @@ printf '%s\\n' "$*" >> '${calls}'
 connector_host=default
 if [ "$1" = --hostname ]; then
   connector_host="$2"
-  if [ "$2" = '${options.slowConnectorHost ?? ""}' ]; then sleep 1; fi
+  if [ "$2" = '${options.slowConnectorHost ?? ""}' ]; then touch '${slowStarted}'; sleep 2; touch '${slowFinished}'; fi
   shift 2
 fi
 if [ "$connector_host" = '${options.slowConnectorHost ?? ""}' ]; then state_file='${slowTransitioned}'; else state_file='${fastTransitioned}'; fi
@@ -903,6 +905,14 @@ exit 1
       const value = readFileSync(calls, "utf8");
       cleanup();
       return value;
+    },
+    async waitForSlowCommandStart(timeoutMs = 5_000) {
+      const deadline = Date.now() + timeoutMs;
+      while (!existsSync(slowStarted) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      if (!existsSync(slowStarted)) throw new Error("slow connector command did not start");
+    },
+    slowCommandFinished() {
+      return existsSync(slowFinished);
     },
     cleanup,
   };
@@ -5131,6 +5141,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     const restore = installGithubBriefGh(slow.snapshot, { transitionSnapshot: slow.transitionSnapshot, slowConnectorHost: "slow.github.test" });
     try {
       let slowSettled = false;
+      const slowCommandStarted = restore.waitForSlowCommandStart();
       const slowResult = slow.fixture.host.harness.callAgentTool("dispatch_lane", {
         request: slow.request,
         spawn: dispatchSpawn(slow.fixture.orchestratorThreadId, { projectId: slow.projectId }),
@@ -5138,13 +5149,16 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
         slowSettled = true;
         return JSON.parse(value as string) as { outcome: string };
       });
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await slowCommandStarted;
+      expect(slowSettled).toBe(false);
+      expect(restore.slowCommandFinished()).toBe(false);
       const fastResult = JSON.parse(await fast.fixture.host.harness.callAgentTool("dispatch_lane", {
         request: fast.request,
         spawn: dispatchSpawn(fast.fixture.orchestratorThreadId, { projectId: fast.projectId }),
       }, { projectId: fast.projectId, threadId: fast.fixture.orchestratorThreadId }) as string) as { outcome: string };
       expect(fastResult.outcome).toBe("OK");
       expect(slowSettled).toBe(false);
+      expect(restore.slowCommandFinished()).toBe(false);
       expect((await slowResult).outcome).toBe("OK");
     } finally {
       restore.cleanup();
