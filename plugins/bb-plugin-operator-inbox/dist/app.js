@@ -256,157 +256,146 @@ var {
   useSettings
 } = mod2;
 
-// src/inbox-nav-indicator.ts
-var INBOX_NAV_REGION_SELECTOR = '[data-testid="plugin-nav-sidebar-items"]';
-var INBOX_NAV_ROW_TITLE = "Inbox";
-var LANES_NAV_ROW_TITLE = "Lanes";
-var INBOX_INDICATOR_BROKEN_TITLE = "Inbox unread indicator broken";
-var LEGACY_UNREAD_MARKER = "[data-bb-collab-inbox-unread]";
-var paintedRows = /* @__PURE__ */ new Map();
-var RENDERING_ATTRIBUTES = [
-  "d",
-  "points",
-  "cx",
-  "cy",
-  "r",
-  "rx",
-  "ry",
-  "x",
-  "y",
-  "x1",
-  "y1",
-  "x2",
-  "y2",
-  "width",
-  "height",
-  "transform",
-  "transform-origin",
-  "style",
-  "viewBox",
-  "preserveAspectRatio",
-  "href",
-  "xlink:href",
-  "offset"
-];
-function navRows(root) {
-  const region = root.querySelector(INBOX_NAV_REGION_SELECTOR);
-  return region === null ? null : Array.from(region.querySelectorAll("button"));
+// src/inbox-unread.ts
+var READ_INPUT = { recipient: "operator", withSenderTitles: true };
+var UNREGISTERED_INBOX_PROJECT = "PROJECT_CONFIG_REQUIRED";
+var NON_OPERATOR_MESSAGE_ERROR = "operator inbox response included a non-operator message";
+var FOREIGN_PROJECT_MESSAGE_ERROR = "operator inbox response included a foreign-project message";
+var MALFORMED_MESSAGE_ERROR = "operator inbox response was malformed";
+var reads = /* @__PURE__ */ new Map();
+var provenUnread = /* @__PURE__ */ new Map();
+var projectEpochs = /* @__PURE__ */ new Map();
+var readEpochs = /* @__PURE__ */ new Map();
+var mutationEpochs = /* @__PURE__ */ new Map();
+var listeners = /* @__PURE__ */ new Set();
+var activeProjects = /* @__PURE__ */ new Set();
+var snapshot = 0;
+var lifecycleEpoch = 0;
+var rpcClient = null;
+var rpcGeneration = 0;
+function emit() {
+  snapshot = [...provenUnread.values()].reduce((total, messages) => total + messages.size, 0);
+  for (const listener of listeners) listener();
 }
-function rowsTitled(rows, title) {
-  return rows.filter((row) => row.textContent?.trim() === title);
+function messageKey(message) {
+  return `${message.projectId}:${message.messageId}`;
 }
-function resolveGlyph(row) {
-  const assets = Array.from(row.querySelectorAll("[data-plugin-icon-asset]"));
-  if (assets.length > 1) return { reason: `the ${INBOX_NAV_ROW_TITLE} row has ${assets.length} plugin icon assets, expected exactly 1` };
-  if (assets.length === 1) return { element: assets[0] };
-  const svgs = Array.from(row.querySelectorAll("svg"));
-  if (svgs.length > 1) return { reason: `the ${INBOX_NAV_ROW_TITLE} row has ${svgs.length} SVG glyphs and no plugin icon asset, expected exactly 1` };
-  if (svgs.length === 1) return { element: svgs[0] };
-  return { reason: `the ${INBOX_NAV_ROW_TITLE} row has neither a plugin icon asset nor an SVG glyph` };
+function isUnregisteredInboxProject(result) {
+  return result.outcome === UNREGISTERED_INBOX_PROJECT;
 }
-function restoreAttribute(element, name, value) {
-  if (value === null) element.removeAttribute(name);
-  else element.setAttribute(name, value);
+function operatorOnlyMessages(result, requestedProjectId) {
+  const candidate = result;
+  if (candidate.outcome !== "OK" && candidate.outcome !== UNREGISTERED_INBOX_PROJECT || !Array.isArray(candidate.messages)) throw new Error(MALFORMED_MESSAGE_ERROR);
+  if (candidate.outcome === UNREGISTERED_INBOX_PROJECT) return [];
+  if (candidate.messages.some((message) => !message || typeof message !== "object" || message.recipient !== "operator")) throw new Error(NON_OPERATOR_MESSAGE_ERROR);
+  if (candidate.messages.some((message) => {
+    const value = message;
+    const validTimestamp = (timestamp) => timestamp === null || typeof timestamp === "number" && Number.isFinite(timestamp);
+    return typeof value.projectId !== "string" || !Number.isInteger(value.messageId) || !validTimestamp(value.readAtMs) || !validTimestamp(value.archivedAtMs);
+  })) throw new Error(MALFORMED_MESSAGE_ERROR);
+  if (candidate.messages.some((message) => message.projectId !== requestedProjectId)) throw new Error(FOREIGN_PROJECT_MESSAGE_ERROR);
+  return candidate.messages;
 }
-function restoreSnapshot(row, snapshot) {
-  restoreAttribute(row, "aria-label", snapshot.ariaLabel);
-  restoreAttribute(row, "title", snapshot.title);
-  restoreAttribute(snapshot.glyph, "class", snapshot.glyphClass);
-  restoreAttribute(snapshot.glyph, "style", snapshot.glyphStyle);
+function projectIdFromInput(input) {
+  return typeof input.projectId === "string" ? input.projectId : "";
 }
-function clearPaintedRows(keep) {
-  for (const [row, snapshot] of paintedRows) {
-    if (row === keep) continue;
-    row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
-    restoreSnapshot(row, snapshot);
-    paintedRows.delete(row);
+function bumpEpoch(epochs, projectId) {
+  const next = (epochs.get(projectId) ?? 0) + 1;
+  epochs.set(projectId, next);
+  return next;
+}
+function ensureRpcGeneration(rpc) {
+  if (rpcClient !== rpc) {
+    rpcClient = rpc;
+    rpcGeneration += 1;
+  }
+  return rpcGeneration;
+}
+function currentReadEpoch(rpc, projectId) {
+  return { lifecycle: lifecycleEpoch, rpcGeneration: ensureRpcGeneration(rpc), project: projectEpochs.get(projectId) ?? 0, read: readEpochs.get(projectId) ?? 0, mutation: mutationEpochs.get(projectId) ?? 0, projectId };
+}
+function readKey(input, epoch) {
+  return JSON.stringify([epoch.lifecycle, epoch.rpcGeneration, epoch.projectId, epoch.project, epoch.read, epoch.mutation, input]);
+}
+function isReadEpochCurrent(epoch) {
+  return epoch.lifecycle === lifecycleEpoch && epoch.rpcGeneration === rpcGeneration && epoch.project === (projectEpochs.get(epoch.projectId) ?? 0) && epoch.read === (readEpochs.get(epoch.projectId) ?? 0) && epoch.mutation === (mutationEpochs.get(epoch.projectId) ?? 0);
+}
+function readOperatorMessagesWithEpoch(rpc, input) {
+  const projectId = projectIdFromInput(input);
+  const baseEpoch = currentReadEpoch(rpc, projectId);
+  const existing = reads.get(readKey(input, baseEpoch));
+  if (existing) return existing;
+  const epoch = { ...baseEpoch, read: bumpEpoch(readEpochs, projectId) };
+  const key = readKey(input, epoch);
+  const request = {};
+  request.promise = Promise.resolve().then(() => rpc.call("operatorMessages", input)).finally(() => {
+    if (reads.get(key) === request) reads.delete(key);
+  });
+  request.epoch = epoch;
+  reads.set(key, request);
+  return request;
+}
+function applyRead(projectId, result, epoch) {
+  if (!activeProjects.has(projectId) || !isReadEpochCurrent(epoch)) return;
+  if (isUnregisteredInboxProject(result)) {
+    if (provenUnread.delete(projectId)) emit();
+    return;
+  }
+  const messages = operatorOnlyMessages(result, projectId);
+  provenUnread.set(projectId, new Set(messages.filter((message) => message.readAtMs === null && message.archivedAtMs === null).map(messageKey)));
+  emit();
+}
+function refreshUnread(rpc, projects) {
+  const nextProjects = new Set(projects.map((project) => project.id));
+  const previousProjects = activeProjects;
+  for (const projectId of previousProjects) if (!nextProjects.has(projectId)) {
+    bumpEpoch(projectEpochs, projectId);
+    bumpEpoch(readEpochs, projectId);
+  }
+  for (const projectId of nextProjects) if (!previousProjects.has(projectId)) bumpEpoch(projectEpochs, projectId);
+  activeProjects = nextProjects;
+  let changed = false;
+  for (const projectId of provenUnread.keys()) {
+    if (!nextProjects.has(projectId)) {
+      provenUnread.delete(projectId);
+      changed = true;
+    }
+  }
+  if (changed) emit();
+  for (const project of projects) {
+    const request = readOperatorMessagesWithEpoch(rpc, { projectId: project.id, ...READ_INPUT });
+    void request.promise.then((result) => {
+      try {
+        applyRead(project.id, result, request.epoch);
+      } catch {
+      }
+    }, () => void 0);
   }
 }
-function cleanupDetachedRows(root) {
-  const owner = root;
-  for (const [row, snapshot] of paintedRows) {
-    if (row.isConnected || owner.contains(row)) continue;
-    restoreSnapshot(row, snapshot);
-    paintedRows.delete(row);
-  }
+function applyUnreadReadResult(projectId, result, epoch) {
+  applyRead(projectId, result, epoch);
 }
-function restoreNavState(row) {
-  row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
-  const snapshot = paintedRows.get(row);
-  if (snapshot === void 0) return;
-  restoreSnapshot(row, snapshot);
-  paintedRows.delete(row);
+function applyUnreadMutation(message) {
+  if (message.readAtMs === null && message.archivedAtMs === null) return;
+  bumpEpoch(mutationEpochs, message.projectId);
+  bumpEpoch(readEpochs, message.projectId);
+  const unread = provenUnread.get(message.projectId);
+  if (!activeProjects.has(message.projectId) || !unread) return;
+  if (unread.delete(messageKey(message))) emit();
 }
-function paintInboxNavUnread(root, unread) {
-  cleanupDetachedRows(root);
-  const rows = navRows(root);
-  if (rows === null) {
-    clearPaintedRows();
-    return { matched: false, reason: `no element matches ${INBOX_NAV_REGION_SELECTOR}` };
-  }
-  const matches = rowsTitled(rows, INBOX_NAV_ROW_TITLE);
-  if (matches.length !== 1) {
-    clearPaintedRows();
-    return { matched: false, reason: `${matches.length} of the ${rows.length} rows in ${INBOX_NAV_REGION_SELECTOR} are titled ${JSON.stringify(INBOX_NAV_ROW_TITLE)}, expected exactly 1` };
-  }
-  const row = matches[0];
-  clearPaintedRows(row);
-  const resolution = resolveGlyph(row);
-  if ("reason" in resolution) {
-    restoreNavState(row);
-    return { matched: false, reason: resolution.reason };
-  }
-  const glyph = resolution.element;
-  if (unread < 1) {
-    restoreNavState(row);
-    return { matched: true };
-  }
-  const current = paintedRows.get(row);
-  if (current === void 0) {
-    paintedRows.set(row, {
-      ariaLabel: row.getAttribute("aria-label"),
-      title: row.getAttribute("title"),
-      glyph,
-      glyphClass: glyph.getAttribute("class"),
-      glyphStyle: glyph.getAttribute("style")
-    });
-  } else if (current.glyph !== glyph) {
-    restoreAttribute(current.glyph, "class", current.glyphClass);
-    restoreAttribute(current.glyph, "style", current.glyphStyle);
-    paintedRows.set(row, { ...current, glyph, glyphClass: glyph.getAttribute("class"), glyphStyle: glyph.getAttribute("style") });
-  }
-  row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
-  glyph.classList.add("text-primary");
-  const countLabel = `${unread} unread operator ${unread === 1 ? "message" : "messages"}`;
-  const snapshot = paintedRows.get(row);
-  row.setAttribute("aria-label", `${snapshot.ariaLabel ?? INBOX_NAV_ROW_TITLE}, ${countLabel}`);
-  row.setAttribute("title", `${snapshot.title === null ? "" : `${snapshot.title} \u2014 `}${countLabel}`);
-  return { matched: true };
+function useInboxUnreadCount() {
+  return useSyncExternalStore((listener) => {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }, () => snapshot, () => snapshot);
 }
-function glyphFingerprint(row) {
-  const resolution = resolveGlyph(row);
-  if ("reason" in resolution) return null;
-  if (resolution.element.hasAttribute("data-plugin-icon-asset")) return `asset:${resolution.element.getAttribute("data-plugin-icon-asset") ?? ""}`;
-  const shapes = [resolution.element, ...Array.from(resolution.element.querySelectorAll("svg *"))].map((node) => {
-    const geometry = RENDERING_ATTRIBUTES.flatMap((name) => {
-      const value = node.getAttribute(name);
-      return value === null ? [] : [`${name}=${value}`];
-    });
-    return geometry.length === 0 ? "" : `${node.tagName}[${geometry.join(",")}]`;
-  }).filter((shape) => shape !== "");
-  return shapes.length === 0 ? null : shapes.join("|");
-}
-function inspectInboxNavGlyph(root) {
-  const rows = navRows(root);
-  if (rows === null) return null;
-  const inbox = rowsTitled(rows, INBOX_NAV_ROW_TITLE);
-  const lanes = rowsTitled(rows, LANES_NAV_ROW_TITLE);
-  if (inbox.length !== 1 || lanes.length !== 1) return null;
-  const inboxGlyph = glyphFingerprint(inbox[0]);
-  const lanesGlyph = glyphFingerprint(lanes[0]);
-  if (inboxGlyph === null || lanesGlyph === null) return null;
-  if (inboxGlyph !== lanesGlyph) return { matched: true };
-  return { matched: false, reason: `the ${INBOX_NAV_ROW_TITLE} and ${LANES_NAV_ROW_TITLE} rows draw the same glyph (${inboxGlyph}) though they declare different icons` };
+function clearUnreadObserver() {
+  lifecycleEpoch += 1;
+  activeProjects = /* @__PURE__ */ new Set();
+  if (provenUnread.size > 0 || snapshot !== 0) {
+    provenUnread.clear();
+    emit();
+  }
 }
 
 // bb-plugin-runtime-shim:react/jsx-runtime
@@ -427,15 +416,6 @@ function asText(value) {
 }
 var MAX_VISIBLE_INBOX_MESSAGES = 256;
 var INBOX_FILTER_STORAGE_KEY = "bb-collab.inbox-filters";
-var UNREGISTERED_INBOX_PROJECT = "PROJECT_CONFIG_REQUIRED";
-var NON_OPERATOR_MESSAGE_ERROR = "operator inbox response included a non-operator message";
-function isUnregisteredInboxProject(result) {
-  return result.outcome === UNREGISTERED_INBOX_PROJECT;
-}
-function operatorOnlyMessages(result) {
-  if (result.messages.some((message) => message.recipient !== "operator")) throw new Error(NON_OPERATOR_MESSAGE_ERROR);
-  return result.messages;
-}
 function readInboxFilters() {
   try {
     const value = JSON.parse(window.localStorage.getItem(INBOX_FILTER_STORAGE_KEY) ?? "null");
@@ -450,7 +430,7 @@ function writeInboxFilters(filters) {
   } catch {
   }
 }
-function messageKey(message) {
+function messageKey2(message) {
   return `${message.projectId}:${message.messageId}`;
 }
 function formatExactTime(timestamp) {
@@ -501,58 +481,15 @@ function InboxPanel(_props) {
   const [pendingAction, setPendingAction] = useState(null);
   const [errors, setErrors] = useState([]);
   const [notice, setNotice] = useState(null);
-  const [indicatorBroken, setIndicatorBroken] = useState(null);
-  const provenUnread = useRef(/* @__PURE__ */ new Map());
-  const reportedBreak = useRef(null);
   const refreshSequence = useRef(0);
   const showArchivedRef = useRef(showArchived);
   showArchivedRef.current = showArchived;
   const projects = useMemo(() => projectId ? sidebar.projects.filter((candidate) => candidate.id === projectId) : sidebar.projects, [projectId, sidebar.projects]);
   const projectNames = useMemo(() => new Map(sidebar.projects.map((candidate) => [candidate.id, candidate.name])), [sidebar.projects]);
   const visibleMessages = messages.slice(0, MAX_VISIBLE_INBOX_MESSAGES);
-  const selectedKey = selectedMessageKey && visibleMessages.some((message) => messageKey(message) === selectedMessageKey) ? selectedMessageKey : visibleMessages[0] ? messageKey(visibleMessages[0]) : null;
-  const selectedMessage = selectedKey === null ? void 0 : visibleMessages.find((message) => messageKey(message) === selectedKey);
+  const selectedKey = selectedMessageKey && visibleMessages.some((message) => messageKey2(message) === selectedMessageKey) ? selectedMessageKey : visibleMessages[0] ? messageKey2(visibleMessages[0]) : null;
+  const selectedMessage = selectedKey === null ? void 0 : visibleMessages.find((message) => messageKey2(message) === selectedKey);
   const unreadCount = messages.filter((message) => message.readAtMs === null).length;
-  useEffect(() => {
-    if (!document.querySelector(INBOX_NAV_REGION_SELECTOR)) return;
-    let cancelled = false;
-    const paint = async () => {
-      const results = await Promise.allSettled(sidebar.projects.map((project) => rpc.call("operatorMessages", { projectId: project.id, recipient: "operator" })));
-      if (cancelled) return;
-      const unread = results.reduce((total, result, index) => {
-        const currentProjectId = sidebar.projects[index].id;
-        if (result.status === "fulfilled") {
-          try {
-            const count = operatorOnlyMessages(result.value).filter((message) => message.readAtMs === null).length;
-            provenUnread.current.set(currentProjectId, count);
-            return total + count;
-          } catch {
-            return total + (provenUnread.current.get(currentProjectId) ?? 0);
-          }
-        }
-        return total + (provenUnread.current.get(currentProjectId) ?? 0);
-      }, 0);
-      const painted = paintInboxNavUnread(document, unread);
-      const broken = painted.matched === false ? painted : inspectInboxNavGlyph(document);
-      if (broken === null || broken.matched) {
-        reportedBreak.current = null;
-        setIndicatorBroken(null);
-        return;
-      }
-      if (reportedBreak.current !== broken.reason) {
-        console.error(`[operator-inbox] ${INBOX_INDICATOR_BROKEN_TITLE}: ${broken.reason}`);
-        reportedBreak.current = broken.reason;
-      }
-      setIndicatorBroken(broken.reason);
-    };
-    void paint();
-    const timer = window.setInterval(() => void paint(), 3e4);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-      paintInboxNavUnread(document, 0);
-    };
-  }, [rpc, sidebar.projects]);
   const setFiltersAndPersist = (next) => {
     setFilters(next);
     writeInboxFilters(next);
@@ -567,20 +504,28 @@ function InboxPanel(_props) {
       setLoading(false);
       return;
     }
-    void Promise.allSettled(projects.map((project) => rpc.call("operatorMessages", { projectId: project.id, recipient: "operator", withSenderTitles: true, ...showArchived ? { includeArchived: true } : {} }))).then((results) => {
+    const reads2 = projects.map((project) => readOperatorMessagesWithEpoch(rpc, { projectId: project.id, recipient: "operator", withSenderTitles: true, ...showArchived ? { includeArchived: true } : {} }));
+    void Promise.allSettled(reads2.map((read) => read.promise)).then((results) => {
       if (sequence !== refreshSequence.current) return;
       const loaded = [];
       const failed = [];
       results.forEach((result, index) => {
+        const request = reads2[index];
         const label = `${projects[index].name} (${projects[index].id})`;
+        if (!isReadEpochCurrent(request.epoch)) return;
         if (result.status === "rejected") failed.push(`${label}: ${String(result.reason)}`);
         else if (!isUnregisteredInboxProject(result.value)) {
           try {
-            loaded.push(...operatorOnlyMessages(result.value));
+            const projectMessages = operatorOnlyMessages(result.value, projects[index].id);
+            loaded.push(...projectMessages);
+            applyUnreadReadResult(projects[index].id, result.value, request.epoch);
           } catch (reason) {
             failed.push(`${label}: ${String(reason)}`);
           }
-        } else if (projectId !== "") failed.push(`${label}: ${result.value.outcome}`);
+        } else {
+          applyUnreadReadResult(projects[index].id, result.value, request.epoch);
+          if (projectId !== "") failed.push(`${label}: ${result.value.outcome}`);
+        }
       });
       loaded.sort((left, right) => Number(left.readAtMs !== null) - Number(right.readAtMs !== null) || right.createdAtMs - left.createdAtMs || right.messageId - left.messageId);
       setMessages(loaded);
@@ -590,10 +535,10 @@ function InboxPanel(_props) {
     });
   }, [projects, projectId, rpc, showArchived]);
   useEffect(refresh, [refresh]);
-  const updateMessage = (next) => setMessages((current) => current.map((message) => messageKey(message) === messageKey(next) ? next : message));
+  const updateMessage = (next) => setMessages((current) => current.map((message) => messageKey2(message) === messageKey2(next) ? next : message));
   const currentProjectLabel = projectId ? projectNames.get(projectId) ?? projectId : "All projects";
   const selectedProjectLabel = selectedMessage ? projectNames.get(selectedMessage.projectId) ?? selectedMessage.projectId : null;
-  const replyKey = selectedMessage ? messageKey(selectedMessage) : null;
+  const replyKey = selectedMessage ? messageKey2(selectedMessage) : null;
   const replyText = selectedMessage && replyKey ? drafts[replyKey] ?? selectedMessage.replyText ?? "" : "";
   const selectedSenderId = selectedMessage ? asText(selectedMessage.senderThreadId) : null;
   const pendingSelectedAction = pendingAction?.key === replyKey ? pendingAction.action : null;
@@ -606,6 +551,7 @@ function InboxPanel(_props) {
     setErrors([]);
     setNotice(null);
     void rpc.call("markOperatorMessageRead", { projectId: selectedMessage.projectId, messageId: selectedMessage.messageId }).then((read) => {
+      applyUnreadMutation(read);
       updateMessage(read);
       setNotice("Marked read. This message is no longer counted as unread.");
     }).catch((reason) => setErrors([String(reason)])).finally(() => setPendingAction((current) => current === action ? null : current));
@@ -616,7 +562,7 @@ function InboxPanel(_props) {
   };
   const archiveOperations = useRef(/* @__PURE__ */ new Map());
   const archiveMessage = (message) => {
-    const key = messageKey(message);
+    const key = messageKey2(message);
     const existing = archiveOperations.current.get(key);
     if (existing) return existing;
     const action = { key, action: "archive" };
@@ -625,7 +571,8 @@ function InboxPanel(_props) {
     setErrors([]);
     setNotice(null);
     const operation = rpc.call("archiveOperatorMessage", { projectId: message.projectId, messageId: message.messageId }).then((archived) => {
-      if (sequence === refreshSequence.current) setMessages((current) => showArchivedRef.current ? current.map((item) => messageKey(item) === key ? archived : item) : current.filter((item) => messageKey(item) !== key));
+      applyUnreadMutation(archived);
+      if (sequence === refreshSequence.current) setMessages((current) => showArchivedRef.current ? current.map((item) => messageKey2(item) === key ? archived : item) : current.filter((item) => messageKey2(item) !== key));
       setNotice("Archived. Turn on Show archived to include it again.");
       return archived;
     }).catch((reason) => {
@@ -639,11 +586,6 @@ function InboxPanel(_props) {
     return operation;
   };
   return /* @__PURE__ */ jsx("main", { className: "h-full overflow-y-auto p-4 md:p-5", children: /* @__PURE__ */ jsxs("div", { className: "mx-auto grid max-w-5xl gap-4", style: { minWidth: 0, width: "100%" }, children: [
-    indicatorBroken ? /* @__PURE__ */ jsxs("p", { role: "alert", className: "text-sm text-destructive", children: [
-      INBOX_INDICATOR_BROKEN_TITLE,
-      " \u2014 open Inbox to check for unread messages. Cause: ",
-      indicatorBroken
-    ] }) : null,
     /* @__PURE__ */ jsxs("header", { className: "grid gap-1", children: [
       /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-center justify-between gap-2", children: [
         /* @__PURE__ */ jsxs("div", { children: [
@@ -702,19 +644,21 @@ function InboxPanel(_props) {
           " messages. Unread messages appear first."
         ] }) : null,
         /* @__PURE__ */ jsx("div", { role: "list", "aria-label": "Operator messages", children: visibleMessages.map((message) => {
-          const key = messageKey(message);
+          const key = messageKey2(message);
           const selected = key === selectedKey;
           const sender = senderLabel(message);
           const delivery = deliveryLabel(message);
           return /* @__PURE__ */ jsxs("article", { role: "listitem", className: `border-b border-border last:border-b-0 ${selected ? "bg-primary/5 ring-2 ring-inset ring-primary" : message.readAtMs === null ? "bg-primary/10" : "bg-transparent"}`, children: [
             /* @__PURE__ */ jsxs("button", { type: "button", "aria-pressed": selected, "aria-label": `${selected ? "Selected. " : "Select "}message from ${sender}. ${projectNames.get(message.projectId) ?? message.projectId}. ${severityLabel(message.severity)}. ${stateLabel(message)}. ${formatExactTime(message.createdAtMs)}`, style: { textAlign: "left", width: "100%" }, onClick: () => setSelectedMessageKey(key), className: "grid min-w-0 gap-2 px-3 py-3 transition-colors duration-150 hover:bg-muted/60 active:bg-muted/80 focus-visible:z-10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none", children: [
               /* @__PURE__ */ jsx("span", { className: "sr-only", children: message.readAtMs === null ? "Unread message. " : "" }),
-              /* @__PURE__ */ jsxs("span", { className: "flex min-w-0 items-start gap-2", children: [
-                /* @__PURE__ */ jsx("span", { className: `min-w-0 flex-1 break-words text-sm ${message.readAtMs === null ? "font-semibold" : "font-medium"}`, children: sender }),
+              /* @__PURE__ */ jsxs("span", { className: "flex min-w-0 items-center gap-2", children: [
+                /* @__PURE__ */ jsx("span", { className: `min-w-0 flex-1 truncate text-sm ${message.readAtMs === null ? "font-semibold" : "font-medium"}`, title: sender, children: sender }),
                 /* @__PURE__ */ jsx("time", { className: "shrink-0 text-xs text-muted-foreground", dateTime: new Date(message.createdAtMs).toISOString(), title: formatExactTime(message.createdAtMs), "aria-label": `Received ${formatExactTime(message.createdAtMs)}`, children: formatRelativeTime(message.createdAtMs) })
               ] }),
-              /* @__PURE__ */ jsx("span", { className: "break-words text-sm leading-5 text-muted-foreground", children: selected ? "Selected \u2014 details shown here" : message.text.length > 96 ? `${message.text.slice(0, 96).trimEnd()}\u2026` : message.text }),
-              /* @__PURE__ */ jsxs("span", { className: "flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground", children: [
+              /* @__PURE__ */ jsx("span", { className: "truncate text-sm leading-5 text-muted-foreground", title: message.text, children: message.text.length > 96 ? `${message.text.slice(0, 96).trimEnd()}\u2026` : message.text })
+            ] }),
+            /* @__PURE__ */ jsxs("div", { className: "flex min-w-0 items-center gap-2 px-3 pb-2 text-xs text-muted-foreground", children: [
+              /* @__PURE__ */ jsxs("div", { className: "flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1", children: [
                 /* @__PURE__ */ jsx("span", { children: projectNames.get(message.projectId) ?? message.projectId }),
                 /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
                 /* @__PURE__ */ jsx("span", { children: severityLabel(message.severity) }),
@@ -726,11 +670,11 @@ function InboxPanel(_props) {
                   /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
                   /* @__PURE__ */ jsx("span", { children: "Archived" })
                 ] }) : null
-              ] })
-            ] }),
-            message.archivedAtMs === null ? /* @__PURE__ */ jsx("div", { className: "flex justify-end px-3 pb-2", children: /* @__PURE__ */ jsx("button", { type: "button", "aria-busy": pendingAction?.key === key && pendingAction.action === "archive", "aria-label": pendingAction?.key === key && pendingAction.action === "archive" ? "Archiving message" : "Archive message", title: pendingAction?.key === key && pendingAction.action === "archive" ? "Archiving message" : "Archive message", disabled: pendingAction !== null, className: "min-h-8 min-w-8 rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: () => {
-              void archiveMessage(message).catch(() => void 0);
-            }, children: /* @__PURE__ */ jsx(o2, { "aria-hidden": "true", focusable: "false", color: "currentColor", weight: "duotone", size: 16 }) }) }) : null
+              ] }),
+              message.archivedAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", "aria-busy": pendingAction?.key === key && pendingAction.action === "archive", "aria-label": pendingAction?.key === key && pendingAction.action === "archive" ? "Archiving message" : "Archive message", title: pendingAction?.key === key && pendingAction.action === "archive" ? "Archiving message" : "Archive message", disabled: pendingAction !== null, className: "min-h-8 min-w-8 shrink-0 rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: () => {
+                void archiveMessage(message).catch(() => void 0);
+              }, children: /* @__PURE__ */ jsx(o2, { "aria-hidden": "true", focusable: "false", color: "currentColor", weight: "duotone", size: 16 }) }) : null
+            ] })
           ] }, key);
         }) })
       ] }),
@@ -814,8 +758,25 @@ function InboxPanel(_props) {
     ] })
   ] }) });
 }
+function InboxUnreadAccessory() {
+  const sidebar = experimental_useSidebarThreads();
+  const rpc = useRpc();
+  const unread = useInboxUnreadCount();
+  const projects = useMemo(() => sidebar.projects.map(({ id }) => ({ id })), [sidebar.projects]);
+  useEffect(() => {
+    refreshUnread(rpc, projects);
+    const timer = window.setInterval(() => refreshUnread(rpc, projects), 3e4);
+    return () => {
+      window.clearInterval(timer);
+      clearUnreadObserver();
+    };
+  }, [projects, rpc]);
+  if (unread < 1) return null;
+  const label = `${unread} unread operator ${unread === 1 ? "message" : "messages"}`;
+  return /* @__PURE__ */ jsx("span", { role: "status", "aria-live": "polite", "aria-label": label, title: label, className: "max-w-full truncate rounded-full bg-primary px-1.5 text-xs font-semibold leading-5 text-primary-foreground", children: unread });
+}
 var app_default = definePluginApp((app) => {
-  app.slots.navPanel({ id: "inbox", title: "Inbox", icon: "./assets/envelope-simple-duotone.svg", path: "inbox", component: InboxPanel });
+  app.slots.navPanel({ id: "inbox", title: "Inbox", icon: "./assets/envelope-simple-duotone.svg", path: "inbox", component: InboxPanel, experimental_sidebarAccessory: InboxUnreadAccessory });
 });
 export {
   app_default as default

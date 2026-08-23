@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArchiveIcon, ArrowClockwiseIcon, EnvelopeOpenIcon, PaperPlaneTiltIcon } from "@phosphor-icons/react";
 import { definePluginApp, experimental_useSidebarThreads, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import type { PluginNavPanelProps, PluginRpcResult } from "@get-bb/plugin-sdk/app";
-import { INBOX_INDICATOR_BROKEN_TITLE, INBOX_NAV_REGION_SELECTOR, inspectInboxNavGlyph, paintInboxNavUnread } from "./src/inbox-nav-indicator";
+import { applyUnreadMutation, applyUnreadReadResult, clearUnreadObserver, isReadEpochCurrent, isUnregisteredInboxProject, operatorOnlyMessages, readOperatorMessagesWithEpoch, refreshUnread, useInboxUnreadCount } from "./src/inbox-unread";
 import type { rpcContract } from "./contract";
 
 type OperatorMessagesResult = PluginRpcResult<typeof rpcContract["operatorMessages"]>;
@@ -12,13 +12,6 @@ type PendingInboxAction = { key: string; action: "mark-read" | "archive" };
 function asText(value: unknown): string | null { return typeof value === "string" && value.trim() ? value : null; }
 const MAX_VISIBLE_INBOX_MESSAGES = 256;
 const INBOX_FILTER_STORAGE_KEY = "bb-collab.inbox-filters";
-const UNREGISTERED_INBOX_PROJECT = "PROJECT_CONFIG_REQUIRED" satisfies OperatorMessagesResult["outcome"];
-const NON_OPERATOR_MESSAGE_ERROR = "operator inbox response included a non-operator message";
-function isUnregisteredInboxProject(result: OperatorMessagesResult): boolean { return result.outcome === UNREGISTERED_INBOX_PROJECT; }
-function operatorOnlyMessages(result: OperatorMessagesResult): readonly OperatorMessage[] {
-  if (result.messages.some((message) => message.recipient !== "operator")) throw new Error(NON_OPERATOR_MESSAGE_ERROR);
-  return result.messages;
-}
 function readInboxFilters(): InboxFilters {
   try { const value = JSON.parse(window.localStorage.getItem(INBOX_FILTER_STORAGE_KEY) ?? "null") as Partial<InboxFilters> | null; return { projectId: typeof value?.projectId === "string" ? value.projectId : "", showArchived: value?.showArchived === true }; }
   catch { return { projectId: "", showArchived: false }; }
@@ -67,9 +60,6 @@ function InboxPanel(_props: PluginNavPanelProps) {
   const [pendingAction, setPendingAction] = useState<PendingInboxAction | null>(null);
   const [errors, setErrors] = useState<readonly string[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
-  const [indicatorBroken, setIndicatorBroken] = useState<string | null>(null);
-  const provenUnread = useRef(new Map<string, number>());
-  const reportedBreak = useRef<string | null>(null);
   const refreshSequence = useRef(0);
   const showArchivedRef = useRef(showArchived);
   showArchivedRef.current = showArchived;
@@ -80,50 +70,28 @@ function InboxPanel(_props: PluginNavPanelProps) {
   const selectedMessage = selectedKey === null ? undefined : visibleMessages.find((message) => messageKey(message) === selectedKey);
   const unreadCount = messages.filter((message) => message.readAtMs === null).length;
 
-  useEffect(() => {
-    if (!document.querySelector(INBOX_NAV_REGION_SELECTOR)) return;
-    let cancelled = false;
-    const paint = async () => {
-      const results = await Promise.allSettled(sidebar.projects.map((project) => rpc.call("operatorMessages", { projectId: project.id, recipient: "operator" })));
-      if (cancelled) return;
-      const unread = results.reduce((total, result, index) => {
-        const currentProjectId = sidebar.projects[index]!.id;
-        if (result.status === "fulfilled") {
-          try { const count = operatorOnlyMessages(result.value).filter((message) => message.readAtMs === null).length; provenUnread.current.set(currentProjectId, count); return total + count; }
-          catch { return total + (provenUnread.current.get(currentProjectId) ?? 0); }
-        }
-        return total + (provenUnread.current.get(currentProjectId) ?? 0);
-      }, 0);
-      const painted = paintInboxNavUnread(document, unread);
-      const broken = painted.matched === false ? painted : inspectInboxNavGlyph(document);
-      if (broken === null || broken.matched) { reportedBreak.current = null; setIndicatorBroken(null); return; }
-      if (reportedBreak.current !== broken.reason) { console.error(`[operator-inbox] ${INBOX_INDICATOR_BROKEN_TITLE}: ${broken.reason}`); reportedBreak.current = broken.reason; }
-      setIndicatorBroken(broken.reason);
-    };
-    void paint();
-    const timer = window.setInterval(() => void paint(), 30_000);
-    return () => { cancelled = true; window.clearInterval(timer); paintInboxNavUnread(document, 0); };
-  }, [rpc, sidebar.projects]);
-
   const setFiltersAndPersist = (next: InboxFilters) => { setFilters(next); writeInboxFilters(next); };
   const refresh = useCallback(() => {
     const sequence = ++refreshSequence.current;
     setNotice(null);
     setLoading(true);
     if (projects.length === 0) { setMessages([]); setErrors([]); setLoading(false); return; }
-    void Promise.allSettled(projects.map((project) => rpc.call("operatorMessages", { projectId: project.id, recipient: "operator", withSenderTitles: true, ...(showArchived ? { includeArchived: true } : {}) })))
+    const reads = projects.map((project) => readOperatorMessagesWithEpoch(rpc, { projectId: project.id, recipient: "operator", withSenderTitles: true, ...(showArchived ? { includeArchived: true } : {}) }));
+    void Promise.allSettled(reads.map((read) => read.promise))
       .then((results) => {
         if (sequence !== refreshSequence.current) return;
         const loaded: OperatorMessage[] = [];
         const failed: string[] = [];
         results.forEach((result, index) => {
+          const request = reads[index]!;
           const label = `${projects[index]!.name} (${projects[index]!.id})`;
+          if (!isReadEpochCurrent(request.epoch)) return;
           if (result.status === "rejected") failed.push(`${label}: ${String(result.reason)}`);
           else if (!isUnregisteredInboxProject(result.value)) {
-            try { loaded.push(...operatorOnlyMessages(result.value)); }
+            try { const projectMessages = operatorOnlyMessages(result.value, projects[index]!.id); loaded.push(...projectMessages); applyUnreadReadResult(projects[index]!.id, result.value, request.epoch); }
             catch (reason) { failed.push(`${label}: ${String(reason)}`); }
           }
-          else if (projectId !== "") failed.push(`${label}: ${result.value.outcome}`);
+          else { applyUnreadReadResult(projects[index]!.id, result.value, request.epoch); if (projectId !== "") failed.push(`${label}: ${result.value.outcome}`); }
         });
         loaded.sort((left, right) => Number(left.readAtMs !== null) - Number(right.readAtMs !== null) || right.createdAtMs - left.createdAtMs || right.messageId - left.messageId);
         setMessages(loaded);
@@ -149,6 +117,7 @@ function InboxPanel(_props: PluginNavPanelProps) {
     setErrors([]);
     setNotice(null);
     void rpc.call("markOperatorMessageRead", { projectId: selectedMessage.projectId, messageId: selectedMessage.messageId }).then((read) => {
+      applyUnreadMutation(read);
       updateMessage(read);
       setNotice("Marked read. This message is no longer counted as unread.");
     }).catch((reason: unknown) => setErrors([String(reason)])).finally(() => setPendingAction((current) => current === action ? null : current));
@@ -168,6 +137,7 @@ function InboxPanel(_props: PluginNavPanelProps) {
     setErrors([]);
     setNotice(null);
     const operation = rpc.call("archiveOperatorMessage", { projectId: message.projectId, messageId: message.messageId }).then((archived) => {
+      applyUnreadMutation(archived);
       if (sequence === refreshSequence.current) setMessages((current) => showArchivedRef.current ? current.map((item) => messageKey(item) === key ? archived : item) : current.filter((item) => messageKey(item) !== key));
       setNotice("Archived. Turn on Show archived to include it again.");
       return archived;
@@ -183,7 +153,6 @@ function InboxPanel(_props: PluginNavPanelProps) {
   };
 
   return <main className="h-full overflow-y-auto p-4 md:p-5"><div className="mx-auto grid max-w-5xl gap-4" style={{ minWidth: 0, width: "100%" }}>
-    {indicatorBroken ? <p role="alert" className="text-sm text-destructive">{INBOX_INDICATOR_BROKEN_TITLE} — open Inbox to check for unread messages. Cause: {indicatorBroken}</p> : null}
     <header className="grid gap-1"><div className="flex flex-wrap items-center justify-between gap-2"><div><p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Operator workspace</p><h1 className="text-xl font-semibold tracking-tight">Inbox</h1></div><p className="text-sm text-muted-foreground" aria-live="polite">{unreadCount ? `${unreadCount} unread` : "All caught up"}</p></div><p className="max-w-2xl text-sm text-muted-foreground">Review messages from your project agents, then reply, mark read, or archive from one place.</p></header>
     <section aria-label="Inbox toolbar" className="grid gap-3 rounded-lg border border-border bg-muted/10 p-3 md:grid-cols-[minmax(0,1fr)_auto_auto] md:items-end"><label className="grid min-w-0 gap-1 text-sm"><span className="text-xs font-medium text-muted-foreground">Project</span><select className="w-full min-w-0 rounded-md border border-border bg-background px-3 py-2" value={projectId} onChange={(event) => setFiltersAndPersist({ projectId: event.target.value, showArchived })}><option value="">All projects</option>{sidebar.projects.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}</select></label><label className="flex min-h-10 items-center gap-2 px-1 text-sm"><input type="checkbox" checked={showArchived} onChange={(event) => setFiltersAndPersist({ projectId, showArchived: event.target.checked })} />Show archived</label><button type="button" aria-label="Refresh inbox" title="Refresh inbox" className="min-h-10 min-w-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none" onClick={refresh} disabled={loading}><ArrowClockwiseIcon aria-hidden="true" focusable="false" color="currentColor" weight="duotone" size={18} /></button></section>
     {errors.map((loadError) => <p role="alert" key={loadError} className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">Refresh failed: {loadError}</p>)}
@@ -200,11 +169,10 @@ function InboxPanel(_props: PluginNavPanelProps) {
           const delivery = deliveryLabel(message);
           return <article key={key} role="listitem" className={`border-b border-border last:border-b-0 ${selected ? "bg-primary/5 ring-2 ring-inset ring-primary" : message.readAtMs === null ? "bg-primary/10" : "bg-transparent"}`}>
             <button type="button" aria-pressed={selected} aria-label={`${selected ? "Selected. " : "Select "}message from ${sender}. ${projectNames.get(message.projectId) ?? message.projectId}. ${severityLabel(message.severity)}. ${stateLabel(message)}. ${formatExactTime(message.createdAtMs)}`} style={{ textAlign: "left", width: "100%" }} onClick={() => setSelectedMessageKey(key)} className="grid min-w-0 gap-2 px-3 py-3 transition-colors duration-150 hover:bg-muted/60 active:bg-muted/80 focus-visible:z-10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none">
-              <span className="sr-only">{message.readAtMs === null ? "Unread message. " : ""}</span><span className="flex min-w-0 items-start gap-2"><span className={`min-w-0 flex-1 break-words text-sm ${message.readAtMs === null ? "font-semibold" : "font-medium"}`}>{sender}</span><time className="shrink-0 text-xs text-muted-foreground" dateTime={new Date(message.createdAtMs).toISOString()} title={formatExactTime(message.createdAtMs)} aria-label={`Received ${formatExactTime(message.createdAtMs)}`}>{formatRelativeTime(message.createdAtMs)}</time></span>
-              <span className="break-words text-sm leading-5 text-muted-foreground">{selected ? "Selected — details shown here" : message.text.length > 96 ? `${message.text.slice(0, 96).trimEnd()}…` : message.text}</span>
-              <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground"><span>{projectNames.get(message.projectId) ?? message.projectId}</span><span aria-hidden="true">·</span><span>{severityLabel(message.severity)}</span>{delivery ? <><span aria-hidden="true">·</span><span className={delivery === "Delivery failed" ? "text-destructive" : ""}>{delivery}</span></> : null}{message.archivedAtMs != null ? <><span aria-hidden="true">·</span><span>Archived</span></> : null}</span>
+              <span className="sr-only">{message.readAtMs === null ? "Unread message. " : ""}</span><span className="flex min-w-0 items-center gap-2"><span className={`min-w-0 flex-1 truncate text-sm ${message.readAtMs === null ? "font-semibold" : "font-medium"}`} title={sender}>{sender}</span><time className="shrink-0 text-xs text-muted-foreground" dateTime={new Date(message.createdAtMs).toISOString()} title={formatExactTime(message.createdAtMs)} aria-label={`Received ${formatExactTime(message.createdAtMs)}`}>{formatRelativeTime(message.createdAtMs)}</time></span>
+              <span className="truncate text-sm leading-5 text-muted-foreground" title={message.text}>{message.text.length > 96 ? `${message.text.slice(0, 96).trimEnd()}…` : message.text}</span>
             </button>
-            {message.archivedAtMs === null ? <div className="flex justify-end px-3 pb-2"><button type="button" aria-busy={pendingAction?.key === key && pendingAction.action === "archive"} aria-label={pendingAction?.key === key && pendingAction.action === "archive" ? "Archiving message" : "Archive message"} title={pendingAction?.key === key && pendingAction.action === "archive" ? "Archiving message" : "Archive message"} disabled={pendingAction !== null} className="min-h-8 min-w-8 rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none" onClick={() => { void archiveMessage(message).catch(() => undefined); }}><ArchiveIcon aria-hidden="true" focusable="false" color="currentColor" weight="duotone" size={16} /></button></div> : null}
+            <div className="flex min-w-0 items-center gap-2 px-3 pb-2 text-xs text-muted-foreground"><div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1"><span>{projectNames.get(message.projectId) ?? message.projectId}</span><span aria-hidden="true">·</span><span>{severityLabel(message.severity)}</span>{delivery ? <><span aria-hidden="true">·</span><span className={delivery === "Delivery failed" ? "text-destructive" : ""}>{delivery}</span></> : null}{message.archivedAtMs != null ? <><span aria-hidden="true">·</span><span>Archived</span></> : null}</div>{message.archivedAtMs === null ? <button type="button" aria-busy={pendingAction?.key === key && pendingAction.action === "archive"} aria-label={pendingAction?.key === key && pendingAction.action === "archive" ? "Archiving message" : "Archive message"} title={pendingAction?.key === key && pendingAction.action === "archive" ? "Archiving message" : "Archive message"} disabled={pendingAction !== null} className="min-h-8 min-w-8 shrink-0 rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none" onClick={() => { void archiveMessage(message).catch(() => undefined); }}><ArchiveIcon aria-hidden="true" focusable="false" color="currentColor" weight="duotone" size={16} /></button> : null}</div>
           </article>;
         })}</div>
       </div>
@@ -218,4 +186,21 @@ function InboxPanel(_props: PluginNavPanelProps) {
   </div></main>;
 }
 
-export default definePluginApp((app) => { app.slots.navPanel({ id: "inbox", title: "Inbox", icon: "./assets/envelope-simple-duotone.svg", path: "inbox", component: InboxPanel }); });
+function InboxUnreadAccessory() {
+  const sidebar = experimental_useSidebarThreads();
+  const rpc = useRpc<typeof rpcContract>();
+  const unread = useInboxUnreadCount();
+  const projects = useMemo(() => sidebar.projects.map(({ id }) => ({ id })), [sidebar.projects]);
+
+  useEffect(() => {
+    refreshUnread(rpc, projects);
+    const timer = window.setInterval(() => refreshUnread(rpc, projects), 30_000);
+    return () => { window.clearInterval(timer); clearUnreadObserver(); };
+  }, [projects, rpc]);
+
+  if (unread < 1) return null;
+  const label = `${unread} unread operator ${unread === 1 ? "message" : "messages"}`;
+  return <span role="status" aria-live="polite" aria-label={label} title={label} className="max-w-full truncate rounded-full bg-primary px-1.5 text-xs font-semibold leading-5 text-primary-foreground">{unread}</span>;
+}
+
+export default definePluginApp((app) => { app.slots.navPanel({ id: "inbox", title: "Inbox", icon: "./assets/envelope-simple-duotone.svg", path: "inbox", component: InboxPanel, experimental_sidebarAccessory: InboxUnreadAccessory }); });
