@@ -5125,7 +5125,11 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
     const spawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
     let spawnCalls = 0;
-    fixture.host.harness.sdk.stub("threads.list", (async () => []) as never);
+    const historicalChildren = [
+      ...Array.from({ length: 68 }, (_, index) => makeThreadResponse({ id: `historical-active-${index}`, projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: `historical-active-${index} [dispatch:historical-active-${index}]` })),
+      ...Array.from({ length: 4 }, (_, index) => makeThreadResponse({ id: `historical-archived-${index}`, projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: `historical-archived-${index} [dispatch:historical-archived-${index}]`, archivedAt: 1 })),
+    ];
+    fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => historicalChildren.filter((thread) => archived ? thread.archivedAt !== null : thread.archivedAt === null)) as never);
     fixture.host.harness.sdk.stub("threads.spawn", (async (input: { title?: string }) => {
       spawnCalls += 1;
       if (spawnCalls === 1) throw new Error("native pre-create refusal");
@@ -5170,7 +5174,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => threads.filter((thread) => archived ? thread.archivedAt !== null : thread.archivedAt === null)) as never);
     const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", { request, spawn }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
     expect(result.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
-    expect(calls).toBe(1);
+    expect(calls).toBe(name === "wrong idempotency" ? 2 : 1);
     expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared", thread_id: null });
     expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "in_progress" });
     }
@@ -5200,6 +5204,158 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(second.outcome).toBe("OK");
     expect(spawnCalls).toBe(2);
     expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "running", thread_id: "prepared-recovered" });
+  });
+
+  it("refuses a new-format prepared dispatch replay whose title changed", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const originalSpawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
+    const changedSpawn = { ...originalSpawn, title: "changed" };
+    const { threadId: _threadId, ...intentAttempt } = request.workAttempt!;
+    expect(applyWithFixtureReceipt(fixture.db, {
+      ...request,
+      workAttempt: intentAttempt,
+      reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=${encodeURIComponent(originalSpawn.title)}`,
+    })).toMatchObject({ outcome: "OK" });
+    expect(fixture.db.prepare("SELECT reason_code FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ reason_code: `work_item_dispatch_intent:${request.idempotencyKey}:parent=${fixture.orchestratorThreadId}:title=lane` });
+    const replayRequest = {
+      ...request,
+      workAttempt: intentAttempt,
+      reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=${encodeURIComponent(changedSpawn.title)}`,
+    };
+    fixture.db.prepare("UPDATE mutation_receipts SET request_digest = ? WHERE project_id = ? AND idempotency_key = ?").run(
+      mutationRequestDigest(parseApplyRequest(replayRequest)),
+      PROJECT_ID,
+      request.idempotencyKey,
+    );
+    fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => archived ? [] : [makeThreadResponse({
+      id: "changed-replay-title",
+      projectId: PROJECT_ID,
+      parentThreadId: fixture.orchestratorThreadId,
+      title: `changed [dispatch:${request.idempotencyKey}]`,
+      status: "active",
+    })]) as never);
+    let spawnCalls = 0;
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { spawnCalls += 1; throw new Error("title weakening must not bind or retry"); }) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", { request, spawn: changedSpawn }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(spawnCalls).toBe(0);
+    expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared", thread_id: null });
+  });
+
+  it("recovers an exact legacy prepared reason after complete no-match evidence", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const spawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
+    const { threadId: _threadId, ...intentAttempt } = request.workAttempt!;
+    const preparedRequest = { ...request, workAttempt: intentAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=${encodeURIComponent(spawn.title)}` };
+    expect(applyWithFixtureReceipt(fixture.db, preparedRequest)).toMatchObject({ outcome: "OK" });
+    fixture.db.prepare("UPDATE execution_attempts SET reason_code = ? WHERE project_id = ? AND work_item_id = ? AND state = 'prepared' AND thread_id IS NULL").run(
+      `work_item_dispatch_intent:${request.idempotencyKey}:parent=${fixture.orchestratorThreadId}`,
+      PROJECT_ID,
+      WORK_ITEM_ID,
+    );
+    fixture.host.harness.sdk.stub("threads.list", (async () => []) as never);
+    let spawnCalls = 0;
+    fixture.host.harness.sdk.stub("threads.spawn", (async (input: { projectId: string; parentThreadId?: string; title?: string }) => {
+      spawnCalls += 1;
+      return makeThreadResponse({ id: "legacy-recovered", projectId: input.projectId, parentThreadId: input.parentThreadId ?? null, title: input.title ?? null, status: "active" });
+    }) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", { request, spawn }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("OK");
+    expect(spawnCalls).toBe(1);
+    expect(fixture.db.prepare("SELECT state, thread_id, reason_code FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "running", thread_id: "legacy-recovered", reason_code: "work_item_dispatch" });
+  });
+
+  it("binds one exact active legacy prepared marker only to the replay title", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const spawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
+    const { threadId: _threadId, ...intentAttempt } = request.workAttempt!;
+    const preparedRequest = { ...request, workAttempt: intentAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=${encodeURIComponent(spawn.title)}` };
+    expect(applyWithFixtureReceipt(fixture.db, preparedRequest)).toMatchObject({ outcome: "OK" });
+    fixture.db.prepare("UPDATE execution_attempts SET reason_code = ? WHERE project_id = ? AND work_item_id = ? AND state = 'prepared' AND thread_id IS NULL").run(
+      `work_item_dispatch_intent:${request.idempotencyKey}:parent=${fixture.orchestratorThreadId}`,
+      PROJECT_ID,
+      WORK_ITEM_ID,
+    );
+    fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => archived ? [] : [makeThreadResponse({
+      id: "legacy-existing",
+      projectId: PROJECT_ID,
+      parentThreadId: fixture.orchestratorThreadId,
+      title: `lane [dispatch:${request.idempotencyKey}]`,
+      status: "active",
+    })]) as never);
+    let spawnCalls = 0;
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { spawnCalls += 1; throw new Error("must not spawn"); }) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", { request, spawn }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("OK");
+    expect(spawnCalls).toBe(0);
+    expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "running", thread_id: "legacy-existing" });
+  });
+
+  it("refuses legacy prepared recovery on archived, marker mismatch, foreign, or multiple marker evidence", async () => {
+    const cases = ["archived", "marker mismatch", "foreign parent", "foreign project", "multiple"] as const;
+    for (const name of cases) {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+      const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+      const spawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
+      const { threadId: _threadId, ...intentAttempt } = request.workAttempt!;
+      const preparedRequest = { ...request, workAttempt: intentAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=${encodeURIComponent(spawn.title)}` };
+      expect(applyWithFixtureReceipt(fixture.db, preparedRequest)).toMatchObject({ outcome: "OK" });
+      fixture.db.prepare("UPDATE execution_attempts SET reason_code = ? WHERE project_id = ? AND work_item_id = ? AND state = 'prepared' AND thread_id IS NULL").run(
+        `work_item_dispatch_intent:${request.idempotencyKey}:parent=${fixture.orchestratorThreadId}`,
+        PROJECT_ID,
+        WORK_ITEM_ID,
+      );
+      const marker = `[dispatch:${request.idempotencyKey}]`;
+      const threads = name === "archived"
+        ? [makeThreadResponse({ id: "archived", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: `lane ${marker}`, archivedAt: 1 })]
+        : name === "marker mismatch"
+          ? [makeThreadResponse({ id: "changed", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: `changed ${marker}` })]
+          : name === "foreign parent"
+            ? [makeThreadResponse({ id: "foreign-parent", projectId: PROJECT_ID, parentThreadId: "other-orchestrator", title: `lane ${marker}` })]
+            : name === "foreign project"
+              ? [makeThreadResponse({ id: "foreign-project", projectId: "project-foreign", parentThreadId: fixture.orchestratorThreadId, title: `lane ${marker}` })]
+              : [makeThreadResponse({ id: "one", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: `lane ${marker}` }), makeThreadResponse({ id: "two", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: `lane ${marker}` })];
+      fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => threads.filter((thread) => archived ? thread.archivedAt !== null : thread.archivedAt === null)) as never);
+      let spawnCalls = 0;
+      fixture.host.harness.sdk.stub("threads.spawn", (async () => { spawnCalls += 1; throw new Error("blind retry"); }) as never);
+      const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", { request, spawn }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+      expect(result.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+      expect(spawnCalls).toBe(0);
+      expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared", thread_id: null });
+    }
+  });
+
+  it("refuses legacy prepared recovery when the complete inventory is capped or unreadable", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const spawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
+    const { threadId: _threadId, ...intentAttempt } = request.workAttempt!;
+    const preparedRequest = { ...request, workAttempt: intentAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=${encodeURIComponent(spawn.title)}` };
+    expect(applyWithFixtureReceipt(fixture.db, preparedRequest)).toMatchObject({ outcome: "OK" });
+    fixture.db.prepare("UPDATE execution_attempts SET reason_code = ? WHERE project_id = ? AND work_item_id = ? AND state = 'prepared' AND thread_id IS NULL").run(
+      `work_item_dispatch_intent:${request.idempotencyKey}:parent=${fixture.orchestratorThreadId}`,
+      PROJECT_ID,
+      WORK_ITEM_ID,
+    );
+    fixture.host.harness.sdk.stub("threads.list", (async ({ archived, offset }: { archived?: boolean; offset?: number }) => {
+      if (archived) return [];
+      if (offset === 0) return Array.from({ length: 1000 }, (_, index) => makeThreadResponse({ id: `page-${index}`, projectId: PROJECT_ID }));
+      throw new Error("capped page cannot be read");
+    }) as never);
+    let spawnCalls = 0;
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { spawnCalls += 1; throw new Error("blind retry"); }) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", { request, spawn }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(spawnCalls).toBe(0);
+    expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared", thread_id: null });
   });
 
   it("refuses stale lane authorization before spawning", async () => {

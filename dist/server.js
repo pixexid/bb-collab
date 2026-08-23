@@ -23518,7 +23518,6 @@ async function reconcileDispatchIntent(bb, db, request, spawn, intentResult, all
   const intent = preparedDispatchIntent(db, request);
   if (intent === "ambiguous") return dispatchRecoveryRefusal(request.projectId, "multiple prepared dispatch intents match the recorded idempotency and project", { intent: intentResult });
   if (!intent) return intentResult;
-  if (intent.title === null) return dispatchRecoveryRefusal(request.projectId, "recorded dispatch intent has no original title identity", { intent: intentResult });
   let threads;
   try {
     threads = await dispatchThreadInventory(bb, request.projectId);
@@ -23526,29 +23525,23 @@ async function reconcileDispatchIntent(bb, db, request, spawn, intentResult, all
     return dispatchRecoveryRefusal(request.projectId, `complete native dispatch inventory is unavailable: ${String(error48)}`, { intent: intentResult });
   }
   const marker = `[dispatch:${request.idempotencyKey}]`;
+  const replayTitle = String(spawn.title ?? "lane");
+  if (intent.title !== null && replayTitle !== intent.title) {
+    return dispatchRecoveryRefusal(request.projectId, "replay title does not match the recorded dispatch title", { intent: intentResult });
+  }
+  const expectedTitle = intent.title ?? replayTitle;
   const marked = threads.filter((thread) => thread.title?.includes(marker) === true);
   const exact = marked.filter(
-    (thread) => intent.title !== null && thread.parentThreadId === intent.parentThreadId && thread.title === `${intent.title} ${marker}`
+    (thread) => thread.parentThreadId === intent.parentThreadId && thread.archivedAt === null && thread.title === `${expectedTitle} ${marker}`
   );
   if (marked.length > 1 || exact.length > 1 || marked.length === 1 && exact.length !== 1) {
     return dispatchRecoveryRefusal(request.projectId, "native dispatch evidence is foreign, multiple, or not bound to the recorded parent", { intent: intentResult, matches: marked.map((thread) => ({ id: thread.id, parentThreadId: thread.parentThreadId, title: thread.title })) });
   }
-  if (exact.length === 1) {
-    if (exact[0].archivedAt !== null || exact[0].deletedAt !== null) {
-      return dispatchRecoveryRefusal(request.projectId, "the exact dispatch thread is archived or deleted; refusing duplicate spawn or binding", { intent: intentResult, thread: exact[0] });
-    }
-    return finalizeDispatchIntent(bb, db, request, intent, exact[0].id);
-  }
-  if (threads.some((thread) => thread.parentThreadId === intent.parentThreadId && thread.archivedAt !== null)) {
-    return dispatchRecoveryRefusal(request.projectId, "native dispatch inventory contains an archived child under the recorded parent", { intent: intentResult });
-  }
-  if (threads.some((thread) => thread.parentThreadId === intent.parentThreadId && thread.archivedAt === null && thread.deletedAt === null)) {
-    return dispatchRecoveryRefusal(request.projectId, "native dispatch inventory has a child under the recorded parent without the exact dispatch identity", { intent: intentResult });
-  }
+  if (exact.length === 1) return finalizeDispatchIntent(bb, db, request, intent, exact[0].id);
   if (!allowRetry) return dispatchRecoveryRefusal(request.projectId, "native dispatch inventory proves no exact thread, but the prior spawn outcome is not retryable", { intent: intentResult });
   try {
     const retried = await spawnDispatchThread(bb, spawn, request.idempotencyKey);
-    if (retried.projectId !== request.projectId || retried.parentThreadId !== intent.parentThreadId || intent.title === null || retried.title !== `${intent.title} ${marker}`) {
+    if (retried.projectId !== request.projectId || retried.parentThreadId !== intent.parentThreadId || retried.title !== `${expectedTitle} ${marker}`) {
       return dispatchRecoveryRefusal(request.projectId, "native retry returned a foreign or wrong-parent thread", { intent: intentResult, thread: retried });
     }
     return finalizeDispatchIntent(bb, db, request, intent, retried.id);
