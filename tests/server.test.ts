@@ -11708,6 +11708,24 @@ else printf '%s\\n' '[]'; fi
     expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items").get()).toEqual({ lifecycle_state: "ready", resource_revision: 2 });
   });
 
+  it("maintains the projected issue body when a canonical transition changes lifecycle and scope", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    const adapter = new DeterministicGitHubIssueAdapter();
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, {
+      idempotencyKey: "maintained-body-ready",
+      workItemBody: "Updated current scope.",
+    })).outcome).toBe("OK");
+    expect(db.prepare("SELECT body, lifecycle_state, resource_revision FROM work_items").get()).toEqual({
+      body: "Updated current scope.", lifecycle_state: "ready", resource_revision: 2,
+    });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, { idempotencyKey: "maintained-body-project" }), adapter).outcome).toBe("OK");
+    expect(adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)?.body).toContain("- Lifecycle: ready");
+    expect(adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)?.body).toContain("Updated current scope.");
+  });
+
   it("durably fences contradictory delivery and suppresses same/new-key retry after reopen", () => {
     const { db, path, directory } = directDatabase();
     try {

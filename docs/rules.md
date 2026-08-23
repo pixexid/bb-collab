@@ -72,6 +72,10 @@ Modes: `auto` is the default tell — delivers now, starts a turn on an idle thr
 
 The bound is the intended delivery path, not the word "operator": a direct reply to an operator participating in the current conversation stays in it; a lane receipt goes to its named fleet return path; decisions and evidence land in their canonical stores. The same inbox surface carries messages to the supervisor, while the `SUPERVISOR-REPORT` marker convention remains in force until its separately governed retirement. If the tool is absent or refuses, report that failure through the return path — printing the intended message and calling it delivered repeats the defect the inbox exists to remove.
 
+## Operator Inbox communication doctrine
+
+> The Operator Inbox is the sole wire for all operator-bound traffic in every tenant. A needs-decision ask is a separate explicit blocking question, not progress mixed into a digest. Phase boundaries, blocked escalations, and mandated-loop `DONE` reports are concise Inbox messages. Routine progress is a low-frequency batched digest. BB chat is not an operator channel. A `replyToOperatorMessage` reply is intake truth: consume it from the Inbox record and do not treat an unrelated chat message or an unobserved reply as an answer. Keep public messages free of private paths, settings, message contents, and incident-private values.
+
 ## Project-agnostic by construction
 
 > New or changed surfaces that store, read, or route project-owned data require the exact `project_id` as an explicit dimension; never substitute an ambient, default, or hardcoded project. A missing or null project never matches. The rule does not attach a fake project to genuinely global state, does not require a retroactive audit of untouched surfaces, and binds the project-owned behavior introduced or changed by the current work.

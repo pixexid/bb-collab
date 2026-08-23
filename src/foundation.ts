@@ -4,6 +4,7 @@ import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import type Database from "better-sqlite3";
 import { z } from "zod";
 import type { CheckoutDivergence } from "./checkout-divergence.js";
+import { maintainedIssueBody } from "./github-issue-brief.js";
 
 export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
@@ -2041,6 +2042,7 @@ export const applyRequestSchema = z
     decisionEvidence: z.array(decisionEvidenceSchema).max(64).optional(),
     workItem: workItemInputSchema.optional(),
     workItemId: id.optional(),
+    workItemBody: z.string().max(64 * 1024).optional(),
     lifecycleState: workItemStateSchema.optional(),
     workItemWait: workItemWaitSchema.nullable().optional(),
     workItemUnblock: workItemBlockerSchema.optional(),
@@ -3099,6 +3101,7 @@ function normalizeRequest(request: ApplyRequest): ApplyRequest {
     decisionEvidence: request.decisionEvidence ?? undefined,
     workItem: request.workItem ?? undefined,
     workItemId: request.workItemId ?? undefined,
+    workItemBody: request.workItemBody ?? undefined,
     lifecycleState: request.lifecycleState ?? undefined,
     workItemWait: request.workItemWait === undefined ? undefined : request.workItemWait,
     workAttempt: request.workAttempt ?? undefined,
@@ -3149,6 +3152,9 @@ export function parseApplyRequest(input: unknown): ApplyRequest {
     ) {
       throw refusal("INVALID_INPUT", "bootstrapAuthority requires the exact registerProject request projection");
     }
+  }
+  if (request.workItemBody !== undefined && request.operationClass !== "work_item_transition") {
+    throw refusal("INVALID_INPUT", "workItemBody is valid only on a work item transition");
   }
   return request;
 }
@@ -6678,6 +6684,9 @@ function applyWorkItemTransition(
   const existingWait = asRow<WorkItemWaitRow>(db.prepare(
     "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?",
   ).get(request.projectId, workItem.work_item_id));
+  if (request.workItemBody !== undefined && nextState === undefined && wait === undefined) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work item body updates require a lifecycle or wait transition");
+  }
   const machineWait = wait && (wait.kind === "work_item_succeeded" || wait.kind === "github_issue_closed") ? wait : null;
   const enteringBlocked = nextState === "blocked" && workItem.lifecycle_state !== "blocked";
   const swappingBlockedWait = workItem.lifecycle_state === "blocked" && nextState === "blocked";
@@ -6724,9 +6733,9 @@ function applyWorkItemTransition(
     if (wait === null && !existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item carries no open wait");
     const nextRevision = workItem.resource_revision + 1;
     const updated = db.prepare(
-      `UPDATE work_items SET resource_revision = ?, updated_at_ms = ?
+      `UPDATE work_items SET body = ?, resource_revision = ?, updated_at_ms = ?
        WHERE project_id = ? AND work_item_id = ? AND resource_revision = ?`,
-    ).run(nextRevision, now(), request.projectId, workItem.work_item_id, workItem.resource_revision);
+    ).run(request.workItemBody ?? workItem.body, nextRevision, now(), request.projectId, workItem.work_item_id, workItem.resource_revision);
     if (updated.changes !== 1) throw refusal("WORK_ITEM_REVISION_STALE", "work item compare-and-swap failed", {
       currentResourceRevision: workItem.resource_revision,
       expectedResourceRevision: request.expectedResourceRevision ?? undefined,
@@ -6750,7 +6759,11 @@ function applyWorkItemTransition(
         aggregateId: workItem.work_item_id,
         aggregateRevision: nextRevision,
         eventType: wait === null ? "work_item_wait_cleared" : "work_item_wait_declared",
-        event: { workItemId: workItem.work_item_id, ...(wait === null ? {} : { waker: wait, declaredBySeat: wait.declaredBySeat }) },
+        event: {
+          workItemId: workItem.work_item_id,
+          ...(wait === null ? {} : { waker: wait, declaredBySeat: wait.declaredBySeat }),
+          ...(request.workItemBody === undefined ? {} : { bodyDigest: sha256(request.workItemBody) }),
+        },
       },
       { expected: 1, attempted: 1, verified: 1 },
       {
@@ -6951,9 +6964,9 @@ function applyWorkItemTransition(
   }
   const nextRevision = workItem.resource_revision + 1;
   const updated = db.prepare(
-    `UPDATE work_items SET lifecycle_state = ?, resource_revision = ?, updated_at_ms = ?
+    `UPDATE work_items SET lifecycle_state = ?, body = ?, resource_revision = ?, updated_at_ms = ?
      WHERE project_id = ? AND work_item_id = ? AND resource_revision = ? AND lifecycle_state = ?`,
-  ).run(nextState, nextRevision, now(), request.projectId, workItem.work_item_id, workItem.resource_revision, workItem.lifecycle_state);
+  ).run(nextState, request.workItemBody ?? workItem.body, nextRevision, now(), request.projectId, workItem.work_item_id, workItem.resource_revision, workItem.lifecycle_state);
   if (updated.changes !== 1) {
     throw refusal("WORK_ITEM_REVISION_STALE", "work item compare-and-swap failed", {
       currentResourceRevision: workItem.resource_revision,
@@ -7062,6 +7075,7 @@ function applyWorkItemTransition(
         ...(machineWait === null ? {} : { blocker: machineWait }),
         ...(unblock === undefined ? {} : { unblock }),
         ...(recordedExternalEvent === null ? {} : { externalEvent: recordedExternalEvent }),
+        ...(request.workItemBody === undefined ? {} : { bodyDigest: sha256(request.workItemBody) }),
       },
     },
     { expected: 1, attempted: 1, verified: 1 },
@@ -7092,12 +7106,12 @@ interface DesiredProjection {
   digest: string;
 }
 
-function desiredProjection(workItem: WorkItemRow, github: GithubIssuesConfig): DesiredProjection {
+function desiredProjection(workItem: WorkItemRow, github: GithubIssuesConfig, blocker: string | null = null): DesiredProjection {
   const convention = github.issue;
   const names = new Set(convention?.managedLabels?.names ?? []);
   const managedLabels = [...new Set(convention?.managedLabels?.byLifecycle?.[workItem.lifecycle_state] ?? [])].sort();
   const title = `${convention?.titlePrefix ?? ""}${workItem.title}`;
-  const body = `${convention?.bodyPrefix ?? ""}${workItem.body}`;
+  const body = `${convention?.bodyPrefix ?? ""}${maintainedIssueBody({ lifecycleState: workItem.lifecycle_state, scope: workItem.body, blocker })}`;
   const state = (["succeeded", "failed", "cancelled"] as WorkItemState[]).includes(workItem.lifecycle_state) ? "closed" : "open";
   return {
     title,
@@ -7502,7 +7516,11 @@ function prepareProjection(
     const workItem = requireWorkItem(db, request, configRevision);
     const { github, mapping } = requireGithubMapping(db, request.projectId, configRevision, workItem.repo_target_id);
     if (adapter.connectorHost !== mapping.connectorHost) throw refusal("EXTERNAL_TARGET_MISMATCH", "GitHub connector host does not match the exact mapping");
-    const desired = desiredProjection(workItem, github);
+    const wait = asRow<WorkItemWaitRow>(db.prepare(
+      "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?",
+    ).get(request.projectId, workItem.work_item_id));
+    const blocker = wait ? storedWorkItemBlocker(wait) : null;
+    const desired = desiredProjection(workItem, github, blocker ? workItemBlockerWaker(blocker) : null);
     let ref = externalRef(db, request.projectId, workItem.work_item_id);
     if (ref) {
       if (ref.project_id !== request.projectId || ref.work_item_id !== workItem.work_item_id || ref.provider !== "github") {

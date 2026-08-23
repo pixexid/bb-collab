@@ -57,6 +57,14 @@ import {
   type SqliteDatabase,
 } from "./src/foundation.js";
 import {
+  GITHUB_ISSUE_COMMENT_TAIL_LIMIT,
+  assertGithubIssueBriefAnchor,
+  assertGithubIssueBriefBinding,
+  composeGithubIssueBrief,
+  type GithubIssueBrief,
+  type GithubIssueBriefSource,
+} from "./src/github-issue-brief.js";
+import {
   createStallGuardCycle,
   STALL_GUARD_KV_KEY,
   STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME,
@@ -319,6 +327,53 @@ async function readGithubIssueForBackfillAsync(owner: string, repo: string, issu
     || !Array.isArray(record.labels) || !record.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof (label as { name?: unknown }).name === "string")
     || typeof record.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
   return { owner, repo, issueNumber: record.number, title: record.title, body: record.body ?? "", state: record.state === "OPEN" ? "open" : "closed", stateReason: record.stateReason === "" || record.stateReason === null ? undefined : record.stateReason as GithubStateReason, labels: (record.labels as Array<{ name: string }>).map((label) => label.name), externalRevision: record.updatedAt };
+}
+
+async function readGithubIssueBriefAsync(projectId: string, owner: string, repo: string, issueNumber: number): Promise<{ brief: GithubIssueBrief; source: GithubIssueBriefSource }> {
+  const issue = await readGithubIssueForBackfillAsync(owner, repo, issueNumber);
+  const value = await githubJsonAsync([
+    "api",
+    `repos/${owner}/${repo}/issues/${issueNumber}/comments?per_page=${GITHUB_ISSUE_COMMENT_TAIL_LIMIT}&page=1&sort=created&direction=desc`,
+  ]);
+  if (!Array.isArray(value)) throw new Error("GitHub issue comments unavailable");
+  const comments = value.map((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) throw new Error("GitHub issue comment response is invalid");
+    const record = candidate as { id?: unknown; body?: unknown; updated_at?: unknown };
+    if (!Number.isSafeInteger(record.id) || typeof record.body !== "string" || typeof record.updated_at !== "string") {
+      throw new Error("GitHub issue comment response is invalid");
+    }
+    return { id: String(record.id), body: record.body, externalRevision: record.updated_at };
+  }).reverse();
+  const source: GithubIssueBriefSource = {
+    ...issue,
+    projectId,
+    comments,
+    commentsReadComplete: true,
+    commentsCapped: value.length === GITHUB_ISSUE_COMMENT_TAIL_LIMIT,
+  };
+  const brief = composeGithubIssueBrief(source);
+  assertGithubIssueBriefBinding(brief, { projectId, owner, repo, issueNumber });
+  return { brief, source };
+}
+
+function githubIssueBriefTarget(db: SqliteDatabase | null, projectId: string, workItemId: string): { owner: string; repo: string; issueNumber: number } | null {
+  if (!db) return null;
+  const ref = db.prepare(
+    `SELECT owner, repo, issue_number
+     FROM external_work_refs
+     WHERE project_id = ? AND work_item_id = ? AND provider = 'github' AND issue_number IS NOT NULL`,
+  ).get(projectId, workItemId) as { owner?: unknown; repo?: unknown; issue_number?: unknown } | undefined;
+  if (!ref || typeof ref.owner !== "string" || typeof ref.repo !== "string" || typeof ref.issue_number !== "number" || !Number.isSafeInteger(ref.issue_number)) return null;
+  return { owner: ref.owner, repo: ref.repo, issueNumber: ref.issue_number };
+}
+
+function appendGithubIssueBrief(spawn: Record<string, unknown>, brief: GithubIssueBrief): Record<string, unknown> {
+  if (typeof spawn.prompt === "string") return { ...spawn, prompt: `${spawn.prompt}\n\n${brief.content}` };
+  if (!Array.isArray(spawn.input)) throw new Error("dispatch prompt shape is unavailable");
+  return {
+    ...spawn,
+    input: [...spawn.input, { type: "text", visibility: "agent-only", text: brief.content, mentions: [] }],
+  };
 }
 
 function linkedGithubObservation(owner: string, repo: string, issueNumber: number): LinkedGithubObservation | null {
@@ -949,6 +1004,15 @@ async function dispatchLane(
   ) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "native spawn routing profile does not match the requested execution profile" };
   }
+  const briefTarget = githubIssueBriefTarget(db, request.projectId, request.workItemId ?? "");
+  let initialBrief: GithubIssueBrief | null = null;
+  if (briefTarget) {
+    try {
+      initialBrief = (await readGithubIssueBriefAsync(request.projectId, briefTarget.owner, briefTarget.repo, briefTarget.issueNumber)).brief;
+    } catch {
+      return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub issue body and comment-tail source is unavailable" };
+    }
+  }
   const dispatchParentThreadId = spawnShape.data.parentThreadId;
   const dispatchTitle = String(spawnShape.data.title ?? "lane");
   const { threadId: _threadId, ...intentAttempt } = request.workAttempt;
@@ -963,9 +1027,24 @@ async function dispatchLane(
   }, false, "stop-active");
   if (intent.outcome !== "OK") return intent;
   return serializeDispatchRecovery(request, async () => {
+    let dispatchSpawn = spawnShape.data;
+    if (initialBrief && briefTarget) {
+      let latestRead: { brief: GithubIssueBrief; source: GithubIssueBriefSource };
+      try {
+        latestRead = await readGithubIssueBriefAsync(request.projectId, briefTarget.owner, briefTarget.repo, briefTarget.issueNumber);
+      } catch {
+        return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub issue body and comment-tail reread is unavailable" };
+      }
+      try {
+        assertGithubIssueBriefAnchor(initialBrief, latestRead.source);
+      } catch {
+        return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub issue body or comment tail moved before dispatch" };
+      }
+      dispatchSpawn = appendGithubIssueBrief(dispatchSpawn as Record<string, unknown>, latestRead.brief) as typeof dispatchSpawn;
+    }
     if (!intent.replay) {
       try {
-        const spawnedThread = await spawnDispatchThread(bb, spawnShape.data, request.idempotencyKey);
+        const spawnedThread = await spawnDispatchThread(bb, dispatchSpawn, request.idempotencyKey);
         const prepared = preparedDispatchIntent(db, request);
         if (prepared === "ambiguous" || !prepared) {
           return dispatchRecoveryRefusal(request.projectId, "native spawn returned without a uniquely recoverable prepared intent");
@@ -975,14 +1054,14 @@ async function dispatchLane(
           spawnedThread.parentThreadId !== prepared.parentThreadId ||
           spawnedThread.title !== `${dispatchTitle} [dispatch:${request.idempotencyKey}]`
         ) {
-          return reconcileDispatchIntent(bb, db, request, spawnShape.data, intent, false);
+          return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, false);
         }
         return finalizeDispatchIntent(bb, db, request, prepared, spawnedThread.id);
       } catch {
-        return reconcileDispatchIntent(bb, db, request, spawnShape.data, intent, true);
+        return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true);
       }
     }
-    return reconcileDispatchIntent(bb, db, request, spawnShape.data, intent, true);
+    return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true);
   });
 }
 
