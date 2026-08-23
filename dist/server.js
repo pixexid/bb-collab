@@ -14661,9 +14661,87 @@ function createIdleFleetDetector(options) {
 }
 
 // src/foundation.ts
-import { createHash, randomBytes } from "node:crypto";
+import { createHash as createHash2, randomBytes } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
+
+// src/github-issue-brief.ts
+import { createHash } from "node:crypto";
+var GITHUB_ISSUE_COMMENT_TAIL_LIMIT = 8;
+var MAINTAINED_ISSUE_BODY_MARKER = "<!-- bb-collab:maintained-issue-body:v1 -->";
+var digest = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+function exactIdentity(source) {
+  if (!source.projectId || !/^[A-Za-z0-9_.-]+$/u.test(source.owner) || !/^[A-Za-z0-9_.-]+$/u.test(source.repo) || !Number.isSafeInteger(source.issueNumber) || source.issueNumber < 1) {
+    throw new Error("GitHub issue source identity is invalid");
+  }
+}
+function hasMaintainedBody(body) {
+  const marker = body.indexOf(MAINTAINED_ISSUE_BODY_MARKER);
+  return marker >= 0 && /^## Current state\s*$/mu.test(body.slice(marker + MAINTAINED_ISSUE_BODY_MARKER.length));
+}
+function maintainedIssueBody(input) {
+  const lines = [
+    MAINTAINED_ISSUE_BODY_MARKER,
+    "## Current state",
+    "",
+    `- Lifecycle: ${input.lifecycleState}`,
+    `- Blocker: ${input.blocker ?? "none"}`,
+    `- Disposition: ${input.disposition ?? (input.lifecycleState === "succeeded" || input.lifecycleState === "failed" || input.lifecycleState === "cancelled" ? "closed" : "open")}`,
+    "",
+    "## Scope",
+    "",
+    input.scope
+  ];
+  return lines.join("\n");
+}
+function anchorFor(source) {
+  return {
+    projectId: source.projectId,
+    owner: source.owner,
+    repo: source.repo,
+    issueNumber: source.issueNumber,
+    bodyDigest: digest(source.body),
+    commentTailDigest: digest(source.comments.map(({ id: id2, body, externalRevision }) => ({ id: id2, body, externalRevision }))),
+    externalRevision: source.externalRevision,
+    ...source.projection
+  };
+}
+function composeGithubIssueBrief(source) {
+  exactIdentity(source);
+  if (source.bodyCurrent !== true) throw new Error("GitHub issue body freshness is unavailable");
+  if (source.projection.projectionState !== "current" || source.projection.canonicalResourceRevision !== source.projection.attemptedResourceRevision || source.projection.canonicalResourceRevision !== source.projection.projectedResourceRevision || source.projection.desiredDigest !== source.projection.observedExternalDigest || source.projection.desiredDigest.length === 0 || source.projection.observedExternalRevision.length === 0) {
+    throw new Error("GitHub issue projection is stale or mismatched for the canonical WorkItem");
+  }
+  if (!source.commentsReadComplete) throw new Error("GitHub issue comment pagination is incomplete");
+  if (source.comments.length > GITHUB_ISSUE_COMMENT_TAIL_LIMIT) throw new Error("GitHub issue comment tail exceeds its bound");
+  if (!hasMaintainedBody(source.body)) throw new Error("GitHub issue body is not a maintained current-state summary; omitted history may remain operative");
+  const anchor = anchorFor(source);
+  const tail = source.comments.length === 0 ? "(no recent comments)" : source.comments.map((comment) => `### Comment ${comment.id}
+${comment.body}`).join("\n\n");
+  return {
+    content: `${source.body}
+
+## Recent comment tail
+
+${tail}`,
+    comments: source.comments,
+    anchor
+  };
+}
+function assertGithubIssueBriefAnchor(brief, source) {
+  exactIdentity(source);
+  const current = anchorFor(source);
+  if (JSON.stringify(current) !== JSON.stringify(brief.anchor)) {
+    throw new Error("GitHub issue body or comment tail moved after brief composition");
+  }
+}
+function assertGithubIssueBriefBinding(brief, expected) {
+  if (brief.anchor.projectId !== expected.projectId || brief.anchor.owner !== expected.owner || brief.anchor.repo !== expected.repo || brief.anchor.issueNumber !== expected.issueNumber) {
+    throw new Error("GitHub issue brief is foreign to the requested project or repository");
+  }
+}
+
+// src/foundation.ts
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
@@ -16476,6 +16554,7 @@ var applyRequestSchema = external_exports.object({
   decisionEvidence: external_exports.array(decisionEvidenceSchema).max(64).optional(),
   workItem: workItemInputSchema.optional(),
   workItemId: id.optional(),
+  workItemBody: external_exports.string().max(64 * 1024).optional(),
   lifecycleState: workItemStateSchema.optional(),
   workItemWait: workItemWaitSchema.nullable().optional(),
   workItemUnblock: workItemBlockerSchema.optional(),
@@ -16787,7 +16866,7 @@ function isRefusal(error48) {
   return error48 instanceof Refusal;
 }
 function sha256(value) {
-  return createHash("sha256").update(value, "utf8").digest("hex");
+  return createHash2("sha256").update(value, "utf8").digest("hex");
 }
 function stableValue(value, path = "$", seen = /* @__PURE__ */ new Set()) {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
@@ -17044,6 +17123,7 @@ function normalizeRequest(request) {
     decisionEvidence: request.decisionEvidence ?? void 0,
     workItem: request.workItem ?? void 0,
     workItemId: request.workItemId ?? void 0,
+    workItemBody: request.workItemBody ?? void 0,
     lifecycleState: request.lifecycleState ?? void 0,
     workItemWait: request.workItemWait === void 0 ? void 0 : request.workItemWait,
     workAttempt: request.workAttempt ?? void 0,
@@ -17092,6 +17172,9 @@ function parseApplyRequest(input) {
     if (request.operationClass !== "bootstrap" || request.actorReceiptId !== null || request.expectedConfigRevision !== null || request.configRevision !== 1 || request.expectedGovernanceEpoch !== null || request.expectedFenceToken !== null || request.repoTargetId !== null || unexpectedKeys.length > 0) {
       throw refusal("INVALID_INPUT", "bootstrapAuthority requires the exact registerProject request projection");
     }
+  }
+  if (request.workItemBody !== void 0 && request.operationClass !== "work_item_transition") {
+    throw refusal("INVALID_INPUT", "workItemBody is valid only on a work item transition");
   }
   return request;
 }
@@ -17266,7 +17349,7 @@ function requireTarget(db, projectId, configRevision, targetId, allowStaleTarget
   if (sameProject) throw refusal("REPO_TARGET_STALE", "repository target is not registered in the expected config revision");
   throw refusal("REPO_TARGET_FOREIGN", "repository target is not registered for this project");
 }
-function checkIdempotency(db, request, digest) {
+function checkIdempotency(db, request, digest2) {
   const row = asRow(
     db.prepare("SELECT request_digest, outcome_json FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?").get(
       request.projectId,
@@ -17274,7 +17357,7 @@ function checkIdempotency(db, request, digest) {
     )
   );
   if (!row) return null;
-  if (row.request_digest !== digest) {
+  if (row.request_digest !== digest2) {
     throw refusal("IDEMPOTENCY_KEY_CONFLICT", "idempotency key was already used for another request");
   }
   const replay = JSON.parse(row.outcome_json);
@@ -17287,7 +17370,7 @@ function nextEventSequence(db, projectId) {
   );
   return row?.next_sequence ?? 1;
 }
-function appendStateEvent(db, request, digest, actorReceiptId, event) {
+function appendStateEvent(db, request, digest2, actorReceiptId, event) {
   const eventSequence = nextEventSequence(db, request.projectId);
   const createdAtMs = now();
   db.prepare(
@@ -17309,13 +17392,13 @@ function appendStateEvent(db, request, digest, actorReceiptId, event) {
   );
   return { eventSequence, createdAtMs };
 }
-function commitMutation(db, request, digest, actorReceiptId, event, counts, extra = {}, outcome = "OK") {
-  const { eventSequence, createdAtMs } = appendStateEvent(db, request, digest, actorReceiptId, event);
+function commitMutation(db, request, digest2, actorReceiptId, event, counts, extra = {}, outcome = "OK") {
+  const { eventSequence, createdAtMs } = appendStateEvent(db, request, digest2, actorReceiptId, event);
   const mutationReceipt = {
     projectId: request.projectId,
     idempotencyKey: request.idempotencyKey,
     operationClass: request.operationClass,
-    requestDigest: digest,
+    requestDigest: digest2,
     committedEventSequence: eventSequence,
     createdAtMs
   };
@@ -17333,14 +17416,14 @@ function commitMutation(db, request, digest, actorReceiptId, event, counts, extr
     request.projectId,
     request.idempotencyKey,
     request.operationClass,
-    digest,
+    digest2,
     canonicalJson(output),
     eventSequence,
     createdAtMs
   );
   return output;
 }
-function deriveBootstrapActor(db, request, digest) {
+function deriveBootstrapActor(db, request, digest2) {
   const authority = request.bootstrapAuthority;
   if (!authority || request.actorReceiptId) throw refusal("BOOTSTRAP_AUTHORITY_REQUIRED", "bootstrap derivation requires one source authority and no target actor receipt");
   if (authority.sourceProjectId === request.projectId) throw refusal("BOOTSTRAP_SOURCE_INVALID", "bootstrap derivation requires a distinct source project");
@@ -17479,7 +17562,7 @@ function deriveBootstrapActor(db, request, digest) {
     sourceGovernor.actor_receipt_id,
     authority.authorizingDecisionId,
     authority.authorizingDispositionSequence,
-    digest,
+    digest2,
     createdAtMs
   );
   return {
@@ -17497,7 +17580,7 @@ function deriveBootstrapActor(db, request, digest) {
     }
   };
 }
-function applyBootstrap(db, request, digest) {
+function applyBootstrap(db, request, digest2) {
   if (request.expectedConfigRevision !== null) {
     throw refusal("PROJECT_CONFIG_STALE", "bootstrap requires an empty config head");
   }
@@ -17518,7 +17601,7 @@ function applyBootstrap(db, request, digest) {
   if (existingConfig || existingGovernor) {
     throw refusal(request.bootstrapAuthority ? "BOOTSTRAP_DERIVATION_CONFLICT" : "GOVERNOR_CAS_FAILED", "bootstrap head already exists");
   }
-  const derived = request.bootstrapAuthority ? deriveBootstrapActor(db, request, digest) : null;
+  const derived = request.bootstrapAuthority ? deriveBootstrapActor(db, request, digest2) : null;
   const actorReceiptId = derived?.actorReceiptId ?? requireActor(db, request);
   const createdAtMs = now();
   db.prepare(
@@ -17591,7 +17674,7 @@ function applyBootstrap(db, request, digest) {
   return commitMutation(
     db,
     request,
-    digest,
+    digest2,
     actorReceiptId,
     {
       aggregateType: "project",
@@ -17613,7 +17696,7 @@ function applyBootstrap(db, request, digest) {
     }
   );
 }
-function applyConfigRevision(db, request, digest) {
+function applyConfigRevision(db, request, digest2) {
   const currentRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
@@ -17667,7 +17750,7 @@ function applyConfigRevision(db, request, digest) {
   return commitMutation(
     db,
     request,
-    digest,
+    digest2,
     actorReceiptId,
     {
       aggregateType: "project_config",
@@ -17680,7 +17763,7 @@ function applyConfigRevision(db, request, digest) {
     { currentConfigRevision: nextRevision, currentGovernanceEpoch: governor.governance_epoch }
   );
 }
-function applyGovernorClaim(db, request, digest) {
+function applyGovernorClaim(db, request, digest2) {
   const currentRevision = requireConfig(db, request);
   const currentHead = asRow(
     db.prepare("SELECT governance_epoch, fence_token, state FROM project_governorship_heads WHERE project_id = ?").get(request.projectId)
@@ -17725,7 +17808,7 @@ function applyGovernorClaim(db, request, digest) {
   return commitMutation(
     db,
     request,
-    digest,
+    digest2,
     actorReceiptId,
     {
       aggregateType: "project_governorship",
@@ -18031,7 +18114,7 @@ function validateMigrationExport(db, input, projectId) {
   }
   return payload;
 }
-function applyMigrationPrepare(db, request, digest) {
+function applyMigrationPrepare(db, request, digest2) {
   const configRevision = requireConfig(db, request);
   if (request.configRevision !== configRevision) throw refusal("PROJECT_CONFIG_STALE", "migration prepare must bind the current config revision");
   const head = exactGovernor(db, request);
@@ -18116,7 +18199,7 @@ function applyMigrationPrepare(db, request, digest) {
   return commitMutation(
     db,
     request,
-    digest,
+    digest2,
     actorReceiptId,
     { aggregateType: "migration_run", aggregateId: run.migration_id, aggregateRevision: 1, eventType: "migration_run_changed", event: migrationEvent("prepare", null, run, migration.sourceSnapshotDigest) },
     { expected: 1, attempted: 1, verified: 1 },
@@ -18138,7 +18221,7 @@ function requireCompleteCanaries(request) {
     });
   }
 }
-function applyMigrationStep(db, request, digest) {
+function applyMigrationStep(db, request, digest2) {
   const configRevision = requireConfig(db, request);
   const actorReceiptId = requireActor(db, request);
   requireRoleActorBinding(db, request);
@@ -18436,7 +18519,7 @@ function applyMigrationStep(db, request, digest) {
   return commitMutation(
     db,
     request,
-    digest,
+    digest2,
     actorReceiptId,
     { aggregateType: "migration_run", aggregateId: next.migration_id, aggregateRevision: next.resource_revision, eventType: "migration_run_changed", event: migrationEvent(eventStep, run.state, next, step.proofDigest, eventExtra) },
     mutationCounts,
@@ -18641,7 +18724,7 @@ function requireDecisionActor(db, request) {
   }
   return actorReceiptId;
 }
-function applyDecisionCreate(db, request, digest) {
+function applyDecisionCreate(db, request, digest2) {
   const currentRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const decision = request.decision;
@@ -18693,7 +18776,7 @@ function applyDecisionCreate(db, request, digest) {
   return commitMutation(
     db,
     request,
-    digest,
+    digest2,
     actorReceiptId,
     {
       aggregateType: "decision",
@@ -18760,11 +18843,11 @@ function dispositionReference(db, decisionId, sequence) {
     db.prepare("SELECT * FROM decision_dispositions WHERE decision_id = ? AND disposition_sequence = ?").get(decisionId, sequence)
   ) ?? null;
 }
-function applyDecisionMutation(db, request, digest, _reader) {
+function applyDecisionMutation(db, request, digest2, _reader) {
   try {
     return transaction(db, () => {
-      const replay = checkIdempotency(db, request, digest);
-      return replay ?? applyDecisionDisposition(db, request, digest);
+      const replay = checkIdempotency(db, request, digest2);
+      return replay ?? applyDecisionDisposition(db, request, digest2);
     });
   } catch (error48) {
     if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
@@ -18772,7 +18855,7 @@ function applyDecisionMutation(db, request, digest, _reader) {
     return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal decision mutation error" });
   }
 }
-function applyDecisionDisposition(db, request, digest) {
+function applyDecisionDisposition(db, request, digest2) {
   const currentRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const decisionId = request.decisionId;
@@ -18938,7 +19021,7 @@ function applyDecisionDisposition(db, request, digest) {
   const output = commitMutation(
     db,
     request,
-    digest,
+    digest2,
     actorReceiptId,
     {
       aggregateType: "decision",
@@ -19052,7 +19135,7 @@ function qualificationContextDigest(context, resolved, request) {
     fixtureContextDigest: request.fixtureContextDigest
   }));
 }
-function applyQualificationObservation(db, request, digest, context) {
+function applyQualificationObservation(db, request, digest2, context) {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
@@ -19192,7 +19275,7 @@ function applyQualificationObservation(db, request, digest, context) {
   return commitMutation(
     db,
     request,
-    digest,
+    digest2,
     actorReceiptId,
     {
       aggregateType: "qualification_observation",
@@ -19308,7 +19391,7 @@ function materializeRoleHolderAttempt(db, request, context, resolved, governance
     attemptDigest
   );
 }
-function applyRoleGenerationSuccession(db, request, digest, context) {
+function applyRoleGenerationSuccession(db, request, digest2, context) {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
@@ -19452,7 +19535,7 @@ function applyRoleGenerationSuccession(db, request, digest, context) {
   return commitMutation(
     db,
     request,
-    digest,
+    digest2,
     actorReceiptId,
     {
       aggregateType: "role_generation",
@@ -19487,17 +19570,17 @@ function applyRoleGenerationSuccession(db, request, digest, context) {
     }
   );
 }
-function applyRoleMutation(db, request, digest, reader) {
+function applyRoleMutation(db, request, digest2, reader) {
   try {
-    const replay = checkIdempotency(db, request, digest);
+    const replay = checkIdempotency(db, request, digest2);
     if (replay) return replay;
     const context = resolveRoleContext(reader, request);
     const configRevision = requireConfig(db, request);
     const resolved = requireRoleRequirement(db, request, configRevision);
     return transaction(db, () => {
-      const replayInTransaction = checkIdempotency(db, request, digest);
+      const replayInTransaction = checkIdempotency(db, request, digest2);
       if (replayInTransaction) return replayInTransaction;
-      return request.operationClass === "qualification_observation_record" ? applyQualificationObservation(db, request, digest, context) : applyRoleGenerationSuccession(db, request, digest, context);
+      return request.operationClass === "qualification_observation_record" ? applyQualificationObservation(db, request, digest2, context) : applyRoleGenerationSuccession(db, request, digest2, context);
     });
   } catch (error48) {
     if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
@@ -19809,7 +19892,7 @@ function requireWorkItem(db, request, configRevision, expectedRevision = request
   }
   return row;
 }
-function applyWorkItemCreate(db, request, digest) {
+function applyWorkItemCreate(db, request, digest2) {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
@@ -19861,12 +19944,12 @@ function applyWorkItemCreate(db, request, digest) {
     mapping: githubBinding.mapping,
     issueNumber: githubIssue.issueNumber,
     idempotencyKey: request.idempotencyKey,
-    requestDigest: digest
+    requestDigest: digest2
   });
   return commitMutation(
     db,
     request,
-    digest,
+    digest2,
     actorReceiptId,
     {
       aggregateType: "work_item",
@@ -19973,7 +20056,7 @@ function recordedGithubCloseObservation(db, projectId, workItemId, resourceRevis
   if (!parsed.success) throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item has no exact recorded close observation");
   return parsed.data.externalEvent;
 }
-function applyWorkItemTransition(db, request, digest, githubObservation) {
+function applyWorkItemTransition(db, request, digest2, githubObservation) {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
@@ -19993,6 +20076,9 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
   const existingWait = asRow(db.prepare(
     "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?"
   ).get(request.projectId, workItem.work_item_id));
+  if (request.workItemBody !== void 0 && nextState === void 0 && wait === void 0) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "work item body updates require a lifecycle or wait transition");
+  }
   const machineWait = wait && (wait.kind === "work_item_succeeded" || wait.kind === "github_issue_closed") ? wait : null;
   const enteringBlocked = nextState === "blocked" && workItem.lifecycle_state !== "blocked";
   const swappingBlockedWait = workItem.lifecycle_state === "blocked" && nextState === "blocked";
@@ -20029,9 +20115,9 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
     if (wait === null && !existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item carries no open wait");
     const nextRevision2 = workItem.resource_revision + 1;
     const updated2 = db.prepare(
-      `UPDATE work_items SET resource_revision = ?, updated_at_ms = ?
+      `UPDATE work_items SET body = ?, resource_revision = ?, updated_at_ms = ?
        WHERE project_id = ? AND work_item_id = ? AND resource_revision = ?`
-    ).run(nextRevision2, now(), request.projectId, workItem.work_item_id, workItem.resource_revision);
+    ).run(request.workItemBody ?? workItem.body, nextRevision2, now(), request.projectId, workItem.work_item_id, workItem.resource_revision);
     if (updated2.changes !== 1) throw refusal("WORK_ITEM_REVISION_STALE", "work item compare-and-swap failed", {
       currentResourceRevision: workItem.resource_revision,
       expectedResourceRevision: request.expectedResourceRevision ?? void 0
@@ -20048,14 +20134,18 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
     return commitMutation(
       db,
       request,
-      digest,
+      digest2,
       actorReceiptId,
       {
         aggregateType: "work_item",
         aggregateId: workItem.work_item_id,
         aggregateRevision: nextRevision2,
         eventType: wait === null ? "work_item_wait_cleared" : "work_item_wait_declared",
-        event: { workItemId: workItem.work_item_id, ...wait === null ? {} : { waker: wait, declaredBySeat: wait.declaredBySeat } }
+        event: {
+          workItemId: workItem.work_item_id,
+          ...wait === null ? {} : { waker: wait, declaredBySeat: wait.declaredBySeat },
+          ...request.workItemBody === void 0 ? {} : { bodyDigest: sha256(request.workItemBody) }
+        }
       },
       { expected: 1, attempted: 1, verified: 1 },
       {
@@ -20101,7 +20191,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
       return commitMutation(
         db,
         request,
-        digest,
+        digest2,
         actorReceiptId,
         {
           aggregateType: "work_item",
@@ -20161,7 +20251,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
     return commitMutation(
       db,
       request,
-      digest,
+      digest2,
       actorReceiptId,
       {
         aggregateType: "work_item",
@@ -20245,9 +20335,9 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
   }
   const nextRevision = workItem.resource_revision + 1;
   const updated = db.prepare(
-    `UPDATE work_items SET lifecycle_state = ?, resource_revision = ?, updated_at_ms = ?
+    `UPDATE work_items SET lifecycle_state = ?, body = ?, resource_revision = ?, updated_at_ms = ?
      WHERE project_id = ? AND work_item_id = ? AND resource_revision = ? AND lifecycle_state = ?`
-  ).run(nextState, nextRevision, now(), request.projectId, workItem.work_item_id, workItem.resource_revision, workItem.lifecycle_state);
+  ).run(nextState, request.workItemBody ?? workItem.body, nextRevision, now(), request.projectId, workItem.work_item_id, workItem.resource_revision, workItem.lifecycle_state);
   if (updated.changes !== 1) {
     throw refusal("WORK_ITEM_REVISION_STALE", "work item compare-and-swap failed", {
       currentResourceRevision: workItem.resource_revision,
@@ -20331,7 +20421,7 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
   return commitMutation(
     db,
     request,
-    digest,
+    digest2,
     actorReceiptId,
     {
       aggregateType: "work_item",
@@ -20347,7 +20437,8 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
         ...workAttempt === void 0 ? {} : { workAttempt },
         ...machineWait === null ? {} : { blocker: machineWait },
         ...unblock === void 0 ? {} : { unblock },
-        ...recordedExternalEvent === null ? {} : { externalEvent: recordedExternalEvent }
+        ...recordedExternalEvent === null ? {} : { externalEvent: recordedExternalEvent },
+        ...request.workItemBody === void 0 ? {} : { bodyDigest: sha256(request.workItemBody) }
       }
     },
     { expected: 1, attempted: 1, verified: 1 },
@@ -20368,12 +20459,12 @@ function applyWorkItemTransition(db, request, digest, githubObservation) {
     }
   );
 }
-function desiredProjection(workItem, github) {
+function desiredProjection(workItem, github, blocker = null) {
   const convention = github.issue;
   const names = new Set(convention?.managedLabels?.names ?? []);
   const managedLabels = [...new Set(convention?.managedLabels?.byLifecycle?.[workItem.lifecycle_state] ?? [])].sort();
   const title = `${convention?.titlePrefix ?? ""}${workItem.title}`;
-  const body = `${convention?.bodyPrefix ?? ""}${workItem.body}`;
+  const body = `${convention?.bodyPrefix ?? ""}${maintainedIssueBody({ lifecycleState: workItem.lifecycle_state, scope: workItem.body, blocker })}`;
   const state = ["succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state) ? "closed" : "open";
   return {
     title,
@@ -20640,9 +20731,9 @@ function revalidateProjectionContext(db, request, context) {
   }
   return { configRevision, governor, actorReceiptId, workItem, mapping };
 }
-function prepareProjection(db, request, digest, adapter) {
+function prepareProjection(db, request, digest2, adapter) {
   return transaction(db, () => {
-    const replay = checkIdempotency(db, request, digest);
+    const replay = checkIdempotency(db, request, digest2);
     if (replay) return replay;
     if (request.projectionKind !== "github_issue") throw refusal("INVALID_INPUT", "GitHub projection requires projectionKind github_issue");
     const configRevision = requireConfig(db, request);
@@ -20651,7 +20742,11 @@ function prepareProjection(db, request, digest, adapter) {
     const workItem = requireWorkItem(db, request, configRevision);
     const { github, mapping } = requireGithubMapping(db, request.projectId, configRevision, workItem.repo_target_id);
     if (adapter.connectorHost !== mapping.connectorHost) throw refusal("EXTERNAL_TARGET_MISMATCH", "GitHub connector host does not match the exact mapping");
-    const desired = desiredProjection(workItem, github);
+    const wait = asRow(db.prepare(
+      "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?"
+    ).get(request.projectId, workItem.work_item_id));
+    const blocker = wait ? storedWorkItemBlocker(wait) : null;
+    const desired = desiredProjection(workItem, github, blocker ? workItemBlockerWaker(blocker) : null);
     let ref = externalRef(db, request.projectId, workItem.work_item_id);
     if (ref) {
       if (ref.project_id !== request.projectId || ref.work_item_id !== workItem.work_item_id || ref.provider !== "github") {
@@ -20684,11 +20779,11 @@ function prepareProjection(db, request, digest, adapter) {
         workItem.resource_revision,
         desired.digest,
         request.idempotencyKey,
-        digest,
+        digest2,
         createdAtMs,
         createdAtMs
       );
-      appendStateEvent(db, request, digest, actorReceiptId, {
+      appendStateEvent(db, request, digest2, actorReceiptId, {
         aggregateType: "external_work_ref",
         aggregateId: workItem.work_item_id,
         aggregateRevision: workItem.resource_revision,
@@ -20715,9 +20810,9 @@ function prepareProjection(db, request, digest, adapter) {
     };
   });
 }
-function reserveExistingProjection(db, request, digest, context) {
+function reserveExistingProjection(db, request, digest2, context) {
   return transaction(db, () => {
-    const replay = checkIdempotency(db, request, digest);
+    const replay = checkIdempotency(db, request, digest2);
     if (replay) throw refusal("IDEMPOTENCY_KEY_CONFLICT", "projection was concurrently finalized");
     revalidateProjectionContext(db, request, context);
     const updated = db.prepare(
@@ -20728,12 +20823,12 @@ function reserveExistingProjection(db, request, digest, context) {
       context.workItem.resource_revision,
       context.desired.digest,
       request.idempotencyKey,
-      digest,
+      digest2,
       now(),
       ...externalRefCasArgs(context.ref)
     );
     if (updated.changes !== 1) throw refusal("EXTERNAL_REF_CONFLICT", "external ref reservation lost its compare-and-swap race");
-    appendStateEvent(db, request, digest, context.actorReceiptId, {
+    appendStateEvent(db, request, digest2, context.actorReceiptId, {
       aggregateType: "external_work_ref",
       aggregateId: context.workItem.work_item_id,
       aggregateRevision: context.workItem.resource_revision,
@@ -20749,9 +20844,9 @@ function reserveExistingProjection(db, request, digest, context) {
     return { ...context, ref: externalRef(db, request.projectId, context.workItem.work_item_id) };
   });
 }
-function recordProjectionState(db, request, digest, context, state, outcome, counts, message) {
+function recordProjectionState(db, request, digest2, context, state, outcome, counts, message) {
   return transaction(db, () => {
-    const replay = checkIdempotency(db, request, digest);
+    const replay = checkIdempotency(db, request, digest2);
     if (replay) return replay;
     const authority = revalidateProjectionContext(db, request, context);
     const updated = db.prepare(
@@ -20763,7 +20858,7 @@ function recordProjectionState(db, request, digest, context, state, outcome, cou
       context.workItem.resource_revision,
       context.desired.digest,
       request.idempotencyKey,
-      digest,
+      digest2,
       now(),
       ...externalRefCasArgs(context.ref)
     );
@@ -20771,7 +20866,7 @@ function recordProjectionState(db, request, digest, context, state, outcome, cou
     return commitMutation(
       db,
       request,
-      digest,
+      digest2,
       authority.actorReceiptId,
       {
         aggregateType: "external_work_ref",
@@ -20793,9 +20888,9 @@ function recordProjectionState(db, request, digest, context, state, outcome, cou
     );
   });
 }
-function finalizeProjection(db, request, digest, context, adapter, snapshot2, mutationKind) {
+function finalizeProjection(db, request, digest2, context, adapter, snapshot2, mutationKind) {
   return transaction(db, () => {
-    const replay = checkIdempotency(db, request, digest);
+    const replay = checkIdempotency(db, request, digest2);
     if (replay) return replay;
     const authority = revalidateProjectionContext(db, request, context);
     if (authority.mapping.connectorHost !== adapter.connectorHost) {
@@ -20804,7 +20899,7 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot2, mu
     if (context.ref.owner !== snapshot2.owner || context.ref.repo !== snapshot2.repo || context.ref.issue_number !== null && context.ref.issue_number !== snapshot2.issueNumber) {
       throw refusal("EXTERNAL_REF_CONFLICT", "external identity changed before projection finalization");
     }
-    if (mutationKind === "verify" && !["current", "pending"].includes(context.ref.projection_state) || mutationKind !== "verify" && (context.ref.projection_state !== "pending" || context.ref.last_idempotency_key !== request.idempotencyKey || context.ref.last_request_digest !== digest)) {
+    if (mutationKind === "verify" && !["current", "pending"].includes(context.ref.projection_state) || mutationKind !== "verify" && (context.ref.projection_state !== "pending" || context.ref.last_idempotency_key !== request.idempotencyKey || context.ref.last_request_digest !== digest2)) {
       throw refusal("EXTERNAL_REF_CONFLICT", "external reservation changed before projection finalization");
     }
     const observed = observedDigest(snapshot2, context.desired);
@@ -20822,7 +20917,7 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot2, mu
       snapshot2.externalRevision,
       observed,
       request.idempotencyKey,
-      digest,
+      digest2,
       now(),
       ...externalRefCasArgs(context.ref)
     );
@@ -20830,7 +20925,7 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot2, mu
     return commitMutation(
       db,
       request,
-      digest,
+      digest2,
       authority.actorReceiptId,
       {
         aggregateType: "external_work_ref",
@@ -20859,9 +20954,9 @@ function finalizeProjection(db, request, digest, context, adapter, snapshot2, mu
     );
   });
 }
-function applyGithubIssueProjection(db, request, digest, adapter) {
+function applyGithubIssueProjection(db, request, digest2, adapter) {
   try {
-    const replay = checkIdempotency(db, request, digest);
+    const replay = checkIdempotency(db, request, digest2);
     if (replay) return replay;
   } catch (error48) {
     if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
@@ -20871,7 +20966,7 @@ function applyGithubIssueProjection(db, request, digest, adapter) {
   if (!adapter.available) return result("EXTERNAL_UNAVAILABLE", request.projectId, 1, 0, 0, { message: "the GitHub Issues adapter is unavailable" });
   let context;
   try {
-    const prepared = prepareProjection(db, request, digest, adapter);
+    const prepared = prepareProjection(db, request, digest2, adapter);
     if ("outcome" in prepared) return prepared;
     context = prepared;
   } catch (error48) {
@@ -20906,21 +21001,21 @@ function applyGithubIssueProjection(db, request, digest, adapter) {
     const initialBinding = context.ref.projection_state === "pending" && context.ref.issue_number !== null && context.ref.observed_external_digest === null;
     if (!initialBinding && (!context.ref.observed_external_digest || observedDigest(current, context.desired) !== context.ref.observed_external_digest)) {
       try {
-        return recordProjectionState(db, request, digest, context, "drifted", "EXTERNAL_DIVERGED", { expected: 1, attempted: 1, verified: 0 }, "the GitHub issue diverged from its last verified projection");
+        return recordProjectionState(db, request, digest2, context, "drifted", "EXTERNAL_DIVERGED", { expected: 1, attempted: 1, verified: 0 }, "the GitHub issue diverged from its last verified projection");
       } catch {
         return result("EXTERNAL_DIVERGED", request.projectId, 1, 1, 0, { message: "the GitHub issue diverged from its last verified projection" });
       }
     }
     if (observedDigest(current, context.desired) === context.desired.digest) {
       try {
-        return finalizeProjection(db, request, digest, context, adapter, current, "verify");
+        return finalizeProjection(db, request, digest2, context, adapter, current, "verify");
       } catch (error48) {
         if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
         return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
       }
     }
     try {
-      context = reserveExistingProjection(db, request, digest, context);
+      context = reserveExistingProjection(db, request, digest2, context);
     } catch (error48) {
       if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
       return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
@@ -20949,13 +21044,119 @@ function applyGithubIssueProjection(db, request, digest, adapter) {
     if (readBack.owner !== mutation.owner || readBack.repo !== mutation.repo || readBack.issueNumber !== mutationResponse.issueNumber) {
       throw new GitHubIssueAdapterError("ambiguous");
     }
-    return finalizeProjection(db, request, digest, context, adapter, readBack, mutation.kind);
+    return finalizeProjection(db, request, digest2, context, adapter, readBack, mutation.kind);
   } catch {
     try {
       return recordProjectionState(
         db,
         request,
-        digest,
+        digest2,
+        context,
+        "delivery_ambiguous",
+        "EXTERNAL_DELIVERY_AMBIGUOUS",
+        { expected: 1, attempted: 1, verified: 0 },
+        "GitHub delivery or exact read-back could not be proven"
+      );
+    } catch {
+      return result("EXTERNAL_DELIVERY_AMBIGUOUS", request.projectId, 1, 1, 0, { message: "GitHub delivery or local finalization could not be proven" });
+    }
+  }
+}
+async function applyGithubIssueProjectionAsync(db, request, digest2, adapter) {
+  if (!adapter.readAsync || !adapter.mutateAsync) return applyGithubIssueProjection(db, request, digest2, adapter);
+  try {
+    const replay = checkIdempotency(db, request, digest2);
+    if (replay) return replay;
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+  }
+  if (!adapter.available) return result("EXTERNAL_UNAVAILABLE", request.projectId, 1, 0, 0, { message: "the GitHub Issues adapter is unavailable" });
+  let context;
+  try {
+    const prepared = prepareProjection(db, request, digest2, adapter);
+    if ("outcome" in prepared) return prepared;
+    context = prepared;
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+  }
+  let mutation;
+  if (context.ref.issue_number === null) {
+    mutation = {
+      kind: "create",
+      owner: context.mapping.owner,
+      repo: context.mapping.repo,
+      title: context.desired.title,
+      body: context.desired.body,
+      state: context.desired.state,
+      addLabels: context.desired.managedLabels,
+      removeLabels: []
+    };
+  } else {
+    let current;
+    try {
+      current = await adapter.readAsync(context.mapping.owner, context.mapping.repo, context.ref.issue_number);
+      if (current === null) return result("EXTERNAL_NOT_FOUND", request.projectId, 1, 1, 0, { message: "the bound GitHub issue was not found" });
+      current = parseSnapshot(current);
+    } catch (error48) {
+      if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+      return result("EXTERNAL_UNAVAILABLE", request.projectId, 1, 1, 0, { message: "the bound GitHub issue could not be read" });
+    }
+    if (current.owner !== context.mapping.owner || current.repo !== context.mapping.repo || current.issueNumber !== context.ref.issue_number) {
+      return result("EXTERNAL_TARGET_MISMATCH", request.projectId, 1, 1, 0, { message: "the GitHub issue response has the wrong exact identity" });
+    }
+    const initialBinding = context.ref.projection_state === "pending" && context.ref.issue_number !== null && context.ref.observed_external_digest === null;
+    if (!initialBinding && (!context.ref.observed_external_digest || observedDigest(current, context.desired) !== context.ref.observed_external_digest)) {
+      try {
+        return recordProjectionState(db, request, digest2, context, "drifted", "EXTERNAL_DIVERGED", { expected: 1, attempted: 1, verified: 0 }, "the GitHub issue diverged from its last verified projection");
+      } catch {
+        return result("EXTERNAL_DIVERGED", request.projectId, 1, 1, 0, { message: "the GitHub issue diverged from its last verified projection" });
+      }
+    }
+    if (observedDigest(current, context.desired) === context.desired.digest) {
+      try {
+        return finalizeProjection(db, request, digest2, context, adapter, current, "verify");
+      } catch (error48) {
+        if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+        return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+      }
+    }
+    try {
+      context = reserveExistingProjection(db, request, digest2, context);
+    } catch (error48) {
+      if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+      return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+    }
+    const currentLabels = new Set(current.labels);
+    mutation = {
+      kind: "update",
+      owner: context.mapping.owner,
+      repo: context.mapping.repo,
+      issueNumber: context.ref.issue_number,
+      title: context.desired.title,
+      body: context.desired.body,
+      state: context.desired.state,
+      addLabels: context.desired.managedLabels.filter((label) => !currentLabels.has(label)),
+      removeLabels: current.labels.filter((label) => context.desired.managedNames.has(label) && !context.desired.managedLabels.includes(label))
+    };
+  }
+  try {
+    const mutationResponse = parseSnapshot(await adapter.mutateAsync(mutation));
+    if (mutationResponse.owner !== mutation.owner || mutationResponse.repo !== mutation.repo || mutation.issueNumber !== void 0 && mutationResponse.issueNumber !== mutation.issueNumber) throw new GitHubIssueAdapterError("ambiguous");
+    const readBackValue = await adapter.readAsync(mutation.owner, mutation.repo, mutationResponse.issueNumber);
+    if (readBackValue === null) throw new GitHubIssueAdapterError("ambiguous");
+    const readBack = parseSnapshot(readBackValue);
+    if (readBack.owner !== mutation.owner || readBack.repo !== mutation.repo || readBack.issueNumber !== mutationResponse.issueNumber) {
+      throw new GitHubIssueAdapterError("ambiguous");
+    }
+    return finalizeProjection(db, request, digest2, context, adapter, readBack, mutation.kind);
+  } catch {
+    try {
+      return recordProjectionState(
+        db,
+        request,
+        digest2,
         context,
         "delivery_ambiguous",
         "EXTERNAL_DELIVERY_AMBIGUOUS",
@@ -20984,6 +21185,25 @@ function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, dryRun);
 }
+async function applyAuthorizedMutationAsync(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, dryRun = false) {
+  let request;
+  try {
+    request = parseApplyRequest(input);
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult("apply", error48.data);
+    return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error48) });
+  }
+  if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
+  if (request.operationClass !== "github_issue_projection" || !githubAdapter?.readAsync || !githubAdapter.mutateAsync) {
+    return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, dryRun);
+  }
+  try {
+    return await applyGithubIssueProjectionAsync(db, request, mutationRequestDigest(request), githubAdapter);
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+  }
+}
 function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, dryRun = false) {
   let request;
   try {
@@ -20994,20 +21214,20 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   try {
-    const digest = mutationRequestDigest(request);
+    const digest2 = mutationRequestDigest(request);
     if (request.operationClass === "github_issue_projection") {
-      return applyGithubIssueProjection(db, request, digest, githubAdapter);
+      return applyGithubIssueProjection(db, request, digest2, githubAdapter);
     }
     if (request.operationClass === "qualification_observation_record" || request.operationClass === "role_generation_succession") {
-      return applyRoleMutation(db, request, digest, roleFactReader);
+      return applyRoleMutation(db, request, digest2, roleFactReader);
     }
     if (request.operationClass === "decision_disposition") {
-      return applyDecisionMutation(db, request, digest, reviewFactReader);
+      return applyDecisionMutation(db, request, digest2, reviewFactReader);
     }
     const githubTargets = request.operationClass === "work_item_transition" ? workItemGithubReadTarget(request) : [];
     let githubObservation = null;
     if (githubTargets.length > 0) {
-      const replay = checkIdempotency(db, request, digest);
+      const replay = checkIdempotency(db, request, digest2);
       if (replay) return replay;
       const reader = githubIssueReader ?? (githubAdapter ? githubAdapter.read.bind(githubAdapter) : null);
       if (!reader) throw refusal("EXTERNAL_TARGET_REQUIRED", "work item transition requires a live GitHub issue reader");
@@ -21025,27 +21245,27 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
       githubObservation = replacement && replacement.kind === "github_issue_closed" ? observations.find((observation2) => observation2.owner === replacement.owner && observation2.repo === replacement.repo && observation2.issueNumber === replacement.issueNumber) ?? null : observations[0] ?? null;
     }
     const mutate = () => {
-      const replay = checkIdempotency(db, request, digest);
+      const replay = checkIdempotency(db, request, digest2);
       if (replay) return replay;
       switch (request.operationClass) {
         case "bootstrap":
-          return applyBootstrap(db, request, digest);
+          return applyBootstrap(db, request, digest2);
         case "config_revision":
-          return applyConfigRevision(db, request, digest);
+          return applyConfigRevision(db, request, digest2);
         case "governor_claim":
-          return applyGovernorClaim(db, request, digest);
+          return applyGovernorClaim(db, request, digest2);
         case "migration_prepare":
-          return applyMigrationPrepare(db, request, digest);
+          return applyMigrationPrepare(db, request, digest2);
         case "migration_step":
-          return applyMigrationStep(db, request, digest);
+          return applyMigrationStep(db, request, digest2);
         case "decision_create":
-          return applyDecisionCreate(db, request, digest);
+          return applyDecisionCreate(db, request, digest2);
         case "decision_disposition":
           throw refusal("INTERNAL_ERROR", "decision disposition must use the Decision resolver");
         case "work_item_create":
-          return applyWorkItemCreate(db, request, digest);
+          return applyWorkItemCreate(db, request, digest2);
         case "work_item_transition":
-          return applyWorkItemTransition(db, request, digest, githubObservation);
+          return applyWorkItemTransition(db, request, digest2, githubObservation);
         case "github_issue_projection":
           throw refusal("INTERNAL_ERROR", "projection must not run inside the canonical transaction");
         case "qualification_observation_record":
@@ -21948,7 +22168,7 @@ function createStallGuardCycle(options) {
 }
 
 // src/registered-waits.ts
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash3 } from "node:crypto";
 import { homedir as homedir2 } from "node:os";
 import { join as join3 } from "node:path";
 var DEFAULT_WAIT_DEADLINE_MS = 8 * 60 * 6e4;
@@ -21988,7 +22208,7 @@ function resolveWaitDeadline(input) {
   return { ok: true, deadlineAtMs: input.deadlineAtMs, overrideReason: input.overrideReason };
 }
 function boundedWaitId(idempotencyKey) {
-  return createHash2("sha256").update(idempotencyKey).digest("hex").slice(0, 40);
+  return createHash3("sha256").update(idempotencyKey).digest("hex").slice(0, 40);
 }
 async function registerBoundedWait(options) {
   const now2 = options.now ?? Date.now;
@@ -22779,10 +22999,13 @@ var ROLE_QUEUE_CACHE_MS = 2e4;
 var ROLE_QUEUE_IDLE_THRESHOLD_MS = 3e4;
 var ROLE_QUEUE_OBSERVATION_MS = 1e3;
 var FLEET_WATCHDOG_LANE_INVENTORY_TIMEOUT_MS = 1e3;
-function githubJson(args) {
+function githubCommandArgs(args, connectorHost) {
+  return connectorHost ? ["--hostname", connectorHost, ...args] : args;
+}
+function githubJson(args, connectorHost) {
   try {
     const options = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1e4, killSignal: "SIGKILL", detached: true };
-    const result2 = spawnSync2("gh", args, options);
+    const result2 = spawnSync2("gh", githubCommandArgs(args, connectorHost), options);
     if (typeof result2.pid === "number" && result2.pid > 0) {
       try {
         process.kill(-result2.pid, "SIGKILL");
@@ -22796,9 +23019,9 @@ function githubJson(args) {
     return null;
   }
 }
-function githubJsonAsync(args) {
+function githubJsonAsync(args, connectorHost) {
   return new Promise((resolve3) => {
-    execFile("gh", args, { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL" }, (error48, stdout) => {
+    execFile("gh", githubCommandArgs(args, connectorHost), { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL" }, (error48, stdout) => {
       if (error48) {
         resolve3(null);
         return;
@@ -22898,15 +23121,104 @@ async function linkedGithubObservationAsync(owner, repo, issueNumber) {
   const updatedAtMs = Date.parse(externalRevision);
   return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason: stateReason === "" || stateReason === null ? void 0 : stateReason, externalRevision, updatedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : null };
 }
-async function readGithubIssueForBackfillAsync(owner, repo, issueNumber) {
-  const value = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"]);
+async function readGithubIssueForBackfillAsync(owner, repo, issueNumber, connectorHost) {
+  const value = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"], connectorHost);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
   const record2 = value;
   if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !validGithubStateReason(record2.state, record2.stateReason) || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
   return { owner, repo, issueNumber: record2.number, title: record2.title, body: record2.body ?? "", state: record2.state === "OPEN" ? "open" : "closed", stateReason: record2.stateReason === "" || record2.stateReason === null ? void 0 : record2.stateReason, labels: record2.labels.map((label) => label.name), externalRevision: record2.updatedAt };
 }
-function readGithubIssueForBackfill(owner, repo, issueNumber) {
-  const value = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"]);
+function githubIssueBriefTarget(db, projectId, workItemId) {
+  if (!db) return null;
+  const ref = db.prepare(
+    `SELECT work_items.resource_revision, external_work_refs.*
+     FROM external_work_refs
+     JOIN work_items ON work_items.project_id = external_work_refs.project_id
+       AND work_items.work_item_id = external_work_refs.work_item_id
+     WHERE external_work_refs.project_id = ? AND external_work_refs.work_item_id = ? AND external_work_refs.provider = 'github'`
+  ).get(projectId, workItemId);
+  if (!ref) return null;
+  if (typeof ref.owner !== "string" || typeof ref.repo !== "string" || typeof ref.issue_number !== "number" || !Number.isSafeInteger(ref.issue_number) || ref.issue_number < 1 || typeof ref.resource_revision !== "number" || !Number.isSafeInteger(ref.resource_revision) || typeof ref.attempted_resource_revision !== "number" || typeof ref.projected_resource_revision !== "number" || typeof ref.desired_digest !== "string" || typeof ref.observed_external_digest !== "string" || typeof ref.observed_external_revision !== "string" || ref.projection_state !== "pending" && ref.projection_state !== "current" && ref.projection_state !== "drifted" && ref.projection_state !== "delivery_ambiguous") {
+    throw new Error("GitHub issue projection identity is invalid");
+  }
+  return {
+    projectId,
+    workItemId,
+    owner: ref.owner,
+    repo: ref.repo,
+    issueNumber: ref.issue_number,
+    projection: {
+      projectionState: ref.projection_state,
+      canonicalResourceRevision: ref.resource_revision,
+      attemptedResourceRevision: ref.attempted_resource_revision,
+      projectedResourceRevision: ref.projected_resource_revision,
+      desiredDigest: ref.desired_digest,
+      observedExternalDigest: ref.observed_external_digest,
+      observedExternalRevision: ref.observed_external_revision
+    }
+  };
+}
+function projectionIsCurrent(target) {
+  const projection = target.projection;
+  return projection.projectionState === "current" && projection.canonicalResourceRevision === projection.attemptedResourceRevision && projection.canonicalResourceRevision === projection.projectedResourceRevision && projection.desiredDigest.length > 0 && projection.desiredDigest === projection.observedExternalDigest && projection.observedExternalRevision.length > 0;
+}
+function parseGithubIssueComments(value) {
+  if (!Array.isArray(value) || value.length > GITHUB_ISSUE_COMMENT_TAIL_LIMIT) throw new Error("GitHub issue comments response is invalid");
+  return value.map((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) throw new Error("GitHub issue comment response is invalid");
+    const record2 = candidate;
+    if (!Number.isSafeInteger(record2.id) || typeof record2.body !== "string" || typeof record2.updated_at !== "string") {
+      throw new Error("GitHub issue comment response is invalid");
+    }
+    return { id: String(record2.id), body: record2.body, externalRevision: record2.updated_at };
+  }).reverse();
+}
+async function readGithubIssueBriefAsync(db, projectId, workItemId, connectorHost) {
+  const target = githubIssueBriefTarget(db, projectId, workItemId);
+  if (!target || !projectionIsCurrent(target)) throw new Error("GitHub issue projection is unavailable for the current WorkItem revision");
+  const issue2 = await readGithubIssueForBackfillAsync(target.owner, target.repo, target.issueNumber, connectorHost);
+  if (issue2.externalRevision !== target.projection.observedExternalRevision) throw new Error("GitHub issue body freshness does not match the current projection");
+  const firstPage = await githubJsonAsync([
+    "api",
+    `repos/${target.owner}/${target.repo}/issues/${target.issueNumber}/comments?per_page=${GITHUB_ISSUE_COMMENT_TAIL_LIMIT}&page=1&sort=created&direction=desc`
+  ], connectorHost);
+  const comments = parseGithubIssueComments(firstPage);
+  let commentsCapped = false;
+  if (comments.length === GITHUB_ISSUE_COMMENT_TAIL_LIMIT) {
+    const secondPage = await githubJsonAsync([
+      "api",
+      `repos/${target.owner}/${target.repo}/issues/${target.issueNumber}/comments?per_page=${GITHUB_ISSUE_COMMENT_TAIL_LIMIT}&page=2&sort=created&direction=desc`
+    ], connectorHost);
+    const olderComments = parseGithubIssueComments(secondPage);
+    commentsCapped = olderComments.length > 0;
+  }
+  const currentTarget = githubIssueBriefTarget(db, projectId, workItemId);
+  if (!currentTarget || JSON.stringify(currentTarget) !== JSON.stringify(target)) throw new Error("GitHub issue projection moved during brief composition");
+  const source = {
+    ...issue2,
+    projectId,
+    comments,
+    commentsReadComplete: true,
+    commentsCapped,
+    bodyCurrent: true,
+    projection: target.projection
+  };
+  const brief = composeGithubIssueBrief(source);
+  assertGithubIssueBriefBinding(brief, { projectId, owner: target.owner, repo: target.repo, issueNumber: target.issueNumber });
+  return { brief, source };
+}
+function appendGithubIssueBrief(spawn, brief) {
+  if (typeof spawn.prompt === "string") return { ...spawn, prompt: `${spawn.prompt}
+
+${brief.content}` };
+  if (!Array.isArray(spawn.input)) throw new Error("dispatch prompt shape is unavailable");
+  return {
+    ...spawn,
+    input: [...spawn.input, { type: "text", visibility: "agent-only", text: brief.content, mentions: [] }]
+  };
+}
+function readGithubIssueForBackfill(owner, repo, issueNumber, connectorHost) {
+  const value = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"], connectorHost);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
   const record2 = value;
   if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !validGithubStateReason(record2.state, record2.stateReason) || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
@@ -22921,6 +23233,92 @@ function readGithubIssueForBackfill(owner, repo, issueNumber) {
     labels: record2.labels.map((label) => label.name),
     externalRevision: record2.updatedAt
   };
+}
+function githubCliAdapterForWorkItem(db, projectId, workItemId) {
+  if (!db) return null;
+  const row = db.prepare(
+    `SELECT work_items.repo_target_id, project_config_revisions.canonical_config_json
+     FROM work_items
+     JOIN project_config_heads ON project_config_heads.project_id = work_items.project_id
+     JOIN project_config_revisions ON project_config_revisions.project_id = project_config_heads.project_id
+       AND project_config_revisions.config_revision = project_config_heads.config_revision
+     WHERE work_items.project_id = ? AND work_items.work_item_id = ?`
+  ).get(projectId, workItemId);
+  if (!row || typeof row.repo_target_id !== "string" || typeof row.canonical_config_json !== "string") return null;
+  try {
+    const config2 = JSON.parse(row.canonical_config_json);
+    const mappings = config2.extensions?.bbCollab?.githubIssues?.repositoryMappings;
+    if (!Array.isArray(mappings)) return null;
+    const mapping = mappings.find((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate) && candidate.repoTargetId === row.repo_target_id && typeof candidate.connectorHost === "string");
+    if (!mapping) return null;
+    const connectorHost = mapping.connectorHost;
+    return {
+      connectorHost,
+      available: true,
+      read: (owner, repo, issueNumber) => readGithubIssueForBackfill(owner, repo, issueNumber, connectorHost),
+      mutate: (input) => githubCliMutation(input, connectorHost),
+      readAsync: (owner, repo, issueNumber) => readGithubIssueForBackfillAsync(owner, repo, issueNumber, connectorHost),
+      mutateAsync: (input) => githubCliMutationAsync(input, connectorHost)
+    };
+  } catch {
+    return null;
+  }
+}
+function githubCliMutation(input, connectorHost) {
+  const current = input.kind === "update" ? readGithubIssueForBackfill(input.owner, input.repo, input.issueNumber, connectorHost) : null;
+  const labels = [...new Set([
+    ...current?.labels ?? [],
+    ...input.addLabels
+  ].filter((label) => !input.removeLabels.includes(label)))].sort();
+  const args = [
+    "api",
+    input.kind === "create" ? `repos/${input.owner}/${input.repo}/issues` : `repos/${input.owner}/${input.repo}/issues/${input.issueNumber}`,
+    "--method",
+    input.kind === "create" ? "POST" : "PATCH",
+    "-f",
+    `title=${input.title}`,
+    "-f",
+    `body=${input.body}`,
+    "-f",
+    `state=${input.state}`,
+    ...labels.flatMap((label) => ["-f", `labels[]=${label}`])
+  ];
+  if (input.state === "closed") args.push("-f", "state_reason=completed");
+  const response = githubJson(args, connectorHost);
+  const responseNumber = response && typeof response === "object" && !Array.isArray(response) ? response.number : void 0;
+  const issueNumber = input.kind === "create" ? responseNumber : input.issueNumber;
+  if (typeof issueNumber !== "number" || !Number.isSafeInteger(issueNumber) || issueNumber < 1) throw new Error("GitHub issue mutation identity was not confirmed");
+  const snapshot2 = readGithubIssueForBackfill(input.owner, input.repo, issueNumber, connectorHost);
+  if (snapshot2.owner !== input.owner || snapshot2.repo !== input.repo || snapshot2.issueNumber !== issueNumber) throw new Error("GitHub issue mutation identity changed");
+  return snapshot2;
+}
+async function githubCliMutationAsync(input, connectorHost) {
+  const current = input.kind === "update" ? await readGithubIssueForBackfillAsync(input.owner, input.repo, input.issueNumber, connectorHost) : null;
+  const labels = [...new Set([
+    ...current?.labels ?? [],
+    ...input.addLabels
+  ].filter((label) => !input.removeLabels.includes(label)))].sort();
+  const args = [
+    "api",
+    input.kind === "create" ? `repos/${input.owner}/${input.repo}/issues` : `repos/${input.owner}/${input.repo}/issues/${input.issueNumber}`,
+    "--method",
+    input.kind === "create" ? "POST" : "PATCH",
+    "-f",
+    `title=${input.title}`,
+    "-f",
+    `body=${input.body}`,
+    "-f",
+    `state=${input.state}`,
+    ...labels.flatMap((label) => ["-f", `labels[]=${label}`])
+  ];
+  if (input.state === "closed") args.push("-f", "state_reason=completed");
+  const response = await githubJsonAsync(args, connectorHost);
+  const responseNumber = response && typeof response === "object" && !Array.isArray(response) ? response.number : void 0;
+  const issueNumber = input.kind === "create" ? responseNumber : input.issueNumber;
+  if (typeof issueNumber !== "number" || !Number.isSafeInteger(issueNumber) || issueNumber < 1) throw new Error("GitHub issue mutation identity was not confirmed");
+  const snapshot2 = await readGithubIssueForBackfillAsync(input.owner, input.repo, issueNumber, connectorHost);
+  if (snapshot2.owner !== input.owner || snapshot2.repo !== input.repo || snapshot2.issueNumber !== issueNumber) throw new Error("GitHub issue mutation identity changed");
+  return snapshot2;
 }
 var FLEET_WATCHDOG_FLOOR_MS = 5 * 6e4;
 var FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS = 60 * 6e4;
@@ -23437,6 +23835,15 @@ async function dispatchLane(bb, db, input) {
   if (nativeProfile.providerId !== requestedProfile.providerId || nativeProfile.model !== requestedProfile.model || nativeProfile.reasoningLevel !== requestedProfile.reasoningLevel || nativeProfile.permissionMode !== normalizedPermissionMode(requestedProfile.permissionMode) || nativeProfile.serviceTier !== requestedProfile.serviceTier || nativeProfile.visibility !== requestedProfile.visibility) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "native spawn routing profile does not match the requested execution profile" };
   }
+  const briefTarget = githubIssueBriefTarget(db, request.projectId, request.workItemId ?? "");
+  if (briefTarget && !projectionIsCurrent(briefTarget)) {
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection is stale or ambiguous for the canonical WorkItem" };
+  }
+  const githubAdapter = briefTarget ? githubCliAdapterForWorkItem(db, request.projectId, request.workItemId ?? "") : null;
+  if (briefTarget && !githubAdapter) {
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub projection capability is unavailable for the current WorkItem" };
+  }
+  let initialBrief = null;
   const dispatchParentThreadId = spawnShape.data.parentThreadId;
   const dispatchTitle = String(spawnShape.data.title ?? "lane");
   const { threadId: _threadId, ...intentAttempt } = request.workAttempt;
@@ -23446,25 +23853,61 @@ async function dispatchLane(bb, db, input) {
     ...request,
     reasonCode: legacyReplay ? `dispatch_parent:${dispatchParentThreadId}` : `dispatch_parent:${dispatchParentThreadId}:title=${encodeURIComponent(dispatchTitle)}`,
     workAttempt: intentAttempt
-  }, false, "stop-active");
+  }, false, "stop-active", githubAdapter?.read ?? readGithubIssueForBackfill, githubAdapter);
   if (intent.outcome !== "OK") return intent;
   return serializeDispatchRecovery(request, async () => {
+    let dispatchSpawn = spawnShape.data;
+    if (briefTarget) {
+      const currentWorkItem = db?.prepare(
+        "SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?"
+      ).get(request.projectId, request.workItemId ?? "");
+      if (!currentWorkItem || !Number.isSafeInteger(currentWorkItem.resource_revision)) {
+        return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub projection capability is unavailable for the current WorkItem" };
+      }
+      const { lifecycleState: _lifecycleState, workAttempt: _workAttempt, reasonCode: _reasonCode, ...projectionBase } = request;
+      const projection = await applyLiveAuthorizedMutationAsync(bb, db, {
+        ...projectionBase,
+        operationClass: "github_issue_projection",
+        idempotencyKey: `${request.idempotencyKey}:maintained-body`,
+        expectedResourceRevision: currentWorkItem.resource_revision,
+        workItemId: request.workItemId,
+        projectionKind: "github_issue"
+      }, false, "refuse-active", readGithubIssueForBackfill, githubAdapter);
+      if (projection.outcome !== "OK") return projection;
+      try {
+        initialBrief = (await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "", githubAdapter?.connectorHost)).brief;
+      } catch {
+        return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub issue body, projection, and comment-tail source is unavailable" };
+      }
+      let latestRead;
+      try {
+        latestRead = await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "", githubAdapter?.connectorHost);
+      } catch {
+        return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub issue body and comment-tail reread is unavailable" };
+      }
+      try {
+        assertGithubIssueBriefAnchor(initialBrief, latestRead.source);
+      } catch {
+        return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub issue body or comment tail moved before dispatch" };
+      }
+      dispatchSpawn = appendGithubIssueBrief(dispatchSpawn, latestRead.brief);
+    }
     if (!intent.replay) {
       try {
-        const spawnedThread = await spawnDispatchThread(bb, spawnShape.data, request.idempotencyKey);
+        const spawnedThread = await spawnDispatchThread(bb, dispatchSpawn, request.idempotencyKey);
         const prepared = preparedDispatchIntent(db, request);
         if (prepared === "ambiguous" || !prepared) {
           return dispatchRecoveryRefusal(request.projectId, "native spawn returned without a uniquely recoverable prepared intent");
         }
         if (spawnedThread.projectId !== request.projectId || spawnedThread.parentThreadId !== prepared.parentThreadId || spawnedThread.title !== `${dispatchTitle} [dispatch:${request.idempotencyKey}]`) {
-          return reconcileDispatchIntent(bb, db, request, spawnShape.data, intent, false);
+          return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, false);
         }
         return finalizeDispatchIntent(bb, db, request, prepared, spawnedThread.id);
       } catch {
-        return reconcileDispatchIntent(bb, db, request, spawnShape.data, intent, true);
+        return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true);
       }
     }
-    return reconcileDispatchIntent(bb, db, request, spawnShape.data, intent, true);
+    return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true);
   });
 }
 function preparedDispatchIntent(db, request) {
@@ -23617,10 +24060,10 @@ async function prepareWorkItemAttemptTerminalization(bb, db, request, policy) {
   }
   return null;
 }
-async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = readGithubIssueForBackfill) {
+async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = readGithubIssueForBackfill, githubAdapter = null) {
   const parsed = applyRequestSchema.safeParse(input);
   if (parsed.success && terminalizationPolicy === "stop-active") {
-    const authorized = applyAuthorizedMutation(db, input, null, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, true);
+    const authorized = applyAuthorizedMutation(db, input, githubAdapter, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, true);
     if (authorized.outcome !== "OK" || authorized.replay) return authorized;
   }
   if (parsed.success) {
@@ -23641,7 +24084,21 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     }
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
-  const result2 = applyAuthorizedMutation(db, input, null, reader, null, null, githubIssueReader);
+  const result2 = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader);
+  await deliverSucceededSeatBrief(bb, db, input, result2);
+  return result2;
+}
+async function applyLiveAuthorizedMutationAsync(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = readGithubIssueForBackfill, githubAdapter = null) {
+  const parsed = applyRequestSchema.safeParse(input);
+  if (parsed.success) {
+    const laneGuard = await prepareWorkItemAttemptTerminalization(bb, db, parsed.data, terminalizationPolicy);
+    if (laneGuard) return laneGuard;
+  }
+  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v22-rollout-receipt")) {
+    return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
+  }
+  const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
+  const result2 = await applyAuthorizedMutationAsync(db, input, githubAdapter, reader, null, null, githubIssueReader);
   await deliverSucceededSeatBrief(bb, db, input, result2);
   return result2;
 }

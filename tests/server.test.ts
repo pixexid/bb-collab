@@ -67,6 +67,7 @@ import {
 import { createLaneWatcher, createRoleIdleLedger, IDLE_FLEET_DEBOUNCE_MS, readRoleHolderStates, roleIdleKey, type RoleIdleRecord } from "../src/awareness.js";
 import { findCheckoutRoot, readCheckoutDivergence } from "../src/checkout-divergence.js";
 import { weeklyThroughputReport } from "../src/throughput-report.js";
+import { maintainedIssueBody } from "../src/github-issue-brief.js";
 
 const PROJECT_ID = "proj_test";
 const PLUGIN_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -717,8 +718,8 @@ async function loadedDistHost() {
   return host;
 }
 
-async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, writingLaneCeiling?: number, withoutGithubIssues = true) {
-  const fixture = await assignmentFixture({ directorSeat: true, orchestratorSeat: true, withoutGithubIssues, targetRemoteUrl: includeGithubRemote ? "https://github.com/example/project.git" : undefined, writingLaneCeiling });
+async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, writingLaneCeiling?: number, withoutGithubIssues = true, projectId = PROJECT_ID, connectorHost = CONNECTOR_HOST) {
+  const fixture = await assignmentFixture({ projectId, connectorHost, directorSeat: true, orchestratorSeat: true, withoutGithubIssues, targetRemoteUrl: includeGithubRemote ? "https://github.com/example/project.git" : undefined, writingLaneCeiling });
   const director = fixture.db.prepare(
     "SELECT thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'director'",
   ).get() as { thread_id: string };
@@ -730,26 +731,26 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
   fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) =>
     threadId === director.thread_id && directorPendingInteraction ? [{ status: "pending" }] : []) as never);
   let nativeUpdatedAt = updatedAt;
-  const threadProjects = new Map([[director.thread_id, PROJECT_ID], [orchestrator.thread_id, PROJECT_ID]]);
+  const threadProjects = new Map([[director.thread_id, projectId], [orchestrator.thread_id, projectId]]);
   const lanes = new Map<string, ReturnType<typeof makeThreadResponse> & { environmentBranchName: string | null }>();
   const laneEvents = new Map<string, Array<{ id: string; threadId: string; seq: number; type: string; scope: { kind: "thread" }; data: unknown; createdAt: number }>>();
   fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
     ...(lanes.get(threadId) ?? {}),
     id: threadId,
-    projectId: lanes.get(threadId)?.projectId ?? threadProjects.get(threadId) ?? (threadId.includes("two") ? "project-two" : PROJECT_ID),
+    projectId: lanes.get(threadId)?.projectId ?? threadProjects.get(threadId) ?? (threadId.includes("two") ? "project-two" : projectId),
     status: lanes.get(threadId)?.status ?? threadStatus,
     parentThreadId: lanes.get(threadId)?.parentThreadId ?? null,
     updatedAt: lanes.get(threadId)?.updatedAt ?? nativeUpdatedAt,
   })) as never);
-  fixture.host.harness.sdk.stub("threads.list", (async ({ projectId, archived }: { projectId?: string; archived?: boolean }) => [
+  fixture.host.harness.sdk.stub("threads.list", (async ({ projectId: requestedProjectId, archived }: { projectId?: string; archived?: boolean }) => [
     ...[director.thread_id, orchestrator.thread_id].map((threadId) => makeThreadResponse({
       id: threadId,
-      projectId: threadProjects.get(threadId) ?? PROJECT_ID,
+      projectId: threadProjects.get(threadId) ?? projectId,
       status: threadStatus,
       updatedAt: nativeUpdatedAt,
     })),
     ...lanes.values(),
-  ].filter((thread) => (projectId === undefined || thread.projectId === projectId) && (archived ? thread.archivedAt !== null : thread.archivedAt === null))) as never);
+  ].filter((thread) => (requestedProjectId === undefined || thread.projectId === requestedProjectId) && (archived ? thread.archivedAt !== null : thread.archivedAt === null))) as never);
   fixture.host.harness.sdk.stub("threads.spawn", (async ({ projectId, parentThreadId, title }: { projectId: string; parentThreadId?: string; title?: string }) => {
     const id = `lane-${lanes.size + 1}`;
     const lane = Object.assign(makeThreadResponse({ id, projectId, parentThreadId: parentThreadId ?? null, title: title ?? null, status: "error", updatedAt: nativeUpdatedAt }), {
@@ -785,7 +786,7 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
     setDirectorPendingInteraction(value: boolean) { directorPendingInteraction = value; },
     setThreadProject(threadId: string, projectId: string) { threadProjects.set(threadId, projectId); },
     addNativeLane(threadId: string, status: "idle" | "active" | "error" | "starting" | "stopping" = "active", parentThreadId = orchestrator.thread_id) {
-      lanes.set(threadId, Object.assign(makeThreadResponse({ id: threadId, projectId: PROJECT_ID, parentThreadId, status, updatedAt: nativeUpdatedAt }), {
+      lanes.set(threadId, Object.assign(makeThreadResponse({ id: threadId, projectId, parentThreadId, status, updatedAt: nativeUpdatedAt }), {
         environmentBranchName: null,
       }));
     },
@@ -825,6 +826,96 @@ function bindFixtureGithubIssue(db: Database.Database, issueNumber: number, work
        last_request_digest, created_at_ms, updated_at_ms
      ) VALUES (?, ?, 'github', ?, ?, ?, 'current', 2, 2, ?, 'fixture', ?, 'fixture-ref', ?, 1, 1)`,
   ).run(projectId, workItemId, GITHUB_OWNER, repo, issueNumber, sha256("fixture-desired"), sha256("fixture-observed"), sha256("fixture-request"));
+}
+
+async function currentGithubBriefDispatch(projectId = PROJECT_ID, connectorHost = CONNECTOR_HOST) {
+  const fixture = await fleetWatchdogFixture(0, true, 1, false, projectId, connectorHost);
+  const adapter = new DeterministicGitHubIssueAdapter(connectorHost);
+  expect(applyWithFixtureReceipt(fixture.db, projectionRequest(fixture.fenceToken, 2, { projectId, idempotencyKey: `github-brief-ready-project-${projectId}` }), adapter)).toMatchObject({ outcome: "OK" });
+  const ready = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1);
+  if (!ready) throw new Error("fixture projection did not create its issue");
+  const inProgress = {
+    ...ready,
+    body: `canonical: ${maintainedIssueBody({ lifecycleState: "in_progress", scope: "Keep canonical state local." })}`,
+    state: "open" as const,
+    labels: ["work-active"],
+    externalRevision: "fixture-in-progress",
+  };
+  return {
+    fixture,
+    snapshot: ready,
+    transitionSnapshot: inProgress,
+    request: transitionRequest(fixture.fenceToken, "in_progress", 2, { projectId }),
+    projectId,
+  };
+}
+
+function installGithubBriefGh(snapshot: { title: string; body: string; state: "open" | "closed"; labels: readonly string[]; externalRevision: string }, options: { transitionSnapshot?: typeof snapshot; incomplete?: boolean; mutationFailure?: boolean; slowConnectorHost?: string } = {}) {
+  const bin = mkdtempSync(join(tmpdir(), "bb-collab-github-brief-"));
+  const gh = join(bin, "gh");
+  const calls = join(bin, "calls");
+  const slowTransitioned = join(bin, "slow-transitioned");
+  const fastTransitioned = join(bin, "fast-transitioned");
+  const slowStarted = join(bin, "slow-started");
+  const slowFinished = join(bin, "slow-finished");
+  const issue = JSON.stringify({ number: 1, title: snapshot.title, body: snapshot.body, state: snapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: snapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: snapshot.labels.map((name) => ({ name })), updatedAt: snapshot.externalRevision });
+  const transitionSnapshot = options.transitionSnapshot ?? snapshot;
+  const transitionedIssue = JSON.stringify({ number: 1, title: transitionSnapshot.title, body: transitionSnapshot.body, state: transitionSnapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: transitionSnapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: transitionSnapshot.labels.map((name) => ({ name })), updatedAt: transitionSnapshot.externalRevision });
+  const allComments = Array.from({ length: 48 }, (_, index) => ({ id: 48 - index, body: `comment-${48 - index}`, updated_at: `comment-revision-${48 - index}` }));
+  const recent = JSON.stringify(allComments.slice(0, 8));
+  const older = JSON.stringify(options.incomplete ? { not: "comments" } : allComments.slice(8, 16));
+  writeFileSync(gh, `#!/bin/sh
+printf '%s\\n' "$*" >> '${calls}'
+connector_host=default
+if [ "$1" = --hostname ]; then
+  connector_host="$2"
+  if [ "$2" = '${options.slowConnectorHost ?? ""}' ]; then touch '${slowStarted}'; sleep 2; touch '${slowFinished}'; fi
+  shift 2
+fi
+if [ "$connector_host" = '${options.slowConnectorHost ?? ""}' ]; then state_file='${slowTransitioned}'; else state_file='${fastTransitioned}'; fi
+if [ "$1" = issue ]; then
+  if [ -f "$state_file" ]; then printf '%s\\n' '${transitionedIssue}'; else printf '%s\\n' '${issue}'; fi
+  exit 0
+fi
+if [ "$1" = api ]; then
+  case "$*" in
+    *--method*PATCH*|*--method*POST*)
+      ${options.mutationFailure ? "exit 12" : `touch "$state_file"; printf '%s\\n' '{"number":1}'`}
+      exit 0 ;;
+    *--paginate*) exit 12 ;;
+    *page=1*) printf '%s\\n' '${recent}'; exit 0 ;;
+    *page=2*) printf '%s\\n' '${older}'; exit 0 ;;
+  esac
+fi
+exit 1
+`);
+  chmodSync(gh, 0o755);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${bin}:${originalPath ?? ""}`;
+  let removed = false;
+  const cleanup = () => {
+    if (removed) return;
+    removed = true;
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    rmSync(bin, { recursive: true, force: true });
+  };
+  return {
+    readCallsAndCleanup() {
+      const value = readFileSync(calls, "utf8");
+      cleanup();
+      return value;
+    },
+    async waitForSlowCommandStart(timeoutMs = 5_000) {
+      const deadline = Date.now() + timeoutMs;
+      while (!existsSync(slowStarted) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      if (!existsSync(slowStarted)) throw new Error("slow connector command did not start");
+    },
+    slowCommandFinished() {
+      return existsSync(slowFinished);
+    },
+    cleanup,
+  };
 }
 
 function installStartableQueueFixture(issueNumber: number) {
@@ -1777,6 +1868,8 @@ function seedAssignmentDatabase(
 }
 
 async function assignmentFixture(options: {
+  projectId?: string;
+  connectorHost?: string;
   writingLaneCeiling?: number;
   connectorPolicy?: "required" | "optional" | "prohibited";
   targetDefaultBranch?: string;
@@ -1785,36 +1878,44 @@ async function assignmentFixture(options: {
   directorSeat?: boolean;
   orchestratorSeat?: boolean;
 } = {}) {
-  const host = await loadedHost();
+  const projectId = options.projectId ?? PROJECT_ID;
+  const scopeRoleFacts = (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => {
+    facts.thread.projectId = projectId;
+    facts.environment.projectId = projectId;
+    facts.project = projectFacts(projectId);
+  };
+  const host = await loadedHost(projectId, scopeRoleFacts);
   const directorSeat = options.directorSeat === true;
   const orchestratorSeat = options.orchestratorSeat === true;
   const config = directorSeat ? (orchestratorSeat ? directorAndOrchestratorConfig() : directorSeatConfig()) : roleConfig(options.connectorPolicy);
   if (options.withoutGithubIssues) delete (config.extensions.bbCollab as Record<string, unknown>).githubIssues;
+  const mappings = (config.extensions.bbCollab as { githubIssues?: { repositoryMappings?: Array<{ connectorHost?: string }> } }).githubIssues?.repositoryMappings;
+  if (options.connectorHost && mappings) for (const mapping of mappings) mapping.connectorHost = options.connectorHost;
   if (options.writingLaneCeiling !== undefined) {
     (config.extensions.bbCollab as Record<string, unknown>).writingLaneCeiling = options.writingLaneCeiling;
   }
   const targets = options.targetDefaultBranch || options.targetRemoteUrl
     ? bootstrapRequest().targets!.map((target) => ({ ...target, ...(options.targetDefaultBranch ? { defaultBranch: options.targetDefaultBranch } : {}), ...(options.targetRemoteUrl ? { remoteUrl: options.targetRemoteUrl } : {}) }))
     : undefined;
-  const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config, ...(targets ? { targets } : {}) });
-  expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
-  expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
-  const roleFacts = directorSeat ? directorRoleReader() : roleReader();
-  expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, directorSeat ? {
+  const { db, fenceToken } = seedAndBootstrap(host, projectId, { config, ...(targets ? { targets } : {}) });
+  expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, { projectId })).outcome).toBe("OK");
+  expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, { projectId })).outcome).toBe("OK");
+  const roleFacts = directorSeat ? directorRoleReader(scopeRoleFacts) : roleReader(scopeRoleFacts);
+  expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, { projectId, ...(directorSeat ? {
     roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
     qualificationId: "director-assignment-qualification",
     declaredProfile: DIRECTOR_PROFILE,
-  } : {}), null, roleFacts).outcome).toBe("OK");
-  const succession = applyWithFixtureReceipt(db, successionRequest(fenceToken, directorSeat ? {
+  } : {}) }), null, roleFacts).outcome).toBe("OK");
+  const succession = applyWithFixtureReceipt(db, successionRequest(fenceToken, { projectId, ...(directorSeat ? {
     roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
     qualificationId: "director-assignment-qualification",
     profileDigest: DIRECTOR_PROFILE_DIGEST,
     standbyProfile: DIRECTOR_STANDBY_PROFILE,
-  } : {}), null, directorSeat ? directorRoleReader() : roleReader());
+  } : {}) }), null, directorSeat ? directorRoleReader(scopeRoleFacts) : roleReader(scopeRoleFacts));
   expect(succession.outcome).toBe("OK");
   const holderExecutionAttemptId = (succession.evidence as { holderExecutionAttemptId: string }).holderExecutionAttemptId;
   seedVerifiedFixtureReceipt(db, {
-    projectId: PROJECT_ID,
+    projectId,
     receiptId: "role-actor-assignment",
     actorKind: "role",
     subjectId: holderExecutionAttemptId,
@@ -1830,6 +1931,7 @@ async function assignmentFixture(options: {
       completionEventSeq: 4,
     };
     const facts = () => roleReader((input) => {
+      scopeRoleFacts(input);
       input.thread.id = roleContext.threadId;
       input.thread.environmentId = "environment-fleet-orchestrator";
       input.environment.id = "environment-fleet-orchestrator";
@@ -1837,18 +1939,20 @@ async function assignmentFixture(options: {
       input.events[3]!.id = roleContext.completionEventId;
     });
     expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      projectId,
       idempotencyKey: "qualification-fleet-orchestrator",
       qualificationId: "qualification-fleet-orchestrator",
       roleContext,
     }), null, facts()).outcome).toBe("OK");
     const orchestrator = applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      projectId,
       idempotencyKey: "succession-fleet-orchestrator",
       qualificationId: "qualification-fleet-orchestrator",
       roleContext,
     }), null, facts());
     expect(orchestrator.outcome).toBe("OK");
   }
-  return { host, db, fenceToken, holderExecutionAttemptId };
+  return { host, db, fenceToken, holderExecutionAttemptId, projectId };
 }
 
 function activateReviewer(db: Database.Database, fenceToken: string) {
@@ -4987,6 +5091,113 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
     expect(result).toMatchObject({ outcome: "OK" });
     expect(fixture.db.prepare("SELECT lane_id, thread_id, state FROM execution_attempts WHERE origin = 'work_item' ORDER BY rowid DESC LIMIT 1").get()).toMatchObject({ lane_id: "lane-work-item-1", thread_id: "lane-1", state: "running" });
+  });
+
+  it("refuses dispatch when the exact GitHub projection revision or digest is stale", async () => {
+    for (const kind of ["digest", "revision"] as const) {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      bindFixtureGithubIssue(fixture.db, 1);
+      if (kind === "revision") {
+        fixture.db.prepare("UPDATE external_work_refs SET observed_external_digest = desired_digest, projected_resource_revision = 1").run();
+      }
+      const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+        spawn: dispatchSpawn(fixture.orchestratorThreadId),
+      }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+      expect(result.outcome).toBe("EXTERNAL_UNAVAILABLE");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "ready" });
+    }
+  });
+
+  it("composes a bounded production comment tail through one ordinary dispatch and rejects full-history or one-page completeness mutants", async () => {
+    const projected = await currentGithubBriefDispatch();
+    const restore = installGithubBriefGh(projected.snapshot, { transitionSnapshot: projected.transitionSnapshot });
+    try {
+      const result = JSON.parse(await projected.fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: projected.request,
+        spawn: dispatchSpawn(projected.fixture.orchestratorThreadId),
+      }, { projectId: PROJECT_ID, threadId: projected.fixture.orchestratorThreadId }) as string);
+      expect(result.outcome).toBe("OK");
+      const spawn = projected.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0] as { prompt?: string };
+      expect(spawn.prompt).toContain("comment-48");
+      expect(spawn.prompt).toContain("- Lifecycle: in_progress");
+      expect(spawn.prompt).not.toContain("- Lifecycle: ready");
+      expect(spawn.prompt).not.toContain("comment-1");
+      const calls = restore.readCallsAndCleanup();
+      expect(calls.match(/page=1/gu)).toHaveLength(2);
+      expect(calls.match(/page=2/gu)).toHaveLength(2);
+      expect(calls).toContain(CONNECTOR_HOST);
+      expect(calls).not.toContain("--paginate");
+      expect(calls).not.toContain("page=3");
+    } finally {
+      restore.cleanup();
+    }
+  });
+
+  it("services a second project while the first connector is stalled", async () => {
+    const slow = await currentGithubBriefDispatch("project-a", "slow.github.test");
+    const fast = await currentGithubBriefDispatch("project-b", CONNECTOR_HOST);
+    const restore = installGithubBriefGh(slow.snapshot, { transitionSnapshot: slow.transitionSnapshot, slowConnectorHost: "slow.github.test" });
+    try {
+      let slowSettled = false;
+      const slowCommandStarted = restore.waitForSlowCommandStart();
+      const slowResult = slow.fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: slow.request,
+        spawn: dispatchSpawn(slow.fixture.orchestratorThreadId, { projectId: slow.projectId }),
+      }, { projectId: slow.projectId, threadId: slow.fixture.orchestratorThreadId }).then((value) => {
+        slowSettled = true;
+        return JSON.parse(value as string) as { outcome: string };
+      });
+      await slowCommandStarted;
+      expect(slowSettled).toBe(false);
+      expect(restore.slowCommandFinished()).toBe(false);
+      const fastResult = JSON.parse(await fast.fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: fast.request,
+        spawn: dispatchSpawn(fast.fixture.orchestratorThreadId, { projectId: fast.projectId }),
+      }, { projectId: fast.projectId, threadId: fast.fixture.orchestratorThreadId }) as string) as { outcome: string };
+      expect(fastResult.outcome).toBe("OK");
+      expect(slowSettled).toBe(false);
+      expect(restore.slowCommandFinished()).toBe(false);
+      expect((await slowResult).outcome).toBe("OK");
+    } finally {
+      restore.cleanup();
+    }
+  }, 30_000);
+
+  it("refuses production comment completeness when the bounded older-page read fails", async () => {
+    const projected = await currentGithubBriefDispatch();
+    const restore = installGithubBriefGh(projected.snapshot, { transitionSnapshot: projected.transitionSnapshot, incomplete: true });
+    try {
+      const result = JSON.parse(await projected.fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: projected.request,
+        spawn: dispatchSpawn(projected.fixture.orchestratorThreadId),
+      }, { projectId: PROJECT_ID, threadId: projected.fixture.orchestratorThreadId }) as string);
+      expect(result.outcome).toBe("EXTERNAL_UNAVAILABLE");
+      expect(projected.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+      const calls = restore.readCallsAndCleanup();
+      expect(calls.match(/page=2/gu)).toHaveLength(1);
+    } finally {
+      restore.cleanup();
+    }
+  });
+
+  it("keeps a failed maintained-body projection recoverable without spawning", async () => {
+    const projected = await currentGithubBriefDispatch();
+    const restore = installGithubBriefGh(projected.snapshot, { transitionSnapshot: projected.transitionSnapshot, mutationFailure: true });
+    try {
+      const result = JSON.parse(await projected.fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: projected.request,
+        spawn: dispatchSpawn(projected.fixture.orchestratorThreadId),
+      }, { projectId: PROJECT_ID, threadId: projected.fixture.orchestratorThreadId }) as string);
+      expect(result.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+      expect(projected.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+      expect(projected.fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared", thread_id: null });
+      expect(projected.fixture.db.prepare("SELECT projection_state FROM external_work_refs WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ projection_state: "delivery_ambiguous" });
+      restore.readCallsAndCleanup();
+    } finally {
+      restore.cleanup();
+    }
   });
 
   it("claims permission atomically when identical dispatches race", async () => {
@@ -11706,6 +11917,24 @@ else printf '%s\\n' '[]'; fi
     });
     expect(adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)?.labels).toEqual(["human-triage", "work-ready"]);
     expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items").get()).toEqual({ lifecycle_state: "ready", resource_revision: 2 });
+  });
+
+  it("maintains the projected issue body when a canonical transition changes lifecycle and scope", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    const adapter = new DeterministicGitHubIssueAdapter();
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, {
+      idempotencyKey: "maintained-body-ready",
+      workItemBody: "Updated current scope.",
+    })).outcome).toBe("OK");
+    expect(db.prepare("SELECT body, lifecycle_state, resource_revision FROM work_items").get()).toEqual({
+      body: "Updated current scope.", lifecycle_state: "ready", resource_revision: 2,
+    });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, { idempotencyKey: "maintained-body-project" }), adapter).outcome).toBe("OK");
+    expect(adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)?.body).toContain("- Lifecycle: ready");
+    expect(adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)?.body).toContain("Updated current scope.");
   });
 
   it("durably fences contradictory delivery and suppresses same/new-key retry after reopen", () => {
