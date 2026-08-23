@@ -1705,15 +1705,56 @@ async function liveHistoricalReader(
   if (!attempt || !workItem || typeof attempt.thread_id !== "string") return evidenceUnavailable(request.projectId, "historical canonical attempt, WorkItem, or thread is unavailable");
   try {
     const events = await completeNativeThreadEvents(bb.sdk, attempt.thread_id);
-    const expectedEvents = correction?.evidence ?? [{ eventId: evidence.nativeEventId, eventSeq: evidence.nativeEventSeq, threadId: evidence.threadId, reason: evidence.reason }];
+    const expectedEvents = correction?.evidence ?? [{ eventId: evidence.nativeEventId, eventSeq: evidence.nativeEventSeq }];
     if (expectedEvents.some((event, index) => index > 0 && expectedEvents[index - 1]!.eventSeq >= event.eventSeq)) throw new Error("historical native evidence is unordered or duplicated");
-    const eventRows = expectedEvents.map((expected) => {
+    if (correction && expectedEvents.length !== 2) throw new Error("historical correction requires exactly one interruption and one interrupted completion");
+    const resolvedEvents = expectedEvents.map((expected) => {
       const event = events.find((candidate) => candidate.id === expected.eventId && candidate.seq === expected.eventSeq);
-      if (!event || event.type !== "system/thread/interrupted" || event.threadId !== expected.threadId || event.data.reason !== expected.reason) throw new Error("historical native interruption evidence is missing or foreign");
-      return { eventId: event.id, eventSeq: event.seq, threadId: event.threadId, reason: event.data.reason };
+      if (!event || event.threadId !== attempt.thread_id) throw new Error("historical native event is missing or foreign");
+      return event;
     });
-    const primary = eventRows.find((event) => event.eventId === evidence.nativeEventId && event.eventSeq === evidence.nativeEventSeq);
-    if (!primary || primary.threadId !== evidence.threadId || primary.reason !== evidence.reason) throw new Error("historical primary interruption evidence is not exact");
+    const primaryEvent = resolvedEvents[0];
+    if (!primaryEvent || primaryEvent.type !== "system/thread/interrupted" || (correction && primaryEvent.data.reason !== "manual-stop")) {
+      throw new Error("historical primary interruption is not the exact manual-stop event");
+    }
+    const primary: AuthoritativeHistoricalInterruption["evidence"][number] = {
+      eventId: primaryEvent.id,
+      eventSeq: primaryEvent.seq,
+      threadId: primaryEvent.threadId,
+      eventType: primaryEvent.type,
+      turnId: null,
+      providerThreadId: null,
+      status: null,
+      reason: primaryEvent.data.reason,
+    } as const;
+    const completionEvent = correction ? resolvedEvents[1] : undefined;
+    let completion: AuthoritativeHistoricalInterruption["evidence"][number] | null = null;
+    if (completionEvent) {
+      if (completionEvent.type !== "turn/completed" || completionEvent.data.status !== "interrupted" || typeof completionEvent.data.providerThreadId !== "string") {
+        throw new Error("historical completion is not the exact interrupted turn completion");
+      }
+      const turnId = nativeTurnId(completionEvent);
+      if (!turnId) throw new Error("historical interrupted completion has no exact turn identity");
+      const started = events.filter((event) => event.type === "turn/started"
+        && event.threadId === attempt.thread_id
+        && nativeTurnId(event) === turnId
+        && event.data.providerThreadId === completionEvent.data.providerThreadId);
+      if (started.length !== 1) throw new Error("historical interrupted completion has no unique provider-correlated turn start");
+      completion = {
+        eventId: completionEvent.id,
+        eventSeq: completionEvent.seq,
+        threadId: completionEvent.threadId,
+        eventType: completionEvent.type,
+        turnId,
+        providerThreadId: completionEvent.data.providerThreadId,
+        status: completionEvent.data.status,
+        reason: null,
+      };
+    }
+    const eventRows = completion ? [primary, completion] : [primary];
+    if (primary.eventId !== evidence.nativeEventId || primary.eventSeq !== evidence.nativeEventSeq || primary.threadId !== evidence.threadId || primary.reason !== evidence.reason) {
+      throw new Error("historical primary interruption evidence is not exact");
+    }
     const zeroRealWriter = await liveZeroRealWriterGuard(bb, db, request.projectId, request.workItemId);
     const authoritative: AuthoritativeHistoricalInterruption = {
       projectId: request.projectId,
@@ -1722,12 +1763,12 @@ async function liveHistoricalReader(
       repoTargetId: String(workItem.repo_target_id),
       resourceRevision: Number(workItem.resource_revision),
       threadId: attempt.thread_id,
-      reason: evidence.reason,
+      reason: primary.reason,
       nativeEventId: primary.eventId,
       nativeEventSeq: primary.eventSeq,
       nativeTurnId: null,
-      evidenceDigest: sha256(canonicalJson({ projectId: request.projectId, workItemId: request.workItemId, executionAttemptId: request.executionAttemptId, threadId: attempt.thread_id, reason: evidence.reason, nativeEventId: primary.eventId, nativeEventSeq: primary.eventSeq, nativeTurnId: null })),
-      correctionEvidenceDigest: sha256(canonicalJson({ projectId: request.projectId, workItemId: request.workItemId, executionAttemptId: request.executionAttemptId, threadId: attempt.thread_id, reason: evidence.reason, evidence: eventRows })),
+      evidenceDigest: sha256(canonicalJson({ projectId: request.projectId, workItemId: request.workItemId, executionAttemptId: request.executionAttemptId, threadId: attempt.thread_id, reason: primary.reason, nativeEventId: primary.eventId, nativeEventSeq: primary.eventSeq, nativeTurnId: null })),
+      correctionEvidenceDigest: sha256(canonicalJson({ projectId: request.projectId, workItemId: request.workItemId, executionAttemptId: request.executionAttemptId, threadId: attempt.thread_id, reason: primary.reason, evidence: eventRows })),
       evidence: eventRows,
       zeroRealWriter: correction ? zeroRealWriter : true,
     };

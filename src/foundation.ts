@@ -2178,8 +2178,6 @@ const historicalCorrectionSchema = z
     evidence: z.array(z.object({
       eventId: id,
       eventSeq: z.number().int().positive(),
-      threadId: id,
-      reason: z.enum(["manual-stop", "host-daemon-restarted", "provider-turn-idle"]),
     }).strict()).min(2).max(16),
   })
   .strict();
@@ -2538,7 +2536,16 @@ export type AuthoritativeHistoricalInterruption = {
   nativeTurnId: string | null;
   evidenceDigest: string;
   correctionEvidenceDigest: string;
-  evidence: Array<{ eventId: string; eventSeq: number; threadId: string; reason: InterruptionEvidence["reason"] }>;
+  evidence: Array<{
+    eventId: string;
+    eventSeq: number;
+    threadId: string;
+    eventType: "system/thread/interrupted" | "turn/completed";
+    turnId: string | null;
+    providerThreadId: string | null;
+    status: "interrupted" | null;
+    reason: InterruptionEvidence["reason"] | null;
+  }>;
   zeroRealWriter: boolean;
 };
 
@@ -6751,13 +6758,14 @@ function applyExecutionAttemptInterruption(
     if (correction.evidence.some((item, index) => index > 0 && correction.evidence[index - 1]!.eventSeq >= item.eventSeq)) {
       throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction evidence must be strictly ordered by native event sequence");
     }
-    if (canonicalJson(authoritative.evidence) !== canonicalJson(correction.evidence)) {
-      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction evidence does not match authoritative archived events");
-    }
-    if (correction.evidence.some((item) => item.threadId !== evidence.threadId || item.reason !== evidence.reason)
-      || new Set(correction.evidence.map((item) => item.eventSeq)).size !== correction.evidence.length
-      || !correction.evidence.some((item) => item.eventSeq === evidence.nativeEventSeq)) {
-      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction evidence is not exact to the interrupted thread and reason");
+    if (authoritative.evidence.length !== correction.evidence.length
+      || correction.evidence.some((item, index) => item.eventId !== authoritative.evidence[index]?.eventId || item.eventSeq !== authoritative.evidence[index]?.eventSeq)
+      || authoritative.evidence[0]?.eventId !== evidence.nativeEventId
+      || authoritative.evidence[0]?.eventSeq !== evidence.nativeEventSeq
+      || authoritative.evidence[0]?.threadId !== evidence.threadId
+      || authoritative.evidence[0]?.reason !== evidence.reason
+      || authoritative.evidence.some((item, index) => index > 0 && item.eventSeq <= authoritative.evidence[index - 1]!.eventSeq)) {
+      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction evidence is not the exact ordered native interruption correlation");
     }
   } else if (!WORK_ITEM_CAPACITY_ATTEMPT_STATES.includes(attempt.state as typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES[number])) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", `attempt is not interruptible from state ${attempt.state}`);
@@ -6808,7 +6816,7 @@ function applyExecutionAttemptInterruption(
         nativeEventSeq: evidence.nativeEventSeq,
         nativeTurnId: evidence.nativeTurnId,
         evidenceDigest: evidence.evidenceDigest,
-        ...(historical ? { historicalCorrection: correction } : {}),
+        ...(historical ? { historicalCorrection: { ...correction!, evidence: authoritative.evidence } } : {}),
       },
     },
     { expected: 1, attempted: 1, verified: 1 },

@@ -16690,9 +16690,7 @@ var historicalCorrectionSchema = external_exports.object({
   evidenceDigest: digestSchema,
   evidence: external_exports.array(external_exports.object({
     eventId: id,
-    eventSeq: external_exports.number().int().positive(),
-    threadId: id,
-    reason: external_exports.enum(["manual-stop", "host-daemon-restarted", "provider-turn-idle"])
+    eventSeq: external_exports.number().int().positive()
   }).strict()).min(2).max(16)
 }).strict();
 var applyRequestSchema = external_exports.object({
@@ -20172,11 +20170,8 @@ function applyExecutionAttemptInterruption(db, request, digest2, evidenceReader)
     if (correction.evidence.some((item, index) => index > 0 && correction.evidence[index - 1].eventSeq >= item.eventSeq)) {
       throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction evidence must be strictly ordered by native event sequence");
     }
-    if (canonicalJson(authoritative.evidence) !== canonicalJson(correction.evidence)) {
-      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction evidence does not match authoritative archived events");
-    }
-    if (correction.evidence.some((item) => item.threadId !== evidence.threadId || item.reason !== evidence.reason) || new Set(correction.evidence.map((item) => item.eventSeq)).size !== correction.evidence.length || !correction.evidence.some((item) => item.eventSeq === evidence.nativeEventSeq)) {
-      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction evidence is not exact to the interrupted thread and reason");
+    if (authoritative.evidence.length !== correction.evidence.length || correction.evidence.some((item, index) => item.eventId !== authoritative.evidence[index]?.eventId || item.eventSeq !== authoritative.evidence[index]?.eventSeq) || authoritative.evidence[0]?.eventId !== evidence.nativeEventId || authoritative.evidence[0]?.eventSeq !== evidence.nativeEventSeq || authoritative.evidence[0]?.threadId !== evidence.threadId || authoritative.evidence[0]?.reason !== evidence.reason || authoritative.evidence.some((item, index) => index > 0 && item.eventSeq <= authoritative.evidence[index - 1].eventSeq)) {
+      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction evidence is not the exact ordered native interruption correlation");
     }
   } else if (!WORK_ITEM_CAPACITY_ATTEMPT_STATES.includes(attempt.state)) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", `attempt is not interruptible from state ${attempt.state}`);
@@ -20227,7 +20222,7 @@ function applyExecutionAttemptInterruption(db, request, digest2, evidenceReader)
         nativeEventSeq: evidence.nativeEventSeq,
         nativeTurnId: evidence.nativeTurnId,
         evidenceDigest: evidence.evidenceDigest,
-        ...historical ? { historicalCorrection: correction } : {}
+        ...historical ? { historicalCorrection: { ...correction, evidence: authoritative.evidence } } : {}
       }
     },
     { expected: 1, attempted: 1, verified: 1 },
@@ -24739,15 +24734,53 @@ async function liveHistoricalReader(bb, db, request) {
   if (!attempt || !workItem || typeof attempt.thread_id !== "string") return evidenceUnavailable(request.projectId, "historical canonical attempt, WorkItem, or thread is unavailable");
   try {
     const events = await completeNativeThreadEvents(bb.sdk, attempt.thread_id);
-    const expectedEvents = correction?.evidence ?? [{ eventId: evidence.nativeEventId, eventSeq: evidence.nativeEventSeq, threadId: evidence.threadId, reason: evidence.reason }];
+    const expectedEvents = correction?.evidence ?? [{ eventId: evidence.nativeEventId, eventSeq: evidence.nativeEventSeq }];
     if (expectedEvents.some((event, index) => index > 0 && expectedEvents[index - 1].eventSeq >= event.eventSeq)) throw new Error("historical native evidence is unordered or duplicated");
-    const eventRows = expectedEvents.map((expected) => {
+    if (correction && expectedEvents.length !== 2) throw new Error("historical correction requires exactly one interruption and one interrupted completion");
+    const resolvedEvents = expectedEvents.map((expected) => {
       const event = events.find((candidate) => candidate.id === expected.eventId && candidate.seq === expected.eventSeq);
-      if (!event || event.type !== "system/thread/interrupted" || event.threadId !== expected.threadId || event.data.reason !== expected.reason) throw new Error("historical native interruption evidence is missing or foreign");
-      return { eventId: event.id, eventSeq: event.seq, threadId: event.threadId, reason: event.data.reason };
+      if (!event || event.threadId !== attempt.thread_id) throw new Error("historical native event is missing or foreign");
+      return event;
     });
-    const primary = eventRows.find((event) => event.eventId === evidence.nativeEventId && event.eventSeq === evidence.nativeEventSeq);
-    if (!primary || primary.threadId !== evidence.threadId || primary.reason !== evidence.reason) throw new Error("historical primary interruption evidence is not exact");
+    const primaryEvent = resolvedEvents[0];
+    if (!primaryEvent || primaryEvent.type !== "system/thread/interrupted" || correction && primaryEvent.data.reason !== "manual-stop") {
+      throw new Error("historical primary interruption is not the exact manual-stop event");
+    }
+    const primary = {
+      eventId: primaryEvent.id,
+      eventSeq: primaryEvent.seq,
+      threadId: primaryEvent.threadId,
+      eventType: primaryEvent.type,
+      turnId: null,
+      providerThreadId: null,
+      status: null,
+      reason: primaryEvent.data.reason
+    };
+    const completionEvent = correction ? resolvedEvents[1] : void 0;
+    let completion = null;
+    if (completionEvent) {
+      if (completionEvent.type !== "turn/completed" || completionEvent.data.status !== "interrupted" || typeof completionEvent.data.providerThreadId !== "string") {
+        throw new Error("historical completion is not the exact interrupted turn completion");
+      }
+      const turnId = nativeTurnId(completionEvent);
+      if (!turnId) throw new Error("historical interrupted completion has no exact turn identity");
+      const started = events.filter((event) => event.type === "turn/started" && event.threadId === attempt.thread_id && nativeTurnId(event) === turnId && event.data.providerThreadId === completionEvent.data.providerThreadId);
+      if (started.length !== 1) throw new Error("historical interrupted completion has no unique provider-correlated turn start");
+      completion = {
+        eventId: completionEvent.id,
+        eventSeq: completionEvent.seq,
+        threadId: completionEvent.threadId,
+        eventType: completionEvent.type,
+        turnId,
+        providerThreadId: completionEvent.data.providerThreadId,
+        status: completionEvent.data.status,
+        reason: null
+      };
+    }
+    const eventRows = completion ? [primary, completion] : [primary];
+    if (primary.eventId !== evidence.nativeEventId || primary.eventSeq !== evidence.nativeEventSeq || primary.threadId !== evidence.threadId || primary.reason !== evidence.reason) {
+      throw new Error("historical primary interruption evidence is not exact");
+    }
     const zeroRealWriter = await liveZeroRealWriterGuard(bb, db, request.projectId, request.workItemId);
     const authoritative = {
       projectId: request.projectId,
@@ -24756,12 +24789,12 @@ async function liveHistoricalReader(bb, db, request) {
       repoTargetId: String(workItem.repo_target_id),
       resourceRevision: Number(workItem.resource_revision),
       threadId: attempt.thread_id,
-      reason: evidence.reason,
+      reason: primary.reason,
       nativeEventId: primary.eventId,
       nativeEventSeq: primary.eventSeq,
       nativeTurnId: null,
-      evidenceDigest: sha256(canonicalJson({ projectId: request.projectId, workItemId: request.workItemId, executionAttemptId: request.executionAttemptId, threadId: attempt.thread_id, reason: evidence.reason, nativeEventId: primary.eventId, nativeEventSeq: primary.eventSeq, nativeTurnId: null })),
-      correctionEvidenceDigest: sha256(canonicalJson({ projectId: request.projectId, workItemId: request.workItemId, executionAttemptId: request.executionAttemptId, threadId: attempt.thread_id, reason: evidence.reason, evidence: eventRows })),
+      evidenceDigest: sha256(canonicalJson({ projectId: request.projectId, workItemId: request.workItemId, executionAttemptId: request.executionAttemptId, threadId: attempt.thread_id, reason: primary.reason, nativeEventId: primary.eventId, nativeEventSeq: primary.eventSeq, nativeTurnId: null })),
+      correctionEvidenceDigest: sha256(canonicalJson({ projectId: request.projectId, workItemId: request.workItemId, executionAttemptId: request.executionAttemptId, threadId: attempt.thread_id, reason: primary.reason, evidence: eventRows })),
       evidence: eventRows,
       zeroRealWriter: correction ? zeroRealWriter : true
     };

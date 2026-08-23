@@ -736,7 +736,7 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
   let nativeUpdatedAt = updatedAt;
   const threadProjects = new Map([[director.thread_id, projectId], [orchestrator.thread_id, projectId]]);
   const lanes = new Map<string, ReturnType<typeof makeThreadResponse> & { environmentBranchName: string | null }>();
-  const laneEvents = new Map<string, Array<{ id: string; threadId: string; seq: number; type: string; scope: { kind: "thread" }; data: unknown; createdAt: number }>>();
+  const laneEvents = new Map<string, Array<{ id: string; threadId: string; seq: number; type: string; scope: { kind: "thread" } | { kind: "turn"; turnId: string }; data: unknown; createdAt: number }>>();
   fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
     ...(lanes.get(threadId) ?? {}),
     id: threadId,
@@ -793,9 +793,9 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
         environmentBranchName: null,
       }));
     },
-    recordNativeEvent(threadId: string, event: { id: string; seq: number; type: string; data: unknown; createdAt?: number; scope?: { kind: "thread" } }) {
+    recordNativeEvent(threadId: string, event: { id: string; seq: number; type: string; data: unknown; createdAt?: number; threadId?: string; scope?: { kind: "thread" } | { kind: "turn"; turnId: string } }) {
       const events = laneEvents.get(threadId) ?? [];
-      events.push({ id: event.id, threadId, seq: event.seq, type: event.type, scope: event.scope ?? { kind: "thread" }, data: event.data, createdAt: event.createdAt ?? nativeUpdatedAt });
+      events.push({ id: event.id, threadId: event.threadId ?? threadId, seq: event.seq, type: event.type, scope: event.scope ?? { kind: "thread" }, data: event.data, createdAt: event.createdAt ?? nativeUpdatedAt });
       laneEvents.set(threadId, events);
     },
     archiveNativeLane(threadId: string) {
@@ -14189,8 +14189,8 @@ exit 1
       nativeEventSeq: interruption.nativeEventSeq,
       nativeTurnId: null,
       evidenceDigest: interruption.evidenceDigest,
-      correctionEvidenceDigest: sha256(canonicalJson({ projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: attempt.execution_attempt_id, threadId: attempt.thread_id, reason: interruption.reason, evidence: [{ eventId: interruption.nativeEventId, eventSeq: interruption.nativeEventSeq, threadId: attempt.thread_id, reason: interruption.reason }] })),
-      evidence: [{ eventId: interruption.nativeEventId, eventSeq: interruption.nativeEventSeq, threadId: attempt.thread_id, reason: interruption.reason }],
+      correctionEvidenceDigest: sha256(canonicalJson({ projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: attempt.execution_attempt_id, threadId: attempt.thread_id, reason: interruption.reason, evidence: [{ eventId: interruption.nativeEventId, eventSeq: interruption.nativeEventSeq, threadId: attempt.thread_id, eventType: "system/thread/interrupted", turnId: null, providerThreadId: null, status: null, reason: interruption.reason }] })),
+      evidence: [{ eventId: interruption.nativeEventId, eventSeq: interruption.nativeEventSeq, threadId: attempt.thread_id, eventType: "system/thread/interrupted", turnId: null, providerThreadId: null, status: null, reason: interruption.reason }],
       zeroRealWriter: true,
     };
     expect(applyWithFixtureReceipt(fixture.db, {
@@ -14354,12 +14354,16 @@ exit 1
       priorState: "done" as const,
       evidenceDigest: "1".repeat(64),
       evidence: [
-        { eventId: "native-event-11444", eventSeq: 11444, threadId: original.thread_id, reason: "manual-stop" as const },
-        { eventId: "native-event-11448", eventSeq: 11448, threadId: original.thread_id, reason: "manual-stop" as const },
+        { eventId: "native-event-11444", eventSeq: 11444 },
+        { eventId: "native-event-11448", eventSeq: 11448 },
       ],
     };
+    const normalizedCorrectionEvidence = [
+      { eventId: "native-event-11444", eventSeq: 11444, threadId: original.thread_id, eventType: "system/thread/interrupted" as const, turnId: null, providerThreadId: null, status: null, reason: "manual-stop" as const },
+      { eventId: "native-event-11448", eventSeq: 11448, threadId: original.thread_id, eventType: "turn/completed" as const, turnId: "native-turn-11448", providerThreadId: "provider-thread-613", status: "interrupted" as const, reason: null },
+    ];
     correction.evidenceDigest = sha256(canonicalJson({ projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: original.execution_attempt_id, threadId: original.thread_id, reason: correction.reason, nativeEventId: correction.nativeEventId, nativeEventSeq: correction.nativeEventSeq, nativeTurnId: null }));
-    historicalCorrection.evidenceDigest = sha256(canonicalJson({ projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: original.execution_attempt_id, threadId: original.thread_id, reason: correction.reason, evidence: historicalCorrection.evidence }));
+    historicalCorrection.evidenceDigest = sha256(canonicalJson({ projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: original.execution_attempt_id, threadId: original.thread_id, reason: correction.reason, evidence: normalizedCorrectionEvidence }));
     const evidenceReader = new DeterministicExecutionAttemptEvidenceReader();
     evidenceReader.historicalEvidence = {
       projectId: PROJECT_ID,
@@ -14374,7 +14378,7 @@ exit 1
       nativeTurnId: null,
       evidenceDigest: correction.evidenceDigest,
       correctionEvidenceDigest: historicalCorrection.evidenceDigest,
-      evidence: historicalCorrection.evidence,
+      evidence: normalizedCorrectionEvidence,
       zeroRealWriter: true,
     };
     fixture.db.prepare("UPDATE execution_attempts SET terminal_report_digest = ?, reported_outcome = 'DONE' WHERE execution_attempt_id = ?").run("accepted-report", original.execution_attempt_id);
@@ -14407,7 +14411,7 @@ exit 1
       workItemId: WORK_ITEM_ID,
       executionAttemptId: original.execution_attempt_id,
       interruption: { ...correction, nativeEventId: "fabricated-event-777", nativeEventSeq: 777, evidenceDigest: "2".repeat(64) },
-      historicalCorrection: { ...historicalCorrection, evidenceDigest: "3".repeat(64), evidence: [{ eventId: "fabricated-event-777", eventSeq: 777, threadId: original.thread_id, reason: "manual-stop" as const }, { eventId: "fabricated-event-778", eventSeq: 778, threadId: original.thread_id, reason: "manual-stop" as const }] },
+      historicalCorrection: { ...historicalCorrection, evidenceDigest: "3".repeat(64), evidence: [{ eventId: "fabricated-event-777", eventSeq: 777 }, { eventId: "fabricated-event-778", eventSeq: 778 }] },
     }, null, null, null, null, evidenceReader)).toMatchObject({ outcome: "REPO_TARGET_FOREIGN" });
     expect(fixture.db.prepare("SELECT state, terminal_report_digest FROM execution_attempts WHERE execution_attempt_id = ?").get(original.execution_attempt_id)).toEqual({ state: "done", terminal_report_digest: null });
     expect(applyWithFixtureReceipt(fixture.db, {
@@ -14423,7 +14427,7 @@ exit 1
       workItemId: WORK_ITEM_ID,
       executionAttemptId: original.execution_attempt_id,
       interruption: { ...correction, nativeEventId: "fabricated-event-777", nativeEventSeq: 777, evidenceDigest: "2".repeat(64) },
-      historicalCorrection: { ...historicalCorrection, evidenceDigest: "3".repeat(64), evidence: [{ eventId: "fabricated-event-777", eventSeq: 777, threadId: original.thread_id, reason: "manual-stop" as const }, { eventId: "fabricated-event-778", eventSeq: 778, threadId: original.thread_id, reason: "manual-stop" as const }] },
+      historicalCorrection: { ...historicalCorrection, evidenceDigest: "3".repeat(64), evidence: [{ eventId: "fabricated-event-777", eventSeq: 777 }, { eventId: "fabricated-event-778", eventSeq: 778 }] },
     }, null, null, null, null, evidenceReader)).toMatchObject({ outcome: "TERMINAL_REPORT_AMBIGUOUS" });
     expect(applyWithFixtureReceipt(fixture.db, {
       projectId: PROJECT_ID,
@@ -14446,6 +14450,157 @@ exit 1
     const exported = exportFoundation(fixture.db, PROJECT_ID);
     expect(exported).toMatchObject({ outcome: "OK", export: { recordsNdjson: expect.stringContaining('"state":"interrupted"') } });
     expect((exported.export as ExportPayload).recordsNdjson).toContain("execution_attempt_historical_interruption_correction");
+  });
+
+  it.each([
+    ["another interruption", "another-interruption"],
+    ["completed status", "completed-status"],
+    ["foreign thread", "foreign-thread"],
+    ["foreign turn", "foreign-turn"],
+    ["foreign provider", "foreign-provider"],
+    ["missing completion", "missing-completion"],
+    ["wrong order", "wrong-order"],
+  ] as const)("live GH613 correction refuses %s evidence", async (_label, variant) => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(5_000);
+    try {
+      const fixture = await fleetWatchdogFixture(5_000, true, 1, false);
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: `gh613-live-${variant}`, actorKind: "plugin", subjectId: PLUGIN_ID });
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+      const original = fixture.db.prepare(
+        "SELECT execution_attempt_id, thread_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'running'",
+      ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string; thread_id: string };
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { idempotencyKey: `gh613-live-review-${variant}` })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4, { idempotencyKey: `gh613-live-success-${variant}` })).outcome).toBe("OK");
+      const primaryEventId = `live-native-event-11444-${variant}`;
+      const completionEventId = `live-native-event-11448-${variant}`;
+      const turnId = `live-native-turn-11448-${variant}`;
+      const providerThreadId = `live-provider-thread-613-${variant}`;
+      fixture.recordNativeEvent(original.thread_id, {
+        id: `live-native-start-11440-${variant}`,
+        seq: 11440,
+        type: "turn/started",
+        data: { providerThreadId: "live-provider-thread-613" },
+        scope: { kind: "turn", turnId: "live-native-turn-11448" },
+      });
+      fixture.recordNativeEvent(original.thread_id, {
+        id: primaryEventId,
+        seq: 11444,
+        type: "system/thread/interrupted",
+        data: { reason: "manual-stop" },
+        scope: { kind: "thread" },
+      });
+      if (variant !== "missing-completion") {
+        fixture.recordNativeEvent(original.thread_id, {
+          id: completionEventId,
+          seq: 11448,
+          type: variant === "another-interruption" ? "system/thread/interrupted" : "turn/completed",
+          threadId: variant === "foreign-thread" ? "foreign-thread" : undefined,
+          data: variant === "another-interruption"
+            ? { reason: "manual-stop" }
+            : { status: variant === "completed-status" ? "completed" : "interrupted", providerThreadId: variant === "foreign-provider" ? providerThreadId : "live-provider-thread-613" },
+          scope: variant === "another-interruption"
+            ? { kind: "thread" }
+            : { kind: "turn", turnId: variant === "foreign-turn" ? turnId : "live-native-turn-11448" },
+        });
+      }
+      const interruption = {
+        projectId: PROJECT_ID,
+        workItemId: WORK_ITEM_ID,
+        executionAttemptId: original.execution_attempt_id,
+        threadId: original.thread_id,
+        reason: "manual-stop" as const,
+        nativeEventType: "system/thread/interrupted" as const,
+        nativeEventId: primaryEventId,
+        nativeEventSeq: 11444,
+        nativeTurnId: null,
+        evidenceDigest: sha256(canonicalJson({ projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: original.execution_attempt_id, threadId: original.thread_id, reason: "manual-stop", nativeEventId: primaryEventId, nativeEventSeq: 11444, nativeTurnId: null })),
+      };
+      const correctionEvidence = variant === "wrong-order"
+        ? [{ eventId: completionEventId, eventSeq: 11448 }, { eventId: primaryEventId, eventSeq: 11444 }]
+        : [{ eventId: primaryEventId, eventSeq: 11444 }, { eventId: completionEventId, eventSeq: 11448 }];
+      const request = {
+        projectId: PROJECT_ID,
+        operationClass: "execution_attempt_interruption" as const,
+        idempotencyKey: `gh613-live-correction-${variant}`,
+        actorReceiptId: `gh613-live-${variant}`,
+        expectedConfigRevision: 1,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: fixture.fenceToken,
+        repoTargetId: TARGET_ID,
+        expectedResourceRevision: 5,
+        workItemId: WORK_ITEM_ID,
+        executionAttemptId: original.execution_attempt_id,
+        interruption,
+        historicalCorrection: {
+          correctionId: `gh613-live-correction-${variant}`,
+          priorState: "done" as const,
+          evidenceDigest: "0".repeat(64),
+          evidence: correctionEvidence,
+        },
+      };
+      const result = await fixture.host.harness.callRpc("apply", request);
+      expect(result).toMatchObject({ outcome: "EXTERNAL_UNAVAILABLE" });
+      expect(fixture.db.prepare("SELECT state, terminal_report_digest FROM execution_attempts WHERE execution_attempt_id = ?").get(original.execution_attempt_id)).toEqual({ state: "done", terminal_report_digest: null });
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("accepts the production-shaped GH613 live correction correlation", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(5_000);
+    try {
+      const fixture = await fleetWatchdogFixture(5_000, true, 1, false);
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "gh613-live-valid", actorKind: "plugin", subjectId: PLUGIN_ID });
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+      const original = fixture.db.prepare(
+        "SELECT execution_attempt_id, thread_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'running'",
+      ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string; thread_id: string };
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { idempotencyKey: "gh613-live-valid-review" })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4, { idempotencyKey: "gh613-live-valid-success" })).outcome).toBe("OK");
+      fixture.recordNativeEvent(original.thread_id, { id: "evt_live_start", seq: 11440, type: "turn/started", data: { providerThreadId: "provider-thread-613" }, scope: { kind: "turn", turnId: "turn-live-613" } });
+      fixture.recordNativeEvent(original.thread_id, { id: "evt_gr5za29vps", seq: 11444, type: "system/thread/interrupted", data: { reason: "manual-stop" }, scope: { kind: "thread" } });
+      fixture.recordNativeEvent(original.thread_id, { id: "evt_7raezyfxuw", seq: 11448, type: "turn/completed", data: { status: "interrupted", providerThreadId: "provider-thread-613" }, scope: { kind: "turn", turnId: "turn-live-613" } });
+      const normalizedEvidence = [
+        { eventId: "evt_gr5za29vps", eventSeq: 11444, threadId: original.thread_id, eventType: "system/thread/interrupted" as const, turnId: null, providerThreadId: null, status: null, reason: "manual-stop" as const },
+        { eventId: "evt_7raezyfxuw", eventSeq: 11448, threadId: original.thread_id, eventType: "turn/completed" as const, turnId: "turn-live-613", providerThreadId: "provider-thread-613", status: "interrupted" as const, reason: null },
+      ];
+      const interruption = {
+        projectId: PROJECT_ID,
+        workItemId: WORK_ITEM_ID,
+        executionAttemptId: original.execution_attempt_id,
+        threadId: original.thread_id,
+        reason: "manual-stop" as const,
+        nativeEventType: "system/thread/interrupted" as const,
+        nativeEventId: "evt_gr5za29vps",
+        nativeEventSeq: 11444,
+        nativeTurnId: null,
+        evidenceDigest: sha256(canonicalJson({ projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: original.execution_attempt_id, threadId: original.thread_id, reason: "manual-stop", nativeEventId: "evt_gr5za29vps", nativeEventSeq: 11444, nativeTurnId: null })),
+      };
+      const request = {
+        projectId: PROJECT_ID,
+        operationClass: "execution_attempt_interruption" as const,
+        idempotencyKey: "gh613-live-valid-correction",
+        actorReceiptId: "gh613-live-valid",
+        expectedConfigRevision: 1,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: fixture.fenceToken,
+        repoTargetId: TARGET_ID,
+        expectedResourceRevision: 5,
+        workItemId: WORK_ITEM_ID,
+        executionAttemptId: original.execution_attempt_id,
+        interruption,
+        historicalCorrection: {
+          correctionId: "gh613-live-valid-correction",
+          priorState: "done" as const,
+          evidenceDigest: sha256(canonicalJson({ projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: original.execution_attempt_id, threadId: original.thread_id, reason: "manual-stop", evidence: normalizedEvidence })),
+          evidence: [{ eventId: "evt_gr5za29vps", eventSeq: 11444 }, { eventId: "evt_7raezyfxuw", eventSeq: 11448 }],
+        },
+      };
+      expect(await fixture.host.harness.callRpc("apply", request)).toMatchObject({ outcome: "OK" });
+      expect(fixture.db.prepare("SELECT state, terminal_report_digest, reason_code FROM execution_attempts WHERE execution_attempt_id = ?").get(original.execution_attempt_id)).toEqual({ state: "interrupted", terminal_report_digest: null, reason_code: "historical-correction:gh613-live-valid-correction" });
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("reports one native interruption at T and suppresses the duplicate after T plus one hour", async () => {
