@@ -23106,6 +23106,61 @@ function readGithubIssueForBackfill(owner, repo, issueNumber) {
     externalRevision: record2.updatedAt
   };
 }
+function githubCliAdapterForWorkItem(db, projectId, workItemId) {
+  if (!db) return null;
+  const row = db.prepare(
+    `SELECT work_items.repo_target_id, project_config_revisions.canonical_config_json
+     FROM work_items
+     JOIN project_config_heads ON project_config_heads.project_id = work_items.project_id
+     JOIN project_config_revisions ON project_config_revisions.project_id = project_config_heads.project_id
+       AND project_config_revisions.config_revision = project_config_heads.config_revision
+     WHERE work_items.project_id = ? AND work_items.work_item_id = ?`
+  ).get(projectId, workItemId);
+  if (!row || typeof row.repo_target_id !== "string" || typeof row.canonical_config_json !== "string") return null;
+  try {
+    const config2 = JSON.parse(row.canonical_config_json);
+    const mappings = config2.extensions?.bbCollab?.githubIssues?.repositoryMappings;
+    if (!Array.isArray(mappings)) return null;
+    const mapping = mappings.find((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate) && candidate.repoTargetId === row.repo_target_id && typeof candidate.connectorHost === "string");
+    if (!mapping) return null;
+    return {
+      connectorHost: mapping.connectorHost,
+      available: true,
+      read: readGithubIssueForBackfill,
+      mutate: githubCliMutation
+    };
+  } catch {
+    return null;
+  }
+}
+function githubCliMutation(input) {
+  const current = input.kind === "update" ? readGithubIssueForBackfill(input.owner, input.repo, input.issueNumber) : null;
+  const labels = [...new Set([
+    ...current?.labels ?? [],
+    ...input.addLabels
+  ].filter((label) => !input.removeLabels.includes(label)))].sort();
+  const args = [
+    "api",
+    input.kind === "create" ? `repos/${input.owner}/${input.repo}/issues` : `repos/${input.owner}/${input.repo}/issues/${input.issueNumber}`,
+    "--method",
+    input.kind === "create" ? "POST" : "PATCH",
+    "-f",
+    `title=${input.title}`,
+    "-f",
+    `body=${input.body}`,
+    "-f",
+    `state=${input.state}`,
+    ...labels.flatMap((label) => ["-f", `labels[]=${label}`])
+  ];
+  if (input.state === "closed") args.push("-f", "state_reason=completed");
+  const response = githubJson(args);
+  const responseNumber = response && typeof response === "object" && !Array.isArray(response) ? response.number : void 0;
+  const issueNumber = input.kind === "create" ? responseNumber : input.issueNumber;
+  if (typeof issueNumber !== "number" || !Number.isSafeInteger(issueNumber) || issueNumber < 1) throw new Error("GitHub issue mutation identity was not confirmed");
+  const snapshot2 = readGithubIssueForBackfill(input.owner, input.repo, issueNumber);
+  if (snapshot2.owner !== input.owner || snapshot2.repo !== input.repo || snapshot2.issueNumber !== issueNumber) throw new Error("GitHub issue mutation identity changed");
+  return snapshot2;
+}
 var FLEET_WATCHDOG_FLOOR_MS = 5 * 6e4;
 var FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS = 60 * 6e4;
 var IDLE_FLEET_ATTEMPT_STALE_MS = 10 * 6e4;
@@ -23640,6 +23695,23 @@ async function dispatchLane(bb, db, input) {
   return serializeDispatchRecovery(request, async () => {
     let dispatchSpawn = spawnShape.data;
     if (briefTarget) {
+      const githubAdapter = githubCliAdapterForWorkItem(db, request.projectId, request.workItemId ?? "");
+      const currentWorkItem = db?.prepare(
+        "SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?"
+      ).get(request.projectId, request.workItemId ?? "");
+      if (!githubAdapter || !currentWorkItem || !Number.isSafeInteger(currentWorkItem.resource_revision)) {
+        return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub projection capability is unavailable for the current WorkItem" };
+      }
+      const { lifecycleState: _lifecycleState, workAttempt: _workAttempt, reasonCode: _reasonCode, ...projectionBase } = request;
+      const projection = await applyLiveAuthorizedMutation(bb, db, {
+        ...projectionBase,
+        operationClass: "github_issue_projection",
+        idempotencyKey: `${request.idempotencyKey}:maintained-body`,
+        expectedResourceRevision: currentWorkItem.resource_revision,
+        workItemId: request.workItemId,
+        projectionKind: "github_issue"
+      }, false, "refuse-active", readGithubIssueForBackfill, githubAdapter);
+      if (projection.outcome !== "OK") return projection;
       try {
         initialBrief = (await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "")).brief;
       } catch {
@@ -23826,10 +23898,10 @@ async function prepareWorkItemAttemptTerminalization(bb, db, request, policy) {
   }
   return null;
 }
-async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = readGithubIssueForBackfill) {
+async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = readGithubIssueForBackfill, githubAdapter = null) {
   const parsed = applyRequestSchema.safeParse(input);
   if (parsed.success && terminalizationPolicy === "stop-active") {
-    const authorized = applyAuthorizedMutation(db, input, null, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, true);
+    const authorized = applyAuthorizedMutation(db, input, githubAdapter, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, true);
     if (authorized.outcome !== "OK" || authorized.replay) return authorized;
   }
   if (parsed.success) {
@@ -23850,7 +23922,7 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     }
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
-  const result2 = applyAuthorizedMutation(db, input, null, reader, null, null, githubIssueReader);
+  const result2 = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader);
   await deliverSucceededSeatBrief(bb, db, input, result2);
   return result2;
 }
