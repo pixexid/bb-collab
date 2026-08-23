@@ -1078,15 +1078,13 @@ async function reconcileDispatchIntent(
     return dispatchRecoveryRefusal(request.projectId, "replay title does not match the recorded dispatch title", { intent: intentResult });
   }
   const expectedTitle = intent.title ?? replayTitle;
-  const dispatchMarkerPattern = /\[dispatch:[^\]\r\n]+\]/gu;
-  const dispatchMarkers = threads.flatMap((thread) => thread.title?.match(dispatchMarkerPattern) ?? []);
   const marked = threads.filter((thread) => thread.title?.includes(marker) === true);
   const exact = marked.filter((thread) =>
     thread.parentThreadId === intent.parentThreadId &&
     thread.archivedAt === null &&
     thread.title === `${expectedTitle} ${marker}`,
   );
-  if (dispatchMarkers.some((candidate) => candidate !== marker) || marked.length > 1 || exact.length > 1 || (marked.length === 1 && exact.length !== 1)) {
+  if (marked.length > 1 || exact.length > 1 || (marked.length === 1 && exact.length !== 1)) {
     return dispatchRecoveryRefusal(request.projectId, "native dispatch evidence is foreign, multiple, or not bound to the recorded parent", { intent: intentResult, matches: marked.map((thread) => ({ id: thread.id, parentThreadId: thread.parentThreadId, title: thread.title })) });
   }
   if (exact.length === 1) return finalizeDispatchIntent(bb, db, request, intent, exact[0]!.id);

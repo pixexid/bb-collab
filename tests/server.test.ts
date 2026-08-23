@@ -5126,8 +5126,8 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     const spawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
     let spawnCalls = 0;
     const historicalChildren = [
-      ...Array.from({ length: 68 }, (_, index) => makeThreadResponse({ id: `historical-active-${index}`, projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: `historical-active-${index}` })),
-      ...Array.from({ length: 4 }, (_, index) => makeThreadResponse({ id: `historical-archived-${index}`, projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: `historical-archived-${index}`, archivedAt: 1 })),
+      ...Array.from({ length: 68 }, (_, index) => makeThreadResponse({ id: `historical-active-${index}`, projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: `historical-active-${index} [dispatch:historical-active-${index}]` })),
+      ...Array.from({ length: 4 }, (_, index) => makeThreadResponse({ id: `historical-archived-${index}`, projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: `historical-archived-${index} [dispatch:historical-archived-${index}]`, archivedAt: 1 })),
     ];
     fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => historicalChildren.filter((thread) => archived ? thread.archivedAt !== null : thread.archivedAt === null)) as never);
     fixture.host.harness.sdk.stub("threads.spawn", (async (input: { title?: string }) => {
@@ -5174,7 +5174,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => threads.filter((thread) => archived ? thread.archivedAt !== null : thread.archivedAt === null)) as never);
     const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", { request, spawn }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
     expect(result.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
-    expect(calls).toBe(1);
+    expect(calls).toBe(name === "wrong idempotency" ? 2 : 1);
     expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared", thread_id: null });
     expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "in_progress" });
     }
