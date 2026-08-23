@@ -8,7 +8,6 @@ import {
   INBOX_INDICATOR_BROKEN_TITLE,
   INBOX_NAV_REGION_SELECTOR,
   INBOX_NAV_ROW_TITLE,
-  INBOX_UNREAD_MARKER,
   inspectInboxNavGlyph,
   paintInboxNavUnread,
 } from "../src/inbox-nav-indicator";
@@ -24,7 +23,7 @@ function row(label: string, path: string | null, transform?: string): string {
 function navRegion({
   testid = "plugin-nav-sidebar-items",
   inboxLabel = INBOX_NAV_ROW_TITLE,
-  inboxGlyph = null as string | null,
+  inboxGlyph = MAIL as string | null,
   lanesGlyph = null as string | null,
   inboxTransform = undefined as string | undefined,
   extraRows = "",
@@ -36,8 +35,12 @@ function navRegion({
   return region;
 }
 
-function inboxDot(): Element | null {
-  return document.querySelector(`[${INBOX_UNREAD_MARKER}]`);
+function inboxRow(): HTMLButtonElement {
+  return document.querySelector(`${INBOX_NAV_REGION_SELECTOR} button:nth-of-type(2)`) as HTMLButtonElement;
+}
+
+function inboxGlyph(): Element | null {
+  return inboxRow().querySelector("svg");
 }
 
 function message(messageId: number, readAtMs: number | null) {
@@ -108,7 +111,7 @@ describe("inbox unread nav indicator", () => {
     vi.restoreAllMocks();
   });
 
-  it("marks the Inbox row when unread is above zero and clears it at zero", () => {
+  it("accents only the Inbox glyph, announces the exact count, and clears at zero", () => {
     // #given
     navRegion();
 
@@ -117,11 +120,38 @@ describe("inbox unread nav indicator", () => {
 
     // #then
     expect(painted).toEqual({ matched: true });
-    expect(inboxDot()?.getAttribute(INBOX_UNREAD_MARKER)).toBe("3");
-    expect(inboxDot()?.parentElement?.textContent).toContain(INBOX_NAV_ROW_TITLE);
+    expect(inboxGlyph()?.classList.contains("text-primary")).toBe(true);
+    expect(inboxRow().getAttribute("aria-label")).toBe("Inbox, 3 unread operator messages");
+    expect(inboxRow().getAttribute("title")).toBe("3 unread operator messages");
+    expect(document.querySelector("[data-bb-collab-inbox-unread]")).toBeNull();
+    expect(inboxRow().textContent).toBe(INBOX_NAV_ROW_TITLE);
 
     expect(paintInboxNavUnread(document, 0)).toEqual({ matched: true });
-    expect(inboxDot()).toBeNull();
+    expect(inboxGlyph()?.classList.contains("text-primary")).toBe(false);
+    expect(inboxRow().hasAttribute("aria-label")).toBe(false);
+    expect(inboxRow().hasAttribute("title")).toBe(false);
+    expect(document.querySelector("[data-bb-collab-inbox-unread]")).toBeNull();
+  });
+
+  it("restores host attributes and leaves nav label layout untouched", () => {
+    // #given
+    navRegion({ inboxGlyph: MAIL, lanesGlyph: GIT_BRANCH });
+    const row = inboxRow();
+    row.setAttribute("aria-label", "Inbox");
+    row.setAttribute("title", "Open Inbox");
+    inboxGlyph()!.setAttribute("class", "host-glyph");
+    inboxGlyph()!.setAttribute("style", "color: inherit");
+
+    // #when / #then
+    paintInboxNavUnread(document, 1);
+    expect(inboxGlyph()?.classList.contains("text-primary")).toBe(true);
+    expect(row.textContent).toBe(INBOX_NAV_ROW_TITLE);
+    expect(row.querySelector("[data-bb-collab-inbox-unread]")).toBeNull();
+    paintInboxNavUnread(document, 0);
+    expect(row.getAttribute("aria-label")).toBe("Inbox");
+    expect(row.getAttribute("title")).toBe("Open Inbox");
+    expect(inboxGlyph()?.getAttribute("class")).toBe("host-glyph");
+    expect(inboxGlyph()?.getAttribute("style")).toBe("color: inherit");
   });
 
   it("reports broken when the host renames the region test id", () => {
@@ -134,7 +164,7 @@ describe("inbox unread nav indicator", () => {
     // #then
     expect(painted.matched).toBe(false);
     expect(painted.matched === false ? painted.reason : "").toContain(INBOX_NAV_REGION_SELECTOR);
-    expect(inboxDot()).toBeNull();
+    expect(document.querySelector("[data-bb-collab-inbox-unread]")).toBeNull();
   });
 
   it("reports broken when the host relabels the row", () => {
@@ -147,7 +177,7 @@ describe("inbox unread nav indicator", () => {
     // #then
     expect(painted.matched).toBe(false);
     expect(painted.matched === false ? painted.reason : "").toContain("0 of the 2 rows");
-    expect(inboxDot()).toBeNull();
+    expect(document.querySelector("[data-bb-collab-inbox-unread]")).toBeNull();
   });
 
   it("paints the live unread count from the sidebar poll", async () => {
@@ -159,7 +189,8 @@ describe("inbox unread nav indicator", () => {
     renderList(async () => [message(1, null), message(2, null), message(3, 5)]);
 
     // #then
-    await waitFor(() => expect(inboxDot()?.getAttribute(INBOX_UNREAD_MARKER)).toBe("2"));
+    await waitFor(() => expect(inboxRow().getAttribute("aria-label")).toContain("2 unread operator messages"));
+    expect(inboxGlyph()?.classList.contains("text-primary")).toBe(true);
   });
 
   it("paints nothing when every message is read", async () => {
@@ -173,7 +204,7 @@ describe("inbox unread nav indicator", () => {
 
     // #then
     await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a", recipient: "operator" }));
-    expect(inboxDot()).toBeNull();
+    expect(inboxGlyph()?.classList.contains("text-primary")).toBe(false);
     expect(rendered.queryByRole("alert")).toBeNull();
   });
 
@@ -188,7 +219,7 @@ describe("inbox unread nav indicator", () => {
 
     // #then the panel error also proves the shared response has settled
     await waitFor(() => expect(rendered.getByText(/operator inbox response included a non-operator message/)).toBeTruthy());
-    expect(inboxDot()).toBeNull();
+    expect(inboxGlyph()?.classList.contains("text-primary")).toBe(false);
   });
 
   it("surfaces a visible broken state and records the error when the coupling dies", async () => {
@@ -203,10 +234,10 @@ describe("inbox unread nav indicator", () => {
     // #then
     await waitFor(() => expect(rendered.getByRole("alert").textContent).toContain(INBOX_INDICATOR_BROKEN_TITLE));
     expect(recorded).toHaveBeenCalledWith(expect.stringContaining(INBOX_INDICATOR_BROKEN_TITLE));
-    expect(inboxDot()).toBeNull();
+    expect(inboxGlyph()?.classList.contains("text-primary")).toBe(false);
   });
   it("reports broken when a second row is also titled Inbox", () => {
-    // #given a valid-but-wrong match: the dot would land on someone else's row
+    // #given a valid-but-wrong match: the accent would land on someone else's row
     navRegion({ extraRows: `<button type="button"><span>${INBOX_NAV_ROW_TITLE}</span></button>` });
 
     // #when
@@ -215,7 +246,7 @@ describe("inbox unread nav indicator", () => {
     // #then
     expect(painted.matched).toBe(false);
     expect(painted.matched === false ? painted.reason : "").toContain("2 of the 3 rows");
-    expect(inboxDot()).toBeNull();
+    expect(document.querySelector("[data-bb-collab-inbox-unread]")).toBeNull();
   });
 
   it("accepts distinct row geometry", () => {
@@ -240,7 +271,7 @@ describe("inbox unread nav indicator", () => {
 
   it("judges nothing when the rows carry no readable geometry", () => {
     // #given
-    navRegion();
+    navRegion({ inboxGlyph: null, lanesGlyph: null });
 
     // #when / #then
     expect(inspectInboxNavGlyph(document)).toBeNull();
@@ -258,7 +289,8 @@ describe("inbox unread nav indicator", () => {
     // #then
     await waitFor(() => expect(rendered.getByRole("alert").textContent).toContain("draw the same glyph"));
     expect(recorded).toHaveBeenCalledWith(expect.stringContaining(INBOX_INDICATOR_BROKEN_TITLE));
-    expect(inboxDot()?.getAttribute(INBOX_UNREAD_MARKER)).toBe("1");
+    expect(inboxGlyph()?.classList.contains("text-primary")).toBe(true);
+    expect(inboxRow().getAttribute("aria-label")).toContain("1 unread operator message");
   });
   it("stays healthy when the same path data is drawn under a different transform", () => {
     // #given a legitimate re-theme: identical `d`, rotated 90 degrees
@@ -285,12 +317,13 @@ describe("inbox unread nav indicator", () => {
 
     // #when the first poll proves 2 unread and the next one fails
     await vi.advanceTimersByTimeAsync(1);
-    expect(inboxDot()?.getAttribute(INBOX_UNREAD_MARKER)).toBe("2");
+    expect(inboxGlyph()?.classList.contains("text-primary")).toBe(true);
+    expect(inboxRow().getAttribute("aria-label")).toContain("2 unread operator messages");
     await vi.advanceTimersByTimeAsync(30_000);
 
     // #then the proven count survives the failure rather than reading as zero
     expect(call).toBeGreaterThan(1);
-    expect(inboxDot()?.getAttribute(INBOX_UNREAD_MARKER)).toBe("2");
+    expect(inboxGlyph()?.classList.contains("text-primary")).toBe(true);
   });
 
   it("counts the unregistered outcome as a proven zero rather than retaining the last count", async () => {
@@ -310,14 +343,14 @@ describe("inbox unread nav indicator", () => {
 
     // #when a proven 2 is followed by two unregistered answers
     await vi.advanceTimersByTimeAsync(1);
-    expect(inboxDot()?.getAttribute(INBOX_UNREAD_MARKER)).toBe("2");
+    expect(inboxGlyph()?.classList.contains("text-primary")).toBe(true);
     await vi.advanceTimersByTimeAsync(30_000);
 
-    // #then the dot is gone, and stays gone when the sentence changes
-    expect(inboxDot()).toBeNull();
+    // #then the accent is cleared, and stays cleared when the sentence changes
+    expect(inboxGlyph()?.classList.contains("text-primary")).toBe(false);
     await vi.advanceTimersByTimeAsync(30_000);
     expect(call).toBeGreaterThan(2);
-    expect(inboxDot()).toBeNull();
+    expect(inboxGlyph()?.classList.contains("text-primary")).toBe(false);
   });
 
   it("records the break once rather than on every poll", async () => {

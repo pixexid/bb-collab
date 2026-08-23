@@ -46,8 +46,11 @@ describe("Operator Inbox backend", () => {
     const root = resolve(import.meta.dirname, "../../..");
     const collection = JSON.parse(readFileSync(resolve(root, ".bb/plugins.json"), "utf8"));
     const marketplace = JSON.parse(readFileSync(resolve(root, "marketplace.json"), "utf8"));
+    const packageJson = JSON.parse(readFileSync(resolve(import.meta.dirname, "../package.json"), "utf8"));
     expect(collection.plugins).toContainEqual({ name: "operator-inbox", source: "./plugins/bb-plugin-operator-inbox" });
     expect(marketplace.plugins).toContainEqual(expect.objectContaining({ id: "operator-inbox" }));
+    expect(packageJson.bb.branding.icon).toBe("./assets/envelope-simple-duotone.svg");
+    expect(existsSync(resolve(import.meta.dirname, "../assets/envelope-simple-duotone.svg"))).toBe(true);
     for (const file of ["app.css", "app.js", "app.meta.json", "server.js", "server.meta.json"]) {
       expect(existsSync(resolve(import.meta.dirname, "../dist", file)), file).toBe(true);
     }

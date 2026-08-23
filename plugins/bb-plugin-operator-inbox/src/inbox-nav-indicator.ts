@@ -8,13 +8,10 @@
 export const INBOX_NAV_REGION_SELECTOR = "[data-testid=\"plugin-nav-sidebar-items\"]";
 export const INBOX_NAV_ROW_TITLE = "Inbox";
 export const LANES_NAV_ROW_TITLE = "Lanes";
-export const INBOX_UNREAD_MARKER = "data-bb-collab-inbox-unread";
 export const INBOX_INDICATOR_BROKEN_TITLE = "Inbox unread indicator broken";
 
-// ponytail: inline style, not a class. dist/app.css is generated from tokens
-// found in this plugin's own source, so it cannot carry a rule scoped to a
-// host-rendered row; a stylesheet would be a second coupling to keep alive.
-const DOT_STYLE = "margin-left:auto;flex:0 0 auto;width:0.5rem;height:0.5rem;border-radius:9999px;background-color:currentColor";
+const LEGACY_UNREAD_MARKER = "[data-bb-collab-inbox-unread]";
+const navSnapshots = new WeakMap<Element, { ariaLabel: string | null; title: string | null; glyphClass: string | null; glyphStyle: string | null }>();
 
 // Geometry, never class names: two host icons differ by the shape they draw,
 // and the minified class of a host row tells us nothing about which glyph it is.
@@ -39,6 +36,25 @@ function rowsTitled(rows: Element[], title: string): Element[] {
   return rows.filter((row) => row.textContent?.trim() === title);
 }
 
+function restoreAttribute(element: Element, name: string, value: string | null): void {
+  if (value === null) element.removeAttribute(name);
+  else element.setAttribute(name, value);
+}
+
+function restoreNavState(row: Element): void {
+  row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
+  const snapshot = navSnapshots.get(row);
+  if (snapshot === undefined) return;
+  restoreAttribute(row, "aria-label", snapshot.ariaLabel);
+  restoreAttribute(row, "title", snapshot.title);
+  const glyph = row.querySelector("svg");
+  if (glyph !== null) {
+    restoreAttribute(glyph, "class", snapshot.glyphClass);
+    restoreAttribute(glyph, "style", snapshot.glyphStyle);
+  }
+  navSnapshots.delete(row);
+}
+
 export function paintInboxNavUnread(root: ParentNode, unread: number): InboxNavPaint {
   const rows = navRows(root);
   if (rows === null) {
@@ -51,16 +67,24 @@ export function paintInboxNavUnread(root: ParentNode, unread: number): InboxNavP
     return { matched: false, reason: `${matches.length} of the ${rows.length} rows in ${INBOX_NAV_REGION_SELECTOR} are titled ${JSON.stringify(INBOX_NAV_ROW_TITLE)}, expected exactly 1` };
   }
   const row = matches[0]!;
-  const existing = row.querySelector(`[${INBOX_UNREAD_MARKER}]`);
   if (unread < 1) {
-    existing?.remove();
+    restoreNavState(row);
     return { matched: true };
   }
-  const dot = existing ?? row.appendChild(row.ownerDocument.createElement("span"));
-  dot.setAttribute(INBOX_UNREAD_MARKER, String(unread));
-  dot.setAttribute("aria-hidden", "true");
-  dot.setAttribute("title", `${unread} unread operator ${unread === 1 ? "message" : "messages"}`);
-  dot.setAttribute("style", DOT_STYLE);
+  if (!navSnapshots.has(row)) {
+    navSnapshots.set(row, {
+      ariaLabel: row.getAttribute("aria-label"),
+      title: row.getAttribute("title"),
+      glyphClass: row.querySelector("svg")?.getAttribute("class") ?? null,
+      glyphStyle: row.querySelector("svg")?.getAttribute("style") ?? null,
+    });
+  }
+  row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
+  row.querySelector("svg")?.classList.add("text-primary");
+  const countLabel = `${unread} unread operator ${unread === 1 ? "message" : "messages"}`;
+  const snapshot = navSnapshots.get(row)!;
+  row.setAttribute("aria-label", `${snapshot.ariaLabel ?? INBOX_NAV_ROW_TITLE}, ${countLabel}`);
+  row.setAttribute("title", `${snapshot.title === null ? "" : `${snapshot.title} — `}${countLabel}`);
   return { matched: true };
 }
 
@@ -80,7 +104,7 @@ function glyphFingerprint(row: Element): string | null {
   return shapes.length === 0 ? null : shapes.join("|");
 }
 
-// The second way this indicator dies: the row is found and the dot is painted,
+// The second way this indicator dies: the row is found and the accent is painted,
 // but the glyph beside it is not the one Inbox declared — a manifest icon
 // overriding it, or an unknown name falling back to the host's default. A
 // plugin cannot name the glyph it got, so this reads the control instead: Lanes

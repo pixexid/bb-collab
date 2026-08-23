@@ -10,7 +10,7 @@
     "name": "Operator Inbox",
     "description": "Project-scoped operator and supervisor messages with delivery-aware replies.",
     "branding": {
-      "icon": "Mail"
+      "icon": "./assets/envelope-simple-duotone.svg"
     },
     "server": "./server.ts",
     "app": "./app.tsx",
@@ -22,6 +22,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@phosphor-icons/react": "2.1.10",
     "zod": "4.3.6"
   },
   "devDependencies": {
