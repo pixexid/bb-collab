@@ -718,8 +718,8 @@ async function loadedDistHost() {
   return host;
 }
 
-async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, writingLaneCeiling?: number, withoutGithubIssues = true) {
-  const fixture = await assignmentFixture({ directorSeat: true, orchestratorSeat: true, withoutGithubIssues, targetRemoteUrl: includeGithubRemote ? "https://github.com/example/project.git" : undefined, writingLaneCeiling });
+async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, writingLaneCeiling?: number, withoutGithubIssues = true, projectId = PROJECT_ID, connectorHost = CONNECTOR_HOST) {
+  const fixture = await assignmentFixture({ projectId, connectorHost, directorSeat: true, orchestratorSeat: true, withoutGithubIssues, targetRemoteUrl: includeGithubRemote ? "https://github.com/example/project.git" : undefined, writingLaneCeiling });
   const director = fixture.db.prepare(
     "SELECT thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'director'",
   ).get() as { thread_id: string };
@@ -731,26 +731,26 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
   fixture.host.harness.sdk.stub("threads.interactions.list", (async ({ threadId }: { threadId: string }) =>
     threadId === director.thread_id && directorPendingInteraction ? [{ status: "pending" }] : []) as never);
   let nativeUpdatedAt = updatedAt;
-  const threadProjects = new Map([[director.thread_id, PROJECT_ID], [orchestrator.thread_id, PROJECT_ID]]);
+  const threadProjects = new Map([[director.thread_id, projectId], [orchestrator.thread_id, projectId]]);
   const lanes = new Map<string, ReturnType<typeof makeThreadResponse> & { environmentBranchName: string | null }>();
   const laneEvents = new Map<string, Array<{ id: string; threadId: string; seq: number; type: string; scope: { kind: "thread" }; data: unknown; createdAt: number }>>();
   fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
     ...(lanes.get(threadId) ?? {}),
     id: threadId,
-    projectId: lanes.get(threadId)?.projectId ?? threadProjects.get(threadId) ?? (threadId.includes("two") ? "project-two" : PROJECT_ID),
+    projectId: lanes.get(threadId)?.projectId ?? threadProjects.get(threadId) ?? (threadId.includes("two") ? "project-two" : projectId),
     status: lanes.get(threadId)?.status ?? threadStatus,
     parentThreadId: lanes.get(threadId)?.parentThreadId ?? null,
     updatedAt: lanes.get(threadId)?.updatedAt ?? nativeUpdatedAt,
   })) as never);
-  fixture.host.harness.sdk.stub("threads.list", (async ({ projectId, archived }: { projectId?: string; archived?: boolean }) => [
+  fixture.host.harness.sdk.stub("threads.list", (async ({ projectId: requestedProjectId, archived }: { projectId?: string; archived?: boolean }) => [
     ...[director.thread_id, orchestrator.thread_id].map((threadId) => makeThreadResponse({
       id: threadId,
-      projectId: threadProjects.get(threadId) ?? PROJECT_ID,
+      projectId: threadProjects.get(threadId) ?? projectId,
       status: threadStatus,
       updatedAt: nativeUpdatedAt,
     })),
     ...lanes.values(),
-  ].filter((thread) => (projectId === undefined || thread.projectId === projectId) && (archived ? thread.archivedAt !== null : thread.archivedAt === null))) as never);
+  ].filter((thread) => (requestedProjectId === undefined || thread.projectId === requestedProjectId) && (archived ? thread.archivedAt !== null : thread.archivedAt === null))) as never);
   fixture.host.harness.sdk.stub("threads.spawn", (async ({ projectId, parentThreadId, title }: { projectId: string; parentThreadId?: string; title?: string }) => {
     const id = `lane-${lanes.size + 1}`;
     const lane = Object.assign(makeThreadResponse({ id, projectId, parentThreadId: parentThreadId ?? null, title: title ?? null, status: "error", updatedAt: nativeUpdatedAt }), {
@@ -786,7 +786,7 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
     setDirectorPendingInteraction(value: boolean) { directorPendingInteraction = value; },
     setThreadProject(threadId: string, projectId: string) { threadProjects.set(threadId, projectId); },
     addNativeLane(threadId: string, status: "idle" | "active" | "error" | "starting" | "stopping" = "active", parentThreadId = orchestrator.thread_id) {
-      lanes.set(threadId, Object.assign(makeThreadResponse({ id: threadId, projectId: PROJECT_ID, parentThreadId, status, updatedAt: nativeUpdatedAt }), {
+      lanes.set(threadId, Object.assign(makeThreadResponse({ id: threadId, projectId, parentThreadId, status, updatedAt: nativeUpdatedAt }), {
         environmentBranchName: null,
       }));
     },
@@ -828,10 +828,10 @@ function bindFixtureGithubIssue(db: Database.Database, issueNumber: number, work
   ).run(projectId, workItemId, GITHUB_OWNER, repo, issueNumber, sha256("fixture-desired"), sha256("fixture-observed"), sha256("fixture-request"));
 }
 
-async function currentGithubBriefDispatch() {
-  const fixture = await fleetWatchdogFixture(0, true, 1, false);
-  const adapter = new DeterministicGitHubIssueAdapter();
-  expect(applyWithFixtureReceipt(fixture.db, projectionRequest(fixture.fenceToken, 2, { idempotencyKey: "github-brief-ready-project" }), adapter)).toMatchObject({ outcome: "OK" });
+async function currentGithubBriefDispatch(projectId = PROJECT_ID, connectorHost = CONNECTOR_HOST) {
+  const fixture = await fleetWatchdogFixture(0, true, 1, false, projectId, connectorHost);
+  const adapter = new DeterministicGitHubIssueAdapter(connectorHost);
+  expect(applyWithFixtureReceipt(fixture.db, projectionRequest(fixture.fenceToken, 2, { projectId, idempotencyKey: `github-brief-ready-project-${projectId}` }), adapter)).toMatchObject({ outcome: "OK" });
   const ready = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1);
   if (!ready) throw new Error("fixture projection did not create its issue");
   const inProgress = {
@@ -845,15 +845,17 @@ async function currentGithubBriefDispatch() {
     fixture,
     snapshot: ready,
     transitionSnapshot: inProgress,
-    request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+    request: transitionRequest(fixture.fenceToken, "in_progress", 2, { projectId }),
+    projectId,
   };
 }
 
-function installGithubBriefGh(snapshot: { title: string; body: string; state: "open" | "closed"; labels: readonly string[]; externalRevision: string }, options: { transitionSnapshot?: typeof snapshot; incomplete?: boolean; mutationFailure?: boolean } = {}) {
+function installGithubBriefGh(snapshot: { title: string; body: string; state: "open" | "closed"; labels: readonly string[]; externalRevision: string }, options: { transitionSnapshot?: typeof snapshot; incomplete?: boolean; mutationFailure?: boolean; slowConnectorHost?: string } = {}) {
   const bin = mkdtempSync(join(tmpdir(), "bb-collab-github-brief-"));
   const gh = join(bin, "gh");
   const calls = join(bin, "calls");
-  const transitioned = join(bin, "transitioned");
+  const slowTransitioned = join(bin, "slow-transitioned");
+  const fastTransitioned = join(bin, "fast-transitioned");
   const issue = JSON.stringify({ number: 1, title: snapshot.title, body: snapshot.body, state: snapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: snapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: snapshot.labels.map((name) => ({ name })), updatedAt: snapshot.externalRevision });
   const transitionSnapshot = options.transitionSnapshot ?? snapshot;
   const transitionedIssue = JSON.stringify({ number: 1, title: transitionSnapshot.title, body: transitionSnapshot.body, state: transitionSnapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: transitionSnapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: transitionSnapshot.labels.map((name) => ({ name })), updatedAt: transitionSnapshot.externalRevision });
@@ -862,14 +864,21 @@ function installGithubBriefGh(snapshot: { title: string; body: string; state: "o
   const older = JSON.stringify(options.incomplete ? { not: "comments" } : allComments.slice(8, 16));
   writeFileSync(gh, `#!/bin/sh
 printf '%s\\n' "$*" >> '${calls}'
+connector_host=default
+if [ "$1" = --hostname ]; then
+  connector_host="$2"
+  if [ "$2" = '${options.slowConnectorHost ?? ""}' ]; then sleep 1; fi
+  shift 2
+fi
+if [ "$connector_host" = '${options.slowConnectorHost ?? ""}' ]; then state_file='${slowTransitioned}'; else state_file='${fastTransitioned}'; fi
 if [ "$1" = issue ]; then
-  if [ -f '${transitioned}' ]; then printf '%s\\n' '${transitionedIssue}'; else printf '%s\\n' '${issue}'; fi
+  if [ -f "$state_file" ]; then printf '%s\\n' '${transitionedIssue}'; else printf '%s\\n' '${issue}'; fi
   exit 0
 fi
 if [ "$1" = api ]; then
   case "$*" in
     *--method*PATCH*|*--method*POST*)
-      ${options.mutationFailure ? "exit 12" : `touch '${transitioned}'; printf '%s\\n' '{"number":1}'`}
+      ${options.mutationFailure ? "exit 12" : `touch "$state_file"; printf '%s\\n' '{"number":1}'`}
       exit 0 ;;
     *--paginate*) exit 12 ;;
     *page=1*) printf '%s\\n' '${recent}'; exit 0 ;;
@@ -1849,6 +1858,8 @@ function seedAssignmentDatabase(
 }
 
 async function assignmentFixture(options: {
+  projectId?: string;
+  connectorHost?: string;
   writingLaneCeiling?: number;
   connectorPolicy?: "required" | "optional" | "prohibited";
   targetDefaultBranch?: string;
@@ -1857,36 +1868,44 @@ async function assignmentFixture(options: {
   directorSeat?: boolean;
   orchestratorSeat?: boolean;
 } = {}) {
-  const host = await loadedHost();
+  const projectId = options.projectId ?? PROJECT_ID;
+  const scopeRoleFacts = (facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]) => {
+    facts.thread.projectId = projectId;
+    facts.environment.projectId = projectId;
+    facts.project = projectFacts(projectId);
+  };
+  const host = await loadedHost(projectId, scopeRoleFacts);
   const directorSeat = options.directorSeat === true;
   const orchestratorSeat = options.orchestratorSeat === true;
   const config = directorSeat ? (orchestratorSeat ? directorAndOrchestratorConfig() : directorSeatConfig()) : roleConfig(options.connectorPolicy);
   if (options.withoutGithubIssues) delete (config.extensions.bbCollab as Record<string, unknown>).githubIssues;
+  const mappings = (config.extensions.bbCollab as { githubIssues?: { repositoryMappings?: Array<{ connectorHost?: string }> } }).githubIssues?.repositoryMappings;
+  if (options.connectorHost && mappings) for (const mapping of mappings) mapping.connectorHost = options.connectorHost;
   if (options.writingLaneCeiling !== undefined) {
     (config.extensions.bbCollab as Record<string, unknown>).writingLaneCeiling = options.writingLaneCeiling;
   }
   const targets = options.targetDefaultBranch || options.targetRemoteUrl
     ? bootstrapRequest().targets!.map((target) => ({ ...target, ...(options.targetDefaultBranch ? { defaultBranch: options.targetDefaultBranch } : {}), ...(options.targetRemoteUrl ? { remoteUrl: options.targetRemoteUrl } : {}) }))
     : undefined;
-  const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config, ...(targets ? { targets } : {}) });
-  expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
-  expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
-  const roleFacts = directorSeat ? directorRoleReader() : roleReader();
-  expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, directorSeat ? {
+  const { db, fenceToken } = seedAndBootstrap(host, projectId, { config, ...(targets ? { targets } : {}) });
+  expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, { projectId })).outcome).toBe("OK");
+  expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, { projectId })).outcome).toBe("OK");
+  const roleFacts = directorSeat ? directorRoleReader(scopeRoleFacts) : roleReader(scopeRoleFacts);
+  expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, { projectId, ...(directorSeat ? {
     roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
     qualificationId: "director-assignment-qualification",
     declaredProfile: DIRECTOR_PROFILE,
-  } : {}), null, roleFacts).outcome).toBe("OK");
-  const succession = applyWithFixtureReceipt(db, successionRequest(fenceToken, directorSeat ? {
+  } : {}) }), null, roleFacts).outcome).toBe("OK");
+  const succession = applyWithFixtureReceipt(db, successionRequest(fenceToken, { projectId, ...(directorSeat ? {
     roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
     qualificationId: "director-assignment-qualification",
     profileDigest: DIRECTOR_PROFILE_DIGEST,
     standbyProfile: DIRECTOR_STANDBY_PROFILE,
-  } : {}), null, directorSeat ? directorRoleReader() : roleReader());
+  } : {}) }), null, directorSeat ? directorRoleReader(scopeRoleFacts) : roleReader(scopeRoleFacts));
   expect(succession.outcome).toBe("OK");
   const holderExecutionAttemptId = (succession.evidence as { holderExecutionAttemptId: string }).holderExecutionAttemptId;
   seedVerifiedFixtureReceipt(db, {
-    projectId: PROJECT_ID,
+    projectId,
     receiptId: "role-actor-assignment",
     actorKind: "role",
     subjectId: holderExecutionAttemptId,
@@ -1902,6 +1921,7 @@ async function assignmentFixture(options: {
       completionEventSeq: 4,
     };
     const facts = () => roleReader((input) => {
+      scopeRoleFacts(input);
       input.thread.id = roleContext.threadId;
       input.thread.environmentId = "environment-fleet-orchestrator";
       input.environment.id = "environment-fleet-orchestrator";
@@ -1909,18 +1929,20 @@ async function assignmentFixture(options: {
       input.events[3]!.id = roleContext.completionEventId;
     });
     expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+      projectId,
       idempotencyKey: "qualification-fleet-orchestrator",
       qualificationId: "qualification-fleet-orchestrator",
       roleContext,
     }), null, facts()).outcome).toBe("OK");
     const orchestrator = applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+      projectId,
       idempotencyKey: "succession-fleet-orchestrator",
       qualificationId: "qualification-fleet-orchestrator",
       roleContext,
     }), null, facts());
     expect(orchestrator.outcome).toBe("OK");
   }
-  return { host, db, fenceToken, holderExecutionAttemptId };
+  return { host, db, fenceToken, holderExecutionAttemptId, projectId };
 }
 
 function activateReviewer(db: Database.Database, fenceToken: string) {
@@ -5095,12 +5117,39 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       const calls = restore.readCallsAndCleanup();
       expect(calls.match(/page=1/gu)).toHaveLength(2);
       expect(calls.match(/page=2/gu)).toHaveLength(2);
+      expect(calls).toContain(CONNECTOR_HOST);
       expect(calls).not.toContain("--paginate");
       expect(calls).not.toContain("page=3");
     } finally {
       restore.cleanup();
     }
   });
+
+  it("services a second project while the first connector is stalled", async () => {
+    const slow = await currentGithubBriefDispatch("project-a", "slow.github.test");
+    const fast = await currentGithubBriefDispatch("project-b", CONNECTOR_HOST);
+    const restore = installGithubBriefGh(slow.snapshot, { transitionSnapshot: slow.transitionSnapshot, slowConnectorHost: "slow.github.test" });
+    try {
+      let slowSettled = false;
+      const slowResult = slow.fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: slow.request,
+        spawn: dispatchSpawn(slow.fixture.orchestratorThreadId, { projectId: slow.projectId }),
+      }, { projectId: slow.projectId, threadId: slow.fixture.orchestratorThreadId }).then((value) => {
+        slowSettled = true;
+        return JSON.parse(value as string) as { outcome: string };
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const fastResult = JSON.parse(await fast.fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: fast.request,
+        spawn: dispatchSpawn(fast.fixture.orchestratorThreadId, { projectId: fast.projectId }),
+      }, { projectId: fast.projectId, threadId: fast.fixture.orchestratorThreadId }) as string) as { outcome: string };
+      expect(fastResult.outcome).toBe("OK");
+      expect(slowSettled).toBe(false);
+      expect((await slowResult).outcome).toBe("OK");
+    } finally {
+      restore.cleanup();
+    }
+  }, 30_000);
 
   it("refuses production comment completeness when the bounded older-page read fails", async () => {
     const projected = await currentGithubBriefDispatch();

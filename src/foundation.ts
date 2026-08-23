@@ -2133,6 +2133,8 @@ export interface GitHubIssueAdapter {
   available: boolean;
   read(owner: string, repo: string, issueNumber: number): GitHubIssueSnapshot | null;
   mutate(input: GitHubIssueMutation): GitHubIssueSnapshot;
+  readAsync?(owner: string, repo: string, issueNumber: number): Promise<GitHubIssueSnapshot | null>;
+  mutateAsync?(input: GitHubIssueMutation): Promise<GitHubIssueSnapshot>;
 }
 
 export type GitHubIssueReader = (owner: string, repo: string, issueNumber: number) => GitHubIssueSnapshot | null;
@@ -7884,6 +7886,124 @@ function applyGithubIssueProjection(
   }
 }
 
+async function applyGithubIssueProjectionAsync(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+  adapter: GitHubIssueAdapter,
+): Promise<FoundationResult> {
+  if (!adapter.readAsync || !adapter.mutateAsync) return applyGithubIssueProjection(db, request, digest, adapter);
+  try {
+    const replay = checkIdempotency(db, request, digest);
+    if (replay) return replay;
+  } catch (error) {
+    if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+  }
+  if (!adapter.available) return result("EXTERNAL_UNAVAILABLE", request.projectId, 1, 0, 0, { message: "the GitHub Issues adapter is unavailable" });
+  let context: ProjectionContext;
+  try {
+    const prepared = prepareProjection(db, request, digest, adapter);
+    if ("outcome" in prepared) return prepared;
+    context = prepared;
+  } catch (error) {
+    if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+  }
+
+  let mutation: GitHubIssueMutation;
+  if (context.ref.issue_number === null) {
+    mutation = {
+      kind: "create",
+      owner: context.mapping.owner,
+      repo: context.mapping.repo,
+      title: context.desired.title,
+      body: context.desired.body,
+      state: context.desired.state,
+      addLabels: context.desired.managedLabels,
+      removeLabels: [],
+    };
+  } else {
+    let current: GitHubIssueSnapshot | null;
+    try {
+      current = await adapter.readAsync(context.mapping.owner, context.mapping.repo, context.ref.issue_number);
+      if (current === null) return result("EXTERNAL_NOT_FOUND", request.projectId, 1, 1, 0, { message: "the bound GitHub issue was not found" });
+      current = parseSnapshot(current);
+    } catch (error) {
+      if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
+      return result("EXTERNAL_UNAVAILABLE", request.projectId, 1, 1, 0, { message: "the bound GitHub issue could not be read" });
+    }
+    if (current.owner !== context.mapping.owner || current.repo !== context.mapping.repo || current.issueNumber !== context.ref.issue_number) {
+      return result("EXTERNAL_TARGET_MISMATCH", request.projectId, 1, 1, 0, { message: "the GitHub issue response has the wrong exact identity" });
+    }
+    const initialBinding = context.ref.projection_state === "pending" && context.ref.issue_number !== null && context.ref.observed_external_digest === null;
+    if (!initialBinding && (!context.ref.observed_external_digest || observedDigest(current, context.desired) !== context.ref.observed_external_digest)) {
+      try {
+        return recordProjectionState(db, request, digest, context, "drifted", "EXTERNAL_DIVERGED", { expected: 1, attempted: 1, verified: 0 }, "the GitHub issue diverged from its last verified projection");
+      } catch {
+        return result("EXTERNAL_DIVERGED", request.projectId, 1, 1, 0, { message: "the GitHub issue diverged from its last verified projection" });
+      }
+    }
+    if (observedDigest(current, context.desired) === context.desired.digest) {
+      try {
+        return finalizeProjection(db, request, digest, context, adapter, current, "verify");
+      } catch (error) {
+        if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
+        return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+      }
+    }
+    try {
+      context = reserveExistingProjection(db, request, digest, context);
+    } catch (error) {
+      if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
+      return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+    }
+    const currentLabels = new Set(current.labels);
+    mutation = {
+      kind: "update",
+      owner: context.mapping.owner,
+      repo: context.mapping.repo,
+      issueNumber: context.ref.issue_number!,
+      title: context.desired.title,
+      body: context.desired.body,
+      state: context.desired.state,
+      addLabels: context.desired.managedLabels.filter((label) => !currentLabels.has(label)),
+      removeLabels: current.labels.filter((label) => context.desired.managedNames.has(label) && !context.desired.managedLabels.includes(label)),
+    };
+  }
+
+  try {
+    const mutationResponse = parseSnapshot(await adapter.mutateAsync(mutation));
+    if (
+      mutationResponse.owner !== mutation.owner ||
+      mutationResponse.repo !== mutation.repo ||
+      (mutation.issueNumber !== undefined && mutationResponse.issueNumber !== mutation.issueNumber)
+    ) throw new GitHubIssueAdapterError("ambiguous");
+    const readBackValue = await adapter.readAsync(mutation.owner, mutation.repo, mutationResponse.issueNumber);
+    if (readBackValue === null) throw new GitHubIssueAdapterError("ambiguous");
+    const readBack = parseSnapshot(readBackValue);
+    if (readBack.owner !== mutation.owner || readBack.repo !== mutation.repo || readBack.issueNumber !== mutationResponse.issueNumber) {
+      throw new GitHubIssueAdapterError("ambiguous");
+    }
+    return finalizeProjection(db, request, digest, context, adapter, readBack, mutation.kind);
+  } catch {
+    try {
+      return recordProjectionState(
+        db,
+        request,
+        digest,
+        context,
+        "delivery_ambiguous",
+        "EXTERNAL_DELIVERY_AMBIGUOUS",
+        { expected: 1, attempted: 1, verified: 0 },
+        "GitHub delivery or exact read-back could not be proven",
+      );
+    } catch {
+      return result("EXTERNAL_DELIVERY_AMBIGUOUS", request.projectId, 1, 1, 0, { message: "GitHub delivery or local finalization could not be proven" });
+    }
+  }
+}
+
 type AssignmentIntent = z.infer<typeof assignmentIntentSchema>;
 type TerminalReport = z.infer<typeof terminalReportSchema>;
 
@@ -8030,6 +8150,35 @@ export function applyAuthorizedMutation(
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, dryRun);
+}
+
+export async function applyAuthorizedMutationAsync(
+  db: SqliteDatabase | null,
+  input: unknown,
+  githubAdapter: GitHubIssueAdapter | null = null,
+  roleFactReader: RoleFactReader | null = null,
+  nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
+  reviewFactReader: ReviewFactReader | null = null,
+  githubIssueReader: GitHubIssueReader | null = null,
+  dryRun = false,
+): Promise<FoundationResult> {
+  let request: ApplyRequest;
+  try {
+    request = parseApplyRequest(input);
+  } catch (error) {
+    if (error instanceof Refusal) return refusalResult("apply", error.data);
+    return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error) });
+  }
+  if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
+  if (request.operationClass !== "github_issue_projection" || !githubAdapter?.readAsync || !githubAdapter.mutateAsync) {
+    return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, dryRun);
+  }
+  try {
+    return await applyGithubIssueProjectionAsync(db, request, mutationRequestDigest(request), githubAdapter);
+  } catch (error) {
+    if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+  }
 }
 
 export function applyFixtureMutation(
