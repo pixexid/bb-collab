@@ -115,6 +115,8 @@ const fleetWatchdogLegacyIssueReopenedKey = (workItemId: string, externalRevisio
   `fleet-watchdog:issue-reopened:${workItemId}:${externalRevision}`;
 export const fleetWatchdogMergeCloseKey = (projectId: string, workItemId: string, state: string, externalRevision: string) =>
   `fleet-watchdog:merge-close:${fleetWatchdogCompositeKey(projectId, workItemId, state, externalRevision)}`;
+export const fleetWatchdogMergeCloseMismatchKey = (projectId: string, workItemId: string, externalRevision: string, subject: string) =>
+  `fleet-watchdog:merge-close-mismatch:${fleetWatchdogCompositeKey(projectId, workItemId, externalRevision, subject)}`;
 const fleetWatchdogLegacyMergeCloseKey = (workItemId: string, state: string, externalRevision: string) =>
   `fleet-watchdog:merge-close:${workItemId}:${state}:${externalRevision}`;
 export const fleetWatchdogBlockerFiredKey = (projectId: string, workItemId: string, subject: string) =>
@@ -1539,6 +1541,7 @@ async function serializeDispatchRecovery(
 }
 
 type WorkItemAttemptTerminalizationPolicy = "refuse-active" | "stop-active";
+type PreMutationGuard = () => Promise<FoundationResult | null>;
 
 async function prepareWorkItemAttemptTerminalization(
   bb: BbPluginApi,
@@ -1592,6 +1595,7 @@ async function applyLiveAuthorizedMutation(
   terminalizationPolicy: WorkItemAttemptTerminalizationPolicy = "refuse-active",
   githubIssueReader: (owner: string, repo: string, issueNumber: number) => GitHubIssueSnapshot | null = readGithubIssueForBackfill,
   githubAdapter: GitHubIssueAdapter | null = null,
+  preMutationGuard?: PreMutationGuard,
 ): Promise<FoundationResult> {
   const parsed = applyRequestSchema.safeParse(input);
   if (parsed.success && terminalizationPolicy === "stop-active") {
@@ -1617,6 +1621,8 @@ async function applyLiveAuthorizedMutation(
     }
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
+  const preMutationRefusal = preMutationGuard === undefined ? null : await preMutationGuard();
+  if (preMutationRefusal) return preMutationRefusal;
   const result = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader);
   await deliverSucceededSeatBrief(bb, db, input, result);
   return result;
@@ -3752,6 +3758,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         const threads: FleetWatchdogLaneInventory = [];
         for (let offset = 0; ; offset += 100) {
           const page = await bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset, signal: controller.signal });
+          const ids = new Set(threads.map((thread) => thread.id));
+          const pageIds = new Set<string>();
+          if (page.some((thread) => thread.projectId !== projectId || ids.has(thread.id) || pageIds.has(thread.id) || !pageIds.add(thread.id))) {
+            throw new Error("native-lane-inventory-is-foreign-or-ambiguous");
+          }
           threads.push(...page);
           if (page.length < 100) return threads;
         }
@@ -3774,6 +3785,77 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     return Promise.race([entry.promise, timeout]).catch(() => null).finally(() => {
       if (timer !== undefined) clearTimeout(timer);
     });
+  };
+  type MergeCloseAttempt = {
+    executionAttemptId: string;
+    assignmentId: string | null;
+    state: string;
+    laneId: string | null;
+    threadId: string | null;
+  };
+  type MergeCloseSafety =
+    | { safe: true }
+    | { safe: false; reason: string; attempts: MergeCloseAttempt[]; lanes: Array<{ threadId: string; status: string; laneId: string | null }> };
+  const readMergeCloseSafety = async (
+    projectId: string,
+    workItemId: string,
+    dispatcherThreadIds: Set<string>,
+  ): Promise<MergeCloseSafety> => {
+    let attempts: MergeCloseAttempt[];
+    try {
+      attempts = (db!.prepare(
+        `SELECT execution_attempt_id, assignment_id, state, lane_id, thread_id
+         FROM execution_attempts
+         WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+         ORDER BY attempt_ordinal DESC`,
+      ).all(projectId, workItemId) as Array<{
+        execution_attempt_id: string;
+        assignment_id: string | null;
+        state: string;
+        lane_id: string | null;
+        thread_id: string | null;
+      }>).map((attempt) => ({
+        executionAttemptId: attempt.execution_attempt_id,
+        assignmentId: attempt.assignment_id,
+        state: attempt.state,
+        laneId: attempt.lane_id,
+        threadId: attempt.thread_id,
+      }));
+    } catch (error) {
+      return { safe: false, reason: `canonical-attempt-inventory-uncertain:${String(error)}`, attempts: [], lanes: [] };
+    }
+    const nonterminal = new Set(WORK_ITEM_CAPACITY_ATTEMPT_STATES);
+    const liveAttempts = attempts.filter((attempt) => nonterminal.has(attempt.state as typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES[number]));
+    let inventory: FleetWatchdogLaneInventory | null;
+    try {
+      inventory = await readFleetWatchdogLaneInventory(projectId);
+    } catch {
+      inventory = null;
+    }
+    if (inventory === null) {
+      return { safe: false, reason: "native-lane-inventory-incomplete-or-uncertain", attempts: liveAttempts, lanes: [] };
+    }
+    const lanes = inventory.filter((thread) =>
+      thread.parentThreadId !== null &&
+      dispatcherThreadIds.has(thread.parentThreadId) &&
+      thread.archivedAt === null &&
+      thread.deletedAt === null,
+    );
+    const associatedLanes = lanes.flatMap((lane) => {
+      const attempt = attempts.find((candidate) => candidate.threadId === lane.id);
+      return attempt ? [{ threadId: lane.id, status: lane.status, laneId: attempt.laneId }] : [];
+    });
+    const unknownLanes = associatedLanes.filter((lane) => !["idle", "active", "starting", "stopping", "error"].includes(lane.status));
+    const activeLanes = associatedLanes.filter((lane) => lane.status === "active" || lane.status === "starting");
+    if (liveAttempts.length > 0 || activeLanes.length > 0 || unknownLanes.length > 0) {
+      return {
+        safe: false,
+        reason: liveAttempts.length > 0 ? "nonterminal-canonical-attempt" : unknownLanes.length > 0 ? "native-lane-status-uncertain" : "active-associated-native-lane",
+        attempts: liveAttempts,
+        lanes: [...activeLanes, ...unknownLanes],
+      };
+    }
+    return { safe: true };
   };
   // This model-free detector covers threads with obligations in canonical and platform state.
   // Acts named only in prose are outside mechanical coverage because identifying whether they
@@ -3952,6 +4034,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         githubSnapshot?: GitHubIssueSnapshot,
         legacyIdempotencyKey?: string,
         terminalizationPolicy: WorkItemAttemptTerminalizationPolicy = "refuse-active",
+        reasonCode?: string,
+        preMutationGuard?: PreMutationGuard,
       ): Promise<FoundationResult> => {
         const actor = db.prepare(
           `SELECT receipt_id FROM actor_receipts
@@ -3984,6 +4068,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           expectedResourceRevision: workItem.resource_revision,
           workItemId,
           lifecycleState: state,
+          ...(reasonCode === undefined ? {} : { reasonCode }),
           ...extra,
         };
         const compatibleKey = legacyIdempotencyKey !== undefined && db.prepare(
@@ -3991,7 +4076,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         ).get(projectId, legacyIdempotencyKey, mutationRequestDigest({ ...request, idempotencyKey: legacyIdempotencyKey })) !== undefined
           ? legacyIdempotencyKey
           : idempotencyKey;
-        return applyLiveAuthorizedMutation(bb, db, { ...request, idempotencyKey: compatibleKey }, false, terminalizationPolicy, githubSnapshot ? () => githubSnapshot : projectGithubIssueReader(db, projectId));
+        return applyLiveAuthorizedMutation(bb, db, { ...request, idempotencyKey: compatibleKey }, false, terminalizationPolicy, githubSnapshot ? () => githubSnapshot : projectGithubIssueReader(db, projectId), null, preMutationGuard);
       };
       const inspectWaitTargets = async (projectId: string) => {
         for (const workItem of openWorkItemsByProject.get(projectId) ?? []) {
@@ -4014,7 +4099,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           else waitExternalRevisions.set(key, observation);
         }
       };
-      const inspectLinkedWorkItems = async (projectId: string) => {
+      const inspectLinkedWorkItems = async (projectId: string, orchestrator: RoleHolderState, dispatcherThreadIds: Set<string>) => {
         // The handoff gate owns canonical ledger/attempt drift; this existing watchdog owns
         // external terminal drift. The active writer indexes remain the duplicate-claim detector.
         const linkedWorkItems = db.prepare(
@@ -4028,6 +4113,26 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
              AND external_work_refs.issue_number IS NOT NULL
            ORDER BY work_items.work_item_id`,
         ).all(projectId, ...WORK_ITEM_NON_TERMINAL_STATES, "succeeded") as Array<{ work_item_id: string; lifecycle_state: string; owner: string; repo: string; issue_number: number }>;
+        const reportMismatch = async (
+          linked: (typeof linkedWorkItems)[number],
+          snapshot: GitHubIssueSnapshot,
+          safety: Extract<MergeCloseSafety, { safe: false }>,
+        ) => {
+          const attempts = safety.attempts.length === 0 ? "none" : safety.attempts.map((attempt) =>
+            `executionAttemptId=${attempt.executionAttemptId}[assignmentId=${attempt.assignmentId ?? "null"},laneId=${attempt.laneId ?? "null"},threadId=${attempt.threadId ?? "null"},state=${attempt.state}]`).join(",");
+          const lanes = safety.lanes.length === 0 ? "none" : safety.lanes.map((lane) =>
+            `${lane.threadId}[laneId=${lane.laneId ?? "null"},status=${lane.status}]`).join(",");
+          const subject = `${safety.reason}|attempts=${attempts}|lanes=${lanes}`;
+          const sent = await wake(
+            projectId,
+            orchestrator,
+            fleetWatchdogMergeCloseMismatchKey(projectId, linked.work_item_id, snapshot.externalRevision, subject),
+            `fleet-watchdog merge-close mismatch: project=${projectId} workItem=${linked.work_item_id} issue=${linked.owner}/${linked.repo}#${linked.issue_number} externalRevision=${snapshot.externalRevision} reason=${safety.reason} attempts=${attempts} lanes=${lanes}; no stop or lifecycle transition is authorized.`,
+            false,
+            "owed-act",
+          );
+          if (sent) bb.log.warn(`fleet-watchdog merge-close mismatch reported: project=${projectId} workItem=${linked.work_item_id} reason=${safety.reason}`);
+        };
         for (const linked of linkedWorkItems) {
           const mapping = githubRepositoryMappingForWorkItem(db, projectId, linked.work_item_id, linked.owner, linked.repo);
           if (!mapping) {
@@ -4107,36 +4212,44 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
             continue;
           }
-          const transition = (state: "review_pending" | "succeeded" | "cancelled") => transitionWorkItem(
-            projectId,
-            linked.work_item_id,
-            state,
-            fleetWatchdogMergeCloseKey(projectId, linked.work_item_id, state, githubSnapshot.externalRevision),
-            state === "succeeded" || (state === "cancelled" && workItem.lifecycle_state === "proposed")
-              ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } }
-              : {},
-            githubSnapshot,
-            fleetWatchdogLegacyMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
-            "stop-active",
-          );
+          const safety = await readMergeCloseSafety(projectId, linked.work_item_id, dispatcherThreadIds);
+          if (!safety.safe) {
+            degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
+            await reportMismatch(linked, githubSnapshot, safety);
+            continue;
+          }
+          const finalNativeLaneGuard: PreMutationGuard = async () => {
+            const finalSafety = await readMergeCloseSafety(projectId, linked.work_item_id, dispatcherThreadIds);
+            if (finalSafety.safe) return null;
+            degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
+            await reportMismatch(linked, githubSnapshot, finalSafety);
+            return { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close safety refused: ${finalSafety.reason}` } satisfies FoundationResult;
+          };
+          const transition = async (state: "review_pending" | "succeeded" | "cancelled") => {
+            const latestSafety = await readMergeCloseSafety(projectId, linked.work_item_id, dispatcherThreadIds);
+            if (!latestSafety.safe) {
+              degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
+              await reportMismatch(linked, githubSnapshot, latestSafety);
+              return { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close safety refused: ${latestSafety.reason}` } satisfies FoundationResult;
+            }
+            return transitionWorkItem(
+              projectId,
+              linked.work_item_id,
+              state,
+              fleetWatchdogMergeCloseKey(projectId, linked.work_item_id, state, githubSnapshot.externalRevision),
+              state === "succeeded" || (state === "cancelled" && workItem.lifecycle_state === "proposed")
+                ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } }
+                : {},
+              githubSnapshot,
+              fleetWatchdogLegacyMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
+              "refuse-active",
+              "fleet-watchdog-merge-close",
+              finalNativeLaneGuard,
+            );
+          };
           let result: FoundationResult;
           if (workItem.lifecycle_state === "in_progress") {
-            result = await transition("review_pending");
-            if (result.outcome === "OK") {
-              const current = db.prepare(
-                "SELECT resource_revision, lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?",
-              ).get(projectId, linked.work_item_id) as { resource_revision: number; lifecycle_state: string } | undefined;
-              result = current?.lifecycle_state === "review_pending"
-                ? await transition("succeeded")
-                : {
-                  outcome: "WORK_ITEM_REVISION_STALE",
-                  subject: linked.work_item_id,
-                  expected: 1,
-                  attempted: 1,
-                  verified: 0,
-                  message: "work item changed before merge-close terminalization",
-                };
-            }
+            result = await transition("succeeded");
           } else if (workItem.lifecycle_state === "review_pending") {
             result = await transition("succeeded");
           } else if (workItem.lifecycle_state === "proposed") {
@@ -4146,7 +4259,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             result = { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close automation requires in_progress, review_pending, or proposed, found ${workItem.lifecycle_state}` };
           }
           if (result.outcome === "OK") {
-            bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=${workItem.lifecycle_state === "proposed" ? "proposed-cancel" : "review_pending"}`);
+            const via = workItem.lifecycle_state === "proposed" ? "proposed-cancel" : workItem.lifecycle_state === "in_progress" ? "direct-success" : "review_pending";
+            bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=${via}`);
           } else {
             degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
             bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result.outcome} message=${result.message}`);
@@ -4186,7 +4300,6 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         lanesByProject.set(projectId, lanes);
         const holders = holdersByProject.get(projectId) ?? [];
         try {
-          await inspectLinkedWorkItems(projectId);
           await inspectWaitTargets(projectId);
           const directors = holders.filter((holder) => holder.role_id === "director");
           const orchestrators = holders.filter((holder) => holder.role_id === "project-orchestrator");
@@ -4198,6 +4311,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           }
           const director = directors[0]!;
           const orchestrator = orchestrators[0]!;
+          await inspectLinkedWorkItems(projectId, orchestrator, dispatcherThreadIds);
           for (const holder of holders) {
             let thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
             if (thread.status !== "error" && thread.status !== "stopping") continue;

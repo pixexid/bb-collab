@@ -6444,7 +6444,7 @@ exit 1
       })).toMatchObject({ outcome: "OK", currentConfigRevision: 2 });
 
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
       expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, proposedWorkItemId)).toEqual({ lifecycle_state: "proposed" });
       expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, absorbedWorkItemId)).toEqual({ lifecycle_state: "cancelled" });
       expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, adversarialWorkItemId)).toEqual({ lifecycle_state: "proposed" });
@@ -6454,7 +6454,7 @@ exit 1
         message: expect.stringContaining("workItem=never-started-work-item outcome=WORK_ITEM_STATE_INVALID message=proposed cancellation requires a completed GitHub close observation"),
       }));
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
       expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
         level: "warn",
         message: expect.stringContaining("stale-terminal work item: project=proj_test workItem=work-item-1 linked=example/project#205 status=closed"),
@@ -6463,20 +6463,19 @@ exit 1
         level: "warn",
         message: expect.stringContaining("stale-terminal work item: project=proj_test workItem=merged-work-item linked=example/project#206 status=merged"),
       }));
-      expect(fixture.db.prepare("SELECT config_revision, lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, mergedWorkItemId)).toEqual({ config_revision: 1, lifecycle_state: "succeeded", resource_revision: 5 });
+      expect(fixture.db.prepare("SELECT config_revision, lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, mergedWorkItemId)).toEqual({ config_revision: 1, lifecycle_state: "in_progress", resource_revision: 3 });
       writeFileSync(phaseFile, "open-2\n");
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, mergedWorkItemId)).toEqual({ lifecycle_state: "ready" });
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 6, { idempotencyKey: "merged-work-item-restart", workItemId: mergedWorkItemId, expectedConfigRevision: 2, workAttempt: { laneId: "lane-merged-2", threadId: "thread-merged-2", assignmentKind: "write" } })).outcome).toBe("OK");
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, mergedWorkItemId)).toEqual({ lifecycle_state: "in_progress" });
       writeFileSync(phaseFile, "closed-3\n");
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, mergedWorkItemId)).toEqual({ lifecycle_state: "succeeded" });
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, mergedWorkItemId)).toEqual({ lifecycle_state: "in_progress" });
       expect(fixture.host.harness.inspection.logEntries).not.toContainEqual(expect.objectContaining({ message: expect.stringContaining("workItem=merged-work-item outcome=IDEMPOTENCY_KEY_CONFLICT") }));
-      expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal").all(PROJECT_ID, mergedWorkItemId)).toEqual([{ state: "done" }, { state: "done" }]);
-      expect(fixture.db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, racyWorkItemId)).toEqual({ lifecycle_state: "in_progress", resource_revision: 5 });
+      expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal").all(PROJECT_ID, mergedWorkItemId)).toEqual([{ state: "running" }]);
+      expect(fixture.db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, racyWorkItemId)).toEqual({ lifecycle_state: "in_progress", resource_revision: 3 });
       expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
         level: "warn",
-        message: expect.stringContaining("merge-close transition refused: project=proj_test workItem=racy-work-item outcome=WORK_ITEM_REVISION_STALE"),
+        message: expect.stringContaining("merge-close mismatch reported: project=proj_test workItem=racy-work-item reason=nonterminal-canonical-attempt"),
       }));
       expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
         level: "warn",
@@ -6497,9 +6496,105 @@ exit 1
         message: expect.stringContaining("github-work-item-status:proj_test:unreadable-work-item"),
       }));
       expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
-        level: "info",
-        message: expect.stringContaining("auto-terminalized merged and closed work item: project=proj_test workItem=merged-work-item via=review_pending"),
+        level: "warn",
+        message: expect.stringContaining("fleet-watchdog merge-close mismatch reported: project=proj_test workItem=merged-work-item reason=nonterminal-canonical-attempt"),
       }));
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["prepared", "armed", "content_delivered", "running", "dispatch_unknown"] as const)(
+    "keeps closed GH613 untouched for a nonterminal %s canonical attempt",
+    async (attemptState) => {
+      const bin = mkdtempSync(join(tmpdir(), "bb-collab-gh613-live-attempt-"));
+      const gh = join(bin, "gh");
+      writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[]'; exit 0; fi
+if [ "$1" = "api" ]; then printf '%s\\n' '[[]]'; exit 0; fi
+if [ "$1" = "pr" ]; then printf '%s\\n' '{"state":"MERGED","mergedAt":"2026-08-23T00:00:00Z"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"gh613-closed","closedByPullRequestsReferences":[{"number":623}]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"number":613,"title":"GH613","body":"","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"gh613-closed","url":"https://github.test/example/project/issues/613"}'; exit 0; fi
+exit 1
+`);
+      chmodSync(gh, 0o755);
+      const originalPath = process.env.PATH;
+      process.env.PATH = `${bin}:${originalPath ?? ""}`;
+      try {
+        const fixture = await fleetWatchdogFixture(0, true, 1, false);
+        const workItemId = "wi-gh-613";
+        expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+          idempotencyKey: "gh613-create", workItemId,
+          workItem: { workItemId, title: "GH613", body: "live attempt" },
+        })).outcome).toBe("OK");
+        expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { idempotencyKey: "gh613-ready", workItemId })).outcome).toBe("OK");
+        expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+          idempotencyKey: "gh613-start", workItemId,
+          workAttempt: { laneId: "lane-gh613", threadId: "thread-gh613", assignmentKind: "write" },
+        })).outcome).toBe("OK");
+        bindFixtureGithubIssue(fixture.db, 613, workItemId);
+        fixture.addNativeLane("thread-gh613", "active");
+        fixture.db.prepare("UPDATE execution_attempts SET state = ? WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'").run(attemptState, PROJECT_ID, workItemId);
+        seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: `gh613-plugin-${attemptState}`, actorKind: "plugin", subjectId: PLUGIN_ID });
+        const attempt = fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'").get(PROJECT_ID, workItemId) as { execution_attempt_id: string };
+
+        await fixture.host.harness.runSchedule("fleet-watchdog");
+        await fixture.host.harness.runSchedule("fleet-watchdog");
+
+        expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, workItemId)).toEqual({ lifecycle_state: "in_progress" });
+        expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, workItemId)).toEqual({ state: attemptState });
+        expect(fixture.host.harness.inspection.sdk.callsTo("threads.stop")).toHaveLength(0);
+        const reports = fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([request]) =>
+          (request as { input?: Array<{ text?: string }> }).input?.[0]?.text?.startsWith("fleet-watchdog merge-close mismatch:") === true,
+        );
+        expect(reports).toHaveLength(1);
+        expect((reports[0]![0] as { threadId: string }).threadId).toBe(fixture.orchestratorThreadId);
+        expect((reports[0]![0] as { input: Array<{ text: string }> }).input[0]!.text).toContain(`executionAttemptId=${attempt.execution_attempt_id}`);
+        expect((reports[0]![0] as { input: Array<{ text: string }> }).input[0]!.text).toContain("assignmentId=null");
+      } finally {
+        if (originalPath === undefined) delete process.env.PATH;
+        else process.env.PATH = originalPath;
+        rmSync(bin, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("blocks an active reused lane, incomplete inventory, and a late lane appearance", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-gh613-lane-safety-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[]'; exit 0; fi
+if [ "$1" = "api" ]; then printf '%s\\n' '[[]]'; exit 0; fi
+if [ "$1" = "pr" ]; then printf '%s\\n' '{"state":"MERGED","mergedAt":"2026-08-23T00:00:00Z"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"gh613-lane-closed","closedByPullRequestsReferences":[{"number":623}]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"number":613,"title":"GH613","body":"","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"gh613-lane-closed","url":"https://github.test/example/project/issues/613"}'; exit 0; fi
+exit 1
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      const workItemId = "wi-gh-613-lane";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, { idempotencyKey: "gh613-lane-create", workItemId, workItem: { workItemId, title: workItemId, body: workItemId } })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { idempotencyKey: "gh613-lane-ready", workItemId })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, { idempotencyKey: "gh613-lane-start", workItemId, workAttempt: { laneId: "lane-gh613-lane", threadId: "thread-gh613-lane", assignmentKind: "write" } })).outcome).toBe("OK");
+      bindFixtureGithubIssue(fixture.db, 613, workItemId);
+      fixture.addNativeLane("thread-gh613-lane", "active");
+      fixture.db.prepare("UPDATE execution_attempts SET state = 'done' WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'").run(PROJECT_ID, workItemId);
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "gh613-lane-plugin", actorKind: "plugin", subjectId: PLUGIN_ID });
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, workItemId)).toEqual({ lifecycle_state: "in_progress" });
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.stop")).toHaveLength(0);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([request]) => (request as { input?: Array<{ text?: string }> }).input?.[0]?.text?.startsWith("fleet-watchdog merge-close mismatch:") === true)).toHaveLength(1);
+
+      fixture.host.harness.sdk.stub("threads.list", (async () => { throw new Error("partial lane inventory"); }) as never);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, workItemId)).toEqual({ lifecycle_state: "in_progress" });
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.stop")).toHaveLength(0);
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
@@ -6807,6 +6902,98 @@ exit 1
       } finally {
         vi.useRealTimers();
       }
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("directly merge-closes an in-progress item only after complete absence proof", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-gh623-direct-merge-close-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[]'; exit 0; fi
+if [ "$1" = "api" ]; then printf '%s\\n' '[[]]'; exit 0; fi
+if [ "$1" = "pr" ]; then printf '%s\\n' '{"state":"MERGED","mergedAt":"2026-08-23T00:00:00Z"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"gh613-direct-closed","closedByPullRequestsReferences":[{"number":623}]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"number":613,"title":"GH613","body":"","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"gh613-direct-closed","url":"https://github.test/example/project/issues/613"}'; exit 0; fi
+exit 1
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      const workItemId = "wi-gh-613-direct";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, { idempotencyKey: "gh613-direct-create", workItemId, workItem: { workItemId, title: workItemId, body: workItemId } })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { idempotencyKey: "gh613-direct-ready", workItemId })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, { idempotencyKey: "gh613-direct-start", workItemId, workAttempt: { laneId: "lane-gh613-direct", threadId: "thread-gh613-direct", assignmentKind: "write" } })).outcome).toBe("OK");
+      bindFixtureGithubIssue(fixture.db, 613, workItemId);
+      fixture.addNativeLane("thread-gh613-direct", "idle");
+      fixture.db.prepare("UPDATE execution_attempts SET state = 'done' WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'").run(PROJECT_ID, workItemId);
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "gh613-direct-plugin", actorKind: "plugin", subjectId: PLUGIN_ID });
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, workItemId)).toEqual({ lifecycle_state: "succeeded" });
+      expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, workItemId)).toEqual({ state: "done" });
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.stop")).toHaveLength(0);
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "info",
+        message: expect.stringContaining("workItem=wi-gh-613-direct via=direct-success"),
+      }));
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a native lane that appears during the final merge-close guard", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-gh623-late-lane-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[]'; exit 0; fi
+if [ "$1" = "api" ]; then printf '%s\\n' '[[]]'; exit 0; fi
+if [ "$1" = "pr" ]; then printf '%s\\n' '{"state":"MERGED","mergedAt":"2026-08-23T00:00:00Z"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"gh613-late-closed","closedByPullRequestsReferences":[{"number":623}]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"number":613,"title":"GH613","body":"","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"gh613-late-closed","url":"https://github.test/example/project/issues/613"}'; exit 0; fi
+exit 1
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      const workItemId = "wi-gh-613-late";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, { idempotencyKey: "gh613-late-create", workItemId, workItem: { workItemId, title: workItemId, body: workItemId } })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { idempotencyKey: "gh613-late-ready", workItemId })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, { idempotencyKey: "gh613-late-start", workItemId, workAttempt: { laneId: "lane-gh613-late", threadId: "thread-gh613-late", assignmentKind: "write" } })).outcome).toBe("OK");
+      bindFixtureGithubIssue(fixture.db, 613, workItemId);
+      fixture.db.prepare("UPDATE execution_attempts SET state = 'done' WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'").run(PROJECT_ID, workItemId);
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "gh613-late-plugin", actorKind: "plugin", subjectId: PLUGIN_ID });
+      let listCalls = 0;
+      fixture.host.harness.sdk.stub("threads.list", (async ({ projectId }: { projectId?: string }) => {
+        listCalls += 1;
+        const lateLane = listCalls >= 4 ? [makeThreadResponse({ id: "thread-gh613-late", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active" })] : [];
+        return [
+          makeThreadResponse({ id: fixture.directorThreadId, projectId: PROJECT_ID, status: "idle" }),
+          makeThreadResponse({ id: fixture.orchestratorThreadId, projectId: PROJECT_ID, status: "idle" }),
+          ...lateLane,
+        ].filter((thread) => projectId === undefined || thread.projectId === projectId);
+      }) as never);
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      expect(listCalls).toBe(4);
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, workItemId)).toEqual({ lifecycle_state: "in_progress" });
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.stop")).toHaveLength(0);
+      const reports = fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([request]) =>
+        (request as { input?: Array<{ text?: string }> }).input?.[0]?.text?.startsWith("fleet-watchdog merge-close mismatch:") === true,
+      );
+      expect(reports).toHaveLength(1);
+      expect((reports[0]![0] as { input: Array<{ text: string }> }).input[0]!.text).toContain("reason=active-associated-native-lane");
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
@@ -8859,7 +9046,7 @@ else printf '%s\\n' '[]'; fi
 
   it("appends authority-root schema and bumps the runtime contract", () => {
     expect(SCHEMA_VERSION).toBe(30);
-    expect(RUNTIME_CONTRACT_VERSION).toBe(24);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(26);
     expect(MIGRATIONS).toHaveLength(43);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
@@ -8881,8 +9068,8 @@ else printf '%s\\n' '[]'; fi
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 29,
       newSchemaVersion: 30,
-      oldContractVersion: 23,
-      newContractVersion: 24,
+      oldContractVersion: 25,
+      newContractVersion: 26,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -8891,21 +9078,21 @@ else printf '%s\\n' '[]'; fi
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(20, 22))).toMatchObject({
       oldSchemaVersion: 29,
       newSchemaVersion: 30,
-      oldContractVersion: 23,
-      newContractVersion: 24,
+      oldContractVersion: 25,
+      newContractVersion: 26,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "refused", verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(30, 24))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(30, 26))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 29,
       newSchemaVersion: 30,
-      oldContractVersion: 23,
-      newContractVersion: 24,
+      oldContractVersion: 25,
+      newContractVersion: 26,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -9174,10 +9361,10 @@ else printf '%s\\n' '[]'; fi
   });
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
-    expect(RUNTIME_CONTRACT_VERSION).toBe(24);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(26);
     expect(SCHEMA_VERSION).toBe(30);
     expect(MIGRATIONS).toHaveLength(43);
-    expect(contractDigest).toBe("d2452097ed62cdd6e2e34b152812befa7cd10bddaeddb5e7183cd33711ab70ca");
+    expect(contractDigest).toBe("d4e51b0b1fd68957120cea5febb7762d6c3b9eddab76f67916e556830b062b83");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     const beforeRefusal = exportFoundation(db, PROJECT_ID);
@@ -9193,7 +9380,7 @@ else printf '%s\\n' '[]'; fi
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 30, observedContractVersion: 24 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 30, observedContractVersion: 26 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -9464,7 +9651,7 @@ else printf '%s\\n' '[]'; fi
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
       observedSchemaVersion: 30,
-      observedContractVersion: 24,
+      observedContractVersion: 26,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -9545,8 +9732,8 @@ else printf '%s\\n' '[]'; fi
       outcome: "OK",
       evidence: {
         cachedConsumers: {
-          oldContractVersion: 23,
-          newContractVersion: 24,
+          oldContractVersion: 25,
+          newContractVersion: 26,
           action: "unknown",
           expected: 4,
           attempted: 0,
@@ -9694,7 +9881,7 @@ else printf '%s\\n' '[]'; fi
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 30, schemaDigest, contractVersion: 24, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 30, schemaDigest, contractVersion: 26, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -13392,10 +13579,10 @@ else printf '%s\\n' '[]'; fi
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 23, newContractVersion: 24, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 23, newContractVersion: 24, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 23, newContractVersion: 24, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(30, 24))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 23, newContractVersion: 24, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 25, newContractVersion: 26, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 25, newContractVersion: 26, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 25, newContractVersion: 26, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(30, 26))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 25, newContractVersion: 26, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 
