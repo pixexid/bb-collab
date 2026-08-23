@@ -295,6 +295,15 @@ function navRows(root) {
 function rowsTitled(rows, title) {
   return rows.filter((row) => row.textContent?.trim() === title);
 }
+function resolveGlyph(row) {
+  const assets = Array.from(row.querySelectorAll("[data-plugin-icon-asset]"));
+  if (assets.length > 1) return { reason: `the ${INBOX_NAV_ROW_TITLE} row has ${assets.length} plugin icon assets, expected exactly 1` };
+  if (assets.length === 1) return { element: assets[0] };
+  const svgs = Array.from(row.querySelectorAll("svg"));
+  if (svgs.length > 1) return { reason: `the ${INBOX_NAV_ROW_TITLE} row has ${svgs.length} SVG glyphs and no plugin icon asset, expected exactly 1` };
+  if (svgs.length === 1) return { element: svgs[0] };
+  return { reason: `the ${INBOX_NAV_ROW_TITLE} row has neither a plugin icon asset nor an SVG glyph` };
+}
 function restoreAttribute(element, name, value) {
   if (value === null) element.removeAttribute(name);
   else element.setAttribute(name, value);
@@ -305,11 +314,8 @@ function restoreNavState(row) {
   if (snapshot === void 0) return;
   restoreAttribute(row, "aria-label", snapshot.ariaLabel);
   restoreAttribute(row, "title", snapshot.title);
-  const glyph = row.querySelector("svg");
-  if (glyph !== null) {
-    restoreAttribute(glyph, "class", snapshot.glyphClass);
-    restoreAttribute(glyph, "style", snapshot.glyphStyle);
-  }
+  restoreAttribute(snapshot.glyph, "class", snapshot.glyphClass);
+  restoreAttribute(snapshot.glyph, "style", snapshot.glyphStyle);
   navSnapshots.delete(row);
 }
 function paintInboxNavUnread(root, unread) {
@@ -322,20 +328,32 @@ function paintInboxNavUnread(root, unread) {
     return { matched: false, reason: `${matches.length} of the ${rows.length} rows in ${INBOX_NAV_REGION_SELECTOR} are titled ${JSON.stringify(INBOX_NAV_ROW_TITLE)}, expected exactly 1` };
   }
   const row = matches[0];
+  const resolution = resolveGlyph(row);
+  if ("reason" in resolution) {
+    restoreNavState(row);
+    return { matched: false, reason: resolution.reason };
+  }
+  const glyph = resolution.element;
   if (unread < 1) {
     restoreNavState(row);
     return { matched: true };
   }
-  if (!navSnapshots.has(row)) {
+  const current = navSnapshots.get(row);
+  if (current === void 0) {
     navSnapshots.set(row, {
       ariaLabel: row.getAttribute("aria-label"),
       title: row.getAttribute("title"),
-      glyphClass: row.querySelector("svg")?.getAttribute("class") ?? null,
-      glyphStyle: row.querySelector("svg")?.getAttribute("style") ?? null
+      glyph,
+      glyphClass: glyph.getAttribute("class"),
+      glyphStyle: glyph.getAttribute("style")
     });
+  } else if (current.glyph !== glyph) {
+    restoreAttribute(current.glyph, "class", current.glyphClass);
+    restoreAttribute(current.glyph, "style", current.glyphStyle);
+    navSnapshots.set(row, { ...current, glyph, glyphClass: glyph.getAttribute("class"), glyphStyle: glyph.getAttribute("style") });
   }
   row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
-  row.querySelector("svg")?.classList.add("text-primary");
+  glyph.classList.add("text-primary");
   const countLabel = `${unread} unread operator ${unread === 1 ? "message" : "messages"}`;
   const snapshot = navSnapshots.get(row);
   row.setAttribute("aria-label", `${snapshot.ariaLabel ?? INBOX_NAV_ROW_TITLE}, ${countLabel}`);
@@ -343,9 +361,10 @@ function paintInboxNavUnread(root, unread) {
   return { matched: true };
 }
 function glyphFingerprint(row) {
-  const asset = row.querySelector("[data-plugin-icon-asset]");
-  if (asset !== null) return `asset:${asset.getAttribute("data-plugin-icon-asset") ?? ""}`;
-  const shapes = Array.from(row.querySelectorAll("svg, svg *")).map((node) => {
+  const resolution = resolveGlyph(row);
+  if ("reason" in resolution) return null;
+  if (resolution.element.hasAttribute("data-plugin-icon-asset")) return `asset:${resolution.element.getAttribute("data-plugin-icon-asset") ?? ""}`;
+  const shapes = [resolution.element, ...Array.from(resolution.element.querySelectorAll("svg *"))].map((node) => {
     const geometry = RENDERING_ATTRIBUTES.flatMap((name) => {
       const value = node.getAttribute(name);
       return value === null ? [] : [`${name}=${value}`];

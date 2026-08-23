@@ -14,9 +14,12 @@ import {
 
 const MAIL = "M7 8.5L9.94 10.24a4 4 0 0 0 4.11 0L17 8.5";
 const GIT_BRANCH = "M7 19h6a3 3 0 0 0 3-3v-6";
+const ENVELOPE_ASSET = "./assets/envelope-simple-duotone.svg";
 
-function row(label: string, path: string | null, transform?: string): string {
-  const glyph = path === null ? "" : `<svg><path d="${path}"${transform === undefined ? "" : ` transform="${transform}"`}/></svg>`;
+function row(label: string, path: string | null, transform?: string, asset?: string | null): string {
+  const glyph = asset === null || asset === undefined
+    ? path === null ? "" : `<svg><path d="${path}"${transform === undefined ? "" : ` transform="${transform}"`}/></svg>`
+    : `<span data-plugin-icon-asset="${asset}" class="host-asset" style="mask-image:url(${asset})"></span>`;
   return `<button type="button">${glyph}<span>${label}</span></button>`;
 }
 
@@ -24,13 +27,15 @@ function navRegion({
   testid = "plugin-nav-sidebar-items",
   inboxLabel = INBOX_NAV_ROW_TITLE,
   inboxGlyph = MAIL as string | null,
+  inboxAsset = null as string | null,
   lanesGlyph = null as string | null,
+  lanesAsset = null as string | null,
   inboxTransform = undefined as string | undefined,
   extraRows = "",
 } = {}): HTMLElement {
   const region = document.createElement("div");
   region.setAttribute("data-testid", testid);
-  region.innerHTML = `${row("Lanes", lanesGlyph)}${row(inboxLabel, inboxGlyph, inboxTransform)}${extraRows}`;
+  region.innerHTML = `${row("Lanes", lanesGlyph, undefined, lanesAsset)}${row(inboxLabel, inboxGlyph, inboxTransform, inboxAsset)}${extraRows}`;
   document.body.append(region);
   return region;
 }
@@ -40,7 +45,7 @@ function inboxRow(): HTMLButtonElement {
 }
 
 function inboxGlyph(): Element | null {
-  return inboxRow().querySelector("svg");
+  return inboxRow().querySelector("[data-plugin-icon-asset]") ?? inboxRow().querySelector("svg");
 }
 
 function message(messageId: number, readAtMs: number | null) {
@@ -152,6 +157,64 @@ describe("inbox unread nav indicator", () => {
     expect(row.getAttribute("title")).toBe("Open Inbox");
     expect(inboxGlyph()?.getAttribute("class")).toBe("host-glyph");
     expect(inboxGlyph()?.getAttribute("style")).toBe("color: inherit");
+  });
+
+  it("paints asset masks, updates without accumulation, clears exact attrs, and survives unmount", () => {
+    // #given the compact host representation: a CSS-mask asset element, not an SVG
+    const region = navRegion({ inboxGlyph: null, inboxAsset: ENVELOPE_ASSET, lanesGlyph: GIT_BRANCH });
+    const row = inboxRow();
+    const asset = inboxGlyph()!;
+    const originalClass = asset.getAttribute("class");
+    const originalStyle = asset.getAttribute("style");
+    const originalChildren = row.children.length;
+
+    // #when / #then
+    expect(inspectInboxNavGlyph(document)).toEqual({ matched: true });
+    expect(paintInboxNavUnread(document, 2)).toEqual({ matched: true });
+    expect(asset.className).toBe("host-asset text-primary");
+    expect(row.classList.contains("text-primary")).toBe(false);
+    expect(row.lastElementChild?.className).toBe("");
+    expect(row.textContent).toBe(INBOX_NAV_ROW_TITLE);
+    expect(row.children.length).toBe(originalChildren);
+    expect(row.querySelector("[data-bb-collab-inbox-unread]")).toBeNull();
+    expect(row.getAttribute("aria-label")).toBe("Inbox, 2 unread operator messages");
+
+    paintInboxNavUnread(document, 4);
+    expect(asset.className).toBe("host-asset text-primary");
+    expect(row.children.length).toBe(originalChildren);
+    expect(row.getAttribute("aria-label")).toBe("Inbox, 4 unread operator messages");
+
+    paintInboxNavUnread(document, 0);
+    expect(asset.getAttribute("class")).toBe(originalClass);
+    expect(asset.getAttribute("style")).toBe(originalStyle);
+    expect(row.hasAttribute("aria-label")).toBe(false);
+    expect(row.hasAttribute("title")).toBe(false);
+
+    // #when the host unmounts and remounts its nav subtree
+    region.remove();
+    expect(document.querySelector(INBOX_NAV_REGION_SELECTOR)).toBeNull();
+    navRegion({ inboxGlyph: null, inboxAsset: ENVELOPE_ASSET, lanesGlyph: GIT_BRANCH });
+    expect(paintInboxNavUnread(document, 1)).toEqual({ matched: true });
+    expect(inboxGlyph()?.className).toBe("host-asset text-primary");
+    expect(inboxRow().getAttribute("aria-label")).toBe("Inbox, 1 unread operator message");
+    expect(document.querySelector("[data-bb-collab-inbox-unread]")).toBeNull();
+  });
+
+  it("fails closed when the Inbox glyph is missing or ambiguous", () => {
+    // #given neither supported host representation exists
+    navRegion({ inboxGlyph: null, inboxAsset: null });
+    const missing = paintInboxNavUnread(document, 1);
+    expect(missing.matched).toBe(false);
+    expect(missing.matched === false ? missing.reason : "").toContain("neither");
+
+    // #given two asset elements could both be the host-owned glyph
+    document.body.innerHTML = "";
+    navRegion({ inboxGlyph: null, inboxAsset: ENVELOPE_ASSET, lanesGlyph: GIT_BRANCH });
+    inboxRow().insertAdjacentHTML("afterbegin", `<span data-plugin-icon-asset="${ENVELOPE_ASSET}" class="second-asset"></span>`);
+    const ambiguous = paintInboxNavUnread(document, 1);
+    expect(ambiguous.matched).toBe(false);
+    expect(ambiguous.matched === false ? ambiguous.reason : "").toContain("expected exactly 1");
+    expect(inboxRow().className).not.toContain("text-primary");
   });
 
   it("reports broken when the host renames the region test id", () => {
