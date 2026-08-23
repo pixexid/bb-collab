@@ -870,14 +870,13 @@ function installGithubBriefGh(snapshot: { title: string; body: string; state: "o
   const allComments = Array.from({ length: 48 }, (_, index) => ({ id: 48 - index, body: `comment-${48 - index}`, updated_at: `comment-revision-${48 - index}` }));
   const recent = JSON.stringify(allComments.slice(0, 8));
   const older = JSON.stringify(options.incomplete ? { not: "comments" } : allComments.slice(8, 16));
-  writeFileSync(gh, `#!/bin/sh
-printf '%s\\n' "$*" >> '${calls}'
-connector_host=default
-if [ "$1" = --hostname ]; then
-  connector_host="$2"
-  if [ "$2" = '${options.slowConnectorHost ?? ""}' ]; then touch '${slowStarted}'; sleep 2; touch '${slowFinished}'; fi
-  shift 2
-fi
+writeFileSync(gh, `#!/bin/sh
+printf 'GH_HOST=%s args=%s\\n' "\${GH_HOST:-}" "$*" >> '${calls}'
+for arg in "$@"; do
+  if [ "$arg" = --hostname ]; then exit 64; fi
+done
+connector_host="\${GH_HOST:-default}"
+if [ "$connector_host" = '${options.slowConnectorHost ?? ""}' ]; then touch '${slowStarted}'; sleep 2; touch '${slowFinished}'; fi
 if [ "$connector_host" = '${options.slowConnectorHost ?? ""}' ]; then state_file='${slowTransitioned}'; else state_file='${fastTransitioned}'; fi
 if [ "$1" = issue ]; then
   if [ -f "$state_file" ]; then printf '%s\\n' '${transitionedIssue}'; else printf '%s\\n' '${issue}'; fi
@@ -5176,7 +5175,8 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       const calls = restore.readCallsAndCleanup();
       expect(calls.match(/page=1/gu)).toHaveLength(2);
       expect(calls.match(/page=2/gu)).toHaveLength(2);
-      expect(calls).toContain(CONNECTOR_HOST);
+      expect(calls).toMatch(new RegExp(`GH_HOST=${CONNECTOR_HOST}`));
+      expect(calls).not.toContain("--hostname");
       expect(calls).not.toContain("--paginate");
       expect(calls).not.toContain("page=3");
     } finally {
@@ -5188,6 +5188,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     const slow = await currentGithubBriefDispatch("project-a", "slow.github.test");
     const fast = await currentGithubBriefDispatch("project-b", CONNECTOR_HOST);
     const restore = installGithubBriefGh(slow.snapshot, { transitionSnapshot: slow.transitionSnapshot, slowConnectorHost: "slow.github.test" });
+    const inheritedHost = process.env.GH_HOST;
     try {
       let slowSettled = false;
       const slowCommandStarted = restore.waitForSlowCommandStart();
@@ -5209,10 +5210,33 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       expect(slowSettled).toBe(false);
       expect(restore.slowCommandFinished()).toBe(false);
       expect((await slowResult).outcome).toBe("OK");
+      expect(process.env.GH_HOST).toBe(inheritedHost);
+      const calls = restore.readCallsAndCleanup();
+      expect(calls).toContain("GH_HOST=slow.github.test");
+      expect(calls).toContain(`GH_HOST=${CONNECTOR_HOST}`);
+      expect(calls).not.toContain("--hostname");
     } finally {
       restore.cleanup();
     }
   }, 30_000);
+
+  it("refuses a malformed configured connector host before durable dispatch intent", async () => {
+    const fixture = await currentGithubBriefDispatch();
+    const configRow = fixture.fixture.db.prepare(
+      "SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = 1",
+    ).get(PROJECT_ID) as { canonical_config_json: string };
+    const config = JSON.parse(configRow.canonical_config_json) as { extensions: { bbCollab: { githubIssues: { repositoryMappings: Array<{ connectorHost: string }> } } } };
+    config.extensions.bbCollab.githubIssues.repositoryMappings[0]!.connectorHost = "https://foreign host";
+    fixture.fixture.db.prepare("UPDATE project_config_revisions SET canonical_config_json = ? WHERE project_id = ? AND config_revision = 1")
+      .run(JSON.stringify(config), PROJECT_ID);
+    const result = JSON.parse(await fixture.fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: fixture.request,
+      spawn: dispatchSpawn(fixture.fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId: fixture.fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("EXTERNAL_UNAVAILABLE");
+    expect(fixture.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(fixture.fixture.db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ count: 0 });
+  });
 
   it("refuses production comment completeness when the bounded older-page read fails", async () => {
     const projected = await currentGithubBriefDispatch();

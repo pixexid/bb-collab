@@ -22999,13 +22999,21 @@ var ROLE_QUEUE_CACHE_MS = 2e4;
 var ROLE_QUEUE_IDLE_THRESHOLD_MS = 3e4;
 var ROLE_QUEUE_OBSERVATION_MS = 1e3;
 var FLEET_WATCHDOG_LANE_INVENTORY_TIMEOUT_MS = 1e3;
-function githubCommandArgs(args, connectorHost) {
-  return connectorHost ? ["--hostname", connectorHost, ...args] : args;
+var githubConnectorHostPattern = /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?::[1-9][0-9]{0,4})?$/u;
+var githubRefPartPattern = /^[A-Za-z0-9_.-]+$/u;
+function validGithubConnectorHost(value) {
+  return typeof value === "string" && githubConnectorHostPattern.test(value);
+}
+function githubCommandEnvironment(connectorHost) {
+  if (connectorHost === void 0) return process.env;
+  return validGithubConnectorHost(connectorHost) ? { ...process.env, GH_HOST: connectorHost } : null;
 }
 function githubJson(args, connectorHost) {
   try {
-    const options = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1e4, killSignal: "SIGKILL", detached: true };
-    const result2 = spawnSync2("gh", githubCommandArgs(args, connectorHost), options);
+    const env = githubCommandEnvironment(connectorHost);
+    if (!env) return null;
+    const options = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1e4, killSignal: "SIGKILL", detached: true, env };
+    const result2 = spawnSync2("gh", args, options);
     if (typeof result2.pid === "number" && result2.pid > 0) {
       try {
         process.kill(-result2.pid, "SIGKILL");
@@ -23020,8 +23028,10 @@ function githubJson(args, connectorHost) {
   }
 }
 function githubJsonAsync(args, connectorHost) {
+  const env = githubCommandEnvironment(connectorHost);
+  if (!env) return Promise.resolve(null);
   return new Promise((resolve3) => {
-    execFile("gh", githubCommandArgs(args, connectorHost), { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL" }, (error48, stdout) => {
+    execFile("gh", args, { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL", env }, (error48, stdout) => {
       if (error48) {
         resolve3(null);
         return;
@@ -23254,7 +23264,7 @@ function githubCliAdapterForWorkItem(db, projectId, workItemId) {
     const config2 = JSON.parse(row.canonical_config_json);
     const mappings = config2.extensions?.bbCollab?.githubIssues?.repositoryMappings;
     if (!Array.isArray(mappings)) return null;
-    const matches = mappings.filter((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate) && candidate.repoTargetId === row.repo_target_id && typeof candidate.owner === "string" && typeof candidate.repo === "string" && typeof candidate.connectorHost === "string");
+    const matches = mappings.filter((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate) && candidate.repoTargetId === row.repo_target_id && typeof candidate.owner === "string" && githubRefPartPattern.test(candidate.owner) && typeof candidate.repo === "string" && githubRefPartPattern.test(candidate.repo) && validGithubConnectorHost(candidate.connectorHost));
     if (matches.length !== 1) return null;
     const mapping = matches[0];
     const connectorHost = mapping.connectorHost;
