@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
+export { acceptProvisionalReview, initialReviewAcceptanceState } from "./review-verdict-acceptance.mjs";
 
 const PAGE_SIZE = 1_000;
 const ACTIVE_PROFILE = Symbol("active profile");
@@ -177,12 +178,19 @@ function settle(turns, profiles, source, { absentReason = "provider-native turn 
   };
 }
 
-export async function readExecutedProfiles({ thread, environment, events, home = homedir(), env = process.env }) {
+export async function readExecutedProfiles({ thread, environment, events, expectedTurnId, home = homedir(), env = process.env }) {
   const active = activeTurn(thread, events);
   if (active?.reason) {
     return { outcome: "unknown", coverage: { activeTurns: 1, completedTurns: 0, knownTurns: 0, unknownTurns: 1, observedOnlyTurns: 0 }, turns: [], reason: active.reason };
   }
-  const turns = active ? [active.turn] : completedTurns(events);
+  const allTurns = active ? [active.turn] : completedTurns(events);
+  const turns = expectedTurnId === undefined
+    ? allTurns
+    : allTurns.filter((turn) => turn.scopeTurnId === expectedTurnId);
+  if (expectedTurnId !== undefined && turns.length !== 1) {
+    const reason = `exact requested turn is unavailable or ambiguous: expected ${expectedTurnId}, found ${turns.length}`;
+    return { outcome: "unknown", coverage: { ...(active ? { activeTurns: 1 } : {}), completedTurns: turns.length, knownTurns: 0, unknownTurns: turns.length || 1, observedOnlyTurns: 0 }, turns, reason };
+  }
   const providerThreadIds = [...new Set(turns.map((turn) => turn.providerThreadId).filter(Boolean))];
   if (providerThreadIds.length !== 1) {
     const reason = active ? "active BB turn does not resolve to one provider session" : "BB completions do not resolve to one provider session";
@@ -373,10 +381,11 @@ function parseArgs(argv) {
   for (let index = 0; index < argv.length; index += 2) args.set(argv[index], argv[index + 1]);
   const projectId = args.get("--project");
   const threadId = args.get("--thread") ?? process.env.BB_THREAD_ID;
-  if (!projectId || !threadId || [...args.keys()].some((key) => key !== "--project" && key !== "--thread")) {
-    throw new Error("usage: node scripts/read-executed-profile.mjs --project <project-id> [--thread <thread-id>]");
+  const turnId = args.get("--turn");
+  if (!projectId || !threadId || [...args.keys()].some((key) => !["--project", "--thread", "--turn"].includes(key))) {
+    throw new Error("usage: node scripts/read-executed-profile.mjs --project <project-id> [--thread <thread-id>] [--turn <turn-id>]");
   }
-  return { projectId, threadId };
+  return { projectId, threadId, turnId };
 }
 
 function bbJson(args) {
@@ -400,11 +409,11 @@ function readAllEvents(threadId) {
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  const { projectId, threadId } = parseArgs(argv);
+  const { projectId, threadId, turnId } = parseArgs(argv);
   const shown = bbJson(["thread", "show", threadId, "--json"]);
   if (shown?.thread?.id !== threadId || shown.thread.projectId !== projectId) throw new Error("thread does not belong to the exact project");
   const events = readAllEvents(threadId);
-  const result = await readExecutedProfiles({ thread: shown.thread, environment: shown.environment, events });
+  const result = await readExecutedProfiles({ thread: shown.thread, environment: shown.environment, events, expectedTurnId: turnId });
   const environmentDependent = environmentDependentFromEvents(shown.thread, events);
   console.log(JSON.stringify({ threadId, projectId, providerId: shown.thread.providerId, environmentDependent, ...result }, null, 2));
   if (result.outcome === "unknown") process.exitCode = 2;
