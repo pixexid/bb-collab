@@ -21062,6 +21062,112 @@ function applyGithubIssueProjection(db, request, digest2, adapter) {
     }
   }
 }
+async function applyGithubIssueProjectionAsync(db, request, digest2, adapter) {
+  if (!adapter.readAsync || !adapter.mutateAsync) return applyGithubIssueProjection(db, request, digest2, adapter);
+  try {
+    const replay = checkIdempotency(db, request, digest2);
+    if (replay) return replay;
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+  }
+  if (!adapter.available) return result("EXTERNAL_UNAVAILABLE", request.projectId, 1, 0, 0, { message: "the GitHub Issues adapter is unavailable" });
+  let context;
+  try {
+    const prepared = prepareProjection(db, request, digest2, adapter);
+    if ("outcome" in prepared) return prepared;
+    context = prepared;
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+  }
+  let mutation;
+  if (context.ref.issue_number === null) {
+    mutation = {
+      kind: "create",
+      owner: context.mapping.owner,
+      repo: context.mapping.repo,
+      title: context.desired.title,
+      body: context.desired.body,
+      state: context.desired.state,
+      addLabels: context.desired.managedLabels,
+      removeLabels: []
+    };
+  } else {
+    let current;
+    try {
+      current = await adapter.readAsync(context.mapping.owner, context.mapping.repo, context.ref.issue_number);
+      if (current === null) return result("EXTERNAL_NOT_FOUND", request.projectId, 1, 1, 0, { message: "the bound GitHub issue was not found" });
+      current = parseSnapshot(current);
+    } catch (error48) {
+      if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+      return result("EXTERNAL_UNAVAILABLE", request.projectId, 1, 1, 0, { message: "the bound GitHub issue could not be read" });
+    }
+    if (current.owner !== context.mapping.owner || current.repo !== context.mapping.repo || current.issueNumber !== context.ref.issue_number) {
+      return result("EXTERNAL_TARGET_MISMATCH", request.projectId, 1, 1, 0, { message: "the GitHub issue response has the wrong exact identity" });
+    }
+    const initialBinding = context.ref.projection_state === "pending" && context.ref.issue_number !== null && context.ref.observed_external_digest === null;
+    if (!initialBinding && (!context.ref.observed_external_digest || observedDigest(current, context.desired) !== context.ref.observed_external_digest)) {
+      try {
+        return recordProjectionState(db, request, digest2, context, "drifted", "EXTERNAL_DIVERGED", { expected: 1, attempted: 1, verified: 0 }, "the GitHub issue diverged from its last verified projection");
+      } catch {
+        return result("EXTERNAL_DIVERGED", request.projectId, 1, 1, 0, { message: "the GitHub issue diverged from its last verified projection" });
+      }
+    }
+    if (observedDigest(current, context.desired) === context.desired.digest) {
+      try {
+        return finalizeProjection(db, request, digest2, context, adapter, current, "verify");
+      } catch (error48) {
+        if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+        return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+      }
+    }
+    try {
+      context = reserveExistingProjection(db, request, digest2, context);
+    } catch (error48) {
+      if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+      return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+    }
+    const currentLabels = new Set(current.labels);
+    mutation = {
+      kind: "update",
+      owner: context.mapping.owner,
+      repo: context.mapping.repo,
+      issueNumber: context.ref.issue_number,
+      title: context.desired.title,
+      body: context.desired.body,
+      state: context.desired.state,
+      addLabels: context.desired.managedLabels.filter((label) => !currentLabels.has(label)),
+      removeLabels: current.labels.filter((label) => context.desired.managedNames.has(label) && !context.desired.managedLabels.includes(label))
+    };
+  }
+  try {
+    const mutationResponse = parseSnapshot(await adapter.mutateAsync(mutation));
+    if (mutationResponse.owner !== mutation.owner || mutationResponse.repo !== mutation.repo || mutation.issueNumber !== void 0 && mutationResponse.issueNumber !== mutation.issueNumber) throw new GitHubIssueAdapterError("ambiguous");
+    const readBackValue = await adapter.readAsync(mutation.owner, mutation.repo, mutationResponse.issueNumber);
+    if (readBackValue === null) throw new GitHubIssueAdapterError("ambiguous");
+    const readBack = parseSnapshot(readBackValue);
+    if (readBack.owner !== mutation.owner || readBack.repo !== mutation.repo || readBack.issueNumber !== mutationResponse.issueNumber) {
+      throw new GitHubIssueAdapterError("ambiguous");
+    }
+    return finalizeProjection(db, request, digest2, context, adapter, readBack, mutation.kind);
+  } catch {
+    try {
+      return recordProjectionState(
+        db,
+        request,
+        digest2,
+        context,
+        "delivery_ambiguous",
+        "EXTERNAL_DELIVERY_AMBIGUOUS",
+        { expected: 1, attempted: 1, verified: 0 },
+        "GitHub delivery or exact read-back could not be proven"
+      );
+    } catch {
+      return result("EXTERNAL_DELIVERY_AMBIGUOUS", request.projectId, 1, 1, 0, { message: "GitHub delivery or local finalization could not be proven" });
+    }
+  }
+}
 function isConstraintError(error48) {
   return error48 instanceof Error && /constraint|unique|busy|locked/iu.test(error48.message);
 }
@@ -21078,6 +21184,25 @@ function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, dryRun);
+}
+async function applyAuthorizedMutationAsync(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, dryRun = false) {
+  let request;
+  try {
+    request = parseApplyRequest(input);
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult("apply", error48.data);
+    return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error48) });
+  }
+  if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
+  if (request.operationClass !== "github_issue_projection" || !githubAdapter?.readAsync || !githubAdapter.mutateAsync) {
+    return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, dryRun);
+  }
+  try {
+    return await applyGithubIssueProjectionAsync(db, request, mutationRequestDigest(request), githubAdapter);
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
+  }
 }
 function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, dryRun = false) {
   let request;
@@ -22874,10 +22999,13 @@ var ROLE_QUEUE_CACHE_MS = 2e4;
 var ROLE_QUEUE_IDLE_THRESHOLD_MS = 3e4;
 var ROLE_QUEUE_OBSERVATION_MS = 1e3;
 var FLEET_WATCHDOG_LANE_INVENTORY_TIMEOUT_MS = 1e3;
-function githubJson(args) {
+function githubCommandArgs(args, connectorHost) {
+  return connectorHost ? ["--hostname", connectorHost, ...args] : args;
+}
+function githubJson(args, connectorHost) {
   try {
     const options = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1e4, killSignal: "SIGKILL", detached: true };
-    const result2 = spawnSync2("gh", args, options);
+    const result2 = spawnSync2("gh", githubCommandArgs(args, connectorHost), options);
     if (typeof result2.pid === "number" && result2.pid > 0) {
       try {
         process.kill(-result2.pid, "SIGKILL");
@@ -22891,9 +23019,9 @@ function githubJson(args) {
     return null;
   }
 }
-function githubJsonAsync(args) {
+function githubJsonAsync(args, connectorHost) {
   return new Promise((resolve3) => {
-    execFile("gh", args, { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL" }, (error48, stdout) => {
+    execFile("gh", githubCommandArgs(args, connectorHost), { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL" }, (error48, stdout) => {
       if (error48) {
         resolve3(null);
         return;
@@ -22993,8 +23121,8 @@ async function linkedGithubObservationAsync(owner, repo, issueNumber) {
   const updatedAtMs = Date.parse(externalRevision);
   return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason: stateReason === "" || stateReason === null ? void 0 : stateReason, externalRevision, updatedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : null };
 }
-async function readGithubIssueForBackfillAsync(owner, repo, issueNumber) {
-  const value = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"]);
+async function readGithubIssueForBackfillAsync(owner, repo, issueNumber, connectorHost) {
+  const value = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"], connectorHost);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
   const record2 = value;
   if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !validGithubStateReason(record2.state, record2.stateReason) || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
@@ -23045,22 +23173,22 @@ function parseGithubIssueComments(value) {
     return { id: String(record2.id), body: record2.body, externalRevision: record2.updated_at };
   }).reverse();
 }
-async function readGithubIssueBriefAsync(db, projectId, workItemId) {
+async function readGithubIssueBriefAsync(db, projectId, workItemId, connectorHost) {
   const target = githubIssueBriefTarget(db, projectId, workItemId);
   if (!target || !projectionIsCurrent(target)) throw new Error("GitHub issue projection is unavailable for the current WorkItem revision");
-  const issue2 = await readGithubIssueForBackfillAsync(target.owner, target.repo, target.issueNumber);
+  const issue2 = await readGithubIssueForBackfillAsync(target.owner, target.repo, target.issueNumber, connectorHost);
   if (issue2.externalRevision !== target.projection.observedExternalRevision) throw new Error("GitHub issue body freshness does not match the current projection");
   const firstPage = await githubJsonAsync([
     "api",
     `repos/${target.owner}/${target.repo}/issues/${target.issueNumber}/comments?per_page=${GITHUB_ISSUE_COMMENT_TAIL_LIMIT}&page=1&sort=created&direction=desc`
-  ]);
+  ], connectorHost);
   const comments = parseGithubIssueComments(firstPage);
   let commentsCapped = false;
   if (comments.length === GITHUB_ISSUE_COMMENT_TAIL_LIMIT) {
     const secondPage = await githubJsonAsync([
       "api",
       `repos/${target.owner}/${target.repo}/issues/${target.issueNumber}/comments?per_page=${GITHUB_ISSUE_COMMENT_TAIL_LIMIT}&page=2&sort=created&direction=desc`
-    ]);
+    ], connectorHost);
     const olderComments = parseGithubIssueComments(secondPage);
     commentsCapped = olderComments.length > 0;
   }
@@ -23089,8 +23217,8 @@ ${brief.content}` };
     input: [...spawn.input, { type: "text", visibility: "agent-only", text: brief.content, mentions: [] }]
   };
 }
-function readGithubIssueForBackfill(owner, repo, issueNumber) {
-  const value = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"]);
+function readGithubIssueForBackfill(owner, repo, issueNumber, connectorHost) {
+  const value = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"], connectorHost);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
   const record2 = value;
   if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !validGithubStateReason(record2.state, record2.stateReason) || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
@@ -23123,18 +23251,21 @@ function githubCliAdapterForWorkItem(db, projectId, workItemId) {
     if (!Array.isArray(mappings)) return null;
     const mapping = mappings.find((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate) && candidate.repoTargetId === row.repo_target_id && typeof candidate.connectorHost === "string");
     if (!mapping) return null;
+    const connectorHost = mapping.connectorHost;
     return {
-      connectorHost: mapping.connectorHost,
+      connectorHost,
       available: true,
-      read: readGithubIssueForBackfill,
-      mutate: githubCliMutation
+      read: (owner, repo, issueNumber) => readGithubIssueForBackfill(owner, repo, issueNumber, connectorHost),
+      mutate: (input) => githubCliMutation(input, connectorHost),
+      readAsync: (owner, repo, issueNumber) => readGithubIssueForBackfillAsync(owner, repo, issueNumber, connectorHost),
+      mutateAsync: (input) => githubCliMutationAsync(input, connectorHost)
     };
   } catch {
     return null;
   }
 }
-function githubCliMutation(input) {
-  const current = input.kind === "update" ? readGithubIssueForBackfill(input.owner, input.repo, input.issueNumber) : null;
+function githubCliMutation(input, connectorHost) {
+  const current = input.kind === "update" ? readGithubIssueForBackfill(input.owner, input.repo, input.issueNumber, connectorHost) : null;
   const labels = [...new Set([
     ...current?.labels ?? [],
     ...input.addLabels
@@ -23153,11 +23284,39 @@ function githubCliMutation(input) {
     ...labels.flatMap((label) => ["-f", `labels[]=${label}`])
   ];
   if (input.state === "closed") args.push("-f", "state_reason=completed");
-  const response = githubJson(args);
+  const response = githubJson(args, connectorHost);
   const responseNumber = response && typeof response === "object" && !Array.isArray(response) ? response.number : void 0;
   const issueNumber = input.kind === "create" ? responseNumber : input.issueNumber;
   if (typeof issueNumber !== "number" || !Number.isSafeInteger(issueNumber) || issueNumber < 1) throw new Error("GitHub issue mutation identity was not confirmed");
-  const snapshot2 = readGithubIssueForBackfill(input.owner, input.repo, issueNumber);
+  const snapshot2 = readGithubIssueForBackfill(input.owner, input.repo, issueNumber, connectorHost);
+  if (snapshot2.owner !== input.owner || snapshot2.repo !== input.repo || snapshot2.issueNumber !== issueNumber) throw new Error("GitHub issue mutation identity changed");
+  return snapshot2;
+}
+async function githubCliMutationAsync(input, connectorHost) {
+  const current = input.kind === "update" ? await readGithubIssueForBackfillAsync(input.owner, input.repo, input.issueNumber, connectorHost) : null;
+  const labels = [...new Set([
+    ...current?.labels ?? [],
+    ...input.addLabels
+  ].filter((label) => !input.removeLabels.includes(label)))].sort();
+  const args = [
+    "api",
+    input.kind === "create" ? `repos/${input.owner}/${input.repo}/issues` : `repos/${input.owner}/${input.repo}/issues/${input.issueNumber}`,
+    "--method",
+    input.kind === "create" ? "POST" : "PATCH",
+    "-f",
+    `title=${input.title}`,
+    "-f",
+    `body=${input.body}`,
+    "-f",
+    `state=${input.state}`,
+    ...labels.flatMap((label) => ["-f", `labels[]=${label}`])
+  ];
+  if (input.state === "closed") args.push("-f", "state_reason=completed");
+  const response = await githubJsonAsync(args, connectorHost);
+  const responseNumber = response && typeof response === "object" && !Array.isArray(response) ? response.number : void 0;
+  const issueNumber = input.kind === "create" ? responseNumber : input.issueNumber;
+  if (typeof issueNumber !== "number" || !Number.isSafeInteger(issueNumber) || issueNumber < 1) throw new Error("GitHub issue mutation identity was not confirmed");
+  const snapshot2 = await readGithubIssueForBackfillAsync(input.owner, input.repo, issueNumber, connectorHost);
   if (snapshot2.owner !== input.owner || snapshot2.repo !== input.repo || snapshot2.issueNumber !== issueNumber) throw new Error("GitHub issue mutation identity changed");
   return snapshot2;
 }
@@ -23680,6 +23839,10 @@ async function dispatchLane(bb, db, input) {
   if (briefTarget && !projectionIsCurrent(briefTarget)) {
     return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection is stale or ambiguous for the canonical WorkItem" };
   }
+  const githubAdapter = briefTarget ? githubCliAdapterForWorkItem(db, request.projectId, request.workItemId ?? "") : null;
+  if (briefTarget && !githubAdapter) {
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub projection capability is unavailable for the current WorkItem" };
+  }
   let initialBrief = null;
   const dispatchParentThreadId = spawnShape.data.parentThreadId;
   const dispatchTitle = String(spawnShape.data.title ?? "lane");
@@ -23690,20 +23853,19 @@ async function dispatchLane(bb, db, input) {
     ...request,
     reasonCode: legacyReplay ? `dispatch_parent:${dispatchParentThreadId}` : `dispatch_parent:${dispatchParentThreadId}:title=${encodeURIComponent(dispatchTitle)}`,
     workAttempt: intentAttempt
-  }, false, "stop-active");
+  }, false, "stop-active", githubAdapter?.read ?? readGithubIssueForBackfill, githubAdapter);
   if (intent.outcome !== "OK") return intent;
   return serializeDispatchRecovery(request, async () => {
     let dispatchSpawn = spawnShape.data;
     if (briefTarget) {
-      const githubAdapter = githubCliAdapterForWorkItem(db, request.projectId, request.workItemId ?? "");
       const currentWorkItem = db?.prepare(
         "SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?"
       ).get(request.projectId, request.workItemId ?? "");
-      if (!githubAdapter || !currentWorkItem || !Number.isSafeInteger(currentWorkItem.resource_revision)) {
+      if (!currentWorkItem || !Number.isSafeInteger(currentWorkItem.resource_revision)) {
         return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub projection capability is unavailable for the current WorkItem" };
       }
       const { lifecycleState: _lifecycleState, workAttempt: _workAttempt, reasonCode: _reasonCode, ...projectionBase } = request;
-      const projection = await applyLiveAuthorizedMutation(bb, db, {
+      const projection = await applyLiveAuthorizedMutationAsync(bb, db, {
         ...projectionBase,
         operationClass: "github_issue_projection",
         idempotencyKey: `${request.idempotencyKey}:maintained-body`,
@@ -23713,13 +23875,13 @@ async function dispatchLane(bb, db, input) {
       }, false, "refuse-active", readGithubIssueForBackfill, githubAdapter);
       if (projection.outcome !== "OK") return projection;
       try {
-        initialBrief = (await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "")).brief;
+        initialBrief = (await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "", githubAdapter?.connectorHost)).brief;
       } catch {
         return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub issue body, projection, and comment-tail source is unavailable" };
       }
       let latestRead;
       try {
-        latestRead = await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "");
+        latestRead = await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "", githubAdapter?.connectorHost);
       } catch {
         return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub issue body and comment-tail reread is unavailable" };
       }
@@ -23923,6 +24085,20 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
   const result2 = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader);
+  await deliverSucceededSeatBrief(bb, db, input, result2);
+  return result2;
+}
+async function applyLiveAuthorizedMutationAsync(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = readGithubIssueForBackfill, githubAdapter = null) {
+  const parsed = applyRequestSchema.safeParse(input);
+  if (parsed.success) {
+    const laneGuard = await prepareWorkItemAttemptTerminalization(bb, db, parsed.data, terminalizationPolicy);
+    if (laneGuard) return laneGuard;
+  }
+  if (!allowCachedConsumerRollout && parsed.success && parsed.data.decisionEvidence?.some((evidence) => evidence.evidenceId === "cached-consumer-v22-rollout-receipt")) {
+    return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
+  }
+  const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
+  const result2 = await applyAuthorizedMutationAsync(db, input, githubAdapter, reader, null, null, githubIssueReader);
   await deliverSucceededSeatBrief(bb, db, input, result2);
   return result2;
 }
