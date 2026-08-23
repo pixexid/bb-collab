@@ -109,12 +109,22 @@ const fleetWatchdogLegacyBlockerFiredKey = (workItemId: string, subject: string)
 export const fleetWatchdogRoleLivenessKey = (holder: RoleHolderState) => fleetWatchdogCompositeKey(
   holder.project_id, holder.role_id, String(holder.role_generation), holder.execution_attempt_id, holder.thread_id,
 );
-export const fleetWatchdogEpisodeKey = (holder: RoleHolderState, queueHead: string) => fleetWatchdogCompositeKey(
-  holder.project_id, holder.role_id, String(holder.role_generation), holder.execution_attempt_id, holder.thread_id, "activeLanes=0", queueHead,
+export const fleetWatchdogEpisodeKey = (
+  holder: RoleHolderState,
+  queueHead: string,
+  activeLaneCount = 0,
+  writingLaneCeiling = 0,
+) => fleetWatchdogCompositeKey(
+  holder.project_id, holder.role_id, String(holder.role_generation), holder.execution_attempt_id, holder.thread_id,
+  `activeLanes=${activeLaneCount}`, `writingLaneCeiling=${writingLaneCeiling}`, queueHead,
 );
-const fleetWatchdogLegacyEpisodeKey = (holder: RoleHolderState, queueHead: string) => [
+const fleetWatchdogLegacyEpisodeKey = (
+  holder: RoleHolderState,
+  queueHead: string,
+  activeLaneCount: number,
+) => activeLaneCount === 0 ? [
   holder.project_id, holder.role_id, holder.role_generation, holder.execution_attempt_id, holder.thread_id, "activeLanes=0", queueHead,
-].join(":");
+].join(":") : undefined;
 export const fleetWatchdogScope = (prefix: string, ...parts: string[]) => `${prefix}:${fleetWatchdogCompositeKey(...parts)}`;
 const fleetWatchdogScopeMessage = (scope: string) => {
   const separator = scope.indexOf(":");
@@ -192,7 +202,7 @@ async function startableQueueStateAsync(repositories: string[]): Promise<Startab
   })));
   for (const { repository, pages } of inventories) {
     if (!Array.isArray(pages) || !pages.every((page, index) => Array.isArray(page) && page.length <= 100
-      && (index === pages.length - 1 || page.length === 100) && page.every(isIssue))) return null;
+      && (index === pages.length - 1 ? page.length < 100 : page.length === 100) && page.every(isIssue))) return null;
     const inventory = (pages as QueueInventoryIssue[][]).flat();
     if (new Set(inventory.map((issue) => issue.number)).size !== inventory.length) return null;
     const issues = inventory.filter((issue) => !("pull_request" in issue));
@@ -2207,6 +2217,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     observedAtMs: number;
     configIdentity: string;
     known: boolean;
+    reason: string | null;
     head: { workItemId: string; resourceRevision: number } | null;
   };
   type RoleQueueConfig = { identity: string; repositories: string[]; reason: string | null };
@@ -2240,6 +2251,28 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return { identity: `config-unreadable:${String(error)}`, repositories: [], reason: `role-queue-unreadable:${String(error)}` };
     }
   };
+  const bindRoleQueueHead = (projectId: string, configIdentity: string, queue: StartableQueueState, observedAtMs: number): RoleQueueRead => {
+    let head: RoleQueueRead["head"] = null;
+    let reason: string | null = null;
+    if (queue.head !== null) {
+      const match = queue.head.match(/^([^/]+)\/([^/#]+)#([1-9][0-9]*)$/u);
+      const issueNumber = match?.[3] === undefined ? Number.NaN : Number(match[3]);
+      if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
+        reason = "startable-queue-head-malformed";
+      } else {
+        const matches = db?.prepare(
+          `SELECT items.work_item_id, items.resource_revision
+           FROM work_items AS items JOIN external_work_refs AS refs
+             ON refs.project_id = items.project_id AND refs.work_item_id = items.work_item_id
+           WHERE items.project_id = ? AND items.lifecycle_state IN ('proposed', 'ready')
+             AND refs.provider = 'github' AND refs.owner = ? AND refs.repo = ? AND refs.issue_number = ?`,
+        ).all(projectId, match[1], match[2], issueNumber) as Array<{ work_item_id: string; resource_revision: number }> | undefined;
+        if (!matches || matches.length !== 1) reason = `startable-queue-head-bindings:${matches?.length ?? 0}`;
+        else head = { workItemId: matches[0]!.work_item_id, resourceRevision: matches[0]!.resource_revision };
+      }
+    }
+    return { observedAtMs, configIdentity, known: reason === null, reason, head };
+  };
   const readProjectRoleQueue = async (projectId: string, refresh = false): Promise<RoleQueueRead> => {
     const now = Date.now();
     const config = readRoleQueueConfig(projectId);
@@ -2251,7 +2284,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       if (refreshing.configIdentity === config.identity) return refreshing.promise;
       const reason = "project-config-superseded-in-flight";
       bb.log.warn(`role queue coverage=degraded project=${projectId} reason=${reason}`);
-      return { observedAtMs: now, configIdentity: config.identity, known: false, head: null };
+      return { observedAtMs: now, configIdentity: config.identity, known: false, reason, head: null };
     }
     const next = (async (): Promise<RoleQueueRead> => {
       let reason = config.reason;
@@ -2263,21 +2296,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           if (queue === null) {
             reason = "startable-queue-unreadable";
           } else if (queue.head !== null) {
-            const match = queue.head.match(/^([^/]+)\/([^/#]+)#([1-9][0-9]*)$/u);
-            const issueNumber = match?.[3] === undefined ? Number.NaN : Number(match[3]);
-            if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
-              reason = "startable-queue-head-malformed";
-            } else {
-              const matches = db.prepare(
-                `SELECT items.work_item_id, items.resource_revision
-                 FROM work_items AS items JOIN external_work_refs AS refs
-                   ON refs.project_id = items.project_id AND refs.work_item_id = items.work_item_id
-                 WHERE items.project_id = ? AND items.lifecycle_state IN ('proposed', 'ready')
-                   AND refs.provider = 'github' AND refs.owner = ? AND refs.repo = ? AND refs.issue_number = ?`,
-              ).all(projectId, match[1], match[2], issueNumber) as Array<{ work_item_id: string; resource_revision: number }>;
-              if (matches.length === 1) head = { workItemId: matches[0]!.work_item_id, resourceRevision: matches[0]!.resource_revision };
-              else reason = `startable-queue-head-bindings:${matches.length}`;
-            }
+            const bound = bindRoleQueueHead(projectId, config.identity, queue, Date.now());
+            head = bound.head;
+            reason = bound.reason;
           }
         }
       } catch (error) {
@@ -2288,7 +2309,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         reason = "project-config-moved-during-refresh";
         head = null;
       }
-      const result = { observedAtMs: Date.now(), configIdentity: config.identity, known: reason === null, head };
+      const result = { observedAtMs: Date.now(), configIdentity: config.identity, known: reason === null, reason, head };
       if (currentConfig.identity === config.identity) roleQueueCache.set(projectId, result);
       if (reason !== null) bb.log.warn(`role queue coverage=degraded project=${projectId} reason=${reason}`);
       return result;
@@ -2366,11 +2387,16 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     return true;
   };
 
-  const steerRole = async (role: import("./src/awareness.js").RoleIdleView, queue?: RoleQueueRead) => {
+  const steerRole = async (role: import("./src/awareness.js").RoleIdleView) => {
     if (role.roleId !== "project-orchestrator") return false;
-    const current = queue ?? await readProjectRoleQueue(role.projectId, true);
+    const capacity = await readLaneCapacityObservation(role.projectId);
+    if (capacity.coverageState !== "known" || !capacity.queue || capacity.activeLaneCount === null || capacity.writingLaneCeiling === null) return "error" as const;
+    const currentConfig = readRoleQueueConfig(role.projectId);
+    if (currentConfig.identity !== capacity.configIdentity) return "error" as const;
+    const current = bindRoleQueueHead(role.projectId, capacity.configIdentity, capacity.queue, capacity.observedAtMs);
     if (!current.known) return "error" as const;
     if (!current.head || current.head.workItemId !== role.queueHeadId) return false;
+    if (capacity.activeLaneCount >= capacity.writingLaneCeiling) return false;
     return sendRoleWake(role, `Wrongful idle: queue head ${current.head.workItemId} is startable. Inspect the queue and act or record the blocker.`);
   };
 
@@ -2434,6 +2460,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     laneCapacityObservationId: string;
     observedAtMs: number;
     executionAttemptIds: string[];
+    configIdentity: string;
+    queue: StartableQueueState | null;
   };
   if (db) {
     db.prepare(
@@ -2512,29 +2540,40 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     kind: "blind",
     message: `idle-fleet coverage=blind orchestrator=${orchestrator} activeLanes=${activeLanes} startable=${startable} reason=${reason}`,
   });
-  const readIdleFleetActiveLanes = async (projectId: string): Promise<IdleFleetFact<number>> => {
+  type LaneIdentity = { executionAttemptId: string; laneId: string; threadId: string };
+  const sameLaneIdentitySet = (left: LaneIdentity[], right: LaneIdentity[]) => {
+    if (left.length !== right.length) return false;
+    const keys = (lanes: LaneIdentity[]) => lanes.map((lane) => JSON.stringify(lane)).sort();
+    const rightKeys = keys(right);
+    return keys(left).every((lane, index) => lane === rightKeys[index]);
+  };
+  const readIdleFleetActiveLanes = async (projectId: string): Promise<IdleFleetFact<LaneIdentity[]>> => {
     if (!db) return { known: false, reason: "canonical-store-unavailable" };
     try {
       const capacityEvidence = workItemCapacityLaneEvidence(db, projectId);
       if (capacityEvidence.unboundWorkItemIds.length > 0) return { known: false, reason: "work-items-have-no-thread-binding:GH-300" };
-      const laneIds = new Set<string>();
+      const identities: LaneIdentity[] = [];
       const now = Date.now();
       for (const row of capacityEvidence.lanes) {
         if (row.idle_kind === "blind") return { known: false, reason: "dispatch-unknown-attempt" };
-        if (row.lane_id.length === 0 || typeof row.thread_id !== "string" || row.thread_id.length === 0) {
+        if (row.execution_attempt_id.length === 0 || row.lane_id.length === 0 || typeof row.thread_id !== "string" || row.thread_id.length === 0) {
           return { known: false, reason: "work-item-attempt-has-no-thread-binding:GH-300" };
         }
         if (typeof row.observed_at_ms !== "number" || !Number.isSafeInteger(row.observed_at_ms) || row.observed_at_ms < 0 || now - row.observed_at_ms > IDLE_FLEET_ATTEMPT_STALE_MS) {
           return { known: false, reason: "stale-active-attempt" };
         }
-        laneIds.add(row.lane_id);
+        const identity = { executionAttemptId: row.execution_attempt_id, laneId: row.lane_id, threadId: row.thread_id };
+        if (identities.some((candidate) => candidate.executionAttemptId === identity.executionAttemptId || candidate.laneId === identity.laneId || candidate.threadId === identity.threadId)) {
+          return { known: false, reason: "duplicate-active-lane" };
+        }
+        identities.push(identity);
       }
-      return { known: true, value: laneIds.size };
+      return { known: true, value: identities };
     } catch (error) {
       return { known: false, reason: `active-lanes-unreadable:${String(error)}` };
     }
   };
-  const readIdleFleetNativeLanes = async (projectId: string): Promise<IdleFleetFact<{ count: number; executionAttemptIds: string[] }>> => {
+  const readIdleFleetNativeLanes = async (projectId: string): Promise<IdleFleetFact<LaneIdentity[]>> => {
     if (!db) return { known: false, reason: "canonical-store-unavailable" };
     try {
       const dispatcherThreadIds = new Set(
@@ -2562,40 +2601,44 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         thread.deletedAt === null &&
         isWorkingLane(thread),
       );
-      const executionAttemptIds: string[] = [];
+      const identities: LaneIdentity[] = [];
+      const seenThreadIds = new Set<string>();
       for (const lane of liveLanes) {
+        if (lane.projectId !== projectId) return { known: false, reason: "foreign-native-lane" };
+        if (seenThreadIds.has(lane.id)) return { known: false, reason: "duplicate-native-lane" };
+        seenThreadIds.add(lane.id);
         const matches = db.prepare(
-          `SELECT execution_attempt_id, assignment_kind
+          `SELECT project_id, execution_attempt_id, assignment_kind, lane_id, thread_id
            FROM execution_attempts
-           WHERE project_id = ? AND origin = 'work_item'
-             AND state = 'running' AND thread_id = ?`,
-        ).all(projectId, lane.id) as Array<{ execution_attempt_id: string; assignment_kind: string | null }>;
-        if (matches.length !== 1 || matches[0]!.assignment_kind !== "write") continue;
+           WHERE origin = 'work_item' AND state = 'running' AND thread_id = ?`,
+        ).all(lane.id) as Array<{ project_id: string; execution_attempt_id: string; assignment_kind: string | null; lane_id: string; thread_id: string | null }>;
+        if (matches.some((match) => match.project_id !== projectId)) return { known: false, reason: "foreign-native-attempt" };
+        if (matches.length === 0) return { known: false, reason: "unbound-native-lane" };
+        if (matches.length > 1) return { known: false, reason: "ambiguous-native-attempt" };
+        const match = matches[0]!;
+        if (match.assignment_kind !== "write") continue;
+        if (match.execution_attempt_id.length === 0 || match.lane_id.length === 0 || match.thread_id !== lane.id) return { known: false, reason: "native-lane-binding-invalid" };
+        const identity = { executionAttemptId: match.execution_attempt_id, laneId: match.lane_id, threadId: match.thread_id };
+        if (identities.some((candidate) => candidate.executionAttemptId === identity.executionAttemptId || candidate.laneId === identity.laneId || candidate.threadId === identity.threadId)) {
+          return { known: false, reason: "duplicate-native-lane" };
+        }
         const observedAtMs = Date.now();
         db.prepare(
           `UPDATE execution_attempts SET observed_at_ms = ?
            WHERE project_id = ? AND execution_attempt_id = ? AND state = 'running'`,
-        ).run(observedAtMs, projectId, matches[0]!.execution_attempt_id);
-        executionAttemptIds.push(matches[0]!.execution_attempt_id);
+        ).run(observedAtMs, projectId, match.execution_attempt_id);
+        identities.push(identity);
       }
-      return { known: true, value: { count: liveLanes.length, executionAttemptIds } };
+      return { known: true, value: identities };
     } catch (error) {
       return { known: false, reason: `native-lanes-unreadable:${String(error)}` };
     }
   };
-  const readIdleFleetStartable = async (projectId: string): Promise<IdleFleetFact<StartableQueueState>> => {
+  const readIdleFleetStartable = async (projectId: string, configured = readRoleQueueConfig(projectId)): Promise<IdleFleetFact<StartableQueueState>> => {
     if (!db) return { known: false, reason: "canonical-store-unavailable" };
     try {
-      const repositories = (db.prepare(
-        `SELECT targets.remote_url FROM project_config_heads AS heads
-         JOIN repository_targets AS targets
-           ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
-         WHERE heads.project_id = ? ORDER BY targets.repo_target_id`,
-      ).all(projectId) as Array<{ remote_url: string | null }>).map((target) => githubRepository(target.remote_url));
-      if (repositories.length === 0 || repositories.some((repository) => repository === null)) {
-        return { known: false, reason: "configured-repositories-unreadable" };
-      }
-      const queue = await startableQueueStateAsync(repositories as string[]);
+      if (configured.reason !== null) return { known: false, reason: configured.reason };
+      const queue = await startableQueueStateAsync(configured.repositories);
       return queue === null ? { known: false, reason: "startable-queue-unreadable" } : { known: true, value: queue };
     } catch (error) {
       return { known: false, reason: `startable-queue-unreadable:${String(error)}` };
@@ -2625,20 +2668,23 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     );
     if (orchestrators.length !== 1) throw new Error(`canonical-orchestrator-count:${orchestrators.length}`);
     const holder = orchestrators[0]!;
+    const configured = readRoleQueueConfig(projectId);
     const nativeLanes = await readIdleFleetNativeLanes(projectId);
     const [activeLanes, startable, ceiling] = await Promise.all([
       readIdleFleetActiveLanes(projectId),
-      readIdleFleetStartable(projectId),
+      readIdleFleetStartable(projectId, configured),
       readIdleFleetCeiling(projectId),
     ]);
     const observedAtMs = Date.now();
+    const currentConfig = readRoleQueueConfig(projectId);
     const reasons = [
+      currentConfig.identity !== configured.identity ? "project-config-moved-during-refresh" : null,
       !activeLanes.known ? activeLanes.reason : null,
       !nativeLanes.known ? nativeLanes.reason : null,
       !startable.known ? startable.reason : null,
       !ceiling.known ? ceiling.reason : null,
-      activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value.count
-        ? `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value.count}`
+      activeLanes.known && nativeLanes.known && !sameLaneIdentitySet(activeLanes.value, nativeLanes.value)
+        ? `active-lanes-disagreement:canonical=${activeLanes.value.length}:native=${nativeLanes.value.length}`
         : null,
     ].filter((reason): reason is string => reason !== null);
     const coverageState = reasons.length === 0 ? "known" : "blind";
@@ -2651,7 +2697,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       startable_work: number | null; reason: string | null; lane_capacity_observation_id: string | null;
     } | undefined;
     const sameFacts = open !== undefined && open.coverage_state === coverageState &&
-      open.active_lane_count === (activeLanes.known ? activeLanes.value : null) &&
+      open.active_lane_count === (activeLanes.known ? activeLanes.value.length : null) &&
       open.writing_lane_ceiling === (ceiling.known ? ceiling.value : null) &&
       open.startable_work === (startableWork === null ? null : startableWork ? 1 : 0) &&
       open.reason === (reasons.length === 0 ? null : reasons.join(";"));
@@ -2663,13 +2709,15 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       orchestratorThreadId: holder.thread_id,
       orchestratorRoleGeneration: holder.role_generation,
       coverageState,
-      activeLaneCount: activeLanes.known ? activeLanes.value : null,
+      activeLaneCount: activeLanes.known ? activeLanes.value.length : null,
       writingLaneCeiling: ceiling.known ? ceiling.value : null,
       startableWork,
       reason: reasons.length === 0 ? null : reasons.join(";"),
       laneCapacityObservationId,
       observedAtMs,
-      executionAttemptIds: nativeLanes.known ? nativeLanes.value.executionAttemptIds : [],
+      executionAttemptIds: nativeLanes.known ? nativeLanes.value.map((lane) => lane.executionAttemptId) : [],
+      configIdentity: configured.identity,
+      queue: reasons.length === 0 && startable.known ? startable.value : null,
     };
   };
   const readIdleFleetProbes = async (): Promise<IdleFleetProbe[]> => {
@@ -2721,17 +2769,24 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     if (!Number.isFinite(thread.updatedAt)) return idleFleetBlind("blind", "blind", "blind", "orchestrator-unreadable");
     if (String(thread.updatedAt) !== probe.idleEpisode) return { kind: "silent" };
 
-    const [activeLanes, nativeLanes, startable] = await Promise.all([
+    const configured = readRoleQueueConfig(probe.projectId);
+    const [activeLanes, nativeLanes, startable, ceiling] = await Promise.all([
       readIdleFleetActiveLanes(probe.projectId),
       readIdleFleetNativeLanes(probe.projectId),
-      readIdleFleetStartable(probe.projectId),
+      readIdleFleetStartable(probe.projectId, configured),
+      readIdleFleetCeiling(probe.projectId),
     ]);
-    const laneDisagreement = activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value.count;
-    if (!activeLanes.known || !nativeLanes.known || !startable.known) {
+    const currentConfig = readRoleQueueConfig(probe.projectId);
+    if (currentConfig.identity !== configured.identity) {
+      return idleFleetBlind("known", "blind", "blind", "project-config-moved-during-refresh");
+    }
+    const laneDisagreement = activeLanes.known && nativeLanes.known && !sameLaneIdentitySet(activeLanes.value, nativeLanes.value);
+    if (!activeLanes.known || !nativeLanes.known || !startable.known || !ceiling.known) {
       const blindReasons = [
         !activeLanes.known ? activeLanes.reason : null,
         !nativeLanes.known ? nativeLanes.reason : null,
         !startable.known ? startable.reason : null,
+        !ceiling.known ? ceiling.reason : null,
       ].filter((reason): reason is string => reason !== null);
       return idleFleetBlind(
         "known",
@@ -2741,9 +2796,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       );
     }
     if (laneDisagreement) {
-      return idleFleetBlind("known", "blind", "known", `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value.count}`);
+      return idleFleetBlind("known", "blind", "known", `active-lanes-disagreement:canonical=${activeLanes.value.length}:native=${nativeLanes.value.length}`);
     }
-    if (activeLanes.value > 0 || startable.value.count === 0) return { kind: "silent" };
+    if (activeLanes.value.length >= ceiling.value || startable.value.count === 0) return { kind: "silent" };
     const queueHead = startable.value.head;
     if (!queueHead) return { kind: "silent" };
     const role = {
@@ -2757,10 +2812,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     };
     return {
       kind: "ready",
-      episodeKey: fleetWatchdogEpisodeKey(holder, queueHead),
-      legacyEpisodeKey: fleetWatchdogLegacyEpisodeKey(holder, queueHead),
+      episodeKey: fleetWatchdogEpisodeKey(holder, queueHead, activeLanes.value.length, ceiling.value),
+      legacyEpisodeKey: fleetWatchdogLegacyEpisodeKey(holder, queueHead, activeLanes.value.length),
       role,
-      message: `Idle fleet: queue head ${queueHead} is startable with zero active writing lanes. Dispatch it or record the blocker.`,
+      message: `Idle fleet: queue head ${queueHead} is startable with ${activeLanes.value.length} active writing lane${activeLanes.value.length === 1 ? "" : "s"} below writing capacity ${ceiling.value}. Dispatch it or record the blocker.`,
     };
   };
   const capacityObservationLocks = new Map<string, Promise<void>>();
@@ -2843,7 +2898,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     },
     wakeRole: async (role) => {
       const queue = await readProjectRoleQueue(role.projectId, true);
-      const result = queue.head ? await steerRole({ ...role, queueHeadId: queue.head.workItemId }, queue) : queue.known ? false : "error";
+      const result = queue.head ? await steerRole({ ...role, queueHeadId: queue.head.workItemId }) : queue.known ? false : "error";
       return result === true
         ? { attempted: true, delivered: true }
         : { attempted: false, delivered: false, refusal: result === "error" ? "error" : "policy" };
