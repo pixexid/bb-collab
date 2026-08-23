@@ -347,7 +347,9 @@ type GithubIssueBriefTarget = {
   projection: GithubIssueBriefProjection;
 };
 
-function githubIssueBriefTarget(db: SqliteDatabase | null, projectId: string, workItemId: string): GithubIssueBriefTarget | null {
+type GithubIssueBriefTargetRead = GithubIssueBriefTarget | null | "invalid";
+
+function githubIssueBriefTarget(db: SqliteDatabase | null, projectId: string, workItemId: string): GithubIssueBriefTargetRead {
   if (!db) return null;
   const ref = db.prepare(
     `SELECT work_items.resource_revision, external_work_refs.*
@@ -357,13 +359,20 @@ function githubIssueBriefTarget(db: SqliteDatabase | null, projectId: string, wo
      WHERE external_work_refs.project_id = ? AND external_work_refs.work_item_id = ? AND external_work_refs.provider = 'github'`,
   ).get(projectId, workItemId) as Record<string, unknown> | undefined;
   if (!ref) return null;
-  if (typeof ref.owner !== "string" || typeof ref.repo !== "string" || typeof ref.issue_number !== "number"
-    || !Number.isSafeInteger(ref.issue_number) || ref.issue_number < 1 || typeof ref.resource_revision !== "number"
-    || !Number.isSafeInteger(ref.resource_revision) || typeof ref.attempted_resource_revision !== "number"
-    || typeof ref.projected_resource_revision !== "number" || typeof ref.desired_digest !== "string"
-    || typeof ref.observed_external_digest !== "string" || typeof ref.observed_external_revision !== "string"
-    || (ref.projection_state !== "pending" && ref.projection_state !== "current" && ref.projection_state !== "drifted" && ref.projection_state !== "delivery_ambiguous")) {
-    throw new Error("GitHub issue projection identity is invalid");
+  const initialPending = ref.projection_state === "pending" && ref.issue_number !== null;
+  if (typeof ref.owner !== "string" || typeof ref.repo !== "string"
+    || typeof ref.issue_number !== "number" || !Number.isSafeInteger(ref.issue_number) || ref.issue_number < 1
+    || typeof ref.resource_revision !== "number" || !Number.isSafeInteger(ref.resource_revision) || ref.resource_revision < 1
+    || typeof ref.attempted_resource_revision !== "number" || !Number.isSafeInteger(ref.attempted_resource_revision) || ref.attempted_resource_revision < 1
+    || (ref.projected_resource_revision !== null && (typeof ref.projected_resource_revision !== "number" || !Number.isSafeInteger(ref.projected_resource_revision) || ref.projected_resource_revision < 1))
+    || typeof ref.desired_digest !== "string" || ref.desired_digest.length === 0
+    || (ref.observed_external_digest !== null && typeof ref.observed_external_digest !== "string")
+    || (ref.observed_external_revision !== null && typeof ref.observed_external_revision !== "string")
+    || (ref.projection_state !== "pending" && ref.projection_state !== "current" && ref.projection_state !== "drifted" && ref.projection_state !== "delivery_ambiguous")
+    || (initialPending && (ref.projected_resource_revision !== null || ref.observed_external_digest !== null || ref.observed_external_revision !== null))
+    || (ref.projection_state === "current" && (ref.projected_resource_revision === null || ref.observed_external_digest === null || ref.observed_external_revision === null))
+    || (ref.projection_state !== "pending" && ref.attempted_resource_revision !== ref.resource_revision)) {
+    return "invalid";
   }
   return {
     projectId,
@@ -386,11 +395,22 @@ function githubIssueBriefTarget(db: SqliteDatabase | null, projectId: string, wo
 function projectionIsCurrent(target: GithubIssueBriefTarget): boolean {
   const projection = target.projection;
   return projection.projectionState === "current"
-    && projection.canonicalResourceRevision === projection.attemptedResourceRevision
+    && projection.attemptedResourceRevision <= projection.canonicalResourceRevision
     && projection.canonicalResourceRevision === projection.projectedResourceRevision
     && projection.desiredDigest.length > 0
     && projection.desiredDigest === projection.observedExternalDigest
+    && projection.observedExternalRevision !== null
     && projection.observedExternalRevision.length > 0;
+}
+
+function projectionIsInitialPending(target: GithubIssueBriefTarget): boolean {
+  const projection = target.projection;
+  return projection.projectionState === "pending"
+    && projection.attemptedResourceRevision <= projection.canonicalResourceRevision
+    && projection.projectedResourceRevision === null
+    && projection.observedExternalDigest === null
+    && projection.observedExternalRevision === null
+    && projection.desiredDigest.length > 0;
 }
 
 function parseGithubIssueComments(value: unknown): GithubIssueComment[] {
@@ -407,7 +427,7 @@ function parseGithubIssueComments(value: unknown): GithubIssueComment[] {
 
 async function readGithubIssueBriefAsync(db: SqliteDatabase | null, projectId: string, workItemId: string, connectorHost?: string): Promise<{ brief: GithubIssueBrief; source: GithubIssueBriefSource }> {
   const target = githubIssueBriefTarget(db, projectId, workItemId);
-  if (!target || !projectionIsCurrent(target)) throw new Error("GitHub issue projection is unavailable for the current WorkItem revision");
+  if (!target || target === "invalid" || !projectionIsCurrent(target)) throw new Error("GitHub issue projection is unavailable for the current WorkItem revision");
   const issue = await readGithubIssueForBackfillAsync(target.owner, target.repo, target.issueNumber, connectorHost);
   if (issue.externalRevision !== target.projection.observedExternalRevision) throw new Error("GitHub issue body freshness does not match the current projection");
   const firstPage = await githubJsonAsync([
@@ -509,7 +529,9 @@ function readGithubIssueForBackfill(owner: string, repo: string, issueNumber: nu
   };
 }
 
-function githubCliAdapterForWorkItem(db: SqliteDatabase | null, projectId: string, workItemId: string): GitHubIssueAdapter | null {
+type GithubCliAdapter = GitHubIssueAdapter & { owner: string; repo: string };
+
+function githubCliAdapterForWorkItem(db: SqliteDatabase | null, projectId: string, workItemId: string): GithubCliAdapter | null {
   if (!db) return null;
   const row = db.prepare(
     `SELECT work_items.repo_target_id, project_config_revisions.canonical_config_json
@@ -524,12 +546,17 @@ function githubCliAdapterForWorkItem(db: SqliteDatabase | null, projectId: strin
     const config = JSON.parse(row.canonical_config_json) as { extensions?: { bbCollab?: { githubIssues?: { repositoryMappings?: unknown } } } };
     const mappings = config.extensions?.bbCollab?.githubIssues?.repositoryMappings;
     if (!Array.isArray(mappings)) return null;
-    const mapping = mappings.find((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate)
+    const matches = mappings.filter((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate)
       && (candidate as { repoTargetId?: unknown }).repoTargetId === row.repo_target_id
-      && typeof (candidate as { connectorHost?: unknown }).connectorHost === "string") as { connectorHost: string } | undefined;
-    if (!mapping) return null;
+      && typeof (candidate as { owner?: unknown }).owner === "string"
+      && typeof (candidate as { repo?: unknown }).repo === "string"
+      && typeof (candidate as { connectorHost?: unknown }).connectorHost === "string");
+    if (matches.length !== 1) return null;
+    const mapping = matches[0] as { owner: string; repo: string; connectorHost: string };
     const connectorHost = mapping.connectorHost;
     return {
+      owner: mapping.owner,
+      repo: mapping.repo,
       connectorHost,
       available: true,
       read: (owner, repo, issueNumber) => readGithubIssueForBackfill(owner, repo, issueNumber, connectorHost),
@@ -1169,12 +1196,19 @@ async function dispatchLane(
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "native spawn routing profile does not match the requested execution profile" };
   }
   const briefTarget = githubIssueBriefTarget(db, request.projectId, request.workItemId ?? "");
-  if (briefTarget && !projectionIsCurrent(briefTarget)) {
+  if (briefTarget === "invalid") {
+    return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection identity is malformed or ambiguous" };
+  }
+  if (briefTarget && !projectionIsCurrent(briefTarget) && !projectionIsInitialPending(briefTarget)) {
     return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection is stale or ambiguous for the canonical WorkItem" };
   }
   const githubAdapter = briefTarget ? githubCliAdapterForWorkItem(db, request.projectId, request.workItemId ?? "") : null;
   if (briefTarget && !githubAdapter) {
     return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub projection capability is unavailable for the current WorkItem" };
+  }
+  if (briefTarget && projectionIsInitialPending(briefTarget)
+    && (briefTarget.owner !== githubAdapter!.owner || briefTarget.repo !== githubAdapter!.repo)) {
+    return { outcome: "EXTERNAL_REF_CONFLICT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub pending binding does not match its exact repository-target mapping" };
   }
   let initialBrief: GithubIssueBrief | null = null;
   const dispatchParentThreadId = spawnShape.data.parentThreadId;

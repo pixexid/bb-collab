@@ -10,10 +10,10 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
-export const RUNTIME_CONTRACT_VERSION = 23;
+export const RUNTIME_CONTRACT_VERSION = 24;
 export const SCHEMA_VERSION = 30;
-// v23 establishes governorship-rooted authority for one exact bootstrap Decision identity.
-const PREVIOUS_RUNTIME_CONTRACT_VERSION = 22;
+// v24 permits natural pending GitHub bindings to cross durable dispatch intent.
+const PREVIOUS_RUNTIME_CONTRACT_VERSION = 23;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
 // Schema v30 adds immutable authority-root audit fields to Decisions.

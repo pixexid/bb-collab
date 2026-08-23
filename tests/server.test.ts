@@ -718,8 +718,8 @@ async function loadedDistHost() {
   return host;
 }
 
-async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, writingLaneCeiling?: number, withoutGithubIssues = true, projectId = PROJECT_ID, connectorHost = CONNECTOR_HOST) {
-  const fixture = await assignmentFixture({ projectId, connectorHost, directorSeat: true, orchestratorSeat: true, withoutGithubIssues, targetRemoteUrl: includeGithubRemote ? "https://github.com/example/project.git" : undefined, writingLaneCeiling });
+async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, writingLaneCeiling?: number, withoutGithubIssues = true, projectId = PROJECT_ID, connectorHost = CONNECTOR_HOST, githubIssueNumber?: number) {
+  const fixture = await assignmentFixture({ projectId, connectorHost, directorSeat: true, orchestratorSeat: true, withoutGithubIssues, targetRemoteUrl: includeGithubRemote ? "https://github.com/example/project.git" : undefined, writingLaneCeiling, githubIssueNumber });
   const director = fixture.db.prepare(
     "SELECT thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'director'",
   ).get() as { thread_id: string };
@@ -829,11 +829,17 @@ function bindFixtureGithubIssue(db: Database.Database, issueNumber: number, work
 }
 
 async function currentGithubBriefDispatch(projectId = PROJECT_ID, connectorHost = CONNECTOR_HOST) {
-  const fixture = await fleetWatchdogFixture(0, true, 1, false, projectId, connectorHost);
-  const adapter = new DeterministicGitHubIssueAdapter(connectorHost);
-  expect(applyWithFixtureReceipt(fixture.db, projectionRequest(fixture.fenceToken, 2, { projectId, idempotencyKey: `github-brief-ready-project-${projectId}` }), adapter)).toMatchObject({ outcome: "OK" });
-  const ready = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1);
-  if (!ready) throw new Error("fixture projection did not create its issue");
+  const fixture = await fleetWatchdogFixture(0, true, 1, false, projectId, connectorHost, 1);
+  const ready = {
+    owner: GITHUB_OWNER,
+    repo: GITHUB_REPO,
+    issueNumber: 1,
+    title: "[bb] Ship projection",
+    body: `canonical: ${maintainedIssueBody({ lifecycleState: "proposed", scope: "Keep canonical state local." })}`,
+    state: "open" as const,
+    labels: ["work-proposed"],
+    externalRevision: "fixture-proposed",
+  };
   const inProgress = {
     ...ready,
     body: `canonical: ${maintainedIssueBody({ lifecycleState: "in_progress", scope: "Keep canonical state local." })}`,
@@ -1874,6 +1880,7 @@ async function assignmentFixture(options: {
   connectorPolicy?: "required" | "optional" | "prohibited";
   targetDefaultBranch?: string;
   targetRemoteUrl?: string;
+  githubIssueNumber?: number;
   withoutGithubIssues?: boolean;
   directorSeat?: boolean;
   orchestratorSeat?: boolean;
@@ -1898,7 +1905,10 @@ async function assignmentFixture(options: {
     ? bootstrapRequest().targets!.map((target) => ({ ...target, ...(options.targetDefaultBranch ? { defaultBranch: options.targetDefaultBranch } : {}), ...(options.targetRemoteUrl ? { remoteUrl: options.targetRemoteUrl } : {}) }))
     : undefined;
   const { db, fenceToken } = seedAndBootstrap(host, projectId, { config, ...(targets ? { targets } : {}) });
-  expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, { projectId })).outcome).toBe("OK");
+  const workItem = options.githubIssueNumber === undefined
+    ? undefined
+    : { workItemId: WORK_ITEM_ID, title: "Ship projection", body: "Keep canonical state local.", githubIssue: { issueNumber: options.githubIssueNumber } };
+  expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, { projectId, ...(workItem ? { workItem } : {}) })).outcome).toBe("OK");
   expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, { projectId })).outcome).toBe("OK");
   const roleFacts = directorSeat ? directorRoleReader(scopeRoleFacts) : roleReader(scopeRoleFacts);
   expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, { projectId, ...(directorSeat ? {
@@ -5110,8 +5120,47 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     }
   });
 
+  it("returns a structured refusal for malformed pending GitHub identity before durable intent", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false, PROJECT_ID, CONNECTOR_HOST, 1);
+    fixture.db.prepare("UPDATE external_work_refs SET observed_external_digest = 'malformed-pending'").run();
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: dispatchSpawn(fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result).toMatchObject({ outcome: "EXTERNAL_RESPONSE_INVALID", attempted: 0, verified: 0 });
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "ready" });
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ count: 0 });
+  });
+
+  it("refuses a foreign pending repository identity without spawning", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false, PROJECT_ID, CONNECTOR_HOST, 1);
+    fixture.db.prepare("UPDATE external_work_refs SET owner = 'foreign-owner'").run();
+    const eventsBefore = (fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { count: number }).count;
+    const mutationsBefore = (fixture.db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE project_id = ?").get(PROJECT_ID) as { count: number }).count;
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: dispatchSpawn(fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("EXTERNAL_REF_CONFLICT");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "ready" });
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ count: 0 });
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: eventsBefore });
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: mutationsBefore });
+  });
+
   it("composes a bounded production comment tail through one ordinary dispatch and rejects full-history or one-page completeness mutants", async () => {
     const projected = await currentGithubBriefDispatch();
+    expect(projected.fixture.db.prepare(
+      "SELECT projection_state, issue_number, projected_resource_revision, observed_external_revision, observed_external_digest FROM external_work_refs WHERE project_id = ? AND work_item_id = ?",
+    ).get(PROJECT_ID, WORK_ITEM_ID)).toEqual({
+      projection_state: "pending",
+      issue_number: 1,
+      projected_resource_revision: null,
+      observed_external_revision: null,
+      observed_external_digest: null,
+    });
     const restore = installGithubBriefGh(projected.snapshot, { transitionSnapshot: projected.transitionSnapshot });
     try {
       const result = JSON.parse(await projected.fixture.host.harness.callAgentTool("dispatch_lane", {
@@ -8736,7 +8785,7 @@ else printf '%s\\n' '[]'; fi
 
   it("appends authority-root schema and bumps the runtime contract", () => {
     expect(SCHEMA_VERSION).toBe(30);
-    expect(RUNTIME_CONTRACT_VERSION).toBe(23);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(24);
     expect(MIGRATIONS).toHaveLength(43);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
@@ -8758,8 +8807,8 @@ else printf '%s\\n' '[]'; fi
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 29,
       newSchemaVersion: 30,
-      oldContractVersion: 22,
-      newContractVersion: 23,
+      oldContractVersion: 23,
+      newContractVersion: 24,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -8768,21 +8817,21 @@ else printf '%s\\n' '[]'; fi
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(20, 22))).toMatchObject({
       oldSchemaVersion: 29,
       newSchemaVersion: 30,
-      oldContractVersion: 22,
-      newContractVersion: 23,
+      oldContractVersion: 23,
+      newContractVersion: 24,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "refused", verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(30, 23))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(30, 24))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 29,
       newSchemaVersion: 30,
-      oldContractVersion: 22,
-      newContractVersion: 23,
+      oldContractVersion: 23,
+      newContractVersion: 24,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -9051,10 +9100,10 @@ else printf '%s\\n' '[]'; fi
   });
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
-    expect(RUNTIME_CONTRACT_VERSION).toBe(23);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(24);
     expect(SCHEMA_VERSION).toBe(30);
     expect(MIGRATIONS).toHaveLength(43);
-    expect(contractDigest).toBe("7bb4e66d799db07c37b0d6de2f7244a05b8d5261fb6520359052d7706f849fb1");
+    expect(contractDigest).toBe("d2452097ed62cdd6e2e34b152812befa7cd10bddaeddb5e7183cd33711ab70ca");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     const beforeRefusal = exportFoundation(db, PROJECT_ID);
@@ -9070,7 +9119,7 @@ else printf '%s\\n' '[]'; fi
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 30, observedContractVersion: 23 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 30, observedContractVersion: 24 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -9341,7 +9390,7 @@ else printf '%s\\n' '[]'; fi
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
       observedSchemaVersion: 30,
-      observedContractVersion: 23,
+      observedContractVersion: 24,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -9422,8 +9471,8 @@ else printf '%s\\n' '[]'; fi
       outcome: "OK",
       evidence: {
         cachedConsumers: {
-          oldContractVersion: 22,
-          newContractVersion: 23,
+          oldContractVersion: 23,
+          newContractVersion: 24,
           action: "unknown",
           expected: 4,
           attempted: 0,
@@ -9571,7 +9620,7 @@ else printf '%s\\n' '[]'; fi
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 30, schemaDigest, contractVersion: 23, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 30, schemaDigest, contractVersion: 24, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -13269,10 +13318,10 @@ else printf '%s\\n' '[]'; fi
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 22, newContractVersion: 23, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 22, newContractVersion: 23, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 22, newContractVersion: 23, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(30, 23))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 22, newContractVersion: 23, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 23, newContractVersion: 24, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 23, newContractVersion: 24, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 23, newContractVersion: 24, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(30, 24))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 23, newContractVersion: 24, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 
