@@ -5138,6 +5138,71 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(fixture.db.prepare("SELECT lane_id, thread_id, state FROM execution_attempts WHERE origin = 'work_item' ORDER BY rowid DESC LIMIT 1").get()).toMatchObject({ lane_id: "lane-work-item-1", thread_id: "lane-1", state: "running" });
   });
 
+  it("proves equivalent config cutover before intent and records one governed continuation", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    const stored = fixture.db.prepare(
+      "SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = 1",
+    ).get(PROJECT_ID) as { canonical_config_json: string };
+    const config = JSON.parse(stored.canonical_config_json) as Record<string, unknown>;
+    (config.extensions as Record<string, unknown>).bbCollab = {
+      ...((config.extensions as Record<string, unknown>).bbCollab as Record<string, unknown>),
+      cutoverNote: "unrelated-director-seat-addition",
+    };
+    const target = fixture.db.prepare(
+      "SELECT repo_target_id AS repoTargetId, source_id AS sourceId, host_id AS hostId, path, remote_url AS remoteUrl, default_branch AS defaultBranch FROM repository_targets WHERE project_id = ? AND config_revision = 1",
+    ).get(PROJECT_ID) as { repoTargetId: string; sourceId: string; hostId: string; path: string; remoteUrl: string | null; defaultBranch: string };
+    expect(applyWithFixtureReceipt(fixture.db, {
+      ...bootstrapRequest(),
+      operationClass: "config_revision",
+      idempotencyKey: "dispatch-equivalent-config-2",
+      expectedConfigRevision: 1,
+      configRevision: 2,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fixture.fenceToken,
+      config,
+      targets: [target],
+    })).toMatchObject({ outcome: "OK" });
+
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: { ...transitionRequest(fixture.fenceToken, "in_progress", 2), expectedConfigRevision: 2 },
+      spawn: dispatchSpawn(fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("OK");
+    expect(fixture.db.prepare("SELECT config_revision, lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ config_revision: 1, lifecycle_state: "in_progress", resource_revision: 3 });
+    expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ state: "running", thread_id: "lane-1" });
+    expect(fixture.db.prepare("SELECT event_json FROM state_events WHERE project_id = ? AND event_type = 'work_item_attempt_armed'").get(PROJECT_ID)).toMatchObject({ event_json: expect.stringContaining("configContinuation") });
+  });
+
+  it("refuses a changed dispatch target before the durable intent or native spawn", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    const stored = fixture.db.prepare(
+      "SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = 1",
+    ).get(PROJECT_ID) as { canonical_config_json: string };
+    const target = fixture.db.prepare(
+      "SELECT repo_target_id AS repoTargetId, source_id AS sourceId, host_id AS hostId, path, remote_url AS remoteUrl, default_branch AS defaultBranch FROM repository_targets WHERE project_id = ? AND config_revision = 1",
+    ).get(PROJECT_ID) as { repoTargetId: string; sourceId: string; hostId: string; path: string; remoteUrl: string | null; defaultBranch: string };
+    const changedTarget = { ...target, path: "/workspace/changed" };
+    expect(applyWithFixtureReceipt(fixture.db, {
+      ...bootstrapRequest(),
+      operationClass: "config_revision",
+      idempotencyKey: "dispatch-changed-target-config-2",
+      expectedConfigRevision: 1,
+      configRevision: 2,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fixture.fenceToken,
+      config: JSON.parse(stored.canonical_config_json),
+      targets: [changedTarget],
+    })).toMatchObject({ outcome: "OK" });
+    const before = exportFoundation(fixture.db, PROJECT_ID);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: { ...transitionRequest(fixture.fenceToken, "in_progress", 2), expectedConfigRevision: 2 },
+      spawn: dispatchSpawn(fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result).toMatchObject({ outcome: "PROJECT_CONFIG_STALE", attempted: 0, verified: 0 });
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+  });
+
   it("refuses dispatch when the exact GitHub projection revision or digest is stale", async () => {
     for (const kind of ["digest", "revision"] as const) {
       const fixture = await fleetWatchdogFixture(0, true, 1, false);

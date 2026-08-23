@@ -45,6 +45,7 @@ import {
   refusal,
   roleContextPreflightRefusal,
   writingLaneCeilingFromJson,
+  proveWorkItemDispatchConfig,
   WORK_ITEM_NON_TERMINAL_STATES,
   WORK_ITEM_CAPACITY_ATTEMPT_STATES,
   WORK_ITEM_CAPACITY_LIFECYCLE_STATES,
@@ -62,6 +63,7 @@ import {
   type AuthoritativeTerminalEvidence,
   type ExecutionAttemptEvidenceReader,
   type SqliteDatabase,
+  type WorkItemDispatchConfigProof,
 } from "./src/foundation.js";
 import {
   GITHUB_ISSUE_COMMENT_TAIL_LIMIT,
@@ -1288,6 +1290,22 @@ async function dispatchLane(
   ) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "native spawn routing profile does not match the requested execution profile" };
   }
+  let configProof: WorkItemDispatchConfigProof;
+  try {
+    if (!db || !request.workItemId || !request.repoTargetId) throw refusal("CANONICAL_STORE_UNAVAILABLE", "dispatch config proof requires the canonical WorkItem and target");
+    configProof = proveWorkItemDispatchConfig(db, {
+      projectId: request.projectId,
+      workItemId: request.workItemId,
+      repoTargetId: request.repoTargetId,
+      expectedConfigRevision: request.expectedConfigRevision,
+      expectedGovernanceEpoch: request.expectedGovernanceEpoch,
+      expectedFenceToken: request.expectedFenceToken,
+      requestedProfile,
+    });
+  } catch (error) {
+    if (isRefusal(error)) return { outcome: error.data.code, subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: error.data.message };
+    return { outcome: "INTERNAL_ERROR", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "dispatch config proof failed" };
+  }
   const briefTarget = githubIssueBriefTarget(db, request.projectId, request.workItemId ?? "");
   if (briefTarget === "invalid") {
     return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection identity is malformed or ambiguous" };
@@ -1311,6 +1329,7 @@ async function dispatchLane(
   const legacyReplay = existing !== null && existing !== "ambiguous" && existing.title === null && existing.parentThreadId === dispatchParentThreadId;
   const intent = await applyLiveAuthorizedMutation(bb, db, {
     ...request,
+    ...(configProof.continued ? { configRevision: configProof.currentConfigRevision, fixtureContextDigest: configProof.proofDigest } : {}),
     reasonCode: legacyReplay
       ? `dispatch_parent:${dispatchParentThreadId}`
       : `dispatch_parent:${dispatchParentThreadId}:title=${encodeURIComponent(dispatchTitle)}`,
@@ -1366,14 +1385,14 @@ async function dispatchLane(
           spawnedThread.parentThreadId !== prepared.parentThreadId ||
           spawnedThread.title !== `${dispatchTitle} [dispatch:${request.idempotencyKey}]`
         ) {
-          return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, false);
+          return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, false, configProof);
         }
-        return finalizeDispatchIntent(bb, db, request, prepared, spawnedThread.id);
+        return finalizeDispatchIntent(bb, db, request, prepared, spawnedThread.id, configProof);
       } catch {
-        return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true);
+        return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true, configProof);
       }
     }
-    return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true);
+    return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true, configProof);
   });
 }
 
@@ -1465,12 +1484,18 @@ async function finalizeDispatchIntent(
   request: ApplyRequest,
   intent: PreparedDispatchIntent,
   threadId: string,
+  configProof: WorkItemDispatchConfigProof,
 ): Promise<FoundationResult> {
   return applyLiveAuthorizedMutation(bb, db, {
     ...request,
     lifecycleState: undefined,
     expectedResourceRevision: intent.resourceRevision,
     idempotencyKey: `${request.idempotencyKey}-finalize`,
+    ...(configProof.continued ? {
+      configRevision: configProof.currentConfigRevision,
+      fixtureContextDigest: configProof.proofDigest,
+      reasonCode: "config_revision_continuation",
+    } : {}),
     workAttempt: { ...request.workAttempt!, threadId },
   }, false, "stop-active");
 }
@@ -1482,6 +1507,7 @@ async function reconcileDispatchIntent(
   spawn: z.infer<typeof dispatchSpawnShapeSchema>,
   intentResult: FoundationResult,
   allowRetry: boolean,
+  configProof: WorkItemDispatchConfigProof,
 ): Promise<FoundationResult> {
   const intent = preparedDispatchIntent(db, request);
   if (intent === "ambiguous") return dispatchRecoveryRefusal(request.projectId, "multiple prepared dispatch intents match the recorded idempotency and project", { intent: intentResult });
@@ -1508,7 +1534,7 @@ async function reconcileDispatchIntent(
   if (marked.length > 1 || exact.length > 1 || (marked.length === 1 && exact.length !== 1)) {
     return dispatchRecoveryRefusal(request.projectId, "native dispatch evidence is foreign, multiple, or not bound to the recorded parent", { intent: intentResult, matches: marked.map((thread) => ({ id: thread.id, parentThreadId: thread.parentThreadId, title: thread.title })) });
   }
-  if (exact.length === 1) return finalizeDispatchIntent(bb, db, request, intent, exact[0]!.id);
+  if (exact.length === 1) return finalizeDispatchIntent(bb, db, request, intent, exact[0]!.id, configProof);
   if (!allowRetry) return dispatchRecoveryRefusal(request.projectId, "native dispatch inventory proves no exact thread, but the prior spawn outcome is not retryable", { intent: intentResult });
   try {
     const retried = await spawnDispatchThread(bb, spawn, request.idempotencyKey);
@@ -1519,9 +1545,9 @@ async function reconcileDispatchIntent(
     ) {
       return dispatchRecoveryRefusal(request.projectId, "native retry returned a foreign or wrong-parent thread", { intent: intentResult, thread: retried });
     }
-    return finalizeDispatchIntent(bb, db, request, intent, retried.id);
+    return finalizeDispatchIntent(bb, db, request, intent, retried.id, configProof);
   } catch (error) {
-    return reconcileDispatchIntent(bb, db, request, spawn, intentResult, false).then((result) =>
+    return reconcileDispatchIntent(bb, db, request, spawn, intentResult, false, configProof).then((result) =>
       result.outcome === "EXTERNAL_DELIVERY_AMBIGUOUS"
         ? { ...result, message: `lane spawn failed after a complete no-match recovery retry: ${String(error)}; ${result.message ?? "reconciliation required"}` }
         : result,

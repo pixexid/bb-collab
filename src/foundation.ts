@@ -3221,6 +3221,145 @@ export function writingLaneCeilingFromJson(configJson: string): number {
   return value;
 }
 
+export interface WorkItemDispatchConfigRequest {
+  projectId: string;
+  workItemId: string;
+  repoTargetId: string;
+  expectedConfigRevision: number | null | undefined;
+  expectedGovernanceEpoch: number | null | undefined;
+  expectedFenceToken: string | null | undefined;
+  requestedProfile: ExecutionProfile;
+}
+
+export interface WorkItemDispatchConfigProof {
+  workItemConfigRevision: number;
+  currentConfigRevision: number;
+  governanceEpoch: number;
+  fenceToken: string;
+  continued: boolean;
+  proofDigest: string;
+}
+
+function dispatchProfileIdentity(profile: ExecutionProfile): ExecutionProfile {
+  return { ...profile, permissionMode: profile.permissionMode === "workspace-write" ? "accept-edits" : profile.permissionMode };
+}
+
+function dispatchProfileMatches(requested: ExecutionProfile, configured: ExecutionProfile): boolean {
+  const left = dispatchProfileIdentity(requested);
+  const right = dispatchProfileIdentity(configured);
+  return left.providerId === right.providerId &&
+    left.model === right.model &&
+    left.reasoningLevel === right.reasoningLevel &&
+    left.serviceTier === right.serviceTier &&
+    left.visibility === right.visibility &&
+    (left.permissionMode === right.permissionMode || (requested.permissionMode === "workspace-write" && ["full", "accept-edits"].includes(configured.permissionMode)));
+}
+
+function dispatchTargetIdentity(row: Record<string, unknown>): Record<string, unknown> {
+  return {
+    projectId: row.project_id,
+    repoTargetId: row.repo_target_id,
+    sourceId: row.source_id,
+    hostId: row.host_id,
+    path: row.path,
+    remoteUrl: row.remote_url,
+    defaultBranch: row.default_branch,
+    targetDigest: row.target_digest,
+  };
+}
+
+function dispatchRoleRequirement(db: SqliteDatabase, projectId: string, configRevision: number, repoTargetId: string): RoleRequirement {
+  const requirements = roleRequirementsFromJson(storedConfigJson(db, projectId, configRevision)).filter((requirement) =>
+    requirement.roleId === "worker" && requirement.repoTargetId === repoTargetId,
+  );
+  if (requirements.length !== 1) throw refusal("PROJECT_CONFIG_STALE", "the exact worker role requirement is missing or ambiguous across the config revision");
+  return requirements[0]!;
+}
+
+export function proveWorkItemDispatchConfig(
+  db: SqliteDatabase,
+  request: WorkItemDispatchConfigRequest,
+): WorkItemDispatchConfigProof {
+  const head = currentConfig(db, request.projectId);
+  if (!head) throw refusal("PROJECT_CONFIG_REQUIRED", "project has no stored config revision");
+  if (request.expectedConfigRevision !== head.config_revision) {
+    throw refusal("PROJECT_CONFIG_STALE", "dispatch expected config revision does not match the current head", {
+      currentConfigRevision: head.config_revision,
+      expectedConfigRevision: request.expectedConfigRevision ?? undefined,
+    });
+  }
+  const governor = asRow<{ governance_epoch: number; fence_token: string }>(db.prepare(
+    "SELECT governance_epoch, fence_token FROM project_governorship_heads WHERE project_id = ? AND state = 'target_active'",
+  ).get(request.projectId));
+  if (!governor || request.expectedGovernanceEpoch !== governor.governance_epoch || request.expectedFenceToken !== governor.fence_token) {
+    throw refusal("GOVERNOR_EPOCH_STALE", "dispatch expected governorship epoch or fence token is stale", {
+      currentGovernanceEpoch: governor?.governance_epoch,
+      expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? undefined,
+    });
+  }
+  const workItem = asRow<{ config_revision: number; repo_target_id: string }>(db.prepare(
+    "SELECT config_revision, repo_target_id FROM work_items WHERE project_id = ? AND work_item_id = ?",
+  ).get(request.projectId, request.workItemId));
+  if (!workItem) throw refusal("WORK_ITEM_UNKNOWN", "work item is not known in the exact project");
+  if (workItem.repo_target_id !== request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "dispatch target does not match the WorkItem target");
+
+  const currentTarget = asRow<Record<string, unknown>>(db.prepare(
+    "SELECT * FROM repository_targets WHERE project_id = ? AND repo_target_id = ? AND config_revision = ?",
+  ).get(request.projectId, request.repoTargetId, head.config_revision));
+  const historicalTarget = asRow<Record<string, unknown>>(db.prepare(
+    "SELECT * FROM repository_targets WHERE project_id = ? AND repo_target_id = ? AND config_revision = ?",
+  ).get(request.projectId, request.repoTargetId, workItem.config_revision));
+  if (!currentTarget || !historicalTarget) throw refusal("PROJECT_CONFIG_STALE", "the exact WorkItem target is missing from a config revision");
+
+  const historicalRole = dispatchRoleRequirement(db, request.projectId, workItem.config_revision, request.repoTargetId);
+  const currentRole = dispatchRoleRequirement(db, request.projectId, head.config_revision, request.repoTargetId);
+  const requestedProfile = dispatchProfileIdentity(request.requestedProfile);
+  if (!dispatchProfileMatches(request.requestedProfile, historicalRole.executedProfile) || !dispatchProfileMatches(request.requestedProfile, currentRole.executedProfile)) {
+    throw refusal("PROJECT_CONFIG_STALE", "dispatch profile does not equal the exact historical and current worker requirement");
+  }
+  const historicalConfigJson = storedConfigJson(db, request.projectId, workItem.config_revision);
+  const currentConfigJson = storedConfigJson(db, request.projectId, head.config_revision);
+  const historicalDispatchConfig = {
+    permissionMode: (JSON.parse(historicalConfigJson) as Record<string, unknown>).permissionMode,
+    visibility: (JSON.parse(historicalConfigJson) as Record<string, unknown>).visibility,
+    writingLaneCeiling: writingLaneCeilingFromJson(historicalConfigJson),
+    roleRequirement: historicalRole,
+    target: dispatchTargetIdentity(historicalTarget),
+  };
+  const currentDispatchConfig = {
+    permissionMode: (JSON.parse(currentConfigJson) as Record<string, unknown>).permissionMode,
+    visibility: (JSON.parse(currentConfigJson) as Record<string, unknown>).visibility,
+    writingLaneCeiling: writingLaneCeilingFromJson(currentConfigJson),
+    roleRequirement: currentRole,
+    target: dispatchTargetIdentity(currentTarget),
+  };
+  if (canonicalJson(historicalDispatchConfig) !== canonicalJson(currentDispatchConfig)) {
+    throw refusal("PROJECT_CONFIG_STALE", "dispatch-relevant config authority is not equivalent across revisions", {
+      currentConfigRevision: head.config_revision,
+      expectedConfigRevision: workItem.config_revision,
+    });
+  }
+  const proof = {
+    projectId: request.projectId,
+    workItemId: request.workItemId,
+    repoTargetId: request.repoTargetId,
+    workItemConfigRevision: workItem.config_revision,
+    currentConfigRevision: head.config_revision,
+    governanceEpoch: governor.governance_epoch,
+    fenceToken: governor.fence_token,
+    requestedProfile,
+    dispatchConfig: historicalDispatchConfig,
+  };
+  return {
+    workItemConfigRevision: workItem.config_revision,
+    currentConfigRevision: head.config_revision,
+    governanceEpoch: governor.governance_epoch,
+    fenceToken: governor.fence_token,
+    continued: workItem.config_revision !== head.config_revision,
+    proofDigest: sha256(canonicalJson(proof)),
+  };
+}
+
 function reviewPolicyFromJson(configJson: string): z.infer<typeof reviewPolicySchema> | null {
   const config = JSON.parse(configJson) as { extensions?: { bbCollab?: { reviewPolicy?: unknown } } };
   const value = config.extensions?.bbCollab?.reviewPolicy;
@@ -7221,12 +7360,31 @@ function applyWorkItemTransition(
   // must still prove current standing on every revalidation, including after stop.
   requireRoleActorBinding(db, request, false);
   const nextState = request.lifecycleState;
+  let configContinuation: WorkItemDispatchConfigProof | null = null;
+  if (request.reasonCode === "config_revision_continuation") {
+    if (!request.workItemId || !request.repoTargetId || !request.workAttempt?.requestedProfile || request.fixtureContextDigest === undefined) {
+      throw refusal("PROJECT_CONFIG_STALE", "config-revision continuation proof is incomplete");
+    }
+    const proof = proveWorkItemDispatchConfig(db, {
+      projectId: request.projectId,
+      workItemId: request.workItemId,
+      repoTargetId: request.repoTargetId,
+      expectedConfigRevision: request.expectedConfigRevision,
+      expectedGovernanceEpoch: request.expectedGovernanceEpoch,
+      expectedFenceToken: request.expectedFenceToken,
+      requestedProfile: request.workAttempt.requestedProfile,
+    });
+    if (!proof.continued || proof.proofDigest !== request.fixtureContextDigest) {
+      throw refusal("PROJECT_CONFIG_STALE", "config-revision continuation proof is not the exact governed revision boundary");
+    }
+    configContinuation = proof;
+  }
   const workItem = requireWorkItem(
     db,
     request,
     configRevision,
     request.expectedResourceRevision,
-    nextState !== undefined || request.workItemWait === null,
+    nextState !== undefined || request.workItemWait === null || configContinuation !== null,
   );
   if (request.reasonCode === "fleet-watchdog-merge-close" && nextState !== undefined) {
     const liveAttempt = db.prepare(
@@ -7396,7 +7554,19 @@ function applyWorkItemTransition(
           aggregateId: workItem.work_item_id,
           aggregateRevision: workItem.resource_revision,
           eventType: "work_item_attempt_armed",
-          event: { workItemId: workItem.work_item_id, executionAttemptId: dispatchIntent.execution_attempt_id, workAttempt },
+          event: {
+            workItemId: workItem.work_item_id,
+            executionAttemptId: dispatchIntent.execution_attempt_id,
+            workAttempt,
+            ...(configContinuation === null ? {} : {
+              configContinuation: {
+                fromRevision: configContinuation.workItemConfigRevision,
+                toRevision: configContinuation.currentConfigRevision,
+                proofDigest: configContinuation.proofDigest,
+                disposition: "continued",
+              },
+            }),
+          },
         },
         { expected: 1, attempted: 1, verified: 1 },
         {
@@ -7404,7 +7574,12 @@ function applyWorkItemTransition(
           currentGovernanceEpoch: governor.governance_epoch,
           currentResourceRevision: workItem.resource_revision,
           expectedResourceRevision: request.expectedResourceRevision ?? undefined,
-          evidence: { workItemId: workItem.work_item_id, executionAttemptId: dispatchIntent.execution_attempt_id, workAttempt },
+          evidence: {
+            workItemId: workItem.work_item_id,
+            executionAttemptId: dispatchIntent.execution_attempt_id,
+            workAttempt,
+            ...(configContinuation === null ? {} : { configContinuation: { fromRevision: configContinuation.workItemConfigRevision, toRevision: configContinuation.currentConfigRevision, proofDigest: configContinuation.proofDigest } }),
+          },
         },
       );
     }
@@ -7654,6 +7829,14 @@ function applyWorkItemTransition(
         ...(machineWait === null ? {} : { blocker: machineWait }),
         ...(unblock === undefined ? {} : { unblock }),
         ...(recordedExternalEvent === null ? {} : { externalEvent: recordedExternalEvent }),
+        ...(configContinuation === null ? {} : {
+          configContinuation: {
+            fromRevision: configContinuation.workItemConfigRevision,
+            toRevision: configContinuation.currentConfigRevision,
+            proofDigest: configContinuation.proofDigest,
+            disposition: "continued",
+          },
+        }),
         ...(request.workItemBody === undefined ? {} : { bodyDigest: sha256(request.workItemBody) }),
       },
     },
@@ -7671,6 +7854,14 @@ function applyWorkItemTransition(
           ...(machineWait === null ? {} : { blocker: machineWait }),
           ...(unblock === undefined ? {} : { unblock }),
           ...(recordedExternalEvent === null ? {} : { externalEvent: recordedExternalEvent }),
+          ...(configContinuation === null ? {} : {
+            configContinuation: {
+              fromRevision: configContinuation.workItemConfigRevision,
+              toRevision: configContinuation.currentConfigRevision,
+              proofDigest: configContinuation.proofDigest,
+              disposition: "continued",
+            },
+          }),
         },
     },
   );
