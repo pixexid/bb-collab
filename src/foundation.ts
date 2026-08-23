@@ -4856,10 +4856,35 @@ function currentBootstrapDecisionAuthorityRootForActor(db: SqliteDatabase, proje
   if (head.actor_receipt_id !== actorReceiptId) {
     throw refusal("ACTOR_RECEIPT_UNVERIFIED", "bootstrap Decision authority requires the exact current governorship actor");
   }
-  const actor = asRow<{ actor_kind: string; receipt_digest: string }>(db.prepare(
-    "SELECT actor_kind, receipt_digest FROM actor_receipts WHERE project_id = ? AND receipt_id = ?",
+  const actor = asRow<{
+    project_id: string;
+    actor_kind: string;
+    subject_id: string;
+    role_id: string | null;
+    role_generation: number | null;
+    verification_state: string;
+    operator_receipt_id: string | null;
+    retirement_condition: string | null;
+    receipt_digest: string;
+  }>(db.prepare(
+    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, receipt_digest FROM actor_receipts WHERE project_id = ? AND receipt_id = ?",
   ).get(projectId, actorReceiptId));
-  if (!actor || actor.actor_kind !== "plugin") {
+  if (isBootstrapGenesisReceipt(db, actorReceiptId)) {
+    throw refusal("BOOTSTRAP_GENESIS_REUSED", "bootstrap genesis receipt is single-use and cannot authorize a later Decision root");
+  }
+  const actorDigest = actor && actorReceiptDigest({
+    projectId: actor.project_id,
+    receiptId: actorReceiptId,
+    actorKind: actor.actor_kind,
+    subjectId: actor.subject_id,
+    roleId: actor.role_id,
+    roleGeneration: actor.role_generation,
+    verificationState: actor.verification_state,
+    operatorReceiptId: actor.operator_receipt_id,
+    retirementCondition: actor.retirement_condition,
+  });
+  if (!actor || actor.project_id !== projectId || actor.actor_kind !== "plugin" || actor.subject_id !== PLUGIN_ID ||
+      actor.verification_state !== "verified" || actor.receipt_digest !== actorDigest) {
     throw refusal("ACTOR_RECEIPT_UNVERIFIED", "bootstrap Decision authority requires a verified plugin governorship actor");
   }
   return {

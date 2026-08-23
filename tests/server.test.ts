@@ -2715,6 +2715,26 @@ describe("bb-collab plugin boundary", () => {
 
       expect(applyFixtureMutation(db, {
         projectId: legacyProject,
+        operationClass: "decision_create",
+        idempotencyKey: "legacy-v28-second-bootstrap-decision",
+        actorReceiptId: legacyGenesis,
+        expectedConfigRevision: 1,
+        configRevision: 1,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: legacyFence,
+        repoTargetId: null,
+        decision: {
+          decisionId: "legacy-v28-second-bootstrap-decision",
+          repoTargetId: null,
+          scope: { ...legacyDecisionScope, targetProjectId: "proj_legacy_grandchild" },
+          decisionClass: "operator_only",
+          options: { rootOfTrust: "host_local_operator" },
+          resourceRevision: 1,
+        },
+      })).toMatchObject({ outcome: "BOOTSTRAP_GENESIS_REUSED", attempted: 0, verified: 0 });
+
+      expect(applyFixtureMutation(db, {
+        projectId: legacyProject,
         operationClass: "config_revision",
         idempotencyKey: "legacy-v28-post-upgrade-config",
         actorReceiptId: legacyGenesis,
@@ -10010,6 +10030,39 @@ else printf '%s\\n' '[]'; fi
     expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "legacy-bootstrap-authority", 1, {
       idempotencyKey: "legacy-bootstrap-authority-disposition", actorReceiptId: "bootstrap-plugin", repoTargetId: null,
     })).outcome).toBe("DECISION_IDENTITY_CONFLICT");
+  });
+
+  it("makes doctor reject unverified and tampered bootstrap governor actors", async () => {
+    const { host, db, fenceToken } = await assignmentFixture();
+    const actorReceiptId = "bootstrap-doctor-plugin";
+    const decisionId = "bootstrap-doctor-authority";
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: actorReceiptId, actorKind: "plugin", subjectId: PLUGIN_ID });
+    db.prepare("UPDATE project_governorships SET actor_receipt_id = ? WHERE project_id = ? AND governance_epoch = 1").run(actorReceiptId, PROJECT_ID);
+    const decision = {
+      decisionId,
+      repoTargetId: null,
+      scope: { operation: "cross_project_bootstrap", sourceProjectId: PROJECT_ID, targetProjectId: FOREIGN_PROJECT_ID, repoTargetId: null },
+      decisionClass: "operator_only" as const,
+      options: { rootOfTrust: "host_local_operator" },
+      resourceRevision: 1,
+    };
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, decisionId, {
+      actorReceiptId, repoTargetId: null, decision,
+    })).outcome).toBe("OK");
+    for (const mutation of [
+      () => db.prepare("UPDATE actor_receipts SET verification_state = 'unverified' WHERE project_id = ? AND receipt_id = ?").run(PROJECT_ID, actorReceiptId),
+      () => db.prepare("UPDATE actor_receipts SET verification_state = 'verified', subject_id = 'tampered-plugin' WHERE project_id = ? AND receipt_id = ?").run(PROJECT_ID, actorReceiptId),
+    ]) {
+      mutation();
+      const before = exportFoundation(db, PROJECT_ID);
+      const doctor = await host.harness.callRpc("doctor", { projectId: PROJECT_ID }) as FoundationResult;
+      expect(doctor).toMatchObject({
+        outcome: "OK",
+        evidence: { decisionIntegrity: { unresolvedDecisions: [{ decisionId, reason: "DECISION_AUTHORITY_ROOT_INVALID" }] } },
+      });
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+      db.prepare("UPDATE actor_receipts SET verification_state = 'verified', subject_id = ? WHERE project_id = ? AND receipt_id = ?").run(PLUGIN_ID, PROJECT_ID, actorReceiptId);
+    }
   });
 
   it("migrates v4 to v5 without manufacturing typed authority for existing Decision rows", () => {
