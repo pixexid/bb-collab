@@ -34,6 +34,7 @@ import {
   doctor,
   exportFoundation,
   canonicalJson,
+  sha256,
   mutationRequestDigest,
   isRefusal,
   probeV21NewLegacyApplyProvenanceRefusal,
@@ -3567,20 +3568,41 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     readRoleHolders: readProjectQueueRoleHolders,
     readArtifact: async (projectId) => {
       if (!db) return null;
+      let interrupted: Array<{ execution_attempt_id: string; work_item_id: string; thread_id: string | null; interruption_reason: string | null }>;
+      try {
+        interrupted = db.prepare(
+          `SELECT attempts.execution_attempt_id, attempts.work_item_id, attempts.thread_id, attempts.interruption_reason
+           FROM execution_attempts AS attempts
+           JOIN work_items AS items ON items.project_id = attempts.project_id AND items.work_item_id = attempts.work_item_id
+           WHERE attempts.project_id = ? AND attempts.origin = 'work_item' AND attempts.state = 'interrupted'
+             AND items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
+           ORDER BY attempts.attempt_ordinal, attempts.execution_attempt_id`,
+        ).all(projectId, ...WORK_ITEM_NON_TERMINAL_STATES) as typeof interrupted;
+      } catch (error) {
+        bb.log.warn(`stall-guard coverage=blind project=${projectId} reason=interrupted-attempt-inventory-unreadable:${String(error)}`);
+        return null;
+      }
       const artifacts = [];
       for (const holder of readRoleHolderStates(db).filter((candidate) => candidate.project_id === projectId)) {
+        const appendDebt = () => {
+          if (holder.role_id !== "project-orchestrator") return;
+          for (const debt of interrupted) artifacts.push({ id: `interrupted:${debt.execution_attempt_id}`, unavailable: false, value: { workItemId: debt.work_item_id, threadId: debt.thread_id, reason: debt.interruption_reason, state: "interrupted" } });
+        };
         try {
           const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
           if (thread.projectId !== projectId || !thread.environmentId) {
             artifacts.push({ id: holder.execution_attempt_id, unavailable: false, value: { environmentId: null, result: { outcome: "absent" } } });
+            appendDebt();
             continue;
           }
           const result = await bb.sdk.environments.pullRequest({ environmentId: thread.environmentId });
           artifacts.push(result.outcome === "unavailable"
             ? { id: holder.execution_attempt_id, unavailable: true, value: null }
             : { id: holder.execution_attempt_id, unavailable: false, value: { environmentId: thread.environmentId, result } });
+          appendDebt();
         } catch {
           artifacts.push({ id: holder.execution_attempt_id, unavailable: true, value: null });
+          appendDebt();
         }
       }
       return artifacts;
@@ -4025,6 +4047,106 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           wakeInFlight.delete(key);
         }
       };
+      const superviseNativeInterruption = async (projectId?: string, threadId?: string) => {
+        if (!db) {
+          bb.log.warn(`interrupted-attempt supervision coverage=blind reason=canonical-store-unreadable`);
+          return;
+        }
+        let attempts: Array<{ project_id: string; work_item_id: string; execution_attempt_id: string; repo_target_id: string; resource_revision: number; thread_id: string; created_at_ms: number; state: string }>;
+        try {
+          attempts = db.prepare(
+            `SELECT attempts.project_id, attempts.work_item_id, attempts.execution_attempt_id,
+                    attempts.repo_target_id, items.resource_revision, attempts.thread_id, attempts.created_at_ms, attempts.state
+             FROM execution_attempts AS attempts
+             JOIN work_items AS items ON items.project_id = attempts.project_id AND items.work_item_id = attempts.work_item_id
+             WHERE attempts.origin = 'work_item' AND attempts.thread_id IS NOT NULL
+               AND attempts.state IN (${[...WORK_ITEM_CAPACITY_ATTEMPT_STATES, "interrupted"].map(() => "?").join(", ")})
+               AND items.lifecycle_state IN (${WORK_ITEM_NON_TERMINAL_STATES.map(() => "?").join(", ")})
+               ${projectId === undefined ? "" : "AND attempts.project_id = ?"}
+               ${threadId === undefined ? "" : "AND attempts.thread_id = ?"}
+             ORDER BY attempts.project_id, attempts.execution_attempt_id`,
+          ).all(
+            ...WORK_ITEM_CAPACITY_ATTEMPT_STATES, "interrupted",
+            ...WORK_ITEM_NON_TERMINAL_STATES,
+            ...(projectId === undefined ? [] : [projectId]),
+            ...(threadId === undefined ? [] : [threadId]),
+          ) as typeof attempts;
+        } catch (error) {
+          bb.log.warn(`interrupted-attempt supervision coverage=blind reason=canonical-inventory-unreadable:${String(error)}`);
+          return;
+        }
+        for (const attempt of attempts) {
+          let events: Awaited<ReturnType<typeof bb.sdk.threads.events.list>>;
+          try {
+            events = await bb.sdk.threads.events.list({ threadId: attempt.thread_id, types: ["system/thread/interrupted"], order: "desc", limit: "1000" });
+          } catch (error) {
+            bb.log.warn(`interrupted-attempt supervision coverage=blind project=${attempt.project_id} attempt=${attempt.execution_attempt_id} reason=native-event-inventory-unreadable:${String(error)}`);
+            continue;
+          }
+          const interruption = events.find((event) => event.type === "system/thread/interrupted"
+            && event.threadId === attempt.thread_id
+            && event.createdAt >= attempt.created_at_ms);
+          if (!interruption || interruption.type !== "system/thread/interrupted") continue;
+          const actor = db.prepare(
+            `SELECT receipt_id FROM actor_receipts
+             WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
+               AND verification_state = 'verified' ORDER BY issued_at_ms DESC LIMIT 1`,
+          ).get(attempt.project_id, PLUGIN_ID) as { receipt_id: string } | undefined;
+          const governor = db.prepare("SELECT governance_epoch, fence_token FROM project_governorship_heads WHERE project_id = ?").get(attempt.project_id) as { governance_epoch: number; fence_token: string } | undefined;
+          const config = db.prepare("SELECT config_revision FROM project_config_heads WHERE project_id = ?").get(attempt.project_id) as { config_revision: number } | undefined;
+          if (attempt.state !== "interrupted" && (!actor || !governor || !config)) {
+            bb.log.warn(`interrupted-attempt supervision coverage=blind project=${attempt.project_id} attempt=${attempt.execution_attempt_id} reason=authority-unavailable`);
+            continue;
+          }
+          const evidence = {
+            projectId: attempt.project_id,
+            workItemId: attempt.work_item_id,
+            executionAttemptId: attempt.execution_attempt_id,
+            threadId: attempt.thread_id,
+            reason: interruption.data.reason,
+            nativeEventType: interruption.type,
+            nativeEventId: interruption.id,
+            nativeEventSeq: interruption.seq,
+            nativeTurnId: null,
+            evidenceDigest: sha256(canonicalJson({ id: interruption.id, seq: interruption.seq, threadId: interruption.threadId, reason: interruption.data.reason })),
+          } satisfies NonNullable<ApplyRequest["interruption"]>;
+          if (attempt.state !== "interrupted") {
+            const request: ApplyRequest = {
+              projectId: attempt.project_id,
+              operationClass: "execution_attempt_interruption",
+              idempotencyKey: `native-interruption:${fleetWatchdogCompositeKey(attempt.project_id, attempt.execution_attempt_id, interruption.id, String(interruption.seq))}`,
+              actorReceiptId: actor!.receipt_id,
+              expectedConfigRevision: config!.config_revision,
+              expectedGovernanceEpoch: governor!.governance_epoch,
+              expectedFenceToken: governor!.fence_token,
+              repoTargetId: attempt.repo_target_id,
+              expectedResourceRevision: attempt.resource_revision,
+              workItemId: attempt.work_item_id,
+              executionAttemptId: attempt.execution_attempt_id,
+              interruption: evidence,
+              reasonCode: `native-interruption:${interruption.data.reason}`,
+            };
+            const result = await applyLiveAuthorizedMutation(bb, db, request, false, "refuse-active");
+            if (result.outcome !== "OK" && !result.replay) {
+              bb.log.warn(`interrupted-attempt supervision refused: project=${attempt.project_id} attempt=${attempt.execution_attempt_id} outcome=${result.outcome}`);
+              continue;
+            }
+          }
+          const orchestrators = readRoleHolderStates(db).filter((holder) => holder.project_id === attempt.project_id && holder.role_id === "project-orchestrator");
+          if (orchestrators.length !== 1) {
+            bb.log.warn(`interrupted-attempt supervision coverage=blind project=${attempt.project_id} attempt=${attempt.execution_attempt_id} reason=exact-orchestrator-unresolved holders=${orchestrators.length}`);
+            continue;
+          }
+          await wake(
+            attempt.project_id,
+            orchestrators[0]!,
+            `interrupted-attempt:${fleetWatchdogCompositeKey(attempt.project_id, attempt.execution_attempt_id, interruption.id, String(interruption.seq))}`,
+            `interrupted attempt requires explicit resume or disposition: project=${attempt.project_id} workItem=${attempt.work_item_id} executionAttempt=${attempt.execution_attempt_id} nativeEvent=${interruption.id}@${interruption.seq} reason=${interruption.data.reason}`,
+            false,
+            "owed-act",
+          );
+        }
+      };
       const transitionWorkItem = async (
         projectId: string,
         workItemId: string,
@@ -4311,6 +4433,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           }
           const director = directors[0]!;
           const orchestrator = orchestrators[0]!;
+          await superviseNativeInterruption(projectId);
           await inspectLinkedWorkItems(projectId, orchestrator, dispatcherThreadIds);
           for (const holder of holders) {
             let thread = await bb.sdk.threads.get({ threadId: holder.thread_id });

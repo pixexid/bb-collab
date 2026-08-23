@@ -8,7 +8,7 @@ The fleet is a director, an orchestrator, and workers using BB-native threads an
 
 ## Contract
 
-`INSTRUCTION_CONTRACT_VERSION: 43` — this is the instruction contract for agent sessions; apply the [instruction-contract version-bump test](docs/rules.md#version-bump-test) before changing it. The separate `RUNTIME_CONTRACT_VERSION: 26` lives in `src/foundation.ts` and feeds `contractDigest`.
+`INSTRUCTION_CONTRACT_VERSION: 44` — this is the instruction contract for agent sessions; apply the [instruction-contract version-bump test](docs/rules.md#version-bump-test) before changing it. The separate `RUNTIME_CONTRACT_VERSION: 27` lives in `src/foundation.ts` and feeds `contractDigest`.
 
 ## Reading order for a fresh seat
 
@@ -55,3 +55,4 @@ A fresh worktree may have no dependencies. `npm ci` is expected before verificat
 - [Blast radius](docs/rules.md#blast-radius) — update affected open artifacts with the decision that invalidates them.
 - [External-party content uses the inbox](docs/rules.md#external-party-content-uses-the-inbox) — actionable operator content outside the current conversation goes through the inbox once available.
 - [Project-agnostic by construction](docs/rules.md#project-agnostic-by-construction) — changed project-owned behavior requires an explicit exact `project_id`.
+- Interrupted attempts are first-class debt: native interruption without accepted correlated terminal evidence is never `done`, never fires dependents, and requires explicit resume or disposition.

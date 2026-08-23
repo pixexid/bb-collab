@@ -305,6 +305,21 @@ function extractCandidates(snapshot) {
   const startableNumbers = new Set(githubIssues.filter((issue) => issue.labels.includes("queue:startable")).map((issue) => issue.number));
   const projectWorkItems = canonical.workItems.filter((workItem) => workItem.project_id === projectId);
   const projectRefs = canonical.externalWorkRefs.filter((row) => row.project_id === projectId);
+  if (sourcesKnown("canonical", "timeline")) {
+    const latestByWorkItem = /* @__PURE__ */ new Map();
+    for (const attempt of canonical.executionAttempts.filter((row) => row.project_id === projectId && row.origin === "work_item" && typeof row.work_item_id === "string")) {
+      const prior = latestByWorkItem.get(String(attempt.work_item_id));
+      const attemptOrder = Number(attempt.attempt_ordinal ?? attempt.observed_at_ms ?? 0);
+      const priorOrder = Number(prior?.attempt_ordinal ?? prior?.observed_at_ms ?? 0);
+      if (!prior || attemptOrder > priorOrder) latestByWorkItem.set(String(attempt.work_item_id), attempt);
+    }
+    for (const workItem of projectWorkItems) {
+      const attempt = latestByWorkItem.get(String(workItem.work_item_id));
+      if (!attempt || attempt.state !== "interrupted" || !["proposed", "ready", "in_progress", "review_pending", "blocked"].includes(String(workItem.lifecycle_state))) continue;
+      const anchors = { projectId, kind: "interrupted_attempt", executionAttemptId: String(attempt.execution_attempt_id), workItemId: String(workItem.work_item_id), threadId: attempt.thread_id === null ? null : String(attempt.thread_id) };
+      candidates.push({ id: `${projectId}:interrupted:${anchors.executionAttemptId}`, kind: anchors.kind, anchors, finding: `Interrupted attempt ${anchors.executionAttemptId} left pending work item ${anchors.workItemId} requiring explicit resume or disposition.`, evidence: { projectId, workItemId: anchors.workItemId, threadId: anchors.threadId, reason: attempt.interruption_reason ?? null, state: attempt.state } });
+    }
+  }
   for (const workItem of sourcesKnown("canonical", "githubIssues") ? projectWorkItems : []) {
     const ref = projectRefs.find((row) => row.work_item_id === workItem.work_item_id && row.provider === "github" && row.owner === repository?.owner && row.repo === repository?.repo && typeof row.issue_number === "number");
     if (workItem.lifecycle_state !== "ready" || !ref || !startableNumbers.has(ref.issue_number) || activeAttempts.some((attempt) => attempt.work_item_id === workItem.work_item_id)) continue;
