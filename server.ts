@@ -47,6 +47,7 @@ import {
   WORK_ITEM_CAPACITY_ATTEMPT_STATES,
   WORK_ITEM_CAPACITY_LIFECYCLE_STATES,
   workItemCapacityLaneEvidence,
+  parseWorkItemDispatchIntent,
   reconcilePreparedWorkItemDispatches,
   type ApplyRequest,
   type FoundationCode,
@@ -90,6 +91,7 @@ type PluginOptions = {
 };
 type WorkItemWait = NonNullable<ApplyRequest["workItemWait"]>;
 const ERROR_RECOVERY_IO_TIMEOUT_MS = 10_000;
+const dispatchRecoveryQueues = new Map<string, Promise<FoundationResult>>();
 
 type LaneRecoveryTarget = { project_id: string; thread_id: string; execution_attempt_id: string };
 
@@ -556,6 +558,77 @@ const dispatchLaneInputSchema = z.object({
   request: applyRequestSchema,
   spawn: z.record(z.string(), z.unknown()),
 }).strict();
+const dispatchEnvironmentSchema = z.union([
+  z.object({ type: z.literal("project-default") }).strict(),
+  z.object({ type: z.literal("reuse"), environmentId: z.string().trim().min(1) }).strict(),
+  z.object({
+    type: z.literal("host"),
+    hostId: z.string().trim().min(1).optional(),
+    workspace: z.union([
+      z.object({ type: z.literal("personal") }).strict(),
+      z.object({
+        type: z.literal("unmanaged"),
+        path: z.string().nullable(),
+        branch: z.union([
+          z.object({ kind: z.literal("existing"), name: z.string().trim().min(1) }).strict(),
+          z.object({ kind: z.literal("new"), baseBranch: z.string().trim().min(1) }).strict(),
+        ]).optional(),
+      }).strict(),
+      z.object({
+        type: z.literal("managed-worktree"),
+        baseBranch: z.union([
+          z.object({ kind: z.literal("default") }).strict(),
+          z.object({ kind: z.literal("named"), name: z.string().trim().min(1) }).strict(),
+        ]),
+      }).strict(),
+    ]),
+  }).strict().superRefine((environment, ctx) => {
+    if (environment.workspace.type !== "personal" && environment.hostId === undefined) {
+      ctx.addIssue({ code: "custom", path: ["hostId"], message: "host dispatch requires hostId unless workspace.type is personal" });
+    }
+  }),
+]);
+const dispatchPromptResourceSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("thread"), label: z.string(), projectId: z.string().optional(), threadId: z.string() }).strict(),
+  z.object({ kind: z.literal("project"), label: z.string(), projectId: z.string() }).strict(),
+  z.object({ kind: z.literal("section"), label: z.string(), sectionId: z.string() }).strict(),
+  z.object({ entryKind: z.enum(["directory", "file"]), kind: z.literal("path"), label: z.string(), path: z.string(), source: z.enum(["thread-storage", "workspace"]) }).strict(),
+  z.object({ argumentHint: z.string().nullable(), kind: z.literal("command"), label: z.string(), name: z.string(), origin: z.enum(["builtin", "project", "user"]), source: z.enum(["command", "skill"]), trigger: z.literal("/") }).strict(),
+  z.object({ icon: z.string().nullable().optional(), itemId: z.string(), kind: z.literal("plugin"), label: z.string(), pluginId: z.string() }).strict(),
+]);
+const dispatchPromptInputSchema = z.discriminatedUnion("type", [
+  z.object({
+    mentions: z.array(z.object({ end: z.number(), resource: dispatchPromptResourceSchema, start: z.number() }).strict()).default([]),
+    text: z.string(),
+    type: z.literal("text"),
+    visibility: z.literal("agent-only").optional(),
+  }).strict(),
+  z.object({ type: z.literal("image"), url: z.string(), visibility: z.literal("agent-only").optional() }).strict(),
+  z.object({ path: z.string(), type: z.literal("localImage"), visibility: z.literal("agent-only").optional() }).strict(),
+  z.object({ mimeType: z.string().optional(), name: z.string().optional(), path: z.string(), sizeBytes: z.number().optional(), type: z.literal("localFile"), visibility: z.literal("agent-only").optional() }).strict(),
+]);
+const dispatchSpawnShapeSchema = z.object({
+  projectId: z.string().trim().min(1),
+  parentThreadId: z.string().trim().min(1),
+  environment: dispatchEnvironmentSchema,
+  title: z.string().max(4096).optional(),
+  visibility: z.enum(["visible", "hidden"]).optional(),
+  providerId: z.string().trim().min(1).optional(),
+  model: z.string().trim().min(1).optional(),
+  serviceTier: z.enum(["default", "fast"]).optional(),
+  reasoningLevel: z.enum(["none", "low", "medium", "high", "xhigh", "ultracode", "max", "ultra"]).optional(),
+  permissionMode: z.union([z.enum(["auto", "accept-edits", "full"]), z.literal("workspace-write")]).transform((mode) => mode === "workspace-write" ? "accept-edits" : mode).optional(),
+  executionInputSources: z.object({
+    providerId: z.enum(["explicit", "client-preference"]).optional(),
+    model: z.enum(["explicit", "client-preference"]).optional(),
+    serviceTier: z.enum(["explicit", "client-preference"]).optional(),
+    reasoningLevel: z.enum(["explicit", "client-preference"]).optional(),
+    permissionMode: z.enum(["explicit", "client-preference"]).optional(),
+  }).strict().optional(),
+}).passthrough().and(z.union([
+  z.object({ input: z.never().optional(), prompt: z.string().min(1) }).passthrough(),
+  z.object({ input: z.array(dispatchPromptInputSchema), prompt: z.never().optional() }).passthrough(),
+]));
 
 export const rpcContract = defineRpcContract({
   "v1-lanes": {
@@ -848,36 +921,213 @@ async function dispatchLane(
   if (spawn.projectId !== request.projectId) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "spawn projectId must match request projectId" };
   }
-  const dispatchParentThreadId = typeof spawn.parentThreadId === "string" ? spawn.parentThreadId : null;
-  if (!dispatchParentThreadId) {
-    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "lane dispatch requires the dispatcher parent thread" };
-  }
+  const spawnShape = dispatchSpawnShapeSchema.safeParse(spawn);
+  if (!spawnShape.success) return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: spawnShape.error.message };
+  const dispatchParentThreadId = spawnShape.data.parentThreadId;
+  const dispatchTitle = String(spawnShape.data.title ?? "lane");
   const { threadId: _threadId, ...intentAttempt } = request.workAttempt;
   const intent = await applyLiveAuthorizedMutation(bb, db, {
     ...request,
-    reasonCode: `dispatch_parent:${dispatchParentThreadId}`,
+    reasonCode: `dispatch_parent:${dispatchParentThreadId}:title=${encodeURIComponent(dispatchTitle)}`,
     workAttempt: intentAttempt,
   }, false, "stop-active");
-  if (intent.outcome !== "OK" || intent.replay) return intent;
+  if (intent.outcome !== "OK") return intent;
+  return serializeDispatchRecovery(request, async () => {
+    if (!intent.replay) {
+      try {
+        const spawnedThread = await spawnDispatchThread(bb, spawnShape.data, request.idempotencyKey);
+        const prepared = preparedDispatchIntent(db, request);
+        if (prepared === "ambiguous" || !prepared) {
+          return dispatchRecoveryRefusal(request.projectId, "native spawn returned without a uniquely recoverable prepared intent");
+        }
+        if (
+          spawnedThread.projectId !== request.projectId ||
+          spawnedThread.parentThreadId !== prepared.parentThreadId ||
+          spawnedThread.title !== `${dispatchTitle} [dispatch:${request.idempotencyKey}]`
+        ) {
+          return reconcileDispatchIntent(bb, db, request, spawnShape.data, intent, false);
+        }
+        return finalizeDispatchIntent(bb, db, request, prepared, spawnedThread.id);
+      } catch {
+        return reconcileDispatchIntent(bb, db, request, spawnShape.data, intent, true);
+      }
+    }
+    return reconcileDispatchIntent(bb, db, request, spawnShape.data, intent, true);
+  });
+}
 
-  let thread: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["spawn"]>>;
-  try {
-    thread = await bb.sdk.threads.spawn({
-      ...spawn,
-      title: `${String(spawn.title ?? "lane")} [dispatch:${request.idempotencyKey}]`,
-    } as unknown as Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]);
-  } catch (error) {
-    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `lane spawn failed after durable dispatch intent: ${String(error)}`, evidence: { intent } };
+type DispatchThread = Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["list"]>>[number];
+type PreparedDispatchIntent = {
+  parentThreadId: string;
+  title: string | null;
+  resourceRevision: number;
+};
+
+function preparedDispatchIntent(db: SqliteDatabase | null, request: ApplyRequest): PreparedDispatchIntent | "ambiguous" | null {
+  if (!db || !request.workItemId) return null;
+  const rows = db.prepare(
+    `SELECT reason_code
+     FROM execution_attempts
+     WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+       AND assignment_kind = 'write' AND state = 'prepared' AND thread_id IS NULL
+     ORDER BY attempt_ordinal DESC`,
+  ).all(request.projectId, request.workItemId) as Array<{ reason_code: string | null }>;
+  const matches = rows.filter((row) => parseWorkItemDispatchIntent(row.reason_code)?.idempotencyKey === request.idempotencyKey);
+  if (matches.length > 1) return "ambiguous";
+  const match = matches[0];
+  if (!match || !match.reason_code) return null;
+  const parsed = parseWorkItemDispatchIntent(match.reason_code);
+  if (!parsed) return "ambiguous";
+  const workItem = db.prepare(
+    "SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?",
+  ).get(request.projectId, request.workItemId) as { resource_revision: number } | undefined;
+  return workItem ? { parentThreadId: parsed.parentThreadId, title: parsed.title, resourceRevision: workItem.resource_revision } : "ambiguous";
+}
+
+function dispatchThreadShape(thread: unknown): thread is DispatchThread {
+  if (!thread || typeof thread !== "object") return false;
+  const value = thread as Record<string, unknown>;
+  return typeof value.id === "string" && value.id.length > 0 &&
+    typeof value.projectId === "string" && value.projectId.length > 0 &&
+    (typeof value.parentThreadId === "string" || value.parentThreadId === null) &&
+    (typeof value.title === "string" || value.title === null) &&
+    typeof value.status === "string" &&
+    (typeof value.archivedAt === "number" || value.archivedAt === null) &&
+    (typeof value.deletedAt === "number" || value.deletedAt === null);
+}
+
+async function dispatchThreadInventory(bb: BbPluginApi, projectId: string): Promise<DispatchThread[]> {
+  const [active, archived] = await Promise.all([
+    listAllProjectThreads((args) => bb.sdk.threads.list(args), projectId),
+    listAllProjectThreads((args) => bb.sdk.threads.list({ ...args, archived: true }), projectId),
+  ]);
+  const threads = [...active, ...archived];
+  const ids = new Set<string>();
+  for (const [thread, expectedArchived] of [...active.map((thread) => [thread, false] as const), ...archived.map((thread) => [thread, true] as const)]) {
+    if (!dispatchThreadShape(thread) || thread.projectId !== projectId || ids.has(thread.id) || (expectedArchived ? thread.archivedAt === null : thread.archivedAt !== null)) {
+      throw new Error("native dispatch inventory is incomplete or foreign");
+    }
+    ids.add(thread.id);
   }
+  return threads;
+}
 
-  const intentEvidence = intent as { currentResourceRevision?: number };
+function dispatchRecoveryRefusal(projectId: string, message: string, evidence?: unknown): FoundationResult {
+  return {
+    outcome: "EXTERNAL_DELIVERY_AMBIGUOUS",
+    subject: projectId,
+    expected: 1,
+    attempted: 1,
+    verified: 0,
+    message,
+    ...(evidence === undefined ? {} : { evidence }),
+  };
+}
+
+async function spawnDispatchThread(
+  bb: BbPluginApi,
+  spawn: z.infer<typeof dispatchSpawnShapeSchema>,
+  idempotencyKey: string,
+): Promise<DispatchThread> {
+  const thread = await bb.sdk.threads.spawn({
+    ...spawn,
+    title: `${String(spawn.title ?? "lane")} [dispatch:${idempotencyKey}]`,
+  });
+  if (!dispatchThreadShape(thread)) throw new Error("native spawn returned incomplete thread evidence");
+  return thread;
+}
+
+async function finalizeDispatchIntent(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  request: ApplyRequest,
+  intent: PreparedDispatchIntent,
+  threadId: string,
+): Promise<FoundationResult> {
   return applyLiveAuthorizedMutation(bb, db, {
     ...request,
     lifecycleState: undefined,
-    expectedResourceRevision: intentEvidence?.currentResourceRevision,
+    expectedResourceRevision: intent.resourceRevision,
     idempotencyKey: `${request.idempotencyKey}-finalize`,
-    workAttempt: { ...request.workAttempt, threadId: thread.id },
+    workAttempt: { ...request.workAttempt!, threadId },
   }, false, "stop-active");
+}
+
+async function reconcileDispatchIntent(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  request: ApplyRequest,
+  spawn: z.infer<typeof dispatchSpawnShapeSchema>,
+  intentResult: FoundationResult,
+  allowRetry: boolean,
+): Promise<FoundationResult> {
+  const intent = preparedDispatchIntent(db, request);
+  if (intent === "ambiguous") return dispatchRecoveryRefusal(request.projectId, "multiple prepared dispatch intents match the recorded idempotency and project", { intent: intentResult });
+  if (!intent) return intentResult;
+  if (intent.title === null) return dispatchRecoveryRefusal(request.projectId, "recorded dispatch intent has no original title identity", { intent: intentResult });
+
+  let threads: DispatchThread[];
+  try {
+    threads = await dispatchThreadInventory(bb, request.projectId);
+  } catch (error) {
+    return dispatchRecoveryRefusal(request.projectId, `complete native dispatch inventory is unavailable: ${String(error)}`, { intent: intentResult });
+  }
+  const marker = `[dispatch:${request.idempotencyKey}]`;
+  const marked = threads.filter((thread) => thread.title?.includes(marker) === true);
+  const exact = marked.filter((thread) =>
+    intent.title !== null &&
+    thread.parentThreadId === intent.parentThreadId &&
+    thread.title === `${intent.title} ${marker}`,
+  );
+  if (marked.length > 1 || exact.length > 1 || (marked.length === 1 && exact.length !== 1)) {
+    return dispatchRecoveryRefusal(request.projectId, "native dispatch evidence is foreign, multiple, or not bound to the recorded parent", { intent: intentResult, matches: marked.map((thread) => ({ id: thread.id, parentThreadId: thread.parentThreadId, title: thread.title })) });
+  }
+  if (exact.length === 1) {
+    if (exact[0]!.archivedAt !== null || exact[0]!.deletedAt !== null) {
+      return dispatchRecoveryRefusal(request.projectId, "the exact dispatch thread is archived or deleted; refusing duplicate spawn or binding", { intent: intentResult, thread: exact[0] });
+    }
+    return finalizeDispatchIntent(bb, db, request, intent, exact[0]!.id);
+  }
+  if (threads.some((thread) => thread.parentThreadId === intent.parentThreadId && thread.archivedAt !== null)) {
+    return dispatchRecoveryRefusal(request.projectId, "native dispatch inventory contains an archived child under the recorded parent", { intent: intentResult });
+  }
+  if (threads.some((thread) => thread.parentThreadId === intent.parentThreadId && thread.archivedAt === null && thread.deletedAt === null)) {
+    return dispatchRecoveryRefusal(request.projectId, "native dispatch inventory has a child under the recorded parent without the exact dispatch identity", { intent: intentResult });
+  }
+  if (!allowRetry) return dispatchRecoveryRefusal(request.projectId, "native dispatch inventory proves no exact thread, but the prior spawn outcome is not retryable", { intent: intentResult });
+  try {
+    const retried = await spawnDispatchThread(bb, spawn, request.idempotencyKey);
+    if (
+      retried.projectId !== request.projectId ||
+      retried.parentThreadId !== intent.parentThreadId ||
+      intent.title === null ||
+      retried.title !== `${intent.title} ${marker}`
+    ) {
+      return dispatchRecoveryRefusal(request.projectId, "native retry returned a foreign or wrong-parent thread", { intent: intentResult, thread: retried });
+    }
+    return finalizeDispatchIntent(bb, db, request, intent, retried.id);
+  } catch (error) {
+    return reconcileDispatchIntent(bb, db, request, spawn, intentResult, false).then((result) =>
+      result.outcome === "EXTERNAL_DELIVERY_AMBIGUOUS"
+        ? { ...result, message: `lane spawn failed after a complete no-match recovery retry: ${String(error)}; ${result.message ?? "reconciliation required"}` }
+        : result,
+    );
+  }
+}
+
+async function serializeDispatchRecovery(
+  request: ApplyRequest,
+  recover: () => Promise<FoundationResult>,
+): Promise<FoundationResult> {
+  const key = `${request.projectId}\u0000${request.idempotencyKey}`;
+  const previous = dispatchRecoveryQueues.get(key) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(recover);
+  dispatchRecoveryQueues.set(key, current);
+  try {
+    return await current;
+  } finally {
+    if (dispatchRecoveryQueues.get(key) === current) dispatchRecoveryQueues.delete(key);
+  }
 }
 
 type WorkItemAttemptTerminalizationPolicy = "refuse-active" | "stop-active";
