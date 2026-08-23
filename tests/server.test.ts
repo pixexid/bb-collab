@@ -5776,6 +5776,63 @@ exit 1
     }
   });
 
+  it("migrates a persisted pre-composite zero-writer episode without waking", async () => {
+    const cleanup = installStartableQueueFixture(305);
+    try {
+      const fixture = await fleetWatchdogFixture(1, true, 2);
+      const holder = fixture.db.prepare(
+        "SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'project-orchestrator'",
+      ).get() as Parameters<typeof fleetWatchdogEpisodeKey>[0];
+      const legacyProbeKey = `${PROJECT_ID}:${fixture.orchestratorThreadId}`;
+      const legacyEpisodeKey = [
+        PROJECT_ID, "project-orchestrator", holder.role_generation, holder.execution_attempt_id,
+        fixture.orchestratorThreadId, "activeLanes=0", "example/project#305",
+      ].join(":");
+      await fixture.host.bb.storage.kv.set("idle-fleet.wake", { [legacyProbeKey]: legacyEpisodeKey });
+
+      await emitIdleFleet(fixture, 1);
+
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(await fixture.host.bb.storage.kv.get<Record<string, string>>("idle-fleet.wake")).toEqual({
+        [JSON.stringify([PROJECT_ID, fixture.orchestratorThreadId])]: fleetWatchdogEpisodeKey(holder, "example/project#305", 0, 2),
+      });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("does not let a persisted zero-writer key suppress a new writer episode", async () => {
+    const cleanup = installStartableQueueFixture(305);
+    try {
+      const fixture = await fleetWatchdogFixture(1, true, 2);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+      fixture.addNativeLane("thread-work-item-1", "active");
+      const holder = fixture.db.prepare(
+        "SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'project-orchestrator'",
+      ).get() as Parameters<typeof fleetWatchdogEpisodeKey>[0];
+      const legacyProbeKey = `${PROJECT_ID}:${fixture.orchestratorThreadId}`;
+      const legacyEpisodeKey = [
+        PROJECT_ID, "project-orchestrator", holder.role_generation, holder.execution_attempt_id,
+        fixture.orchestratorThreadId, "activeLanes=0", "example/project#305",
+      ].join(":");
+      await fixture.host.bb.storage.kv.set("idle-fleet.wake", { [legacyProbeKey]: legacyEpisodeKey });
+
+      await emitIdleFleet(fixture, 1);
+
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({
+          threadId: fixture.orchestratorThreadId,
+          mode: "steer",
+          input: [expect.objectContaining({
+            text: expect.stringContaining("1 active writing lane below writing capacity 2"),
+          })],
+        }),
+      ]]);
+    } finally {
+      cleanup();
+    }
+  });
+
   it("permits wake with one writer and one reviewer below the writing ceiling", async () => {
     const cleanup = installStartableQueueFixture(305);
     try {

@@ -22385,16 +22385,15 @@ var fleetWatchdogEpisodeKey = (holder, queueHead, activeLaneCount = 0, writingLa
   `writingLaneCeiling=${writingLaneCeiling}`,
   queueHead
 );
-var fleetWatchdogLegacyEpisodeKey = (holder, queueHead, activeLaneCount, writingLaneCeiling) => [
+var fleetWatchdogLegacyEpisodeKey = (holder, queueHead, activeLaneCount) => activeLaneCount === 0 ? [
   holder.project_id,
   holder.role_id,
   holder.role_generation,
   holder.execution_attempt_id,
   holder.thread_id,
-  `activeLanes=${activeLaneCount}`,
-  `writingLaneCeiling=${writingLaneCeiling}`,
+  "activeLanes=0",
   queueHead
-].join(":");
+].join(":") : void 0;
 var fleetWatchdogScope = (prefix, ...parts) => `${prefix}:${fleetWatchdogCompositeKey(...parts)}`;
 var fleetWatchdogScopeMessage = (scope) => {
   const separator = scope.indexOf(":");
@@ -24698,7 +24697,7 @@ ${thread.titleFallback ?? ""}`);
     return {
       kind: "ready",
       episodeKey: fleetWatchdogEpisodeKey(holder, queueHead, activeLanes.value.length, ceiling.value),
-      legacyEpisodeKey: fleetWatchdogLegacyEpisodeKey(holder, queueHead, activeLanes.value.length, ceiling.value),
+      legacyEpisodeKey: fleetWatchdogLegacyEpisodeKey(holder, queueHead, activeLanes.value.length),
       role,
       message: `Idle fleet: queue head ${queueHead} is startable with ${activeLanes.value.length} active writing lane${activeLanes.value.length === 1 ? "" : "s"} below writing capacity ${ceiling.value}. Dispatch it or record the blocker.`
     };

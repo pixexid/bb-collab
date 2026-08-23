@@ -122,11 +122,9 @@ const fleetWatchdogLegacyEpisodeKey = (
   holder: RoleHolderState,
   queueHead: string,
   activeLaneCount: number,
-  writingLaneCeiling: number,
-) => [
-  holder.project_id, holder.role_id, holder.role_generation, holder.execution_attempt_id, holder.thread_id,
-  `activeLanes=${activeLaneCount}`, `writingLaneCeiling=${writingLaneCeiling}`, queueHead,
-].join(":");
+) => activeLaneCount === 0 ? [
+  holder.project_id, holder.role_id, holder.role_generation, holder.execution_attempt_id, holder.thread_id, "activeLanes=0", queueHead,
+].join(":") : undefined;
 export const fleetWatchdogScope = (prefix: string, ...parts: string[]) => `${prefix}:${fleetWatchdogCompositeKey(...parts)}`;
 const fleetWatchdogScopeMessage = (scope: string) => {
   const separator = scope.indexOf(":");
@@ -2815,7 +2813,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     return {
       kind: "ready",
       episodeKey: fleetWatchdogEpisodeKey(holder, queueHead, activeLanes.value.length, ceiling.value),
-      legacyEpisodeKey: fleetWatchdogLegacyEpisodeKey(holder, queueHead, activeLanes.value.length, ceiling.value),
+      legacyEpisodeKey: fleetWatchdogLegacyEpisodeKey(holder, queueHead, activeLanes.value.length),
       role,
       message: `Idle fleet: queue head ${queueHead} is startable with ${activeLanes.value.length} active writing lane${activeLanes.value.length === 1 ? "" : "s"} below writing capacity ${ceiling.value}. Dispatch it or record the blocker.`,
     };
