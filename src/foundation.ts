@@ -2502,6 +2502,51 @@ export interface NativeAssignmentAdapter {
   reconcile(input: NativeAssignmentInput & { threadId: string | null; nativeRequestId: string | null }): NativeAssignmentEvidence;
 }
 
+export type AuthoritativeTerminalEvidence = {
+  projectId: string;
+  workItemId: string;
+  executionAttemptId: string;
+  repoTargetId: string;
+  resourceRevision: number;
+  assignmentId: string | null;
+  roleId: (typeof ROLE_IDS)[number] | null;
+  roleGeneration: number | null;
+  environmentId: string | null;
+  threadId: string;
+  branchName: string | null;
+  baseSha: string | null;
+  candidateSha: string | null;
+  nativeReceiptDigest: string;
+  actualProfileDigest: string;
+  candidateObservationDigest: string;
+  nativeEventId: string;
+  nativeEventSeq: number;
+  nativeTurnId: string;
+  evidence: Array<{ kind: string; digest: string; ref: string }>;
+};
+
+export type AuthoritativeHistoricalInterruption = {
+  projectId: string;
+  workItemId: string;
+  executionAttemptId: string;
+  repoTargetId: string;
+  resourceRevision: number;
+  threadId: string;
+  reason: InterruptionEvidence["reason"];
+  nativeEventId: string;
+  nativeEventSeq: number;
+  nativeTurnId: string | null;
+  evidenceDigest: string;
+  correctionEvidenceDigest: string;
+  evidence: Array<{ eventId: string; eventSeq: number; threadId: string; reason: InterruptionEvidence["reason"] }>;
+  zeroRealWriter: boolean;
+};
+
+export interface ExecutionAttemptEvidenceReader {
+  terminal(input: { projectId: string; workItemId: string; executionAttemptId: string; nativeEventId: string; nativeEventSeq: number; nativeTurnId: string }): AuthoritativeTerminalEvidence;
+  historical(input: { projectId: string; workItemId: string; executionAttemptId: string; nativeEventId: string; nativeEventSeq: number; threadId: string }): AuthoritativeHistoricalInterruption;
+}
+
 export interface ResolvedRoleContext {
   profile: ExecutionProfile;
   requestedProfileDigest: string;
@@ -6437,12 +6482,22 @@ function latestWorkItemAttempt(
   db: SqliteDatabase,
   projectId: string,
   workItemId: string,
-): { execution_attempt_id: string; state: string; assignment_kind: WorkAttempt["assignmentKind"] | null } | undefined {
+): { execution_attempt_id: string; state: string; assignment_kind: WorkAttempt["assignmentKind"] | null; thread_id: string | null } | undefined {
   return asRow(db.prepare(
-    `SELECT execution_attempt_id, state, assignment_kind FROM execution_attempts
+    `SELECT execution_attempt_id, state, assignment_kind, thread_id FROM execution_attempts
      WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
      ORDER BY attempt_ordinal DESC LIMIT 1`,
   ).get(projectId, workItemId));
+}
+
+function supersedeInterruptedAttempt(db: SqliteDatabase, projectId: string, executionAttemptId: string): void {
+  const updated = db.prepare(
+    `UPDATE execution_attempts
+     SET state = 'superseded', terminalization_class = 'resumed-continuation',
+         observed_at_ms = ?, completed_at_ms = ?, lease_owner_thread_id = NULL, progress_json = '{}'
+     WHERE project_id = ? AND execution_attempt_id = ? AND state = 'interrupted'`,
+  ).run(now(), now(), projectId, executionAttemptId);
+  if (updated.changes !== 1) throw refusal("WORK_ITEM_STATE_INVALID", "interrupted predecessor could not be cleared for explicit resume");
 }
 
 function terminalizeWorkItemAttempt(
@@ -6494,6 +6549,7 @@ function applyExecutionAttemptTerminalReport(
   db: SqliteDatabase,
   request: ApplyRequest,
   digest: string,
+  evidenceReader: ExecutionAttemptEvidenceReader | null,
 ): FoundationResult {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
@@ -6506,6 +6562,8 @@ function applyExecutionAttemptTerminalReport(
   if (!request.workItemId || report.workItemId !== request.workItemId) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report and request do not identify the exact work item");
   }
+  if (!evidenceReader) throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report requires authoritative native evidence");
+  const workItem = requireWorkItem(db, request, configRevision);
   const attempt = requireAttemptForMutation(db, request, report.executionAttemptId);
   const exact: Array<[string, unknown, unknown]> = [
     ["work item", attempt.work_item_id, report.workItemId],
@@ -6524,11 +6582,47 @@ function applyExecutionAttemptTerminalReport(
   if (attempt.thread_id === null || report.nativeEventSeq <= 0 || report.nativeEventId.length === 0) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report lacks exact native thread/event evidence");
   }
+  let authoritative: AuthoritativeTerminalEvidence;
+  try {
+    authoritative = evidenceReader.terminal({
+      projectId: request.projectId,
+      workItemId: workItem.work_item_id,
+      executionAttemptId: report.executionAttemptId,
+      nativeEventId: report.nativeEventId,
+      nativeEventSeq: report.nativeEventSeq,
+      nativeTurnId: report.nativeTurnId,
+    });
+  } catch {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report authoritative native evidence is unavailable or foreign");
+  }
+  const authoritativeExact: Array<[string, unknown, unknown]> = [
+    ["project", authoritative.projectId, request.projectId],
+    ["work item", authoritative.workItemId, workItem.work_item_id],
+    ["attempt", authoritative.executionAttemptId, report.executionAttemptId],
+    ["repository target", authoritative.repoTargetId, workItem.repo_target_id],
+    ["resource revision", authoritative.resourceRevision, workItem.resource_revision],
+    ["assignment", authoritative.assignmentId, attempt.assignment_id],
+    ["role", authoritative.roleId, attempt.role_id],
+    ["role generation", authoritative.roleGeneration, attempt.role_generation],
+    ["environment", authoritative.environmentId, attempt.environment_id],
+    ["thread", authoritative.threadId, attempt.thread_id],
+    ["branch", authoritative.branchName, attempt.branch_name],
+    ["base", authoritative.baseSha, attempt.base_sha],
+    ["candidate", authoritative.candidateSha, attempt.candidate_sha],
+    ["native event", authoritative.nativeEventId, report.nativeEventId],
+    ["native sequence", authoritative.nativeEventSeq, report.nativeEventSeq],
+    ["native turn", authoritative.nativeTurnId, report.nativeTurnId],
+    ["native receipt", authoritative.nativeReceiptDigest, report.nativeReceiptDigest],
+    ["actual profile", authoritative.actualProfileDigest, report.actualProfileDigest],
+    ["candidate observation", authoritative.candidateObservationDigest, report.candidateObservationDigest],
+  ];
+  const authoritativeMismatch = authoritativeExact.find(([, actual, expected]) => !sameNullable(actual, expected));
+  if (authoritativeMismatch) throw refusal("TERMINAL_REPORT_AMBIGUOUS", `terminal report authoritative ${authoritativeMismatch[0]} evidence does not match`);
+  if (canonicalJson(authoritative.evidence) !== canonicalJson(report.evidence)) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report evidence does not match the authoritative native evidence");
+  }
   if (!WORK_ITEM_CAPACITY_ATTEMPT_STATES.includes(attempt.state as typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES[number])) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", `attempt is not reportable from state ${attempt.state}`);
-  }
-  if (attempt.native_receipt_digest !== null && attempt.native_receipt_digest !== report.nativeReceiptDigest) {
-    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report native receipt does not match the canonical attempt");
   }
   const terminalState = report.outcome === "DONE" ? "done" : "blocked";
   const completedAtMs = now();
@@ -6576,19 +6670,62 @@ function applyExecutionAttemptInterruption(
   db: SqliteDatabase,
   request: ApplyRequest,
   digest: string,
+  evidenceReader: ExecutionAttemptEvidenceReader | null,
 ): FoundationResult {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
   requireRoleActorBinding(db, request, false);
   const evidence = request.interruption;
+  if (!evidenceReader) throw refusal("TERMINAL_REPORT_AMBIGUOUS", "interruption requires authoritative native evidence");
   if (!evidence || !request.executionAttemptId || !request.workItemId || evidence.projectId !== request.projectId
     || evidence.executionAttemptId !== request.executionAttemptId || evidence.workItemId !== request.workItemId) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "interruption evidence and request do not identify the exact project, work item, and attempt");
   }
   const attempt = requireAttemptForMutation(db, request, evidence.executionAttemptId);
+  const workItem = requireWorkItem(db, request, configRevision);
   if (attempt.work_item_id !== evidence.workItemId || attempt.thread_id !== evidence.threadId) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "interruption evidence does not match the canonical work item thread");
+  }
+  let authoritative: AuthoritativeHistoricalInterruption;
+  try {
+    authoritative = evidenceReader.historical({
+      projectId: request.projectId,
+      workItemId: workItem.work_item_id,
+      executionAttemptId: evidence.executionAttemptId,
+      nativeEventId: evidence.nativeEventId,
+      nativeEventSeq: evidence.nativeEventSeq,
+      threadId: evidence.threadId,
+    });
+  } catch {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "interruption authoritative native evidence is unavailable or foreign");
+  }
+  const expectedEvidenceDigest = sha256(canonicalJson({
+    projectId: authoritative.projectId,
+    workItemId: authoritative.workItemId,
+    executionAttemptId: authoritative.executionAttemptId,
+    threadId: authoritative.threadId,
+    reason: authoritative.reason,
+    nativeEventId: authoritative.nativeEventId,
+    nativeEventSeq: authoritative.nativeEventSeq,
+    nativeTurnId: authoritative.nativeTurnId,
+  }));
+  const authoritativeExact: Array<[string, unknown, unknown]> = [
+    ["project", authoritative.projectId, request.projectId],
+    ["work item", authoritative.workItemId, workItem.work_item_id],
+    ["attempt", authoritative.executionAttemptId, evidence.executionAttemptId],
+    ["repository target", authoritative.repoTargetId, workItem.repo_target_id],
+    ["resource revision", authoritative.resourceRevision, workItem.resource_revision],
+    ["thread", authoritative.threadId, evidence.threadId],
+    ["reason", authoritative.reason, evidence.reason],
+    ["native event", authoritative.nativeEventId, evidence.nativeEventId],
+    ["native sequence", authoritative.nativeEventSeq, evidence.nativeEventSeq],
+    ["native turn", authoritative.nativeTurnId, evidence.nativeTurnId],
+    ["evidence digest", authoritative.evidenceDigest, evidence.evidenceDigest],
+  ];
+  const authoritativeMismatch = authoritativeExact.find(([, actual, expected]) => !sameNullable(actual, expected));
+  if (authoritativeMismatch || expectedEvidenceDigest !== evidence.evidenceDigest) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", `interruption authoritative ${authoritativeMismatch?.[0] ?? "digest"} evidence does not match`);
   }
   if (attempt.interruption_event_id !== null && attempt.interruption_event_id !== evidence.nativeEventId) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "attempt already has different interruption evidence");
@@ -6599,6 +6736,24 @@ function applyExecutionAttemptInterruption(
     if (attempt.state !== "done" || correction.priorState !== "done" || attempt.terminal_report_digest !== null || attempt.reported_outcome !== null) {
       throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction requires an unreported false done attempt");
     }
+    const expectedCorrectionDigest = sha256(canonicalJson({
+      projectId: authoritative.projectId,
+      workItemId: authoritative.workItemId,
+      executionAttemptId: authoritative.executionAttemptId,
+      threadId: authoritative.threadId,
+      reason: authoritative.reason,
+      evidence: authoritative.evidence,
+    }));
+    if (authoritative.correctionEvidenceDigest !== correction.evidenceDigest || expectedCorrectionDigest !== correction.evidenceDigest) {
+      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction authoritative correction digest does not match");
+    }
+    if (!authoritative.zeroRealWriter) throw refusal("WORK_ITEM_STATE_INVALID", "historical correction requires a proven zero-real-writer window");
+    if (correction.evidence.some((item, index) => index > 0 && correction.evidence[index - 1]!.eventSeq >= item.eventSeq)) {
+      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction evidence must be strictly ordered by native event sequence");
+    }
+    if (canonicalJson(authoritative.evidence) !== canonicalJson(correction.evidence)) {
+      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction evidence does not match authoritative archived events");
+    }
     if (correction.evidence.some((item) => item.threadId !== evidence.threadId || item.reason !== evidence.reason)
       || new Set(correction.evidence.map((item) => item.eventSeq)).size !== correction.evidence.length
       || !correction.evidence.some((item) => item.eventSeq === evidence.nativeEventSeq)) {
@@ -6607,10 +6762,6 @@ function applyExecutionAttemptInterruption(
   } else if (!WORK_ITEM_CAPACITY_ATTEMPT_STATES.includes(attempt.state as typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES[number])) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", `attempt is not interruptible from state ${attempt.state}`);
   }
-  const workItem = asRow<{ lifecycle_state: WorkItemState }>(db.prepare(
-    "SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?",
-  ).get(request.projectId, evidence.workItemId));
-  if (!workItem) throw refusal("WORK_ITEM_UNKNOWN", "interruption work item is not known");
   if (!historical && !(WORK_ITEM_NON_TERMINAL_STATES as readonly string[]).includes(workItem.lifecycle_state)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "interruption evidence cannot create debt for a terminal work item");
   }
@@ -7255,7 +7406,7 @@ function applyWorkItemTransition(
     if (workAttempt.assignmentKind !== "write") {
       throw refusal("WORK_ITEM_STATE_INVALID", "replacement work attempts must be writing attempts");
     }
-    const prior = activeWorkItemAttempt(db, request.projectId, workItem.work_item_id);
+    const prior = latestWorkItemAttempt(db, request.projectId, workItem.work_item_id);
     const nextRevision = workItem.resource_revision + 1;
     const updated = db.prepare(
       `UPDATE work_items SET resource_revision = ?, updated_at_ms = ?
@@ -7265,7 +7416,8 @@ function applyWorkItemTransition(
       currentResourceRevision: workItem.resource_revision,
       expectedResourceRevision: request.expectedResourceRevision ?? undefined,
     });
-    if (prior) terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded");
+    if (prior?.state === "interrupted") supersedeInterruptedAttempt(db, request.projectId, prior.execution_attempt_id);
+    else if (prior) terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded");
     const createdAtMs = now();
     const executionAttemptId = insertWorkItemAttempt(db, {
       projectId: request.projectId,
@@ -8564,6 +8716,7 @@ export function applyAuthorizedMutation(
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
   reviewFactReader: ReviewFactReader | null = null,
   githubIssueReader: GitHubIssueReader | null = null,
+  executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
   dryRun = false,
 ): FoundationResult {
   let request: ApplyRequest;
@@ -8574,7 +8727,7 @@ export function applyAuthorizedMutation(
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, dryRun);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun);
 }
 
 export async function applyAuthorizedMutationAsync(
@@ -8585,6 +8738,7 @@ export async function applyAuthorizedMutationAsync(
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
   reviewFactReader: ReviewFactReader | null = null,
   githubIssueReader: GitHubIssueReader | null = null,
+  executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
   dryRun = false,
 ): Promise<FoundationResult> {
   let request: ApplyRequest;
@@ -8596,7 +8750,7 @@ export async function applyAuthorizedMutationAsync(
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   if (request.operationClass !== "github_issue_projection" || !githubAdapter?.readAsync || !githubAdapter.mutateAsync) {
-    return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, dryRun);
+    return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun);
   }
   try {
     return await applyGithubIssueProjectionAsync(db, request, mutationRequestDigest(request), githubAdapter);
@@ -8614,6 +8768,7 @@ export function applyFixtureMutation(
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
   reviewFactReader: ReviewFactReader | null = null,
   githubIssueReader: GitHubIssueReader | null = null,
+  executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
   dryRun = false,
 ): FoundationResult {
   let request: ApplyRequest;
@@ -8689,9 +8844,9 @@ export function applyFixtureMutation(
         case "work_item_transition":
           return applyWorkItemTransition(db, request, digest, githubObservation);
         case "execution_attempt_terminal_report":
-          return applyExecutionAttemptTerminalReport(db, request, digest);
+          return applyExecutionAttemptTerminalReport(db, request, digest, executionAttemptEvidenceReader);
         case "execution_attempt_interruption":
-          return applyExecutionAttemptInterruption(db, request, digest);
+          return applyExecutionAttemptInterruption(db, request, digest, executionAttemptEvidenceReader);
         case "github_issue_projection":
           throw refusal("INTERNAL_ERROR", "projection must not run inside the canonical transaction");
         case "qualification_observation_record":

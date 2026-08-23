@@ -58,6 +58,9 @@ import {
   type GitHubIssueMutation,
   type GitHubIssueSnapshot,
   type RoleFactReader,
+  type AuthoritativeHistoricalInterruption,
+  type AuthoritativeTerminalEvidence,
+  type ExecutionAttemptEvidenceReader,
   type SqliteDatabase,
 } from "./src/foundation.js";
 import {
@@ -1543,6 +1546,196 @@ async function serializeDispatchRecovery(
 
 type WorkItemAttemptTerminalizationPolicy = "refuse-active" | "stop-active";
 type PreMutationGuard = () => Promise<FoundationResult | null>;
+type LiveThreadEvent = Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["events"]["list"]>>[number];
+
+function evidenceUnavailable(projectId: string, message: string): FoundationResult {
+  return { outcome: "EXTERNAL_UNAVAILABLE", subject: projectId, expected: 1, attempted: 1, verified: 0, message };
+}
+
+async function completeNativeThreadEvents(sdk: BbPluginApi["sdk"], threadId: string): Promise<LiveThreadEvent[]> {
+  const events: LiveThreadEvent[] = [];
+  let afterSeq = 0;
+  for (;;) {
+    const page = await sdk.threads.events.list({ threadId, afterSeq: String(afterSeq), limit: "1000" });
+    if (page.some((event) => event.threadId !== threadId || !Number.isSafeInteger(event.seq) || event.seq <= afterSeq)) {
+      throw new Error("native event inventory is foreign, unordered, or incomplete");
+    }
+    events.push(...page);
+    if (page.length < 1000) return events;
+    const next = page.at(-1)?.seq ?? afterSeq;
+    if (next <= afterSeq) throw new Error("native event inventory did not advance");
+    afterSeq = next;
+  }
+}
+
+function nativeTurnId(event: LiveThreadEvent): string | null {
+  return event.scope?.kind === "turn" ? event.scope.turnId : null;
+}
+
+function liveTerminalReader(
+  sdk: BbPluginApi["sdk"],
+  db: SqliteDatabase,
+  request: ApplyRequest,
+): Promise<ExecutionAttemptEvidenceReader | FoundationResult> {
+  const report = request.terminalReport;
+  if (!report || !request.workItemId || !request.executionAttemptId) return Promise.resolve(evidenceUnavailable(request.projectId, "terminal report identity is unavailable"));
+  const workItemId = request.workItemId;
+  const executionAttemptId = request.executionAttemptId;
+  const attempt = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(request.projectId, request.executionAttemptId) as Record<string, unknown> | undefined;
+  const workItem = db.prepare("SELECT * FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, request.workItemId) as Record<string, unknown> | undefined;
+  if (!attempt || !workItem) return Promise.resolve(evidenceUnavailable(request.projectId, "canonical terminal attempt or WorkItem is unavailable"));
+  const threadId = typeof attempt.thread_id === "string" ? attempt.thread_id : null;
+  if (!threadId) return Promise.resolve(evidenceUnavailable(request.projectId, "terminal attempt has no native thread"));
+  return (async () => {
+    try {
+      const thread = await sdk.threads.get({ threadId });
+      if (thread.projectId !== request.projectId || thread.id !== threadId || thread.environmentId === null) throw new Error("native terminal thread is foreign or has no environment");
+      const events = await completeNativeThreadEvents(sdk, threadId);
+      const completion = events.find((event) => event.id === report.nativeEventId && event.seq === report.nativeEventSeq);
+      if (!completion || completion.type !== "turn/completed" || completion.data.status !== "completed" || nativeTurnId(completion) !== report.nativeTurnId) {
+        throw new Error("exact native completion is missing or not completed");
+      }
+      const turnId = report.nativeTurnId;
+      const requestEvent = events.find((event) => event.type === "client/turn/requested" && nativeTurnId(event) === turnId);
+      const requestData = requestEvent?.data as Record<string, unknown> | undefined;
+      if (!requestEvent || !requestData || typeof requestData.requestId !== "string" || typeof requestData.execution !== "object" || requestData.execution === null) throw new Error("exact native execution request is missing");
+      const execution = requestData.execution as Record<string, unknown>;
+      const profileFields = ["model", "reasoningLevel", "permissionMode", "serviceTier"].map((field) => execution[field]);
+      if (profileFields.some((field) => typeof field !== "string" || field.length === 0) || execution.source !== "client/turn/requested") throw new Error("native execution profile is incomplete");
+      const accepted = events.filter((event) => event.type === "turn/input/accepted" && nativeTurnId(event) === turnId && (event.data as Record<string, unknown>).clientRequestId === requestData.requestId);
+      const started = events.filter((event) => event.type === "turn/started" && nativeTurnId(event) === turnId && (event.data as Record<string, unknown>).providerThreadId === (completion.data as Record<string, unknown>).providerThreadId);
+      if (accepted.length !== 1 || started.length !== 1 || events.some((event) => event.type === "provider/modelFallback" && nativeTurnId(event) === turnId)) throw new Error("native completion correlation is missing or ambiguous");
+      const profile = {
+        providerId: thread.providerId,
+        model: execution.model as string,
+        reasoningLevel: execution.reasoningLevel as string,
+        permissionMode: execution.permissionMode as string,
+        serviceTier: execution.serviceTier as string,
+        visibility: thread.visibility,
+      };
+      const environment = await sdk.environments.get({ environmentId: thread.environmentId });
+      if (environment.projectId !== request.projectId) throw new Error("native terminal environment is foreign");
+      const status = await sdk.environments.status({ environmentId: thread.environmentId });
+      if (status.outcome !== "available") throw new Error("native terminal checkout status is unavailable");
+      const candidateObservation = {
+        projectId: request.projectId,
+        workItemId,
+        executionAttemptId,
+        repoTargetId: workItem.repo_target_id,
+        resourceRevision: workItem.resource_revision,
+        environmentId: thread.environmentId,
+        checkout: status.workspace.checkout,
+        workingTree: status.workspace.workingTree,
+      };
+      const nativeReceipt = {
+        projectId: request.projectId,
+        workItemId,
+        executionAttemptId,
+        threadId,
+        turnId,
+        requestEvent: { id: requestEvent.id, seq: requestEvent.seq },
+        acceptedEvent: { id: accepted[0]!.id, seq: accepted[0]!.seq },
+        startedEvent: { id: started[0]!.id, seq: started[0]!.seq },
+        completionEvent: { id: completion.id, seq: completion.seq, providerThreadId: completion.data.providerThreadId, status: completion.data.status },
+      };
+      const actualProfileDigest = sha256(canonicalJson(profile));
+      const nativeReceiptDigest = sha256(canonicalJson(nativeReceipt));
+      const candidateObservationDigest = sha256(canonicalJson(candidateObservation));
+      const evidence = [
+        { kind: "native-completion", digest: sha256(canonicalJson({ id: completion.id, seq: completion.seq, threadId, turnId, status: completion.data.status })), ref: completion.id },
+        { kind: "native-profile", digest: actualProfileDigest, ref: requestEvent.id },
+        { kind: "native-candidate", digest: candidateObservationDigest, ref: thread.environmentId },
+      ];
+      const authoritative: AuthoritativeTerminalEvidence = {
+        projectId: request.projectId,
+        workItemId,
+        executionAttemptId,
+        repoTargetId: String(workItem.repo_target_id),
+        resourceRevision: Number(workItem.resource_revision),
+        assignmentId: (attempt.assignment_id as string | null) ?? null,
+        roleId: (attempt.role_id as AuthoritativeTerminalEvidence["roleId"]) ?? null,
+        roleGeneration: (attempt.role_generation as number | null) ?? null,
+        environmentId: (attempt.environment_id as string | null) ?? null,
+        threadId,
+        branchName: (attempt.branch_name as string | null) ?? null,
+        baseSha: (attempt.base_sha as string | null) ?? null,
+        candidateSha: (attempt.candidate_sha as string | null) ?? null,
+        nativeReceiptDigest,
+        actualProfileDigest,
+        candidateObservationDigest,
+        nativeEventId: completion.id,
+        nativeEventSeq: completion.seq,
+        nativeTurnId: turnId,
+        evidence,
+      };
+      return { terminal: () => authoritative, historical: () => { throw new Error("historical evidence reader is not available for a terminal-only request"); } } satisfies ExecutionAttemptEvidenceReader;
+    } catch (error) {
+      return evidenceUnavailable(request.projectId, `authoritative terminal evidence unavailable: ${String(error)}`);
+    }
+  })();
+}
+
+async function liveZeroRealWriterGuard(
+  bb: BbPluginApi,
+  db: SqliteDatabase,
+  projectId: string,
+  workItemId: string,
+): Promise<boolean> {
+  const active = db.prepare(
+    `SELECT thread_id FROM execution_attempts
+     WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+       AND assignment_kind = 'write' AND state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})`,
+  ).all(projectId, workItemId, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES) as Array<{ thread_id: string | null }>;
+  if (active.length > 0) return false;
+  const threads = await listAllProjectThreads((args) => bb.sdk.threads.list({ ...args, hasParent: true, includeHidden: true, archived: false }), projectId);
+  if (threads.some((thread) => ["active", "starting"].includes(thread.status) && thread.projectId === projectId)) return false;
+  return true;
+}
+
+async function liveHistoricalReader(
+  bb: BbPluginApi,
+  db: SqliteDatabase,
+  request: ApplyRequest,
+): Promise<ExecutionAttemptEvidenceReader | FoundationResult> {
+  const evidence = request.interruption;
+  const correction = request.historicalCorrection;
+  if (!evidence || !request.workItemId || !request.executionAttemptId) return evidenceUnavailable(request.projectId, "interruption identity is unavailable");
+  const attempt = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(request.projectId, request.executionAttemptId) as Record<string, unknown> | undefined;
+  const workItem = db.prepare("SELECT * FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, request.workItemId) as Record<string, unknown> | undefined;
+  if (!attempt || !workItem || typeof attempt.thread_id !== "string") return evidenceUnavailable(request.projectId, "historical canonical attempt, WorkItem, or thread is unavailable");
+  try {
+    const events = await completeNativeThreadEvents(bb.sdk, attempt.thread_id);
+    const expectedEvents = correction?.evidence ?? [{ eventId: evidence.nativeEventId, eventSeq: evidence.nativeEventSeq, threadId: evidence.threadId, reason: evidence.reason }];
+    if (expectedEvents.some((event, index) => index > 0 && expectedEvents[index - 1]!.eventSeq >= event.eventSeq)) throw new Error("historical native evidence is unordered or duplicated");
+    const eventRows = expectedEvents.map((expected) => {
+      const event = events.find((candidate) => candidate.id === expected.eventId && candidate.seq === expected.eventSeq);
+      if (!event || event.type !== "system/thread/interrupted" || event.threadId !== expected.threadId || event.data.reason !== expected.reason) throw new Error("historical native interruption evidence is missing or foreign");
+      return { eventId: event.id, eventSeq: event.seq, threadId: event.threadId, reason: event.data.reason };
+    });
+    const primary = eventRows.find((event) => event.eventId === evidence.nativeEventId && event.eventSeq === evidence.nativeEventSeq);
+    if (!primary || primary.threadId !== evidence.threadId || primary.reason !== evidence.reason) throw new Error("historical primary interruption evidence is not exact");
+    const zeroRealWriter = await liveZeroRealWriterGuard(bb, db, request.projectId, request.workItemId);
+    const authoritative: AuthoritativeHistoricalInterruption = {
+      projectId: request.projectId,
+      workItemId: request.workItemId,
+      executionAttemptId: request.executionAttemptId,
+      repoTargetId: String(workItem.repo_target_id),
+      resourceRevision: Number(workItem.resource_revision),
+      threadId: attempt.thread_id,
+      reason: evidence.reason,
+      nativeEventId: primary.eventId,
+      nativeEventSeq: primary.eventSeq,
+      nativeTurnId: null,
+      evidenceDigest: sha256(canonicalJson({ projectId: request.projectId, workItemId: request.workItemId, executionAttemptId: request.executionAttemptId, threadId: attempt.thread_id, reason: evidence.reason, nativeEventId: primary.eventId, nativeEventSeq: primary.eventSeq, nativeTurnId: null })),
+      correctionEvidenceDigest: sha256(canonicalJson({ projectId: request.projectId, workItemId: request.workItemId, executionAttemptId: request.executionAttemptId, threadId: attempt.thread_id, reason: evidence.reason, evidence: eventRows })),
+      evidence: eventRows,
+      zeroRealWriter: correction ? zeroRealWriter : true,
+    };
+    return { terminal: () => { throw new Error("terminal evidence reader is not available for a historical request"); }, historical: () => authoritative } satisfies ExecutionAttemptEvidenceReader;
+  } catch (error) {
+    return evidenceUnavailable(request.projectId, `authoritative historical evidence unavailable: ${String(error)}`);
+  }
+}
 
 async function prepareWorkItemAttemptTerminalization(
   bb: BbPluginApi,
@@ -1600,7 +1793,7 @@ async function applyLiveAuthorizedMutation(
 ): Promise<FoundationResult> {
   const parsed = applyRequestSchema.safeParse(input);
   if (parsed.success && terminalizationPolicy === "stop-active") {
-    const authorized = applyAuthorizedMutation(db, input, githubAdapter, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, true);
+    const authorized = applyAuthorizedMutation(db, input, githubAdapter, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, null, true);
     if (authorized.outcome !== "OK" || authorized.replay) return authorized;
   }
   if (parsed.success) {
@@ -1624,7 +1817,17 @@ async function applyLiveAuthorizedMutation(
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
   const preMutationRefusal = preMutationGuard === undefined ? null : await preMutationGuard();
   if (preMutationRefusal) return preMutationRefusal;
-  const result = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader);
+  let evidenceReader: ExecutionAttemptEvidenceReader | null = null;
+  if (parsed.success && db && parsed.data.operationClass === "execution_attempt_terminal_report") {
+    const resolved = await liveTerminalReader(bb.sdk, db, parsed.data);
+    if ("outcome" in resolved) return resolved;
+    evidenceReader = resolved;
+  } else if (parsed.success && db && parsed.data.operationClass === "execution_attempt_interruption") {
+    const resolved = await liveHistoricalReader(bb, db, parsed.data);
+    if ("outcome" in resolved) return resolved;
+    evidenceReader = resolved;
+  }
+  const result = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader, evidenceReader);
   await deliverSucceededSeatBrief(bb, db, input, result);
   return result;
 }
@@ -1647,7 +1850,17 @@ async function applyLiveAuthorizedMutationAsync(
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
-  const result = await applyAuthorizedMutationAsync(db, input, githubAdapter, reader, null, null, githubIssueReader);
+  let evidenceReader: ExecutionAttemptEvidenceReader | null = null;
+  if (parsed.success && db && parsed.data.operationClass === "execution_attempt_terminal_report") {
+    const resolved = await liveTerminalReader(bb.sdk, db, parsed.data);
+    if ("outcome" in resolved) return resolved;
+    evidenceReader = resolved;
+  } else if (parsed.success && db && parsed.data.operationClass === "execution_attempt_interruption") {
+    const resolved = await liveHistoricalReader(bb, db, parsed.data);
+    if ("outcome" in resolved) return resolved;
+    evidenceReader = resolved;
+  }
+  const result = await applyAuthorizedMutationAsync(db, input, githubAdapter, reader, null, null, githubIssueReader, evidenceReader);
   await deliverSucceededSeatBrief(bb, db, input, result);
   return result;
 }
@@ -4010,8 +4223,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         }
         return latest ? `${latest.type}@${latest.seq}` : "unknown";
       };
-      const wake = async (projectId: string, holder: RoleHolderState, key: string, text: string, requireIdle: boolean, kind: "fleet" | "recovery" | "startable-queue" | "stale-wait" | "owed-act" | "escalation", beforeSend?: () => Promise<boolean>, staleWaitExternalRevision: string | null = null, staleWaitWaker: string | null = null, bypassNotificationFloor = false) => {
+      const wake = async (projectId: string, holder: RoleHolderState, key: string, text: string, requireIdle: boolean, kind: "fleet" | "recovery" | "startable-queue" | "stale-wait" | "owed-act" | "escalation", beforeSend?: () => Promise<boolean>, staleWaitExternalRevision: string | null = null, staleWaitWaker: string | null = null, bypassNotificationFloor = false, deduplicateSuccessfulDelivery = false) => {
         const previous = await fleetWatchdogIdle.get(key);
+        if (deduplicateSuccessfulDelivery && kind === "owed-act" && previous?.lastOwedActWakeAtMs !== null && previous?.lastOwedActWakeAtMs !== undefined) return false;
         const lastNotifiedAtMs = kind === "fleet" ? previous?.lastFleetWakeAtMs
           : kind === "recovery" ? previous?.lastRecoveryWakeAtMs
             : kind === "startable-queue" ? previous?.lastStartableQueueWakeAtMs
@@ -4108,7 +4322,16 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             nativeEventId: interruption.id,
             nativeEventSeq: interruption.seq,
             nativeTurnId: null,
-            evidenceDigest: sha256(canonicalJson({ id: interruption.id, seq: interruption.seq, threadId: interruption.threadId, reason: interruption.data.reason })),
+            evidenceDigest: sha256(canonicalJson({
+              projectId: attempt.project_id,
+              workItemId: attempt.work_item_id,
+              executionAttemptId: attempt.execution_attempt_id,
+              threadId: interruption.threadId,
+              reason: interruption.data.reason,
+              nativeEventId: interruption.id,
+              nativeEventSeq: interruption.seq,
+              nativeTurnId: null,
+            })),
           } satisfies NonNullable<ApplyRequest["interruption"]>;
           if (attempt.state !== "interrupted") {
             const request: ApplyRequest = {
@@ -4144,6 +4367,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             `interrupted attempt requires explicit resume or disposition: project=${attempt.project_id} workItem=${attempt.work_item_id} executionAttempt=${attempt.execution_attempt_id} nativeEvent=${interruption.id}@${interruption.seq} reason=${interruption.data.reason}`,
             false,
             "owed-act",
+            undefined,
+            null,
+            null,
+            false,
+            true,
           );
         }
       };

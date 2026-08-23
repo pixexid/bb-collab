@@ -5,6 +5,9 @@ import {
   GitHubIssueAdapterError,
   sha256,
   type ApplyRequest,
+  type AuthoritativeHistoricalInterruption,
+  type AuthoritativeTerminalEvidence,
+  type ExecutionAttemptEvidenceReader,
   type FoundationResult,
   type GitHubIssueAdapter,
   type GitHubIssueMutation,
@@ -329,6 +332,23 @@ export class DeterministicNativeAssignmentAdapter implements NativeAssignmentAda
   }
 }
 
+export class DeterministicExecutionAttemptEvidenceReader implements ExecutionAttemptEvidenceReader {
+  terminalEvidence: AuthoritativeTerminalEvidence | null = null;
+  historicalEvidence: AuthoritativeHistoricalInterruption | null = null;
+
+  terminal(input: { executionAttemptId: string; nativeEventId: string; nativeEventSeq: number; nativeTurnId: string }): AuthoritativeTerminalEvidence {
+    if (!this.terminalEvidence) throw new Error("terminal evidence unavailable");
+    if (this.terminalEvidence.executionAttemptId !== input.executionAttemptId || this.terminalEvidence.nativeEventId !== input.nativeEventId || this.terminalEvidence.nativeEventSeq !== input.nativeEventSeq || this.terminalEvidence.nativeTurnId !== input.nativeTurnId) throw new Error("terminal evidence identity is foreign");
+    return structuredClone(this.terminalEvidence);
+  }
+
+  historical(input: { executionAttemptId: string; nativeEventId: string; nativeEventSeq: number; threadId: string }): AuthoritativeHistoricalInterruption {
+    if (!this.historicalEvidence) throw new Error("historical evidence unavailable");
+    if (this.historicalEvidence.executionAttemptId !== input.executionAttemptId || this.historicalEvidence.nativeEventId !== input.nativeEventId || this.historicalEvidence.nativeEventSeq !== input.nativeEventSeq || this.historicalEvidence.threadId !== input.threadId) throw new Error("historical evidence identity is foreign");
+    return structuredClone(this.historicalEvidence);
+  }
+}
+
 export class DeterministicReviewFactReader implements ReviewFactReader {
   readonly readCalls: Parameters<ReviewFactReader["read"]>[0][] = [];
   facts: ReviewFacts | null = null;
@@ -349,6 +369,7 @@ export function applyWithFixtureReceipt(
   roleFactReader: RoleFactReader | null = null,
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
   reviewFactReader: ReviewFactReader | null = null,
+  executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
 ): FoundationResult {
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, null, executionAttemptEvidenceReader);
 }

@@ -58,6 +58,7 @@ import {
 import {
   applyWithFixtureReceipt,
   DeterministicGitHubIssueAdapter,
+  DeterministicExecutionAttemptEvidenceReader,
   DeterministicNativeAssignmentAdapter,
   DeterministicReviewFactReader,
   DeterministicRoleFactReader,
@@ -791,6 +792,11 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
       lanes.set(threadId, Object.assign(makeThreadResponse({ id: threadId, projectId, parentThreadId, status, updatedAt: nativeUpdatedAt }), {
         environmentBranchName: null,
       }));
+    },
+    recordNativeEvent(threadId: string, event: { id: string; seq: number; type: string; data: unknown; createdAt?: number; scope?: { kind: "thread" } }) {
+      const events = laneEvents.get(threadId) ?? [];
+      events.push({ id: event.id, threadId, seq: event.seq, type: event.type, scope: event.scope ?? { kind: "thread" }, data: event.data, createdAt: event.createdAt ?? nativeUpdatedAt });
+      laneEvents.set(threadId, events);
     },
     archiveNativeLane(threadId: string) {
       const lane = lanes.get(threadId);
@@ -14160,6 +14166,33 @@ exit 1
       nativeTurnId: null,
       evidenceDigest: "a".repeat(64),
     };
+    const evidenceReader = new DeterministicExecutionAttemptEvidenceReader();
+    interruption.evidenceDigest = sha256(canonicalJson({
+      projectId: PROJECT_ID,
+      workItemId: WORK_ITEM_ID,
+      executionAttemptId: attempt.execution_attempt_id,
+      threadId: attempt.thread_id,
+      reason: interruption.reason,
+      nativeEventId: interruption.nativeEventId,
+      nativeEventSeq: interruption.nativeEventSeq,
+      nativeTurnId: interruption.nativeTurnId,
+    }));
+    evidenceReader.historicalEvidence = {
+      projectId: PROJECT_ID,
+      workItemId: WORK_ITEM_ID,
+      executionAttemptId: attempt.execution_attempt_id,
+      repoTargetId: TARGET_ID,
+      resourceRevision: 3,
+      threadId: attempt.thread_id,
+      reason: interruption.reason,
+      nativeEventId: interruption.nativeEventId,
+      nativeEventSeq: interruption.nativeEventSeq,
+      nativeTurnId: null,
+      evidenceDigest: interruption.evidenceDigest,
+      correctionEvidenceDigest: sha256(canonicalJson({ projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: attempt.execution_attempt_id, threadId: attempt.thread_id, reason: interruption.reason, evidence: [{ eventId: interruption.nativeEventId, eventSeq: interruption.nativeEventSeq, threadId: attempt.thread_id, reason: interruption.reason }] })),
+      evidence: [{ eventId: interruption.nativeEventId, eventSeq: interruption.nativeEventSeq, threadId: attempt.thread_id, reason: interruption.reason }],
+      zeroRealWriter: true,
+    };
     expect(applyWithFixtureReceipt(fixture.db, {
       projectId: PROJECT_ID,
       operationClass: "execution_attempt_interruption",
@@ -14173,7 +14206,7 @@ exit 1
       workItemId: WORK_ITEM_ID,
       executionAttemptId: attempt.execution_attempt_id,
       interruption,
-    })).toMatchObject({ outcome: "OK" });
+    }, null, null, null, null, evidenceReader)).toMatchObject({ outcome: "OK" });
     expect(fixture.db.prepare("SELECT state, terminal_report_digest, interruption_reason FROM execution_attempts WHERE execution_attempt_id = ?").get(attempt.execution_attempt_id)).toEqual({ state: "interrupted", terminal_report_digest: null, interruption_reason: "manual-stop" });
     expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lifecycle_state: "in_progress" });
 
@@ -14213,6 +14246,28 @@ exit 1
       receiptEventSeq: 1,
       receivedAtMs: 201,
     };
+    evidenceReader.terminalEvidence = {
+      projectId: PROJECT_ID,
+      workItemId: WORK_ITEM_ID,
+      executionAttemptId: resumedAttempt.execution_attempt_id,
+      repoTargetId: TARGET_ID,
+      resourceRevision: 4,
+      assignmentId: null,
+      roleId: null,
+      roleGeneration: null,
+      environmentId: null,
+      threadId: resumedAttempt.thread_id,
+      branchName: null,
+      baseSha: null,
+      candidateSha: null,
+      nativeReceiptDigest: report.nativeReceiptDigest,
+      actualProfileDigest: report.actualProfileDigest,
+      candidateObservationDigest: report.candidateObservationDigest,
+      nativeEventId: report.nativeEventId,
+      nativeEventSeq: report.nativeEventSeq,
+      nativeTurnId: report.nativeTurnId,
+      evidence: report.evidence,
+    };
     expect(applyWithFixtureReceipt(fixture.db, {
       projectId: PROJECT_ID,
       operationClass: "execution_attempt_terminal_report",
@@ -14222,11 +14277,14 @@ exit 1
       expectedGovernanceEpoch: 1,
       expectedFenceToken: fixture.fenceToken,
       repoTargetId: TARGET_ID,
+      expectedResourceRevision: 4,
       workItemId: WORK_ITEM_ID,
       executionAttemptId: resumedAttempt.execution_attempt_id,
       terminalReport: report,
-    })).toMatchObject({ outcome: "OK" });
+    }, null, null, null, null, evidenceReader)).toMatchObject({ outcome: "OK" });
     expect(fixture.db.prepare("SELECT state, terminalization_class, reported_outcome FROM execution_attempts WHERE execution_attempt_id = ?").get(resumedAttempt.execution_attempt_id)).toEqual({ state: "done", terminalization_class: "accepted-terminal-report", reported_outcome: "DONE" });
+    expect(fixture.db.prepare("SELECT state, continuation_of_attempt_id FROM execution_attempts WHERE execution_attempt_id = ?").get(attempt.execution_attempt_id)).toEqual({ state: "superseded", continuation_of_attempt_id: null });
+    expect(fixture.db.prepare("SELECT continuation_of_attempt_id FROM execution_attempts WHERE execution_attempt_id = ?").get(resumedAttempt.execution_attempt_id)).toEqual({ continuation_of_attempt_id: attempt.execution_attempt_id });
     expect(applyWithFixtureReceipt(fixture.db, {
       projectId: PROJECT_ID,
       operationClass: "execution_attempt_terminal_report",
@@ -14236,10 +14294,39 @@ exit 1
       expectedGovernanceEpoch: 1,
       expectedFenceToken: fixture.fenceToken,
       repoTargetId: TARGET_ID,
+      expectedResourceRevision: 4,
       workItemId: WORK_ITEM_ID,
       executionAttemptId: resumedAttempt.execution_attempt_id,
       terminalReport: { ...report, threadId: "foreign-thread" },
-    })).toMatchObject({ outcome: "TERMINAL_REPORT_AMBIGUOUS" });
+    }, null, null, null, null, evidenceReader)).toMatchObject({ outcome: "TERMINAL_REPORT_AMBIGUOUS" });
+    expect(applyWithFixtureReceipt(fixture.db, {
+      projectId: PROJECT_ID,
+      operationClass: "execution_attempt_terminal_report",
+      idempotencyKey: "attempt-terminal-report-foreign-target",
+      actorReceiptId: RECEIPT_ID,
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fixture.fenceToken,
+      repoTargetId: SECOND_TARGET_ID,
+      expectedResourceRevision: 999,
+      workItemId: WORK_ITEM_ID,
+      executionAttemptId: resumedAttempt.execution_attempt_id,
+      terminalReport: { ...report, repoTargetId: SECOND_TARGET_ID, nativeEventId: "fabricated-event-777", nativeEventSeq: 777, nativeTurnId: "fabricated-turn", nativeReceiptDigest: "f".repeat(64), actualProfileDigest: "f".repeat(64), candidateObservationDigest: "f".repeat(64), evidence: [{ kind: "fabricated", digest: "f".repeat(64), ref: "fabricated" }] },
+    }, null, null, null, null, evidenceReader)).toMatchObject({ outcome: "REPO_TARGET_FOREIGN" });
+    expect(applyWithFixtureReceipt(fixture.db, {
+      projectId: PROJECT_ID,
+      operationClass: "execution_attempt_terminal_report",
+      idempotencyKey: "attempt-terminal-report-fabricated-event",
+      actorReceiptId: RECEIPT_ID,
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fixture.fenceToken,
+      repoTargetId: TARGET_ID,
+      expectedResourceRevision: 4,
+      workItemId: WORK_ITEM_ID,
+      executionAttemptId: resumedAttempt.execution_attempt_id,
+      terminalReport: { ...report, nativeEventId: "fabricated-event-777", nativeEventSeq: 777, nativeTurnId: "fabricated-turn", nativeReceiptDigest: "f".repeat(64), actualProfileDigest: "f".repeat(64), candidateObservationDigest: "f".repeat(64), evidence: [{ kind: "fabricated", digest: "f".repeat(64), ref: "fabricated" }] },
+    }, null, null, null, null, evidenceReader)).toMatchObject({ outcome: "TERMINAL_REPORT_AMBIGUOUS" });
   });
 
   it("corrects the GH613-shaped false done only with the exact historical interruption evidence", async () => {
@@ -14271,6 +14358,73 @@ exit 1
         { eventId: "native-event-11448", eventSeq: 11448, threadId: original.thread_id, reason: "manual-stop" as const },
       ],
     };
+    correction.evidenceDigest = sha256(canonicalJson({ projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: original.execution_attempt_id, threadId: original.thread_id, reason: correction.reason, nativeEventId: correction.nativeEventId, nativeEventSeq: correction.nativeEventSeq, nativeTurnId: null }));
+    historicalCorrection.evidenceDigest = sha256(canonicalJson({ projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: original.execution_attempt_id, threadId: original.thread_id, reason: correction.reason, evidence: historicalCorrection.evidence }));
+    const evidenceReader = new DeterministicExecutionAttemptEvidenceReader();
+    evidenceReader.historicalEvidence = {
+      projectId: PROJECT_ID,
+      workItemId: WORK_ITEM_ID,
+      executionAttemptId: original.execution_attempt_id,
+      repoTargetId: TARGET_ID,
+      resourceRevision: 5,
+      threadId: original.thread_id,
+      reason: correction.reason,
+      nativeEventId: correction.nativeEventId,
+      nativeEventSeq: correction.nativeEventSeq,
+      nativeTurnId: null,
+      evidenceDigest: correction.evidenceDigest,
+      correctionEvidenceDigest: historicalCorrection.evidenceDigest,
+      evidence: historicalCorrection.evidence,
+      zeroRealWriter: true,
+    };
+    fixture.db.prepare("UPDATE execution_attempts SET terminal_report_digest = ?, reported_outcome = 'DONE' WHERE execution_attempt_id = ?").run("accepted-report", original.execution_attempt_id);
+    expect(applyWithFixtureReceipt(fixture.db, {
+      projectId: PROJECT_ID,
+      operationClass: "execution_attempt_interruption",
+      idempotencyKey: "gh613-historical-correction-accepted-report",
+      actorReceiptId: RECEIPT_ID,
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fixture.fenceToken,
+      repoTargetId: TARGET_ID,
+      expectedResourceRevision: 5,
+      workItemId: WORK_ITEM_ID,
+      executionAttemptId: original.execution_attempt_id,
+      interruption: correction,
+      historicalCorrection,
+    }, null, null, null, null, evidenceReader)).toMatchObject({ outcome: "TERMINAL_REPORT_AMBIGUOUS" });
+    fixture.db.prepare("UPDATE execution_attempts SET terminal_report_digest = NULL, reported_outcome = NULL WHERE execution_attempt_id = ?").run(original.execution_attempt_id);
+    expect(applyWithFixtureReceipt(fixture.db, {
+      projectId: PROJECT_ID,
+      operationClass: "execution_attempt_interruption",
+      idempotencyKey: "gh613-historical-correction-foreign-mutant",
+      actorReceiptId: RECEIPT_ID,
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fixture.fenceToken,
+      repoTargetId: SECOND_TARGET_ID,
+      expectedResourceRevision: 999,
+      workItemId: WORK_ITEM_ID,
+      executionAttemptId: original.execution_attempt_id,
+      interruption: { ...correction, nativeEventId: "fabricated-event-777", nativeEventSeq: 777, evidenceDigest: "2".repeat(64) },
+      historicalCorrection: { ...historicalCorrection, evidenceDigest: "3".repeat(64), evidence: [{ eventId: "fabricated-event-777", eventSeq: 777, threadId: original.thread_id, reason: "manual-stop" as const }, { eventId: "fabricated-event-778", eventSeq: 778, threadId: original.thread_id, reason: "manual-stop" as const }] },
+    }, null, null, null, null, evidenceReader)).toMatchObject({ outcome: "REPO_TARGET_FOREIGN" });
+    expect(fixture.db.prepare("SELECT state, terminal_report_digest FROM execution_attempts WHERE execution_attempt_id = ?").get(original.execution_attempt_id)).toEqual({ state: "done", terminal_report_digest: null });
+    expect(applyWithFixtureReceipt(fixture.db, {
+      projectId: PROJECT_ID,
+      operationClass: "execution_attempt_interruption",
+      idempotencyKey: "gh613-historical-correction-fabricated-event-mutant",
+      actorReceiptId: RECEIPT_ID,
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fixture.fenceToken,
+      repoTargetId: TARGET_ID,
+      expectedResourceRevision: 5,
+      workItemId: WORK_ITEM_ID,
+      executionAttemptId: original.execution_attempt_id,
+      interruption: { ...correction, nativeEventId: "fabricated-event-777", nativeEventSeq: 777, evidenceDigest: "2".repeat(64) },
+      historicalCorrection: { ...historicalCorrection, evidenceDigest: "3".repeat(64), evidence: [{ eventId: "fabricated-event-777", eventSeq: 777, threadId: original.thread_id, reason: "manual-stop" as const }, { eventId: "fabricated-event-778", eventSeq: 778, threadId: original.thread_id, reason: "manual-stop" as const }] },
+    }, null, null, null, null, evidenceReader)).toMatchObject({ outcome: "TERMINAL_REPORT_AMBIGUOUS" });
     expect(applyWithFixtureReceipt(fixture.db, {
       projectId: PROJECT_ID,
       operationClass: "execution_attempt_interruption",
@@ -14280,17 +14434,48 @@ exit 1
       expectedGovernanceEpoch: 1,
       expectedFenceToken: fixture.fenceToken,
       repoTargetId: TARGET_ID,
-      expectedResourceRevision: 4,
+      expectedResourceRevision: 5,
       workItemId: WORK_ITEM_ID,
       executionAttemptId: original.execution_attempt_id,
       interruption: correction,
       historicalCorrection,
-    })).toMatchObject({ outcome: "OK" });
+    }, null, null, null, null, evidenceReader)).toMatchObject({ outcome: "OK" });
     expect(fixture.db.prepare("SELECT state, terminal_report_digest, reason_code FROM execution_attempts WHERE execution_attempt_id = ?").get(original.execution_attempt_id)).toEqual({ state: "interrupted", terminal_report_digest: null, reason_code: "historical-correction:gh613-correction-fixture" });
     expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lifecycle_state: "succeeded" });
     expect(fixture.db.prepare("SELECT event_type FROM state_events WHERE aggregate_type = 'execution_attempt' AND aggregate_id = ? ORDER BY event_sequence DESC LIMIT 1").get(original.execution_attempt_id)).toEqual({ event_type: "execution_attempt_historical_interruption_correction" });
     const exported = exportFoundation(fixture.db, PROJECT_ID);
     expect(exported).toMatchObject({ outcome: "OK", export: { recordsNdjson: expect.stringContaining('"state":"interrupted"') } });
     expect((exported.export as ExportPayload).recordsNdjson).toContain("execution_attempt_historical_interruption_correction");
+  });
+
+  it("reports one native interruption at T and suppresses the duplicate after T plus one hour", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      const fixture = await fleetWatchdogFixture(1_000, true, 1, false);
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "native-interruption-plugin", actorKind: "plugin", subjectId: PLUGIN_ID });
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+        workAttempt: { laneId: "lane-native-interrupted", threadId: "thread-native-interrupted", assignmentKind: "write" },
+      })).outcome).toBe("OK");
+      fixture.recordNativeEvent("thread-native-interrupted", {
+        id: "native-stop-at-t",
+        seq: 11444,
+        type: "system/thread/interrupted",
+        data: { reason: "manual-stop" },
+        createdAt: 1_000,
+      });
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      const first = fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([input]) => (input as { threadId: string }).threadId === fixture.orchestratorThreadId);
+      expect(first).toHaveLength(1);
+      expect(first[0]?.[0]).toEqual(expect.objectContaining({
+        threadId: fixture.orchestratorThreadId,
+        input: [expect.objectContaining({ text: expect.stringContaining("native-stop-at-t@11444") })],
+      }));
+      expect(fixture.db.prepare("SELECT state, terminal_report_digest FROM execution_attempts WHERE thread_id = ?").get("thread-native-interrupted")).toEqual({ state: "interrupted", terminal_report_digest: null });
+      clock.mockReturnValue(3_601_000);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([input]) => (input as { threadId: string }).threadId === fixture.orchestratorThreadId)).toHaveLength(1);
+    } finally {
+      clock.mockRestore();
+    }
   });
 });
