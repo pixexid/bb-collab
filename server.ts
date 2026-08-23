@@ -2530,30 +2530,40 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     kind: "blind",
     message: `idle-fleet coverage=blind orchestrator=${orchestrator} activeLanes=${activeLanes} startable=${startable} reason=${reason}`,
   });
-  const readIdleFleetActiveLanes = async (projectId: string): Promise<IdleFleetFact<number>> => {
+  type LaneIdentity = { executionAttemptId: string; laneId: string; threadId: string };
+  const sameLaneIdentitySet = (left: LaneIdentity[], right: LaneIdentity[]) => {
+    if (left.length !== right.length) return false;
+    const keys = (lanes: LaneIdentity[]) => lanes.map((lane) => JSON.stringify(lane)).sort();
+    const rightKeys = keys(right);
+    return keys(left).every((lane, index) => lane === rightKeys[index]);
+  };
+  const readIdleFleetActiveLanes = async (projectId: string): Promise<IdleFleetFact<LaneIdentity[]>> => {
     if (!db) return { known: false, reason: "canonical-store-unavailable" };
     try {
       const capacityEvidence = workItemCapacityLaneEvidence(db, projectId);
       if (capacityEvidence.unboundWorkItemIds.length > 0) return { known: false, reason: "work-items-have-no-thread-binding:GH-300" };
-      const laneIds = new Set<string>();
+      const identities: LaneIdentity[] = [];
       const now = Date.now();
       for (const row of capacityEvidence.lanes) {
         if (row.idle_kind === "blind") return { known: false, reason: "dispatch-unknown-attempt" };
-        if (row.lane_id.length === 0 || typeof row.thread_id !== "string" || row.thread_id.length === 0) {
+        if (row.execution_attempt_id.length === 0 || row.lane_id.length === 0 || typeof row.thread_id !== "string" || row.thread_id.length === 0) {
           return { known: false, reason: "work-item-attempt-has-no-thread-binding:GH-300" };
         }
         if (typeof row.observed_at_ms !== "number" || !Number.isSafeInteger(row.observed_at_ms) || row.observed_at_ms < 0 || now - row.observed_at_ms > IDLE_FLEET_ATTEMPT_STALE_MS) {
           return { known: false, reason: "stale-active-attempt" };
         }
-        if (laneIds.has(row.lane_id)) return { known: false, reason: "duplicate-active-lane" };
-        laneIds.add(row.lane_id);
+        const identity = { executionAttemptId: row.execution_attempt_id, laneId: row.lane_id, threadId: row.thread_id };
+        if (identities.some((candidate) => candidate.executionAttemptId === identity.executionAttemptId || candidate.laneId === identity.laneId || candidate.threadId === identity.threadId)) {
+          return { known: false, reason: "duplicate-active-lane" };
+        }
+        identities.push(identity);
       }
-      return { known: true, value: laneIds.size };
+      return { known: true, value: identities };
     } catch (error) {
       return { known: false, reason: `active-lanes-unreadable:${String(error)}` };
     }
   };
-  const readIdleFleetNativeLanes = async (projectId: string): Promise<IdleFleetFact<{ count: number; executionAttemptIds: string[] }>> => {
+  const readIdleFleetNativeLanes = async (projectId: string): Promise<IdleFleetFact<LaneIdentity[]>> => {
     if (!db) return { known: false, reason: "canonical-store-unavailable" };
     try {
       const dispatcherThreadIds = new Set(
@@ -2581,23 +2591,35 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         thread.deletedAt === null &&
         isWorkingLane(thread),
       );
-      const executionAttemptIds: string[] = [];
+      const identities: LaneIdentity[] = [];
+      const seenThreadIds = new Set<string>();
       for (const lane of liveLanes) {
+        if (lane.projectId !== projectId) return { known: false, reason: "foreign-native-lane" };
+        if (seenThreadIds.has(lane.id)) return { known: false, reason: "duplicate-native-lane" };
+        seenThreadIds.add(lane.id);
         const matches = db.prepare(
-          `SELECT execution_attempt_id, assignment_kind
+          `SELECT project_id, execution_attempt_id, assignment_kind, lane_id, thread_id
            FROM execution_attempts
-           WHERE project_id = ? AND origin = 'work_item'
-             AND state = 'running' AND thread_id = ?`,
-        ).all(projectId, lane.id) as Array<{ execution_attempt_id: string; assignment_kind: string | null }>;
-        if (matches.length !== 1 || matches[0]!.assignment_kind !== "write") continue;
+           WHERE origin = 'work_item' AND state = 'running' AND thread_id = ?`,
+        ).all(lane.id) as Array<{ project_id: string; execution_attempt_id: string; assignment_kind: string | null; lane_id: string; thread_id: string | null }>;
+        if (matches.some((match) => match.project_id !== projectId)) return { known: false, reason: "foreign-native-attempt" };
+        if (matches.length === 0) return { known: false, reason: "unbound-native-lane" };
+        if (matches.length > 1) return { known: false, reason: "ambiguous-native-attempt" };
+        const match = matches[0]!;
+        if (match.assignment_kind !== "write") continue;
+        if (match.execution_attempt_id.length === 0 || match.lane_id.length === 0 || match.thread_id !== lane.id) return { known: false, reason: "native-lane-binding-invalid" };
+        const identity = { executionAttemptId: match.execution_attempt_id, laneId: match.lane_id, threadId: match.thread_id };
+        if (identities.some((candidate) => candidate.executionAttemptId === identity.executionAttemptId || candidate.laneId === identity.laneId || candidate.threadId === identity.threadId)) {
+          return { known: false, reason: "duplicate-native-lane" };
+        }
         const observedAtMs = Date.now();
         db.prepare(
           `UPDATE execution_attempts SET observed_at_ms = ?
            WHERE project_id = ? AND execution_attempt_id = ? AND state = 'running'`,
-        ).run(observedAtMs, projectId, matches[0]!.execution_attempt_id);
-        executionAttemptIds.push(matches[0]!.execution_attempt_id);
+        ).run(observedAtMs, projectId, match.execution_attempt_id);
+        identities.push(identity);
       }
-      return { known: true, value: { count: liveLanes.length, executionAttemptIds } };
+      return { known: true, value: identities };
     } catch (error) {
       return { known: false, reason: `native-lanes-unreadable:${String(error)}` };
     }
@@ -2651,8 +2673,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       !nativeLanes.known ? nativeLanes.reason : null,
       !startable.known ? startable.reason : null,
       !ceiling.known ? ceiling.reason : null,
-      activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value.count
-        ? `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value.count}`
+      activeLanes.known && nativeLanes.known && !sameLaneIdentitySet(activeLanes.value, nativeLanes.value)
+        ? `active-lanes-disagreement:canonical=${activeLanes.value.length}:native=${nativeLanes.value.length}`
         : null,
     ].filter((reason): reason is string => reason !== null);
     const coverageState = reasons.length === 0 ? "known" : "blind";
@@ -2665,7 +2687,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       startable_work: number | null; reason: string | null; lane_capacity_observation_id: string | null;
     } | undefined;
     const sameFacts = open !== undefined && open.coverage_state === coverageState &&
-      open.active_lane_count === (activeLanes.known ? activeLanes.value : null) &&
+      open.active_lane_count === (activeLanes.known ? activeLanes.value.length : null) &&
       open.writing_lane_ceiling === (ceiling.known ? ceiling.value : null) &&
       open.startable_work === (startableWork === null ? null : startableWork ? 1 : 0) &&
       open.reason === (reasons.length === 0 ? null : reasons.join(";"));
@@ -2677,13 +2699,13 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       orchestratorThreadId: holder.thread_id,
       orchestratorRoleGeneration: holder.role_generation,
       coverageState,
-      activeLaneCount: activeLanes.known ? activeLanes.value : null,
+      activeLaneCount: activeLanes.known ? activeLanes.value.length : null,
       writingLaneCeiling: ceiling.known ? ceiling.value : null,
       startableWork,
       reason: reasons.length === 0 ? null : reasons.join(";"),
       laneCapacityObservationId,
       observedAtMs,
-      executionAttemptIds: nativeLanes.known ? nativeLanes.value.executionAttemptIds : [],
+      executionAttemptIds: nativeLanes.known ? nativeLanes.value.map((lane) => lane.executionAttemptId) : [],
       configIdentity: configured.identity,
       queue: reasons.length === 0 && startable.known ? startable.value : null,
     };
@@ -2748,7 +2770,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     if (currentConfig.identity !== configured.identity) {
       return idleFleetBlind("known", "blind", "blind", "project-config-moved-during-refresh");
     }
-    const laneDisagreement = activeLanes.known && nativeLanes.known && activeLanes.value !== nativeLanes.value.count;
+    const laneDisagreement = activeLanes.known && nativeLanes.known && !sameLaneIdentitySet(activeLanes.value, nativeLanes.value);
     if (!activeLanes.known || !nativeLanes.known || !startable.known || !ceiling.known) {
       const blindReasons = [
         !activeLanes.known ? activeLanes.reason : null,
@@ -2764,9 +2786,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       );
     }
     if (laneDisagreement) {
-      return idleFleetBlind("known", "blind", "known", `active-lanes-disagreement:canonical=${activeLanes.value}:native=${nativeLanes.value.count}`);
+      return idleFleetBlind("known", "blind", "known", `active-lanes-disagreement:canonical=${activeLanes.value.length}:native=${nativeLanes.value.length}`);
     }
-    if (activeLanes.value >= ceiling.value || startable.value.count === 0) return { kind: "silent" };
+    if (activeLanes.value.length >= ceiling.value || startable.value.count === 0) return { kind: "silent" };
     const queueHead = startable.value.head;
     if (!queueHead) return { kind: "silent" };
     const role = {

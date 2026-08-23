@@ -1563,6 +1563,7 @@ export const WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES = ["prepared", "armed", "conte
 export const WORK_ITEM_IDLE_BLIND_ATTEMPT_STATES = ["dispatch_unknown"] as const;
 
 export interface WorkItemCapacityLaneEvidence {
+  execution_attempt_id: string;
   lane_id: string;
   thread_id: string | null;
   state: (typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES)[number];
@@ -1631,7 +1632,7 @@ export function reconcilePreparedWorkItemDispatches(
 
 export function workItemCapacityLaneEvidence(db: SqliteDatabase, projectId: string): WorkItemCapacityEvidence {
   const lanes = (db.prepare(
-    `SELECT execution_attempts.lane_id, execution_attempts.thread_id, execution_attempts.state, execution_attempts.observed_at_ms
+    `SELECT execution_attempts.execution_attempt_id, execution_attempts.lane_id, execution_attempts.thread_id, execution_attempts.state, execution_attempts.observed_at_ms
      FROM execution_attempts
      JOIN work_items ON work_items.project_id = execution_attempts.project_id
        AND work_items.work_item_id = execution_attempts.work_item_id
@@ -1642,6 +1643,7 @@ export function workItemCapacityLaneEvidence(db: SqliteDatabase, projectId: stri
        AND execution_attempts.state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
      ORDER BY execution_attempts.lane_id, execution_attempts.execution_attempt_id`,
   ).all(projectId, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES) as Array<{
+    execution_attempt_id: string;
     lane_id: string;
     thread_id: string | null;
     state: (typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES)[number];

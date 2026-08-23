@@ -781,6 +781,21 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
   };
 }
 
+async function emitIdleFleet(fixture: Awaited<ReturnType<typeof fleetWatchdogFixture>>, updatedAt = 1) {
+  fixture.host.harness.sdk.stub("threads.wait", (async () => undefined) as never);
+  vi.useFakeTimers();
+  try {
+    await fixture.host.harness.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: fixture.orchestratorThreadId, projectId: PROJECT_ID, status: "idle", updatedAt }),
+      lastAssistantText: null,
+    });
+    await vi.advanceTimersByTimeAsync(IDLE_FLEET_DEBOUNCE_MS);
+  } finally {
+    vi.useRealTimers();
+  }
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+}
+
 function bindFixtureGithubIssue(db: Database.Database, issueNumber: number, workItemId = WORK_ITEM_ID) {
   db.prepare(
     `INSERT INTO external_work_refs (
@@ -5760,7 +5775,83 @@ exit 1
     }
   });
 
-  it.each(["active orchestrator", "one active writing lane", "zero startable issues"])("stays silent for %s", async (scenario) => {
+  it("permits wake with one writer and one reviewer below the writing ceiling", async () => {
+    const cleanup = installStartableQueueFixture(305);
+    try {
+      const fixture = await fleetWatchdogFixture(1, true, 2);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      activateReviewer(fixture.db, fixture.fenceToken);
+      const reviewAttemptId = insertFixtureAssignment(fixture.db, fixture.fenceToken, {
+        assignmentId: "review-only-capacity",
+        assignmentKind: "review",
+        laneId: "lane-review-only",
+        roleRequirementId: "reviewer-v1",
+        roleId: "independent-reviewer",
+        roleGeneration: 2,
+        candidateSha: CANDIDATE_SHA,
+        workItemRevision: 3,
+        executionAttemptId: "review-only-capacity-attempt",
+      });
+      fixture.db.prepare(
+        "UPDATE execution_attempts SET origin = 'work_item', assignment_id = NULL, assignment_digest = NULL, state = 'running', thread_id = ?, observed_at_ms = ? WHERE project_id = ? AND execution_attempt_id = ?",
+      ).run("thread-review-only", Date.now(), PROJECT_ID, reviewAttemptId);
+      fixture.addNativeLane("thread-work-item-1", "active");
+      fixture.addNativeLane("thread-review-only", "active");
+
+      await emitIdleFleet(fixture);
+
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([[
+        expect.objectContaining({
+          threadId: fixture.orchestratorThreadId,
+          mode: "steer",
+          input: [expect.objectContaining({ text: expect.stringContaining("example/project#305") })],
+        }),
+      ]]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("blinds an equal-count replacement of canonical writer identities", async () => {
+    const cleanup = installStartableQueueFixture(305);
+    try {
+      const fixture = await fleetWatchdogFixture(1, true, 2);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      const startWriter = (workItemId: string, laneId: string, threadId: string) => {
+        expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+          idempotencyKey: `${workItemId}-create`,
+          workItemId,
+          workItem: { workItemId, title: workItemId, body: workItemId },
+        })).outcome).toBe("OK");
+        expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, {
+          idempotencyKey: `${workItemId}-ready`,
+          workItemId,
+        })).outcome).toBe("OK");
+        expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+          idempotencyKey: `${workItemId}-in-progress`,
+          workItemId,
+          workAttempt: { laneId, threadId, assignmentKind: "write" },
+        })).outcome).toBe("OK");
+      };
+      startWriter("replacement-writer", "lane-replacement", "thread-replacement");
+      startWriter("excluded-writer", "lane-excluded", "thread-excluded");
+      fixture.db.prepare("UPDATE work_items SET lifecycle_state = 'ready' WHERE project_id = ? AND work_item_id = ?").run(PROJECT_ID, "excluded-writer");
+      fixture.addNativeLane("thread-work-item-1", "active");
+      fixture.addNativeLane("thread-excluded", "active");
+
+      await emitIdleFleet(fixture);
+
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining("reason=active-lanes-disagreement:canonical=2:native=2"),
+      }));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it.each(["active orchestrator", "one exact full writing lane", "zero startable issues"])("stays silent for %s", async (scenario) => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-false-"));
     const gh = join(bin, "gh");
     writeFileSync(gh, `#!/bin/sh\nprintf '%s\\n' '${scenario === "zero startable issues" ? "[]" : "[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]"}'\n`);
@@ -5771,7 +5862,7 @@ exit 1
       const fixture = await fleetWatchdogFixture(1, true);
       fixture.host.harness.sdk.stub("threads.wait", (async () => undefined) as never);
       if (scenario === "active orchestrator") fixture.setThreadStatus("active");
-      if (scenario === "one active writing lane") {
+      if (scenario === "one exact full writing lane") {
         expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
         fixture.addNativeLane("thread-work-item-1");
       }
@@ -6253,7 +6344,7 @@ exit 1
       fixture.host.harness.sdk.stub("threads.wait", (async () => undefined) as never);
       const originalPrepare = fixture.db.prepare.bind(fixture.db);
       vi.spyOn(fixture.db, "prepare").mockImplementation(((sql: string) => {
-        if (sql.includes("SELECT execution_attempts.lane_id, execution_attempts.thread_id, execution_attempts.state, execution_attempts.observed_at_ms")) throw new Error("lane read failed");
+        if (sql.includes("SELECT execution_attempts.execution_attempt_id, execution_attempts.lane_id, execution_attempts.thread_id, execution_attempts.state, execution_attempts.observed_at_ms")) throw new Error("lane read failed");
         return originalPrepare(sql);
       }) as never);
       vi.useFakeTimers();
@@ -6358,7 +6449,7 @@ exit 1
     }
   });
 
-  it("reports native live lanes disagreeing with canonical zero and never wakes", async () => {
+  it("blinds an unbound active native child and never wakes", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-native-disagreement-"));
     const gh = join(bin, "gh");
     writeFileSync(gh, "#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s\\n' '[[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]]'; else printf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'; fi\n");
@@ -6391,7 +6482,7 @@ exit 1
         expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
         expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
           level: "warn",
-          message: "idle-fleet coverage=blind orchestrator=known activeLanes=blind startable=known reason=active-lanes-disagreement:canonical=0:native=3 occurrences=1",
+          message: "idle-fleet coverage=blind orchestrator=known activeLanes=blind startable=known reason=unbound-native-lane occurrences=1",
         }));
       } finally {
         vi.useRealTimers();
