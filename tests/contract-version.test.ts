@@ -5,5 +5,5 @@ import { RUNTIME_CONTRACT_VERSION } from "../src/foundation.js";
 
 it("bumps the runtime contract without changing the session instruction contract", () => {
   expect(readFileSync(join(process.cwd(), "AGENTS.md"), "utf8")).toMatch(/INSTRUCTION_CONTRACT_VERSION:\s*43/u);
-  expect(RUNTIME_CONTRACT_VERSION).toBe(25);
+  expect(RUNTIME_CONTRACT_VERSION).toBe(26);
 });

@@ -14745,9 +14745,9 @@ function assertGithubIssueBriefBinding(brief, expected) {
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var RUNTIME_CONTRACT_VERSION = 25;
+var RUNTIME_CONTRACT_VERSION = 26;
 var SCHEMA_VERSION = 30;
-var PREVIOUS_RUNTIME_CONTRACT_VERSION = 24;
+var PREVIOUS_RUNTIME_CONTRACT_VERSION = 25;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
 var PREVIOUS_SCHEMA_VERSION = 29;
@@ -20085,6 +20085,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
   const unblock = request.workItemUnblock;
   const externalEvent = request.workItemExternalEvent;
   const workAttempt = request.workAttempt;
+  const directMergeClose = request.reasonCode === "fleet-watchdog-merge-close" && workItem.lifecycle_state === "in_progress" && nextState === "succeeded" && externalEvent?.kind === "github_issue_closed";
   const existingWait = asRow(db.prepare(
     "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?"
   ).get(request.projectId, workItem.work_item_id));
@@ -20287,7 +20288,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
       }
     );
   }
-  if (!nextState || !redispatchingReview && !swappingBlockedWait && !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
+  if (!nextState || !redispatchingReview && !swappingBlockedWait && !directMergeClose && !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
   let recordedExternalEvent = null;
@@ -24156,7 +24157,7 @@ async function prepareWorkItemAttemptTerminalization(bb, db, request, policy) {
   }
   return null;
 }
-async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = readGithubIssueForBackfill, githubAdapter = null) {
+async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = readGithubIssueForBackfill, githubAdapter = null, preMutationGuard) {
   const parsed = applyRequestSchema.safeParse(input);
   if (parsed.success && terminalizationPolicy === "stop-active") {
     const authorized = applyAuthorizedMutation(db, input, githubAdapter, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, true);
@@ -24180,6 +24181,8 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     }
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
+  const preMutationRefusal = preMutationGuard === void 0 ? null : await preMutationGuard();
+  if (preMutationRefusal) return preMutationRefusal;
   const result2 = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader);
   await deliverSucceededSeatBrief(bb, db, input, result2);
   return result2;
@@ -26271,7 +26274,7 @@ ${thread.titleFallback ?? ""}`);
           wakeInFlight.delete(key);
         }
       };
-      const transitionWorkItem = async (projectId, workItemId, state, idempotencyKey, extra = {}, githubSnapshot, legacyIdempotencyKey, terminalizationPolicy = "refuse-active", reasonCode) => {
+      const transitionWorkItem = async (projectId, workItemId, state, idempotencyKey, extra = {}, githubSnapshot, legacyIdempotencyKey, terminalizationPolicy = "refuse-active", reasonCode, preMutationGuard) => {
         const actor = db.prepare(
           `SELECT receipt_id FROM actor_receipts
            WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
@@ -26309,7 +26312,7 @@ ${thread.titleFallback ?? ""}`);
         const compatibleKey = legacyIdempotencyKey !== void 0 && db.prepare(
           "SELECT 1 FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ? AND request_digest = ?"
         ).get(projectId, legacyIdempotencyKey, mutationRequestDigest({ ...request, idempotencyKey: legacyIdempotencyKey })) !== void 0 ? legacyIdempotencyKey : idempotencyKey;
-        return applyLiveAuthorizedMutation(bb, db, { ...request, idempotencyKey: compatibleKey }, false, terminalizationPolicy, githubSnapshot ? () => githubSnapshot : projectGithubIssueReader(db, projectId));
+        return applyLiveAuthorizedMutation(bb, db, { ...request, idempotencyKey: compatibleKey }, false, terminalizationPolicy, githubSnapshot ? () => githubSnapshot : projectGithubIssueReader(db, projectId), null, preMutationGuard);
       };
       const inspectWaitTargets = async (projectId) => {
         for (const workItem of openWorkItemsByProject.get(projectId) ?? []) {
@@ -26443,6 +26446,13 @@ ${thread.titleFallback ?? ""}`);
             await reportMismatch(linked, githubSnapshot, safety);
             continue;
           }
+          const finalNativeLaneGuard = async () => {
+            const finalSafety = await readMergeCloseSafety(projectId, linked.work_item_id, dispatcherThreadIds);
+            if (finalSafety.safe) return null;
+            degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
+            await reportMismatch(linked, githubSnapshot, finalSafety);
+            return { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close safety refused: ${finalSafety.reason}` };
+          };
           const transition = async (state) => {
             const latestSafety = await readMergeCloseSafety(projectId, linked.work_item_id, dispatcherThreadIds);
             if (!latestSafety.safe) {
@@ -26459,25 +26469,13 @@ ${thread.titleFallback ?? ""}`);
               githubSnapshot,
               fleetWatchdogLegacyMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
               "refuse-active",
-              "fleet-watchdog-merge-close"
+              "fleet-watchdog-merge-close",
+              finalNativeLaneGuard
             );
           };
           let result2;
           if (workItem.lifecycle_state === "in_progress") {
-            result2 = await transition("review_pending");
-            if (result2.outcome === "OK") {
-              const current = db.prepare(
-                "SELECT resource_revision, lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?"
-              ).get(projectId, linked.work_item_id);
-              result2 = current?.lifecycle_state === "review_pending" ? await transition("succeeded") : {
-                outcome: "WORK_ITEM_REVISION_STALE",
-                subject: linked.work_item_id,
-                expected: 1,
-                attempted: 1,
-                verified: 0,
-                message: "work item changed before merge-close terminalization"
-              };
-            }
+            result2 = await transition("succeeded");
           } else if (workItem.lifecycle_state === "review_pending") {
             result2 = await transition("succeeded");
           } else if (workItem.lifecycle_state === "proposed") {
@@ -26486,7 +26484,8 @@ ${thread.titleFallback ?? ""}`);
             result2 = { outcome: "WORK_ITEM_STATE_INVALID", subject: linked.work_item_id, expected: 1, attempted: 0, verified: 0, message: `merge-close automation requires in_progress, review_pending, or proposed, found ${workItem.lifecycle_state}` };
           }
           if (result2.outcome === "OK") {
-            bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=${workItem.lifecycle_state === "proposed" ? "proposed-cancel" : "review_pending"}`);
+            const via = workItem.lifecycle_state === "proposed" ? "proposed-cancel" : workItem.lifecycle_state === "in_progress" ? "direct-success" : "review_pending";
+            bb.log.info(`fleet-watchdog auto-terminalized merged and closed work item: project=${projectId} workItem=${linked.work_item_id} via=${via}`);
           } else {
             degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
             bb.log.warn(`fleet-watchdog merge-close transition refused: project=${projectId} workItem=${linked.work_item_id} outcome=${result2.outcome} message=${result2.message}`);

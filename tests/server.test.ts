@@ -6909,6 +6909,98 @@ exit 1
     }
   });
 
+  it("directly merge-closes an in-progress item only after complete absence proof", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-gh623-direct-merge-close-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[]'; exit 0; fi
+if [ "$1" = "api" ]; then printf '%s\\n' '[[]]'; exit 0; fi
+if [ "$1" = "pr" ]; then printf '%s\\n' '{"state":"MERGED","mergedAt":"2026-08-23T00:00:00Z"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"gh613-direct-closed","closedByPullRequestsReferences":[{"number":623}]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"number":613,"title":"GH613","body":"","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"gh613-direct-closed","url":"https://github.test/example/project/issues/613"}'; exit 0; fi
+exit 1
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      const workItemId = "wi-gh-613-direct";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, { idempotencyKey: "gh613-direct-create", workItemId, workItem: { workItemId, title: workItemId, body: workItemId } })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { idempotencyKey: "gh613-direct-ready", workItemId })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, { idempotencyKey: "gh613-direct-start", workItemId, workAttempt: { laneId: "lane-gh613-direct", threadId: "thread-gh613-direct", assignmentKind: "write" } })).outcome).toBe("OK");
+      bindFixtureGithubIssue(fixture.db, 613, workItemId);
+      fixture.addNativeLane("thread-gh613-direct", "idle");
+      fixture.db.prepare("UPDATE execution_attempts SET state = 'done' WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'").run(PROJECT_ID, workItemId);
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "gh613-direct-plugin", actorKind: "plugin", subjectId: PLUGIN_ID });
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, workItemId)).toEqual({ lifecycle_state: "succeeded" });
+      expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, workItemId)).toEqual({ state: "done" });
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.stop")).toHaveLength(0);
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "info",
+        message: expect.stringContaining("workItem=wi-gh-613-direct via=direct-success"),
+      }));
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a native lane that appears during the final merge-close guard", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-gh623-late-lane-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\\n' '[]'; exit 0; fi
+if [ "$1" = "api" ]; then printf '%s\\n' '[[]]'; exit 0; fi
+if [ "$1" = "pr" ]; then printf '%s\\n' '{"state":"MERGED","mergedAt":"2026-08-23T00:00:00Z"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"gh613-late-closed","closedByPullRequestsReferences":[{"number":623}]}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"number":613,"title":"GH613","body":"","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"gh613-late-closed","url":"https://github.test/example/project/issues/613"}'; exit 0; fi
+exit 1
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      const workItemId = "wi-gh-613-late";
+      expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, { idempotencyKey: "gh613-late-create", workItemId, workItem: { workItemId, title: workItemId, body: workItemId } })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { idempotencyKey: "gh613-late-ready", workItemId })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, { idempotencyKey: "gh613-late-start", workItemId, workAttempt: { laneId: "lane-gh613-late", threadId: "thread-gh613-late", assignmentKind: "write" } })).outcome).toBe("OK");
+      bindFixtureGithubIssue(fixture.db, 613, workItemId);
+      fixture.db.prepare("UPDATE execution_attempts SET state = 'done' WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'").run(PROJECT_ID, workItemId);
+      seedVerifiedFixtureReceipt(fixture.db, { projectId: PROJECT_ID, receiptId: "gh613-late-plugin", actorKind: "plugin", subjectId: PLUGIN_ID });
+      let listCalls = 0;
+      fixture.host.harness.sdk.stub("threads.list", (async ({ projectId }: { projectId?: string }) => {
+        listCalls += 1;
+        const lateLane = listCalls >= 4 ? [makeThreadResponse({ id: "thread-gh613-late", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active" })] : [];
+        return [
+          makeThreadResponse({ id: fixture.directorThreadId, projectId: PROJECT_ID, status: "idle" }),
+          makeThreadResponse({ id: fixture.orchestratorThreadId, projectId: PROJECT_ID, status: "idle" }),
+          ...lateLane,
+        ].filter((thread) => projectId === undefined || thread.projectId === projectId);
+      }) as never);
+
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      expect(listCalls).toBe(4);
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, workItemId)).toEqual({ lifecycle_state: "in_progress" });
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.stop")).toHaveLength(0);
+      const reports = fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([request]) =>
+        (request as { input?: Array<{ text?: string }> }).input?.[0]?.text?.startsWith("fleet-watchdog merge-close mismatch:") === true,
+      );
+      expect(reports).toHaveLength(1);
+      expect((reports[0]![0] as { input: Array<{ text: string }> }).input[0]!.text).toContain("reason=active-associated-native-lane");
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("wakes an idle orchestrator when non-terminal work is review_pending", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-review-pending-"));
     const gh = join(bin, "gh");
@@ -8954,7 +9046,7 @@ else printf '%s\\n' '[]'; fi
 
   it("appends authority-root schema and bumps the runtime contract", () => {
     expect(SCHEMA_VERSION).toBe(30);
-    expect(RUNTIME_CONTRACT_VERSION).toBe(25);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(26);
     expect(MIGRATIONS).toHaveLength(43);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
@@ -8976,8 +9068,8 @@ else printf '%s\\n' '[]'; fi
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 29,
       newSchemaVersion: 30,
-      oldContractVersion: 24,
-      newContractVersion: 25,
+      oldContractVersion: 25,
+      newContractVersion: 26,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -8986,21 +9078,21 @@ else printf '%s\\n' '[]'; fi
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(20, 22))).toMatchObject({
       oldSchemaVersion: 29,
       newSchemaVersion: 30,
-      oldContractVersion: 24,
-      newContractVersion: 25,
+      oldContractVersion: 25,
+      newContractVersion: 26,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "refused", verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(30, 25))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(30, 26))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 29,
       newSchemaVersion: 30,
-      oldContractVersion: 24,
-      newContractVersion: 25,
+      oldContractVersion: 25,
+      newContractVersion: 26,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -9269,10 +9361,10 @@ else printf '%s\\n' '[]'; fi
   });
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
-    expect(RUNTIME_CONTRACT_VERSION).toBe(25);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(26);
     expect(SCHEMA_VERSION).toBe(30);
     expect(MIGRATIONS).toHaveLength(43);
-    expect(contractDigest).toBe("a6df2cfa9a9458995106c0996374c78df39e41ce4c45554befb489d7b196faf3");
+    expect(contractDigest).toBe("d4e51b0b1fd68957120cea5febb7762d6c3b9eddab76f67916e556830b062b83");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     const beforeRefusal = exportFoundation(db, PROJECT_ID);
@@ -9288,7 +9380,7 @@ else printf '%s\\n' '[]'; fi
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 30, observedContractVersion: 25 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 30, observedContractVersion: 26 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -9559,7 +9651,7 @@ else printf '%s\\n' '[]'; fi
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
       observedSchemaVersion: 30,
-      observedContractVersion: 25,
+      observedContractVersion: 26,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -9640,8 +9732,8 @@ else printf '%s\\n' '[]'; fi
       outcome: "OK",
       evidence: {
         cachedConsumers: {
-          oldContractVersion: 24,
-          newContractVersion: 25,
+          oldContractVersion: 25,
+          newContractVersion: 26,
           action: "unknown",
           expected: 4,
           attempted: 0,
@@ -9789,7 +9881,7 @@ else printf '%s\\n' '[]'; fi
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 30, schemaDigest, contractVersion: 25, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 30, schemaDigest, contractVersion: 26, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -13487,10 +13579,10 @@ else printf '%s\\n' '[]'; fi
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 24, newContractVersion: 25, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 24, newContractVersion: 25, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 24, newContractVersion: 25, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(30, 25))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 24, newContractVersion: 25, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 25, newContractVersion: 26, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 25, newContractVersion: 26, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 25, newContractVersion: 26, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(30, 26))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 25, newContractVersion: 26, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 

@@ -10,10 +10,10 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
-export const RUNTIME_CONTRACT_VERSION = 25;
+export const RUNTIME_CONTRACT_VERSION = 26;
 export const SCHEMA_VERSION = 30;
-// v25 makes fleet-watchdog merge-close refuse live canonical attempts.
-const PREVIOUS_RUNTIME_CONTRACT_VERSION = 24;
+// v26 makes fleet-watchdog merge-close revalidate native lanes and allow safe direct success.
+const PREVIOUS_RUNTIME_CONTRACT_VERSION = 25;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
 // Schema v30 adds immutable authority-root audit fields to Decisions.
@@ -6701,6 +6701,10 @@ function applyWorkItemTransition(
   const unblock = request.workItemUnblock;
   const externalEvent = request.workItemExternalEvent;
   const workAttempt = request.workAttempt;
+  const directMergeClose = request.reasonCode === "fleet-watchdog-merge-close" &&
+    workItem.lifecycle_state === "in_progress" &&
+    nextState === "succeeded" &&
+    externalEvent?.kind === "github_issue_closed";
   const existingWait = asRow<WorkItemWaitRow>(db.prepare(
     "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?",
   ).get(request.projectId, workItem.work_item_id));
@@ -6920,7 +6924,7 @@ function applyWorkItemTransition(
       },
     );
   }
-  if (!nextState || (!redispatchingReview && !swappingBlockedWait && !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState))) {
+  if (!nextState || (!redispatchingReview && !swappingBlockedWait && !directMergeClose && !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState))) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
   let recordedExternalEvent: { kind: "github_issue_closed" | "github_issue_reopened"; owner: string; repo: string; issueNumber: number; externalRevision: string } | null = null;
