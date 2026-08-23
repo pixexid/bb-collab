@@ -22375,22 +22375,24 @@ var fleetWatchdogRoleLivenessKey = (holder) => fleetWatchdogCompositeKey(
   holder.execution_attempt_id,
   holder.thread_id
 );
-var fleetWatchdogEpisodeKey = (holder, queueHead) => fleetWatchdogCompositeKey(
+var fleetWatchdogEpisodeKey = (holder, queueHead, activeLaneCount = 0, writingLaneCeiling = 0) => fleetWatchdogCompositeKey(
   holder.project_id,
   holder.role_id,
   String(holder.role_generation),
   holder.execution_attempt_id,
   holder.thread_id,
-  "activeLanes=0",
+  `activeLanes=${activeLaneCount}`,
+  `writingLaneCeiling=${writingLaneCeiling}`,
   queueHead
 );
-var fleetWatchdogLegacyEpisodeKey = (holder, queueHead) => [
+var fleetWatchdogLegacyEpisodeKey = (holder, queueHead, activeLaneCount, writingLaneCeiling) => [
   holder.project_id,
   holder.role_id,
   holder.role_generation,
   holder.execution_attempt_id,
   holder.thread_id,
-  "activeLanes=0",
+  `activeLanes=${activeLaneCount}`,
+  `writingLaneCeiling=${writingLaneCeiling}`,
   queueHead
 ].join(":");
 var fleetWatchdogScope = (prefix, ...parts) => `${prefix}:${fleetWatchdogCompositeKey(...parts)}`;
@@ -24695,10 +24697,10 @@ ${thread.titleFallback ?? ""}`);
     };
     return {
       kind: "ready",
-      episodeKey: fleetWatchdogEpisodeKey(holder, queueHead),
-      legacyEpisodeKey: fleetWatchdogLegacyEpisodeKey(holder, queueHead),
+      episodeKey: fleetWatchdogEpisodeKey(holder, queueHead, activeLanes.value.length, ceiling.value),
+      legacyEpisodeKey: fleetWatchdogLegacyEpisodeKey(holder, queueHead, activeLanes.value.length, ceiling.value),
       role,
-      message: `Idle fleet: queue head ${queueHead} is startable with zero active writing lanes. Dispatch it or record the blocker.`
+      message: `Idle fleet: queue head ${queueHead} is startable with ${activeLanes.value.length} active writing lane${activeLanes.value.length === 1 ? "" : "s"} below writing capacity ${ceiling.value}. Dispatch it or record the blocker.`
     };
   };
   const capacityObservationLocks = /* @__PURE__ */ new Map();

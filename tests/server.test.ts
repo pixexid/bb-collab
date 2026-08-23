@@ -783,6 +783,7 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
 
 async function emitIdleFleet(fixture: Awaited<ReturnType<typeof fleetWatchdogFixture>>, updatedAt = 1) {
   fixture.host.harness.sdk.stub("threads.wait", (async () => undefined) as never);
+  fixture.setThreadUpdatedAt(updatedAt);
   vi.useFakeTimers();
   try {
     await fixture.host.harness.emitThreadEvent("thread.idle", {
@@ -5804,9 +5805,34 @@ exit 1
         expect.objectContaining({
           threadId: fixture.orchestratorThreadId,
           mode: "steer",
-          input: [expect.objectContaining({ text: expect.stringContaining("example/project#305") })],
+          input: [expect.objectContaining({
+            text: expect.stringContaining("1 active writing lane below writing capacity 2"),
+          })],
         }),
       ]]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("rearms the same queue head when writing capacity changes", async () => {
+    const cleanup = installStartableQueueFixture(305);
+    try {
+      const fixture = await fleetWatchdogFixture(1, true, 2);
+      fixture.host.harness.sdk.stub("threads.wait", (async () => undefined) as never);
+      await emitIdleFleet(fixture, 1);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+      fixture.addNativeLane("thread-work-item-1", "active");
+      await emitIdleFleet(fixture, 2);
+
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")[1]?.[0]).toEqual(expect.objectContaining({
+        input: [expect.objectContaining({
+          text: expect.stringContaining("1 active writing lane below writing capacity 2"),
+        })],
+      }));
     } finally {
       cleanup();
     }
@@ -5854,12 +5880,13 @@ exit 1
   it.each(["active orchestrator", "one exact full writing lane", "zero startable issues"])("stays silent for %s", async (scenario) => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-false-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, `#!/bin/sh\nprintf '%s\\n' '${scenario === "zero startable issues" ? "[]" : "[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]"}'\n`);
+    const page = scenario === "zero startable issues" ? "[]" : "[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]";
+    writeFileSync(gh, `#!/bin/sh\nprintf '%s\\n' '[${page}]'\n`);
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
     try {
-      const fixture = await fleetWatchdogFixture(1, true);
+      const fixture = await fleetWatchdogFixture(1, true, scenario === "one exact full writing lane" ? 1 : undefined);
       fixture.host.harness.sdk.stub("threads.wait", (async () => undefined) as never);
       if (scenario === "active orchestrator") fixture.setThreadStatus("active");
       if (scenario === "one exact full writing lane") {
@@ -5890,7 +5917,7 @@ exit 1
   it("stays silent when the queue is startable but the configured writing capacity is zero", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-idle-fleet-zero-capacity-"));
     const gh = join(bin, "gh");
-    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]'\n");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[[{\"number\":305,\"labels\":[{\"name\":\"queue:startable\"}]}]]'\n");
     chmodSync(gh, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}:${originalPath ?? ""}`;
