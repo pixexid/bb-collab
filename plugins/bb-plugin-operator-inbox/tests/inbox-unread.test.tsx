@@ -2,10 +2,10 @@
 
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { clearUnreadObserver, refreshUnread, useInboxUnreadCount } from "../src/inbox-unread";
+import { applyUnreadMutation, clearUnreadObserver, refreshUnread, useInboxUnreadCount } from "../src/inbox-unread";
 
 function message(projectId: string, messageId: number, readAtMs: number | null = null) {
-  return { messageId, projectId, recipient: "operator" as const, senderThreadId: "sender", senderLaneId: null, severity: "routine" as const, text: "message", createdAtMs: 1, readAtMs, archivedAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null };
+  return { messageId, projectId, recipient: "operator" as const, senderThreadId: "sender", senderLaneId: null, severity: "routine" as const, text: "message", createdAtMs: 1, readAtMs, archivedAtMs: null, senderTitle: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null };
 }
 
 function Probe() {
@@ -39,18 +39,40 @@ describe("persistent Inbox unread observer", () => {
   it("retains a failed project's proof and subtracts a removed project", async () => {
     const probe = render(<Probe />);
     let failed = false;
+    let malformed = false;
+    let readA = false;
     const operatorMessages = vi.fn(async ({ projectId }: { projectId: string }) => {
       if (failed && projectId === "project-b") throw new Error("unavailable");
-      return { outcome: "OK", messages: projectId === "project-a" ? [message(projectId, 1, failed ? 2 : null)] : [message(projectId, 2)] };
+      if (malformed && projectId === "project-b") return { outcome: "OK", messages: [{ ...message(projectId, 2), readAtMs: undefined }] };
+      return { outcome: "OK", messages: projectId === "project-a" ? [message(projectId, 1, readA ? 2 : null)] : [message(projectId, 2)] };
     });
 
     refreshUnread(operatorMessages as never, [{ id: "project-a" }, { id: "project-b" }]);
     await waitFor(() => expect(probe.getByLabelText("unread count").textContent).toBe("2"));
     failed = true;
+    readA = true;
+    refreshUnread(operatorMessages as never, [{ id: "project-a" }, { id: "project-b" }]);
+    await waitFor(() => expect(probe.getByLabelText("unread count").textContent).toBe("1"));
+    failed = false;
+    malformed = true;
     refreshUnread(operatorMessages as never, [{ id: "project-a" }, { id: "project-b" }]);
     await waitFor(() => expect(probe.getByLabelText("unread count").textContent).toBe("1"));
     refreshUnread(operatorMessages as never, [{ id: "project-a" }]);
     await waitFor(() => expect(probe.getByLabelText("unread count").textContent).toBe("0"));
+  });
+
+  it("updates the proven count immediately for read and archive mutations", async () => {
+    const probe = render(<Probe />);
+    const unread = message("project-a", 1);
+    const operatorMessages = vi.fn(async () => ({ outcome: "OK", messages: [unread] }));
+    refreshUnread(operatorMessages as never, [{ id: "project-a" }]);
+    await waitFor(() => expect(probe.getByLabelText("unread count").textContent).toBe("1"));
+    await act(async () => applyUnreadMutation({ ...unread, readAtMs: 2 }));
+    expect(probe.getByLabelText("unread count").textContent).toBe("0");
+    refreshUnread(operatorMessages as never, [{ id: "project-a" }]);
+    await waitFor(() => expect(probe.getByLabelText("unread count").textContent).toBe("1"));
+    await act(async () => applyUnreadMutation({ ...unread, archivedAtMs: 3 }));
+    expect(probe.getByLabelText("unread count").textContent).toBe("0");
   });
 
   it("shares one settlement-lifetime read across overlapping refreshes", async () => {
