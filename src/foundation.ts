@@ -3236,23 +3236,20 @@ export interface WorkItemDispatchConfigProof {
   currentConfigRevision: number;
   governanceEpoch: number;
   fenceToken: string;
+  sourceId: string;
+  hostId: string;
+  path: string;
+  defaultBranch: string;
   continued: boolean;
   proofDigest: string;
 }
 
 function dispatchProfileIdentity(profile: ExecutionProfile): ExecutionProfile {
-  return { ...profile, permissionMode: profile.permissionMode === "workspace-write" ? "accept-edits" : profile.permissionMode };
+  return profile;
 }
 
 function dispatchProfileMatches(requested: ExecutionProfile, configured: ExecutionProfile): boolean {
-  const left = dispatchProfileIdentity(requested);
-  const right = dispatchProfileIdentity(configured);
-  return left.providerId === right.providerId &&
-    left.model === right.model &&
-    left.reasoningLevel === right.reasoningLevel &&
-    left.serviceTier === right.serviceTier &&
-    left.visibility === right.visibility &&
-    (left.permissionMode === right.permissionMode || (requested.permissionMode === "workspace-write" && ["full", "accept-edits"].includes(configured.permissionMode)));
+  return canonicalJson(dispatchProfileIdentity(requested)) === canonicalJson(dispatchProfileIdentity(configured));
 }
 
 function dispatchTargetIdentity(row: Record<string, unknown>): Record<string, unknown> {
@@ -3279,10 +3276,15 @@ function dispatchRoleRequirement(db: SqliteDatabase, projectId: string, configRe
 export function proveWorkItemDispatchConfig(
   db: SqliteDatabase,
   request: WorkItemDispatchConfigRequest,
+  committedConfigRevision?: number,
 ): WorkItemDispatchConfigProof {
   const head = currentConfig(db, request.projectId);
   if (!head) throw refusal("PROJECT_CONFIG_REQUIRED", "project has no stored config revision");
-  if (request.expectedConfigRevision !== head.config_revision) {
+  const currentConfigRevision = committedConfigRevision ?? head.config_revision;
+  if (committedConfigRevision !== undefined && (committedConfigRevision > head.config_revision || !Number.isSafeInteger(committedConfigRevision))) {
+    throw refusal("PROJECT_CONFIG_STALE", "committed dispatch config revision is not an existing revision before the current head");
+  }
+  if (committedConfigRevision === undefined && request.expectedConfigRevision !== head.config_revision) {
     throw refusal("PROJECT_CONFIG_STALE", "dispatch expected config revision does not match the current head", {
       currentConfigRevision: head.config_revision,
       expectedConfigRevision: request.expectedConfigRevision ?? undefined,
@@ -3305,20 +3307,20 @@ export function proveWorkItemDispatchConfig(
 
   const currentTarget = asRow<Record<string, unknown>>(db.prepare(
     "SELECT * FROM repository_targets WHERE project_id = ? AND repo_target_id = ? AND config_revision = ?",
-  ).get(request.projectId, request.repoTargetId, head.config_revision));
+  ).get(request.projectId, request.repoTargetId, currentConfigRevision));
   const historicalTarget = asRow<Record<string, unknown>>(db.prepare(
     "SELECT * FROM repository_targets WHERE project_id = ? AND repo_target_id = ? AND config_revision = ?",
   ).get(request.projectId, request.repoTargetId, workItem.config_revision));
   if (!currentTarget || !historicalTarget) throw refusal("PROJECT_CONFIG_STALE", "the exact WorkItem target is missing from a config revision");
 
   const historicalRole = dispatchRoleRequirement(db, request.projectId, workItem.config_revision, request.repoTargetId);
-  const currentRole = dispatchRoleRequirement(db, request.projectId, head.config_revision, request.repoTargetId);
+  const currentRole = dispatchRoleRequirement(db, request.projectId, currentConfigRevision, request.repoTargetId);
   const requestedProfile = dispatchProfileIdentity(request.requestedProfile);
   if (!dispatchProfileMatches(request.requestedProfile, historicalRole.executedProfile) || !dispatchProfileMatches(request.requestedProfile, currentRole.executedProfile)) {
     throw refusal("PROJECT_CONFIG_STALE", "dispatch profile does not equal the exact historical and current worker requirement");
   }
   const historicalConfigJson = storedConfigJson(db, request.projectId, workItem.config_revision);
-  const currentConfigJson = storedConfigJson(db, request.projectId, head.config_revision);
+  const currentConfigJson = storedConfigJson(db, request.projectId, currentConfigRevision);
   const historicalDispatchConfig = {
     permissionMode: (JSON.parse(historicalConfigJson) as Record<string, unknown>).permissionMode,
     visibility: (JSON.parse(historicalConfigJson) as Record<string, unknown>).visibility,
@@ -3344,7 +3346,7 @@ export function proveWorkItemDispatchConfig(
     workItemId: request.workItemId,
     repoTargetId: request.repoTargetId,
     workItemConfigRevision: workItem.config_revision,
-    currentConfigRevision: head.config_revision,
+    currentConfigRevision,
     governanceEpoch: governor.governance_epoch,
     fenceToken: governor.fence_token,
     requestedProfile,
@@ -3352,10 +3354,14 @@ export function proveWorkItemDispatchConfig(
   };
   return {
     workItemConfigRevision: workItem.config_revision,
-    currentConfigRevision: head.config_revision,
+    currentConfigRevision,
     governanceEpoch: governor.governance_epoch,
     fenceToken: governor.fence_token,
-    continued: workItem.config_revision !== head.config_revision,
+    sourceId: String(currentTarget.source_id),
+    hostId: String(currentTarget.host_id),
+    path: String(currentTarget.path),
+    defaultBranch: String(currentTarget.default_branch),
+    continued: workItem.config_revision !== currentConfigRevision,
     proofDigest: sha256(canonicalJson(proof)),
   };
 }
@@ -7353,7 +7359,17 @@ function applyWorkItemTransition(
   digest: string,
   githubObservation: GitHubIssueSnapshot | null,
 ): FoundationResult {
-  const configRevision = requireConfig(db, request);
+  const committedDispatchIntent = request.reasonCode === "dispatch_intent_finalize" && request.lifecycleState === undefined && request.workAttempt?.threadId !== undefined;
+  let configRevision: number;
+  if (committedDispatchIntent) {
+    const committedRevision = request.configRevision;
+    if (!Number.isSafeInteger(committedRevision) || committedRevision === null || committedRevision === undefined || committedRevision <= 0 || request.fixtureContextDigest === undefined || !request.workItemId || !request.repoTargetId || !request.workAttempt?.requestedProfile) {
+      throw refusal("PROJECT_CONFIG_STALE", "durable dispatch finalization proof is incomplete");
+    }
+    configRevision = committedRevision;
+  } else {
+    configRevision = requireConfig(db, request);
+  }
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
   // The watchdog uses a verified plugin actor rather than a role holder; role actors
@@ -7361,7 +7377,28 @@ function applyWorkItemTransition(
   requireRoleActorBinding(db, request, false);
   const nextState = request.lifecycleState;
   let configContinuation: WorkItemDispatchConfigProof | null = null;
-  if (request.reasonCode === "config_revision_continuation") {
+  let dispatchIntentEvidence: { committedConfigRevision: number; observedConfigRevision: number; proofDigest: string; disposition: "bound_to_durable_intent" } | null = null;
+  if (committedDispatchIntent) {
+    const proof = proveWorkItemDispatchConfig(db, {
+      projectId: request.projectId,
+      workItemId: request.workItemId!,
+      repoTargetId: request.repoTargetId!,
+      expectedConfigRevision: request.expectedConfigRevision,
+      expectedGovernanceEpoch: request.expectedGovernanceEpoch,
+      expectedFenceToken: request.expectedFenceToken,
+      requestedProfile: request.workAttempt!.requestedProfile!,
+    }, configRevision);
+    if (proof.proofDigest !== request.fixtureContextDigest) {
+      throw refusal("PROJECT_CONFIG_STALE", "durable dispatch finalization proof does not match the prepared intent");
+    }
+    if (proof.continued) configContinuation = proof;
+    dispatchIntentEvidence = {
+      committedConfigRevision: configRevision,
+      observedConfigRevision: currentConfig(db, request.projectId)?.config_revision ?? configRevision,
+      proofDigest: proof.proofDigest,
+      disposition: "bound_to_durable_intent",
+    };
+  } else if (request.reasonCode === "config_revision_continuation") {
     if (!request.workItemId || !request.repoTargetId || !request.workAttempt?.requestedProfile || request.fixtureContextDigest === undefined) {
       throw refusal("PROJECT_CONFIG_STALE", "config-revision continuation proof is incomplete");
     }
@@ -7384,7 +7421,7 @@ function applyWorkItemTransition(
     request,
     configRevision,
     request.expectedResourceRevision,
-    nextState !== undefined || request.workItemWait === null || configContinuation !== null,
+    nextState !== undefined || request.workItemWait === null || configContinuation !== null || committedDispatchIntent,
   );
   if (request.reasonCode === "fleet-watchdog-merge-close" && nextState !== undefined) {
     const liveAttempt = db.prepare(
@@ -7558,6 +7595,7 @@ function applyWorkItemTransition(
             workItemId: workItem.work_item_id,
             executionAttemptId: dispatchIntent.execution_attempt_id,
             workAttempt,
+            ...(dispatchIntentEvidence === null ? {} : { dispatchIntent: dispatchIntentEvidence }),
             ...(configContinuation === null ? {} : {
               configContinuation: {
                 fromRevision: configContinuation.workItemConfigRevision,
@@ -7578,6 +7616,7 @@ function applyWorkItemTransition(
             workItemId: workItem.work_item_id,
             executionAttemptId: dispatchIntent.execution_attempt_id,
             workAttempt,
+            ...(dispatchIntentEvidence === null ? {} : { dispatchIntent: dispatchIntentEvidence }),
             ...(configContinuation === null ? {} : { configContinuation: { fromRevision: configContinuation.workItemConfigRevision, toRevision: configContinuation.currentConfigRevision, proofDigest: configContinuation.proofDigest } }),
           },
         },

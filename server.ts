@@ -958,7 +958,7 @@ const dispatchSpawnShapeSchema = z.object({
   model: z.string().trim().min(1).optional(),
   serviceTier: z.enum(["default", "fast"]).optional(),
   reasoningLevel: z.enum(["none", "low", "medium", "high", "xhigh", "ultracode", "max", "ultra"]).optional(),
-  permissionMode: z.union([z.enum(["auto", "accept-edits", "full"]), z.literal("workspace-write")]).transform((mode) => mode === "workspace-write" ? "accept-edits" : mode).optional(),
+  permissionMode: z.enum(["auto", "accept-edits", "full"]).optional(),
   executionInputSources: z.object({
     providerId: z.enum(["explicit", "client-preference"]).optional(),
     model: z.enum(["explicit", "client-preference"]).optional(),
@@ -1279,12 +1279,11 @@ async function dispatchLane(
   if (Object.values(nativeProfile).some((value) => value === undefined)) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "native spawn routing profile must be complete" };
   }
-  const normalizedPermissionMode = (mode: string) => mode === "workspace-write" ? "accept-edits" : mode;
   if (
     nativeProfile.providerId !== requestedProfile.providerId ||
     nativeProfile.model !== requestedProfile.model ||
     nativeProfile.reasoningLevel !== requestedProfile.reasoningLevel ||
-    nativeProfile.permissionMode !== normalizedPermissionMode(requestedProfile.permissionMode) ||
+    nativeProfile.permissionMode !== requestedProfile.permissionMode ||
     nativeProfile.serviceTier !== requestedProfile.serviceTier ||
     nativeProfile.visibility !== requestedProfile.visibility
   ) {
@@ -1306,6 +1305,8 @@ async function dispatchLane(
     if (isRefusal(error)) return { outcome: error.data.code, subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: error.data.message };
     return { outcome: "INTERNAL_ERROR", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "dispatch config proof failed" };
   }
+  const environmentRefusal = await dispatchEnvironmentPreflight(bb, request.projectId, spawnShape.data.environment, configProof);
+  if (environmentRefusal) return environmentRefusal;
   const briefTarget = githubIssueBriefTarget(db, request.projectId, request.workItemId ?? "");
   if (briefTarget === "invalid") {
     return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection identity is malformed or ambiguous" };
@@ -1478,6 +1479,42 @@ async function spawnDispatchThread(
   return thread;
 }
 
+async function dispatchEnvironmentPreflight(
+  bb: BbPluginApi,
+  projectId: string,
+  environment: z.infer<typeof dispatchEnvironmentSchema>,
+  proof: WorkItemDispatchConfigProof,
+): Promise<FoundationResult | null> {
+  if (environment.type !== "host" || environment.workspace.type !== "managed-worktree" || !environment.hostId) {
+    return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "dispatch requires one exact host managed-worktree environment" };
+  }
+  const baseBranch = environment.workspace.baseBranch.kind === "default" ? proof.defaultBranch : environment.workspace.baseBranch.name;
+  if (environment.hostId !== proof.hostId || baseBranch !== proof.defaultBranch) {
+    return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "dispatch environment does not match the exact target host and default branch" };
+  }
+  try {
+    const [project, host] = await Promise.all([
+      bb.sdk.projects.get({ projectId }),
+      bb.sdk.hosts.get({ hostId: proof.hostId }),
+    ]);
+    if (project.id !== projectId) {
+      return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "BB returned a foreign project for the dispatch target" };
+    }
+    const sources = project.sources.filter((source) =>
+      source.id === proof.sourceId && source.projectId === projectId && source.hostId === proof.hostId && source.path === proof.path,
+    );
+    if (sources.length !== 1) {
+      return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "dispatch target source and path are missing, foreign, or ambiguous" };
+    }
+    if (host.id !== proof.hostId || host.status !== "connected") {
+      return { outcome: "HOST_UNAVAILABLE", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "dispatch target host is unavailable or foreign" };
+    }
+  } catch (error) {
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: projectId, expected: 1, attempted: 0, verified: 0, message: `dispatch project and host facts are unavailable: ${String(error)}` };
+  }
+  return null;
+}
+
 async function finalizeDispatchIntent(
   bb: BbPluginApi,
   db: SqliteDatabase | null,
@@ -1489,13 +1526,11 @@ async function finalizeDispatchIntent(
   return applyLiveAuthorizedMutation(bb, db, {
     ...request,
     lifecycleState: undefined,
+    configRevision: configProof.currentConfigRevision,
     expectedResourceRevision: intent.resourceRevision,
     idempotencyKey: `${request.idempotencyKey}-finalize`,
-    ...(configProof.continued ? {
-      configRevision: configProof.currentConfigRevision,
-      fixtureContextDigest: configProof.proofDigest,
-      reasonCode: "config_revision_continuation",
-    } : {}),
+    fixtureContextDigest: configProof.proofDigest,
+    reasonCode: "dispatch_intent_finalize",
     workAttempt: { ...request.workAttempt!, threadId },
   }, false, "stop-active");
 }
