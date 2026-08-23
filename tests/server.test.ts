@@ -5136,13 +5136,18 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
   it("refuses a foreign pending repository identity without spawning", async () => {
     const fixture = await fleetWatchdogFixture(0, true, 1, false, PROJECT_ID, CONNECTOR_HOST, 1);
     fixture.db.prepare("UPDATE external_work_refs SET owner = 'foreign-owner'").run();
+    const eventsBefore = (fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { count: number }).count;
+    const mutationsBefore = (fixture.db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE project_id = ?").get(PROJECT_ID) as { count: number }).count;
     const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
       request: transitionRequest(fixture.fenceToken, "in_progress", 2),
       spawn: dispatchSpawn(fixture.orchestratorThreadId),
     }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
     expect(result.outcome).toBe("EXTERNAL_REF_CONFLICT");
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
-    expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared", thread_id: null });
+    expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "ready" });
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ count: 0 });
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: eventsBefore });
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: mutationsBefore });
   });
 
   it("composes a bounded production comment tail through one ordinary dispatch and rejects full-history or one-page completeness mutants", async () => {

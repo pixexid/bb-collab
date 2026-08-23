@@ -23254,10 +23254,13 @@ function githubCliAdapterForWorkItem(db, projectId, workItemId) {
     const config2 = JSON.parse(row.canonical_config_json);
     const mappings = config2.extensions?.bbCollab?.githubIssues?.repositoryMappings;
     if (!Array.isArray(mappings)) return null;
-    const mapping = mappings.find((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate) && candidate.repoTargetId === row.repo_target_id && typeof candidate.connectorHost === "string");
-    if (!mapping) return null;
+    const matches = mappings.filter((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate) && candidate.repoTargetId === row.repo_target_id && typeof candidate.owner === "string" && typeof candidate.repo === "string" && typeof candidate.connectorHost === "string");
+    if (matches.length !== 1) return null;
+    const mapping = matches[0];
     const connectorHost = mapping.connectorHost;
     return {
+      owner: mapping.owner,
+      repo: mapping.repo,
       connectorHost,
       available: true,
       read: (owner, repo, issueNumber) => readGithubIssueForBackfill(owner, repo, issueNumber, connectorHost),
@@ -23850,6 +23853,9 @@ async function dispatchLane(bb, db, input) {
   const githubAdapter = briefTarget ? githubCliAdapterForWorkItem(db, request.projectId, request.workItemId ?? "") : null;
   if (briefTarget && !githubAdapter) {
     return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub projection capability is unavailable for the current WorkItem" };
+  }
+  if (briefTarget && projectionIsInitialPending(briefTarget) && (briefTarget.owner !== githubAdapter.owner || briefTarget.repo !== githubAdapter.repo)) {
+    return { outcome: "EXTERNAL_REF_CONFLICT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub pending binding does not match its exact repository-target mapping" };
   }
   let initialBrief = null;
   const dispatchParentThreadId = spawnShape.data.parentThreadId;

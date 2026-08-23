@@ -529,7 +529,9 @@ function readGithubIssueForBackfill(owner: string, repo: string, issueNumber: nu
   };
 }
 
-function githubCliAdapterForWorkItem(db: SqliteDatabase | null, projectId: string, workItemId: string): GitHubIssueAdapter | null {
+type GithubCliAdapter = GitHubIssueAdapter & { owner: string; repo: string };
+
+function githubCliAdapterForWorkItem(db: SqliteDatabase | null, projectId: string, workItemId: string): GithubCliAdapter | null {
   if (!db) return null;
   const row = db.prepare(
     `SELECT work_items.repo_target_id, project_config_revisions.canonical_config_json
@@ -544,12 +546,17 @@ function githubCliAdapterForWorkItem(db: SqliteDatabase | null, projectId: strin
     const config = JSON.parse(row.canonical_config_json) as { extensions?: { bbCollab?: { githubIssues?: { repositoryMappings?: unknown } } } };
     const mappings = config.extensions?.bbCollab?.githubIssues?.repositoryMappings;
     if (!Array.isArray(mappings)) return null;
-    const mapping = mappings.find((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate)
+    const matches = mappings.filter((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate)
       && (candidate as { repoTargetId?: unknown }).repoTargetId === row.repo_target_id
-      && typeof (candidate as { connectorHost?: unknown }).connectorHost === "string") as { connectorHost: string } | undefined;
-    if (!mapping) return null;
+      && typeof (candidate as { owner?: unknown }).owner === "string"
+      && typeof (candidate as { repo?: unknown }).repo === "string"
+      && typeof (candidate as { connectorHost?: unknown }).connectorHost === "string");
+    if (matches.length !== 1) return null;
+    const mapping = matches[0] as { owner: string; repo: string; connectorHost: string };
     const connectorHost = mapping.connectorHost;
     return {
+      owner: mapping.owner,
+      repo: mapping.repo,
       connectorHost,
       available: true,
       read: (owner, repo, issueNumber) => readGithubIssueForBackfill(owner, repo, issueNumber, connectorHost),
@@ -1198,6 +1205,10 @@ async function dispatchLane(
   const githubAdapter = briefTarget ? githubCliAdapterForWorkItem(db, request.projectId, request.workItemId ?? "") : null;
   if (briefTarget && !githubAdapter) {
     return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub projection capability is unavailable for the current WorkItem" };
+  }
+  if (briefTarget && projectionIsInitialPending(briefTarget)
+    && (briefTarget.owner !== githubAdapter!.owner || briefTarget.repo !== githubAdapter!.repo)) {
+    return { outcome: "EXTERNAL_REF_CONFLICT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub pending binding does not match its exact repository-target mapping" };
   }
   let initialBrief: GithubIssueBrief | null = null;
   const dispatchParentThreadId = spawnShape.data.parentThreadId;
