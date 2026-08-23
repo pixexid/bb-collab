@@ -1,4 +1,5 @@
-const PROFILE_FIELDS = ["providerId", "model", "reasoningLevel", "permissionMode", "serviceTier", "visibility"];
+const PROFILE_FIELDS = ["providerId", "model", "reasoningLevel"];
+const REVIEW_VERDICTS = new Set(["APPROVE", "REQUEST_CHANGES"]);
 
 export const initialReviewAcceptanceState = {
   attempt: "initial",
@@ -10,9 +11,20 @@ export const initialReviewAcceptanceState = {
 
 const sameProfile = (left, right) => PROFILE_FIELDS.every((field) => left?.[field] === right?.[field]);
 
-const sameIdentity = (left, right) => left?.projectId === right?.projectId && left?.threadId === right?.threadId && left?.turnId === right?.turnId;
+const sameIdentity = (left, right) => ["projectId", "threadId", "turnId", "prNumber", "candidateHeadSha"].every((field) => left?.[field] === right?.[field]);
 
-const refused = (reason, state) => ({ status: "refused", reason, qualifiedPassConsumed: false, state });
+const validIdentity = (value) =>
+  value &&
+  ["projectId", "threadId", "turnId"].every((field) => typeof value[field] === "string" && value[field].length > 0) &&
+  Number.isSafeInteger(value.prNumber) &&
+  value.prNumber > 0 &&
+  typeof value.candidateHeadSha === "string" &&
+  /^[0-9a-f]{40}$/u.test(value.candidateHeadSha);
+
+const failed = (reason, state) =>
+  state.attempt === "replacement" && state.replacementConsumed
+    ? { status: "blocked", action: "escalate-replacement-failure", reason, qualifiedPassConsumed: false, state: { ...state, blocked: true } }
+    : { status: "refused", reason, qualifiedPassConsumed: false, state };
 
 const unknown = (input) => {
   if (!input.state.idleRetryUsed) {
@@ -48,18 +60,21 @@ const unknown = (input) => {
  */
 export function acceptProvisionalReview(input) {
   const { expected, requiredProfile, verdict, native, state = initialReviewAcceptanceState } = input;
-  if (state.blocked) return refused("review acceptance is blocked after the replacement failure", state);
-  if (state.qualifiedPassConsumed) return refused("qualified review pass is already consumed", state);
-  if (state.attempt === "replacement" && !state.replacementConsumed) return refused("replacement was not authorized by the initial failure", state);
-  if (!sameIdentity(verdict, expected) || !sameIdentity(native, expected)) return refused("provisional review identity is not the exact project, thread, and turn", state);
-  if (native.threadStatus !== "idle") return refused("reviewer thread is not natively idle", state);
-  if (native.completion?.status !== "completed") return refused("exact reviewer turn has no successful native completion", state);
+  if (state.blocked) return failed("review acceptance is blocked after the replacement failure", state);
+  if (state.qualifiedPassConsumed) return failed("qualified review pass is already consumed", state);
+  if (state.attempt === "replacement" && !state.replacementConsumed) return failed("replacement was not authorized by the initial failure", state);
+  if (!validIdentity(expected) || !validIdentity(verdict) || !validIdentity(native)) return failed("review acceptance identity is malformed", state);
+  if (!REVIEW_VERDICTS.has(verdict.verdict)) return failed("provisional verdict enum is invalid", state);
+  if (!sameIdentity(verdict, expected) || !sameIdentity(native, expected)) return failed("provisional review identity is not the exact project, thread, turn, PR, and candidate head", state);
+  if (native.threadStatus !== "idle") return failed("reviewer thread is not natively idle", state);
+  if (native.completion?.status !== "completed") return failed("exact reviewer turn has no successful native completion", state);
   if (native.completion.turnId !== expected.turnId || native.profile?.turnId !== expected.turnId) {
-    return refused("native completion or profile readback is for a different turn", state);
+    return failed("native completion or profile readback is for a different turn", state);
   }
-  if (native.profile.outcome !== "known" || !native.profile.executedProfile) return unknown({ ...input, state });
-  if (!sameProfile(native.profile.executedProfile, requiredProfile)) return refused("native executed profile does not satisfy the frozen review requirement", state);
-  if (!sameProfile(verdict.actualProfile, native.profile.executedProfile)) return refused("provisional actual-profile claim does not match native evidence", state);
+  if (native.profile?.outcome === "unknown") return unknown({ ...input, state });
+  if (native.profile?.outcome !== "known" || !native.profile.executedProfile) return failed("native executed profile readback is malformed", state);
+  if (!sameProfile(native.profile.executedProfile, requiredProfile)) return failed("native executed profile does not satisfy the frozen review requirement", state);
+  if (!sameProfile(verdict.actualProfile, native.profile.executedProfile)) return failed("provisional actual-profile claim does not match native evidence", state);
   return {
     status: "accepted",
     verdict: verdict.verdict,
