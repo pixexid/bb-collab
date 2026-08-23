@@ -23,6 +23,16 @@ const source = (overrides: Partial<GithubIssueBriefSource> = {}): GithubIssueBri
   comments: [],
   commentsReadComplete: true,
   commentsCapped: false,
+  bodyCurrent: true,
+  projection: {
+    projectionState: "current",
+    canonicalResourceRevision: 5,
+    attemptedResourceRevision: 5,
+    projectedResourceRevision: 5,
+    desiredDigest: "projection-digest",
+    observedExternalDigest: "projection-digest",
+    observedExternalRevision: "revision-1",
+  },
   ...overrides,
 });
 
@@ -41,9 +51,17 @@ describe("GitHub issue brief source", () => {
   });
 
   it("refuses incomplete pagination and an omitted operative history without a maintained body", () => {
-    expect(() => composeGithubIssueBrief(source({ bodyCurrent: false }))).toThrow(/body is stale/iu);
+    expect(() => composeGithubIssueBrief(source({ bodyCurrent: false }))).toThrow(/freshness is unavailable/iu);
+    expect(() => composeGithubIssueBrief(source({ bodyCurrent: undefined as never, comments: comments(8), commentsCapped: true }))).toThrow(/freshness is unavailable/iu);
     expect(() => composeGithubIssueBrief(source({ commentsReadComplete: false }))).toThrow(/pagination is incomplete/iu);
     expect(() => composeGithubIssueBrief(source({ body: "stale body", comments: comments(8), commentsCapped: true }))).toThrow(/omitted history/iu);
+  });
+
+  it("refuses stale projection revision or digest and binds anchors to canonical revision", () => {
+    expect(() => composeGithubIssueBrief(source({ projection: { ...source().projection, projectedResourceRevision: 4 } }))).toThrow(/projection is stale/iu);
+    expect(() => composeGithubIssueBrief(source({ projection: { ...source().projection, observedExternalDigest: "different" } }))).toThrow(/projection is stale/iu);
+    const brief = composeGithubIssueBrief(source());
+    expect(() => assertGithubIssueBriefAnchor(brief, source({ projection: { ...source().projection, canonicalResourceRevision: 6, attemptedResourceRevision: 6, projectedResourceRevision: 6 } }))).toThrow(/moved/iu);
   });
 
   it("fails closed when body or tail movement invalidates the same-snapshot anchor", () => {

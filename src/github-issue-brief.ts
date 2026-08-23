@@ -22,7 +22,18 @@ export type GithubIssueBriefSource = {
   comments: readonly GithubIssueComment[];
   commentsReadComplete: boolean;
   commentsCapped: boolean;
-  bodyCurrent?: boolean;
+  bodyCurrent: boolean;
+  projection: GithubIssueBriefProjection;
+};
+
+export type GithubIssueBriefProjection = {
+  projectionState: "pending" | "current" | "drifted" | "delivery_ambiguous";
+  canonicalResourceRevision: number;
+  attemptedResourceRevision: number;
+  projectedResourceRevision: number;
+  desiredDigest: string;
+  observedExternalDigest: string;
+  observedExternalRevision: string;
 };
 
 export type GithubIssueBriefAnchor = {
@@ -33,6 +44,13 @@ export type GithubIssueBriefAnchor = {
   bodyDigest: string;
   commentTailDigest: string;
   externalRevision: string;
+  projectionState: GithubIssueBriefProjection["projectionState"];
+  canonicalResourceRevision: number;
+  attemptedResourceRevision: number;
+  projectedResourceRevision: number;
+  desiredDigest: string;
+  observedExternalDigest: string;
+  observedExternalRevision: string;
 };
 
 export type GithubIssueBrief = {
@@ -85,17 +103,24 @@ function anchorFor(source: GithubIssueBriefSource): GithubIssueBriefAnchor {
     bodyDigest: digest(source.body),
     commentTailDigest: digest(source.comments.map(({ id, body, externalRevision }) => ({ id, body, externalRevision }))),
     externalRevision: source.externalRevision,
+    ...source.projection,
   };
 }
 
 export function composeGithubIssueBrief(source: GithubIssueBriefSource): GithubIssueBrief {
   exactIdentity(source);
-  if (source.bodyCurrent === false) throw new Error("GitHub issue body is stale");
+  if (source.bodyCurrent !== true) throw new Error("GitHub issue body freshness is unavailable");
+  if (source.projection.projectionState !== "current"
+    || source.projection.canonicalResourceRevision !== source.projection.attemptedResourceRevision
+    || source.projection.canonicalResourceRevision !== source.projection.projectedResourceRevision
+    || source.projection.desiredDigest !== source.projection.observedExternalDigest
+    || source.projection.desiredDigest.length === 0
+    || source.projection.observedExternalRevision.length === 0) {
+    throw new Error("GitHub issue projection is stale or mismatched for the canonical WorkItem");
+  }
   if (!source.commentsReadComplete) throw new Error("GitHub issue comment pagination is incomplete");
   if (source.comments.length > GITHUB_ISSUE_COMMENT_TAIL_LIMIT) throw new Error("GitHub issue comment tail exceeds its bound");
-  if (source.commentsCapped && !hasMaintainedBody(source.body)) {
-    throw new Error("GitHub issue body is not a maintained current-state summary; omitted history may remain operative");
-  }
+  if (!hasMaintainedBody(source.body)) throw new Error("GitHub issue body is not a maintained current-state summary; omitted history may remain operative");
   const anchor = anchorFor(source);
   const tail = source.comments.length === 0
     ? "(no recent comments)"

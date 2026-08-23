@@ -827,6 +827,70 @@ function bindFixtureGithubIssue(db: Database.Database, issueNumber: number, work
   ).run(projectId, workItemId, GITHUB_OWNER, repo, issueNumber, sha256("fixture-desired"), sha256("fixture-observed"), sha256("fixture-request"));
 }
 
+async function preparedGithubBriefDispatch() {
+  const fixture = await fleetWatchdogFixture(0, true, 1, false);
+  expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+  const prepared = transitionRequest(fixture.fenceToken, undefined, 3, {
+    idempotencyKey: "github-brief-dispatch",
+    reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=lane`,
+    workAttempt: { laneId: "lane-prepared", assignmentKind: "write", requestedProfile: ROLE_PROFILE },
+  });
+  expect(applyWithFixtureReceipt(fixture.db, prepared)).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+  const adapter = new DeterministicGitHubIssueAdapter();
+  expect(applyWithFixtureReceipt(fixture.db, projectionRequest(fixture.fenceToken, 4, { idempotencyKey: "github-brief-project" }), adapter)).toMatchObject({ outcome: "OK" });
+  const snapshot = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1);
+  if (!snapshot) throw new Error("fixture projection did not create its issue");
+  return {
+    fixture,
+    snapshot,
+    request: {
+      ...prepared,
+      workAttempt: { ...prepared.workAttempt!, threadId: "thread-brief-dispatch" },
+    },
+  };
+}
+
+function installGithubBriefGh(snapshot: { title: string; body: string; state: "open" | "closed"; labels: readonly string[]; externalRevision: string }, incomplete = false) {
+  const bin = mkdtempSync(join(tmpdir(), "bb-collab-github-brief-"));
+  const gh = join(bin, "gh");
+  const calls = join(bin, "calls");
+  const issue = JSON.stringify({ number: 1, title: snapshot.title, body: snapshot.body, state: snapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: snapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: snapshot.labels.map((name) => ({ name })), updatedAt: snapshot.externalRevision });
+  const allComments = Array.from({ length: 48 }, (_, index) => ({ id: 48 - index, body: `comment-${48 - index}`, updated_at: `comment-revision-${48 - index}` }));
+  const recent = JSON.stringify(allComments.slice(0, 8));
+  const older = JSON.stringify(incomplete ? { not: "comments" } : allComments.slice(8, 16));
+  writeFileSync(gh, `#!/bin/sh
+printf '%s\\n' "$*" >> '${calls}'
+if [ "$1" = issue ]; then printf '%s\\n' '${issue}'; exit 0; fi
+if [ "$1" = api ]; then
+  case "$*" in
+    *--paginate*) exit 12 ;;
+    *page=1*) printf '%s\\n' '${recent}'; exit 0 ;;
+    *page=2*) printf '%s\\n' '${older}'; exit 0 ;;
+  esac
+fi
+exit 1
+`);
+  chmodSync(gh, 0o755);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${bin}:${originalPath ?? ""}`;
+  let removed = false;
+  const cleanup = () => {
+    if (removed) return;
+    removed = true;
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    rmSync(bin, { recursive: true, force: true });
+  };
+  return {
+    readCallsAndCleanup() {
+      const value = readFileSync(calls, "utf8");
+      cleanup();
+      return value;
+    },
+    cleanup,
+  };
+}
+
 function installStartableQueueFixture(issueNumber: number) {
   const bin = mkdtempSync(join(tmpdir(), "bb-collab-role-queue-"));
   const gh = join(bin, "gh");
@@ -4987,6 +5051,62 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
     expect(result).toMatchObject({ outcome: "OK" });
     expect(fixture.db.prepare("SELECT lane_id, thread_id, state FROM execution_attempts WHERE origin = 'work_item' ORDER BY rowid DESC LIMIT 1").get()).toMatchObject({ lane_id: "lane-work-item-1", thread_id: "lane-1", state: "running" });
+  });
+
+  it("refuses dispatch when the exact GitHub projection revision or digest is stale", async () => {
+    for (const kind of ["digest", "revision"] as const) {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      bindFixtureGithubIssue(fixture.db, 1);
+      if (kind === "revision") {
+        fixture.db.prepare("UPDATE external_work_refs SET observed_external_digest = desired_digest, projected_resource_revision = 1").run();
+      }
+      const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+        spawn: dispatchSpawn(fixture.orchestratorThreadId),
+      }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+      expect(result.outcome).toBe("EXTERNAL_UNAVAILABLE");
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "ready" });
+    }
+  });
+
+  it("composes a bounded production comment tail and rejects full-history or one-page completeness mutants", async () => {
+    const projected = await preparedGithubBriefDispatch();
+    const restore = installGithubBriefGh(projected.snapshot);
+    try {
+      const result = JSON.parse(await projected.fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: projected.request,
+        spawn: dispatchSpawn(projected.fixture.orchestratorThreadId),
+      }, { projectId: PROJECT_ID, threadId: projected.fixture.orchestratorThreadId }) as string);
+      expect(result.outcome).toBe("OK");
+      const spawn = projected.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0] as { prompt?: string };
+      expect(spawn.prompt).toContain("comment-48");
+      expect(spawn.prompt).not.toContain("comment-1");
+      const calls = restore.readCallsAndCleanup();
+      expect(calls.match(/page=1/gu)).toHaveLength(2);
+      expect(calls.match(/page=2/gu)).toHaveLength(2);
+      expect(calls).not.toContain("--paginate");
+      expect(calls).not.toContain("page=3");
+    } finally {
+      restore.cleanup();
+    }
+  });
+
+  it("refuses production comment completeness when the bounded older-page read fails", async () => {
+    const projected = await preparedGithubBriefDispatch();
+    const restore = installGithubBriefGh(projected.snapshot, true);
+    try {
+      const result = JSON.parse(await projected.fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: projected.request,
+        spawn: dispatchSpawn(projected.fixture.orchestratorThreadId),
+      }, { projectId: PROJECT_ID, threadId: projected.fixture.orchestratorThreadId }) as string);
+      expect(result.outcome).toBe("EXTERNAL_UNAVAILABLE");
+      expect(projected.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+      const calls = restore.readCallsAndCleanup();
+      expect(calls.match(/page=2/gu)).toHaveLength(1);
+    } finally {
+      restore.cleanup();
+    }
   });
 
   it("claims permission atomically when identical dispatches race", async () => {
