@@ -1621,6 +1621,32 @@ export interface WorkItemDispatchWedge {
   workItemId: string;
 }
 
+export interface WorkItemDispatchIntent {
+  idempotencyKey: string;
+  parentThreadId: string;
+  title: string | null;
+}
+
+export function parseWorkItemDispatchIntent(reasonCode: string | null): WorkItemDispatchIntent | null {
+  const prefix = "work_item_dispatch_intent:";
+  if (!reasonCode?.startsWith(prefix)) return null;
+  const marker = reasonCode.slice(prefix.length);
+  const parentMarker = marker.lastIndexOf(":parent=");
+  if (parentMarker < 1) return null;
+  const idempotencyKey = marker.slice(0, parentMarker);
+  const parentAndTitle = marker.slice(parentMarker + ":parent=".length);
+  if (!idempotencyKey || !parentAndTitle) return null;
+  const titleMarker = parentAndTitle.indexOf(":title=");
+  const parentThreadId = titleMarker < 0 ? parentAndTitle : parentAndTitle.slice(0, titleMarker);
+  if (!parentThreadId) return null;
+  if (titleMarker < 0) return { idempotencyKey, parentThreadId, title: null };
+  try {
+    return { idempotencyKey, parentThreadId, title: decodeURIComponent(parentAndTitle.slice(titleMarker + ":title=".length)) };
+  } catch {
+    return null;
+  }
+}
+
 /** Reconcile only positive identity evidence; ambiguity remains a capacity-consuming wedge. */
 export function reconcilePreparedWorkItemDispatches(
   db: SqliteDatabase,
@@ -1634,19 +1660,14 @@ export function reconcilePreparedWorkItemDispatches(
   ).all(projectId) as Array<{ execution_attempt_id: string; work_item_id: string; reason_code: string | null }>;
   const wedges: WorkItemDispatchWedge[] = [];
   for (const attempt of prepared) {
-    const marker = attempt.reason_code?.startsWith("work_item_dispatch_intent:")
-      ? attempt.reason_code.slice("work_item_dispatch_intent:".length)
-      : null;
-    const parentMarker = marker?.lastIndexOf(":parent=") ?? -1;
-    const dispatchMarker = parentMarker >= 0 ? marker!.slice(0, parentMarker) : null;
-    const expectedParentThreadId = parentMarker >= 0 ? marker!.slice(parentMarker + ":parent=".length) : null;
-    if (!dispatchMarker || !expectedParentThreadId) {
+    const intent = parseWorkItemDispatchIntent(attempt.reason_code);
+    if (!intent || intent.title === null) {
       wedges.push({ executionAttemptId: attempt.execution_attempt_id, workItemId: attempt.work_item_id });
       continue;
     }
     const thread = threads.find((candidate) =>
-      candidate.parentThreadId === expectedParentThreadId && candidate.archivedAt === null && candidate.deletedAt === null &&
-      candidate.title?.includes(`[dispatch:${dispatchMarker}]`) === true,
+      candidate.parentThreadId === intent.parentThreadId && candidate.archivedAt === null && candidate.deletedAt === null &&
+      candidate.title === `${intent.title} [dispatch:${intent.idempotencyKey}]`,
     );
     const observedAtMs = now();
     if (thread) {

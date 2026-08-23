@@ -722,7 +722,7 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
     parentThreadId: lanes.get(threadId)?.parentThreadId ?? null,
     updatedAt: lanes.get(threadId)?.updatedAt ?? nativeUpdatedAt,
   })) as never);
-  fixture.host.harness.sdk.stub("threads.list", (async ({ projectId }: { projectId?: string }) => [
+  fixture.host.harness.sdk.stub("threads.list", (async ({ projectId, archived }: { projectId?: string; archived?: boolean }) => [
     ...[director.thread_id, orchestrator.thread_id].map((threadId) => makeThreadResponse({
       id: threadId,
       projectId: threadProjects.get(threadId) ?? PROJECT_ID,
@@ -730,7 +730,7 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
       updatedAt: nativeUpdatedAt,
     })),
     ...lanes.values(),
-  ].filter((thread) => projectId === undefined || thread.projectId === projectId)) as never);
+  ].filter((thread) => (projectId === undefined || thread.projectId === projectId) && (archived ? thread.archivedAt !== null : thread.archivedAt === null))) as never);
   fixture.host.harness.sdk.stub("threads.spawn", (async ({ projectId, parentThreadId, title }: { projectId: string; parentThreadId?: string; title?: string }) => {
     const id = `lane-${lanes.size + 1}`;
     const lane = Object.assign(makeThreadResponse({ id, projectId, parentThreadId: parentThreadId ?? null, title: title ?? null, status: "error", updatedAt: nativeUpdatedAt }), {
@@ -5019,6 +5019,24 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "ready" });
   });
 
+  it("rejects malformed structured prompt input before canonical intent", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: {
+        projectId: PROJECT_ID,
+        parentThreadId: fixture.orchestratorThreadId,
+        environment: { type: "project-default" },
+        input: [{ type: "not-a-prompt-input" }],
+      },
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("INVALID_INPUT");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ count: 0 });
+    expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "ready" });
+  });
+
   it("finalizes one exact same-id dispatch thread after a lost spawn response", async () => {
     const fixture = await fleetWatchdogFixture(0, true, 1, false);
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
@@ -5026,7 +5044,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     const spawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
     let spawnCalls = 0;
     fixture.host.harness.sdk.stub("threads.spawn", (async () => { spawnCalls += 1; throw new Error("response lost after create"); }) as never);
-    fixture.host.harness.sdk.stub("threads.list", (async () => [makeThreadResponse({
+    fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => archived ? [] : [makeThreadResponse({
       id: "recovered-lane",
       projectId: PROJECT_ID,
       parentThreadId: fixture.orchestratorThreadId,
@@ -5038,6 +5056,67 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(result.outcome).toBe("OK");
     expect(spawnCalls).toBe(1);
     expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "running", thread_id: "recovered-lane" });
+  });
+
+  it("refuses an archived exact thread without retrying a possible created side effect", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const spawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
+    let spawnCalls = 0;
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { spawnCalls += 1; throw new Error("response lost after create"); }) as never);
+    fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => archived ? [makeThreadResponse({
+      id: "archived-lane",
+      projectId: PROJECT_ID,
+      parentThreadId: fixture.orchestratorThreadId,
+      title: `lane [dispatch:${request.idempotencyKey}]`,
+      archivedAt: 1,
+      deletedAt: null,
+    })] : []) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", { request, spawn }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(spawnCalls).toBe(1);
+    expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared", thread_id: null });
+  });
+
+  it("refuses active and archived duplicate dispatch identities as multiple evidence", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const spawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
+    let spawnCalls = 0;
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { spawnCalls += 1; throw new Error("response lost after create"); }) as never);
+    fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => [makeThreadResponse({
+      id: archived ? "archived-lane" : "active-lane",
+      projectId: PROJECT_ID,
+      parentThreadId: fixture.orchestratorThreadId,
+      title: `lane [dispatch:${request.idempotencyKey}]`,
+      archivedAt: archived ? 1 : null,
+      deletedAt: null,
+    })]) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", { request, spawn }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(spawnCalls).toBe(1);
+    expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared", thread_id: null });
+  });
+
+  it("rejects same-marker evidence whose title changed from the recorded dispatch", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const spawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
+    let spawnCalls = 0;
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { spawnCalls += 1; throw new Error("response lost after create"); }) as never);
+    fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => archived ? [] : [makeThreadResponse({
+      id: "changed-title-lane",
+      projectId: PROJECT_ID,
+      parentThreadId: fixture.orchestratorThreadId,
+      title: `changed [dispatch:${request.idempotencyKey}]`,
+    })]) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", { request, spawn }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(spawnCalls).toBe(1);
+    expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared", thread_id: null });
   });
 
   it("retries once after a complete no-match inventory and never retries blind evidence", async () => {
@@ -5088,7 +5167,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
             : [makeThreadResponse({ id: "wrong-id", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: "lane [dispatch:other-id]" })];
     let calls = 0;
     fixture.host.harness.sdk.stub("threads.spawn", (async () => { calls += 1; throw new Error("response ambiguous"); }) as never);
-    fixture.host.harness.sdk.stub("threads.list", (async () => threads) as never);
+    fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => threads.filter((thread) => archived ? thread.archivedAt !== null : thread.archivedAt === null)) as never);
     const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", { request, spawn }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
     expect(result.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
     expect(calls).toBe(1);
