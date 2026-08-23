@@ -23418,6 +23418,25 @@ async function dispatchLane(bb, db, input) {
   }
   const spawnShape = dispatchSpawnShapeSchema.safeParse(spawn);
   if (!spawnShape.success) return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: spawnShape.error.message };
+  const requestedProfile = request.workAttempt.requestedProfile;
+  if (!requestedProfile) return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "lane dispatch requires a requested execution profile" };
+  const clientPreferenceField = Object.entries(spawnShape.data.executionInputSources ?? {}).find(([, source]) => source === "client-preference")?.[0];
+  if (clientPreferenceField) return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: `native ${clientPreferenceField} routing must be explicit or absent` };
+  const nativeProfile = {
+    providerId: spawnShape.data.providerId,
+    model: spawnShape.data.model,
+    reasoningLevel: spawnShape.data.reasoningLevel,
+    permissionMode: spawnShape.data.permissionMode,
+    serviceTier: spawnShape.data.serviceTier,
+    visibility: spawnShape.data.visibility
+  };
+  if (Object.values(nativeProfile).some((value) => value === void 0)) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "native spawn routing profile must be complete" };
+  }
+  const normalizedPermissionMode = (mode) => mode === "workspace-write" ? "accept-edits" : mode;
+  if (nativeProfile.providerId !== requestedProfile.providerId || nativeProfile.model !== requestedProfile.model || nativeProfile.reasoningLevel !== requestedProfile.reasoningLevel || nativeProfile.permissionMode !== normalizedPermissionMode(requestedProfile.permissionMode) || nativeProfile.serviceTier !== requestedProfile.serviceTier || nativeProfile.visibility !== requestedProfile.visibility) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "native spawn routing profile does not match the requested execution profile" };
+  }
   const dispatchParentThreadId = spawnShape.data.parentThreadId;
   const dispatchTitle = String(spawnShape.data.title ?? "lane");
   const { threadId: _threadId, ...intentAttempt } = request.workAttempt;
