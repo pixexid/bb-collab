@@ -81,8 +81,9 @@ describe("Operator Inbox app", () => {
     fireEvent.change(rendered.getByLabelText("Project"), { target: { value: "project-a" } });
     await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a", recipient: "operator", withSenderTitles: true }));
     expect(rendered.getByText("Need an answer")).toBeTruthy();
-    expect(rendered.getByText(/Reply delivery failed: environment deleted/)).toBeTruthy();
-    expect(rendered.getByRole("heading", { name: "Project A" })).toBeTruthy();
+    expect(rendered.getByText(/Delivery failed: environment deleted/)).toBeTruthy();
+    expect(rendered.getAllByText("Sender unavailable")).toHaveLength(2);
+    expect(rendered.getAllByText("Project A").length).toBeGreaterThan(0);
   });
 
   it("refreshes with archived messages after Show archived is checked", async () => {
@@ -97,6 +98,28 @@ describe("Operator Inbox app", () => {
     await waitFor(() => expect(operatorMessages).toHaveBeenCalledWith({ projectId: "project-a", recipient: "operator", withSenderTitles: true }));
     fireEvent.click(rendered.getByLabelText("Show archived"));
     await waitFor(() => expect(operatorMessages).toHaveBeenLastCalledWith({ projectId: "project-a", recipient: "operator", withSenderTitles: true, includeArchived: true }));
+  });
+
+  it("keeps same-minute relative times minimal while exact labels include seconds and offset", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const now = Date.now();
+    const messages = [
+      { messageId: 20, projectId: "project-a", recipient: "operator" as const, senderThreadId: "sender-a", senderLaneId: null, severity: "routine" as const, text: "First timestamp", createdAtMs: now - 10 * 60 * 1000 - 5 * 1000, readAtMs: null, archivedAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null },
+      { messageId: 21, projectId: "project-a", recipient: "operator" as const, senderThreadId: "sender-b", senderLaneId: null, severity: "routine" as const, text: "Second timestamp", createdAtMs: now - 10 * 60 * 1000 - 45 * 1000, readAtMs: null, archivedAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null },
+    ];
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(async () => messages) } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("First timestamp")).toBeTruthy());
+    const times = Array.from(rendered.container.querySelectorAll("time"));
+    const exactLabels = [...new Set(times.map((time) => time.getAttribute("title")).filter((label): label is string => label !== null))];
+    expect(exactLabels).toHaveLength(2);
+    expect(exactLabels.every((label) => /\d{1,2}:\d{2}:\d{2}/.test(label))).toBe(true);
+    expect(exactLabels.every((label) => /GMT|UTC|[A-Z]{2,5}/.test(label))).toBe(true);
+    expect(times.every((time) => time.textContent === "10m ago")).toBe(true);
   });
 
   it("aggregates every project by default, sorts unread first, and filters by project", async () => {
@@ -115,9 +138,9 @@ describe("Operator Inbox app", () => {
     await waitFor(() => expect(rendered.getByText("unread B")).toBeTruthy());
     expect(operatorMessages).toHaveBeenCalledTimes(2);
     const rows = rendered.getAllByRole("listitem");
-    expect(rows[0]!.textContent).toContain("unread B");
+    expect(rendered.getByText("unread B")).toBeTruthy();
     expect(rows[0]!.textContent).toContain("Project B");
-    expect(rows[1]!.textContent).toContain("read A");
+    expect(rendered.getByText("read A")).toBeTruthy();
     expect(rows[1]!.textContent).toContain("Project A");
     fireEvent.change(rendered.getByLabelText("Project"), { target: { value: "project-a" } });
     await waitFor(() => expect(rendered.queryByText("unread B")).toBeNull());
@@ -153,7 +176,7 @@ describe("Operator Inbox app", () => {
       rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(async () => [operator, supervisor]) } as never,
     });
 
-    await waitFor(() => expect(rendered.getByText(/Unable to read inbox: Project A \(project-a\): Error: operator inbox response included a non-operator message/)).toBeTruthy());
+    await waitFor(() => expect(rendered.getByText(/Refresh failed: Project A \(project-a\): Error: operator inbox response included a non-operator message/)).toBeTruthy());
     expect(rendered.queryByText("operator row must also stay closed")).toBeNull();
     expect(rendered.queryByText("hostile supervisor row")).toBeNull();
   });
@@ -188,7 +211,7 @@ describe("Operator Inbox app", () => {
     expect((rendered.getByLabelText("Project") as HTMLSelectElement).value).toBe("");
   });
 
-  it("shows the sender title with lane, secondary id, and exact navigation", async () => {
+  it("shows the compact linked sender title with exact navigation without raw ids", async () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
     const rendered = renderSlot(inbox, { subPath: "" }, {
@@ -212,14 +235,15 @@ describe("Operator Inbox app", () => {
       }]) } as never,
     });
 
-    const sender = await waitFor(() => rendered.getByRole("link", { name: "Open sender session sender-thread" }));
+    const sender = await waitFor(() => rendered.getByRole("link", { name: "Open sender session Inbox drill: URGENT to operator" }));
     expect(sender.textContent).toBe("Inbox drill: URGENT to operator");
-    expect(rendered.getByText("lane-one · sender-thread")).toBeTruthy();
+    expect(rendered.queryByText("lane-one")).toBeNull();
+    expect(rendered.queryByText("sender-thread")).toBeNull();
     fireEvent.click(sender);
     expect(rendered.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "sender-thread" });
   });
 
-  it("falls back to the secondary sender id when its live title is unavailable", async () => {
+  it("does not expose a raw sender id when its live title is unavailable", async () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
     const rendered = renderSlot(inbox, { subPath: "" }, {
@@ -243,10 +267,8 @@ describe("Operator Inbox app", () => {
       }]) } as never,
     });
 
-    const sender = await waitFor(() => rendered.getByRole("link", { name: "Open sender session missing-sender-thread" }));
-    expect(sender.textContent).toBe("missing-sender-thread");
-    fireEvent.click(sender);
-    expect(rendered.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "missing-sender-thread" });
+    await waitFor(() => expect(rendered.getAllByText("Sender unavailable")).toHaveLength(2));
+    expect(rendered.queryByText("missing-sender-thread")).toBeNull();
   });
 
   it("keeps the inbox mounted when a sender id has a hostile shape", async () => {
@@ -290,7 +312,7 @@ describe("Operator Inbox app", () => {
     });
 
     await waitFor(() => expect(rendered.getByText("loaded A")).toBeTruthy());
-    expect(rendered.getByText(/Unable to read inbox: Project B \(project-b\): Error: project unavailable/)).toBeTruthy();
+    expect(rendered.getByText(/Refresh failed: Project B \(project-b\): Error: project unavailable/)).toBeTruthy();
   });
 
   it("skips unregistered projects silently while a genuine read failure keeps its scoped error", async () => {
@@ -307,8 +329,8 @@ describe("Operator Inbox app", () => {
     });
 
     await waitFor(() => expect(rendered.getByText("loaded A")).toBeTruthy());
-    expect(rendered.getByText(/Unable to read inbox: Project C \(project-c\): Error: project unavailable/)).toBeTruthy();
-    expect(rendered.queryByText(/Unable to read inbox: Project B/)).toBeNull();
+    expect(rendered.getByText(/Refresh failed: Project C \(project-c\): Error: project unavailable/)).toBeTruthy();
+    expect(rendered.queryByText(/Refresh failed: Project B/)).toBeNull();
     expect(rendered.container.querySelectorAll("p.text-destructive")).toHaveLength(1);
   });
 
@@ -332,11 +354,11 @@ describe("Operator Inbox app", () => {
     };
 
     const aggregate = renderSlot(inbox, { subPath: "" }, options);
-    await waitFor(() => expect(aggregate.getByText("No operator messages for this project filter.")).toBeTruthy());
+    await waitFor(() => expect(aggregate.getByText("No messages in this view")).toBeTruthy());
     expect(aggregate.container.querySelectorAll("p.text-destructive")).toHaveLength(0);
 
     fireEvent.change(aggregate.getByLabelText("Project"), { target: { value: "project-b" } });
-    await waitFor(() => expect(aggregate.getByText("Unable to read inbox: Project B (project-b): PROJECT_CONFIG_REQUIRED")).toBeTruthy());
+    await waitFor(() => expect(aggregate.getByText("Refresh failed: Project B (project-b): PROJECT_CONFIG_REQUIRED")).toBeTruthy());
   });
 
   it("branches on the outcome code alone, so rewording the human sentence moves nothing", async () => {
@@ -356,10 +378,10 @@ describe("Operator Inbox app", () => {
         } as never,
       });
 
-      await waitFor(() => expect(rendered.getByText("No operator messages for this project filter.")).toBeTruthy());
+      await waitFor(() => expect(rendered.getByText("No messages in this view")).toBeTruthy());
       expect(rendered.container.querySelectorAll("p.text-destructive")).toHaveLength(0);
       fireEvent.change(rendered.getByLabelText("Project"), { target: { value: "project-b" } });
-      await waitFor(() => expect(rendered.getByText("Unable to read inbox: Project B (project-b): PROJECT_CONFIG_REQUIRED")).toBeTruthy());
+      await waitFor(() => expect(rendered.getByText("Refresh failed: Project B (project-b): PROJECT_CONFIG_REQUIRED")).toBeTruthy());
       cleanup();
       window.localStorage.clear();
     }
@@ -375,7 +397,7 @@ describe("Operator Inbox app", () => {
       rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => { throw new Error("operator inbox project is not registered"); } } as never,
     });
 
-    await waitFor(() => expect(rendered.getByText(/Unable to read inbox: Project B \(project-b\): Error: operator inbox project is not registered/)).toBeTruthy());
+    await waitFor(() => expect(rendered.getByText(/Refresh failed: Project B \(project-b\): Error: operator inbox project is not registered/)).toBeTruthy());
   });
 
   it("keeps a failure that merely quotes the unregistered sentence visible", async () => {
@@ -386,7 +408,7 @@ describe("Operator Inbox app", () => {
       rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: async () => { throw new Error("transport failed after operator inbox project is not registered response"); } } as never,
     });
 
-    await waitFor(() => expect(rendered.getByText(/Unable to read inbox: Project B \(project-b\): Error: transport failed after operator inbox project is not registered response/)).toBeTruthy());
+    await waitFor(() => expect(rendered.getByText(/Refresh failed: Project B \(project-b\): Error: transport failed after operator inbox project is not registered response/)).toBeTruthy());
   });
 
   it("headers the card with the project name and not its raw id", async () => {
@@ -401,7 +423,7 @@ describe("Operator Inbox app", () => {
     const card = rendered.container.querySelector("article")!;
     expect(card.textContent).toContain("bb-collab");
     expect(card.textContent).not.toContain("proj_a8zzfsx36j");
-    expect(rendered.getByRole("heading", { name: "All projects" })).toBeTruthy();
+    expect(rendered.getAllByText("All projects").length).toBeGreaterThan(0);
   });
 
   it("confirms a delivered reply and a mark-read with visible success feedback", async () => {
@@ -419,12 +441,55 @@ describe("Operator Inbox app", () => {
     });
 
     await waitFor(() => expect(rendered.getByText("answer me")).toBeTruthy());
-    fireEvent.click(rendered.getByRole("button", { name: "Mark read" }));
-    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Marked read."));
+    fireEvent.click(rendered.getByRole("button", { name: "Mark message read" }));
+    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Marked read. This message is no longer counted as unread."));
 
-    fireEvent.change(rendered.getByLabelText("Reply"), { target: { value: "on it" } });
+    fireEvent.change(rendered.getByLabelText("Reply text"), { target: { value: "on it" } });
     fireEvent.click(rendered.getByRole("button", { name: /reply/i }));
-    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Reply delivered."));
+    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Reply delivered. BB confirmed the matching input."));
+    const archive = rendered.getByRole("button", { name: "Archive message" });
+    expect(archive.hasAttribute("disabled")).toBe(false);
+    expect(archive.textContent).not.toContain("Archive");
+  });
+
+  it("keeps mark-read and archive pending, single-flight, and recoverable", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const message = { messageId: 22, projectId: "project-a", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "pending controls", createdAtMs: 1, readAtMs: null as number | null, archivedAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null };
+    let resolveRead!: (value: typeof message) => void;
+    let rejectArchive!: (reason: unknown) => void;
+    const readResult = new Promise<typeof message>((resolve) => { resolveRead = resolve; });
+    const archiveResult = new Promise<typeof message>((_resolve, reject) => { rejectArchive = reject; });
+    const markOperatorMessageRead = vi.fn(async () => readResult);
+    const archiveOperatorMessage = vi.fn(async () => archiveResult);
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(async () => [message]), markOperatorMessageRead, archiveOperatorMessage } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("pending controls")).toBeTruthy());
+    const markRead = rendered.getByRole("button", { name: "Mark message read" });
+    fireEvent.click(markRead);
+    fireEvent.click(markRead);
+    expect(markOperatorMessageRead).toHaveBeenCalledTimes(1);
+    expect(markRead.hasAttribute("disabled")).toBe(true);
+    expect(markRead.getAttribute("aria-busy")).toBe("true");
+    expect(rendered.getByRole("button", { name: "Marking message read" })).toBeTruthy();
+
+    await act(async () => resolveRead({ ...message, readAtMs: 5 }));
+    await waitFor(() => expect(rendered.queryByRole("button", { name: "Mark message read" })).toBeNull());
+    const archive = rendered.getByRole("button", { name: "Archive message" });
+    fireEvent.click(archive);
+    fireEvent.click(archive);
+    expect(archiveOperatorMessage).toHaveBeenCalledTimes(1);
+    expect(archive.hasAttribute("disabled")).toBe(true);
+    expect(archive.getAttribute("aria-busy")).toBe("true");
+    expect(rendered.getByRole("button", { name: "Archiving message" })).toBeTruthy();
+
+    await act(async () => rejectArchive(new Error("archive unavailable")));
+    await waitFor(() => expect(rendered.getByRole("button", { name: "Archive message" })).toBeTruthy());
+    expect(rendered.getByRole("button", { name: "Archive message" }).hasAttribute("disabled")).toBe(false);
+    expect(rendered.getByText("Refresh failed: Error: archive unavailable")).toBeTruthy();
   });
 
   it("does not claim delivery for pending or explicitly failed reply results", async () => {
@@ -445,19 +510,19 @@ describe("Operator Inbox app", () => {
     });
 
     await waitFor(() => expect(rendered.getByText("answer me")).toBeTruthy());
-    fireEvent.change(rendered.getByLabelText("Reply"), { target: { value: "on it" } });
+    fireEvent.change(rendered.getByLabelText("Reply text"), { target: { value: "on it" } });
     fireEvent.click(rendered.getByRole("button", { name: /reply/i }));
-    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Reply delivery is still in progress; outcome is not yet known."));
-    expect(rendered.queryByText("Reply delivered.")).toBeNull();
+    await waitFor(() => expect(rendered.getAllByRole("status").map((status) => status.textContent)).toContain("Delivery pending. The outcome is not yet known."));
+    expect(rendered.queryByText("Reply delivered")).toBeNull();
 
     fireEvent.click(rendered.getByRole("button", { name: /reply/i }));
-    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Reply delivery failed."));
-    expect(rendered.getByText("Reply delivery failed: environment deleted")).toBeTruthy();
-    expect(rendered.queryByText("Reply delivered.")).toBeNull();
+    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Delivery failed. The message remains retryable."));
+    expect(rendered.getByText("Delivery failed: environment deleted You can retry without losing this message.")).toBeTruthy();
+    expect(rendered.queryByText("Reply delivered")).toBeNull();
 
     fireEvent.click(rendered.getByRole("button", { name: /reply/i }));
     await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Reply delivery is not confirmed."));
-    expect(rendered.queryByText("Reply delivered.")).toBeNull();
+    expect(rendered.queryByText("Reply delivered")).toBeNull();
   });
 
   it("archives a message with visible success feedback", async () => {
@@ -475,9 +540,9 @@ describe("Operator Inbox app", () => {
     });
 
     await waitFor(() => expect(rendered.getByText("archive me")).toBeTruthy());
-    fireEvent.click(rendered.getByRole("button", { name: "Archive" }));
+    fireEvent.click(rendered.getByRole("button", { name: "Archive message" }));
     await waitFor(() => expect(archiveOperatorMessage).toHaveBeenCalledWith({ projectId: "project-a", messageId: 10 }));
-    expect(rendered.getByRole("status").textContent).toBe("Archived.");
+    expect(rendered.getByRole("status").textContent).toBe("Archived. Turn on Show archived to include it again.");
     expect(rendered.queryByText("archive me")).toBeNull();
   });
 
@@ -495,12 +560,12 @@ describe("Operator Inbox app", () => {
     });
 
     await waitFor(() => expect(rendered.getByText("archive race")).toBeTruthy());
-    fireEvent.click(rendered.getByRole("button", { name: "Archive" }));
+    fireEvent.click(rendered.getByRole("button", { name: "Archive message" }));
     fireEvent.click(rendered.getByLabelText("Show archived"));
     await waitFor(() => expect(rendered.getAllByText("Refreshed archived row").length).toBeGreaterThan(0));
     await act(async () => resolveArchive({ ...message, senderTitle: "Late archive result", archivedAtMs: 5 }));
 
-    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Archived."));
+    await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Archived. Turn on Show archived to include it again."));
     expect(rendered.getAllByText("Refreshed archived row").length).toBeGreaterThan(0);
     expect(rendered.queryByText("Late archive result")).toBeNull();
   });
@@ -519,12 +584,12 @@ describe("Operator Inbox app", () => {
     });
 
     await waitFor(() => expect(rendered.getByText("failed archive race")).toBeTruthy());
-    fireEvent.click(rendered.getByRole("button", { name: "Archive" }));
+    fireEvent.click(rendered.getByRole("button", { name: "Archive message" }));
     fireEvent.click(rendered.getByLabelText("Show archived"));
     await waitFor(() => expect(rendered.getAllByText("Refresh survived failure").length).toBeGreaterThan(0));
     await act(async () => rejectArchive(new Error("archive unavailable")));
 
-    await waitFor(() => expect(rendered.getByText("Unable to read inbox: Error: archive unavailable")).toBeTruthy());
+    await waitFor(() => expect(rendered.getByText("Refresh failed: Error: archive unavailable")).toBeTruthy());
     expect(rendered.getAllByText("Refresh survived failure").length).toBeGreaterThan(0);
   });
 
@@ -539,11 +604,11 @@ describe("Operator Inbox app", () => {
 
     await waitFor(() => expect(rendered.getByText("message 1")).toBeTruthy());
     expect(rendered.getAllByRole("listitem")).toHaveLength(256);
-    expect(rendered.getByText("Showing the first 256 of 257 messages; unread messages are first. Select a project to narrow the list.")).toBeTruthy();
+    expect(rendered.getByText("Showing the first 256 of 257 messages. Unread messages appear first.")).toBeTruthy();
     expect(rendered.queryByText("message 257")).toBeNull();
   });
 
-  it("expands compact operator messages in place", async () => {
+  it("keeps the selected message in one detail pane without duplicating its body", async () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
     const messages = [
@@ -559,12 +624,14 @@ describe("Operator Inbox app", () => {
     const rows = rendered.getAllByRole("listitem");
     const first = rows[0]!.querySelector("button")!;
     const second = rows[1]!.querySelector("button")!;
-    expect(first.getAttribute("aria-expanded")).toBe("true");
-    expect(second.getAttribute("aria-expanded")).toBe("false");
+    expect(first.getAttribute("aria-pressed")).toBe("true");
+    expect(second.getAttribute("aria-pressed")).toBe("false");
+    expect(rendered.getAllByText("First message body")).toHaveLength(1);
     fireEvent.click(second);
-    expect(first.getAttribute("aria-expanded")).toBe("false");
-    expect(second.getAttribute("aria-expanded")).toBe("true");
-    expect(rendered.getByText("Reply delivery is still in progress; outcome is not yet known.")).toBeTruthy();
+    expect(first.getAttribute("aria-pressed")).toBe("false");
+    expect(second.getAttribute("aria-pressed")).toBe("true");
+    expect(rendered.getAllByText("Second message body")).toHaveLength(1);
+    expect(rendered.getByText("Delivery pending. Keep this message open; the outcome is not yet known.")).toBeTruthy();
     expect(rendered.queryByText("Supervisor")).toBeNull();
   });
 

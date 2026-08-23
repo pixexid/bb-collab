@@ -184,9 +184,7 @@ function isUnregisteredInboxProject(result) {
   return result.outcome === UNREGISTERED_INBOX_PROJECT;
 }
 function operatorOnlyMessages(result) {
-  if (result.messages.some((message) => message.recipient !== "operator")) {
-    throw new Error(NON_OPERATOR_MESSAGE_ERROR);
-  }
+  if (result.messages.some((message) => message.recipient !== "operator")) throw new Error(NON_OPERATOR_MESSAGE_ERROR);
   return result.messages;
 }
 function readInboxFilters() {
@@ -203,6 +201,42 @@ function writeInboxFilters(filters) {
   } catch {
   }
 }
+function messageKey(message) {
+  return `${message.projectId}:${message.messageId}`;
+}
+function formatExactTime(timestamp) {
+  const date = new Date(timestamp);
+  try {
+    return new Intl.DateTimeFormat(void 0, { year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "shortOffset" }).format(date);
+  } catch {
+    return `${date.toISOString().replace("T", " ").replace(".000Z", "")} UTC`;
+  }
+}
+function formatRelativeTime(timestamp) {
+  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1e3));
+  if (seconds < 60) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+function severityLabel(severity) {
+  return severity === "needs-decision" ? "Needs decision" : severity[0].toUpperCase() + severity.slice(1);
+}
+function senderLabel(message) {
+  return asText(message.senderTitle) ?? "Sender unavailable";
+}
+function deliveryLabel(message) {
+  if (message.repliedAtMs != null) return "Delivered";
+  if (message.replyInProgress) return "Delivery pending";
+  if (message.replyDeliveryError) return "Delivery failed";
+  return null;
+}
+function stateLabel(message) {
+  if (message.archivedAtMs != null) return "Archived";
+  return deliveryLabel(message) ?? (message.readAtMs === null ? "Unread" : "Read");
+}
 function InboxPanel(_props) {
   const sidebar = experimental_useSidebarThreads();
   const navigate = useBbNavigate();
@@ -211,10 +245,11 @@ function InboxPanel(_props) {
   const projectId = filters.projectId && sidebar.projects.some((project) => project.id === filters.projectId) ? filters.projectId : "";
   const { showArchived } = filters;
   const [messages, setMessages] = useState([]);
-  const [expandedMessageKey, setExpandedMessageKey] = useState(null);
+  const [selectedMessageKey, setSelectedMessageKey] = useState(null);
   const [loading, setLoading] = useState(true);
   const [drafts, setDrafts] = useState({});
   const [replyingMessageKey, setReplyingMessageKey] = useState(null);
+  const [pendingAction, setPendingAction] = useState(null);
   const [errors, setErrors] = useState([]);
   const [notice, setNotice] = useState(null);
   const [indicatorBroken, setIndicatorBroken] = useState(null);
@@ -225,9 +260,10 @@ function InboxPanel(_props) {
   showArchivedRef.current = showArchived;
   const projects = useMemo(() => projectId ? sidebar.projects.filter((candidate) => candidate.id === projectId) : sidebar.projects, [projectId, sidebar.projects]);
   const projectNames = useMemo(() => new Map(sidebar.projects.map((candidate) => [candidate.id, candidate.name])), [sidebar.projects]);
-  const messageKey = (message) => `${message.projectId}:${message.messageId}`;
   const visibleMessages = messages.slice(0, MAX_VISIBLE_INBOX_MESSAGES);
-  const openKey = expandedMessageKey === null ? visibleMessages[0] ? messageKey(visibleMessages[0]) : null : visibleMessages.some((message) => messageKey(message) === expandedMessageKey) ? expandedMessageKey : null;
+  const selectedKey = selectedMessageKey && visibleMessages.some((message) => messageKey(message) === selectedMessageKey) ? selectedMessageKey : visibleMessages[0] ? messageKey(visibleMessages[0]) : null;
+  const selectedMessage = selectedKey === null ? void 0 : visibleMessages.find((message) => messageKey(message) === selectedKey);
+  const unreadCount = messages.filter((message) => message.readAtMs === null).length;
   useEffect(() => {
     if (!document.querySelector(INBOX_NAV_REGION_SELECTOR)) return;
     let cancelled = false;
@@ -235,17 +271,17 @@ function InboxPanel(_props) {
       const results = await Promise.allSettled(sidebar.projects.map((project) => rpc.call("operatorMessages", { projectId: project.id, recipient: "operator" })));
       if (cancelled) return;
       const unread = results.reduce((total, result, index) => {
-        const projectId2 = sidebar.projects[index].id;
+        const currentProjectId = sidebar.projects[index].id;
         if (result.status === "fulfilled") {
           try {
             const count = operatorOnlyMessages(result.value).filter((message) => message.readAtMs === null).length;
-            provenUnread.current.set(projectId2, count);
+            provenUnread.current.set(currentProjectId, count);
             return total + count;
           } catch {
-            return total + (provenUnread.current.get(projectId2) ?? 0);
+            return total + (provenUnread.current.get(currentProjectId) ?? 0);
           }
         }
-        return total + (provenUnread.current.get(projectId2) ?? 0);
+        return total + (provenUnread.current.get(currentProjectId) ?? 0);
       }, 0);
       const painted = paintInboxNavUnread(document, unread);
       const broken = painted.matched === false ? painted : inspectInboxNavGlyph(document);
@@ -306,152 +342,205 @@ function InboxPanel(_props) {
   }, [projects, projectId, rpc, showArchived]);
   useEffect(refresh, [refresh]);
   const updateMessage = (next) => setMessages((current) => current.map((message) => messageKey(message) === messageKey(next) ? next : message));
-  return /* @__PURE__ */ jsx("main", { className: "h-full overflow-y-auto p-4 md:p-5", children: /* @__PURE__ */ jsxs("div", { className: "mx-auto grid max-w-4xl gap-3", style: { minWidth: 0, width: "100%" }, children: [
+  const currentProjectLabel = projectId ? projectNames.get(projectId) ?? projectId : "All projects";
+  const selectedProjectLabel = selectedMessage ? projectNames.get(selectedMessage.projectId) ?? selectedMessage.projectId : null;
+  const replyKey = selectedMessage ? messageKey(selectedMessage) : null;
+  const replyText = selectedMessage && replyKey ? drafts[replyKey] ?? selectedMessage.replyText ?? "" : "";
+  const selectedSenderId = selectedMessage ? asText(selectedMessage.senderThreadId) : null;
+  const pendingSelectedAction = pendingAction?.key === replyKey ? pendingAction.action : null;
+  const markReadPending = pendingSelectedAction === "mark-read";
+  const archivePending = pendingSelectedAction === "archive";
+  const markSelectedMessageRead = () => {
+    if (!selectedMessage || !replyKey || pendingAction !== null) return;
+    const action = { key: replyKey, action: "mark-read" };
+    setPendingAction(action);
+    setErrors([]);
+    setNotice(null);
+    void rpc.call("markOperatorMessageRead", { projectId: selectedMessage.projectId, messageId: selectedMessage.messageId }).then((read) => {
+      updateMessage(read);
+      setNotice("Marked read. This message is no longer counted as unread.");
+    }).catch((reason) => setErrors([String(reason)])).finally(() => setPendingAction((current) => current === action ? null : current));
+  };
+  const archiveSelectedMessage = () => {
+    if (!selectedMessage || !replyKey || pendingAction !== null) return;
+    const action = { key: replyKey, action: "archive" };
+    const sequence = refreshSequence.current;
+    setPendingAction(action);
+    setErrors([]);
+    setNotice(null);
+    void rpc.call("archiveOperatorMessage", { projectId: selectedMessage.projectId, messageId: selectedMessage.messageId }).then((archived) => {
+      if (sequence === refreshSequence.current) setMessages((current) => showArchivedRef.current ? current.map((item) => messageKey(item) === replyKey ? archived : item) : current.filter((item) => messageKey(item) !== replyKey));
+      setNotice("Archived. Turn on Show archived to include it again.");
+    }).catch((reason) => setErrors([String(reason)])).finally(() => setPendingAction((current) => current === action ? null : current));
+  };
+  return /* @__PURE__ */ jsx("main", { className: "h-full overflow-y-auto p-4 md:p-5", children: /* @__PURE__ */ jsxs("div", { className: "mx-auto grid max-w-5xl gap-4", style: { minWidth: 0, width: "100%" }, children: [
     indicatorBroken ? /* @__PURE__ */ jsxs("p", { role: "alert", className: "text-sm text-destructive", children: [
       INBOX_INDICATOR_BROKEN_TITLE,
       " \u2014 open Inbox to check for unread messages. Cause: ",
       indicatorBroken
     ] }) : null,
-    /* @__PURE__ */ jsxs("section", { "aria-label": "Inbox filters", className: "items-end gap-3 border-b border-border pb-3", style: { display: "flex", flexWrap: "wrap", minWidth: 0, width: "100%" }, children: [
-      /* @__PURE__ */ jsxs("label", { className: "grid min-w-0 gap-1 text-sm", style: { flex: "1 0 20rem" }, children: [
-        /* @__PURE__ */ jsx("span", { className: "text-xs text-muted-foreground", children: "Project" }),
-        /* @__PURE__ */ jsxs("select", { className: "w-full min-w-0 rounded-md border border-border bg-background px-3 py-1.5", value: projectId, onChange: (event) => setFiltersAndPersist({ projectId: event.target.value, showArchived }), children: [
+    /* @__PURE__ */ jsxs("header", { className: "grid gap-1", children: [
+      /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-center justify-between gap-2", children: [
+        /* @__PURE__ */ jsxs("div", { children: [
+          /* @__PURE__ */ jsx("p", { className: "text-xs font-medium uppercase tracking-wide text-muted-foreground", children: "Operator workspace" }),
+          /* @__PURE__ */ jsx("h1", { className: "text-xl font-semibold tracking-tight", children: "Inbox" })
+        ] }),
+        /* @__PURE__ */ jsx("p", { className: "text-sm text-muted-foreground", "aria-live": "polite", children: unreadCount ? `${unreadCount} unread` : "All caught up" })
+      ] }),
+      /* @__PURE__ */ jsx("p", { className: "max-w-2xl text-sm text-muted-foreground", children: "Review messages from your project agents, then reply, mark read, or archive from one place." })
+    ] }),
+    /* @__PURE__ */ jsxs("section", { "aria-label": "Inbox toolbar", className: "grid gap-3 rounded-lg border border-border bg-muted/10 p-3 md:grid-cols-[minmax(0,1fr)_auto_auto] md:items-end", children: [
+      /* @__PURE__ */ jsxs("label", { className: "grid min-w-0 gap-1 text-sm", children: [
+        /* @__PURE__ */ jsx("span", { className: "text-xs font-medium text-muted-foreground", children: "Project" }),
+        /* @__PURE__ */ jsxs("select", { className: "w-full min-w-0 rounded-md border border-border bg-background px-3 py-2", value: projectId, onChange: (event) => setFiltersAndPersist({ projectId: event.target.value, showArchived }), children: [
           /* @__PURE__ */ jsx("option", { value: "", children: "All projects" }),
-          sidebar.projects.map((candidate) => /* @__PURE__ */ jsxs("option", { value: candidate.id, children: [
-            candidate.name,
-            " \xB7 ",
-            candidate.id
-          ] }, candidate.id))
+          sidebar.projects.map((candidate) => /* @__PURE__ */ jsx("option", { value: candidate.id, children: candidate.name }, candidate.id))
         ] })
       ] }),
-      /* @__PURE__ */ jsxs("label", { className: "items-center gap-2 py-1.5 text-sm", style: { display: "flex", flex: "0 0 8rem", whiteSpace: "nowrap" }, children: [
+      /* @__PURE__ */ jsxs("label", { className: "flex min-h-10 items-center gap-2 px-1 text-sm", children: [
         /* @__PURE__ */ jsx("input", { type: "checkbox", checked: showArchived, onChange: (event) => setFiltersAndPersist({ projectId, showArchived: event.target.checked }) }),
         "Show archived"
       ] }),
-      /* @__PURE__ */ jsx("button", { type: "button", "aria-label": "Refresh inbox", title: "Refresh inbox", style: { flex: "0 0 2rem" }, className: "rounded-md bg-transparent px-2 py-1.5 text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none", onClick: refresh, children: /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\u21BB" }) })
+      /* @__PURE__ */ jsx("button", { type: "button", "aria-label": "Refresh inbox", title: "Refresh inbox", className: "min-h-10 min-w-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: refresh, disabled: loading, children: /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\u21BB" }) })
     ] }),
-    errors.map((loadError) => /* @__PURE__ */ jsxs("p", { role: "alert", className: "text-sm text-destructive", children: [
-      "Unable to read inbox: ",
+    errors.map((loadError) => /* @__PURE__ */ jsxs("p", { role: "alert", className: "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive", children: [
+      "Refresh failed: ",
       loadError
     ] }, loadError)),
-    notice ? /* @__PURE__ */ jsx("p", { role: "status", className: "text-sm text-primary", children: notice }) : null,
-    sidebar.projects.length === 0 ? /* @__PURE__ */ jsx("p", { className: "text-sm text-muted-foreground", children: "No registered projects." }) : /* @__PURE__ */ jsxs("section", { "aria-labelledby": "inbox-project-heading", className: "overflow-hidden rounded-md border border-border", style: { minWidth: 0, width: "100%" }, children: [
-      /* @__PURE__ */ jsxs("div", { className: "flex items-center justify-between gap-2 border-b border-border px-3 py-2", children: [
-        /* @__PURE__ */ jsx("h2", { id: "inbox-project-heading", className: "text-sm font-semibold", children: projectId ? projectNames.get(projectId) ?? projectId : "All projects" }),
-        /* @__PURE__ */ jsxs("span", { className: "text-xs text-muted-foreground", children: [
+    notice ? /* @__PURE__ */ jsx("p", { role: "status", className: "rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-sm text-primary", children: notice }) : null,
+    sidebar.projects.length === 0 ? /* @__PURE__ */ jsxs("section", { className: "rounded-lg border border-dashed border-border p-6 text-center", children: [
+      /* @__PURE__ */ jsx("h2", { className: "font-medium", children: "No projects available" }),
+      /* @__PURE__ */ jsx("p", { className: "mt-1 text-sm text-muted-foreground", children: "A registered project is required before operator messages can appear here." })
+    ] }) : /* @__PURE__ */ jsxs("section", { "aria-labelledby": "inbox-list-heading", className: "grid min-w-0 gap-3 md:grid-cols-[minmax(16rem,0.42fr)_minmax(0,1fr)]", children: [
+      /* @__PURE__ */ jsxs("div", { className: "min-w-0 overflow-hidden rounded-lg border border-border", children: [
+        /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-baseline justify-between gap-2 border-b border-border bg-muted/10 px-3 py-3", children: [
+          /* @__PURE__ */ jsxs("div", { children: [
+            /* @__PURE__ */ jsx("h2", { id: "inbox-list-heading", className: "font-semibold", children: "Messages" }),
+            /* @__PURE__ */ jsx("p", { className: "text-xs text-muted-foreground", children: currentProjectLabel })
+          ] }),
+          /* @__PURE__ */ jsxs("span", { className: "text-xs text-muted-foreground", children: [
+            messages.length,
+            " ",
+            messages.length === 1 ? "message" : "messages"
+          ] })
+        ] }),
+        loading ? /* @__PURE__ */ jsx("p", { role: "status", className: "p-5 text-sm text-muted-foreground", children: "Loading messages\u2026" }) : null,
+        !loading && messages.length === 0 ? /* @__PURE__ */ jsxs("div", { className: "p-5", children: [
+          /* @__PURE__ */ jsx("p", { className: "font-medium", children: "No messages in this view" }),
+          /* @__PURE__ */ jsx("p", { className: "mt-1 text-sm text-muted-foreground", children: "Try another project or show archived messages." })
+        ] }) : null,
+        messages.length > MAX_VISIBLE_INBOX_MESSAGES ? /* @__PURE__ */ jsxs("p", { className: "border-b border-border bg-muted/10 p-3 text-xs text-muted-foreground", children: [
+          "Showing the first ",
+          MAX_VISIBLE_INBOX_MESSAGES,
+          " of ",
           messages.length,
-          " ",
-          messages.length === 1 ? "message" : "messages"
-        ] })
-      ] }),
-      loading ? /* @__PURE__ */ jsx("p", { role: "status", className: "p-4 text-sm text-muted-foreground", children: "Loading messages\u2026" }) : null,
-      !loading && messages.length === 0 ? /* @__PURE__ */ jsx("p", { className: "p-4 text-sm text-muted-foreground", children: "No operator messages for this project filter." }) : null,
-      messages.length > MAX_VISIBLE_INBOX_MESSAGES ? /* @__PURE__ */ jsxs("p", { className: "border-b border-border p-3 text-xs text-muted-foreground", children: [
-        "Showing the first ",
-        MAX_VISIBLE_INBOX_MESSAGES,
-        " of ",
-        messages.length,
-        " messages; unread messages are first. Select a project to narrow the list."
-      ] }) : null,
-      /* @__PURE__ */ jsx("div", { role: "list", "aria-label": "Operator messages", children: visibleMessages.map((message) => {
-        const key = messageKey(message);
-        const expanded = key === openKey;
-        return /* @__PURE__ */ jsxs("article", { role: "listitem", className: "border-b border-border last:border-b-0", children: [
-          /* @__PURE__ */ jsxs("button", { type: "button", "aria-expanded": expanded, style: { textAlign: "left", width: "100%" }, onClick: () => setExpandedMessageKey(expanded ? "" : key), className: `grid min-w-0 gap-1 px-3 py-2.5 transition-colors duration-150 hover:bg-muted/60 active:bg-muted/80 focus-visible:z-10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none ${expanded ? "bg-muted/40" : "bg-transparent"}`, children: [
-            /* @__PURE__ */ jsxs("span", { className: "flex min-w-0 items-center gap-2", children: [
-              message.readAtMs === null ? /* @__PURE__ */ jsx("span", { "aria-label": "Unread", className: "h-2 w-2 shrink-0 rounded-full bg-primary" }) : null,
-              /* @__PURE__ */ jsx("span", { className: `min-w-0 truncate text-sm ${message.readAtMs === null ? "font-semibold" : "font-medium"}`, children: asText(message.senderTitle) ?? asText(message.senderThreadId) ?? "Sender unavailable" }),
-              /* @__PURE__ */ jsx("span", { "aria-hidden": "true", className: `text-xs text-muted-foreground transition-transform duration-150 motion-reduce:transition-none ${expanded ? "rotate-90" : ""}`, children: "\u203A" }),
-              /* @__PURE__ */ jsx("time", { className: "ml-auto shrink-0 text-xs text-muted-foreground", dateTime: new Date(message.createdAtMs).toISOString(), children: new Date(message.createdAtMs).toLocaleDateString() })
+          " messages. Unread messages appear first."
+        ] }) : null,
+        /* @__PURE__ */ jsx("div", { role: "list", "aria-label": "Operator messages", children: visibleMessages.map((message) => {
+          const key = messageKey(message);
+          const selected = key === selectedKey;
+          const sender = senderLabel(message);
+          const delivery = deliveryLabel(message);
+          return /* @__PURE__ */ jsx("article", { role: "listitem", className: `border-b border-border last:border-b-0 ${selected ? "bg-primary/5" : "bg-transparent"}`, children: /* @__PURE__ */ jsxs("button", { type: "button", "aria-pressed": selected, "aria-label": `${selected ? "Selected. " : "Select "}message from ${sender}. ${projectNames.get(message.projectId) ?? message.projectId}. ${severityLabel(message.severity)}. ${stateLabel(message)}. ${formatExactTime(message.createdAtMs)}`, style: { textAlign: "left", width: "100%" }, onClick: () => setSelectedMessageKey(key), className: `grid min-w-0 gap-2 px-3 py-3 transition-colors duration-150 hover:bg-muted/60 active:bg-muted/80 focus-visible:z-10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none ${selected ? "border-l-2 border-primary pl-[0.625rem]" : "border-l-2 border-transparent"}`, children: [
+            /* @__PURE__ */ jsxs("span", { className: "flex min-w-0 items-start gap-2", children: [
+              /* @__PURE__ */ jsx("span", { className: `mt-1.5 h-2 w-2 shrink-0 rounded-full ${message.readAtMs === null ? "bg-primary" : "bg-transparent"}`, "aria-label": message.readAtMs === null ? "Unread" : void 0 }),
+              /* @__PURE__ */ jsx("span", { className: `min-w-0 flex-1 break-words text-sm ${message.readAtMs === null ? "font-semibold" : "font-medium"}`, children: sender }),
+              /* @__PURE__ */ jsx("time", { className: "shrink-0 text-xs text-muted-foreground", dateTime: new Date(message.createdAtMs).toISOString(), title: formatExactTime(message.createdAtMs), "aria-label": `Received ${formatExactTime(message.createdAtMs)}`, children: formatRelativeTime(message.createdAtMs) })
             ] }),
-            /* @__PURE__ */ jsxs("span", { className: "truncate text-xs text-muted-foreground", children: [
-              message.text.slice(0, 90),
-              "\u2026"
-            ] }),
-            /* @__PURE__ */ jsxs("span", { className: "flex flex-wrap items-center gap-2 text-xs text-muted-foreground", children: [
+            /* @__PURE__ */ jsx("span", { className: "break-words text-sm leading-5 text-muted-foreground", children: selected ? "Selected \u2014 details shown here" : message.text.length > 96 ? `${message.text.slice(0, 96).trimEnd()}\u2026` : message.text }),
+            /* @__PURE__ */ jsxs("span", { className: "flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground", children: [
               /* @__PURE__ */ jsx("span", { children: projectNames.get(message.projectId) ?? message.projectId }),
               /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
-              /* @__PURE__ */ jsx("span", { children: message.severity }),
-              message.repliedAtMs !== null ? /* @__PURE__ */ jsxs(Fragment2, { children: [
+              /* @__PURE__ */ jsx("span", { children: severityLabel(message.severity) }),
+              delivery ? /* @__PURE__ */ jsxs(Fragment2, { children: [
                 /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
-                /* @__PURE__ */ jsx("span", { children: "Delivered" })
-              ] }) : message.replyInProgress ? /* @__PURE__ */ jsxs(Fragment2, { children: [
+                /* @__PURE__ */ jsx("span", { className: delivery === "Delivery failed" ? "text-destructive" : "", children: delivery })
+              ] }) : null,
+              message.archivedAtMs != null ? /* @__PURE__ */ jsxs(Fragment2, { children: [
                 /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
-                /* @__PURE__ */ jsx("span", { children: "Delivery pending" })
-              ] }) : message.replyDeliveryError ? /* @__PURE__ */ jsxs(Fragment2, { children: [
-                /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
-                /* @__PURE__ */ jsx("span", { className: "text-destructive", children: "Delivery failed" })
+                /* @__PURE__ */ jsx("span", { children: "Archived" })
               ] }) : null
             ] })
-          ] }),
-          expanded ? /* @__PURE__ */ jsxs("div", { className: "grid gap-3 border-t border-border bg-muted/10 p-3 md:p-4", style: { minWidth: 0 }, children: [
-            /* @__PURE__ */ jsxs("p", { className: "text-xs text-muted-foreground", children: [
-              message.readAtMs === null ? "Unread" : "Read",
-              " \xB7 ",
-              message.severity,
-              " \xB7 ",
-              /* @__PURE__ */ jsx("time", { dateTime: new Date(message.createdAtMs).toISOString(), children: new Date(message.createdAtMs).toLocaleString() })
-            ] }),
-            /* @__PURE__ */ jsxs("div", { className: "min-w-0", children: [
-              asText(message.senderThreadId) ? /* @__PURE__ */ jsx("a", { href: "#", className: "font-medium text-foreground underline decoration-muted-foreground/50 underline-offset-2", "aria-label": `Open sender session ${asText(message.senderThreadId)}`, title: `Open sender session ${asText(message.senderThreadId)}`, onClick: (event) => {
+          ] }) }, key);
+        }) })
+      ] }),
+      selectedMessage ? /* @__PURE__ */ jsxs("article", { "aria-labelledby": "selected-message-heading", className: "min-w-0 rounded-lg border border-border bg-background", children: [
+        /* @__PURE__ */ jsx("header", { className: "grid gap-3 border-b border-border bg-muted/10 p-4", children: /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-start justify-between gap-3", children: [
+          /* @__PURE__ */ jsxs("div", { className: "min-w-0", children: [
+            /* @__PURE__ */ jsx("p", { className: "text-xs font-medium uppercase tracking-wide text-muted-foreground", children: "Selected message" }),
+            /* @__PURE__ */ jsx("h2", { id: "selected-message-heading", className: "mt-1 text-lg font-semibold", children: "Message" }),
+            /* @__PURE__ */ jsxs("p", { className: "mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground", children: [
+              /* @__PURE__ */ jsx("span", { children: "From" }),
+              selectedSenderId && asText(selectedMessage.senderTitle) ? /* @__PURE__ */ jsx("a", { href: "#", className: "min-w-0 break-words font-medium text-foreground underline decoration-muted-foreground/50 underline-offset-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary", "aria-label": `Open sender session ${selectedMessage.senderTitle}`, onClick: (event) => {
                 event.preventDefault();
-                navigate.toThread(asText(message.senderThreadId));
-              }, children: asText(message.senderTitle) ?? asText(message.senderThreadId) }) : /* @__PURE__ */ jsx("span", { className: "font-medium", children: "Sender unavailable" }),
-              /* @__PURE__ */ jsxs("p", { className: "break-words text-xs text-muted-foreground", children: [
-                asText(message.senderLaneId) ? `${asText(message.senderLaneId)} \xB7 ` : "",
-                asText(message.senderThreadId)
-              ] })
-            ] }),
-            /* @__PURE__ */ jsx("p", { className: "whitespace-pre-wrap break-words text-sm leading-6", children: message.text }),
-            message.notificationError ? /* @__PURE__ */ jsxs("p", { className: "text-xs text-destructive", children: [
-              "Urgent notification failed: ",
-              message.notificationError
-            ] }) : null,
-            message.repliedAtMs !== null ? /* @__PURE__ */ jsxs("div", { className: "border-l-2 border-border pl-3", children: [
-              /* @__PURE__ */ jsx("p", { className: "text-xs font-medium text-muted-foreground", children: "Reply delivered" }),
-              /* @__PURE__ */ jsx("p", { className: "mt-1 whitespace-pre-wrap break-words text-sm", children: message.replyText })
-            ] }) : /* @__PURE__ */ jsxs("div", { className: "grid gap-2 border-t border-border pt-3", children: [
-              message.replyInProgress ? /* @__PURE__ */ jsx("p", { className: "text-xs text-primary", children: "Reply delivery is still in progress; outcome is not yet known." }) : null,
-              message.replyDeliveryError ? /* @__PURE__ */ jsxs("p", { role: "alert", className: "text-xs text-destructive", children: [
-                "Reply delivery failed: ",
-                message.replyDeliveryError
-              ] }) : null,
-              /* @__PURE__ */ jsx("label", { className: "text-xs font-medium text-muted-foreground", htmlFor: `operator-reply-${key}`, children: "Reply" }),
-              /* @__PURE__ */ jsx("textarea", { id: `operator-reply-${key}`, className: "min-h-24 w-full rounded-md border border-border bg-background p-2.5 text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary", value: drafts[key] ?? message.replyText ?? "", onChange: (event) => setDrafts((current) => ({ ...current, [key]: event.target.value })) }),
-              /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap gap-2", children: [
-                /* @__PURE__ */ jsx("button", { type: "button", disabled: replyingMessageKey !== null, className: "rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground transition-opacity duration-150 hover:opacity-90 active:opacity-80 disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none", onClick: () => {
-                  const text = (drafts[key] ?? message.replyText ?? "").trim();
-                  if (!text) return;
-                  setErrors([]);
-                  setNotice(null);
-                  setReplyingMessageKey(key);
-                  void rpc.call("replyToOperatorMessage", { projectId: message.projectId, messageId: message.messageId, text }).then((replied) => {
-                    updateMessage(replied);
-                    setNotice(replied.repliedAtMs !== null ? "Reply delivered." : replied.replyInProgress ? "Reply delivery is still in progress; outcome is not yet known." : replied.replyDeliveryError ? "Reply delivery failed." : "Reply delivery is not confirmed.");
-                  }).catch((reason) => setErrors([String(reason)])).finally(() => setReplyingMessageKey(null));
-                }, children: replyingMessageKey === key ? "Delivering\u2026" : message.replyDeliveryError ? "Retry reply" : "Reply" }),
-                message.readAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", className: "rounded-md bg-transparent px-3 py-1.5 text-sm text-muted-foreground transition-colors duration-150 hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none", onClick: () => {
-                  setErrors([]);
-                  setNotice(null);
-                  void rpc.call("markOperatorMessageRead", { projectId: message.projectId, messageId: message.messageId }).then((read) => {
-                    updateMessage(read);
-                    setNotice("Marked read.");
-                  }).catch((reason) => setErrors([String(reason)]));
-                }, children: "Mark read" }) : null,
-                message.archivedAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", className: "rounded-md bg-transparent px-3 py-1.5 text-sm text-muted-foreground transition-colors duration-150 hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none", onClick: () => {
-                  const sequence = refreshSequence.current;
-                  setErrors([]);
-                  setNotice(null);
-                  void rpc.call("archiveOperatorMessage", { projectId: message.projectId, messageId: message.messageId }).then((archived) => {
-                    if (sequence === refreshSequence.current) setMessages((current) => showArchivedRef.current ? current.map((item) => messageKey(item) === key ? archived : item) : current.filter((item) => messageKey(item) !== key));
-                    setNotice("Archived.");
-                  }).catch((reason) => setErrors([String(reason)]));
-                }, children: "Archive" }) : null
-              ] })
+                navigate.toThread(selectedSenderId);
+              }, children: selectedMessage.senderTitle }) : /* @__PURE__ */ jsx("span", { children: "Sender unavailable" }),
+              /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
+              /* @__PURE__ */ jsx("span", { children: selectedProjectLabel }),
+              /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
+              /* @__PURE__ */ jsx("span", { children: severityLabel(selectedMessage.severity) }),
+              /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
+              /* @__PURE__ */ jsx("time", { dateTime: new Date(selectedMessage.createdAtMs).toISOString(), title: formatExactTime(selectedMessage.createdAtMs), "aria-label": `Received ${formatExactTime(selectedMessage.createdAtMs)}`, children: formatRelativeTime(selectedMessage.createdAtMs) })
             ] })
-          ] }) : null
-        ] }, key);
-      }) })
+          ] }),
+          /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap gap-2 text-xs", children: [
+            /* @__PURE__ */ jsx("span", { className: `rounded-full px-2.5 py-1 font-medium ${selectedMessage.readAtMs === null ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground"}`, children: selectedMessage.readAtMs === null ? "Unread" : "Read" }),
+            selectedMessage.archivedAtMs != null ? /* @__PURE__ */ jsx("span", { className: "rounded-full bg-muted px-2.5 py-1 font-medium text-muted-foreground", children: "Archived" }) : null,
+            deliveryLabel(selectedMessage) ? /* @__PURE__ */ jsx("span", { className: `rounded-full px-2.5 py-1 font-medium ${deliveryLabel(selectedMessage) === "Delivery failed" ? "bg-destructive/10 text-destructive" : "bg-muted text-muted-foreground"}`, children: deliveryLabel(selectedMessage) }) : null
+          ] })
+        ] }) }),
+        /* @__PURE__ */ jsxs("div", { className: "grid gap-5 p-4", children: [
+          /* @__PURE__ */ jsxs("section", { "aria-labelledby": "message-body-heading", className: "grid gap-2", children: [
+            /* @__PURE__ */ jsx("h3", { id: "message-body-heading", className: "text-xs font-semibold uppercase tracking-wide text-muted-foreground", children: "Message" }),
+            /* @__PURE__ */ jsx("p", { className: "whitespace-pre-wrap break-words text-sm leading-6", children: selectedMessage.text }),
+            selectedMessage.notificationError ? /* @__PURE__ */ jsxs("p", { role: "alert", className: "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive", children: [
+              "Urgent notification could not be sent: ",
+              selectedMessage.notificationError
+            ] }) : null
+          ] }),
+          selectedMessage.repliedAtMs != null ? /* @__PURE__ */ jsxs("section", { "aria-label": "Reply delivered", className: "grid gap-2 rounded-md border border-border bg-muted/10 p-3", children: [
+            /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-center justify-between gap-2", children: [
+              /* @__PURE__ */ jsx("h3", { className: "text-sm font-semibold", children: "Reply delivered" }),
+              /* @__PURE__ */ jsx("time", { className: "text-xs text-muted-foreground", dateTime: new Date(selectedMessage.repliedAtMs).toISOString(), title: formatExactTime(selectedMessage.repliedAtMs), "aria-label": `Delivered ${formatExactTime(selectedMessage.repliedAtMs)}`, children: formatRelativeTime(selectedMessage.repliedAtMs) })
+            ] }),
+            /* @__PURE__ */ jsx("p", { className: "whitespace-pre-wrap break-words text-sm leading-6", children: selectedMessage.replyText }),
+            /* @__PURE__ */ jsx("p", { className: "text-xs text-muted-foreground", children: "BB confirmed the matching input in the sender thread." })
+          ] }) : /* @__PURE__ */ jsxs("section", { "aria-labelledby": "reply-heading", className: "grid gap-3 border-t border-border pt-4", children: [
+            /* @__PURE__ */ jsxs("div", { children: [
+              /* @__PURE__ */ jsx("h3", { id: "reply-heading", className: "text-sm font-semibold", children: "Reply to sender" }),
+              /* @__PURE__ */ jsx("p", { className: "mt-1 text-xs text-muted-foreground", children: "Your reply is delivered only after BB confirms the matching input in the sender thread." })
+            ] }),
+            selectedMessage.replyInProgress ? /* @__PURE__ */ jsx("p", { role: "status", className: "rounded-md border border-border bg-muted/10 px-3 py-2 text-sm text-primary", children: "Delivery pending. Keep this message open; the outcome is not yet known." }) : null,
+            selectedMessage.replyDeliveryError ? /* @__PURE__ */ jsxs("p", { role: "alert", className: "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive", children: [
+              "Delivery failed: ",
+              selectedMessage.replyDeliveryError,
+              " You can retry without losing this message."
+            ] }) : null,
+            /* @__PURE__ */ jsxs("label", { className: "grid gap-1 text-sm", htmlFor: `operator-reply-${replyKey}`, children: [
+              /* @__PURE__ */ jsx("span", { className: "text-xs font-medium text-muted-foreground", children: "Reply text" }),
+              /* @__PURE__ */ jsx("textarea", { id: `operator-reply-${replyKey}`, className: "min-h-24 w-full rounded-md border border-border bg-background p-2.5 text-sm leading-5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary", value: replyText, onChange: (event) => setDrafts((current) => ({ ...current, [replyKey]: event.target.value })) })
+            ] })
+          ] }),
+          /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap gap-2 border-t border-border pt-4", children: [
+            /* @__PURE__ */ jsx("button", { type: "button", "aria-label": replyingMessageKey === replyKey ? "Delivering reply" : selectedMessage.repliedAtMs != null ? "Reply delivered" : selectedMessage.replyDeliveryError ? "Retry reply" : "Send reply", title: replyingMessageKey === replyKey ? "Delivering reply" : selectedMessage.repliedAtMs != null ? "Reply delivered" : selectedMessage.replyDeliveryError ? "Retry reply" : "Send reply", disabled: replyingMessageKey !== null || pendingAction !== null || selectedMessage.repliedAtMs != null || !replyText.trim(), className: "min-h-10 min-w-10 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-opacity duration-150 hover:opacity-90 active:opacity-80 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none", onClick: () => {
+              const text = replyText.trim();
+              if (!text || !replyKey) return;
+              setErrors([]);
+              setNotice(null);
+              setReplyingMessageKey(replyKey);
+              void rpc.call("replyToOperatorMessage", { projectId: selectedMessage.projectId, messageId: selectedMessage.messageId, text }).then((replied) => {
+                updateMessage(replied);
+                setNotice(replied.repliedAtMs != null ? "Reply delivered. BB confirmed the matching input." : replied.replyInProgress ? "Delivery pending. The outcome is not yet known." : replied.replyDeliveryError ? "Delivery failed. The message remains retryable." : "Reply delivery is not confirmed.");
+              }).catch((reason) => setErrors([String(reason)])).finally(() => setReplyingMessageKey(null));
+            }, children: /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\u2197" }) }),
+            selectedMessage.readAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", "aria-busy": markReadPending, "aria-label": markReadPending ? "Marking message read" : "Mark message read", title: markReadPending ? "Marking message read" : "Mark message read", disabled: pendingAction !== null, className: "min-h-10 min-w-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: markSelectedMessageRead, children: /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: markReadPending ? "\u2026" : "\u2713" }) }) : null,
+            selectedMessage.archivedAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", "aria-busy": archivePending, "aria-label": archivePending ? "Archiving message" : "Archive message", title: archivePending ? "Archiving message" : "Archive message", disabled: pendingAction !== null, className: "min-h-10 min-w-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: archiveSelectedMessage, children: /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: archivePending ? "\u2026" : "\u25B1" }) }) : null
+          ] })
+        ] })
+      ] }) : /* @__PURE__ */ jsxs("section", { className: "min-w-0 rounded-lg border border-dashed border-border p-6 text-center", children: [
+        /* @__PURE__ */ jsx("h2", { className: "font-medium", children: "Select a message" }),
+        /* @__PURE__ */ jsx("p", { className: "mt-1 text-sm text-muted-foreground", children: "Choose a message from the list to read it and see available actions." })
+      ] })
     ] })
   ] }) });
 }
