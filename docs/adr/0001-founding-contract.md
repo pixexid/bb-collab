@@ -661,12 +661,15 @@ The founding direction adopts:
 The following remain unresolved until the named proof or operator decision:
 
 - General operator actor authentication. Do not infer identity from a display
-  name, checkout possession or thread ID. The narrow exception is the
-  explicitly ratified `plugin/bb-collab` derived actor for the bounded
-  bootstrap, config-revision, operator-only Decision, work-item, role, and migration mutation
-  classes, which is issued by an active exact authorized-approver attestation and remains bound
-  to its exact operator receipt; other operator actors still wait for a proven
-  BB-native authenticated subject/receipt or a separately explicit decision.
+  name, checkout possession or thread ID. The narrow cross-project bootstrap
+  Decision precedent is not a role-actor mint: for exactly one immutable
+  `operator_only` identity with source-project scope
+  `{operation: "cross_project_bootstrap", sourceProjectId, targetProjectId,
+  repoTargetId: null}` and options `{rootOfTrust: "host_local_operator"}`, the
+  exact verified plugin receipt recorded by the current source governorship head
+  may create and dispose the Decision. Its source project, epoch, fence, actor
+  receipt and integrity digest are immutable audit state; disposition revalidates
+  the same current root. All other Decisions remain role-actor bound.
 - Connector policy per repository. Set required, optional or prohibited only
   after the exact installation and terminal-artifact probe. Capability
   observations cannot rewrite policy.

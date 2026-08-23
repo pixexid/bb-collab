@@ -77,6 +77,10 @@ The current root of trust is host-local operator control exercised through the
 verified bb-collab plugin actor and adopted Decision. Host-issued operator
 receipts from get-bb/bb#1541 are the preferred future root; when that surface
 is available, bootstrap authority must be re-ruled before changing this seam.
+The exact bootstrap Decision also persists the source project, current
+governance epoch, fence, plugin actor receipt, and receipt digest as an
+immutable authority-root binding; creation and later disposition must resolve
+the same current root.
 
 ## Minimum safe Phase-3 tenant-binding sequence
 

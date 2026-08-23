@@ -9,14 +9,14 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
-export const RUNTIME_CONTRACT_VERSION = 22;
-export const SCHEMA_VERSION = 29;
-// v22 establishes the director's exact accepted-profile set.
-const PREVIOUS_RUNTIME_CONTRACT_VERSION = 21;
+export const RUNTIME_CONTRACT_VERSION = 23;
+export const SCHEMA_VERSION = 30;
+// v23 establishes governorship-rooted authority for one exact bootstrap Decision identity.
+const PREVIOUS_RUNTIME_CONTRACT_VERSION = 22;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-// Schema v29 separates one-shot bootstrap genesis receipts from operational actors.
-const PREVIOUS_SCHEMA_VERSION = 28;
+// Schema v30 adds immutable authority-root audit fields to Decisions.
+const PREVIOUS_SCHEMA_VERSION = 29;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatPrimaryProfile = {
@@ -990,6 +990,8 @@ export const MIGRATIONS: string[] = [
   CREATE UNIQUE INDEX IF NOT EXISTS bootstrap_derivation_one_per_target
     ON bootstrap_derivation_receipts(project_id);`,
   `ALTER TABLE bootstrap_derivation_receipts ADD COLUMN operational_actor_receipt_id TEXT;`,
+  `ALTER TABLE decisions ADD COLUMN authority_root_json TEXT CHECK (authority_root_json IS NULL OR json_valid(authority_root_json));
+   ALTER TABLE decisions ADD COLUMN authority_root_digest TEXT`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -1277,6 +1279,16 @@ export const contractDigest = sha256(canonicalJson({
     nativeWitnessMarker: "witness",
     refusal: "ROLE_CONTEXT_WITNESS",
   },
+  decisionAuthorityPolicy: {
+    crossProjectBootstrap: {
+      decisionClass: "operator_only",
+      repoTargetId: null,
+      scope: { operation: "cross_project_bootstrap", sourceProjectId: "request.projectId", targetProjectId: "distinct", repoTargetId: null },
+      options: { rootOfTrust: "host_local_operator" },
+      authority: "exact_verified_plugin_receipt_on_current_source_governorship_head",
+      rootFields: ["projectId", "governanceEpoch", "fenceToken", "actorReceiptId", "actorReceiptDigest"],
+    },
+  },
 }));
 const migrationArtifactSchema = z
   .object({
@@ -1489,6 +1501,26 @@ const decisionSchema = z
     decisionClass: id.optional(),
     options: z.unknown().optional(),
     resourceRevision: z.number().int().positive().default(1),
+  })
+  .strict();
+const crossProjectBootstrapScopeSchema = z
+  .object({
+    operation: z.literal("cross_project_bootstrap"),
+    sourceProjectId: id,
+    targetProjectId: id,
+    repoTargetId: z.null(),
+  })
+  .strict();
+const crossProjectBootstrapOptionsSchema = z
+  .object({ rootOfTrust: z.literal("host_local_operator") })
+  .strict();
+const decisionAuthorityRootSchema = z
+  .object({
+    projectId: id,
+    governanceEpoch: z.number().int().positive(),
+    fenceToken: id,
+    actorReceiptId: id,
+    actorReceiptDigest: digestSchema,
   })
   .strict();
 
@@ -3678,6 +3710,9 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
     if (identity.decisionClass === "review_adjudication") {
       throw refusal("WORK_ITEM_UNKNOWN", "review Decisions require an existing exact WorkItem and cannot be bootstrapped");
     }
+    if (isCrossProjectBootstrapDecision(request.projectId, identity.decisionClass, decision.repoTargetId, identity.scopeJson, identity.optionsJson)) {
+      throw refusal("ACTOR_RECEIPT_UNVERIFIED", "cross-project bootstrap Decisions require an existing source governorship root");
+    }
     db.prepare(
       `INSERT INTO decisions
         (decision_id, project_id, config_revision, repo_target_id, scope_json, scope_digest,
@@ -3922,13 +3957,7 @@ function requireBootstrapDecisionAuthority(
   sourceProjectId: string,
   targetProjectId: string,
 ): void {
-  requireCurrentAdoptedDecision(db, projectId, configRevision, decisionId, dispositionSequence);
-  const decision = asRow<{
-    decision_class: string | null;
-    repo_target_id: string | null;
-    scope_json: string;
-    options_json: string | null;
-  }>(db.prepare("SELECT decision_class, repo_target_id, scope_json, options_json FROM decisions WHERE decision_id = ?").get(decisionId));
+  const decision = asRow<DecisionRow>(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decisionId));
   let scope: unknown;
   let options: unknown;
   try {
@@ -3952,6 +3981,16 @@ function requireBootstrapDecisionAuthority(
   ) {
     throw refusal("BOOTSTRAP_AUTHORITY_INVALID", "bootstrap authorizing Decision is not the exact operator-scoped source-to-target authority");
   }
+  const sourceGovernor = asRow<{ actor_receipt_id: string }>(db.prepare(
+    "SELECT actor_receipt_id FROM project_governorship_heads JOIN project_governorships USING (project_id, governance_epoch) WHERE project_governorship_heads.project_id = ?",
+  ).get(sourceProjectId));
+  if (!sourceGovernor) throw refusal("GOVERNOR_UNAVAILABLE", "bootstrap source has no current governorship head");
+  const storedRoot = storedDecisionAuthorityRoot(decision);
+  const currentRoot = currentBootstrapDecisionAuthorityRootForActor(db, sourceProjectId, sourceGovernor.actor_receipt_id);
+  if (canonicalJson(storedRoot) !== canonicalJson(currentRoot)) {
+    throw refusal("GOVERNOR_EPOCH_STALE", "bootstrap Decision authority root is no longer the current source governorship root");
+  }
+  requireCurrentAdoptedDecision(db, projectId, configRevision, decisionId, dispositionSequence, "bootstrap", storedRoot);
 }
 
 function requireCurrentAdoptedDecision(
@@ -3961,6 +4000,7 @@ function requireCurrentAdoptedDecision(
   decisionId: string,
   dispositionSequence: number,
   authorityLabel = "bootstrap",
+  authorityRoot: DecisionAuthorityRoot | null = null,
 ): void {
   const decision = asRow<{
     decision_id: string; project_id: string; config_revision: number; repo_target_id: string | null; scope_json: string;
@@ -4000,10 +4040,13 @@ function requireCurrentAdoptedDecision(
     operatorReceiptId: actor.operator_receipt_id,
     retirementCondition: actor.retirement_condition,
   });
-  if (!actor || actor.project_id !== projectId || actor.actor_kind !== "role" || actor.verification_state !== "verified" || actor.receipt_digest !== actorDigest) {
+  const bootstrapPluginActor = authorityRoot !== null && disposition.actor_receipt_id === authorityRoot.actorReceiptId &&
+    actor?.actor_kind === "plugin" && actor.project_id === projectId && actor.verification_state === "verified" &&
+    actor.receipt_digest === authorityRoot.actorReceiptDigest;
+  if (!bootstrapPluginActor && (!actor || actor.project_id !== projectId || actor.actor_kind !== "role" || actor.verification_state !== "verified" || actor.receipt_digest !== actorDigest)) {
     throw refusal("ACTOR_RECEIPT_UNVERIFIED", "authorizing Decision actor receipt is not verified");
   }
-  requireRoleActorBinding(db, { projectId, actorReceiptId: disposition.actor_receipt_id } as ApplyRequest);
+  if (!bootstrapPluginActor) requireRoleActorBinding(db, { projectId, actorReceiptId: disposition.actor_receipt_id } as ApplyRequest);
 }
 
 function rotateMigrationGovernor(
@@ -4664,6 +4707,8 @@ interface DecisionRow {
   decision_class: string | null;
   options_json: string | null;
   decision_identity_digest: string | null;
+  authority_root_json: string | null;
+  authority_root_digest: string | null;
   current_resource_revision: number;
 }
 
@@ -4750,7 +4795,7 @@ function validateReviewDecisionCreate(
   }
 }
 
-function storedDecisionIdentityDigest(decision: DecisionRow): string | null {
+function storedDecisionIdentityDigest(decision: Pick<DecisionRow, "project_id" | "config_revision" | "repo_target_id" | "scope_json" | "decision_class" | "options_json">): string | null {
   if (!decision.decision_class || !decision.options_json) return null;
   try {
     return sha256(canonicalJson({
@@ -4764,6 +4809,134 @@ function storedDecisionIdentityDigest(decision: DecisionRow): string | null {
   } catch {
     return null;
   }
+}
+
+function isCrossProjectBootstrapDecision(
+  projectId: string,
+  decisionClass: string | null,
+  repoTargetId: string | null,
+  scopeJson: string,
+  optionsJson: string | null,
+): boolean {
+  if (decisionClass !== "operator_only" || repoTargetId !== null || !optionsJson) return false;
+  try {
+    const scope = crossProjectBootstrapScopeSchema.safeParse(JSON.parse(scopeJson));
+    const options = crossProjectBootstrapOptionsSchema.safeParse(JSON.parse(optionsJson));
+    return scope.success && options.success && scope.data.sourceProjectId === projectId && scope.data.targetProjectId !== projectId;
+  } catch {
+    return false;
+  }
+}
+
+type DecisionAuthorityRoot = z.infer<typeof decisionAuthorityRootSchema>;
+
+function decisionAuthorityRootDigest(root: DecisionAuthorityRoot): string {
+  return sha256(canonicalJson(root));
+}
+
+function currentBootstrapDecisionAuthorityRoot(db: SqliteDatabase, request: ApplyRequest): DecisionAuthorityRoot {
+  return currentBootstrapDecisionAuthorityRootForActor(db, request.projectId, requireActor(db, request));
+}
+
+function currentBootstrapDecisionAuthorityRootForActor(db: SqliteDatabase, projectId: string, actorReceiptId: string): DecisionAuthorityRoot {
+  const head = asRow<{
+    project_id: string;
+    governance_epoch: number;
+    fence_token: string;
+    state: string;
+    actor_receipt_id: string;
+  }>(db.prepare(
+    `SELECT heads.project_id, heads.governance_epoch, heads.fence_token, heads.state, governorships.actor_receipt_id
+     FROM project_governorship_heads AS heads
+     JOIN project_governorships AS governorships
+       ON governorships.project_id = heads.project_id AND governorships.governance_epoch = heads.governance_epoch
+     WHERE heads.project_id = ?`,
+  ).get(projectId));
+  if (!head) throw refusal("GOVERNOR_UNAVAILABLE", "project has no current governorship head");
+  if (head.actor_receipt_id !== actorReceiptId) {
+    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "bootstrap Decision authority requires the exact current governorship actor");
+  }
+  const actor = asRow<{
+    project_id: string;
+    actor_kind: string;
+    subject_id: string;
+    role_id: string | null;
+    role_generation: number | null;
+    verification_state: string;
+    operator_receipt_id: string | null;
+    retirement_condition: string | null;
+    receipt_digest: string;
+  }>(db.prepare(
+    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, receipt_digest FROM actor_receipts WHERE project_id = ? AND receipt_id = ?",
+  ).get(projectId, actorReceiptId));
+  if (isBootstrapGenesisReceipt(db, actorReceiptId)) {
+    throw refusal("BOOTSTRAP_GENESIS_REUSED", "bootstrap genesis receipt is single-use and cannot authorize a later Decision root");
+  }
+  const actorDigest = actor && actorReceiptDigest({
+    projectId: actor.project_id,
+    receiptId: actorReceiptId,
+    actorKind: actor.actor_kind,
+    subjectId: actor.subject_id,
+    roleId: actor.role_id,
+    roleGeneration: actor.role_generation,
+    verificationState: actor.verification_state,
+    operatorReceiptId: actor.operator_receipt_id,
+    retirementCondition: actor.retirement_condition,
+  });
+  if (!actor || actor.project_id !== projectId || actor.actor_kind !== "plugin" || actor.subject_id !== PLUGIN_ID ||
+      actor.verification_state !== "verified" || actor.receipt_digest !== actorDigest) {
+    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "bootstrap Decision authority requires a verified plugin governorship actor");
+  }
+  return {
+    projectId: head.project_id,
+    governanceEpoch: head.governance_epoch,
+    fenceToken: head.fence_token,
+    actorReceiptId,
+    actorReceiptDigest: actor.receipt_digest,
+  };
+}
+
+function storedDecisionAuthorityRoot(decision: DecisionRow): DecisionAuthorityRoot {
+  if (!decision.authority_root_json || !decision.authority_root_digest) {
+    throw refusal("DECISION_IDENTITY_CONFLICT", "bootstrap Decision has no immutable authority root");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decision.authority_root_json);
+  } catch {
+    throw refusal("DECISION_IDENTITY_CONFLICT", "bootstrap Decision authority root is malformed");
+  }
+  const root = decisionAuthorityRootSchema.safeParse(parsed);
+  if (!root.success || canonicalJson(root.data) !== decision.authority_root_json || decisionAuthorityRootDigest(root.data) !== decision.authority_root_digest) {
+    throw refusal("DECISION_IDENTITY_CONFLICT", "bootstrap Decision authority root integrity is invalid");
+  }
+  return root.data;
+}
+
+function requireDecisionAuthority(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  decision: Pick<DecisionRow, "project_id" | "repo_target_id" | "scope_json" | "decision_class" | "options_json" | "authority_root_json" | "authority_root_digest">,
+  capture = false,
+): { actorReceiptId: string; authorityRoot: DecisionAuthorityRoot | null } {
+  const bootstrap = isCrossProjectBootstrapDecision(
+    decision.project_id,
+    decision.decision_class,
+    decision.repo_target_id,
+    decision.scope_json,
+    decision.options_json,
+  );
+  if (!bootstrap) return { actorReceiptId: requireDecisionActor(db, request), authorityRoot: null };
+  if (capture) {
+    const root = currentBootstrapDecisionAuthorityRoot(db, request);
+    return { actorReceiptId: root.actorReceiptId, authorityRoot: root };
+  }
+  const stored = storedDecisionAuthorityRoot(decision as DecisionRow);
+  const current = currentBootstrapDecisionAuthorityRoot(db, request);
+  if (canonicalJson(stored) !== canonicalJson(current)) {
+    throw refusal("GOVERNOR_EPOCH_STALE", "bootstrap Decision authority root is no longer the current source governorship root");
+  }
+  return { actorReceiptId: current.actorReceiptId, authorityRoot: stored };
 }
 
 function requireDecisionActor(db: SqliteDatabase, request: ApplyRequest): string {
@@ -4795,7 +4968,16 @@ function applyDecisionCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
   }
   const identity = decisionIdentity(request.projectId, currentRevision, decision);
   validateReviewDecisionCreate(db, request, decision, identity, currentRevision);
-  const actorReceiptId = requireDecisionActor(db, request);
+  const authority = requireDecisionAuthority(db, request, {
+    project_id: request.projectId,
+    repo_target_id: decision.repoTargetId,
+    scope_json: identity.scopeJson,
+    decision_class: identity.decisionClass,
+    options_json: identity.optionsJson,
+    authority_root_json: null,
+    authority_root_digest: null,
+  }, true);
+  const actorReceiptId = authority.actorReceiptId;
   const existing = asRow<DecisionRow>(db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decision.decisionId));
   if (existing) {
     if (existing.project_id !== request.projectId || existing.decision_identity_digest !== identity.identityDigest) {
@@ -4806,8 +4988,8 @@ function applyDecisionCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
   db.prepare(
     `INSERT INTO decisions
       (decision_id, project_id, config_revision, repo_target_id, scope_json, scope_digest,
-       current_resource_revision, decision_class, options_json, decision_identity_digest)
-     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+       current_resource_revision, decision_class, options_json, decision_identity_digest, authority_root_json, authority_root_digest)
+     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
   ).run(
     decision.decisionId,
     request.projectId,
@@ -4818,6 +5000,8 @@ function applyDecisionCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
     identity.decisionClass,
     identity.optionsJson,
     identity.identityDigest,
+    authority.authorityRoot ? canonicalJson(authority.authorityRoot) : null,
+    authority.authorityRoot ? decisionAuthorityRootDigest(authority.authorityRoot) : null,
   );
   return commitMutation(
     db,
@@ -4949,7 +5133,8 @@ function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, dig
   ) {
     throw refusal("DECISION_IDENTITY_CONFLICT", "decision has no valid immutable typed identity");
   }
-  const actorReceiptId = requireDecisionActor(db, request);
+  const authority = requireDecisionAuthority(db, request, decision);
+  const actorReceiptId = authority.actorReceiptId;
   if (decision.config_revision !== currentRevision) {
     throw refusal("PROJECT_CONFIG_STALE", "decision is bound to a stale config revision", {
       currentConfigRevision: currentRevision,
@@ -8247,6 +8432,7 @@ function decisionDoctorEvidence(db: SqliteDatabase, projectId: string): {
   const derivedHolds: Array<{ decisionId: string; holdCode: string; setterSequence: number }> = [];
   let relationCount = 0;
   for (const decision of decisions) {
+    let bootstrapAuthorityRoot: DecisionAuthorityRoot | null = null;
     if (
       !(DECISION_CLASSES as readonly string[]).includes(decision.decision_class ?? "") ||
       !decision.options_json || !decision.decision_identity_digest ||
@@ -8254,6 +8440,21 @@ function decisionDoctorEvidence(db: SqliteDatabase, projectId: string): {
       storedDecisionIdentityDigest(decision) !== decision.decision_identity_digest
     ) {
       unresolvedDecisions.push({ decisionId: decision.decision_id, reason: "DECISION_IDENTITY_CONFLICT" });
+    }
+    if (isCrossProjectBootstrapDecision(decision.project_id, decision.decision_class, decision.repo_target_id, decision.scope_json, decision.options_json)) {
+      try {
+        const head = asRow<{ actor_receipt_id: string }>(db.prepare(
+          "SELECT project_governorships.actor_receipt_id FROM project_governorship_heads JOIN project_governorships USING (project_id, governance_epoch) WHERE project_governorship_heads.project_id = ?",
+        ).get(projectId));
+        const storedRoot = storedDecisionAuthorityRoot(decision);
+        const currentRoot = head && currentBootstrapDecisionAuthorityRootForActor(db, projectId, head.actor_receipt_id);
+        if (!currentRoot || canonicalJson(storedRoot) !== canonicalJson(currentRoot)) {
+          throw new Error("authority root is not current");
+        }
+        bootstrapAuthorityRoot = storedRoot;
+      } catch {
+        unresolvedDecisions.push({ decisionId: decision.decision_id, reason: "DECISION_AUTHORITY_ROOT_INVALID" });
+      }
     }
     const dispositions = db.prepare(
       "SELECT * FROM decision_dispositions WHERE decision_id = ? ORDER BY disposition_sequence",
@@ -8273,7 +8474,10 @@ function decisionDoctorEvidence(db: SqliteDatabase, projectId: string): {
       const pluginActor = actor?.actor_kind === "plugin" && decision.decision_class === "operator_only" && actor.subject_id === PLUGIN_ID &&
         actor.retirement_condition === OPERATOR_RECEIPT_RETIREMENT_CONDITION && linkedReceipt?.caller_plugin_id === PLUGIN_ID &&
         linkedReceipt.mutation_class === "decision_disposition";
-      if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || (!pluginActor && !["role", "operator"].includes(actor.actor_kind))) {
+      const bootstrapPluginActor = bootstrapAuthorityRoot !== null && disposition.actor_receipt_id === bootstrapAuthorityRoot.actorReceiptId &&
+        actor?.actor_kind === "plugin" && actor.project_id === projectId && actor.verification_state === "verified" &&
+        actor.receipt_digest === bootstrapAuthorityRoot.actorReceiptDigest;
+      if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || (!pluginActor && !bootstrapPluginActor && !["role", "operator"].includes(actor.actor_kind))) {
         issues.push({ decisionId: decision.decision_id, reason: "decision_actor_invalid" });
       } else {
         const receiptDigest = actorReceiptDigest({
