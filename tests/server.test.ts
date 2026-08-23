@@ -5244,20 +5244,21 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared", thread_id: null });
   });
 
-  it("recovers an exact legacy prepared reason after complete no-match evidence", async () => {
+  it("recovers an exact legacy receipt after complete no-current-marker evidence", async () => {
     const fixture = await fleetWatchdogFixture(0, true, 1, false);
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
     const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
     const spawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
     const { threadId: _threadId, ...intentAttempt } = request.workAttempt!;
-    const preparedRequest = { ...request, workAttempt: intentAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=${encodeURIComponent(spawn.title)}` };
-    expect(applyWithFixtureReceipt(fixture.db, preparedRequest)).toMatchObject({ outcome: "OK" });
-    fixture.db.prepare("UPDATE execution_attempts SET reason_code = ? WHERE project_id = ? AND work_item_id = ? AND state = 'prepared' AND thread_id IS NULL").run(
-      `work_item_dispatch_intent:${request.idempotencyKey}:parent=${fixture.orchestratorThreadId}`,
-      PROJECT_ID,
-      WORK_ITEM_ID,
-    );
-    fixture.host.harness.sdk.stub("threads.list", (async () => []) as never);
+    const legacyRequest = { ...request, workAttempt: intentAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+    expect(applyWithFixtureReceipt(fixture.db, legacyRequest)).toMatchObject({ outcome: "OK" });
+    expect(fixture.db.prepare("SELECT reason_code FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ reason_code: `work_item_dispatch_intent:${request.idempotencyKey}:parent=${fixture.orchestratorThreadId}` });
+    expect(fixture.db.prepare("SELECT request_digest FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?").get(PROJECT_ID, request.idempotencyKey)).toEqual({ request_digest: mutationRequestDigest(parseApplyRequest(legacyRequest)) });
+    const historicalChildren = [
+      ...Array.from({ length: 68 }, (_, index) => makeThreadResponse({ id: `historical-active-${index}`, projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: `historical-active-${index} [dispatch:orch-g5-wi-gh-${571 + index}-dispatch-v1]` })),
+      ...Array.from({ length: 4 }, (_, index) => makeThreadResponse({ id: `historical-archived-${index}`, projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: `historical-archived-${index} [dispatch:orch-g5-wi-gh-${639 + index}-dispatch-v1]`, archivedAt: 1 })),
+    ];
+    fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => historicalChildren.filter((thread) => archived ? thread.archivedAt !== null : thread.archivedAt === null)) as never);
     let spawnCalls = 0;
     fixture.host.harness.sdk.stub("threads.spawn", (async (input: { projectId: string; parentThreadId?: string; title?: string }) => {
       spawnCalls += 1;
@@ -5269,19 +5270,47 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(fixture.db.prepare("SELECT state, thread_id, reason_code FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "running", thread_id: "legacy-recovered", reason_code: "work_item_dispatch" });
   });
 
+  it("does not select legacy receipt compatibility for mismatched dispatch context", async () => {
+    const cases = ["parent", "project", "work item", "idempotency", "profile", "lifecycle"] as const;
+    for (const name of cases) {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+      const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+      const spawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
+      const { threadId: _threadId, ...intentAttempt } = request.workAttempt!;
+      const legacyRequest = { ...request, workAttempt: intentAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+      expect(applyWithFixtureReceipt(fixture.db, legacyRequest)).toMatchObject({ outcome: "OK" });
+      const replayRequest = name === "work item"
+        ? { ...request, workItemId: "other-work-item" }
+        : name === "idempotency"
+          ? { ...request, idempotencyKey: "other-idempotency" }
+          : name === "profile"
+            ? { ...request, workAttempt: { ...request.workAttempt!, requestedProfile: { ...ROLE_PROFILE, model: "other-model" } } }
+            : name === "lifecycle"
+              ? { ...request, lifecycleState: "ready" as const }
+              : request;
+      const replaySpawn = name === "parent"
+        ? { ...spawn, parentThreadId: "other-orchestrator" }
+        : name === "project"
+          ? { ...spawn, projectId: "project-foreign" }
+          : spawn;
+      let spawnCalls = 0;
+      fixture.host.harness.sdk.stub("threads.spawn", (async () => { spawnCalls += 1; throw new Error("mismatched replay must not spawn"); }) as never);
+      const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", { request: replayRequest, spawn: replaySpawn }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+      expect(result.outcome).not.toBe("OK");
+      expect(spawnCalls).toBe(0);
+      expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared", thread_id: null });
+    }
+  });
+
   it("binds one exact active legacy prepared marker only to the replay title", async () => {
     const fixture = await fleetWatchdogFixture(0, true, 1, false);
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
     const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
     const spawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
     const { threadId: _threadId, ...intentAttempt } = request.workAttempt!;
-    const preparedRequest = { ...request, workAttempt: intentAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=${encodeURIComponent(spawn.title)}` };
-    expect(applyWithFixtureReceipt(fixture.db, preparedRequest)).toMatchObject({ outcome: "OK" });
-    fixture.db.prepare("UPDATE execution_attempts SET reason_code = ? WHERE project_id = ? AND work_item_id = ? AND state = 'prepared' AND thread_id IS NULL").run(
-      `work_item_dispatch_intent:${request.idempotencyKey}:parent=${fixture.orchestratorThreadId}`,
-      PROJECT_ID,
-      WORK_ITEM_ID,
-    );
+    const legacyRequest = { ...request, workAttempt: intentAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+    expect(applyWithFixtureReceipt(fixture.db, legacyRequest)).toMatchObject({ outcome: "OK" });
     fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => archived ? [] : [makeThreadResponse({
       id: "legacy-existing",
       projectId: PROJECT_ID,
@@ -5305,13 +5334,8 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
       const spawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
       const { threadId: _threadId, ...intentAttempt } = request.workAttempt!;
-      const preparedRequest = { ...request, workAttempt: intentAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=${encodeURIComponent(spawn.title)}` };
-      expect(applyWithFixtureReceipt(fixture.db, preparedRequest)).toMatchObject({ outcome: "OK" });
-      fixture.db.prepare("UPDATE execution_attempts SET reason_code = ? WHERE project_id = ? AND work_item_id = ? AND state = 'prepared' AND thread_id IS NULL").run(
-        `work_item_dispatch_intent:${request.idempotencyKey}:parent=${fixture.orchestratorThreadId}`,
-        PROJECT_ID,
-        WORK_ITEM_ID,
-      );
+      const legacyRequest = { ...request, workAttempt: intentAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+      expect(applyWithFixtureReceipt(fixture.db, legacyRequest)).toMatchObject({ outcome: "OK" });
       const marker = `[dispatch:${request.idempotencyKey}]`;
       const threads = name === "archived"
         ? [makeThreadResponse({ id: "archived", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: `lane ${marker}`, archivedAt: 1 })]
@@ -5338,13 +5362,8 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
     const spawn = { projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, environment: { type: "project-default" }, title: "lane", prompt: "lane brief" };
     const { threadId: _threadId, ...intentAttempt } = request.workAttempt!;
-    const preparedRequest = { ...request, workAttempt: intentAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=${encodeURIComponent(spawn.title)}` };
-    expect(applyWithFixtureReceipt(fixture.db, preparedRequest)).toMatchObject({ outcome: "OK" });
-    fixture.db.prepare("UPDATE execution_attempts SET reason_code = ? WHERE project_id = ? AND work_item_id = ? AND state = 'prepared' AND thread_id IS NULL").run(
-      `work_item_dispatch_intent:${request.idempotencyKey}:parent=${fixture.orchestratorThreadId}`,
-      PROJECT_ID,
-      WORK_ITEM_ID,
-    );
+    const legacyRequest = { ...request, workAttempt: intentAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+    expect(applyWithFixtureReceipt(fixture.db, legacyRequest)).toMatchObject({ outcome: "OK" });
     fixture.host.harness.sdk.stub("threads.list", (async ({ archived, offset }: { archived?: boolean; offset?: number }) => {
       if (archived) return [];
       if (offset === 0) return Array.from({ length: 1000 }, (_, index) => makeThreadResponse({ id: `page-${index}`, projectId: PROJECT_ID }));

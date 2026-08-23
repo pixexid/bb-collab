@@ -926,9 +926,13 @@ async function dispatchLane(
   const dispatchParentThreadId = spawnShape.data.parentThreadId;
   const dispatchTitle = String(spawnShape.data.title ?? "lane");
   const { threadId: _threadId, ...intentAttempt } = request.workAttempt;
+  const existing = preparedDispatchIntent(db, request);
+  const legacyReplay = existing !== null && existing !== "ambiguous" && existing.title === null && existing.parentThreadId === dispatchParentThreadId;
   const intent = await applyLiveAuthorizedMutation(bb, db, {
     ...request,
-    reasonCode: `dispatch_parent:${dispatchParentThreadId}:title=${encodeURIComponent(dispatchTitle)}`,
+    reasonCode: legacyReplay
+      ? `dispatch_parent:${dispatchParentThreadId}`
+      : `dispatch_parent:${dispatchParentThreadId}:title=${encodeURIComponent(dispatchTitle)}`,
     workAttempt: intentAttempt,
   }, false, "stop-active");
   if (intent.outcome !== "OK") return intent;
