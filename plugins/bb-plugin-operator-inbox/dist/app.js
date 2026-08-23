@@ -49,6 +49,188 @@ var {
   version
 } = mod;
 
+// ../../node_modules/@phosphor-icons/react/dist/defs/Archive.es.js
+var e = /* @__PURE__ */ new Map([
+  [
+    "bold",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M224,44H32A20,20,0,0,0,12,64V88a20,20,0,0,0,16,19.6V192a20,20,0,0,0,20,20H208a20,20,0,0,0,20-20V107.6A20,20,0,0,0,244,88V64A20,20,0,0,0,224,44ZM36,68H220V84H36ZM52,188V108H204v80Zm112-52a12,12,0,0,1-12,12H104a12,12,0,0,1,0-24h48A12,12,0,0,1,164,136Z" }))
+  ],
+  [
+    "duotone",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M216,96v96a8,8,0,0,1-8,8H48a8,8,0,0,1-8-8V96Z", opacity: "0.2" }), /* @__PURE__ */ createElement("path", { d: "M224,48H32A16,16,0,0,0,16,64V88a16,16,0,0,0,16,16v88a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V104a16,16,0,0,0,16-16V64A16,16,0,0,0,224,48ZM208,192H48V104H208ZM224,88H32V64H224V88ZM96,136a8,8,0,0,1,8-8h48a8,8,0,0,1,0,16H104A8,8,0,0,1,96,136Z" }))
+  ],
+  [
+    "fill",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M224,48H32A16,16,0,0,0,16,64V88a16,16,0,0,0,16,16v88a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V104a16,16,0,0,0,16-16V64A16,16,0,0,0,224,48Zm-72,96H104a8,8,0,0,1,0-16h48a8,8,0,0,1,0,16Zm72-56H32V64H224V88Z" }))
+  ],
+  [
+    "light",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M224,50H32A14,14,0,0,0,18,64V88a14,14,0,0,0,14,14h2v90a14,14,0,0,0,14,14H208a14,14,0,0,0,14-14V102h2a14,14,0,0,0,14-14V64A14,14,0,0,0,224,50ZM210,192a2,2,0,0,1-2,2H48a2,2,0,0,1-2-2V102H210ZM226,88a2,2,0,0,1-2,2H32a2,2,0,0,1-2-2V64a2,2,0,0,1,2-2H224a2,2,0,0,1,2,2ZM98,136a6,6,0,0,1,6-6h48a6,6,0,0,1,0,12H104A6,6,0,0,1,98,136Z" }))
+  ],
+  [
+    "regular",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M224,48H32A16,16,0,0,0,16,64V88a16,16,0,0,0,16,16v88a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V104a16,16,0,0,0,16-16V64A16,16,0,0,0,224,48ZM208,192H48V104H208ZM224,88H32V64H224V88ZM96,136a8,8,0,0,1,8-8h48a8,8,0,0,1,0,16H104A8,8,0,0,1,96,136Z" }))
+  ],
+  [
+    "thin",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M224,52H32A12,12,0,0,0,20,64V88a12,12,0,0,0,12,12h4v92a12,12,0,0,0,12,12H208a12,12,0,0,0,12-12V100h4a12,12,0,0,0,12-12V64A12,12,0,0,0,224,52ZM212,192a4,4,0,0,1-4,4H48a4,4,0,0,1-4-4V100H212ZM228,88a4,4,0,0,1-4,4H32a4,4,0,0,1-4-4V64a4,4,0,0,1,4-4H224a4,4,0,0,1,4,4ZM100,136a4,4,0,0,1,4-4h48a4,4,0,0,1,0,8H104A4,4,0,0,1,100,136Z" }))
+  ]
+]);
+
+// ../../node_modules/@phosphor-icons/react/dist/defs/ArrowClockwise.es.js
+var a = /* @__PURE__ */ new Map([
+  [
+    "bold",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M244,56v48a12,12,0,0,1-12,12H184a12,12,0,1,1,0-24H201.1l-19-17.38c-.13-.12-.26-.24-.38-.37A76,76,0,1,0,127,204h1a75.53,75.53,0,0,0,52.15-20.72,12,12,0,0,1,16.49,17.45A99.45,99.45,0,0,1,128,228h-1.37A100,100,0,1,1,198.51,57.06L220,76.72V56a12,12,0,0,1,24,0Z" }))
+  ],
+  [
+    "duotone",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M216,128a88,88,0,1,1-88-88A88,88,0,0,1,216,128Z", opacity: "0.2" }), /* @__PURE__ */ createElement("path", { d: "M240,56v48a8,8,0,0,1-8,8H184a8,8,0,0,1,0-16H211.4L184.81,71.64l-.25-.24a80,80,0,1,0-1.67,114.78,8,8,0,0,1,11,11.63A95.44,95.44,0,0,1,128,224h-1.32A96,96,0,1,1,195.75,60L224,85.8V56a8,8,0,1,1,16,0Z" }))
+  ],
+  [
+    "fill",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M240,56v48a8,8,0,0,1-8,8H184a8,8,0,0,1-5.66-13.66l17-17-10.55-9.65-.25-.24a80,80,0,1,0-1.67,114.78,8,8,0,1,1,11,11.63A95.44,95.44,0,0,1,128,224h-1.32A96,96,0,1,1,195.75,60l10.93,10L226.34,50.3A8,8,0,0,1,240,56Z" }))
+  ],
+  [
+    "light",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M238,56v48a6,6,0,0,1-6,6H184a6,6,0,0,1,0-12h32.55l-30.38-27.8c-.06-.06-.12-.13-.19-.19a82,82,0,1,0-1.7,117.65,6,6,0,0,1,8.24,8.73A93.46,93.46,0,0,1,128,222h-1.28A94,94,0,1,1,194.37,61.4L226,90.35V56a6,6,0,1,1,12,0Z" }))
+  ],
+  [
+    "regular",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M240,56v48a8,8,0,0,1-8,8H184a8,8,0,0,1,0-16H211.4L184.81,71.64l-.25-.24a80,80,0,1,0-1.67,114.78,8,8,0,0,1,11,11.63A95.44,95.44,0,0,1,128,224h-1.32A96,96,0,1,1,195.75,60L224,85.8V56a8,8,0,1,1,16,0Z" }))
+  ],
+  [
+    "thin",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M236,56v48a4,4,0,0,1-4,4H184a4,4,0,0,1,0-8h37.7L187.53,68.69l-.13-.12a84,84,0,1,0-1.75,120.51,4,4,0,0,1,5.5,5.82A91.43,91.43,0,0,1,128,220h-1.26A92,92,0,1,1,193,62.84l35,32.05V56a4,4,0,1,1,8,0Z" }))
+  ]
+]);
+
+// ../../node_modules/@phosphor-icons/react/dist/defs/EnvelopeOpen.es.js
+var l = /* @__PURE__ */ new Map([
+  [
+    "bold",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M230.66,86l-96-64a12,12,0,0,0-13.32,0l-96,64A12,12,0,0,0,20,96V200a20,20,0,0,0,20,20H216a20,20,0,0,0,20-20V96A12,12,0,0,0,230.66,86ZM89.81,152,44,184.31v-65ZM114.36,164h27.28L187,196H69.05ZM166.19,152,212,119.29v65ZM128,46.42l74.86,49.91L141.61,140H114.39L53.14,96.33Z" }))
+  ],
+  [
+    "duotone",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M224,96l-78.55,56h-34.9L32,96l96-64Z", opacity: "0.2" }), /* @__PURE__ */ createElement("path", { d: "M228.44,89.34l-96-64a8,8,0,0,0-8.88,0l-96,64A8,8,0,0,0,24,96V200a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V96A8,8,0,0,0,228.44,89.34ZM96.72,152,40,192V111.53Zm16.37,8h29.82l56.63,40H56.46Zm46.19-8L216,111.53V192ZM128,41.61l81.91,54.61-67,47.78H113.11l-67-47.78Z" }))
+  ],
+  [
+    "fill",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M228.44,89.34l-96-64a8,8,0,0,0-8.88,0l-96,64A8,8,0,0,0,24,96V200a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V96A8,8,0,0,0,228.44,89.34ZM96.72,152,40,192V111.53Zm16.37,8h29.82l56.63,40H56.46Zm46.19-8L216,111.53V192Z" }))
+  ],
+  [
+    "light",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M227.33,91l-96-64a6,6,0,0,0-6.66,0l-96,64A6,6,0,0,0,26,96V200a14,14,0,0,0,14,14H216a14,14,0,0,0,14-14V96A6,6,0,0,0,227.33,91ZM100.18,152,38,195.9V107.65Zm12.27,6h31.1l62.29,44H50.16Zm43.37-6L218,107.65V195.9ZM128,39.21l85.43,57L143.53,146H112.47L42.57,96.17Z" }))
+  ],
+  [
+    "regular",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M228.44,89.34l-96-64a8,8,0,0,0-8.88,0l-96,64A8,8,0,0,0,24,96V200a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V96A8,8,0,0,0,228.44,89.34ZM96.72,152,40,192V111.53Zm16.37,8h29.82l56.63,40H56.46Zm46.19-8L216,111.53V192ZM128,41.61l81.91,54.61-67,47.78H113.11l-67-47.78Z" }))
+  ],
+  [
+    "thin",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M226.22,92.67l-96-64a4,4,0,0,0-4.44,0l-96,64A4,4,0,0,0,28,96V200a12,12,0,0,0,12,12H216a12,12,0,0,0,12-12V96A4,4,0,0,0,226.22,92.67ZM103.63,152,36,199.76v-96Zm8.19,4h32.36l68,48H43.86Zm40.55-4L220,103.76v96ZM128,36.81,217,96.11,144.17,148H111.83L39.05,96.11Z" }))
+  ]
+]);
+
+// ../../node_modules/@phosphor-icons/react/dist/defs/PaperPlaneTilt.es.js
+var e2 = /* @__PURE__ */ new Map([
+  [
+    "bold",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M230.14,25.86a20,20,0,0,0-19.57-5.11l-.22.07L18.44,79a20,20,0,0,0-3.06,37.25L99,157l40.71,83.65a19.81,19.81,0,0,0,18,11.38c.57,0,1.15,0,1.73-.07A19.82,19.82,0,0,0,177,237.56L235.18,45.65a1.42,1.42,0,0,0,.07-.22A20,20,0,0,0,230.14,25.86ZM156.91,221.07l-34.37-70.64,46-45.95a12,12,0,0,0-17-17l-46,46L34.93,99.09,210,46Z" }))
+  ],
+  [
+    "duotone",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement(
+      "path",
+      {
+        d: "M223.69,42.18l-58.22,192a8,8,0,0,1-14.92,1.25L108,148,20.58,105.45a8,8,0,0,1,1.25-14.92l192-58.22A8,8,0,0,1,223.69,42.18Z",
+        opacity: "0.2"
+      }
+    ), /* @__PURE__ */ createElement("path", { d: "M227.32,28.68a16,16,0,0,0-15.66-4.08l-.15,0L19.57,82.84a16,16,0,0,0-2.49,29.8L102,154l41.3,84.87A15.86,15.86,0,0,0,157.74,248q.69,0,1.38-.06a15.88,15.88,0,0,0,14-11.51l58.2-191.94c0-.05,0-.1,0-.15A16,16,0,0,0,227.32,28.68ZM157.83,231.85l-.05.14,0-.07-40.06-82.3,48-48a8,8,0,0,0-11.31-11.31l-48,48L24.08,98.25l-.07,0,.14,0L216,40Z" }))
+  ],
+  [
+    "fill",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M231.4,44.34s0,.1,0,.15l-58.2,191.94a15.88,15.88,0,0,1-14,11.51q-.69.06-1.38.06a15.86,15.86,0,0,1-14.42-9.15L107,164.15a4,4,0,0,1,.77-4.58l57.92-57.92a8,8,0,0,0-11.31-11.31L96.43,148.26a4,4,0,0,1-4.58.77L17.08,112.64a16,16,0,0,1,2.49-29.8l191.94-58.2.15,0A16,16,0,0,1,231.4,44.34Z" }))
+  ],
+  [
+    "light",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M225.88,30.12a13.83,13.83,0,0,0-13.7-3.58l-.11,0L20.14,84.77A14,14,0,0,0,18,110.85l85.56,41.64L145.12,238a13.87,13.87,0,0,0,12.61,8c.4,0,.81,0,1.21-.05a13.9,13.9,0,0,0,12.29-10.09l58.2-191.93,0-.11A13.83,13.83,0,0,0,225.88,30.12Zm-8,10.4L159.73,232.43l0,.11a2,2,0,0,1-3.76.26l-40.68-83.58,49-49a6,6,0,1,0-8.49-8.49l-49,49L23.15,100a2,2,0,0,1,.31-3.74l.11,0L215.48,38.08a1.94,1.94,0,0,1,1.92.52A2,2,0,0,1,217.92,40.52Z" }))
+  ],
+  [
+    "regular",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M227.32,28.68a16,16,0,0,0-15.66-4.08l-.15,0L19.57,82.84a16,16,0,0,0-2.49,29.8L102,154l41.3,84.87A15.86,15.86,0,0,0,157.74,248q.69,0,1.38-.06a15.88,15.88,0,0,0,14-11.51l58.2-191.94c0-.05,0-.1,0-.15A16,16,0,0,0,227.32,28.68ZM157.83,231.85l-.05.14,0-.07-40.06-82.3,48-48a8,8,0,0,0-11.31-11.31l-48,48L24.08,98.25l-.07,0,.14,0L216,40Z" }))
+  ],
+  [
+    "thin",
+    /* @__PURE__ */ createElement(Fragment, null, /* @__PURE__ */ createElement("path", { d: "M224.47,31.52a11.87,11.87,0,0,0-11.82-3L20.74,86.67a12,12,0,0,0-1.91,22.38L105,151l41.92,86.15A11.88,11.88,0,0,0,157.74,244c.34,0,.69,0,1,0a11.89,11.89,0,0,0,10.52-8.63l58.21-192,0-.08A11.85,11.85,0,0,0,224.47,31.52Zm-4.62,9.54-58.23,192a4,4,0,0,1-7.48.59l-41.3-84.86,50-50a4,4,0,1,0-5.66-5.66l-50,50-84.9-41.31a3.88,3.88,0,0,1-2.27-4,3.93,3.93,0,0,1,3-3.54L214.9,36.16A3.93,3.93,0,0,1,216,36a4,4,0,0,1,2.79,1.19A3.93,3.93,0,0,1,219.85,41.06Z" }))
+  ]
+]);
+
+// ../../node_modules/@phosphor-icons/react/dist/lib/context.es.js
+var o = createContext({
+  color: "currentColor",
+  size: "1em",
+  weight: "regular",
+  mirrored: false
+});
+
+// ../../node_modules/@phosphor-icons/react/dist/lib/IconBase.es.js
+var p = forwardRef(
+  (s2, a3) => {
+    const {
+      alt: n,
+      color: r2,
+      size: t,
+      weight: o4,
+      mirrored: c2,
+      children: i,
+      weights: m3,
+      ...x
+    } = s2, {
+      color: d = "currentColor",
+      size: l2,
+      weight: f = "regular",
+      mirrored: g = false,
+      ...w
+    } = useContext(o);
+    return /* @__PURE__ */ createElement(
+      "svg",
+      {
+        ref: a3,
+        xmlns: "http://www.w3.org/2000/svg",
+        width: t != null ? t : l2,
+        height: t != null ? t : l2,
+        fill: r2 != null ? r2 : d,
+        viewBox: "0 0 256 256",
+        transform: c2 || g ? "scale(-1, 1)" : void 0,
+        ...w,
+        ...x
+      },
+      !!n && /* @__PURE__ */ createElement("title", null, n),
+      i,
+      m3.get(o4 != null ? o4 : f)
+    );
+  }
+);
+p.displayName = "IconBase";
+
+// ../../node_modules/@phosphor-icons/react/dist/csr/Archive.es.js
+var o2 = forwardRef((r2, c2) => /* @__PURE__ */ createElement(p, { ref: c2, ...r2, weights: e }));
+o2.displayName = "ArchiveIcon";
+
+// ../../node_modules/@phosphor-icons/react/dist/csr/ArrowClockwise.es.js
+var r = forwardRef((e3, c2) => /* @__PURE__ */ createElement(p, { ref: c2, ...e3, weights: a }));
+r.displayName = "ArrowClockwiseIcon";
+
+// ../../node_modules/@phosphor-icons/react/dist/csr/EnvelopeOpen.es.js
+var o3 = forwardRef((n, p2) => /* @__PURE__ */ createElement(p, { ref: p2, ...n, weights: l }));
+o3.displayName = "EnvelopeOpenIcon";
+
+// ../../node_modules/@phosphor-icons/react/dist/csr/PaperPlaneTilt.es.js
+var a2 = forwardRef((o4, r2) => /* @__PURE__ */ createElement(p, { ref: r2, ...o4, weights: e2 }));
+a2.displayName = "PaperPlaneTiltIcon";
+
 // bb-plugin-runtime-shim:@get-bb/plugin-sdk/app
 var runtime2 = globalThis.__bbPluginRuntime;
 if (runtime2 == null || runtime2.pluginSdkApp == null) {
@@ -78,9 +260,9 @@ var {
 var INBOX_NAV_REGION_SELECTOR = '[data-testid="plugin-nav-sidebar-items"]';
 var INBOX_NAV_ROW_TITLE = "Inbox";
 var LANES_NAV_ROW_TITLE = "Lanes";
-var INBOX_UNREAD_MARKER = "data-bb-collab-inbox-unread";
 var INBOX_INDICATOR_BROKEN_TITLE = "Inbox unread indicator broken";
-var DOT_STYLE = "margin-left:auto;flex:0 0 auto;width:0.5rem;height:0.5rem;border-radius:9999px;background-color:currentColor";
+var LEGACY_UNREAD_MARKER = "[data-bb-collab-inbox-unread]";
+var paintedRows = /* @__PURE__ */ new Map();
 var RENDERING_ATTRIBUTES = [
   "d",
   "points",
@@ -113,32 +295,99 @@ function navRows(root) {
 function rowsTitled(rows, title) {
   return rows.filter((row) => row.textContent?.trim() === title);
 }
+function resolveGlyph(row) {
+  const assets = Array.from(row.querySelectorAll("[data-plugin-icon-asset]"));
+  if (assets.length > 1) return { reason: `the ${INBOX_NAV_ROW_TITLE} row has ${assets.length} plugin icon assets, expected exactly 1` };
+  if (assets.length === 1) return { element: assets[0] };
+  const svgs = Array.from(row.querySelectorAll("svg"));
+  if (svgs.length > 1) return { reason: `the ${INBOX_NAV_ROW_TITLE} row has ${svgs.length} SVG glyphs and no plugin icon asset, expected exactly 1` };
+  if (svgs.length === 1) return { element: svgs[0] };
+  return { reason: `the ${INBOX_NAV_ROW_TITLE} row has neither a plugin icon asset nor an SVG glyph` };
+}
+function restoreAttribute(element, name, value) {
+  if (value === null) element.removeAttribute(name);
+  else element.setAttribute(name, value);
+}
+function restoreSnapshot(row, snapshot) {
+  restoreAttribute(row, "aria-label", snapshot.ariaLabel);
+  restoreAttribute(row, "title", snapshot.title);
+  restoreAttribute(snapshot.glyph, "class", snapshot.glyphClass);
+  restoreAttribute(snapshot.glyph, "style", snapshot.glyphStyle);
+}
+function clearPaintedRows(keep) {
+  for (const [row, snapshot] of paintedRows) {
+    if (row === keep) continue;
+    row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
+    restoreSnapshot(row, snapshot);
+    paintedRows.delete(row);
+  }
+}
+function cleanupDetachedRows(root) {
+  const owner = root;
+  for (const [row, snapshot] of paintedRows) {
+    if (row.isConnected || owner.contains(row)) continue;
+    restoreSnapshot(row, snapshot);
+    paintedRows.delete(row);
+  }
+}
+function restoreNavState(row) {
+  row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
+  const snapshot = paintedRows.get(row);
+  if (snapshot === void 0) return;
+  restoreSnapshot(row, snapshot);
+  paintedRows.delete(row);
+}
 function paintInboxNavUnread(root, unread) {
+  cleanupDetachedRows(root);
   const rows = navRows(root);
   if (rows === null) {
+    clearPaintedRows();
     return { matched: false, reason: `no element matches ${INBOX_NAV_REGION_SELECTOR}` };
   }
   const matches = rowsTitled(rows, INBOX_NAV_ROW_TITLE);
   if (matches.length !== 1) {
+    clearPaintedRows();
     return { matched: false, reason: `${matches.length} of the ${rows.length} rows in ${INBOX_NAV_REGION_SELECTOR} are titled ${JSON.stringify(INBOX_NAV_ROW_TITLE)}, expected exactly 1` };
   }
   const row = matches[0];
-  const existing = row.querySelector(`[${INBOX_UNREAD_MARKER}]`);
+  clearPaintedRows(row);
+  const resolution = resolveGlyph(row);
+  if ("reason" in resolution) {
+    restoreNavState(row);
+    return { matched: false, reason: resolution.reason };
+  }
+  const glyph = resolution.element;
   if (unread < 1) {
-    existing?.remove();
+    restoreNavState(row);
     return { matched: true };
   }
-  const dot = existing ?? row.appendChild(row.ownerDocument.createElement("span"));
-  dot.setAttribute(INBOX_UNREAD_MARKER, String(unread));
-  dot.setAttribute("aria-hidden", "true");
-  dot.setAttribute("title", `${unread} unread operator ${unread === 1 ? "message" : "messages"}`);
-  dot.setAttribute("style", DOT_STYLE);
+  const current = paintedRows.get(row);
+  if (current === void 0) {
+    paintedRows.set(row, {
+      ariaLabel: row.getAttribute("aria-label"),
+      title: row.getAttribute("title"),
+      glyph,
+      glyphClass: glyph.getAttribute("class"),
+      glyphStyle: glyph.getAttribute("style")
+    });
+  } else if (current.glyph !== glyph) {
+    restoreAttribute(current.glyph, "class", current.glyphClass);
+    restoreAttribute(current.glyph, "style", current.glyphStyle);
+    paintedRows.set(row, { ...current, glyph, glyphClass: glyph.getAttribute("class"), glyphStyle: glyph.getAttribute("style") });
+  }
+  row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
+  glyph.classList.add("text-primary");
+  const countLabel = `${unread} unread operator ${unread === 1 ? "message" : "messages"}`;
+  const snapshot = paintedRows.get(row);
+  row.setAttribute("aria-label", `${snapshot.ariaLabel ?? INBOX_NAV_ROW_TITLE}, ${countLabel}`);
+  row.setAttribute("title", `${snapshot.title === null ? "" : `${snapshot.title} \u2014 `}${countLabel}`);
   return { matched: true };
 }
 function glyphFingerprint(row) {
-  const asset = row.querySelector("[data-plugin-icon-asset]");
-  if (asset !== null) return `asset:${asset.getAttribute("data-plugin-icon-asset") ?? ""}`;
-  const shapes = Array.from(row.querySelectorAll("svg, svg *")).map((node) => {
+  const resolution = resolveGlyph(row);
+  if ("reason" in resolution) return null;
+  if (resolution.element.hasAttribute("data-plugin-icon-asset")) return `asset:${resolution.element.getAttribute("data-plugin-icon-asset") ?? ""}`;
+  const shapes = [resolution.element, ...Array.from(resolution.element.querySelectorAll("svg *"))].map((node) => {
     const geometry = RENDERING_ATTRIBUTES.flatMap((name) => {
       const value = node.getAttribute(name);
       return value === null ? [] : [`${name}=${value}`];
@@ -362,16 +611,32 @@ function InboxPanel(_props) {
     }).catch((reason) => setErrors([String(reason)])).finally(() => setPendingAction((current) => current === action ? null : current));
   };
   const archiveSelectedMessage = () => {
-    if (!selectedMessage || !replyKey || pendingAction !== null) return;
-    const action = { key: replyKey, action: "archive" };
+    if (!selectedMessage || !replyKey) return;
+    void archiveMessage(selectedMessage).catch(() => void 0);
+  };
+  const archiveOperations = useRef(/* @__PURE__ */ new Map());
+  const archiveMessage = (message) => {
+    const key = messageKey(message);
+    const existing = archiveOperations.current.get(key);
+    if (existing) return existing;
+    const action = { key, action: "archive" };
     const sequence = refreshSequence.current;
     setPendingAction(action);
     setErrors([]);
     setNotice(null);
-    void rpc.call("archiveOperatorMessage", { projectId: selectedMessage.projectId, messageId: selectedMessage.messageId }).then((archived) => {
-      if (sequence === refreshSequence.current) setMessages((current) => showArchivedRef.current ? current.map((item) => messageKey(item) === replyKey ? archived : item) : current.filter((item) => messageKey(item) !== replyKey));
+    const operation = rpc.call("archiveOperatorMessage", { projectId: message.projectId, messageId: message.messageId }).then((archived) => {
+      if (sequence === refreshSequence.current) setMessages((current) => showArchivedRef.current ? current.map((item) => messageKey(item) === key ? archived : item) : current.filter((item) => messageKey(item) !== key));
       setNotice("Archived. Turn on Show archived to include it again.");
-    }).catch((reason) => setErrors([String(reason)])).finally(() => setPendingAction((current) => current === action ? null : current));
+      return archived;
+    }).catch((reason) => {
+      setErrors([String(reason)]);
+      throw reason;
+    }).finally(() => {
+      archiveOperations.current.delete(key);
+      setPendingAction((current) => current === action ? null : current);
+    });
+    archiveOperations.current.set(key, operation);
+    return operation;
   };
   return /* @__PURE__ */ jsx("main", { className: "h-full overflow-y-auto p-4 md:p-5", children: /* @__PURE__ */ jsxs("div", { className: "mx-auto grid max-w-5xl gap-4", style: { minWidth: 0, width: "100%" }, children: [
     indicatorBroken ? /* @__PURE__ */ jsxs("p", { role: "alert", className: "text-sm text-destructive", children: [
@@ -401,7 +666,7 @@ function InboxPanel(_props) {
         /* @__PURE__ */ jsx("input", { type: "checkbox", checked: showArchived, onChange: (event) => setFiltersAndPersist({ projectId, showArchived: event.target.checked }) }),
         "Show archived"
       ] }),
-      /* @__PURE__ */ jsx("button", { type: "button", "aria-label": "Refresh inbox", title: "Refresh inbox", className: "min-h-10 min-w-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: refresh, disabled: loading, children: /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\u21BB" }) })
+      /* @__PURE__ */ jsx("button", { type: "button", "aria-label": "Refresh inbox", title: "Refresh inbox", className: "min-h-10 min-w-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: refresh, disabled: loading, children: /* @__PURE__ */ jsx(r, { "aria-hidden": "true", focusable: "false", color: "currentColor", weight: "duotone", size: 18 }) })
     ] }),
     errors.map((loadError) => /* @__PURE__ */ jsxs("p", { role: "alert", className: "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive", children: [
       "Refresh failed: ",
@@ -441,27 +706,32 @@ function InboxPanel(_props) {
           const selected = key === selectedKey;
           const sender = senderLabel(message);
           const delivery = deliveryLabel(message);
-          return /* @__PURE__ */ jsx("article", { role: "listitem", className: `border-b border-border last:border-b-0 ${selected ? "bg-primary/5" : "bg-transparent"}`, children: /* @__PURE__ */ jsxs("button", { type: "button", "aria-pressed": selected, "aria-label": `${selected ? "Selected. " : "Select "}message from ${sender}. ${projectNames.get(message.projectId) ?? message.projectId}. ${severityLabel(message.severity)}. ${stateLabel(message)}. ${formatExactTime(message.createdAtMs)}`, style: { textAlign: "left", width: "100%" }, onClick: () => setSelectedMessageKey(key), className: `grid min-w-0 gap-2 px-3 py-3 transition-colors duration-150 hover:bg-muted/60 active:bg-muted/80 focus-visible:z-10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none ${selected ? "border-l-2 border-primary pl-[0.625rem]" : "border-l-2 border-transparent"}`, children: [
-            /* @__PURE__ */ jsxs("span", { className: "flex min-w-0 items-start gap-2", children: [
-              /* @__PURE__ */ jsx("span", { className: `mt-1.5 h-2 w-2 shrink-0 rounded-full ${message.readAtMs === null ? "bg-primary" : "bg-transparent"}`, "aria-label": message.readAtMs === null ? "Unread" : void 0 }),
-              /* @__PURE__ */ jsx("span", { className: `min-w-0 flex-1 break-words text-sm ${message.readAtMs === null ? "font-semibold" : "font-medium"}`, children: sender }),
-              /* @__PURE__ */ jsx("time", { className: "shrink-0 text-xs text-muted-foreground", dateTime: new Date(message.createdAtMs).toISOString(), title: formatExactTime(message.createdAtMs), "aria-label": `Received ${formatExactTime(message.createdAtMs)}`, children: formatRelativeTime(message.createdAtMs) })
+          return /* @__PURE__ */ jsxs("article", { role: "listitem", className: `border-b border-border last:border-b-0 ${selected ? "bg-primary/5 ring-2 ring-inset ring-primary" : message.readAtMs === null ? "bg-primary/10" : "bg-transparent"}`, children: [
+            /* @__PURE__ */ jsxs("button", { type: "button", "aria-pressed": selected, "aria-label": `${selected ? "Selected. " : "Select "}message from ${sender}. ${projectNames.get(message.projectId) ?? message.projectId}. ${severityLabel(message.severity)}. ${stateLabel(message)}. ${formatExactTime(message.createdAtMs)}`, style: { textAlign: "left", width: "100%" }, onClick: () => setSelectedMessageKey(key), className: "grid min-w-0 gap-2 px-3 py-3 transition-colors duration-150 hover:bg-muted/60 active:bg-muted/80 focus-visible:z-10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none", children: [
+              /* @__PURE__ */ jsx("span", { className: "sr-only", children: message.readAtMs === null ? "Unread message. " : "" }),
+              /* @__PURE__ */ jsxs("span", { className: "flex min-w-0 items-start gap-2", children: [
+                /* @__PURE__ */ jsx("span", { className: `min-w-0 flex-1 break-words text-sm ${message.readAtMs === null ? "font-semibold" : "font-medium"}`, children: sender }),
+                /* @__PURE__ */ jsx("time", { className: "shrink-0 text-xs text-muted-foreground", dateTime: new Date(message.createdAtMs).toISOString(), title: formatExactTime(message.createdAtMs), "aria-label": `Received ${formatExactTime(message.createdAtMs)}`, children: formatRelativeTime(message.createdAtMs) })
+              ] }),
+              /* @__PURE__ */ jsx("span", { className: "break-words text-sm leading-5 text-muted-foreground", children: selected ? "Selected \u2014 details shown here" : message.text.length > 96 ? `${message.text.slice(0, 96).trimEnd()}\u2026` : message.text }),
+              /* @__PURE__ */ jsxs("span", { className: "flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground", children: [
+                /* @__PURE__ */ jsx("span", { children: projectNames.get(message.projectId) ?? message.projectId }),
+                /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
+                /* @__PURE__ */ jsx("span", { children: severityLabel(message.severity) }),
+                delivery ? /* @__PURE__ */ jsxs(Fragment2, { children: [
+                  /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
+                  /* @__PURE__ */ jsx("span", { className: delivery === "Delivery failed" ? "text-destructive" : "", children: delivery })
+                ] }) : null,
+                message.archivedAtMs != null ? /* @__PURE__ */ jsxs(Fragment2, { children: [
+                  /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
+                  /* @__PURE__ */ jsx("span", { children: "Archived" })
+                ] }) : null
+              ] })
             ] }),
-            /* @__PURE__ */ jsx("span", { className: "break-words text-sm leading-5 text-muted-foreground", children: selected ? "Selected \u2014 details shown here" : message.text.length > 96 ? `${message.text.slice(0, 96).trimEnd()}\u2026` : message.text }),
-            /* @__PURE__ */ jsxs("span", { className: "flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground", children: [
-              /* @__PURE__ */ jsx("span", { children: projectNames.get(message.projectId) ?? message.projectId }),
-              /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
-              /* @__PURE__ */ jsx("span", { children: severityLabel(message.severity) }),
-              delivery ? /* @__PURE__ */ jsxs(Fragment2, { children: [
-                /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
-                /* @__PURE__ */ jsx("span", { className: delivery === "Delivery failed" ? "text-destructive" : "", children: delivery })
-              ] }) : null,
-              message.archivedAtMs != null ? /* @__PURE__ */ jsxs(Fragment2, { children: [
-                /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
-                /* @__PURE__ */ jsx("span", { children: "Archived" })
-              ] }) : null
-            ] })
-          ] }) }, key);
+            message.archivedAtMs === null ? /* @__PURE__ */ jsx("div", { className: "flex justify-end px-3 pb-2", children: /* @__PURE__ */ jsx("button", { type: "button", "aria-busy": pendingAction?.key === key && pendingAction.action === "archive", "aria-label": pendingAction?.key === key && pendingAction.action === "archive" ? "Archiving message" : "Archive message", title: pendingAction?.key === key && pendingAction.action === "archive" ? "Archiving message" : "Archive message", disabled: pendingAction !== null, className: "min-h-8 min-w-8 rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: () => {
+              void archiveMessage(message).catch(() => void 0);
+            }, children: /* @__PURE__ */ jsx(o2, { "aria-hidden": "true", focusable: "false", color: "currentColor", weight: "duotone", size: 16 }) }) }) : null
+          ] }, key);
         }) })
       ] }),
       selectedMessage ? /* @__PURE__ */ jsxs("article", { "aria-labelledby": "selected-message-heading", className: "min-w-0 rounded-lg border border-border bg-background", children: [
@@ -532,9 +802,9 @@ function InboxPanel(_props) {
                 updateMessage(replied);
                 setNotice(replied.repliedAtMs != null ? "Reply delivered. BB confirmed the matching input." : replied.replyInProgress ? "Delivery pending. The outcome is not yet known." : replied.replyDeliveryError ? "Delivery failed. The message remains retryable." : "Reply delivery is not confirmed.");
               }).catch((reason) => setErrors([String(reason)])).finally(() => setReplyingMessageKey(null));
-            }, children: /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\u2197" }) }),
-            selectedMessage.readAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", "aria-busy": markReadPending, "aria-label": markReadPending ? "Marking message read" : "Mark message read", title: markReadPending ? "Marking message read" : "Mark message read", disabled: pendingAction !== null, className: "min-h-10 min-w-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: markSelectedMessageRead, children: /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: markReadPending ? "\u2026" : "\u2713" }) }) : null,
-            selectedMessage.archivedAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", "aria-busy": archivePending, "aria-label": archivePending ? "Archiving message" : "Archive message", title: archivePending ? "Archiving message" : "Archive message", disabled: pendingAction !== null, className: "min-h-10 min-w-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: archiveSelectedMessage, children: /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: archivePending ? "\u2026" : "\u25B1" }) }) : null
+            }, children: /* @__PURE__ */ jsx(a2, { "aria-hidden": "true", focusable: "false", color: "currentColor", weight: "duotone", size: 18 }) }),
+            selectedMessage.readAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", "aria-busy": markReadPending, "aria-label": markReadPending ? "Marking message read" : "Mark message read", title: markReadPending ? "Marking message read" : "Mark message read", disabled: pendingAction !== null, className: "min-h-10 min-w-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: markSelectedMessageRead, children: /* @__PURE__ */ jsx(o3, { "aria-hidden": "true", focusable: "false", color: "currentColor", weight: "duotone", size: 18 }) }) : null,
+            selectedMessage.archivedAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", "aria-busy": archivePending, "aria-label": archivePending ? "Archiving message" : "Archive message", title: archivePending ? "Archiving message" : "Archive message", disabled: pendingAction !== null, className: "min-h-10 min-w-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: archiveSelectedMessage, children: /* @__PURE__ */ jsx(o2, { "aria-hidden": "true", focusable: "false", color: "currentColor", weight: "duotone", size: 18 }) }) : null
           ] })
         ] })
       ] }) : /* @__PURE__ */ jsxs("section", { className: "min-w-0 rounded-lg border border-dashed border-border p-6 text-center", children: [
@@ -545,7 +815,7 @@ function InboxPanel(_props) {
   ] }) });
 }
 var app_default = definePluginApp((app) => {
-  app.slots.navPanel({ id: "inbox", title: "Inbox", icon: "Mail", path: "inbox", component: InboxPanel });
+  app.slots.navPanel({ id: "inbox", title: "Inbox", icon: "./assets/envelope-simple-duotone.svg", path: "inbox", component: InboxPanel });
 });
 export {
   app_default as default

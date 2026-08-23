@@ -53,6 +53,17 @@ describe("Operator Inbox app", () => {
     expect(app.contentScripts).toEqual([]);
   });
 
+  it("uses decorative duotone Phosphor actions without Unicode glyph fallbacks", () => {
+    const source = readFileSync(resolve(import.meta.dirname, "../app.tsx"), "utf8");
+    for (const icon of ["ArchiveIcon", "EnvelopeOpenIcon", "PaperPlaneTiltIcon", "ArrowClockwiseIcon"]) {
+      expect(source).toContain(icon);
+    }
+    expect(source.match(/weight="duotone"/g)?.length).toBeGreaterThanOrEqual(4);
+    expect(source.match(/color="currentColor"/g)?.length).toBeGreaterThanOrEqual(4);
+    expect(source.match(/aria-hidden="true"/g)?.length).toBeGreaterThanOrEqual(4);
+    expect(source).not.toMatch(/[>](?:↻|↗|✓|▱)[<]/);
+  });
+
   it("registers a project-exact Inbox panel and surfaces reply delivery failures", async () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
@@ -447,7 +458,7 @@ describe("Operator Inbox app", () => {
     fireEvent.change(rendered.getByLabelText("Reply text"), { target: { value: "on it" } });
     fireEvent.click(rendered.getByRole("button", { name: /reply/i }));
     await waitFor(() => expect(rendered.getByRole("status").textContent).toBe("Reply delivered. BB confirmed the matching input."));
-    const archive = rendered.getByRole("button", { name: "Archive message" });
+    const archive = rendered.getAllByRole("button", { name: "Archive message" }).at(-1)!;
     expect(archive.hasAttribute("disabled")).toBe(false);
     expect(archive.textContent).not.toContain("Archive");
   });
@@ -478,18 +489,54 @@ describe("Operator Inbox app", () => {
 
     await act(async () => resolveRead({ ...message, readAtMs: 5 }));
     await waitFor(() => expect(rendered.queryByRole("button", { name: "Mark message read" })).toBeNull());
-    const archive = rendered.getByRole("button", { name: "Archive message" });
-    fireEvent.click(archive);
-    fireEvent.click(archive);
+    const archiveButtons = rendered.getAllByRole("button", { name: "Archive message" });
+    const rowArchive = archiveButtons[0]!;
+    const detailArchive = archiveButtons.at(-1)!;
+    fireEvent.click(rowArchive);
+    fireEvent.click(detailArchive);
     expect(archiveOperatorMessage).toHaveBeenCalledTimes(1);
-    expect(archive.hasAttribute("disabled")).toBe(true);
-    expect(archive.getAttribute("aria-busy")).toBe("true");
-    expect(rendered.getByRole("button", { name: "Archiving message" })).toBeTruthy();
+    expect(rowArchive.hasAttribute("disabled")).toBe(true);
+    expect(detailArchive.hasAttribute("disabled")).toBe(true);
+    expect(rowArchive.getAttribute("aria-busy")).toBe("true");
+    expect(detailArchive.getAttribute("aria-busy")).toBe("true");
+    expect(rendered.getAllByRole("button", { name: "Archiving message" })).toHaveLength(2);
 
     await act(async () => rejectArchive(new Error("archive unavailable")));
-    await waitFor(() => expect(rendered.getByRole("button", { name: "Archive message" })).toBeTruthy());
-    expect(rendered.getByRole("button", { name: "Archive message" }).hasAttribute("disabled")).toBe(false);
+    await waitFor(() => expect(rendered.getAllByRole("button", { name: "Archive message" }).at(-1)).toBeTruthy());
+    expect(rendered.getAllByRole("button", { name: "Archive message" }).at(-1)!.hasAttribute("disabled")).toBe(false);
     expect(rendered.getByText("Refresh failed: Error: archive unavailable")).toBeTruthy();
+  });
+
+  it("offers compact archive actions on unread and delivered rows without nesting controls", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const messages = [
+      { messageId: 31, projectId: "project-a", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "unread row", createdAtMs: 2, readAtMs: null, archivedAtMs: null, senderTitle: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null },
+      { messageId: 32, projectId: "project-a", recipient: "operator" as const, senderThreadId: "b", senderLaneId: null, severity: "routine" as const, text: "delivered row", createdAtMs: 1, readAtMs: 1, archivedAtMs: null, senderTitle: null, repliedAtMs: 3, replyText: "done", replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null },
+    ];
+    const archiveOperatorMessage = vi.fn(async () => ({ ...messages[1]!, archivedAtMs: 5 }));
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(async () => messages), archiveOperatorMessage } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("unread row")).toBeTruthy());
+    const rows = rendered.getAllByRole("listitem");
+    expect(rows).toHaveLength(2);
+    const selectedUnread = rows[0]!.querySelector('button[aria-pressed="true"]')!;
+    expect(selectedUnread.getAttribute("aria-label")).toContain("Selected.");
+    expect(selectedUnread.getAttribute("aria-label")).toContain("Unread.");
+    expect(rows[0]!.className).toContain("bg-primary/5");
+    expect(rows[0]!.className).toContain("ring-primary");
+    expect(rows[0]!.querySelector(".h-2.w-2.rounded-full")).toBeNull();
+    expect(rows.every((row) => row.querySelector('button[aria-label="Archive message"]') !== null)).toBe(true);
+    expect(rows.every((row) => row.querySelector("button button, button a, a button") === null)).toBe(true);
+    expect(rendered.getAllByRole("button", { name: "Archive message" })).toHaveLength(3);
+
+    fireEvent.click(rows[1]!.querySelector('button[aria-label="Archive message"]')!);
+    await waitFor(() => expect(archiveOperatorMessage).toHaveBeenCalledWith({ projectId: "project-a", messageId: 32 }));
+    await waitFor(() => expect(rendered.queryByText("delivered row")).toBeNull());
+    expect(rendered.getByText("unread row")).toBeTruthy();
   });
 
   it("does not claim delivery for pending or explicitly failed reply results", async () => {
@@ -540,7 +587,7 @@ describe("Operator Inbox app", () => {
     });
 
     await waitFor(() => expect(rendered.getByText("archive me")).toBeTruthy());
-    fireEvent.click(rendered.getByRole("button", { name: "Archive message" }));
+    fireEvent.click(rendered.getAllByRole("button", { name: "Archive message" }).at(-1)!);
     await waitFor(() => expect(archiveOperatorMessage).toHaveBeenCalledWith({ projectId: "project-a", messageId: 10 }));
     expect(rendered.getByRole("status").textContent).toBe("Archived. Turn on Show archived to include it again.");
     expect(rendered.queryByText("archive me")).toBeNull();
@@ -560,7 +607,7 @@ describe("Operator Inbox app", () => {
     });
 
     await waitFor(() => expect(rendered.getByText("archive race")).toBeTruthy());
-    fireEvent.click(rendered.getByRole("button", { name: "Archive message" }));
+    fireEvent.click(rendered.getAllByRole("button", { name: "Archive message" }).at(-1)!);
     fireEvent.click(rendered.getByLabelText("Show archived"));
     await waitFor(() => expect(rendered.getAllByText("Refreshed archived row").length).toBeGreaterThan(0));
     await act(async () => resolveArchive({ ...message, senderTitle: "Late archive result", archivedAtMs: 5 }));
@@ -584,7 +631,7 @@ describe("Operator Inbox app", () => {
     });
 
     await waitFor(() => expect(rendered.getByText("failed archive race")).toBeTruthy());
-    fireEvent.click(rendered.getByRole("button", { name: "Archive message" }));
+    fireEvent.click(rendered.getAllByRole("button", { name: "Archive message" }).at(-1)!);
     fireEvent.click(rendered.getByLabelText("Show archived"));
     await waitFor(() => expect(rendered.getAllByText("Refresh survived failure").length).toBeGreaterThan(0));
     await act(async () => rejectArchive(new Error("archive unavailable")));

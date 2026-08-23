@@ -8,13 +8,12 @@
 export const INBOX_NAV_REGION_SELECTOR = "[data-testid=\"plugin-nav-sidebar-items\"]";
 export const INBOX_NAV_ROW_TITLE = "Inbox";
 export const LANES_NAV_ROW_TITLE = "Lanes";
-export const INBOX_UNREAD_MARKER = "data-bb-collab-inbox-unread";
 export const INBOX_INDICATOR_BROKEN_TITLE = "Inbox unread indicator broken";
 
-// ponytail: inline style, not a class. dist/app.css is generated from tokens
-// found in this plugin's own source, so it cannot carry a rule scoped to a
-// host-rendered row; a stylesheet would be a second coupling to keep alive.
-const DOT_STYLE = "margin-left:auto;flex:0 0 auto;width:0.5rem;height:0.5rem;border-radius:9999px;background-color:currentColor";
+const LEGACY_UNREAD_MARKER = "[data-bb-collab-inbox-unread]";
+type NavSnapshot = { ariaLabel: string | null; title: string | null; glyph: Element; glyphClass: string | null; glyphStyle: string | null };
+type GlyphResolution = { element: Element } | { reason: string };
+const paintedRows = new Map<Element, NavSnapshot>();
 
 // Geometry, never class names: two host icons differ by the shape they draw,
 // and the minified class of a host row tells us nothing about which glyph it is.
@@ -39,36 +38,109 @@ function rowsTitled(rows: Element[], title: string): Element[] {
   return rows.filter((row) => row.textContent?.trim() === title);
 }
 
+function resolveGlyph(row: Element): GlyphResolution {
+  const assets = Array.from(row.querySelectorAll("[data-plugin-icon-asset]"));
+  if (assets.length > 1) return { reason: `the ${INBOX_NAV_ROW_TITLE} row has ${assets.length} plugin icon assets, expected exactly 1` };
+  if (assets.length === 1) return { element: assets[0]! };
+  const svgs = Array.from(row.querySelectorAll("svg"));
+  if (svgs.length > 1) return { reason: `the ${INBOX_NAV_ROW_TITLE} row has ${svgs.length} SVG glyphs and no plugin icon asset, expected exactly 1` };
+  if (svgs.length === 1) return { element: svgs[0]! };
+  return { reason: `the ${INBOX_NAV_ROW_TITLE} row has neither a plugin icon asset nor an SVG glyph` };
+}
+
+function restoreAttribute(element: Element, name: string, value: string | null): void {
+  if (value === null) element.removeAttribute(name);
+  else element.setAttribute(name, value);
+}
+
+function restoreSnapshot(row: Element, snapshot: NavSnapshot): void {
+  restoreAttribute(row, "aria-label", snapshot.ariaLabel);
+  restoreAttribute(row, "title", snapshot.title);
+  restoreAttribute(snapshot.glyph, "class", snapshot.glyphClass);
+  restoreAttribute(snapshot.glyph, "style", snapshot.glyphStyle);
+}
+
+function clearPaintedRows(keep?: Element): void {
+  for (const [row, snapshot] of paintedRows) {
+    if (row === keep) continue;
+    row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
+    restoreSnapshot(row, snapshot);
+    paintedRows.delete(row);
+  }
+}
+
+function cleanupDetachedRows(root: ParentNode): void {
+  const owner = root as Node;
+  for (const [row, snapshot] of paintedRows) {
+    if (row.isConnected || owner.contains(row)) continue;
+    restoreSnapshot(row, snapshot);
+    paintedRows.delete(row);
+  }
+}
+
+function restoreNavState(row: Element): void {
+  row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
+  const snapshot = paintedRows.get(row);
+  if (snapshot === undefined) return;
+  restoreSnapshot(row, snapshot);
+  paintedRows.delete(row);
+}
+
 export function paintInboxNavUnread(root: ParentNode, unread: number): InboxNavPaint {
+  cleanupDetachedRows(root);
   const rows = navRows(root);
   if (rows === null) {
+    clearPaintedRows();
     return { matched: false, reason: `no element matches ${INBOX_NAV_REGION_SELECTOR}` };
   }
   const matches = rowsTitled(rows, INBOX_NAV_ROW_TITLE);
   if (matches.length !== 1) {
     // Two matches is the wrong-but-plausible death: another plugin's row is
-    // titled Inbox too, and the dot would land on a row that is not ours.
+    // titled Inbox too, and the accent would land on a row that is not ours.
+    clearPaintedRows();
     return { matched: false, reason: `${matches.length} of the ${rows.length} rows in ${INBOX_NAV_REGION_SELECTOR} are titled ${JSON.stringify(INBOX_NAV_ROW_TITLE)}, expected exactly 1` };
   }
   const row = matches[0]!;
-  const existing = row.querySelector(`[${INBOX_UNREAD_MARKER}]`);
+  clearPaintedRows(row);
+  const resolution = resolveGlyph(row);
+  if ("reason" in resolution) {
+    restoreNavState(row);
+    return { matched: false, reason: resolution.reason };
+  }
+  const glyph = resolution.element;
   if (unread < 1) {
-    existing?.remove();
+    restoreNavState(row);
     return { matched: true };
   }
-  const dot = existing ?? row.appendChild(row.ownerDocument.createElement("span"));
-  dot.setAttribute(INBOX_UNREAD_MARKER, String(unread));
-  dot.setAttribute("aria-hidden", "true");
-  dot.setAttribute("title", `${unread} unread operator ${unread === 1 ? "message" : "messages"}`);
-  dot.setAttribute("style", DOT_STYLE);
+  const current = paintedRows.get(row);
+  if (current === undefined) {
+    paintedRows.set(row, {
+      ariaLabel: row.getAttribute("aria-label"),
+      title: row.getAttribute("title"),
+      glyph,
+      glyphClass: glyph.getAttribute("class"),
+      glyphStyle: glyph.getAttribute("style"),
+    });
+  } else if (current.glyph !== glyph) {
+    restoreAttribute(current.glyph, "class", current.glyphClass);
+    restoreAttribute(current.glyph, "style", current.glyphStyle);
+    paintedRows.set(row, { ...current, glyph, glyphClass: glyph.getAttribute("class"), glyphStyle: glyph.getAttribute("style") });
+  }
+  row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
+  glyph.classList.add("text-primary");
+  const countLabel = `${unread} unread operator ${unread === 1 ? "message" : "messages"}`;
+  const snapshot = paintedRows.get(row)!;
+  row.setAttribute("aria-label", `${snapshot.ariaLabel ?? INBOX_NAV_ROW_TITLE}, ${countLabel}`);
+  row.setAttribute("title", `${snapshot.title === null ? "" : `${snapshot.title} — `}${countLabel}`);
   return { matched: true };
 }
 
 function glyphFingerprint(row: Element): string | null {
-  const asset = row.querySelector("[data-plugin-icon-asset]");
-  if (asset !== null) return `asset:${asset.getAttribute("data-plugin-icon-asset") ?? ""}`;
+  const resolution = resolveGlyph(row);
+  if ("reason" in resolution) return null;
+  if (resolution.element.hasAttribute("data-plugin-icon-asset")) return `asset:${resolution.element.getAttribute("data-plugin-icon-asset") ?? ""}`;
   // The root svg counts: its viewBox and transform re-frame everything under it.
-  const shapes = Array.from(row.querySelectorAll("svg, svg *"))
+  const shapes = [resolution.element, ...Array.from(resolution.element.querySelectorAll("svg *"))]
     .map((node) => {
       const geometry = RENDERING_ATTRIBUTES.flatMap((name) => {
         const value = node.getAttribute(name);
@@ -80,7 +152,7 @@ function glyphFingerprint(row: Element): string | null {
   return shapes.length === 0 ? null : shapes.join("|");
 }
 
-// The second way this indicator dies: the row is found and the dot is painted,
+// The second way this indicator dies: the row is found and the accent is painted,
 // but the glyph beside it is not the one Inbox declared — a manifest icon
 // overriding it, or an unknown name falling back to the host's default. A
 // plugin cannot name the glyph it got, so this reads the control instead: Lanes
