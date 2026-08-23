@@ -2222,8 +2222,13 @@ describe("bb-collab plugin boundary", () => {
     });
     const secondProject = "proj_second_tenant";
     const adoptSourceDecision = (decisionId: string, decision: NonNullable<ApplyRequest["decision"]>) => {
+      const scope = decision.scope as { operation?: string; sourceProjectId?: string; targetProjectId?: string; repoTargetId?: null };
+      const options = decision.options as { rootOfTrust?: string };
+      const actorReceiptId = decision.decisionClass === "operator_only" && scope.operation === "cross_project_bootstrap" &&
+        scope.sourceProjectId === PROJECT_ID && scope.targetProjectId !== PROJECT_ID && scope.repoTargetId === null &&
+        options.rootOfTrust === "host_local_operator" ? sourceActor : sourceRoleActor;
       expect(applyFixtureMutation(db, decisionCreateRequest(sourceFence, decisionId, {
-        actorReceiptId: sourceRoleActor,
+        actorReceiptId,
         expectedGovernanceEpoch: 2,
         expectedFenceToken: sourceFence,
         repoTargetId: null,
@@ -2231,7 +2236,7 @@ describe("bb-collab plugin boundary", () => {
         decision,
       }))).toMatchObject({ outcome: "OK" });
       expect(applyFixtureMutation(db, decisionDispositionRequest(sourceFence, decisionId, 1, {
-        actorReceiptId: sourceRoleActor,
+        actorReceiptId,
         expectedGovernanceEpoch: 2,
         expectedFenceToken: sourceFence,
         repoTargetId: null,
@@ -2586,7 +2591,7 @@ describe("bb-collab plugin boundary", () => {
     const legacyGenesis = "legacy-v28-genesis";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -2)) db.exec(statement);
       })();
       seedVerifiedFixtureReceipt(db, {
         projectId: legacyProject,
@@ -2601,6 +2606,8 @@ describe("bb-collab plugin boundary", () => {
       }));
       expect(bootstrapped).toMatchObject({ outcome: "OK" });
       const legacyFence = (bootstrapped.evidence as { fenceToken: string }).fenceToken;
+      db.exec(MIGRATIONS.at(-2)!);
+      db.exec(MIGRATIONS.at(-1)!);
 
       const legacyRoleFacts = () => roleReader((facts) => {
         facts.thread.projectId = legacyProject;
@@ -2641,7 +2648,7 @@ describe("bb-collab plugin boundary", () => {
         projectId: legacyProject,
         operationClass: "decision_create",
         idempotencyKey: "legacy-v28-decision-create",
-        actorReceiptId: legacyRoleActor,
+        actorReceiptId: legacyGenesis,
         expectedConfigRevision: 1,
         configRevision: 1,
         expectedGovernanceEpoch: 1,
@@ -2660,7 +2667,7 @@ describe("bb-collab plugin boundary", () => {
         projectId: legacyProject,
         operationClass: "decision_disposition",
         idempotencyKey: "legacy-v28-decision-adopt",
-        actorReceiptId: legacyRoleActor,
+        actorReceiptId: legacyGenesis,
         expectedConfigRevision: 1,
         configRevision: 1,
         expectedGovernanceEpoch: 1,
@@ -2681,8 +2688,6 @@ describe("bb-collab plugin boundary", () => {
         legacyProject, "legacy-v28-derivation", legacyGenesis, legacyProject, 1, legacyFence,
         legacyGenesis, legacyDecisionId, 1, "legacy-request", 1,
       );
-      db.exec(MIGRATIONS.at(-1)!);
-
       const refusedSource = applyFixtureMutation(db, {
         projectId: "proj_legacy_child",
         operationClass: "bootstrap",
@@ -8033,25 +8038,26 @@ else printf '%s\\n' '[]'; fi
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-    for (const statement of MIGRATIONS.slice(0, -14)) db.exec(statement);
+    for (const statement of MIGRATIONS.slice(0, -15)) db.exec(statement);
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, '{}', ?, 1)").run(PROJECT_ID, sha256("{}"));
       db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 1)").run(PROJECT_ID);
       db.prepare(`INSERT INTO operator_messages (project_id, recipient, sender_thread_id, severity, message_text, created_at_ms, reply_text, reply_delivery_error) VALUES (?, 'operator', 'fixture-thread', 'routine', 'failed delivery', 10, 'reply retained', 'delivery failed')`).run(PROJECT_ID);
-      db.exec(MIGRATIONS.at(-3)!);
+      db.exec(MIGRATIONS.at(-4)!);
       expect(db.prepare("SELECT reply_text, reply_delivery_error, replied_at_ms, archived_at_ms FROM operator_messages").get()).toEqual({ reply_text: "reply retained", reply_delivery_error: "delivery failed", replied_at_ms: null, archived_at_ms: null });
     } finally { db.close(); }
   });
 
-  it("appends operator inbox archive schema without bumping runtime contract v22", () => {
-    expect(SCHEMA_VERSION).toBe(29);
-    expect(RUNTIME_CONTRACT_VERSION).toBe(22);
-    expect(MIGRATIONS).toHaveLength(42);
+  it("appends authority-root schema and bumps the runtime contract", () => {
+    expect(SCHEMA_VERSION).toBe(30);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(23);
+    expect(MIGRATIONS).toHaveLength(43);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
-    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("bf7fc787a2e44193f0523c640f2ca57d4e56ee7e5366b89d7ef3b577b85bce88");
-    expect(schemaDigest).toBe("0a652ca20ac4d7de6ec357d6a9c7a6d381a4266060ccae6d225c26c146981190");
-    expect(MIGRATIONS.at(-3)).toContain("ALTER TABLE operator_messages ADD COLUMN archived_at_ms");
-    expect(MIGRATIONS.at(-2)).toContain("CREATE TABLE IF NOT EXISTS bootstrap_derivation_receipts");
+    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("0a652ca20ac4d7de6ec357d6a9c7a6d381a4266060ccae6d225c26c146981190");
+    expect(schemaDigest).toBe("6901dfc3766969621d1557feae76ad91877088dfdf3cc1879ee3e79463e67ced");
+    expect(contractDigest).not.toBe("f6b0ecbda7e8afd986d46e0eda77662815a737dadc94e268ef00b7d74ba18ed4");
+    expect(MIGRATIONS.at(-4)).toContain("ALTER TABLE operator_messages ADD COLUMN archived_at_ms");
+    expect(MIGRATIONS.at(-3)).toContain("CREATE TABLE IF NOT EXISTS bootstrap_derivation_receipts");
     expect(TABLES).toContain("migration_runs");
     expect(TABLES).toContain("lane_capacity_intervals");
     expect(TABLES).toContain("operator_messages");
@@ -8063,33 +8069,33 @@ else printf '%s\\n' '[]'; fi
     ]);
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 28,
-      newSchemaVersion: 29,
-      oldContractVersion: 21,
-      newContractVersion: 22,
+      oldSchemaVersion: 29,
+      newSchemaVersion: 30,
+      oldContractVersion: 22,
+      newContractVersion: 23,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(20, 22))).toMatchObject({
-      oldSchemaVersion: 28,
-      newSchemaVersion: 29,
-      oldContractVersion: 21,
-      newContractVersion: 22,
+      oldSchemaVersion: 29,
+      newSchemaVersion: 30,
+      oldContractVersion: 22,
+      newContractVersion: 23,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "refused", verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(29, 22))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(30, 23))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 28,
-      newSchemaVersion: 29,
-      oldContractVersion: 21,
-      newContractVersion: 22,
+      oldSchemaVersion: 29,
+      newSchemaVersion: 30,
+      oldContractVersion: 22,
+      newContractVersion: 23,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -8133,7 +8139,7 @@ else printf '%s\\n' '[]'; fi
     databaseIsReady(db);
     const projectId = "proj_gh200_migration";
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -7)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -8)) db.exec(statement); })();
       for (const configRevision of [5, 6]) {
         db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, ?, '{}', ?, ?)")
           .run(projectId, configRevision, sha256("{}"), configRevision);
@@ -8170,7 +8176,7 @@ else printf '%s\\n' '[]'; fi
          WHERE work_items.project_id = ? ORDER BY work_items.work_item_id`,
       ).all(projectId);
       const before = snapshot();
-      db.transaction(() => db.exec(MIGRATIONS.at(-8)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-9)!))();
       expect(snapshot()).toEqual(before);
       expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
       expect(db.prepare("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
@@ -8187,15 +8193,15 @@ else printf '%s\\n' '[]'; fi
     const projectId = "proj_gh295_migration";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -12)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -13)) db.exec(statement);
       })();
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, '{}', ?, 1)").run(projectId, sha256("{}"));
       db.prepare("INSERT INTO repository_targets (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest) VALUES (?, 'target-main', 1, 'source', 'host', '/migration', NULL, 'main', 'target-digest')").run(projectId);
       db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'historical', 1, 'target-main', 'Historical', 'preserve me', 'in_progress', 3, 10, 20)").run(projectId);
       const beforeRows = db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId);
-      const priorStatementDigests = MIGRATIONS.slice(0, -12).map(sha256);
-      db.transaction(() => db.exec(MIGRATIONS.at(-13)!))();
-      expect(MIGRATIONS.slice(0, -12).map(sha256)).toEqual(priorStatementDigests);
+      const priorStatementDigests = MIGRATIONS.slice(0, -13).map(sha256);
+      db.transaction(() => db.exec(MIGRATIONS.at(-14)!))();
+      expect(MIGRATIONS.slice(0, -13).map(sha256)).toEqual(priorStatementDigests);
       expect(db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId)).toEqual(beforeRows);
       expect(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'work_items'").get()).toMatchObject({ sql: expect.stringContaining("review_pending") });
       db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'reviewable', 1, 'target-main', 'Reviewable', 'new state', 'review_pending', 1, 30, 30)").run(projectId);
@@ -8211,7 +8217,7 @@ else printf '%s\\n' '[]'; fi
     databaseIsReady(db);
     const projectId = "proj_review_linkage_migration";
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -10)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -11)) db.exec(statement); })();
       const configJson = "{}";
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, ?, ?, 1)").run(projectId, configJson, sha256(configJson));
       db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 1)").run(projectId);
@@ -8226,7 +8232,7 @@ else printf '%s\\n' '[]'; fi
       const before = db.prepare(`SELECT ${existingColumns.join(", ")} FROM execution_attempts`).all();
       const rowCount = (db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get() as { count: number }).count;
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-10)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-11)!))();
 
       expect((db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get() as { count: number }).count).toBe(rowCount);
       expect(db.prepare(`SELECT ${existingColumns.join(", ")} FROM execution_attempts`).all()).toEqual(before);
@@ -8242,7 +8248,7 @@ else printf '%s\\n' '[]'; fi
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -9)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -10)) db.exec(statement); })();
       db.pragma("foreign_keys = OFF");
       db.prepare("INSERT INTO project_config_revisions VALUES ('project', 1, '{}', 'config-digest', 1)").run();
       db.prepare("INSERT INTO repository_targets VALUES ('project', 'target', 1, 'source', 'host', '/target', NULL, 'main', 'target-digest')").run();
@@ -8274,11 +8280,11 @@ else printf '%s\\n' '[]'; fi
         eligibility: db.prepare("SELECT profile_digest, derivation_digest FROM eligibility_projections").get(),
         generation: db.prepare("SELECT holder_executed_profile_digest, holder_context_digest, eligibility_derivation_digest FROM role_generations").get(),
       };
-      const priorStatementDigests = MIGRATIONS.slice(0, -8).map(sha256);
+      const priorStatementDigests = MIGRATIONS.slice(0, -9).map(sha256);
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-9)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-10)!))();
 
-      expect(MIGRATIONS.slice(0, -8).map(sha256)).toEqual(priorStatementDigests);
+      expect(MIGRATIONS.slice(0, -9).map(sha256)).toEqual(priorStatementDigests);
       expect(db.prepare("SELECT requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode, requested_service_tier, requested_visibility, requested_profile_digest, attempt_digest FROM execution_attempts").get()).toEqual(Object.fromEntries(Object.entries(before.attempt as Record<string, unknown>).map(([name, value]) => [name.replace(/^actual_/u, "requested_"), value])));
       expect(db.prepare("SELECT requested_profile_digest, requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode, requested_service_tier, requested_visibility, evidence_digest, observation_digest FROM qualification_observations").get()).toEqual({
         requested_profile_digest: "legacy-profile-digest", requested_provider_id: "provider", requested_model: "model",
@@ -8322,7 +8328,7 @@ else printf '%s\\n' '[]'; fi
     databaseIsReady(db);
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -11)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -12)) db.exec(statement);
       })();
       const legacyResult = JSON.stringify({
         projectId: "proj_backfill_legacy",
@@ -8343,7 +8349,7 @@ else printf '%s\\n' '[]'; fi
         "SELECT project_id, epoch_created_at_ms, state, result_json, created_at_ms, updated_at_ms FROM work_item_github_backfills",
       ).get();
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-11)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-12)!))();
 
       expect((db.prepare("PRAGMA table_info(work_item_github_backfills)").all() as Array<{ name: string }>).map((column) => column.name)).toEqual([
         "project_id", "epoch_created_at_ms", "state", "result_json", "created_at_ms", "updated_at_ms", "config_revision", "attempt_reason",
@@ -8358,10 +8364,10 @@ else printf '%s\\n' '[]'; fi
   });
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
-    expect(RUNTIME_CONTRACT_VERSION).toBe(22);
-    expect(SCHEMA_VERSION).toBe(29);
-    expect(MIGRATIONS).toHaveLength(42);
-    expect(contractDigest).toBe("f6b0ecbda7e8afd986d46e0eda77662815a737dadc94e268ef00b7d74ba18ed4");
+    expect(RUNTIME_CONTRACT_VERSION).toBe(23);
+    expect(SCHEMA_VERSION).toBe(30);
+    expect(MIGRATIONS).toHaveLength(43);
+    expect(contractDigest).toBe("7bb4e66d799db07c37b0d6de2f7244a05b8d5261fb6520359052d7706f849fb1");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
     const beforeRefusal = exportFoundation(db, PROJECT_ID);
@@ -8377,7 +8383,7 @@ else printf '%s\\n' '[]'; fi
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 29, observedContractVersion: 22 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 30, observedContractVersion: 23 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -8535,7 +8541,7 @@ else printf '%s\\n' '[]'; fi
     const projectId = "proj_gh300_rebuild";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -14)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -15)) db.exec(statement);
       })();
       db.pragma("foreign_keys = OFF");
       const insert = (table: string, row: Record<string, unknown>) => {
@@ -8593,7 +8599,7 @@ else printf '%s\\n' '[]'; fi
       const before = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.values(before).every((value) => value !== null)).toBe(true);
       expect(new Set(Object.values(before).map((value) => String(value))).size).toBeGreaterThan(20);
-      db.transaction(() => db.exec(MIGRATIONS.at(-14)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-15)!))();
       const after = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.fromEntries(columns.map((column) => [column, after[column]]))).toEqual(Object.fromEntries(columns.map((column) => [column, before[column]])));
       expect(after.progress_json).toBe("{}");
@@ -8647,8 +8653,8 @@ else printf '%s\\n' '[]'; fi
     const before = exportFoundation(db, PROJECT_ID);
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
-      observedSchemaVersion: 29,
-      observedContractVersion: 22,
+      observedSchemaVersion: 30,
+      observedContractVersion: 23,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -8729,8 +8735,8 @@ else printf '%s\\n' '[]'; fi
       outcome: "OK",
       evidence: {
         cachedConsumers: {
-          oldContractVersion: 21,
-          newContractVersion: 22,
+          oldContractVersion: 22,
+          newContractVersion: 23,
           action: "unknown",
           expected: 4,
           attempted: 0,
@@ -8878,7 +8884,7 @@ else printf '%s\\n' '[]'; fi
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 29, schemaDigest, contractVersion: 22, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 30, schemaDigest, contractVersion: 23, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -9908,6 +9914,104 @@ else printf '%s\\n' '[]'; fi
     db.exec("DROP TRIGGER fail_decision_receipt");
   });
 
+  it("authorizes only the exact governorship-rooted cross-project bootstrap Decision", async () => {
+    const { db, fenceToken } = await assignmentFixture();
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "bootstrap-plugin", actorKind: "plugin", subjectId: PLUGIN_ID });
+    db.prepare("UPDATE project_governorships SET actor_receipt_id = ? WHERE project_id = ? AND governance_epoch = 1").run("bootstrap-plugin", PROJECT_ID);
+    const decision = {
+      decisionId: "cross-project-authority",
+      repoTargetId: null,
+      scope: { operation: "cross_project_bootstrap", sourceProjectId: PROJECT_ID, targetProjectId: FOREIGN_PROJECT_ID, repoTargetId: null },
+      decisionClass: "operator_only" as const,
+      options: { rootOfTrust: "host_local_operator" },
+      resourceRevision: 1,
+    };
+    const create = applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, decision.decisionId, {
+      actorReceiptId: "bootstrap-plugin", repoTargetId: null, decision,
+    }));
+    expect(create).toMatchObject({ outcome: "OK", currentResourceRevision: 1 });
+    const stored = db.prepare("SELECT authority_root_json, authority_root_digest FROM decisions WHERE decision_id = ?").get(decision.decisionId) as { authority_root_json: string; authority_root_digest: string };
+    expect(stored.authority_root_digest).toBe(sha256(stored.authority_root_json));
+    expect(JSON.parse(stored.authority_root_json)).toMatchObject({ projectId: PROJECT_ID, governanceEpoch: 1, actorReceiptId: "bootstrap-plugin" });
+    const adoptRequest = decisionDispositionRequest(fenceToken, decision.decisionId, 1, {
+      actorReceiptId: "bootstrap-plugin", repoTargetId: null,
+    });
+    const adopted = applyWithFixtureReceipt(db, adoptRequest);
+    expect(adopted).toMatchObject({ outcome: "OK", currentResourceRevision: 2 });
+    expect(applyWithFixtureReceipt(db, adoptRequest)).toMatchObject({ outcome: "OK", replay: true });
+    const switchedDecision = {
+      ...decision,
+      decisionId: "cross-project-root-switch",
+    };
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, switchedDecision.decisionId, {
+      actorReceiptId: "bootstrap-plugin", repoTargetId: null, decision: switchedDecision,
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, {
+      projectId: PROJECT_ID,
+      operationClass: "governor_claim",
+      idempotencyKey: "cross-project-root-switch-claim",
+      actorReceiptId: "bootstrap-plugin",
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fenceToken,
+      repoTargetId: null,
+    }).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, switchedDecision.decisionId, 1, {
+      actorReceiptId: "bootstrap-plugin", repoTargetId: null, idempotencyKey: "cross-project-root-switch-stale-disposition",
+    })).outcome).toBe("GOVERNOR_EPOCH_STALE");
+  });
+
+  it("kills bootstrap authority mutants and preserves ordinary role authority", async () => {
+    const { db, fenceToken } = await assignmentFixture();
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "bootstrap-plugin", actorKind: "plugin", subjectId: PLUGIN_ID });
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "wrong-plugin", actorKind: "plugin", subjectId: "other-plugin" });
+    db.prepare("UPDATE project_governorships SET actor_receipt_id = ? WHERE project_id = ? AND governance_epoch = 1").run("bootstrap-plugin", PROJECT_ID);
+    const exact = {
+      repoTargetId: null,
+      scope: { operation: "cross_project_bootstrap", sourceProjectId: PROJECT_ID, targetProjectId: FOREIGN_PROJECT_ID, repoTargetId: null },
+      decisionClass: "operator_only" as const,
+      options: { rootOfTrust: "host_local_operator" },
+      resourceRevision: 1,
+    };
+    const mutants = [
+      { name: "wrong-actor", actorReceiptId: "wrong-plugin", decision: { ...exact } },
+      { name: "wrong-source", actorReceiptId: "bootstrap-plugin", decision: { ...exact, scope: { ...exact.scope, sourceProjectId: "proj_other" } } },
+      { name: "same-target", actorReceiptId: "bootstrap-plugin", decision: { ...exact, scope: { ...exact.scope, targetProjectId: PROJECT_ID } } },
+      { name: "extra-scope", actorReceiptId: "bootstrap-plugin", decision: { ...exact, scope: { ...exact.scope, extra: true } } },
+      { name: "extra-options", actorReceiptId: "bootstrap-plugin", decision: { ...exact, options: { ...exact.options, extra: true } } },
+      { name: "wrong-class", actorReceiptId: "bootstrap-plugin", decision: { ...exact, decisionClass: "legacy_adoption" as const } },
+    ];
+    for (const mutant of mutants) {
+      const before = exportFoundation(db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, `cross-project-${mutant.name}`, {
+        idempotencyKey: `cross-project-${mutant.name}`, actorReceiptId: mutant.actorReceiptId, repoTargetId: null,
+        decision: { decisionId: `cross-project-${mutant.name}`, ...mutant.decision },
+      })).outcome).toBe("ACTOR_RECEIPT_UNVERIFIED");
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    }
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cross-project-foreign-request-target", {
+      idempotencyKey: "cross-project-foreign-request-target", actorReceiptId: "bootstrap-plugin", repoTargetId: TARGET_ID,
+      decision: { decisionId: "cross-project-foreign-request-target", ...exact },
+    })).outcome).toBe("REPO_TARGET_FOREIGN");
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cross-project-stale-fence", {
+      idempotencyKey: "cross-project-stale-fence", actorReceiptId: "bootstrap-plugin", repoTargetId: null,
+      expectedFenceToken: "stale-fence", decision: { decisionId: "cross-project-stale-fence", ...exact },
+    })).outcome).toBe("GOVERNOR_EPOCH_STALE");
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "ordinary-plugin-refused", {
+      idempotencyKey: "ordinary-plugin-refused", actorReceiptId: "bootstrap-plugin",
+    })).outcome).toBe("ACTOR_RECEIPT_UNVERIFIED");
+    const ordinary = applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "ordinary-role-still-works"));
+    expect(ordinary.outcome).toBe("OK");
+    const legacyScope = canonicalJson(exact.scope);
+    db.prepare(
+      `INSERT INTO decisions (decision_id, project_id, config_revision, repo_target_id, scope_json, scope_digest, current_resource_revision, decision_class, options_json, decision_identity_digest)
+       VALUES ('legacy-bootstrap-authority', ?, 1, NULL, ?, ?, 1, 'operator_only', ?, ?)`,
+    ).run(PROJECT_ID, legacyScope, sha256(legacyScope), canonicalJson(exact.options), sha256(canonicalJson({ projectId: PROJECT_ID, configRevision: 1, repoTargetId: null, scope: exact.scope, decisionClass: "operator_only", options: exact.options })));
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "legacy-bootstrap-authority", 1, {
+      idempotencyKey: "legacy-bootstrap-authority-disposition", actorReceiptId: "bootstrap-plugin", repoTargetId: null,
+    })).outcome).toBe("DECISION_IDENTITY_CONFLICT");
+  });
+
   it("migrates v4 to v5 without manufacturing typed authority for existing Decision rows", () => {
     const db = new Database(":memory:");
     databaseIsReady(db);
@@ -9973,8 +10077,8 @@ else printf '%s\\n' '[]'; fi
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 28, newSchemaVersion: 29, action: "unknown", expected: 4, attempted: 0, verified: 0 },
-        schema: { version: 29 },
+        cachedConsumers: { oldSchemaVersion: 29, newSchemaVersion: 30, action: "unknown", expected: 4, attempted: 0, verified: 0 },
+        schema: { version: 30 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -12403,7 +12507,7 @@ else printf '%s\\n' '[]'; fi
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
     db.exec(MIGRATIONS.find((statement) => statement.includes("CREATE TABLE IF NOT EXISTS assignments"))!);
-    for (const statement of MIGRATIONS.at(-9)!.split(";").filter((statement) => statement.includes("ALTER TABLE execution_attempts"))) db.exec(statement);
+    for (const statement of MIGRATIONS.at(-10)!.split(";").filter((statement) => statement.includes("ALTER TABLE execution_attempts"))) db.exec(statement);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -12423,10 +12527,10 @@ else printf '%s\\n' '[]'; fi
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 28, newSchemaVersion: 29, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 28, newSchemaVersion: 29, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 28, newSchemaVersion: 29, oldContractVersion: 21, newContractVersion: 22, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(29, 22))).toMatchObject({ oldSchemaVersion: 28, newSchemaVersion: 29, oldContractVersion: 21, newContractVersion: 22, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 22, newContractVersion: 23, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 22, newContractVersion: 23, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 22, newContractVersion: 23, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(30, 23))).toMatchObject({ oldSchemaVersion: 29, newSchemaVersion: 30, oldContractVersion: 22, newContractVersion: 23, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 
