@@ -955,7 +955,60 @@ export function createIdleFleetDetector(options: {
     state = idleFleetWakeState(options.persistence ? await options.persistence.read() : null);
     loaded = true;
   };
-  const save = () => options.persistence?.write(structuredClone(state));
+  let commitQueue = Promise.resolve();
+  const pendingProjectChanges = new Map<string, Map<string, string | undefined>>();
+  const keyBelongsToProject = (key: string, projectId: string) => {
+    if (key.startsWith(`${projectId}:`)) return true;
+    try {
+      const parsed = JSON.parse(key) as unknown;
+      return Array.isArray(parsed) && parsed[0] === projectId;
+    } catch {
+      return false;
+    }
+  };
+  const applyChanges = (base: Record<string, string>, changes: ReadonlyMap<string, string | undefined>) => {
+    const merged = structuredClone(base);
+    for (const [key, value] of changes) {
+      if (value === undefined) delete merged[key];
+      else merged[key] = value;
+    }
+    return merged;
+  };
+  const flushPendingProject = async (projectId: string) => {
+    const pending = pendingProjectChanges.get(projectId);
+    if (!pending || pending.size === 0) return;
+    const commit = commitQueue.then(async () => {
+      const merged = applyChanges(state, pending);
+      state = merged;
+      await options.persistence?.write(merged);
+      pendingProjectChanges.clear();
+    });
+    commitQueue = commit.then(() => undefined, () => undefined);
+    await commit;
+  };
+  const commitProjectState = async (projectId: string, before: Record<string, string>, after: Record<string, string>) => {
+    const changes = new Map<string, string | undefined>();
+    for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+      if (!keyBelongsToProject(key, projectId) || before[key] === after[key]) continue;
+      changes.set(key, after[key]);
+    }
+    if (changes.size === 0) return;
+    const commit = commitQueue.then(async () => {
+      const merged = applyChanges(state, changes);
+      state = merged;
+      try {
+        await options.persistence?.write(merged);
+        pendingProjectChanges.clear();
+      } catch (error) {
+        const pending = pendingProjectChanges.get(projectId) ?? new Map<string, string | undefined>();
+        for (const [key, value] of changes) pending.set(key, value);
+        pendingProjectChanges.set(projectId, pending);
+        throw error;
+      }
+    });
+    commitQueue = commit.then(() => undefined, () => undefined);
+    await commit;
+  };
   const blindReportIntervalMs = 1_000;
   let lastBlindMessage: string | null = null;
   let blindOccurrences = 0;
@@ -999,45 +1052,62 @@ export function createIdleFleetDetector(options: {
   const evaluate = async (probe: IdleFleetProbe) => {
     try {
       await load();
+      await flushPendingProject(probe.projectId);
       const decision = await options.read(probe);
       const key = probeKey(probe);
+      const before = structuredClone(state);
+      const next = structuredClone(before);
       if (decision.kind === "silent") {
-        if (state[key] !== undefined) {
-          delete state[key];
-          await save();
+        if (next[key] !== undefined) {
+          delete next[key];
+          await commitProjectState(probe.projectId, before, next);
         }
         return;
       }
       if (decision.kind === "blind") {
-        if (state[key] !== undefined) {
-          delete state[key];
-          await save();
+        if (next[key] !== undefined) {
+          delete next[key];
+          await commitProjectState(probe.projectId, before, next);
         }
         reportBlind(decision.message);
         return;
       }
       const legacyKey = legacyProbeKey(probe);
-      if (state[legacyKey] !== undefined) {
-        if (state[key] !== undefined) {
+      if (next[legacyKey] !== undefined) {
+        if (next[key] !== undefined) {
           reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=ambiguous-migration:${key}`);
           return;
         }
-        state[key] = state[legacyKey]!;
-        delete state[legacyKey];
-        await save();
+        next[key] = next[legacyKey]!;
+        delete next[legacyKey];
       }
-      if (state[key] === decision.episodeKey) return;
-      if (decision.legacyEpisodeKey !== undefined && state[key] === decision.legacyEpisodeKey) {
-        state[key] = decision.episodeKey;
-        await save();
+      if (next[key] === decision.episodeKey) {
+        await commitProjectState(probe.projectId, before, next);
+        return;
+      }
+      if (decision.legacyEpisodeKey !== undefined && next[key] === decision.legacyEpisodeKey) {
+        next[key] = decision.episodeKey;
+        await commitProjectState(probe.projectId, before, next);
         return;
       }
       if (!await options.wake({ ...decision, probe })) return;
-      state[key] = decision.episodeKey;
-      await save();
+      next[key] = decision.episodeKey;
+      await commitProjectState(probe.projectId, before, next);
     } catch (error) {
       reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=detector-unreadable:${String(error)}`);
     }
+  };
+
+  const evaluationQueues = new Map<string, Promise<void>>();
+  const enqueueEvaluate = (probe: IdleFleetProbe) => {
+    const previous = evaluationQueues.get(probe.projectId) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(() => evaluate(probe));
+    evaluationQueues.set(probe.projectId, current);
+    void current.then(() => {
+      if (evaluationQueues.get(probe.projectId) === current) evaluationQueues.delete(probe.projectId);
+    }, () => {
+      if (evaluationQueues.get(probe.projectId) === current) evaluationQueues.delete(probe.projectId);
+    });
   };
 
   const arm = (probe: IdleFleetProbe) => {
@@ -1047,7 +1117,7 @@ export function createIdleFleetDetector(options: {
     if (existing !== undefined) clearTimeout(existing);
     const timer = setTimeout(() => {
       timers.delete(key);
-      void evaluate(probe);
+      enqueueEvaluate(probe);
     }, debounceMs);
     timers.set(key, timer);
   };

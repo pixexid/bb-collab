@@ -94,16 +94,16 @@ const ERROR_RECOVERY_IO_TIMEOUT_MS = 10_000;
 type LaneRecoveryTarget = { project_id: string; thread_id: string; execution_attempt_id: string };
 
 export const fleetWatchdogCompositeKey = (...parts: string[]) => JSON.stringify(parts);
-export const fleetWatchdogIssueReopenedKey = (workItemId: string, externalRevision: string) =>
-  `fleet-watchdog:issue-reopened:${fleetWatchdogCompositeKey(workItemId, externalRevision)}`;
+export const fleetWatchdogIssueReopenedKey = (projectId: string, workItemId: string, externalRevision: string) =>
+  `fleet-watchdog:issue-reopened:${fleetWatchdogCompositeKey(projectId, workItemId, externalRevision)}`;
 const fleetWatchdogLegacyIssueReopenedKey = (workItemId: string, externalRevision: string) =>
   `fleet-watchdog:issue-reopened:${workItemId}:${externalRevision}`;
-export const fleetWatchdogMergeCloseKey = (workItemId: string, state: string, externalRevision: string) =>
-  `fleet-watchdog:merge-close:${fleetWatchdogCompositeKey(workItemId, state, externalRevision)}`;
+export const fleetWatchdogMergeCloseKey = (projectId: string, workItemId: string, state: string, externalRevision: string) =>
+  `fleet-watchdog:merge-close:${fleetWatchdogCompositeKey(projectId, workItemId, state, externalRevision)}`;
 const fleetWatchdogLegacyMergeCloseKey = (workItemId: string, state: string, externalRevision: string) =>
   `fleet-watchdog:merge-close:${workItemId}:${state}:${externalRevision}`;
-export const fleetWatchdogBlockerFiredKey = (workItemId: string, subject: string) =>
-  `fleet-watchdog:blocker-fired:${fleetWatchdogCompositeKey(workItemId, subject)}`;
+export const fleetWatchdogBlockerFiredKey = (projectId: string, workItemId: string, subject: string) =>
+  `fleet-watchdog:blocker-fired:${fleetWatchdogCompositeKey(projectId, workItemId, subject)}`;
 const fleetWatchdogLegacyBlockerFiredKey = (workItemId: string, subject: string) =>
   `fleet-watchdog:blocker-fired:${workItemId}:${subject}`;
 export const fleetWatchdogRoleLivenessKey = (holder: RoleHolderState) => fleetWatchdogCompositeKey(
@@ -152,6 +152,7 @@ export const ROLE_QUEUE_REFRESH_TIMEOUT_MS = 8_000;
 export const ROLE_QUEUE_CACHE_MS = 20_000;
 export const ROLE_QUEUE_IDLE_THRESHOLD_MS = 30_000;
 export const ROLE_QUEUE_OBSERVATION_MS = 1_000;
+export const FLEET_WATCHDOG_LANE_INVENTORY_TIMEOUT_MS = 1_000;
 
 function githubJson(args: string[]): unknown | null {
   try {
@@ -1061,34 +1062,36 @@ async function sendRoleBrief(
     threadId,
     mode: "queue-if-active",
     input: [{ type: "text", visibility: "agent-only", text: brief.prompt, mentions: [] }],
-  });
+  }, projectId);
 }
 
 async function enqueueAutomatedTell(
   bb: BbPluginApi,
   request: Parameters<BbPluginApi["sdk"]["threads"]["send"]>[0],
   waitForIdle: boolean,
+  projectId: string,
 ): Promise<void> {
   // ponytail: this process-local queue covers this plugin’s senders; a host atomic send-if-idle API is the cross-process upgrade.
-  const previous = automatedTellQueues.get(request.threadId) ?? Promise.resolve();
+  const queueKey = JSON.stringify([projectId, request.threadId]);
+  const previous = automatedTellQueues.get(queueKey) ?? Promise.resolve();
   const current = previous.catch(() => undefined).then(async () => {
     if (waitForIdle) await bb.sdk.threads.wait({ threadId: request.threadId, status: "idle", timeoutMs: AUTOMATED_TELL_IDLE_WAIT_MS });
     await bb.sdk.threads.send(request);
   });
-  automatedTellQueues.set(request.threadId, current);
+  automatedTellQueues.set(queueKey, current);
   try {
     await current;
   } finally {
-    if (automatedTellQueues.get(request.threadId) === current) automatedTellQueues.delete(request.threadId);
+    if (automatedTellQueues.get(queueKey) === current) automatedTellQueues.delete(queueKey);
   }
 }
 
-async function sendWhenThreadReady(bb: BbPluginApi, request: Parameters<BbPluginApi["sdk"]["threads"]["send"]>[0]): Promise<void> {
-  await enqueueAutomatedTell(bb, request, false);
+async function sendWhenThreadReady(bb: BbPluginApi, request: Parameters<BbPluginApi["sdk"]["threads"]["send"]>[0], projectId: string): Promise<void> {
+  await enqueueAutomatedTell(bb, request, false, projectId);
 }
 
-async function sendWhenThreadIdle(bb: BbPluginApi, request: Parameters<BbPluginApi["sdk"]["threads"]["send"]>[0]): Promise<void> {
-  await enqueueAutomatedTell(bb, request, true);
+async function sendWhenThreadIdle(bb: BbPluginApi, request: Parameters<BbPluginApi["sdk"]["threads"]["send"]>[0], projectId: string): Promise<void> {
+  await enqueueAutomatedTell(bb, request, true, projectId);
 }
 
 async function deliverSucceededSeatBrief(
@@ -2018,12 +2021,13 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     }
   };
   const recoverErroredThread = async (threadId: string, projectId: string, holder?: RoleHolderState, lane?: LaneRecoveryTarget) => {
-    if (recoveryInFlight.has(threadId)) {
+    const recoveryKey = JSON.stringify([projectId, threadId]);
+    if (recoveryInFlight.has(recoveryKey)) {
       bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=recovery-in-flight`);
       return null;
     }
     if (db === null) return null;
-    recoveryInFlight.add(threadId);
+    recoveryInFlight.add(recoveryKey);
     try {
       if (!db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId)) return false;
       const thread = await withRecoveryTimeout("threads.get", (signal) => bb.sdk.threads.get({ threadId, signal }));
@@ -2073,7 +2077,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       bb.log.warn(`error-recovery wake failed: project=${projectId} thread=${threadId} ${String(error)}`);
       return null;
     } finally {
-      recoveryInFlight.delete(threadId);
+      recoveryInFlight.delete(recoveryKey);
     }
   };
   const reconcileErrorRecovery = async () => {
@@ -2379,7 +2383,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         threadId: holders[0].thread_id,
         mode: "steer",
         input: [{ type: "text", visibility: "agent-only", text, mentions: [] }],
-      });
+      }, role.projectId);
     } catch (error) {
       warnRoleLiveness(holders[0], `idle-wait=failed error=${String(error)}`);
       return "error" as const;
@@ -2827,9 +2831,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       write: (state) => bb.storage.kv.set("idle-fleet.wake", state),
     },
     capacity: {
-      readProjectIds: async () => [...new Set((db ? readRoleHolderStates(db) : []).filter((holder) =>
-        holder.role_id === "project-orchestrator",
-      ).map((holder) => holder.project_id))],
+      readProjectIds: async () => db
+        ? (db.prepare("SELECT project_id FROM project_config_heads ORDER BY project_id").all() as Array<{ project_id: string }>).map((row) => row.project_id)
+        : [],
       observe: async (projectId) => {
         const previous = capacityObservationLocks.get(projectId) ?? Promise.resolve();
         let release!: () => void;
@@ -2869,6 +2873,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   const stallGuardCycle = createStallGuardCycle({
     onAmbiguous: (message) => bb.log.warn(message),
+    readProjectIds: () => db
+      ? (db.prepare("SELECT project_id FROM project_config_heads ORDER BY project_id").all() as Array<{ project_id: string }>).map((row) => row.project_id)
+      : [],
     readRoleHolders: readProjectQueueRoleHolders,
     readArtifact: async (projectId) => {
       if (!db) return null;
@@ -3053,6 +3060,39 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   const wakeInFlight = new Set<string>();
   const permanentlyRefusedReopens = new Map<string, string>();
   const pendingRefusedReopens = new Map<string, string>();
+  type FleetWatchdogLaneInventory = Awaited<ReturnType<typeof bb.sdk.threads.list>>;
+  const laneInventoryReads = new Map<string, { promise: Promise<FleetWatchdogLaneInventory>; abort: () => void }>();
+  const readFleetWatchdogLaneInventory = (projectId: string): Promise<FleetWatchdogLaneInventory | null> => {
+    let entry = laneInventoryReads.get(projectId);
+    if (!entry) {
+      const controller = new AbortController();
+      const promise = (async () => {
+        const threads: FleetWatchdogLaneInventory = [];
+        for (let offset = 0; ; offset += 100) {
+          const page = await bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset, signal: controller.signal });
+          threads.push(...page);
+          if (page.length < 100) return threads;
+        }
+      })();
+      entry = { promise, abort: () => controller.abort() };
+      laneInventoryReads.set(projectId, entry);
+      void promise.then(() => {
+        if (laneInventoryReads.get(projectId) === entry) laneInventoryReads.delete(projectId);
+      }, () => {
+        if (laneInventoryReads.get(projectId) === entry) laneInventoryReads.delete(projectId);
+      });
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<null>((resolve) => {
+      timer = setTimeout(() => {
+        entry!.abort();
+        resolve(null);
+      }, FLEET_WATCHDOG_LANE_INVENTORY_TIMEOUT_MS);
+    });
+    return Promise.race([entry.promise, timeout]).catch(() => null).finally(() => {
+      if (timer !== undefined) clearTimeout(timer);
+    });
+  };
   // This model-free detector covers threads with obligations in canonical and platform state.
   // Acts named only in prose are outside mechanical coverage because identifying whether they
   // have an executing surface would require interpreting prose.
@@ -3101,58 +3141,24 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         threadIds.add(row.thread_id);
         dispatcherThreadIdsByProject.set(row.project_id, threadIds);
       }
-      const projectIds = new Set([...holdersByProject.keys(), ...dispatcherThreadIdsByProject.keys()]);
-      for (const row of db.prepare(
-        `SELECT DISTINCT work_items.project_id FROM work_items JOIN external_work_refs
-           ON external_work_refs.project_id = work_items.project_id
-          AND external_work_refs.work_item_id = work_items.work_item_id
-          AND external_work_refs.provider = 'github'
-         WHERE work_items.lifecycle_state IN (${[...WORK_ITEM_NON_TERMINAL_STATES, "succeeded"].map(() => "?").join(", ")})
-           AND external_work_refs.issue_number IS NOT NULL`,
-      ).all(...WORK_ITEM_NON_TERMINAL_STATES, "succeeded") as Array<{ project_id: string }>) projectIds.add(row.project_id);
+      // Canonical config heads are the only tenant population. Role holders,
+      // attempts, and WorkItems are project-scoped evidence, not discovery.
+      const projectIds = new Set((db.prepare(
+        "SELECT project_id FROM project_config_heads ORDER BY project_id",
+      ).all() as Array<{ project_id: string }>).map((row) => row.project_id));
       const lanesByProject = new Map<string, Awaited<ReturnType<typeof bb.sdk.threads.list>>>();
       const readableLaneProjects = new Set<string>();
-      const listProjectChildThreads = async (projectId: string) => {
-        const threads: Awaited<ReturnType<typeof bb.sdk.threads.list>> = [];
-        for (let offset = 0; ; offset += 100) {
-          const page = await bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset });
-          threads.push(...page);
-          if (page.length < 100) return threads;
-        }
-      };
       const dispatchWedgesByProject = new Map<string, Array<{ executionAttemptId: string; workItemId: string }>>();
-      for (const projectId of projectIds) {
-        if (onlyProjectId !== undefined && projectId !== onlyProjectId) continue;
-        const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? new Set<string>();
-        let threads: Awaited<ReturnType<typeof bb.sdk.threads.list>> = [];
-        let threadInventoryReadable = true;
-        try {
-          threads = await listProjectChildThreads(projectId);
-        } catch (error) {
-          threadInventoryReadable = false;
-          degrade(fleetWatchdogScope("platform-parentage", projectId, String(error)));
-        }
-        if (threadInventoryReadable) {
-          readableLaneProjects.add(projectId);
-          const wedges = reconcilePreparedWorkItemDispatches(db, projectId, threads);
-          if (wedges.length > 0) {
-            dispatchWedgesByProject.set(projectId, wedges);
-            bb.log.warn(`fleet-watchdog dispatch wedge: project=${projectId} workItems=${wedges.map(({ workItemId }) => workItemId).join(",")}`);
-          }
-        }
-        const lanes = threads.filter((thread) =>
-          thread.parentThreadId !== null &&
-          dispatcherThreadIds.has(thread.parentThreadId) &&
-          thread.archivedAt === null &&
-          thread.deletedAt === null,
-        );
-        visibleLaneCount += lanes.length;
-        lanesByProject.set(projectId, lanes);
-      }
+      // Start every project read before awaiting any one of them. Each project enters its
+      // evaluation as soon as its own bounded inventory settles; a slow project is not a
+      // fleet-wide barrier.
+      const laneInventoryByProject = new Map([...projectIds]
+        .filter((projectId) => onlyProjectId === undefined || projectId === onlyProjectId)
+        .map((projectId) => [projectId, readFleetWatchdogLaneInventory(projectId)] as const));
       const openWorkItemsByProject = new Map<string, Array<{ workItemId: string; lifecycleState: string; waker: string | null; wakerKind: "schedule" | "seat" | "work_item_succeeded" | "github_issue_closed" | null; declaredAtMs: number | null }>>();
       const externalRevisions = new Map<string, LinkedGithubObservation>();
       const waitExternalRevisions = new Map<string, LinkedGithubObservation>();
-      const waitExternalKey = (owner: string, repo: string, issueNumber: number) => `${owner}\u0000${repo}\u0000${issueNumber}`;
+      const waitExternalKey = (projectId: string, owner: string, repo: string, issueNumber: number) => `${projectId}\u0000${owner}\u0000${repo}\u0000${issueNumber}`;
       for (const workItem of db.prepare(
         `SELECT work_items.project_id, work_items.work_item_id, work_items.lifecycle_state, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
          FROM work_items LEFT JOIN work_item_waits
@@ -3314,7 +3320,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
             continue;
           }
-          const key = waitExternalKey(match[1], match[2], issueNumber);
+          const key = waitExternalKey(projectId, match[1], match[2], issueNumber);
           if (waitExternalRevisions.has(key)) continue;
           const observation = await linkedGithubObservationAsync(match[1], match[2], issueNumber);
           if (observation === null) degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
@@ -3364,7 +3370,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               projectId,
               linked.work_item_id,
               "ready",
-              fleetWatchdogIssueReopenedKey(linked.work_item_id, observation.externalRevision),
+              fleetWatchdogIssueReopenedKey(projectId, linked.work_item_id, observation.externalRevision),
               { workItemExternalEvent: { kind: "github_issue_reopened", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } },
               githubSnapshot,
               fleetWatchdogLegacyIssueReopenedKey(linked.work_item_id, observation.externalRevision),
@@ -3413,7 +3419,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             projectId,
             linked.work_item_id,
             state,
-            fleetWatchdogMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
+            fleetWatchdogMergeCloseKey(projectId, linked.work_item_id, state, githubSnapshot.externalRevision),
             state === "succeeded" || (state === "cancelled" && workItem.lifecycle_state === "proposed")
               ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } }
               : {},
@@ -3456,10 +3462,38 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         }
       };
       let brokenWakePath = false;
-      for (const projectId of projectIds) {
+      await Promise.all([...projectIds]
+        .filter((projectId) => onlyProjectId === undefined || projectId === onlyProjectId)
+        .map(async (projectId) => {
+        const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? new Set<string>();
+        let threads: Awaited<ReturnType<typeof bb.sdk.threads.list>> = [];
+        let threadInventoryReadable = true;
+        try {
+          const inventory = await laneInventoryByProject.get(projectId)!;
+          if (inventory === null) throw new Error("native-lane-inventory-timeout");
+          threads = inventory;
+        } catch (error) {
+          threadInventoryReadable = false;
+          degrade(fleetWatchdogScope("platform-parentage", projectId, String(error)));
+        }
+        if (threadInventoryReadable) {
+          readableLaneProjects.add(projectId);
+          const wedges = reconcilePreparedWorkItemDispatches(db, projectId, threads);
+          if (wedges.length > 0) {
+            dispatchWedgesByProject.set(projectId, wedges);
+            bb.log.warn(`fleet-watchdog dispatch wedge: project=${projectId} workItems=${wedges.map(({ workItemId }) => workItemId).join(",")}`);
+          }
+        }
+        const lanes = threads.filter((thread) =>
+          thread.parentThreadId !== null &&
+          dispatcherThreadIds.has(thread.parentThreadId) &&
+          thread.archivedAt === null &&
+          thread.deletedAt === null,
+        );
+        visibleLaneCount += lanes.length;
+        lanesByProject.set(projectId, lanes);
         const holders = holdersByProject.get(projectId) ?? [];
         try {
-          if (onlyProjectId !== undefined && projectId !== onlyProjectId) continue;
           await inspectLinkedWorkItems(projectId);
           await inspectWaitTargets(projectId);
           const directors = holders.filter((holder) => holder.role_id === "director");
@@ -3468,7 +3502,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             if (directors.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active director holders=${directors.length}`);
             if (orchestrators.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active project-orchestrator holders=${orchestrators.length}`);
             degrade(fleetWatchdogScope("routing", projectId, `directors=${directors.length},orchestrators=${orchestrators.length}`));
-            continue;
+            return;
           }
           const director = directors[0]!;
           const orchestrator = orchestrators[0]!;
@@ -3587,12 +3621,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           if (blindLaneCount > 0) {
             bb.log.warn(`fleet-watchdog idle enforcer activeLanes=blind project=${projectId} visible=${idleActiveLaneCount} dispatchUnknown=${blindLaneCount}`);
           }
-          const repositories = (db.prepare(
-            `SELECT targets.remote_url FROM project_config_heads AS heads
-             JOIN repository_targets AS targets
-               ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
-             WHERE heads.project_id = ? ORDER BY targets.repo_target_id`,
-          ).all(projectId) as Array<{ remote_url: string | null }>).map((target) => githubRepository(target.remote_url));
+          const configured = readRoleQueueConfig(projectId);
+          const repositories = configured.repositories;
           for (const wedge of dispatchWedgesByProject.get(projectId) ?? []) {
             await wake(
               projectId,
@@ -3603,9 +3633,14 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               "owed-act",
             );
           }
-          const queue = repositories.length === 0 || repositories.some((repository) => repository === null)
-            ? null
-            : await startableQueueStateAsync(repositories as string[]);
+          const observedQueue = configured.reason === null
+            ? await startableQueueStateAsync(repositories)
+            : null;
+          const currentConfig = readRoleQueueConfig(projectId);
+          const queue = currentConfig.identity === configured.identity ? observedQueue : null;
+          if (currentConfig.identity !== configured.identity) {
+            degrade(fleetWatchdogScope("project-config", projectId, "replaced-during-refresh"));
+          }
           const fleetQueueHead = queue?.head === null || queue?.head === undefined ? null : `fleet:queue:${queue.head}`;
           await Promise.all(holders.map((holder) => fleetWatchdogIdle.clearPrefixExcept(
             roleIdleKey(holder, "fleet:queue:").slice(0, -2),
@@ -3645,7 +3680,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
                           return false;
                         }
                         const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? new Set<string>();
-                        const freshLanes = (await listProjectChildThreads(projectId)).filter((thread) =>
+                        const freshInventory = await readFleetWatchdogLaneInventory(projectId);
+                        if (freshInventory === null) throw new Error("native-lane-inventory-timeout");
+                        const freshLanes = freshInventory.filter((thread) =>
                           thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) &&
                           thread.archivedAt === null && thread.deletedAt === null,
                         );
@@ -3674,7 +3711,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               ).get(projectId, blocked.waker) as { lifecycle_state: string } | undefined;
               if (dependency?.lifecycle_state !== "succeeded") continue;
               condition = { kind: "work_item_succeeded", workItemId: blocked.waker };
-              idempotencyKey = fleetWatchdogBlockerFiredKey(blocked.workItemId, blocked.waker);
+              idempotencyKey = fleetWatchdogBlockerFiredKey(projectId, blocked.workItemId, blocked.waker);
             } else if (blocked.wakerKind === "github_issue_closed" && blocked.waker !== null) {
               const match = blocked.waker.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u);
               const issueNumber = match?.[3] === undefined ? NaN : Number(match[3]);
@@ -3690,7 +3727,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               }
               if (snapshot.state !== "closed") continue;
               condition = { kind: "github_issue_closed", owner: match[1], repo: match[2], issueNumber };
-              idempotencyKey = fleetWatchdogBlockerFiredKey(blocked.workItemId, snapshot.externalRevision);
+              idempotencyKey = fleetWatchdogBlockerFiredKey(projectId, blocked.workItemId, snapshot.externalRevision);
             } else {
               degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
               continue;
@@ -3713,7 +3750,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             const targetMatch = candidate.wakerKind === "github_issue_closed" ? candidate.waker?.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u) ?? null : null;
             const targetIssueNumber = targetMatch?.[3] === undefined ? NaN : Number(targetMatch[3]);
             const observation = targetMatch?.[1] && targetMatch[2] && Number.isSafeInteger(targetIssueNumber)
-              ? waitExternalRevisions.get(waitExternalKey(targetMatch[1], targetMatch[2], targetIssueNumber))
+              ? waitExternalRevisions.get(waitExternalKey(projectId, targetMatch[1], targetMatch[2], targetIssueNumber))
               : undefined;
             if (!observation) {
               const record = await fleetWatchdogIdle.get(roleIdleKey(orchestrator, candidate.workItemId));
@@ -3734,32 +3771,32 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           }
           if (staleWait) {
             await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait", undefined, staleObservation?.externalRevision ?? null, staleWait.waker, staleExternalMoved);
-            continue;
+            return;
           }
           const seatWait = remainingWorkItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null);
           if (seatWait) {
             const owing = holders.find((holder) => holder.role_id === seatWait.waker);
-            if (!owing) continue;
+            if (!owing) return;
             const owingKey = roleIdleKey(owing, seatWait.workItemId);
             const owingThread = await bb.sdk.threads.get({ threadId: owing.thread_id });
             if (roleThreadRefusal(owing, owingThread, true) || await readPendingExternalWait(owing.thread_id)) {
               await fleetWatchdogIdle.resetIdle(owingKey);
-              continue;
+              return;
             }
             const owingRecord = await fleetWatchdogIdle.observeIdle(owingKey, now);
-            if (owingRecord.idleSinceMs === null || now - owingRecord.idleSinceMs < floorMs) continue;
+            if (owingRecord.idleSinceMs === null || now - owingRecord.idleSinceMs < floorMs) return;
             if (owingRecord.lastOwedActWakeAtMs === null || owingRecord.lastOwedActWakeAtMs < owingRecord.idleSinceMs) {
               await wake(projectId, owing, owingKey, `owed act quiet at cycle ${new Date(now).toISOString()} with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
-              continue;
+              return;
             }
             if (owing.role_id !== "director" && now - owingRecord.lastOwedActWakeAtMs >= FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) {
               await wake(projectId, director, roleIdleKey(director, seatWait.workItemId), `owed act still quiet at cycle ${new Date(now).toISOString()} with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
             }
-            continue;
+            return;
           }
           if (queue === null || queue.count === 0 || queue.head === null) {
             await resetIdle();
-            continue;
+            return;
           }
           const workKey = `fleet:queue:${queue.head}`;
           const orchestratorKey = roleIdleKey(orchestrator, workKey);
@@ -3769,7 +3806,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
               const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
               return !roleThreadRefusal(holder, thread, true) && !await readPendingExternalWait(holder.thread_id);
             }))).every(Boolean));
-            continue;
+            return;
           }
           const idle = await Promise.all(holders.map(async (holder) => {
             const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
@@ -3780,17 +3817,17 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             const record = await fleetWatchdogIdle.observeIdle(roleIdleKey(holder, workKey), now);
             return record.idleSinceMs !== null && now - record.idleSinceMs >= floorMs;
           }));
-          if (!idle.every(Boolean)) continue;
+          if (!idle.every(Boolean)) return;
           const orchestratorRecord = await fleetWatchdogIdle.get(orchestratorKey);
           if (orchestratorRecord?.lastFleetWakeAtMs === null || orchestratorRecord?.lastFleetWakeAtMs === undefined || orchestratorRecord.lastFleetWakeAtMs < (orchestratorRecord.idleSinceMs ?? now)) {
             await wake(projectId, orchestrator, orchestratorKey, `fleet quiet at cycle ${new Date(now).toISOString()} with open work since ${new Date(orchestratorRecord?.idleSinceMs ?? now).toISOString()}`, true, "fleet");
-            continue;
+            return;
           }
         } catch (error) {
           degrade(fleetWatchdogScope("project", projectId, String(error)));
           bb.log.warn(`fleet-watchdog failed: ${String(error)}`);
         }
-      }
+        }));
       if (!brokenWakePath && coverage === "visible") bb.log.info("fleet-watchdog healthy cycle");
     } catch (error) {
       degrade(fleetWatchdogScope("cycle", String(error)));

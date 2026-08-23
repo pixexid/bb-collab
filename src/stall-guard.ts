@@ -23,6 +23,8 @@ export interface StallGuardArtifact {
 
 export interface StallGuardCycleOptions {
   readRoleHolders: () => RoleHolderState[];
+  /** Canonical tenant inventory; role holders are not a tenant population. */
+  readProjectIds?: () => readonly string[];
   readArtifact: (projectId: string) => Promise<StallGuardArtifact[] | null>;
   readQueueHead?: (projectId: string) => { workItemId: string; resourceRevision: number } | null;
   wakeRole: (role: RoleIdleView) => Promise<RoleWakeResult>;
@@ -84,99 +86,221 @@ function hasArtifactDelta(previous: string, current: readonly StallGuardArtifact
   });
 }
 
+function validArtifactSnapshot(value: StallGuardArtifact[] | null): StallGuardArtifact[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const ids = new Set<string>();
+  for (const artifact of value) {
+    if (!artifact || typeof artifact.id !== "string" || artifact.id.length === 0 || ids.has(artifact.id) || typeof artifact.unavailable !== "boolean") return null;
+    if (artifact.unavailable) return null;
+    ids.add(artifact.id);
+  }
+  return value;
+}
+
+function keyBelongsToProject(key: string, projectId: string): boolean {
+  if (key.startsWith(`${projectId}:`)) return true;
+  try {
+    const parsed = JSON.parse(key) as unknown;
+    return Array.isArray(parsed) && parsed[0] === projectId;
+  } catch {
+    return false;
+  }
+}
+
+function emptySummary(observed = 0): StallGuardCycleSummary {
+  return { outcome: "OK", subject: "stall-guard", observed, changed: 0, attempted: 0, verified: 0, steered: 0, ambiguous: 0 };
+}
+
 export function createStallGuardCycle(options: StallGuardCycleOptions) {
   let state: Record<string, string> | null = null;
+  let stateLoad: Promise<Record<string, string>> | null = null;
+  let commitQueue = Promise.resolve();
+  const projectCycles = new Map<string, Promise<StallGuardCycleSummary>>();
+  const artifactReads = new Map<string, Promise<StallGuardArtifact[] | null>>();
+
+  const readState = async () => {
+    if (state !== null) return state;
+    const load = stateLoad ??= options.persistence.read().then(stateFromUnknown);
+    try {
+      state = await load;
+    } catch (error) {
+      if (stateLoad === load) stateLoad = null;
+      throw error;
+    }
+    return state;
+  };
+
+  const pendingProjectChanges = new Map<string, Map<string, string | undefined>>();
+  const applyChanges = (base: Record<string, string>, changes: ReadonlyMap<string, string | undefined>) => {
+    const merged = structuredClone(base);
+    for (const [key, value] of changes) {
+      if (value === undefined) delete merged[key];
+      else merged[key] = value;
+    }
+    return merged;
+  };
+  const flushPendingProject = async (projectId: string) => {
+    const pending = pendingProjectChanges.get(projectId);
+    if (!pending || pending.size === 0) return;
+    const commit = commitQueue.then(async () => {
+      const merged = applyChanges(state ?? {}, pending);
+      state = merged;
+      await options.persistence.write(merged);
+      pendingProjectChanges.clear();
+    });
+    commitQueue = commit.then(() => undefined, () => undefined);
+    await commit;
+  };
+  const commitProjectState = async (projectId: string, before: Record<string, string>, after: Record<string, string>) => {
+    const changes = new Map<string, string | undefined>();
+    for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+      if (!keyBelongsToProject(key, projectId) || before[key] === after[key]) continue;
+      changes.set(key, after[key]);
+    }
+    if (changes.size === 0) return;
+    const commit = commitQueue.then(async () => {
+      const merged = applyChanges(state ?? {}, changes);
+      state = merged;
+      try {
+        await options.persistence.write(merged);
+        pendingProjectChanges.clear();
+      } catch (error) {
+        const pending = pendingProjectChanges.get(projectId) ?? new Map<string, string | undefined>();
+        for (const [key, value] of changes) pending.set(key, value);
+        pendingProjectChanges.set(projectId, pending);
+        throw error;
+      }
+    });
+    commitQueue = commit.then(() => undefined, () => undefined);
+    await commit;
+  };
 
   return {
     async cycle(projectId?: string): Promise<StallGuardCycleSummary> {
-      state ??= stateFromUnknown(await options.persistence.read());
-      const holders = options.readRoleHolders().filter((holder) => projectId === undefined || holder.project_id === projectId);
-      const nextState = structuredClone(state);
-      const artifacts = new Map<string, Promise<StallGuardArtifact[] | null>>();
-      const readArtifacts = (id: string) => {
-        let current = artifacts.get(id);
-        if (!current) {
-          current = options.readArtifact(id).catch(() => null);
-          artifacts.set(id, current);
+      const holdersInStore = options.readRoleHolders();
+      const inventory = [...new Set(options.readProjectIds?.() ?? holdersInStore.map((holder) => holder.project_id))];
+      const projectIds = projectId === undefined ? inventory : inventory.filter((id) => id === projectId);
+      const runProject = async (currentProjectId: string): Promise<StallGuardCycleSummary> => {
+        await readState();
+        await flushPendingProject(currentProjectId);
+        const currentHolders = options.readRoleHolders();
+        const currentInventory = options.readProjectIds?.();
+        if (currentInventory !== undefined && !currentInventory.includes(currentProjectId)) return emptySummary();
+        const holders = currentHolders.filter((holder) => holder.project_id === currentProjectId);
+        const before = structuredClone(state ?? {});
+        const nextState = structuredClone(before);
+        const readArtifacts = (id: string) => {
+          let current = artifactReads.get(id);
+          if (!current) {
+            current = options.readArtifact(id).then(validArtifactSnapshot).catch(() => null);
+            artifactReads.set(id, current);
+            void current.then(() => {
+              if (artifactReads.get(id) === current) artifactReads.delete(id);
+            });
+          }
+          return current;
+        };
+        let changed = 0;
+        let attempted = 0;
+        let verified = 0;
+        let steered = 0;
+        let ambiguous = 0;
+
+        await Promise.all(holders.map(async (holder) => {
+          const key = JSON.stringify([holder.project_id, holder.role_id]);
+          const legacyKey = `${holder.project_id}:${holder.role_id}`;
+          if (nextState[legacyKey] !== undefined) {
+            if (nextState[key] !== undefined) {
+              ambiguous += 1;
+              options.onAmbiguous?.(`stall-guard ambiguous migration: ${key}`);
+              return;
+            }
+            nextState[key] = nextState[legacyKey]!;
+            delete nextState[legacyKey];
+            changed += 1;
+          }
+          const current = await readArtifacts(holder.project_id);
+          if (current === null) return;
+          // Queue-head detection belongs to fleet-watchdog; this read only preserves #533 suppression.
+          const queueHead = options.readQueueHead?.(holder.project_id);
+          const queueSuppressionKey = queueHead ? roleIdleKey(holder, queueHead.workItemId) : undefined;
+          const queueAlreadyWoken = queueSuppressionKey !== undefined && (() => {
+            const record = observation(nextState[queueSuppressionKey] ?? "");
+            return record?.woken === true && record.queueHead?.resourceRevision === queueHead!.resourceRevision;
+          })();
+          const next = snapshot(current);
+          if (nextState[key] === undefined) {
+            nextState[key] = next;
+            changed += 1;
+            return;
+          }
+          if (nextState[key] === next) return;
+          if (queueAlreadyWoken || !hasArtifactDelta(nextState[key], current)) {
+            nextState[key] = next;
+            changed += 1;
+            return;
+          }
+
+          const role: RoleIdleView = {
+            projectId: holder.project_id,
+            roleId: holder.role_id,
+            roleGeneration: holder.role_generation,
+            executionAttemptId: holder.execution_attempt_id,
+            threadId: holder.thread_id,
+            queueHeadId: queueHead?.workItemId ?? holder.execution_attempt_id,
+            idleAgeMs: 0,
+          };
+          let result: RoleWakeResult;
+          try {
+            result = await options.wakeRole(role);
+          } catch {
+            return;
+          }
+          if (!result.attempted) {
+            if (result.refusal !== "policy") return;
+            nextState[key] = next;
+            changed += 1;
+            return;
+          }
+          attempted += 1;
+          if (!result.delivered) return;
+          nextState[key] = next;
+          if (queueHead) nextState[queueSuppressionKey!] = JSON.stringify({ artifacts: current, queueHead, woken: true });
+          changed += 1;
+          verified += 1;
+          steered += 1;
+        }));
+
+        if (changed > 0) {
+          const latestInventory = options.readProjectIds?.();
+          if (latestInventory !== undefined && !latestInventory.includes(currentProjectId)) return emptySummary(holders.length);
+          await commitProjectState(currentProjectId, before, nextState);
         }
+        return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered, ambiguous };
+      };
+      const enqueue = (currentProjectId: string) => {
+        const previous = projectCycles.get(currentProjectId) ?? Promise.resolve();
+        const current = previous.catch(() => undefined).then(() => runProject(currentProjectId));
+        projectCycles.set(currentProjectId, current);
+        void current.then(() => {
+          if (projectCycles.get(currentProjectId) === current) projectCycles.delete(currentProjectId);
+        }, () => {
+          if (projectCycles.get(currentProjectId) === current) projectCycles.delete(currentProjectId);
+        });
         return current;
       };
-      let changed = 0;
-      let attempted = 0;
-      let verified = 0;
-      let steered = 0;
-      let ambiguous = 0;
-
-      for (const holder of holders) {
-        const key = JSON.stringify([holder.project_id, holder.role_id]);
-        const legacyKey = `${holder.project_id}:${holder.role_id}`;
-        if (nextState[legacyKey] !== undefined) {
-          if (nextState[key] !== undefined) {
-            ambiguous += 1;
-            options.onAmbiguous?.(`stall-guard ambiguous migration: ${key}`);
-            continue;
-          }
-          nextState[key] = nextState[legacyKey]!;
-          delete nextState[legacyKey];
-          changed += 1;
-        }
-        const current = await readArtifacts(holder.project_id);
-        if (current === null) continue;
-        // Queue-head detection belongs to fleet-watchdog; this read only preserves #533 suppression.
-        const queueHead = options.readQueueHead?.(holder.project_id);
-        const queueSuppressionKey = queueHead ? roleIdleKey(holder, queueHead.workItemId) : undefined;
-        const queueAlreadyWoken = queueSuppressionKey !== undefined && (() => {
-          const record = observation(nextState[queueSuppressionKey] ?? "");
-          return record?.woken === true && record.queueHead?.resourceRevision === queueHead!.resourceRevision;
-        })();
-        const next = snapshot(current);
-        if (nextState[key] === undefined) {
-          nextState[key] = next;
-          changed += 1;
-          continue;
-        }
-        if (nextState[key] === next) continue;
-        if (queueAlreadyWoken || !hasArtifactDelta(nextState[key], current)) {
-          nextState[key] = next;
-          changed += 1;
-          continue;
-        }
-
-        const role: RoleIdleView = {
-          projectId: holder.project_id,
-          roleId: holder.role_id,
-          roleGeneration: holder.role_generation,
-          executionAttemptId: holder.execution_attempt_id,
-          threadId: holder.thread_id,
-          queueHeadId: holder.execution_attempt_id,
-          idleAgeMs: 0,
-        };
-        let result: RoleWakeResult;
-        try {
-          result = await options.wakeRole(role);
-        } catch {
-          continue;
-        }
-        if (!result.attempted) {
-          if (result.refusal !== "policy") continue;
-          nextState[key] = next;
-          changed += 1;
-          continue;
-        }
-        attempted += 1;
-        if (!result.delivered) continue;
-        nextState[key] = next;
-        if (queueHead) nextState[queueSuppressionKey!] = JSON.stringify({ artifacts: current, queueHead, woken: true });
-        changed += 1;
-        verified += 1;
-        steered += 1;
-      }
-
-      if (changed > 0) {
-        await options.persistence.write(nextState);
-        state = nextState;
-      }
-      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered, ambiguous };
+      if (projectId !== undefined) return enqueue(projectId);
+      const summaries = await Promise.all(projectIds.map((currentProjectId) => enqueue(currentProjectId)));
+      return summaries.reduce((total, summary) => ({
+        outcome: "OK",
+        subject: "stall-guard",
+        observed: total.observed + summary.observed,
+        changed: total.changed + summary.changed,
+        attempted: total.attempted + summary.attempted,
+        verified: total.verified + summary.verified,
+        steered: total.steered + summary.steered,
+        ambiguous: total.ambiguous + summary.ambiguous,
+      }), emptySummary());
     },
   };
 }

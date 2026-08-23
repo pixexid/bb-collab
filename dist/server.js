@@ -14435,7 +14435,60 @@ function createIdleFleetDetector(options) {
     state = idleFleetWakeState(options.persistence ? await options.persistence.read() : null);
     loaded = true;
   };
-  const save = () => options.persistence?.write(structuredClone(state));
+  let commitQueue = Promise.resolve();
+  const pendingProjectChanges = /* @__PURE__ */ new Map();
+  const keyBelongsToProject2 = (key, projectId) => {
+    if (key.startsWith(`${projectId}:`)) return true;
+    try {
+      const parsed = JSON.parse(key);
+      return Array.isArray(parsed) && parsed[0] === projectId;
+    } catch {
+      return false;
+    }
+  };
+  const applyChanges = (base, changes) => {
+    const merged = structuredClone(base);
+    for (const [key, value] of changes) {
+      if (value === void 0) delete merged[key];
+      else merged[key] = value;
+    }
+    return merged;
+  };
+  const flushPendingProject = async (projectId) => {
+    const pending = pendingProjectChanges.get(projectId);
+    if (!pending || pending.size === 0) return;
+    const commit = commitQueue.then(async () => {
+      const merged = applyChanges(state, pending);
+      state = merged;
+      await options.persistence?.write(merged);
+      pendingProjectChanges.clear();
+    });
+    commitQueue = commit.then(() => void 0, () => void 0);
+    await commit;
+  };
+  const commitProjectState = async (projectId, before, after) => {
+    const changes = /* @__PURE__ */ new Map();
+    for (const key of /* @__PURE__ */ new Set([...Object.keys(before), ...Object.keys(after)])) {
+      if (!keyBelongsToProject2(key, projectId) || before[key] === after[key]) continue;
+      changes.set(key, after[key]);
+    }
+    if (changes.size === 0) return;
+    const commit = commitQueue.then(async () => {
+      const merged = applyChanges(state, changes);
+      state = merged;
+      try {
+        await options.persistence?.write(merged);
+        pendingProjectChanges.clear();
+      } catch (error48) {
+        const pending = pendingProjectChanges.get(projectId) ?? /* @__PURE__ */ new Map();
+        for (const [key, value] of changes) pending.set(key, value);
+        pendingProjectChanges.set(projectId, pending);
+        throw error48;
+      }
+    });
+    commitQueue = commit.then(() => void 0, () => void 0);
+    await commit;
+  };
   const blindReportIntervalMs = 1e3;
   let lastBlindMessage = null;
   let blindOccurrences = 0;
@@ -14477,45 +14530,61 @@ function createIdleFleetDetector(options) {
   const evaluate = async (probe) => {
     try {
       await load();
+      await flushPendingProject(probe.projectId);
       const decision = await options.read(probe);
       const key = probeKey(probe);
+      const before = structuredClone(state);
+      const next = structuredClone(before);
       if (decision.kind === "silent") {
-        if (state[key] !== void 0) {
-          delete state[key];
-          await save();
+        if (next[key] !== void 0) {
+          delete next[key];
+          await commitProjectState(probe.projectId, before, next);
         }
         return;
       }
       if (decision.kind === "blind") {
-        if (state[key] !== void 0) {
-          delete state[key];
-          await save();
+        if (next[key] !== void 0) {
+          delete next[key];
+          await commitProjectState(probe.projectId, before, next);
         }
         reportBlind(decision.message);
         return;
       }
       const legacyKey = legacyProbeKey(probe);
-      if (state[legacyKey] !== void 0) {
-        if (state[key] !== void 0) {
+      if (next[legacyKey] !== void 0) {
+        if (next[key] !== void 0) {
           reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=ambiguous-migration:${key}`);
           return;
         }
-        state[key] = state[legacyKey];
-        delete state[legacyKey];
-        await save();
+        next[key] = next[legacyKey];
+        delete next[legacyKey];
       }
-      if (state[key] === decision.episodeKey) return;
-      if (decision.legacyEpisodeKey !== void 0 && state[key] === decision.legacyEpisodeKey) {
-        state[key] = decision.episodeKey;
-        await save();
+      if (next[key] === decision.episodeKey) {
+        await commitProjectState(probe.projectId, before, next);
+        return;
+      }
+      if (decision.legacyEpisodeKey !== void 0 && next[key] === decision.legacyEpisodeKey) {
+        next[key] = decision.episodeKey;
+        await commitProjectState(probe.projectId, before, next);
         return;
       }
       if (!await options.wake({ ...decision, probe })) return;
-      state[key] = decision.episodeKey;
-      await save();
+      next[key] = decision.episodeKey;
+      await commitProjectState(probe.projectId, before, next);
     } catch (error48) {
       reportBlind(`idle-fleet coverage=blind orchestrator=blind activeLanes=blind startable=blind reason=detector-unreadable:${String(error48)}`);
     }
+  };
+  const evaluationQueues = /* @__PURE__ */ new Map();
+  const enqueueEvaluate = (probe) => {
+    const previous = evaluationQueues.get(probe.projectId) ?? Promise.resolve();
+    const current = previous.catch(() => void 0).then(() => evaluate(probe));
+    evaluationQueues.set(probe.projectId, current);
+    void current.then(() => {
+      if (evaluationQueues.get(probe.projectId) === current) evaluationQueues.delete(probe.projectId);
+    }, () => {
+      if (evaluationQueues.get(probe.projectId) === current) evaluationQueues.delete(probe.projectId);
+    });
   };
   const arm = (probe) => {
     if (stopped) return;
@@ -14524,7 +14593,7 @@ function createIdleFleetDetector(options) {
     if (existing !== void 0) clearTimeout(existing);
     const timer = setTimeout(() => {
       timers.delete(key);
-      void evaluate(probe);
+      enqueueEvaluate(probe);
     }, debounceMs);
     timers.set(key, timer);
   };
@@ -21493,94 +21562,211 @@ function hasArtifactDelta(previous, current) {
     return before !== void 0 && !artifact.unavailable && !before.unavailable && snapshot(before.value) !== snapshot(artifact.value);
   });
 }
+function validArtifactSnapshot(value) {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const ids = /* @__PURE__ */ new Set();
+  for (const artifact of value) {
+    if (!artifact || typeof artifact.id !== "string" || artifact.id.length === 0 || ids.has(artifact.id) || typeof artifact.unavailable !== "boolean") return null;
+    if (artifact.unavailable) return null;
+    ids.add(artifact.id);
+  }
+  return value;
+}
+function keyBelongsToProject(key, projectId) {
+  if (key.startsWith(`${projectId}:`)) return true;
+  try {
+    const parsed = JSON.parse(key);
+    return Array.isArray(parsed) && parsed[0] === projectId;
+  } catch {
+    return false;
+  }
+}
+function emptySummary(observed = 0) {
+  return { outcome: "OK", subject: "stall-guard", observed, changed: 0, attempted: 0, verified: 0, steered: 0, ambiguous: 0 };
+}
 function createStallGuardCycle(options) {
   let state = null;
+  let stateLoad = null;
+  let commitQueue = Promise.resolve();
+  const projectCycles = /* @__PURE__ */ new Map();
+  const artifactReads = /* @__PURE__ */ new Map();
+  const readState = async () => {
+    if (state !== null) return state;
+    const load = stateLoad ??= options.persistence.read().then(stateFromUnknown);
+    try {
+      state = await load;
+    } catch (error48) {
+      if (stateLoad === load) stateLoad = null;
+      throw error48;
+    }
+    return state;
+  };
+  const pendingProjectChanges = /* @__PURE__ */ new Map();
+  const applyChanges = (base, changes) => {
+    const merged = structuredClone(base);
+    for (const [key, value] of changes) {
+      if (value === void 0) delete merged[key];
+      else merged[key] = value;
+    }
+    return merged;
+  };
+  const flushPendingProject = async (projectId) => {
+    const pending = pendingProjectChanges.get(projectId);
+    if (!pending || pending.size === 0) return;
+    const commit = commitQueue.then(async () => {
+      const merged = applyChanges(state ?? {}, pending);
+      state = merged;
+      await options.persistence.write(merged);
+      pendingProjectChanges.clear();
+    });
+    commitQueue = commit.then(() => void 0, () => void 0);
+    await commit;
+  };
+  const commitProjectState = async (projectId, before, after) => {
+    const changes = /* @__PURE__ */ new Map();
+    for (const key of /* @__PURE__ */ new Set([...Object.keys(before), ...Object.keys(after)])) {
+      if (!keyBelongsToProject(key, projectId) || before[key] === after[key]) continue;
+      changes.set(key, after[key]);
+    }
+    if (changes.size === 0) return;
+    const commit = commitQueue.then(async () => {
+      const merged = applyChanges(state ?? {}, changes);
+      state = merged;
+      try {
+        await options.persistence.write(merged);
+        pendingProjectChanges.clear();
+      } catch (error48) {
+        const pending = pendingProjectChanges.get(projectId) ?? /* @__PURE__ */ new Map();
+        for (const [key, value] of changes) pending.set(key, value);
+        pendingProjectChanges.set(projectId, pending);
+        throw error48;
+      }
+    });
+    commitQueue = commit.then(() => void 0, () => void 0);
+    await commit;
+  };
   return {
     async cycle(projectId) {
-      state ??= stateFromUnknown(await options.persistence.read());
-      const holders = options.readRoleHolders().filter((holder) => projectId === void 0 || holder.project_id === projectId);
-      const nextState = structuredClone(state);
-      const artifacts = /* @__PURE__ */ new Map();
-      const readArtifacts = (id2) => {
-        let current = artifacts.get(id2);
-        if (!current) {
-          current = options.readArtifact(id2).catch(() => null);
-          artifacts.set(id2, current);
+      const holdersInStore = options.readRoleHolders();
+      const inventory = [...new Set(options.readProjectIds?.() ?? holdersInStore.map((holder) => holder.project_id))];
+      const projectIds = projectId === void 0 ? inventory : inventory.filter((id2) => id2 === projectId);
+      const runProject = async (currentProjectId) => {
+        await readState();
+        await flushPendingProject(currentProjectId);
+        const currentHolders = options.readRoleHolders();
+        const currentInventory = options.readProjectIds?.();
+        if (currentInventory !== void 0 && !currentInventory.includes(currentProjectId)) return emptySummary();
+        const holders = currentHolders.filter((holder) => holder.project_id === currentProjectId);
+        const before = structuredClone(state ?? {});
+        const nextState = structuredClone(before);
+        const readArtifacts = (id2) => {
+          let current = artifactReads.get(id2);
+          if (!current) {
+            current = options.readArtifact(id2).then(validArtifactSnapshot).catch(() => null);
+            artifactReads.set(id2, current);
+            void current.then(() => {
+              if (artifactReads.get(id2) === current) artifactReads.delete(id2);
+            });
+          }
+          return current;
+        };
+        let changed = 0;
+        let attempted = 0;
+        let verified = 0;
+        let steered = 0;
+        let ambiguous = 0;
+        await Promise.all(holders.map(async (holder) => {
+          const key = JSON.stringify([holder.project_id, holder.role_id]);
+          const legacyKey = `${holder.project_id}:${holder.role_id}`;
+          if (nextState[legacyKey] !== void 0) {
+            if (nextState[key] !== void 0) {
+              ambiguous += 1;
+              options.onAmbiguous?.(`stall-guard ambiguous migration: ${key}`);
+              return;
+            }
+            nextState[key] = nextState[legacyKey];
+            delete nextState[legacyKey];
+            changed += 1;
+          }
+          const current = await readArtifacts(holder.project_id);
+          if (current === null) return;
+          const queueHead = options.readQueueHead?.(holder.project_id);
+          const queueSuppressionKey = queueHead ? roleIdleKey(holder, queueHead.workItemId) : void 0;
+          const queueAlreadyWoken = queueSuppressionKey !== void 0 && (() => {
+            const record2 = observation(nextState[queueSuppressionKey] ?? "");
+            return record2?.woken === true && record2.queueHead?.resourceRevision === queueHead.resourceRevision;
+          })();
+          const next = snapshot(current);
+          if (nextState[key] === void 0) {
+            nextState[key] = next;
+            changed += 1;
+            return;
+          }
+          if (nextState[key] === next) return;
+          if (queueAlreadyWoken || !hasArtifactDelta(nextState[key], current)) {
+            nextState[key] = next;
+            changed += 1;
+            return;
+          }
+          const role = {
+            projectId: holder.project_id,
+            roleId: holder.role_id,
+            roleGeneration: holder.role_generation,
+            executionAttemptId: holder.execution_attempt_id,
+            threadId: holder.thread_id,
+            queueHeadId: queueHead?.workItemId ?? holder.execution_attempt_id,
+            idleAgeMs: 0
+          };
+          let result2;
+          try {
+            result2 = await options.wakeRole(role);
+          } catch {
+            return;
+          }
+          if (!result2.attempted) {
+            if (result2.refusal !== "policy") return;
+            nextState[key] = next;
+            changed += 1;
+            return;
+          }
+          attempted += 1;
+          if (!result2.delivered) return;
+          nextState[key] = next;
+          if (queueHead) nextState[queueSuppressionKey] = JSON.stringify({ artifacts: current, queueHead, woken: true });
+          changed += 1;
+          verified += 1;
+          steered += 1;
+        }));
+        if (changed > 0) {
+          const latestInventory = options.readProjectIds?.();
+          if (latestInventory !== void 0 && !latestInventory.includes(currentProjectId)) return emptySummary(holders.length);
+          await commitProjectState(currentProjectId, before, nextState);
         }
+        return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered, ambiguous };
+      };
+      const enqueue = (currentProjectId) => {
+        const previous = projectCycles.get(currentProjectId) ?? Promise.resolve();
+        const current = previous.catch(() => void 0).then(() => runProject(currentProjectId));
+        projectCycles.set(currentProjectId, current);
+        void current.then(() => {
+          if (projectCycles.get(currentProjectId) === current) projectCycles.delete(currentProjectId);
+        }, () => {
+          if (projectCycles.get(currentProjectId) === current) projectCycles.delete(currentProjectId);
+        });
         return current;
       };
-      let changed = 0;
-      let attempted = 0;
-      let verified = 0;
-      let steered = 0;
-      let ambiguous = 0;
-      for (const holder of holders) {
-        const key = JSON.stringify([holder.project_id, holder.role_id]);
-        const legacyKey = `${holder.project_id}:${holder.role_id}`;
-        if (nextState[legacyKey] !== void 0) {
-          if (nextState[key] !== void 0) {
-            ambiguous += 1;
-            options.onAmbiguous?.(`stall-guard ambiguous migration: ${key}`);
-            continue;
-          }
-          nextState[key] = nextState[legacyKey];
-          delete nextState[legacyKey];
-          changed += 1;
-        }
-        const current = await readArtifacts(holder.project_id);
-        if (current === null) continue;
-        const queueHead = options.readQueueHead?.(holder.project_id);
-        const queueSuppressionKey = queueHead ? roleIdleKey(holder, queueHead.workItemId) : void 0;
-        const queueAlreadyWoken = queueSuppressionKey !== void 0 && (() => {
-          const record2 = observation(nextState[queueSuppressionKey] ?? "");
-          return record2?.woken === true && record2.queueHead?.resourceRevision === queueHead.resourceRevision;
-        })();
-        const next = snapshot(current);
-        if (nextState[key] === void 0) {
-          nextState[key] = next;
-          changed += 1;
-          continue;
-        }
-        if (nextState[key] === next) continue;
-        if (queueAlreadyWoken || !hasArtifactDelta(nextState[key], current)) {
-          nextState[key] = next;
-          changed += 1;
-          continue;
-        }
-        const role = {
-          projectId: holder.project_id,
-          roleId: holder.role_id,
-          roleGeneration: holder.role_generation,
-          executionAttemptId: holder.execution_attempt_id,
-          threadId: holder.thread_id,
-          queueHeadId: holder.execution_attempt_id,
-          idleAgeMs: 0
-        };
-        let result2;
-        try {
-          result2 = await options.wakeRole(role);
-        } catch {
-          continue;
-        }
-        if (!result2.attempted) {
-          if (result2.refusal !== "policy") continue;
-          nextState[key] = next;
-          changed += 1;
-          continue;
-        }
-        attempted += 1;
-        if (!result2.delivered) continue;
-        nextState[key] = next;
-        if (queueHead) nextState[queueSuppressionKey] = JSON.stringify({ artifacts: current, queueHead, woken: true });
-        changed += 1;
-        verified += 1;
-        steered += 1;
-      }
-      if (changed > 0) {
-        await options.persistence.write(nextState);
-        state = nextState;
-      }
-      return { outcome: "OK", subject: "stall-guard", observed: holders.length, changed, attempted, verified, steered, ambiguous };
+      if (projectId !== void 0) return enqueue(projectId);
+      const summaries = await Promise.all(projectIds.map((currentProjectId) => enqueue(currentProjectId)));
+      return summaries.reduce((total, summary) => ({
+        outcome: "OK",
+        subject: "stall-guard",
+        observed: total.observed + summary.observed,
+        changed: total.changed + summary.changed,
+        attempted: total.attempted + summary.attempted,
+        verified: total.verified + summary.verified,
+        steered: total.steered + summary.steered,
+        ambiguous: total.ambiguous + summary.ambiguous
+      }), emptySummary());
     }
   };
 }
@@ -22362,11 +22548,11 @@ import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute2, 
 import { fileURLToPath } from "node:url";
 var ERROR_RECOVERY_IO_TIMEOUT_MS = 1e4;
 var fleetWatchdogCompositeKey = (...parts) => JSON.stringify(parts);
-var fleetWatchdogIssueReopenedKey = (workItemId, externalRevision) => `fleet-watchdog:issue-reopened:${fleetWatchdogCompositeKey(workItemId, externalRevision)}`;
+var fleetWatchdogIssueReopenedKey = (projectId, workItemId, externalRevision) => `fleet-watchdog:issue-reopened:${fleetWatchdogCompositeKey(projectId, workItemId, externalRevision)}`;
 var fleetWatchdogLegacyIssueReopenedKey = (workItemId, externalRevision) => `fleet-watchdog:issue-reopened:${workItemId}:${externalRevision}`;
-var fleetWatchdogMergeCloseKey = (workItemId, state, externalRevision) => `fleet-watchdog:merge-close:${fleetWatchdogCompositeKey(workItemId, state, externalRevision)}`;
+var fleetWatchdogMergeCloseKey = (projectId, workItemId, state, externalRevision) => `fleet-watchdog:merge-close:${fleetWatchdogCompositeKey(projectId, workItemId, state, externalRevision)}`;
 var fleetWatchdogLegacyMergeCloseKey = (workItemId, state, externalRevision) => `fleet-watchdog:merge-close:${workItemId}:${state}:${externalRevision}`;
-var fleetWatchdogBlockerFiredKey = (workItemId, subject) => `fleet-watchdog:blocker-fired:${fleetWatchdogCompositeKey(workItemId, subject)}`;
+var fleetWatchdogBlockerFiredKey = (projectId, workItemId, subject) => `fleet-watchdog:blocker-fired:${fleetWatchdogCompositeKey(projectId, workItemId, subject)}`;
 var fleetWatchdogLegacyBlockerFiredKey = (workItemId, subject) => `fleet-watchdog:blocker-fired:${workItemId}:${subject}`;
 var fleetWatchdogRoleLivenessKey = (holder) => fleetWatchdogCompositeKey(
   holder.project_id,
@@ -22415,6 +22601,7 @@ var ROLE_QUEUE_REFRESH_TIMEOUT_MS = 8e3;
 var ROLE_QUEUE_CACHE_MS = 2e4;
 var ROLE_QUEUE_IDLE_THRESHOLD_MS = 3e4;
 var ROLE_QUEUE_OBSERVATION_MS = 1e3;
+var FLEET_WATCHDOG_LANE_INVENTORY_TIMEOUT_MS = 1e3;
 function githubJson(args) {
   try {
     const options = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1e4, killSignal: "SIGKILL", detached: true };
@@ -23142,26 +23329,27 @@ async function sendRoleBrief(bb, db, projectId, threadId, role) {
     threadId,
     mode: "queue-if-active",
     input: [{ type: "text", visibility: "agent-only", text: brief.prompt, mentions: [] }]
-  });
+  }, projectId);
 }
-async function enqueueAutomatedTell(bb, request, waitForIdle) {
-  const previous = automatedTellQueues.get(request.threadId) ?? Promise.resolve();
+async function enqueueAutomatedTell(bb, request, waitForIdle, projectId) {
+  const queueKey = JSON.stringify([projectId, request.threadId]);
+  const previous = automatedTellQueues.get(queueKey) ?? Promise.resolve();
   const current = previous.catch(() => void 0).then(async () => {
     if (waitForIdle) await bb.sdk.threads.wait({ threadId: request.threadId, status: "idle", timeoutMs: AUTOMATED_TELL_IDLE_WAIT_MS });
     await bb.sdk.threads.send(request);
   });
-  automatedTellQueues.set(request.threadId, current);
+  automatedTellQueues.set(queueKey, current);
   try {
     await current;
   } finally {
-    if (automatedTellQueues.get(request.threadId) === current) automatedTellQueues.delete(request.threadId);
+    if (automatedTellQueues.get(queueKey) === current) automatedTellQueues.delete(queueKey);
   }
 }
-async function sendWhenThreadReady(bb, request) {
-  await enqueueAutomatedTell(bb, request, false);
+async function sendWhenThreadReady(bb, request, projectId) {
+  await enqueueAutomatedTell(bb, request, false, projectId);
 }
-async function sendWhenThreadIdle(bb, request) {
-  await enqueueAutomatedTell(bb, request, true);
+async function sendWhenThreadIdle(bb, request, projectId) {
+  await enqueueAutomatedTell(bb, request, true, projectId);
 }
 async function deliverSucceededSeatBrief(bb, db, input, result2) {
   const request = applyRequestSchema.safeParse(input);
@@ -23978,12 +24166,13 @@ async function plugin(bb, options = {}) {
     }
   };
   const recoverErroredThread = async (threadId, projectId, holder, lane) => {
-    if (recoveryInFlight.has(threadId)) {
+    const recoveryKey = JSON.stringify([projectId, threadId]);
+    if (recoveryInFlight.has(recoveryKey)) {
       bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=recovery-in-flight`);
       return null;
     }
     if (db === null) return null;
-    recoveryInFlight.add(threadId);
+    recoveryInFlight.add(recoveryKey);
     try {
       if (!db.prepare("SELECT 1 FROM project_config_heads WHERE project_id = ?").get(projectId)) return false;
       const thread = await withRecoveryTimeout("threads.get", (signal) => bb.sdk.threads.get({ threadId, signal }));
@@ -24030,7 +24219,7 @@ async function plugin(bb, options = {}) {
       bb.log.warn(`error-recovery wake failed: project=${projectId} thread=${threadId} ${String(error48)}`);
       return null;
     } finally {
-      recoveryInFlight.delete(threadId);
+      recoveryInFlight.delete(recoveryKey);
     }
   };
   const reconcileErrorRecovery = async () => {
@@ -24308,7 +24497,7 @@ ${thread.titleFallback ?? ""}`);
         threadId: holders[0].thread_id,
         mode: "steer",
         input: [{ type: "text", visibility: "agent-only", text, mentions: [] }]
-      });
+      }, role.projectId);
     } catch (error48) {
       warnRoleLiveness(holders[0], `idle-wait=failed error=${String(error48)}`);
       return "error";
@@ -24711,9 +24900,7 @@ ${thread.titleFallback ?? ""}`);
       write: (state) => bb.storage.kv.set("idle-fleet.wake", state)
     },
     capacity: {
-      readProjectIds: async () => [...new Set((db ? readRoleHolderStates(db) : []).filter(
-        (holder) => holder.role_id === "project-orchestrator"
-      ).map((holder) => holder.project_id))],
+      readProjectIds: async () => db ? db.prepare("SELECT project_id FROM project_config_heads ORDER BY project_id").all().map((row) => row.project_id) : [],
       observe: async (projectId) => {
         const previous = capacityObservationLocks.get(projectId) ?? Promise.resolve();
         let release;
@@ -24754,6 +24941,7 @@ ${thread.titleFallback ?? ""}`);
   });
   const stallGuardCycle = createStallGuardCycle({
     onAmbiguous: (message) => bb.log.warn(message),
+    readProjectIds: () => db ? db.prepare("SELECT project_id FROM project_config_heads ORDER BY project_id").all().map((row) => row.project_id) : [],
     readRoleHolders: readProjectQueueRoleHolders,
     readArtifact: async (projectId) => {
       if (!db) return null;
@@ -24922,6 +25110,38 @@ ${thread.titleFallback ?? ""}`);
   const wakeInFlight = /* @__PURE__ */ new Set();
   const permanentlyRefusedReopens = /* @__PURE__ */ new Map();
   const pendingRefusedReopens = /* @__PURE__ */ new Map();
+  const laneInventoryReads = /* @__PURE__ */ new Map();
+  const readFleetWatchdogLaneInventory = (projectId) => {
+    let entry = laneInventoryReads.get(projectId);
+    if (!entry) {
+      const controller = new AbortController();
+      const promise2 = (async () => {
+        const threads = [];
+        for (let offset = 0; ; offset += 100) {
+          const page = await bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset, signal: controller.signal });
+          threads.push(...page);
+          if (page.length < 100) return threads;
+        }
+      })();
+      entry = { promise: promise2, abort: () => controller.abort() };
+      laneInventoryReads.set(projectId, entry);
+      void promise2.then(() => {
+        if (laneInventoryReads.get(projectId) === entry) laneInventoryReads.delete(projectId);
+      }, () => {
+        if (laneInventoryReads.get(projectId) === entry) laneInventoryReads.delete(projectId);
+      });
+    }
+    let timer;
+    const timeout = new Promise((resolve3) => {
+      timer = setTimeout(() => {
+        entry.abort();
+        resolve3(null);
+      }, FLEET_WATCHDOG_LANE_INVENTORY_TIMEOUT_MS);
+    });
+    return Promise.race([entry.promise, timeout]).catch(() => null).finally(() => {
+      if (timer !== void 0) clearTimeout(timer);
+    });
+  };
   const fleetWatchdogCycle = async (onlyProjectId) => {
     let coverage = "blind";
     let visibleSeatCount = 0;
@@ -24967,55 +25187,17 @@ ${thread.titleFallback ?? ""}`);
         threadIds.add(row.thread_id);
         dispatcherThreadIdsByProject.set(row.project_id, threadIds);
       }
-      const projectIds = /* @__PURE__ */ new Set([...holdersByProject.keys(), ...dispatcherThreadIdsByProject.keys()]);
-      for (const row of db.prepare(
-        `SELECT DISTINCT work_items.project_id FROM work_items JOIN external_work_refs
-           ON external_work_refs.project_id = work_items.project_id
-          AND external_work_refs.work_item_id = work_items.work_item_id
-          AND external_work_refs.provider = 'github'
-         WHERE work_items.lifecycle_state IN (${[...WORK_ITEM_NON_TERMINAL_STATES, "succeeded"].map(() => "?").join(", ")})
-           AND external_work_refs.issue_number IS NOT NULL`
-      ).all(...WORK_ITEM_NON_TERMINAL_STATES, "succeeded")) projectIds.add(row.project_id);
+      const projectIds = new Set(db.prepare(
+        "SELECT project_id FROM project_config_heads ORDER BY project_id"
+      ).all().map((row) => row.project_id));
       const lanesByProject = /* @__PURE__ */ new Map();
       const readableLaneProjects = /* @__PURE__ */ new Set();
-      const listProjectChildThreads = async (projectId) => {
-        const threads = [];
-        for (let offset = 0; ; offset += 100) {
-          const page = await bb.sdk.threads.list({ projectId, hasParent: true, includeHidden: true, archived: false, limit: 100, offset });
-          threads.push(...page);
-          if (page.length < 100) return threads;
-        }
-      };
       const dispatchWedgesByProject = /* @__PURE__ */ new Map();
-      for (const projectId of projectIds) {
-        if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
-        const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? /* @__PURE__ */ new Set();
-        let threads = [];
-        let threadInventoryReadable = true;
-        try {
-          threads = await listProjectChildThreads(projectId);
-        } catch (error48) {
-          threadInventoryReadable = false;
-          degrade(fleetWatchdogScope("platform-parentage", projectId, String(error48)));
-        }
-        if (threadInventoryReadable) {
-          readableLaneProjects.add(projectId);
-          const wedges = reconcilePreparedWorkItemDispatches(db, projectId, threads);
-          if (wedges.length > 0) {
-            dispatchWedgesByProject.set(projectId, wedges);
-            bb.log.warn(`fleet-watchdog dispatch wedge: project=${projectId} workItems=${wedges.map(({ workItemId }) => workItemId).join(",")}`);
-          }
-        }
-        const lanes = threads.filter(
-          (thread) => thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null
-        );
-        visibleLaneCount += lanes.length;
-        lanesByProject.set(projectId, lanes);
-      }
+      const laneInventoryByProject = new Map([...projectIds].filter((projectId) => onlyProjectId === void 0 || projectId === onlyProjectId).map((projectId) => [projectId, readFleetWatchdogLaneInventory(projectId)]));
       const openWorkItemsByProject = /* @__PURE__ */ new Map();
       const externalRevisions = /* @__PURE__ */ new Map();
       const waitExternalRevisions = /* @__PURE__ */ new Map();
-      const waitExternalKey = (owner, repo, issueNumber) => `${owner}\0${repo}\0${issueNumber}`;
+      const waitExternalKey = (projectId, owner, repo, issueNumber) => `${projectId}\0${owner}\0${repo}\0${issueNumber}`;
       for (const workItem of db.prepare(
         `SELECT work_items.project_id, work_items.work_item_id, work_items.lifecycle_state, work_item_waits.waker, work_item_waits.waker_kind, work_item_waits.declared_at_ms
          FROM work_items LEFT JOIN work_item_waits
@@ -25145,7 +25327,7 @@ ${thread.titleFallback ?? ""}`);
             degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
             continue;
           }
-          const key = waitExternalKey(match[1], match[2], issueNumber);
+          const key = waitExternalKey(projectId, match[1], match[2], issueNumber);
           if (waitExternalRevisions.has(key)) continue;
           const observation2 = await linkedGithubObservationAsync(match[1], match[2], issueNumber);
           if (observation2 === null) degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
@@ -25193,7 +25375,7 @@ ${thread.titleFallback ?? ""}`);
               projectId,
               linked.work_item_id,
               "ready",
-              fleetWatchdogIssueReopenedKey(linked.work_item_id, observation2.externalRevision),
+              fleetWatchdogIssueReopenedKey(projectId, linked.work_item_id, observation2.externalRevision),
               { workItemExternalEvent: { kind: "github_issue_reopened", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } },
               githubSnapshot2,
               fleetWatchdogLegacyIssueReopenedKey(linked.work_item_id, observation2.externalRevision)
@@ -25242,7 +25424,7 @@ ${thread.titleFallback ?? ""}`);
             projectId,
             linked.work_item_id,
             state,
-            fleetWatchdogMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
+            fleetWatchdogMergeCloseKey(projectId, linked.work_item_id, state, githubSnapshot.externalRevision),
             state === "succeeded" || state === "cancelled" && workItem.lifecycle_state === "proposed" ? { workItemExternalEvent: { kind: "github_issue_closed", owner: linked.owner, repo: linked.repo, issueNumber: linked.issue_number } } : {},
             githubSnapshot,
             fleetWatchdogLegacyMergeCloseKey(linked.work_item_id, state, githubSnapshot.externalRevision),
@@ -25280,10 +25462,33 @@ ${thread.titleFallback ?? ""}`);
         }
       };
       let brokenWakePath = false;
-      for (const projectId of projectIds) {
+      await Promise.all([...projectIds].filter((projectId) => onlyProjectId === void 0 || projectId === onlyProjectId).map(async (projectId) => {
+        const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? /* @__PURE__ */ new Set();
+        let threads = [];
+        let threadInventoryReadable = true;
+        try {
+          const inventory = await laneInventoryByProject.get(projectId);
+          if (inventory === null) throw new Error("native-lane-inventory-timeout");
+          threads = inventory;
+        } catch (error48) {
+          threadInventoryReadable = false;
+          degrade(fleetWatchdogScope("platform-parentage", projectId, String(error48)));
+        }
+        if (threadInventoryReadable) {
+          readableLaneProjects.add(projectId);
+          const wedges = reconcilePreparedWorkItemDispatches(db, projectId, threads);
+          if (wedges.length > 0) {
+            dispatchWedgesByProject.set(projectId, wedges);
+            bb.log.warn(`fleet-watchdog dispatch wedge: project=${projectId} workItems=${wedges.map(({ workItemId }) => workItemId).join(",")}`);
+          }
+        }
+        const lanes = threads.filter(
+          (thread) => thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null
+        );
+        visibleLaneCount += lanes.length;
+        lanesByProject.set(projectId, lanes);
         const holders = holdersByProject.get(projectId) ?? [];
         try {
-          if (onlyProjectId !== void 0 && projectId !== onlyProjectId) continue;
           await inspectLinkedWorkItems(projectId);
           await inspectWaitTargets(projectId);
           const directors = holders.filter((holder) => holder.role_id === "director");
@@ -25292,7 +25497,7 @@ ${thread.titleFallback ?? ""}`);
             if (directors.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active director holders=${directors.length}`);
             if (orchestrators.length > 1) bb.log.warn(`fleet-watchdog refused: project=${projectId} active project-orchestrator holders=${orchestrators.length}`);
             degrade(fleetWatchdogScope("routing", projectId, `directors=${directors.length},orchestrators=${orchestrators.length}`));
-            continue;
+            return;
           }
           const director = directors[0];
           const orchestrator = orchestrators[0];
@@ -25408,12 +25613,8 @@ ${thread.titleFallback ?? ""}`);
           if (blindLaneCount > 0) {
             bb.log.warn(`fleet-watchdog idle enforcer activeLanes=blind project=${projectId} visible=${idleActiveLaneCount} dispatchUnknown=${blindLaneCount}`);
           }
-          const repositories = db.prepare(
-            `SELECT targets.remote_url FROM project_config_heads AS heads
-             JOIN repository_targets AS targets
-               ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
-             WHERE heads.project_id = ? ORDER BY targets.repo_target_id`
-          ).all(projectId).map((target) => githubRepository(target.remote_url));
+          const configured = readRoleQueueConfig(projectId);
+          const repositories = configured.repositories;
           for (const wedge of dispatchWedgesByProject.get(projectId) ?? []) {
             await wake(
               projectId,
@@ -25424,7 +25625,12 @@ ${thread.titleFallback ?? ""}`);
               "owed-act"
             );
           }
-          const queue = repositories.length === 0 || repositories.some((repository) => repository === null) ? null : await startableQueueStateAsync(repositories);
+          const observedQueue = configured.reason === null ? await startableQueueStateAsync(repositories) : null;
+          const currentConfig2 = readRoleQueueConfig(projectId);
+          const queue = currentConfig2.identity === configured.identity ? observedQueue : null;
+          if (currentConfig2.identity !== configured.identity) {
+            degrade(fleetWatchdogScope("project-config", projectId, "replaced-during-refresh"));
+          }
           const fleetQueueHead = queue?.head === null || queue?.head === void 0 ? null : `fleet:queue:${queue.head}`;
           await Promise.all(holders.map((holder) => fleetWatchdogIdle.clearPrefixExcept(
             roleIdleKey(holder, "fleet:queue:").slice(0, -2),
@@ -25463,9 +25669,11 @@ ${thread.titleFallback ?? ""}`);
                           degrade(fleetWatchdogScope("dispatched-lane-revalidation", projectId, "queue-unreadable"));
                           return false;
                         }
-                        const dispatcherThreadIds = dispatcherThreadIdsByProject.get(projectId) ?? /* @__PURE__ */ new Set();
-                        const freshLanes = (await listProjectChildThreads(projectId)).filter(
-                          (thread) => thread.parentThreadId !== null && dispatcherThreadIds.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null
+                        const dispatcherThreadIds2 = dispatcherThreadIdsByProject.get(projectId) ?? /* @__PURE__ */ new Set();
+                        const freshInventory = await readFleetWatchdogLaneInventory(projectId);
+                        if (freshInventory === null) throw new Error("native-lane-inventory-timeout");
+                        const freshLanes = freshInventory.filter(
+                          (thread) => thread.parentThreadId !== null && dispatcherThreadIds2.has(thread.parentThreadId) && thread.archivedAt === null && thread.deletedAt === null
                         );
                         const freshUnowned = dispatchedWithoutLiveLane(db, projectId, freshQueue.dispatched, freshLanes);
                         return freshUnowned !== null && JSON.stringify(freshUnowned) === JSON.stringify(unowned);
@@ -25492,7 +25700,7 @@ ${thread.titleFallback ?? ""}`);
               ).get(projectId, blocked.waker);
               if (dependency?.lifecycle_state !== "succeeded") continue;
               condition = { kind: "work_item_succeeded", workItemId: blocked.waker };
-              idempotencyKey = fleetWatchdogBlockerFiredKey(blocked.workItemId, blocked.waker);
+              idempotencyKey = fleetWatchdogBlockerFiredKey(projectId, blocked.workItemId, blocked.waker);
             } else if (blocked.wakerKind === "github_issue_closed" && blocked.waker !== null) {
               const match = blocked.waker.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u);
               const issueNumber = match?.[3] === void 0 ? NaN : Number(match[3]);
@@ -25508,7 +25716,7 @@ ${thread.titleFallback ?? ""}`);
               }
               if (snapshot2.state !== "closed") continue;
               condition = { kind: "github_issue_closed", owner: match[1], repo: match[2], issueNumber };
-              idempotencyKey = fleetWatchdogBlockerFiredKey(blocked.workItemId, snapshot2.externalRevision);
+              idempotencyKey = fleetWatchdogBlockerFiredKey(projectId, blocked.workItemId, snapshot2.externalRevision);
             } else {
               degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
               continue;
@@ -25530,7 +25738,7 @@ ${thread.titleFallback ?? ""}`);
             if (candidate.declaredAtMs === null || now2 - candidate.declaredAtMs < staleWaitMs) continue;
             const targetMatch = candidate.wakerKind === "github_issue_closed" ? candidate.waker?.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u) ?? null : null;
             const targetIssueNumber = targetMatch?.[3] === void 0 ? NaN : Number(targetMatch[3]);
-            const observation2 = targetMatch?.[1] && targetMatch[2] && Number.isSafeInteger(targetIssueNumber) ? waitExternalRevisions.get(waitExternalKey(targetMatch[1], targetMatch[2], targetIssueNumber)) : void 0;
+            const observation2 = targetMatch?.[1] && targetMatch[2] && Number.isSafeInteger(targetIssueNumber) ? waitExternalRevisions.get(waitExternalKey(projectId, targetMatch[1], targetMatch[2], targetIssueNumber)) : void 0;
             if (!observation2) {
               const record3 = await fleetWatchdogIdle.get(roleIdleKey(orchestrator, candidate.workItemId));
               staleExternalMoved = record3?.lastStaleWaitWaker !== candidate.waker;
@@ -25549,32 +25757,32 @@ ${thread.titleFallback ?? ""}`);
           }
           if (staleWait) {
             await wake(projectId, orchestrator, roleIdleKey(orchestrator, staleWait.workItemId), staleWait.wakerKind === "seat" ? "owed act went stale" : "wait went stale: chase the external or re-plan", false, "stale-wait", void 0, staleObservation?.externalRevision ?? null, staleWait.waker, staleExternalMoved);
-            continue;
+            return;
           }
           const seatWait = remainingWorkItems.find((workItem) => workItem.wakerKind === "seat" && workItem.waker !== null);
           if (seatWait) {
             const owing = holders.find((holder) => holder.role_id === seatWait.waker);
-            if (!owing) continue;
+            if (!owing) return;
             const owingKey = roleIdleKey(owing, seatWait.workItemId);
             const owingThread = await bb.sdk.threads.get({ threadId: owing.thread_id });
             if (roleThreadRefusal(owing, owingThread, true) || await readPendingExternalWait(owing.thread_id)) {
               await fleetWatchdogIdle.resetIdle(owingKey);
-              continue;
+              return;
             }
             const owingRecord = await fleetWatchdogIdle.observeIdle(owingKey, now2);
-            if (owingRecord.idleSinceMs === null || now2 - owingRecord.idleSinceMs < floorMs) continue;
+            if (owingRecord.idleSinceMs === null || now2 - owingRecord.idleSinceMs < floorMs) return;
             if (owingRecord.lastOwedActWakeAtMs === null || owingRecord.lastOwedActWakeAtMs < owingRecord.idleSinceMs) {
               await wake(projectId, owing, owingKey, `owed act quiet at cycle ${new Date(now2).toISOString()} with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
-              continue;
+              return;
             }
             if (owing.role_id !== "director" && now2 - owingRecord.lastOwedActWakeAtMs >= FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS) {
               await wake(projectId, director, roleIdleKey(director, seatWait.workItemId), `owed act still quiet at cycle ${new Date(now2).toISOString()} with open work since ${new Date(owingRecord.idleSinceMs).toISOString()}`, true, "owed-act");
             }
-            continue;
+            return;
           }
           if (queue === null || queue.count === 0 || queue.head === null) {
             await resetIdle();
-            continue;
+            return;
           }
           const workKey = `fleet:queue:${queue.head}`;
           const orchestratorKey = roleIdleKey(orchestrator, workKey);
@@ -25584,7 +25792,7 @@ ${thread.titleFallback ?? ""}`);
               const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
               return !roleThreadRefusal(holder, thread, true) && !await readPendingExternalWait(holder.thread_id);
             }))).every(Boolean));
-            continue;
+            return;
           }
           const idle = await Promise.all(holders.map(async (holder) => {
             const thread = await bb.sdk.threads.get({ threadId: holder.thread_id });
@@ -25595,17 +25803,17 @@ ${thread.titleFallback ?? ""}`);
             const record2 = await fleetWatchdogIdle.observeIdle(roleIdleKey(holder, workKey), now2);
             return record2.idleSinceMs !== null && now2 - record2.idleSinceMs >= floorMs;
           }));
-          if (!idle.every(Boolean)) continue;
+          if (!idle.every(Boolean)) return;
           const orchestratorRecord = await fleetWatchdogIdle.get(orchestratorKey);
           if (orchestratorRecord?.lastFleetWakeAtMs === null || orchestratorRecord?.lastFleetWakeAtMs === void 0 || orchestratorRecord.lastFleetWakeAtMs < (orchestratorRecord.idleSinceMs ?? now2)) {
             await wake(projectId, orchestrator, orchestratorKey, `fleet quiet at cycle ${new Date(now2).toISOString()} with open work since ${new Date(orchestratorRecord?.idleSinceMs ?? now2).toISOString()}`, true, "fleet");
-            continue;
+            return;
           }
         } catch (error48) {
           degrade(fleetWatchdogScope("project", projectId, String(error48)));
           bb.log.warn(`fleet-watchdog failed: ${String(error48)}`);
         }
-      }
+      }));
       if (!brokenWakePath && coverage === "visible") bb.log.info("fleet-watchdog healthy cycle");
     } catch (error48) {
       degrade(fleetWatchdogScope("cycle", String(error48)));
@@ -26002,6 +26210,7 @@ ${thread.titleFallback ?? ""}`);
 }
 export {
   FLEET_WATCHDOG_FLOOR_MS,
+  FLEET_WATCHDOG_LANE_INVENTORY_TIMEOUT_MS,
   FLEET_WATCHDOG_NOTIFICATION_FLOOR_MS,
   FLEET_WATCHDOG_STALE_WAIT_MS,
   IDLE_FLEET_ATTEMPT_STALE_MS,

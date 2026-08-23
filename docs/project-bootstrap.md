@@ -108,3 +108,19 @@ seats bind to that tenant's exact repository targets. The isolated second-tenant
 test in `tests/server.test.ts` bootstraps two projects, preserves the first
 export, and establishes all three configured non-director role generations for
 the second.
+
+## Stall Guard dependency and Phase-3 activation check
+
+Stall Guard discovers tenants only from the canonical `project_config_heads`
+inventory. For each exact project it rereads the active config revision and
+repository targets, then binds queue-label inventory, canonical capacity and
+lane evidence, waits, episode state, idempotency, and the current role-holder
+wake route to that project. Missing, replaced, malformed, partial, slow, or
+unavailable evidence is a project-local blind result and cannot authorize a
+wake or alter another project's state.
+
+Phase 3 may activate a tenant only after bootstrap has returned `OK`, doctor
+and export are clean for that project, the current governorship and role
+generations are established, and the Stall Guard two-project isolation,
+capacity/wait contamination, and exact-head wake checks pass. Phase 0 itself
+does not register a tenant, deploy, reload, or mutate an external repository.
