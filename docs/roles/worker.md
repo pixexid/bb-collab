@@ -2,11 +2,11 @@
 
 ## What this is
 
-bb-collab is a BB-native collaboration runtime: the plugin keeps canonical work state while BB supplies native threads, environments, and events. This page is the worker’s operating brief; it does not store live state.
+bb-collab keeps canonical work state; BB supplies native threads, environments, and events. This page is the worker brief, not live state.
 
 ## Authority
 
-Workers act only within their frozen work order. A blocked worker asks the orchestrator; the orchestrator decides within its authority and asks the director beyond it. The director holds standing approval over its own class and orchestrator asks, then tells the operator what was approved and why. Only credentials and accounts, real spend, legal matters, product direction, and destructive-irreversible actions go to the operator as plain questions; the operator’s typed reply settles them. Approval means a message from the tier that owns the decision, nothing more.
+Workers act only within their frozen order. Blocks go to the orchestrator, then the director when outside orchestrator authority. The director approves its class and tells the operator why; only credentials/accounts, spend, legal matters, product direction, and destructive-irreversible actions go to the operator as questions.
 
 ## Matrix
 
@@ -14,15 +14,19 @@ Use the [Merge-bound worker rows](../operations-model.md#role-matrix). Do not co
 
 ## Tools and surfaces
 
-Use your BB thread and managed environment for assigned work, Git and GitHub for repository evidence, and the plugin’s read-only surfaces to check the state named in your work order. Use [Ponytail](../ponytail.md) for implementation choices and the [working rules](../rules.md) for coordination.
+Use your BB thread/environment for assigned work, Git/GitHub for evidence, and plugin read-only surfaces for named state. Use [Ponytail](../ponytail.md) and the [working rules](../rules.md).
 
 A freshly provisioned managed worktree may not have `node_modules`; if dependencies are absent, run `npm install` before running tests.
 
 Use the canonical [delegation return-path rule](../rules.md#delegation-return-path) for every work order.
 
+## Independent review seat
+
+Inspect the frozen exact head read-only and return a `PROVISIONAL` verdict with native evidence and the actual-profile claim. Do not require pre-inspection proof; the parent owns post-idle acceptance through the [canonical gate](../operations-model.md#provisional-tier-a-verdict-acceptance).
+
 ## Live state
 
-Live state is never this page. The canonical store is the bb-collab plugin database: use the `role_generation_heads` current-role query to resolve the current worker and orchestrator records. A per-work-order dispatch may be an unseated lane: an absent worker seat record and predecessor handoff are expected, not missing. If a worker generation exists, the predecessor handoff is `handoff.md` in the predecessor seat’s thread storage: resolve the predecessor thread id from the same current-role query, then read `handoff.md` under that thread’s storage directory (`~/.bb/thread-storage/<threadId>/`). Read that file, not a checked-in copy. Before retiring, a seat writes its own `handoff.md` into its own thread storage so its successor can follow this same path. Current seat IDs are the values returned by that query—query them when needed and never write them into documentation.
+Live state is never this page. Query the plugin database’s `role_generation_heads` joined to `role_generations` for current worker/orchestrator records. An unseated dispatch may have no worker seat or handoff. If a worker generation exists, resolve its predecessor thread from that query and read its `handoff.md` from thread storage, not a checked-in copy; write your own there before retiring.
 
 ## First actions
 

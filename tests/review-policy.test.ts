@@ -57,6 +57,7 @@ describe("pull-request review tier policy", () => {
       "scripts/check-composed-pr.mjs",
       "scripts/check-production-reachability.mjs",
       "scripts/read-executed-profile.mjs",
+      "scripts/review-verdict-acceptance.mjs",
       "scripts/check-css-bundle.mjs",
       "package.json",
     ]) {

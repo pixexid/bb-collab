@@ -56,6 +56,34 @@ describe("executed profile read-back", () => {
     expect(result.outcome).not.toBe("known");
   });
 
+  it("filters completed readback to one exact BB turn", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    const turnA = "123e4567-e89b-42d3-a456-426614174000";
+    const turnB = "123e4567-e89b-42d3-a456-426614174001";
+    const events = [...stoppedEvents(providerThreadId, turnA, "completed"), ...stoppedEvents(providerThreadId, turnB, "completed")];
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/test/project" } },
+      { type: "turn_context", payload: { turn_id: turnA, model: "gpt-a", effort: "medium" } },
+      { type: "turn_context", payload: { turn_id: turnB, model: "gpt-b", effort: "medium" } },
+    ]);
+    const expected = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "idle" },
+      environment: { path: "/test/project" },
+      events,
+      expectedTurnId: `bta2647fb7-1-${turnB}`,
+      home,
+    });
+    expect(expected).toMatchObject({ outcome: "known", coverage: { completedTurns: 1, knownTurns: 1 }, turns: [{ scopeTurnId: `bta2647fb7-1-${turnB}`, executedProfile: { model: "gpt-b" } }] });
+    await expect(readExecutedProfiles({
+      thread: { providerId: "codex", status: "idle" },
+      environment: { path: "/test/project" },
+      events,
+      expectedTurnId: "foreign-turn",
+      home,
+    })).resolves.toMatchObject({ outcome: "unknown", reason: expect.stringContaining("found 0") });
+  });
+
   it("DISCRIMINATOR: reads the active Codex turn from its provider-native rollout", async () => {
     const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
     const providerThreadId = "018cc251-f400-7000-8000-000000000000";

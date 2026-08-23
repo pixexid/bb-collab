@@ -30,6 +30,7 @@ const tierA = [
   /^scripts\/check-dist\.mjs$/u,
   /^scripts\/check-production-reachability\.mjs$/u,
   /^scripts\/read-executed-profile\.mjs$/u,
+  /^scripts\/review-verdict-acceptance\.mjs$/u,
   /^scripts\/check-css-bundle\.mjs$/u,
   /^package\.json$/u,
   /^server\.ts$/u,
