@@ -47,6 +47,32 @@ describe("semantic idle guard", () => {
     expect(extractCandidates(snapshot)).toEqual([expect.objectContaining({ id: `${projectId}:work-item:wi-gh-560:3`, anchors: { projectId, kind: "work_item", workItemId: "wi-gh-560", resourceRevision: 3 }, evidence: { projectId, lifecycleState: "ready", issueNumber: 560, activeAttemptCount: 0 } })]);
   });
 
+  it("reports a latest interrupted attempt as explicit resume/disposition debt and blinds it with partial inventory", async () => {
+    const base = await capturedExport();
+    const interrupted = {
+      ...base.executionAttempts[1],
+      project_id: projectId,
+      execution_attempt_id: "attempt-gh624-interrupted",
+      origin: "work_item",
+      state: "interrupted",
+      work_item_id: "wi-gh-624",
+      assignment_kind: "write",
+      attempt_ordinal: 2,
+      thread_id: "thread-gh624",
+      observed_at_ms: 1_000_000,
+      interruption_reason: "manual-stop",
+    };
+    const workItem = { ...base.workItems[0], project_id: projectId, work_item_id: "wi-gh-624", lifecycle_state: "in_progress", resource_revision: 4 };
+    const snapshot = await emptySnapshot({ canonical: { ...base, executionAttempts: [interrupted], workItems: [workItem] } });
+    expect(extractCandidates(snapshot)).toEqual([expect.objectContaining({
+      id: `${projectId}:interrupted:attempt-gh624-interrupted`,
+      kind: "interrupted_attempt",
+      anchors: { projectId, kind: "interrupted_attempt", executionAttemptId: "attempt-gh624-interrupted", workItemId: "wi-gh-624", threadId: "thread-gh624" },
+      finding: expect.stringContaining("explicit resume or disposition"),
+    })]);
+    expect(extractCandidates({ ...snapshot, coverage: "partial", sourceCoverage: { canonical: "blind", timeline: "known", github: "known", queue: "known" } })).toEqual([]);
+  });
+
   it("excludes the captured wi-gh-141 wrongful-idle control", async () => {
     const base = await capturedExport();
     const control = { ...base.workItems[0], work_item_id: "wi-gh-141", lifecycle_state: "ready", resource_revision: 2 };

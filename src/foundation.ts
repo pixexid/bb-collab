@@ -10,14 +10,14 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
-export const RUNTIME_CONTRACT_VERSION = 26;
-export const SCHEMA_VERSION = 30;
-// v26 makes fleet-watchdog merge-close revalidate native lanes and allow safe direct success.
-const PREVIOUS_RUNTIME_CONTRACT_VERSION = 25;
+export const RUNTIME_CONTRACT_VERSION = 27;
+export const SCHEMA_VERSION = 31;
+// v27 records correlated terminal evidence and first-class interrupted attempts.
+const PREVIOUS_RUNTIME_CONTRACT_VERSION = 26;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
-// Schema v30 adds immutable authority-root audit fields to Decisions.
-const PREVIOUS_SCHEMA_VERSION = 29;
+// Schema v31 adds interrupted-attempt evidence and terminalization provenance.
+const PREVIOUS_SCHEMA_VERSION = 30;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatPrimaryProfile = {
@@ -431,7 +431,7 @@ export const MIGRATIONS: string[] = [
     repo_target_id TEXT,
     role_id TEXT NOT NULL,
     role_generation INTEGER NOT NULL CHECK (role_generation > 0),
-    state TEXT NOT NULL CHECK (state IN ('prepared', 'armed', 'content_delivered', 'running', 'done', 'blocked', 'failed', 'dispatch_unknown')),
+    state TEXT NOT NULL CHECK (state IN ('prepared', 'armed', 'content_delivered', 'running', 'done', 'blocked', 'failed', 'interrupted', 'dispatch_unknown')),
     bb_server_id TEXT NOT NULL,
     environment_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
@@ -691,7 +691,7 @@ export const MIGRATIONS: string[] = [
     repo_target_id TEXT,
     role_id TEXT,
     role_generation INTEGER CHECK (role_generation IS NULL OR role_generation > 0),
-    state TEXT NOT NULL CHECK (state IN ('prepared', 'armed', 'content_delivered', 'running', 'done', 'blocked', 'failed', 'dispatch_unknown', 'superseded')),
+    state TEXT NOT NULL CHECK (state IN ('prepared', 'armed', 'content_delivered', 'running', 'done', 'blocked', 'failed', 'interrupted', 'dispatch_unknown', 'superseded')),
     bb_server_id TEXT,
     environment_id TEXT,
     source_id TEXT,
@@ -993,6 +993,147 @@ export const MIGRATIONS: string[] = [
   `ALTER TABLE bootstrap_derivation_receipts ADD COLUMN operational_actor_receipt_id TEXT;`,
   `ALTER TABLE decisions ADD COLUMN authority_root_json TEXT CHECK (authority_root_json IS NULL OR json_valid(authority_root_json));
    ALTER TABLE decisions ADD COLUMN authority_root_digest TEXT`,
+  `PRAGMA defer_foreign_keys = ON;
+   CREATE TABLE execution_attempts_gh624 (
+     project_id TEXT NOT NULL,
+     execution_attempt_id TEXT NOT NULL,
+     assignment_id TEXT,
+     origin TEXT NOT NULL CHECK (origin IN ('assignment', 'role_holder', 'legacy_unresolved', 'work_item')),
+     assignment_digest TEXT,
+     lane_id TEXT,
+     assignment_kind TEXT CHECK (assignment_kind IS NULL OR assignment_kind IN ('write', 'review', 'probe')),
+     attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal > 0),
+     dispatch_kind TEXT CHECK (dispatch_kind IS NULL OR dispatch_kind IN ('spawn', 'attach')),
+     config_revision INTEGER NOT NULL,
+     governance_epoch INTEGER CHECK (governance_epoch IS NULL OR governance_epoch > 0),
+     work_item_id TEXT,
+     repo_target_id TEXT,
+     role_id TEXT,
+     role_generation INTEGER CHECK (role_generation IS NULL OR role_generation > 0),
+     state TEXT NOT NULL CHECK (state IN ('prepared', 'armed', 'content_delivered', 'running', 'done', 'blocked', 'failed', 'interrupted', 'dispatch_unknown', 'superseded')),
+     bb_server_id TEXT,
+     environment_id TEXT,
+     source_id TEXT,
+     host_id TEXT,
+     environment_path TEXT,
+     thread_id TEXT,
+     provider_thread_id TEXT,
+     native_request_id TEXT,
+     request_event_id TEXT,
+     request_event_seq INTEGER,
+     accepted_event_id TEXT,
+     accepted_event_seq INTEGER,
+     first_action_event_id TEXT,
+     first_action_event_seq INTEGER,
+     content_event_id TEXT,
+     content_event_seq INTEGER,
+     completion_event_id TEXT,
+     completion_event_seq INTEGER,
+     terminal_event_id TEXT,
+     terminal_event_seq INTEGER,
+     frozen_brief_digest TEXT,
+     content_receipt_digest TEXT,
+     requested_provider_id TEXT,
+     requested_model TEXT,
+     requested_reasoning_level TEXT,
+     requested_permission_mode TEXT,
+     requested_service_tier TEXT,
+     requested_visibility TEXT CHECK (requested_visibility IS NULL OR requested_visibility IN ('visible', 'hidden')),
+     requested_profile_digest TEXT,
+     branch_name TEXT,
+     base_sha TEXT,
+     candidate_sha TEXT,
+     environment_digest TEXT,
+     native_receipt_digest TEXT,
+     terminal_result TEXT CHECK (terminal_result IS NULL OR terminal_result IN ('DONE', 'BLOCKED')),
+     reported_outcome TEXT CHECK (reported_outcome IS NULL OR reported_outcome IN ('DONE', 'BLOCKED')),
+     terminal_report_digest TEXT,
+     conflicting_terminal_digest TEXT,
+     reason_code TEXT,
+     last_event_seq INTEGER,
+     progress_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(progress_json)),
+     lease_owner_thread_id TEXT,
+     lease_expires_at_ms INTEGER CHECK (lease_expires_at_ms IS NULL OR lease_expires_at_ms >= 0),
+     continuation_of_attempt_id TEXT,
+     created_at_ms INTEGER NOT NULL,
+     observed_at_ms INTEGER,
+     completed_at_ms INTEGER,
+     attempt_digest TEXT NOT NULL,
+     review_pr_number INTEGER CHECK (review_pr_number IS NULL OR review_pr_number > 0),
+     review_pr_head_sha TEXT CHECK (review_pr_head_sha IS NULL OR review_pr_head_sha GLOB '[0-9a-f]*'),
+     lane_capacity_observation_id TEXT CHECK (lane_capacity_observation_id IS NULL OR length(lane_capacity_observation_id) > 0),
+     terminalization_class TEXT,
+     terminal_report_json TEXT CHECK (terminal_report_json IS NULL OR json_valid(terminal_report_json)),
+     terminal_actual_profile_digest TEXT,
+     interruption_reason TEXT,
+     interruption_event_id TEXT,
+     interruption_event_seq INTEGER,
+     interruption_turn_id TEXT,
+     interruption_evidence_digest TEXT,
+     PRIMARY KEY (project_id, execution_attempt_id),
+     FOREIGN KEY (project_id, assignment_id) REFERENCES assignments(project_id, assignment_id),
+     FOREIGN KEY (project_id, repo_target_id, config_revision) REFERENCES repository_targets(project_id, repo_target_id, config_revision),
+     CHECK ((origin = 'assignment' AND assignment_id IS NOT NULL AND assignment_digest IS NOT NULL AND lane_id IS NOT NULL AND assignment_kind IS NOT NULL) OR
+       (origin IN ('role_holder', 'legacy_unresolved', 'work_item') AND assignment_id IS NULL)),
+     CHECK ((origin = 'work_item' AND work_item_id IS NOT NULL AND lane_id IS NOT NULL AND assignment_kind IS NOT NULL) OR origin != 'work_item'),
+     CHECK (origin = 'work_item' OR
+       (role_id IS NOT NULL AND role_generation IS NOT NULL AND governance_epoch IS NOT NULL AND bb_server_id IS NOT NULL AND
+        environment_id IS NOT NULL AND source_id IS NOT NULL AND host_id IS NOT NULL AND environment_path IS NOT NULL AND environment_digest IS NOT NULL))
+   );
+   INSERT INTO execution_attempts_gh624 (
+     project_id, execution_attempt_id, assignment_id, origin, assignment_digest, lane_id, assignment_kind, attempt_ordinal,
+     dispatch_kind, config_revision, governance_epoch, work_item_id, repo_target_id, role_id, role_generation, state,
+     bb_server_id, environment_id, source_id, host_id, environment_path, thread_id, provider_thread_id, native_request_id,
+     request_event_id, request_event_seq, accepted_event_id, accepted_event_seq, first_action_event_id, first_action_event_seq,
+     content_event_id, content_event_seq, completion_event_id, completion_event_seq, terminal_event_id, terminal_event_seq,
+     frozen_brief_digest, content_receipt_digest, requested_provider_id, requested_model, requested_reasoning_level,
+     requested_permission_mode, requested_service_tier, requested_visibility, requested_profile_digest, branch_name, base_sha,
+     candidate_sha, environment_digest, native_receipt_digest, terminal_result, reported_outcome, terminal_report_digest,
+     conflicting_terminal_digest, reason_code, last_event_seq, progress_json, lease_owner_thread_id, lease_expires_at_ms,
+     continuation_of_attempt_id, created_at_ms, observed_at_ms, completed_at_ms, attempt_digest, review_pr_number,
+     review_pr_head_sha, lane_capacity_observation_id, terminalization_class, terminal_report_json, terminal_actual_profile_digest,
+     interruption_reason, interruption_event_id, interruption_event_seq, interruption_turn_id, interruption_evidence_digest
+   ) SELECT project_id, execution_attempt_id, assignment_id, origin, assignment_digest, lane_id, assignment_kind, attempt_ordinal,
+     dispatch_kind, config_revision, governance_epoch, work_item_id, repo_target_id, role_id, role_generation, state,
+     bb_server_id, environment_id, source_id, host_id, environment_path, thread_id, provider_thread_id, native_request_id,
+     request_event_id, request_event_seq, accepted_event_id, accepted_event_seq, first_action_event_id, first_action_event_seq,
+     content_event_id, content_event_seq, completion_event_id, completion_event_seq, terminal_event_id, terminal_event_seq,
+     frozen_brief_digest, content_receipt_digest, requested_provider_id, requested_model, requested_reasoning_level,
+     requested_permission_mode, requested_service_tier, requested_visibility, requested_profile_digest, branch_name, base_sha,
+     candidate_sha, environment_digest, native_receipt_digest, terminal_result, reported_outcome, terminal_report_digest,
+     conflicting_terminal_digest, reason_code, last_event_seq, progress_json, lease_owner_thread_id, lease_expires_at_ms,
+     continuation_of_attempt_id, created_at_ms, observed_at_ms, completed_at_ms, attempt_digest, review_pr_number,
+     review_pr_head_sha, lane_capacity_observation_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+   FROM execution_attempts;
+   DROP TABLE execution_attempts;
+   ALTER TABLE execution_attempts_gh624 RENAME TO execution_attempts;
+   CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_active_assignment
+     ON execution_attempts(project_id, assignment_digest)
+     WHERE origin = 'assignment' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown');
+   CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_active_writer_lane
+     ON execution_attempts(project_id, lane_id)
+     WHERE origin IN ('assignment', 'work_item') AND assignment_kind = 'write'
+       AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown');
+   CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_active_work_item
+     ON execution_attempts(project_id, work_item_id)
+     WHERE origin = 'work_item' AND assignment_kind = 'write'
+       AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown');
+   CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_active_writer_thread
+     ON execution_attempts(project_id, thread_id)
+     WHERE origin = 'work_item' AND assignment_kind = 'write' AND thread_id IS NOT NULL
+       AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown');
+   CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_native_request
+     ON execution_attempts(bb_server_id, thread_id, native_request_id)
+     WHERE thread_id IS NOT NULL AND native_request_id IS NOT NULL;
+   CREATE INDEX IF NOT EXISTS execution_attempts_project_state
+     ON execution_attempts(project_id, state, assignment_kind, lane_id);
+   CREATE INDEX IF NOT EXISTS execution_attempts_interrupted_pending
+     ON execution_attempts(project_id, work_item_id, attempt_ordinal)
+     WHERE origin = 'work_item' AND state = 'interrupted';
+   CREATE TRIGGER execution_attempts_lane_capacity_observation_immutable
+     BEFORE UPDATE OF lane_capacity_observation_id ON execution_attempts
+     WHEN OLD.lane_capacity_observation_id IS NOT NULL AND NEW.lane_capacity_observation_id IS NOT OLD.lane_capacity_observation_id
+     BEGIN SELECT RAISE(ABORT, 'lane capacity observation identifier is immutable'); END;`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -1234,7 +1375,7 @@ export const MIGRATION_STEPS = [
 ] as const;
 export const contractDigest = sha256(canonicalJson({
   contractVersion: RUNTIME_CONTRACT_VERSION,
-  operationClasses: ["migration_prepare", "migration_step"],
+  operationClasses: ["migration_prepare", "migration_step", "execution_attempt_terminal_report", "execution_attempt_interruption"],
   migrationStates: MIGRATION_STATES,
   migrationSteps: MIGRATION_STEPS,
   roleCapacityPolicy: {
@@ -1930,6 +2071,8 @@ export const CANONICAL_MUTATION_CLASSES = [
   "decision_disposition",
   "work_item_create",
   "work_item_transition",
+  "execution_attempt_terminal_report",
+  "execution_attempt_interruption",
   "github_issue_projection",
   "qualification_observation_record",
   "role_generation_succession",
@@ -1988,26 +2131,54 @@ const terminalReportSchema = z
     receiptVersion: z.literal(1),
     outcome: z.enum(["DONE", "BLOCKED"]),
     projectId: id,
-    assignmentId: id,
+    assignmentId: id.nullable(),
     executionAttemptId: id,
     workItemId: id,
-    roleId: roleIdSchema,
-    roleGeneration: z.number().int().positive(),
+    roleId: roleIdSchema.nullable(),
+    roleGeneration: z.number().int().positive().nullable(),
     repoTargetId: id,
-    environmentId: id,
+    environmentId: id.nullable(),
     threadId: id,
-    branchName: id,
-    baseSha: gitShaSchema,
-    candidateSha: gitShaSchema,
+    branchName: id.nullable(),
+    baseSha: gitShaSchema.nullable(),
+    candidateSha: gitShaSchema.nullable(),
     nativeReceiptDigest: digestSchema,
     actualProfileDigest: digestSchema,
     candidateObservationDigest: digestSchema,
     reasonCode: id,
+    nativeEventId: id,
+    nativeEventSeq: z.number().int().positive(),
+    nativeTurnId: id,
     evidence: z.array(terminalEvidenceSchema).min(1).max(64),
     reportedAtMs: z.number().int().nonnegative(),
     receiptEventId: id,
     receiptEventSeq: z.number().int().positive(),
     receivedAtMs: z.number().int().nonnegative(),
+  })
+  .strict();
+const interruptionEvidenceSchema = z
+  .object({
+    projectId: id,
+    workItemId: id,
+    executionAttemptId: id,
+    threadId: id,
+    reason: z.enum(["manual-stop", "host-daemon-restarted", "provider-turn-idle"]),
+    nativeEventType: z.literal("system/thread/interrupted"),
+    nativeEventId: id,
+    nativeEventSeq: z.number().int().positive(),
+    nativeTurnId: id.nullable(),
+    evidenceDigest: digestSchema,
+  })
+  .strict();
+const historicalCorrectionSchema = z
+  .object({
+    correctionId: id,
+    priorState: z.literal("done"),
+    evidenceDigest: digestSchema,
+    evidence: z.array(z.object({
+      eventId: id,
+      eventSeq: z.number().int().positive(),
+    }).strict()).min(2).max(16),
   })
   .strict();
 
@@ -2068,6 +2239,8 @@ export const applyRequestSchema = z
     executionAttemptId: id.optional(),
     frozenBriefContent: z.string().max(256 * 1024).optional(),
     terminalReport: terminalReportSchema.optional(),
+    interruption: interruptionEvidenceSchema.optional(),
+    historicalCorrection: historicalCorrectionSchema.optional(),
     migration: migrationPrepareSchema.optional(),
     migrationStep: migrationStepSchema.optional(),
   })
@@ -2325,6 +2498,60 @@ export interface NativeAssignmentAdapter {
   inspect(input: { projectId: string; repoTargetId: string; assignment: z.infer<typeof assignmentIntentSchema> }): NativeAssignmentInspection;
   dispatch(input: NativeAssignmentInput): NativeAssignmentEvidence;
   reconcile(input: NativeAssignmentInput & { threadId: string | null; nativeRequestId: string | null }): NativeAssignmentEvidence;
+}
+
+export type AuthoritativeTerminalEvidence = {
+  projectId: string;
+  workItemId: string;
+  executionAttemptId: string;
+  repoTargetId: string;
+  resourceRevision: number;
+  assignmentId: string | null;
+  roleId: (typeof ROLE_IDS)[number] | null;
+  roleGeneration: number | null;
+  environmentId: string | null;
+  threadId: string;
+  branchName: string | null;
+  baseSha: string | null;
+  candidateSha: string | null;
+  nativeReceiptDigest: string;
+  actualProfileDigest: string;
+  candidateObservationDigest: string;
+  nativeEventId: string;
+  nativeEventSeq: number;
+  nativeTurnId: string;
+  evidence: Array<{ kind: string; digest: string; ref: string }>;
+};
+
+export type AuthoritativeHistoricalInterruption = {
+  projectId: string;
+  workItemId: string;
+  executionAttemptId: string;
+  repoTargetId: string;
+  resourceRevision: number;
+  threadId: string;
+  reason: InterruptionEvidence["reason"];
+  nativeEventId: string;
+  nativeEventSeq: number;
+  nativeTurnId: string | null;
+  evidenceDigest: string;
+  correctionEvidenceDigest: string;
+  evidence: Array<{
+    eventId: string;
+    eventSeq: number;
+    threadId: string;
+    eventType: "system/thread/interrupted" | "turn/completed";
+    turnId: string | null;
+    providerThreadId: string | null;
+    status: "interrupted" | null;
+    reason: InterruptionEvidence["reason"] | null;
+  }>;
+  zeroRealWriter: boolean;
+};
+
+export interface ExecutionAttemptEvidenceReader {
+  terminal(input: { projectId: string; workItemId: string; executionAttemptId: string; nativeEventId: string; nativeEventSeq: number; nativeTurnId: string }): AuthoritativeTerminalEvidence;
+  historical(input: { projectId: string; workItemId: string; executionAttemptId: string; nativeEventId: string; nativeEventSeq: number; threadId: string }): AuthoritativeHistoricalInterruption;
 }
 
 export interface ResolvedRoleContext {
@@ -3126,6 +3353,8 @@ function normalizeRequest(request: ApplyRequest): ApplyRequest {
     executionAttemptId: request.executionAttemptId ?? undefined,
     frozenBriefContent: request.frozenBriefContent ?? undefined,
     terminalReport: request.terminalReport ?? undefined,
+    interruption: request.interruption ?? undefined,
+    historicalCorrection: request.historicalCorrection ?? undefined,
   };
 }
 
@@ -6256,23 +6485,343 @@ function activeWorkItemAttempt(
   ).get(projectId, workItemId, ...ACTIVE_WORK_ATTEMPT_STATES, ...(assignmentKind === undefined ? [] : [assignmentKind])));
 }
 
+function latestWorkItemAttempt(
+  db: SqliteDatabase,
+  projectId: string,
+  workItemId: string,
+): { execution_attempt_id: string; state: string; assignment_kind: WorkAttempt["assignmentKind"] | null; thread_id: string | null } | undefined {
+  return asRow(db.prepare(
+    `SELECT execution_attempt_id, state, assignment_kind, thread_id FROM execution_attempts
+     WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+     ORDER BY attempt_ordinal DESC LIMIT 1`,
+  ).get(projectId, workItemId));
+}
+
+function supersedeInterruptedAttempt(db: SqliteDatabase, projectId: string, executionAttemptId: string): void {
+  const updated = db.prepare(
+    `UPDATE execution_attempts
+     SET state = 'superseded', terminalization_class = 'resumed-continuation',
+         observed_at_ms = ?, completed_at_ms = ?, lease_owner_thread_id = NULL, progress_json = '{}'
+     WHERE project_id = ? AND execution_attempt_id = ? AND state = 'interrupted'`,
+  ).run(now(), now(), projectId, executionAttemptId);
+  if (updated.changes !== 1) throw refusal("WORK_ITEM_STATE_INVALID", "interrupted predecessor could not be cleared for explicit resume");
+}
+
 function terminalizeWorkItemAttempt(
   db: SqliteDatabase,
   projectId: string,
   workItemId: string,
   state: "done" | "blocked" | "failed" | "superseded",
   assignmentKind?: WorkAttempt["assignmentKind"],
+  terminalizationClass?: string,
 ): string | null {
   const active = activeWorkItemAttempt(db, projectId, workItemId, assignmentKind);
   if (!active) return null;
+  if (state === "done" && terminalizationClass === undefined) {
+    throw refusal("TERMINAL_REPORT_REQUIRED", "done requires accepted terminal evidence or an authorized no-report class");
+  }
   const completedAtMs = now();
   db.prepare(
     `UPDATE execution_attempts
      SET state = ?, observed_at_ms = ?, completed_at_ms = ?, lease_owner_thread_id = NULL,
-         progress_json = '{}'
+         progress_json = '{}', terminalization_class = COALESCE(?, terminalization_class)
      WHERE project_id = ? AND execution_attempt_id = ?`,
-  ).run(state, completedAtMs, completedAtMs, projectId, active.execution_attempt_id);
+  ).run(state, completedAtMs, completedAtMs, terminalizationClass ?? null, projectId, active.execution_attempt_id);
   return active.execution_attempt_id;
+}
+
+type InterruptionEvidence = z.infer<typeof interruptionEvidenceSchema>;
+type HistoricalCorrection = z.infer<typeof historicalCorrectionSchema>;
+
+function sameNullable(actual: unknown, expected: unknown): boolean {
+  return actual === expected;
+}
+
+function requireAttemptForMutation(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  attemptId: string,
+): ExecutionAttemptRow {
+  const attempt = asRow<ExecutionAttemptRow>(db.prepare(
+    "SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?",
+  ).get(request.projectId, attemptId));
+  if (attempt) return attempt;
+  const foreign = db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ? LIMIT 1").get(attemptId);
+  throw refusal(foreign ? "EXECUTION_CONTEXT_FOREIGN" : "TERMINAL_REPORT_AMBIGUOUS", foreign
+    ? "execution attempt belongs to another project"
+    : "execution attempt is not known");
+}
+
+function applyExecutionAttemptTerminalReport(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+  evidenceReader: ExecutionAttemptEvidenceReader | null,
+): FoundationResult {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request, false);
+  const report = request.terminalReport;
+  if (!report || !request.executionAttemptId || report.projectId !== request.projectId || report.executionAttemptId !== request.executionAttemptId) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report and request do not identify the exact project and attempt");
+  }
+  if (!request.workItemId || report.workItemId !== request.workItemId) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report and request do not identify the exact work item");
+  }
+  if (!evidenceReader) throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report requires authoritative native evidence");
+  const workItem = requireWorkItem(db, request, configRevision);
+  const attempt = requireAttemptForMutation(db, request, report.executionAttemptId);
+  const exact: Array<[string, unknown, unknown]> = [
+    ["work item", attempt.work_item_id, report.workItemId],
+    ["assignment", attempt.assignment_id, report.assignmentId],
+    ["role", attempt.role_id, report.roleId],
+    ["role generation", attempt.role_generation, report.roleGeneration],
+    ["repository target", attempt.repo_target_id, report.repoTargetId],
+    ["environment", attempt.environment_id, report.environmentId],
+    ["thread", attempt.thread_id, report.threadId],
+    ["branch", attempt.branch_name, report.branchName],
+    ["base", attempt.base_sha, report.baseSha],
+    ["candidate", attempt.candidate_sha, report.candidateSha],
+  ];
+  const mismatch = exact.find(([, actual, expected]) => !sameNullable(actual, expected));
+  if (mismatch) throw refusal("TERMINAL_REPORT_AMBIGUOUS", `terminal report ${mismatch[0]} identity does not match the canonical attempt`);
+  if (attempt.thread_id === null || report.nativeEventSeq <= 0 || report.nativeEventId.length === 0) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report lacks exact native thread/event evidence");
+  }
+  let authoritative: AuthoritativeTerminalEvidence;
+  try {
+    authoritative = evidenceReader.terminal({
+      projectId: request.projectId,
+      workItemId: workItem.work_item_id,
+      executionAttemptId: report.executionAttemptId,
+      nativeEventId: report.nativeEventId,
+      nativeEventSeq: report.nativeEventSeq,
+      nativeTurnId: report.nativeTurnId,
+    });
+  } catch {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report authoritative native evidence is unavailable or foreign");
+  }
+  const authoritativeExact: Array<[string, unknown, unknown]> = [
+    ["project", authoritative.projectId, request.projectId],
+    ["work item", authoritative.workItemId, workItem.work_item_id],
+    ["attempt", authoritative.executionAttemptId, report.executionAttemptId],
+    ["repository target", authoritative.repoTargetId, workItem.repo_target_id],
+    ["resource revision", authoritative.resourceRevision, workItem.resource_revision],
+    ["assignment", authoritative.assignmentId, attempt.assignment_id],
+    ["role", authoritative.roleId, attempt.role_id],
+    ["role generation", authoritative.roleGeneration, attempt.role_generation],
+    ["environment", authoritative.environmentId, attempt.environment_id],
+    ["thread", authoritative.threadId, attempt.thread_id],
+    ["branch", authoritative.branchName, attempt.branch_name],
+    ["base", authoritative.baseSha, attempt.base_sha],
+    ["candidate", authoritative.candidateSha, attempt.candidate_sha],
+    ["native event", authoritative.nativeEventId, report.nativeEventId],
+    ["native sequence", authoritative.nativeEventSeq, report.nativeEventSeq],
+    ["native turn", authoritative.nativeTurnId, report.nativeTurnId],
+    ["native receipt", authoritative.nativeReceiptDigest, report.nativeReceiptDigest],
+    ["actual profile", authoritative.actualProfileDigest, report.actualProfileDigest],
+    ["candidate observation", authoritative.candidateObservationDigest, report.candidateObservationDigest],
+  ];
+  const authoritativeMismatch = authoritativeExact.find(([, actual, expected]) => !sameNullable(actual, expected));
+  if (authoritativeMismatch) throw refusal("TERMINAL_REPORT_AMBIGUOUS", `terminal report authoritative ${authoritativeMismatch[0]} evidence does not match`);
+  if (canonicalJson(authoritative.evidence) !== canonicalJson(report.evidence)) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report evidence does not match the authoritative native evidence");
+  }
+  if (!WORK_ITEM_CAPACITY_ATTEMPT_STATES.includes(attempt.state as typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES[number])) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", `attempt is not reportable from state ${attempt.state}`);
+  }
+  const terminalState = report.outcome === "DONE" ? "done" : "blocked";
+  const completedAtMs = now();
+  db.prepare(
+    `UPDATE execution_attempts
+     SET state = ?, terminal_result = ?, reported_outcome = ?, terminal_report_digest = ?,
+         terminal_report_json = ?, terminal_actual_profile_digest = ?, native_receipt_digest = ?,
+         terminal_event_id = ?, terminal_event_seq = ?, terminalization_class = 'accepted-terminal-report',
+         observed_at_ms = ?, completed_at_ms = ?, lease_owner_thread_id = NULL, progress_json = '{}'
+     WHERE project_id = ? AND execution_attempt_id = ? AND state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})`,
+  ).run(
+    terminalState,
+    report.outcome,
+    report.outcome,
+    sha256(canonicalJson(report)),
+    canonicalJson(report),
+    report.actualProfileDigest,
+    report.nativeReceiptDigest,
+    report.nativeEventId,
+    report.nativeEventSeq,
+    completedAtMs,
+    completedAtMs,
+    request.projectId,
+    report.executionAttemptId,
+    ...WORK_ITEM_CAPACITY_ATTEMPT_STATES,
+  );
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "execution_attempt",
+      aggregateId: report.executionAttemptId,
+      aggregateRevision: nextAggregateRevision(db, request.projectId, "execution_attempt", report.executionAttemptId),
+      eventType: "execution_attempt_terminal_report_accepted",
+      event: { projectId: request.projectId, workItemId: report.workItemId, executionAttemptId: report.executionAttemptId, outcome: report.outcome, nativeEventId: report.nativeEventId, nativeEventSeq: report.nativeEventSeq, terminalReportDigest: sha256(canonicalJson(report)) },
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    { currentConfigRevision: configRevision, currentGovernanceEpoch: governor.governance_epoch, evidence: { executionAttemptId: report.executionAttemptId, terminalReportDigest: sha256(canonicalJson(report)) } },
+  );
+}
+
+function applyExecutionAttemptInterruption(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+  evidenceReader: ExecutionAttemptEvidenceReader | null,
+): FoundationResult {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request, false);
+  const evidence = request.interruption;
+  if (!evidenceReader) throw refusal("TERMINAL_REPORT_AMBIGUOUS", "interruption requires authoritative native evidence");
+  if (!evidence || !request.executionAttemptId || !request.workItemId || evidence.projectId !== request.projectId
+    || evidence.executionAttemptId !== request.executionAttemptId || evidence.workItemId !== request.workItemId) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "interruption evidence and request do not identify the exact project, work item, and attempt");
+  }
+  const attempt = requireAttemptForMutation(db, request, evidence.executionAttemptId);
+  const workItem = requireWorkItem(db, request, configRevision);
+  if (attempt.work_item_id !== evidence.workItemId || attempt.thread_id !== evidence.threadId) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "interruption evidence does not match the canonical work item thread");
+  }
+  let authoritative: AuthoritativeHistoricalInterruption;
+  try {
+    authoritative = evidenceReader.historical({
+      projectId: request.projectId,
+      workItemId: workItem.work_item_id,
+      executionAttemptId: evidence.executionAttemptId,
+      nativeEventId: evidence.nativeEventId,
+      nativeEventSeq: evidence.nativeEventSeq,
+      threadId: evidence.threadId,
+    });
+  } catch {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "interruption authoritative native evidence is unavailable or foreign");
+  }
+  const expectedEvidenceDigest = sha256(canonicalJson({
+    projectId: authoritative.projectId,
+    workItemId: authoritative.workItemId,
+    executionAttemptId: authoritative.executionAttemptId,
+    threadId: authoritative.threadId,
+    reason: authoritative.reason,
+    nativeEventId: authoritative.nativeEventId,
+    nativeEventSeq: authoritative.nativeEventSeq,
+    nativeTurnId: authoritative.nativeTurnId,
+  }));
+  const authoritativeExact: Array<[string, unknown, unknown]> = [
+    ["project", authoritative.projectId, request.projectId],
+    ["work item", authoritative.workItemId, workItem.work_item_id],
+    ["attempt", authoritative.executionAttemptId, evidence.executionAttemptId],
+    ["repository target", authoritative.repoTargetId, workItem.repo_target_id],
+    ["resource revision", authoritative.resourceRevision, workItem.resource_revision],
+    ["thread", authoritative.threadId, evidence.threadId],
+    ["reason", authoritative.reason, evidence.reason],
+    ["native event", authoritative.nativeEventId, evidence.nativeEventId],
+    ["native sequence", authoritative.nativeEventSeq, evidence.nativeEventSeq],
+    ["native turn", authoritative.nativeTurnId, evidence.nativeTurnId],
+    ["evidence digest", authoritative.evidenceDigest, evidence.evidenceDigest],
+  ];
+  const authoritativeMismatch = authoritativeExact.find(([, actual, expected]) => !sameNullable(actual, expected));
+  if (authoritativeMismatch || expectedEvidenceDigest !== evidence.evidenceDigest) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", `interruption authoritative ${authoritativeMismatch?.[0] ?? "digest"} evidence does not match`);
+  }
+  if (attempt.interruption_event_id !== null && attempt.interruption_event_id !== evidence.nativeEventId) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "attempt already has different interruption evidence");
+  }
+  const correction = request.historicalCorrection;
+  const historical = correction !== undefined;
+  if (historical) {
+    if (attempt.state !== "done" || correction.priorState !== "done" || attempt.terminal_report_digest !== null || attempt.reported_outcome !== null) {
+      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction requires an unreported false done attempt");
+    }
+    const expectedCorrectionDigest = sha256(canonicalJson({
+      projectId: authoritative.projectId,
+      workItemId: authoritative.workItemId,
+      executionAttemptId: authoritative.executionAttemptId,
+      threadId: authoritative.threadId,
+      reason: authoritative.reason,
+      evidence: authoritative.evidence,
+    }));
+    if (authoritative.correctionEvidenceDigest !== correction.evidenceDigest || expectedCorrectionDigest !== correction.evidenceDigest) {
+      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction authoritative correction digest does not match");
+    }
+    if (!authoritative.zeroRealWriter) throw refusal("WORK_ITEM_STATE_INVALID", "historical correction requires a proven zero-real-writer window");
+    if (correction.evidence.some((item, index) => index > 0 && correction.evidence[index - 1]!.eventSeq >= item.eventSeq)) {
+      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction evidence must be strictly ordered by native event sequence");
+    }
+    if (authoritative.evidence.length !== correction.evidence.length
+      || correction.evidence.some((item, index) => item.eventId !== authoritative.evidence[index]?.eventId || item.eventSeq !== authoritative.evidence[index]?.eventSeq)
+      || authoritative.evidence[0]?.eventId !== evidence.nativeEventId
+      || authoritative.evidence[0]?.eventSeq !== evidence.nativeEventSeq
+      || authoritative.evidence[0]?.threadId !== evidence.threadId
+      || authoritative.evidence[0]?.reason !== evidence.reason
+      || authoritative.evidence.some((item, index) => index > 0 && item.eventSeq <= authoritative.evidence[index - 1]!.eventSeq)) {
+      throw refusal("TERMINAL_REPORT_AMBIGUOUS", "historical correction evidence is not the exact ordered native interruption correlation");
+    }
+  } else if (!WORK_ITEM_CAPACITY_ATTEMPT_STATES.includes(attempt.state as typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES[number])) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", `attempt is not interruptible from state ${attempt.state}`);
+  }
+  if (!historical && !(WORK_ITEM_NON_TERMINAL_STATES as readonly string[]).includes(workItem.lifecycle_state)) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "interruption evidence cannot create debt for a terminal work item");
+  }
+  const completedAtMs = now();
+  db.prepare(
+    `UPDATE execution_attempts
+     SET state = 'interrupted', terminalization_class = 'native-interruption',
+         interruption_reason = ?, interruption_event_id = ?, interruption_event_seq = ?,
+         interruption_turn_id = ?, interruption_evidence_digest = ?, terminal_event_id = ?,
+         terminal_event_seq = ?, observed_at_ms = ?, completed_at_ms = ?,
+         lease_owner_thread_id = NULL, progress_json = '{}', reason_code = ?
+     WHERE project_id = ? AND execution_attempt_id = ?`,
+  ).run(
+    evidence.reason,
+    evidence.nativeEventId,
+    evidence.nativeEventSeq,
+    evidence.nativeTurnId,
+    evidence.evidenceDigest,
+    evidence.nativeEventId,
+    evidence.nativeEventSeq,
+    completedAtMs,
+    completedAtMs,
+    historical ? `historical-correction:${correction!.correctionId}` : `interrupted:${evidence.reason}`,
+    request.projectId,
+    evidence.executionAttemptId,
+  );
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "execution_attempt",
+      aggregateId: evidence.executionAttemptId,
+      aggregateRevision: nextAggregateRevision(db, request.projectId, "execution_attempt", evidence.executionAttemptId),
+      eventType: historical ? "execution_attempt_historical_interruption_correction" : "execution_attempt_interrupted",
+      event: {
+        projectId: request.projectId,
+        workItemId: evidence.workItemId,
+        executionAttemptId: evidence.executionAttemptId,
+        reason: evidence.reason,
+        nativeEventType: evidence.nativeEventType,
+        nativeEventId: evidence.nativeEventId,
+        nativeEventSeq: evidence.nativeEventSeq,
+        nativeTurnId: evidence.nativeTurnId,
+        evidenceDigest: evidence.evidenceDigest,
+        ...(historical ? { historicalCorrection: { ...correction!, evidence: authoritative.evidence } } : {}),
+      },
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    { currentConfigRevision: configRevision, currentGovernanceEpoch: governor.governance_epoch, evidence: { executionAttemptId: evidence.executionAttemptId, workItemId: evidence.workItemId, state: "interrupted", historicalCorrection: historical } },
+  );
 }
 
 export interface WorkItemReconciliationIssue {
@@ -6865,7 +7414,7 @@ function applyWorkItemTransition(
     if (workAttempt.assignmentKind !== "write") {
       throw refusal("WORK_ITEM_STATE_INVALID", "replacement work attempts must be writing attempts");
     }
-    const prior = activeWorkItemAttempt(db, request.projectId, workItem.work_item_id);
+    const prior = latestWorkItemAttempt(db, request.projectId, workItem.work_item_id);
     const nextRevision = workItem.resource_revision + 1;
     const updated = db.prepare(
       `UPDATE work_items SET resource_revision = ?, updated_at_ms = ?
@@ -6875,7 +7424,8 @@ function applyWorkItemTransition(
       currentResourceRevision: workItem.resource_revision,
       expectedResourceRevision: request.expectedResourceRevision ?? undefined,
     });
-    if (prior) terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded");
+    if (prior?.state === "interrupted") supersedeInterruptedAttempt(db, request.projectId, prior.execution_attempt_id);
+    else if (prior) terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded");
     const createdAtMs = now();
     const executionAttemptId = insertWorkItemAttempt(db, {
       projectId: request.projectId,
@@ -6980,6 +7530,10 @@ function applyWorkItemTransition(
   if (nextState === "review_pending" && !redispatchingReview && !activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
     throw refusal("WORK_ITEM_STATE_INVALID", "review-pending requires an active writing attempt to close");
   }
+  const latestAttempt = latestWorkItemAttempt(db, request.projectId, workItem.work_item_id);
+  if (nextState === "succeeded" && latestAttempt?.state === "interrupted") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "interrupted attempt requires explicit resume or disposition before success");
+  }
   if (workItem.lifecycle_state === "review_pending" && activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
     throw refusal("WORK_ITEM_STATE_INVALID", "review-pending cannot carry an active writing attempt");
   }
@@ -7047,7 +7601,7 @@ function applyWorkItemTransition(
   } else if (nextState === "review_pending") {
     executionAttemptId = redispatchingReview
       ? terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded", "review")
-      : terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "done", "write");
+      : terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "done", "write", "work-item-review-handoff");
     if (workAttempt) {
       reviewExecutionAttemptId = insertWorkItemAttempt(db, {
         projectId: request.projectId,
@@ -7077,6 +7631,7 @@ function applyWorkItemTransition(
       workItem.work_item_id,
       nextState === "succeeded" ? "done" : nextState === "blocked" ? "blocked" : "failed",
       workItem.lifecycle_state === "review_pending" ? "review" : undefined,
+      nextState === "succeeded" ? (directMergeClose ? "fleet-watchdog-merge-close" : "work-item-review-adjudication") : undefined,
     );
   }
   return commitMutation(
@@ -8093,7 +8648,7 @@ interface ExecutionAttemptRow {
   role_generation: number;
   branch_name: string | null;
   base_sha: string | null;
-  state: "prepared" | "armed" | "content_delivered" | "running" | "done" | "blocked" | "failed" | "dispatch_unknown";
+  state: "prepared" | "armed" | "content_delivered" | "running" | "done" | "blocked" | "failed" | "interrupted" | "dispatch_unknown";
   bb_server_id: string;
   environment_id: string;
   source_id: string;
@@ -8125,6 +8680,14 @@ interface ExecutionAttemptRow {
   terminal_result: "DONE" | "BLOCKED" | null;
   reported_outcome: "DONE" | "BLOCKED" | null;
   terminal_report_digest: string | null;
+  terminalization_class: string | null;
+  terminal_report_json: string | null;
+  terminal_actual_profile_digest: string | null;
+  interruption_reason: string | null;
+  interruption_event_id: string | null;
+  interruption_event_seq: number | null;
+  interruption_turn_id: string | null;
+  interruption_evidence_digest: string | null;
   conflicting_terminal_digest: string | null;
   terminal_event_id: string | null;
   terminal_event_seq: number | null;
@@ -8161,6 +8724,7 @@ export function applyAuthorizedMutation(
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
   reviewFactReader: ReviewFactReader | null = null,
   githubIssueReader: GitHubIssueReader | null = null,
+  executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
   dryRun = false,
 ): FoundationResult {
   let request: ApplyRequest;
@@ -8171,7 +8735,7 @@ export function applyAuthorizedMutation(
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, dryRun);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun);
 }
 
 export async function applyAuthorizedMutationAsync(
@@ -8182,6 +8746,7 @@ export async function applyAuthorizedMutationAsync(
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
   reviewFactReader: ReviewFactReader | null = null,
   githubIssueReader: GitHubIssueReader | null = null,
+  executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
   dryRun = false,
 ): Promise<FoundationResult> {
   let request: ApplyRequest;
@@ -8193,7 +8758,7 @@ export async function applyAuthorizedMutationAsync(
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   if (request.operationClass !== "github_issue_projection" || !githubAdapter?.readAsync || !githubAdapter.mutateAsync) {
-    return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, dryRun);
+    return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun);
   }
   try {
     return await applyGithubIssueProjectionAsync(db, request, mutationRequestDigest(request), githubAdapter);
@@ -8211,6 +8776,7 @@ export function applyFixtureMutation(
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
   reviewFactReader: ReviewFactReader | null = null,
   githubIssueReader: GitHubIssueReader | null = null,
+  executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
   dryRun = false,
 ): FoundationResult {
   let request: ApplyRequest;
@@ -8285,6 +8851,10 @@ export function applyFixtureMutation(
           return applyWorkItemCreate(db, request, digest);
         case "work_item_transition":
           return applyWorkItemTransition(db, request, digest, githubObservation);
+        case "execution_attempt_terminal_report":
+          return applyExecutionAttemptTerminalReport(db, request, digest, executionAttemptEvidenceReader);
+        case "execution_attempt_interruption":
+          return applyExecutionAttemptInterruption(db, request, digest, executionAttemptEvidenceReader);
         case "github_issue_projection":
           throw refusal("INTERNAL_ERROR", "projection must not run inside the canonical transaction");
         case "qualification_observation_record":
