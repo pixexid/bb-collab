@@ -100,6 +100,28 @@ describe("Operator Inbox app", () => {
     await waitFor(() => expect(operatorMessages).toHaveBeenLastCalledWith({ projectId: "project-a", recipient: "operator", withSenderTitles: true, includeArchived: true }));
   });
 
+  it("keeps same-minute relative times minimal while exact labels include seconds and offset", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const now = Date.now();
+    const messages = [
+      { messageId: 20, projectId: "project-a", recipient: "operator" as const, senderThreadId: "sender-a", senderLaneId: null, severity: "routine" as const, text: "First timestamp", createdAtMs: now - 10 * 60 * 1000 - 5 * 1000, readAtMs: null, archivedAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null },
+      { messageId: 21, projectId: "project-a", recipient: "operator" as const, senderThreadId: "sender-b", senderLaneId: null, severity: "routine" as const, text: "Second timestamp", createdAtMs: now - 10 * 60 * 1000 - 45 * 1000, readAtMs: null, archivedAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null },
+    ];
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(async () => messages) } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("First timestamp")).toBeTruthy());
+    const times = Array.from(rendered.container.querySelectorAll("time"));
+    const exactLabels = [...new Set(times.map((time) => time.getAttribute("title")).filter((label): label is string => label !== null))];
+    expect(exactLabels).toHaveLength(2);
+    expect(exactLabels.every((label) => /\d{1,2}:\d{2}:\d{2}/.test(label))).toBe(true);
+    expect(exactLabels.every((label) => /GMT|UTC|[A-Z]{2,5}/.test(label))).toBe(true);
+    expect(times.every((time) => time.textContent === "10m ago")).toBe(true);
+  });
+
   it("aggregates every project by default, sorts unread first, and filters by project", async () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
@@ -428,6 +450,46 @@ describe("Operator Inbox app", () => {
     const archive = rendered.getByRole("button", { name: "Archive message" });
     expect(archive.hasAttribute("disabled")).toBe(false);
     expect(archive.textContent).not.toContain("Archive");
+  });
+
+  it("keeps mark-read and archive pending, single-flight, and recoverable", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const message = { messageId: 22, projectId: "project-a", recipient: "operator" as const, senderThreadId: "a", senderLaneId: null, severity: "routine" as const, text: "pending controls", createdAtMs: 1, readAtMs: null as number | null, archivedAtMs: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null };
+    let resolveRead!: (value: typeof message) => void;
+    let rejectArchive!: (reason: unknown) => void;
+    const readResult = new Promise<typeof message>((resolve) => { resolveRead = resolve; });
+    const archiveResult = new Promise<typeof message>((_resolve, reject) => { rejectArchive = reject; });
+    const markOperatorMessageRead = vi.fn(async () => readResult);
+    const archiveOperatorMessage = vi.fn(async () => archiveResult);
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(async () => [message]), markOperatorMessageRead, archiveOperatorMessage } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText("pending controls")).toBeTruthy());
+    const markRead = rendered.getByRole("button", { name: "Mark message read" });
+    fireEvent.click(markRead);
+    fireEvent.click(markRead);
+    expect(markOperatorMessageRead).toHaveBeenCalledTimes(1);
+    expect(markRead.hasAttribute("disabled")).toBe(true);
+    expect(markRead.getAttribute("aria-busy")).toBe("true");
+    expect(rendered.getByRole("button", { name: "Marking message read" })).toBeTruthy();
+
+    await act(async () => resolveRead({ ...message, readAtMs: 5 }));
+    await waitFor(() => expect(rendered.queryByRole("button", { name: "Mark message read" })).toBeNull());
+    const archive = rendered.getByRole("button", { name: "Archive message" });
+    fireEvent.click(archive);
+    fireEvent.click(archive);
+    expect(archiveOperatorMessage).toHaveBeenCalledTimes(1);
+    expect(archive.hasAttribute("disabled")).toBe(true);
+    expect(archive.getAttribute("aria-busy")).toBe("true");
+    expect(rendered.getByRole("button", { name: "Archiving message" })).toBeTruthy();
+
+    await act(async () => rejectArchive(new Error("archive unavailable")));
+    await waitFor(() => expect(rendered.getByRole("button", { name: "Archive message" })).toBeTruthy());
+    expect(rendered.getByRole("button", { name: "Archive message" }).hasAttribute("disabled")).toBe(false);
+    expect(rendered.getByText("Refresh failed: Error: archive unavailable")).toBeTruthy();
   });
 
   it("does not claim delivery for pending or explicitly failed reply results", async () => {

@@ -123,6 +123,9 @@
     .visible {
       visibility: visible;
     }
+    .relative {
+      position: relative;
+    }
     .mx-auto {
       margin-inline: auto;
     }

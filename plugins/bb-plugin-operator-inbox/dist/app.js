@@ -204,8 +204,13 @@ function writeInboxFilters(filters) {
 function messageKey(message) {
   return `${message.projectId}:${message.messageId}`;
 }
-function formatTime(timestamp) {
-  return new Date(timestamp).toLocaleString(void 0, { dateStyle: "medium", timeStyle: "short" });
+function formatExactTime(timestamp) {
+  const date = new Date(timestamp);
+  try {
+    return new Intl.DateTimeFormat(void 0, { year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "shortOffset" }).format(date);
+  } catch {
+    return `${date.toISOString().replace("T", " ").replace(".000Z", "")} UTC`;
+  }
 }
 function formatRelativeTime(timestamp) {
   const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1e3));
@@ -244,6 +249,7 @@ function InboxPanel(_props) {
   const [loading, setLoading] = useState(true);
   const [drafts, setDrafts] = useState({});
   const [replyingMessageKey, setReplyingMessageKey] = useState(null);
+  const [pendingAction, setPendingAction] = useState(null);
   const [errors, setErrors] = useState([]);
   const [notice, setNotice] = useState(null);
   const [indicatorBroken, setIndicatorBroken] = useState(null);
@@ -341,6 +347,32 @@ function InboxPanel(_props) {
   const replyKey = selectedMessage ? messageKey(selectedMessage) : null;
   const replyText = selectedMessage && replyKey ? drafts[replyKey] ?? selectedMessage.replyText ?? "" : "";
   const selectedSenderId = selectedMessage ? asText(selectedMessage.senderThreadId) : null;
+  const pendingSelectedAction = pendingAction?.key === replyKey ? pendingAction.action : null;
+  const markReadPending = pendingSelectedAction === "mark-read";
+  const archivePending = pendingSelectedAction === "archive";
+  const markSelectedMessageRead = () => {
+    if (!selectedMessage || !replyKey || pendingAction !== null) return;
+    const action = { key: replyKey, action: "mark-read" };
+    setPendingAction(action);
+    setErrors([]);
+    setNotice(null);
+    void rpc.call("markOperatorMessageRead", { projectId: selectedMessage.projectId, messageId: selectedMessage.messageId }).then((read) => {
+      updateMessage(read);
+      setNotice("Marked read. This message is no longer counted as unread.");
+    }).catch((reason) => setErrors([String(reason)])).finally(() => setPendingAction((current) => current === action ? null : current));
+  };
+  const archiveSelectedMessage = () => {
+    if (!selectedMessage || !replyKey || pendingAction !== null) return;
+    const action = { key: replyKey, action: "archive" };
+    const sequence = refreshSequence.current;
+    setPendingAction(action);
+    setErrors([]);
+    setNotice(null);
+    void rpc.call("archiveOperatorMessage", { projectId: selectedMessage.projectId, messageId: selectedMessage.messageId }).then((archived) => {
+      if (sequence === refreshSequence.current) setMessages((current) => showArchivedRef.current ? current.map((item) => messageKey(item) === replyKey ? archived : item) : current.filter((item) => messageKey(item) !== replyKey));
+      setNotice("Archived. Turn on Show archived to include it again.");
+    }).catch((reason) => setErrors([String(reason)])).finally(() => setPendingAction((current) => current === action ? null : current));
+  };
   return /* @__PURE__ */ jsx("main", { className: "h-full overflow-y-auto p-4 md:p-5", children: /* @__PURE__ */ jsxs("div", { className: "mx-auto grid max-w-5xl gap-4", style: { minWidth: 0, width: "100%" }, children: [
     indicatorBroken ? /* @__PURE__ */ jsxs("p", { role: "alert", className: "text-sm text-destructive", children: [
       INBOX_INDICATOR_BROKEN_TITLE,
@@ -409,11 +441,11 @@ function InboxPanel(_props) {
           const selected = key === selectedKey;
           const sender = senderLabel(message);
           const delivery = deliveryLabel(message);
-          return /* @__PURE__ */ jsx("article", { role: "listitem", className: `border-b border-border last:border-b-0 ${selected ? "bg-primary/5" : "bg-transparent"}`, children: /* @__PURE__ */ jsxs("button", { type: "button", "aria-pressed": selected, "aria-label": `${selected ? "Selected. " : "Select "}message from ${sender}. ${projectNames.get(message.projectId) ?? message.projectId}. ${severityLabel(message.severity)}. ${stateLabel(message)}. ${formatTime(message.createdAtMs)}`, style: { textAlign: "left", width: "100%" }, onClick: () => setSelectedMessageKey(key), className: `grid min-w-0 gap-2 px-3 py-3 transition-colors duration-150 hover:bg-muted/60 active:bg-muted/80 focus-visible:z-10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none ${selected ? "border-l-2 border-primary pl-[0.625rem]" : "border-l-2 border-transparent"}`, children: [
+          return /* @__PURE__ */ jsx("article", { role: "listitem", className: `border-b border-border last:border-b-0 ${selected ? "bg-primary/5" : "bg-transparent"}`, children: /* @__PURE__ */ jsxs("button", { type: "button", "aria-pressed": selected, "aria-label": `${selected ? "Selected. " : "Select "}message from ${sender}. ${projectNames.get(message.projectId) ?? message.projectId}. ${severityLabel(message.severity)}. ${stateLabel(message)}. ${formatExactTime(message.createdAtMs)}`, style: { textAlign: "left", width: "100%" }, onClick: () => setSelectedMessageKey(key), className: `grid min-w-0 gap-2 px-3 py-3 transition-colors duration-150 hover:bg-muted/60 active:bg-muted/80 focus-visible:z-10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none ${selected ? "border-l-2 border-primary pl-[0.625rem]" : "border-l-2 border-transparent"}`, children: [
             /* @__PURE__ */ jsxs("span", { className: "flex min-w-0 items-start gap-2", children: [
               /* @__PURE__ */ jsx("span", { className: `mt-1.5 h-2 w-2 shrink-0 rounded-full ${message.readAtMs === null ? "bg-primary" : "bg-transparent"}`, "aria-label": message.readAtMs === null ? "Unread" : void 0 }),
               /* @__PURE__ */ jsx("span", { className: `min-w-0 flex-1 break-words text-sm ${message.readAtMs === null ? "font-semibold" : "font-medium"}`, children: sender }),
-              /* @__PURE__ */ jsx("time", { className: "shrink-0 text-xs text-muted-foreground", dateTime: new Date(message.createdAtMs).toISOString(), title: formatTime(message.createdAtMs), "aria-label": `Received ${formatTime(message.createdAtMs)}`, children: formatRelativeTime(message.createdAtMs) })
+              /* @__PURE__ */ jsx("time", { className: "shrink-0 text-xs text-muted-foreground", dateTime: new Date(message.createdAtMs).toISOString(), title: formatExactTime(message.createdAtMs), "aria-label": `Received ${formatExactTime(message.createdAtMs)}`, children: formatRelativeTime(message.createdAtMs) })
             ] }),
             /* @__PURE__ */ jsx("span", { className: "break-words text-sm leading-5 text-muted-foreground", children: selected ? "Selected \u2014 details shown here" : message.text.length > 96 ? `${message.text.slice(0, 96).trimEnd()}\u2026` : message.text }),
             /* @__PURE__ */ jsxs("span", { className: "flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground", children: [
@@ -448,7 +480,7 @@ function InboxPanel(_props) {
               /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
               /* @__PURE__ */ jsx("span", { children: severityLabel(selectedMessage.severity) }),
               /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\xB7" }),
-              /* @__PURE__ */ jsx("time", { dateTime: new Date(selectedMessage.createdAtMs).toISOString(), title: formatTime(selectedMessage.createdAtMs), "aria-label": `Received ${formatTime(selectedMessage.createdAtMs)}`, children: formatRelativeTime(selectedMessage.createdAtMs) })
+              /* @__PURE__ */ jsx("time", { dateTime: new Date(selectedMessage.createdAtMs).toISOString(), title: formatExactTime(selectedMessage.createdAtMs), "aria-label": `Received ${formatExactTime(selectedMessage.createdAtMs)}`, children: formatRelativeTime(selectedMessage.createdAtMs) })
             ] })
           ] }),
           /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap gap-2 text-xs", children: [
@@ -469,7 +501,7 @@ function InboxPanel(_props) {
           selectedMessage.repliedAtMs != null ? /* @__PURE__ */ jsxs("section", { "aria-label": "Reply delivered", className: "grid gap-2 rounded-md border border-border bg-muted/10 p-3", children: [
             /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-center justify-between gap-2", children: [
               /* @__PURE__ */ jsx("h3", { className: "text-sm font-semibold", children: "Reply delivered" }),
-              /* @__PURE__ */ jsx("time", { className: "text-xs text-muted-foreground", dateTime: new Date(selectedMessage.repliedAtMs).toISOString(), title: formatTime(selectedMessage.repliedAtMs), "aria-label": `Delivered ${formatTime(selectedMessage.repliedAtMs)}`, children: formatRelativeTime(selectedMessage.repliedAtMs) })
+              /* @__PURE__ */ jsx("time", { className: "text-xs text-muted-foreground", dateTime: new Date(selectedMessage.repliedAtMs).toISOString(), title: formatExactTime(selectedMessage.repliedAtMs), "aria-label": `Delivered ${formatExactTime(selectedMessage.repliedAtMs)}`, children: formatRelativeTime(selectedMessage.repliedAtMs) })
             ] }),
             /* @__PURE__ */ jsx("p", { className: "whitespace-pre-wrap break-words text-sm leading-6", children: selectedMessage.replyText }),
             /* @__PURE__ */ jsx("p", { className: "text-xs text-muted-foreground", children: "BB confirmed the matching input in the sender thread." })
@@ -490,7 +522,7 @@ function InboxPanel(_props) {
             ] })
           ] }),
           /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap gap-2 border-t border-border pt-4", children: [
-            /* @__PURE__ */ jsx("button", { type: "button", "aria-label": replyingMessageKey === replyKey ? "Delivering reply" : selectedMessage.repliedAtMs != null ? "Reply delivered" : selectedMessage.replyDeliveryError ? "Retry reply" : "Send reply", title: replyingMessageKey === replyKey ? "Delivering reply" : selectedMessage.repliedAtMs != null ? "Reply delivered" : selectedMessage.replyDeliveryError ? "Retry reply" : "Send reply", disabled: replyingMessageKey !== null || selectedMessage.repliedAtMs != null || !replyText.trim(), className: "min-h-10 min-w-10 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-opacity duration-150 hover:opacity-90 active:opacity-80 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none", onClick: () => {
+            /* @__PURE__ */ jsx("button", { type: "button", "aria-label": replyingMessageKey === replyKey ? "Delivering reply" : selectedMessage.repliedAtMs != null ? "Reply delivered" : selectedMessage.replyDeliveryError ? "Retry reply" : "Send reply", title: replyingMessageKey === replyKey ? "Delivering reply" : selectedMessage.repliedAtMs != null ? "Reply delivered" : selectedMessage.replyDeliveryError ? "Retry reply" : "Send reply", disabled: replyingMessageKey !== null || pendingAction !== null || selectedMessage.repliedAtMs != null || !replyText.trim(), className: "min-h-10 min-w-10 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-opacity duration-150 hover:opacity-90 active:opacity-80 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none", onClick: () => {
               const text = replyText.trim();
               if (!text || !replyKey) return;
               setErrors([]);
@@ -501,23 +533,8 @@ function InboxPanel(_props) {
                 setNotice(replied.repliedAtMs != null ? "Reply delivered. BB confirmed the matching input." : replied.replyInProgress ? "Delivery pending. The outcome is not yet known." : replied.replyDeliveryError ? "Delivery failed. The message remains retryable." : "Reply delivery is not confirmed.");
               }).catch((reason) => setErrors([String(reason)])).finally(() => setReplyingMessageKey(null));
             }, children: /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\u2197" }) }),
-            selectedMessage.readAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", "aria-label": "Mark message read", title: "Mark message read", className: "min-h-10 min-w-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none", onClick: () => {
-              setErrors([]);
-              setNotice(null);
-              void rpc.call("markOperatorMessageRead", { projectId: selectedMessage.projectId, messageId: selectedMessage.messageId }).then((read) => {
-                updateMessage(read);
-                setNotice("Marked read. This message is no longer counted as unread.");
-              }).catch((reason) => setErrors([String(reason)]));
-            }, children: /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: "\u2713" }) }) : null,
-            selectedMessage.archivedAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", "aria-label": "Archive message", title: "Archive message", className: "min-h-10 min-w-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none", onClick: () => {
-              const sequence = refreshSequence.current;
-              setErrors([]);
-              setNotice(null);
-              void rpc.call("archiveOperatorMessage", { projectId: selectedMessage.projectId, messageId: selectedMessage.messageId }).then((archived) => {
-                if (sequence === refreshSequence.current) setMessages((current) => showArchivedRef.current ? current.map((item) => messageKey(item) === replyKey ? archived : item) : current.filter((item) => messageKey(item) !== replyKey));
-                setNotice("Archived. Turn on Show archived to include it again.");
-              }).catch((reason) => setErrors([String(reason)]));
-            }, children: "\u25B1" }) : null
+            selectedMessage.readAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", "aria-busy": markReadPending, "aria-label": markReadPending ? "Marking message read" : "Mark message read", title: markReadPending ? "Marking message read" : "Mark message read", disabled: pendingAction !== null, className: "min-h-10 min-w-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: markSelectedMessageRead, children: /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: markReadPending ? "\u2026" : "\u2713" }) }) : null,
+            selectedMessage.archivedAtMs === null ? /* @__PURE__ */ jsx("button", { type: "button", "aria-busy": archivePending, "aria-label": archivePending ? "Archiving message" : "Archive message", title: archivePending ? "Archiving message" : "Archive message", disabled: pendingAction !== null, className: "min-h-10 min-w-10 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted active:bg-muted/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none", onClick: archiveSelectedMessage, children: /* @__PURE__ */ jsx("span", { "aria-hidden": "true", children: archivePending ? "\u2026" : "\u25B1" }) }) : null
           ] })
         ] })
       ] }) : /* @__PURE__ */ jsxs("section", { className: "min-w-0 rounded-lg border border-dashed border-border p-6 text-center", children: [
