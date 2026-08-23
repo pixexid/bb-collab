@@ -192,6 +192,18 @@ describe("Operator Inbox app", () => {
     expect(rendered.queryByText("hostile supervisor row")).toBeNull();
   });
 
+  it("fails the panel read closed when an operator row belongs to another project", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(async () => [{ messageId: 2, projectId: "project-b", recipient: "operator" as const, senderThreadId: "foreign", senderLaneId: null, severity: "routine" as const, text: "foreign row must stay hidden", createdAtMs: 2, readAtMs: null, senderTitle: null, repliedAtMs: null, replyText: null, replyDeliveryError: null, notificationStatus: "not-requested" as const, notificationError: null }]) } as never,
+    });
+
+    await waitFor(() => expect(rendered.getByText(/Refresh failed: Project A \(project-a\): Error: operator inbox response included a foreign-project message/)).toBeTruthy());
+    expect(rendered.queryByText("foreign row must stay hidden")).toBeNull();
+  });
+
   it("falls back to all projects when a persisted project no longer exists", async () => {
     window.localStorage.setItem("bb-collab.inbox-filters", JSON.stringify({ projectId: "deleted-project", recipient: "" }));
     const app = await loadedApp();

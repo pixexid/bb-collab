@@ -260,12 +260,19 @@ var {
 var READ_INPUT = { recipient: "operator", withSenderTitles: true };
 var UNREGISTERED_INBOX_PROJECT = "PROJECT_CONFIG_REQUIRED";
 var NON_OPERATOR_MESSAGE_ERROR = "operator inbox response included a non-operator message";
+var FOREIGN_PROJECT_MESSAGE_ERROR = "operator inbox response included a foreign-project message";
 var MALFORMED_MESSAGE_ERROR = "operator inbox response was malformed";
 var reads = /* @__PURE__ */ new Map();
 var provenUnread = /* @__PURE__ */ new Map();
+var projectEpochs = /* @__PURE__ */ new Map();
+var readEpochs = /* @__PURE__ */ new Map();
+var mutationEpochs = /* @__PURE__ */ new Map();
 var listeners = /* @__PURE__ */ new Set();
 var activeProjects = /* @__PURE__ */ new Set();
 var snapshot = 0;
+var lifecycleEpoch = 0;
+var rpcClient = null;
+var rpcGeneration = 0;
 function emit() {
   snapshot = [...provenUnread.values()].reduce((total, messages) => total + messages.size, 0);
   for (const listener of listeners) listener();
@@ -276,7 +283,7 @@ function messageKey(message) {
 function isUnregisteredInboxProject(result) {
   return result.outcome === UNREGISTERED_INBOX_PROJECT;
 }
-function operatorOnlyMessages(result) {
+function operatorOnlyMessages(result, requestedProjectId) {
   const candidate = result;
   if (candidate.outcome !== "OK" && candidate.outcome !== UNREGISTERED_INBOX_PROJECT || !Array.isArray(candidate.messages)) throw new Error(MALFORMED_MESSAGE_ERROR);
   if (candidate.outcome === UNREGISTERED_INBOX_PROJECT) return [];
@@ -286,29 +293,66 @@ function operatorOnlyMessages(result) {
     const validTimestamp = (timestamp) => timestamp === null || typeof timestamp === "number" && Number.isFinite(timestamp);
     return typeof value.projectId !== "string" || !Number.isInteger(value.messageId) || !validTimestamp(value.readAtMs) || !validTimestamp(value.archivedAtMs);
   })) throw new Error(MALFORMED_MESSAGE_ERROR);
+  if (candidate.messages.some((message) => message.projectId !== requestedProjectId)) throw new Error(FOREIGN_PROJECT_MESSAGE_ERROR);
   return candidate.messages;
 }
-function readOperatorMessages(rpc, input) {
-  const key = JSON.stringify(input);
-  let read = reads.get(key);
-  if (!read) {
-    read = Promise.resolve().then(() => rpc.call("operatorMessages", input)).finally(() => reads.delete(key));
-    reads.set(key, read);
-  }
-  return read;
+function projectIdFromInput(input) {
+  return typeof input.projectId === "string" ? input.projectId : "";
 }
-function applyRead(projectId, result) {
-  if (!activeProjects.has(projectId)) return;
+function bumpEpoch(epochs, projectId) {
+  const next = (epochs.get(projectId) ?? 0) + 1;
+  epochs.set(projectId, next);
+  return next;
+}
+function ensureRpcGeneration(rpc) {
+  if (rpcClient !== rpc) {
+    rpcClient = rpc;
+    rpcGeneration += 1;
+  }
+  return rpcGeneration;
+}
+function currentReadEpoch(rpc, projectId) {
+  return { lifecycle: lifecycleEpoch, rpcGeneration: ensureRpcGeneration(rpc), project: projectEpochs.get(projectId) ?? 0, read: readEpochs.get(projectId) ?? 0, mutation: mutationEpochs.get(projectId) ?? 0, projectId };
+}
+function readKey(input, epoch) {
+  return JSON.stringify([epoch.lifecycle, epoch.rpcGeneration, epoch.projectId, epoch.project, epoch.read, epoch.mutation, input]);
+}
+function isReadEpochCurrent(epoch) {
+  return epoch.lifecycle === lifecycleEpoch && epoch.rpcGeneration === rpcGeneration && epoch.project === (projectEpochs.get(epoch.projectId) ?? 0) && epoch.read === (readEpochs.get(epoch.projectId) ?? 0) && epoch.mutation === (mutationEpochs.get(epoch.projectId) ?? 0);
+}
+function readOperatorMessagesWithEpoch(rpc, input) {
+  const projectId = projectIdFromInput(input);
+  const baseEpoch = currentReadEpoch(rpc, projectId);
+  const existing = reads.get(readKey(input, baseEpoch));
+  if (existing) return existing;
+  const epoch = { ...baseEpoch, read: bumpEpoch(readEpochs, projectId) };
+  const key = readKey(input, epoch);
+  const request = {};
+  request.promise = Promise.resolve().then(() => rpc.call("operatorMessages", input)).finally(() => {
+    if (reads.get(key) === request) reads.delete(key);
+  });
+  request.epoch = epoch;
+  reads.set(key, request);
+  return request;
+}
+function applyRead(projectId, result, epoch) {
+  if (!activeProjects.has(projectId) || !isReadEpochCurrent(epoch)) return;
   if (isUnregisteredInboxProject(result)) {
     if (provenUnread.delete(projectId)) emit();
     return;
   }
-  const messages = operatorOnlyMessages(result);
+  const messages = operatorOnlyMessages(result, projectId);
   provenUnread.set(projectId, new Set(messages.filter((message) => message.readAtMs === null && message.archivedAtMs === null).map(messageKey)));
   emit();
 }
 function refreshUnread(rpc, projects) {
   const nextProjects = new Set(projects.map((project) => project.id));
+  const previousProjects = activeProjects;
+  for (const projectId of previousProjects) if (!nextProjects.has(projectId)) {
+    bumpEpoch(projectEpochs, projectId);
+    bumpEpoch(readEpochs, projectId);
+  }
+  for (const projectId of nextProjects) if (!previousProjects.has(projectId)) bumpEpoch(projectEpochs, projectId);
   activeProjects = nextProjects;
   let changed = false;
   for (const projectId of provenUnread.keys()) {
@@ -319,21 +363,25 @@ function refreshUnread(rpc, projects) {
   }
   if (changed) emit();
   for (const project of projects) {
-    void readOperatorMessages(rpc, { projectId: project.id, ...READ_INPUT }).then((result) => {
+    const request = readOperatorMessagesWithEpoch(rpc, { projectId: project.id, ...READ_INPUT });
+    void request.promise.then((result) => {
       try {
-        applyRead(project.id, result);
+        applyRead(project.id, result, request.epoch);
       } catch {
       }
     }, () => void 0);
   }
 }
-function applyUnreadReadResult(projectId, result) {
-  applyRead(projectId, result);
+function applyUnreadReadResult(projectId, result, epoch) {
+  applyRead(projectId, result, epoch);
 }
 function applyUnreadMutation(message) {
+  if (message.readAtMs === null && message.archivedAtMs === null) return;
+  bumpEpoch(mutationEpochs, message.projectId);
+  bumpEpoch(readEpochs, message.projectId);
   const unread = provenUnread.get(message.projectId);
   if (!activeProjects.has(message.projectId) || !unread) return;
-  if ((message.readAtMs !== null || message.archivedAtMs !== null) && unread.delete(messageKey(message))) emit();
+  if (unread.delete(messageKey(message))) emit();
 }
 function useInboxUnreadCount() {
   return useSyncExternalStore((listener) => {
@@ -342,6 +390,7 @@ function useInboxUnreadCount() {
   }, () => snapshot, () => snapshot);
 }
 function clearUnreadObserver() {
+  lifecycleEpoch += 1;
   activeProjects = /* @__PURE__ */ new Set();
   if (provenUnread.size > 0 || snapshot !== 0) {
     provenUnread.clear();
@@ -455,23 +504,26 @@ function InboxPanel(_props) {
       setLoading(false);
       return;
     }
-    void Promise.allSettled(projects.map((project) => readOperatorMessages(rpc, { projectId: project.id, recipient: "operator", withSenderTitles: true, ...showArchived ? { includeArchived: true } : {} }))).then((results) => {
+    const reads2 = projects.map((project) => readOperatorMessagesWithEpoch(rpc, { projectId: project.id, recipient: "operator", withSenderTitles: true, ...showArchived ? { includeArchived: true } : {} }));
+    void Promise.allSettled(reads2.map((read) => read.promise)).then((results) => {
       if (sequence !== refreshSequence.current) return;
       const loaded = [];
       const failed = [];
       results.forEach((result, index) => {
+        const request = reads2[index];
         const label = `${projects[index].name} (${projects[index].id})`;
+        if (!isReadEpochCurrent(request.epoch)) return;
         if (result.status === "rejected") failed.push(`${label}: ${String(result.reason)}`);
         else if (!isUnregisteredInboxProject(result.value)) {
           try {
-            const projectMessages = operatorOnlyMessages(result.value);
+            const projectMessages = operatorOnlyMessages(result.value, projects[index].id);
             loaded.push(...projectMessages);
-            applyUnreadReadResult(projects[index].id, result.value);
+            applyUnreadReadResult(projects[index].id, result.value, request.epoch);
           } catch (reason) {
             failed.push(`${label}: ${String(reason)}`);
           }
         } else {
-          applyUnreadReadResult(projects[index].id, result.value);
+          applyUnreadReadResult(projects[index].id, result.value, request.epoch);
           if (projectId !== "") failed.push(`${label}: ${result.value.outcome}`);
         }
       });

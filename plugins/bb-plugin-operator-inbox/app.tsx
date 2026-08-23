@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArchiveIcon, ArrowClockwiseIcon, EnvelopeOpenIcon, PaperPlaneTiltIcon } from "@phosphor-icons/react";
 import { definePluginApp, experimental_useSidebarThreads, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import type { PluginNavPanelProps, PluginRpcResult } from "@get-bb/plugin-sdk/app";
-import { applyUnreadMutation, applyUnreadReadResult, clearUnreadObserver, isUnregisteredInboxProject, operatorOnlyMessages, readOperatorMessages, refreshUnread, useInboxUnreadCount } from "./src/inbox-unread";
+import { applyUnreadMutation, applyUnreadReadResult, clearUnreadObserver, isReadEpochCurrent, isUnregisteredInboxProject, operatorOnlyMessages, readOperatorMessagesWithEpoch, refreshUnread, useInboxUnreadCount } from "./src/inbox-unread";
 import type { rpcContract } from "./contract";
 
 type OperatorMessagesResult = PluginRpcResult<typeof rpcContract["operatorMessages"]>;
@@ -76,19 +76,22 @@ function InboxPanel(_props: PluginNavPanelProps) {
     setNotice(null);
     setLoading(true);
     if (projects.length === 0) { setMessages([]); setErrors([]); setLoading(false); return; }
-    void Promise.allSettled(projects.map((project) => readOperatorMessages(rpc, { projectId: project.id, recipient: "operator", withSenderTitles: true, ...(showArchived ? { includeArchived: true } : {}) })))
+    const reads = projects.map((project) => readOperatorMessagesWithEpoch(rpc, { projectId: project.id, recipient: "operator", withSenderTitles: true, ...(showArchived ? { includeArchived: true } : {}) }));
+    void Promise.allSettled(reads.map((read) => read.promise))
       .then((results) => {
         if (sequence !== refreshSequence.current) return;
         const loaded: OperatorMessage[] = [];
         const failed: string[] = [];
         results.forEach((result, index) => {
+          const request = reads[index]!;
           const label = `${projects[index]!.name} (${projects[index]!.id})`;
+          if (!isReadEpochCurrent(request.epoch)) return;
           if (result.status === "rejected") failed.push(`${label}: ${String(result.reason)}`);
           else if (!isUnregisteredInboxProject(result.value)) {
-            try { const projectMessages = operatorOnlyMessages(result.value); loaded.push(...projectMessages); applyUnreadReadResult(projects[index]!.id, result.value); }
+            try { const projectMessages = operatorOnlyMessages(result.value, projects[index]!.id); loaded.push(...projectMessages); applyUnreadReadResult(projects[index]!.id, result.value, request.epoch); }
             catch (reason) { failed.push(`${label}: ${String(reason)}`); }
           }
-          else { applyUnreadReadResult(projects[index]!.id, result.value); if (projectId !== "") failed.push(`${label}: ${result.value.outcome}`); }
+          else { applyUnreadReadResult(projects[index]!.id, result.value, request.epoch); if (projectId !== "") failed.push(`${label}: ${result.value.outcome}`); }
         });
         loaded.sort((left, right) => Number(left.readAtMs !== null) - Number(right.readAtMs !== null) || right.createdAtMs - left.createdAtMs || right.messageId - left.messageId);
         setMessages(loaded);
